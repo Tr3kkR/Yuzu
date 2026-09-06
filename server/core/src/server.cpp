@@ -121,6 +121,7 @@
 #include "dispatch_scope_ladder.hpp" // A-3/QE-2: the shared scope-resolution ladder + caller wiring
 #include "json_extract.hpp" // #2557: shared JSON body-extraction helpers (was 7 ServerImpl statics)
 #include "command_routes.hpp" // #2557: POST /api/command, extracted onto the HttpRouteSink seam
+#include "page_routes.hpp" // #2542: page-shell/static-asset routes, extracted onto the HttpRouteSink seam
 #include "command_capability.hpp" // PR1.9c: CommandCapabilityRegistry — the dispatch classification vocabulary
 #include "command_capability_parsers.hpp" // PR1.9c: encode_dispatch_tag / compute_plan_hash
 // PR1.9c: the seven capability spans build_classified_command's registry composes over —
@@ -13121,6 +13122,18 @@ private:
                               const std::string& type, const std::string& op) -> bool {
             return require_permission(req, res, type, op);
         };
+
+        // #2542: page-shell/static-asset routes (25), extracted onto inline_sink
+        // (this call's own HttpRouteSink seam) rather than any per-owner sink —
+        // these routes are pure page-shell/static-asset serving with no owning
+        // store of their own.
+        yuzu::server::page::register_page_routes(inline_sink, yuzu::server::page::Deps{
+            .auth_fn = auth_fn,
+            .perm_fn = perm_fn,
+            .viz_disabled = &viz_disabled_,
+            .registry = &registry_,
+        });
+
         // Per-device tier + management-group scope gate (wraps
         // require_scoped_permission). Used by DeviceRoutes' per-device routes so an
         // operator can only open / read / live-query a device inside their scope.
@@ -14504,125 +14517,7 @@ private:
             res.set_content(j.dump(), "application/json");
         });
 
-        // -- Static design-system assets ----------------------------------------
-        // CSS is served with no-cache so dashboard skin iteration during
-        // active dev/UAT is picked up on a normal browser reload. The bundle
-        // is ~22 KB; revalidation cost is negligible. Switch back to
-        // max-age + content-hashed URL for prod once the skin stabilises.
-        web_server_->Get("/static/yuzu.css", [](const httplib::Request&, httplib::Response& res) {
-            res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
-            res.set_content(yuzu::server::kYuzuCss, "text/css; charset=utf-8");
-        });
-        web_server_->Get("/static/icons.svg", [](const httplib::Request&, httplib::Response& res) {
-            res.set_header("Cache-Control", "public, max-age=3600");
-            res.set_content(kYuzuIconsSvg, "image/svg+xml");
-        });
-        web_server_->Get("/static/htmx.js", [](const httplib::Request&, httplib::Response& res) {
-            res.set_header("Cache-Control", "public, max-age=86400");
-            res.set_content(kHtmxJs, "application/javascript; charset=utf-8");
-        });
-        web_server_->Get("/static/sse.js", [](const httplib::Request&, httplib::Response& res) {
-            res.set_header("Cache-Control", "public, max-age=86400");
-            res.set_content(kSseJs, "application/javascript; charset=utf-8");
-        });
-        // Issue #253: response visualization renderer.
-        // /static/echarts.min.js is the vendored Apache ECharts 5 library
-        // (Apache-2.0). /static/yuzu-charts.js is the thin Yuzu adapter
-        // that maps our chart payload onto ECharts options and reads
-        // Yuzu design-system CSS tokens for theming. Both are cached aggressively
-        // because the bundle is content-addressed by binary version.
-        web_server_->Get(
-            "/static/echarts.min.js", [](const httplib::Request&, httplib::Response& res) {
-                res.set_header("Cache-Control", "public, max-age=86400");
-                res.set_content(yuzu::server::kEChartsJs, "application/javascript; charset=utf-8");
-            });
-
-        // PR 4 of feat/viz-engine: vendored Three.js r168 (MIT) + OrbitControls
-        // (MIT, ES module). Modern Three.js (r150+) ships only as ES modules,
-        // so PR 5's page scaffold loads these via `<script type="importmap">`
-        // mapping `"three"` to `/static/three.module.min.js` and
-        // `"three/addons/controls/OrbitControls.js"` to
-        // `/static/three-orbit-controls.js`. Cache-Control matches the
-        // ECharts pattern: public, max-age=86400, content-addressed by
-        // server binary version.
-        web_server_->Get(
-            "/static/three.module.min.js", [](const httplib::Request&, httplib::Response& res) {
-                res.set_header("Cache-Control", "public, max-age=86400");
-                res.set_content(yuzu::server::kThreeJs, "application/javascript; charset=utf-8");
-            });
-        web_server_->Get("/static/three-orbit-controls.js",
-                         [](const httplib::Request&, httplib::Response& res) {
-                             res.set_header("Cache-Control", "public, max-age=86400");
-                             res.set_content(yuzu::server::kThreeOrbitControlsJs,
-                                             "application/javascript; charset=utf-8");
-                         });
-        // PR 5 of feat/viz-engine: yuzu-viz.js renderer module. Loaded as
-        // type="module" so it can resolve the `import 'three'` bare
-        // specifier through the importmap declared in viz_page_ui.cpp.
-        //
-        // Cache-Control: no-cache, no-store, must-revalidate -- matches the
-        // /viz/fleet page shell. The renderer bundles change on every
-        // feat/viz-engine PR; a `max-age` here means operators serve a
-        // stale renderer (wrong tier classification, missing features,
-        // outdated layout code) for up to the max-age window after a
-        // server upgrade, with no signal that anything is wrong. The page
-        // shell already revalidates; the bundle it pulls must too, or the
-        // skew window just moves from the HTML to the JS. ~88 KB of
-        // revalidated body per page load is cheap next to a silently-stale
-        // renderer. Vendored libs below (cytoscape, three) keep max-age --
-        // they're content-stable and only change on a deliberate refresh.
-        web_server_->Get(
-            "/static/yuzu-viz.js", [](const httplib::Request&, httplib::Response& res) {
-                res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
-                res.set_content(yuzu::server::kYuzuVizJs, "application/javascript; charset=utf-8");
-            });
-
-        // PR 9-pre: per-host renderer + vendored Cytoscape.js 3.33.3 (MIT).
-        // yuzu-viz-host.js is the ES module entry; cytoscape.min.js is the
-        // ESM minified Cytoscape bundle resolved via the importmap in
-        // viz_host_page_ui.cpp. The renderer uses cytoscape's built-in
-        // `cose` layout — no layout-extension asset is served.
-        //
-        // yuzu-viz-host.js gets the same no-cache treatment as yuzu-viz.js
-        // (it's our renderer code, changes every viz PR); cytoscape.min.js
-        // keeps max-age (vendored, content-stable).
-        web_server_->Get("/static/yuzu-viz-host.js", [](const httplib::Request&,
-                                                        httplib::Response& res) {
-            res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
-            res.set_content(yuzu::server::kYuzuVizHostJs, "application/javascript; charset=utf-8");
-        });
-        web_server_->Get("/static/cytoscape.min.js", [](const httplib::Request&,
-                                                        httplib::Response& res) {
-            res.set_header("Cache-Control", "public, max-age=86400");
-            res.set_content(yuzu::server::kCytoscapeJs, "application/javascript; charset=utf-8");
-        });
-        // Inter variable webfont (SIL OFL) — the Yuzu design system's
-        // default family. Single woff2 covers all weights via font-
-        // variation-settings on the @font-face declaration in
-        // css_bundle.cpp.
-        web_server_->Get("/static/fonts/InterVariable.woff2", [](const httplib::Request&,
-                                                                 httplib::Response& res) {
-            res.set_header("Cache-Control", "public, max-age=2592000, immutable");
-            // Zero-copy: pass the byte view's data+size directly so we
-            // don't allocate a 345 KB std::string per fetch. (Gate 3
-            // cpp-S1.) httplib's set_content(const char*, size_t, ...)
-            // copies into the response buffer once.
-            res.set_content(yuzu::server::kInterVariableWoff2.data(),
-                            yuzu::server::kInterVariableWoff2.size(), "font/woff2");
-        });
-
-        web_server_->Get("/static/yuzu-charts.js", [](const httplib::Request&,
-                                                      httplib::Response& res) {
-            res.set_header("Cache-Control", "public, max-age=86400");
-            res.set_content(yuzu::server::kYuzuChartsJs, "application/javascript; charset=utf-8");
-        });
-
         // Issue #253 fragment route lives in dashboard_routes.cpp now (#589).
-
-        // -- Dashboard (unified UI) -------------------------------------------
-        web_server_->Get("/", [](const httplib::Request&, httplib::Response& res) {
-            res.set_content(kDashboardIndexHtml, "text/html; charset=utf-8");
-        });
 
         // PR2 — MFA step-up gate. Single shared closure (governance Gate 2
         // sec-M5: was duplicated at the SettingsRoutes and RestApiV1
@@ -14710,14 +14605,6 @@ private:
         // F1: live-apply hook for the DEX alerts settings (wired before the
         // listener starts, so no request races the set).
         settings_routes_->set_dex_alert_apply_fn([this]() { apply_dex_alert_config(); });
-
-        // Legacy routes — redirect to dashboard
-        web_server_->Get("/chargen", [](const httplib::Request&, httplib::Response& res) {
-            res.set_redirect("/");
-        });
-        web_server_->Get("/procfetch", [](const httplib::Request&, httplib::Response& res) {
-            res.set_redirect("/");
-        });
 
         // SSE endpoint
         web_server_->Get("/events", [this](const httplib::Request& req, httplib::Response& res) {
@@ -14821,53 +14708,6 @@ private:
         });
 
         // /fragments/scope-list — moved to DashboardRoutes (with groups support)
-
-        web_server_->Get("/api/help", [this](const httplib::Request& req, httplib::Response& res) {
-            if (!require_permission(req, res, "Infrastructure", "Read"))
-                return;
-            res.set_content(registry_.help_json(), "application/json");
-        });
-
-        // Help table HTML fragment (HTMX)
-        web_server_->Get("/api/help/html",
-                         [this](const httplib::Request& req, httplib::Response& res) {
-                             if (!require_permission(req, res, "Infrastructure", "Read"))
-                                 return;
-                             std::string filter;
-                             if (req.has_param("filter"))
-                                 filter = req.get_param_value("filter");
-                             res.set_content(registry_.help_html(filter), "text/html");
-                         });
-
-        // Autocomplete HTML fragment (HTMX)
-        web_server_->Get("/api/help/autocomplete",
-                         [this](const httplib::Request& req, httplib::Response& res) {
-                             if (!require_permission(req, res, "Infrastructure", "Read"))
-                                 return;
-                             std::string q;
-                             if (req.has_param("q"))
-                                 q = req.get_param_value("q");
-                             if (q.empty()) {
-                                 res.set_content("", "text/html");
-                                 return;
-                             }
-                             res.set_content(registry_.autocomplete_html(q), "text/html");
-                         });
-
-        // Command palette instruction search HTML fragment (HTMX)
-        web_server_->Get("/api/help/palette",
-                         [this](const httplib::Request& req, httplib::Response& res) {
-                             if (!require_permission(req, res, "Infrastructure", "Read"))
-                                 return;
-                             std::string q;
-                             if (req.has_param("q"))
-                                 q = req.get_param_value("q");
-                             if (q.empty()) {
-                                 res.set_content("", "text/html");
-                                 return;
-                             }
-                             res.set_content(registry_.palette_html(q), "text/html");
-                         });
 
         // -- NVD CVE feed endpoints -------------------------------------------
 
@@ -15853,40 +15693,6 @@ private:
                             "application/json");
         });
 
-        // -- Help page --------------------------------------------------------
-        web_server_->Get("/help", [](const httplib::Request&, httplib::Response& res) {
-            res.set_content(kHelpHtml, "text/html; charset=utf-8");
-        });
-
-        // -- TAR dashboard page (Phase 15.A — issue #547) --------------------
-        // Auth required because the page makes HTMX calls to retention-paused
-        // and (later) SQL fragment endpoints that themselves require auth +
-        // RBAC; loading the page unauthenticated would just produce a blank
-        // shell that immediately redirects on first fragment request. Mirror
-        // the /instructions pattern.
-        web_server_->Get("/tar", [this](const httplib::Request& req, httplib::Response& res) {
-            auto session = require_auth(req, res);
-            if (!session) {
-                res.set_redirect("/login");
-                return;
-            }
-            res.set_content(kTarPageHtml, "text/html; charset=utf-8");
-        });
-
-        // ── Result Sets (scope walking — capability §30) ─────────────────
-        // Page shell + HTML fragment routes. Per-operator, owner-scoped: every
-        // fragment authenticates and filters/loads by the session principal.
-        // Rendering lives in result_sets_ui.cpp; store I/O happens here.
-        web_server_->Get("/result-sets",
-                         [this](const httplib::Request& req, httplib::Response& res) {
-                             auto session = require_auth(req, res);
-                             if (!session) {
-                                 res.set_redirect("/login");
-                                 return;
-                             }
-                             res.set_content(kResultSetsPageHtml, "text/html; charset=utf-8");
-                         });
-
         // Owner-scoped sidebar list.
         //
         // guardian-confinement-2298 PR3 §3e: every result-set fragment below
@@ -16149,109 +15955,6 @@ private:
                 res.set_content(render_result_sets_sidebar(sets, created->id),
                                 "text/html; charset=utf-8");
             });
-
-        // PR 5 of feat/viz-engine: Fleet visualization page. Auth-gated
-        // (same posture as /tar) but the per-request RBAC check happens
-        // inside VizRoutes when the page's JS hits /api/v1/viz/fleet/topology.
-        // The page itself is just the renderer scaffold + nav chrome -- no
-        // per-machine data is rendered server-side; the JSON fetch on the
-        // client is what enforces Response.Read.
-        //
-        // Cache-Control: no-cache, no-store, must-revalidate forces the
-        // browser to revalidate the page HTML on every navigation. This
-        // closes the gov R4 UP-10 / DEP-1 / CHAOS-C3 "stale page + new
-        // bundle" skew window: the page references a hard-coded importmap
-        // for `/static/three.module.min.js` etc. that are themselves
-        // cached for 24 hours. Without revalidation, a heuristically-
-        // cached stale page after a server upgrade pairs with new asset
-        // bytes (or vice versa), producing a silent blank canvas with a
-        // module-resolution console error.
-        //
-        // Future-PR ordering note (gov R4 arch-S1): if a future PR
-        // introduces a regex route like `R"(/viz/([^/]+))"` for per-
-        // machine drill-in, register it AFTER this literal route or the
-        // first-match-wins routing in cpp-httplib would swallow `fleet`
-        // as a path parameter.
-        web_server_->Get("/viz/fleet", [this](const httplib::Request& req, httplib::Response& res) {
-            auto session = require_auth(req, res);
-            if (!session) {
-                res.set_redirect("/login");
-                return;
-            }
-            // Gate 7 sec-L1 / cons-N1 — honour the kill switch on the page
-            // shell, not just the REST/fragment endpoints. Previously the
-            // shell rendered and only the JSON fetch 503'd, leaving the
-            // operator with a half-working page and a console error. 503
-            // here matches the VizRoutes posture and the invariant doc's
-            // "a disabled viz surface returns 503".
-            if (viz_disabled_.load(std::memory_order_acquire)) {
-                res.status = 503;
-                res.set_content("fleet visualization is disabled by an administrator "
-                                "(--viz-disable / YUZU_VIZ_DISABLE)",
-                                "text/plain; charset=utf-8");
-                return;
-            }
-            res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
-            res.set_content(kVizFleetPageHtml, "text/html; charset=utf-8");
-        });
-
-        // PR 9-pre: per-host drill-down page. Opened by the 3D viz's
-        // dblclick handler in a new tab. Must be registered AFTER
-        // /viz/fleet (literal match wins; the regex below would otherwise
-        // swallow `fleet` as a parameter — gov R4 arch-S1 ordering).
-        // Agent_id is URL-decoded by httplib (req.matches[1]); we replace
-        // `{{AGENT_ID}}` in the static HTML with the sanitised id so the
-        // renderer can read it from data-agent-id without parsing the URL.
-        // Allow-list: a-z A-Z 0-9 dash underscore dot — anything else is
-        // 400 (the agent_id schema is hexadecimal-uuid-ish; nothing else
-        // should reach this route).
-        web_server_->Get(
-            R"(/viz/host/([^/]+))", [this](const httplib::Request& req, httplib::Response& res) {
-                auto session = require_auth(req, res);
-                if (!session) {
-                    res.set_redirect("/login");
-                    return;
-                }
-                // Gate 7 sec-L1 / cons-N1 — kill switch on the host
-                // drill-down page shell too (cons-N1 confirmed the gap
-                // spans both viz page routes, not just /viz/fleet).
-                if (viz_disabled_.load(std::memory_order_acquire)) {
-                    res.status = 503;
-                    res.set_content("fleet visualization is disabled by an administrator "
-                                    "(--viz-disable / YUZU_VIZ_DISABLE)",
-                                    "text/plain; charset=utf-8");
-                    return;
-                }
-                const std::string raw_id = req.matches.size() > 1 ? req.matches[1].str() : "";
-                for (char c : raw_id) {
-                    const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                                    (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.';
-                    if (!ok) {
-                        res.status = 400;
-                        res.set_content("invalid agent_id", "text/plain");
-                        return;
-                    }
-                }
-                std::string html(kVizHostPageHtml);
-                const std::string token = "{{AGENT_ID}}";
-                for (auto pos = html.find(token); pos != std::string::npos;
-                     pos = html.find(token, pos + raw_id.size())) {
-                    html.replace(pos, token.size(), raw_id);
-                }
-                res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
-                res.set_content(std::move(html), "text/html; charset=utf-8");
-            });
-
-        // -- Instruction management page --------------------------------------
-        web_server_->Get("/instructions",
-                         [this](const httplib::Request& req, httplib::Response& res) {
-                             auto session = require_auth(req, res);
-                             if (!session) {
-                                 res.set_redirect("/login");
-                                 return;
-                             }
-                             res.set_content(kInstructionPageHtml, "text/html; charset=utf-8");
-                         });
 
         // -- Generic JSON-to-CSV export -----------------------------------------
         web_server_->Post("/api/export/json-to-csv", [this](const httplib::Request& req,
