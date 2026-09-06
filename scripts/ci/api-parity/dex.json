@@ -51,9 +51,12 @@
     "method": "GET",
     "path": "/fragments/dex/catalogue",
     "capability_id": "get.fragments-dex-catalogue",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/dex/signals"
+    },
+    "mcp_twin": "list_dex_signals",
+    "status": "twinned"
   },
   {
     "method": "GET",
@@ -67,9 +70,12 @@
     "method": "GET",
     "path": "/fragments/dex/catalogue/signal",
     "capability_id": "get.fragments-dex-catalogue-signal",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/dex/signals/{obs_type}"
+    },
+    "mcp_twin": "get_dex_signal_detail",
+    "status": "twinned"
   },
   {
     "method": "GET",
@@ -147,25 +153,34 @@
     "method": "GET",
     "path": "/fragments/dex/perf",
     "capability_id": "get.fragments-dex-perf",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/dex/perf/fleet"
+    },
+    "mcp_twin": "get_dex_perf_fleet",
+    "status": "twinned"
   },
   {
     "method": "GET",
     "path": "/fragments/dex/perf/app",
     "capability_id": "get.fragments-dex-perf-app",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/dex/perf/app"
+    },
+    "mcp_twin": "get_dex_app_perf",
+    "status": "twinned"
   },
   {
     "method": "GET",
     "path": "/fragments/dex/perf/apps",
     "capability_id": "get.fragments-dex-perf-apps",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/dex/perf/apps"
+    },
+    "mcp_twin": "list_dex_perf_apps",
+    "status": "twinned"
   },
   {
     "method": "GET",
@@ -182,9 +197,12 @@
     "method": "GET",
     "path": "/fragments/dex/perf/devices",
     "capability_id": "get.fragments-dex-perf-devices",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/dex/perf/devices"
+    },
+    "mcp_twin": "list_dex_perf_devices",
+    "status": "twinned"
   },
   {
     "method": "GET",
