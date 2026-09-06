@@ -110,59 +110,17 @@ BASELINE_UNTWINNED = 265
 # F2's job is to backfill openapi_spec() until this list is empty - it must
 # only ever SHRINK. Each entry is [METHOD, canonical_path, reason].
 ALLOWLIST_OPENAPI_MISSING = [
-    # Device tokens (rest_api_v1.cpp) - DeviceTokenStore CRUD, undocumented.
-    ("GET", "/api/v1/device-tokens", "F2 backlog: DeviceTokenStore CRUD undocumented"),
-    ("POST", "/api/v1/device-tokens", "F2 backlog: DeviceTokenStore CRUD undocumented"),
-    ("DELETE", "/api/v1/device-tokens/{param}", "F2 backlog: DeviceTokenStore CRUD undocumented"),
-    # License store (rest_api_v1.cpp) - undocumented.
-    ("GET", "/api/v1/license", "F2 backlog: LicenseStore surface undocumented"),
-    ("POST", "/api/v1/license", "F2 backlog: LicenseStore surface undocumented"),
-    ("DELETE", "/api/v1/license/{param}", "F2 backlog: LicenseStore surface undocumented"),
-    ("GET", "/api/v1/license/alerts", "F2 backlog: LicenseStore surface undocumented"),
-    # Sessions (rest_api_v1.cpp) - self/admin session revocation, undocumented.
-    ("DELETE", "/api/v1/sessions", "F2 backlog: session revocation undocumented"),
-    ("DELETE", "/api/v1/sessions/me", "F2 backlog: session revocation undocumented"),
-    # Agent plugin policy (settings_routes.cpp).
-    ("GET", "/api/v1/agent/plugin-policy", "F2 backlog: agent plugin-policy read undocumented"),
-    # Execution statistics (rest_api_v1.cpp).
-    ("GET", "/api/v1/execution-statistics", "F2 backlog: ExecutionStatistics surface undocumented"),
-    ("GET", "/api/v1/execution-statistics/agents", "F2 backlog: ExecutionStatistics surface undocumented"),
-    ("GET", "/api/v1/execution-statistics/definitions", "F2 backlog: ExecutionStatistics surface undocumented"),
-    # Result sets / scope walking (rest_api_v1.cpp) - docs/scope-walking-design.md
-    # ships the design; the REST surface itself was never folded into
-    # openapi_spec(). Largest single cluster in the 40 - a natural F2 slice.
-    ("GET", "/api/v1/result-sets", "F2 backlog: scope-walking result-set surface undocumented (docs/scope-walking-design.md)"),
-    ("POST", "/api/v1/result-sets", "F2 backlog: scope-walking result-set surface undocumented"),
-    ("GET", "/api/v1/result-sets/{param}", "F2 backlog: scope-walking result-set surface undocumented"),
-    ("DELETE", "/api/v1/result-sets/{param}", "F2 backlog: scope-walking result-set surface undocumented"),
-    ("GET", "/api/v1/result-sets/{param}/lineage", "F2 backlog: scope-walking result-set surface undocumented"),
-    ("GET", "/api/v1/result-sets/{param}/members", "F2 backlog: scope-walking result-set surface undocumented"),
-    ("POST", "/api/v1/result-sets/{param}/pin", "F2 backlog: scope-walking result-set surface undocumented"),
-    ("POST", "/api/v1/result-sets/{param}/unpin", "F2 backlog: scope-walking result-set surface undocumented"),
-    ("POST", "/api/v1/result-sets/{param}/re-eval", "F2 backlog: scope-walking result-set surface undocumented"),
-    ("POST", "/api/v1/result-sets/from-instruction-result", "F2 backlog: scope-walking result-set surface undocumented"),
-    ("POST", "/api/v1/result-sets/from-inventory-query", "F2 backlog: scope-walking result-set surface undocumented"),
-    ("POST", "/api/v1/result-sets/from-tar-query", "F2 backlog: scope-walking result-set surface undocumented"),
-    # Software deployments / packages (rest_api_v1.cpp).
-    ("GET", "/api/v1/software-deployments", "F2 backlog: software deployment surface undocumented"),
-    ("POST", "/api/v1/software-deployments", "F2 backlog: software deployment surface undocumented"),
-    ("POST", "/api/v1/software-deployments/{param}/start", "F2 backlog: software deployment surface undocumented"),
-    ("POST", "/api/v1/software-deployments/{param}/cancel", "F2 backlog: software deployment surface undocumented"),
-    ("POST", "/api/v1/software-deployments/{param}/rollback", "F2 backlog: software deployment surface undocumented"),
-    ("GET", "/api/v1/software-packages", "F2 backlog: software package surface undocumented"),
-    ("POST", "/api/v1/software-packages", "F2 backlog: software package surface undocumented"),
-    # Statistics / topology (rest_api_v1.cpp, viz_routes.cpp).
-    ("GET", "/api/v1/statistics", "F2 backlog: fleet statistics surface undocumented"),
-    ("GET", "/api/v1/topology", "F2 backlog: legacy topology surface undocumented"),
-    ("GET", "/api/v1/viz/fleet/topology", "F2 backlog: fleet-viz REST surface undocumented (docs/fleet-viz-invariants.md)"),
-    ("GET", "/api/v1/viz/host/{param}/topology", "F2 backlog: fleet-viz REST surface undocumented"),
-    # Misc singletons.
-    ("POST", "/api/v1/inventory/evaluate", "F2 backlog: inventory evaluate-now trigger undocumented"),
-    ("POST", "/api/v1/tar/retention-paused/purge", "F2 backlog: TAR retention-pause purge action undocumented"),
-    ("POST", "/api/v1/users/elevation-eligibility", "F2 backlog: JIT-elevation eligibility admin route undocumented"),
+    # The 39-entry "F2 backlog" this list originally carried (device tokens,
+    # license, sessions, agent plugin-policy, execution-statistics, the
+    # result-sets/scope-walking cluster, software deployments/packages,
+    # statistics/topology, and three misc singletons) was backfilled into
+    # openapi_spec() by #3992 (merged to dev 2026-09-06) - see
+    # changelog.d/3992-openapi-backfill.added.md. Removed here rather than
+    # left stale, per this script's own "no stale allowlist entry" check.
+    #
     # Blanket CORS preflight, not a discrete documentable capability - every
     # /api/v1/* path answers OPTIONS the same way (204, no body). Structural
-    # exception, not an F2 backlog item.
+    # exception, never an F2-style backlog item.
     ("OPTIONS", "/api/v1/{param}", "blanket CORS preflight handler (sink.Options(R\"(/api/v1/.*)\", ...)) - not a discrete capability, exempt from OpenAPI documentation"),
 ]
 
