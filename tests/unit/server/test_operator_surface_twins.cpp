@@ -426,6 +426,11 @@ constexpr TwinRow kExpectedTwins[] = {
     {"mint_upload_grant", "UploadGrant", "Write", false},
     {"list_upload_grants", "UploadGrant", "Read", true},
     {"revoke_upload_grant", "UploadGrant", "Delete", false},
+    // #4033 (#2146 Batch A) — pinned against
+    // /fragments/create-group-form's own ManagementGroup:Write gate
+    // (dashboard_routes.cpp) and its REST twin GET /api/v1/management-groups/
+    // agent-count-preview (rest_api_v1.cpp).
+    {"preview_management_group_agent_count", "ManagementGroup", "Write", false},
 };
 
 } // namespace

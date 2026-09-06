@@ -941,6 +941,13 @@ struct McpTestServer {
         return {true, std::nullopt};
     };
 
+    /// #4033 — the fake twin of the D3 Response:Read-visible-set resolver
+    /// backing preview_management_group_agent_count. Default: TOP
+    /// (nullopt, unfiltered) — a test that cares about scoping overrides
+    /// this per-case.
+    yuzu::server::mcp::McpServer::ResponseVisibleSetFn response_visible_set_fn_for_test =
+        [](const std::string&) -> std::optional<std::set<std::string>> { return std::nullopt; };
+
     /// ADR-0024 (SLE discovery): optionally wire a typed SoftwareLicensingStore so
     /// query_software_licenses (the MCP twin of the GET /sle/agents/{id} drill) is
     /// exercised end-to-end — success shape, the deliberate user_scope/user_ref PII
@@ -1172,6 +1179,12 @@ private:
         // predicate's "legacy-open" posture, so this is a no-op change of
         // shape for every pre-existing test that never touches it.
         mcp.set_fleet_read_fn(fleet_read_fn_for_test);
+
+        // #4033: response_visible_set_fn ALSO rides a setter, same pattern
+        // as fleet_read_fn above — wire before the handlers are built.
+        // Unconditional: the fixture default above is TOP/unfiltered, a
+        // no-op for every pre-existing test.
+        mcp.set_response_visible_set_fn(response_visible_set_fn_for_test);
 
         // #3685: the Destructive-targeting classifier ALSO rides a setter,
         // same pattern as the two above — wire before the handlers are
@@ -11592,6 +11605,87 @@ TEST_CASE("MCP query_installed_software: a degraded store errors, never success+
     CHECK(saw_failure_audit);
 }
 
+// ── preview_management_group_agent_count (#4033, #2146 API-parity Batch A) ──
+// MCP twin of GET /api/v1/management-groups/agent-count-preview and
+// /fragments/create-group-form's own live count — all three call the SAME
+// shared builder (group_agent_count_preview.hpp). No Postgres substrate
+// needed here: response_store_for_test stays nullptr, which exercises the
+// "empty filters -> genuine 0, no store call" branch and the "non-empty
+// filters against an unconfigured store -> degrade" branch, both entirely
+// store-free per the shared model's own contract (see
+// test_group_agent_count_preview.cpp for direct coverage of that contract).
+
+TEST_CASE("MCP preview_management_group_agent_count: no filters is a genuine 0",
+          "[mcp][devices]") {
+    McpTestServer ts; // response_store_for_test stays nullptr
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":90,)"
+        R"("params":{"name":"preview_management_group_agent_count",)"
+        R"("arguments":{"command_id":"cmd-1","plugin":"procfetch"}}})");
+    REQUIRE(res->status == 200);
+    auto envelope = nlohmann::json::parse(res->body);
+    REQUIRE(envelope.contains("result"));
+    auto data = nlohmann::json::parse(envelope["result"]["content"][0]["text"].get<std::string>());
+    CHECK(data["agent_count"].get<int64_t>() == 0);
+}
+
+TEST_CASE("MCP preview_management_group_agent_count: a real filter against an unwired "
+          "store degrades, never a false 0",
+          "[mcp][devices]") {
+    McpTestServer ts; // response_store_for_test stays nullptr
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":91,)"
+        R"("params":{"name":"preview_management_group_agent_count",)"
+        R"("arguments":{"command_id":"cmd-1","plugin":"procfetch","filters":{"pid":"1234"}}}})");
+    REQUIRE(res->status == 200);
+    auto envelope = nlohmann::json::parse(res->body);
+    REQUIRE(envelope.contains("error"));
+    CHECK_FALSE(envelope.contains("result"));
+}
+
+TEST_CASE("MCP preview_management_group_agent_count: readonly tier is denied "
+          "(ManagementGroup:Write, not Read)",
+          "[mcp][devices]") {
+    McpTestServer ts;
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":92,)"
+        R"("params":{"name":"preview_management_group_agent_count",)"
+        R"("arguments":{"command_id":"cmd-1","plugin":"procfetch"}}})");
+    REQUIRE(res->status == 200);
+    auto envelope = nlohmann::json::parse(res->body);
+    REQUIRE(envelope.contains("error"));
+}
+
+TEST_CASE("MCP preview_management_group_agent_count: RBAC denial (ManagementGroup:Write) "
+          "blocks the call",
+          "[mcp][devices]") {
+    McpTestServer ts;
+    ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+        return !(securable == "ManagementGroup" && op == "Write");
+    };
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":93,)"
+        R"("params":{"name":"preview_management_group_agent_count",)"
+        R"("arguments":{"command_id":"cmd-1","plugin":"procfetch"}}})");
+    REQUIRE(res->status == 403);
+}
+
+TEST_CASE("MCP preview_management_group_agent_count: securable/operation registration "
+          "matches the REST twin",
+          "[mcp][devices]") {
+    const auto rows = tool_security_rows_for_test();
+    auto it = std::find_if(rows.begin(), rows.end(), [](const auto& r) {
+        return r.name == "preview_management_group_agent_count";
+    });
+    REQUIRE(it != rows.end());
+    CHECK(it->securable == "ManagementGroup");
+    CHECK(it->operation == "Write");
+}
+
 // ── query_software_licenses (ADR-0024 SLE discovery — the MCP twin of the ──────
 //    GET /api/v1/sle/agents/{id} drill). Same per-device SCOPED SoftwareLicensing:
 //    Read gate (ADR-0017 confinement) as the REST drill, the same #1717 fail-closed
@@ -13917,6 +14011,11 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
         {"delete_plugin_config", nlohmann::json::parse(R"({"plugin":"p","key":"k"})")},
         {"delete_plugin_secret", nlohmann::json::parse(R"({"plugin":"p","key":"k"})")},
         {"revoke_upload_grant", nlohmann::json::parse(R"({"grant_id":"ab12"})")},
+        // #4033: ManagementGroup:Write is in the supervised-tier gated list —
+        // this tool inherits that gate as a consequence of matching the
+        // fragment's own gate exactly (see its kTools[] entry's comment).
+        {"preview_management_group_agent_count",
+         nlohmann::json::parse(R"({"command_id":"cmd-1","plugin":"procfetch"})")},
     };
 
     // Tether: the gated set derived from security rows + requires_approval()
