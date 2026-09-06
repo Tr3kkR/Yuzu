@@ -173,6 +173,10 @@ Each column object:
 |---|---|---|---|---|
 | `name` | string | Yes | -- | Column identifier. |
 | `type` | string | Yes | -- | Column type. Values: `bool`, `int32`, `int64`, `string`, `datetime`, `guid`, `clob`. See [Section 11](#11-result-column-type-system). |
+| `description` | string | No | -- | Documentation only: what the column carries. Rendered into the plugin README's Outputs table and the `content/plugin-docs` manifest by `tools/plugin-doc-gen` (`docs/plugin-readme-standard.md` rule 8). The server does not read it. |
+| `values` | list of string | No | -- | Documentation only: the closed vocabulary the column may carry (e.g. `[ok, warning, failing, unknown, unsupported]`). Not enforced at runtime. |
+| `example` | string | No | -- | Documentation only: one representative value. |
+| `platforms` | list of string | No | -- | Documentation only: the platforms on which the column carries a real value, from `windows`, `linux`, `darwin`. Omitted means every platform the definition lists. |
 
 #### `spec.result.aggregation`
 

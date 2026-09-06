@@ -1,5 +1,6 @@
 # Build artifacts
 builddir/
+build-*/
 vcpkg_installed/
 *.exe
 *.dll

@@ -74,20 +74,51 @@ spec:
     columns:
       - name: device
         type: string
+        description: OS device name of the physical drive
+        example: PhysicalDrive0
+        platforms: [windows, darwin]
       - name: model
         type: string
+        description: Drive model string as reported by the OS, escaped
+        example: Samsung SSD 970 EVO Plus 1TB
+        platforms: [windows, darwin]
       - name: bus
         type: string
+        description: Transport, a closed vocabulary
+        values: [nvme, sata, usb, sas, virtual, unknown]
+        example: nvme
+        platforms: [windows, darwin]
       - name: media
         type: string
+        description: Media type, a closed vocabulary
+        values: [ssd, hdd, unknown]
+        example: ssd
+        platforms: [windows, darwin]
       - name: health
         type: string
+        description: >-
+          Health verdict. unknown means the device did not say; unsupported
+          means this OS leg cannot ask. Windows reports a verdict for NVMe
+          drives only; macOS always reports unknown; Linux always unsupported.
+        values: [ok, warning, failing, unknown, unsupported]
+        example: ok
+        platforms: [windows]
       - name: pct_used
         type: string
+        description: >-
+          NVMe "Percentage Used" (0-255 by specification, never clamped), or
+          "-" when not read.
+        example: "5"
+        platforms: [windows]
       - name: spare_pct
         type: string
+        description: NVMe "Available Spare" (0-100), or "-" when not read.
+        example: "100"
+        platforms: [windows]
       - name: detail
         type: string
+        description: Free text, or "-".
+        example: "-"
     aggregation:
       groupBy:
         - health
@@ -151,16 +182,38 @@ spec:
     columns:
       - name: volume
         type: string
+        description: >-
+          Volume GUID path (Windows) or BSD name (macOS); "-" only on the
+          empty-result placeholder row.
+        example: disk3s1s1
+        platforms: [windows, darwin]
       - name: mount_points
         type: string
+        description: Comma-separated mount points or drive letters, or "-" when the volume serves none.
+        example: /System/Volumes/Data
+        platforms: [windows, darwin]
       - name: device
         type: string
+        description: Backing physical drive; several, comma-separated, on a spanned volume.
+        example: disk0
+        platforms: [windows, darwin]
       - name: fstype
         type: string
+        description: Filesystem when mounted, else "-". Windows reports "-" today.
+        example: apfs
+        platforms: [darwin]
       - name: total_bytes
         type: int64
+        description: >-
+          Raw media capacity (sum of disk extents on Windows, IOMedia size on
+          macOS), not filesystem capacity. Not comparable with
+          crossplatform.storage.mounts.total_bytes.
+        example: "494384795648"
+        platforms: [windows, darwin]
       - name: detail
         type: string
+        description: Free text, or "-".
+        example: "-"
     aggregation:
       groupBy:
         - device

@@ -2,9 +2,11 @@
 ## Queries firewall state and enumerates rules across platforms.
 ## Plugin: firewall | Actions: state, rules
 ##
-## Sources by platform:
-##   Windows: netsh advfirewall (Domain/Private/Public profiles)
-##   Linux:   firewalld, ufw, or iptables (auto-detected)
+## Sources by platform (see agents/plugins/firewall/README.md):
+##   Windows: INetFwPolicy2 COM (Domain/Private/Public profiles; INetFwRules
+##            enumeration for rules)
+##   Linux:   firewalld (sd-bus), else nftables (netlink), else ufw, else
+##            iptables (auto-detected in that order)
 ##   macOS:   state: Application Firewall (socketfilterfw) primary, pf (pfctl)
 ##            secondary; rules: pf (pfctl)
 
@@ -45,8 +47,21 @@ spec:
     columns:
       - name: profile_or_backend
         type: string
+        description: >-
+          Row key. Windows: "profile" rows carry the profile name in the next
+          field (Domain, Private, Public). Linux and macOS: "backend", "state",
+          "mode" and "pf" rows, one key each.
+        values: [profile, backend, state, mode, pf, error]
+        example: profile
       - name: state
         type: string
+        description: >-
+          Windows profile rows: enabled, disabled, unknown or error:<hresult>.
+          Linux "state" rows: running (firewalld), active, inactive or unknown.
+          macOS "state" rows: enabled, disabled or unknown; "pf" rows the same;
+          "mode" row is block_all. "backend" rows name the backend (appfirewall,
+          firewalld, nftables, ufw, iptables, none).
+        example: enabled
     aggregation:
       groupBy: [state]
       operations: [count]
@@ -96,11 +111,15 @@ metadata:
   displayName: List Firewall Rules
   version: 1.0.0
   description: >
-    List firewall rules on the endpoint. On Windows, enumerates inbound
-    rules via netsh (capped at 100 rules) with rule name, enabled state,
-    direction, action, and profiles. On Linux, uses the detected backend
-    (firewall-cmd --list-all, ufw status numbered, or iptables -L). On
-    macOS, lists pf rules via pfctl -s rules.
+    List firewall rules on the endpoint. On Windows, enumerates the
+    Windows Firewall rule set through the INetFwPolicy2 COM interface
+    (capped at 100 rules, with a truncated marker row when the cap is hit)
+    with rule name, enabled state, direction, action, and profile mask. On
+    Linux, uses the detected backend: firewalld zones and services over
+    D-Bus, nftables chains and rule handles over netlink, or the structured
+    parse of ufw status numbered / iptables -S. On macOS, lists pf rules
+    via pfctl -s rules (root required to read /dev/pf; unprivileged runs
+    list nothing).
   tags: [security, firewall, compliance, network, audit]
 
 spec:
@@ -120,14 +139,34 @@ spec:
     columns:
       - name: rule_name
         type: string
+        description: >-
+          Windows: the rule's display name. Linux ufw: the numbered index;
+          firewalld: the zone; nftables: the chain or rule handle row; macOS:
+          the raw pf rule line.
+        example: Core Networking - DNS (UDP-Out)
       - name: enabled
         type: string
+        description: Windows only; enabled or disabled.
+        values: [enabled, disabled]
+        example: enabled
+        platforms: [windows]
       - name: direction
         type: string
+        description: Windows only; in, out or unknown.
+        values: [in, out, unknown]
+        example: out
+        platforms: [windows]
       - name: action
         type: string
+        description: Windows only; allow, block or unknown.
+        values: [allow, block, unknown]
+        example: allow
+        platforms: [windows]
       - name: profiles
         type: string
+        description: Windows only; the NET_FW_PROFILE_TYPE2 bitmask as an integer (1 domain, 2 private, 4 public, 2147483647 all).
+        example: "2147483647"
+        platforms: [windows]
 
   readablePayload: "List firewall rules"
 
