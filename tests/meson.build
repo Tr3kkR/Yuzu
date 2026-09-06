@@ -452,6 +452,8 @@ agent_test_exe = executable(
                                                 # TU on Windows via the file's own #ifndef _WIN32 guard)
     'unit/test_power_health_parsers.cpp',        # Wave 6 PR6.2-a: pure power_health parser/decision tests, fixture-driven, no OS calls
     'unit/test_power_health_local_dispatcher.cpp', # Wave 6 PR6.2-a: real power_health dylib/.so via
+    'unit/test_app_usage_parsers.cpp',           # Wave 7 PR7.2: pure sqlite seam, :memory: fixture db
+    'unit/test_app_usage_local_dispatcher.cpp',  # Wave 7 PR7.2: real plugin via LocalDispatcher, unguarded on every OS
                                                 # LocalDispatcher. Deliberately NOT platform-guarded — it
                                                 # runs on every OS, and on a host with no battery it emits an
                                                 # explicit named SKIP rather than passing silently.
@@ -464,6 +466,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/installed_apps/src'),  # installed_apps_registry_utf8.hpp (#1662 test)
     include_directories('../agents/plugins/disk_actions/src'), # disk_actions_legs.hpp (pure formatters)
     include_directories('../agents/plugins/power_health/src'),  # power_health_parsers.hpp (pure helpers)
+    include_directories('../agents/plugins/app_usage/src'),  # Wave 7 PR7.2: app_usage_parsers.hpp
     include_directories('../agents/plugins/license_scan/src'),    # licensing_parsers.hpp / licensing_record.hpp (pure, SLE PR1)
     include_directories('../agents/plugins/wifi/src'),            # wifi_corewlan.hpp (pure connected-record formatter)
     include_directories('../agents/plugins/interaction/src'),     # interaction_parsers.hpp (pure helpers)
@@ -508,6 +511,10 @@ agent_test_exe = executable(
   cpp_args: test_partial_init_args + agent_platform_args + agent_test_native_args +
             ['-DYUZU_AGENT_SRC_DIR="' +
              (meson.project_source_root() / 'agents' / 'core' / 'src').replace('\\', '/') +
+             '"',
+             # Wave 7: committed fixture root; tests REQUIRE(exists), never skip
+             '-DYUZU_TEST_FIXTURE_DIR="' +
+             (meson.project_source_root() / 'tests' / 'unit' / 'fixtures').replace('\\', '/') +
              '"'],
   # catch2_nomain_dep (#1648 diagnostic): yuzu_agent_tests supplies its own main()
   # via unit/test_runner_main.cpp, so it links Catch2 without Catch2Main.
@@ -591,6 +598,7 @@ agent_test_exe = executable(
                 users_plugin_lib,
                 wifi_plugin_lib,
                 power_health_plugin_lib,
+                app_usage_plugin_lib,  # Wave 7 PR7.2
                 windows_updates_plugin_lib,
                 ],
 )

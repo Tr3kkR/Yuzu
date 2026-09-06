@@ -88,12 +88,13 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_disk_actions.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_filesystem_posture.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_power_health.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_app_usage.hpp",
 ]
 # 3 + 5 + 45 + 55 + 34 + 42 + 2 + 3 + 4 — see command_capability.hpp's fragment
 # doc comments and the #1398 design doc's verified row-count audit. The 2 is
 # disk_actions and the trailing 4 is power_health
 # (battery/thermal/power_plan/set_power_plan), both Wave 6.
-EXPECTED_TOTAL_ROWS = 193
+EXPECTED_TOTAL_ROWS = 196  # Wave 7 wave-1: +3 app_usage (summary/last_used/foreground); autoruns +2 and execution_artifacts +3 follow in later waves
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no

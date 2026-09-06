@@ -328,7 +328,7 @@ private:
     }
 
     int do_foreground(yuzu::CommandContext& ctx) {
-        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
                               "foreground/focus attribution not captured by this source");
         ctx.write_output(
             "constrained|foreground_not_captured|user-context-bridge roadmap (session-scope "

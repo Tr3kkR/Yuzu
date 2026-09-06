@@ -189,6 +189,13 @@ TEST_CASE("app_usage plugin: summary — real tar.db if present, else an explici
 
     // A real tar.db was found on this host — meta + (zero or more) usage rows.
     CHECK(result.rc == 0);
+    if (rows.front().rfind("constrained|usage_source_disabled|", 0) == 0 ||
+        rows.front().rfind("constrained|usage_schema_missing|", 0) == 0) {
+        // A real, openable tar.db whose TAR predates usage_daily or has usage_enabled=false
+        // legitimately answers constrained (rc 0) — not the meta| success shape (review M2).
+        SUCCEED("openable tar.db without a usage source: constrained token accepted");
+        return;
+    }
     CHECK(rows.front().rfind("meta|", 0) == 0);
     for (std::size_t i = 1; i < rows.size(); ++i)
         CHECK(rows[i].rfind("usage|", 0) == 0);
@@ -207,7 +214,7 @@ TEST_CASE("app_usage plugin: foreground is always constrained, exit code agrees 
     auto result = dispatcher.run(plugin->descriptor, "foreground");
 
     CHECK(result.rc == 1);
-    CHECK(result.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);  // spec: foreground -> UNAVAILABLE (review M1)
 
     const auto rows = captured_rows(result.captured);
     REQUIRE(rows.size() == 1);

@@ -471,6 +471,7 @@ if build_agent
     subdir('agents/plugins/discovery')
     subdir('agents/plugins/license_scan')
     subdir('agents/plugins/power_health')
+subdir('agents/plugins/app_usage')  # Wave 7 PR7.2
   endif
 endif
 
