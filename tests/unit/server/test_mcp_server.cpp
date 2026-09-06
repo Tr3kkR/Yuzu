@@ -29,6 +29,7 @@
 #include "test_analytics_pg_helper.hpp" // AnalyticsEventStorePg — ADR-0049 PG port
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "test_approval_manager_pg_helper.hpp" // ApprovalManagerPg — ADR-0065 PG port
+#include "test_directory_sync_pg_helper.hpp" // DirectorySyncPg — #4031 list_directory_users/get_directory_status
 #include "test_execution_tracker_pg_helper.hpp" // ExecutionTrackerPg — ADR-0065 PG port
 #include "test_response_execution_authz_pg_helper.hpp"
 #include "test_tag_store_pg_helper.hpp"  // TagStorePg — ADR-0050 PG port
@@ -961,6 +962,9 @@ struct McpTestServer {
     yuzu::server::TagStore* tag_store_for_test{nullptr};
     yuzu::server::ApprovalManager* approval_manager_for_test{nullptr};
     yuzu::server::QuarantineStore* quarantine_store_for_test{nullptr};
+    /// #4031: list_directory_users / get_directory_status. Default nullptr
+    /// keeps every pre-existing test on the store-unavailable path.
+    yuzu::server::DirectorySync* directory_sync_for_test{nullptr};
     /// Records (agent_id,key) pairs pushed via the tag-push closure (D4), so a
     /// set_tag test can assert the agent push fired.
     std::vector<std::pair<std::string, std::string>> tag_pushes;
@@ -1255,7 +1259,7 @@ private:
             /*engine_principal_store=*/nullptr,
             /*access_review_store=*/nullptr,
             /*auth_db=*/nullptr,
-            /*directory_sync=*/nullptr,
+            /*directory_sync=*/directory_sync_for_test,
             /*caller_fn=*/caller_fn_for_test,
             // 2f PR 3b: the POST handler leases from the SAME budget as GET.
             // Default nullptr keeps every pre-3b test on the plain path - a test
@@ -10692,6 +10696,100 @@ TEST_CASE("MCP operator surface: list_upload_grants is confined to what's actual
     REQUIRE(ts.audit_log.size() == 2);
     CHECK(ts.audit_log[0] == "mcp.list_upload_grants|success");
     CHECK(ts.audit_log[1] == "mcp.list_upload_grants|success");
+}
+
+// ── #4031: list_directory_users / get_directory_status ──────────────────
+//
+// Round-trip dispatch tests proving the shared-builder claim (docs/
+// api-twin-recipe.md §1) actually holds for these two tools: both call the
+// SAME directory_user_row_json / directory_status_json functions the REST
+// v1 twins (enrollment_directory_routes.cpp) and the legacy
+// /api/directory/* routes (discovery_routes.cpp) use. Deliberately does NOT
+// seed data via sync_entra/apply_entra_sync — see
+// test_enrollment_directory_routes.cpp's identical note (sync_entra makes a
+// real outbound Graph call; apply_entra_sync's test seam is a file-local
+// friend struct in test_directory_sync.cpp, not safely duplicable here
+// without an ODR risk). A freshly-opened, empty store already proves the
+// tool's registration, gating, and response-shape wiring.
+
+TEST_CASE("MCP #4031: list_directory_users dispatches, returns the shared builder's shape, and "
+          "uses the REST-domain audit verb (not mcp.list_directory_users)",
+          "[pg][mcp][integration]") {
+    yuzu::test::DirectorySyncPg ds;
+
+    McpTestServer ts;
+    ts.directory_sync_for_test = ds.get();
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"list_directory_users",)"
+        R"("arguments":{}}})");
+    REQUIRE(res);
+    auto payload = operator_surface_payload(res);
+    REQUIRE(payload["users"].is_array());
+    CHECK(payload["users"].empty());
+    CHECK(payload["count"] == 0);
+
+    // Prefers the REST-established domain verb over the generic
+    // mcp.<tool_name> action (docs/api-twin-recipe.md §4).
+    REQUIRE(ts.audit_log.size() == 1);
+    CHECK(ts.audit_log[0] == "directory.users.view|success");
+}
+
+TEST_CASE("MCP #4031: list_directory_users answers store-unavailable when directory_sync is "
+          "unwired",
+          "[mcp][integration]") {
+    McpTestServer ts;
+    // directory_sync_for_test stays nullptr — default.
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"list_directory_users",)"
+        R"("arguments":{}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+}
+
+TEST_CASE("MCP #4031: get_directory_status dispatches, returns the shared builder's shape, and "
+          "is NOT audited (no per-person PII)",
+          "[pg][mcp][integration]") {
+    yuzu::test::DirectorySyncPg ds;
+
+    McpTestServer ts;
+    ts.directory_sync_for_test = ds.get();
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"get_directory_status",)"
+        R"("arguments":{}}})");
+    REQUIRE(res);
+    auto payload = operator_surface_payload(res);
+    CHECK(payload.contains("provider"));
+    CHECK(payload.contains("status"));
+    CHECK(payload.contains("user_count"));
+    CHECK(payload.contains("group_count"));
+    REQUIRE(payload["groups"].is_array());
+
+    CHECK(ts.audit_log.empty());
+}
+
+TEST_CASE("MCP #4031: list_directory_users respects perm_fn denial on Directory:Read",
+          "[pg][mcp][integration]") {
+    yuzu::test::DirectorySyncPg ds;
+
+    McpTestServer ts;
+    ts.directory_sync_for_test = ds.get();
+    ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+        return !(securable == "Directory" && op == "Read");
+    };
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"list_directory_users",)"
+        R"("arguments":{}}})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
 }
 
 TEST_CASE("MCP operator surface: revoke_upload_grant flips the REAL store row to revoked and "

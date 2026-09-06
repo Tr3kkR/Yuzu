@@ -47,6 +47,7 @@
 #include "access_review_model.hpp"      // Periodic Access Reviews (SOC 2 CC6.2) — read-model
 #include "access_review_store.hpp"      // Periodic Access Reviews — campaign persistence
 #include "directory_sync.hpp"           // access-review read-model optional email enrichment
+#include "enrollment_directory_model.hpp" // #4031: shared row builders — REST/MCP parity (Rule 1)
 // ADR-0031 operator surface (PR1.5c/1.6c, p14) — MCP twins of p5's plugin
 // config/secret/kill-switch surface and p6's upload-grant mint/list/revoke.
 // The *_parsers.hpp headers are the SAME pure validation grammar the REST
@@ -529,6 +530,24 @@ static const ToolDef kTools[] = {
     {"list_pending_approvals", "List pending approval requests.",
      R"({"type":"object","properties":{"status":{"type":"string","enum":["pending","approved","rejected"]},"submitted_by":{"type":"string"}}})",
      R"j({"type":"object","properties":{"approvals":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"status":{"type":"string"},"submitted_by":{"type":"string"},"submitted_at":{"type":"integer"},"scope_expression":{"type":"string"}},"required":["id","definition_id","status","submitted_by","submitted_at","scope_expression"]}}},"required":["approvals"]})j"},
+
+    // ── #4031: AD/Entra directory-sync read twins — parity with GET
+    // /api/v1/directory/users and /directory/status. NOT the OIDC SSO config
+    // route (that stays REST-only per #520, see docs/mcp-server.md) — the
+    // naming trap this comment exists to head off.
+    {"list_directory_users",
+     "List AD/Entra-synced directory users, optionally filtered by group. Requires "
+     "Directory:Read. Returns email/UPN/group-membership PII — every call is audited "
+     "(directory.users.view).",
+     R"({"type":"object","properties":{"group_id":{"type":"string","description":"Optional directory group id to filter by"}}})",
+     R"j({"type":"object","properties":{"users":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"display_name":{"type":"string"},"email":{"type":"string"},"upn":{"type":"string"},"enabled":{"type":"boolean"},"groups":{"type":"array","items":{"type":"string"}},"synced_at":{"type":"integer"}},"required":["id","display_name","email","upn","enabled","groups","synced_at"]}},"count":{"type":"integer"}},"required":["users","count"]})j"},
+
+    {"get_directory_status",
+     "Get AD/Entra directory-sync status: provider, last sync time/error, user/group counts, "
+     "and the synced group catalog. Requires Directory:Read. No PII (counts + group metadata "
+     "only).",
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{"provider":{"type":"string"},"status":{"type":"string"},"last_sync_at":{"type":"integer"},"user_count":{"type":"integer"},"group_count":{"type":"integer"},"last_error":{"type":"string"},"groups":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"display_name":{"type":"string"},"description":{"type":"string"},"mapped_role":{"type":"string"},"synced_at":{"type":"integer"}},"required":["id","display_name","description","mapped_role","synced_at"]}}},"required":["provider","status","last_sync_at","user_count","group_count","last_error","groups"]})j"},
 
     {"get_guardian_schemas",
      "Get the Guardian (Guaranteed State) Guard authoring schema catalog — the "
@@ -1887,6 +1906,8 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"validate_scope", {"Infrastructure", "Read"}},
     {"preview_scope_targets", {"Infrastructure", "Read"}},
     {"list_pending_approvals", {"Approval", "Read"}},
+    {"list_directory_users", {"Directory", "Read"}},
+    {"get_directory_status", {"Directory", "Read"}},
     {"get_guardian_schemas", {"GuaranteedState", "Read"}},
     {"list_dex_signals", {"GuaranteedState", "Read"}},
     {"get_dex_signal_scope", {"GuaranteedState", "Read"}},
@@ -2361,6 +2382,8 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"validate_scope", {ToolEffect::ReadOnly, true, "Validate scope"}},
     {"preview_scope_targets", {ToolEffect::ReadOnly, true, "Preview scope targets"}},
     {"list_pending_approvals", {ToolEffect::ReadOnly, true, "List pending approvals"}},
+    {"list_directory_users", {ToolEffect::ReadOnly, true, "List directory users"}},
+    {"get_directory_status", {ToolEffect::ReadOnly, true, "Get directory sync status"}},
     {"get_guardian_schemas", {ToolEffect::ReadOnly, true, "Get Guardian schemas"}},
     {"list_dex_signals", {ToolEffect::ReadOnly, true, "List DEX signals"}},
     {"get_dex_signal_scope", {ToolEffect::ReadOnly, true, "Get DEX signal scope"}},
@@ -7160,6 +7183,77 @@ McpServer::HandlerFn McpServer::build_handler(
                                       tool_result_split(arr.str(),
                                                          JObj().raw("approvals", arr.str()).str(),
                                                          kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // ── #4031: AD/Entra directory-sync read twins (REST/MCP parity
+            // for GET /api/v1/directory/users and /directory/status). Both
+            // call the SAME shared builders discovery_routes.cpp and
+            // enrollment_directory_routes.cpp use (docs/api-twin-recipe.md
+            // §1). The OIDC-config route stays REST-only per #520 — see
+            // docs/mcp-server.md.
+
+            if (tool_name == "list_directory_users") {
+                if (!tier_allows(tier, "Directory", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Directory", "Read"))
+                    return;
+                if (!directory_sync || !directory_sync->is_open()) {
+                    res.set_content(error_response(id, kInternalError, "directory sync unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto group_filter = param_str(args, "group_id");
+                auto users = directory_sync->get_synced_users(group_filter);
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& u : users)
+                    arr.push_back(directory_user_row_json(u));
+                nlohmann::json payload;
+                payload["users"] = arr;
+                payload["count"] = arr.size();
+                // Prefer the REST-established domain verb over the generic
+                // mcp.<tool_name> action (docs/api-twin-recipe.md §4) — set-
+                // and-proceed with audit_persisted:false on a persist
+                // failure, never a hard MCP error (this is a read, not a
+                // mutation, but MCP has no Sec-Audit-Failed header channel).
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "directory.users.view", "success", "Directory", group_filter,
+                    "MCP directory users read");
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                res.set_content(
+                    success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "get_directory_status") {
+                if (!tier_allows(tier, "Directory", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Directory", "Read"))
+                    return;
+                if (!directory_sync || !directory_sync->is_open()) {
+                    res.set_content(error_response(id, kInternalError, "directory sync unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto status = directory_sync->get_status();
+                auto groups = directory_sync->get_synced_groups();
+                // No audit call — no per-person PII (counts + group metadata
+                // only), matching the REST twin's same decision.
+                res.set_content(
+                    success_response(
+                        id, tool_result(directory_status_json(status, groups).dump(),
+                                        kObjectOutputSchema)),
                     "application/json");
                 return;
             }

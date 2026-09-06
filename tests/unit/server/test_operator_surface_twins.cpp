@@ -426,6 +426,22 @@ constexpr TwinRow kExpectedTwins[] = {
     {"mint_upload_grant", "UploadGrant", "Write", false},
     {"list_upload_grants", "UploadGrant", "Read", true},
     {"revoke_upload_grant", "UploadGrant", "Delete", false},
+    // #4031: directory-sync (AD/Entra) read twin — parity with GET
+    // /api/v1/directory/users. The OIDC-config, auto-approve-rules, and
+    // pending-agents read twins are REST-only per #520 (see
+    // docs/mcp-server.md) and so carry no MCP tool, no row here.
+    //
+    // get_directory_status (the /directory/status twin) is deliberately NOT
+    // listed here even though it shares Directory:Read: it takes no input
+    // parameters, so its schema is the honest, bounded
+    // {"type":"object","properties":{}} shape — same precedent as
+    // get_guardian_schemas above, also absent from this array for the same
+    // reason (the A5 sweep below asserts every LISTED tool's schema differs
+    // from that literal, which is correct for this curated list but not a
+    // universal rule; validate_tool_security_registration's boot-time check
+    // is what proves get_directory_status's own table entries are
+    // consistent, and test_mcp_server.cpp exercises its dispatch directly).
+    {"list_directory_users", "Directory", "Read", true},
 };
 
 } // namespace
