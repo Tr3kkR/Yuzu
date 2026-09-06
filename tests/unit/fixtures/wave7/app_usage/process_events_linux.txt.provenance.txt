@@ -1,0 +1,22 @@
+REAL CAPTURE
+host/image: docker run --rm ubuntu:24.04 (Docker Desktop on macOS, host braga.local)
+date: 2026-09-06
+command: |
+  Sampled /proc/[0-9]*/status (Name, PPid, Uid; the source's own pid comes
+  from the /proc/<pid> directory name) every ~150ms for ~20s while spawning
+  one pre-existing long-lived `sleep 3` before sampling started (to produce
+  an orphan-stop case) plus 45 short-lived `sleep <0.3-1.55s>` processes
+  staggered every 0.2s during the sampling window. `started`/`stopped` were
+  derived by diffing consecutive /proc snapshots (a pid present in frame N
+  but not frame N-1 is `started`; present in N-1 but not N is `stopped`);
+  pids already present in the very first frame are treated as pre-existing
+  baseline, not `started`, so a baseline pid's later disappearance correctly
+  shows as an orphan `stopped` with no matching `started` line, mirroring
+  what a live-since-boot process would look like to a collector that starts
+  observing partway through its life.
+format: this fixture set's own convention (see README.md in this directory):
+  ts_unix|action|pid|ppid|image_name|user  — NOT the wire format emitted by
+  agents/plugins/tar/src/tar_proc_stream.cpp, which is a typed ProcEvent
+  struct (tar_proc_stream.hpp:27-51), not text. action=started maps to
+  ProcEvent::is_start=true, action=stopped to is_start=false, name maps to
+  image_name.
