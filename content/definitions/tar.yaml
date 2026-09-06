@@ -637,7 +637,9 @@ spec:
           removable history is not lawful.
           The source WILL use the same durable log-position cursor model as
           power (see power_enabled) — a lost/invalid cursor will re-baseline
-          forward and record a capture_gap rather than replaying history. Set to "false"
+          forward and record a capture_gap rather than replaying history.
+          Queried via tar.sql only ($Removable_Live); the legacy tar.query /
+          tar.export actions do not surface removable. Set to "false"
           to opt out. Requires agent v0.12.0+; older agents silently ignore.
           Valid: "true" | "false".
         validation:

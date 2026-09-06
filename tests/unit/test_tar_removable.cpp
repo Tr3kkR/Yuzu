@@ -770,6 +770,64 @@ TEST_CASE("a re-attach starts a new exec session, so the same binary does not re
           removable_exec_record_key("usb-1", 3000, "/Volumes/USB/tool"));
 }
 
+TEST_CASE("a CursorLost re-baseline does not permanently wedge on its own baseline row "
+          "(PR #4023 review round 2, blocker #2)",
+          "[tar][removable][cursor][rebaseline]") {
+    // removable_baseline_record_key() is keyed ONLY on device_key -- ts is
+    // deliberately excluded, because a CursorLost re-baseline re-emits the
+    // SAME baseline row for a still-present device with a fresh wall-clock
+    // ts. Before this fix, tar_db.cpp's replay-dedupe still compared ts for
+    // a present_at_baseline row, so that re-emission collided against the
+    // original row forever: every following tick reproduced the identical
+    // KeyCollision, and the source was permanently wedged with no recovery
+    // short of wiping the whole tar.db (tar_cursor is SELECT-only via
+    // execute_user_query).
+    auto t = make_test_db();
+
+    RemovableEvent first;
+    first.ts = 1000;
+    first.action = "present_at_baseline";
+    first.device_key = "usb-1";
+    first.vendor = "Kingston";
+    first.product = "DataTraveler";
+    first.serial = "SN-1";
+    first.bus = "block";
+    first.evidence = "linux:/sys/block/sda";
+    first.record_key = removable_baseline_record_key("usb-1");
+
+    auto ins1 = t.db.insert_removable_events_and_cursor({first}, R"({"v":1})");
+    REQUIRE(ins1.has_value());
+
+    // A later CursorLost re-baseline re-emits the identical baseline row --
+    // same record_key, same identity fields, but a DIFFERENT ts (now).
+    RemovableEvent rebaselined = first;
+    rebaselined.ts = 2000;
+
+    auto ins2 = t.db.insert_removable_events_and_cursor({rebaselined}, R"({"v":1,"n":2})");
+    REQUIRE(ins2.has_value()); // must NOT be CursorInsertError::KeyCollision
+
+    // A genuinely DIFFERENT device at the same ts must still be accepted
+    // normally -- this fix must not have widened the dedupe into ignoring
+    // real distinct baseline rows.
+    RemovableEvent other = first;
+    other.device_key = "usb-2";
+    other.record_key = removable_baseline_record_key("usb-2");
+    auto ins3 = t.db.insert_removable_events_and_cursor({other}, R"({"v":1,"n":3})");
+    REQUIRE(ins3.has_value());
+
+    // And a row that collides on record_key but genuinely IS a different
+    // event (different vendor, say a corrupted key derivation) must still be
+    // refused as a real collision -- the fix narrows the ts exclusion to
+    // present_at_baseline/capture_gap, it does not remove identity checking
+    // altogether.
+    RemovableEvent conflicting = first;
+    conflicting.ts = 3000;
+    conflicting.vendor = "SanDisk"; // genuinely different identity, same key
+    auto ins4 = t.db.insert_removable_events_and_cursor({conflicting}, R"({"v":1,"n":4})");
+    REQUIRE_FALSE(ins4.has_value());
+    CHECK(ins4.error() == TarDatabase::CursorInsertError::KeyCollision);
+}
+
 TEST_CASE("exec_from_removable is reported once per attach session, not once per tick, and a "
           "re-attach reports afresh (K1)",
           "[tar][removable][exec][k1]") {

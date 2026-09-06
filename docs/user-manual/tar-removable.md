@@ -89,17 +89,36 @@ always visible in the data, never silent.
 
 **Known limitation 2**: a *non*-generic serial can still be shared —
 measured on real hardware, a multi-format card reader whose several LUNs all
-report one controller-level serial. A LUN reported in the same collection
-batch as another LUN sharing its serial is correctly told apart by its
-platform instance id (Windows: PnP `ParentId`), so this is not the common
-case. The residual is a LUN that first attaches long enough after its sibling
-to land in a *different* batch: nothing persists "this serial is shared"
-across that gap, so it is not caught. Unlike limitation 1, no evidence-column
-marker names this case specifically — a row affected by it looks like an
-ordinary trusted-serial row. Closing it durably would mean persisting a
-shared-serial registry across restarts, which has not been justified against
-how rare this device class is in a managed fleet; revisit if it proves
-otherwise.
+report one controller-level serial. A LUN reported in the **same** collection
+batch (Windows event-log tick) as another LUN sharing its serial is correctly
+told apart by its platform instance id (Windows: PnP `ParentId`); this is
+scoped to one tick's channel read only, not persisted across ticks or
+restarts. Two real failure shapes follow from that scoping, both confirmed on
+real hardware:
+
+- **Cross-tick collision**: the same two LUNs re-attaching minutes apart (two
+  separate, singleton batches) collide again — each takes the trusted-serial
+  path independently and computes the same `device_key`.
+- **Lifecycle split**: an attach that happens to land in a shared batch gets
+  the anonymous-fallback key, while a later solo detach of the *same physical
+  LUN* gets the trusted-serial key instead. The detach then names a
+  `device_key` that was never attached; the live-snapshot leg "recovers" the
+  trusted key via a fabricated `reconcile:missed-channel-attach` row, and the
+  anonymous key is left as a **permanent ghost** in the durable attach state
+  (the reconcile-remove filter only clears snapshot-keyed entries).
+
+Unlike limitation 1, no evidence-column marker names either case
+specifically — an affected row looks like an ordinary trusted-serial row.
+**Linux has no equivalent protection at all**: `compute_device_key()` is
+called per-device with no batch comparison of any kind, so two LUNs sharing a
+real serial simply collapse onto one `device_key` there, silently, on every
+tick. Closing this durably means persisting a small shared-serial registry
+across ticks and restarts, and extending it to the Linux scan and the Windows
+live-snapshot leg (today's fix covers the Windows event-log leg only) —
+tracked as a follow-up rather than shipped in this pass; the device class
+this affects (multi-LUN readers reusing one controller serial) is uncommon in
+a managed fleet, but the failure mode is a silent, evidence-marker-free
+identity error, not a benign gap.
 
 ## Hybrid capture model
 

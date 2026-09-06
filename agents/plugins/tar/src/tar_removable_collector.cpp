@@ -44,6 +44,7 @@
 #include "tar_capture_status.hpp" // IncompleteCaptureError
 #include "tar_cursor.hpp"
 #include "tar_db.hpp"
+#include "tar_module_stream.hpp" // redact_module_dir -- shared sanitiser, tar_cursor.hpp rule 4b
 
 #include <yuzu/agent/process_enum.hpp>
 #include <yuzu/agent/scoped_fd.hpp>
@@ -282,19 +283,31 @@ private:
         const auto procs = yuzu::agent::enumerate_processes();
         for (auto& m : select_exec_from_removable_processes(procs, attached_roots,
                                                             kCaseInsensitivePaths)) {
+            // tar_cursor.hpp rule 4b (PR #4023 review round 2, blocker #4):
+            // a removable-media exec path can carry a username
+            // (`/media/<user>/...`, `/run/media/<user>/...`,
+            // `/Volumes/<name>/...`) and this table is default-ON and
+            // works-council-class, so it goes through the same sanitiser the
+            // module stream uses -- redacted ONCE, here, before it touches
+            // the event, the durable exec_seen dedupe key, or the record_key,
+            // so nothing downstream ever sees the raw path. Redaction is a
+            // pure function of the input, so a retry re-derives the identical
+            // redacted string -- the DB's replay-dedupe (tar_db.cpp) stays
+            // self-consistent across commits.
+            const std::string redacted_image_path = redact_module_dir(m.image_path);
             RemovableEvent ev;
             ev.ts = now_seconds();
             ev.action = "exec_from_removable";
             ev.device_key = m.device_key;
-            ev.image_path = m.image_path;
+            ev.image_path = redacted_image_path;
             ev.pid = m.pid;
             ev.evidence = "process_enum:exec_path";
             const auto ep = st.attach_epoch.find(m.device_key);
             if (ep == st.attach_epoch.end())
                 continue; // not in a known attach session -- no honest key to mint
             ev.record_key =
-               removable_exec_record_key(m.device_key, ep->second, m.image_path);
-            const std::string seen_key = m.device_key + "\x1f" + m.image_path;
+               removable_exec_record_key(m.device_key, ep->second, redacted_image_path);
+            const std::string seen_key = m.device_key + "\x1f" + redacted_image_path;
             if (!st.exec_seen.insert(seen_key).second)
                 continue; // already reported for this attach session
             out.push_back(std::move(ev));
@@ -946,6 +959,17 @@ CursorCollectResult RemovableCursorSource::collect(TarDatabase& db,
             current_scan[name] = key.device_key;
             if (linux_known_devices_.count(name))
                 continue; // already tracked (baseline, a live event, or a prior reconciliation)
+            if (st.attach_set.count(key.device_key)) {
+                // PR #4023 review round 2, blocker #3: this device is
+                // already persisted as attached -- it survived an agent
+                // restart (stop() clears linux_known_devices_, but the
+                // durable attach_set is untouched). No uevent was missed;
+                // the process simply was not running. Track it for THIS
+                // life without fabricating an "attached"/"missed-uevent-add"
+                // row for a device that never left.
+                linux_known_devices_[name] = key.device_key;
+                continue;
+            }
 
             RemovableEvent re;
             re.ts = now_seconds();
@@ -996,6 +1020,44 @@ CursorCollectResult RemovableCursorSource::collect(TarDatabase& db,
                           [&](const auto& p) { return p.first == it->second; }),
            linux_device_roots_.end());
         it = linux_known_devices_.erase(it);
+    }
+
+    // A device persisted as attached that never appears in linux_known_devices_
+    // THIS life at all is invisible to the loop above -- it happens when the
+    // device was physically removed WHILE THE AGENT WAS STOPPED, so it was
+    // never scanned into linux_known_devices_ this life to begin with (the
+    // reconcile-add loop above only iterates devices the /sys/block scan
+    // currently sees). Without this, such a device is a PERMANENT ghost in
+    // st.attach_set: no future tick can ever correct it, since it can never
+    // appear in linux_known_devices_ either (PR #4023 review round 2,
+    // blocker #3). Diff directly against the PERSISTED attach_set, checked
+    // AFTER the loop above so a device that loop already resolved (the
+    // ordinary "known this life, vanished this tick" case) is not
+    // double-reported here.
+    {
+        std::unordered_set<std::string> current_scan_device_keys;
+        for (const auto& [name, device_key] : current_scan)
+            current_scan_device_keys.insert(device_key);
+        std::vector<std::string> ghosted_keys;
+        for (const auto& [device_key, present] : st.attach_set)
+            if (present && !current_scan_device_keys.count(device_key))
+                ghosted_keys.push_back(device_key);
+        for (const auto& device_key : ghosted_keys) {
+            RemovableEvent re;
+            re.ts = now_seconds();
+            re.action = "detached";
+            re.device_key = device_key;
+            re.bus = "block";
+            re.evidence = "linux:reconcile:missing-after-restart";
+            re.record_key = next_seq_record_key("reconcile_rm", device_key);
+            events.push_back(std::move(re));
+            st.attach_set.erase(device_key);
+            end_attach_session(st, device_key); // PR #4023 review blocker
+            linux_device_roots_.erase(
+               std::remove_if(linux_device_roots_.begin(), linux_device_roots_.end(),
+                              [&](const auto& p) { return p.first == device_key; }),
+               linux_device_roots_.end());
+        }
     }
 
     // exec-from-removable root correlation (respec 2026-09-04 amendment):
@@ -1371,14 +1433,16 @@ CursorCollectResult RemovableCursorSource::collect(TarDatabase& db,
     // current log end exactly like a re-enable, never a from-zero backfill.
     const bool force_head_jump = is_reenable || cursor_was_lost;
 
-    const std::int64_t lookback_s = [&db] {
-        try {
-            return std::stoll(
-               db.get_config("removable_lookback_seconds", std::to_string(kDefaultRemovableLookbackSeconds)));
-        } catch (...) {
-            return kDefaultRemovableLookbackSeconds;
-        }
-    }();
+    // tar_cursor.hpp rule 5 (PR #4023 review round 2, blocker #1): a source
+    // that cannot READ its lookback treats it as 0 (forward-only), never as
+    // the default -- db.get_config() returns the caller's default on ANY
+    // read failure, so the previous lambda turned a transient SQLite failure
+    // into a 7-day retrospective backfill on a host where the operator set 0
+    // precisely because that is not lawful. lookback_seconds_or_forward_only()
+    // is the mandated helper for exactly this (already used by the sibling
+    // `power` source's fix for the identical defect).
+    const std::int64_t lookback_s =
+        lookback_seconds_or_forward_only(db, "removable", kDefaultRemovableLookbackSeconds);
     const bool first_run = !cursor_json.has_value();
     // R-006: computed ONCE and applied to EVERY Partition/Diagnostic
     // classification below, not just a first-run batch — a backlog longer
