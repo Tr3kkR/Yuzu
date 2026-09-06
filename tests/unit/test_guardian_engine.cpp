@@ -29,6 +29,7 @@
 #include "test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp>
 
 #include <cstdlib>
 #include <filesystem>
@@ -129,9 +130,156 @@ struct GuardianFixture {
         (*a->mutable_params())["service_name"] = "Spooler";
         return r;
     }
+
+    // #4021: a file-change/file-hash-equals rule. FileGuard is Windows-only for
+    // the MVP (start() no-ops elsewhere), so this never actually arms a running
+    // guard off Windows — what IS testable everywhere is start_guard_for_rule_locked's
+    // config-build step (path/expected_hash/baseline-seed), observed via
+    // last_file_expected_hash_for_test(). `expected_hash` empty means author it
+    // as baseline-on-arm (the case this issue is about).
+    static gpb::GuaranteedStateRule make_file_hash_rule(const std::string& id,
+                                                        const std::string& path,
+                                                        const std::string& expected_hash = "") {
+        gpb::GuaranteedStateRule r = make_rule(id, id);
+        r.mutable_spark()->set_type("file-change");
+        auto* a = r.mutable_assertion();
+        a->set_type("file-hash-equals");
+        (*a->mutable_params())["path"] = path;
+        if (!expected_hash.empty())
+            (*a->mutable_params())["expected_hash"] = expected_hash;
+        return r;
+    }
+
+    static gpb::GuaranteedStatePush make_push(std::vector<gpb::GuaranteedStateRule> rules,
+                                              bool full_sync) {
+        gpb::GuaranteedStatePush push;
+        push.set_full_sync(full_sync);
+        for (auto& r : rules)
+            *push.add_rules() = std::move(r);
+        return push;
+    }
 };
 
 } // namespace
+
+// ── #4021: persisted baseline survives full_sync / seeds a re-arm ──────────
+//
+// full_sync (any unrelated fleet rule mutation, or an agent restart) used to tear
+// down every guard and re-arm fresh, with no memory of a baseline a rule had
+// already captured — a `file-hash-equals` rule authored with no `expected_hash`
+// would silently re-capture "whatever's on disk right now" as its new baseline,
+// laundering genuine drift into a false compliant with no remediation. These
+// tests exercise the KV-persisted-baseline substrate + the seed-lookup that now
+// runs at legacy arm time (start_guard_for_rule_locked) — the config-build step
+// runs identically on every OS; only the running FileGuard itself is
+// Windows-only, so last_file_expected_hash_for_test() is what's observable here.
+
+TEST_CASE("a file-hash-equals rule with no persisted baseline arms with no seed",
+          "[guardian][engine][baseline]") {
+    GuardianFixture f;
+    f.engine->apply_rules(GuardianFixture::make_push({GuardianFixture::make_file_hash_rule("r1", "/tmp/x")},
+                                           /*full_sync=*/true));
+    CHECK(f.engine->last_file_expected_hash_for_test().empty()); // first-ever arm: nothing to seed
+}
+
+TEST_CASE("a persisted baseline matching this rule's fingerprint seeds the arm",
+          "[guardian][engine][baseline]") {
+    GuardianFixture f;
+    const std::string hash(64, 'a');
+    nlohmann::json j;
+    j["schema"] = 1;
+    j["fingerprint"] = "v1|file-hash-equals|/tmp/x";
+    j["hash"] = hash;
+    REQUIRE(f.kv->set(GuardianEngine::kv_namespace(), "baseline:r1", j.dump()));
+
+    f.engine->apply_rules(GuardianFixture::make_push({GuardianFixture::make_file_hash_rule("r1", "/tmp/x")},
+                                           /*full_sync=*/true));
+    CHECK(f.engine->last_file_expected_hash_for_test() == hash);
+}
+
+TEST_CASE("a persisted baseline for a DIFFERENT target does not seed (fingerprint mismatch)",
+          "[guardian][engine][baseline]") {
+    GuardianFixture f;
+    nlohmann::json j;
+    j["schema"] = 1;
+    j["fingerprint"] = "v1|file-hash-equals|/tmp/some-other-path";
+    j["hash"] = std::string(64, 'b');
+    REQUIRE(f.kv->set(GuardianEngine::kv_namespace(), "baseline:r1", j.dump()));
+
+    f.engine->apply_rules(GuardianFixture::make_push({GuardianFixture::make_file_hash_rule("r1", "/tmp/x")},
+                                           /*full_sync=*/true));
+    CHECK(f.engine->last_file_expected_hash_for_test().empty()); // genuinely different target
+}
+
+TEST_CASE("an authored expected_hash always wins over any persisted baseline",
+          "[guardian][engine][baseline]") {
+    GuardianFixture f;
+    nlohmann::json j;
+    j["schema"] = 1;
+    j["fingerprint"] = "v1|file-hash-equals|/tmp/x";
+    j["hash"] = std::string(64, 'c');
+    REQUIRE(f.kv->set(GuardianEngine::kv_namespace(), "baseline:r1", j.dump()));
+
+    const std::string authored(64, 'd');
+    f.engine->apply_rules(GuardianFixture::make_push(
+        {GuardianFixture::make_file_hash_rule("r1", "/tmp/x", authored)}, /*full_sync=*/true));
+    CHECK(f.engine->last_file_expected_hash_for_test() == authored);
+}
+
+TEST_CASE("full_sync clears the prior rule set but PRESERVES a persisted baseline",
+          "[guardian][engine][baseline][full_sync]") {
+    GuardianFixture f;
+    nlohmann::json j;
+    j["schema"] = 1;
+    j["fingerprint"] = "v1|file-hash-equals|/tmp/x";
+    j["hash"] = std::string(64, 'e');
+    REQUIRE(f.kv->set(GuardianEngine::kv_namespace(), "baseline:r1", j.dump()));
+
+    // r1's baseline was captured BEFORE this push; the new full_sync push doesn't
+    // even name r1 (an unrelated rule's fleet edit, mirroring #3990's amplifier) —
+    // r1 is genuinely gone from this push, same as the server omitting a
+    // disabled/out-of-scope rule (guardian_push_builder.cpp). The baseline record
+    // must survive regardless: the agent cannot distinguish "r1 was deleted" from
+    // "r1 is temporarily out of scope for this push", and sweeping on absence
+    // would reintroduce this issue's exact laundering the next time r1 reappears.
+    f.engine->apply_rules(
+        GuardianFixture::make_push({GuardianFixture::make_rule("other", "other")}, /*full_sync=*/true));
+
+    auto raw = f.kv->get(GuardianEngine::kv_namespace(), "baseline:r1");
+    REQUIRE(raw.has_value());
+    auto parsed = nlohmann::json::parse(*raw);
+    CHECK(parsed.value("hash", std::string{}) == std::string(64, 'e'));
+
+    // The rule cache itself IS cleared by full_sync, unaffected by this change —
+    // only baseline: keys are exempted from the sweep.
+    CHECK_FALSE(f.kv->exists(GuardianEngine::kv_namespace(), "rule:r1"));
+}
+
+TEST_CASE("a full_sync that DOES re-arm the baselined rule seeds it from the persisted "
+          "record, not from current disk content",
+          "[guardian][engine][baseline][full_sync]") {
+    GuardianFixture f;
+    const std::string original_hash(64, 'f');
+    nlohmann::json j;
+    j["schema"] = 1;
+    j["fingerprint"] = "v1|file-hash-equals|/tmp/x";
+    j["hash"] = original_hash;
+    REQUIRE(f.kv->set(GuardianEngine::kv_namespace(), "baseline:r1", j.dump()));
+
+    // Simulates the exact bug scenario: r1 was baselined at `original_hash` some
+    // time ago (possibly now genuinely drifted on disk — this test doesn't need a
+    // real file since FileGuard doesn't run off Windows); an UNRELATED fleet edit
+    // now triggers a full_sync that also re-includes r1 unchanged.
+    f.engine->apply_rules(GuardianFixture::make_push({GuardianFixture::make_file_hash_rule("r1", "/tmp/x")},
+                                           /*full_sync=*/true));
+    CHECK(f.engine->last_file_expected_hash_for_test() == original_hash);
+
+    // The persisted record itself is unchanged — this arm attempt (whether or not
+    // a real guard ever runs to re-confirm it) did not silently recapture.
+    auto raw = f.kv->get(GuardianEngine::kv_namespace(), "baseline:r1");
+    REQUIRE(raw.has_value());
+    CHECK(nlohmann::json::parse(*raw).value("hash", std::string{}) == original_hash);
+}
 
 TEST_CASE("GuardianEngine: start_local on fresh KV reports zero rules",
           "[guardian][engine][start]") {

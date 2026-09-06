@@ -417,6 +417,19 @@ public:
     /// production caller.
     [[nodiscard]] std::string last_rearm_degrade_message_for_test() const;
 
+    /// #4021: the `expected_hash` a file-hash-equals rule's most recent legacy arm
+    /// attempt ended up with — empty if never armed as file-hash-equals, the
+    /// authored value if `expected_hash` was set, or a SEEDED persisted baseline
+    /// if one existed for this rule_id/target. This is what
+    /// start_guard_for_rule_locked built INTO `FileGuard::Config` before calling
+    /// `start()` — set regardless of whether `start()` itself actually arms
+    /// (FileGuard is Windows-only for the MVP; off Windows this is the only
+    /// observable proof the seed-lookup ran and produced the right value, since no
+    /// FileGuard object survives to observe otherwise). Locked, returned by value
+    /// — same rationale as last_rearm_degrade_message_for_test above. No
+    /// production caller.
+    [[nodiscard]] std::string last_file_expected_hash_for_test() const;
+
     /// Live bounded-I/O worker count on the spark reader (0 if never wired) -
     /// the F3 orphan-exit obligation's plumbing (rung 7.6 is the enforcement).
     [[nodiscard]] std::size_t active_io_workers() const;
@@ -579,6 +592,9 @@ private:
     std::function<void(const std::string&)> rearm_fault_hook_for_test_;
     /// TEST-ONLY (see last_rearm_degrade_message_for_test); empty = no degrade this run.
     std::string last_rearm_degrade_message_for_test_;
+    /// TEST-ONLY (see last_file_expected_hash_for_test); empty = no file-hash-equals
+    /// arm attempt has run yet.
+    std::string last_file_expected_hash_for_test_;
     std::unordered_map<std::string, std::unique_ptr<IGuard>> guards_;
 
     /// rule_id -> SparkType for every rule CURRENTLY classified RulePlacement::Unsupported

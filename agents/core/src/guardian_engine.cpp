@@ -69,6 +69,14 @@ namespace apb = ::yuzu::agent::v1;
 constexpr std::string_view kKvNamespace = "__guardian__";
 constexpr std::string_view kRulePrefix  = "rule:";
 constexpr std::string_view kKeyGen      = "meta:policy_generation";
+// #4021: a captured file-hash-equals baseline, keyed by rule_id, NEVER swept by
+// full_sync (only kRulePrefix keys are - see the full_sync teardown block) and
+// never swept merely because a rule is absent from one push (the server omits
+// disabled/out-of-scope rules from every push - guardian_push_builder.cpp - so
+// absence is not deletion; a dormant baseline record for a rule that never comes
+// back is an accepted, deliberate trade against silently laundering a genuinely
+// still-drifted rule's compliance state - see guardian_seed_baseline's doc).
+constexpr std::string_view kBaselinePrefix = "baseline:";
 
 // #2303 sec-M. GuardianEngine persists rule state under kKvNamespace on the shared kv_store.db,
 // keyed the same way plugin storage is (yuzu_ctx_storage_* by the plugin's own declared name).
@@ -119,6 +127,131 @@ std::string hex_decode(std::string_view hex) {
         out += static_cast<char>((hi << 4) | lo);
     }
     return out;
+}
+
+// #4021: baseline-on-arm persistence. A `file-hash-equals` rule authored with no
+// `expected_hash` captures whatever the target contains at arm time as its "known
+// good" state (guardian_rule_eval.cpp's own "baseline-on-arm" comment; the legacy
+// FileGuard mirrors it independently in guard_file.cpp). Before this fix, that
+// captured state lived ONLY in the running guard's own memory - a full_sync
+// (any unrelated fleet rule mutation bumps the single global policy_generation,
+// this file's full_sync teardown/rearm) or an agent restart (start_local()'s
+// rearm loop) constructed a brand-new guard with no memory of the prior baseline,
+// so the NEXT read re-captured "whatever's on disk right now" - silently
+// reclassifying a rule that had been genuinely drifted for weeks as compliant,
+// with no remediation and no visible action. This persists the FIRST captured
+// baseline per rule_id in KvStore so every later arm re-seeds the SAME value
+// instead of recapturing current content.
+//
+// Scope of this fix (deliberate, documented - see #4021 PR description): wired for
+// the LEGACY FileGuard path only (start_guard_for_rule_locked below), the
+// currently-shipped detection backend (prefer_spark_ defaults false - "legacy
+// IGuard remains the sole live detection path"). The SEED lookup below also
+// benefits a rule armed via Spark (reconcile_rule_locked mutates the shared
+// RuleAssertion before the backend fork), so a baseline captured under legacy
+// survives a later flip to Spark. Spark's OWN capture (guardian_rule_eval.cpp /
+// guardian_spark_runtime.cpp) is NOT wired to this store - those files are
+// Spark-workstream-in-flight elsewhere; under prefer_spark_=true a first-ever
+// Spark-side capture is not yet persisted here, so the SAME full_sync-relaunder
+// gap remains for a rule that has NEVER been armed via legacy. Tracked as an
+// explicit follow-up rather than silently left undocumented.
+constexpr int kBaselineSchemaVersion = 1;
+
+std::string make_baseline_key(const std::string& rule_id) {
+    return std::string(kBaselinePrefix) + rule_id;
+}
+
+/// Identifies WHAT is asserted, not how it's authored/watched elsewhere: changing
+/// `settle_ms`/debounce/name/severity/enforcement_mode must NOT invalidate a
+/// captured baseline (those don't change what "compliant" means); changing the
+/// assertion TYPE or its TARGET must (a rule_id re-authored against a different
+/// path is a genuinely different target, and its "first good read" baseline
+/// captured under this fingerprint must never seed a mismatched one - a
+/// fingerprint mismatch is simply treated as "no baseline yet", never a failure).
+/// Only `file-hash-equals` baselines-on-arm today; a future baselining assertion
+/// kind extends this, never guesses a shared shape with an unrelated one.
+std::string guardian_baseline_fingerprint(std::string_view assertion_type,
+                                          std::string_view target) {
+    return "v" + std::to_string(kBaselineSchemaVersion) + "|" + std::string(assertion_type) +
+          "|" + std::string(target);
+}
+
+bool is_valid_baseline_hash(const std::string& h) {
+    if (h.size() != 64) // lowercase hex SHA-256, matching sha256_file's own output format
+        return false;
+    for (char c : h)
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+            return false;
+    return true;
+}
+
+/// Look up a persisted baseline for `rule_id`, returning it ONLY when the stored
+/// fingerprint matches `fingerprint` (a mismatch is a genuinely different target,
+/// not a failure - the caller captures fresh, same as a rule with no baseline at
+/// all). A read failure or a malformed record is logged and treated as absent
+/// (capture fresh) rather than propagated as an arm failure: the legacy FileGuard
+/// has no "errored, don't arm" channel for this today (unlike Spark's Unhealthy
+/// verdict), and a KvStore read failure here is the same failure mode every other
+/// KV-backed read in this file already degrades-and-logs on (put_rule_locked's own
+/// json_to_rule parse-failure sites), not a new weaker posture introduced for
+/// baselines specifically.
+std::optional<std::string> guardian_seed_baseline(KvStore& kv, const std::string& rule_id,
+                                                   const std::string& fingerprint) {
+    auto raw = kv.get_entry(kKvNamespace, make_baseline_key(rule_id));
+    if (!raw) {
+        spdlog::error("Guardian: baseline lookup for rule '{}' failed (KV read error) - "
+                     "arming as if no baseline is on record",
+                     rule_id);
+        return std::nullopt;
+    }
+    if (!raw->has_value())
+        return std::nullopt; // genuinely no baseline yet - first-ever arm for this rule_id
+    nlohmann::json j;
+    try {
+        j = nlohmann::json::parse(**raw);
+    } catch (const nlohmann::json::exception&) {
+        spdlog::error("Guardian: baseline record for rule '{}' is not valid JSON - discarding "
+                     "and arming as if no baseline is on record",
+                     rule_id);
+        return std::nullopt;
+    }
+    const auto stored_fp = j.value("fingerprint", std::string{});
+    const auto hash = j.value("hash", std::string{});
+    if (stored_fp != fingerprint)
+        return std::nullopt; // different target under this rule_id - not a failure, fresh capture
+    if (!is_valid_baseline_hash(hash)) {
+        spdlog::error("Guardian: baseline record for rule '{}' has a malformed hash - discarding "
+                     "and arming as if no baseline is on record",
+                     rule_id);
+        return std::nullopt;
+    }
+    return hash;
+}
+
+/// Persist a newly-captured baseline. Takes `KvStore*` by raw pointer (not
+/// `GuardianEngine&`/`this`) so it is safe to call from a guard worker thread via a
+/// callback: the worker must never reach back into GuardianEngine state or take
+/// its lock (see emit_guard_event's own doc), and `kv_` outlives every guard
+/// thread by construction (agent.cpp declares kv_store_ before guardian_, so it
+/// destructs AFTER - and stop_all_guards_locked()/withdraw join every guard thread
+/// before GuardianEngine itself is torn down). Fire-and-forget: a write failure is
+/// logged, not escalated - the in-memory guard still holds the correct baseline
+/// for its own remaining lifetime; only a LATER full_sync/restart would miss the
+/// persisted copy and (safely, not incorrectly) re-capture fresh.
+void guardian_persist_baseline(KvStore* kv, const std::string& rule_id,
+                               const std::string& fingerprint, const std::string& hash) {
+    if (!kv)
+        return;
+    nlohmann::json j;
+    j["schema"] = kBaselineSchemaVersion;
+    j["fingerprint"] = fingerprint;
+    j["hash"] = hash;
+    if (!kv->set(kKvNamespace, make_baseline_key(rule_id), j.dump())) {
+        spdlog::error("Guardian: failed to persist captured baseline for rule '{}' - a later "
+                     "full_sync or restart will re-capture current content instead of this "
+                     "one (#4021)",
+                     rule_id);
+    }
 }
 
 nlohmann::json block_to_json(const gpb::GuardianSpecBlock& b) {
@@ -653,10 +786,21 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     // it needs this set instead.
     std::set<std::string> full_sync_ids;
     if (push.full_sync()) {
-        const int cleared = kv_->clear(kKvNamespace);
+        // #4021: NEVER kv_->clear(kKvNamespace) here — a blanket clear would also
+        // wipe every kBaselinePrefix baseline record, reintroducing exactly the
+        // silent-relaunder bug this file's baseline persistence exists to close (a
+        // rule's captured "known good" state must survive a full_sync). Scoped to
+        // kRulePrefix keys only — the ONLY other keys ever written under this
+        // namespace are kKeyGen (rewritten unconditionally just below regardless)
+        // and kBaselinePrefix records (deliberately untouched by full_sync — see
+        // guardian_seed_baseline's doc for why absence-from-a-push must not sweep
+        // a baseline either).
+        const auto rule_keys = kv_->list(kKvNamespace, kRulePrefix);
+        const int cleared = rule_keys.empty() ? 0 : kv_->del_keys(kKvNamespace, rule_keys);
         if (cleared > 0)
             spdlog::info("Guardian: full_sync cleared {} prior rule(s)", cleared);
-        // Re-persist the policy generation marker after clear() wiped everything.
+        // Re-persist the policy generation marker (rewritten unconditionally here,
+        // same as before this change — harmless whether or not the key survived).
         persist_generation_locked();
         // Full sync replaces the active set - tear down BOTH backends before
         // re-arming (rung 7: a spark-attached rule the new push omits must be
@@ -897,6 +1041,11 @@ std::string GuardianEngine::last_rearm_degrade_message_for_test() const {
     return last_rearm_degrade_message_for_test_;
 }
 
+std::string GuardianEngine::last_file_expected_hash_for_test() const {
+    std::lock_guard lock(mtx_);
+    return last_file_expected_hash_for_test_;
+}
+
 std::uint64_t GuardianEngine::policy_generation() const {
     std::lock_guard lock(mtx_);
     return policy_generation_;
@@ -1062,6 +1211,34 @@ bool GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule&
                 fcfg.max_hash_bytes = clamped;
             }
             fcfg.settle_ms = aparam_u64("settle_ms", fcfg.settle_ms);
+
+            // #4021: seed a previously-captured baseline before this guard ever gets
+            // to baseline-on-arm itself, so a full_sync/restart re-arm of an
+            // already-baselined rule re-asserts the SAME known-good state instead of
+            // silently recapturing whatever the (possibly still-drifted) target
+            // currently contains. A fingerprint mismatch (this rule_id's target
+            // genuinely changed) is not seeded — that IS a fresh target, and a fresh
+            // capture is correct for it. See guardian_baseline_fingerprint/
+            // guardian_seed_baseline's doc for the full rationale and this fix's
+            // documented scope.
+            const auto baseline_fingerprint =
+                guardian_baseline_fingerprint("file-hash-equals", fcfg.path);
+            if (fcfg.expected_hash.empty()) {
+                if (auto seeded = guardian_seed_baseline(*kv_, rule.rule_id(), baseline_fingerprint))
+                    fcfg.expected_hash = *seeded;
+            }
+            last_file_expected_hash_for_test_ = fcfg.expected_hash; // test-only observability
+            // Persist the FIRST-ever capture (fires at most once per FileGuard
+            // lifetime — FileGuard's own `!baseline_set` guard ensures that; a
+            // seeded rule never re-enters the capture branch at all, since
+            // expected_hash is no longer empty from FileGuard's point of view).
+            // Captures kv_ BY VALUE (a raw pointer, not `this`/GuardianEngine&) —
+            // see guardian_persist_baseline's doc for why that's safe from a guard
+            // worker thread.
+            fcfg.on_baseline = [kv = kv_, rule_id = rule.rule_id(),
+                               fp = baseline_fingerprint](const std::string& hash) {
+                guardian_persist_baseline(kv, rule_id, fp, hash);
+            };
         } else {
             // file-exists: "absent" → drift when the file EXISTS; anything else
             // (default "present") → drift when the file is missing / has been deleted.
@@ -1248,6 +1425,21 @@ GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule) {
         withdraw_legacy_guard_locked(rule.rule_id());
         unsupported_rules_.erase(rule.rule_id()); // F7: an authoring fault, not Unsupported
         return ReconcileOutcome::Inert;
+    }
+
+    // #4021: seed a persisted baseline into the Spark-side assertion BEFORE the
+    // backend fork below, so a rule that was previously armed (and baselined) via
+    // legacy survives a later flip to Spark instead of Spark re-capturing current
+    // content fresh. This does NOT cover Spark's OWN first-ever capture (see
+    // guardian_seed_baseline's doc for the documented scope of this fix) — only
+    // seeds a value that ALREADY exists in the durable store.
+    if (assertion->kind == AssertionKind::FileHashEquals && assertion->expected_hash.empty()) {
+        std::string path;
+        if (auto it = rule.assertion().params().find("path"); it != rule.assertion().params().end())
+            path = it->second;
+        const auto fingerprint = guardian_baseline_fingerprint("file-hash-equals", path);
+        if (auto seeded = guardian_seed_baseline(*kv_, rule.rule_id(), fingerprint))
+            assertion->expected_hash = *seeded;
     }
 
     // spark_availability_ is set exactly once by wire_spark_engine() and never

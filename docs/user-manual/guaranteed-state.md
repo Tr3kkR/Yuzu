@@ -76,6 +76,8 @@ A `file-change` spark watches a file via `ReadDirectoryChangesW` on its parent d
 
 `file-hash-equals` uses a size pre-filter then a **bounded SHA-256**, and waits for the file to quiesce before hashing (a write is not atomic), so a no-op rewrite of identical bytes is **not** reported as drift — only a real content change is. Absent / oversize / unreadable states are reported (`<absent>` / `<oversize>` / `<unreadable>`), never a silent "compliant". File guards are **detection-only** (file-content remediation is deferred); `enforcement_mode` still gates whether the rule is active, but there is no write-back.
 
+A baseline captured on arm (empty `expected_hash`) is **persisted per rule** on the agent and re-asserted on every later arm — a fleet-wide policy change elsewhere, or an agent restart, does not re-capture the target's then-current content as a new baseline (#4021). The original baseline holds until the rule's `path` is deliberately changed (which is treated as a genuinely new target) or an explicit `expected_hash` is authored.
+
 ```bash
 # Alert if a sensitive config is modified OR deleted, in realtime.
 curl -X POST https://yuzu.example.com/api/v1/guaranteed-state/rules \
