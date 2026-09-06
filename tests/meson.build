@@ -612,7 +612,7 @@ agent_test_exe = executable(
 # build they detect nothing (no instrumentation), so that cost buys no signal there - skip
 # them. A sanitizer build runs everything, but as of #2373's split (below) NOT in this same
 # entry: they get their OWN test() with its own budget, so a stall here no longer risks
-# timing out the other ~1500 fast cases sharing this entry's ceiling. The OTHER four [tsan]
+# timing out the other fast cases sharing this entry's ceiling. The OTHER four [tsan]
 # tests are cheap and bounded (no real SQLite, or a fixed sleep) and stay in every build. A
 # coverage build (b_coverage, no sanitizer) also skips the two heavy tests; their concurrent
 # code paths are line-covered by the sequential prune/page/gauge tests and the cheap
@@ -668,7 +668,7 @@ if get_option('b_sanitize') != 'none'
   # under shared-filesystem contention, and #4018 saw the same mechanism recur on Wee
   # Tam/Windows ASan). Their own entry means a stall here times out AT ITS OWN BUDGET,
   # classifiably, instead of either being absorbed into the fast suite's tight 240s ceiling
-  # (windows-asan's prior state, #4018) or dragging the whole ~1500-case fast suite down with
+  # (windows-asan's prior state, #4018) or dragging the whole fast suite down with
   # it. 600s is sized off the measured ~480s (8-minute) stall with headroom, not the plain
   # suite's ~28s baseline; nightly's own --timeout-multiplier 2 (Linux legs) / the
   # windows-asan job's now-added multiplier scale this to 1200s under sanitizer instrumentation

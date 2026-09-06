@@ -9,16 +9,20 @@
 // One dedicated TU, same reasoning as test_pg_template_cleanup.cpp's listener: a
 // CATCH_REGISTER_LISTENER in a header would register once per including TU.
 
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <format>
+#include <memory>
+#include <string>
+#include <string_view>
+
 #include <catch2/catch_get_random_seed.hpp>
 #include <catch2/catch_test_case_info.hpp>
 #include <catch2/catch_test_run_info.hpp>
 #include <catch2/interfaces/catch_interfaces_reporter.hpp>
 #include <catch2/reporters/catch_reporter_event_listener.hpp>
 #include <catch2/reporters/catch_reporter_registrars.hpp>
-
-#include <chrono>
-#include <cstdio>
-#include <cstdlib>
 
 namespace {
 
@@ -30,15 +34,16 @@ public:
     void testRunStarting(Catch::TestRunInfo const& info) override {
         if (!enabled_)
             return;
-        emit("[progress] RUN %.*s seed=%u\n", static_cast<int>(info.name.size()), info.name.data(),
-             Catch::getSeed());
+        emit(std::format("[progress] RUN {} seed={}\n",
+                          std::string_view(info.name.data(), info.name.size()),
+                          Catch::getSeed()));
     }
 
     void testCaseStarting(Catch::TestCaseInfo const& info) override {
         if (!enabled_)
             return;
         start_ = clock::now();
-        emit("[progress] START %s\n", info.name.c_str());
+        emit(std::format("[progress] START {}\n", info.name));
     }
 
     void testCaseEnded(Catch::TestCaseStats const& stats) override {
@@ -46,7 +51,7 @@ public:
             return;
         const auto ms =
             std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - start_).count();
-        emit("[progress] END %s %lld ms\n", stats.testInfo->name.c_str(), static_cast<long long>(ms));
+        emit(std::format("[progress] END {} {} ms\n", stats.testInfo->name, ms));
     }
 
 private:
@@ -59,18 +64,26 @@ private:
         return v != nullptr && std::atoi(v) != 0; // atoi(nullptr) is UB - guarded above
     }
 
-    template <class... Args>
-    void emit(const char* fmt, Args... args) {
-        std::fprintf(stderr, fmt, args...);
+    // decltype(&std::fclose) as a unique_ptr deleter template argument triggers
+    // -Wignored-attributes on glibc (fclose's declared attributes don't survive
+    // taking its address); a plain functor deleter sidesteps that cleanly.
+    struct FileCloser {
+        void operator()(std::FILE* f) const noexcept {
+            if (f)
+                std::fclose(f);
+        }
+    };
+
+    void emit(const std::string& line) {
+        std::fputs(line.c_str(), stderr);
         std::fflush(stderr);
         // Mirrored to a file when set (e.g. so a live-tailing diagnostic doesn't have to
-        // share the runner's stderr pipe); opened/closed per line, not held open, so a
-        // hard kill never leaves a line half-written or a handle leaked.
+        // share the runner's stderr pipe); opened/closed per line via an RAII owner, not
+        // held open, so a hard kill never leaves a line half-written or a handle leaked.
         if (const char* path = std::getenv("YUZU_TEST_PROGRESS_FILE")) {
-            if (FILE* f = std::fopen(path, "a")) {
-                std::fprintf(f, fmt, args...);
-                std::fclose(f);
-            }
+            std::unique_ptr<std::FILE, FileCloser> f(std::fopen(path, "a"));
+            if (f)
+                std::fputs(line.c_str(), f.get());
         }
     }
 

@@ -622,12 +622,12 @@ jobs:
         if: always()
         run: ccache -s
 
-      - name: Upload meson testlog (on failure; always on a windows-asan-only dispatch)
-        # The always() half matters for #4018: a 90-minute job-level timeout is a
-        # CANCEL, not a failure, and that's exactly when the progress log matters
-        # most; it also lets a `jobs=windows-asan` recurrence dispatch record a
-        # clean run's timings, not only a failing one.
-        if: failure() || (always() && inputs.jobs == 'windows-asan')
+      - name: Upload meson testlog (on failure/cancel; always on a windows-asan-only dispatch)
+        # cancelled() matters for #4018: a 90-minute job-level timeout is a CANCEL,
+        # not a failure, and that's exactly when the progress log matters most.
+        # The always() half separately lets a `jobs=windows-asan` recurrence
+        # dispatch record a clean run's timings, not only a failing/cancelled one.
+        if: failure() || cancelled() || (always() && inputs.jobs == 'windows-asan')
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: meson-testlog-windows-asan
