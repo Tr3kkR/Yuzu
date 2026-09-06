@@ -979,6 +979,39 @@ groups:
             denials are observed on yuzu_server_quarantine_gate_total and audited
             as quarantine.dispatch_denied.
 
+      - alert: YuzuDispatchFanoutThrew
+        expr: |
+          increase(yuzu_server_dispatch_fanout_throw_total[15m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "POST /api/command's audit sink or a post-dispatch helper is throwing, not degrading cleanly"
+          description: >-
+            yuzu_server_dispatch_fanout_throw_total is non-zero on
+            {{ $labels.route }} (phase={{ $labels.phase }}).
+            phase=success/denial means the wired AuditFn (ultimately
+            AuditStore::log) threw an exception rather than returning false —
+            a distinct condition from an ordinary persist failure, which
+            yuzu_server_audit_emit_failed_total / YuzuAuditPersistFailures
+            already cover and which the caller-visible response
+            (Sec-Audit-Failed, audit_emitted:false) is unaffected by either
+            way. Any OTHER phase value (governance round 1, UP-1b) names a
+            specific post-dispatch helper in command_routes.cpp's guarded()
+            wrapper that threw instead — e.g. phase=forward_gateway_pending
+            means the gateway-forward step itself threw, not the audit sink;
+            check the named helper, not AuditStore, for that case. Either way
+            a well-behaved sink/helper should report failure via its own
+            return value, not an exception; a non-zero rate here points at a
+            bug in that specific sink/helper (e.g. an allocation failure
+            surfacing as bad_alloc, or a logic error) rather than at ordinary
+            store degradation. BE PRECISE ABOUT for: 2m (governance round 1, SRE-2):
+            it delays the page by two minutes, it does NOT require a
+            sustained episode. increase()[15m] stays true for ~15 minutes
+            after a single increment, so one throw still pages, two minutes
+            later. The delay exists so a self-resolving blip clears before
+            anyone is woken, not so a single throw is ignored.
+
   - name: yuzu-tls
     rules:
       - alert: YuzuCertificateExpiringSoon
