@@ -489,15 +489,24 @@ for the tool to execute.
 | 73 | `list_tar_capture_sources_devices` (#4027) | List the operator-scoped device picker for the TAR capture-sources (ADR-0015 enable/disable) frame. Same row shape and provider as `list_tar_process_tree_devices`. Mirrors `GET /api/v1/tar/capture-sources`. | `Infrastructure:Read` |
 | 74 | `list_tar_retention_paused` (#4027) | List the calling operator's most recent TAR retention-paused source scan (per-username state; filtered to the operator's visible agents), one row per (agent, paused source). `scan_id` is `""` when the operator has not dispatched a scan yet — `POST /fragments/tar/retention-paused/scan` is dashboard-only today. Mirrors `GET /api/v1/tar/retention-paused`. | `Infrastructure:Read` |
 
-> **TAR read twins (#4027) — two related fragments deliberately NOT twinned.**
+> **TAR read twins (#4027) — two related fragments deliberately NOT twinned,
+> deferred as scope, not impossibility.**
 > `GET /fragments/tar/process-tree/result` and `GET /fragments/tar/process-tree/detail`
-> read a token-keyed reconstruction cache populated only by the dashboard-only
-> `GET /fragments/tar/process-tree/run` route, itself excluded here as a
-> dispatch-shaped GET (batched with a later dispatch-twin effort, #3994). No
-> REST/MCP-only path exists to mint a valid `pcmd`/`tcmd`/`token` today, so a
-> "twin" of either would have no usable input — recorded as a ledger
-> `exception:` in `scripts/ci/api-parity/tar.json`, not silently dropped.
-> Revisit once that later batch ships a `/run` twin.
+> read a token-keyed reconstruction cache. `/detail`'s `token` is a CSPRNG value
+> minted and principal-bound only inside the `/result` handler itself — no other
+> path mints one, so a `/detail` twin genuinely has no usable input today.
+> `/result`'s `pcmd`/`tcmd` pair is an ordinary `tar sql` dispatch result
+> (`Infrastructure:Read`, no execute gate) and could in principle be obtained
+> through the already-twinned generic dispatch surface (`execute_instruction` /
+> `POST /api/command`) by reproducing the two canned `$Process_Live`/`$TCP_Live`
+> queries verbatim — but that is not a dedicated API path, and a real `/result`
+> twin would still need a new async "not ready yet" polling contract (no
+> htmx-style auto-reissue on REST/MCP). Both are otherwise reachable today only
+> via the dashboard-only `GET /fragments/tar/process-tree/run` route, itself
+> excluded here as a dispatch-shaped GET (batched with a later dispatch-twin
+> effort, #3994) — recorded as a ledger `exception:` in
+> `scripts/ci/api-parity/tar.json`, not silently dropped. Revisit once that
+> later batch ships `/run` (and `/result`) twins.
 
 > **`rotate_api_token`/`confirm_api_token_rotation` tier behavior (P2 #11, SOC 2
 > CC6.3) — deliberately NOT the engine-credential arm's answer, and NOT plain

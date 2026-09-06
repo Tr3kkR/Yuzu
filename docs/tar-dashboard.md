@@ -287,10 +287,18 @@ in-panel error and caches nothing rather than minting a weak token.
   no path collision) and the retention-paused source list (`GET
   /api/v1/tar/retention-paused`) — plus MCP tools `list_tar_process_tree_devices`
   / `list_tar_capture_sources_devices` / `list_tar_retention_paused`. #4027
-  deliberately did NOT twin `/fragments/tar/process-tree/result` or `.../detail`:
-  both depend on artifacts (a `pcmd`/`tcmd` pair; a cache `token`) mintable only
-  via the dashboard-only `/run` route, itself excluded as dispatch-shaped
-  (batched with #3994). Revisit once a `/run` twin lands — see
+  deliberately did NOT twin `/fragments/tar/process-tree/result` or `.../detail`
+  — deferred as scope, not impossibility. `/detail`'s cache `token` is a CSPRNG
+  value minted and principal-bound only inside the `/result` handler itself, so
+  a `/detail` twin genuinely has no usable input today. `/result`'s `pcmd`/`tcmd`
+  pair is an ordinary `tar sql` dispatch result (`Infrastructure:Read`, no
+  execute gate) reachable in principle through the already-twinned generic
+  dispatch surface (`execute_instruction` / `POST /api/command`) by reproducing
+  the two canned `$Process_Live`/`$TCP_Live` queries verbatim — not a dedicated
+  API path, and a real twin would still need a new async polling contract (no
+  htmx auto-reissue on REST/MCP). Both are otherwise minted only by the
+  dashboard-only `/run` route, itself excluded as dispatch-shaped (batched with
+  #3994). Revisit once a `/run` (and `/result`) twin lands — see
   `scripts/ci/api-parity/tar.json`'s `exception:` rows on those two paths.
 - **Loaded modules / libraries** — out of scope: TAR records no module-load data; it
   would need a new collector (ETW `Image`/`Load`) or a live modules probe.

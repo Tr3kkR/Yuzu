@@ -29,13 +29,21 @@
 /// here, over the SAME `Infrastructure:Read` gate + service-scoped-token guard as
 /// their fragment siblings, via the shared pure builders below (api-twin-recipe.md
 /// Rule 1). `GET /fragments/tar/process-tree/result` and `.../detail` are
-/// DELIBERATELY NOT twinned by #4027 — both depend on artifacts (`pcmd`/`tcmd`
-/// command-ids for /result; a cache `token` for /detail) that today are mintable
-/// ONLY by the dashboard-only `/run` route (excluded from #4027 as a dispatch-shaped
-/// GET, batched with #3994's later dispatch-twin work). A "twin" whose required input
-/// has no REST/MCP-only path to obtain is not a real capability closure — see the
-/// #4027 ledger row for the recorded `exception:` reason. Revisit once Batch C lands
-/// a `/run` twin that can mint a token/command-id pair over the API.
+/// DELIBERATELY NOT twinned by #4027 — scope, not impossibility. `/detail`'s
+/// cache `token` is a CSPRNG value minted and cached ONLY by `/result` itself
+/// (`cache_render_detail`/`ReconEntry`, principal-bound) — no other path mints
+/// one, so a `/detail` twin genuinely has no input to accept today. `/result`'s
+/// `pcmd`/`tcmd` command-ids are ordinary `tar sql` dispatch results
+/// (`plugin_action_catalogue_a.hpp`: `Infrastructure:Read`, `execute_gate=None`)
+/// and COULD in principle be minted by an operator through the already-twinned
+/// generic dispatch surface (`execute_instruction` / `POST /api/command`) by
+/// reproducing the two canned `$Process_Live`/`$TCP_Live` SELECTs verbatim —
+/// there is no dedicated API path, only that indirect route, so shipping a real
+/// `/result` twin would still need a caller to hand-derive those exact queries
+/// AND a new async "not ready yet" polling contract (REST/MCP have no htmx
+/// auto-reissue mechanism to lean on). Deferred as scope for now — see the
+/// #4027 ledger row for the recorded `exception:` reasoning. Revisit once Batch C
+/// lands a `/run` twin that mints pcmd/tcmd (and a token) directly over the API.
 
 #include <yuzu/server/auth.hpp>
 
