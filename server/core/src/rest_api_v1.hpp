@@ -16,6 +16,7 @@
 #include "device_token_store.hpp"
 #include "dex_app_perf_model.hpp"
 #include "dex_perf_model.hpp"
+#include "dex_routes.hpp" // DexFleet -- the DexFleetFn provider type below
 #include "network_perf_model.hpp"
 #include "execution_tracker.hpp"
 #include "guaranteed_state_store.hpp"
@@ -221,6 +222,17 @@ public:
     /// the agent dispatch path. Returns the number of agents pushed to, or -1 on an
     /// invalid scope expression. Injected from server.cpp where the registry/scope live.
     using GuardianPushFn = std::function<int(const std::string& scope, bool full_sync)>;
+    /// #4035: the SAME cross-store fleet denominator DexRoutes::FleetFn already
+    /// supplies to the dashboard fragments (windows/linux/macos-online counts +
+    /// connected-agent list) — reused verbatim (not re-derived) so the new
+    /// GET /api/v1/dex/{health,trends,overview,catalogue/group} twins read the
+    /// exact same fleet snapshot the fragments render against. Injected from
+    /// server.cpp, which already builds one `DexFleet` provider lambda for
+    /// DexRoutes; that SAME lambda is passed here too (see server.cpp). Trailing
+    /// optional (`{}`) for source-stability of existing call sites/tests — a
+    /// route that needs it treats an unwired fn as "no fleet data" (score/
+    /// crash-free suppressed), never a crash.
+    using DexFleetFn = std::function<DexFleet()>;
 
     /// Outcome of a session-revocation REST call. `cookie_sessions_revoked`
     /// is the number of in-memory cookie sessions wiped (the operationally
@@ -398,7 +410,12 @@ public:
         // #3290 Phase 2: GET /api/v1/inventory/software's SOLE authorization gate
         // (see FleetReadFn's doc comment above). Trailing optional dep; `{}` makes
         // the route FAIL CLOSED (503), same contract as list_read_fn.
-        FleetReadFn fleet_read_fn = {});
+        FleetReadFn fleet_read_fn = {},
+        // #4035: see DexFleetFn's doc comment above. Trailing optional dep; `{}`
+        // degrades the fleet-dependent DEX twins (health/trends/overview/
+        // catalogue-group) to their "no reporting agents" suppressed shape —
+        // never a crash.
+        DexFleetFn dex_fleet_fn = {});
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
@@ -466,7 +483,10 @@ public:
         ListReadFn list_read_fn = {},
         // #3290 Phase 2: see the production overload's doc comment above; identical
         // trailing-optional-dep, fail-closed-when-unwired contract.
-        FleetReadFn fleet_read_fn = {});
+        FleetReadFn fleet_read_fn = {},
+        // #4035: see the production overload's doc comment above; identical
+        // trailing-optional-dep, degrade-not-crash contract.
+        DexFleetFn dex_fleet_fn = {});
 
     /// PR 4.3 — engine-principal lifecycle store backing
     /// `/api/v1/engine-principals`, threaded post-construction. (During the

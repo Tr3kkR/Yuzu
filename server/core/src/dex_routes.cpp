@@ -550,19 +550,10 @@ std::string dex_window_chips(const char* frag, int window_days) {
 }
 
 // One family's rollup over the window (events, active count, blast radius, leader).
-struct DexFamilyRollup {
-    int64_t events = 0;
-    int active = 0;
-    int total = 0;
-    // #1374: the MAX of member signals' distinct-device counts, NOT the family-wide
-    // union. Two disjoint 50-device signals yield 50, not 100. Named explicitly so
-    // the UI label and the health-deduction basis agree (a true union would need a
-    // per-family COUNT(DISTINCT agent_id) query — deferred; this is a secondary,
-    // already-cross-family-overlapping composite).
-    int64_t max_signal_devices = 0;
-    const DexSignalCount* top = nullptr;
-    bool benign = false;
-};
+// #4035: DexFamilyRollup itself moved to dex_routes.hpp (external linkage, no
+// longer inside this TU's anonymous namespace below) so dex_read_model.cpp can
+// build the same rollup without a second copy (Rule 1) — this stays the ONE definition
+// of the function, now implementing the header's declared struct.
 DexFamilyRollup dex_family_rollup(const DexSignalGroup& g,
                                   const std::vector<DexSignalCount>& signals) {
     DexFamilyRollup r;
@@ -1187,14 +1178,9 @@ double dex_preset_mult(const DexFamilyWeight& fw, const std::string& preset) {
 // The composite-health computation, shared by the Health page and the Overview
 // hub's health teaser. score = 100 − Σ deductions; -1 when N<=0 (suppressed, no
 // reporting agents → no fabricated 100).
-struct DexHealthResult {
-    double score = -1.0;
-    struct Ded {
-        std::string name, sev;
-        double deduction = 0.0;
-    };
-    std::vector<Ded> deds;
-};
+// #4035: DexHealthResult moved to dex_routes.hpp (same rationale as
+// DexFamilyRollup above) so dex_read_model.cpp's health-score builder shares
+// this exact computation instead of a second copy (Rule 1).
 DexHealthResult dex_compute_health(const std::vector<DexSignalCount>& signals, int64_t N,
                                    const std::string& preset) {
     DexHealthResult r;

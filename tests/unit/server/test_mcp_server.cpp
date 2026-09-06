@@ -941,6 +941,13 @@ struct McpTestServer {
         return {true, std::nullopt};
     };
 
+    /// #4035 — the DexFleet provider for get_dex_health/get_dex_trends/
+    /// get_dex_overview/get_dex_catalogue_group. Default DexFleet{} (all-zero:
+    /// no online agents), matching production's unwired-degrades-not-crashes
+    /// contract; a test targeting the fleet-dependent shape mutates this
+    /// field (read LIVE at request time via the wiring lambda below).
+    DexFleet dex_fleet_for_test;
+
     /// ADR-0024 (SLE discovery): optionally wire a typed SoftwareLicensingStore so
     /// query_software_licenses (the MCP twin of the GET /sle/agents/{id} drill) is
     /// exercised end-to-end — success shape, the deliberate user_scope/user_ref PII
@@ -1172,6 +1179,11 @@ private:
         // predicate's "legacy-open" posture, so this is a no-op change of
         // shape for every pre-existing test that never touches it.
         mcp.set_fleet_read_fn(fleet_read_fn_for_test);
+
+        // #4035: same setter idiom, reads dex_fleet_for_test LIVE at request
+        // time (see that field's doc comment) — unconditional, no-op-shaped
+        // default for every pre-existing test.
+        mcp.set_dex_fleet_fn([this]() { return dex_fleet_for_test; });
 
         // #3685: the Destructive-targeting classifier ALSO rides a setter,
         // same pattern as the two above — wire before the handlers are
@@ -4024,6 +4036,111 @@ TEST_CASE("MCP DEX: get_dex_device_score missing agent_id -> invalid params",
     CHECK(res->body.find("-32602") != std::string::npos); // kInvalidParams
 }
 
+TEST_CASE("MCP DEX: get_dex_device_score off-enum window -> invalid params, never a "
+          "silently-defaulted 7d (parity with REST GET /api/v1/dex/devices/{id})",
+          "[pg][mcp][integration][dex]") {
+    // A real store must be wired (not left null): the store-unavailable branch
+    // is checked BEFORE the window validation (same order as the REST twin),
+    // so a null store would short-circuit to 503 before ever reaching the
+    // window check this test targets -- an earlier version of this test made
+    // exactly that mistake ("no store wired" premise, silently testing the
+    // wrong branch).
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":971,"params":{"name":"get_dex_device_score","arguments":{"agent_id":"WS-1","window":"banana"}}})");
+    REQUIRE(res);
+    CHECK(res->body.find("invalid window") != std::string::npos);
+    CHECK(res->body.find("-32602") != std::string::npos); // kInvalidParams
+}
+
+TEST_CASE("MCP DEX: list_dex_apps off-enum window -> invalid params, never a "
+          "silently-defaulted 7d (parity with REST GET /api/v1/dex/apps)",
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":982,"params":{"name":"list_dex_apps","arguments":{"window":"banana"}}})");
+    REQUIRE(res);
+    CHECK(res->body.find("invalid window") != std::string::npos);
+    CHECK(res->body.find("-32602") != std::string::npos); // kInvalidParams
+}
+
+TEST_CASE("MCP DEX: get_dex_catalogue_group off-enum window -> invalid params, never a "
+          "silently-defaulted 7d (parity with REST GET /api/v1/dex/catalogue/group)",
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":983,"params":{"name":"get_dex_catalogue_group","arguments":{"name":"App reliability","window":"banana"}}})");
+    REQUIRE(res);
+    CHECK(res->body.find("invalid window") != std::string::npos);
+    CHECK(res->body.find("-32602") != std::string::npos); // kInvalidParams
+}
+
+TEST_CASE("MCP DEX: get_dex_health off-enum window -> invalid params, never a "
+          "silently-defaulted 7d (parity with REST GET /api/v1/dex/health)",
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":984,"params":{"name":"get_dex_health","arguments":{"window":"banana"}}})");
+    REQUIRE(res);
+    CHECK(res->body.find("invalid window") != std::string::npos);
+    CHECK(res->body.find("-32602") != std::string::npos); // kInvalidParams
+}
+
+TEST_CASE("MCP DEX: get_dex_trends off-enum window -> invalid params, never a "
+          "silently-defaulted 7d (parity with REST GET /api/v1/dex/trends)",
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":985,"params":{"name":"get_dex_trends","arguments":{"window":"banana"}}})");
+    REQUIRE(res);
+    CHECK(res->body.find("invalid window") != std::string::npos);
+    CHECK(res->body.find("-32602") != std::string::npos); // kInvalidParams
+}
+
+TEST_CASE("MCP DEX: get_dex_overview off-enum window -> invalid params, never a "
+          "silently-defaulted 7d (parity with REST GET /api/v1/dex/overview)",
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":986,"params":{"name":"get_dex_overview","arguments":{"window":"banana"}}})");
+    REQUIRE(res);
+    CHECK(res->body.find("invalid window") != std::string::npos);
+    CHECK(res->body.find("-32602") != std::string::npos); // kInvalidParams
+}
+
 TEST_CASE("MCP DEX: get_dex_device_score out-of-scope device -> 403, no store read",
           "[mcp][integration][dex]") {
     McpTestServer ts; // no store wired: proves the gate short-circuits first
@@ -4136,6 +4253,287 @@ TEST_CASE("MCP DEX: get_dex_device_app_perf out-of-scope device -> 403, no provi
     CHECK(res->body.find("service unavailable") == std::string::npos);
 }
 
+// ═══ #4035 (api-parity #2146 Batch A): the 8 genuinely-new DEX MCP twins ═══
+
+TEST_CASE("MCP DEX: get_dex_app returns the blast-radius shape, audits dex.app.view, "
+          "service-scoped token denied",
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_obs(store, "a1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    mcp_seed_obs(store, "a2", "WS-2", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T11:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":972,"params":{"name":"get_dex_app","arguments":{"name":"chrome.exe","window":"all"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["process_name"] == "chrome.exe");
+    CHECK(payload["crashes"].get<int64_t>() == 2);
+    REQUIRE(payload["devices"].is_array());
+    CHECK(payload["devices"].size() == 2);
+    bool saw_view = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "dex.app.view|success")
+            saw_view = true;
+    CHECK(saw_view);
+
+    // service-scoped token -> 403, no data.
+    McpTestServer ts2;
+    ts2.guaranteed_state_store_for_test = &store;
+    ts2.mock_token_scope_service = "printers";
+    ts2.start("readonly");
+    auto denied = ts2.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":973,"params":{"name":"get_dex_app","arguments":{"name":"chrome.exe"}}})");
+    REQUIRE(denied);
+    CHECK(denied->body.find("chrome.exe") == std::string::npos);
+}
+
+TEST_CASE("MCP DEX: list_dex_apps returns the stability list, no audit (aggregate)",
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_obs(store, "b1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":974,"params":{"name":"list_dex_apps","arguments":{"window":"all"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(payload["apps"].is_array());
+    bool saw_chrome = false;
+    for (const auto& a : payload["apps"])
+        if (a["subject"] == "chrome.exe")
+            saw_chrome = true;
+    CHECK(saw_chrome);
+    // Fleet aggregate — only the generic tool-call audit, never a domain verb.
+    CHECK(ts.audit_log.back() == "mcp.list_dex_apps|success");
+    for (const auto& a : ts.audit_log)
+        CHECK(a.find("dex.app.view") == std::string::npos);
+}
+
+TEST_CASE("MCP DEX: get_dex_catalogue_group returns the family drill, unknown family -> "
+          "invalid params",
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_obs(store, "c1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":975,"params":{"name":"get_dex_catalogue_group","arguments":{"name":"App reliability","window":"all"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["group_name"] == "App reliability");
+    CHECK(payload["total_type_count"].get<int64_t>() > 0);
+
+    auto unknown = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":976,"params":{"name":"get_dex_catalogue_group","arguments":{"name":"NoSuchFamily"}}})");
+    REQUIRE(unknown);
+    CHECK(unknown->body.find("-32602") != std::string::npos);
+}
+
+TEST_CASE("MCP DEX: get_dex_health suppressed with no reporting agents, real fleet -> real score",
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_obs(store, "d1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":977,"params":{"name":"get_dex_health","arguments":{"window":"all"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["score"].is_null());
+
+    ts.dex_fleet_for_test.windows_online = 5;
+    auto res2 = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":978,"params":{"name":"get_dex_health","arguments":{"window":"all"}}})");
+    REQUIRE(res2);
+    auto body2 = nlohmann::json::parse(res2->body);
+    auto payload2 = nlohmann::json::parse(body2["result"]["content"][0]["text"].get<std::string>());
+    CHECK_FALSE(payload2["score"].is_null());
+}
+
+TEST_CASE("MCP DEX: get_dex_trends returns families + days, no audit (aggregate)",
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_obs(store, "e1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":979,"params":{"name":"get_dex_trends","arguments":{"window":"all"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(payload["families"].is_array());
+    REQUIRE(payload["days"].is_array());
+    // Fleet aggregate — only the generic tool-call audit, never a domain verb.
+    CHECK(ts.audit_log.back() == "mcp.get_dex_trends|success");
+}
+
+TEST_CASE("MCP DEX: get_dex_overview returns the fleet summary, audits dex.overview.view, "
+          "service-scoped token denied",
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_obs(store, "f1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    mcp_seed_obs(store, "f2", "WS-2", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T11:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":980,"params":{"name":"get_dex_overview","arguments":{"window":"all"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(payload["top_apps"].is_array());
+    bool saw_chrome = false;
+    for (const auto& a : payload["top_apps"])
+        if (a["subject"] == "chrome.exe")
+            saw_chrome = true;
+    CHECK(saw_chrome);
+    bool saw_view = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "dex.overview.view|success")
+            saw_view = true;
+    CHECK(saw_view);
+
+    McpTestServer ts2;
+    ts2.guaranteed_state_store_for_test = &store;
+    ts2.mock_token_scope_service = "printers";
+    ts2.start("readonly");
+    auto denied = ts2.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":981,"params":{"name":"get_dex_overview","arguments":{}}})");
+    REQUIRE(denied);
+    CHECK(denied->body.find("chrome.exe") == std::string::npos);
+}
+
+TEST_CASE("MCP DEX: get_dex_device_history returns per-device history, audits dex.device.view "
+          "(same verb get_dex_device_score uses), out-of-scope device -> 403",
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_obs(store, "g1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    mcp_seed_obs(store, "g2", "WS-2", "os.boot", "boot", "windows", "2026-06-10T08:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":982,"params":{"name":"get_dex_device_history","arguments":{"agent_id":"WS-1","window":"all"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["agent_id"] == "WS-1");
+    REQUIRE(payload["history"].is_array());
+    bool saw_it = false, saw_other = false;
+    for (const auto& r : payload["history"]) {
+        if (r["obs_type"] == "process.crashed")
+            saw_it = true;
+        if (r["subject"] == "boot")
+            saw_other = true;
+    }
+    CHECK(saw_it);
+    CHECK_FALSE(saw_other);
+    bool saw_view = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "dex.device.view|success")
+            saw_view = true;
+    CHECK(saw_view);
+
+    McpTestServer ts2;
+    ts2.guaranteed_state_store_for_test = &store;
+    ts2.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response& res,
+                                     const std::string&, const std::string&,
+                                     const std::string& agent_id) -> bool {
+        if (agent_id == "WS-9") {
+            res.status = 403;
+            res.set_content(R"({"error":"forbidden"})", "application/json");
+            return false;
+        }
+        return true;
+    };
+    ts2.start("readonly");
+    auto denied = ts2.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":983,"params":{"name":"get_dex_device_history","arguments":{"agent_id":"WS-9"}}})");
+    REQUIRE(denied);
+    CHECK(denied->status == 403);
+}
+
+TEST_CASE("MCP DEX: get_dex_observation returns the detail, audits dex.observation.view, "
+          "foreign event_id -> invalid params (same as genuinely-absent, no oracle)",
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_obs(store, "h1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    mcp_seed_obs(store, "h2", "WS-2", "os.boot", "boot", "windows", "2026-06-10T08:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":984,"params":{"name":"get_dex_observation","arguments":{"agent_id":"WS-1","event_id":"h1"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["event_id"] == "h1");
+    CHECK(payload["agent_id"] == "WS-1");
+    bool saw_view = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "dex.observation.view|success")
+            saw_view = true;
+    CHECK(saw_view);
+
+    // h2 belongs to WS-2, not WS-1 -- same error as a genuinely-absent event.
+    auto foreign = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":985,"params":{"name":"get_dex_observation","arguments":{"agent_id":"WS-1","event_id":"h2"}}})");
+    REQUIRE(foreign);
+    CHECK(foreign->body.find("-32602") != std::string::npos);
+}
+
 TEST_CASE("MCP DEX: tools report unavailable when no Guaranteed State store is wired",
           "[mcp][integration][dex]") {
     McpTestServer ts; // guaranteed_state_store_for_test stays nullptr
@@ -4146,6 +4544,22 @@ TEST_CASE("MCP DEX: tools report unavailable when no Guaranteed State store is w
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+
+    // #4035 fix-round: get_dex_health / get_dex_trends / get_dex_catalogue_group
+    // previously had NO null-store guard and would silently degrade to
+    // reporting:0/score:null instead of erroring — indistinguishable from a
+    // genuine "no reporting agents" answer. Same explicit-503-equivalent
+    // contract as list_dex_signals above now applies to all three.
+    for (const char* const call :
+         {R"({"jsonrpc":"2.0","method":"tools/call","id":45,"params":{"name":"get_dex_health"}})",
+          R"({"jsonrpc":"2.0","method":"tools/call","id":46,"params":{"name":"get_dex_trends"}})",
+          R"({"jsonrpc":"2.0","method":"tools/call","id":47,"params":{"name":"get_dex_catalogue_group","arguments":{"name":"App reliability"}}})"}) {
+        auto r = ts.call(call);
+        REQUIRE(r);
+        auto b = nlohmann::json::parse(r->body);
+        REQUIRE(b.contains("error"));
+        CHECK(b["error"]["code"] == yuzu::server::mcp::kInternalError);
+    }
 }
 
 // #2298 PR 3 §3c: the C8 chokepoint's default-deny classification. Before

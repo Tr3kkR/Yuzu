@@ -60,8 +60,11 @@ constexpr std::string_view kScope[] = {"validate_scope", "preview_scope_targets"
 constexpr std::string_view kMgmtGroups[] = {"list_management_groups"};
 constexpr std::string_view kApprovals[] = {"list_pending_approvals", "approve_request",
                                            "reject_request"};
-constexpr std::string_view kDexSignals[] = {"list_dex_signals", "get_dex_signal_scope",
-                                            "get_dex_signal_detail", "get_dex_device_score"};
+constexpr std::string_view kDexSignals[] = {
+    "list_dex_signals",       "get_dex_signal_scope",     "get_dex_signal_detail",
+    "get_dex_device_score",   "get_dex_app",              "list_dex_apps",
+    "get_dex_catalogue_group", "get_dex_device_history",  "get_dex_observation",
+    "get_dex_health",         "get_dex_trends",           "get_dex_overview"};
 constexpr std::string_view kDexPerf[] = {"get_dex_perf_fleet",   "get_dex_perf_cohorts",
                                          "get_dex_perf_cohort_diff", "list_dex_perf_devices",
                                          "list_dex_perf_apps",   "get_dex_app_perf",

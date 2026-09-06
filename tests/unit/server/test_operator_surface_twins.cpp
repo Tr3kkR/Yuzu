@@ -433,6 +433,15 @@ constexpr TwinRow kExpectedTwins[] = {
     // header comment above was originally pinned against).
     {"get_dex_device_score", "GuaranteedState", "Read", true},
     {"get_dex_device_app_perf", "GuaranteedState", "Read", true},
+    // #4035: the 8 genuinely-new REST+MCP twins from the same issue.
+    {"get_dex_app", "GuaranteedState", "Read", true},
+    {"list_dex_apps", "GuaranteedState", "Read", true},
+    {"get_dex_catalogue_group", "GuaranteedState", "Read", true},
+    {"get_dex_device_history", "GuaranteedState", "Read", true},
+    {"get_dex_observation", "GuaranteedState", "Read", true},
+    {"get_dex_health", "GuaranteedState", "Read", true},
+    {"get_dex_trends", "GuaranteedState", "Read", true},
+    {"get_dex_overview", "GuaranteedState", "Read", true},
 };
 
 } // namespace

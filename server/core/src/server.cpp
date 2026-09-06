@@ -19711,72 +19711,80 @@ private:
             return out;
         };
 
+        // Cross-store fleet denominator for the DEX rates: count online agents,
+        // and of those the Windows ones (the only OS with a crash collector
+        // today — the coverage-honest crash-free denominator). Real data; an
+        // empty fleet degrades the rates to the "no data" tile, never a fake number.
+        //
+        // SCOPING NOTE (PR #1522 re-review): this provider is intentionally
+        // fleet-wide and is NOT an enumeration vector — it renders NO agent_ids.
+        // It feeds only fleet AGGREGATES (the crash-free rate denominator + the
+        // score-distribution histogram). The device-id LISTS the re-review flagged
+        // get their ids from the per-OBSERVATION store queries (dex_top_devices /
+        // dex_signal_devices / dex_app_devices / dex_perf_devices), which the
+        // dashboard fragments narrow via VisibleSetFn (username-keyed) — this
+        // closes the enumeration for a management-group-confined OPERATOR
+        // session, but NOT for a service-scoped API token: VisibleSetFn has no
+        // token_scope_service branch (same gap SEC-2/SEC-3 fixed elsewhere), so a
+        // service token whose username resolves to an unscoped grant still sees
+        // the whole fleet through these fragments. That axis is closed by an
+        // explicit deny_service_scoped_-style gate on each fragment, not by this
+        // provider or by VisibleSetFn. True per-TENANT aggregate RATES would also
+        // need the store-side crash/signal NUMERATORS (dex_crash_summary /
+        // dex_signal_summary) scoped — a tracked follow-up; scoping the
+        // denominator here without them would ship a misleading rate.
+        //
+        // #4035: extracted into a named variable (was inline at the
+        // DexRoutes::register_routes call site below) so the SAME provider is
+        // also passed to RestApiV1::register_routes's dex_fleet_fn param —
+        // the new GET /api/v1/dex/{health,trends,overview,catalogue/group}
+        // REST twins read the identical fleet snapshot the dashboard renders
+        // against, never a second independently-computed copy.
+        auto dex_fleet_fn = [this]() -> DexFleet {
+            DexFleet f;
+            const auto ids = registry_.all_ids();
+            f.total_online = static_cast<int64_t>(ids.size());
+            for (const auto& id : ids) {
+                if (auto s = registry_.get_session(id)) {
+                    std::string os = s->os;
+                    for (auto& c : os)
+                        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                    // starts_with, NOT find — "darwin" contains "win"
+                    // (G4 UP-1; pre-existing here, fixed with the sibling).
+                    if (os.starts_with("win"))
+                        ++f.windows_online;
+                    // Per-OS online denominators (#1746) — same coverage-honest
+                    // count as windows_online, so the Catalogue's single-OS
+                    // filter can score a family against THAT OS's own fleet.
+                    if (os.starts_with("lin"))
+                        ++f.linux_online;
+                    if (os.starts_with("darwin") || os.starts_with("macos"))
+                        ++f.macos_online; // prefix, like win/lin — keep in
+                                          // step with the store's write canon
+                    // Distinct connected OS tokens → the Catalogue's "All
+                    // connected" coverage scope (render normalises darwin→macos).
+                    if (!os.empty() && std::find(f.connected_os.begin(),
+                                                 f.connected_os.end(), os) ==
+                                           f.connected_os.end())
+                        f.connected_os.push_back(os);
+                    // Normalized (id, os) for the Overview score distribution +
+                    // the segment breakdown.
+                    const std::string nos = os.starts_with("win")            ? "windows"
+                                            : os.starts_with("lin")          ? "linux"
+                                            : (os == "darwin" || os == "macos") ? "macos"
+                                                                                : os;
+                    f.connected_agents.emplace_back(id, nos);
+                }
+            }
+            return f;
+        };
+
         // DexRoutes — /dex + /fragments/dex/overview (DEX reliability read model
         // over the crash-observation projection). Read-only; NO mock data — real
         // aggregations or a "no data" placeholder. Gates on GuaranteedState:Read.
         dex_routes_ = std::make_unique<DexRoutes>();
         dex_routes_->register_routes(
-            *web_server_, auth_fn, perm_fn, guaranteed_state_store_.get(),
-            // Cross-store fleet denominator for the DEX rates: count online agents,
-            // and of those the Windows ones (the only OS with a crash collector
-            // today — the coverage-honest crash-free denominator). Real data; an
-            // empty fleet degrades the rates to the "no data" tile, never a fake number.
-            //
-            // SCOPING NOTE (PR #1522 re-review): this provider is intentionally
-            // fleet-wide and is NOT an enumeration vector — it renders NO agent_ids.
-            // It feeds only fleet AGGREGATES (the crash-free rate denominator + the
-            // score-distribution histogram). The device-id LISTS the re-review flagged
-            // get their ids from the per-OBSERVATION store queries (dex_top_devices /
-            // dex_signal_devices / dex_app_devices / dex_perf_devices), which the
-            // dashboard fragments narrow via VisibleSetFn (username-keyed) — this
-            // closes the enumeration for a management-group-confined OPERATOR
-            // session, but NOT for a service-scoped API token: VisibleSetFn has no
-            // token_scope_service branch (same gap SEC-2/SEC-3 fixed elsewhere), so a
-            // service token whose username resolves to an unscoped grant still sees
-            // the whole fleet through these fragments. That axis is closed by an
-            // explicit deny_service_scoped_-style gate on each fragment, not by this
-            // provider or by VisibleSetFn. True per-TENANT aggregate RATES would also
-            // need the store-side crash/signal NUMERATORS (dex_crash_summary /
-            // dex_signal_summary) scoped — a tracked follow-up; scoping the
-            // denominator here without them would ship a misleading rate.
-            [this]() -> DexFleet {
-                DexFleet f;
-                const auto ids = registry_.all_ids();
-                f.total_online = static_cast<int64_t>(ids.size());
-                for (const auto& id : ids) {
-                    if (auto s = registry_.get_session(id)) {
-                        std::string os = s->os;
-                        for (auto& c : os)
-                            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                        // starts_with, NOT find — "darwin" contains "win"
-                        // (G4 UP-1; pre-existing here, fixed with the sibling).
-                        if (os.starts_with("win"))
-                            ++f.windows_online;
-                        // Per-OS online denominators (#1746) — same coverage-honest
-                        // count as windows_online, so the Catalogue's single-OS
-                        // filter can score a family against THAT OS's own fleet.
-                        if (os.starts_with("lin"))
-                            ++f.linux_online;
-                        if (os.starts_with("darwin") || os.starts_with("macos"))
-                            ++f.macos_online; // prefix, like win/lin — keep in
-                                              // step with the store's write canon
-                        // Distinct connected OS tokens → the Catalogue's "All
-                        // connected" coverage scope (render normalises darwin→macos).
-                        if (!os.empty() && std::find(f.connected_os.begin(),
-                                                     f.connected_os.end(), os) ==
-                                               f.connected_os.end())
-                            f.connected_os.push_back(os);
-                        // Normalized (id, os) for the Overview score distribution +
-                        // the segment breakdown.
-                        const std::string nos = os.starts_with("win")            ? "windows"
-                                                : os.starts_with("lin")          ? "linux"
-                                                : (os == "darwin" || os == "macos") ? "macos"
-                                                                                    : os;
-                        f.connected_agents.emplace_back(id, nos);
-                    }
-                }
-                return f;
-            },
+            *web_server_, auth_fn, perm_fn, guaranteed_state_store_.get(), dex_fleet_fn,
             audit_fn,
             // A4 device perf panel: canned tar.sql dispatch through the shared
             // chokepoint (untracked path — empty execution_id, same posture as
@@ -21782,7 +21790,12 @@ private:
             // #3290 Phase 2: GET /api/v1/inventory/software's SOLE
             // authorization gate — see rest_api_v1.cpp's route comment for
             // why it must never be stacked with perm_fn.
-            fleet_read_fn);
+            fleet_read_fn,
+            // #4035: the SAME DexFleet provider DexRoutes::register_routes
+            // above already received — see its doc comment (defined once,
+            // just above the DexRoutes registration) for why this must be
+            // the identical lambda, not a second copy.
+            dex_fleet_fn);
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -21939,6 +21952,11 @@ private:
             // decision for the same caller (same conversion, same underlying
             // require_fleet_read call).
             mcp_server_->set_fleet_read_fn(fleet_read_fn);
+            // #4035: the SAME DexFleet provider DexRoutes/RestApiV1 already
+            // received above — see its doc comment (defined once, just above
+            // the DexRoutes registration) for why this must be the identical
+            // lambda, not a second copy.
+            mcp_server_->set_dex_fleet_fn(dex_fleet_fn);
             // PR1.5c/1.6c (p14) — ADR-0031 operator surface MCP twins,
             // wired UNCONDITIONALLY exactly like kek_ops above (never
             // gated behind an unrelated conditional — see the KEK comment

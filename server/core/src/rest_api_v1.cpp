@@ -1103,7 +1103,35 @@ const std::string& openapi_spec() {
     },
     "/dex/perf/compare": {
       "get": {"summary": "Before/after app performance (cohort-paired, /auto VERIFY)", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. The UAT non-functional evidence: did upgrading 'app' from 'baseline' to 'candidate' change how the SAME machines in 'group' perform? The shift is computed PER MACHINE (each device's own baseline-version window vs its own candidate-version window, both from the per-device B1 store, the window anchored to that machine's version transition not to today), then the per-machine deltas are aggregated — so the population is held fixed (a fleet baseline-vs-candidate diff would be confounded by different populations). A machine that ran only one of the two versions in-window is EXCLUDED and counted (baseline_only/candidate_only); cohort members with no app-perf data at all are no_data. EVIDENTIAL ONLY: the response is the measured shift (cpu/ws before/after means, median per-machine delta, p95 across machines) plus the up/flat/down per-machine split — there is NO verdict, NO threshold, NO pass/fail. NO cohort floor (real canaries are 2-3 devices): a sub-floor paired set carries small_cohort=true (render 'indicative'), never suppression; insufficient=true means no machine ran both versions. The aggregate carries NO per-machine row (that PII is the audited dashboard drill). Because an unfloored small-cohort aggregate is near-individual, the read IS audited (dex.app_perf.compare, operational set-and-proceed). Gated on GLOBAL GuaranteedState:Read like /dex/perf/group, including the same service-scoped-token caveat: a token holds a global grant via ITServiceOwner regardless of scope, so it could otherwise supply any group, including one outside its own service — denied outright (403), audited under this same dex.app_perf.compare verb.", "parameters": [{"name": "app", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "App name; discover via GET /dex/perf/apps."}, {"name": "group", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "Management-group id whose members are the cohort."}, {"name": "baseline", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "The before version (canonicalized + matched exactly)."}, {"name": "candidate", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "The after version; must differ from baseline."}, {"name": "window", "in": "query", "required": false, "schema": {"type": "integer", "default": 7, "minimum": 1, "maximum": 31}, "description": "Days of each version per machine to reduce."}], "responses": {"200": {"description": "Comparison object (app, group_id, baseline_version, candidate_version, window_days, cohort_size, paired, baseline_only, candidate_only, no_data, small_cohort, insufficient, cpu{before_mean, after_mean, delta_median, before_p95, after_p95}, ws{...}, distribution{up, flat, down})"}, "400": {"description": "missing/invalid param, or baseline == candidate"}, "403": {"description": "Service-scoped API token — this near-individual before/after comparison cannot be confined to the token's service."}, "503": {"description": "service unavailable, or the app-perf cohort read degraded (retry)"}}}
+    })json"
+        // Split again (MSVC C2026 ~16 KB per-literal cap); concatenated at
+        // compile time. #4035's 8 new DEX twins start a fresh literal segment.
+        R"json(,
+    "/dex/app": {
+      "get": {"summary": "App blast-radius drill", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Crash/hang summary, faulting modules, exception codes, and the affected-device list for one application (process image name) — the REST twin of the /fragments/dex/app dashboard drill. The devices array names affected agent_ids fleet-wide (individual-identifying behavioral data), so every call emits a dex.app.view audit event and a service-scoped API token is denied outright (403) — there is no single agent_id to confine the token's own service-tag scope against. FAILS CLOSED (503 + Sec-Audit-Failed: true header) when that audit row cannot persist.", "parameters": [{"name": "name", "in": "query", "required": true, "schema": {"type": "string"}, "description": "Process image name, e.g. notepad.exe."}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "App drill object (process_name, window, crashes, hangs, signals, distinct_devices, first_seen, last_seen, modules[], exceptions[], devices[])"}, "400": {"description": "missing name, or invalid window"}, "403": {"description": "Service-scoped API token — this fleet-wide read cannot be confined to the token's service."}, "503": {"description": "Service unavailable OR the dex.app.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
     },
+    "/dex/apps": {
+      "get": {"summary": "App-centric stability list", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Every application with a crash/hang signal in the window, ranked by activity — the REST twin of the /fragments/dex/apps dashboard tab. No per-agent identity (a distinct-device COUNT per app, never an agent_id) — fleet aggregate, NOT audited.", "parameters": [{"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Apps list (data.window, data.apps[].{subject, crashes, hangs, distinct_devices, last_seen})"}, "400": {"description": "invalid window"}, "503": {"description": "service unavailable"}}}
+    },
+    "/dex/catalogue/group": {
+      "get": {"summary": "Signal-family drill (Catalogue View 2)", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. One signal family's member signals: per-type monitored/not-collected state, coverage platforms, event count + blast radius, plus the family's own health-score slice — the REST twin of the /fragments/dex/catalogue/group dashboard drill (see docs/dex-signal-catalog.md for the family names). No per-agent identity — fleet aggregate, NOT audited.", "parameters": [{"name": "name", "in": "query", "required": true, "schema": {"type": "string"}, "description": "Exact family name, e.g. 'App reliability'."}, {"name": "os", "in": "query", "required": false, "schema": {"type": "string", "enum": ["all", "windows", "linux", "macos"], "default": "all"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Family drill object (group_name, os, window, monitored_count, total_type_count, health_score|null, active_events, max_signal_devices, types[].{obs_type, monitored, coverage_platforms, count, distinct_devices, last_seen})"}, "400": {"description": "missing name, or invalid window"}, "404": {"description": "no such signal family"}, "503": {"description": "service unavailable"}}}
+    },
+    "/dex/health": {
+      "get": {"summary": "Derived composite health score", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. The derived/SECONDARY composite (100 minus weighted per-family deductions, one of the allowlisted presets default/stability/productivity/security) — the REST twin of the /fragments/dex/health dashboard tab. score/band/crash_free_pct are null when reporting is 0 (no fabricated 100). No per-agent identity — fleet aggregate, NOT audited.", "parameters": [{"name": "weighting", "in": "query", "required": false, "schema": {"type": "string", "enum": ["default", "stability", "productivity", "security"], "default": "default"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Health object (weighting, window, reporting, total_crashes, crash_free_pct|null, score|null, band|null, deductions[].{name, severity, deduction})"}, "400": {"description": "invalid window"}, "503": {"description": "service unavailable"}}}
+    },
+    "/dex/trends": {
+      "get": {"summary": "Cross-OS comparison + per-family day-by-day trend", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Cross-OS scope cards plus per-family event counts for every day in the window (the small-multiples/heatmap source data) — the REST twin of the /fragments/dex/trends dashboard tab. No per-agent identity — fleet aggregate, NOT audited.", "parameters": [{"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Trends object (window, total_catalogued_types, windows_reporting, crash_free_pct|null, os_cards[].{platform, live, distinct_types, total_events}, days[], families[].{name, total, counts[]})"}, "400": {"description": "invalid window"}, "503": {"description": "service unavailable"}}}
+    },
+    "/dex/overview": {
+      "get": {"summary": "Fleet DEX overview (the /dex landing page's summary)", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Per-device experience score distribution + the Device/App/Network composite, the measured crash-free rate, top apps, and the most-affected-devices list — the REST twin of the /fragments/dex/overview dashboard hub. The top_devices array names affected agent_ids fleet-wide (individual-identifying behavioral data), so every call emits a dex.overview.view audit event and a service-scoped API token is denied outright (403). FAILS CLOSED (503 + Sec-Audit-Failed: true header) when that audit row cannot persist.", "parameters": [{"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Overview object (window, overall_experience, device_score, app_score, network_score, great, fair, poor, coverage_monitored, coverage_total, crash_free_pct|null, windows_reporting, crashes_per_1k_device_days|null, total_crashes, devices_impacted, total_online, active_signal_types, health_score|null, os_reporting_count, segments[], crashes_by_day[], top_apps[], top_devices[], os_table[])"}, "400": {"description": "invalid window"}, "403": {"description": "Service-scoped API token — this fleet-wide read cannot be confined to the token's service."}, "503": {"description": "Service unavailable OR the dex.overview.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
+    },
+    "/dex/devices/{id}/history": {
+      "get": {"summary": "Per-device raw signal history", "tags": ["DEX"], "description": "Requires GuaranteedState:Read, scoped to the device's management group. The distinct signal-HISTORY capability from GET /dex/devices/{id} above (same device, different data: every observation row, not just the rollup score) — the REST twin of the /fragments/dex/device dashboard drill. Individual-identifying behavioral data, so every call emits a dex.device.view audit event (the SAME verb GET /dex/devices/{id} uses; the dashboard fragment audits this exact capability under this exact verb too). FAILS CLOSED (503 + Sec-Audit-Failed: true header) when that row cannot persist.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "History object (agent_id, window, crashes, hangs, signals, distinct_apps, last_seen, history[].{event_id, observed_at, obs_type, subject, reason, symbolic, component, metric})"}, "400": {"description": "invalid window"}, "403": {"description": "outside the caller's management scope"}, "503": {"description": "Service unavailable OR the dex.device.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
+    },
+    "/dex/devices/{id}/observations/{event_id}": {
+      "get": {"summary": "Single-observation detail", "tags": ["DEX"], "description": "Requires GuaranteedState:Read, scoped to the device's management group. Every captured projection field for one event (the device-history row click target) — the REST twin of the /fragments/dex/observation dashboard drill. A foreign or guessed event_id resolves identically to a genuinely-absent one (404, no oracle). Individual-identifying behavioral data, so every call emits a dex.observation.view audit event and FAILS CLOSED (503 + Sec-Audit-Failed: true header) when that row cannot persist.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "event_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Observation object (event_id, agent_id, observed_at, obs_type, subject, reason, symbolic, component, version, metric, platform)"}, "403": {"description": "outside the caller's management scope"}, "404": {"description": "observation not found (or belongs to a different device — same response, no oracle)"}, "503": {"description": "Service unavailable OR the dex.observation.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
+    })json"
+        R"json(,
     "/network/fleet": {
       "get": {"summary": "Fleet network quality now-stats", "tags": ["Network"], "description": "Requires GuaranteedState:Read. Current-cycle fleet stats (avg/p50/p90/max + n) for smoothed RTT ms, the interval TCP retransmit rate % and device throughput bps, computed at request time over registry heartbeat NETWORK facts — OS-blended across the fleet (the per-OS yuzu_fleet_net_* Prometheus gauges split the same facts by os, so a gauge series differs from this blended number on a mixed fleet; the /network Overview cards show this same blended view). A metric nobody reported is null (absent, never 0); reporting, rtt_reporting (the honest RTT denominator) and online carry the populations. cooccurrence counts net-degraded devices that also show device-perf pressure / app instability (measured co-occurrence, never a cause). Device-aggregate link health — NOT audited.", "responses": {"200": {"description": "Fleet now object (rtt_ms|null, retrans_pct|null, throughput_bps|null, reporting, rtt_reporting, online, cooccurrence{degraded, also_device, also_app, network_only})"}, "503": {"description": "service unavailable"}}}
     })json"
@@ -1549,7 +1577,8 @@ void RestApiV1::register_routes(
     ResponseScopeFn response_scope_fn, AppPerfProviders app_perf_providers,
     EnginePrincipalStore* engine_principal_store, AccessReviewStore* access_review_store,
     AuthDB* auth_db, DirectorySync* directory_sync, detail::StreamBudget* stream_budget,
-    ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn, FleetReadFn fleet_read_fn) {
+    ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn, FleetReadFn fleet_read_fn,
+    DexFleetFn dex_fleet_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -1564,7 +1593,7 @@ void RestApiV1::register_routes(
                     std::move(response_scope_fn),
                     std::move(app_perf_providers), engine_principal_store, access_review_store,
                     auth_db, directory_sync, stream_budget, std::move(exec_visible_fn),
-                    std::move(list_read_fn), std::move(fleet_read_fn));
+                    std::move(list_read_fn), std::move(fleet_read_fn), std::move(dex_fleet_fn));
 }
 
 void RestApiV1::register_routes(
@@ -1585,7 +1614,8 @@ void RestApiV1::register_routes(
     ResponseScopeFn response_scope_fn, AppPerfProviders app_perf_providers,
     EnginePrincipalStore* engine_principal_store, AccessReviewStore* access_review_store,
     AuthDB* auth_db, DirectorySync* directory_sync, detail::StreamBudget* stream_budget,
-    ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn, FleetReadFn fleet_read_fn) {
+    ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn, FleetReadFn fleet_read_fn,
+    DexFleetFn dex_fleet_fn) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -11542,6 +11572,391 @@ void RestApiV1::register_routes(
                                         .raw("distribution", dist)
                                         .str()),
                             "application/json");
+        });
+
+    // ── #4035 (api-parity #2146 Batch A): the 8 genuinely-new DEX REST twins ──
+    //
+    // Every builder call below is the SAME shared pure function
+    // (dex_read_model.hpp) the MCP twins in mcp_server.cpp call — Rule 1
+    // (docs/api-twin-recipe.md): REST/MCP/the HTML fragment build their
+    // response DATA from one function, never three independently-maintained
+    // copies. `dex_fleet_fn` is the SAME DexFleet provider DexRoutes already
+    // uses for the dashboard fragments (server.cpp wires the identical
+    // lambda to both).
+    //
+    // Audit posture (per capability, matching each fragment's OWN posture --
+    // #4035 AC): `apps`/`catalogue/group`/`health`/`trends` are fleet
+    // aggregates with no per-agent identity, so no audit (their fragments
+    // carry none either). `app` and `overview` each enumerate a
+    // most-affected-DEVICES list (agent_ids -- individual-identifying); their
+    // OWN fragments audit only the service-scoped DENIAL (deny_service_scoped_
+    // at dex_routes.cpp:2831/2692), not success -- an inconsistency against
+    // the two sibling fragments that DO audit success on an identical
+    // device-id-list shape (/fragments/dex/catalogue/signal's dex.signal.view,
+    // /fragments/dex/perf/devices' dex.perf.device.view). Judgment call: the
+    // REST/MCP twins here audit success FAIL-CLOSED (dex.app.view /
+    // dex.overview.view) to match those two precedents rather than the
+    // under-audited fragments -- REST legitimately adding MORE rigor than an
+    // already-inconsistent fragment, not a mismatch to "fix" in the fragment
+    // (out of this issue's scope; not changing dex_routes.cpp's fragment
+    // handlers). `device` history and `observation` detail reuse
+    // dex.device.view / dex.observation.view fail-closed, matching their
+    // fragments (which DO audit success already).
+
+    // GET /dex/app?name=&window= -- app blast-radius (crash/hang summary +
+    // faulting modules + exceptions + affected devices). Fleet-wide
+    // identity-linked device list -> deny_fleet_wide_service_scoped +
+    // fail-closed success audit (dex.app.view), per the posture note above.
+    sink.Get("/api/v1/dex/app", [perm_fn, audit_fn, guaranteed_state_store,
+                                 deny_fleet_wide_service_scoped](const httplib::Request& req,
+                                                                 httplib::Response& res) {
+        const auto cid = detail::make_correlation_id();
+        res.set_header("X-Correlation-Id", cid);
+        if (deny_fleet_wide_service_scoped(
+                req, res, "dex.app.view", "GuaranteedState",
+                "fleet-wide DEX app affected-devices list denied to a service-scoped token",
+                "service-scoped tokens may not read the fleet-wide DEX app affected-devices "
+                "list"))
+            return;
+        if (!perm_fn(req, res, "GuaranteedState", "Read"))
+            return;
+        if (!guaranteed_state_store) {
+            res.status = 503;
+            res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                            "application/json");
+            return;
+        }
+        const std::string name = req.has_param("name") ? req.get_param_value("name") : "";
+        if (name.empty()) {
+            res.status = 400;
+            res.set_content(detail::error_json_a4(400, "missing required parameter 'name'", cid),
+                            "application/json");
+            return;
+        }
+        const std::string window = req.has_param("window") ? req.get_param_value("window") : "7d";
+        if (window != "24h" && window != "7d" && window != "30d" && window != "all") {
+            res.status = 400;
+            res.set_content(
+                detail::error_json_a4(400, "invalid window (expected 24h|7d|30d|all)", cid),
+                "application/json");
+            return;
+        }
+        if (!detail::emit_behavioral_audit(audit_fn, req, res, "dex.app.view", "success",
+                                           "GuaranteedState", "",
+                                           "REST DEX app affected-devices read cid=" + cid)) {
+            res.status = 503;
+            res.set_content(
+                detail::error_json_a4(503,
+                                      "audit subsystem unavailable; refusing to serve device "
+                                      "data without durable evidence",
+                                      cid, 5000, "retry the request"),
+                "application/json");
+            spdlog::warn("dex.app.view audit fail-closed (503) cid={}", cid);
+            return;
+        }
+        const std::string since = dex_iso_since(dex_window_to_days(window));
+        const auto model =
+            build_dex_app_model(guaranteed_state_store, name, window, since, /*visible=*/nullptr);
+        res.set_content(ok_json(dex_app_json(model)), "application/json");
+    });
+
+    // GET /dex/apps?window= -- app-centric stability list. No per-agent
+    // identity (a distinct-device COUNT per app, never an agent_id) -- no
+    // audit, matching the fragment's own posture.
+    sink.Get("/api/v1/dex/apps", [perm_fn, guaranteed_state_store](const httplib::Request& req,
+                                                                    httplib::Response& res) {
+        if (!perm_fn(req, res, "GuaranteedState", "Read"))
+            return;
+        const auto cid = detail::make_correlation_id();
+        res.set_header("X-Correlation-Id", cid);
+        if (!guaranteed_state_store) {
+            res.status = 503;
+            res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                            "application/json");
+            return;
+        }
+        const std::string window = req.has_param("window") ? req.get_param_value("window") : "7d";
+        if (window != "24h" && window != "7d" && window != "30d" && window != "all") {
+            res.status = 400;
+            res.set_content(
+                detail::error_json_a4(400, "invalid window (expected 24h|7d|30d|all)", cid),
+                "application/json");
+            return;
+        }
+        const std::string since = dex_iso_since(dex_window_to_days(window));
+        const auto model = build_dex_apps_model(guaranteed_state_store, window, since);
+        res.set_content(ok_json(dex_apps_json(model)), "application/json");
+    });
+
+    // GET /dex/catalogue/group?name=&os=&window= -- one signal family's
+    // member signals (Catalogue View 2). No per-agent identity -- no audit,
+    // matching the fragment's own posture.
+    sink.Get("/api/v1/dex/catalogue/group",
+             [perm_fn, guaranteed_state_store, dex_fleet_fn](const httplib::Request& req,
+                                                             httplib::Response& res) {
+                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                     return;
+                 const auto cid = detail::make_correlation_id();
+                 res.set_header("X-Correlation-Id", cid);
+                 if (!guaranteed_state_store) {
+                     res.status = 503;
+                     res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                     "application/json");
+                     return;
+                 }
+                 const std::string name = req.has_param("name") ? req.get_param_value("name") : "";
+                 if (name.empty()) {
+                     res.status = 400;
+                     res.set_content(
+                         detail::error_json_a4(400, "missing required parameter 'name'", cid),
+                         "application/json");
+                     return;
+                 }
+                 const std::string window =
+                     req.has_param("window") ? req.get_param_value("window") : "7d";
+                 if (window != "24h" && window != "7d" && window != "30d" && window != "all") {
+                     res.status = 400;
+                     res.set_content(
+                         detail::error_json_a4(400, "invalid window (expected 24h|7d|30d|all)", cid),
+                         "application/json");
+                     return;
+                 }
+                 const std::string os = req.has_param("os") ? req.get_param_value("os") : "all";
+                 const std::string since = dex_iso_since(dex_window_to_days(window));
+                 const DexFleet fleet = dex_fleet_fn ? dex_fleet_fn() : DexFleet{};
+                 auto model = build_dex_catalogue_group_model(guaranteed_state_store, name, os,
+                                                              fleet, window, since);
+                 if (!model) {
+                     res.status = 404;
+                     res.set_content(
+                         detail::error_json_a4(404, "no such signal family: " + name, cid),
+                         "application/json");
+                     return;
+                 }
+                 res.set_content(ok_json(dex_catalogue_group_json(*model)), "application/json");
+             });
+
+    // GET /dex/health?weighting=&window= -- the derived composite health
+    // score. No per-agent identity -- no audit, matching the fragment.
+    sink.Get("/api/v1/dex/health",
+             [perm_fn, guaranteed_state_store, dex_fleet_fn](const httplib::Request& req,
+                                                             httplib::Response& res) {
+                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                     return;
+                 const auto cid = detail::make_correlation_id();
+                 res.set_header("X-Correlation-Id", cid);
+                 if (!guaranteed_state_store) {
+                     res.status = 503;
+                     res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                     "application/json");
+                     return;
+                 }
+                 const std::string window =
+                     req.has_param("window") ? req.get_param_value("window") : "7d";
+                 if (window != "24h" && window != "7d" && window != "30d" && window != "all") {
+                     res.status = 400;
+                     res.set_content(
+                         detail::error_json_a4(400, "invalid window (expected 24h|7d|30d|all)", cid),
+                         "application/json");
+                     return;
+                 }
+                 const std::string weighting =
+                     req.has_param("weighting") ? req.get_param_value("weighting") : "default";
+                 const std::string since = dex_iso_since(dex_window_to_days(window));
+                 const DexFleet fleet = dex_fleet_fn ? dex_fleet_fn() : DexFleet{};
+                 const auto model = build_dex_health_model(guaranteed_state_store, fleet, weighting,
+                                                            window, since);
+                 res.set_content(ok_json(dex_health_json(model)), "application/json");
+             });
+
+    // GET /dex/trends?window= -- cross-OS comparison + per-family
+    // small-multiples/heatmap source data. No per-agent identity -- no audit.
+    sink.Get("/api/v1/dex/trends",
+             [perm_fn, guaranteed_state_store, dex_fleet_fn](const httplib::Request& req,
+                                                             httplib::Response& res) {
+                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                     return;
+                 const auto cid = detail::make_correlation_id();
+                 res.set_header("X-Correlation-Id", cid);
+                 if (!guaranteed_state_store) {
+                     res.status = 503;
+                     res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                     "application/json");
+                     return;
+                 }
+                 const std::string window =
+                     req.has_param("window") ? req.get_param_value("window") : "7d";
+                 if (window != "24h" && window != "7d" && window != "30d" && window != "all") {
+                     res.status = 400;
+                     res.set_content(
+                         detail::error_json_a4(400, "invalid window (expected 24h|7d|30d|all)", cid),
+                         "application/json");
+                     return;
+                 }
+                 const std::string since = dex_iso_since(dex_window_to_days(window));
+                 const DexFleet fleet = dex_fleet_fn ? dex_fleet_fn() : DexFleet{};
+                 const auto model =
+                     build_dex_trends_model(guaranteed_state_store, fleet, window, since);
+                 res.set_content(ok_json(dex_trends_json(model)), "application/json");
+             });
+
+    // GET /dex/overview?window= -- the /dex landing page's fleet summary.
+    // Fleet-wide identity-linked top-devices list -> deny_fleet_wide_service_scoped
+    // + fail-closed success audit (dex.overview.view), per the posture note above.
+    sink.Get("/api/v1/dex/overview",
+             [perm_fn, audit_fn, guaranteed_state_store, dex_fleet_fn,
+              deny_fleet_wide_service_scoped](const httplib::Request& req,
+                                              httplib::Response& res) {
+                 const auto cid = detail::make_correlation_id();
+                 res.set_header("X-Correlation-Id", cid);
+                 if (deny_fleet_wide_service_scoped(
+                         req, res, "dex.overview.view", "GuaranteedState",
+                         "fleet-wide DEX overview top-devices list denied to a service-scoped "
+                         "token",
+                         "service-scoped tokens may not read the fleet-wide DEX overview "
+                         "top-devices list"))
+                     return;
+                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                     return;
+                 if (!guaranteed_state_store) {
+                     res.status = 503;
+                     res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                     "application/json");
+                     return;
+                 }
+                 const std::string window =
+                     req.has_param("window") ? req.get_param_value("window") : "7d";
+                 const int window_days = dex_window_to_days(window);
+                 if (window != "24h" && window != "7d" && window != "30d" && window != "all") {
+                     res.status = 400;
+                     res.set_content(
+                         detail::error_json_a4(400, "invalid window (expected 24h|7d|30d|all)", cid),
+                         "application/json");
+                     return;
+                 }
+                 if (!detail::emit_behavioral_audit(audit_fn, req, res, "dex.overview.view",
+                                                    "success", "GuaranteedState", "",
+                                                    "REST DEX overview top-devices read cid=" +
+                                                        cid)) {
+                     res.status = 503;
+                     res.set_content(
+                         detail::error_json_a4(503,
+                                               "audit subsystem unavailable; refusing to serve "
+                                               "device data without durable evidence",
+                                               cid, 5000, "retry the request"),
+                         "application/json");
+                     spdlog::warn("dex.overview.view audit fail-closed (503) cid={}", cid);
+                     return;
+                 }
+                 const std::string since = dex_iso_since(window_days);
+                 const DexFleet fleet = dex_fleet_fn ? dex_fleet_fn() : DexFleet{};
+                 const auto model = build_dex_overview_model(guaranteed_state_store, fleet, window,
+                                                              window_days, since,
+                                                              /*visible=*/nullptr);
+                 res.set_content(ok_json(dex_overview_json(model)), "application/json");
+             });
+
+    // GET /dex/devices/{id}/history?window= -- the per-device raw signal
+    // history (distinct from the score-only GET /dex/devices/{id} above).
+    // Behavioral PII, per-device SCOPED, fail-closed audit (dex.device.view --
+    // #4035 AC: the SAME verb the score-only route already uses; the
+    // fragment at dex_routes.cpp:2878 audits its OWN distinct signal-history
+    // capability under this identical verb, so REST/MCP match their own
+    // fragment's ground truth rather than inventing a second verb).
+    sink.Get(
+        R"(/api/v1/dex/devices/([^/]+)/history)",
+        [scoped_perm_fn, guaranteed_state_store, audit_fn](const httplib::Request& req,
+                                                           httplib::Response& res) {
+            const std::string agent_id = req.matches[1].str();
+            const auto cid = detail::make_correlation_id();
+            res.set_header("X-Correlation-Id", cid);
+            if (!scoped_perm_fn) {
+                res.status = 500;
+                res.set_content(detail::error_json_a4(500, "scope gate not configured", cid),
+                                "application/json");
+                return;
+            }
+            if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
+                return;
+            if (!guaranteed_state_store) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                "application/json");
+                return;
+            }
+            const std::string window =
+                req.has_param("window") ? req.get_param_value("window") : "7d";
+            if (window != "24h" && window != "7d" && window != "30d" && window != "all") {
+                res.status = 400;
+                res.set_content(
+                    detail::error_json_a4(400, "invalid window (expected 24h|7d|30d|all)", cid),
+                    "application/json");
+                return;
+            }
+            if (!detail::emit_behavioral_audit(audit_fn, req, res, "dex.device.view", "success",
+                                               "Agent", agent_id,
+                                               "REST per-device DEX signal history cid=" + cid)) {
+                res.status = 503;
+                res.set_content(
+                    detail::error_json_a4(503, "audit subsystem unavailable; refusing to serve "
+                                               "device data without durable evidence",
+                                          cid, 5000, "retry the request"),
+                    "application/json");
+                spdlog::warn("dex.device.view audit fail-closed (503) cid={} agent_id={}", cid,
+                             agent_id);
+                return;
+            }
+            const std::string since = dex_iso_since(dex_window_to_days(window));
+            const auto model =
+                build_dex_device_history_model(guaranteed_state_store, agent_id, window, since);
+            res.set_content(ok_json(dex_device_history_json(model)), "application/json");
+        });
+
+    // GET /dex/devices/{id}/observations/{event_id} -- single-observation
+    // detail (the device-history row click target). Behavioral PII,
+    // per-device SCOPED, fail-closed audit (dex.observation.view).
+    sink.Get(
+        R"(/api/v1/dex/devices/([^/]+)/observations/([^/]+))",
+        [scoped_perm_fn, guaranteed_state_store, audit_fn](const httplib::Request& req,
+                                                           httplib::Response& res) {
+            const std::string agent_id = req.matches[1].str();
+            const std::string event_id = req.matches[2].str();
+            const auto cid = detail::make_correlation_id();
+            res.set_header("X-Correlation-Id", cid);
+            if (!scoped_perm_fn) {
+                res.status = 500;
+                res.set_content(detail::error_json_a4(500, "scope gate not configured", cid),
+                                "application/json");
+                return;
+            }
+            if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
+                return;
+            // Same oracle-closed contract as the fragment
+            // (dex_routes.cpp:2916): a guessed/foreign event_id and a
+            // genuinely-absent one both resolve to the SAME 404, so neither
+            // reveals anything beyond what the scope gate already allowed.
+            auto obs = build_dex_observation_model(guaranteed_state_store, agent_id, event_id);
+            if (!obs) {
+                res.status = 404;
+                res.set_content(detail::error_json_a4(404, "observation not found", cid),
+                                "application/json");
+                return;
+            }
+            if (!detail::emit_behavioral_audit(
+                    audit_fn, req, res, "dex.observation.view", "success", "Agent", agent_id,
+                    "REST single-observation detail: " + audit_token(obs->obs_type) +
+                        " (event " + audit_token(obs->event_id) + ") cid=" + cid)) {
+                res.status = 503;
+                res.set_content(
+                    detail::error_json_a4(503, "audit subsystem unavailable; refusing to serve "
+                                               "device data without durable evidence",
+                                          cid, 5000, "retry the request"),
+                    "application/json");
+                spdlog::warn("dex.observation.view audit fail-closed (503) cid={} agent_id={}",
+                             cid, agent_id);
+                return;
+            }
+            res.set_content(ok_json(dex_observation_json(*obs)), "application/json");
         });
 
     // ── N1: network quality read model (/api/v1/network/*) ───────────────────

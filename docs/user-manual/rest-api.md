@@ -6496,7 +6496,7 @@ Per-device DEX read model — the machine-readable equivalent of the **DEX** len
 
 #### `GET /api/v1/dex/devices/{id}/app-perf`
 
-One device's retained per-`(app, version, day)` performance history (B1) — the per-device companion to the fleet/group trend. This is behavioural PII (which applications a person runs, over time), so unlike the aggregate endpoints it is scoped + audited fail-closed. This endpoint also backs the `/device` dashboard DEX drill's *Application performance over time* panel (same `dex.device.app_perf.view` verb, dashboard set-and-proceed posture); there is deliberately **no** MCP twin (MCP's set-and-proceed audit posture cannot express this REST fail-closed contract).
+One device's retained per-`(app, version, day)` performance history (B1) — the per-device companion to the fleet/group trend. This is behavioural PII (which applications a person runs, over time), so unlike the aggregate endpoints it is scoped + audited fail-closed. This endpoint also backs the `/device` dashboard DEX drill's *Application performance over time* panel (same `dex.device.app_perf.view` verb, dashboard set-and-proceed posture). **MCP twin:** `get_dex_device_app_perf` (#4035) closed the earlier MCP-only gap — see the MCP tool table below; the MCP surface follows its own set-and-proceed / `audit_persisted:false` posture rather than this route's fail-closed 503 (different surface, different posture — `docs/api-twin-recipe.md` §4).
 
 - **Permission:** `GuaranteedState:Read`, scoped to the device's management group.
 - **Path parameter:** `id` — the agent's `agent_id`.
@@ -6504,6 +6504,75 @@ One device's retained per-`(app, version, day)` performance history (B1) — the
 - **Response:** `data` object `{agent_id, rows[]}` where each row is one retained daily summary `{app_name, version, day, samples, instances_max, cpu_avg, cpu_max, ws_avg_bytes, ws_max_bytes}`. An unknown `agent_id` returns `200` with empty `rows`. `403` outside the operator's scope; `503` when the store is unavailable, or `503` + `Sec-Audit-Failed: true` when the audit row cannot persist (serving **no** data).
 - **Headers:** `X-Correlation-Id` echoed on every response path.
 - **Audit:** emits `dex.device.app_perf.view` (`target_type=Agent`, `target_id=<agent_id>`, `detail` carries `cid=<correlation_id>`) **before** the PII is served — kept a separate verb from `dex.device.view` / `dex.device.procperf.query` so usage-class reads stay separately countable for works-council evidence. Fail-closed as above.
+
+#### `GET /api/v1/dex/devices/{id}/history`
+
+Per-device raw signal history — the distinct signal-**history** capability from `GET /api/v1/dex/devices/{id}` above (same device, different data: every observation row, not just the rollup score). The machine-readable equivalent of the `/device` dashboard DEX lens's Signal history table.
+
+- **Permission:** `GuaranteedState:Read`, scoped to the device's management group.
+- **Path parameter:** `id` — the agent's `agent_id`.
+- **Query parameter:** `window` — one of `24h`/`7d`/`30d`/`all` (default `7d`); an off-enum value is rejected with `400`.
+- **Response:** `data` object `{agent_id, window, crashes, hangs, signals, distinct_apps, last_seen, history[]}` — `history[]` each `{event_id, observed_at, obs_type, subject, reason, symbolic, component, metric}` (raw facts; no pre-formatted display string — derive your own summary from the fields, the fragment's "what happened" column is presentation-only). `403` outside scope; `503` on store unavailable or a dropped audit row (`Sec-Audit-Failed: true`).
+- **Audit:** emits **`dex.device.view`** — the SAME verb `GET /api/v1/dex/devices/{id}` uses (a deliberate reuse: the dashboard fragment audits this exact signal-history capability under this exact verb too). Fail-closed as above.
+
+#### `GET /api/v1/dex/devices/{id}/observations/{event_id}`
+
+Single-observation detail — every captured projection field for one event (the device-history row's click target).
+
+- **Permission:** `GuaranteedState:Read`, scoped to the device's management group.
+- **Path parameters:** `id` (agent_id), `event_id`.
+- **Response:** `data` object `{event_id, agent_id, observed_at, obs_type, subject, reason, symbolic, component, version, metric, platform}`. `404` when the event does not exist **or** belongs to a different device — same response either way (a foreign/guessed `event_id` reveals nothing beyond what the scope gate already allowed, matching the dashboard fragment's oracle-closed contract).
+- **Audit:** emits **`dex.observation.view`** (`target_type=Agent`, `target_id=<agent_id>`). Fail-closed as above.
+
+#### `GET /api/v1/dex/app`
+
+App blast-radius drill — crash/hang summary, faulting modules, exception codes, and the affected-device list for one application. The machine-readable equivalent of the `/fragments/dex/app` dashboard drill.
+
+- **Permission:** `GuaranteedState:Read`.
+- **Query parameters:** `name` — **required**, process image name (e.g. `chrome.exe`). `window`.
+- **Response:** `data` object `{process_name, window, crashes, hangs, signals, distinct_devices, first_seen, last_seen, modules[], exceptions[], devices[]}`. `400` on missing `name` or an off-enum `window`. `403` — a service-scoped API token is denied outright: the `devices[]` array is fleet-wide with no single agent to confine a per-target check against.
+- **Audit:** emits **`dex.app.view`** before serving (fail-closed 503 + `Sec-Audit-Failed: true` on a dropped row) — the dashboard fragment audits only the service-scoped *denial* under this verb (not an ordinary success), so this REST route deliberately carries MORE rigor than its own fragment (matching the sibling per-signal/per-device-perf routes' fail-closed posture on an identical device-id-list shape).
+
+#### `GET /api/v1/dex/apps`
+
+App-centric stability list — every application with a crash/hang signal in the window, ranked by activity. The machine-readable equivalent of the `/dex` **Apps** tab.
+
+- **Permission:** `GuaranteedState:Read`.
+- **Query parameters:** `window` — one of `24h`/`7d`/`30d`/`all` (default `7d`); an off-enum value is rejected with `400`.
+- **Response:** `data` object `{window, apps[]}` — `apps[]` each `{subject, crashes, hangs, distinct_devices, last_seen}`. No per-agent identity (a distinct-device **count** per app, never an `agent_id`) — not audited.
+
+#### `GET /api/v1/dex/catalogue/group`
+
+One signal family's member signals (Catalogue View 2) — per-type monitored/not-collected state, coverage platforms, event count + blast radius, plus the family's own health-score slice. See [`docs/dex-signal-catalog.md`](../dex-signal-catalog.md) for the family names.
+
+- **Permission:** `GuaranteedState:Read`.
+- **Query parameters:** `name` — **required**, exact family name (e.g. `App reliability`). `os` (`all`/`windows`/`linux`/`macos`, default `all`). `window` — one of `24h`/`7d`/`30d`/`all` (default `7d`); an off-enum value is rejected with `400`.
+- **Response:** `data` object `{group_name, os, window, monitored_count, total_type_count, health_score, active_events, max_signal_devices, types[]}` — `types[]` each `{obs_type, monitored, coverage_platforms, count, distinct_devices, last_seen}`; `health_score` is `null` when nothing is monitored or the scoped denominator is 0. `400` on missing `name` or an off-enum `window`. `404` on an unknown family name. `503` when the store is unavailable. Not audited (no per-agent identity).
+
+#### `GET /api/v1/dex/health`
+
+The derived/**secondary** composite health score (100 minus weighted per-family deductions). The machine-readable equivalent of the `/dex` **Health score** tab.
+
+- **Permission:** `GuaranteedState:Read`.
+- **Query parameters:** `weighting` — one of `default`/`stability`/`productivity`/`security` (default `default`; an off-list value resolves to `default`). `window` — one of `24h`/`7d`/`30d`/`all` (default `7d`); an off-enum value is rejected with `400`.
+- **Response:** `data` object `{weighting, window, reporting, total_crashes, crash_free_pct, score, band, deductions[]}` — `score`/`band`/`crash_free_pct` are `null` when `reporting` (reporting Windows agents) is 0, never a fabricated `100`; `deductions[]` each `{name, severity, deduction}` in catalogue order. `400` on an off-enum `window`. `503` when the store is unavailable. Not audited (no per-agent identity).
+
+#### `GET /api/v1/dex/trends`
+
+Cross-OS comparison + per-family day-by-day event counts (the small-multiples/heatmap source data). The machine-readable equivalent of the `/dex` **Trends** tab.
+
+- **Permission:** `GuaranteedState:Read`.
+- **Query parameters:** `window` — one of `24h`/`7d`/`30d`/`all` (default `7d`); an off-enum value is rejected with `400`.
+- **Response:** `data` object `{window, total_catalogued_types, windows_reporting, crash_free_pct, os_cards[], days[], families[]}` — `os_cards[]` each `{platform, live, distinct_types, total_events}` for `windows`/`macos`/`linux` (fixed order); `families[]` each `{name, total, counts[]}`, `counts[]` index-aligned with `days[]`. Not audited (no per-agent identity).
+
+#### `GET /api/v1/dex/overview`
+
+Fleet DEX overview — the `/dex` landing page's fleet summary: per-device experience score distribution + the Device/App/Network composite, the measured crash-free rate, top apps, and the most-affected-devices list.
+
+- **Permission:** `GuaranteedState:Read`.
+- **Query parameters:** `window` — one of `24h`/`7d`/`30d`/`all` (default `7d`); an off-enum value is rejected with `400`.
+- **Response:** `data` object `{window, overall_experience, device_score, app_score, network_score, great, fair, poor, coverage_monitored, coverage_total, crash_free_pct, windows_reporting, crashes_per_1k_device_days, total_crashes, devices_impacted, total_online, active_signal_types, health_score, os_reporting_count, segments[], crashes_by_day[], top_apps[], top_devices[], os_table[]}`. `403` — a service-scoped API token is denied outright: `top_devices[]` is fleet-wide with no single agent to confine a per-target check against.
+- **Audit:** emits **`dex.overview.view`** before serving (fail-closed 503 + `Sec-Audit-Failed: true` on a dropped row) — same "REST adds more rigor than its own fragment" rationale as `GET /api/v1/dex/app` above (the dashboard fragment audits only the service-scoped denial, not an ordinary success).
 
 #### `POST /api/v1/dex/devices/{id}/live`
 
@@ -8321,6 +8390,14 @@ JSON-RPC 2.0 endpoint for MCP tool calls, resource reads, and prompt requests.
 | `compare_app_perf_versions` | Cohort-paired before/after comparison (the `/auto` VERIFY stage). Parameters `group`, `app`, `baseline`, `candidate` (all required) + `window` (integer days, default 7). Returns the same identity-free aggregate shape as `GET /api/v1/dex/perf/compare`. A successful call is **recorded under the generic `mcp.compare_app_perf_versions` tool-call audit** (not the REST `dex.app_perf.compare` verb) — but a service-scoped API token is denied outright (`kPermissionDenied`, found by this branch's own governance review, PR #3156) and that denial IS recorded under `dex.app_perf.compare`, matching its REST twin's deny-path verb rather than the generic one. |
 | `get_dex_device_score` (#4035) | Per-device DEX read model — the MCP twin of `GET /api/v1/dex/devices/{id}`. Score (-1 = unavailable) + this device's own signal summary. Ancestor-aware SCOPED `GuaranteedState:Read` gate (like `query_software_licenses`); every call emits `dex.device.view` (set-and-proceed, `audit_persisted:false` on a dropped row — MCP has no `Sec-Audit-Failed` header, unlike the REST twin's fail-closed 503). |
 | `get_dex_device_app_perf` (#4035) | Per-device retained daily app-perf series — the MCP twin of `GET /api/v1/dex/devices/{id}/app-perf` (closes the gap this section previously documented as "no MCP twin"). Optional `app` narrows to one app. Same SCOPED gate + `dex.device.app_perf.view` audit posture as `get_dex_device_score`. |
+| `get_dex_app` (#4035) | App blast-radius drill — the MCP twin of `GET /api/v1/dex/app`. Required `name`, optional `window`. `deny_fleet_wide_service_scoped` (the `devices[]` array is fleet-wide) + fail-closed `try_persist_audit` under `dex.app.view` (`audit_persisted:false` on a dropped row), matching the REST twin's posture even though the dashboard fragment only audits the denial. |
+| `list_dex_apps` (#4035) | App-centric stability list — the MCP twin of `GET /api/v1/dex/apps`. No per-agent identity — not audited. |
+| `get_dex_catalogue_group` (#4035) | Signal-family drill (Catalogue View 2) — the MCP twin of `GET /api/v1/dex/catalogue/group`. Required `name`, optional `os`/`window`. An unknown family name returns `kInvalidParams`. Not audited (no per-agent identity). |
+| `get_dex_device_history` (#4035) | Per-device raw signal history — the MCP twin of `GET /api/v1/dex/devices/{id}/history`; the distinct signal-**history** capability from `get_dex_device_score` above (same device, different data). Ancestor-aware SCOPED gate, same shape as `get_dex_device_score`. Emits `dex.device.view` — the SAME verb `get_dex_device_score` uses (both the fragment and this pair deliberately reuse one verb across the two distinct per-device capabilities). |
+| `get_dex_observation` (#4035) | Single-observation detail — the MCP twin of `GET /api/v1/dex/devices/{id}/observations/{event_id}`. Required `agent_id`/`event_id`. A foreign or guessed `event_id` returns `kInvalidParams` — same no-oracle contract as the REST 404 (indistinguishable from a genuinely-absent event). Ancestor-aware SCOPED gate; emits `dex.observation.view`. |
+| `get_dex_health` (#4035) | Derived composite health score — the MCP twin of `GET /api/v1/dex/health`. Optional `weighting`/`window`. Not audited (no per-agent identity). |
+| `get_dex_trends` (#4035) | Cross-OS + per-family day-by-day trend — the MCP twin of `GET /api/v1/dex/trends`. Optional `window`. Not audited (no per-agent identity). |
+| `get_dex_overview` (#4035) | Fleet DEX overview — the MCP twin of `GET /api/v1/dex/overview`. Optional `window`. `deny_fleet_wide_service_scoped` (`top_devices[]` is fleet-wide) + fail-closed `try_persist_audit` under `dex.overview.view`, same "REST/MCP add more rigor than the fragment" rationale as `get_dex_app` above. |
 
 The first three gate `GuaranteedState:Read` and are not audited (cohort posture) on success; `get_dex_group_app_perf` is now audited on a service-scoped-token deny (see above). `compare_app_perf_versions` also gates `GuaranteedState:Read`; because it has no cohort floor it **is** accountable — but over MCP that accountability is the generic `mcp.<tool>` tool-call audit, and the tool exposes only the identity-free aggregate (no per-machine drill — that is dashboard-only, see `GET /api/v1/dex/perf/compare`). The per-device app-perf drill (`GET /api/v1/dex/devices/{id}/app-perf`) is reachable via REST, the `/device` dashboard DEX drill (the *Application performance over time* panel), **and now MCP** (`get_dex_device_app_perf`, #4035) — the REST route stays fail-closed (503 on a dropped audit row), while the MCP twin follows the set-and-proceed / `audit_persisted:false` posture every other DEX MCP read tool uses (different surface, different posture — see `docs/api-twin-recipe.md` §4). See the *Application performance over time* REST section above for the shared percentile/suppression semantics.
 
