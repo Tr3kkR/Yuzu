@@ -934,9 +934,27 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
             rule_keys.reserve(rule_key_rows->size());
             for (auto& row : *rule_key_rows)
                 rule_keys.push_back(std::move(row.key));
-            const int cleared = rule_keys.empty() ? 0 : kv_->del_keys(kKvNamespace, rule_keys);
-            if (cleared > 0)
-                spdlog::info("Guardian: full_sync cleared {} prior rule(s)", cleared);
+            if (!rule_keys.empty()) {
+                const int cleared = kv_->del_keys(kKvNamespace, rule_keys);
+                if (static_cast<std::size_t>(cleared) == rule_keys.size()) {
+                    spdlog::info("Guardian: full_sync cleared {} prior rule(s)", cleared);
+                } else {
+                    // del_keys() is transactional (all-or-nothing) but returns 0 on
+                    // EITHER a genuine BEGIN/step/COMMIT failure OR (defensively) a
+                    // prepare failure - indistinguishable from here, and it does not
+                    // throw. Gate 5 CH-1 (#4021 follow-up): treat any undercount as
+                    // suspect and hold the generation for retry, mirroring the
+                    // list_entries() failure branch immediately above - a stale
+                    // rule: key lingering one extra cycle is safe, a failed delete
+                    // silently reported as ordinary success is not.
+                    ++reconcile_failures;
+                    arm_failures_.fetch_add(1, std::memory_order_relaxed);
+                    spdlog::error("Guardian: full_sync del_keys cleared {}/{} rule(s) - "
+                                 "holding policy_generation for retry rather than trust a "
+                                 "failed delete",
+                                 cleared, rule_keys.size());
+                }
+            }
         }
         // Re-persist the policy generation marker (rewritten unconditionally here,
         // same as before this change — harmless whether or not the key survived).
