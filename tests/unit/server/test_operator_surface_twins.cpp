@@ -426,6 +426,10 @@ constexpr TwinRow kExpectedTwins[] = {
     {"mint_upload_grant", "UploadGrant", "Write", false},
     {"list_upload_grants", "UploadGrant", "Read", true},
     {"revoke_upload_grant", "UploadGrant", "Delete", false},
+    // #4034 — compliance/policy REST v1 read twins.
+    {"get_policy", "Policy", "Read", true},
+    {"list_policy_fragments", "Policy", "Read", true},
+    {"get_policy_agent_statuses", "Policy", "Read", true},
 };
 
 } // namespace

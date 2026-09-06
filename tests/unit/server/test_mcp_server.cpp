@@ -3322,6 +3322,87 @@ TEST_CASE("MCP Integration: get_guardian_schemas matches the REST catalog",
     CHECK(resource_catalog == rest_catalog);
 }
 
+// ── Compliance/policy REST v1 read twins (api-parity #4034) ─────────────────
+// McpTestServer wires policy_store=nullptr (no live Postgres in this fixture,
+// matching the pre-existing #3559 item 3 ComplianceHarness gap on the REST
+// side), so these round trips prove each new tool is REGISTERED, DISPATCHED
+// through the real JSON-RPC surface, passes its tier/perm(/fleet-read) gate,
+// and reaches its handler body's null-store branch — not that it returns
+// live compliance data (compliance_model.hpp's pure builders are unit-tested
+// directly, no store needed, in test_compliance_model.cpp).
+
+TEST_CASE("MCP Integration: tools/call get_policy reaches the null-store branch",
+          "[mcp][integration][compliance]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":30,)"
+        R"("params":{"name":"get_policy","arguments":{"policy_id":"pol_1"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["id"] == 30);
+    // Dispatched (not kMethodNotFound) and reached the handler: a real
+    // JSON-RPC error, not a bare 404/500, with the store-unavailable message
+    // — proves param parsing + tier_allows + perm_fn all passed.
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["message"].get<std::string>().find("Policy store unavailable") !=
+          std::string::npos);
+}
+
+TEST_CASE("MCP Integration: tools/call list_policy_fragments reaches the null-store branch",
+          "[mcp][integration][compliance]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":31,)"
+        R"("params":{"name":"list_policy_fragments","arguments":{}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["message"].get<std::string>().find("Policy store unavailable") !=
+          std::string::npos);
+}
+
+TEST_CASE("MCP Integration: tools/call get_policy_agent_statuses passes its fleet_read_fn_ "
+          "gate then reaches the null-store branch",
+          "[mcp][integration][compliance]") {
+    McpTestServer ts;
+    ts.start(); // fixture default fleet_read_fn_for_test admits unfiltered (nullopt scope)
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":32,)"
+        R"("params":{"name":"get_policy_agent_statuses","arguments":{"policy_id":"pol_1"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["message"].get<std::string>().find("Policy store unavailable") !=
+          std::string::npos);
+}
+
+TEST_CASE("MCP Integration: tools/call get_policy_agent_statuses fails closed when "
+          "fleet_read_fn_ is genuinely unwired",
+          "[mcp][integration][compliance][security]") {
+    McpTestServer ts;
+    ts.fleet_read_fn_for_test = {}; // genuinely empty std::function, not the fixture default
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":33,)"
+        R"("params":{"name":"get_policy_agent_statuses","arguments":{"policy_id":"pol_1"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"].get<int>() == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"].get<std::string>().find("service unavailable") !=
+          std::string::npos);
+}
+
 // ── A2 discovery tools (roadmap Issue 17.1) ─────────────────────────────────
 // Each mirrors its GET /api/v1/discover/* REST sibling via the SAME builder
 // function (discover_routes.hpp) — this suite proves that parity directly by
