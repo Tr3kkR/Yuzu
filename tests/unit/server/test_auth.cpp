@@ -540,6 +540,8 @@ TEST_CASE("get_user_role reflects a cross-manager removal immediately, no re-log
 
     AuthManager mgr_a;
     mgr_a.set_auth_db(auth_db.get());
+    yuzu::MetricsRegistry metrics;
+    mgr_a.set_metrics_registry(&metrics);
     REQUIRE(mgr_a.upsert_user("cora", "password1234", Role::admin));
     REQUIRE(mgr_a.get_user_role("cora") == Role::admin);
 
@@ -548,6 +550,16 @@ TEST_CASE("get_user_role reflects a cross-manager removal immediately, no re-log
     REQUIRE(mgr_b.remove_user("cora"));
 
     REQUIRE_FALSE(mgr_a.get_user_role("cora").has_value());
+    // A genuine UserNotFound is NOT a store error - must not fire the
+    // store-error counter (Gate 5 CH-3 re-review follow-up: this discrimination
+    // is exactly what would drown the real signal if it ever regressed).
+    CHECK(metrics.counter("yuzu_auth_get_user_role_store_error_total").value() == 0);
+
+    // Same discrimination for an InvalidUsername rejection (a NUL-embedded
+    // username is a rejected-shape input, not a store health signal - #4020's
+    // own get_user()/is_valid_principal fix, bucketed with UserNotFound).
+    REQUIRE_FALSE(mgr_a.get_user_role(std::string("cor") + '\0' + "a").has_value());
+    CHECK(metrics.counter("yuzu_auth_get_user_role_store_error_total").value() == 0);
 }
 
 TEST_CASE("get_user_role fails closed (not cached-admin) when AuthDB is pool-saturated",

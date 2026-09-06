@@ -2669,6 +2669,20 @@ public:
             metrics_.counter("yuzu_auth_read_degrade_total",
                              {{"route", "login"}, {"reason", reason}});
         }
+        // Gate 5 chaos-injector CH-3/UP-6 follow-up (#4020): the ONE
+        // caller-visible signal that get_user_role() is about to floor a
+        // legacy-API-token-authenticated request's role to Role::user
+        // (auth_routes.cpp's `.value_or(Role::user)`) on a genuine AuthDB
+        // store error - not a plain not-found. Single call site, single
+        // failure shape reaches it (AuthDBError::QueryFailed; UserNotFound/
+        // InvalidUsername are excluded before the increment), so no label
+        // set - pre-seeded to 0 so an increase() alert is meaningful.
+        metrics_.describe("yuzu_auth_get_user_role_store_error_total",
+                          "get_user_role() AuthDB lookups that failed on a genuine store error "
+                          "(not a plain not-found/invalid-username miss) - each one floors the "
+                          "caller's legacy-API-token-authenticated request to Role::user",
+                          "counter");
+        metrics_.counter("yuzu_auth_get_user_role_store_error_total");
         // HA WS-1/1a: durable SessionStore degradation on the auth hot path
         // (validate/create/touch/generation-refresh/reap). Mirrors the
         // yuzu_auth_read_degrade_total / yuzu_server_rbac_read_degrade_total
