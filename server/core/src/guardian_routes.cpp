@@ -1960,14 +1960,21 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
         // #4037: same shared builder as the REST/MCP twins
         // (guardian_model.hpp::guardian_rule_agent_status_rows), so all three
         // surfaces compute this census identically. Pre-existing degrade
-        // posture of this fragment, deliberately UNCHANGED by this refactor:
-        // a degraded census still renders empty here (`value_or`), matching
-        // what this loop already did before this commit. The REST/MCP twins
-        // apply ADR-0038 (degraded read -> nullopt -> 503/error, never a
-        // silent empty render); this fragment does not, and whether it
-        // should is a pre-existing question this #4037 refactor does not
-        // decide either way — out of scope here, not something this comment
-        // should be read as endorsing.
+        // posture of this fragment, PRE-EXISTING and deliberately UNCHANGED by
+        // this refactor (this loop already collapsed a degraded read to empty
+        // via value_or before this commit; this refactor only swapped the
+        // store call it wraps): KNOWN, CONFIRMED CONTRADICTION of ADR-0038
+        // (docs/adr/0038-guaranteed-state-store-postgres-migration.md, "Posture"
+        // section) — that ADR names `agent_rule_statuses`/
+        // `agent_rule_statuses_for_agent` explicitly in its catastrophic-read
+        // set and states "status reads feeding the enforce-gate/dashboard stay
+        // degrade-distinguishable (empty != unknown)". This fragment does not:
+        // it folds nullopt-on-degrade back to an empty vector and renders as
+        // "no devices report this guard", indistinguishable from a genuinely
+        // unreported guard. Not fixed here — #4037 is scoped to building REST/MCP
+        // read twins, not remediating a pre-existing ADR-0038 gap in the
+        // dashboard fragment (which the REST/MCP twins DO honor: they fail
+        // closed/error on the same nullopt). Flagged for a follow-up issue.
         for (const auto& s : yuzu::server::guardian_rule_agent_status_rows(*store_, guard_id)
                                   .value_or(std::vector<yuzu::server::GuardianRuleAgentStatusRow>{})) {
             seen.insert(s.agent_id);
