@@ -67,6 +67,7 @@ HEADINGS = (
 HAND_SECTIONS = (
     "## How it works",
     "## Privileges and prerequisites",
+    "### Outputs",
     "### Result status",
     "### Where the data goes",
     "## Caveats and known gaps",
@@ -137,6 +138,22 @@ class PluginDoc:
 
 # ── source parsers (pure) ─────────────────────────────────────────────────────
 
+_UNESCAPED_PIPE_RE = re.compile(r"(?<!\\)\|")
+
+
+def split_md_row(line: str) -> list[str]:
+    r"""Split one Markdown table row on UNESCAPED pipes only; `\|` inside a
+    cell is a literal pipe (GFM's own escape), unescaped in the returned cell.
+    Shared by the hand-table parser and the capability-matrix parser — both
+    feed byte-gated artefacts, so both must agree with the renderer."""
+    body = line.strip()
+    if body.startswith("|"):
+        body = body[1:]
+    if body.endswith("|") and not body.endswith("\\|"):
+        body = body[:-1]
+    return [c.strip().replace("\\|", "|") for c in _UNESCAPED_PIPE_RE.split(body)]
+
+
 def parse_matrix_block(text: str) -> dict[str, dict[str, dict[str, Leg]]]:
     """Parse the capmatrix-gen block of docs/os-capability-matrix.md.
 
@@ -153,7 +170,7 @@ def parse_matrix_block(text: str) -> dict[str, dict[str, dict[str, Leg]]]:
     for line in block.splitlines():
         if not line.startswith("| ") or line.startswith("| Plugin ") or line.startswith("|---"):
             continue
-        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        cells = split_md_row(line)  # capmatrix-gen escapes a literal pipe as \| (GFM)
         if len(cells) < 7:
             continue
         plugin, action, os_name, support, rung, mechanism, fallback = cells[:7]
@@ -175,7 +192,7 @@ def parse_capability_fragment(text: str, fragment: str) -> list[CapRow]:
     """Every ``CommandCapability`` designated-initialiser row in one fragment."""
     rows: list[CapRow] = []
     for m in re.finditer(r"\{\s*(\.plugin\s*=.*?)\}", text, re.DOTALL):
-        body = m.group(1)
+        body = re.sub(r"//[^\n]*", "", m.group(1))  # a trailing line comment is not a value
         fields: dict[str, str] = {}
         for fm in _CAP_FIELD_RE.finditer(body):
             key, raw = fm.group(1), fm.group(2).strip()
@@ -208,6 +225,16 @@ _DESC_RE = re.compile(
 _LITERAL_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
 
 
+_CPP_ESCAPES = {"\\\\": "\\", '\\"': '"', "\\n": " ", "\\t": " "}
+
+
+def _unescape_cpp(literal: str) -> str:
+    """Undo the four escapes a description literal realistically carries,
+    without touching the (already UTF-8) bytes around them — `unicode_escape`
+    would re-decode them as Latin-1."""
+    return re.sub(r'\\\\|\\"|\\n|\\t', lambda m: _CPP_ESCAPES[m.group(0)], literal)
+
+
 def _resolve_constant(text: str, ident: str) -> str | None:
     ident = ident.rsplit("::", 1)[-1]
     m = re.search(r'\b' + re.escape(ident) + r'\b[^=;]*=\s*"([^"]+)"', text)
@@ -223,8 +250,7 @@ def parse_plugin_identity(text: str) -> dict[str, str | None]:
     if m := _VERSION_RE.search(text):
         version = m.group(1) or _resolve_constant(text, m.group(2))
     if m := _DESC_RE.search(text):
-        description = "".join(_LITERAL_RE.findall(m.group(1)))
-        description = description.encode("utf-8").decode("unicode_escape") if "\\" in description else description
+        description = _unescape_cpp("".join(_LITERAL_RE.findall(m.group(1))))
     return {"name": name, "version": version, "description": description}
 
 
@@ -277,6 +303,8 @@ _STAMP_RE = re.compile(
 _ACTION_LINE_RE = re.compile(r"^== action=(?P<name>\S+)(?P<params>.*)$")
 _STATUS_LINE_RE = re.compile(r"^\[result_status\]\s*(?P<status>\w+)\s*/\s*(?P<comp>\w+)\s*/\s*(?P<prov>.*)$")
 _NOT_CAPTURED_RE = re.compile(r"^\[not captured\]\s*(?P<why>.+)$")
+_TRUNCATED_RE = re.compile(r"^\[truncated\]\s*(?P<why>.*)$")
+_RC_RE = re.compile(r"^\[rc\]\s*(?P<rc>-?\d+)\s*$")
 
 
 def parse_sample(text: str, os_name: str) -> Sample:
@@ -294,13 +322,20 @@ def parse_sample(text: str, os_name: str) -> Sample:
     for line in lines[1:]:
         if am := _ACTION_LINE_RE.match(line):
             current = {"action": am.group("name"), "params": am.group("params").strip(),
-                       "rows": [], "result_status": None, "not_captured": None}
+                       "rows": [], "result_status": None, "not_captured": None,
+                       "truncated": False, "rc": 0}
             actions.append(current)
         elif nm := _NOT_CAPTURED_RE.match(line):
             # A mutating action deliberately not executed on a live host
             # (docs/plugin-readme-standard.md rule 5): the marker is the sample.
             if current is not None:
                 current["not_captured"] = nm.group("why").strip()
+        elif tm := _TRUNCATED_RE.match(line):
+            if current is not None:
+                current["truncated"] = True
+        elif rm := _RC_RE.match(line):
+            if current is not None:
+                current["rc"] = int(rm.group("rc"))
         elif sm := _STATUS_LINE_RE.match(line):
             if current is not None:
                 current["result_status"] = {"status": sm.group("status"),
@@ -366,7 +401,7 @@ def parse_md_table(text: str) -> list[list[str]]:
         s = line.strip()
         if not s.startswith("|"):
             continue
-        cells = [c.strip() for c in s.strip("|").split("|")]
+        cells = split_md_row(s)
         if all(re.fullmatch(r":?-+:?", c or "-") for c in cells):
             continue
         rows.append(cells)
@@ -390,6 +425,7 @@ def hand_sections_to_manifest(readme: str) -> dict:
     status_rows = parse_md_table(sec.get("### Result status", ""))
     return {
         "how_it_works": strip_fences(strip_generated(sec.get("## How it works", ""))),
+        "outputs_note": strip_fences(strip_generated(sec.get("### Outputs", ""))),
         "privileges": [dict(zip(("os", "runs_as", "grant", "measured", "if_refused"), r + [""] * 5))
                        for r in priv_rows],
         "result_status": [dict(zip(("status", "completeness", "provenance", "when"), r + [""] * 4))
@@ -430,9 +466,12 @@ def collect_source(repo: Path, name: str, definitions: list[Definition],
                    cap_rows: list[CapRow]) -> dict:
     pdir = repo / "agents" / "plugins" / name
     srcs = sorted(p.relative_to(repo).as_posix() for p in (pdir / "src").glob("*") if p.is_file())
-    tests = sorted(p.relative_to(repo).as_posix() for p in (repo / "tests").rglob(f"test_{name}*")
-                   if p.is_file() and p.suffix in (".cpp", ".py"))
-    changelog = sorted(p.relative_to(repo).as_posix() for p in (repo / "changelog.d").glob(f"*{name}*.md"))
+    # Explicit, case-sensitive name matching — pathlib globbing is case-insensitive
+    # on Windows only, and this list is byte-gated on every host.
+    tests = sorted(p.relative_to(repo).as_posix() for p in (repo / "tests").rglob("*")
+                   if p.is_file() and p.suffix in (".cpp", ".py") and p.name.startswith(f"test_{name}"))
+    changelog = sorted(p.relative_to(repo).as_posix() for p in (repo / "changelog.d").iterdir()
+                       if p.is_file() and p.suffix == ".md" and name in p.name)
     priv = repo / "docs" / "agent-privilege-model.md"
     priv_row = priv.exists() and (f"`{name}." in _read(priv))
     return {
@@ -457,6 +496,9 @@ def load_plugin(repo: Path, name: str, matrix: dict, defs: dict, caps: dict) -> 
     if not identity["name"]:
         warnings.append(f"{name}: no name() override found under src/ — identity rendered as '-'")
     declared = identity["name"] or name
+    if declared != name:
+        warnings.append(f"error: {name}: plugin declares name() '{declared}' but lives in agents/plugins/{name}/ — "
+                        "the gate keys legs, definitions and samples by directory; rename one of them")
     legs = matrix.get(declared, {})
     if not legs:
         warnings.append(f"{name}: no rows in the capability-matrix block (regenerate it?)")
@@ -632,9 +674,13 @@ def render_samples(doc: PluginDoc) -> str:
             if a.get("not_captured"):
                 body.append(f"[not captured] {a['not_captured']}")
             body += trim_rows(a["rows"])
+            if a.get("truncated"):
+                body.append("[truncated] capture hit the LocalDispatcher byte cap")
             rs = a["result_status"]
             if rs:
                 body.append(f"[result_status] {rs['status']} / {rs['completeness']} / {rs['provenance']}".rstrip(" /"))
+            if a.get("rc"):
+                body.append(f"[rc] {a['rc']}")
             body.append("")
         while body and body[-1] == "":
             body.pop()
@@ -695,7 +741,8 @@ def build_manifest(doc: PluginDoc, readme: str) -> dict:
             "stamp": s.stamp,
             "actions": [{"action": a["action"], "params": a["params"], "rows": a["rows"][:MANIFEST_SAMPLE_ROWS],
                          "row_count": len(a["rows"]), "result_status": a["result_status"],
-                         "not_captured": a.get("not_captured")} for a in s.actions],
+                         "not_captured": a.get("not_captured"), "truncated": a.get("truncated", False),
+                         "rc": a.get("rc", 0)} for a in s.actions],
         }
     return {
         "manifest_version": MANIFEST_VERSION,
@@ -784,7 +831,8 @@ def generate(repo: Path, only: str | None = None) -> Outcome:
     docs: list[PluginDoc] = []
     for name in names:
         doc = load_plugin(repo, name, matrix, defs, caps)
-        out.warnings += doc.warnings
+        out.errors += [w for w in doc.warnings if w.startswith("error:")]
+        out.warnings += [w for w in doc.warnings if not w.startswith("error:")]
         readme_path = repo / doc.readme_path
         readme = _read(readme_path)
         blocks = {b: RENDERERS[b](doc) for b in README_BLOCKS}

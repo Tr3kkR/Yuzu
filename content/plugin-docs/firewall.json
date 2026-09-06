@@ -211,6 +211,7 @@
       "definition_id": "security.firewall.state"
     }
   ],
+  "outputs_note": "Pipe-delimited key rows; the first field is the row kind. `state` emits `profile|<Domain|Private|Public>|<enabled|disabled|unknown|error:0x…>` on Windows, and `backend|<name>`, `state|<value>`, optional `mode|block_all` and `pf|<value>` rows on macOS and Linux. `rules` emits `rule|<name>|<enabled|disabled>|<in|out|unknown>|<allow|block|unknown>|<profile mask>` on Windows (plus `truncated|true` after 100 rules), `rule|<raw pf line>` on macOS, and per backend on Linux: `rule|firewalld|<zone>|service|<service>`, `rule|nftables|<family>|<table>|<chain>|<hook>|<policy>` and `rule|nftables|<family>|<table>|<chain>|handle|<n>`, or `rule|<index>|<to>|<action>|<from>` for ufw. The server parses this plugin as key/value rows (`profile_or_backend`, `state`), so the value column carries the remainder of each row verbatim. A run that reads nothing emits no `rule` rows and, for state, `unknown` values; it never fabricates a row.",
   "platforms": {
     "linux": "supported",
     "macos": "supported",
@@ -219,21 +220,21 @@
   "privileges": [
     {
       "grant": "None. `INetFwPolicy2` profile and rule reads need no elevation.",
-      "if_refused": "true` marker",
-      "measured": "2026-09-06 on the-rig (Windows 11 Pro 10.0.26200), elevated SSH session: three profiles read `enabled`, 100 rule rows plus the `truncated",
+      "if_refused": "`error|com_init` or `error|policy2_create:<hresult>` row; profile rows read `error:<hresult>`",
+      "measured": "2026-09-06 on the-rig (Windows 11 Pro 10.0.26200), elevated SSH session: three profiles read `enabled`, 100 rule rows plus the `truncated|true` marker",
       "os": "Windows",
       "runs_as": "agent service account (LocalSystem today, #1442)"
     },
     {
       "grant": "None for the primary Application Firewall read (`socketfilterfw --getglobalstate` is unprivileged). The secondary pf read opens `/dev/pf` and needs root; the plugin deliberately does not ride the quarantine plugin's `pfctl` sudoers grant.",
-      "if_refused": "disabled`, `pf",
-      "measured": "2026-09-06 at euid 501 on this host: `state",
+      "if_refused": "`pf|unknown` (state), no rows (rules), never a false-safe value",
+      "measured": "2026-09-06 at euid 501 on this host: `state|disabled`, `pf|unknown`, no pf rule rows",
       "os": "macOS",
       "runs_as": "LaunchDaemon (root today)"
     },
     {
       "grant": "`firewall-cmd --state` is an unprivileged D-Bus query. The nftables netlink dump conventionally needs `CAP_NET_ADMIN` (verified 2026-08-23 with the capability present); `ufw status` and `iptables -S` need root. No sudoers entry is granted for any of them.",
-      "if_refused": "a refused table dump falls through to the next backend; a refused chain or rule dump after a successful table dump reports `state",
+      "if_refused": "a refused table dump falls through to the next backend; a refused chain or rule dump after a successful table dump reports `state|unknown` / `rules|unknown`; a host with no readable backend reports `backend|none`",
       "measured": "nftables verified 2026-08-23 in an Ubuntu 26.04 container with `CAP_NET_ADMIN`; the unprivileged denial path is reasoned from the `chains_ok && rules_ok` gate, not measured",
       "os": "Linux",
       "runs_as": "agent service account"
@@ -255,6 +256,7 @@
           "action": "state",
           "not_captured": null,
           "params": "",
+          "rc": 0,
           "result_status": {
             "completeness": "UNKNOWN",
             "provenance": "",
@@ -262,23 +264,30 @@
           },
           "row_count": 2,
           "rows": [
-            "backend|none",
-            "state|unknown"
-          ]
+            "backend|nftables",
+            "state|active"
+          ],
+          "truncated": false
         },
         {
           "action": "rules",
           "not_captured": null,
           "params": "",
+          "rc": 0,
           "result_status": {
             "completeness": "UNKNOWN",
             "provenance": "",
             "status": "UNDECLARED"
           },
-          "row_count": 1,
+          "row_count": 55,
           "rows": [
-            "backend|none"
-          ]
+            "backend|nftables",
+            "rule|nftables|ip|filter|OUTPUT|output|accept",
+            "rule|nftables|ip|filter|FORWARD|forward|accept",
+            "rule|nftables|ip6|filter|OUTPUT|output|accept",
+            "rule|nftables|ip6|filter|FORWARD|forward|accept"
+          ],
+          "truncated": false
         }
       ],
       "stamp": {
@@ -287,7 +296,7 @@
         "leg_hash": "8ef7b004fc8a",
         "os": "linux",
         "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
-        "privilege": "euid 0"
+        "privilege": "euid 0 with CAP_NET_ADMIN in the host network namespace"
       }
     },
     "macos": {
@@ -296,6 +305,7 @@
           "action": "state",
           "not_captured": null,
           "params": "",
+          "rc": 0,
           "result_status": {
             "completeness": "UNKNOWN",
             "provenance": "",
@@ -306,19 +316,22 @@
             "backend|appfirewall",
             "state|disabled",
             "pf|unknown"
-          ]
+          ],
+          "truncated": false
         },
         {
           "action": "rules",
           "not_captured": null,
           "params": "",
+          "rc": 0,
           "result_status": {
             "completeness": "UNKNOWN",
             "provenance": "",
             "status": "UNDECLARED"
           },
           "row_count": 0,
-          "rows": []
+          "rows": [],
+          "truncated": false
         }
       ],
       "stamp": {
@@ -336,6 +349,7 @@
           "action": "state",
           "not_captured": null,
           "params": "",
+          "rc": 0,
           "result_status": {
             "completeness": "UNKNOWN",
             "provenance": "",
@@ -346,12 +360,14 @@
             "profile|Domain|enabled",
             "profile|Private|enabled",
             "profile|Public|enabled"
-          ]
+          ],
+          "truncated": false
         },
         {
           "action": "rules",
           "not_captured": null,
           "params": "",
+          "rc": 0,
           "result_status": {
             "completeness": "UNKNOWN",
             "provenance": "",
@@ -364,7 +380,8 @@
             "rule|ChatGPT|enabled|in|allow|2147483647",
             "rule|ChatGPT|enabled|in|allow|2147483647",
             "rule|ChatGPT|enabled|in|allow|2147483647"
-          ]
+          ],
+          "truncated": false
         }
       ],
       "stamp": {

@@ -283,6 +283,7 @@
       "definition_id": "crossplatform.storage.volumes"
     }
   ],
+  "outputs_note": "Pipe-delimited rows, one per drive or volume. Field 0 is a literal discriminator (`smart` or `volume`) that precedes the columns below; every row of a kind has the same field count, with `-` where a value is inapplicable or was not read. `-` never means zero. A leg that finds nothing still emits one placeholder row so zero rows can never be misread as \"no disks\": a `smart` placeholder carries `health=unsupported`, a `volume` placeholder carries `volume=-`, and both are accompanied by a typed status, which is the authoritative signal.",
   "platforms": {
     "linux": "unsupported",
     "macos": "constrained",
@@ -345,6 +346,7 @@
           "action": "smart",
           "not_captured": null,
           "params": "",
+          "rc": 0,
           "result_status": {
             "completeness": "PARTIAL",
             "provenance": "linux:smart",
@@ -353,12 +355,14 @@
           "row_count": 1,
           "rows": [
             "smart|-|-|unknown|unknown|unsupported|-|-|drive health is not implemented on Linux in this release; no mechanism was bound against real hardware"
-          ]
+          ],
+          "truncated": false
         },
         {
           "action": "volumes",
           "not_captured": null,
           "params": "",
+          "rc": 0,
           "result_status": {
             "completeness": "PARTIAL",
             "provenance": "linux:volumes",
@@ -367,7 +371,8 @@
           "row_count": 1,
           "rows": [
             "volume|-|-|-|-|-|physical-to-logical volume mapping is not implemented on Linux in this release; it ships with the smart leg it exists to support"
-          ]
+          ],
+          "truncated": false
         }
       ],
       "stamp": {
@@ -385,6 +390,7 @@
           "action": "smart",
           "not_captured": null,
           "params": "",
+          "rc": 0,
           "result_status": {
             "completeness": "PARTIAL",
             "provenance": "macos:iokit:health_unread",
@@ -394,12 +400,14 @@
           "rows": [
             "smart|disk0|APPLE SSD AP0512Z|nvme|ssd|unknown|-|-|device advertises SMART; health attributes are not read on macOS (they require Apple's private IONVMeSMARTUserClient interface)",
             "smart|disk4|Disk Image|virtual|unknown|unknown|-|-|device does not advertise SMART capability"
-          ]
+          ],
+          "truncated": false
         },
         {
           "action": "volumes",
           "not_captured": null,
           "params": "",
+          "rc": 0,
           "result_status": {
             "completeness": "UNKNOWN",
             "provenance": "",
@@ -412,7 +420,8 @@
             "volume|disk0s3|-|disk0|-|5368664064|-",
             "volume|disk1|-|disk0|-|524288000|-",
             "volume|disk3|-|disk0|-|494384795648|-"
-          ]
+          ],
+          "truncated": false
         }
       ],
       "stamp": {
@@ -430,6 +439,7 @@
           "action": "smart",
           "not_captured": null,
           "params": "",
+          "rc": 0,
           "result_status": {
             "completeness": "UNKNOWN",
             "provenance": "",
@@ -439,12 +449,14 @@
           "rows": [
             "smart|PhysicalDrive0|Samsung SSD 970 EVO Plus 250GB|nvme|ssd|ok|5|100|-",
             "smart|PhysicalDrive1|Samsung SSD 970 EVO Plus 1TB|nvme|ssd|ok|1|100|-"
-          ]
+          ],
+          "truncated": false
         },
         {
           "action": "volumes",
           "not_captured": null,
           "params": "",
+          "rc": 0,
           "result_status": {
             "completeness": "UNKNOWN",
             "provenance": "",
@@ -457,7 +469,8 @@
             "volume|//?/Volume{daa59534-884a-4ce4-8fc8-4244f7bbe7ae}/|-|PhysicalDrive0|NTFS|967835648|-",
             "volume|//?/Volume{785383ef-b682-41d9-9b28-27c4b8882d65}/|D:/|PhysicalDrive1|NTFS|1000187363328|-",
             "volume|//?/Volume{b188886e-39bb-4915-a893-d61a3ca3c707}/|-|PhysicalDrive0|FAT32|272629760|-"
-          ]
+          ],
+          "truncated": false
         }
       ],
       "stamp": {

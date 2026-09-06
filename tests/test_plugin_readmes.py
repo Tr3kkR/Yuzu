@@ -91,6 +91,14 @@ class ReadmeShape(unittest.TestCase):
             for block in g.README_BLOCKS:
                 if f"<!-- BEGIN GENERATED: plugin-doc-gen {block} -->" not in text:
                     problems.append(f"{rel}: missing fence 'plugin-doc-gen {block}'")
+            # Hand tables feed the manifest positionally: an unescaped `|` in a
+            # cell shifts every field after it, deterministically, so the byte
+            # gate cannot see it — the contracted column count can.
+            for heading, width in (("## Privileges and prerequisites", 5), ("### Result status", 4)):
+                for row in g.parse_md_table(sections.get(heading, "")):
+                    if len(row) != width:
+                        problems.append(f"{rel}: '{heading}' row has {len(row)} cells, contract is {width} "
+                                        f"(escape a literal pipe as \\|): {row[0][:40]!r}")
         self.assertFalse(problems, "\n".join(problems))
 
 

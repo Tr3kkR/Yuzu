@@ -54,7 +54,7 @@ for p in $plugins; do
     echo "check-plugin-readme-touch: ${p}: src/ changed and no README exists at HEAD — exempt (README-existence ratchet governs; tests/test_plugin_readmes.py)"
     continue
   fi
-  if printf '%s\n' "$CHANGED" | grep -qx "$readme"; then
+  if printf '%s\n' "$CHANGED" | grep -qxF "$readme"; then
     echo "check-plugin-readme-touch: ${p}: src/ and README.md both changed — ok"
     continue
   fi

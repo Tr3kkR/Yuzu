@@ -44,9 +44,9 @@ flowchart LR
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | agent service account (LocalSystem today, #1442) | None. `INetFwPolicy2` profile and rule reads need no elevation. | 2026-09-06 on the-rig (Windows 11 Pro 10.0.26200), elevated SSH session: three profiles read `enabled`, 100 rule rows plus the `truncated|true` marker | `error|com_init` or `error|policy2_create:<hresult>` row; profile rows read `error:<hresult>` |
-| macOS | LaunchDaemon (root today) | None for the primary Application Firewall read (`socketfilterfw --getglobalstate` is unprivileged). The secondary pf read opens `/dev/pf` and needs root; the plugin deliberately does not ride the quarantine plugin's `pfctl` sudoers grant. | 2026-09-06 at euid 501 on this host: `state|disabled`, `pf|unknown`, no pf rule rows | `pf|unknown` (state), no rows (rules), never a false-safe value |
-| Linux | agent service account | `firewall-cmd --state` is an unprivileged D-Bus query. The nftables netlink dump conventionally needs `CAP_NET_ADMIN` (verified 2026-08-23 with the capability present); `ufw status` and `iptables -S` need root. No sudoers entry is granted for any of them. | nftables verified 2026-08-23 in an Ubuntu 26.04 container with `CAP_NET_ADMIN`; the unprivileged denial path is reasoned from the `chains_ok && rules_ok` gate, not measured | a refused table dump falls through to the next backend; a refused chain or rule dump after a successful table dump reports `state|unknown` / `rules|unknown`; a host with no readable backend reports `backend|none` |
+| Windows | agent service account (LocalSystem today, #1442) | None. `INetFwPolicy2` profile and rule reads need no elevation. | 2026-09-06 on the-rig (Windows 11 Pro 10.0.26200), elevated SSH session: three profiles read `enabled`, 100 rule rows plus the `truncated\|true` marker | `error\|com_init` or `error\|policy2_create:<hresult>` row; profile rows read `error:<hresult>` |
+| macOS | LaunchDaemon (root today) | None for the primary Application Firewall read (`socketfilterfw --getglobalstate` is unprivileged). The secondary pf read opens `/dev/pf` and needs root; the plugin deliberately does not ride the quarantine plugin's `pfctl` sudoers grant. | 2026-09-06 at euid 501 on this host: `state\|disabled`, `pf\|unknown`, no pf rule rows | `pf\|unknown` (state), no rows (rules), never a false-safe value |
+| Linux | agent service account | `firewall-cmd --state` is an unprivileged D-Bus query. The nftables netlink dump conventionally needs `CAP_NET_ADMIN` (verified 2026-08-23 with the capability present); `ufw status` and `iptables -S` need root. No sudoers entry is granted for any of them. | nftables verified 2026-08-23 in an Ubuntu 26.04 container with `CAP_NET_ADMIN`; the unprivileged denial path is reasoned from the `chains_ok && rules_ok` gate, not measured | a refused table dump falls through to the next backend; a refused chain or rule dump after a successful table dump reports `state\|unknown` / `rules\|unknown`; a host with no readable backend reports `backend\|none` |
 
 Subprocesses: `socketfilterfw`, `pfctl` (macOS), `ufw`, `iptables` (Linux), each as an argv vector through the bounded runner (rung 2), never a shell. Windows and the firewalld and nftables legs are native (rung 1). No network access.
 
@@ -138,16 +138,28 @@ pf|unknown
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 8ef7b004fc8a
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 with CAP_NET_ADMIN in the host network namespace · leg-hash 8ef7b004fc8a
 
 ```
 == action=state
-backend|none
-state|unknown
+backend|nftables
+state|active
 [result_status] UNDECLARED / UNKNOWN
 
 == action=rules
-backend|none
+backend|nftables
+rule|nftables|ip|filter|OUTPUT|output|accept
+rule|nftables|ip|filter|FORWARD|forward|accept
+rule|nftables|ip6|filter|OUTPUT|output|accept
+rule|nftables|ip6|filter|FORWARD|forward|accept
+rule|nftables|ip|nat|PREROUTING|prerouting|accept
+rule|nftables|ip|nat|OUTPUT|output|accept
+rule|nftables|ip|nat|POSTROUTING|postrouting|accept
+rule|nftables|ip6|nat|PREROUTING|prerouting|accept
+rule|nftables|ip6|nat|OUTPUT|output|accept
+rule|nftables|ip|raw|PREROUTING|prerouting|accept
+rule|nftables|ip|filter|DOCKER-USER|handle|2
+… 12 of 55 rows shown
 [result_status] UNDECLARED / UNKNOWN
 ```
 <!-- END GENERATED -->

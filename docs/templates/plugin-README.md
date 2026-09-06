@@ -46,7 +46,7 @@ flowchart LR
 | macOS | <account> | <grant or none> | <date, host, account> | <status and row> |
 | Linux | <account> | <grant or none> | <date, host, account> | <status and row> |
 
-<Binaries, subprocesses, network: name them, or "none".>
+<Binaries, subprocesses, network: name them, or "none". A literal pipe inside any table cell is written \| .>
 
 ## Data contract
 

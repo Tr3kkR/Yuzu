@@ -81,6 +81,12 @@ row|two
 
 == action=danger key=value path="/Applications/Some App"
 [not captured] Destructive/Irreversible: not executed on a live host
+
+== action=big
+row|x
+[truncated] capture hit the LocalDispatcher byte cap
+[result_status] OK / FULL / 
+[rc] 1
 """
 
 README = """# alpha
@@ -107,9 +113,16 @@ flowchart LR
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | svc | none | 2026-09-01 | denied row |
+| Windows | svc | none | 2026-09-01 | `error\|com_init` row |
 
 ## Data contract
+
+### Outputs
+
+Rows are `kind|a|b`; field 0 is the discriminator.
+
+<!-- BEGIN GENERATED: plugin-doc-gen outputs -->
+<!-- END GENERATED -->
 
 ### Result status
 
@@ -218,7 +231,11 @@ class SampleParsing(unittest.TestCase):
         self.assertEqual(s.stamp["host_class"], "bare-metal")
         self.assertEqual(s.stamp["privilege"], "euid 501")
         self.assertEqual(s.stamp["leg_hash"], "pending")
-        self.assertEqual([a["action"] for a in s.actions], ["probe", "danger"])
+        self.assertEqual([a["action"] for a in s.actions], ["probe", "danger", "big"])
+        big = s.actions[2]
+        self.assertEqual(big["rows"], ["row|x"])
+        self.assertTrue(big["truncated"])
+        self.assertEqual(big["rc"], 1)
         self.assertEqual(s.actions[0]["rows"], ["row|one", "row|two"])
         self.assertEqual(s.actions[0]["result_status"]["provenance"], "macos:iokit:health_unread")
         self.assertEqual(s.actions[1]["params"], 'key=value path="/Applications/Some App"')
@@ -235,6 +252,29 @@ class SampleParsing(unittest.TestCase):
         self.assertEqual(len(out), 13)
         self.assertEqual(out[-1], "… 12 of 15 rows shown")
         self.assertEqual(g.trim_rows(rows[:3], 12), rows[:3])
+
+
+class Splitting(unittest.TestCase):
+    def test_escaped_pipe_is_a_literal_cell_character(self):
+        self.assertEqual(g.split_md_row("| a | `x\\|y` | c |"), ["a", "`x|y`", "c"])
+        self.assertEqual(g.split_md_row("| a | b |"), ["a", "b"])
+
+    def test_matrix_block_honours_capmatrix_escapes(self):
+        block = MATRIX.replace("| IOCTL thing | - |", "| IOCTL \\| thing | - |")
+        m = g.parse_matrix_block(block)
+        self.assertEqual(m["alpha"]["probe"]["windows"].mechanism, "IOCTL | thing")
+
+    def test_capability_row_trailing_comment_and_missing_comma(self):
+        frag = """{ .plugin = "z", .action = "q",
+            .execute_gate = ExecuteGate::AlwaysApproval, // note
+            .securable = "Security" // last field, no comma
+        }"""
+        rows = g.parse_capability_fragment(frag, "f")
+        self.assertEqual(rows[0].execute_gate, "AlwaysApproval")
+        self.assertEqual(rows[0].securable, "Security")
+
+    def test_cpp_unescape_keeps_utf8(self):
+        self.assertEqual(g._unescape_cpp('Gr\u00f6\u00dfen \\"x\\" a\\\\b'), 'Größen "x" a\\b')
 
 
 class LegHash(unittest.TestCase):
@@ -264,7 +304,7 @@ class Splicing(unittest.TestCase):
         self.assertIn("<!-- BEGIN GENERATED: plugin-doc-gen header -->\nNEW\n<!-- END GENERATED -->", out)
         self.assertIn("<!-- BEGIN GENERATED: plugin-doc-gen capability -->\nCAP\n<!-- END GENERATED -->", out)
         self.assertNotIn("old", out)
-        self.assertEqual(missing, ["inputs", "outputs", "samples", "source"])
+        self.assertEqual(missing, ["inputs", "samples", "source"])
 
     def test_idempotent(self):
         once, _ = g.splice(README, {"header": "NEW"})
@@ -280,7 +320,8 @@ class HandSections(unittest.TestCase):
         m = g.hand_sections_to_manifest(README)
         self.assertEqual(m["how_it_works"], "Reads things.")
         self.assertEqual(m["privileges"], [{"os": "Windows", "runs_as": "svc", "grant": "none",
-                                            "measured": "2026-09-01", "if_refused": "denied row"}])
+                                            "measured": "2026-09-01", "if_refused": "`error|com_init` row"}])
+        self.assertEqual(m["outputs_note"], "Rows are `kind|a|b`; field 0 is the discriminator.")
         self.assertEqual(m["result_status"][0]["status"], "`OK`")
         self.assertEqual(m["where_the_data_goes"], ["**Instruction result.** store", "**Siblings:** none"])
         self.assertEqual(m["caveats"], ["**One.** first", "**Two.** second"])
