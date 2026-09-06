@@ -701,6 +701,22 @@ if host_machine.system() == 'windows'
   tar_test_deps += cxx.find_library('ws2_32')   # winsock2 symbols the iphlpapi/netioapi headers in tar_netqual_boot.cpp pull in
   tar_test_deps += cxx.find_library('mpr')      # tar_mapdrive_collector.cpp WNet outbound
   tar_test_deps += cxx.find_library('netapi32') # tar_mapdrive_collector.cpp NetSessionEnum inbound
+  tar_test_deps += cxx.find_library('powrprof') # tar_power_collector.cpp PowerRegisterSuspendResumeNotification
+elif host_machine.system() == 'linux'
+  # tar_power_collector.cpp is compiled DIRECTLY into this exe, and its Linux
+  # sleep/wake leg is compile-gated on YUZU_HAVE_LIBSYSTEMD. That define was
+  # added to the plugin's args only, so the whole sd-bus leg -- and the two test
+  # cases that exercise it -- compiled OUT of this binary on Linux, where the
+  # #else branch SUCCEEDs with a "skipped" message. The suite stayed green while
+  # testing nothing, on the one platform that is this leg's enforcement point.
+  # Mirror the plugin's block (agents/plugins/tar/meson.build) so the tests
+  # compile in wherever the plugin's leg does.
+  libsystemd_test_dep = dependency('libsystemd', required: get_option('systemd_guard'),
+                                   include_type: 'system')
+  if libsystemd_test_dep.found()
+    tar_test_deps += libsystemd_test_dep
+    tar_test_cpp_args += '-DYUZU_HAVE_LIBSYSTEMD'
+  endif
 elif host_machine.system() == 'darwin'
   # tar_proc_es.cpp (compiled directly into this exe) → Endpoint Security client +
   # audit-token helpers, gated on the framework being present (full Xcode SDK).
@@ -741,6 +757,7 @@ tar_test_exe = executable(
     'unit/test_tar_capture_status.cpp', # BR-001 remediation: pure subprocess-capture completeness predicate
     'unit/test_tar_win_raii_guards.cpp', # Gate 3 remediation: injectable-closer RAII guard coverage (Windows-only body, empty TU elsewhere)
     'unit/test_tar_cursor.cpp',                  # Wave 6: cursor-source seam — lifecycle + persistence, atomic event+cursor commit, record_key dedupe, ack-by-sequence incl. the R-005 overflow regression (on-disk TarDb via unique_temp_path)
+    'unit/test_tar_power.cpp',                   # Wave 6 PR6.2-b: pmset parser + exact-tail cursor/gap decisions, REAL-CAPTURE fixtures, RunFn-injected
     'unit/test_fleet_snapshot.cpp',
     '../agents/plugins/tar/src/tar_db.cpp',
     # Wave 6: the cursor seam's factory AND lookback_seconds_or_forward_only,
@@ -767,6 +784,9 @@ tar_test_exe = executable(
     '../agents/plugins/tar/src/tar_arp_collector.cpp',     # Wave 5 PR5.2 Finding 4: real enumerate_arp() macOS smoke test
     '../agents/plugins/tar/src/tar_service_collector.cpp', # Wave 5 PR5.2 Finding 3: real enumerate_services() argv-assertion tests
     '../agents/plugins/tar/src/tar_fleet_snapshot.cpp',
+    # Wave 6 PR6.2-b: test_tar_power.cpp drives mac_power_collect_impl with an
+    # injected runner, so the real collector links into this exe.
+    '../agents/plugins/tar/src/tar_power_collector.cpp',
   ),
   include_directories: [
     include_directories('../agents/plugins/tar/src'),

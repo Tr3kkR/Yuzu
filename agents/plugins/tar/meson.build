@@ -35,6 +35,9 @@ tar_sources = files(
   'src/tar_cursor_sources.cpp',
 )
 
+# Wave 6 PR6.2-b: the power cursor source
+tar_sources += files('src/tar_power_collector.cpp')
+
 if host_machine.system() == 'windows'
   tar_deps += cxx.find_library('advapi32')
   tar_deps += cxx.find_library('iphlpapi')
@@ -48,6 +51,8 @@ if host_machine.system() == 'windows'
   tar_deps += cxx.find_library('wevtapi')  # EvtQuery / EvtNext / EvtRender (tar_netconn_win)
   tar_deps += cxx.find_library('mpr')      # WNetOpenEnumW / WNetGetUserW — outbound mapped drives (tar_mapdrive_collector)
   tar_deps += cxx.find_library('netapi32') # NetSessionEnum — inbound share sessions (tar_mapdrive_collector)
+  tar_deps += cxx.find_library('powrprof') # PowerRegisterSuspendResumeNotification /
+                                           # PowerSettingRegisterNotification (tar_power_collector)
 elif host_machine.system() == 'linux'
   # Optional sd-bus leg for the wave-2 POWER cursor source: systemd-logind's
   # PrepareForSleep signal, which is the only sleep/wake source on Linux.
