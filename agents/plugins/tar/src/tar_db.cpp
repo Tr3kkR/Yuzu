@@ -651,6 +651,53 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
         spdlog::info("TarDatabase: migrated to schema version 5 (legacy tar_events retired)");
     }
 
+    // Version 6: the `usage` derived fold's supplementary table + the two
+    // UNIQUE indexes it and usage_live's fold logic depend on (P21/wave 2).
+    // usage_live and usage_daily themselves come from the schema registry's
+    // usual CREATE-TABLE-IF-NOT-EXISTS path (create_warehouse_tables() above)
+    // once the "usage" CaptureSourceDef is registered -- this migration is
+    // the SINGLE source of usage_daily_user and both indexes; there is no
+    // generate_warehouse_ddl special case for them. A fresh DB runs v2->v6
+    // sequentially in this one open() call, so it reaches v6 with no
+    // usage_daily/usage_live rows to reconcile -- the indexes are created
+    // against empty tables and can never fail on a pre-existing duplicate.
+    if (db.schema_version() == 5) {
+        std::lock_guard lock(db.mu_);
+        char* emsg = nullptr;
+        sqlite3_exec(raw_db, "SAVEPOINT v6_migration", nullptr, nullptr, nullptr);
+        bool ok = true;
+        for (const char* stmt :
+             {"CREATE TABLE IF NOT EXISTS usage_daily_user (day_ts INTEGER NOT NULL, "
+              "exe_key TEXT NOT NULL, user TEXT NOT NULL, PRIMARY KEY(day_ts, exe_key, user))",
+              "CREATE UNIQUE INDEX IF NOT EXISTS usage_daily_day_exe_uq ON usage_daily(day_ts, "
+              "exe_key)",
+              "CREATE UNIQUE INDEX IF NOT EXISTS usage_live_pid_exe_uq ON usage_live(pid, "
+              "exe_key)"}) {
+            if (sqlite3_exec(raw_db, stmt, nullptr, nullptr, &emsg) != SQLITE_OK) {
+                spdlog::error("TarDatabase: v6 migration statement failed: {} ({})",
+                              emsg ? emsg : "unknown", stmt);
+                sqlite3_free(emsg);
+                emsg = nullptr;
+                ok = false;
+                break;
+            }
+        }
+        if (ok) {
+            db.set_config_locked("schema_version", "6");
+            sqlite3_exec(raw_db, "RELEASE v6_migration", nullptr, nullptr, nullptr);
+            spdlog::info(
+                "TarDatabase: migrated to schema version 6 (usage_daily_user + usage indexes)");
+        } else {
+            // Schema stays at 5 -- usage_live/usage_daily DDL from the registry
+            // still exists (create_warehouse_tables ran unconditionally above),
+            // but without these indexes the fold's DELETE-then-INSERT open-run
+            // lifecycle relies on an application-level invariant instead of a
+            // DB-enforced one. Retried on the next open.
+            sqlite3_exec(raw_db, "ROLLBACK TO v6_migration", nullptr, nullptr, nullptr);
+            sqlite3_exec(raw_db, "RELEASE v6_migration", nullptr, nullptr, nullptr);
+        }
+    }
+
     // Open a dedicated read-only, authorizer-sandboxed connection for untrusted
     // operator SQL (the tar.sql action). On this handle writes are structurally
     // impossible and the authorizer restricts reads to registry-known warehouse

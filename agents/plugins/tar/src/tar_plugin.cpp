@@ -29,6 +29,7 @@
 #include "tar_proc_stream.hpp"
 #include "tar_module_etw.hpp"
 #include "tar_db.hpp"
+#include "tar_usage.hpp"
 #include "tar_fleet_snapshot.hpp"
 #include "tar_status_format.hpp"
 #include "tar_netconn.hpp"
@@ -781,6 +782,21 @@ public:
         if (db_->get_config("mapdrive_enabled", "").empty()) {
             db_->set_config("mapdrive_enabled", "false");
         }
+        // P21/wave 2: first run after upgrade for the `usage` derived fold.
+        // usage_coverage_since is absent on any DB that predates this source
+        // (fresh install included) -- re-baseline forward-only from NOW rather
+        // than fold retrospectively over process_live history the fold was
+        // never told to cover (rule 5). A DB that already has the key was
+        // either already re-baselined here on a prior boot, or on the
+        // usage_enabled false->true edge (tar_aggregator.cpp
+        // apply_source_enabled_transition) -- either way, never re-run.
+        if (auto coverage = db_->try_get_config("usage_coverage_since");
+            coverage.has_value() && !coverage->has_value()) {
+            // Read succeeded and matched no row -- genuinely absent, not a
+            // transient failure (a failed read here retries at the next boot
+            // rather than risk re-baselining on every restart of a healthy DB).
+            yuzu::tar::usage::usage_rebaseline(*db_, now_epoch_seconds());
+        }
 #ifdef _WIN32
         // Construct the Windows ETW image-load collector; the session is STARTED
         // LAZILY by collect_fast on the first tick where module_enabled is true (so
@@ -1128,6 +1144,11 @@ private:
     // High-water mark of ProcEventRing::dropped() already logged, so the overflow
     // warning fires on each new drop rather than every tick. Guarded by collect_mu_.
     std::uint64_t last_logged_dropped_{0};
+    // Epoch seconds of the last `usage` fold failure warning -- rate-limits
+    // run_usage_fold() failure logging to once per minute (P21/wave 2) so a
+    // persistently wedged fold does not spam every fast tick. Guarded by
+    // collect_mu_ (only read/written from collect_fast_impl).
+    int64_t usage_last_fold_warn_ts_{0};
 
     // ── M2: gap-free module/image-load stream (Windows ETW; null elsewhere) ───
     // Unlike the always-on process stream, this is OPT-IN (module_enabled,
@@ -1367,6 +1388,23 @@ private:
                 }
 
                 db_->set_state(proc_key, processes_to_json(current).dump());
+            }
+        }
+
+        // `usage` derived fold (P21/wave 2): ONE call, after BOTH process
+        // feeders above have had their chance to insert this tick (the
+        // gap-free stream branch or the snapshot-diff poll branch -- they are
+        // mutually exclusive per tick; the one-time boot-backfill, the third
+        // feeder, always runs at init, strictly before any fast tick can
+        // reach here). Still under collect_mu_ (this whole function runs
+        // under the caller's lock_guard). Gates itself on usage_enabled AND
+        // process_enabled; a disabled feeder is not a failure.
+        if (auto fold = yuzu::tar::usage::run_usage_fold(*db_, ts); !fold.ok) {
+            if (ts - usage_last_fold_warn_ts_ >= 60) {
+                spdlog::warn("TAR: usage fold failed this tick ({}) -- hwm unchanged, retrying "
+                            "next tick",
+                            fold.error);
+                usage_last_fold_warn_ts_ = ts;
             }
         }
 

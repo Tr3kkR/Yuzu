@@ -8,6 +8,7 @@
 
 #include "tar_aggregator.hpp"
 #include "tar_schema_registry.hpp"
+#include "tar_usage.hpp"
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -218,6 +219,16 @@ bool apply_source_enabled_transition(TarDatabase& db, std::string_view source,
     // true→true is a no-op here (paused_at is already "0").
     if (new_value == "true" && prev_canon != "true") {
         db.set_config(paused_at_key, "0");
+    }
+    // P21/wave 2: the `usage` derived fold's false->true edge re-baselines
+    // instead of clearing a diff baseline (usage has none -- it is not a
+    // snapshot-diff source). Forward-only (rule 5): an operator re-enabling
+    // `usage` after a pause gets coverage from the moment of re-enable, never
+    // a retrospective fold over whatever process_live history survived the
+    // pause. Placed after the flag write above (mirrors every other leg here)
+    // so a re-baseline never runs while the config still reads disabled.
+    if (source == "usage" && new_value == "true" && prev_canon != "true") {
+        yuzu::tar::usage::usage_rebaseline(db, now_epoch);
     }
     return true;
 }
