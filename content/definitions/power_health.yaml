@@ -43,9 +43,10 @@ metadata:
     CYCLE_COUNT). On a Windows host with no system battery (desktops),
     BatteryFlag=128 reports
     present=false, state=ac_no_battery — measured live, not inferred. The
-    battery-PRESENT path is fixture-tested through an injected boundary and
-    UNVERIFIED on real battery hardware pending a reviewer's laptop run —
-    see docs/user-manual/power-health.md.
+    battery-PRESENT path is verified on real Windows hardware (HP ZBook
+    Firefly); on macOS it is still fixture-tested through an injected
+    boundary and UNVERIFIED on real battery hardware — see
+    docs/user-manual/power-health.md.
   tags: [power, battery, inventory]
 
 spec:

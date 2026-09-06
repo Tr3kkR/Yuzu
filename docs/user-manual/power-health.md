@@ -187,6 +187,9 @@ is present, matched and active even on the battery-less Mac mini, so a leg
 built on it would have reported a phantom battery on every desktop Mac. If a
 future change "simplifies" this to an `ioreg` read, that is a regression.
 
-Until those captures land, the battery-PRESENT path is **not** described as
-verified anywhere in this plugin's docs, changelog, or capability
-declaration — on **either** platform. Only the no-battery desktop paths are.
+The battery-PRESENT path is described as verified on **Windows** only — the
+HP ZBook Firefly run above. On **macOS** it is not described as verified
+anywhere in this plugin's docs, changelog, or capability declaration, and must
+not be until a capture lands: the Windows run found a state no fixture had
+thought to cover, so the macOS leg's fixtures are not evidence that its
+classification is complete either.
