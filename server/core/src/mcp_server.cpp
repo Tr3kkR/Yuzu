@@ -35,6 +35,7 @@
 #include "upload_grant_parsers.hpp"
 #include "engine_principal_store.hpp"     // PR 4.2: engine role-assignment MCP twins
 #include "dex_routes.hpp"               // dex_window_to_days / dex_iso_since (shared resolver)
+#include "dex_read_model.hpp"    // #4035: shared REST+MCP builders (device score, device app-perf, ...)
 #include "auth_routes.hpp"      // detail::sanitize_detail_value — audit-string sanitiser
 #include "rest_a4_envelope.hpp"         // detail::make_correlation_id (A4 error.data, #1463)
 #include "rest_audit.hpp"               // detail::try_persist_audit (behavioural-audit kernel, #1647)
@@ -573,6 +574,27 @@ static const ToolDef kTools[] = {
      R"j("by_day":{"type":"array","items":{"type":"object","properties":{"day":{"type":"string"},"count":{"type":"integer"}},"required":["day","count"]}},)j"
      R"j("audit_persisted":{"type":"boolean"}},"required":["obs_type","os","subjects","by_os","devices","by_day"]})j"},
 
+    // ── #4035 (api-parity #2146 Batch A): MCP-only gap — REST twin GET
+    // /api/v1/dex/devices/{id} already exists, this tool closes the MCP side.
+    // Per-device behavioral data → the same ancestor-aware SCOPED
+    // GuaranteedState:Read gate as query_software_licenses/get_dex_device_app_perf
+    // below, not the global perm gate.
+    {"get_dex_device_score",
+     "Per-device DEX read model: the 0-100 experience score (-1 when unavailable — no "
+     "store, or the score cannot be computed) plus this device's OWN signal summary "
+     "(obs_type -> count/distinct_devices/last_seen). The per-device twin of "
+     "list_dex_signals's fleet rollup. Behavioral PII — every call is audit-logged "
+     "(dex.device.view), same verb as the REST twin and the dashboard's per-device DEX "
+     "lens. Mirrors GET /api/v1/dex/devices/{id}. Requires GuaranteedState:Read, "
+     "management-group-scoped to this device.",
+     R"j({"type":"object","properties":{)j"
+     R"j("agent_id":{"type":"string","minLength":1,"maxLength":256,"description":"Exact agent/device id"},)j"
+     R"j("window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"})j"
+     R"j(},"required":["agent_id"]})j",
+     R"j({"type":"object","properties":{"agent_id":{"type":"string"},"window":{"type":"string"},"score":{"type":"integer"},)j"
+     R"j("signals":{"type":"array","items":{"type":"object","properties":{"obs_type":{"type":"string"},"count":{"type":"integer"},"distinct_devices":{"type":"integer"},"last_seen":{"type":"string"}},"required":["obs_type","count","distinct_devices","last_seen"]}},)j"
+     R"j("audit_persisted":{"type":"boolean"}},"required":["agent_id","window","score","signals"]})j"},
+
     // ── F2a: DEX fleet performance read tools — parity with /api/v1/dex/perf/* ──
     {"get_dex_perf_fleet",
      "Fleet device-performance now-stats: avg/p50/p90/max + reporting population for CPU "
@@ -710,6 +732,32 @@ static const ToolDef kTools[] = {
      R"j("hist_stale":{"type":"boolean"})j"
      R"j(},"required":["version","day","device_count","suppressed"]}})j"
      R"j(},"required":["group_id","app","version","floor","points"]})j"},
+
+    // ── #4035 (api-parity #2146 Batch A): MCP-only gap -- REST twin GET
+    // /api/v1/dex/devices/{id}/app-perf already exists (docs/api-twin-recipe.md
+    // §4's own worked "no MCP twin yet" example), this tool closes the MCP
+    // side. Per-device behavioral data -> the same ancestor-aware SCOPED
+    // GuaranteedState:Read gate as get_dex_device_score above.
+    {"get_dex_device_app_perf",
+     "One device's retained daily app-version performance series (B1) -- the 'on THIS "
+     "box, over time' companion to get_dex_app_perf's fleet trend. One row per "
+     "(app_name, version, day): samples, instances_max, cpu_avg/cpu_max (share of this "
+     "machine's own capacity), ws_avg_bytes/ws_max_bytes. No percentiles -- a single "
+     "device's daily averages ARE the series. Optional app narrows to one app name. "
+     "Behavioral PII -- every call is audit-logged (dex.device.app_perf.view), same "
+     "verb as the REST twin and the dashboard's per-device app-perf drill. Mirrors GET "
+     "/api/v1/dex/devices/{id}/app-perf. Requires GuaranteedState:Read, "
+     "management-group-scoped to this device.",
+     R"j({"type":"object","properties":{)j"
+     R"j("agent_id":{"type":"string","minLength":1,"maxLength":256,"description":"Exact agent/device id"},)j"
+     R"j("app":{"type":"string","maxLength":512,"description":"Narrow to one app name; omit for every app"})j"
+     R"j(},"required":["agent_id"]})j",
+     R"j({"type":"object","properties":{"agent_id":{"type":"string"},"app":{"type":"string"},)j"
+     R"j("rows":{"type":"array","items":{"type":"object","properties":{)j"
+     R"j("app_name":{"type":"string"},"version":{"type":"string"},"day":{"type":"integer"},"samples":{"type":"integer"},"instances_max":{"type":"integer"},)j"
+     R"j("cpu_avg":{"type":"number"},"cpu_max":{"type":"number"},"ws_avg_bytes":{"type":"integer"},"ws_max_bytes":{"type":"integer"}},)j"
+     R"j("required":["app_name","version","day","samples","instances_max","cpu_avg","cpu_max","ws_avg_bytes","ws_max_bytes"]}},)j"
+     R"j("audit_persisted":{"type":"boolean"}},"required":["agent_id","app","rows"]})j"},
 
     {"compare_app_perf_versions",
      "Before/after app performance for an upgrade (the /auto VERIFY evidence): did "
@@ -1891,6 +1939,10 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"list_dex_signals", {"GuaranteedState", "Read"}},
     {"get_dex_signal_scope", {"GuaranteedState", "Read"}},
     {"get_dex_signal_detail", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
+    // #4035: MCP-only gaps, per-device -> confined (same class as
+    // get_dex_signal_detail/get_dex_group_app_perf above).
+    {"get_dex_device_score", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
+    {"get_dex_device_app_perf", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
     {"get_dex_perf_fleet", {"GuaranteedState", "Read"}},
     {"get_dex_perf_cohorts", {"GuaranteedState", "Read"}},
     {"list_dex_perf_apps", {"GuaranteedState", "Read"}},
@@ -2359,6 +2411,8 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"list_dex_signals", {ToolEffect::ReadOnly, true, "List DEX signals"}},
     {"get_dex_signal_scope", {ToolEffect::ReadOnly, true, "Get DEX signal scope"}},
     {"get_dex_signal_detail", {ToolEffect::ReadOnly, true, "Get DEX signal detail"}},
+    {"get_dex_device_score", {ToolEffect::ReadOnly, true, "Get per-device DEX score"}},
+    {"get_dex_device_app_perf", {ToolEffect::ReadOnly, true, "Get per-device DEX app performance"}},
     {"get_dex_perf_fleet", {ToolEffect::ReadOnly, true, "Get DEX fleet performance"}},
     {"get_dex_perf_cohorts", {ToolEffect::ReadOnly, true, "Get DEX performance cohorts"}},
     {"get_dex_perf_cohort_diff", {ToolEffect::ReadOnly, true, "Get DEX cohort performance diff"}},
@@ -7375,6 +7429,122 @@ McpServer::HandlerFn McpServer::build_handler(
                         .str();
                 mcp_audit("success");
                 res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
+            // ── #4035 (api-parity #2146 Batch A): MCP-only gaps closing the
+            // per-device DEX read model + app-perf drill's REST-only twins.
+            // Both are per-device behavioral PII -> the SAME ancestor-aware
+            // SCOPED gate query_software_licenses/get_dex_group_app_perf use
+            // (never the global perm_fn), and both call the SHARED builder
+            // (dex_read_model.hpp) their REST twins also call, per Rule 1.
+            if (tool_name == "get_dex_device_score") {
+                if (!tier_allows(tier, "GuaranteedState", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                const auto agent_id = param_str(args, "agent_id");
+                if (agent_id.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "agent_id is required"),
+                                    "application/json");
+                    return;
+                }
+                // Per-device SCOPED gate (GuaranteedState:Read + management group) —
+                // mirrors REST's GET /api/v1/dex/devices/{id} (scoped_perm_fn
+                // mandatory there too), NOT the global perm_fn.
+                if (!scoped_perm_fn) {
+                    res.set_content(a4_error(kInternalError, "scope gate not configured"),
+                                    "application/json");
+                    return;
+                }
+                if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
+                    return; // the gate wrote its own 401/403
+                if (!guaranteed_state_store) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Guaranteed State store unavailable"),
+                        "application/json");
+                    return;
+                }
+                // Same shared window vocabulary as list_dex_signals/get_dex_signal_detail
+                // above — an off-enum value resolves to 7d (dex_window_to_days), not a 400;
+                // MCP input-schema enums are not server-enforced (unlike REST's own explicit
+                // window-enum validation on this route).
+                const std::string window = param_str(args, "window", "7d");
+                const std::string since = dex_iso_since(dex_window_to_days(window));
+                const auto model =
+                    build_dex_device_score_model(guaranteed_state_store, agent_id, window, since);
+                // Behavioral-PII access audit — same verb/target as the REST twin and
+                // the dashboard's per-device DEX lens, so one SIEM filter catches all
+                // three. Set-and-proceed: MCP has no Sec-Audit-Failed header, so the
+                // persist bool is captured and surfaced as audit_persisted:false in the
+                // body instead (never a failed call — see docs/api-twin-recipe.md §4).
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "dex.device.view", "success", "Agent", agent_id,
+                    "DEX per-device score + signal summary via MCP get_dex_device_score");
+                mcp_audit("success", agent_id);
+                res.set_content(
+                    success_response(
+                        id, tool_result(dex_device_score_json(model, audit_ok), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "get_dex_device_app_perf") {
+                if (!tier_allows(tier, "GuaranteedState", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                const auto agent_id = param_str(args, "agent_id");
+                if (agent_id.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "agent_id is required"),
+                                    "application/json");
+                    return;
+                }
+                // Per-device SCOPED gate — mirrors REST's GET
+                // /api/v1/dex/devices/{id}/app-perf (scoped_perm_fn mandatory there too).
+                if (!scoped_perm_fn) {
+                    res.set_content(a4_error(kInternalError, "scope gate not configured"),
+                                    "application/json");
+                    return;
+                }
+                if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
+                    return; // the gate wrote its own 401/403
+                if (!app_perf_providers.device) {
+                    res.set_content(
+                        a4_error(kInternalError, "service unavailable", "retry the request",
+                                 /*retry_after_ms=*/mcp::kMcpProviderWarmupRetryMs),
+                        "application/json");
+                    return;
+                }
+                // Behavioral-PII access audit BEFORE the read (provider-null already
+                // checked, matching the REST twin's ordering) — same verb/target as
+                // the REST twin and the dashboard's app-perf-over-time drill.
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "dex.device.app_perf.view", "success", "Agent", agent_id,
+                    "device app-perf-over-time drill (B1 retained) via MCP "
+                    "get_dex_device_app_perf");
+                const auto app_filter = param_str(args, "app", "");
+                auto rows = app_perf_providers.device(agent_id);
+                if (!rows) {
+                    // Authoritative read degrade — an ERROR, never success+[] (matches
+                    // every other app-perf provider-degrade branch in this file).
+                    mcp_audit("failure", "app-perf store read degraded; agent=" + agent_id);
+                    res.set_content(
+                        a4_error(kInternalError, "app-perf store read degraded", "retry shortly",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                        "application/json");
+                    return;
+                }
+                mcp_audit("success", agent_id);
+                res.set_content(
+                    success_response(id, tool_result(dex_device_app_perf_json(agent_id, app_filter,
+                                                                               *rows, audit_ok),
+                                                      kObjectOutputSchema)),
+                    "application/json");
                 return;
             }
 

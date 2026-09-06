@@ -426,6 +426,13 @@ constexpr TwinRow kExpectedTwins[] = {
     {"mint_upload_grant", "UploadGrant", "Write", false},
     {"list_upload_grants", "UploadGrant", "Read", true},
     {"revoke_upload_grant", "UploadGrant", "Delete", false},
+    // #4035 (api-parity #2146 Batch A): MCP-only gaps closing the REST-only
+    // twins for /fragments/device/dex and /fragments/dex/device/app-perf —
+    // see docs/api-twin-recipe.md §6/§7/§8, which directs a twin PR to extend
+    // this array (not only the plugin-config/upload-grant families the
+    // header comment above was originally pinned against).
+    {"get_dex_device_score", "GuaranteedState", "Read", true},
+    {"get_dex_device_app_perf", "GuaranteedState", "Read", true},
 };
 
 } // namespace

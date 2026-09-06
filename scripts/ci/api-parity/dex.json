@@ -27,9 +27,12 @@
     "method": "GET",
     "path": "/fragments/device/dex",
     "capability_id": "get.fragments-device-dex",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/dex/devices/{id}"
+    },
+    "mcp_twin": "get_dex_device_score",
+    "status": "twinned"
   },
   {
     "method": "GET",
@@ -89,9 +92,12 @@
     "method": "GET",
     "path": "/fragments/dex/device/app-perf",
     "capability_id": "get.fragments-dex-device-app-perf",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/dex/devices/{id}/app-perf"
+    },
+    "mcp_twin": "get_dex_device_app_perf",
+    "status": "twinned"
   },
   {
     "method": "GET",

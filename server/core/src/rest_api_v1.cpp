@@ -10,6 +10,7 @@
 #include "bundle_orchestrator.hpp" // live-query bundle (ADR-0011): dispatch + collate
 #include "bundle_service.hpp"      // validate_bundle_steps / aggregate_to_json
 #include "engine_principal_store.hpp" // PR 4.2: engine role-assignment authoring surface
+#include "dex_read_model.hpp" // #4035: shared REST+MCP builders (device score, device app-perf, ...)
 #include "dex_routes.hpp" // dex_window_to_days / dex_iso_since (shared window resolver)
 #include "engine_principal_store.hpp" // PR 4.3 — /api/v1/engine-principals
 #include "live_kinds.hpp" // shared live-read kind table + wire-format parser (S2)
@@ -10314,21 +10315,12 @@ void RestApiV1::register_routes(
                 return;
             }
             const std::string since = dex_iso_since(dex_window_to_days(window));
-            const int score = dex_device_score(guaranteed_state_store, agent_id, since);
-            JArr signals;
-            for (const auto& s : guaranteed_state_store->dex_device_signal_summary(agent_id, since))
-                signals.add(JObj()
-                                .add("obs_type", s.obs_type)
-                                .add("count", s.count)
-                                .add("distinct_devices", s.distinct_devices)
-                                .add("last_seen", s.last_seen));
-            auto data = JObj()
-                            .add("agent_id", agent_id)
-                            .add("window", window)
-                            .add("score", score)
-                            .raw("signals", signals.str())
-                            .str();
-            res.set_content(ok_json(data), "application/json");
+            // #4035: shared builder (dex_read_model.hpp) -- the MCP twin
+            // get_dex_device_score calls the SAME two functions so the two
+            // response shapes cannot drift (docs/api-twin-recipe.md Rule 1).
+            const auto model =
+                build_dex_device_score_model(guaranteed_state_store, agent_id, window, since);
+            res.set_content(ok_json(dex_device_score_json(model)), "application/json");
         });
 
     // GET /dex/devices/{id}/app-perf?app=<name> — the per-device B1 drill: this
@@ -10389,25 +10381,11 @@ void RestApiV1::register_routes(
                 return;
             }
             const std::string app_filter = req.has_param("app") ? req.get_param_value("app") : "";
-            JArr arr;
-            for (const auto& r : *rows) {
-                if (!app_filter.empty() && r.app_name != app_filter)
-                    continue;
-                arr.add(JObj()
-                            .add("app_name", r.app_name)
-                            .add("version", r.version)
-                            .add("day", r.day)
-                            .add("samples", r.samples)
-                            .add("instances_max", r.instances_max)
-                            .add("cpu_avg", r.cpu_avg)
-                            .add("cpu_max", r.cpu_max)
-                            .add("ws_avg_bytes", r.ws_avg_bytes)
-                            .add("ws_max_bytes", r.ws_max_bytes));
-            }
-            res.set_content(
-                ok_json(JObj().add("agent_id", agent_id).add("app", app_filter).raw("rows",
-                                                                                    arr.str()).str()),
-                "application/json");
+            // #4035: shared builder (dex_read_model.hpp) -- the MCP twin
+            // get_dex_device_app_perf calls the SAME provider + serializer so
+            // the two response shapes cannot drift (Rule 1).
+            res.set_content(ok_json(dex_device_app_perf_json(agent_id, app_filter, *rows)),
+                            "application/json");
         });
 
     if (metrics_registry) {
