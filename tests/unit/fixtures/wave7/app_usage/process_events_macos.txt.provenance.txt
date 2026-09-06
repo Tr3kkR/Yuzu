@@ -1,0 +1,16 @@
+REAL CAPTURE
+host: braga.local, macOS 26.5.1 (Darwin 25.5.0, arm64)
+date: 2026-09-06
+command: |
+  `ps -axo pid,ppid,comm,user` sampled every ~150ms for ~20s while spawning
+  45 short-lived `/bin/sleep <0.3-1.55s>` processes staggered every 0.2s
+  during the sampling window (the full system was running ~770 processes
+  per snapshot; the raw ps output was filtered post-capture to comm=="sleep"
+  — the synthetic spawns — so the fixture stays legible instead of carrying
+  ~770 lines of unrelated desktop-process noise per snapshot; this is a
+  real-data filter, not a reconstruction). `started`/`stopped` derived the
+  same way as the Linux capture: diff of consecutive snapshots, first-frame
+  presence treated as pre-existing baseline (not `started`), so a baseline
+  pid's disappearance correctly shows as an orphan `stopped`.
+format: this fixture set's own convention (see README.md in this directory) —
+  ts_unix|action|pid|ppid|image_name|user — not a real TAR wire format.
