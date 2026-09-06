@@ -1716,8 +1716,9 @@ TEST_CASE("MCP 2383: RBAC catalogue mirrors have the expected cardinality", "[mc
     // distinct from "Write" (see mcp_policy.hpp's tier_allows() operator-tier
     // comment for why a shared op would have been a privilege escalation).
     CHECK(rbac_ops_for_test().size() == 8);
-    // 23 + 3 PR1.9a additions (PluginConfig, PluginSecret, UploadGrant).
-    CHECK(rbac_securables_for_test().size() == 26);
+    // 23 + 3 PR1.9a additions (PluginConfig, PluginSecret, UploadGrant)
+    // + 1 Wave 6 (PowerManagement, power_health's set_power_plan).
+    CHECK(rbac_securables_for_test().size() == 27);
 }
 
 TEST_CASE("MCP 2383: three-way dispatch classifier — knownness decides first", "[mcp][2g]") {

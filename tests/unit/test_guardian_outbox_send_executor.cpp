@@ -474,11 +474,29 @@ TEST_CASE("#3953 item 2: a send crossing the threshold DURING one bounded wait i
     GuardianOutboxSendExecutor exec{50ms};
     auto entry = lifecycle_entry("e1");
     auto slow_but_completes = [](const OutboxEntry&) -> SendResult {
-        std::this_thread::sleep_for(80ms); // > the 50ms threshold, < the 200ms wait below
+        std::this_thread::sleep_for(80ms); // sleeps AT LEAST 80ms — over the 50ms threshold
         return SendResult::Sent;
     };
 
-    auto result = exec.offer(entry, slow_but_completes, 200ms);
+    // The wait is a LIVENESS bound, not a tight one, and that distinction is the
+    // point. This case needs the send to cross the 50ms threshold and still
+    // finish inside ONE offer() call. sleep_for guarantees the lower half — it
+    // sleeps at least 80ms — but nothing guarantees the upper half, because a
+    // loaded runner can stretch an 80ms sleep plus a detached-thread spawn past
+    // any tight ceiling. At 200ms this failed on macOS CI (PR #4009): offer()
+    // timed out, returned nullopt, and REQUIRE(result.has_value()) fired.
+    //
+    // Widening 200ms to some larger tight number is the fix that does not hold:
+    // the sibling case at line ~435 was already widened 50ms -> 300ms for this
+    // same reason one day earlier, and this case then flaked anyway. A margin
+    // chosen against observed jitter is a bet on the next runner being no
+    // slower. So the ceiling is instead set far beyond any scheduling delay,
+    // which makes it a bound on the send COMPLETING AT ALL rather than on how
+    // quickly: the assertions below still prove exactly what they did (the send
+    // completed within one wait, having crossed the threshold), and the only way
+    // to fail now is a send that never returns — a real defect, not load.
+    // The case still takes ~80ms; the ceiling is never reached in a passing run.
+    auto result = exec.offer(entry, slow_but_completes, 30s);
     REQUIRE(result.has_value());
     CHECK(*result == SendResult::Sent);
     CHECK(exec.send_stall_count() == 1);

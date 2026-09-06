@@ -171,7 +171,7 @@ TEST_CASE("RbacStore: seed data — securable types", "[rbac_store][pg]") {
     // +SoftwareLicensing (ADR-0024) +AccessReview (SOC 2 CC6.2) +EnginePrincipal
     // (#2376, cut away from Security:Read) +PluginConfig +PluginSecret
     // +UploadGrant (PR1.9a, peer finding PLAN-001) = 26.
-    REQUIRE(types.size() == 26);
+    REQUIRE(types.size() == 27);
 
     auto has = [&](const std::string& t) {
         return std::find(types.begin(), types.end(), t) != types.end();
@@ -231,16 +231,17 @@ TEST_CASE("RbacStore: seeded catalogues match the MCP C8 validator mirrors",
 TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_store][pg]") {
     RBAC_STORE(store);
     auto perms = store.get_role_permissions("Administrator");
-    // 26 types * 5 CRUD ops = 130 permissions, plus a single targeted Push
-    // grant on GuaranteedState (= 131), plus a single AccessReview:Attest grant
-    // (Periodic Access Reviews, CC6.2, = 132), plus a single ApiToken:Rotate
-    // grant (P2 #11, SOC 2 CC6.3) = 133 permissions total. Push, Attest, and
+    // 27 types * 5 CRUD ops = 135 permissions, plus a single targeted Push
+    // grant on GuaranteedState (= 136), plus a single AccessReview:Attest grant
+    // (Periodic Access Reviews, CC6.2, = 137), plus a single ApiToken:Rotate
+    // grant (P2 #11, SOC 2 CC6.3) = 138 permissions total. Push, Attest, and
     // Rotate are deliberately NOT cross-seeded on other securables — see the
-    // rationale in rbac_store.cpp seed_defaults(). (26th-24th: UploadGrant/
+    // rationale in rbac_store.cpp seed_defaults(). (27th: PowerManagement, Wave 6
+    // power_health set_power_plan; 26th-24th: UploadGrant/
     // PluginSecret/PluginConfig, PR1.9a peer finding PLAN-001; 23rd:
     // EnginePrincipal, #2376; 22nd: AccessReview, SOC 2 CC6.2; 21st:
     // SoftwareLicensing, ADR-0024.)
-    CHECK(perms.size() == 133);
+    CHECK(perms.size() == 138);
     for (auto& p : perms)
         CHECK(p.effect == "allow");
 
