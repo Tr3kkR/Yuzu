@@ -96,9 +96,11 @@ TEST_CASE("journal heartbeat: every field has a distinct key", "[guardian][journ
         .sweep_exceptions = 26,
         .send_exceptions = 28,
         .lifecycle_backpressure_drops = 29,
+        .send_orphan_exceptions = 31,
+        .send_stalls = 32,
     };
     emit_guardian_journal_heartbeat_tags(tags, s);
-    CHECK(tags.size() == 30);
+    CHECK(tags.size() == 32);
 }
 
 TEST_CASE("journal heartbeat: the capacity/size gauges emit under their pinned keys",
@@ -166,6 +168,7 @@ TEST_CASE("every documented Guardian heartbeat tag is one the emitter actually e
     s.journal_bytes = s.journal_batch_count = 1;
     s.page_read_failures = s.clock_jump_skips = s.gauge_underflow = 1;
     s.send_exceptions = s.lifecycle_backpressure_drops = 1;
+    s.send_orphan_exceptions = s.send_stalls = 1;
     emit_guardian_journal_heartbeat_tags(emitted, s);
     // Union in the AGE emitter's keys (item 6 + #2364): its tags share the
     // yuzu.guardian_ namespace this check scrapes, so documenting them without this
