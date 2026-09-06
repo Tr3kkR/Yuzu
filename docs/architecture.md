@@ -293,11 +293,16 @@ Operator                     Server                                  Agent
 
 Most HTTP surfaces the server exposes — REST, dashboard fragments, MCP — are registered by a
 **route owner**: a class with a `register_routes(...)` method that the server calls once at
-startup. `server.cpp` wires those owners, *and* registers a further **105 routes inline** on
-`web_server_->{Get,Post,Put,Delete}` — the health and readiness probes, the static-asset surface,
-much of the `/api/*` dashboard JSON, and `POST /api/command`
-(`server/core/src/server.cpp:7951`). It constructs no `HttplibRouteSink` of its own, so none of
-those inline routes is reachable from the in-process test harness.
+startup. `server.cpp` wires those owners, *and* registers a further **79 routes inline** on
+`web_server_->{Get,Post,Put,Delete}` — the health and readiness probes and much of the `/api/*`
+dashboard JSON. It constructs no persistent `HttplibRouteSink` of its own for these remaining
+inline routes, so none of them is reachable from the in-process test harness. (Two surfaces this
+prose previously credited to this inline count have since moved to their own `HttpRouteSink`
+modules and are no longer part of it: `POST /api/command` is `command_routes.cpp` (#2557), and the
+page-shell/static-asset surface — `/static/*`, `/`, `/chargen`, `/procfetch`, `/api/help*`,
+`/help`, `/tar`, `/result-sets`, `/viz/fleet`, `/viz/host/:id`, `/instructions`; 25 routes — is
+`page_routes.{hpp,cpp}` (#2542), registered against the stack-local `inline_sink` constructed in
+`start_web_server()`.)
 
 Counting the surface therefore needs a receiver-agnostic pattern, not a search for one variable
 name:
@@ -333,11 +338,16 @@ fragments shipped a destructive operation with no route-handler coverage until #
 register through the sink that owner already uses. Do not add a handler that only the
 `httplib::Server&` overload — or an inline `web_server_->` call in `server.cpp` — can reach.
 Registrations outside the sink are pre-existing debt, not a precedent to copy: after #2542 PR-1
-(`VerifyRoutes` and `NotificationRoutes` joined the sink pattern), `mcp_server.cpp` is the only
-remaining route owner registering directly on a raw `svr.{Get,Post,Delete}` (3 registrations) —
-plus `server.cpp`'s own 105 inline routes (a bare `grep -c` of the pattern above returns 106; one
-hit at `server.cpp:9468` is a comment, not a registration), which are not a route-owner class and
-are untouched by this migration; 108 registrations remain outside the sink in total.
+(`VerifyRoutes` and `NotificationRoutes` joined the sink pattern) and the page-shell/static-asset
+extraction (`page_routes.{hpp,cpp}`, 25 routes registered against `inline_sink`), `mcp_server.cpp`
+is the only remaining route owner registering directly on a raw `svr.{Get,Post,Delete}` (3
+registrations) — plus `server.cpp`'s own 79 inline routes, which are not a route-owner class and
+are untouched by this migration; 82 registrations remain outside the sink in total. Count these
+with the anchored pattern `grep -cE '^\s*web_server_->(Get|Post|Put|Delete|Patch|Options)\('
+server/core/src/server.cpp`, not a bare `grep -c` of the receiver-agnostic pattern above — the
+unanchored form over-counts by picking up at least one comment-line false match, which is how a
+105/106 figure was previously published here; the anchored count was 104 immediately before the
+page-shell extraction (independently re-verified during that extraction) and is 79 after it.
 
 ## Storage Architecture
 

@@ -992,25 +992,26 @@ const std::vector<CaptureSourceDef>& build_sources() {
         // seconds (ADR-0020).
         //
         // os_support: mechanisms are the 2026-09-04 measured bindings
-        // (hardware-probe measurement, Wave 6); collectors land wave 2.
+        // (hardware-probe measurement, Wave 6); the collector ships in this
+        // same PR (tar_power_collector.cpp) -- PR #4017 review, minor #12.
         {
             .name = "power",
             .dollar_name = "Power",
             .default_enabled = true,
             .unique_key_column = "record_key",
             .os_support = {
-                {"windows", OsSupportStatus::kPlanned, "powerbroadcast",
+                {"windows", OsSupportStatus::kSupportedConstrained, "powerbroadcast",
                  "Suspend/resume + AC transitions via "
                  "PowerRegisterSuspendResumeNotification / WM_POWERBROADCAST, "
-                 "cursor-model (tar_cursor.hpp) — collector lands wave 2."},
-                {"linux",   OsSupportStatus::kPlanned, "logind",
+                 "cursor-model (tar_cursor.hpp)."},
+                {"linux",   OsSupportStatus::kSupportedConstrained, "logind",
                  "systemd-logind PrepareForSleep sd-bus signal + power-supply "
-                 "sysfs/udev, cursor-model — collector lands wave 2. Gated by "
+                 "sysfs/udev, cursor-model. Gated by "
                  "the optional libsystemd dep (YUZU_HAVE_LIBSYSTEMD)."},
-                {"macos",   OsSupportStatus::kPlanned, "pmset_log",
+                {"macos",   OsSupportStatus::kSupported, "pmset_log",
                  "`pmset -g log` retrospective replay (measured working "
                  "unprivileged on this Mac 2026-09-04, 9,629 lines: "
-                 "hardware-probe measurement, Wave 6), cursor-model — collector lands wave 2."},
+                 "hardware-probe measurement, Wave 6), cursor-model."},
             },
             .granularities = {
                 {
