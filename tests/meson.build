@@ -1046,6 +1046,7 @@ if build_server
       'unit/server/test_rest_visualization.cpp',
       'unit/server/test_response_templates_engine.cpp',
       'unit/server/test_rest_response_templates.cpp',
+      'unit/server/test_rest_instructions_productpacks.cpp', # #4029: GET /api/v1/instructions*, /api/v1/product-packs*
       'unit/server/test_offload_target_store.cpp',
       'unit/server/test_rest_offload_targets.cpp',
       'unit/server/test_directory_sync.cpp', # ADR-0063: directory_sync Postgres migration

@@ -71,6 +71,7 @@ A separate, narrower shape applies to ordinary mutation routes that audit a chan
   - [RBAC](#rbac)
   - [Tags](#tags)
   - [Definitions](#definitions)
+  - [Product Packs](#product-packs)
   - [Response Templates](#response-templates)
   - [Audit Log](#audit-log)
   - [Access Reviews](#access-reviews)
@@ -2513,6 +2514,162 @@ List all instruction definitions.
   "meta": { "api_version": "v1" }
 }
 ```
+
+---
+
+#### `GET /api/v1/instructions`
+
+(#4029, api-parity Batch A) Twin of the legacy `GET /api/instructions` — the full filter set (`name`/`plugin`/`type`/`set_id`/`enabled_only`/`limit`), reconciled onto the same shared builder MCP's `list_definitions` tool calls (`instruction_definition_row_json`, `instruction_definition_model.hpp`) so REST and MCP cannot drift from each other by construction. A distinct route from `GET /api/v1/definitions` above (that route predates this issue and is unaffected by it).
+
+**Permission:** `InstructionDefinition:Read`
+
+**Query parameters:** `name`, `plugin`, `type` (`question`|`action`), `set_id`, `enabled_only` (bool), `limit` (default 100).
+
+**Response:**
+
+```json
+{
+  "data": [
+    {
+      "id": "def-abc123",
+      "name": "hardware.cpu-info",
+      "version": "1.0.0",
+      "type": "question",
+      "plugin": "hardware",
+      "action": "cpu-info",
+      "description": "Retrieve CPU model, core count, and architecture",
+      "enabled": true,
+      "instruction_set_id": "",
+      "created_at": 1742385600,
+      "updated_at": 1742385600
+    }
+  ],
+  "pagination": { "total": 1, "start": 0, "page_size": 50 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+#### `GET /api/v1/instructions/{id}`
+
+(#4029) Single-definition detail — the RECONCILED SUPERSET of the legacy `GET /api/instructions/{id}` fragment's fields (`gather_ttl_seconds`/`response_ttl_days`/`created_by`/timestamps) and MCP `get_definition`'s pre-existing fields (`approval_mode`/`parameter_schema`/`result_schema`/`yaml_source`) — both surfaces call the same builder (`instruction_definition_detail_json`) now, closing the field-set drift that existed between them before this issue.
+
+**Permission:** `InstructionDefinition:Read`
+
+**Response:**
+
+```json
+{
+  "data": {
+    "id": "def-abc123",
+    "name": "hardware.cpu-info",
+    "version": "1.0.0",
+    "type": "question",
+    "plugin": "hardware",
+    "action": "cpu-info",
+    "description": "Retrieve CPU model, core count, and architecture",
+    "enabled": true,
+    "instruction_set_id": "",
+    "created_at": 1742385600,
+    "updated_at": 1742385600,
+    "gather_ttl_seconds": 300,
+    "response_ttl_days": 90,
+    "created_by": "operator@example.com",
+    "approval_mode": "auto",
+    "parameter_schema": "{}",
+    "result_schema": "{}",
+    "yaml_source": "apiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\n..."
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**404** if no definition has that id.
+
+---
+
+#### `GET /api/v1/instructions/{id}/export`
+
+(#4029) Export a single instruction definition as its full JSON document (every field, including the operator-authoring-only fields `concurrency_mode`/`platforms`/`min_agent_version`/`required_plugins`/`readable_payload`/`visualization_spec`/`response_templates_spec`). Twin of the legacy `GET /api/instructions/{id}/export` route and the new MCP `export_definition` tool — all three now call the same builder (`instruction_definition_export_json`), which `InstructionStore::export_definition_json` itself delegates to as well. **Diverges from the legacy route on an unknown id:** the legacy route returns `200 "{}"` (a store-export quirk, never fixed since the field it checks was designed around "found but empty"); this route resolves the definition first and returns a real `404`.
+
+**Permission:** `InstructionDefinition:Read`
+
+**404** if no definition has that id.
+
+---
+
+### Product Packs
+
+(#4029, api-parity Batch A) A product pack is a bundle of `InstructionDefinition`/`PolicyFragment`/`Policy`/`Workflow` documents installed together (`POST /api/product-packs`, legacy — unversioned, unaffected by this issue). These two routes are read-only twins of the legacy `GET /api/product-packs[/{id}]` routes and of new MCP `list_product_packs`/`get_product_pack` tools, all three sharing one builder per shape (`product_pack_model.hpp`) so they cannot drift from each other by construction.
+
+**Prerequisite fix (#4029):** `ProductPack` is used as the RBAC securable string gating every one of these routes, but was never seeded into RBAC's securable-types catalogue before this issue — no role, not even Administrator, could be granted `ProductPack:*` while RBAC was enabled. Fixed as part of this issue: `ProductPack` is now seeded with full CRUD granted to Administrator, and `Read` additionally granted to Operator/PlatformEngineer/Viewer (the same population that already holds `InstructionDefinition:Read`).
+
+#### `GET /api/v1/product-packs`
+
+List installed product packs.
+
+**Permission:** `ProductPack:Read`
+
+**Query parameters:** `name`, `limit` (default 100).
+
+**Response:**
+
+```json
+{
+  "data": [
+    {
+      "id": "pack-abc123",
+      "name": "windows-baseline",
+      "version": "1.0.0",
+      "description": "Baseline Windows fleet content",
+      "item_count": 3,
+      "items": [
+        { "kind": "InstructionDefinition", "item_id": "def-1", "name": "hardware.cpu-info" }
+      ],
+      "installed_at": 1742385600,
+      "verified": true
+    }
+  ],
+  "pagination": { "total": 1, "start": 0, "page_size": 50 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+#### `GET /api/v1/product-packs/{id}`
+
+Get a single installed product pack's detail, including the pack's own `yaml_source` (the full multi-document bundle) and each item's own `yaml_source`.
+
+**Permission:** `ProductPack:Read`
+
+**Response:**
+
+```json
+{
+  "data": {
+    "id": "pack-abc123",
+    "name": "windows-baseline",
+    "version": "1.0.0",
+    "description": "Baseline Windows fleet content",
+    "yaml_source": "apiVersion: yuzu.io/v1alpha1\nkind: ProductPack\n...",
+    "items": [
+      {
+        "kind": "InstructionDefinition",
+        "item_id": "def-1",
+        "name": "hardware.cpu-info",
+        "yaml_source": "apiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\n..."
+      }
+    ],
+    "installed_at": 1742385600,
+    "verified": true
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**404** if no product pack has that id.
 
 ---
 

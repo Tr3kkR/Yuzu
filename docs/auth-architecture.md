@@ -2456,6 +2456,28 @@ counter registrations). Tests: `tests/unit/server/test_saml_scim_link.cpp`,
 - **OIDC SSO** — Full PKCE flow, Entra ID discovery, JWT validation, group-to-role mapping.
 - **AD/Entra integration** — Microsoft Graph API for user/group import.
 
+### `ProductPack` securable seeding fix (#4029)
+
+`ProductPack` was used as an RBAC securable-type string by the shipped
+`/api/product-packs*` routes (`workflow_routes.cpp`, `perm_fn(req, res,
+"ProductPack", "Read"/"Write"/"Delete")`) but was never seeded into
+`RbacStore::seed_defaults()`'s `types[]` array or `mcp_server.cpp`'s
+mirrored `kRbacSecurables[]`. `role_permissions.securable_type` carries a
+hard FK to `securable_types(name)`, so no role — not even Administrator —
+could ever be granted `ProductPack:*` while RBAC was enabled; the routes
+were reachable only via the RBAC-off legacy fallback or an elevated-session
+bypass. Fixed as part of #4029 (the same class of gap #2376's
+`EnginePrincipal` cut fixed for a different securable, see above): `types[]`
+now includes `ProductPack` (Administrator gets full CRUD for free via the
+existing cross-type loop), and `Read` is additionally granted to
+Operator/PlatformEngineer/Viewer — the same population that already holds
+`InstructionDefinition:Read`, for consistency across the content/catalog
+domain. Write/Delete stay Administrator-only (the issue's ask was scoped to
+the read twins; a follow-up could widen this if an operator role needs to
+author/uninstall packs directly). `#4032` tracks the identical gap for
+`Workflow` and `Directory`, fixed by sibling issues in their own PRs — this
+fix touches `ProductPack` only.
+
 ## The authorization topology floor (#2376)
 
 **The defect.** `RbacStore::rbac_enabled_` defaults `false`, so a fresh
