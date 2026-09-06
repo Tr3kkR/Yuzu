@@ -271,7 +271,14 @@ tracked separately below)
     restart (whose boot re-arm calls `reconcile_rule_locked` unconditionally) - absent
     either, it can sit un-enforced for the deployment's lifetime with no proactive
     operator signal beyond the "errored" audit entry itself. Tracked as a pre-PR-5
-    hardening candidate (see the risk-accept register addendum below).
+    hardening candidate (see the risk-accept register addendum below). **Scope residual
+    (Gate 5 chaos-injector CH-7):** `Lost` is structurally reachable only from
+    `drop_key_locked`'s sole call site - a brand-new key's FIRST watch failing. A
+    previously-healthy, already-armed watch that later dies completely (not merely
+    faults) has no `Lost` path today; it surfaces only via a sustained `Faulted` if the
+    mechanism itself calls `report_fault`, or not at all. Deliberate scope per #2818's
+    own text, not a defect - recorded here as an undocumented-until-now residual rather
+    than left implicit.
     `on_subscription_faulted` mirrors this for the
     health-toggle edge without touching `keys_`/`rules_` (the key is still armed).
   - **Poll backstop, folded into the same PR** (Dave's call): a full Queued consumer
