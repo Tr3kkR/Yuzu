@@ -458,6 +458,7 @@ yuzu_server_core_lib = static_library(
     'src/dex_alert_router.cpp',
     'src/dex_blast_radius.cpp',
     'src/custom_properties_store.cpp',
+    'src/custom_properties_routes.cpp',
     'src/mcp_server.cpp',
     'src/mcp_input_schema.cpp',
     'src/mcp_orientation.cpp',
