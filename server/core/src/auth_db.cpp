@@ -671,6 +671,47 @@ std::expected<void, AuthDBError> AuthDB::upsert_sso_identity(const std::string& 
 }
 
 std::expected<auth::UserEntry, AuthDBError> AuthDB::get_user(const std::string& username) {
+    // Gate 4 governance BLOCKING finding (unhappy-path): unlike ~20 sibling
+    // AuthDB methods, this READ path never validated `username` at all before
+    // handing it to PQexecParams. PQexecParams is called with paramLengths=
+    // nullptr (pg_exec.hpp), so libpq reads every text-format parameter as a
+    // NUL-terminated C string — an embedded NUL in `username` (trivially
+    // produced by URL-decoding a request body's "username=admin%00<garbage>")
+    // makes the SQL query match the TRUNCATED prefix ("admin") while the
+    // FULL raw C++ string (NUL and garbage suffix included) is what callers
+    // use as an in-memory map/session key. #4020 made this function newly
+    // reachable, unauthenticated, from POST /login's raw form field (via
+    // find_user_or_hydrate -> verify_password/authenticate), where the
+    // returned row was then try_emplace'd into AuthManager::users_ keyed by
+    // the FULL mangled string — every distinct garbage suffix an attacker
+    // sends for the SAME real username creates a new, permanent, unevictable
+    // cache entry (unauthenticated, unbounded memory growth) and, if the
+    // attacker also holds the real password, mints a session whose
+    // `Session::username` (the same mangled string) never matches the
+    // canonical name compared during remove_user()/update_role()'s session
+    // sweep — surviving a demotion or removal. Both closed at the source:
+    // reject here, before any query or any caller ever sees a successful
+    // result to cache.
+    //
+    // `is_valid_principal`, NOT `is_valid_username`: `auth.users.username`
+    // legitimately holds SSO principal strings too (upsert_sso_identity
+    // stores an "oidc:"/"saml:"/"ad:"-prefixed principal directly as this
+    // column, validated there via this SAME wider function) — and this
+    // function IS called with such a principal today, via
+    // get_user_role(api_token.principal_id) at auth_routes.cpp's legacy
+    // API-token session synthesis for an SSO-authenticated human's token.
+    // is_valid_username() would reject the ':' every SSO-prefixed principal
+    // contains, silently demoting every such token to Role::user
+    // (auth_routes.cpp's own .value_or(Role::user)) — a regression nearly as
+    // bad as the vulnerability this fixes. is_valid_principal() still closes
+    // the NUL-byte attack: its non-prefixed branch delegates to
+    // is_valid_username's own alnum/./_/- allowlist (NUL is none of those),
+    // and its reserved-prefix branch explicitly rejects every byte < 0x20
+    // (NUL included) plus a control/shell-metacharacter set.
+    if (!is_valid_principal(username)) {
+        spdlog::warn("get_user rejected invalid username/principal: '{}'", username);
+        return std::unexpected(AuthDBError::InvalidUsername);
+    }
     auto lease = impl_->pool.try_acquire_for(kReadTimeout);
     if (!lease)
         return std::unexpected(AuthDBError::QueryFailed);

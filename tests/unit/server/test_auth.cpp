@@ -468,6 +468,42 @@ TEST_CASE("authenticate on a cold cache is a plain miss for an unknown user (#40
     REQUIRE_FALSE(cold_mgr.verify_password("nonexistent", "password1234").has_value());
 }
 
+TEST_CASE("a NUL-mangled username never pollutes the cache or matches the real account "
+          "(Gate 4 governance BLOCKING finding)",
+          "[pg][auth][session][cold_cache][security]") {
+    // The exact attack: url_decode("admin%00garbage") produces the C++
+    // string "admin\0garbage" (an embedded NUL, legally representable in
+    // std::string). Before this fix, AuthDB::get_user had no input
+    // validation, so PQexecParams (paramLengths=nullptr, reads text params
+    // as NUL-terminated C strings) matched the TRUNCATED "admin" row while
+    // find_user_or_hydrate's try_emplace cached the result under the FULL
+    // mangled string - an unauthenticated caller could grow AuthManager::
+    // users_ without bound (a distinct cache entry per garbage suffix, no
+    // eviction) using nothing but a known-valid username and zero
+    // credentials, since the hydration happens BEFORE the password check.
+    yuzu::test::AuthDbPg auth_db;
+    AuthManager warm_mgr;
+    warm_mgr.set_auth_db(auth_db.get());
+    REQUIRE(warm_mgr.upsert_user("admin", "password1234", Role::admin));
+
+    AuthManager cold_mgr;
+    cold_mgr.set_auth_db(auth_db.get());
+    REQUIRE_FALSE(cold_mgr.has_users()); // genuinely empty cache to start
+
+    const std::string mangled = std::string("admin", 5) + '\0' + "garbage";
+    REQUIRE(mangled.size() == 13); // 5 + 1 (NUL) + 7 ("garbage")
+
+    // No credentials needed to reach the hydration attempt - even a
+    // deliberately wrong password exercises find_user_or_hydrate first.
+    REQUIRE_FALSE(cold_mgr.authenticate(mangled, "wrong-password").has_value());
+    REQUIRE_FALSE(cold_mgr.verify_password(mangled, "wrong-password").has_value());
+    CHECK_FALSE(cold_mgr.has_users()); // still empty - nothing was cached
+
+    // The real account is completely unaffected and still logs in normally.
+    REQUIRE(cold_mgr.authenticate("admin", "password1234").has_value());
+    CHECK(cold_mgr.has_users()); // now warmed, by the LEGITIMATE username only
+}
+
 // ── get_user_role(): AuthDB-authoritative on every call (Gate 3 governance
 // BLOCKING finding, fix shape confirmed via Sol/codex opine) ────────────────
 //
