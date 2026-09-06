@@ -199,9 +199,9 @@ spec:
         platforms: [windows, darwin]
       - name: fstype
         type: string
-        description: Filesystem when mounted, else "-". Windows reports "-" today.
+        description: Filesystem of the volume (NTFS, FAT32, apfs, ...), or "-" when unmounted or unknown.
         example: apfs
-        platforms: [darwin]
+        platforms: [windows, darwin]
       - name: total_bytes
         type: int64
         description: >-

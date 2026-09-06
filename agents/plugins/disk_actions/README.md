@@ -94,7 +94,7 @@ Pipe-delimited rows, one per drive or volume. Field 0 is a literal discriminator
 | `volume` | string | - | Windows, macOS | `disk3s1s1` | Volume GUID path (Windows) or BSD name (macOS); "-" only on the empty-result placeholder row. |
 | `mount_points` | string | - | Windows, macOS | `/System/Volumes/Data` | Comma-separated mount points or drive letters, or "-" when the volume serves none. |
 | `device` | string | - | Windows, macOS | `disk0` | Backing physical drive; several, comma-separated, on a spanned volume. |
-| `fstype` | string | - | macOS | `apfs` | Filesystem when mounted, else "-". Windows reports "-" today. |
+| `fstype` | string | - | Windows, macOS | `apfs` | Filesystem of the volume (NTFS, FAT32, apfs, ...), or "-" when unmounted or unknown. |
 | `total_bytes` | int64 | - | Windows, macOS | `494384795648` | Raw media capacity (sum of disk extents on Windows, IOMedia size on macOS), not filesystem capacity. Not comparable with crossplatform.storage.mounts.total_bytes. |
 | `detail` | string | - | all | `-` | Free text, or "-". |
 <!-- END GENERATED -->
@@ -120,6 +120,23 @@ Surfaced as `plugin_result_status` on the command response.
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
+**Windows** — captured: windows Windows 11 Pro 10.0.26200 · bare-metal · 2026-09-06 · Administrator (elevated SSH session) · leg-hash f062fb9a3dfd
+
+```
+== action=smart
+smart|PhysicalDrive0|Samsung SSD 970 EVO Plus 250GB|nvme|ssd|ok|5|100|-
+smart|PhysicalDrive1|Samsung SSD 970 EVO Plus 1TB|nvme|ssd|ok|1|100|-
+[result_status] UNDECLARED / UNKNOWN
+
+== action=volumes
+volume|//?/Volume{0a35801e-3f40-4114-a073-3d7ea1dd7664}/|-|PhysicalDrive0|NTFS|524288000|-
+volume|//?/Volume{c9a5f911-4689-41b2-b774-5b0e25b60e10}/|C:/|PhysicalDrive0|NTFS|248158093312|-
+volume|//?/Volume{daa59534-884a-4ce4-8fc8-4244f7bbe7ae}/|-|PhysicalDrive0|NTFS|967835648|-
+volume|//?/Volume{785383ef-b682-41d9-9b28-27c4b8882d65}/|D:/|PhysicalDrive1|NTFS|1000187363328|-
+volume|//?/Volume{b188886e-39bb-4915-a893-d61a3ca3c707}/|-|PhysicalDrive0|FAT32|272629760|-
+[result_status] UNDECLARED / UNKNOWN
+```
+
 **macOS** — captured: macos 26.5.1 · bare-metal · 2026-09-06 · euid 501 · leg-hash f062fb9a3dfd
 
 ```

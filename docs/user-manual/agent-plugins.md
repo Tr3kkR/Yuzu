@@ -1085,5 +1085,6 @@ Use the `example` plugin as a starting template. The minimum steps are:
 3. Add the plugin to `meson.build`.
 4. Write an `InstructionDefinition` YAML file in `content/definitions/` following the `yuzu.io/v1alpha1` DSL spec.
 5. Register plugin actions in the Substrate Primitive Reference table (`docs/yaml-dsl-spec.md`, section 14).
+6. Write `agents/plugins/<your_plugin>/README.md` from `docs/templates/plugin-README.md` per `docs/plugin-readme-standard.md`, capture a sample on each supported OS with `tools/plugin-capture`, and run `python3 tools/plugin-doc-gen/plugin_doc_gen.py --all` (or `meson compile docs-regen`) so the generated fences, this index, the site navigation and the plugin's `content/plugin-docs` manifest are current. The `docs` test suite and the docs-lint touch rule enforce this.
 
 For the full DSL specification, see `docs/yaml-dsl-spec.md`. For a walkthrough, see `docs/getting-started.md`.

@@ -99,6 +99,32 @@ The plugin does not call `set_result_status`; every run reports `UNDECLARED`, fr
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
+**Windows** — captured: windows Windows 11 Pro 10.0.26200 · bare-metal · 2026-09-06 · Administrator (elevated SSH session) · leg-hash 8ef7b004fc8a
+
+```
+== action=state
+profile|Domain|enabled
+profile|Private|enabled
+profile|Public|enabled
+[result_status] UNDECLARED / UNKNOWN
+
+== action=rules
+rule|ChatGPT|enabled|in|allow|2147483647
+rule|ChatGPT|enabled|in|allow|2147483647
+rule|ChatGPT|enabled|in|allow|2147483647
+rule|ChatGPT|enabled|in|allow|2147483647
+rule|ChatGPT|enabled|in|allow|2147483647
+rule|ChatGPT|enabled|in|allow|2147483647
+rule|Microsoft Edge (mDNS-In)|enabled|in|allow|2147483647
+rule|Microsoft Edge (mDNS-In)|enabled|in|allow|2147483647
+rule|Tailscale-In|enabled|in|allow|3
+rule|Tailscale-In|enabled|in|allow|3
+rule|Tailscale-Process|enabled|in|allow|2147483647
+rule|Microsoft Edge (mDNS-In)|enabled|in|allow|2147483647
+… 12 of 101 rows shown
+[result_status] UNDECLARED / UNKNOWN
+```
+
 **macOS** — captured: macos 26.5.1 · bare-metal · 2026-09-06 · euid 501 · leg-hash 8ef7b004fc8a
 
 ```

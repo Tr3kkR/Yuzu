@@ -289,6 +289,52 @@
         "os_version": "26.5.1",
         "privilege": "euid 501"
       }
+    },
+    "windows": {
+      "actions": [
+        {
+          "action": "state",
+          "not_captured": null,
+          "params": "",
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 3,
+          "rows": [
+            "profile|Domain|enabled",
+            "profile|Private|enabled",
+            "profile|Public|enabled"
+          ]
+        },
+        {
+          "action": "rules",
+          "not_captured": null,
+          "params": "",
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 101,
+          "rows": [
+            "rule|ChatGPT|enabled|in|allow|2147483647",
+            "rule|ChatGPT|enabled|in|allow|2147483647",
+            "rule|ChatGPT|enabled|in|allow|2147483647",
+            "rule|ChatGPT|enabled|in|allow|2147483647",
+            "rule|ChatGPT|enabled|in|allow|2147483647"
+          ]
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-06",
+        "host_class": "bare-metal",
+        "leg_hash": "8ef7b004fc8a",
+        "os": "windows",
+        "os_version": "Windows 11 Pro 10.0.26200",
+        "privilege": "Administrator (elevated SSH session)"
+      }
     }
   },
   "security": [
