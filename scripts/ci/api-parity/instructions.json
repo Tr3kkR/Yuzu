@@ -123,17 +123,23 @@
     "method": "GET",
     "path": "/api/workflow-executions/{param}",
     "capability_id": "get.api-workflow-executions-param",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/workflow-executions/{param}"
+    },
+    "mcp_twin": "get_workflow_execution",
+    "status": "twinned"
   },
   {
     "method": "GET",
     "path": "/api/workflows",
     "capability_id": "get.api-workflows",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/workflows"
+    },
+    "mcp_twin": "list_workflows",
+    "status": "twinned"
   },
   {
     "method": "POST",
@@ -155,9 +161,12 @@
     "method": "GET",
     "path": "/api/workflows/{param}",
     "capability_id": "get.api-workflows-param",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/workflows/{param}"
+    },
+    "mcp_twin": "get_workflow",
+    "status": "twinned"
   },
   {
     "method": "POST",
@@ -171,24 +180,33 @@
     "method": "GET",
     "path": "/fragments/executions",
     "capability_id": "get.fragments-executions",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/executions"
+    },
+    "mcp_twin": "list_executions",
+    "status": "twinned"
   },
   {
     "method": "GET",
     "path": "/fragments/executions/{param}/detail",
     "capability_id": "get.fragments-executions-param-detail",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/executions/{param}"
+    },
+    "mcp_twin": "get_execution_status",
+    "status": "twinned"
   },
   {
     "method": "GET",
     "path": "/fragments/schedules",
     "capability_id": "get.fragments-schedules",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/schedules"
+    },
+    "mcp_twin": "list_schedules",
+    "status": "twinned"
   }
 ]

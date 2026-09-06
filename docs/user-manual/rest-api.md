@@ -83,6 +83,7 @@ A separate, narrower shape applies to ordinary mutation routes that audit a chan
   - [Offload Targets](#offload-targets)
   - [Network Discovery](#network-discovery)
   - [Workflows](#workflows)
+  - [Workflows, Executions & Schedules — v1 read twins (#4030)](#workflows-executions--schedules--v1-read-twins-4030)
   - [OpenAPI Spec](#openapi-spec)
   - [Discovery (A2)](#discovery-a2)
   - [Inventory](#inventory)
@@ -4384,6 +4385,114 @@ execution whose workflow was later soft-deleted.
 2. Execute the workflow against a scope expression to target specific agents.
 3. Monitor execution progress via `GET /api/workflow-executions/{id}`.
 4. Each step runs sequentially; if a step fails on an agent, subsequent steps for that agent are skipped.
+
+---
+
+### Workflows, Executions & Schedules — v1 read twins (#4030)
+
+Versioned REST + MCP twins of the legacy `/api/workflows*` routes above, the `/fragments/executions`
+and `/fragments/executions/{id}/detail` dashboard fragments, and the `/fragments/schedules`
+fragment — closing the last gaps in that domain's `docs/api-parity-ledger.md` row set. Every route
+here shares its JSON row builder with its MCP tool twin (`docs/api-twin-recipe.md` Rule 1), so the
+two surfaces cannot drift independently.
+
+**Prerequisite fix bundled with this PR:** `Workflow` was used as an RBAC securable throughout
+`workflow_routes.cpp` but was never seeded into `RbacStore`'s securable-types catalogue — meaning
+no role, including Administrator, could ever be granted `Workflow:Read` while RBAC was enabled.
+This PR seeds it and grants `Read` to Administrator (via the standard CRUD seed), PlatformEngineer,
+Operator, ITServiceOwner, and Viewer — the same role footprint `Schedule:Read` already has.
+
+#### `GET /api/v1/workflows`
+
+**Permission:** `Workflow:Read`. List workflows — the v1 twin of `GET /api/workflows` above (same
+`name`/`limit` query parameters), MCP twin `list_workflows`.
+
+**Response:**
+
+```json
+{
+  "data": [
+    { "id": "abc123", "name": "Patch and Reboot", "description": "...",
+      "steps": [ { "index": 0, "instruction_id": "windows-update-install", "condition": "",
+                   "retry_count": 0, "retry_delay_seconds": 5, "foreach": "", "label": "",
+                   "on_failure": "abort" } ],
+      "step_count": 1, "created_at": 1710849600, "updated_at": 1710849600 }
+  ],
+  "pagination": { "total": 1, "start": 0, "page_size": 50 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+#### `GET /api/v1/workflows/{id}`
+
+**Permission:** `Workflow:Read`. Fetch one workflow's full detail, including `yaml_source`. The v1
+twin of `GET /api/workflows/{id}` above, MCP twin `get_workflow`. `404` for an unknown or
+soft-deleted id.
+
+#### `GET /api/v1/workflow-executions/{id}`
+
+**Permission:** `Workflow:Read`, gated on the fleet-read chokepoint (unlike the legacy route, which
+uses a plain permission check) — `WorkflowExecution.agent_ids` names agents directly, so a
+management-group-confined caller sees only the in-scope agent ids in the response. The v1 twin of
+`GET /api/workflow-executions/{id}` above, MCP twin `get_workflow_execution`. Audited as
+`workflow_execution.detail.fetch` (operator-supplied step parameters/output are worth the same
+evidentiary posture as instruction executions). `404` for an unknown execution id.
+
+#### `GET /api/v1/executions`
+
+**Permission:** `Execution:Read`, gated on the fleet-read chokepoint (ADR-0017) — **not** the plain
+permission check `GET /fragments/executions` uses; a confined caller sees only executions
+involving at least one visible agent (or that they dispatched). The v1 twin of
+`GET /fragments/executions`, MCP twin `list_executions` (widened by this PR to the same field set).
+Accepts `definition_id`, `status`, and `limit` (capped at 500) query parameters.
+
+**Response:**
+
+```json
+{
+  "data": [
+    { "id": "exec-1", "definition_id": "def-1", "definition_name": "Collect OS Info",
+      "status": "completed", "dispatched_by": "alice", "dispatched_at": 1735689600,
+      "agents_targeted": 2, "agents_responded": 2, "agents_success": 1, "agents_failure": 1,
+      "completed_at": 1735689620, "rerun_of": "", "error_preview": "boom" }
+  ],
+  "pagination": { "total": 1, "start": 0, "page_size": 50 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+#### `GET /api/v1/executions/{id}?include=agents`
+
+**Permission:** `Execution:Read` (same gate as the bare route, `docs/executions-history-ladder.md`).
+`?include=agents` is the #4030 per-agent status/duration expansion decided for this row: a query
+parameter on the existing detail route rather than a new one, so the fragment's aggregate +
+per-agent capability stays a single genuine REST+MCP twin (MCP twin: `get_execution_status` with
+`"include":["agents"]`). Adds a confined `agents` array (`agent_id`, `status`, `dispatched_at`,
+`first_response_at`, `completed_at`, `exit_code`, `error_detail`) and a `kpi` object (`total`,
+`succeeded`, `failed`, `p50_ms`, `p95_ms` — `null` percentiles when no agent has a usable duration
+yet). Unlike the bare request, this expansion **is** audited (`execution.detail.fetch`, REST
+fail-closed 503 on an audit-persist failure) because it discloses raw agent identities. Response
+bodies are a **separate** route (below), not part of this expansion.
+
+#### `GET /api/v1/executions/{id}/responses`
+
+**Permission:** `Response:Read`, gated on the fleet-read chokepoint — deliberately a **different**
+securable than the detail route's `Execution:Read`, so folding this into the detail-route expansion
+above would have over-disclosed response bodies to a caller who holds `Execution:Read` but not
+`Response:Read`. The v1 twin of MCP `query_responses`' `execution_id`-scoped filter (no new MCP
+tool — `query_responses` already covers this shape). Accepts `agent_id`, `status`, `since`, `until`,
+`limit`, `offset` query parameters, same shape as `query_responses`. Scope pushdown mirrors that
+tool exactly: the caller's visible agent set is resolved and pushed into the store query before
+`limit`/`offset` (ADR-0017 INV-3) — never filtered after the fact. Audited as
+`execution.detail.fetch`.
+
+#### `GET /api/v1/schedules`
+
+**Permission:** same two-stage gate as `GET /fragments/schedules`: a service-scoped API token is
+denied the fleet-wide list outright (schedules carry no per-agent axis for `fleet_read_fn` to
+confine against), then `Schedule:Read`. The v1 twin of `GET /fragments/schedules`, MCP twin
+`list_schedules` (widened by this PR to include `execution_count`). **Not** the separate legacy
+unversioned `GET /api/schedules` documented above — a distinct, untouched capability.
 
 ---
 
