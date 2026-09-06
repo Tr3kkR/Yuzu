@@ -9,11 +9,24 @@
 #include "scope_engine.hpp"
 
 #include <exception>
+#include <stdexcept>
 #include <string>
 
 namespace yuzu::server::dashboard_api {
 
 void register_dashboard_api_routes(HttpRouteSink& sink, Deps deps) {
+    // Fail fast at boot, not per-request: an unset visible_agents_json_fn is a
+    // caller wiring bug (this codebase has no other precedent for asserting a
+    // required Deps field, so this is the first — a future field with the
+    // same "no safe degrade" property should follow this shape). Catching it
+    // here means the server refuses to start rather than serving a silent,
+    // permanent 503 with no signal (governance Gate 4/6 finding on the PR
+    // that introduced this module).
+    if (!deps.visible_agents_json_fn) {
+        throw std::invalid_argument(
+            "register_dashboard_api_routes: deps.visible_agents_json_fn must be bound");
+    }
+
     // -- Current user info (/api/me) --------------------------------------
     sink.Get("/api/me", [deps](const httplib::Request& req, httplib::Response& res) {
         auto session = deps.auth_fn(req, res);
@@ -49,11 +62,18 @@ void register_dashboard_api_routes(HttpRouteSink& sink, Deps deps) {
     });
 
     // -- Agent listing API ------------------------------------------------
-    // Gate order is deliberate and load-bearing (preserved verbatim from
-    // server.cpp): perm_fn(Infrastructure,Read) runs BEFORE auth_fn. A
-    // caller with no session but also no Infrastructure:Read grant is
-    // rejected by the permission check first — never reaches the session
-    // lookup.
+    // Call order (perm_fn(Infrastructure,Read) before auth_fn) is preserved
+    // verbatim from server.cpp. Do NOT read this as guaranteeing a 403 over a
+    // 401 for a caller with neither a session nor the grant: `perm_fn` is
+    // bound to `require_permission`, whose OWN first action is an internal
+    // `require_auth` call — a session-less caller is already answered 401 by
+    // that internal check before any permission verdict is reached, so this
+    // external ordering does not change the caller-visible status code
+    // (verified against auth_routes.cpp's require_permission/require_auth;
+    // governance Gate 4 finding). What this order DOES guarantee, and is the
+    // only reason to preserve it, is that `perm_fn` — not the explicit
+    // `auth_fn` call below it — is the thing that runs and is exercised on
+    // every request, matching the pre-extraction code exactly.
     sink.Get("/api/agents", [deps](const httplib::Request& req,
                                    httplib::Response& res) {
         if (!deps.perm_fn(req, res, "Infrastructure", "Read"))
@@ -61,13 +81,6 @@ void register_dashboard_api_routes(HttpRouteSink& sink, Deps deps) {
         auto session = deps.auth_fn(req, res);
         if (!session)
             return;
-        if (!deps.visible_agents_json_fn) {
-            res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"agent listing unavailable"},"meta":{"api_version":"v1"}})",
-                "application/json");
-            return;
-        }
         res.set_content(deps.visible_agents_json_fn(session->username).dump(),
                         "application/json");
     });

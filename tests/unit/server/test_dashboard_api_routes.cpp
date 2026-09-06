@@ -61,10 +61,12 @@ struct Harness {
     AuditStore* audit_store{nullptr};
     AnalyticsEventStore* analytics_store{nullptr};
 
-    /// Empty by default — exercises the Deps::visible_agents_json_fn
-    /// bad_function_call-avoidance contract. A test that needs the happy
-    /// path sets this explicitly.
-    dashboard_api::Deps::VisibleAgentsJsonFn visible_agents_json_fn;
+    /// Defaults to a harmless no-op: register_dashboard_api_routes() now
+    /// REQUIRES this bound (throws otherwise, see the dedicated fail-fast
+    /// test below, which deliberately bypasses this default). A test that
+    /// cares about the returned shape overrides this field explicitly.
+    dashboard_api::Deps::VisibleAgentsJsonFn visible_agents_json_fn =
+        [](const std::string&) { return json::object(); };
     std::string last_visible_agents_username;
 
     yuzu::server::test::TestRouteSink sink;
@@ -96,12 +98,10 @@ struct Harness {
             s.role = session_role;
             return s;
         };
-        if (visible_agents_json_fn) {
-            deps.visible_agents_json_fn = [this](const std::string& username) {
-                last_visible_agents_username = username;
-                return visible_agents_json_fn(username);
-            };
-        }
+        deps.visible_agents_json_fn = [this](const std::string& username) {
+            last_visible_agents_username = username;
+            return visible_agents_json_fn(username);
+        };
         deps.rbac_store = rbac_store;
         deps.audit_store = audit_store;
         deps.analytics_store = analytics_store;
@@ -166,8 +166,12 @@ TEST_CASE("dashboard_api_routes: /api/me falls back to the legacy-role mapping f
 
 // ── GET /api/agents: perm_fn(Infrastructure, Read) THEN auth_fn ────────────
 
-TEST_CASE("dashboard_api_routes: /api/agents fails closed with 403 (not 401) when BOTH the "
-          "permission and the session are missing — proves perm_fn runs before auth_fn",
+TEST_CASE("dashboard_api_routes: /api/agents calls perm_fn before auth_fn — a denial "
+          "short-circuits before the session lookup runs (call-ORDER proof only: this "
+          "harness's mock perm_fn denies with 403 unconditionally, which is what makes 403 "
+          "vs 401 legible here; the REAL require_permission resolves auth internally and "
+          "answers 401 for a session-less caller regardless of order — see the route's own "
+          "comment in dashboard_api_routes.cpp)",
           "[server][routes][dashboard_api_routes]") {
     Harness h;
     h.perm_allow = false;
@@ -195,14 +199,15 @@ TEST_CASE("dashboard_api_routes: /api/agents denies with 401 when perm passes bu
     CHECK(h.last_perm_op == "Read");
 }
 
-TEST_CASE("dashboard_api_routes: /api/agents 503s when visible_agents_json_fn is unset",
+TEST_CASE("dashboard_api_routes: register_dashboard_api_routes rejects an unset "
+          "visible_agents_json_fn at registration time — fail-fast at boot, not a "
+          "per-request 503 (a caller wiring bug should crash startup, not silently "
+          "degrade one route forever)",
           "[server][routes][dashboard_api_routes]") {
-    Harness h; // visible_agents_json_fn stays empty
-    h.wire();
-
-    auto r = h.sink.Get("/api/agents");
-    REQUIRE(r);
-    CHECK(r->status == 503);
+    yuzu::server::test::TestRouteSink sink;
+    dashboard_api::Deps deps; // visible_agents_json_fn deliberately left unset
+    REQUIRE_THROWS_AS(dashboard_api::register_dashboard_api_routes(sink, deps),
+                      std::invalid_argument);
 }
 
 TEST_CASE("dashboard_api_routes: /api/agents returns the visible-agents JSON for the "
