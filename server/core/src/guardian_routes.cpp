@@ -1974,7 +1974,15 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
         // unreported guard. Not fixed here — #4037 is scoped to building REST/MCP
         // read twins, not remediating a pre-existing ADR-0038 gap in the
         // dashboard fragment (which the REST/MCP twins DO honor: they fail
-        // closed/error on the same nullopt). Flagged for a follow-up issue.
+        // closed/error on the same nullopt). Not fixed here — out of #4037's
+        // scope; needs its own issue (searched for an existing one, 2026-09-06,
+        // found none). A sibling site with the identical pattern also exists,
+        // untouched by #4037: render_baseline_page_fragment's
+        // rollup_by_rule(store_->agent_rule_statuses().value_or(...)) call
+        // above in this file. The main guards-overview route (this file,
+        // ~line 399) and the per-device Guardian lens (device_routes.cpp)
+        // both already guard this correctly (503/placeholder on nullopt) —
+        // this gap is specific to the two per-item detail fragments.
         for (const auto& s : yuzu::server::guardian_rule_agent_status_rows(*store_, guard_id)
                                   .value_or(std::vector<yuzu::server::GuardianRuleAgentStatusRow>{})) {
             seen.insert(s.agent_id);
