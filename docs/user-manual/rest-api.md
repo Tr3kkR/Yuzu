@@ -91,6 +91,7 @@ A separate, narrower shape applies to ordinary mutation routes that audit a chan
   - [Execution Statistics](#execution-statistics)
   - [Live-Query Bundles](#live-query-bundles)
   - [Device Tokens](#device-tokens)
+  - [Pre-flight & Deploy](#pre-flight--deploy)
   - [Software Deployment](#software-deployment)
   - [License Management](#license-management)
   - [Topology](#topology)
@@ -5473,6 +5474,108 @@ Revoke a device token.
 |---|---|
 | No token with this id | `404` — `token not found` |
 | A genuine database write failure | `503` — `service unavailable` |
+
+---
+
+### Pre-flight & Deploy
+
+REST twins of the `/auto` pre-flight ASSESS stage's saved-runs rail and the deploy ACT stage's
+go/warn preview — see [Pre-flight readiness checks](preflight.md) for the full workflow these
+routes are read-only slices of. Both are **owner-scoped** (your own runs/deployments only) and
+confirmed inert — neither creates a run or a deployment. MCP twins: `list_preflight_runs` /
+`get_deployment_preview` (`docs/mcp-server.md`).
+
+#### `GET /api/v1/preflight/runs`
+
+Your own saved pre-flight runs, newest first. This is the saved-runs-rail HALF of
+`GET /fragments/auto`'s payload only — the config-options half (available management groups for
+the scope dropdown) is not duplicated here; see [Management Groups](#management-groups) for that
+identical catalogue (`groups_fn_` sources from the exact same `list_groups()` call both routes
+share).
+
+**Permission:** `Infrastructure:Read`
+
+**Parameters:**
+
+| Name | In | Required | Description |
+|---|---|---|---|
+| `limit` | query | No | Max runs to return (default 12, matching the dashboard rail; capped at 100) |
+
+**Response:**
+
+```json
+{
+  "data": [
+    {
+      "run_id": "a1b2c3d4e5f6a7b8",
+      "name": "AcmeVPN 4.2.0 rollout",
+      "scope_label": "Sales laptops",
+      "status": "complete",
+      "created_at_ms": 1758000000000,
+      "deadline_at_ms": 1758001800000,
+      "completed_at_ms": 1758001200000,
+      "total": 40,
+      "go": 35,
+      "warn": 2,
+      "nogo": 1,
+      "incomplete": 2
+    }
+  ],
+  "pagination": { "total": 1, "start": 0, "page_size": 12 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Errors:**
+
+| Condition | Response |
+|---|---|
+| `limit` is not a positive integer | `400` |
+| A service-scoped API token — this owner-scoped read cannot be confined to the token's service | `403`, audited under `preflight.run.view` (a distinct verb from `preflight.run`, the run-**creation** verb — see the audit note below) |
+| Pre-flight run store unavailable | `503` |
+
+**Audit:** unaudited on a successful read (run scope/lifecycle metadata, not per-agent behavioural
+PII — matches the fragment's own posture); a service-scoped-token denial is audited under
+`preflight.run.view`, deliberately **not** the reused `preflight.run` verb — that verb is the run
+**creation** audit (`POST /fragments/auto/run`'s success event), and reusing it here would make a
+denied list read indistinguishable from a run being created in the audit log.
+
+---
+
+#### `GET /api/v1/deployments/preview`
+
+The deploy-config go/warn preview for one pre-flight run's cleared cohort — how many devices are
+ready to receive an installer, before you configure and start a deployment.
+
+**Permission:** `SoftwareDeployment:Read`
+
+**Parameters:**
+
+| Name | In | Required | Description |
+|---|---|---|---|
+| `run` | query | Yes | The source pre-flight run id |
+
+**Response:**
+
+```json
+{
+  "data": { "run_id": "a1b2c3d4e5f6a7b8", "name": "AcmeVPN 4.2.0 rollout", "go": 35, "warn": 2 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Errors:**
+
+| Condition | Response |
+|---|---|
+| Missing `run` parameter | `400` |
+| A service-scoped API token — this owner-scoped read cannot be confined to the token's service | `403`, audited under `deployment.config.view` |
+| No such run, or it belongs to another operator | `404` — indistinguishable by design (closes the existence oracle) |
+| Pre-flight run store unavailable | `503` |
+
+**Audit:** unaudited on a successful read (same rationale as the runs list above); a
+service-scoped-token denial is audited under `deployment.config.view` — already distinct from
+`deployment.create` (this route never creates a deployment).
 
 ---
 

@@ -35,6 +35,9 @@
 #include "upload_grant_parsers.hpp"
 #include "engine_principal_store.hpp"     // PR 4.2: engine role-assignment MCP twins
 #include "dex_routes.hpp"               // dex_window_to_days / dex_iso_since (shared resolver)
+#include "deployment_routes.hpp"        // deploy_preview_json (shared REST/MCP builder, #4036)
+#include "preflight_routes.hpp"         // preflight_run_row_json (shared REST/MCP builder, #4036)
+#include "preflight_run_store.hpp"      // PreflightRunStore (fwd-declared only in mcp_server.hpp)
 #include "auth_routes.hpp"      // detail::sanitize_detail_value — audit-string sanitiser
 #include "rest_a4_envelope.hpp"         // detail::make_correlation_id (A4 error.data, #1463)
 #include "rest_audit.hpp"               // detail::try_persist_audit (behavioural-audit kernel, #1647)
@@ -1731,6 +1734,39 @@ static const ToolDef kTools[] = {
      "not_found (nothing to revoke), never a silent success.",
      R"j({"type":"object","properties":{"grant_id":{"type":"string","pattern":"^[a-f0-9]+$","maxLength":64},"approval_id":{"type":"string","description":"Approval ticket id from a prior kApprovalRequired response; supply after admin approval to execute"}},"required":["grant_id"]})j",
      R"j({"type":"object","properties":{"revoked":{"type":"boolean"},"audit_persisted":{"type":"boolean","description":"present and false only when the audit row could not be persisted"}},"required":["revoked"]})j"},
+
+    // #4036 (api-parity Batch A) — /auto pre-flight + deploy read twins.
+    // Owner-scoped by the caller's own session, matching their REST twins
+    // and the underlying /fragments/auto* fragments. AUDIT POSTURE
+    // DELIBERATELY DIVERGES BY TRANSPORT (stated decision, #4036): the REST
+    // twins stay unaudited on a successful read, matching the fragments'
+    // own posture and api-twin-recipe.md §8's list_software_deployments
+    // precedent (run scope/lifecycle metadata, not per-agent behavioural
+    // PII, so emit_behavioral_audit's stricter posture doesn't apply); MCP's
+    // generic mcp_audit("success") IS called here (action "mcp." +
+    // tool_name), matching the dominant convention nearly every sibling
+    // read tool in this file already uses (list_management_groups,
+    // list_upload_grants, list_plugin_config) — see each dispatch branch
+    // below. A denial (tier/service-scope/permission) is audited on both
+    // transports either way, either generically by the C8 service-scope
+    // default-deny gate (kToolSecurityRows default-deny below) or, for a
+    // plain RBAC 403, by require_permission itself.
+    {"list_preflight_runs",
+     "List the caller's own saved pre-flight runs (owner-scoped). Mirrors GET "
+     "/api/v1/preflight/runs, the REST/MCP twin of /fragments/auto's saved-runs-rail HALF "
+     "only — the config-options half (available management groups for the scope dropdown) is "
+     "NOT duplicated here; use list_management_groups for that (same underlying catalogue, "
+     "already gated ManagementGroup:Read). Requires Infrastructure:Read.",
+     R"j({"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":100,"description":"Max runs to return, newest first; defaults to 12 (matches the dashboard rail)"}}})j",
+     R"j({"type":"object","properties":{"data":{"type":"array","items":{"type":"object","properties":{"run_id":{"type":"string"},"name":{"type":"string"},"scope_label":{"type":"string"},"status":{"type":"string","description":"running | complete"},"created_at_ms":{"type":"integer"},"deadline_at_ms":{"type":"integer"},"completed_at_ms":{"type":"integer"},"total":{"type":"integer"},"go":{"type":"integer"},"warn":{"type":"integer"},"nogo":{"type":"integer"},"incomplete":{"type":"integer"}},"required":["run_id","name","scope_label","status","total","go","warn","nogo","incomplete"]}}},"required":["data"]})j"},
+
+    {"get_deployment_preview",
+     "Deploy-config go/warn preview for one pre-flight run's cleared cohort (owner-scoped). "
+     "Mirrors GET /api/v1/deployments/preview. Confirmed inert — reads only the pre-flight run "
+     "store, never creates or advances a deployment (own audit verb deployment.config.view, "
+     "distinct from deployment.create). Requires SoftwareDeployment:Read.",
+     R"j({"type":"object","properties":{"run_id":{"type":"string","minLength":1,"description":"The source pre-flight run id"}},"required":["run_id"]})j",
+     R"j({"type":"object","properties":{"run_id":{"type":"string"},"name":{"type":"string"},"go":{"type":"integer"},"warn":{"type":"integer"}},"required":["run_id","name","go","warn"]})j"},
 };
 
 static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
@@ -2001,6 +2037,17 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"mint_upload_grant", {"UploadGrant", "Write"}},
     {"list_upload_grants", {"UploadGrant", "Read"}},
     {"revoke_upload_grant", {"UploadGrant", "Delete"}},
+    // #4036 (api-parity Batch A) — parity with the REST twins' securable:
+    // operation gates exactly (preflight_routes.cpp / deployment_routes.cpp
+    // doc comments). Deliberately the 2-element (default `ServiceScopeClass::
+    // denied`) form, NOT `confined`: owner-scoping by session->username is
+    // not a service-scope confinement mechanism (a service-scoped token
+    // sharing its creating principal's username would otherwise read back
+    // that principal's runs for an unrelated service — same SEC-2/SEC-3
+    // class the REST twins' deny_service_scoped_ calls close), so `confined`
+    // would be a false claim per ServiceScopeClass's own doc comment.
+    {"list_preflight_runs", {"Infrastructure", "Read"}},
+    {"get_deployment_preview", {"SoftwareDeployment", "Read"}},
 };
 
 // Lookup map DERIVED from the raw sequence; first-wins collapse here is safe
@@ -2484,6 +2531,10 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     // than a clean no-op success → not idempotent (same shape as
     // revoke_certificate/revoke_engine_principal above).
     {"revoke_upload_grant", {ToolEffect::Destructive, false, "Revoke upload grant"}},
+    // #4036 (api-parity Batch A) — plain reads, repeat calls return the same
+    // shape for unchanged server state.
+    {"list_preflight_runs", {ToolEffect::ReadOnly, true, "List pre-flight runs"}},
+    {"get_deployment_preview", {ToolEffect::ReadOnly, true, "Get deployment preview"}},
 };
 
 // Generate a tool's served MCP `annotations` object from its classification.
@@ -11953,6 +12004,91 @@ McpServer::HandlerFn McpServer::build_handler(
                 mcp_audit("success");
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");
+                return;
+            }
+
+            // #4036 (api-parity Batch A) — owner-scoped by session->username,
+            // matching the REST twin (GET /api/v1/preflight/runs) exactly:
+            // both call the SAME preflight_run_row_json builder
+            // (preflight_routes.hpp) so the JSON shape cannot drift
+            // (api-twin-recipe.md Rule 1). The C8 gate above already
+            // default-denies a service-scoped caller for this tool's 2-element
+            // kToolSecurityRows entry before this branch is ever reached — see
+            // that table's comment.
+            if (tool_name == "list_preflight_runs") {
+                if (!tier_allows(tier, "Infrastructure", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                    return;
+                if (!preflight_run_store_) {
+                    res.set_content(a4_error(kInternalError, "pre-flight run store unavailable",
+                                             "retry once the server reports ready",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                                    "application/json");
+                    return;
+                }
+                int64_t limit = param_int(args, "limit", 12);
+                if (limit < 1)
+                    limit = 1;
+                if (limit > 100)
+                    limit = 100;
+                auto rows = preflight_run_store_->list_runs(session->username, /*is_admin=*/false,
+                                                            static_cast<int>(limit));
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& r : rows)
+                    arr.push_back(preflight_run_row_json(r));
+                nlohmann::json payload = {{"data", arr}};
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // #4036 (api-parity Batch A) — owner-scoped by session->username,
+            // matching the REST twin (GET /api/v1/deployments/preview)
+            // exactly: both call the SAME deploy_preview_json builder
+            // (deployment_routes.hpp). Reads ONLY preflight_run_store_ —
+            // never a DeploymentRunStore call, same as the fragment's own
+            // /fragments/auto/deploy handler (deployment_routes.cpp).
+            if (tool_name == "get_deployment_preview") {
+                if (!tier_allows(tier, "SoftwareDeployment", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "SoftwareDeployment", "Read"))
+                    return;
+                if (!preflight_run_store_) {
+                    res.set_content(a4_error(kInternalError, "pre-flight run store unavailable",
+                                             "retry once the server reports ready",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                                    "application/json");
+                    return;
+                }
+                const auto run_id = param_str(args, "run_id");
+                if (run_id.empty()) {
+                    res.set_content(a4_error(kInvalidParams, "run_id is required"),
+                                    "application/json");
+                    return;
+                }
+                auto run = preflight_run_store_->get_run(run_id, session->username);
+                if (!run) {
+                    res.set_content(a4_error(kInvalidParams, "pre-flight run not found"),
+                                    "application/json");
+                    return;
+                }
+                nlohmann::json payload =
+                    deploy_preview_json(run->run_id, run->name, run->go, run->warn);
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                    "application/json");
                 return;
             }
 

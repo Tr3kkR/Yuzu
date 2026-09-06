@@ -208,6 +208,29 @@ std::vector<std::pair<std::string, std::string>> recent_runs(PreflightRunStore* 
 
 } // namespace
 
+// REST (`GET /api/v1/preflight/runs`) + MCP (`list_preflight_runs`) shared
+// builder — declared in preflight_routes.hpp so mcp_server.cpp can call the
+// SAME function (api-twin-recipe.md Rule 1). Deliberately richer than
+// `recent_runs()`'s flattened rail label above: an API caller gets the raw
+// go/warn/nogo/incomplete counts and lifecycle timestamps, not a pre-formatted
+// display string.
+nlohmann::json preflight_run_row_json(const PreflightRunRow& r) {
+    return nlohmann::json{
+        {"run_id", r.run_id},
+        {"name", r.name},
+        {"scope_label", r.scope_label},
+        {"status", r.status},
+        {"created_at_ms", r.created_at_ms},
+        {"deadline_at_ms", r.deadline_at_ms},
+        {"completed_at_ms", r.completed_at_ms},
+        {"total", r.total},
+        {"go", r.go},
+        {"warn", r.warn},
+        {"nogo", r.nogo},
+        {"incomplete", r.incomplete},
+    };
+}
+
 bool PreflightRoutes::deny_service_scoped_(const httplib::Request& req, httplib::Response& res,
                                            const std::string& action,
                                            const std::string& audit_detail,
@@ -496,6 +519,95 @@ void PreflightRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
             }
         }
         res.set_content(render_run(*run, attempt), "text/html; charset=utf-8");
+    });
+
+    // ── REST twin: GET /api/v1/preflight/runs (#4036, api-parity Batch A) ────
+    // Owner-scoped list of the caller's own saved runs — the REST/MCP twin of
+    // /fragments/auto's saved-runs-rail HALF only. The config-options half
+    // (`groups_fn_`, the management-group catalogue for the scope dropdown)
+    // is DELIBERATELY NOT duplicated here: `groups_fn_` is wired from
+    // server.cpp to `mgmt_group_store_->list_groups()` — byte-identical to
+    // what `GET /api/v1/management-groups` (ManagementGroup:Read) and the
+    // `list_management_groups` MCP tool already serve. Folding it into this
+    // response would (a) violate the shared-builder Rule 1 by giving the same
+    // catalogue two independently-maintained JSON shapes, and (b) gate
+    // identical data under a DIFFERENT permission (Infrastructure:Read here
+    // vs ManagementGroup:Read there) — a principal holding one but not the
+    // other would read the group catalogue through whichever side door is
+    // open, an authorization inconsistency worse than the duplication itself.
+    // A caller assembling the full /auto config form makes two calls, exactly
+    // as a REST client already must for any other page composed of more than
+    // one resource.
+    sink.Get("/api/v1/preflight/runs", [this](const httplib::Request& req, httplib::Response& res) {
+        auto session = auth_fn_ ? auth_fn_(req, res) : std::optional<auth::Session>{};
+        if (!session) {
+            res.status = 401;
+            res.set_content("auth required", "text/plain");
+            return;
+        }
+        // SEC-2/SEC-3 confinement gap, same rationale as the fragment's own
+        // deny_service_scoped_ call sites above: this read is OWNER-scoped by
+        // session->username, not fleet-wide, but a service-scoped token
+        // shares its creating principal's username, so username-only
+        // owner-scoping does not confine it to its OWN service — without
+        // this, a token scoped to e.g. "printers" could list back a
+        // fleet-wide run its creating human made for an unrelated service.
+        // NOTE: `perm_fn_` below (require_permission) ALSO structurally
+        // denies a service-scoped caller here per ADR-1006's default-deny
+        // flip (server/core/src/service_scope_policy.hpp's
+        // kServiceScopeGlobalSafe allow-list is seeded empty, and
+        // "Infrastructure:Read" is not in it) — this call is now
+        // belt-and-braces, kept for an EARLY, domain-verb-specific audited
+        // denial (preflight.run.view, distinct from the run-creation verb
+        // preflight.run per this issue's own correction) rather than the
+        // generic auth.permission_required action ADR-1006's flip alone
+        // would record.
+        if (deny_service_scoped_(req, res, "preflight.run.view",
+                                 "REST pre-flight runs list denied to a service-scoped token"))
+            return;
+        if (!perm_fn_ || !perm_fn_(req, res, "Infrastructure", "Read"))
+            return;
+        if (!run_store_) {
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "pre-flight run store is unavailable on this server"),
+                            "application/json");
+            return;
+        }
+        // `limit`: default matches the fragment rail's own cap (12); callers
+        // may ask for more, bounded well below any pagination concern for a
+        // per-operator run list.
+        int64_t limit = 12;
+        if (req.has_param("limit")) {
+            try {
+                limit = std::clamp<int64_t>(std::stoll(req.get_param_value("limit")), 1, 100);
+            } catch (...) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid limit"), "application/json");
+                return;
+            }
+        }
+        auto rows = run_store_->list_runs(session->username, /*is_admin=*/false,
+                                          static_cast<int>(limit));
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& r : rows)
+            arr.push_back(preflight_run_row_json(r));
+        // Deliberately UNAUDITED on success (stated decision, #4036): matches
+        // this domain's own fragment posture today (neither /fragments/auto
+        // nor its rail audits a successful read) and the api-twin-recipe.md
+        // §8 worked-example precedent for a non-behavioural-PII metadata
+        // list (`list_software_deployments`) — these rows are run
+        // scope/lifecycle metadata, not per-agent behavioural PII, so
+        // emit_behavioral_audit's stricter REST-fail-closed posture does not
+        // apply, and a plain unaudited read is proportionate. The DENIAL
+        // path above still gets a domain-verb-specific audit row.
+        nlohmann::json out = {
+            {"data", arr},
+            {"pagination", {{"total", static_cast<int64_t>(rows.size())},
+                            {"start", 0},
+                            {"page_size", limit}}},
+            {"meta", {{"api_version", "v1"}}},
+        };
+        res.set_content(out.dump(), "application/json");
     });
 }
 

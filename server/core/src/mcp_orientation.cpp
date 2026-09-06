@@ -108,8 +108,13 @@ constexpr std::string_view kAgenticHelpers[] = {"get_fleet_posture_fast",
 constexpr std::string_view kDiscovery[] = {"discover_permissions", "discover_instructions",
                                            "discover_routes", "discover_scope_kinds",
                                            "discover_plugins"};
+// #4036 (api-parity Batch A) — the /auto pre-flight ASSESS + deploy ACT
+// stages' read twins. Own family, distinct from Fleet & agents / Live
+// execution: these are owner-scoped readiness/preview reads over the
+// operator's OWN saved runs, not fleet-wide agent data or dispatch.
+constexpr std::string_view kPreflightDeploy[] = {"list_preflight_runs", "get_deployment_preview"};
 
-constexpr std::array<ToolFamily, 24> kFamilies{{
+constexpr std::array<ToolFamily, 25> kFamilies{{
     {"Fleet & agents", "connected agents, their OS/arch/version, and details", kFleet},
     {"Tags", "read and write agent tags, and find agents by tag", kTags},
     {"Instructions & schedules", "instruction definitions and recurring schedules", kDefinitions},
@@ -151,6 +156,9 @@ constexpr std::array<ToolFamily, 24> kFamilies{{
      kAgenticHelpers},
     {"Discovery", "enumerate permissions, instructions, routes, scope kinds, and plugins",
      kDiscovery},
+    {"Pre-flight & deploy", "owner-scoped saved pre-flight runs and the deploy-config go/warn "
+                            "preview for one of them",
+     kPreflightDeploy},
 }};
 
 }  // namespace

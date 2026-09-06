@@ -91,6 +91,20 @@ deployment::DeploymentConfig config_from_row(const DeploymentRow& r) {
 
 } // namespace
 
+// REST (`GET /api/v1/deployments/preview`) + MCP (`get_deployment_preview`)
+// shared builder — declared in deployment_routes.hpp so mcp_server.cpp can
+// call the SAME function (api-twin-recipe.md Rule 1). Mirrors
+// render_deploy_config's four scalar inputs exactly.
+nlohmann::json deploy_preview_json(const std::string& run_id, const std::string& run_name,
+                                   int go_count, int warn_count) {
+    return nlohmann::json{
+        {"run_id", run_id},
+        {"name", run_name},
+        {"go", go_count},
+        {"warn", warn_count},
+    };
+}
+
 yuzu::server::DispatchCaller
 DeploymentRoutes::caller_from_session(const auth::Session& session) const {
     return yuzu::server::DispatchCaller{
@@ -443,6 +457,71 @@ void DeploymentRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, Perm
         res.set_content(render_deploy_note(deleted ? "Deployment deleted."
                                                    : "Nothing to delete."),
                         "text/html; charset=utf-8");
+    });
+
+    // ── REST twin: GET /api/v1/deployments/preview (#4036, api-parity Batch A) ─
+    // Owner-scoped deploy-config go/warn preview for one pre-flight run —
+    // confirmed inert (reads preflight_store_ only, no DeploymentRunStore
+    // call, no dispatch). Own audit verb `deployment.config.view`, already
+    // distinct from `deployment.create` (matches the fragment's own comment:
+    // "no deployment is created by this GET").
+    sink.Get("/api/v1/deployments/preview", [this](const httplib::Request& req,
+                                                   httplib::Response& res) {
+        auto session = auth_fn_ ? auth_fn_(req, res) : std::optional<auth::Session>{};
+        if (!session) {
+            res.status = 401;
+            res.set_content("auth required", "text/plain");
+            return;
+        }
+        // SEC-2/SEC-3 confinement gap, same rationale + same call as the
+        // fragment's own deny_service_scoped_ above: owner-scoped by
+        // session->username, so a service-scoped token sharing its creating
+        // principal's username could otherwise read back the go/warn counts
+        // for a fleet-wide run outside its own service. NOTE: `perm_fn_`
+        // below (require_permission) ALSO structurally denies a
+        // service-scoped caller here per ADR-1006's default-deny flip
+        // (service_scope_policy.hpp's kServiceScopeGlobalSafe allow-list is
+        // seeded empty, and "SoftwareDeployment:Read" is not in it) — this
+        // call is now belt-and-braces, kept for an early, `deployment.config.
+        // view`-audited denial rather than the generic auth.permission_
+        // required action ADR-1006's flip alone would record.
+        if (deny_service_scoped_(req, res, "deployment.config.view",
+                                 "REST deploy-preview denied to a service-scoped token", "Scope"))
+            return;
+        if (!perm_fn_ || !perm_fn_(req, res, "SoftwareDeployment", "Read"))
+            return;
+        if (!preflight_store_) {
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "pre-flight run store is unavailable on this server"),
+                            "application/json");
+            return;
+        }
+        const std::string run_id = param(req, "run");
+        if (run_id.empty()) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, "missing required query parameter: run"),
+                            "application/json");
+            return;
+        }
+        // Owner-scoped: a not-yours run reads as not-found (no existence
+        // oracle) — same posture as the fragment.
+        auto run = preflight_store_->get_run(run_id, session->username);
+        if (!run) {
+            res.status = 404;
+            res.set_content(detail::a4_error(res, "pre-flight run not found"), "application/json");
+            return;
+        }
+        // Deliberately UNAUDITED on success (stated decision, #4036) — same
+        // reasoning as the /api/v1/preflight/runs twin above: run
+        // scope/go/warn metadata, not per-agent behavioural PII, matching
+        // the fragment's own unaudited-read posture and the
+        // api-twin-recipe.md §8 worked-example precedent. The DENIAL path
+        // above still audits under `deployment.config.view`.
+        nlohmann::json out = {
+            {"data", deploy_preview_json(run->run_id, run->name, run->go, run->warn)},
+            {"meta", {{"api_version", "v1"}}},
+        };
+        res.set_content(out.dump(), "application/json");
     });
 }
 
