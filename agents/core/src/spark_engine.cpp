@@ -885,6 +885,19 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
     // brand-new key down already (its sole subscriber — ours — removed, e.g. by
     // unregister_consumer racing our own consumer), in which case watching it
     // now would leave an orphaned OS watch with no armed_ entry.
+    // #2818: populated only on the failed-watch path below, and only consumed AFTER
+    // this whole `if (mech)` scope (and therefore `ops` and `mu_`) have been released.
+    // deliver() MUST NOT run while `ops` is held: an Inline subscriber reacting to a
+    // Lost notification by re-arming this same type would re-enter arm_impl, try to
+    // take mech_ops_mu_by_type_.at(spec.type) again, and self-deadlock on this
+    // non-recursive mutex (spark_engine.hpp's documented invariant against a
+    // mechanism/consumer synchronously re-entering the engine from inside a
+    // watch()/unwatch() call stack).
+    bool watch_failed = false;
+    std::string watch_fail_result;
+    SparkEvent lost_ev;
+    std::vector<Subscriber> lost_subs;
+
     if (mech) {
         std::lock_guard ops(mech_ops_mu_by_type_.at(spec.type));
         {
@@ -903,16 +916,83 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
         auto w = watch_guarded(mech, key, watch_params, watch_threw_msg,
                                arm_fault_hook_for_test_);
         if (!w) {
+            // #2818 item (b), orphan reclamation: still under mech_ops_mu_by_type_[type],
+            // no new locking. Defensive — watch_guarded()'s failure may be a clean
+            // "never registered anything" or a partial mechanism-side registration
+            // (watch() is not guaranteed atomic on every failure path); unwatch() on a
+            // key the mechanism never (or only partially) registered is independently
+            // verified a safe no-op on all three real mechanisms (spark_file.cpp's
+            // unwatch_locked, spark_registry.cpp's unwatch, spark_service.cpp's
+            // worker-side Cmd::Remove handling all early-return/no-op on an unknown
+            // key). Contained: a throw here costs a possibly-orphaned resource, never
+            // a skipped drop_key_locked() below.
+            try {
+                mech->unwatch(key);
+            } catch (const std::exception& e) {
+                arm_race_unwatch_failures_.fetch_add(1, std::memory_order_relaxed);
+                try {
+                    spdlog::error("SparkEngine: defensive unwatch('{}') after a failed "
+                                  "watch() threw ({}) - a partial mechanism resource may "
+                                  "be orphaned", key, e.what());
+                } catch (...) {
+                }
+            } catch (...) {
+                arm_race_unwatch_failures_.fetch_add(1, std::memory_order_relaxed);
+                try {
+                    spdlog::error("SparkEngine: defensive unwatch('{}') after a failed "
+                                  "watch() threw - a partial mechanism resource may be "
+                                  "orphaned", key);
+                } catch (...) {
+                }
+            }
             {
                 std::lock_guard lk(mu_);
-                drop_key_locked(key);
+                // #2818: snapshot every CURRENT subscriber before drop_key_locked erases
+                // the key's bookkeeping, so a sibling that deduped onto this key while
+                // our watch() was in flight is notified too — not just this caller.
+                // Snapshot + erase in ONE mu_ acquisition: a late dedup landing before
+                // this block starts is captured by find(); drop_key_locked is the LAST
+                // statement, so nothing can join between snapshot and erase either.
+                // Contained: a bad_alloc here (the key/detail string copies, the
+                // vector<Subscriber> copy) costs a lost notification, never a skipped
+                // drop_key_locked() call — the same #2270 discipline the rest of this
+                // function is built on ("losing a log line is strictly better than
+                // unwinding a live arm") applies equally to losing a notification.
+                auto it = armed_.find(key);
+                if (it != armed_.end()) {
+                    try {
+                        lost_ev.key = key;
+                        lost_ev.type = spec.type;
+                        lost_ev.seq = ++it->second.seq;
+                        lost_ev.at = std::chrono::system_clock::now();
+                        lost_ev.kind = SparkEventKind::Lost;
+                        lost_ev.detail = w.error();
+                        lost_subs = it->second.subs;
+                    } catch (...) {
+                        lost_subs.clear(); // contained: no notification, key still drops below
+                    }
+                }
+                drop_key_locked(key); // ALWAYS runs — allocates nothing, cannot throw
             }
             // Bookkeeping is already clean, but the message is still completed from
             // the pre-sized buffer: a mechanism error is caller-controlled in length,
             // so concatenating it here would put an unbounded allocation past the
             // commit and break the property the whole layer rests on.
-            return std::unexpected(watch_fail_msg.finish(w.error()));
+            watch_failed = true;
+            watch_fail_result = watch_fail_msg.finish(w.error());
         }
+    }
+    if (watch_failed) {
+        // Both `ops` and `mu_` are released here — see the comment above lost_ev's
+        // declaration for why that's load-bearing, not incidental.
+        if (!lost_subs.empty()) {
+            subscription_lost_.fetch_add(1, std::memory_order_relaxed);
+            try {
+                deliver(lost_ev, lost_subs);
+            } catch (...) {
+            }
+        }
+        return std::unexpected(std::move(watch_fail_result));
     }
 
     if (arm_race_hook_for_test_)
@@ -1624,38 +1704,75 @@ void SparkEngine::emit_event(const std::string& key, SparkData data) {
 }
 
 void SparkEngine::report_fault(const std::string& key, bool faulted, std::string_view reason) {
-    std::lock_guard lk(mu_);
-    auto it = armed_.find(key);
-    if (it == armed_.end())
-        return; // disarmed between the mechanism's report and here
-    if (it->second.faulted == faulted)
-        return; // no edge — idempotent per state
-    it->second.faulted = faulted;
-    if (faulted) {
-        watch_faults_.fetch_add(1, std::memory_order_relaxed);
-        spdlog::warn("SparkEngine: watch '{}' FAULTED — armed but not watching ({})", key, reason);
-    } else {
-        spdlog::info("SparkEngine: watch '{}' recovered", key);
+    SparkEvent ev;
+    std::vector<Subscriber> subs;
+    {
+        std::lock_guard lk(mu_);
+        auto it = armed_.find(key);
+        if (it == armed_.end())
+            return; // disarmed between the mechanism's report and here — unchanged
+        if (it->second.faulted == faulted)
+            return; // no edge — idempotent per state — unchanged
+        it->second.faulted = faulted;
+        if (faulted) {
+            watch_faults_.fetch_add(1, std::memory_order_relaxed);
+            spdlog::warn("SparkEngine: watch '{}' FAULTED — armed but not watching ({})", key, reason);
+        } else {
+            spdlog::info("SparkEngine: watch '{}' recovered", key);
+        }
+        // #2818: the faulted-flag flip and its log/counter above already committed —
+        // contained the same way as arm_impl's Lost snapshot: a bad_alloc here (the
+        // string copies) costs a lost notification, never an unwound state flip.
+        try {
+            ev.key = key;
+            ev.type = it->second.spec.type;
+            ev.seq = ++it->second.seq;
+            ev.at = std::chrono::system_clock::now();
+            ev.kind = faulted ? SparkEventKind::Faulted : SparkEventKind::Recovered;
+            ev.detail.assign(reason);
+            subs = it->second.subs;
+        } catch (...) {
+            subs.clear();
+        }
+    }
+    if (!subs.empty()) {
+        try {
+            deliver(ev, subs); // mu_ already released — safe for an Inline handler to
+                                // re-arm/re-query this same type
+        } catch (...) {
+        }
     }
 }
 
 void SparkEngine::deliver(const SparkEvent& ev, const std::vector<Subscriber>& subs) {
     for (const auto& sub : subs) {
+        // #2818: one key-level condition fans out to potentially several
+        // differently-subscribed consumers, so a single shared SparkEvent object
+        // cannot itself name "the" subscription — stamp it per-recipient. Copy only
+        // for a non-Fired kind: the Fired hot path (µs-median Inline SLO) must stay
+        // untouched, and subscription_id is meaningless for Fired anyway.
+        const bool needs_copy = ev.kind != SparkEventKind::Fired;
+        SparkEvent stamped;
+        if (needs_copy) {
+            stamped = ev;
+            stamped.subscription_id = sub.id;
+        }
+        const SparkEvent& out = needs_copy ? stamped : ev;
         if (sub.tier == SparkTier::Inline) {
             // ADR §3 watchdog: every inline call is timed; the counters feed the
             // Stage-11 resource gate. Handlers must not throw — but the watcher
             // must survive a contract breach, so catch + count anyway.
             const auto t0 = std::chrono::steady_clock::now();
             try {
-                sub.inline_fn(ev);
+                sub.inline_fn(out);
             } catch (const std::exception& e) {
                 inline_errors_.fetch_add(1, std::memory_order_relaxed);
                 spdlog::error("SparkEngine: INLINE handler threw on spark '{}' (contract breach): {}",
-                              ev.key, e.what());
+                              out.key, e.what());
             } catch (...) {
                 inline_errors_.fetch_add(1, std::memory_order_relaxed);
                 spdlog::error("SparkEngine: INLINE handler threw on spark '{}' (contract breach)",
-                              ev.key);
+                              out.key);
             }
             const auto us = static_cast<std::uint64_t>(
                 std::chrono::duration_cast<std::chrono::microseconds>(
@@ -1694,7 +1811,7 @@ void SparkEngine::deliver(const SparkEvent& ev, const std::vector<Subscriber>& s
                 spdlog::warn("SparkEngine: consumer '{}' queue full (cap {}) — dropped oldest",
                              consumer->name, consumer->cap);
             }
-            consumer->queue.push_back(ev);
+            consumer->queue.push_back(out);
         }
         consumer->cv.notify_one();
     }
@@ -1738,6 +1855,7 @@ SparkEngineStats SparkEngine::stats() const {
         arm_race_unwatch_failures_.load(std::memory_order_relaxed);
     s.disarm_unwatch_failures_total = disarm_unwatch_failures_.load(std::memory_order_relaxed);
     s.teardown_join_timeouts_total = teardown_join_timeouts_.load(std::memory_order_relaxed);
+    s.subscription_lost_total = subscription_lost_.load(std::memory_order_relaxed);
     s.consumer_threads_detached = consumer_threads_detached_.load(std::memory_order_relaxed);
     s.events_total = events_total_.load(std::memory_order_relaxed);
     s.queued_delivered_total = delivery_->delivered.load(std::memory_order_relaxed);
@@ -1750,6 +1868,20 @@ SparkEngineStats SparkEngine::stats() const {
     s.inline_over_100us_total = inline_over_100us_.load(std::memory_order_relaxed);
     s.inline_over_10ms_total = inline_over_10ms_.load(std::memory_order_relaxed);
     return s;
+}
+
+SubscriptionHealth SparkEngine::subscription_health(SubscriptionId id) const {
+    std::lock_guard lk(mu_);
+    auto sit = sub_keys_.find(id);
+    if (sit == sub_keys_.end())
+        return SubscriptionHealth::Dead;
+    auto ait = armed_.find(sit->second);
+    // armed_ missing the key sit->second points at cannot happen absent a bug
+    // (sub_keys_/armed_ are kept in lockstep everywhere they're mutated), but
+    // treat it as Dead rather than UB if it ever does.
+    if (ait == armed_.end())
+        return SubscriptionHealth::Dead;
+    return ait->second.faulted ? SubscriptionHealth::Faulted : SubscriptionHealth::Healthy;
 }
 
 std::map<SparkType, SparkMechanismStats> SparkEngine::stats_by_type() const {
