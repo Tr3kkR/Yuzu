@@ -632,7 +632,7 @@ void GuardianSparkRuntime::detach_all() {
 }
 
 std::optional<GuardianSparkRuntime::DisarmWork>
-GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id) {
+GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id, const char* lifecycle_kind) {
     // #2233 item 3: rule_id belongs to a key whose FIRST arm is still resolving
     // off-lock (attach_rule released registry_mu_ before the backend call) - it has
     // no rules_/keys_ entry to withdraw yet. Mark the in-flight episode withdrawn so
@@ -688,13 +688,122 @@ GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id) {
             kit->second->pending_initial.erase(rule_id);
     }
     if (known)
-        enqueue_lifecycle_locked(rule_id, gen, "disarmed", guard_type, rule_name);
+        enqueue_lifecycle_locked(rule_id, gen, lifecycle_kind, guard_type, rule_name);
     return work;
 }
 
+void GuardianSparkRuntime::on_subscription_lost(const std::string& key,
+                                                 std::uint64_t subscription_id) {
+    // #2818: the underlying watch for `key` was torn down entirely - every rule
+    // currently on it lost its enforcement, not just withdrew from it. Report each as
+    // "errored" (guardian_outbox.hpp's documented vocabulary) rather than "disarmed",
+    // and wait for the next server-issued PushRules (or an agent restart, whose boot
+    // re-arm calls reconcile_rule_locked for every persisted rule unconditionally) to
+    // re-attach - no immediate self-heal in this PR (Dave's call, 2026-09-06: smaller,
+    // safer diff, no new blocking-retry policy).
+    std::function<void()> outbox_waker;
+    {
+        std::lock_guard<std::mutex> lk{registry_mu_};
+        if (stopping_)
+            return;
+        const auto kit = keys_.find(key);
+        // Staleness guard: a fresh re-arm may have already superseded this
+        // notification by the time it's dispatched (async queue hop) - subscription_id
+        // pins it to the EXACT dead id the engine told us about, mirroring
+        // evaluate_key's own shared_ptr-identity re-check for the ordinary Fired case.
+        if (kit == keys_.end() || kit->second->subscription != subscription_id)
+            return;
+        const std::vector<std::string> rule_ids = index_->rules_for(key); // copy: mutates below
+        for (const auto& rid : rule_ids)
+            detach_rule_locked(rid, "errored"); // DisarmWork discarded: the guard above
+                                                 // already proves this id is dead, so any
+                                                 // resulting disarm() is a guaranteed,
+                                                 // already-idempotent no-op
+        outbox_waker = outbox_enqueue_waker_;
+    }
+    if (outbox_waker)
+        outbox_waker();
+}
+
+void GuardianSparkRuntime::on_subscription_faulted(const std::string& key,
+                                                    std::uint64_t subscription_id, bool faulted,
+                                                    const std::string& detail) {
+    // #2818: the watch reported itself unhealthy (or recovered) WITHOUT the key being
+    // torn down - Armed still exists at the engine level, so unlike Lost this does NOT
+    // touch keys_/rules_/index_. Just surfaces a Health-domain entry per active rule.
+    std::vector<OutboxEntry> entries;
+    std::function<void()> outbox_waker;
+    {
+        std::lock_guard<std::mutex> lk{registry_mu_};
+        if (stopping_)
+            return;
+        const auto kit = keys_.find(key);
+        if (kit == keys_.end() || kit->second->subscription != subscription_id)
+            return; // stale - same guard as on_subscription_lost
+        const auto now_wall = std::chrono::system_clock::now().time_since_epoch();
+        const std::int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now_wall).count();
+        const std::int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(now_wall).count();
+        const std::string agent_id = agent_id_fn_ ? agent_id_fn_() : std::string{};
+        for (const auto& rid : index_->rules_for(key)) {
+            const auto rit = rules_.find(rid);
+            if (rit == rules_.end() || !rit->second->active)
+                continue;
+            const auto& rg = rit->second;
+            entries.push_back(OutboxEntry::health(
+                rid, rg->generation, make_event_id(rid, ms, agent_id), ns,
+                /*healthy=*/!faulted, faulted ? detail : std::string{},
+                guard_type_for(rg->assertion.kind), rg->assertion.rule_name));
+        }
+        if (!entries.empty()) {
+            std::lock_guard<std::mutex> ob{outbox_mu_};
+            outbox_.enqueue_all(std::move(entries)); // best-effort, same posture as
+                                                      // evaluate_key's own enqueue - a
+                                                      // rejected (full) enqueue is dropped
+            outbox_waker = outbox_enqueue_waker_;
+        }
+    }
+    if (outbox_waker)
+        outbox_waker();
+}
+
+void GuardianSparkRuntime::revalidate_subscriptions() {
+    // Snapshot under registry_mu_, query health with it released (subscription_health()
+    // is cheap/lock-only on a DIFFERENT mutex, but this keeps the same
+    // snapshot-then-act discipline the rest of this file uses rather than nesting
+    // locks). on_subscription_lost re-validates staleness itself before acting, so a
+    // fresh re-arm landing between this snapshot and that call is still handled
+    // correctly - no duplicated detach logic here.
+    std::vector<std::pair<std::string, std::uint64_t>> snapshot;
+    {
+        std::lock_guard<std::mutex> lk{registry_mu_};
+        if (stopping_)
+            return;
+        snapshot.reserve(keys_.size());
+        for (const auto& [key, pk] : keys_)
+            snapshot.emplace_back(key, pk->subscription);
+    }
+    for (const auto& [key, subscription_id] : snapshot) {
+        if (backend_->subscription_health(subscription_id) == SubscriptionHealth::Dead)
+            on_subscription_lost(key, subscription_id);
+    }
+}
+
 void GuardianSparkRuntime::on_event(const SparkEvent& ev) {
-    // The event is an invalidation HINT; evaluate_key re-reads live state.
-    evaluate_key(ev.key, EvalReason::Event);
+    switch (ev.kind) {
+    case SparkEventKind::Fired:
+        // The event is an invalidation HINT; evaluate_key re-reads live state.
+        evaluate_key(ev.key, EvalReason::Event);
+        return;
+    case SparkEventKind::Lost:
+        on_subscription_lost(ev.key, ev.subscription_id);
+        return;
+    case SparkEventKind::Faulted:
+        on_subscription_faulted(ev.key, ev.subscription_id, /*faulted=*/true, ev.detail);
+        return;
+    case SparkEventKind::Recovered:
+        on_subscription_faulted(ev.key, ev.subscription_id, /*faulted=*/false, ev.detail);
+        return;
+    }
 }
 
 void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason reason) {

@@ -152,6 +152,14 @@ public:
     virtual ~ISparkBackend() = default;
     virtual std::expected<std::uint64_t, std::string> arm(const SparkSpec& spec) = 0;
     virtual void disarm(std::uint64_t subscription) = 0;
+
+    /// #2818 poll backstop: cheap, lock-only, no I/O (see SubscriptionHealth's own doc
+    /// comment, spark.hpp). Non-pure so no pre-existing implementation (production or
+    /// test fake) is forced to change — a double not exercising #2818 simply reports
+    /// every subscription Healthy, which is the correct "not modeling this" default.
+    virtual SubscriptionHealth subscription_health(std::uint64_t /*subscription*/) {
+        return SubscriptionHealth::Healthy;
+    }
 };
 
 /// Injected monotonic clock (steady). Tests supply a deterministic source; the
@@ -278,6 +286,18 @@ public:
     /// eval path for all reasons. Serialised per key; commits a verdict to the
     /// outbox (or a health event on Unknown). No-op if stopping or the key is gone.
     void evaluate_key(const std::string& key, EvalReason reason);
+
+    /// #2818 poll backstop: scan every armed key and query the backend's
+    /// subscription_health() for it, cheaply (no I/O). A Dead subscription is
+    /// reported "errored" exactly like a delivered Lost notification would have -
+    /// this is the delivery-guarantee backstop for the case where a genuine Lost
+    /// notification was silently dropped by a full Queued consumer channel
+    /// (queued_dropped_total), not an independent detection path. Intended to be
+    /// driven off GuardianConvergenceScheduler's existing ~5s priority lane - no new
+    /// thread. Scoped to Dead only: a missed Faulted/Recovered toggle is
+    /// health-reporting-only (no enforcement break, no keys_ mutation), lower
+    /// severity, and not backstopped here.
+    void revalidate_subscriptions();
 
     /// Drain buffered emits through `send`. `send(const OutboxEntry&) -> SendResult`.
     /// Drains the Lifecycle audit log FIRST, then (only if it fully cleared) the
@@ -712,7 +732,24 @@ private:
     /// registry_mu_ held. Returns backend work still owed (a watcher disarm on the
     /// rule's key ->0 edge) for the CALLER to submit off-lock once it unlocks - see
     /// the class comment above and attach_rule/detach_rule/detach_all's own docs.
-    std::optional<DisarmWork> detach_rule_locked(const std::string& rule_id);
+    /// `lifecycle_kind` names the audit entry ("disarmed" | "errored" -
+    /// guardian_outbox.hpp's documented vocabulary): #2818's on_subscription_lost
+    /// passes "errored" - the rule wasn't withdrawn, its enforcement broke - every
+    /// other call site keeps the default.
+    std::optional<DisarmWork> detach_rule_locked(const std::string& rule_id,
+                                                  const char* lifecycle_kind = "disarmed");
+    /// #2818: `key`'s watch died entirely (SparkEventKind::Lost, or revalidate_
+    /// subscriptions() finding it Dead). Staleness-guarded on `subscription_id`
+    /// against keys_[key]->subscription: a fresh re-arm superseding this key between
+    /// the detection and this call means there is nothing to do. Detaches every rule
+    /// on the key as "errored".
+    void on_subscription_lost(const std::string& key, std::uint64_t subscription_id);
+    /// #2818: `key`'s watch toggled health WITHOUT being torn down (B1 Faulted/
+    /// Recovered) - same staleness guard, but does NOT touch keys_/rules_/index_,
+    /// since the key is still armed. Surfaces a Health-domain outbox entry per active
+    /// rule on the key.
+    void on_subscription_faulted(const std::string& key, std::uint64_t subscription_id,
+                                  bool faulted, const std::string& detail);
     /// Submit a disarm and discard/count its outcome - detach's audit trail and
     /// confirmed-state mutation are already committed by the time this runs (see
     /// DisarmWork's doc); this is best-effort teardown of the OS watcher only,
