@@ -157,6 +157,28 @@ void on_disk_appeared(DADiskRef disk, void* context) {
         if (!is_removable_or_ejectable(disk))
             return; // internal fixed disk — never reaches the seam
         RemovableDiskArbEvent ev = build_event(disk, "attached");
+        // ADMIT ONLY WHAT THE SNAPSHOT CAN ALSO EXPRESS.
+        //
+        // DiskArbitration reports WHOLE media as well as its partitions: a
+        // single stick delivers a callback for disk4 (whole, no mount, no
+        // MediaUUID -> its device_key falls back to the BSD name) and another
+        // for disk4s1. snapshot_attached() enumerates getfsstat MOUNTS, so it
+        // can only ever see disk4s1. Admitting both gave one physical device
+        // TWO device_keys: two `attached` rows, and then the reconciler emitted
+        // a `detached` for the whole-disk key -- evidenced as a missed
+        // callback -- while the stick was still plugged in. The BSD name is not
+        // stable across reconnects either, so the split key changed on every
+        // replug.
+        //
+        // Requiring a volume path makes the callback and the snapshot agree by
+        // construction, which is the same property that made the Windows
+        // serial-keyed guard correct. RESIDUAL, accepted and documented: a
+        // removable device that is inserted but never mounts is not reported on
+        // macOS. That is a missing row rather than a fabricated one, and the
+        // per-tick reconciliation still picks the device up the moment it
+        // mounts.
+        if (ev.volume_path.empty())
+            return;
         impl->admitted[ev.bsd_name] = ev; // remember identity for a future disappear (R-010)
         impl->on_event(ev);
     } catch (...) {

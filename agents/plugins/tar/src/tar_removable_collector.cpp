@@ -155,7 +155,7 @@ using yuzu::agent::ScopedFd;
 ///    tar_cursor.hpp's on_enabled_changed contract).
 class RemovableCursorSource : public CursorSource {
 public:
-    [[nodiscard]] std::string name() const override { return "removable"; }
+    [[nodiscard]] std::string name() const noexcept override { return "removable"; }
 
     void start(TarDatabase& db) override;
     CursorCollectResult collect(TarDatabase& db,
@@ -320,6 +320,8 @@ private:
 
 #if defined(__APPLE__)
     std::unique_ptr<RemovableDiskArbSession> da_session_;
+    // Guarded by disable_mu_, which the DA callback already takes.
+    std::set<std::string> replay_suppress_;
 #endif
 
 #if defined(__linux__)
@@ -369,6 +371,26 @@ void RemovableCursorSource::start(TarDatabase& db) {
     if (auto existing = db.get_cursor("removable"); existing && existing->has_value()) {
         pending_reenable_gap_ = true;
         pending_gap_cause_ = GapCause::Restart;
+        // REGISTRATION REPLAY SUPPRESSION.
+        //
+        // DARegisterDiskAppearedCallback does not only report FUTURE arrivals:
+        // it immediately replays an appeared callback for every matching disk
+        // already present. Measured on this host, registering with no hardware
+        // change at all delivered 22 of them. The callback stamps ts = now, so
+        // without this every agent restart writes a fresh `attached` row, dated
+        // at restart, for a stick that has been plugged in for days -- a
+        // fabricated arrival in a forensic table, on every restart.
+        //
+        // The callback cannot read the database (rule 6: it runs on DA's
+        // dispatch queue), so the set of already-known devices is loaded HERE,
+        // once, from the cursor we have just read. A key is dropped from the
+        // set the first time it suppresses, so a genuine detach-and-reattach
+        // later in the same process is still reported.
+        const auto st = decode_removable_cursor(**existing);
+        std::lock_guard lock(disable_mu_);
+        for (const auto& [key, present] : st.attach_set)
+            if (present)
+                replay_suppress_.insert(key);
     }
     da_session_ = std::make_unique<RemovableDiskArbSession>();
     da_session_->start([this](RemovableDiskArbEvent ev) {
@@ -393,6 +415,16 @@ void RemovableCursorSource::start(TarDatabase& db) {
         re.bus = "diskarb";
         re.evidence = "macos:diskarbitration:" + std::string(ev.bsd_name) +
                      ":anonymous-serial-fallback";
+        // Registration replay: this device was already in the persisted
+        // attach_set, so DA is telling us about an arrival we already know
+        // about, not a new one.
+        if (re.action == "attached") {
+            const auto it = replay_suppress_.find(re.device_key);
+            if (it != replay_suppress_.end()) {
+                replay_suppress_.erase(it); // once only -- a real re-attach still reports
+                return;
+            }
+        }
         re.record_key = next_seq_record_key("diskarb", re.device_key);
         queue_.push(std::move(re));
     });
@@ -548,8 +580,18 @@ CursorCollectResult RemovableCursorSource::collect(TarDatabase& db,
                         ? CursorOutcome::CursorLost
                         : (cursor_json.has_value() ? CursorOutcome::Advanced : CursorOutcome::Baseline);
 
-    if (!db.insert_removable_events_and_cursor(events, result.new_cursor_json))
+    if (auto ins = db.insert_removable_events_and_cursor(events, result.new_cursor_json); !ins) {
+        // A KeyCollision is PERMANENT (tar_db.hpp): this source re-derives the
+        // same batch every tick and the store refuses it every tick, so retrying
+        // is a silent stall, not recovery. It also means rule 3(a) was violated
+        // -- a persisted field is not deterministically re-derivable -- which is
+        // a bug here rather than a condition to wait out.
+        if (ins.error() == TarDatabase::CursorInsertError::KeyCollision)
+            spdlog::critical("TAR removable: record_key COLLISION on the macOS leg -- a persisted "
+                             "field is not deterministically re-derivable (rule 3a). Capture is "
+                             "STUCK and retrying cannot clear it.");
         throw IncompleteCaptureError("TAR removable: macOS event/cursor commit failed");
+    }
     // Only clear/advance transient state AFTER the commit above succeeds
     // (R-003/R-004) — a thrown IncompleteCaptureError above never reaches
     // here, so a failed commit leaves pending_reenable_gap_ and
@@ -973,8 +1015,18 @@ CursorCollectResult RemovableCursorSource::collect(TarDatabase& db,
     if (!mounts_note.empty())
         result.detail = mounts_note;
 
-    if (!db.insert_removable_events_and_cursor(events, result.new_cursor_json))
+    if (auto ins = db.insert_removable_events_and_cursor(events, result.new_cursor_json); !ins) {
+        // A KeyCollision is PERMANENT (tar_db.hpp): this source re-derives the
+        // same batch every tick and the store refuses it every tick, so retrying
+        // is a silent stall, not recovery. It also means rule 3(a) was violated
+        // -- a persisted field is not deterministically re-derivable -- which is
+        // a bug here rather than a condition to wait out.
+        if (ins.error() == TarDatabase::CursorInsertError::KeyCollision)
+            spdlog::critical("TAR removable: record_key COLLISION on the Linux leg -- a persisted "
+                             "field is not deterministically re-derivable (rule 3a). Capture is "
+                             "STUCK and retrying cannot clear it.");
         throw IncompleteCaptureError("TAR removable: Linux event/cursor commit failed");
+    }
     // Only clear/advance transient state AFTER the commit above succeeds
     // (R-003/R-004) — see the identical comment in the macOS leg.
     queue_.ack_through(batch.last_seq);
@@ -1532,8 +1584,18 @@ CursorCollectResult RemovableCursorSource::collect(TarDatabase& db,
            "TAR removable: a Windows channel owed a head jump but its head could not be read -- "
            "retaining cursor and re-enable state");
     }
-    if (!db.insert_removable_events_and_cursor(events, result.new_cursor_json))
+    if (auto ins = db.insert_removable_events_and_cursor(events, result.new_cursor_json); !ins) {
+        // A KeyCollision is PERMANENT (tar_db.hpp): this source re-derives the
+        // same batch every tick and the store refuses it every tick, so retrying
+        // is a silent stall, not recovery. It also means rule 3(a) was violated
+        // -- a persisted field is not deterministically re-derivable -- which is
+        // a bug here rather than a condition to wait out.
+        if (ins.error() == TarDatabase::CursorInsertError::KeyCollision)
+            spdlog::critical("TAR removable: record_key COLLISION on the Windows leg -- a persisted "
+                             "field is not deterministically re-derivable (rule 3a). Capture is "
+                             "STUCK and retrying cannot clear it.");
         throw IncompleteCaptureError("TAR removable: Windows event/cursor commit failed");
+    }
     pending_reenable_gap_ = false; // only clear after the commit above succeeds (R-003)
     return result;
 }

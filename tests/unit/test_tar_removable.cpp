@@ -617,6 +617,30 @@ TEST_CASE("a POSIX sibling whose NAME contains a backslash is not under the remo
     CHECK(exec_path_under_removable_root("/media/user/USB/decoy", "/media/user/USB"));
 }
 
+TEST_CASE("a non-UTF-8 exec_path cannot take the cursor write down with it (HIGH-4)",
+          "[tar][removable][cursor][utf8]") {
+    // exec_seen stores ProcessInfo::exec_path verbatim, and on Linux that is raw
+    // bytes from /proc/<pid>/exe -- a binary on a FAT/exFAT stick can be named
+    // with bytes that are not valid UTF-8. nlohmann's default dump() throws on
+    // those, and the throw lands on collect()'s path, so the tick and every
+    // retry are lost for as long as that process runs. It would also violate
+    // the contract's rule that collect() throws only IncompleteCaptureError.
+    yuzu::tar::RemovableCursorState st;
+    st.attach_set["usb-1"] = true;
+    st.exec_seen.insert(std::string("usb-1\x1f/mnt/usb/\xff\xfe-payload"));
+
+    std::string encoded;
+    REQUIRE_NOTHROW(encoded = yuzu::tar::encode_removable_cursor(st));
+    CHECK_FALSE(encoded.empty());
+
+    // And it must still round-trip to something usable rather than poisoning
+    // the next decode.
+    const auto back = yuzu::tar::decode_removable_cursor(encoded);
+    CHECK_FALSE(back.malformed);
+    CHECK(back.attach_set.count("usb-1") == 1);
+    CHECK(back.exec_seen.size() == 1);
+}
+
 TEST_CASE("a re-attach starts a new exec session, so the same binary does not re-collide (HIGH-3)",
           "[tar][removable][exec][session]") {
     // The exec key must be STABLE while a device stays attached (one row per

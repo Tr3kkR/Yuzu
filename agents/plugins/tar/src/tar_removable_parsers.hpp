@@ -470,7 +470,17 @@ inline std::string encode_removable_cursor(const RemovableCursorState& st) {
     for (const auto& [k, e] : st.attach_epoch)
         epochs[k] = e;
     j["attach_epoch"] = epochs;
-    return j.dump();
+    // Never let a path decide whether the cursor can be written.
+    //
+    // exec_seen holds ProcessInfo::exec_path verbatim, and on Linux that is raw
+    // bytes from /proc/<pid>/exe -- a binary on a FAT/exFAT stick can carry a
+    // name that is not valid UTF-8. nlohmann's default dump() THROWS on that,
+    // and the throw lands on collect()'s path: the tick is lost, and so is
+    // every retry, for as long as that process runs. The contract also says
+    // collect() throws only IncompleteCaptureError, which this would not be.
+    // Replacing the invalid bytes keeps the cursor writable; the affected entry
+    // is a dedupe key, not evidence, and the row itself carries the real path.
+    return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
 }
 
 /// A channel has WRAPPED (tar_cursor.hpp rule 2) when the stored cursor
