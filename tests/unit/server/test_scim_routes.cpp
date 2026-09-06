@@ -1098,11 +1098,15 @@ TEST_CASE("ScimRoutes: deprovision refused for a DB-elevated admin even with a C
 
     // A second AuthManager over the SAME AuthDB file/object, standing in
     // for a fresh process: its users_ cache has never been populated for
-    // either username.
+    // either username. (NOTE: get_user_role() is no longer a valid "cache is
+    // cold" probe as of a later governance BLOCKING fix that made it itself
+    // AuthDB-authoritative — see auth.cpp's doc on that method. This
+    // incidentally closes PR #2018's own N1 follow-up, which flagged that
+    // get_user_role()'s staleness class also reached two SCIM PUT/PATCH
+    // desync branches beyond the H2 fix below; those now read live state
+    // too, with no further change needed here.)
     auth::AuthManager cold_auth_mgr;
     cold_auth_mgr.set_auth_db(f.auth_db.get());
-    REQUIRE_FALSE(cold_auth_mgr.get_user_role("cora").has_value());
-    REQUIRE_FALSE(cold_auth_mgr.get_user_role("dana").has_value());
 
     // Prime the cache for "dana" only, via `reactivate_user` — a legitimate,
     // idempotent AuthDB write (harmless on an already-active row; clears

@@ -575,7 +575,16 @@ public:
     /// Returns false if user not found.
     bool update_role(const std::string& username, Role new_role);
 
-    /// Look up a user's legacy role. Returns nullopt if user not found.
+    /// Look up a user's legacy role. Returns nullopt if user not found (or,
+    /// in AuthDB-backed mode, if the store could not answer - never falls
+    /// back to a cached value on a store error). AuthDB-authoritative on
+    /// EVERY call when configured (no cache, no cache fallback) - see the
+    /// .cpp definition's doc for why (Gate 3 governance BLOCKING finding,
+    /// #4020: this is the call auth_routes.cpp's legacy API-token session
+    /// synthesis makes on every request, so a stale cached role here was a
+    /// live stale-privilege gap after a demotion, independent of
+    /// authenticate()/verify_password() entirely). Config-file mode (no
+    /// AuthDB) remains cache-only, unchanged.
     std::optional<Role> get_user_role(const std::string& username) const;
 
     /// Check whether any users are configured.

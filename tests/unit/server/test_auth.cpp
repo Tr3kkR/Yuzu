@@ -336,7 +336,13 @@ TEST_CASE("authenticate succeeds for a cold-cache DB hit (#4020)",
 
     AuthManager cold_mgr;
     cold_mgr.set_auth_db(auth_db.get());
-    REQUIRE_FALSE(cold_mgr.get_user_role("cora").has_value()); // genuinely cold
+    // NOTE: get_user_role() is no longer a valid "is this cache cold" probe —
+    // it became AuthDB-authoritative (Gate 3 governance BLOCKING fix), so it
+    // now correctly finds "cora" via a direct DB read regardless of whether
+    // users_ has ever cached her. `cold_mgr` genuinely never having cached
+    // her is still true and still the point of this test — it's proven by
+    // the call below succeeding via find_user_or_hydrate's own cold-cache
+    // path, not by get_user_role() returning nullopt beforehand.
 
     auto token = cold_mgr.authenticate("cora", "password1234");
     REQUIRE(token.has_value());
@@ -373,7 +379,13 @@ TEST_CASE("verify_password returns the DB role for a cold-cache DB hit (#4020)",
 
     AuthManager cold_mgr;
     cold_mgr.set_auth_db(auth_db.get());
-    REQUIRE_FALSE(cold_mgr.get_user_role("cora").has_value()); // genuinely cold
+    // NOTE: get_user_role() is no longer a valid "is this cache cold" probe —
+    // it became AuthDB-authoritative (Gate 3 governance BLOCKING fix), so it
+    // now correctly finds "cora" via a direct DB read regardless of whether
+    // users_ has ever cached her. `cold_mgr` genuinely never having cached
+    // her is still true and still the point of this test — it's proven by
+    // the call below succeeding via find_user_or_hydrate's own cold-cache
+    // path, not by get_user_role() returning nullopt beforehand.
 
     auto role = cold_mgr.verify_password("cora", "password1234");
     REQUIRE(role.has_value());
@@ -454,6 +466,85 @@ TEST_CASE("authenticate on a cold cache is a plain miss for an unknown user (#40
     cold_mgr.set_auth_db(auth_db.get());
     REQUIRE_FALSE(cold_mgr.authenticate("nonexistent", "password1234").has_value());
     REQUIRE_FALSE(cold_mgr.verify_password("nonexistent", "password1234").has_value());
+}
+
+// ── get_user_role(): AuthDB-authoritative on every call (Gate 3 governance
+// BLOCKING finding, fix shape confirmed via Sol/codex opine) ────────────────
+//
+// get_user_role() previously had NO AuthDB fallback at all - it was a pure
+// `users_` cache read, completely independent of authenticate()/
+// verify_password() (the two functions #4020's other fixes touch). It is
+// what auth_routes.cpp's legacy API-token session synthesis calls on EVERY
+// request, so a stale cached role here was a live stale-privilege gap for
+// any manager that ever cached the user, reachable without any further
+// password login at all.
+
+TEST_CASE("get_user_role reflects a cross-manager demotion immediately, no re-login needed",
+          "[pg][auth][cold_cache]") {
+    yuzu::test::AuthDbPg auth_db;
+
+    AuthManager mgr_a;
+    mgr_a.set_auth_db(auth_db.get());
+    REQUIRE(mgr_a.upsert_user("cora", "password1234", Role::admin));
+    REQUIRE(mgr_a.get_user_role("cora") == Role::admin);
+
+    AuthManager mgr_b;
+    mgr_b.set_auth_db(auth_db.get());
+    REQUIRE(mgr_b.update_role("cora", Role::user)); // the "other replica" demotes
+
+    // No re-login through mgr_a at all - get_user_role() itself must reflect
+    // the demotion on its own next call.
+    REQUIRE(mgr_a.get_user_role("cora") == Role::user);
+}
+
+TEST_CASE("get_user_role reflects a cross-manager removal immediately, no re-login needed",
+          "[pg][auth][cold_cache]") {
+    yuzu::test::AuthDbPg auth_db;
+
+    AuthManager mgr_a;
+    mgr_a.set_auth_db(auth_db.get());
+    REQUIRE(mgr_a.upsert_user("cora", "password1234", Role::admin));
+    REQUIRE(mgr_a.get_user_role("cora") == Role::admin);
+
+    AuthManager mgr_b;
+    mgr_b.set_auth_db(auth_db.get());
+    REQUIRE(mgr_b.remove_user("cora"));
+
+    REQUIRE_FALSE(mgr_a.get_user_role("cora").has_value());
+}
+
+TEST_CASE("get_user_role fails closed (not cached-admin) when AuthDB is pool-saturated",
+          "[pg][auth][cold_cache]") {
+    // The critical negative case: a DB-backed manager must NEVER fall back to
+    // a stale cached role on a store error - that would silently reopen the
+    // exact gap this fix closes, at the one moment (a degraded store) it
+    // matters most.
+    yuzu::test::AuthDbPg auth_db;
+
+    AuthManager mgr;
+    mgr.set_auth_db(auth_db.get());
+    REQUIRE(mgr.upsert_user("cora", "password1234", Role::admin));
+    REQUIRE(mgr.get_user_role("cora") == Role::admin);
+
+    std::vector<yuzu::server::pg::PgPool::Lease> held;
+    for (int i = 0; i < 4; ++i) {
+        auto lease = auth_db.pool().try_acquire_for(std::chrono::seconds(2));
+        REQUIRE(lease);
+        held.push_back(std::move(lease));
+    }
+
+    REQUIRE_FALSE(mgr.get_user_role("cora").has_value()); // NOT Role::admin from cache
+
+    held.clear();
+    REQUIRE(mgr.get_user_role("cora") == Role::admin); // recovers once the pool frees
+}
+
+TEST_CASE("get_user_role stays cache-only in config-file (no AuthDB) mode",
+          "[auth][cold_cache]") {
+    auto mgr = make_temp_auth();
+    mgr->upsert_user("alice", "secret123456", Role::admin);
+    REQUIRE(mgr->get_user_role("alice") == Role::admin);
+    REQUIRE_FALSE(mgr->get_user_role("nobody").has_value());
 }
 
 TEST_CASE("authenticate mints a session at the CURRENT role after a cross-manager demotion "

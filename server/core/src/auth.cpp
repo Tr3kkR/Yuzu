@@ -1725,6 +1725,56 @@ bool AuthManager::reactivate_user(const std::string& username) {
 }
 
 std::optional<Role> AuthManager::get_user_role(const std::string& username) const {
+    // Gate 3 governance BLOCKING finding (cpp-safety), fix shape confirmed via
+    // Sol/codex opine: this was a pure `users_` cache read with NO AuthDB
+    // fallback at all - completely independent of authenticate()/
+    // verify_password(), which #4020's other fixes never reach from here.
+    // `auth_routes.cpp`'s legacy API-token session synthesis calls this
+    // EVERY request (`synth.role = get_user_role(principal_id).value_or(user)`)
+    // - its own adjacent (pre-existing, not written by this change) comment
+    // already asserts the intent ("queries the current role on every call, so
+    // a creator who's been demoted... will produce a user-role session"),
+    // which the cache-only implementation never actually delivered. A
+    // DEMOTED user's still-valid token (tokens are NOT revoked on a role
+    // change, by design - the documented contract is "inherits the creator's
+    // CURRENT role", not "frozen at mint time") kept resolving to their
+    // pre-demotion role indefinitely on any manager whose cache was ever
+    // warmed for that username.
+    //
+    // (Removal is a narrower residual: production's actual user-deletion
+    // paths - the dashboard DELETE and SCIM deprovision, both via
+    // deprovision_revoke.hpp/ADR-2001 - already revoke a removed principal's
+    // API tokens credentials-FIRST, before AuthManager::remove_user() is ever
+    // called, so a removed user's token already fails validation before
+    // reaching this method in production. This fix does not depend on that
+    // and also covers removal for any future/direct caller of remove_user()
+    // that bypasses the orchestrator.)
+    //
+    // Fix: when AuthDB is configured, this is now ALWAYS authoritative - no
+    // cache read, no cache fallback on a miss or a store error (falling back
+    // to `users_` on a DB error would silently reopen the exact stale-
+    // privilege gap this exists to close, the one time it matters most:
+    // while the store degrades). `users_`/`mu_` need no change - a `const`
+    // method may freely call through the already-non-const-pointee `AuthDB*`.
+    // Config-file mode (no `auth_db_`) is unchanged: the cache IS the truth
+    // there, exactly as before.
+    //
+    // Cost (deliberately accepted for this P0, not silently overlooked): an
+    // unconditional PG round-trip on every legacy-API-token-authenticated
+    // request - this repo's session/token validation paths use generation-
+    // gated or TTL caches specifically to avoid this class of cost, and this
+    // method does not. A per-entry TTL was considered and rejected here: it
+    // would convert a correctness BLOCKING closure into an explicitly-
+    // accepted stale-privilege window, and adds refresh/single-flight/outage
+    // semantics not worth inventing under this fix's time budget. If
+    // profiling later shows this cost matters, the durable answer is a
+    // generation-gated cache modeled on SessionStore/RbacStore (~1s
+    // propagation, single-flight refresh, mutation-time generation bump) -
+    // not a bare TTL.
+    if (auth_db_) {
+        auto db_user = auth_db_->get_user(username);
+        return db_user ? std::optional{db_user->role} : std::nullopt;
+    }
     std::shared_lock lock(mu_);
     auto it = users_.find(username);
     if (it == users_.end())
