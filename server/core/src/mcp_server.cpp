@@ -2127,7 +2127,8 @@ constexpr std::string_view kRbacSecurables[] = {
     "Security",       "Policy",             "DeviceToken",           "SoftwareDeployment",
     "License",        "FileRetrieval",      "GuaranteedState",       "Inventory",
     "AccessReview",   "SoftwareLicensing",  "EnginePrincipal",       "PluginConfig",
-    "PluginSecret",   "UploadGrant"};
+    "PluginSecret",   "UploadGrant",
+    "PowerManagement"};
 
 // Borrowed (name, input_schema_json) row for the registration validator's
 // 4th sequence (#2405). Views are valid only for the duration of the call.
