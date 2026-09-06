@@ -85,6 +85,7 @@
 #include "device_inventory_store.hpp"
 #include "software_inventory_store.hpp"
 #include "software_licensing_store.hpp"
+#include "app_usage_store.hpp"
 #include "product_registry_store.hpp"
 #include "sle_routes.hpp"
 #include "agent_decommission.hpp"
@@ -6611,6 +6612,27 @@ public:
                     gateway_service_->set_software_licensing_store(software_licensing_store_.get());
             }
         }
+
+        // Typed per-executable last-used projection — born-on-Postgres (wave 7
+        // PR7.2, `app_usage` daily-sync source). Independent of the stores above
+        // (its own schema, its own fail-closed). Wires BOTH server entry points
+        // (direct ReportInventory + gateway ProxyInventory) to the app_usage
+        // ingest seam. NOT registered in the agent-decommission cascade by this
+        // package (P26 wave 4 promotes it behind Decommission:Delete).
+        if (pg_pool_ && !startup_failed_) {
+            app_usage_store_ = std::make_unique<AppUsageStore>(*pg_pool_);
+            if (!app_usage_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: app_usage store migration/open failed "
+                              "(database reachable but the app_usage_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                app_usage_store_->set_metrics(&metrics_);
+                agent_service_.set_app_usage_store(app_usage_store_.get());
+                if (gateway_service_)
+                    gateway_service_->set_app_usage_store(app_usage_store_.get());
+            }
+        }
         // ProductRegistryStore — SLE canonical product identities + match links
         // (ADR-0024 Decision 4). Sibling of the licensing store: its own schema, its
         // own fail-closed open. The UCE module's compliance evaluator (ADR-1005) is
@@ -9061,6 +9083,13 @@ public:
         if (gateway_service_)
             gateway_service_->set_software_licensing_store(nullptr);
         software_licensing_store_.reset();
+        // Wave 7 PR7.2 app_usage store: same discipline. Not registered in the
+        // decommission cascade by this package, so nothing else borrows it
+        // long-lived before this reset.
+        agent_service_.set_app_usage_store(nullptr);
+        if (gateway_service_)
+            gateway_service_->set_app_usage_store(nullptr);
+        app_usage_store_.reset();
         // SLE ProductRegistryStore: the /api/v1/sle/* route closures capture `this`
         // and dereference this store only at request time; the gRPC + HTTP drains
         // above have quiesced every handler, so drop it BEFORE the pool (ADR-0012
@@ -13785,6 +13814,11 @@ private:
                 // degrade to 503 (both) — surface it so an LB/operator sees the half-state.
                 {"software_licensing_store",
                  software_licensing_store_ && software_licensing_store_->is_open()},
+                // Wave 7 PR7.2 app_usage born-on-Pg store — same rationale as the
+                // software_licensing_store row above: fail-closed at boot, but a
+                // not-open state post-boot makes ReportInventory silently ack the
+                // last-used blob with no ingest.
+                {"app_usage_store", app_usage_store_ && app_usage_store_->is_open()},
                 {"product_registry_store",
                  product_registry_store_ && product_registry_store_->is_open()},
                 // gov W7.4 R1 sre-B1: ProductPackStore became more load-bearing
@@ -22952,6 +22986,7 @@ private:
     // SLE detected-licence store (ADR-0024 Decision 4). Declared after pg_pool_
     // so it destructs before the pool.
     std::unique_ptr<SoftwareLicensingStore> software_licensing_store_;
+    std::unique_ptr<AppUsageStore> app_usage_store_;
     // SLE canonical product registry (ADR-0024 Decision 4). Declared after pg_pool_
     // so it destructs before the pool; the /api/v1/sle/* routes read it (the UCE
     // module's evaluator writes it, out-of-server).

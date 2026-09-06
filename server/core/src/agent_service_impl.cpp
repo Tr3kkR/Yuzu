@@ -35,6 +35,8 @@
 #include "software_inventory_store.hpp"
 #include "software_licensing_ingestion.hpp"
 #include "software_licensing_store.hpp"
+#include "app_usage_ingestion.hpp"
+#include "app_usage_store.hpp"
 #include "management_group_store.hpp"
 #include "notification_store.hpp"
 #include "offload_target_store.hpp"
@@ -812,6 +814,18 @@ grpc::Status AgentServiceImpl::ReportInventory(grpc::ServerContext* context,
         } catch (...) {
             spdlog::warn("ReportInventory: software_licensing ingest threw unknown exception for "
                          "agent {} — acked",
+                         agent_id);
+        }
+    }
+    if (app_usage_store_ && app_usage_store_->is_open()) {
+        try {
+            ingest_app_usage_report(*app_usage_store_, agent_id, *request, *response, &metrics_);
+        } catch (const std::exception& ex) {
+            spdlog::warn("ReportInventory: app_usage ingest threw for agent {} — acked: {}",
+                         agent_id, ex.what());
+        } catch (...) {
+            spdlog::warn("ReportInventory: app_usage ingest threw unknown exception for agent {} "
+                         "— acked",
                          agent_id);
         }
     }

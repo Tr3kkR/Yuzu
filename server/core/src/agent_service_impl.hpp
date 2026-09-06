@@ -49,6 +49,7 @@ class SoftwareInventoryStore;
 class AppPerfDailyStore;
 class DeviceInventoryStore;
 class SoftwareLicensingStore;
+class AppUsageStore;
 class UpdateRegistry;
 class ExecutionTracker;
 class FleetTopologyStore;
@@ -204,6 +205,9 @@ public:
     void set_software_licensing_store(SoftwareLicensingStore* store) {
         software_licensing_store_ = store;
     }
+    /// Typed daily-sync last-used projection (ADR-0016) — receives the
+    /// app_usage daily-sync source via ReportInventory.
+    void set_app_usage_store(AppUsageStore* store) { app_usage_store_ = store; }
     /// Guardian (Guaranteed State) store — receives drift/remediation events
     /// ingested from the agent `__guard__` side-channel on the Subscribe stream
     /// (contract G2/step 5). nullptr disables ingest — used by tests that don't
@@ -534,6 +538,7 @@ private:
     AppPerfDailyStore* app_perf_daily_store_{nullptr};
     DeviceInventoryStore* device_inventory_store_{nullptr};
     SoftwareLicensingStore* software_licensing_store_{nullptr};
+    AppUsageStore* app_usage_store_{nullptr};
     GuaranteedStateStore* guaranteed_state_store_{nullptr};
     BlastRadiusDetector* blast_radius_detector_{nullptr};
     DexAlertRouter* dex_alert_router_{nullptr};
