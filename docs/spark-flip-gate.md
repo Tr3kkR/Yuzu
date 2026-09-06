@@ -261,9 +261,18 @@ tracked separately below)
     vocabulary, not `"disarmed"` - the rule didn't withdraw, its enforcement broke),
     staleness-guarded against `PerKey::subscription` so a fresh re-arm racing the async
     notification wins. **No self-heal in this PR** (Dave's call: smaller, safer diff, no
-    new blocking-retry policy) - an errored rule sits until the next server-issued
-    `PushRules` or an agent restart (whose boot re-arm calls `reconcile_rule_locked`
-    unconditionally) re-attaches it. `on_subscription_faulted` mirrors this for the
+    new blocking-retry policy). **Recovery path, corrected (governance Gate 4
+    unhappy-path UP-4 - an earlier version of this row overclaimed "the next
+    server-issued PushRules")**: a subscription death is local to the agent and never
+    changes the server's policy generation, so `server.cpp`'s heartbeat reconcile gate
+    (which re-pushes only when the server's generation has moved past what the agent
+    last reported) is NOT triggered by this event on its own. An errored rule recovers
+    only via an UNRELATED rule/policy edit bumping the server generation, or an agent
+    restart (whose boot re-arm calls `reconcile_rule_locked` unconditionally) - absent
+    either, it can sit un-enforced for the deployment's lifetime with no proactive
+    operator signal beyond the "errored" audit entry itself. Tracked as a pre-PR-5
+    hardening candidate (see the risk-accept register addendum below).
+    `on_subscription_faulted` mirrors this for the
     health-toggle edge without touching `keys_`/`rules_` (the key is still armed).
   - **Poll backstop, folded into the same PR** (Dave's call): a full Queued consumer
     channel drops entries under backpressure (`queued_dropped_total`), so a push-only fix
@@ -287,6 +296,17 @@ tracked separately below)
     correctness defect. The `arm_impl` alloc-budget test's failed-watch-path literal
     (`test_spark_alloc_budget.cpp`) was re-measured, not guessed, per that file's own
     methodology: 2 -> 6, the four new allocations named in its own updated comment.
+  - **Re-verification round (governance Gate 3, cpp-safety): this "Verification"
+    paragraph was written before a real BLOCKING finding, and describes the pre-fix
+    tree.** cpp-safety found `report_fault()`'s new `deliver()` call reachable from
+    `start()`'s pre-start-replay loop while that loop's own `mech_ops_mu_by_type_`
+    guard was still held - a self-deadlock class this PR's own audit had covered for
+    `arm_impl`'s Lost-delivery path but missed on this pre-existing call site. Fixed by
+    scoping the lock to just the staleness-check + `watch_guarded()` call. Confirmed
+    empirically, not just by lock-order reasoning: a new regression test genuinely
+    hung (killed by a 12s timeout, zero output) with the fix reverted, and passed
+    clean with it restored. The full `[spark]` suite (plain/TSan/ASan) was re-run
+    against the corrected tree above and remains clean under the same terms.
   - **`PR-2d was NOT gated on PR-2e (#3816) landing`** (already merged as PR #3979
     before this PR started) - confirmed correct in hindsight: #3816 supplied an
     executor-level caller-abandonment signal, #2818 needed an engine-level

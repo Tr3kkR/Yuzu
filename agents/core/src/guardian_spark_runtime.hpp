@@ -296,11 +296,20 @@ public:
     /// #2818 poll backstop: scan every armed key and query the backend's
     /// subscription_health() for it, cheaply (no I/O). A Dead subscription is
     /// reported "errored" exactly like a delivered Lost notification would have -
-    /// this is the delivery-guarantee backstop for the case where a genuine Lost
-    /// notification was silently dropped by a full Queued consumer channel
-    /// (queued_dropped_total), not an independent detection path. Intended to be
-    /// driven off GuardianConvergenceScheduler's existing ~5s priority lane - no new
-    /// thread. Scoped to Dead only: a missed Faulted/Recovered toggle is
+    /// this is the delivery-guarantee backstop for TWO ways a genuine Lost
+    /// notification can fail to land, not an independent detection path:
+    ///   (1) a full Queued consumer channel silently drops it (queued_dropped_total);
+    ///   (2) a dedup-race window (governance Gate 4 unhappy-path UP-4): a sibling
+    ///       dedups onto a key whose first arm is still in flight off-lock
+    ///       (attach_rule's bounded arm); if that first arm then fails and delivers
+    ///       Lost BEFORE attach_rule's own commit re-acquires registry_mu_ and writes
+    ///       keys_[key], on_subscription_lost's staleness guard sees no keys_ entry
+    ///       yet, treats the notification as stale, and discards it - the commit that
+    ///       follows then persists a subscription that is already dead, with its one
+    ///       Lost already consumed. This sweep is what actually recovers that case,
+    ///       bounded by its own cadence rather than instant.
+    /// Intended to be driven off GuardianConvergenceScheduler's existing ~5s priority
+    /// lane - no new thread. Scoped to Dead only: a missed Faulted/Recovered toggle is
     /// health-reporting-only (no enforcement break, no keys_ mutation), lower
     /// severity, and not backstopped here.
     void revalidate_subscriptions();

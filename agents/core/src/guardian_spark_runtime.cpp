@@ -696,11 +696,23 @@ void GuardianSparkRuntime::on_subscription_lost(const std::string& key,
                                                  std::uint64_t subscription_id) {
     // #2818: the underlying watch for `key` was torn down entirely - every rule
     // currently on it lost its enforcement, not just withdrew from it. Report each as
-    // "errored" (guardian_outbox.hpp's documented vocabulary) rather than "disarmed",
-    // and wait for the next server-issued PushRules (or an agent restart, whose boot
-    // re-arm calls reconcile_rule_locked for every persisted rule unconditionally) to
-    // re-attach - no immediate self-heal in this PR (Dave's call, 2026-09-06: smaller,
-    // safer diff, no new blocking-retry policy).
+    // "errored" (guardian_outbox.hpp's documented vocabulary) rather than "disarmed" -
+    // no immediate self-heal in this PR (Dave's call, 2026-09-06: smaller, safer diff,
+    // no new blocking-retry policy).
+    //
+    // RECOVERY PATH, STATED PRECISELY (governance Gate 4 unhappy-path UP-4 - an
+    // earlier version of this comment overclaimed "the next server-issued
+    // PushRules"): a subscription dying is LOCAL to this agent and never changes the
+    // server's policy generation, so server.cpp's heartbeat reconcile gate
+    // (`if (agent_gen >= current) ...`, i.e. it re-pushes only when the SERVER's
+    // generation has moved past what the agent last reported) is NOT triggered by
+    // this event on its own. The two things that DO recover an errored rule are an
+    // UNRELATED rule/policy edit bumping the server generation (whatever its cause),
+    // or an agent restart (whose boot re-arm calls reconcile_rule_locked for every
+    // persisted rule unconditionally). Absent either, an errored rule can sit
+    // un-enforced for the life of the deployment with no proactive operator signal
+    // beyond the "errored" audit entry itself - a real, undocumented-until-now
+    // residual, tracked as a hardening candidate before the prefer_spark_ flip.
     std::function<void()> outbox_waker;
     {
         std::lock_guard<std::mutex> lk{registry_mu_};
