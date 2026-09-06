@@ -373,9 +373,15 @@ insert+projection, legacy + DEX duplicate-ingest coverage.
 (a) True at-least-once: server→agent per-batch **ack** (post-commit) as the deletion linearization point -
 removes sent-unacked + the re-send-all traffic. (b) Deterministic ordering: preserve **nanoseconds**
 (`guardian_ingest.cpp:91`) + per-agent **boot/session sequence** server-side. (c) Power-loss: likely already
-FULL - confirm. (d) Doc: correct §"7.7b split" item-7 "audit-grade" wording. (e) `guard.errored` producer.
+FULL - confirm. (d) Doc: correct §"7.7b split" item-7 "audit-grade" wording. (e) `guard.errored` producer -
+**partially landed via #2818** (the subscription-death path only, see below); broader `errored` coverage
+(arm/boot-failure paths) is still deferred.
 (f) **Dedup tombstones** for cross-retention resurrection (server retention < agent `D_max`).
 
-## Scope - armed/disarmed only
-`guard.errored` has no producer (`guardian_spark_runtime.cpp:164/240` are the only enqueue sites); the journal
-is kind-agnostic, so adding it later needs only a producer (deferred (e)).
+## Scope - armed/disarmed/errored(#2818 subscription-death only)
+`guard.errored` gained its first producer in #2818: `GuardianSparkRuntime::on_subscription_lost`
+(via `detach_rule_locked(rid, "errored")`) fires when a spark subscription dies out from under a
+rule, plus `revalidate_subscriptions()`'s poll-backstop path calling the same detach - both dormant
+while `prefer_spark_=false`. No other `errored` path exists yet (arm/boot failures still journal
+nothing) - the journal itself is kind-agnostic, so widening this further needs only a producer
+(deferred (e), narrowed).

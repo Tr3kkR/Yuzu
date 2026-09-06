@@ -2632,9 +2632,11 @@ zero — a dead worker must not read identically to a healthy idle one). A third
 
 **Not claimed:** end-to-end at-least-once (there is no server ack of an individual
 lifecycle event, by design — Option A per the source doc); deterministic sub-second
-ordering. `guard.errored` has no lifecycle-journal producer today (scope is
-armed/disarmed only). All fleet counters are unlabelled or low-cardinality —
-never keyed by raw `agent_id`.
+ordering. `guard.errored` has exactly ONE lifecycle-journal producer today (#2818:
+`GuardianSparkRuntime::on_subscription_lost`/`revalidate_subscriptions`, a spark
+subscription-death detach) — dormant while `prefer_spark_=false`; other `errored`-status
+paths (arm/boot failures) still journal nothing. All fleet counters are unlabelled or
+low-cardinality — never keyed by raw `agent_id`.
 
 **Standing invariant** (also recorded in §24): journal maintenance is paced by
 time, not by wake count — the drain worker wakes on every outbox enqueue, and a
