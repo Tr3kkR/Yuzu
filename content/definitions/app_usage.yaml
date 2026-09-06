@@ -1,0 +1,236 @@
+## App Usage Definitions
+## Read-only, machine-scope application usage inventory derived from TAR's
+## usage fold (usage_daily / usage_daily_user / usage_live inside tar.db).
+## No pid, cmdline, or user name is ever surfaced by this source — user
+## identity is folded into a COUNT(DISTINCT user) only, and open-run state
+## is a plain count. Default-ON: this reads TAR's own default-on usage
+## fold; it requires no separate opt-in beyond TAR itself and
+## `usage_enabled` (tar_config, default true).
+## Plugin: app_usage | Actions: summary, last_used, foreground
+##
+## Gated behind the Forensics securable (Administrator / approval-gated) —
+## per-executable usage history is forensics-sensitive even with names
+## redacted. See server/core/src/capability_decls/
+## plugin_action_catalogue_app_usage.hpp.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.app_usage.summary
+  displayName: App Usage Summary
+  version: 1.0.0
+  description: >
+    Machine-scope summary of application run activity over a window of
+    days, aggregated from TAR's usage_daily table. One row per executable:
+    run_count, total_seconds, first_seen, last_seen, distinct_users (a
+    COUNT(DISTINCT user) only — no user name ever leaves the agent's
+    SQLite database), superseded_runs, and expired_runs. Preceded by one
+    meta row carrying the fold's own health counters (coverage window,
+    open runs, unmatched stops, clock anomalies, capture gaps, feeder
+    state). If the machine's TAR usage source is disabled, or the host's
+    TAR schema predates this table, this reports an explicit constrained
+    reason rather than an empty result.
+  tags: [forensics, usage, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: app_usage
+    action: summary
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      days:
+        type: int32
+        displayName: Window (days)
+        description: Number of trailing days to summarise. Clamped to 1-365.
+        default: 30
+      top:
+        type: int32
+        displayName: Top N executables
+        description: Maximum number of executables to return. Clamped to 1-500.
+        default: 25
+      by:
+        type: string
+        displayName: Sort by
+        description: >
+          Ranking metric: "run_time" (total_seconds, default) or
+          "run_count". Any other value is rejected with error|bad_param|by.
+        default: "run_time"
+
+  result:
+    # meta|window_days|<n>|coverage_since|<ts>|days_present|<n>|open_runs|<n>|
+    #   unmatched_stops|<n>|clock_anomalies|<n>|gap_count|<n>|
+    #   gap_lost_events|<n>|gap_last_ts|<ts>|lag_events|<n>|
+    #   feeder_enabled|<0/1>|last_fold_ts|<ts>
+    # usage|<exe_key>|<run_count>|<total_seconds>|<first_seen>|<last_seen>|
+    #   <distinct_users>|<superseded_runs>|<expired_runs>
+    columns:
+      - name: exe_key
+        type: string
+      - name: run_count
+        type: int64
+      - name: total_seconds
+        type: int64
+      - name: first_seen
+        type: int64
+      - name: last_seen
+        type: int64
+      - name: distinct_users
+        type: int64
+      - name: superseded_runs
+        type: int64
+      - name: expired_runs
+        type: int64
+
+  readablePayload: "Summarise application usage for the last ${days} days"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: role-gated
+
+  permissions:
+    executeRoles: [endpoint-admin, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [app_usage]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.app_usage.last_used
+  displayName: App Last Used
+  version: 1.0.0
+  description: >
+    Per-executable last/first-seen (all time) plus a trailing-30-day
+    run_count/total_seconds window, aggregated from TAR's usage_daily
+    table. Optional `exe` parameter narrows the result to one executable,
+    normalised with the same rule TAR uses to write exe_key (lowercased
+    basename, trimmed). Machine scope only — no pid, cmdline, or user name
+    is ever surfaced.
+  tags: [forensics, usage, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: app_usage
+    action: last_used
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      exe:
+        type: string
+        displayName: Executable
+        description: >
+          Optional executable name (or path — only the basename is used)
+          to narrow the result to. Omit to return every executable TAR
+          has ever recorded.
+
+  result:
+    # last_used|<exe_key>|<last_seen>|<first_seen>|<run_count_30d>|<total_seconds_30d>
+    columns:
+      - name: exe_key
+        type: string
+      - name: last_seen
+        type: int64
+      - name: first_seen
+        type: int64
+      - name: run_count_30d
+        type: int64
+      - name: total_seconds_30d
+        type: int64
+
+  readablePayload: "Report when ${exe} was last used"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: role-gated
+
+  permissions:
+    executeRoles: [endpoint-admin, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [app_usage]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.app_usage.foreground
+  displayName: App Foreground Time
+  version: 1.0.0
+  description: >
+    Reserved for a future foreground/focus-time and per-session
+    attribution capability. This source does not capture per-session
+    focus state on any platform today; every call reports
+    constrained|foreground_not_captured. Promoted here (rather than left
+    unimplemented) by the user-context-bridge roadmap, which will fill
+    this action in without a schema change once session-scope
+    attribution lands.
+  tags: [forensics, usage, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: app_usage
+    action: foreground
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # constrained|foreground_not_captured|<reason>
+    columns:
+      - name: status
+        type: string
+      - name: reason
+        type: string
+      - name: detail
+        type: string
+
+  readablePayload: "Report current foreground application"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: role-gated
+
+  permissions:
+    executeRoles: [endpoint-admin, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [app_usage]
+
+status:
+  phase: active
