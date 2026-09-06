@@ -20,6 +20,7 @@
 #include "token_rotation_lookup.hpp" // shared REST/MCP human-token rotation successor lookup (P2 #11)
 
 #include "agent_registry.hpp"           // AgentRegistry (discover_plugins tool)
+#include "dashboard_routes.hpp"         // DashboardRoutes::gather_tar_retention_paused (#4027)
 #include "discover_routes.hpp"          // A2 discovery builders shared with REST /discover/*
 #include "engine_principal_store.hpp"   // EnginePrincipalStore (fwd-declared only in mcp_server.hpp)
 #include "openapi_spec_access.hpp"      // openapi_spec_json() (discover_routes tool)
@@ -366,6 +367,41 @@ static const ToolDef kTools[] = {
     {"list_agents", "List all connected agents with hostname, OS, architecture, and version.",
      R"({"type":"object","properties":{}})",
      R"j({"type":"object","properties":{"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"}},"required":["agent_id","hostname","os","arch","agent_version"]}}},"required":["agents"]})j"},
+
+    // ── #4027 API-parity read twins: TAR process-tree / capture-sources device
+    // pickers + retention-paused source list. Requires Infrastructure:Read (same
+    // gate as their REST/fragment siblings). Unlike list_agents' agents_fn (fleet-
+    // wide, no per-operator narrowing), these three read through the SAME
+    // operator-scoped provider (tar_devices_fn_) / DashboardRoutes gatherer their
+    // REST twins use — see set_tar_devices_fn/set_dashboard_routes (mcp_server.hpp).
+    // GET /fragments/tar/process-tree/result and .../detail are DELIBERATELY NOT
+    // twinned by #4027 (see tar_tree_routes.hpp's file comment) — no REST/MCP-only
+    // path exists to mint their required pcmd/tcmd/token inputs today.
+    {"list_tar_process_tree_devices",
+     "List the operator-scoped device picker for the TAR process-tree viewer "
+     "(online and offline devices; each row carries `online`). Requires "
+     "Infrastructure:Read. Read-only twin of GET /fragments/tar/process-tree's "
+     "device picker / GET /api/v1/tar/process-tree.",
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{"devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"},"online":{"type":"boolean"}},"required":["agent_id","hostname","os","arch","agent_version","online"]}}},"required":["devices"]})j"},
+
+    {"list_tar_capture_sources_devices",
+     "List the operator-scoped device picker for the TAR capture-sources (ADR-0015 "
+     "enable/disable) frame. Same row shape as list_tar_process_tree_devices. "
+     "Requires Infrastructure:Read. Read-only twin of GET /fragments/tar/"
+     "capture-sources's device picker / GET /api/v1/tar/capture-sources.",
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{"devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"},"online":{"type":"boolean"}},"required":["agent_id","hostname","os","arch","agent_version","online"]}}},"required":["devices"]})j"},
+
+    {"list_tar_retention_paused",
+     "List the calling operator's most recent TAR retention-paused source scan "
+     "(per-username state; filtered to the operator's visible agents), one row per "
+     "(agent, paused source). Requires Infrastructure:Read. Read-only twin of GET "
+     "/fragments/tar/retention-paused / GET /api/v1/tar/retention-paused. Returns "
+     "scan_id=\"\" when the operator has not dispatched a scan yet (call "
+     "POST /fragments/tar/retention-paused/scan first, dashboard-only today).",
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{"scan_id":{"type":"string"},"scan_count":{"type":"integer"},"scan_at":{"type":"integer"},"agents_responded":{"type":"integer"},"agents_with_no_paused_sources":{"type":"integer"},"agents_filtered_out_of_scope":{"type":"integer"},"store_degraded":{"type":"boolean"},"rows":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"agent_display":{"type":"string"},"source":{"type":"string"},"paused_at":{"type":"integer"},"live_rows":{"type":"integer"},"oldest_ts":{"type":"integer"},"value_error":{"type":"boolean"},"enabled_raw":{"type":"string"}},"required":["agent_id","agent_display","source","paused_at","live_rows","oldest_ts","value_error","enabled_raw"]}}},"required":["scan_id","scan_count","scan_at","agents_responded","agents_with_no_paused_sources","agents_filtered_out_of_scope","store_degraded","rows"]})j"},
 
     {"get_agent_details",
      "Get detailed info for a single agent including tags and inventory. "
@@ -1850,6 +1886,12 @@ struct ToolSecurityEntry {
 static const ToolSecurityEntry kToolSecurityRows[] = {
     // Phase 1 read-only tools
     {"list_agents", {"Infrastructure", "Read"}},
+    // #4027 — default (2-element) form, matching list_agents: service-scoped
+    // tokens are structurally denied at the generic C8 chokepoint, same as
+    // their REST twins' deny_fleet_wide_device_enumeration guard.
+    {"list_tar_process_tree_devices", {"Infrastructure", "Read"}},
+    {"list_tar_capture_sources_devices", {"Infrastructure", "Read"}},
+    {"list_tar_retention_paused", {"Infrastructure", "Read"}},
     // #1700 / #3290 Phase 2: migrated onto require_fleet_read, which gives
     // this tool a REAL confinement mechanism (meet(management-group,
     // service-scope)) — reclassified from the default `denied` to
@@ -2333,6 +2375,12 @@ struct ToolAnnotation {
 static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     // ── Read-only tools (effect ReadOnly, idempotent) ─────────────────────────
     {"list_agents", {ToolEffect::ReadOnly, true, "List agents"}},
+    {"list_tar_process_tree_devices",
+     {ToolEffect::ReadOnly, true, "List TAR process-tree device picker"}},
+    {"list_tar_capture_sources_devices",
+     {ToolEffect::ReadOnly, true, "List TAR capture-sources device picker"}},
+    {"list_tar_retention_paused",
+     {ToolEffect::ReadOnly, true, "List TAR retention-paused sources"}},
     {"get_agent_details", {ToolEffect::ReadOnly, true, "Get agent details"}},
     {"query_audit_log", {ToolEffect::ReadOnly, true, "Query audit log"}},
     {"list_definitions", {ToolEffect::ReadOnly, true, "List instruction definitions"}},
@@ -5416,6 +5464,86 @@ McpServer::HandlerFn McpServer::build_handler(
                                                          JObj().raw("agents", arr.str()).str(),
                                                          kObjectOutputSchema)),
                     "application/json");
+                return;
+            }
+
+            // ── #4027 read twins: TAR process-tree / capture-sources device
+            // pickers + retention-paused source list. All three: tier_allows +
+            // perm_fn (Infrastructure:Read, same as list_agents above), then the
+            // SAME shared builder their REST twin calls (api-twin-recipe.md Rule
+            // 1). Unaudited-on-success posture for the two device pickers would
+            // match their REST siblings, but every other MCP tool in this file
+            // (including list_agents just above) calls mcp_audit("success") as
+            // baseline MCP-transport access logging regardless of the REST-side
+            // audit decision — followed here for consistency rather than
+            // introducing a fourth posture into an already-three-posture table
+            // (docs/api-twin-recipe.md §4). ──
+            if (tool_name == "list_tar_process_tree_devices") {
+                if (!tier_allows(tier, "Infrastructure", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                    return;
+                const std::vector<DeviceRow> devices =
+                    tar_devices_fn_ ? tar_devices_fn_(session->username) : std::vector<DeviceRow>{};
+                const std::string devices_json = tar_process_tree_frame_json(devices);
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id,
+                                      tool_result_split(devices_json,
+                                                         JObj().raw("devices", devices_json).str(),
+                                                         kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "list_tar_capture_sources_devices") {
+                if (!tier_allows(tier, "Infrastructure", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                    return;
+                const std::vector<DeviceRow> devices =
+                    tar_devices_fn_ ? tar_devices_fn_(session->username) : std::vector<DeviceRow>{};
+                const std::string devices_json = tar_capture_sources_devices_json(devices);
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id,
+                                      tool_result_split(devices_json,
+                                                         JObj().raw("devices", devices_json).str(),
+                                                         kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "list_tar_retention_paused") {
+                if (!tier_allows(tier, "Infrastructure", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                    return;
+                if (!dashboard_routes_) {
+                    res.set_content(
+                        a4_error(kInternalError, "TAR retention-paused surface unavailable",
+                                 "this is a server configuration/wiring fault, not a caller "
+                                 "error; contact an administrator"),
+                        "application/json");
+                    return;
+                }
+                const std::string payload = tar_retention_paused_json(
+                    dashboard_routes_->gather_tar_retention_paused(session->username));
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(payload, kObjectOutputSchema)),
+                                "application/json");
                 return;
             }
 

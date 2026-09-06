@@ -21939,6 +21939,16 @@ private:
             // decision for the same caller (same conversion, same underlying
             // require_fleet_read call).
             mcp_server_->set_fleet_read_fn(fleet_read_fn);
+            // #4027 — the SAME devices_fn lambda TarTreeRoutes' REST/fragment
+            // routes use (registered above), so list_tar_process_tree_devices/
+            // list_tar_capture_sources_devices apply the identical per-operator
+            // management-group narrowing REST already does, rather than a fresh
+            // unscoped binding (contrast list_agents' agents_fn, a deliberate
+            // pre-existing exception this twin does not extend). dashboard_routes_
+            // is guaranteed constructed by this point (registered well above, in
+            // the same function, before MCP setup begins).
+            mcp_server_->set_tar_devices_fn(devices_fn);
+            mcp_server_->set_dashboard_routes(dashboard_routes_.get());
             // PR1.5c/1.6c (p14) — ADR-0031 operator surface MCP twins,
             // wired UNCONDITIONALLY exactly like kek_ops above (never
             // gated behind an unrelated conditional — see the KEK comment
