@@ -103,7 +103,17 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # stated reason, raise) this in the SAME change that changes the real count -
 # see check-capability-matrix.sh's CDX-P2-006 comment for why an un-adjusted
 # baseline is not a real ratchet.
-BASELINE_UNTWINNED = 265
+BASELINE_UNTWINNED = 259
+# #4037 (api-parity #2146 Batch A): lowered 265 -> 259. Six guardian.json rows
+# flipped to "twinned" (get.fragments-device-guardian, get.fragments-guardian-
+# events, get.fragments-guardian-guard-form, get.fragments-guardian-guard-
+# param-page, get.fragments-guardian-guards, get.fragments-guardian-status).
+# Two more rows flipped "planned:#2146" -> "composed-of:..." (guard-form's
+# sibling baseline-form/baseline-param-edit) - composed-of still counts as
+# untwinned by this gate's own definition above, so those two do not move
+# the count. Two rows were re-pointed "planned:#2146" -> "planned:#3266"
+# (baselines list/detail, deferred to #3266's REST work) - also no count
+# change, same reason.
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.
