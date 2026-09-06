@@ -1945,8 +1945,9 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // mirroring their REST siblings' require_list_read bare-deny posture.
     {"get_guardian_status", {"GuaranteedState", "Read"}},
     {"list_guardian_rules", {"GuaranteedState", "Read"}},
-    // list_guardian_events is `confined`, not `denied`: unlike the three tools
-    // above it, its handler has TWO branches (see the dispatch code) — an
+    // list_guardian_events is `confined`, not `denied`: unlike the other three
+    // #4037 denied-class tools (get_guardian_status, list_guardian_rules,
+    // get_guardian_rule_status below), its handler has TWO branches — an
     // optional agent_id narrows to a real per-device scoped_perm_fn gate,
     // matching REST GET /guaranteed-state/events exactly. `denied` would 403
     // a service-scoped token's agent_id-supplied call before the handler's

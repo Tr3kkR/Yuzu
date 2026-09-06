@@ -3447,6 +3447,12 @@ TEST_CASE("MCP Guardian: list_guardian_events fleet-wide branch denies a service
           "[pg][mcp][integration][guardian]") {
     // #3238: the fleet-wide branch keeps REST's own bare-perm_fn posture — this
     // proves the MCP twin does NOT invent a different (stronger OR weaker) gate.
+    // list_guardian_events is ServiceScopeClass::confined, so this denial MUST
+    // come from the handler's own deny_fleet_wide_service_scoped call, not C8's
+    // structural pre-handler refusal (that only fires for `denied`-class tools).
+    // The audit row is the discriminator: only the handler's own deny path
+    // emits dex.device.view|denied — C8's refusal never reaches the handler,
+    // so it never audits at all.
     YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool);
@@ -3461,6 +3467,7 @@ TEST_CASE("MCP Guardian: list_guardian_events fleet-wide branch denies a service
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(ts.audit_log.back() == "dex.device.view|denied");
 }
 
 TEST_CASE("MCP Guardian: list_guardian_events with agent_id scopes via scoped_perm_fn",

@@ -1959,12 +1959,15 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
         std::unordered_set<std::string> seen;  // agent_ids that already have a status row
         // #4037: same shared builder as the REST/MCP twins
         // (guardian_model.hpp::guardian_rule_agent_status_rows), so all three
-        // surfaces compute this census identically. Preserves this fragment's
-        // pre-existing degrade posture unchanged — a degraded read still
-        // falls back to an empty vector here (`value_or`), not a 503; that is
-        // the dashboard fragment's own set-and-proceed contract per the
-        // recipe's per-surface audit fail-mode table (see docs/api-twin-recipe.md
-        // §4), not something this refactor changes.
+        // surfaces compute this census identically. Pre-existing degrade
+        // posture of this fragment, deliberately UNCHANGED by this refactor:
+        // a degraded census still renders empty here (`value_or`), matching
+        // what this loop already did before this commit. The REST/MCP twins
+        // apply ADR-0038 (degraded read -> nullopt -> 503/error, never a
+        // silent empty render); this fragment does not, and whether it
+        // should is a pre-existing question this #4037 refactor does not
+        // decide either way — out of scope here, not something this comment
+        // should be read as endorsing.
         for (const auto& s : yuzu::server::guardian_rule_agent_status_rows(*store_, guard_id)
                                   .value_or(std::vector<yuzu::server::GuardianRuleAgentStatusRow>{})) {
             seen.insert(s.agent_id);
