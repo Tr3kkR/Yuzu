@@ -88,6 +88,7 @@
 #include "app_usage_store.hpp"
 #include "product_registry_store.hpp"
 #include "sle_routes.hpp"
+#include "app_usage_routes.hpp"
 #include "agent_decommission.hpp"
 // Visualization engine consumers live in dashboard_routes.cpp (#589) and
 // rest_api_v1.cpp; server.cpp no longer references the engine directly.
@@ -20318,6 +20319,22 @@ private:
             },
             audit_fn);
 
+        // AppUsageRoutes — /api/v1/forensics/agents/{id}/app-usage read surface
+        // (wave 7 PR7.2). Gated on Forensics:Read via the SAME fail-closed
+        // scoped-gate lambda as SleRoutes above (sle_scoped_perm_fn is
+        // securable-generic — it takes type/op as parameters rather than
+        // hardcoding SoftwareLicensing — so the #1717 fail-closed guard
+        // (rbac_enforcement_in_effect) applies here unchanged).
+        app_usage_routes_ = std::make_unique<AppUsageRoutes>();
+        app_usage_routes_->register_routes(
+            *web_server_, sle_scoped_perm_fn,
+            [this](const std::string& agent_id) -> std::optional<std::vector<AgentLastUsedRow>> {
+                if (!app_usage_store_)
+                    return std::nullopt;
+                return app_usage_store_->get_agent_last_used(agent_id);
+            },
+            audit_fn);
+
         // PreflightRoutes — /auto pre-flight page. A config section (per-check
         // params + thresholds) runs the live checks (app version / os_version /
         // os_arch / free-disk / pending-reboot) across the operator-VISIBLE devices
@@ -22142,6 +22159,9 @@ private:
                 // MCP twin of GET /api/v1/sle/agents/{id} (machine-scope facts; the
                 // per-user user_ref PII stays on the audited REST drill).
                 software_licensing_store_.get(),
+                // wave 7 PR7.2: backs the get_agent_app_usage MCP twin of
+                // GET /api/v1/forensics/agents/{id}/app-usage.
+                app_usage_store_.get(),
                 // PR 4.2 — engine role-assignment MCP twins.
                 engine_principal_store_.get(),
                 // Periodic Access Reviews (SOC 2 CC6.2) — the campaign store plus the
@@ -22727,6 +22747,7 @@ private:
     std::unique_ptr<DeviceRoutes> device_routes_;
     std::unique_ptr<InventoryRoutes> inventory_routes_;
     std::unique_ptr<SleRoutes> sle_routes_;
+    std::unique_ptr<AppUsageRoutes> app_usage_routes_;
     std::unique_ptr<PreflightRoutes> preflight_routes_;
     std::unique_ptr<VerifyRoutes> verify_routes_;
     std::unique_ptr<DeploymentRoutes> deployment_routes_;

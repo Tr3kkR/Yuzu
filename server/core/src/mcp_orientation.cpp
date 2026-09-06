@@ -53,7 +53,7 @@ constexpr std::string_view kExecutionsAudit[] = {"get_execution_status", "list_e
                                                  "query_audit_log"};
 constexpr std::string_view kInventory[] = {"query_inventory", "list_inventory_tables",
                                            "get_agent_inventory", "query_installed_software",
-                                           "query_software_licenses"};
+                                           "query_software_licenses", "get_agent_app_usage"};
 constexpr std::string_view kCompliance[] = {"list_policies", "get_compliance_summary",
                                             "get_fleet_compliance", "get_guardian_schemas"};
 constexpr std::string_view kScope[] = {"validate_scope", "preview_scope_targets"};
@@ -116,8 +116,8 @@ constexpr std::array<ToolFamily, 24> kFamilies{{
     {"Command responses", "query and aggregate stored command/instruction responses", kResponses},
     {"Executions & audit", "execution status/history and the who-did-what audit log",
      kExecutionsAudit},
-    {"Inventory & software", "collected inventory tables, installed software, and licenses",
-     kInventory},
+    {"Inventory & software",
+     "collected inventory tables, installed software, licenses, and app usage", kInventory},
     {"Policy & compliance", "policies, per-device and fleet compliance, Guardian schemas",
      kCompliance},
     {"Scope targeting", "validate a scope expression and preview the devices it selects", kScope},

@@ -671,6 +671,7 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[pg][mcp][audit]") {
 #include "dex_app_perf_model.hpp"      // AppPerfProviders + the app-perf read types
 #include "software_inventory_store.hpp"  // typed daily-sync store (ADR-0016)
 #include "software_licensing_store.hpp"  // SLE discovery store (query_software_licenses, ADR-0024)
+#include "app_usage_store.hpp"           // wave 7 PR7.2 projection (get_agent_app_usage)
 
 #include "guardian_schema_registry.hpp" // guardian_schema_catalog (REST↔MCP parity)
 
@@ -948,6 +949,13 @@ struct McpTestServer {
     /// tests on the "Software licensing store unavailable" path. The per-device
     /// SCOPED gate is driven by scoped_perm_fn_for_test (below), like set_tag.
     yuzu::server::SoftwareLicensingStore* software_licensing_store_for_test{nullptr};
+
+    /// Wave 7 PR7.2: optionally wire a typed AppUsageStore so get_agent_app_usage
+    /// (the MCP twin of GET /api/v1/forensics/agents/{id}/app-usage) is exercised
+    /// end-to-end. Default nullptr keeps tests on the "App-usage store unavailable"
+    /// path. The per-device SCOPED gate is driven by scoped_perm_fn_for_test, like
+    /// query_software_licenses above.
+    yuzu::server::AppUsageStore* app_usage_store_for_test{nullptr};
 
     /// DEX app-perf-over-time (slice 2): optionally wire the AppPerfProviders so the
     /// app-perf tools (list_dex_perf_apps / get_dex_app_perf / get_dex_group_app_perf)
@@ -1250,6 +1258,7 @@ private:
             /*mcp_streamed_post_enabled=*/&streamed_post_enabled_,
             /*allowed_origins=*/allowed_origins_for_test,
             /*software_licensing_store=*/software_licensing_store_for_test,
+            /*app_usage_store=*/app_usage_store_for_test,
             // Spelled out only because the streamed-POST params after them are
             // what this call actually needs; nullptr is the pre-existing default.
             /*engine_principal_store=*/nullptr,
@@ -11986,6 +11995,271 @@ TEST_CASE("MCP query_software_licenses: throwing audit_fn is caught → audit_pe
     REQUIRE(payload.contains("audit_persisted"));
     CHECK(payload.at("audit_persisted") == false);
     CHECK(payload.at("count").get<std::int64_t>() == 1);
+}
+
+// ── get_agent_app_usage (wave 7 PR7.2 — the MCP twin of the GET ────────────────
+//    /api/v1/forensics/agents/{id}/app-usage read). Same per-device SCOPED
+//    Forensics:Read gate (ADR-0017 confinement) and #1717 fail-closed guard as
+//    query_software_licenses above; payload mirrors the REST drill field-for-field
+//    (no PII to omit — the store carries no user names/pids).
+
+namespace {
+AgentLastUsedRow app_usage_row() {
+    AgentLastUsedRow r;
+    r.exe_key = "chrome.exe";
+    r.first_seen = 1699000000;
+    r.last_seen = 1700000500;
+    r.run_count_30d = 12;
+    r.total_seconds_30d = 43200;
+    r.collected_at = 1700000600;
+    return r;
+}
+
+// Pre-migrated template for the [pg] case below, mirroring mcp_sle_rbac_tpl:
+// AppUsageStore + RbacStore on the same shared pool/db (RbacStore only
+// satisfies the #1717 fail-closed guard).
+yuzu::test::PgTestTemplate mcp_app_usage_rbac_tpl{
+    "mcpappusagerbac", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        yuzu::server::AppUsageStore store{pool};
+        yuzu::server::RbacStore rbac{pool};
+        if (!store.is_open() || !rbac.is_open())
+            throw std::runtime_error("mcp_app_usage_rbac template: a store failed to migrate");
+    }};
+} // namespace
+
+TEST_CASE("MCP get_agent_app_usage: tool is listed", "[mcp]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1,"params":{}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("\"get_agent_app_usage\"") != std::string::npos);
+}
+
+TEST_CASE("MCP get_agent_app_usage: scope gate unwired → fail closed (never legacy-open)",
+          "[mcp][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db, mcp_rbac_tpl);
+    yuzu::server::pg::PgPool rbac_pool{{.conninfo = rbac_db.dsn(), .size = 4}};
+    REQUIRE(rbac_pool.valid());
+    yuzu::server::RbacStore rbac{rbac_pool};
+    REQUIRE(rbac.is_open());
+    McpTestServer ts; // no scoped gate, no store
+    ts.rbac_store_for_test = &rbac;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":90,)"
+                       R"("params":{"name":"get_agent_app_usage","arguments":{"agent_id":"agent-1"}}})");
+    REQUIRE(res);
+    CHECK(res->body.find("scope gate not configured") != std::string::npos);
+    CHECK(res->body.find("\"result\"") == std::string::npos);
+}
+
+TEST_CASE("MCP get_agent_app_usage: authorization subsystem unavailable → #1717 fail closed",
+          "[mcp]") {
+    // #1717 parity with query_software_licenses above: rbac_store_for_test left
+    // null ⇒ rbac_enforcement_in_effect(nullptr) is true and a null store is not
+    // is_open(), so the guard fires before the scope gate or store are consulted.
+    McpTestServer ts; // rbac_store_for_test left null ⇒ enforcement in effect, store unusable
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":88,)"
+                       R"("params":{"name":"get_agent_app_usage","arguments":{"agent_id":"agent-1"}}})");
+    REQUIRE(res);
+    CHECK(res->body.find("authorization subsystem unavailable") != std::string::npos);
+    CHECK(res->body.find("\"result\"") == std::string::npos); // fail closed, not a served read
+    bool saw_failure = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "mcp.get_agent_app_usage|failure")
+            saw_failure = true;
+    CHECK(saw_failure);
+}
+
+TEST_CASE("MCP get_agent_app_usage: corrupt rbac.db (non-null, closed) → #1717 fail closed",
+          "[mcp]") {
+    // The OTHER arm of the #1717 guard (`rbac_store && rbac_store->is_open()`):
+    // a NON-NULL store whose backing substrate never connects, so is_open()
+    // stays false — see query_software_licenses's identical case above (#2104).
+    yuzu::server::pg::PgPool bad_pool{
+        {.conninfo = "host=127.0.0.1 port=1 dbname=nope user=nope connect_timeout=1", .size = 1}};
+    yuzu::server::RbacStore broken{bad_pool};
+    REQUIRE_FALSE(broken.is_open());
+
+    McpTestServer ts;
+    ts.rbac_store_for_test = &broken; // non-null but unusable
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":98,)"
+                       R"("params":{"name":"get_agent_app_usage","arguments":{"agent_id":"agent-1"}}})");
+    REQUIRE(res);
+    CHECK(res->body.find("authorization subsystem unavailable") != std::string::npos);
+    CHECK(res->body.find("\"result\"") == std::string::npos); // fail closed, not a served read
+    bool saw_failure = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "mcp.get_agent_app_usage|failure")
+            saw_failure = true;
+    CHECK(saw_failure);
+}
+
+TEST_CASE("MCP get_agent_app_usage: missing agent_id → invalid params", "[mcp]") {
+    McpTestServer ts;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) { return true; };
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":91,)"
+                       R"("params":{"name":"get_agent_app_usage","arguments":{}}})");
+    REQUIRE(res);
+    CHECK(res->body.find("\"result\"") == std::string::npos);
+    CHECK(res->body.find("agent_id is required") != std::string::npos);
+}
+
+TEST_CASE("MCP get_agent_app_usage: out-of-scope agent is 403'd by the scoped gate", "[mcp]") {
+    McpTestServer ts;
+    ts.app_usage_store_for_test = nullptr; // gate refuses before any store read
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response& res,
+                                    const std::string&, const std::string&,
+                                    const std::string& agent_id) -> bool {
+        if (agent_id == "agent-in")
+            return true;
+        res.status = 403;
+        res.set_content(R"({"error":{"code":403}})", "application/json");
+        return false;
+    };
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":92,)"
+                       R"("params":{"name":"get_agent_app_usage","arguments":{"agent_id":"agent-outside"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("\"result\"") == std::string::npos);
+}
+
+TEST_CASE("MCP get_agent_app_usage: store unavailable → A4 internal error", "[mcp]") {
+    McpTestServer ts;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) { return true; };
+    ts.start(); // app_usage_store_for_test left null
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":93,)"
+                       R"("params":{"name":"get_agent_app_usage","arguments":{"agent_id":"agent-1"}}})");
+    REQUIRE(res);
+    CHECK(res->body.find("\"result\"") == std::string::npos);
+    CHECK(res->body.find("App-usage store unavailable") != std::string::npos);
+}
+
+TEST_CASE("MCP get_agent_app_usage: success payload mirrors REST field-for-field (pinned)",
+          "[mcp][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_app_usage_rbac_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::AppUsageStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.replace_agent_last_used("agent-in", {app_usage_row()}, "hash-1"));
+    yuzu::server::RbacStore rbac{pool};
+    REQUIRE(rbac.is_open());
+
+    McpTestServer ts;
+    ts.rbac_store_for_test = &rbac;
+    ts.app_usage_store_for_test = &store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string& agent_id) -> bool {
+        return agent_id == "agent-in";
+    };
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":94,)"
+                       R"("params":{"name":"get_agent_app_usage","arguments":{"agent_id":"agent-in"}}})");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+
+    auto envelope = nlohmann::json::parse(res->body);
+    const auto& payload = envelope.at("result").at("structuredContent");
+    CHECK(payload.at("agent_id") == "agent-in");
+    CHECK(payload.at("collected_at").get<std::int64_t>() == 1700000600);
+    REQUIRE(payload.at("apps").size() == 1);
+    const auto& app = payload.at("apps")[0];
+    CHECK(app.at("exe_key") == "chrome.exe");
+    CHECK(app.at("first_seen").get<std::int64_t>() == 1699000000);
+    CHECK(app.at("last_seen").get<std::int64_t>() == 1700000500);
+    CHECK(app.at("run_count_30d").get<std::int64_t>() == 12);
+    CHECK(app.at("total_seconds_30d").get<std::int64_t>() == 43200);
+    CHECK_FALSE(app.contains("collected_at")); // hoisted to the top level, like the REST drill
+
+    bool saw_success = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "mcp.get_agent_app_usage|success")
+            saw_success = true;
+    CHECK(saw_success);
+}
+
+TEST_CASE("MCP get_agent_app_usage: a degraded store errors, never success+[]", "[mcp][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_app_usage_rbac_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::AppUsageStore store{pool};
+    REQUIRE(store.is_open());
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        yuzu::server::pg::PgResult drop = yuzu::server::pg::exec_params(
+            lease.get(), "DROP SCHEMA app_usage_store CASCADE", std::vector<std::string>{});
+        REQUIRE(drop.status() == PGRES_COMMAND_OK);
+    }
+    yuzu::server::RbacStore rbac{pool};
+    REQUIRE(rbac.is_open());
+
+    McpTestServer ts;
+    ts.rbac_store_for_test = &rbac;
+    ts.app_usage_store_for_test = &store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) { return true; };
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":95,)"
+                       R"("params":{"name":"get_agent_app_usage","arguments":{"agent_id":"agent-in"}}})");
+    REQUIRE(res);
+    CHECK(res->body.find("\"result\"") == std::string::npos);
+    CHECK(res->body.find("read failed") != std::string::npos);
+}
+
+TEST_CASE("MCP get_agent_app_usage: dropped audit row surfaces audit_persisted:false",
+          "[mcp][pg][audit]") {
+    // Mirrors query_software_licenses's dropped-audit-row case above: set-and-
+    // proceed, never a refusal, on the success path.
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_app_usage_rbac_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::AppUsageStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.replace_agent_last_used("agent-in", {app_usage_row()}, "hash-1"));
+    yuzu::server::RbacStore rbac{pool};
+    REQUIRE(rbac.is_open());
+
+    McpTestServer ts;
+    ts.rbac_store_for_test = &rbac;
+    ts.app_usage_store_for_test = &store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string& agent_id) -> bool {
+        return agent_id == "agent-in";
+    };
+    ts.audit_succeeds_ = false; // the mcp.get_agent_app_usage row cannot persist
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":99,)"
+                       R"("params":{"name":"get_agent_app_usage","arguments":{"agent_id":"agent-in"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200); // set-and-proceed, NOT a refusal
+
+    auto envelope = nlohmann::json::parse(res->body);
+    const auto& payload = envelope.at("result").at("structuredContent");
+    REQUIRE(payload.contains("audit_persisted"));
+    CHECK(payload.at("audit_persisted") == false);
+    // Data is STILL SERVED alongside the flag — that is the set-and-proceed half.
+    CHECK(payload.at("agent_id") == "agent-in");
+    REQUIRE(payload.at("apps").size() == 1);
 }
 
 // ── aggregate_responses — #1634 management-group scope (filter-BEFORE-aggregate) ──

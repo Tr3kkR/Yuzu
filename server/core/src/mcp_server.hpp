@@ -63,6 +63,7 @@ class MetricsRegistry; // optional bundle-metrics sink (yuzu_bundle_*)
 namespace yuzu::server {
 class SoftwareInventoryStore; // typed daily-sync software store (ADR-0016)
 class SoftwareLicensingStore; // ADR-0024 discovery store (query_software_licenses)
+class AppUsageStore; // wave 7 PR7.2 app-usage projection (get_agent_app_usage)
 // EnginePrincipalStore backs BOTH the PR 4.2 role-assignment MCP twins
 // (assign_engine_role/unassign_engine_role/list_engine_roles) AND the PR 4.3
 // engine-principal lifecycle tools (ADR-1005 item 2b). Forward-declared
@@ -526,6 +527,9 @@ public:
                             // ADR-0024: backs the query_software_licenses discovery read
                             // (the MCP twin of GET /api/v1/sle/agents/{id}).
                             SoftwareLicensingStore* software_licensing_store = nullptr,
+                            // wave 7 PR7.2: backs the get_agent_app_usage discovery read
+                            // (the MCP twin of GET /api/v1/forensics/agents/{id}/app-usage).
+                            AppUsageStore* app_usage_store = nullptr,
                             // PR 4.2 (design §4.1): backs assign_engine_role /
                             // unassign_engine_role / list_engine_roles — the MCP twins
                             // of the REST engine-principal role-assignment surface.
@@ -632,6 +636,8 @@ public:
                             const bool* mcp_streamed_post_enabled = nullptr,
                          std::vector<std::string> allowed_origins = {},
                          SoftwareLicensingStore* software_licensing_store = nullptr,
+                         // wave 7 PR7.2: backs get_agent_app_usage (see build_handler).
+                         AppUsageStore* app_usage_store = nullptr,
                          // PR 4.2 (design §4.1): engine-principal role-assignment MCP
                          // twins (the 4.2 grant handlers capture this param).
                          EnginePrincipalStore* engine_principal_store = nullptr,
