@@ -153,8 +153,8 @@ std::string hex_decode(std::string_view hex) {
 // guardian_spark_runtime.cpp) is NOT wired to this store - those files are
 // Spark-workstream-in-flight elsewhere; under prefer_spark_=true a first-ever
 // Spark-side capture is not yet persisted here, so the SAME full_sync-relaunder
-// gap remains for a rule that has NEVER been armed via legacy. Tracked as an
-// explicit follow-up rather than silently left undocumented.
+// gap remains for a rule that has NEVER been armed via legacy. Tracked as
+// #4045 rather than a bare prose follow-up (adversarial-review K4/C2-3).
 constexpr int kBaselineSchemaVersion = 1;
 
 std::string make_baseline_key(const std::string& rule_id) {
@@ -185,6 +185,42 @@ bool is_valid_baseline_hash(const std::string& h) {
     return true;
 }
 
+/// How a persisted baseline record read went. `Ok` means the record parsed and its
+/// hash is well-formed (the fingerprint may or may not match what the caller
+/// wanted — that's for the caller to compare); every other value means "nothing
+/// USABLE was read", collapsing "genuinely absent" and "read/parse/hash failure"
+/// into one non-throwing shape both `guardian_seed_baseline` and
+/// `guardian_persist_baseline` can switch on without duplicating the KV-read/JSON-
+/// parse plumbing between them (adversarial-review K1/C2-1: the persist side needs
+/// to distinguish "confirmed nothing there" from "read failed" too, not just the
+/// seed side).
+enum class BaselineReadOutcome { Ok, Absent, ReadError, Malformed };
+
+struct BaselineRecord {
+    std::string fingerprint;
+    std::string hash;
+};
+
+BaselineReadOutcome read_baseline_record_locked(KvStore& kv, const std::string& rule_id,
+                                                BaselineRecord& out) {
+    auto raw = kv.get_entry(kKvNamespace, make_baseline_key(rule_id));
+    if (!raw)
+        return BaselineReadOutcome::ReadError;
+    if (!raw->has_value())
+        return BaselineReadOutcome::Absent;
+    nlohmann::json j;
+    try {
+        j = nlohmann::json::parse(**raw);
+    } catch (const nlohmann::json::exception&) {
+        return BaselineReadOutcome::Malformed;
+    }
+    out.fingerprint = j.value("fingerprint", std::string{});
+    out.hash = j.value("hash", std::string{});
+    if (!is_valid_baseline_hash(out.hash))
+        return BaselineReadOutcome::Malformed;
+    return BaselineReadOutcome::Ok;
+}
+
 /// Look up a persisted baseline for `rule_id`, returning it ONLY when the stored
 /// fingerprint matches `fingerprint` (a mismatch is a genuinely different target,
 /// not a failure - the caller captures fresh, same as a rule with no baseline at
@@ -197,35 +233,26 @@ bool is_valid_baseline_hash(const std::string& h) {
 /// baselines specifically.
 std::optional<std::string> guardian_seed_baseline(KvStore& kv, const std::string& rule_id,
                                                    const std::string& fingerprint) {
-    auto raw = kv.get_entry(kKvNamespace, make_baseline_key(rule_id));
-    if (!raw) {
+    BaselineRecord rec;
+    switch (read_baseline_record_locked(kv, rule_id, rec)) {
+    case BaselineReadOutcome::Absent:
+        return std::nullopt; // genuinely no baseline yet - first-ever arm for this rule_id
+    case BaselineReadOutcome::ReadError:
         spdlog::error("Guardian: baseline lookup for rule '{}' failed (KV read error) - "
                      "arming as if no baseline is on record",
                      rule_id);
         return std::nullopt;
-    }
-    if (!raw->has_value())
-        return std::nullopt; // genuinely no baseline yet - first-ever arm for this rule_id
-    nlohmann::json j;
-    try {
-        j = nlohmann::json::parse(**raw);
-    } catch (const nlohmann::json::exception&) {
-        spdlog::error("Guardian: baseline record for rule '{}' is not valid JSON - discarding "
-                     "and arming as if no baseline is on record",
+    case BaselineReadOutcome::Malformed:
+        spdlog::error("Guardian: baseline record for rule '{}' is malformed (bad JSON or hash) "
+                     "- discarding and arming as if no baseline is on record",
                      rule_id);
         return std::nullopt;
+    case BaselineReadOutcome::Ok:
+        break;
     }
-    const auto stored_fp = j.value("fingerprint", std::string{});
-    const auto hash = j.value("hash", std::string{});
-    if (stored_fp != fingerprint)
+    if (rec.fingerprint != fingerprint)
         return std::nullopt; // different target under this rule_id - not a failure, fresh capture
-    if (!is_valid_baseline_hash(hash)) {
-        spdlog::error("Guardian: baseline record for rule '{}' has a malformed hash - discarding "
-                     "and arming as if no baseline is on record",
-                     rule_id);
-        return std::nullopt;
-    }
-    return hash;
+    return rec.hash;
 }
 
 /// Persist a newly-captured baseline. Takes `KvStore*` by raw pointer (not
@@ -234,14 +261,56 @@ std::optional<std::string> guardian_seed_baseline(KvStore& kv, const std::string
 /// its lock (see emit_guard_event's own doc), and `kv_` outlives every guard
 /// thread by construction (agent.cpp declares kv_store_ before guardian_, so it
 /// destructs AFTER - and stop_all_guards_locked()/withdraw join every guard thread
-/// before GuardianEngine itself is torn down). Fire-and-forget: a write failure is
-/// logged, not escalated - the in-memory guard still holds the correct baseline
-/// for its own remaining lifetime; only a LATER full_sync/restart would miss the
-/// persisted copy and (safely, not incorrectly) re-capture fresh.
+/// before GuardianEngine itself is torn down).
+///
+/// adversarial-review K1/C2-1 (both Kimi and Codex, independently): a TRANSIENT
+/// failure of guardian_seed_baseline's read (not absence — an actual KV read
+/// error, or a momentarily-malformed record) makes the arm proceed as if there
+/// were no baseline, so the guard captures WHATEVER the target currently holds —
+/// which, if the target has genuinely drifted since the real baseline was
+/// captured, is the drifted content. Persisting that unconditionally would
+/// overwrite the still-good prior record with the drifted one, permanently
+/// losing the only durable copy of the real baseline — reproducing this issue's
+/// exact laundering through the read-failure path instead of the full_sync path
+/// it was written to close. So this re-reads the CURRENT record first: if one
+/// already exists, is well-formed, AND matches `fingerprint` (same target), this
+/// write is refused — that combination is otherwise unreachable on the happy path
+/// (a matching well-formed record means guardian_seed_baseline would have seeded
+/// `expected_hash` and the guard's capture branch would never have fired at all),
+/// so its only reachable cause is a failed seed lookup, and keeping the existing
+/// record is always safer than trusting a capture that may be re-recording
+/// drift. A genuinely ABSENT record, a malformed one (self-heals — it was
+/// already unrecoverable), or one for a DIFFERENT fingerprint (a genuine
+/// retarget) all still write normally. A read failure on THIS (persist-side) re-
+/// read degrades to "write anyway" — the pre-existing, narrower posture — logged
+/// distinctly, so a KV outage cannot indefinitely wedge a rule out of ever
+/// getting a persisted baseline at all.
 void guardian_persist_baseline(KvStore* kv, const std::string& rule_id,
                                const std::string& fingerprint, const std::string& hash) {
     if (!kv)
         return;
+    BaselineRecord existing;
+    switch (read_baseline_record_locked(*kv, rule_id, existing)) {
+    case BaselineReadOutcome::Ok:
+        if (existing.fingerprint == fingerprint) {
+            spdlog::warn("Guardian: refusing to overwrite rule '{}''s persisted baseline with a "
+                        "fresh capture for the SAME target - a capture attempt only reaches "
+                        "here for an already-baselined target via a failed seed lookup "
+                        "(adversarial-review K1/C2-1); keeping the existing record",
+                        rule_id);
+            return;
+        }
+        break; // different fingerprint - a genuine retarget, write below
+    case BaselineReadOutcome::Absent:
+    case BaselineReadOutcome::Malformed:
+        break; // nothing usable on record - safe to write
+    case BaselineReadOutcome::ReadError:
+        spdlog::warn("Guardian: could not re-check rule '{}''s persisted baseline before "
+                    "writing (KV read error) - writing the fresh capture anyway rather than "
+                    "risk wedging the rule out of ever getting a persisted baseline",
+                    rule_id);
+        break;
+    }
     nlohmann::json j;
     j["schema"] = kBaselineSchemaVersion;
     j["fingerprint"] = fingerprint;
@@ -1771,6 +1840,26 @@ guardian_dispatch_push_bytes_for_test(GuardianEngine& engine,
 // that method from a guard worker's sink lambda (see start_guard_for_rule_locked).
 void guardian_emit_drift_for_test(GuardianEngine& engine, const GuardDrift& drift) {
     engine.emit_guard_event(drift);
+}
+
+// Test-support helpers — see guardian_engine.hpp (#4021 adversarial-review
+// K1/C2-1 regression net). Not friends: `guardian_persist_baseline`/
+// `guardian_seed_baseline` are free functions in this file's anonymous
+// namespace above (internal linkage), so these two thin, externally-linked
+// forwarders are the only way a different translation unit reaches them —
+// nothing else about them changes. Needed because the real call site
+// (`FileGuard::Config::on_baseline`) fires only from a running Windows-only
+// guard worker thread, which this platform's tests cannot exercise end-to-end.
+void guardian_persist_baseline_for_test(KvStore& kv, const std::string& rule_id,
+                                        const std::string& fingerprint,
+                                        const std::string& hash) {
+    guardian_persist_baseline(&kv, rule_id, fingerprint, hash);
+}
+
+std::optional<std::string> guardian_seed_baseline_for_test(KvStore& kv,
+                                                           const std::string& rule_id,
+                                                           const std::string& fingerprint) {
+    return guardian_seed_baseline(kv, rule_id, fingerprint);
 }
 
 } // namespace yuzu::agent

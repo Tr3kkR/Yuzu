@@ -681,4 +681,19 @@ guardian_dispatch_push_bytes_for_test(GuardianEngine& engine,
 YUZU_EXPORT void guardian_emit_drift_for_test(GuardianEngine& engine,
                                               const GuardDrift& drift);
 
+/// Test-support helpers (#4021 adversarial-review K1/C2-1 regression net): reach
+/// the persist-side overwrite guard and the seed-side lookup directly, since the
+/// real call site (`FileGuard::Config::on_baseline`) fires only from a running
+/// Windows-only guard worker thread — not exercisable end-to-end on this
+/// platform's tests. Both are thin forwarders into guardian_engine.cpp's
+/// anonymous-namespace `guardian_persist_baseline`/`guardian_seed_baseline`
+/// (internal linkage) — not friends, no GuardianEngine state involved. No
+/// production caller.
+YUZU_EXPORT void guardian_persist_baseline_for_test(KvStore& kv, const std::string& rule_id,
+                                                    const std::string& fingerprint,
+                                                    const std::string& hash);
+YUZU_EXPORT std::optional<std::string>
+guardian_seed_baseline_for_test(KvStore& kv, const std::string& rule_id,
+                                const std::string& fingerprint);
+
 } // namespace yuzu::agent

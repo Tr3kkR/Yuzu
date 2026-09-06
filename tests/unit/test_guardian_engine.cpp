@@ -281,6 +281,86 @@ TEST_CASE("a full_sync that DOES re-arm the baselined rule seeds it from the per
     CHECK(nlohmann::json::parse(*raw).value("hash", std::string{}) == original_hash);
 }
 
+// ── guardian_persist_baseline's overwrite guard (adversarial-review K1/C2-1) ──
+//
+// A TRANSIENT seed-lookup failure (or, equivalently for this guard's purposes,
+// any reason a capture fires despite a good record already being on file) must
+// never let the resulting fresh capture overwrite that good record — on the
+// happy path a matching well-formed record means guardian_seed_baseline would
+// have seeded expected_hash and the capture branch would never fire at all, so
+// reaching persist with a same-fingerprint record already present is only
+// reachable via a failed seed lookup. Exercised directly via the
+// `_for_test` forwarders since the real call site (FileGuard::Config::
+// on_baseline) only fires from a Windows-only guard worker this platform's
+// tests cannot run end-to-end.
+
+TEST_CASE("persist refuses to overwrite an existing SAME-fingerprint baseline",
+          "[guardian][engine][baseline][persist]") {
+    GuardianFixture f;
+    const std::string fp = "v1|file-hash-equals|/tmp/x";
+    const std::string good(64, 'a');
+    const std::string drifted(64, 'b');
+    nlohmann::json j;
+    j["schema"] = 1;
+    j["fingerprint"] = fp;
+    j["hash"] = good;
+    REQUIRE(f.kv->set(GuardianEngine::kv_namespace(), "baseline:r1", j.dump()));
+
+    // Simulates a fresh capture reaching persist despite a good record already
+    // on file (the only reachable cause: the seed lookup that should have
+    // prevented this capture in the first place failed transiently).
+    yuzu::agent::guardian_persist_baseline_for_test(*f.kv, "r1", fp, drifted);
+
+    auto raw = f.kv->get(GuardianEngine::kv_namespace(), "baseline:r1");
+    REQUIRE(raw.has_value());
+    CHECK(nlohmann::json::parse(*raw).value("hash", std::string{}) == good); // NOT overwritten
+}
+
+TEST_CASE("persist writes normally when no baseline exists yet",
+          "[guardian][engine][baseline][persist]") {
+    GuardianFixture f;
+    const std::string fp = "v1|file-hash-equals|/tmp/x";
+    const std::string hash(64, 'c');
+
+    yuzu::agent::guardian_persist_baseline_for_test(*f.kv, "r1", fp, hash);
+
+    auto seeded = yuzu::agent::guardian_seed_baseline_for_test(*f.kv, "r1", fp);
+    REQUIRE(seeded.has_value());
+    CHECK(*seeded == hash);
+}
+
+TEST_CASE("persist writes normally for a genuine retarget (different fingerprint)",
+          "[guardian][engine][baseline][persist]") {
+    GuardianFixture f;
+    nlohmann::json j;
+    j["schema"] = 1;
+    j["fingerprint"] = "v1|file-hash-equals|/tmp/old-path";
+    j["hash"] = std::string(64, 'd');
+    REQUIRE(f.kv->set(GuardianEngine::kv_namespace(), "baseline:r1", j.dump()));
+
+    const std::string new_fp = "v1|file-hash-equals|/tmp/new-path";
+    const std::string new_hash(64, 'e');
+    yuzu::agent::guardian_persist_baseline_for_test(*f.kv, "r1", new_fp, new_hash);
+
+    auto seeded = yuzu::agent::guardian_seed_baseline_for_test(*f.kv, "r1", new_fp);
+    REQUIRE(seeded.has_value());
+    CHECK(*seeded == new_hash); // the retarget's own capture DID write
+}
+
+TEST_CASE("persist writes normally over a malformed existing record (self-heals)",
+          "[guardian][engine][baseline][persist]") {
+    GuardianFixture f;
+    const std::string fp = "v1|file-hash-equals|/tmp/x";
+    REQUIRE(f.kv->set(GuardianEngine::kv_namespace(), "baseline:r1", "not valid json"));
+
+    const std::string hash(64, 'f');
+    yuzu::agent::guardian_persist_baseline_for_test(*f.kv, "r1", fp, hash);
+
+    auto seeded = yuzu::agent::guardian_seed_baseline_for_test(*f.kv, "r1", fp);
+    REQUIRE(seeded.has_value());
+    CHECK(*seeded == hash);
+}
+
 TEST_CASE("GuardianEngine: start_local on fresh KV reports zero rules",
           "[guardian][engine][start]") {
     GuardianFixture f;
