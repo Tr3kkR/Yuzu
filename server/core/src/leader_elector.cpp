@@ -144,6 +144,7 @@ bool LeaderElector::try_acquire() {
         pg::PgResult live = pg::exec_params(conn_.get(), "SELECT 1", std::vector<std::string>{});
         if (live.status() == PGRES_TUPLES_OK)
             return true;
+        spdlog::warn("leader_elector: liveness check failed while leading; dropping and reconnecting");
         drop_leadership_locked();
         if (!connect_locked())
             return false;
@@ -236,8 +237,12 @@ std::string LeaderElector::epoch_fence_sql(const std::string& lock_name, std::in
     // producing SQL that could admit a claim. is_valid_lock_name constrains
     // lock_name to [a-z][a-z0-9_]{0,47}, so the value below cannot break out of
     // the single-quoted literal; epoch is rendered from an integer.
-    if (!is_valid_lock_name(lock_name))
+    if (!is_valid_lock_name(lock_name)) {
+        // An invalid lock_name is a programming error (the caller passed an
+        // unvalidated name); mark it before slice 3.3 wires a real consumer.
+        spdlog::warn("leader_elector: epoch_fence_sql got an invalid lock_name; fencing closed");
         return "(1=0)";
+    }
     return "((SELECT current_leader_epoch FROM leader_elector.leader_state "
            "WHERE lock_key = '" +
            lock_name + "') = " + std::to_string(epoch) + ")";

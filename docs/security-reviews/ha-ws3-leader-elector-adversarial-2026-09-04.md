@@ -27,7 +27,9 @@ produces), splitting only on severity.
   result), `drop_leadership_locked()` + `connect_locked()` best-effort, mirroring the
   leader liveness branch. Pinned by `test_leader_elector.cpp` "recovers leadership after its
   backend is terminated" (kills the elector's backend via `pg_terminate_backend`, then
-  asserts a later `try_acquire()` re-leads with a strictly higher epoch).
+  asserts a later `try_acquire()` recovers leadership and mints an epoch). Strict
+  epoch monotonicity is asserted separately by the "epoch is strictly monotonic
+  across handover" case, not by the F1 recovery test.
 
 ## F2 — the fence was check-then-act, not atomic with the claim
 

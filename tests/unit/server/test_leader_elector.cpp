@@ -23,6 +23,7 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <stdexcept>
 #include <string>
 #include <thread>
 
@@ -42,6 +43,20 @@ PgConn connect(const std::string& dsn) {
 LeaderElector::Config cfg(const std::string& dsn, std::string holder) {
     return LeaderElector::Config{.dsn = dsn, .holder_id = std::move(holder)};
 }
+
+// Store-behaviour cases clone this pre-migrated template rather than migrating a
+// fresh database each time (docs/testing/unit-test-conventions.md — per-test
+// migration DDL is tied to a documented 2026-07-12 Windows CI timeout). The
+// setup runs the LeaderElector migration ONCE on the template; it does not
+// acquire, so the cloned leader_state is empty. The "migrates schema" and
+// fail-closed-construction cases deliberately stay off the template (they must
+// exercise migration-from-empty, or never touch a database at all).
+yuzu::test::PgTestTemplate leader_elector_tpl{
+    "leaderelector", [](const std::string& dsn) {
+        LeaderElector migrator{LeaderElector::Config{.dsn = dsn, .holder_id = "template"}};
+        if (!migrator.is_open())
+            throw std::runtime_error("leader_elector template: store failed to migrate");
+    }};
 
 // Evaluate an SQL boolean expression; true iff it evaluates to 't' (a NULL,
 // e.g. a fence over a missing leader row, reads as false — fail-closed).
@@ -72,7 +87,7 @@ TEST_CASE("LeaderElector migrates schema and starts non-leader", "[pg][store][le
 }
 
 TEST_CASE("LeaderElector acquires leadership and mints an epoch", "[pg][store][leader-elector]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, leader_elector_tpl);
     LeaderElector e(cfg(db.dsn(), "holder-a"));
     REQUIRE(e.is_open());
     REQUIRE(e.try_acquire());
@@ -87,7 +102,7 @@ TEST_CASE("LeaderElector acquires leadership and mints an epoch", "[pg][store][l
 
 TEST_CASE("LeaderElector refuses a second elector while the first holds",
           "[pg][store][leader-elector]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, leader_elector_tpl);
     LeaderElector a(cfg(db.dsn(), "holder-a"));
     LeaderElector b(cfg(db.dsn(), "holder-b"));
     REQUIRE(a.is_open());
@@ -104,7 +119,7 @@ TEST_CASE("LeaderElector refuses a second elector while the first holds",
 
 TEST_CASE("LeaderElector epoch is strictly monotonic across handover",
           "[pg][store][leader-elector]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, leader_elector_tpl);
     LeaderElector a(cfg(db.dsn(), "holder-a"));
     LeaderElector b(cfg(db.dsn(), "holder-b"));
     REQUIRE(a.try_acquire());
@@ -126,7 +141,7 @@ TEST_CASE("LeaderElector epoch is strictly monotonic across handover",
 
 TEST_CASE("epoch_fence_sql predicate fences a stale ex-leader epoch (fail-closed)",
           "[pg][store][leader-elector]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, leader_elector_tpl);
     const std::string lock_name = kServerBackgroundLeaderLock;
     auto claim = connect(db.dsn()); // an ordinary (non-owning) connection, like a claim conn
 
@@ -151,7 +166,7 @@ TEST_CASE("epoch_fence_sql predicate fences a stale ex-leader epoch (fail-closed
 
 TEST_CASE("epoch_fence_sql guards a claim WRITE atomically",
           "[pg][store][leader-elector]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, leader_elector_tpl);
     const std::string lock_name = kServerBackgroundLeaderLock;
     auto claim = connect(db.dsn());
     PgResult tmp{PQexec(claim.get(), "CREATE TEMP TABLE claim_probe(n int)")};
@@ -169,7 +184,7 @@ TEST_CASE("epoch_fence_sql guards a claim WRITE atomically",
 
 TEST_CASE("epoch_fence_sql fails closed with no leader row and on an invalid name",
           "[pg][store][leader-elector]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, leader_elector_tpl);
     // Construct an elector only to run the migration (creates leader_state), but
     // never acquire — so the table exists with no row.
     LeaderElector e(cfg(db.dsn(), "holder-a"));
@@ -184,7 +199,7 @@ TEST_CASE("epoch_fence_sql fails closed with no leader row and on an invalid nam
 
 TEST_CASE("LeaderElector follower recovers after its backend is terminated (F1)",
           "[pg][store][leader-elector]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, leader_elector_tpl);
     LeaderElector a(cfg(db.dsn(), "holder-a"));
     LeaderElector b(cfg(db.dsn(), "holder-b"));
     REQUIRE(a.is_open());
@@ -220,7 +235,7 @@ TEST_CASE("LeaderElector follower recovers after its backend is terminated (F1)"
 }
 
 TEST_CASE("LeaderElector heartbeat tracks leadership", "[pg][store][leader-elector]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, leader_elector_tpl);
     LeaderElector a(cfg(db.dsn(), "holder-a"));
     CHECK_FALSE(a.heartbeat()); // not leader yet
     REQUIRE(a.try_acquire());
@@ -231,7 +246,7 @@ TEST_CASE("LeaderElector heartbeat tracks leadership", "[pg][store][leader-elect
 
 TEST_CASE("LeaderElector distinct lock names hold independent locks",
           "[pg][store][leader-elector]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, leader_elector_tpl);
     LeaderElector alpha(LeaderElector::Config{.dsn = db.dsn(), .holder_id = "h", .lock_name = "alpha"});
     LeaderElector beta(LeaderElector::Config{.dsn = db.dsn(), .holder_id = "h", .lock_name = "beta"});
     REQUIRE(alpha.is_open());
