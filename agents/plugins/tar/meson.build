@@ -33,6 +33,7 @@ tar_sources = files(
   'src/tar_mapdrive_collector.cpp',
   'src/tar_fleet_snapshot.cpp',
   'src/tar_cursor_sources.cpp',
+  'src/tar_usage.cpp',
 )
 
 if host_machine.system() == 'windows'
