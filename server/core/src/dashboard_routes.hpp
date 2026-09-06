@@ -38,6 +38,7 @@ class TagStore;
 class InstructionStore;
 class HttpRouteSink; // http_route_sink.hpp — the in-process-testable seam (#438)
 struct FacetFilter;
+struct TarRetentionPausedScan; // tar_tree_routes.hpp — #4027 REST+MCP twin shape
 
 namespace detail {
 class AgentRegistry;
@@ -199,6 +200,15 @@ public:
     /// `this` at registration and read the member per request, so an
     /// injection after `register_routes` still takes live effect.
     void set_capability_classify_fn(ClassifyFn fn) { classify_fn_ = std::move(fn); }
+
+    /// #4027: the data-gathering half of render_tar_retention_paused, extracted so
+    /// the HTML fragment renderer, the new `GET /api/v1/tar/retention-paused` REST
+    /// twin, and the `list_tar_retention_paused` MCP twin share ONE read of the scan
+    /// state / response store / visibility filter (api-twin-recipe.md Rule 1) instead
+    /// of the REST/MCP surface re-deriving it. Public (unlike the private renderer
+    /// above) — `McpServer` calls it via a `DashboardRoutes*` threaded in through
+    /// server.cpp, the same pattern other route classes use for cross-class access.
+    TarRetentionPausedScan gather_tar_retention_paused(const std::string& username) const;
 
 private:
     std::vector<std::string> csrf_trusted_origins_;

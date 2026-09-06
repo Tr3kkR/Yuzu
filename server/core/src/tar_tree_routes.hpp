@@ -23,6 +23,19 @@
 /// Execute on the cached device_id) AND binds the entry to the originating principal,
 /// so a predicted/leaked token can neither cross management scope, downgrade the
 /// Execute tier, nor be replayed under a different session.
+///
+/// REST + MCP twins (api-parity programme, issue #4027): `GET /api/v1/tar/process-tree`
+/// (device picker) and `GET /api/v1/tar/capture-sources` (device picker) are twinned
+/// here, over the SAME `Infrastructure:Read` gate + service-scoped-token guard as
+/// their fragment siblings, via the shared pure builders below (api-twin-recipe.md
+/// Rule 1). `GET /fragments/tar/process-tree/result` and `.../detail` are
+/// DELIBERATELY NOT twinned by #4027 — both depend on artifacts (`pcmd`/`tcmd`
+/// command-ids for /result; a cache `token` for /detail) that today are mintable
+/// ONLY by the dashboard-only `/run` route (excluded from #4027 as a dispatch-shaped
+/// GET, batched with #3994's later dispatch-twin work). A "twin" whose required input
+/// has no REST/MCP-only path to obtain is not a real capability closure — see the
+/// #4027 ledger row for the recorded `exception:` reason. Revisit once Batch C lands
+/// a `/run` twin that can mint a token/command-id pair over the API.
 
 #include <yuzu/server/auth.hpp>
 
@@ -47,6 +60,62 @@ namespace yuzu::server {
 
 class HttpRouteSink;
 
+/// Pure JSON builder (api-twin-recipe.md Rule 1) for the process-tree host picker's
+/// device list — the SAME operator-scoped `devices` list `render_frame` turns into
+/// `<option>` elements. Called by `GET /api/v1/tar/process-tree` and the
+/// `list_tar_process_tree_devices` MCP tool; the HTML fragment keeps its own
+/// presentation-only "hide offline" filter (a picker dropdown for live dispatch,
+/// unlike this JSON list) rather than being refactored onto this builder's output —
+/// low risk to add, non-trivial to merge without changing the picker's UX, so left
+/// alone per Rule 1's "where that refactor is low-risk" carve-out. Includes BOTH
+/// online and offline devices (each row carries `online`) — an API/MCP caller isn't
+/// choosing a live-dispatch target the way the picker is, so hiding offline rows
+/// would silently under-report the operator's visible fleet.
+std::string tar_process_tree_frame_json(const std::vector<DeviceRow>& devices);
+
+/// Same shape and same "why a distinct name" rationale as
+/// `tar_process_tree_frame_json` — the capture-sources device picker's list
+/// (`render_cap_frame`). `GET /api/v1/tar/capture-sources` +
+/// `list_tar_capture_sources_devices` MCP twin.
+std::string tar_capture_sources_devices_json(const std::vector<DeviceRow>& devices);
+
+/// One row in the TAR retention-paused source list (Phase 15.A). Mirrors
+/// `DashboardRoutes`' private `PausedRow` field-for-field — extracted here (not into
+/// `dashboard_routes.hpp`) so the REST/MCP JSON twin and DashboardRoutes' HTML
+/// fragment renderer share ONE row shape without re-deriving it (api-twin-recipe.md
+/// Rule 1), per the `#4027` AC's explicit `tar_retention_paused_json(...)` builder.
+struct TarPausedSourceRow {
+    std::string agent_id;
+    std::string agent_display;
+    std::string source;
+    std::int64_t paused_at = 0;
+    std::int64_t live_rows = -1; ///< -1 = unknown (older agent)
+    std::int64_t oldest_ts = 0;
+    bool value_error = false;    ///< #560: `<source>_enabled` held a non-canonical value
+    std::string enabled_raw;     ///< the offending value, when value_error
+};
+
+/// Scan-level metadata + honesty counters accompanying a `TarPausedSourceRow` list.
+/// See `DashboardRoutes::gather_tar_retention_paused` (dashboard_routes.cpp) for how
+/// these are computed from the operator's per-username scan state + the response
+/// store + the visible-agent set.
+struct TarRetentionPausedScan {
+    std::string scan_id;
+    int scan_count = 0;
+    std::int64_t scan_at = 0;
+    int agents_responded = 0;
+    int agents_with_no_paused_sources = 0;
+    int agents_filtered_out_of_scope = 0;
+    bool store_degraded = false;
+    std::vector<TarPausedSourceRow> rows;
+};
+
+/// Pure JSON builder for the retention-paused source list — shared by
+/// `GET /api/v1/tar/retention-paused` and the `list_tar_retention_paused` MCP tool.
+/// Row order matches the HTML renderer's sort (value-error rows first, then
+/// oldest-paused-first, then by display name) so the two surfaces agree.
+std::string tar_retention_paused_json(const TarRetentionPausedScan& scan);
+
 /// The `/tar` interactive-fragment route controller. Despite the historical name it
 /// now owns THREE operator surfaces, all sharing the same scoped-Read + Execute-probe
 /// + dispatch/poll seam and the eight providers below:
@@ -55,6 +124,13 @@ class HttpRouteSink;
 ///   3. Capture-sources frame — `/fragments/tar/capture-sources[/load|/push]` (ADR-0015)
 /// (A rename to `TarFrameRoutes` + a split of the capture-sources surface is tracked
 /// as a deferred follow-up; folding them here avoids a second server.cpp registration.)
+///
+/// #4027 adds two REST v1 twins registered by the SAME `register_routes` call:
+/// `GET /api/v1/tar/process-tree` and `GET /api/v1/tar/capture-sources`, both device
+/// picker lists gated identically to their fragment siblings (`Infrastructure:Read`
+/// + the service-scoped-token fleet-wide-enumeration guard, deduplicated into
+/// `deny_fleet_wide_device_enumeration` below rather than left as two, now
+/// three-going-on-four, copies of the same inline check).
 class TarTreeRoutes {
 public:
     using AuthFn =
@@ -133,6 +209,26 @@ private:
     /// nullopt → token unknown/expired. Validates node_id internally.
     std::optional<std::string> cache_render_detail(const std::string& token, std::size_t node_id,
                                                    std::string* out_device_id);
+
+    /// #4027: the fleet-wide device-enumeration guard shared by the frame fragment
+    /// routes (`/fragments/tar/process-tree`, `/fragments/tar/capture-sources`) and
+    /// their new `/api/v1/tar/...` twins — previously two byte-for-byte-identical
+    /// inline copies (one per fragment route); adding the REST twins would have made
+    /// a third and fourth. Resolves the session itself via `auth_fn_` (writing its
+    /// own 401 on failure), denies + audits (`tar.device_picker.view`, denied) a
+    /// service-scoped token, and returns true iff the caller must return immediately
+    /// (401 already written, or the 403 deny itself) — same contract as
+    /// `rest_api_v1.cpp`'s/`mcp_server.cpp`'s OWN separate `deny_fleet_wide_service_scoped`
+    /// lambdas, which this does not call: those are TU-local lambdas in different
+    /// translation units (not exported via a header), so consolidating across all
+    /// three would mean extracting a new shared header function and touching two
+    /// large, already-hardened files outside this change's blast radius. Deduplicating
+    /// TarTreeRoutes' own copies closes the concrete "third copy" risk #4027 flags
+    /// without that wider, riskier refactor; a genuinely shared header function is a
+    /// reasonable fast-follow. On success (no session, or a non-service-scoped one),
+    /// `*out_session` is set when non-null and the session resolved.
+    bool deny_fleet_wide_device_enumeration(const httplib::Request& req, httplib::Response& res,
+                                            std::optional<auth::Session>* out_session = nullptr);
 
     AuthFn auth_fn_;
     PermFn perm_fn_;

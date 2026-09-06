@@ -5,10 +5,12 @@
 #include "tar_tree_routes.hpp"
 
 #include "http_route_sink.hpp"
-#include "rest_a4_envelope_http.hpp" // detail::a4_denial
+#include "rest_a4_envelope_http.hpp" // detail::a4_denial, detail::a4_error, make_correlation_id
 #include "rest_audit.hpp"     // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
 #include "secure_random.hpp" // random_hex (CSPRNG cache token, #801)
 #include "web_utils.hpp"      // html_escape, audit_token, now_epoch_seconds
+
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
@@ -23,6 +25,18 @@
 namespace yuzu::server {
 
 namespace {
+using json = nlohmann::json;
+
+// A4 success envelope — mirrors rest_api_v1.cpp's `ok_json` (rest_api_v1.cpp:211):
+// takes an ALREADY-SERIALIZED JSON `data` payload and wraps it, no re-parse. Not
+// shared via a header (see docs/api-twin-recipe.md §2: `ok_json`/`list_json` are
+// rest_api_v1.cpp-local; other self-registering `*_routes.cpp` modules —
+// ca_routes.cpp, viz_routes.cpp — each hand-roll their own envelope the same way
+// rather than reach across translation units for it).
+std::string ok_json(std::string_view data_json) {
+    return std::string("{\"data\":") + std::string(data_json) +
+          ",\"meta\":{\"api_version\":\"v1\"}}";
+}
 
 // Percent-encode for query values (mirrors device_routes' url_enc).
 std::string url_enc(const std::string& s) {
@@ -243,6 +257,111 @@ PollResult poll_command(const TarTreeRoutes::ResponsesFn& responses_fn, const st
 
 } // namespace
 
+namespace {
+
+// Shared row shape behind BOTH tar_process_tree_frame_json and
+// tar_capture_sources_devices_json — the two public builders are separate names
+// (matching the AC's own naming; the two frames are distinct capabilities) but must
+// not become two independently-maintained JSON shapes for the same DeviceRow (Rule
+// 1). Sort matches render_frame/render_cap_frame's own device sort (display name
+// ascending) so the JSON twin and the HTML picker present devices in the same order.
+std::string device_picker_json(const std::vector<DeviceRow>& devices) {
+    std::vector<DeviceRow> rows = devices;
+    std::sort(rows.begin(), rows.end(), [](const DeviceRow& a, const DeviceRow& b) {
+        return (a.hostname.empty() ? a.agent_id : a.hostname) <
+               (b.hostname.empty() ? b.agent_id : b.hostname);
+    });
+    json arr = json::array();
+    for (const auto& d : rows) {
+        arr.push_back({{"agent_id", d.agent_id},
+                       {"hostname", d.hostname},
+                       {"os", d.os},
+                       {"arch", d.arch},
+                       {"agent_version", d.agent_version},
+                       {"online", d.online}});
+    }
+    return arr.dump();
+}
+
+} // namespace
+
+std::string tar_process_tree_frame_json(const std::vector<DeviceRow>& devices) {
+    return device_picker_json(devices);
+}
+
+std::string tar_capture_sources_devices_json(const std::vector<DeviceRow>& devices) {
+    return device_picker_json(devices);
+}
+
+std::string tar_retention_paused_json(const TarRetentionPausedScan& scan) {
+    // Same sort as DashboardRoutes::render_tar_retention_paused: value-error rows
+    // float to the top, then oldest-paused-first (0 == oldest, per #558), then by
+    // display name — kept in lockstep with the HTML renderer's own std::sort so the
+    // two surfaces agree on row order (see gather_tar_retention_paused's doc comment
+    // for why the SORT itself still lives twice: the HTML renderer sorts its own
+    // internal PausedRow vector, and duplicating a five-line comparator is far lower
+    // risk than threading a shared-order guarantee through two different row types).
+    std::vector<TarPausedSourceRow> rows = scan.rows;
+    std::sort(rows.begin(), rows.end(),
+              [](const TarPausedSourceRow& a, const TarPausedSourceRow& b) {
+                  if (a.value_error != b.value_error)
+                      return a.value_error;
+                  if (a.paused_at != b.paused_at)
+                      return a.paused_at < b.paused_at;
+                  return a.agent_display < b.agent_display;
+              });
+    json rows_json = json::array();
+    for (const auto& r : rows) {
+        rows_json.push_back({{"agent_id", r.agent_id},
+                             {"agent_display", r.agent_display},
+                             {"source", r.source},
+                             {"paused_at", r.paused_at},
+                             {"live_rows", r.live_rows},
+                             {"oldest_ts", r.oldest_ts},
+                             {"value_error", r.value_error},
+                             {"enabled_raw", r.enabled_raw}});
+    }
+    return json{{"scan_id", scan.scan_id},
+               {"scan_count", scan.scan_count},
+               {"scan_at", scan.scan_at},
+               {"agents_responded", scan.agents_responded},
+               {"agents_with_no_paused_sources", scan.agents_with_no_paused_sources},
+               {"agents_filtered_out_of_scope", scan.agents_filtered_out_of_scope},
+               {"store_degraded", scan.store_degraded},
+               {"rows", rows_json}}
+        .dump();
+}
+
+bool TarTreeRoutes::deny_fleet_wide_device_enumeration(const httplib::Request& req,
+                                                       httplib::Response& res,
+                                                       std::optional<auth::Session>* out_session) {
+    auto session = auth_fn_(req, res);
+    if (!session) {
+        res.status = 401;
+        res.set_content("auth required", "text/plain");
+        return true;
+    }
+    if (!session->token_scope_service.empty()) {
+        // Write the 403 FIRST, audit after (normalized — #3167). `.permission`
+        // omitted: kServiceScopeGlobalSafe is compile-time-empty, so no grant admits
+        // a service-scoped caller here; naming one would be a false
+        // self-remediation claim.
+        res.status = 403;
+        res.set_content(
+            detail::a4_denial(res, 403,
+                              "service-scoped tokens may not read the fleet-wide device list"),
+            "application/json");
+        (void)detail::try_persist_audit(
+            audit_fn_, req, "tar.device_picker.view", "denied", "Infrastructure", "",
+            "fleet-wide TAR device picker denied to a service-scoped token "
+            "(path=" + req.path + ")");
+        return true;
+    }
+    if (out_session)
+        *out_session = std::move(session);
+    return false;
+}
+
 void TarTreeRoutes::cache_put(const std::string& token, ReconEntry entry) {
     std::lock_guard<std::mutex> lk(cache_mu_);
     const std::int64_t now = now_epoch_seconds();
@@ -327,37 +446,37 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
     // -- Frame body: toolbar + targets (host list is operator-scoped). --
     sink.Get("/fragments/tar/process-tree", [this](const httplib::Request& req,
                                                    httplib::Response& res) {
-        auto session = auth_fn_(req, res);
-        if (!session) {
-            res.status = 401;
-            res.set_content("auth required", "text/plain");
+        std::optional<auth::Session> session;
+        if (deny_fleet_wide_device_enumeration(req, res, &session))
             return;
-        }
-        // Fleet-wide device-enumeration disclosure (SEC-2/SEC-3 confinement-gap
-        // class, found during a docs sweep): devices_fn_ below is username-keyed
-        // and does not confine a service-scoped API token whose principal
-        // resolves to an unscoped grant.
-        if (!session->token_scope_service.empty()) {
-            // Write the 403 FIRST, audit after (normalized — #3167).
-            // `.permission` omitted: kServiceScopeGlobalSafe is
-            // compile-time-empty, so no grant admits a service-scoped caller
-            // here; naming one would be a false self-remediation claim.
-            res.status = 403;
-            res.set_content(
-                detail::a4_denial(
-                    res, 403, "service-scoped tokens may not read the fleet-wide device list"),
-                "application/json");
-            (void)detail::try_persist_audit(
-                audit_fn_, req, "tar.device_picker.view", "denied", "Infrastructure", "",
-                "fleet-wide TAR device picker denied to a service-scoped token "
-                "(path=" + req.path + ")");
-            return;
-        }
         if (!perm_fn_(req, res, "Infrastructure", "Read"))
             return;
         std::vector<DeviceRow> devices =
             devices_fn_ ? devices_fn_(session->username) : std::vector<DeviceRow>{};
         res.set_content(render_frame(devices), "text/html; charset=utf-8");
+    });
+
+    // -- REST v1 twin: same operator-scoped device list, JSON (#4027). Same gate
+    // sequence as the fragment above (deny_fleet_wide_device_enumeration then
+    // Infrastructure:Read); unaudited on the success path — a device identity/online
+    // list, not per-device behavioral content (matches this fragment's own
+    // today-unaudited success path; see docs/api-twin-recipe.md's
+    // list_software_deployments worked example for the same "metadata, not
+    // behavioral PII" reasoning). --
+    sink.Get("/api/v1/tar/process-tree", [this](const httplib::Request& req,
+                                                httplib::Response& res) {
+        const auto cid = detail::make_correlation_id();
+        res.set_header("X-Correlation-Id", cid);
+        std::optional<auth::Session> session;
+        if (deny_fleet_wide_device_enumeration(req, res, &session))
+            return;
+        if (!perm_fn_(req, res, "Infrastructure", "Read"))
+            return;
+        std::vector<DeviceRow> devices =
+            devices_fn_ ? devices_fn_(session->username) : std::vector<DeviceRow>{};
+        res.set_content(
+            ok_json(std::string("{\"devices\":") + tar_process_tree_frame_json(devices) + "}"),
+            "application/json");
     });
 
     // -- Run: scope + execute gate -> dispatch two canned tar.sql -> poll fragment. --
@@ -678,37 +797,33 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
     // page JS (a toggle never dispatches — only Push does). ──
     sink.Get("/fragments/tar/capture-sources", [this](const httplib::Request& req,
                                                       httplib::Response& res) {
-        auto session = auth_fn_(req, res);
-        if (!session) {
-            res.status = 401;
-            res.set_content("auth required", "text/plain");
+        std::optional<auth::Session> session;
+        if (deny_fleet_wide_device_enumeration(req, res, &session))
             return;
-        }
-        // Fleet-wide device-enumeration disclosure (SEC-2/SEC-3 confinement-gap
-        // class): same gap and same verb as /fragments/tar/process-tree above —
-        // devices_fn_ is username-keyed and does not confine a service-scoped
-        // API token whose principal resolves to an unscoped grant.
-        if (!session->token_scope_service.empty()) {
-            // Write the 403 FIRST, audit after (normalized — #3167).
-            // `.permission` omitted: kServiceScopeGlobalSafe is
-            // compile-time-empty, so no grant admits a service-scoped caller
-            // here; naming one would be a false self-remediation claim.
-            res.status = 403;
-            res.set_content(
-                detail::a4_denial(
-                    res, 403, "service-scoped tokens may not read the fleet-wide device list"),
-                "application/json");
-            (void)detail::try_persist_audit(
-                audit_fn_, req, "tar.device_picker.view", "denied", "Infrastructure", "",
-                "fleet-wide TAR device picker denied to a service-scoped token "
-                "(path=" + req.path + ")");
-            return;
-        }
         if (!perm_fn_(req, res, "Infrastructure", "Read"))
             return;
         std::vector<DeviceRow> devices =
             devices_fn_ ? devices_fn_(session->username) : std::vector<DeviceRow>{};
         res.set_content(render_cap_frame(devices), "text/html; charset=utf-8");
+    });
+
+    // -- REST v1 twin: same operator-scoped device list, JSON (#4027). Same gate
+    // sequence + unaudited success-path posture as
+    // GET /api/v1/tar/process-tree above — see that route's comment. --
+    sink.Get("/api/v1/tar/capture-sources", [this](const httplib::Request& req,
+                                                   httplib::Response& res) {
+        const auto cid = detail::make_correlation_id();
+        res.set_header("X-Correlation-Id", cid);
+        std::optional<auth::Session> session;
+        if (deny_fleet_wide_device_enumeration(req, res, &session))
+            return;
+        if (!perm_fn_(req, res, "Infrastructure", "Read"))
+            return;
+        std::vector<DeviceRow> devices =
+            devices_fn_ ? devices_fn_(session->username) : std::vector<DeviceRow>{};
+        res.set_content(
+            ok_json(std::string("{\"devices\":") + tar_capture_sources_devices_json(devices) + "}"),
+            "application/json");
     });
 
     sink.Get("/fragments/tar/capture-sources/load", [this, can_execute](const httplib::Request& req,

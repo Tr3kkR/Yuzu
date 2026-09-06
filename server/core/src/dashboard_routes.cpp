@@ -3,6 +3,8 @@
 #include "dispatch_destructive_gate.hpp" // PR6.0b: the shared Destructive targeting gate (#3685)
 #include "on_behalf_guard.hpp"              // sanitize_for_log
 #include "dispatch_target_shape.hpp" // kBroadcastScope (#2500), kReasonDestructiveUntargeted
+#include "rest_a4_envelope_http.hpp" // detail::a4_error, make_correlation_id (#4027 REST twin)
+#include "tar_tree_routes.hpp" // TarRetentionPausedScan/TarPausedSourceRow/tar_retention_paused_json (#4027)
 
 #include <algorithm>
 #include <chrono>
@@ -1458,6 +1460,42 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 }
             });
 
+    // -- REST v1 twin: same per-operator scan/paused-source list, JSON (#4027).
+    // Same gate + per-operator-scoped Cache-Control posture as the fragment above;
+    // unaudited on the success path — scan/config metadata, not per-device
+    // behavioral content (matches this fragment's own today-unaudited posture; see
+    // docs/api-twin-recipe.md's list_software_deployments worked example for the
+    // same "metadata, not behavioral PII" reasoning). --
+    sink.Get("/api/v1/tar/retention-paused",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                const auto cid = detail::make_correlation_id();
+                res.set_header("X-Correlation-Id", cid);
+                if (!perm_fn_(req, res, "Infrastructure", "Read")) {
+                    if (metrics_) {
+                        metrics_->counter("yuzu_tar_dashboard_view_total",
+                                          {{"frame", "retention_rest"},
+                                           {"result", "denied"}}).increment();
+                    }
+                    return;
+                }
+                auto session = auth_fn_(req, res);
+                if (!session) return;
+                // Per-operator scoped data — see the fragment route's UP-11 comment.
+                res.set_header("Cache-Control", "no-store, private");
+                res.set_header("Vary", "Cookie");
+                const TarRetentionPausedScan scan =
+                    gather_tar_retention_paused(session->username);
+                res.set_content(
+                    std::string("{\"data\":") + tar_retention_paused_json(scan) +
+                        ",\"meta\":{\"api_version\":\"v1\"}}",
+                    "application/json");
+                if (metrics_) {
+                    metrics_->counter("yuzu_tar_dashboard_view_total",
+                                      {{"frame", "retention_rest"},
+                                       {"result", "success"}}).increment();
+                }
+            });
+
     sink.Post("/fragments/tar/retention-paused/scan",
              [this](const httplib::Request& req, httplib::Response& res) {
                  // Dispatching a command to the fleet is an Execute action,
@@ -2753,28 +2791,31 @@ std::string DashboardRoutes::render_scope_list(const std::string& selected,
 // informational placeholders rather than table-with-zero-rows so the
 // operator gets actionable guidance.
 
-std::string DashboardRoutes::render_tar_retention_paused(
-    const std::string& username, bool can_execute, bool can_delete) const {
-    std::string scan_id;
-    int scan_count = 0;
-    int64_t scan_at = 0;
+// #4027: the data-gathering half, extracted from render_tar_retention_paused so the
+// HTML fragment renderer below AND the new GET /api/v1/tar/retention-paused REST twin
+// + list_tar_retention_paused MCP twin all read the SAME scan state / response store /
+// visibility filter exactly once (api-twin-recipe.md Rule 1) rather than the REST/MCP
+// surface re-deriving it. `store_degraded` covers BOTH "response_store_ was never
+// wired" and "the store was wired but the query itself failed" — the caller (the HTML
+// renderer's empty-state branch, or the JSON builder) doesn't need the distinction,
+// only "was this data trustworthy."
+TarRetentionPausedScan
+DashboardRoutes::gather_tar_retention_paused(const std::string& username) const {
+    TarRetentionPausedScan scan;
     {
         std::lock_guard<std::mutex> lk(tar_scan_mu_);
         auto it = tar_scans_by_user_.find(username);
         if (it != tar_scans_by_user_.end()) {
-            scan_id = it->second.command_id;
-            scan_count = it->second.dispatched_count;
-            scan_at = it->second.dispatched_at;
+            scan.scan_id = it->second.command_id;
+            scan.scan_count = it->second.dispatched_count;
+            scan.scan_at = it->second.dispatched_at;
         }
     }
-
-    if (scan_id.empty()) {
-        return "<div class=\"empty-state\">No scan data yet — click "
-               "<strong>Scan fleet</strong> above to query the agents "
-               "in your scope for TAR retention state.</div>";
-    }
+    if (scan.scan_id.empty())
+        return scan; // no scan yet for this operator
     if (!response_store_) {
-        return "<div class=\"empty-state\">Response store unavailable.</div>";
+        scan.store_degraded = true;
+        return scan;
     }
 
     // Build the operator's visible-agent allow-set so we can filter the
@@ -2800,8 +2841,8 @@ std::string DashboardRoutes::render_tar_retention_paused(
     // view exists to make.
     ResponseQuery q;
     q.limit = 10000;
-    auto responses_opt = response_store_->query(scan_id, q);
-    bool store_degraded = !responses_opt.has_value();
+    auto responses_opt = response_store_->query(scan.scan_id, q);
+    scan.store_degraded = !responses_opt.has_value();
     auto responses = responses_opt.value_or(std::vector<StoredResponse>{});
 
     // Each response is from one agent. Parse each line for
@@ -2809,23 +2850,9 @@ std::string DashboardRoutes::render_tar_retention_paused(
     //   config|<source>_paused_at|<ts>
     //   config|<source>_live_rows|<count>
     //   config|<source>_oldest_ts|<ts>
-    // and emit one table row for every (agent, source) pair where
-    // `<source>_enabled` == "false". Sources with `enabled=true` are
-    // dropped — the operator wants the *paused* set, not the whole fleet.
-    struct PausedRow {
-        std::string agent_id;
-        std::string agent_display;
-        std::string source;
-        int64_t paused_at{0};
-        int64_t live_rows{-1};   // -1 = unknown (older agent)
-        int64_t oldest_ts{0};
-        bool value_error{false}; // #560: <source>_enabled held a non-canonical value
-        std::string enabled_raw; // the offending value, for the value-error badge
-    };
-    std::vector<PausedRow> rows;
-    int agents_responded = 0;
-    int agents_with_no_paused_sources = 0;
-    int agents_filtered_out_of_scope = 0;
+    // and emit one row for every (agent, source) pair where `<source>_enabled` ==
+    // "false". Sources with `enabled=true` are dropped — callers want the *paused*
+    // set, not the whole fleet.
 
     // #561 — a malicious or buggy agent can spam many responses under one
     // command_id (no (command_id, agent_id) uniqueness at the write path). Dedup
@@ -2854,10 +2881,10 @@ std::string DashboardRoutes::render_tar_retention_paused(
         // see. If mgmt_group_store_ is unavailable, fail closed (drop all
         // — operator sees an empty list rather than unscoped data).
         if (!visible_set.contains(resp.agent_id)) {
-            ++agents_filtered_out_of_scope;
+            ++scan.agents_filtered_out_of_scope;
             continue;
         }
-        ++agents_responded;
+        ++scan.agents_responded;
         std::unordered_map<std::string, std::string> kv;
         auto lines = split_output_lines(resp.output);
         for (const auto& line : lines) {
@@ -2886,7 +2913,7 @@ std::string DashboardRoutes::render_tar_retention_paused(
             // (silent omission shows clean state for an actually-paused source).
             const bool value_error = (it->second != "false");
 
-            PausedRow row;
+            TarPausedSourceRow row;
             row.agent_id = resp.agent_id;
             row.agent_display = registry_ ? registry_->display_name(resp.agent_id)
                                           : resp.agent_id;
@@ -2906,10 +2933,34 @@ std::string DashboardRoutes::render_tar_retention_paused(
                 ot != kv.end()) {
                 try { row.oldest_ts = std::stoll(ot->second); } catch (...) {}
             }
-            rows.push_back(std::move(row));
+            scan.rows.push_back(std::move(row));
             any_paused_for_this_agent = true;
         }
-        if (!any_paused_for_this_agent) ++agents_with_no_paused_sources;
+        if (!any_paused_for_this_agent) ++scan.agents_with_no_paused_sources;
+    }
+
+    return scan;
+}
+
+std::string DashboardRoutes::render_tar_retention_paused(
+    const std::string& username, bool can_execute, bool can_delete) const {
+    TarRetentionPausedScan scan = gather_tar_retention_paused(username);
+    const std::string& scan_id = scan.scan_id;
+    const int scan_count = scan.scan_count;
+    const int64_t scan_at = scan.scan_at;
+    const bool store_degraded = scan.store_degraded;
+    const int agents_responded = scan.agents_responded;
+    const int agents_with_no_paused_sources = scan.agents_with_no_paused_sources;
+    const int agents_filtered_out_of_scope = scan.agents_filtered_out_of_scope;
+    // Local, mutable alias (the HTML rendering below sorts in place) so the
+    // unchanged HTML-building code (which iterates `rows` and reads
+    // `TarPausedSourceRow` fields) needs no further edits.
+    std::vector<TarPausedSourceRow>& rows = scan.rows;
+
+    if (scan_id.empty()) {
+        return "<div class=\"empty-state\">No scan data yet — click "
+               "<strong>Scan fleet</strong> above to query the agents "
+               "in your scope for TAR retention state.</div>";
     }
 
     int64_t now = now_epoch();
@@ -2994,7 +3045,7 @@ std::string DashboardRoutes::render_tar_retention_paused(
     // the BOTTOM, inverting operator intent; sort 0 as the smallest (oldest)
     // instead so they rank at the top.
     std::sort(rows.begin(), rows.end(),
-              [](const PausedRow& a, const PausedRow& b) {
+              [](const TarPausedSourceRow& a, const TarPausedSourceRow& b) {
                   if (a.value_error != b.value_error)
                       return a.value_error; // errors float to the top
                   if (a.paused_at != b.paused_at)
