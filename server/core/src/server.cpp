@@ -65,6 +65,7 @@
 #include "grpc_on_behalf_interceptor.hpp"
 #include "guardian_health_fleet_tags.hpp" // Guardian M1 health-stream fleet gauge names + HELP (#2298 item 6d)
 #include "guardian_journal_fleet_tags.hpp" // Guardian journal fleet gauge names + HELP (#2298)
+#include "instruction_definition_model.hpp" // #4029: shared row/detail/export builders
 #include "instruction_store.hpp"
 #include "instruction_yaml.hpp"
 #include "on_behalf_guard.hpp"
@@ -16318,20 +16319,13 @@ private:
                 return;
             }
             const auto& defs = *defs_result;
+            // #4029: shared builder (instruction_definition_model.hpp) — the exact
+            // same 11-field shape this route always returned, now also called by
+            // GET /api/v1/instructions and MCP list_definitions (zero shape change
+            // here; closes the duplication before those two callers existed).
             nlohmann::json arr = nlohmann::json::array();
-            for (const auto& d : defs) {
-                arr.push_back({{"id", d.id},
-                               {"name", d.name},
-                               {"version", d.version},
-                               {"type", d.type},
-                               {"plugin", d.plugin},
-                               {"action", d.action},
-                               {"description", d.description},
-                               {"enabled", d.enabled},
-                               {"instruction_set_id", d.instruction_set_id},
-                               {"created_at", d.created_at},
-                               {"updated_at", d.updated_at}});
-            }
+            for (const auto& d : defs)
+                arr.push_back(instruction_definition_row_json(d));
             res.set_content(nlohmann::json({{"definitions", arr}, {"count", arr.size()}}).dump(),
                             "application/json");
         });
@@ -22141,7 +22135,9 @@ private:
                 // /api/command's visible-set half uses, now carrying identity too.
                 [this](const auth::Session& s) -> yuzu::server::DispatchCaller {
                     return derive_dispatch_caller(s);
-                });
+                },
+                // #4029: backs list_product_packs/get_product_pack.
+                product_pack_store_.get());
         }
 
         // -- Listen -----------------------------------------------------------

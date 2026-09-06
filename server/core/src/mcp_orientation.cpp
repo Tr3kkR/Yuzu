@@ -47,7 +47,13 @@ namespace {
 
 constexpr std::string_view kFleet[] = {"list_agents", "get_agent_details"};
 constexpr std::string_view kTags[] = {"get_tags", "search_agents_by_tag", "set_tag", "delete_tag"};
-constexpr std::string_view kDefinitions[] = {"list_definitions", "get_definition", "list_schedules"};
+// #4029: export_definition joins the family — same domain, same securable.
+constexpr std::string_view kDefinitions[] = {"list_definitions", "get_definition",
+                                             "export_definition", "list_schedules"};
+// #4029: product packs are a distinct catalog domain (installed bundles of
+// InstructionDefinition/PolicyFragment/Policy/Workflow documents), own
+// securable (ProductPack), own family.
+constexpr std::string_view kProductPacks[] = {"list_product_packs", "get_product_pack"};
 constexpr std::string_view kResponses[] = {"query_responses", "aggregate_responses"};
 constexpr std::string_view kExecutionsAudit[] = {"get_execution_status", "list_executions",
                                                  "query_audit_log"};
@@ -109,10 +115,13 @@ constexpr std::string_view kDiscovery[] = {"discover_permissions", "discover_ins
                                            "discover_routes", "discover_scope_kinds",
                                            "discover_plugins"};
 
-constexpr std::array<ToolFamily, 24> kFamilies{{
+constexpr std::array<ToolFamily, 25> kFamilies{{
     {"Fleet & agents", "connected agents, their OS/arch/version, and details", kFleet},
     {"Tags", "read and write agent tags, and find agents by tag", kTags},
-    {"Instructions & schedules", "instruction definitions and recurring schedules", kDefinitions},
+    {"Instructions & schedules", "instruction definitions, their full export, and recurring "
+                                 "schedules",
+     kDefinitions},
+    {"Product packs", "installed bundles of instruction/policy/workflow content", kProductPacks},
     {"Command responses", "query and aggregate stored command/instruction responses", kResponses},
     {"Executions & audit", "execution status/history and the who-did-what audit log",
      kExecutionsAudit},

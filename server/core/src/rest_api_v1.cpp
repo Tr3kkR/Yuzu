@@ -20,9 +20,11 @@
 #include "guardian_rule_spec.hpp"
 #include "guardian_schema_registry.hpp"
 #include "http_route_sink.hpp"
+#include "instruction_definition_model.hpp" // #4029: shared row/detail/export builders
 #include "inventory_eval.hpp"
 #include "openapi_spec_access.hpp" // external-linkage accessor for discover_routes.cpp / mcp_server.cpp
 #include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (UP-1)
+#include "product_pack_model.hpp" // #4029: shared row/detail builders + error classifiers
 #include "quarantine_reapply.hpp" // quarantine_whitelist_tokens_safe / kQuarantineWhitelistMaxLen (#3425 gate3-rest-whitelist-validation-gap)
 #include "rest_a4_envelope.hpp"
 #include "sensitive_instruction_params.hpp" // redact_sensitive_instruction_params (#3136 blocker)
@@ -945,6 +947,24 @@ const std::string& openapi_spec() {
     },
     "/inventory/software": {
       "get": {"summary": "Fleet-wide installed-software inventory (typed daily-sync store, ADR-0016)", "tags": ["Inventory"], "description": "Installed-software rows across the fleet from the typed SoftwareInventoryStore (DISTINCT from the generic /inventory/* routes, which read the generic blob store). Rows carry name, version, publisher, install_date plus the blob-v2 package fields: kind (package|app), ecosystem (rpm|deb|apk|pacman|windows|macos|homebrew), epoch, release, arch, signature_status (rpm stored-tag), distro_id, distro_version — fields an ecosystem does not store are empty, never synthesised. Requires Inventory:Read (#3290 Phase 2: the SOLE gate is the ADR-0017 admit-then-filter fleet-read gate, never stacked with a separate permission check). Results are scoped to the caller's management groups AND, for a service-scoped API token, to that token's service-tagged agents (the intersection of both when both apply); out-of-scope devices are dropped and counted in devices_omitted (a positive value means matching software exists outside your scope — an empty/short result does NOT mean the software is absent fleet-wide). A correctly-confined service-scoped token now gets a real filtered read here rather than an outright 403. Capped at limit rows (max 1000); result_truncated_by_cap=true means more exist past the cap (keyset pagination is a follow-up). On store degradation, or the caller's tag-scope lookup degrading, the endpoint returns 503 (never an empty 200) so a vulnerability query cannot read a transient outage as 'installed nowhere'.", "parameters": [{"name": "name", "in": "query", "schema": {"type": "string"}, "description": "Exact software-name filter (optional)"}, {"name": "agent_id", "in": "query", "schema": {"type": "string"}, "description": "Exact agent filter (optional)"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "{data:{software[], count, devices_omitted, result_truncated_by_cap?, audit_persisted?}}"}, "400": {"description": "Non-integer limit"}, "401": {"description": "Unauthenticated"}, "403": {"description": "No management-group grant for Inventory:Read (or a service-scoped token whose RBAC/ITServiceOwner grant is missing/RBAC disabled)"}, "503": {"description": "Software inventory store unavailable/degraded, RBAC/management-group/tag store unavailable, or the fleet-read gate unwired"}}}
+    },)json"
+        // #4029 (api-parity Batch A content/catalog half) — GET /api/v1/instructions*
+        // and GET /api/v1/product-packs*. Own segment (MSVC C2026 16,380-byte cap).
+        R"json(
+    "/instructions": {
+      "get": {"summary": "List instruction definitions (full filter set)", "tags": ["Instructions"], "description": "Requires InstructionDefinition:Read. Twin of the legacy GET /api/instructions, reconciled onto the same builder MCP list_definitions calls (instruction_definition_row_json) — cannot drift from it by construction. Not audited (content/catalog metadata, not per-agent behavioural PII — matches the legacy route's own unaudited posture).", "parameters": [{"name": "name", "in": "query", "schema": {"type": "string"}}, {"name": "plugin", "in": "query", "schema": {"type": "string"}}, {"name": "type", "in": "query", "schema": {"type": "string", "enum": ["question", "action"]}}, {"name": "set_id", "in": "query", "schema": {"type": "string"}, "description": "Filter to definitions in this instruction set"}, {"name": "enabled_only", "in": "query", "schema": {"type": "boolean"}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100}}], "responses": {"200": {"description": "{data:[{id,name,version,type,plugin,action,description,enabled,instruction_set_id,created_at,updated_at}], pagination, meta}"}, "400": {"description": "Non-integer limit"}, "403": {"description": "Requires InstructionDefinition:Read"}, "503": {"description": "Instruction store unavailable, or a genuine read failure"}}}
+    },
+    "/instructions/{id}": {
+      "get": {"summary": "Get a single instruction definition (reconciled superset)", "tags": ["Instructions"], "description": "Requires InstructionDefinition:Read. Twin of the legacy GET /api/instructions/{id} AND of MCP get_definition — reconciles both pre-existing shapes onto one builder (instruction_definition_detail_json): the legacy fragment's gather_ttl_seconds/response_ttl_days/created_by/timestamps AND MCP's approval_mode/parameter_schema/result_schema/yaml_source, together.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{data:{id,name,version,type,plugin,action,description,enabled,instruction_set_id,created_at,updated_at,gather_ttl_seconds,response_ttl_days,created_by,approval_mode,parameter_schema,result_schema,yaml_source}, meta}"}, "403": {"description": "Requires InstructionDefinition:Read"}, "404": {"description": "No definition with that id"}, "503": {"description": "Instruction store unavailable, or a genuine read failure"}}}
+    },
+    "/instructions/{id}/export": {
+      "get": {"summary": "Export a single instruction definition as its full JSON document", "tags": ["Instructions"], "description": "Requires InstructionDefinition:Read. Twin of the legacy GET /api/instructions/{id}/export and the new MCP export_definition tool — all three call the same builder (instruction_definition_export_json), which InstructionStore::export_definition_json itself now delegates to as well. DIVERGES from the legacy route on a not-found id: the legacy route returns 200 \"{}\" (a store-export quirk); this route resolves the definition first and returns a real 404.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{data:{...every InstructionDefinition field, including yaml_source/concurrency_mode/platforms/min_agent_version/required_plugins/readable_payload/visualization_spec/response_templates_spec}, meta}"}, "403": {"description": "Requires InstructionDefinition:Read"}, "404": {"description": "No definition with that id"}, "503": {"description": "Instruction store unavailable, or a genuine read failure"}}}
+    },
+    "/product-packs": {
+      "get": {"summary": "List installed product packs", "tags": ["Product Packs"], "description": "Requires ProductPack:Read (#4029 prerequisite fix: ProductPack was used as this route's securable string by the legacy GET /api/product-packs but was never seeded into RBAC's securable-types catalogue — no role, not even Administrator, could be granted it; fixed as part of this issue). Twin of the legacy route and of the new MCP list_product_packs tool, all three sharing product_pack_row_json.", "parameters": [{"name": "name", "in": "query", "schema": {"type": "string"}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100}}], "responses": {"200": {"description": "{data:[{id,name,version,description,item_count,items:[{kind,item_id,name}],installed_at,verified}], pagination, meta}"}, "400": {"description": "Non-integer limit"}, "403": {"description": "Requires ProductPack:Read"}, "503": {"description": "Product pack store unavailable, or a genuine read failure"}}}
+    },
+    "/product-packs/{id}": {
+      "get": {"summary": "Get a single installed product pack's detail", "tags": ["Product Packs"], "description": "Requires ProductPack:Read. Twin of the legacy GET /api/product-packs/{id} and the new MCP get_product_pack tool, all three sharing product_pack_detail_json (includes each item's own yaml_source, unlike the list row above).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{data:{id,name,version,description,yaml_source,items:[{kind,item_id,name,yaml_source}],installed_at,verified}, meta}"}, "403": {"description": "Requires ProductPack:Read"}, "404": {"description": "No product pack with that id"}, "503": {"description": "Product pack store unavailable, or a genuine read failure"}}}
     },)json"
         // SLE (Software Licensing & Entitlements, ADR-0024) — /api/v1/sle/* read
         // surface, gated on the SoftwareLicensing securable (DISTINCT from `License`,
@@ -5391,6 +5411,203 @@ void RestApiV1::register_routes(
                                  .add("created_at", d.created_at));
                  }
                  res.set_content(list_json(arr.str(), static_cast<int64_t>(defs.size())),
+                                 "application/json");
+             });
+
+    // ── Instructions / Product Packs (#4029, api-parity Batch A content/catalog
+    // half) ──────────────────────────────────────────────────────────────────
+    //
+    // Twins of the legacy GET /api/instructions[/{id}[/export]] and
+    // GET /api/product-packs[/{id}] routes (server.cpp / workflow_routes.cpp),
+    // reconciled onto the shared instruction_definition_model.hpp /
+    // product_pack_model.hpp builders (docs/api-twin-recipe.md §1) — MCP's
+    // list_definitions/get_definition dispatch branches call the SAME builders
+    // (mcp_server.cpp), so REST and MCP cannot drift from each other by
+    // construction. Audit: content/catalog definition reads, matching the
+    // majority unaudited posture already on all five underlying legacy routes
+    // (docs/api-twin-recipe.md §4's "reads" table; no emit_behavioral_audit
+    // here — this is not per-agent behavioural PII). MCP's twins still call the
+    // generic `mcp.<tool_name>` audit (list_definitions/get_definition already
+    // did before this PR; export_definition/list_product_packs/
+    // get_product_pack now do the same for consistency) — that MCP-side audit
+    // predates this PR for two of the five and is preserved, not silently
+    // dropped; REST stays silent for all five, matching the legacy fragments.
+
+    sink.Get("/api/v1/instructions", [perm_fn, instruction_store](const httplib::Request& req,
+                                                                  httplib::Response& res) {
+        if (!perm_fn(req, res, "InstructionDefinition", "Read"))
+            return;
+        if (!instruction_store || !instruction_store->is_open()) {
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "instruction store not available"),
+                            "application/json");
+            return;
+        }
+
+        InstructionQuery q;
+        if (req.has_param("name"))
+            q.name_filter = req.get_param_value("name");
+        if (req.has_param("plugin"))
+            q.plugin_filter = req.get_param_value("plugin");
+        if (req.has_param("type"))
+            q.type_filter = req.get_param_value("type");
+        if (req.has_param("set_id"))
+            q.set_id_filter = req.get_param_value("set_id");
+        if (req.has_param("enabled_only"))
+            q.enabled_only = true;
+        if (req.has_param("limit")) {
+            try {
+                q.limit = std::stoi(req.get_param_value("limit"));
+            } catch (const std::exception&) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
+                                "application/json");
+                return;
+            }
+        }
+
+        auto defs_result = instruction_store->query_definitions(q);
+        if (!defs_result) {
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "instruction store read failed"),
+                            "application/json");
+            return;
+        }
+        JArr arr;
+        for (const auto& d : *defs_result)
+            arr.add_raw(instruction_definition_row_json(d).dump());
+        res.set_content(list_json(arr.str(), static_cast<int64_t>(defs_result->size())),
+                        "application/json");
+    });
+
+    sink.Get(R"(/api/v1/instructions/([^/]+))",
+             [perm_fn, instruction_store](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "InstructionDefinition", "Read"))
+                     return;
+                 if (!instruction_store || !instruction_store->is_open()) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "instruction store not available"),
+                                     "application/json");
+                     return;
+                 }
+                 auto id = req.matches[1].str();
+                 auto def_result = instruction_store->get_definition(id);
+                 if (!def_result) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "instruction store read failed"),
+                                     "application/json");
+                     return;
+                 }
+                 if (!*def_result) {
+                     res.status = 404;
+                     res.set_content(detail::a4_error(res, "not found"), "application/json");
+                     return;
+                 }
+                 res.set_content(ok_json(instruction_definition_detail_json(**def_result).dump()),
+                                 "application/json");
+             });
+
+    // NOTE on divergence from the legacy (non-v1) export route: the legacy
+    // GET /api/instructions/{id}/export returns 200 "{}" for an unknown id
+    // (InstructionStore::export_definition_json's own not-found sentinel,
+    // never distinguished from "found but empty" by that route). This v1
+    // twin instead resolves the definition itself first, so an unknown id
+    // is a real 404 — a deliberate correction, not a copied quirk.
+    sink.Get(R"(/api/v1/instructions/([^/]+)/export)",
+             [perm_fn, instruction_store](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "InstructionDefinition", "Read"))
+                     return;
+                 if (!instruction_store || !instruction_store->is_open()) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "instruction store not available"),
+                                     "application/json");
+                     return;
+                 }
+                 auto id = req.matches[1].str();
+                 auto def_result = instruction_store->get_definition(id);
+                 if (!def_result) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "instruction store read failed"),
+                                     "application/json");
+                     return;
+                 }
+                 if (!*def_result) {
+                     res.status = 404;
+                     res.set_content(detail::a4_error(res, "not found"), "application/json");
+                     return;
+                 }
+                 res.set_content(ok_json(instruction_definition_export_json(**def_result).dump()),
+                                 "application/json");
+             });
+
+    sink.Get("/api/v1/product-packs", [perm_fn, product_pack_store](const httplib::Request& req,
+                                                                     httplib::Response& res) {
+        if (!perm_fn(req, res, "ProductPack", "Read"))
+            return;
+        if (!product_pack_store || !product_pack_store->is_open()) {
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "product pack store not available"),
+                            "application/json");
+            return;
+        }
+
+        ProductPackQuery q;
+        if (req.has_param("name"))
+            q.name_filter = req.get_param_value("name");
+        if (req.has_param("limit")) {
+            try {
+                q.limit = std::stoi(req.get_param_value("limit"));
+            } catch (const std::exception&) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
+                                "application/json");
+                return;
+            }
+        }
+
+        auto packs_result = product_pack_store->list(q);
+        if (!packs_result) {
+            res.status = product_pack_error_status(packs_result.error());
+            res.set_content(detail::a4_error(res, product_pack_client_message(
+                                                       "GET /api/v1/product-packs",
+                                                       packs_result.error())),
+                            "application/json");
+            return;
+        }
+        JArr arr;
+        for (const auto& p : *packs_result)
+            arr.add_raw(product_pack_row_json(p).dump());
+        res.set_content(list_json(arr.str(), static_cast<int64_t>(packs_result->size())),
+                        "application/json");
+    });
+
+    sink.Get(R"(/api/v1/product-packs/([^/]+))",
+             [perm_fn, product_pack_store](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "ProductPack", "Read"))
+                     return;
+                 if (!product_pack_store || !product_pack_store->is_open()) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "product pack store not available"),
+                                     "application/json");
+                     return;
+                 }
+                 auto id = req.matches[1].str();
+                 auto pack_result = product_pack_store->get(id);
+                 if (!pack_result) {
+                     res.status = product_pack_error_status(pack_result.error());
+                     res.set_content(detail::a4_error(res, product_pack_client_message(
+                                                                "GET /api/v1/product-packs/{id}",
+                                                                pack_result.error())),
+                                     "application/json");
+                     return;
+                 }
+                 if (!*pack_result) {
+                     res.status = 404;
+                     res.set_content(detail::a4_error(res, "product pack not found"),
+                                     "application/json");
+                     return;
+                 }
+                 res.set_content(ok_json(product_pack_detail_json(**pack_result).dump()),
                                  "application/json");
              });
 
