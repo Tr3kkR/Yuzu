@@ -556,7 +556,7 @@ void RbacStore::seed_defaults() {
          "ON CONFLICT (key) DO NOTHING");
 
     // Securable types.
-    const std::array<std::string_view, 27> types = {
+    const std::array<std::string_view, 28> types = {
         "Infrastructure",  "UserManagement",  "InstructionDefinition",
         "InstructionSet",  "Execution",       "Schedule",
         "Approval",        "Tag",             "AuditLog",
@@ -583,7 +583,20 @@ void RbacStore::seed_defaults() {
         // mutating action). Administrator-only via the CRUD loop below —
         // same PluginConfig/UploadGrant precedent, deliberately absent from
         // the explicit Viewer read-list further down this function.
-        "PowerManagement"};
+        "PowerManagement",
+        // #4029 prerequisite fix: `ProductPack` is used as an RBAC securable
+        // string by the already-shipped `/api/product-packs*` routes
+        // (workflow_routes.cpp, `perm_fn(req, res, "ProductPack", "Read"/
+        // "Write"/"Delete")`) but was never seeded here or into
+        // mcp_server.cpp's `kRbacSecurables[]` mirror — `role_permissions.
+        // securable_type` carries a hard FK to `securable_types(name)`, so no
+        // role, not even Administrator, could ever be granted ProductPack:*
+        // while RBAC is enabled. Administrator gets full CRUD for free via
+        // the types-loop below; Read is additionally granted to Operator/
+        // PlatformEngineer/Viewer further down (the same population that
+        // already holds InstructionDefinition:Read) — Write/Delete stay
+        // Administrator-only, matching the issue's scoped ask.
+        "ProductPack"};
     for (auto t : types)
         exec("INSERT INTO rbac_store.securable_types (name, is_system) VALUES ($1, TRUE) "
              "ON CONFLICT (name) DO NOTHING",
@@ -689,7 +702,10 @@ void RbacStore::seed_defaults() {
         for (std::string_view o : {"Read", "Write", "Execute", "Delete"})
             grant("PlatformEngineer", t, o);
     for (std::string_view t : {"Execution", "Schedule", "Approval", "Tag", "AuditLog", "Response",
-                               "SoftwareLicensing", "Inventory"})
+                               "SoftwareLicensing", "Inventory",
+                               // #4029: read visibility on installed product packs, matching the
+                               // existing InstructionDefinition:Read population's consistency.
+                               "ProductPack"})
         grant("PlatformEngineer", t, "Read");
     for (std::string_view o : {"Read", "Write", "Delete"})
         grant("PlatformEngineer", "Policy", o);
@@ -724,6 +740,8 @@ void RbacStore::seed_defaults() {
     grant("Operator", "FileRetrieval", "Write");
     grant("Operator", "GuaranteedState", "Read");
     grant("Operator", "GuaranteedState", "Push");
+    // #4029: read visibility on installed product packs.
+    grant("Operator", "ProductPack", "Read");
     // PR1.5/1.6: read visibility only — config and grant LIFECYCLE stay
     // privileged operations, and PluginSecret is deliberately absent here
     // (secret material is never Operator-readable).
@@ -755,7 +773,9 @@ void RbacStore::seed_defaults() {
                                "Execution", "Schedule", "Approval", "Tag", "AuditLog", "Response",
                                "ManagementGroup", "ApiToken", "Security", "Policy", "DeviceToken",
                                "SoftwareDeployment", "License", "FileRetrieval", "GuaranteedState",
-                               "Inventory", "SoftwareLicensing", "EnginePrincipal"})
+                               "Inventory", "SoftwareLicensing", "EnginePrincipal",
+                               // #4029: read visibility on installed product packs.
+                               "ProductPack"})
         grant("Viewer", t, "Read");
 
     // Reviewer.
