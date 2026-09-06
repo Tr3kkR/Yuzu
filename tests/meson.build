@@ -229,6 +229,7 @@ agent_test_exe = executable(
     # real return value; see unit/test_runner_main.cpp and catch2_nomain_dep
     # above.
     'unit/test_runner_main.cpp',
+    'unit/test_progress_listener.cpp', # #4018 per-test START/END progress log, env-gated
     'unit/test_detached_signature.cpp', # shared detached-CMS verifier (#416/#3807)
     'unit/test_updater_signature.cpp', # OTA signature gate, end to end (#416/#3807)
     'unit/test_plugin_loader.cpp',
@@ -607,18 +608,18 @@ agent_test_exe = executable(
 # four to five threads with no throttle, two of them on real SQLite I/O. Their wall time is
 # contention-dominated - it ballooned under Big Tam filesystem contention (four CI jobs
 # sharing one host's /tmp), where one stalled ~8 minutes and timed the whole agent suite out
-# (#2345). In a PLAIN build they detect nothing (no instrumentation), so that cost buys no
-# signal there - skip them. A
-# sanitizer build runs everything (ASan for use-after-free in the concurrent teardown, TSan
-# for the races they exist for), where the ~10x-larger job budget absorbs their cost as it did
-# before this change. The OTHER four [tsan] tests are cheap and bounded (no real SQLite, or a
-# fixed sleep) and stay in every build. A coverage build (b_coverage, no sanitizer) also skips
-# the two heavy tests; their concurrent code paths are line-covered by the sequential
-# prune/page/gauge tests and the cheap concurrent tests, so no meaningful line coverage is lost.
-# The residual risk that these two balloon on the shared Big Tam pool even under the sanitizer
-# budget is tracked in #2373 (split/redesign), not papered over with a wall-clock cap here -
-# that route introduced its own flakiness (a busy main thread starving the workers it waited on)
-# and was backed out.
+# (#2345), and the same mechanism recurred on Wee Tam/Windows under ASan (#4018). In a PLAIN
+# build they detect nothing (no instrumentation), so that cost buys no signal there - skip
+# them. A sanitizer build runs everything, but as of #2373's split (below) NOT in this same
+# entry: they get their OWN test() with its own budget, so a stall here no longer risks
+# timing out the other ~1500 fast cases sharing this entry's ceiling. The OTHER four [tsan]
+# tests are cheap and bounded (no real SQLite, or a fixed sleep) and stay in every build. A
+# coverage build (b_coverage, no sanitizer) also skips the two heavy tests; their concurrent
+# code paths are line-covered by the sequential prune/page/gauge tests and the cheap
+# concurrent tests, so no meaningful line coverage is lost.
+# #2373 (split/redesign) is now acted on directly below, not merely tracked: a wall-clock cap
+# on these tests was tried and backed out (a busy main thread starving the workers it waited
+# on), so the fix is a separately-budgeted entry, never a tighter deadline on this one.
 # ── #2270 allocation-budget probe (separate binary, deliberately) ────────────
 # test_spark_alloc_budget.cpp REPLACES the global operator new/delete to count
 # allocations, which is process-wide and cannot be scoped to one test. Two
@@ -648,7 +649,10 @@ if host_machine.system() == 'linux' and get_option('b_sanitize') == 'none'
   )
 endif
 
-agent_test_args = (get_option('b_sanitize') == 'none') ? ['~[tsan-heavy]'] : []
+# [tsan-heavy] is now ALWAYS excluded from this entry (previously only in a plain build) -
+# see the #2373 split comment above and the dedicated 'agent tsan-heavy checkpoints' entry
+# below, which is the only place a sanitizer build runs them now.
+agent_test_args = ['~[tsan-heavy]']
 test(
   'agent unit tests',
   agent_test_exe,
@@ -657,6 +661,29 @@ test(
   timeout: 240, # restored after moving the (now three, #3848) [tsan-heavy] tests to sanitizer-only (#2345): plain suite is ~28s, so 240s is ~8x headroom and surfaces a genuine hang rather than absorbing it into a loose ceiling.
   depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin, abi3_fixture_plugin],
 )
+
+if get_option('b_sanitize') != 'none'
+  # #2373's split, acted on: these three [tsan-heavy] checkpoints are contention-dominated
+  # (two spin unthrottled real SQLite I/O; #2345 measured one stalling ~8 minutes on Big Tam
+  # under shared-filesystem contention, and #4018 saw the same mechanism recur on Wee
+  # Tam/Windows ASan). Their own entry means a stall here times out AT ITS OWN BUDGET,
+  # classifiably, instead of either being absorbed into the fast suite's tight 240s ceiling
+  # (windows-asan's prior state, #4018) or dragging the whole ~1500-case fast suite down with
+  # it. 600s is sized off the measured ~480s (8-minute) stall with headroom, not the plain
+  # suite's ~28s baseline; nightly's own --timeout-multiplier 2 (Linux legs) / the
+  # windows-asan job's now-added multiplier scale this to 1200s under sanitizer instrumentation
+  # plus contention. Do NOT replace this with a wall-clock cap inside the tests themselves -
+  # that was tried and backed out (comment above): a busy main thread starves the worker
+  # threads whose progress it is waiting on.
+  test(
+    'agent tsan-heavy checkpoints',
+    agent_test_exe,
+    args: ['[tsan-heavy]'],
+    suite: 'agent',
+    timeout: 600,
+    depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin, abi3_fixture_plugin],
+  )
+endif
 
 # ── cert_store macOS honest-unsupported unit test (A-1.20 / P8; BR-001/BR-003
 #    branch-review fix) ────────────────────────────────────────────────────

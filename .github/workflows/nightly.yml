@@ -16,7 +16,15 @@ name: Nightly
 on:
   schedule:
     - cron: '0 6 * * *'  # 06:00 UTC daily
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      jobs:
+        description: "Which jobs to run (#4018: lets recurrence be measured on dev without paying for the full Big Tam matrix each time - scheduled nightlies only ever run main, never dev)"
+        type: choice
+        options:
+          - all
+          - windows-asan
+        default: all
 
 permissions:
   contents: read
@@ -71,7 +79,7 @@ jobs:
   sanitize-asan:
     name: "Sanitizers (ASan+UBSan)"
     needs: [preflight]
-    if: needs.preflight.outputs.bigtam_pool_healthy == 'true'
+    if: needs.preflight.outputs.bigtam_pool_healthy == 'true' && inputs.jobs != 'windows-asan'
     # Pinned to the Big Tam pool (native Ubuntu 26.04, GCC 15). The ASan
     # triplet (x64-linux-asan) is a forced cold-cache rebuild every run
     # because per-instrumentation vcpkg packages can't be safely shared
@@ -215,7 +223,7 @@ jobs:
   sanitize-tsan:
     name: "Sanitizers (TSan)"
     needs: [preflight]
-    if: needs.preflight.outputs.bigtam_pool_healthy == 'true'
+    if: needs.preflight.outputs.bigtam_pool_healthy == 'true' && inputs.jobs != 'windows-asan'
     # Pinned to the Big Tam pool. Same compute argument as the ASan job:
     # the TSan triplet (x64-linux-tsan, issue #917) is a forced cold-cache
     # rebuild every run because per-instrumentation vcpkg packages can't be
@@ -585,22 +593,48 @@ jobs:
         run: meson compile -C build-windows-asan tests/yuzu_agent_tests -j "$YUZU_BUILD_JOBS"
 
       - name: Test
+        # #4018/#2373: sibling-aligned with every other sanitizer leg (Linux
+        # asan/tsan/coverage, sanitizer-tests.yml, the macOS ci.yml leg all carry
+        # --timeout-multiplier 2 already) and joins ci.yml's Windows with-test-slot.sh
+        # gate (this leg previously ran ungated on the shared 4-runner Wee Tam box).
+        # YUZU_TEST_PROGRESS_FILE is an ABSOLUTE path deliberately: meson's default
+        # test workdir is the build directory itself (verified against meson's own
+        # source), so a bare "build-windows-asan/meson-logs/..." value would resolve
+        # relative to a cwd that's already build-windows-asan and double-prefix.
+        env:
+          YUZU_TEST_SLOT_TIMEOUT_MIN: "30"
         run: |
           export PATH="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/bin:$PATH"
-          meson test -C build-windows-asan --suite agent --print-errorlogs
+          export YUZU_TEST_PROGRESS=1
+          export YUZU_TEST_PROGRESS_FILE="$GITHUB_WORKSPACE/build-windows-asan/meson-logs/progress.log"
+          mkdir -p "$(dirname "$YUZU_TEST_PROGRESS_FILE")"
+          rm -f "$YUZU_TEST_PROGRESS_FILE"
+          bash scripts/ci/with-test-slot.sh 2 -- \
+            meson test -C build-windows-asan --suite agent --print-errorlogs --timeout-multiplier 2
+
+      - name: Process snapshot (on stall/cancel)
+        # #4018 Gate-4 ask: a process inventory before teardown, so a future stall's
+        # contention theory can be checked against evidence instead of staying a guess.
+        if: failure() || cancelled()
+        run: tasklist //v
 
       - name: ccache stats
         if: always()
         run: ccache -s
 
-      - name: Upload meson testlog (on failure)
-        if: failure()
+      - name: Upload meson testlog (on failure; always on a windows-asan-only dispatch)
+        # The always() half matters for #4018: a 90-minute job-level timeout is a
+        # CANCEL, not a failure, and that's exactly when the progress log matters
+        # most; it also lets a `jobs=windows-asan` recurrence dispatch record a
+        # clean run's timings, not only a failing one.
+        if: failure() || (always() && inputs.jobs == 'windows-asan')
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: meson-testlog-windows-asan
           path: |
             build-windows-asan/meson-logs/testlog.txt
             build-windows-asan/meson-logs/testlog.junit.xml
+            build-windows-asan/meson-logs/progress.log
           retention-days: 14
           if-no-files-found: warn
 
@@ -608,7 +642,7 @@ jobs:
   coverage:
     name: "Coverage (GCC 15)"
     needs: [preflight]
-    if: needs.preflight.outputs.bigtam_pool_healthy == 'true'
+    if: needs.preflight.outputs.bigtam_pool_healthy == 'true' && inputs.jobs != 'windows-asan'
     # Pinned to the Big Tam pool. Was the generic [self-hosted, Linux, X64]
     # pool, but that spans both Shulgi (24.04/gcc-13) and Big Tam
     # (26.04/gcc-15); a gcc-15 coverage build can only run on Big Tam, so
@@ -783,7 +817,7 @@ jobs:
     needs: [preflight, sanitize-asan, sanitize-tsan, windows-asan, coverage]
     # `always()` alone also runs after cancellation, which must not create a
     # repository-wide merge block. Retain failure handling for preflight.
-    if: ${{ !cancelled() && (failure() || needs.preflight.result == 'failure') }}
+    if: ${{ !cancelled() && inputs.jobs != 'windows-asan' && (failure() || needs.preflight.result == 'failure') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -868,7 +902,7 @@ jobs:
   close-on-green:
     name: "Close nightly-broken on green"
     needs: [preflight, sanitize-asan, sanitize-tsan, windows-asan, coverage]
-    if: success()
+    if: success() && inputs.jobs != 'windows-asan'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
