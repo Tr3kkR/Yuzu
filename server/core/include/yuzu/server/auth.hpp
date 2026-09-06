@@ -113,6 +113,19 @@ struct UserEntry {
     /// - erase/reinsert included. Only a u64 wraparound (~2^64 writes across
     /// every username combined, over one process's lifetime) could
     /// theoretically repeat a stamp, which is not a realistic concern.
+    ///
+    /// One creation path is a carve-out, not covered by "every entry is
+    /// stamped": `load_config()`'s cfg-file bulk load builds entries directly
+    /// and never calls `next_role_version_()`, so a cfg-seeded entry keeps
+    /// this field's struct-default `0`. Safe ONLY because
+    /// `role_version_epoch_` starts at 1 and can never (re)issue 0 - see that
+    /// field's own doc - and because `load_config()` runs boot-only,
+    /// single-threaded, strictly before `set_auth_db()` is ever called on the
+    /// same `AuthManager` (`main.cpp`), so no in-flight recheck call can exist
+    /// yet to capture a stale `pre_check_version` against one of these
+    /// entries. A future config-reload feature reusing `load_config()` at
+    /// runtime would need to stamp these entries too, or it would reopen
+    /// this exact ABA class for cfg-file-seeded accounts.
     std::uint64_t role_version{0};
 };
 
@@ -1011,8 +1024,18 @@ private:
 
     /// Backing counter for `next_role_version_()` - see `UserEntry::role_version`'s
     /// doc for why this is process-wide, not per-username. `std::atomic` since
-    /// it's incremented both under `mu_` (most call sites) and without it
-    /// (none today, but the method's own contract doesn't require the lock).
+    /// it's drawn from both under `mu_` (most call sites) and without it
+    /// (`find_user_or_hydrate`/`reactivate_user` stamp a LOCAL copy before ever
+    /// taking `mu_`) - safe either way, since uniqueness comes from `fetch_add`'s
+    /// atomicity alone (no two RMWs on one atomic ever observe the same prior
+    /// value, independent of memory order) and cross-thread visibility of the
+    /// stamped value, once published into `users_`, comes from `mu_` itself, not
+    /// from this counter's ordering. Starts at 1, not 0: `load_config()`
+    /// (cfg-file bulk load, boot-only, always before `set_auth_db()` - see that
+    /// call's doc) seeds entries at the struct default `role_version{0}`
+    /// without drawing a stamp at all, and 0 must stay a value this counter can
+    /// never (re)issue, or such an entry's version could coincidentally match a
+    /// stale in-flight caller's `pre_check_version`.
     std::atomic<std::uint64_t> role_version_epoch_{1};
 
     // ── Durable session store integration (HA WS-1/1a) ─────────────────────────
