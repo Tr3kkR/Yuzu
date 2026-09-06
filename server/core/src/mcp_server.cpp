@@ -2120,6 +2120,11 @@ constexpr std::string_view kRbacOps[] = {"Read",   "Write",  "Execute", "Delete"
 // seeds them for the new plugin/upload securables, and letting this mirror drift would fail the
 // seeded-catalogues binding test in test_rbac_store.cpp or, for a typo'd entry, silently fail open
 // exactly as above.
+//
+// #4028 adds TlsConfig/PluginSigning/ServerConfig/AnalyticsConfig for the same reason — rbac_store.cpp's
+// `types[]` now seeds them for the Settings read-twins. None of the four is used by any MCP tool
+// today (#4028 ships those 8 routes REST-only per #520 — see docs/mcp-server.md); they are mirrored
+// here purely to keep this catalogue in lockstep with the seeded set, same as every other entry.
 constexpr std::string_view kRbacSecurables[] = {
     "Infrastructure", "UserManagement",     "InstructionDefinition", "InstructionSet",
     "Execution",      "Schedule",           "Approval",              "Tag",
@@ -2128,7 +2133,8 @@ constexpr std::string_view kRbacSecurables[] = {
     "License",        "FileRetrieval",      "GuaranteedState",       "Inventory",
     "AccessReview",   "SoftwareLicensing",  "EnginePrincipal",       "PluginConfig",
     "PluginSecret",   "UploadGrant",
-    "PowerManagement"};
+    "PowerManagement",
+    "TlsConfig",      "PluginSigning",      "ServerConfig",          "AnalyticsConfig"};
 
 // Borrowed (name, input_schema_json) row for the registration validator's
 // 4th sequence (#2405). Views are valid only for the duration of the call.

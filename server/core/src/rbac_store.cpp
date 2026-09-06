@@ -556,7 +556,7 @@ void RbacStore::seed_defaults() {
          "ON CONFLICT (key) DO NOTHING");
 
     // Securable types.
-    const std::array<std::string_view, 27> types = {
+    const std::array<std::string_view, 31> types = {
         "Infrastructure",  "UserManagement",  "InstructionDefinition",
         "InstructionSet",  "Execution",       "Schedule",
         "Approval",        "Tag",             "AuditLog",
@@ -583,7 +583,24 @@ void RbacStore::seed_defaults() {
         // mutating action). Administrator-only via the CRUD loop below —
         // same PluginConfig/UploadGrant precedent, deliberately absent from
         // the explicit Viewer read-list further down this function.
-        "PowerManagement"};
+        "PowerManagement",
+        // #4028 (api-parity programme #2146) — Settings read-twins, split
+        // along sensitivity lines rather than one blanket Settings:Read
+        // (per the issue's own scoping note). All four are Administrator-
+        // only via the CRUD loop below, deliberately absent from every
+        // other role's explicit grant list further down (incl. Viewer's
+        // blanket read-list) — matching today's admin_fn_-only gate on the
+        // 8 /fragments/settings/* routes this PR twins. Every (securable,
+        // "Read") pair here is ALSO added to authz_topology_floor.hpp's
+        // kTopologyFloor[], so an RBAC-off deployment stays admin-gated
+        // instead of silently widening to any authenticated user.
+        "TlsConfig",       // TLS + HTTPS listener config (tls/https fragments)
+        "PluginSigning",   // plugin code-signing trust bundle (distinct from
+                           // PluginConfig, which gates per-plugin runtime
+                           // kill-switch config — a different domain)
+        "ServerConfig",    // gateway/server-config/mcp/data-retention fragments
+        "AnalyticsConfig"  // analytics fragment (ClickHouse integration)
+    };
     for (auto t : types)
         exec("INSERT INTO rbac_store.securable_types (name, is_system) VALUES ($1, TRUE) "
              "ON CONFLICT (name) DO NOTHING",
