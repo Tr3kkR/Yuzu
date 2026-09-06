@@ -40,15 +40,20 @@
 /// matching server.cpp's original code exactly.
 ///
 /// AUDIT ASYMMETRY (preserved verbatim, not a defect introduced by this
-/// move): both GET routes are unaudited (pure reads). PUT/DELETE audit
-/// their mid-body validation/not-found and success outcomes, but — like
-/// GET and POST — an early store-unavailable 503 on ANY of the 5 routes
-/// returns before `deps.audit_fn` is ever reached, so that specific path is
-/// unaudited on all 5. POST /api/property-schemas additionally audits ONLY
-/// success even once the store IS available — a validation/db failure past
-/// that point returns its error response with no matching audit call. This
-/// is the pre-existing server.cpp behaviour, copied as-is; it is not this
-/// extraction's place to change it.
+/// move): both GET routes are unaudited (pure reads). An early
+/// store-unavailable 503 is unaudited on ALL 5 routes — it returns before
+/// `deps.audit_fn` is ever reached. Past that point the three mutating
+/// routes diverge:
+///   - PUT: its own request-body validation 400s (missing 'value', invalid
+///     JSON) are unaudited; once past body parsing, both the store-level
+///     failure ("failure") and success outcomes ARE audited.
+///   - DELETE: no body-validation stage exists, so both its store-level
+///     not_found and success outcomes ARE audited.
+///   - POST /api/property-schemas: its own request-body validation 400s
+///     are unaudited (same as PUT), but UNLIKE PUT/DELETE its store-level
+///     failure is ALSO unaudited — only success is audited.
+/// This is the pre-existing server.cpp behaviour, copied as-is; it is not
+/// this extraction's place to change it.
 
 #include <yuzu/server/auth.hpp>
 
