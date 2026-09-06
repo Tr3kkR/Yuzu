@@ -35,9 +35,11 @@
 
 #include <yuzu/server/auth.hpp>
 
-#include "dex_routes.hpp" // DexRoutes::DispatchFn/ResponsesFn/AuditFn + DexAgentResponse
+#include "dex_routes.hpp"      // DexRoutes::DispatchFn/ResponsesFn/AuditFn + DexAgentResponse
+#include "tag_store.hpp"       // DeviceTag — device_agent_detail_json's optional tags
 
 #include <httplib.h>
+#include <nlohmann/json.hpp>
 
 #include <cstdint>
 #include <functional>
@@ -49,6 +51,35 @@ namespace yuzu::server {
 
 class HttpRouteSink;
 class GuaranteedStateStore;
+
+// ── Shared builders (REST + MCP; #4033/#2146 Batch A) ──────────────────────
+// PURE JSON builders — no httplib.h, no mcp_jsonrpc.hpp — the recipe's Rule 1
+// (docs/api-twin-recipe.md §1): REST's GET /api/v1/devices[/{id}] and MCP's
+// pre-existing list_agents/get_agent_details tools all build the device row/
+// detail shape from ONE function so the two transports cannot drift. Built
+// from a single AgentRegistry JSON entry — the SAME 5-field shape
+// `AgentRegistry::to_json_obj()`/MCP's `agents_fn()` already produce
+// (agent_id/hostname/os/arch/agent_version) — deliberately NOT `DeviceRow`
+// (the dashboard-fragment-only richer shape with online/segment/tags/
+// dex_score; see this file's header). list_agents/get_agent_details are not
+// refactored onto these by this PR (out of scope; see #4033) — the builders
+// exist so the NEW REST routes match those tools' served shape byte-for-byte
+// from day one, and so a future refactor of the MCP handlers has a function
+// to call instead of a third inline copy.
+
+/// PURE: one device row — `agent_id`/`hostname`/`os`/`arch`/`agent_version`,
+/// defensively extracted (`.value(key, "")`) so a short/malformed source
+/// object degrades to empty fields rather than throwing. Mirrors MCP
+/// `list_agents`'/`get_agent_details`'s existing inline row-building exactly.
+nlohmann::json device_agent_row_json(const nlohmann::json& agent);
+
+/// PURE: the device DETAIL object — `device_agent_row_json`'s fields plus a
+/// `tags` array (`{key,value,source}` per entry). `tags` is `nullptr` when no
+/// TagStore is wired, in which case the `tags` key is OMITTED entirely (never
+/// a synthesised empty array) — mirrors `get_agent_details`'s conditional-tags
+/// posture on a null store.
+nlohmann::json device_agent_detail_json(const nlohmann::json& agent,
+                                        const std::vector<DeviceTag>* tags);
 
 /// One row of the fleet device list / the identity of one device. SLICE 1 carries
 /// only what the thin AgentInfo + registry session provide for real; richer CI /
