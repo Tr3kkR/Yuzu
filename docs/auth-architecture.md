@@ -2555,6 +2555,52 @@ only when a change cannot be expressed as an idempotent additive re-seed
 it needed one — distinct from the PG schema's own migration sequence,
 ADR-0041, currently at v3).
 
+## Settings read-twins (#4028, api-parity programme #2146)
+
+Eight `/fragments/settings/*` dashboard sub-areas (TLS, HTTPS, gateway, server-config, MCP,
+data-retention, analytics, plugin-signing) were gated **only** by `AuthRoutes::require_admin` — a
+whole-route role check, not an RBAC securable/operation pair, with no REST v1 twin and no RBAC-off
+fallback at all. #4028 migrated all eight onto four new securables, split along sensitivity lines
+rather than one blanket `Settings:Read` (the same reasoning `EnginePrincipal` above was cut for):
+
+- **`TlsConfig`** — the `tls` and `https` fragments (mTLS/HTTPS listener posture, cert/key/CA file
+  paths).
+- **`PluginSigning`** — the `plugin-signing` fragment and its REST twin, the hardened
+  `GET /api/v1/agent/plugin-policy` (deliberately distinct from the unrelated `PluginConfig`
+  securable, which gates per-plugin runtime kill-switch config — a different domain).
+- **`ServerConfig`** — the `gateway`, `server-config`, `mcp`, and `data-retention` fragments
+  (operational/infra config, "nothing secret" per #4028's own evidence).
+- **`AnalyticsConfig`** — the `analytics` fragment (ClickHouse integration; embedded-credential
+  risk, see below).
+
+Each is `Read`-only today, seeded to `Administrator` only (via the existing cross-type CRUD loop in
+`seed_defaults()` — matching every other admin-only securable's precedent, e.g. `PluginConfig`,
+`PluginSecret`, `UploadGrant`, `PowerManagement` above), deliberately absent from `Viewer`'s blanket
+read-list and every other role's explicit grant list — this is a mechanical RBAC-ification of an
+already-admin-only gate, not a broadening. All four `(securable, "Read")` pairs are also added to
+`authz_topology_floor.hpp`'s `kTopologyFloor[]` (see that file's own doc comment for why: migrating
+an admin-only gate onto a Read securable without flooring it would silently widen every one of these
+eight routes from admin-only to any-authenticated-user on an RBAC-off install, the out-of-the-box
+default) — extending that file's floor beyond its original "authorization topology" framing to a
+second, related case: preserving an *existing* admin-only posture across the RBAC-off toggle.
+
+**The MCP question (#520).** `require_admin`'s own comment states the deliberate design this issue
+had to resolve explicitly, not silently override: "MCP tokens are for fleet management (queries,
+instruction execution) and must not be used to administer the server itself (settings, users, TLS,
+OIDC)." #4028 ships all eight sub-areas **REST-only** — no MCP tool touches any of them — treating
+read-only settings visibility as a meaningfully different exposure than the fleet-query surface #520
+was written to keep MCP confined to, but one that still requires its own reviewed amendment to #520
+rather than a side effect of a routine twin PR. See [MCP Server](mcp-server.md) for the policy
+itself.
+
+**Analytics also fixed a leak, not just added RBAC.** `render_analytics_fragment` (and the new
+`GET /api/v1/settings/analytics` twin) previously rendered the ClickHouse URL verbatim, masking only
+the separate `clickhouse_password` field — a URL with embedded userinfo credentials
+(`clickhouse://user:pass@host:9000/db`) leaked the credential regardless. The shared builder now
+strips URL userinfo unconditionally (`settings_model::sanitize_url_userinfo`) before either surface
+ever sees it, and never reads the raw password into a response at all — only a
+`clickhouse_password_set` bool.
+
 ## On-behalf-of assertions rejected (ADR-1005 Interim rules)
 
 Until server-verifiable delegation ships (ADR-1005 auth follow-up), the server

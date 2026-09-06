@@ -78,6 +78,7 @@ A separate, narrower shape applies to ordinary mutation routes that audit a chan
   - [Policies](#policies)
   - [Compliance](#compliance)
   - [Runtime Configuration](#runtime-configuration)
+  - [Settings](#settings)
   - [Custom Properties](#custom-properties)
   - [Webhooks](#webhooks)
   - [Offload Targets](#offload-targets)
@@ -3743,6 +3744,214 @@ client secret contains `<redacted>`, rotate it at the IdP to a value that does n
 
 **Audit:** a successful write emits `config.update` / `RuntimeConfig` with `target_id` = the key.
 See [Audit log](audit-log.md) for the `detail` contract, which differs for secret-valued keys.
+
+---
+
+### Settings
+
+**#4028 (api-parity programme #2146).** REST v1 read-twins for the eight `/fragments/settings/*`
+dashboard sub-areas (TLS, HTTPS, gateway, server-config, MCP, data-retention, analytics,
+plugin-signing) — previously gated by a whole-endpoint admin role check (`require_admin`) with no
+RBAC securable and no REST twin at all. All eight routes are **read-only** and **Administrator-only
+today** (see the per-route Permission line); broadening to another role is a separate, explicit
+decision. Every builder is shared verbatim with the corresponding HTML fragment renderer
+(`docs/api-twin-recipe.md` §1) — the REST and dashboard views cannot drift from each other.
+
+**MCP.** None of these eight routes has an MCP twin, deliberately. Issue #520 established that
+`require_admin` "explicitly reject[s] every MCP-tier token... MCP tokens are for fleet management
+(queries, instruction execution) and must not be used to administer the server itself (settings,
+users, TLS, OIDC)". #4028 ships these eight sub-areas REST-only rather than silently widening that
+decision — a future MCP carve-out for read-only settings visibility would need its own
+security-guardian-reviewed amendment to #520, not a side effect of this twin work. See
+[MCP Server](../mcp-server.md) for the full #520 policy.
+
+#### `GET /api/v1/settings/tls`
+
+TLS/mTLS listener settings: enabled state, server cert/key/CA file paths, `insecure_skip_client_verify`,
+and the management-listener TLS override paths.
+
+**Permission:** `TlsConfig:Read`. **Audit:** `settings.tls.read` (fail-closed — TLS/mTLS posture and
+cert paths are reconnaissance value for an attacker learning the mTLS enforcement posture).
+
+```json
+{
+  "data": {
+    "enabled": true,
+    "server_cert_path": "/etc/yuzu/certs/server.pem",
+    "server_key_path": "/etc/yuzu/certs/server.key",
+    "ca_cert_path": "/etc/yuzu/certs/ca.pem",
+    "insecure_skip_client_verify": false,
+    "mgmt_server_cert_path": "",
+    "mgmt_server_key_path": "",
+    "mgmt_ca_cert_path": ""
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+#### `GET /api/v1/settings/https`
+
+HTTPS listener settings: enabled state, port, cert/key file paths, HTTP-redirect state.
+
+**Permission:** `TlsConfig:Read` (same securable as `/settings/tls`). **Audit:** `settings.https.read`
+(fail-closed).
+
+```json
+{
+  "data": {
+    "enabled": true,
+    "port": 8443,
+    "cert_path": "/etc/yuzu/certs/https.pem",
+    "key_path": "/etc/yuzu/certs/https.key",
+    "redirect": true
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+#### `GET /api/v1/agent/plugin-policy`
+
+Plugin code-signing trust bundle — **this is plugin-signing's REST v1 twin**, not a separate
+`/api/v1/settings/plugin-signing` route (deliberate: the acceptance criteria for #4028 hardens this
+pre-existing, previously off-ledger route onto the A4 envelope + OpenAPI + the shared builder
+rather than adding a parallel one). Superset of the `/fragments/settings/plugin-signing` fragment's
+data — this route alone also returns the raw `trust_bundle_pem` bytes, for out-of-band agent-config
+distribution (`--plugin-trust-bundle`).
+
+**Permission:** `PluginSigning:Read` (dedicated securable, deliberately distinct from the unrelated
+`PluginConfig` securable, which gates per-plugin runtime kill-switch config — a different domain).
+**Audit:** `settings.plugin_signing.read` (fail-closed) — CC6.1 least-privilege: a non-admin token
+holder learning when the trust anchor rotates (sha256 changes) is useful reconnaissance for a
+supply-chain attacker.
+
+```json
+{
+  "data": {
+    "enabled": true,
+    "required": false,
+    "cert_count": 2,
+    "sha256": "a1b2c3...",
+    "subjects": ["CN=Yuzu Plugin Signer, O=Example Corp"],
+    "bundle_unreadable": false,
+    "trust_bundle_pem": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n"
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+No bundle uploaded (still 200, not 404 — a normal operational state): `enabled: false`,
+`cert_count: 0`, `sha256: ""`, `subjects: []`, `trust_bundle_pem: ""`. A bundle present on disk but
+unreadable returns 500 (A4 error envelope) instead.
+
+#### `GET /api/v1/settings/gateway`
+
+Erlang gateway upstream status: enabled state, listen address, gateway mode, live session count.
+
+**Permission:** `ServerConfig:Read`. **Audit:** none — operational status, nothing secret.
+
+```json
+{
+  "data": { "enabled": true, "listen_address": "0.0.0.0:50053", "gateway_mode": false, "active_sessions": 3 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`listen_address`/`gateway_mode`/`active_sessions` are defaulted (`""`/`false`/`0`) when
+`enabled` is `false`.
+
+#### `GET /api/v1/settings/server-config`
+
+Core server configuration: gRPC/web addresses and ports, session timeout, max agents, rate limits,
+OTA/gRPC tuning knobs. Nothing secret.
+
+**Permission:** `ServerConfig:Read`. **Audit:** none.
+
+```json
+{
+  "data": {
+    "agent_grpc_address": "0.0.0.0:50051",
+    "management_grpc_address": "0.0.0.0:50052",
+    "web_address": "127.0.0.1",
+    "web_port": 8080,
+    "session_timeout_seconds": 3600,
+    "max_agents": 10000,
+    "auth_config_path": "/etc/yuzu/yuzu-server.cfg",
+    "rate_limit_per_ip": 100,
+    "login_rate_limit_per_ip": 10,
+    "ota_max_concurrent_per_peer": 2,
+    "ota_rate_refill_per_min": 1.0,
+    "ota_rate_capacity": 20.0,
+    "ota_max_concurrent_total": 64,
+    "ota_max_peers_tracked": 50000,
+    "ota_transfer_deadline_secs": 900,
+    "ota_chunk_write_deadline_secs": 30,
+    "grpc_max_concurrent_streams": 128,
+    "grpc_max_resource_memory_mb": 512
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+#### `GET /api/v1/settings/mcp`
+
+MCP server status and the client-connection info shown on the dashboard (enabled/read-only state,
+the `/mcp/v1/` endpoint URL).
+
+**Permission:** `ServerConfig:Read`. **Audit:** none — low sensitivity; an MCP client with a valid
+token already knows this endpoint exists. This route describes the MCP surface but is itself
+REST-only — see the #520 note above.
+
+```json
+{
+  "data": { "enabled": true, "read_only": false, "endpoint_url": "https://localhost:8443/mcp/v1/" },
+  "meta": { "api_version": "v1" }
+}
+```
+
+#### `GET /api/v1/settings/data-retention`
+
+Response/audit data retention windows, in days.
+
+**Permission:** `ServerConfig:Read`. **Audit:** none — lowest sensitivity of the eight (two
+integers).
+
+```json
+{
+  "data": { "response_retention_days": 90, "audit_retention_days": 365 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+#### `GET /api/v1/settings/analytics`
+
+Analytics drain configuration and ClickHouse integration settings.
+
+**Permission:** `AnalyticsConfig:Read`. **Audit:** `settings.analytics.read` (fail-closed) — mixed,
+leans high (embedded-credential risk).
+
+> **`clickhouse_url` is sanitized of embedded userinfo credentials** (a URL of the form
+> `clickhouse://user:pass@host:9000/db` has the `user:pass@` segment stripped) before being
+> returned — this closes a gap where the sibling HTML fragment previously rendered the URL
+> verbatim, masking only the separate `clickhouse_password` field. The raw password is never
+> returned at all; only `clickhouse_password_set` (a bool) is.
+
+```json
+{
+  "data": {
+    "enabled": true,
+    "drain_interval_seconds": 10,
+    "batch_size": 100,
+    "clickhouse_configured": true,
+    "clickhouse_url": "clickhouse://host:9000/yuzu",
+    "clickhouse_database": "yuzu",
+    "clickhouse_table": "yuzu_events",
+    "clickhouse_username": "default",
+    "clickhouse_password_set": true,
+    "jsonl_export_path": ""
+  },
+  "meta": { "api_version": "v1" }
+}
+```
 
 ---
 
