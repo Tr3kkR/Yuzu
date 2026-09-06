@@ -152,6 +152,17 @@ inline constexpr std::chrono::milliseconds kGuardianDrainMaxWall{2'000};
 /// stops waiting on it.
 inline constexpr std::chrono::milliseconds kGuardianSendOfferWait{200};
 
+/// Internal re-check bound (#3953 item 3): when a send is known in flight on either
+/// lane (GuardianOutboxSendExecutor::has_in_flight_send()), loop()'s own wait is
+/// clamped to at most this, instead of riding out the full periodic bound. Closes the
+/// throughput cliff a send finishing between kGuardianSendOfferWait and the periodic
+/// bound used to hit: detection latency after completion is now bounded by roughly
+/// kGuardianSendOfferWait + this, not by kDefaultPeriodicBoundMs (5s in production).
+/// Deliberately NOT a wake source (no sig_->gen bump, no notify_all) - it only shortens
+/// how long the loop's OWN wait blocks, so it cannot perturb any test whose timing
+/// depends on nothing else waking the loop (see the R4 test's own comment).
+inline constexpr std::chrono::milliseconds kGuardianSendRecheckInterval{200};
+
 /// Journal-maintenance knobs for GuardianOutboxDrainWorker. A struct rather than more
 /// positional parameters so the two same-typed intervals cannot be transposed at a call
 /// site, and so a test can name only what it overrides:
@@ -381,6 +392,39 @@ public:
         return lifecycle_send_exec_.active_worker_count() + compliance_send_exec_.active_worker_count();
     }
 
+    /// #3953 item 1: fleet sum of both lanes' reclaimed-orphan thrown-exception counts.
+    [[nodiscard]] std::uint64_t send_orphan_exception_count() const {
+        return lifecycle_send_exec_.orphan_exception_count() + compliance_send_exec_.orphan_exception_count();
+    }
+
+    /// #3953 item 2: fleet sum of both lanes' send-stall counts.
+    [[nodiscard]] std::uint64_t send_stall_count() const {
+        return lifecycle_send_exec_.send_stall_count() + compliance_send_exec_.send_stall_count();
+    }
+
+    /// Test-only forwarder to the private wrapped_send() (#3953 item 6) - lets a test
+    /// drive a single send attempt directly, on the test's own thread, without
+    /// start()ing the worker thread. No production caller.
+    [[nodiscard]] SendResult wrapped_send_for_test(const OutboxEntry& entry) {
+        return wrapped_send(entry);
+    }
+
+    /// Test-only synchronization seam - see the call site in stop() for what race it
+    /// exists to make deterministic (#3953 item 6). Production callers never set this.
+    void set_stop_race_hook_for_test(std::function<void()> hook) {
+        stop_race_hook_for_test_ = std::move(hook);
+    }
+
+    /// Test-only synchronization seam - see the call site in stop() (between the two
+    /// lane executors' own stop() calls) for the tolerated admission window it pins
+    /// (governance Gate 4 unhappy-path UP-4). Fire-once by construction (moved out and
+    /// invoked, see stop()) - both lane stop() calls are unconditional, not gated on
+    /// first_stop, so a second/idempotent stop() call must not re-fire this against an
+    /// already-stopped lane. Production callers never set this.
+    void set_between_lane_stops_hook_for_test(std::function<void()> hook) {
+        between_lane_stops_hook_for_test_ = std::move(hook);
+    }
+
 private:
     void loop();
     /// The SendFn actually threaded through rt_.drain_bounded(): bounces each send
@@ -404,11 +448,28 @@ private:
     /// in flight at once - that is the SAME pre-existing, already-disclaimed
     /// contention this whole class's header names ("NOT a fix for stream_write_mu_
     /// contention"), now on two detached threads instead of one; it never touches the
-    /// worker's own thread.
+    /// worker's own thread. The same two-executor split also makes a same-pass
+    /// cross-lane WIRE ORDERING residual reachable (#3953 item 5 / #3972) - see
+    /// GuardianSparkRuntime::drain_bounded()'s own note for the mechanism.
     [[nodiscard]] SendResult wrapped_send(const OutboxEntry& entry) {
-        auto& exec = entry.domain == OutboxDomain::Lifecycle ? lifecycle_send_exec_
-                                                              : compliance_send_exec_;
-        return exec.offer(entry, send_, kGuardianSendOfferWait).value_or(SendResult::Retain);
+        // Enumerator-exhaustive, no `default` (#3953 item 4): a new OutboxDomain value
+        // added without updating this routing is at least a silent fall-through into
+        // `compliance_send_exec_` (the pre-switch default), never something crash-safe
+        // to ignore. On GCC/Clang this also warns via -Wswitch (part of warning_level=3,
+        // meson.build) - but this repo builds with werror=false project-wide, so that
+        // warning does not fail CI, and MSVC's equivalent (C4062) is off at this
+        // project's current warning level (no /w14062 or /Wall set anywhere) - governance
+        // Gate 3 cpp-expert finding: do not assume uniform compiler protection here.
+        GuardianOutboxSendExecutor* exec = &compliance_send_exec_;
+        switch (entry.domain) {
+        case OutboxDomain::Lifecycle:
+            exec = &lifecycle_send_exec_;
+            break;
+        case OutboxDomain::Compliance:
+        case OutboxDomain::Health:
+            break;
+        }
+        return exec->offer(entry, send_, kGuardianSendOfferWait).value_or(SendResult::Retain);
     }
     /// True once stop() has been requested. Lock-free and noexcept BY DESIGN: this is
     /// the one check loop() makes outside a try, and taking a mutex here would let
@@ -446,6 +507,8 @@ private:
     std::shared_ptr<Signal> sig_;
     bool started_{false};
     std::thread thread_;
+    std::function<void()> stop_race_hook_for_test_; ///< test seam; null = no-op (set-then-use)
+    std::function<void()> between_lane_stops_hook_for_test_; ///< test seam; null = no-op, fire-once
     std::atomic<std::uint64_t> drain_exceptions_{0}; ///< firewalled drain-pass throws (item 4 hardening)
     std::atomic<std::uint64_t> journal_maint_exceptions_{0}; ///< firewalled maintenance-pass throws (C0)
     /// Success stamps for the staleness gauges (item 6). Seeded at start() (clamped >= 1 so

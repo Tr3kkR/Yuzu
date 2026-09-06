@@ -64,11 +64,14 @@ using yuzu::agent::make_registry_mechanism;
 using yuzu::agent::make_service_mechanism;
 using yuzu::agent::OutboxEntry;
 using yuzu::agent::SendResult;
+using yuzu::agent::ServiceSparkParams; // #2818 pin: the raw sibling's spec
 using yuzu::agent::SparkData;
 using yuzu::agent::SparkEmitFn;
 using yuzu::agent::SparkEngine;
+using yuzu::agent::SparkEvent; // #2818 pin: the raw sibling's queued handler
 using yuzu::agent::SparkFaultFn;
 using yuzu::agent::SparkParams;
+using yuzu::agent::SparkSpec; // #2818 pin
 using yuzu::agent::SparkType;
 
 namespace {
@@ -98,6 +101,7 @@ public:
     void start(SparkEmitFn, SparkFaultFn) override {}
     std::expected<void, std::string> watch(const std::string& key, const SparkParams&) override {
         bool hang = false;
+        bool do_throw = false;
         {
             std::lock_guard<std::mutex> lk{mu_};
             if (fail_next_watch_) {
@@ -106,6 +110,8 @@ public:
             }
             hang = hang_next_watch_;
             hang_next_watch_ = false;
+            do_throw = throw_next_watch_;
+            throw_next_watch_ = false;
         }
         // #2233 item 3: the gate wait is deliberately OUTSIDE mu_ so release_hang()
         // (which only touches gate_mu_, never mu_) can never deadlock against a
@@ -120,6 +126,15 @@ public:
             gate_cv_.notify_all();
             gate_cv_.wait(gate_lk, [this] { return released_; });
         }
+        // #2818 pin: THROW rather than return std::unexpected, and do it AFTER the hang
+        // gate. Both halves matter. `fail_next_watch_` is checked before the gate and
+        // returns immediately, so it cannot produce the state that pin needs — a watch
+        // still IN FLIGHT (key committed in armed_, teardown not yet run) while a second
+        // consumer dedups onto it, which only THEN fails. Throwing also routes the
+        // failure through watch_guarded's catch arm, the shape a real mechanism produces
+        // under memory pressure.
+        if (do_throw)
+            throw std::runtime_error("forced watch throw");
         std::lock_guard<std::mutex> lk{mu_};
         watched_.insert(key);
         return {};
@@ -144,6 +159,12 @@ public:
     void set_fail_next_watch() {
         std::lock_guard<std::mutex> lk{mu_};
         fail_next_watch_ = true;
+    }
+    /// #2818 pin: next watch() THROWS (after the hang gate, if one is armed) instead of
+    /// returning std::unexpected. See watch() for why the distinction is load-bearing.
+    void set_throw_next_watch() {
+        std::lock_guard<std::mutex> lk{mu_};
+        throw_next_watch_ = true;
     }
     /// Next watch() blocks until release_hang() is called, from inside watch() with
     /// this mechanism's own mu_ released (mirrors the real contract: SparkEngine calls
@@ -186,6 +207,7 @@ private:
     std::mutex mu_;
     std::set<std::string> watched_;
     bool fail_next_watch_{false};
+    bool throw_next_watch_{false};
     bool hang_next_watch_{false};
     bool hang_next_unwatch_{false};
     // Gate is a SEPARATE lock from mu_ (see watch()'s comment) - release_hang() must
@@ -330,6 +352,75 @@ struct SparkReconcileFixture {
 };
 
 } // namespace
+
+TEST_CASE("#2818 PIN — Guardian's subscription is erased by a sibling's failed watch and "
+          "Guardian keeps reporting the rule armed",
+          "[spark][guardian][reconcile]") {
+    // The engine-level halves of this gap are pinned in test_spark_mechanism.cpp. THIS
+    // case is the one that says why it matters: it shows the silent kill landing on
+    // GUARDIAN, the real consumer, and shows what Guardian reports afterwards.
+    //
+    // Guardian cannot be its own sibling — GuardianSparkRuntime's arming_keys_ plus the
+    // executor's AlreadyRunning rejection make two concurrent Guardian arms of one key
+    // impossible. So the sibling here is a RAW SparkEngine consumer, which is exactly the
+    // situation Stage 2 creates the moment anything other than Guardian arms a spark.
+    //
+    // PIN, NOT A REGRESSION TEST: every assertion below states the CURRENT, DEFECTIVE
+    // behaviour. The fix (#2818, PR-2d) will flip the last two.
+    SparkReconcileFixture f;
+
+    // A raw consumer arms the SAME spec Guardian derives from make_service_rule("r1")
+    // — SparkType::Service + service_name "Spooler" — and parks inside watch().
+    auto raw = f.spark_engine.register_consumer("raw-sibling-2818", [](const SparkEvent&) {});
+    REQUIRE(raw.has_value());
+    const SparkSpec spec{SparkType::Service, ServiceSparkParams{"Spooler"}};
+
+    f.mechanism->hang_next_watch();     // park mid-watch: key committed, watch in flight
+    f.mechanism->set_throw_next_watch(); // …and fail once released
+    std::expected<SparkEngine::SubscriptionId, std::string> raw_sub;
+    std::thread armer([&] { raw_sub = f.spark_engine.arm(*raw, spec); });
+    // cpp-safety Gate 3 finding (same class as the "hung watch()/unwatch() wedges
+    // stop()" tests above): a REQUIRE between a thread spawn and its join can throw
+    // and unwind past a still-joinable std::thread -> std::terminate() on the WHOLE
+    // binary. Guard releases the hang and joins `armer` on any unwind path; harmless
+    // no-op on the happy path below (release_hang() only matters once, join() on an
+    // already-joined thread is a no-op via the joinable() check).
+    struct ArmerGuard {
+        FakeServiceMechanism* mech;
+        std::thread* t;
+        ~ArmerGuard() {
+            mech->release_hang();
+            if (t->joinable())
+                t->join();
+        }
+    } armer_guard{f.mechanism, &armer};
+    REQUIRE(f.mechanism->wait_entered_hang(std::chrono::seconds{5}));
+
+    // Guardian now applies its rule. It derives the same spark key, dedups onto the raw
+    // consumer's in-flight entry, and is handed a real subscription id. From Guardian's
+    // side this is an ordinary, successful arm.
+    f.apply(make_service_rule("r1"));
+    CHECK(f.engine->spark_armed_rule_count() == 1);
+    CHECK(f.spark_engine.stats().subscriptions == 2); // raw + Guardian
+    CHECK(f.spark_engine.stats().armed_sparks == 1);
+
+    // Release: the raw consumer's watch throws, and arm_impl tears down the WHOLE key.
+    f.mechanism->release_hang();
+    armer.join();
+    CHECK_FALSE(raw_sub.has_value()); // the raw consumer learns its arm failed
+
+    // THE DEFECT, at the layer that matters. Nothing is armed and nothing is watched…
+    CHECK(f.spark_engine.stats().armed_sparks == 0);
+    CHECK(f.spark_engine.stats().subscriptions == 0);
+    CHECK(f.mechanism->watching_count() == 0);
+    // …and Guardian still reports the rule as armed, because nobody told it otherwise.
+    // Its PerKey subscription id now names nothing, no re-arm is attempted, and the rule
+    // will sit in this state until something unrelated causes a re-reconcile.
+    CHECK(f.engine->spark_armed_rule_count() == 1);
+    // The legacy path did NOT pick the rule up either — this is not a silent fallback to
+    // IGuard, it is a genuine detection hole.
+    CHECK(f.engine->armed_guard_count() == 0);
+}
 
 TEST_CASE("a supported type arms via spark, never in legacy guards_",
           "[spark][guardian][reconcile]") {

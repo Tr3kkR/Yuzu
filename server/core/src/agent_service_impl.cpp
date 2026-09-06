@@ -1439,7 +1439,7 @@ grpc::Status AgentServiceImpl::Subscribe(
                         .observe(static_cast<double>(total_ms) / 1000.0);
                     bus_.publish("timing", "<strong id=\"stat-total\" hx-swap-oob=\"true\">" +
                                                std::to_string(total_ms) + " ms</strong>");
-                    cmd_send_times_.erase(it);
+                    erase_send_time_locked(it);
                 }
                 cmd_first_seen_.erase(resp.command_id());
             }
@@ -1478,6 +1478,29 @@ void AgentServiceImpl::record_send_time(const std::string& command_id) {
     std::lock_guard lock(cmd_times_mu_);
     cmd_send_times_[command_id] = std::chrono::steady_clock::now();
     output_row_count_.store(0, std::memory_order_relaxed);
+    publish_send_times_gauge_locked();
+}
+
+// -- discard_send_time (#2557) -------------------------------------------------
+
+void AgentServiceImpl::erase_send_time_locked(
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point>::iterator it) {
+    cmd_send_times_.erase(it);
+    publish_send_times_gauge_locked();
+}
+
+void AgentServiceImpl::publish_send_times_gauge_locked() {
+    metrics_.gauge("yuzu_cmd_send_times_pending")
+        .set(static_cast<double>(cmd_send_times_.size()));
+}
+
+bool AgentServiceImpl::discard_send_time(const std::string& command_id) {
+    std::lock_guard lock(cmd_times_mu_);
+    auto it = cmd_send_times_.find(command_id);
+    if (it == cmd_send_times_.end())
+        return false;
+    erase_send_time_locked(it);
+    return true;
 }
 
 // -- resolve_execution_id (HA WS-1(1b), ADR-2002 section 5) ------------------
@@ -1704,7 +1727,7 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
                     .observe(static_cast<double>(total_ms) / 1000.0);
                 bus_.publish("timing", "<strong id=\"stat-total\" hx-swap-oob=\"true\">" +
                                            std::to_string(total_ms) + " ms</strong>");
-                cmd_send_times_.erase(it);
+                erase_send_time_locked(it);
             }
             cmd_first_seen_.erase(resp.command_id());
         }

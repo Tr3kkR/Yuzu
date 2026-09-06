@@ -115,11 +115,87 @@ enum class Action : std::uint8_t {
     StopWalk,
 };
 
-/// Metadata `decide_entry` needs about one already-enumerated entry.
+/// Convert a Windows FILETIME (100-nanosecond ticks since 1601-01-01 UTC) to
+/// seconds since the Unix epoch, or nullopt when the value is not a timestamp.
+///
+/// PURE and unit-tested on every platform, deliberately. This is the one piece
+/// of arithmetic in the mtime change that can be silently WRONG rather than
+/// obviously broken: an incorrect epoch offset or tick scale yields timestamps
+/// that are plausible, correctly ORDERED, and off by decades -- so an age
+/// filter built on it would still appear to work while selecting the wrong
+/// files. Getting that wrong on a DELETION path is not cosmetic, which is why
+/// it lives here in the pure layer with its own fixtures rather than inline in
+/// the Windows TU where no test could reach it.
+///
+/// 11644473600 is the number of seconds between 1601-01-01 and 1970-01-01.
+///
+/// Truncation is toward zero, i.e. FLOOR for every value this guard admits, so a
+/// Windows entry can read up to one second OLDER than reality while POSIX's
+/// st_mtime is already whole seconds. Against the minute-or-hour thresholds an
+/// age filter uses that is immaterial; it is recorded because it errs marginally
+/// toward deletion rather than away from it.
+///
+/// A zero or negative tick count is Windows' "not set", NOT a timestamp of
+/// 1601: returning the literal conversion would read to an age filter as
+/// impossibly old and therefore safe to delete.
+[[nodiscard]] inline constexpr std::optional<std::int64_t>
+filetime_to_unix_seconds(std::int64_t ticks) noexcept {
+    if (ticks <= 0) return std::nullopt;
+    constexpr std::int64_t kTicksPerSecond = 10'000'000;        // 100ns units
+    constexpr std::int64_t kEpochDeltaSeconds = 11'644'473'600; // 1601 -> 1970
+    return (ticks / kTicksPerSecond) - kEpochDeltaSeconds;
+}
+
+/// Metadata `decide_entry` needs about one already-enumerated entry, and that
+/// a caller's `MatchFn` may additionally use for its own selection policy.
+///
+/// `mtime` is here so a consumer can express a MINIMUM AGE without re-opening
+/// the entry by path. That distinction is load-bearing rather than convenient:
+/// the first consumer of this primitive (disk_actions' temp-file cleanup) is
+/// required to refuse files younger than a threshold, and the only other way to
+/// learn an entry's age from a `MatchFn` that receives just a path would be to
+/// stat that path -- a path-resolving open BELOW THE ROOT, which is precisely
+/// what this primitive's first catastrophic invariant forbids and what would
+/// hand an attacker the swap target.
+///
+/// It costs nothing to supply: both platform enumerators already hold the
+/// timestamp in the same structure they already read for `size_bytes`
+/// (`fstatat`'s `struct stat` on POSIX, `FILE_FULL_DIR_INFO::LastWriteTime` on
+/// Windows), both obtained parent-handle-relative. No extra syscall, no new
+/// path resolution, and `decide_entry` is deliberately NOT changed -- age is
+/// caller policy, not primitive policy, so the binding first-match order below
+/// is untouched.
+///
+/// AGE IS A SAFETY HEURISTIC, NOT A SECURITY CONTROL. This is the same
+/// best-effort class as `size_bytes`, and for the same reason: a writer who
+/// controls the parent directory can backdate a file (`utimensat`, `SetFileTime`)
+/// exactly as it can swap a large file over a measured name. Confinement holds
+/// absolutely; SELECTION does not. A minimum-age rule stops this primitive
+/// eating a file a legitimate process wrote moments ago -- it does NOT stop a
+/// local attacker choosing what gets deleted, and no consumer may present it
+/// as though it does.
 struct EntryMeta {
     EntryType type;
     std::uint64_t size_bytes;
     bool same_device_as_root;
+
+    /// Seconds since the Unix epoch, or `nullopt` when this platform could not
+    /// supply one. SIGNED because pre-1970 timestamps exist on real
+    /// filesystems (restored archives, deliberately backdated files) and a
+    /// caller comparing ages must see them as old rather than as enormous
+    /// positive values.
+    ///
+    /// OPTIONAL, NOT A SENTINEL, and that is a corrected defect rather than a
+    /// style choice. An earlier revision used INT64_MIN for "unknown", reasoning
+    /// that unknown should mean "do not act". It achieved the opposite: the
+    /// natural predicate `now - mtime >= min_age` reads INT64_MIN as older than
+    /// the epoch -- MAXIMALLY deletable, worse than the 0 the comment rejected --
+    /// and the subtraction is signed-overflow UB that traps under UBSan. Any
+    /// numeric sentinel has that shape. `optional` makes absence
+    /// unrepresentable as a number, so no arithmetic can silently take the
+    /// wrong branch; a caller must decide what absence means before it can
+    /// compute anything.
+    std::optional<std::int64_t> mtime;
 };
 
 /// Caller-supplied blast-radius caps. Zero-initialized fields are
@@ -302,10 +378,22 @@ struct DeleteResult {
     WalkTally tally;
 };
 
-/// Caller-supplied predicate deciding whether a given relative path should
-/// be deleted at all (name/glob/age filtering lives entirely in the
-/// caller's closure -- this header knows nothing about match syntax). May
-/// throw; `walk_delete` firewalls that into `Reason::MatchError`.
-using MatchFn = std::function<bool(std::string_view rel_path)>;
+/// Caller-supplied predicate deciding whether a given entry should be deleted
+/// at all. Name, glob and AGE filtering all live entirely in the caller's
+/// closure -- this header knows nothing about match syntax or policy.
+///
+/// The entry's metadata is passed alongside the path so an age or size policy
+/// never has to re-open the entry by path to learn what it needs; see
+/// `EntryMeta::mtime` for why that matters here specifically. `meta` is
+/// the same value `decide_entry` was given, so a `MatchFn` and the primitive
+/// always reason about identical facts.
+///
+/// BORROWED FOR THE CALL ONLY. `rel_path` views a string the walker owns and
+/// `meta` references an entry in the enumeration buffer; both are valid for the
+/// duration of the invocation and no longer. A predicate needing either beyond
+/// that must copy it.
+///
+/// May throw; `walk_delete` firewalls that into `Reason::MatchError`.
+using MatchFn = std::function<bool(std::string_view rel_path, const EntryMeta& meta)>;
 
 } // namespace yuzu::agent::confined_fs
