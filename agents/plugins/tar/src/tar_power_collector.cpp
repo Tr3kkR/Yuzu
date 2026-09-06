@@ -393,7 +393,7 @@ public:
             suspend_handle_ = nullptr;
         }
         if (acdc_handle_) {
-            PowerUnregisterNotification(acdc_handle_);
+            PowerSettingUnregisterNotification(acdc_handle_);
             acdc_handle_ = nullptr;
         }
     }
@@ -485,15 +485,6 @@ public:
                "no row will appear for them; AC attach/detach is unaffected";
         }
 
-        // Same statement as the Windows leg: an unarmed source says so, once,
-        // rather than falling silent and reading as continuous coverage.
-        std::optional<std::string> unarmed_gap_reason;
-        if (!is_armed()) {
-            unarmed_gap_reason =
-               "power sleep/wake subscription is NOT armed (no libsystemd in this build, or "
-               "logind unreachable) -- sleep and wake transitions cannot be captured on this "
-               "host and no row will appear for them; AC attach/detach is unaffected";
-        }
 
         std::optional<std::string> ac_gap_reason;
         std::string last_ac;
@@ -849,6 +840,18 @@ public:
         // sleep/wake) so it goes through the exact same state-change-driven
         // decision as every other leg's AC handling.
         auto current_ac = linux_read_ac_state();
+
+        // Same statement as the Windows leg: a source that is NOT armed says
+        // so, once, rather than falling silent and reading as continuous
+        // coverage. Keyed on the window start (unarmed_since_ms below) so the
+        // store's record_key dedupe collapses every later tick onto one row.
+        std::optional<std::string> unarmed_gap_reason;
+        if (!is_armed()) {
+            unarmed_gap_reason =
+               "power sleep/wake subscription is NOT armed (no libsystemd in this build, or "
+               "logind unreachable) -- sleep and wake transitions cannot be captured on this "
+               "host and no row will appear for them; AC attach/detach is unaffected";
+        }
 
         SubscriptionTickInputs tick_in;
         tick_in.leg_tag = "linuxpower";
