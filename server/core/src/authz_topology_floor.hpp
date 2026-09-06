@@ -53,6 +53,23 @@ inline constexpr TopologyFloorEntry kTopologyFloor[] = {
     {"AccessReview", "Read"},
     {"UserManagement", "Read"},
     {"EnginePrincipal", "Read"},
+    // #4031: Enrollment (auto-approve rules + pending-agent visibility) and
+    // OidcConfig (OIDC SSO config) REST v1 twins moved these two reads off
+    // `admin_fn_` (a role gate, unconditional regardless of the RBAC
+    // toggle) onto `perm_fn_`/`require_permission` with a freshly-minted,
+    // Administrator-only securable. Without floor entries here, an
+    // RBAC-off deployment (the default) would silently WIDEN both reads
+    // from admin-only to any authenticated user via the generic "Read is
+    // always allowed" legacy fallback below — exactly the risk #4028
+    // (the sibling settings-fragment issue sharing this same #520
+    // MCP-policy question) flags for the identical admin_fn_-to-perm_fn_
+    // migration shape. Not "authorization topology" in the strict sense
+    // this file's header describes, but the same floor mechanism applies
+    // to any admin_fn_->perm_fn_ migration that must preserve its
+    // admin-only posture under RBAC-off — see the file header's "EXTEND
+    // this set, never fork it" rule.
+    {"Enrollment", "Read"},
+    {"OidcConfig", "Read"},
 };
 
 /// True when `(securable, operation)` is in the topology floor, i.e. the

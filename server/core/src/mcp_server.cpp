@@ -2128,7 +2128,13 @@ constexpr std::string_view kRbacSecurables[] = {
     "License",        "FileRetrieval",      "GuaranteedState",       "Inventory",
     "AccessReview",   "SoftwareLicensing",  "EnginePrincipal",       "PluginConfig",
     "PluginSecret",   "UploadGrant",
-    "PowerManagement"};
+    "PowerManagement",
+    // #4031: mirrors rbac_store.cpp's types[] additions (MOVE TOGETHER; same
+    // binding test) — Directory (AD/Entra directory-sync, prerequisite 1 fix),
+    // Enrollment (auto-approve rules + pending-agent visibility), OidcConfig
+    // (OIDC SSO config read — deliberately NOT "Directory", see the naming
+    // trap called out in the issue and in discovery_routes.cpp).
+    "Directory", "Enrollment", "OidcConfig"};
 
 // Borrowed (name, input_schema_json) row for the registration validator's
 // 4th sequence (#2405). Views are valid only for the duration of the call.
