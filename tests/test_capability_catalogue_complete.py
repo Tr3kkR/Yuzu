@@ -77,6 +77,7 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_d.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_disk_actions.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_filesystem_posture.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_power_health.hpp",
 ]
 CORE_FILE = "server/core/src/capability_decls/core_dispatch_capabilities.hpp"
 

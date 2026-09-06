@@ -1,0 +1,101 @@
+[
+  {
+    "method": "GET",
+    "path": "/fragments/tar/capture-sources",
+    "capability_id": "get.fragments-tar-capture-sources",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/tar/capture-sources/load",
+    "capability_id": "get.fragments-tar-capture-sources-load",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/fragments/tar/capture-sources/push",
+    "capability_id": "post.fragments-tar-capture-sources-push",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/tar/process-tree",
+    "capability_id": "get.fragments-tar-process-tree",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/tar/process-tree/detail",
+    "capability_id": "get.fragments-tar-process-tree-detail",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/tar/process-tree/device-net",
+    "capability_id": "get.fragments-tar-process-tree-device-net",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/tar/process-tree/result",
+    "capability_id": "get.fragments-tar-process-tree-result",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/tar/process-tree/run",
+    "capability_id": "get.fragments-tar-process-tree-run",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/tar/retention-paused",
+    "capability_id": "get.fragments-tar-retention-paused",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/fragments/tar/retention-paused/purge",
+    "capability_id": "post.fragments-tar-retention-paused-purge",
+    "rest_v1_twin": {
+      "method": "POST",
+      "path": "/api/v1/tar/retention-paused/purge"
+    },
+    "mcp_twin": null,
+    "status": "twinned"
+  },
+  {
+    "method": "POST",
+    "path": "/fragments/tar/retention-paused/reenable",
+    "capability_id": "post.fragments-tar-retention-paused-reenable",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/fragments/tar/retention-paused/scan",
+    "capability_id": "post.fragments-tar-retention-paused-scan",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  }
+]

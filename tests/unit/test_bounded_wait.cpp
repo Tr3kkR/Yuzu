@@ -163,3 +163,50 @@ TEST_CASE("OutstandingCallGuard: move-construction transfers ownership so only t
     }
     CHECK(g_outstanding_bounded_calls.load() == baseline);
 }
+
+TEST_CASE("bounded_call_ex: a ceiling rejection is reported as Rejected, never as TimedOut "
+          "(M3 — the caller must be able to tell whether fn() ever touched its handles)",
+          "[agent][bounded_wait][m3]") {
+    // bounded_call() collapses both into an empty optional. That is fine for a
+    // caller with nothing to clean up, and wrong for one holding an OS handle
+    // fn() uses: after a TimedOut, a detached thread may still be using it and
+    // closing races a live call; after a Rejected, fn() never ran and closing
+    // is safe. power_health's PDH thermal poll leaked a PDH_HQUERY on BOTH,
+    // and rejection is the case that arrives in bursts under load.
+    using yuzu::shared::BoundedCallStatus;
+    using yuzu::shared::bounded_call_ex;
+    using yuzu::shared::detail::g_outstanding_bounded_calls;
+    using yuzu::shared::detail::kMaxOutstandingBoundedCalls;
+    using yuzu::shared::detail::OutstandingCallGuard;
+
+    // A prompt call, with the ceiling free, completes.
+    {
+        auto ok = bounded_call_ex(std::chrono::milliseconds(2000), [] { return 7; });
+        CHECK(ok.status == BoundedCallStatus::Completed);
+        REQUIRE(ok.value.has_value());
+        CHECK(*ok.value == 7);
+    }
+
+    // Saturate the ceiling from THIS thread, so the next call is rejected
+    // deterministically rather than by racing real work.
+    std::vector<OutstandingCallGuard> held;
+    while (g_outstanding_bounded_calls.load() <= kMaxOutstandingBoundedCalls) {
+        auto g = OutstandingCallGuard::try_acquire();
+        if (!g)
+            break;
+        held.push_back(std::move(*g));
+    }
+
+    bool fn_ran = false;
+    auto rejected = bounded_call_ex(std::chrono::milliseconds(2000), [&fn_ran] {
+        fn_ran = true;
+        return 1;
+    });
+    CHECK(rejected.status == BoundedCallStatus::Rejected);
+    CHECK_FALSE(rejected.value.has_value());
+    // The load-bearing half: Rejected means fn() was never invoked, which is
+    // exactly what makes closing the caller's handle safe on this path.
+    CHECK_FALSE(fn_ran);
+
+    held.clear(); // release the ceiling for later test cases
+}
