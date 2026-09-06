@@ -169,6 +169,7 @@
 #include "schedule_runner.hpp"
 #include "dashboard_routes.hpp"
 #include "discovery_routes.hpp"
+#include "enrollment_directory_routes.hpp" // #4031: REST v1 read twins
 #include "fleet_topology_store.hpp"
 #include "heartbeat_ingestion.hpp"
 #include "fleet_topology_types.hpp"
@@ -20657,6 +20658,14 @@ private:
                                            directory_sync_.get(), patch_manager_.get(),
                                            deployment_store_.get(), discovery_store_.get());
 
+        // EnrollmentDirectoryRoutes — #4031 REST v1 read twins:
+        // /api/v1/directory/{users,status}, /api/v1/enrollment/{auto-approve-rules,
+        // pending-agents}, /api/v1/settings/oidc.
+        enrollment_directory_routes_ = std::make_unique<EnrollmentDirectoryRoutes>();
+        enrollment_directory_routes_->register_routes(*web_server_, auth_fn, perm_fn, audit_fn,
+                                                       directory_sync_.get(), &auto_approve_,
+                                                       &auth_mgr_, &cfg_);
+
         // -- PKI PR4: internal-CA REST surface (/api/v1/ca/*) ---------------------
         // The publish-CRL callback captures `this`; like the agent-cert signer it
         // relies on the gRPC/web drain in stop() running before members destruct.
@@ -22738,6 +22747,7 @@ private:
     std::unique_ptr<WebhookRoutes> webhook_routes_;
     std::unique_ptr<OffloadRoutes> offload_routes_;
     std::unique_ptr<DiscoveryRoutes> discovery_routes_;
+    std::unique_ptr<EnrollmentDirectoryRoutes> enrollment_directory_routes_; // #4031
     std::unique_ptr<CaRoutes> ca_routes_; // PKI PR4: /api/v1/ca/*
     std::unique_ptr<KekRoutes> kek_routes_; // #2395: /api/v1/secrets/kek/*
     // The three KEK operations, shared by the REST routes above and the MCP

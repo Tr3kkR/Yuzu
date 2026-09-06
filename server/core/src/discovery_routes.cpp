@@ -1,5 +1,6 @@
 #include "discovery_routes.hpp"
 
+#include "enrollment_directory_model.hpp" // #4031: shared row builders, REST/MCP parity (Rule 1)
 #include "http_route_sink.hpp"
 
 #include <nlohmann/json.hpp>
@@ -158,8 +159,21 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
              });
 
     // GET /api/directory/users — list synced users
+    //
+    // #4031: row shape now comes from the shared directory_user_row_json
+    // builder (also called by the REST v1 twin GET /api/v1/directory/users
+    // and the MCP tool list_directory_users) — Rule 1, no more independent
+    // drift on this PII-bearing shape. Also closes a real pre-existing gap
+    // the #4031 issue flagged: this route exposed email/UPN/group PII with
+    // NO audit call at all. Uses the file's existing void-AuditFn
+    // fire-and-forget convention (matches this file's directory.sync /
+    // directory.group_mapping.update / discovery.scan calls) rather than
+    // the newer bool/fail-closed rest_audit.hpp contract the REST v1 twin
+    // uses — upgrading DiscoveryRoutes wholesale onto that contract is a
+    // separate, broader modernization, not scoped to this PR.
     sink.Get("/api/directory/users",
-            [perm_fn, directory_sync](const httplib::Request& req, httplib::Response& res) {
+            [perm_fn, audit_fn, directory_sync](const httplib::Request& req,
+                                                httplib::Response& res) {
                 if (!perm_fn(req, res, "Directory", "Read"))
                     return;
                 if (!directory_sync || !directory_sync->is_open()) {
@@ -173,20 +187,12 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                 auto group_filter = req.get_param_value("group_id");
                 auto users = directory_sync->get_synced_users(group_filter);
 
-                nlohmann::json arr = nlohmann::json::array();
-                for (const auto& u : users) {
-                    nlohmann::json groups_arr = nlohmann::json::array();
-                    for (const auto& g : u.groups)
-                        groups_arr.push_back(g);
+                audit_fn(req, "directory.users.view", "success", "Directory", group_filter,
+                         "legacy directory users read");
 
-                    arr.push_back({{"id", u.id},
-                                   {"display_name", u.display_name},
-                                   {"email", u.email},
-                                   {"upn", u.upn},
-                                   {"enabled", u.enabled},
-                                   {"groups", groups_arr},
-                                   {"synced_at", u.synced_at}});
-                }
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& u : users)
+                    arr.push_back(directory_user_row_json(u));
 
                 res.set_content(nlohmann::json({{"users", arr},
                                                 {"count", arr.size()}})
@@ -195,6 +201,11 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
             });
 
     // GET /api/directory/status — sync status
+    //
+    // #4031: shape now comes from directory_status_json (shared with the
+    // REST v1 twin + MCP get_directory_status) — Rule 1. No PII (counts +
+    // group metadata only), so no audit call, matching this route's
+    // pre-existing unaudited posture and the REST v1 twin's same decision.
     sink.Get("/api/directory/status",
             [perm_fn, directory_sync](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Directory", "Read"))
@@ -209,25 +220,8 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
 
                 auto status = directory_sync->get_status();
                 auto groups = directory_sync->get_synced_groups();
-                auto mappings = directory_sync->get_group_role_mappings();
 
-                nlohmann::json groups_arr = nlohmann::json::array();
-                for (const auto& g : groups) {
-                    groups_arr.push_back({{"id", g.id},
-                                          {"display_name", g.display_name},
-                                          {"description", g.description},
-                                          {"mapped_role", g.mapped_role},
-                                          {"synced_at", g.synced_at}});
-                }
-
-                res.set_content(nlohmann::json({{"provider", status.provider},
-                                                {"status", status.status},
-                                                {"last_sync_at", status.last_sync_at},
-                                                {"user_count", status.user_count},
-                                                {"group_count", status.group_count},
-                                                {"last_error", status.last_error},
-                                                {"groups", groups_arr}})
-                                   .dump(),
+                res.set_content(directory_status_json(status, groups).dump(),
                                 "application/json");
             });
 
