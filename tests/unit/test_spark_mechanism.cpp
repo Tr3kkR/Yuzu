@@ -2079,31 +2079,16 @@ TEST_CASE("#2833 — a shutdown-window unwatch failure is counted but has NO hea
     // teardown_arm_race()) — the agent journal, not the fleet metrics.
 }
 
-// ── #2818: a dedup sibling is killed silently ─────────────────────────────────
+// ── #2818: a dedup sibling's watch death is now delivered ─────────────────────
 //
-// CONFIRMED, NOT FIXED HERE. ISparkBackend / the engine->consumer channel is arm+disarm
-// only: there is no "your subscription died" notification in either direction. So when a
-// whole key is torn down for a reason that has nothing to do with a given consumer, that
-// consumer is never told, and its SubscriptionId silently becomes a number that names
-// nothing.
-//
-// Reachable the moment a SECOND consumer exists. A second arm of an equal spec DEDUPS
-// onto the existing key and is handed a success id even while the FIRST arm's mechanism
-// watch is still in flight - arm_impl sets `mech` only on the newly-inserted path, and
-// the dedup path returns without touching mech_ops or recording any "watch pending"
-// state on Armed. When that in-flight watch then fails, arm_impl's teardown is
-// drop_key_locked(), which erases EVERY subscription on the key, correctly (a failed arm
-// of the key is a failed arm for everyone sharing it) and silently (the sibling gets no
-// callback, and the counters it could poll report the truth only if it thinks to poll).
-//
-// THESE CASES ARE PINS, NOT REGRESSION TESTS: they assert the CURRENT, DEFECTIVE
-// behaviour. They exist so the future fix has something to flip, and so the gap cannot be
-// quietly re-litigated as "theoretical". The fix is out of scope here - #2818 needs an
-// engine-level consumer-death notification, which is its own change (PR-2d), and is NOT
-// the same primitive as #3816's executor-level caller-abandonment signal.
+// FIXED. drop_key_locked's sole call site (arm_impl's failed-watch teardown) now
+// snapshots every live subscriber before erasing the key's bookkeeping and delivers a
+// SparkEventKind::Lost through the same Inline/Queued channel an ordinary fire uses - no
+// new registration surface. See report_fault's paired fix below for the milder
+// Faulted/Recovered (B1) edge.
 
-TEST_CASE("#2818 PIN — a deduped sibling is erased by another consumer's failed watch and "
-          "is never told",
+TEST_CASE("#2818 — a deduped sibling is notified when another consumer's failed watch "
+          "kills their shared key",
           "[spark][mechanism]") {
     SparkEngine engine;
     FakeMechanism* fake = wire_fake(engine, SparkType::File);
@@ -2120,7 +2105,7 @@ TEST_CASE("#2818 PIN — a deduped sibling is erased by another consumer's faile
 
     // A arms K and is parked INSIDE watch_guarded's catch — i.e. after its watch has
     // definitively failed but before arm_impl has run the teardown. That is the window in
-    // which B's arm must be allowed to succeed for the defect to be visible at all.
+    // which B's arm must be allowed to succeed for the defect this pins to be reachable.
     ParkGate gate;
     fake->set_throw_watch(true);
     engine.set_arm_fault_hook_for_test([g = &gate](int phase) {
@@ -2137,8 +2122,7 @@ TEST_CASE("#2818 PIN — a deduped sibling is erased by another consumer's faile
     REQUIRE(gate.wait_entered());
 
     // B arms the SAME spec while A's watch is in flight. It dedups onto A's committed
-    // armed_ entry and is handed a real SubscriptionId. Nothing tells it that the watcher
-    // its subscription depends on has not come up — and, by now, never will.
+    // armed_ entry and is handed a real SubscriptionId.
     auto b_sub = engine.arm(*b, spec);
     REQUIRE(b_sub.has_value());
     CHECK(engine.stats().subscriptions == 2); // both live, as far as anyone can see
@@ -2146,39 +2130,59 @@ TEST_CASE("#2818 PIN — a deduped sibling is erased by another consumer's faile
     gate.release();
     armer_a.join();
 
-    // A learns its arm failed. That part is correct.
+    // A learns its arm failed synchronously. That part was always correct.
     CHECK_FALSE(a_sub.has_value());
 
-    // THE DEFECT. B's subscription is gone with the key, and B was told nothing.
     const auto ss = engine.stats();
     CHECK(ss.armed_sparks == 0);
-    CHECK(ss.subscriptions == 0); // B's id now names nothing
-    CHECK(cb.count() == 0);       // no callback, no error, no signal of any kind
-    CHECK(ca.count() == 0);
+    CHECK(ss.subscriptions == 0); // both ids now name nothing
+    CHECK(ss.subscription_lost_total == 1);
 
-    // And the id B still holds is inert in both directions. Disarming it is a silent
-    // no-op (correct, and deliberately kept that way — see #3816's coordination note)...
+    // B — the dedup sibling — is notified async, via the exact channel it registered.
+    REQUIRE(eventually([&] { return cb.count() >= 1; }));
+    const auto lost_b = cb.at(0);
+    CHECK(lost_b.kind == SparkEventKind::Lost);
+    CHECK(lost_b.key == key);
+    CHECK(lost_b.subscription_id == *b_sub);
+
+    // A gets the same notification too — nothing in Armed::subs distinguishes "the
+    // failing caller" from a dedup sibling, and there is no value in adding a field just
+    // to suppress a harmless duplicate signal to the one consumer who already knows. A's
+    // own arm() call returned an error (a_sub has no value), so its subscription_id is
+    // only observable here, via the delivered event.
+    REQUIRE(eventually([&] { return ca.count() >= 1; }));
+    const auto lost_a = ca.at(0);
+    CHECK(lost_a.kind == SparkEventKind::Lost);
+    CHECK(lost_a.key == key);
+    CHECK(lost_a.subscription_id != 0);
+    CHECK(lost_a.subscription_id != lost_b.subscription_id);
+
+    // The defensive unwatch() this fix also adds is a safe no-op here (the mechanism's
+    // own watch() never actually registered anything before throwing).
+    CHECK(fake->unwatch_calls() == 1);
+
+    // The id B still holds is inert in both directions. Disarming it is a silent no-op
+    // (correct, and deliberately kept that way — see #3816's coordination note)...
     CHECK_NOTHROW(engine.disarm(*b_sub));
     // ...and a fire on the key it named reaches nobody and is not even counted, because
-    // emit_event finds no armed_ entry and returns before events_total_.
+    // emit_event finds no armed_ entry and returns before events_total_ — and does NOT
+    // produce a second Lost delivery (there is nothing left to notify).
     fake->fire(key);
     CHECK(engine.stats().events_total == 0);
-    CHECK(cb.count() == 0);
+    CHECK(cb.count() == 1);
 
     engine.set_arm_fault_hook_for_test(nullptr);
     fake->set_throw_watch(false);
     engine.stop();
 }
 
-TEST_CASE("#2818 PIN — a post-arm watch fault is counted but never reaches the consumer",
+TEST_CASE("#2818 — a post-arm watch fault now reaches the consumer",
           "[spark][mechanism]") {
-    // The second, milder face of the same missing channel. Here the arm SUCCEEDS and the
-    // mechanism later reports the watch deaf (B1). The engine records the edge, flags the
-    // spark and bumps a counter — all correct — but the consumer that asked for this
-    // spark is not told that it has stopped being watched, so it keeps believing an armed
-    // subscription is live detection. Health-only by design; pinned because "armed" and
-    // "actually watching" are not the same thing and only the engine can see the
-    // difference.
+    // The second, milder face of the same channel. Here the arm SUCCEEDS and the
+    // mechanism later reports the watch deaf (B1). The engine still records the edge,
+    // flags the spark and bumps the existing counters — unchanged — but now the consumer
+    // that asked for this spark is ALSO told, via a SparkEventKind::Faulted/Recovered
+    // pair, instead of having to poll stats() to learn its subscription degraded.
     SparkEngine engine;
     FakeMechanism* fake = wire_fake(engine, SparkType::File);
     Collector col;
@@ -2197,13 +2201,24 @@ TEST_CASE("#2818 PIN — a post-arm watch fault is counted but never reaches the
     CHECK(ss.armed_faulted == 1);
     CHECK(ss.armed_sparks == 1);  // still armed…
     CHECK(ss.subscriptions == 1); // …and still subscribed…
-    CHECK(col.count() == 0);      // …and the consumer has heard nothing.
 
-    // Recovery is equally silent, so a consumer cannot even infer the state by inversion.
+    REQUIRE(eventually([&] { return col.count() >= 1; }));
+    const auto faulted_ev = col.at(0);
+    CHECK(faulted_ev.kind == SparkEventKind::Faulted);
+    CHECK(faulted_ev.key == key);
+    CHECK(faulted_ev.subscription_id == *sub);
+    CHECK(faulted_ev.detail == "handle went deaf");
+
+    // Recovery is delivered too, so a consumer no longer has to infer state by
+    // inversion (or poll stats()).
     fake->fire_fault(key, false, "recovered");
     CHECK(engine.stats().armed_faulted == 0);
     CHECK(engine.stats().watch_faults_total == 1); // monotonic, edge-counted
-    CHECK(col.count() == 0);
+
+    REQUIRE(eventually([&] { return col.count() >= 2; }));
+    const auto recovered_ev = col.at(1);
+    CHECK(recovered_ev.kind == SparkEventKind::Recovered);
+    CHECK(recovered_ev.detail == "recovered");
     engine.stop();
 }
 

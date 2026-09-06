@@ -264,6 +264,22 @@ struct FakeBackend : ISparkBackend {
     std::vector<std::uint64_t> armed_ids_;
     std::vector<std::uint64_t> disarmed_ids_;
 
+    /// #2818 poll backstop test seam: report a specific health for a specific id,
+    /// simulating "the engine says this subscription is dead/faulted" independent of
+    /// whether any push notification was ever delivered for it - exactly the fact
+    /// revalidate_subscriptions() queries. Unset ids report Healthy (the base class
+    /// default), matching every pre-existing test that never calls this.
+    void set_health_for_test(std::uint64_t id, SubscriptionHealth h) {
+        std::lock_guard<std::mutex> lk{ids_mu_};
+        health_[id] = h;
+    }
+    SubscriptionHealth subscription_health(std::uint64_t id) override {
+        std::lock_guard<std::mutex> lk{ids_mu_};
+        const auto it = health_.find(id);
+        return it != health_.end() ? it->second : SubscriptionHealth::Healthy;
+    }
+    std::unordered_map<std::uint64_t, SubscriptionHealth> health_;
+
     /// Blocks until a hung arm() has actually entered its wait (avoids a racy
     /// sleep-based poll for "is the worker parked yet").
     bool wait_entered_hang(std::chrono::seconds timeout) {
@@ -469,6 +485,53 @@ TEST_CASE("detach disarms on the ->0 edge; a sibling detach keeps the watcher", 
     rt->detach_rule("r2"); // ->0 -> disarm
     REQUIRE(b->disarms.load() == 1);
     REQUIRE(rt->armed_key_count() == 0);
+}
+
+TEST_CASE("#2818 poll backstop: revalidate_subscriptions detects and reports a dead "
+          "subscription no push notification ever announced",
+          "[spark][runtime]") {
+    // The delivery-guarantee backstop for the case where a genuine Lost notification
+    // was silently dropped by a full Queued consumer channel: this test never triggers
+    // (or relies on) a Lost push at all — b->set_health_for_test reports the exact fact
+    // subscription_health() would, independent of how the subscription actually died.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+    REQUIRE(rt->armed_key_count() == 1);
+    REQUIRE(rt->rule_count() == 1);
+    REQUIRE(b->armed_ids().size() == 1);
+
+    b->set_health_for_test(b->armed_ids().front(), SubscriptionHealth::Dead);
+    rt->revalidate_subscriptions();
+
+    CHECK(rt->armed_key_count() == 0);
+    CHECK(rt->rule_count() == 0);
+    const auto lc = drain_lifecycle(*rt);
+    REQUIRE(!lc.empty());
+    CHECK(std::any_of(lc.begin(), lc.end(), [](const OutboxEntry& e) {
+        return e.rule_id == "r1" && e.lifecycle_kind == "errored";
+    }));
+}
+
+TEST_CASE("#2818 poll backstop: a Healthy/Faulted subscription is left alone",
+          "[spark][runtime]") {
+    // Scoped to Dead only (Dave's call, 2026-09-06): a Faulted key is still armed at
+    // the engine level and may self-heal, so the backstop must not detach it.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+    REQUIRE(b->armed_ids().size() == 1);
+    b->set_health_for_test(b->armed_ids().front(), SubscriptionHealth::Faulted);
+
+    rt->revalidate_subscriptions();
+
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(rt->rule_count() == 1);
+    CHECK(b->disarms.load() == 0);
 }
 
 TEST_CASE("evaluate_key re-reads live state each pass (event is a hint)", "[spark][runtime]") {
