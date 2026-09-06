@@ -645,6 +645,14 @@ struct SubscriptionTickInputs {
     // gap. Mutually exclusive with `subscription_gap_reason` (a cursor is
     // either corrupt or a stale-but-valid restart marker, never both).
     std::optional<std::int64_t> restart_gap_since_ms;
+    // The source is NOT armed: sleep/wake cannot be captured on this host at
+    // all (no libsystemd in the build, a failed registration, a lost bus).
+    // Keyed on the window START so the store's record_key dedupe collapses
+    // every subsequent tick onto one row -- an operator gets one honest
+    // statement rather than silence or a per-tick flood.
+    std::optional<std::string> unarmed_gap_reason;
+    std::int64_t unarmed_since_ms{0};
+
     // R-004: same shape as `subscription_gap_reason` for the AC-side key.
     std::optional<std::string> ac_gap_reason;
 };
@@ -667,6 +675,12 @@ inline SubscriptionTickResult build_subscription_tick_events(const SubscriptionT
             *in.pending_gap_until_ms / 1000, "capture_gap", detail,
             in.leg_tag + ":gap:" + std::to_string(*in.pending_gap_since_ms) + ":" +
                 std::to_string(*in.pending_gap_until_ms)});
+    }
+
+    if (in.unarmed_gap_reason.has_value()) {
+        out.events.push_back(PowerEventDraft{
+            in.now, "capture_gap", *in.unarmed_gap_reason,
+            in.leg_tag + ":unarmed:" + std::to_string(in.unarmed_since_ms)});
     }
 
     if (in.subscription_gap_reason.has_value()) {

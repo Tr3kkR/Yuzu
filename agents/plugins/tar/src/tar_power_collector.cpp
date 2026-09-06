@@ -41,6 +41,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -369,8 +370,19 @@ public:
         // start() takes no db either, so re-registration happens lazily on
         // the next collect() if not already armed.
         if (disabled_at_ms_.has_value()) {
-            pending_gap_since_ms_ = *disabled_at_ms_;
-            pending_gap_until_ms_ = now_epoch_ms();
+            // WIDEN, never replace. Two disable->enable cycles inside one
+            // collect interval would otherwise overwrite the first window
+            // (T1..T2) with the second (T3..T4), and T1..T2 -- a window during
+            // which capture really was paused -- would never be reported at
+            // all. The contract owes exactly one gap per disabled window; where
+            // two windows fall inside one tick the honest single report is the
+            // span that covers both.
+            const std::int64_t since = *disabled_at_ms_;
+            const std::int64_t until = now_epoch_ms();
+            pending_gap_since_ms_ =
+               pending_gap_since_ms_ ? std::min(*pending_gap_since_ms_, since) : since;
+            pending_gap_until_ms_ =
+               pending_gap_until_ms_ ? std::max(*pending_gap_until_ms_, until) : until;
             disabled_at_ms_.reset();
         }
         std::lock_guard<std::mutex> lock(handle_mu_);
@@ -416,6 +428,28 @@ public:
             subscribed_since_ms = now_epoch_ms(); // never subscribed before -- fresh, no gap
         }
 
+        // One row, not one per tick: the key encodes the window start, so the
+        // store's record_key dedupe collapses every later tick onto it while
+        // the source stays unarmed.
+        std::optional<std::string> unarmed_gap_reason;
+        if (!is_armed()) {
+            unarmed_gap_reason =
+               "power sleep/wake subscription is NOT armed "
+               "(PowerRegisterSuspendResumeNotification / PowerSettingRegisterNotification did "
+               "not register) -- sleep and wake transitions cannot be captured on this host and "
+               "no row will appear for them; AC attach/detach is unaffected";
+        }
+
+        // Same statement as the Windows leg: an unarmed source says so, once,
+        // rather than falling silent and reading as continuous coverage.
+        std::optional<std::string> unarmed_gap_reason;
+        if (!is_armed()) {
+            unarmed_gap_reason =
+               "power sleep/wake subscription is NOT armed (no libsystemd in this build, or "
+               "logind unreachable) -- sleep and wake transitions cannot be captured on this "
+               "host and no row will appear for them; AC attach/detach is unaffected";
+        }
+
         std::optional<std::string> ac_gap_reason;
         std::string last_ac;
         if (decoded.ac_present && !decoded.ac_valid) {
@@ -439,6 +473,8 @@ public:
         tick_in.pending_gap_since_ms = pending_gap_since_ms_;
         tick_in.pending_gap_until_ms = pending_gap_until_ms_;
         tick_in.subscription_gap_reason = subscription_gap_reason;
+        tick_in.unarmed_gap_reason = unarmed_gap_reason;
+        tick_in.unarmed_since_ms = subscribed_since_ms;
         tick_in.restart_gap_since_ms = restart_gap_since_ms;
         tick_in.ac_gap_reason = ac_gap_reason;
         tick_in.dropped_total = queue_.dropped();
@@ -674,8 +710,19 @@ public:
             return;
         }
         if (disabled_at_ms_.has_value()) {
-            pending_gap_since_ms_ = *disabled_at_ms_;
-            pending_gap_until_ms_ = now_epoch_ms();
+            // WIDEN, never replace. Two disable->enable cycles inside one
+            // collect interval would otherwise overwrite the first window
+            // (T1..T2) with the second (T3..T4), and T1..T2 -- a window during
+            // which capture really was paused -- would never be reported at
+            // all. The contract owes exactly one gap per disabled window; where
+            // two windows fall inside one tick the honest single report is the
+            // span that covers both.
+            const std::int64_t since = *disabled_at_ms_;
+            const std::int64_t until = now_epoch_ms();
+            pending_gap_since_ms_ =
+               pending_gap_since_ms_ ? std::min(*pending_gap_since_ms_, since) : since;
+            pending_gap_until_ms_ =
+               pending_gap_until_ms_ ? std::max(*pending_gap_until_ms_, until) : until;
             disabled_at_ms_.reset();
         }
         needs_rearm_.store(true, std::memory_order_release);
@@ -695,11 +742,16 @@ public:
             decode_subscription_ac_cursor("armed_since_ms", cursor_json.value_or("{}"));
 
         // Same shape as the Windows leg (R-003/R-004) -- see its collect()
-        // for the full rationale. `is_armed()` on a build without
-        // libsystemd is always true: there is no subscription concept to
-        // wait on in that build, so a carried-over restart gap is reported
-        // exactly once and closed immediately rather than every tick
-        // forever.
+        // for the full rationale.
+        //
+        // An UNARMED source never advances armed_since_ms. On a build without
+        // libsystemd, or before sd_bus_match_signal has registered, or after a
+        // mid-run bus loss, sleep/wake cannot be captured at all -- so the
+        // window of missed coverage keeps growing and is reported as such. It
+        // used to close the gap here and then fall silent, which made
+        // $Power_Live read as continuous sleep/wake coverage on a host that
+        // could never produce a single sleep or wake row. The AC leg is
+        // unaffected: it is a polled sysfs read and keeps working.
         std::optional<std::string> subscription_gap_reason;
         std::optional<std::int64_t> restart_gap_since_ms;
         std::int64_t armed_since_ms;
@@ -752,6 +804,8 @@ public:
         tick_in.pending_gap_since_ms = pending_gap_since_ms_;
         tick_in.pending_gap_until_ms = pending_gap_until_ms_;
         tick_in.subscription_gap_reason = subscription_gap_reason;
+        tick_in.unarmed_gap_reason = unarmed_gap_reason;
+        tick_in.unarmed_since_ms = armed_since_ms;
         tick_in.restart_gap_since_ms = restart_gap_since_ms;
         tick_in.ac_gap_reason = ac_gap_reason;
         tick_in.dropped_total = queue_.dropped();
@@ -844,6 +898,9 @@ private:
             arm_failed_.store(true, std::memory_order_release); // R-008
             return;
         }
+        // The match is registered: from here a PrepareForSleep signal can
+        // actually reach us, and only now is this source honestly "armed".
+        arm_confirmed_.store(true, std::memory_order_release);
         while (!stop_requested_.load(std::memory_order_acquire)) {
             // R-015: a negative return is a real bus error (e.g. logind/
             // dbus-daemon disconnected mid-run), not a transient "nothing
@@ -856,6 +913,7 @@ private:
                               "sleep/wake unavailable until re-arm",
                               process_rc);
                 arm_failed_.store(true, std::memory_order_release);
+                arm_confirmed_.store(false, std::memory_order_release);
                 break;
             }
             if (process_rc > 0)
@@ -869,6 +927,7 @@ private:
                               "sleep/wake unavailable until re-arm",
                               wait_rc);
                 arm_failed_.store(true, std::memory_order_release);
+                arm_confirmed_.store(false, std::memory_order_release);
                 break;
             }
         }
@@ -879,15 +938,28 @@ private:
 
     std::uint64_t next_seq() { return seq_.fetch_add(1, std::memory_order_relaxed); }
 
+    // A POSITIVE acknowledgement, not an inference from thread liveness.
+    //
+    // This used to return true on a build without libsystemd -- reasoning that
+    // there is no subscription to wait on, so a carried-over restart gap should
+    // close rather than repeat forever. The consequence was the opposite of
+    // honest: armed_since_ms advanced to now, the restart gap closed, and no
+    // capture_gap was ever emitted again. $Power_Live then read as CONTINUOUS
+    // sleep/wake coverage on a build that can never capture a sleep or a wake.
+    //
+    // With libsystemd it also used to infer arming from `bus_thread_.joinable()`,
+    // which is true the instant the thread is spawned and long before
+    // sd_bus_match_signal has succeeded -- so a tick landing in that window saw
+    // "armed" and closed the gap on a subscription that had not been established.
+    // arm_confirmed_ is set by bus_loop() only after the match actually
+    // registers.
     bool is_armed() {
 #ifdef YUZU_HAVE_LIBSYSTEMD
         std::lock_guard<std::mutex> lock(thread_mu_);
-        return bus_thread_.joinable() && !arm_failed_.load(std::memory_order_acquire);
+        return bus_thread_.joinable() && arm_confirmed_.load(std::memory_order_acquire) &&
+               !arm_failed_.load(std::memory_order_acquire);
 #else
-        // No subscription concept exists in this build -- never block a
-        // carried-over restart gap's closure on "arming" something that
-        // will never arm.
-        return true;
+        return false; // no sd-bus in this build: sleep/wake is genuinely uncapturable
 #endif
     }
 
@@ -900,6 +972,8 @@ private:
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> needs_rearm_{false};
     std::atomic<bool> arm_failed_{false};
+    // Set by bus_loop() ONLY after sd_bus_match_signal succeeds.
+    std::atomic<bool> arm_confirmed_{false};
     std::atomic<bool> enabled_{true}; // seeded from persisted config in start() -- R-002
     std::optional<std::int64_t> disabled_at_ms_;
     std::optional<std::int64_t> pending_gap_since_ms_;

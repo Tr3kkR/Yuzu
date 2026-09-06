@@ -811,6 +811,41 @@ TEST_CASE("a source disabled before its first-ever collect does not replay the p
     CHECK_FALSE(out.is_baseline);
 }
 
+TEST_CASE("an UNARMED subscription reports one deduping gap instead of reading as continuous "
+          "coverage (HIGH-2)",
+          "[tar_power][subscription][unarmed]") {
+    // is_armed() used to return true on a build without libsystemd, which
+    // advanced armed_since_ms, closed the restart gap, and then emitted nothing
+    // ever again -- so $Power_Live read as continuous sleep/wake coverage on a
+    // host that can never produce a single sleep or wake row. The unarmed state
+    // is now stated, once: the key encodes the window start so the store's
+    // record_key dedupe collapses every later tick onto the same row.
+    SubscriptionTickInputs in;
+    in.leg_tag = "linuxpower";
+    in.run_nonce_ms = 1'700'000'000'000;
+    in.unarmed_gap_reason = "not armed (no libsystemd in this build)";
+    in.unarmed_since_ms = 5000;
+    in.now = 100;
+
+    const auto a = build_subscription_tick_events(in);
+    REQUIRE(a.events.size() == 1);
+    CHECK(a.events[0].action == "capture_gap");
+    CHECK(a.events[0].record_key == "linuxpower:unarmed:5000");
+
+    // A later tick, still unarmed: same window, same key, so the store dedupes
+    // it onto the one row rather than accumulating one per tick forever.
+    SubscriptionTickInputs later = in;
+    later.now = 999999;
+    const auto b = build_subscription_tick_events(later);
+    REQUIRE(b.events.size() == 1);
+    CHECK(b.events[0].record_key == a.events[0].record_key);
+
+    // Armed: no gap at all.
+    SubscriptionTickInputs armed = in;
+    armed.unarmed_gap_reason.reset();
+    CHECK(build_subscription_tick_events(armed).events.empty());
+}
+
 TEST_CASE("build_subscription_tick_events: counter-derived record_keys survive an agent "
           "restart, timestamp-derived ones stay idempotent (SP-1)",
           "[tar_power][subscription][sp1]") {
