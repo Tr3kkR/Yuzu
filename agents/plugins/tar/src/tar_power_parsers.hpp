@@ -465,6 +465,26 @@ inline MacPowerCollectDecision decide_mac_power_collect(const std::vector<PmsetL
         }
     };
 
+    // A FORCED GAP OUTRANKS EVERYTHING, INCLUDING "no cursor yet".
+    //
+    // This check used to sit below the !had_prior_cursor branch, which returns.
+    // So a source disabled BEFORE its first-ever collect -- a staged rollout, or
+    // a tar.db quarantine -- came back with cursor_json == nullopt, took the
+    // baseline path, and replayed up to power_lookback_seconds (7 days by
+    // default) of the paused window's real Sleep/Wake/AC lines straight into
+    // $Power_Live, while the capture_gap it owed was dropped on the floor.
+    // tar_cursor.hpp is absolute about this: NOTHING from a paused window is
+    // ever stored. A forced gap always means gap plus forward re-baseline,
+    // whether or not a cursor exists.
+    if (forced_gap_reason.has_value()) {
+        out.cursor_lost = true;
+        out.events.push_back(PowerEventDraft{now, "capture_gap", *forced_gap_reason,
+                                             mac_power_gap_record_key(now, *forced_gap_reason)});
+        rebaseline_at_log_end(cursor.has_value() ? cursor->last_ac : std::string("unknown"));
+        out.detail = *forced_gap_reason;
+        return out;
+    }
+
     if (!had_prior_cursor) {
         out.is_baseline = true;
         std::string last_ac = "unknown";
@@ -490,14 +510,6 @@ inline MacPowerCollectDecision decide_mac_power_collect(const std::vector<PmsetL
         return out;
     }
 
-    if (forced_gap_reason.has_value()) {
-        out.cursor_lost = true;
-        out.events.push_back(PowerEventDraft{now, "capture_gap", *forced_gap_reason,
-                                             mac_power_gap_record_key(now, *forced_gap_reason)});
-        rebaseline_at_log_end(cursor->last_ac);
-        out.detail = *forced_gap_reason;
-        return out;
-    }
 
     if (entries.empty() && cursor->last_line_crc == 0 && cursor->occurrence == 1) {
         // R-012: `rebaseline_at_log_end` on an empty log persists the

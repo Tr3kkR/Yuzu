@@ -786,6 +786,31 @@ TEST_CASE("build_subscription_tick_events: sleep/wake items become events 1:1, e
     CHECK(out.events[0].record_key != out.events[1].record_key);
 }
 
+TEST_CASE("a source disabled before its first-ever collect does not replay the paused window "
+          "(forensic-pause bypass)",
+          "[tar_power][gap][pause]") {
+    // Disable before the first collect, then re-enable. cursor_json is nullopt,
+    // so this used to take the baseline path -- which replays up to
+    // power_lookback_seconds (7 days by default) of the paused window's real
+    // Sleep/Wake lines and drops the capture_gap it owes. tar_cursor.hpp is
+    // absolute: nothing from a paused window is ever stored.
+    std::vector<PmsetLogEntry> entries;
+    entries.push_back(PmsetLogEntry{1000, 111, "sleep", "lid"});
+    entries.push_back(PmsetLogEntry{2000, 222, "wake", "user"});
+
+    const auto out = decide_mac_power_collect(entries, /*had_prior_cursor=*/false,
+                                              /*cursor=*/std::nullopt,
+                                              /*lookback_seconds=*/604800, /*now=*/9000,
+                                              std::optional<std::string>{"re-enabled after a pause"});
+
+    // Exactly one event, and it is the gap -- not the paused window's traffic.
+    REQUIRE(out.events.size() == 1);
+    CHECK(out.events[0].action == "capture_gap");
+    CHECK(out.cursor_lost);
+    // And it re-baselines forward rather than reporting a clean first read.
+    CHECK_FALSE(out.is_baseline);
+}
+
 TEST_CASE("build_subscription_tick_events: counter-derived record_keys survive an agent "
           "restart, timestamp-derived ones stay idempotent (SP-1)",
           "[tar_power][subscription][sp1]") {
