@@ -260,7 +260,10 @@ enum class SparkEventKind : std::uint8_t {
 };
 
 /// What a consumer receives when an armed spark fires — or, since #2818, when a
-/// subscription's underlying watch dies or changes health.
+/// subscription's underlying watch dies or changes health. A CONSUMER MUST SWITCH
+/// ON `kind`: a handler that treats every SparkEvent as a fire (ignoring `kind`)
+/// will silently misread a Lost/Faulted/Recovered notification as a real detection
+/// fire with empty `data` (governance Gate 2 finding, PR-2d).
 struct SparkEvent {
     std::string key;                          ///< spark_key() of the armed spec
     SparkType type{SparkType::Interval};

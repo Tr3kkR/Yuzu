@@ -632,7 +632,7 @@ void GuardianSparkRuntime::detach_all() {
 }
 
 std::optional<GuardianSparkRuntime::DisarmWork>
-GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id, const char* lifecycle_kind) {
+GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id, std::string_view lifecycle_kind) {
     // #2233 item 3: rule_id belongs to a key whose FIRST arm is still resolving
     // off-lock (attach_rule released registry_mu_ before the backend call) - it has
     // no rules_/keys_ entry to withdraw yet. Mark the in-flight episode withdrawn so
@@ -688,7 +688,7 @@ GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id, const char*
             kit->second->pending_initial.erase(rule_id);
     }
     if (known)
-        enqueue_lifecycle_locked(rule_id, gen, lifecycle_kind, guard_type, rule_name);
+        enqueue_lifecycle_locked(rule_id, gen, std::string(lifecycle_kind), guard_type, rule_name);
     return work;
 }
 

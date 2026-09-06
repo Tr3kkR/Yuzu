@@ -534,6 +534,40 @@ TEST_CASE("#2818 poll backstop: a Healthy/Faulted subscription is left alone",
     CHECK(b->disarms.load() == 0);
 }
 
+TEST_CASE("#2818: a stale Lost/Faulted notification (superseded by a fresh re-arm) is a "
+          "safe no-op (quality-engineer Gate 3 finding - the staleness guard was untested)",
+          "[spark][runtime]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+    REQUIRE(b->armed_ids().size() == 1);
+    const auto stale_id = b->armed_ids().front();
+
+    // Detach then re-attach: the key gets a FRESH subscription id, distinct from the
+    // one the (now-stale) notification below still names.
+    rt->detach_rule("r1");
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+    REQUIRE(b->armed_ids().size() == 2);
+    REQUIRE(b->armed_ids().back() != stale_id); // ids are monotonic, never reused
+
+    // A Lost naming the STALE id must be a no-op: r1 stays armed under its fresh id.
+    rt->on_event(SparkEvent{.key = key, .kind = SparkEventKind::Lost, .subscription_id = stale_id});
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(rt->rule_count() == 1);
+
+    // A Faulted naming the STALE id must also be a no-op: no health entry produced.
+    rt->on_event(SparkEvent{.key = key,
+                             .kind = SparkEventKind::Faulted,
+                             .subscription_id = stale_id,
+                             .detail = "stale"});
+    const auto got = drain_all(*rt);
+    CHECK(got.empty());
+    CHECK(rt->armed_key_count() == 1); // still armed - the guard held both times
+}
+
 TEST_CASE("evaluate_key re-reads live state each pass (event is a hint)", "[spark][runtime]") {
     auto r = std::make_shared<FakeReader>();
     auto b = std::make_shared<FakeBackend>();

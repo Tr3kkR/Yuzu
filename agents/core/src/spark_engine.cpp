@@ -1352,22 +1352,34 @@ void SparkEngine::start() {
                      report_fault(key, faulted, reason);
                  });
     for (auto& r : replays) {
-        // Serialized via this type's mech_ops_mu_by_type_ entry with a staleness
-        // re-check (#1994 M2): a concurrent disarm() may have torn this key down
-        // between start()'s collection pass above (mu_ released since) and here.
-        std::lock_guard ops(mech_ops_mu_by_type_.at(r.type));
+        // #2818 (cpp-safety Gate 3): `ops` must NOT still be held when report_fault()
+        // runs below — report_fault() now calls deliver(), which can synchronously
+        // invoke an Inline subscriber's handler; an Inline handler that reacts by
+        // arming/disarming this same type would re-enter this type's
+        // mech_ops_mu_by_type_ entry on the same thread and self-deadlock on this
+        // non-recursive mutex (the exact class arm_impl's own Lost-delivery path was
+        // written to avoid — this pre-existing call site was the one instance that
+        // diff missed). So `ops` is scoped to ONLY the staleness re-check +
+        // watch_guarded() call; report_fault() runs after it releases.
+        std::expected<void, std::string> w;
         {
-            std::lock_guard lk(mu_);
-            if (!armed_.contains(r.key))
-                continue; // disarmed before its pre-start replay could run
+            // Serialized via this type's mech_ops_mu_by_type_ entry with a staleness
+            // re-check (#1994 M2): a concurrent disarm() may have torn this key down
+            // between start()'s collection pass above (mu_ released since) and here.
+            std::lock_guard ops(mech_ops_mu_by_type_.at(r.type));
+            {
+                std::lock_guard lk(mu_);
+                if (!armed_.contains(r.key))
+                    continue; // disarmed before its pre-start replay could run
+            }
+            // An escaping throw here would unwind out of the void start() AFTER
+            // running_ is latched and the wheel + mechanisms are up, leaving this
+            // spark in armed_/sub_keys_ with no watcher — the exact "armed == a
+            // watcher is running" violation UP-7 closed on the live arm_impl path.
+            // watch_guarded() turns a throw into a returned failure; unlike arm_impl
+            // we fault in place (subscribers already hold ids — do NOT roll back).
+            w = watch_guarded(r.mech, r.key, r.params, r.err, arm_fault_hook_for_test_);
         }
-        // An escaping throw here would unwind out of the void start() AFTER
-        // running_ is latched and the wheel + mechanisms are up, leaving this
-        // spark in armed_/sub_keys_ with no watcher — the exact "armed == a
-        // watcher is running" violation UP-7 closed on the live arm_impl path.
-        // watch_guarded() turns a throw into a returned failure; unlike arm_impl
-        // we fault in place (subscribers already hold ids — do NOT roll back).
-        auto w = watch_guarded(r.mech, r.key, r.params, r.err, arm_fault_hook_for_test_);
         if (!w) {
             // Pre-start replay failure leaves the spark armed-without-watcher —
             // mark it faulted so the drift is observable (B1) rather than a

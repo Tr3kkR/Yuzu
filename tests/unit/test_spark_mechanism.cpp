@@ -1322,6 +1322,37 @@ TEST_CASE("File spark: a mechanism that throws a NON-std exception from watch() 
     engine.stop();
 }
 
+TEST_CASE("Pre-start replay fault delivery does not deadlock an inline self-disarm "
+          "(TRAP 2 twin, #2818 cpp-safety Gate 3)",
+          "[spark][mechanism]") {
+    // report_fault() (called from start()'s pre-start-replay loop on a watch failure)
+    // now calls deliver(), which can synchronously invoke an Inline handler on the
+    // CALLING thread - i.e. the thread running start(), inside its replay loop. If
+    // that handler reacts by disarming itself, disarm() re-enters
+    // mech_ops_mu_by_type_.at(File) - the same per-type, non-recursive mutex the
+    // replay loop was (pre-fix) still holding when it called report_fault(). Proof
+    // this doesn't self-deadlock: if it did, engine.start() below would hang forever
+    // and this test binary would never reach engine.stop().
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::File);
+    fake->set_fail_watch(true); // the pre-start replay watch for `spec` will fail
+
+    const auto spec = file_spec("/etc/hosts");
+    std::atomic<bool> disarmed_from_inline{false};
+    auto inline_sub = engine.arm_inline(spec, [&](const SparkEvent& ev) {
+        if (ev.kind != SparkEventKind::Faulted)
+            return;
+        engine.disarm(ev.subscription_id); // re-enters mech_ops_mu_by_type_.at(File)
+        disarmed_from_inline.store(true, std::memory_order_release);
+    });
+    REQUIRE(inline_sub.has_value()); // pre-start: watch deferred to start()'s replay
+
+    engine.start(); // must return - pre-fix this self-deadlocks
+    CHECK(disarmed_from_inline.load());
+    CHECK(engine.stats().subscriptions == 0); // the self-disarm actually completed
+    engine.stop();
+}
+
 TEST_CASE("File spark: a pre-start replay watch failure marks the spark faulted, not silent",
           "[spark][mechanism]") {
     // A spark armed BEFORE start defers its watch to start()'s replay. If that
@@ -2218,7 +2249,38 @@ TEST_CASE("#2818 — a post-arm watch fault now reaches the consumer",
     REQUIRE(eventually([&] { return col.count() >= 2; }));
     const auto recovered_ev = col.at(1);
     CHECK(recovered_ev.kind == SparkEventKind::Recovered);
+    CHECK(recovered_ev.key == key);
+    CHECK(recovered_ev.subscription_id == *sub);
     CHECK(recovered_ev.detail == "recovered");
+    engine.stop();
+}
+
+TEST_CASE("#2818: subscription_health() reports Dead/Faulted/Healthy directly (quality-engineer "
+          "Gate 3 finding - the query itself was untested)",
+          "[spark][mechanism]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::File);
+    auto c = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(c.has_value());
+    engine.start();
+
+    const auto spec = file_spec("/etc/hosts");
+    const std::string key = spark_key(spec);
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value());
+    CHECK(engine.subscription_health(*sub) == SubscriptionHealth::Healthy);
+
+    fake->fire_fault(key, true, "handle went deaf");
+    CHECK(engine.subscription_health(*sub) == SubscriptionHealth::Faulted);
+
+    fake->fire_fault(key, false, "recovered");
+    CHECK(engine.subscription_health(*sub) == SubscriptionHealth::Healthy);
+
+    engine.disarm(*sub);
+    CHECK(engine.subscription_health(*sub) == SubscriptionHealth::Dead);
+    // An id that never existed at all reports Dead too - the query has no separate
+    // "unknown id" state, by design (SubscriptionHealth's own doc comment).
+    CHECK(engine.subscription_health(*sub + 1'000'000) == SubscriptionHealth::Dead);
     engine.stop();
 }
 

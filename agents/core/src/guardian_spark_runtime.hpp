@@ -69,6 +69,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <unordered_map>
 #include <vector>
@@ -157,6 +158,11 @@ public:
     /// comment, spark.hpp). Non-pure so no pre-existing implementation (production or
     /// test fake) is forced to change — a double not exercising #2818 simply reports
     /// every subscription Healthy, which is the correct "not modeling this" default.
+    /// ANY NEW PRODUCTION `ISparkBackend` MUST override this: an unoverridden default
+    /// makes `revalidate_subscriptions()`'s poll backstop silently inert (fails open)
+    /// for that backend, rather than failing loudly (governance Gate 2 finding, PR-2d)
+    /// — `GuardianSparkEngineBackend` (guardian_spark_backend.hpp), the only production
+    /// implementation today, does override it correctly.
     virtual SubscriptionHealth subscription_health(std::uint64_t /*subscription*/) {
         return SubscriptionHealth::Healthy;
     }
@@ -735,9 +741,11 @@ private:
     /// `lifecycle_kind` names the audit entry ("disarmed" | "errored" -
     /// guardian_outbox.hpp's documented vocabulary): #2818's on_subscription_lost
     /// passes "errored" - the rule wasn't withdrawn, its enforcement broke - every
-    /// other call site keeps the default.
+    /// other call site keeps the default. std::string_view per this file's own
+    /// convention for a non-owning string ref (cpp-conventions.md) - both current
+    /// callers pass string literals, but the type itself doesn't privilege that.
     std::optional<DisarmWork> detach_rule_locked(const std::string& rule_id,
-                                                  const char* lifecycle_kind = "disarmed");
+                                                  std::string_view lifecycle_kind = "disarmed");
     /// #2818: `key`'s watch died entirely (SparkEventKind::Lost, or revalidate_
     /// subscriptions() finding it Dead). Staleness-guarded on `subscription_id`
     /// against keys_[key]->subscription: a fresh re-arm superseding this key between
