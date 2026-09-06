@@ -299,6 +299,28 @@ inline std::optional<std::int64_t> extract_event_record_id(std::string_view xml)
 
 // ── 2. Device identity (P-011) ──────────────────────────────────────────────
 
+/// SCSI-INQUIRY fixed-width identity fields (VendorId/ProductId/
+/// SerialNumber) are ASCII SPACE-padded to their declared width (SPC), not
+/// NUL-padded — a driver that copies the raw INQUIRY bytes without its own
+/// NUL-termination leaves that padding in place. Measured on real hardware
+/// (PR #4023 review): Windows' STORAGE_DEVICE_DESCRIPTOR reported
+/// `product="STORE N GO      "` (6 trailing spaces) for a device the
+/// event-log leg's XML-sourced fields — which carry no such padding —
+/// reported as `product="STORE N GO"`. Two representations of one string
+/// split compute_device_key's cross-leg agreement (the very invariant
+/// tar_removable_collector.cpp's C7 comment describes), because the two legs
+/// then disagree on a byte a human would call the same device.
+///
+/// Trims trailing space ONLY. A vendor/product string can legitimately
+/// contain internal spaces ("DataTraveler 3.0", "STORE N GO" itself) — the
+/// padding is by construction only ever appended after the real content, so
+/// anything but a trailing-only trim risks corrupting a genuine name.
+inline std::string trim_trailing_scsi_padding(std::string s) {
+    while (!s.empty() && s.back() == ' ')
+        s.pop_back();
+    return s;
+}
+
 /// A serial is "generic" (untrustworthy as identity) when empty, all
 /// whitespace, or all-zero/all-'0' digits (some USB controllers report a
 /// fixed placeholder like "000000000000" for every unit of a cheap model).
@@ -361,6 +383,48 @@ inline DeviceKeyResult compute_device_key(std::string_view vendor, std::string_v
     }
     r.device_key = hex64(fnv1a64(basis));
     return r;
+}
+
+/// A serial reported by MORE THAN ONE distinct PnP ParentId within one
+/// observation batch is a physically shared/placeholder serial, not a
+/// trustworthy per-device identity — is_generic_serial() cannot catch this
+/// because it looks at one serial string in isolation, and this one is not
+/// empty/whitespace/all-zero. Measured on real hardware (PR #4023 review,
+/// DGRHP): a multi-format card reader exposes two physically distinct
+/// USBSTOR LUNs that both report the identical serial "000000002958", each
+/// with its own ParentId. compute_device_key collapsed both onto one
+/// device_key; the real 7-day lookback replay recorded three real
+/// transitions as six rows — for the acceptance criteria's own "exactly ONE
+/// attached row per physical stick" requirement.
+///
+/// Scoped to ONE batch (one collect() tick's channel read), not persisted
+/// across restarts or ticks: the failure this closes is a multi-LUN reader
+/// whose LUNs enumerate together on physical insertion and land in the SAME
+/// batch — measured, both LUNs' attach records shared one timestamp. A LUN
+/// that first appears in a batch well after its sibling (a much narrower
+/// case) is a residual this does not close; matching the existing
+/// anonymous-serial-fallback limitation's own "best-effort, not absolute"
+/// posture (docs/user-manual/tar-removable.md) rather than adding new
+/// cross-restart persisted state to chase it.
+///
+/// Returns the "vendor\x1fmodel\x1fserial" identities found shared. The
+/// caller re-derives device_key for an affected record with an EMPTY serial
+/// (the same anonymous-fallback path is_generic_serial's empty-string case
+/// already takes) rather than this function mutating anything itself.
+inline std::unordered_set<std::string>
+shared_serials_in_batch(const std::vector<PartitionDiagnosticRecord>& records) {
+    std::unordered_map<std::string, std::unordered_set<std::string>> parent_ids_by_identity;
+    for (const auto& r : records) {
+        if (r.serial_number.empty())
+            continue; // is_generic_serial already refuses an empty serial on its own
+        parent_ids_by_identity[r.manufacturer + "\x1f" + r.model + "\x1f" + r.serial_number]
+           .insert(r.parent_id);
+    }
+    std::unordered_set<std::string> shared;
+    for (const auto& [identity, parent_ids] : parent_ids_by_identity)
+        if (parent_ids.size() > 1)
+            shared.insert(identity);
+    return shared;
 }
 
 // ── 3. Per-channel cursor JSON + wrap/gap decisions ─────────────────────────

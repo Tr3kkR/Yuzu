@@ -599,6 +599,89 @@ TEST_CASE("compute_device_key: the two Windows legs agree exactly when a trusted
     CHECK(ev_anon.device_key != snap_anon.device_key);
 }
 
+TEST_CASE("trim_trailing_scsi_padding: trailing space is removed, internal space is not "
+          "(PR #4023 review, should-fix)",
+          "[tar][removable][identity][scsi_padding]") {
+    // REAL CAPTURE, DGRHP: STORAGE_DEVICE_DESCRIPTOR's ProductId reported
+    // "STORE N GO      " (6 trailing spaces) where the event-log leg's XML
+    // field for the identical device reported "STORE N GO" -- splitting one
+    // physical device across two device_keys despite a matching trusted
+    // serial.
+    CHECK(trim_trailing_scsi_padding("STORE N GO      ") == "STORE N GO");
+    // A genuinely space-containing name must survive untouched apart from
+    // the trailing padding -- only the END may be trimmed.
+    CHECK(trim_trailing_scsi_padding("DataTraveler 3.0   ") == "DataTraveler 3.0");
+    CHECK(trim_trailing_scsi_padding("DataTraveler 3.0") == "DataTraveler 3.0");
+    // No padding at all is a no-op.
+    CHECK(trim_trailing_scsi_padding("Kingston") == "Kingston");
+    // All-padding trims to empty, not a crash.
+    CHECK(trim_trailing_scsi_padding("      ") == "");
+    CHECK(trim_trailing_scsi_padding("") == "");
+
+    // Applied before is_generic_serial, this also closes a latent variant of
+    // the all-zero placeholder check: an untrimmed "000000000000   " is
+    // neither all-'0' (the spaces break that) nor all-whitespace (the zeros
+    // break that), so it was NOT classified generic before trimming. Once
+    // trimmed to "000000000000" it correctly is.
+    CHECK_FALSE(is_generic_serial("000000000000   "));
+    CHECK(is_generic_serial(trim_trailing_scsi_padding("000000000000   ")));
+}
+
+TEST_CASE("shared_serials_in_batch: two distinct ParentIds reporting the same serial in one "
+          "batch is the shared-serial case, not a trustworthy identity (PR #4023 review, "
+          "should-fix)",
+          "[tar][removable][identity][shared_serial]") {
+    // REAL CAPTURE, DGRHP: a multi-format card reader exposes two physically
+    // distinct USBSTOR LUNs that both report the identical, non-generic
+    // serial "000000002958" -- is_generic_serial() cannot catch this (the
+    // string itself is not empty/whitespace/all-zero), and
+    // compute_device_key collapsed both LUNs onto one device_key. The real
+    // 7-day lookback replay recorded three genuine transitions as six rows.
+    auto lun = [](std::string_view parent_id) {
+        PartitionDiagnosticRecord r;
+        r.manufacturer = "Generic-";
+        r.model = "Multi-Card ";
+        r.serial_number = "000000002958";
+        r.parent_id = std::string(parent_id);
+        return r;
+    };
+    const std::vector<PartitionDiagnosticRecord> batch = {
+       lun(R"(USB\VID_0BDA&PID_0158\5&1a2b3c&0&0)"),
+       lun(R"(USB\VID_0BDA&PID_0158\5&1a2b3c&0&1)"),
+    };
+    const auto shared = shared_serials_in_batch(batch);
+    REQUIRE(shared.size() == 1);
+    CHECK(shared.count("Generic-\x1f"
+                       "Multi-Card \x1f"
+                       "000000002958") == 1);
+
+    // The SAME LUN reported twice (e.g. an attach then a detach record for
+    // ONE physical device) shares a ParentId with itself -- exactly one
+    // distinct id, so it must NOT be flagged. A false positive here would
+    // downgrade an ordinary single-LUN device to the anonymous fallback for
+    // no reason.
+    const std::vector<PartitionDiagnosticRecord> one_lun_twice = {lun("same-parent"),
+                                                                   lun("same-parent")};
+    CHECK(shared_serials_in_batch(one_lun_twice).empty());
+
+    // A record with no serial at all must never seed a group -- an empty
+    // serial is already is_generic_serial's own case, and grouping on "" would
+    // incorrectly flag every anonymous device in the batch as "shared."
+    PartitionDiagnosticRecord no_serial = lun("some-parent");
+    no_serial.serial_number.clear();
+    PartitionDiagnosticRecord no_serial2 = lun("other-parent");
+    no_serial2.serial_number.clear();
+    CHECK(shared_serials_in_batch({no_serial, no_serial2}).empty());
+
+    // A genuinely different device (different vendor/model) that happens to
+    // report the SAME serial string is a real-world coincidence this
+    // function must not conflate with the multi-LUN case -- the identity key
+    // includes vendor+model precisely so it does not.
+    PartitionDiagnosticRecord other_vendor = lun("yet-another-parent");
+    other_vendor.manufacturer = "TotallyDifferentCo";
+    CHECK(shared_serials_in_batch({lun("p1"), other_vendor}).empty());
+}
+
 TEST_CASE("a POSIX sibling whose NAME contains a backslash is not under the removable root (C9)",
           "[tar][removable][exec][c9]") {
     // On Linux and macOS a backslash is an ordinary filename character. Treating

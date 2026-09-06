@@ -125,6 +125,54 @@ std::uint64_t seed_process_local_seq() {
           .count());
 }
 
+// Linux and Windows only: the macOS leg drives decide_baseline_and_reconcile()
+// (tar_removable_parsers.hpp), which already does exactly this via its
+// begin_session/forget_execs lambdas — guarded out here so it is not also
+// compiled, and warned-as-unused, on the platform that never calls it.
+#if defined(__linux__) || defined(_WIN32)
+
+// Begin (or continue) `key`'s attach session: attach_epoch stamps the FIRST
+// tick a device is seen, so exec_from_removable can mint a stable
+// "exec:<device_key>:<epoch>:<image>" record_key for it (K1); a device
+// already tracked keeps its existing epoch so the key stays stable while it
+// remains plugged (try_emplace is a no-op when the key already exists).
+//
+// PR #4023 review blocker: decide_baseline_and_reconcile() already does
+// exactly this (its `begin_session` lambda), but only the macOS leg drives
+// that function. The Linux and Windows legs do their own inline attach_set
+// bookkeeping and never wrote attach_epoch through any path — confirmed by
+// grepping every attach_epoch reference in this file and
+// tar_removable_parsers.hpp before this fix — so append_exec_from_removable's
+// `st.attach_epoch.find(m.device_key)` always missed on those two platforms
+// and exec_from_removable was silently dead code on both. Reproduced on real
+// Windows hardware: a process launched from an attached, still-mounted stick
+// produced zero exec_from_removable rows across two consecutive collect()
+// calls.
+//
+// Mirroring the bookkeeping at each Linux/Windows attach_set mutation site
+// (rather than restructuring either leg to route through
+// decide_baseline_and_reconcile(), which assumes a live-callback +
+// current-keys shape neither leg's poll/backfill architecture has) is the fix
+// the review's own falsifier names as acceptable: "or otherwise populate
+// attach_epoch on attach for those legs."
+void begin_attach_session(RemovableCursorState& st, const std::string& key) {
+    st.attach_epoch.try_emplace(key, now_seconds());
+}
+
+// End `key`'s attach session: the session ends with the device (K1), so its
+// recorded executions must be forgotten too — matching
+// decide_baseline_and_reconcile()'s `forget_execs` lambda exactly — or a
+// replug-and-rerun of the SAME binary is silently never reported again (a
+// stale exec_seen entry surviving with no corresponding attach_epoch).
+void end_attach_session(RemovableCursorState& st, const std::string& key) {
+    st.attach_epoch.erase(key);
+    const std::string prefix = key + "\x1f";
+    for (auto it = st.exec_seen.begin(); it != st.exec_seen.end();)
+        it = it->starts_with(prefix) ? st.exec_seen.erase(it) : std::next(it);
+}
+
+#endif // defined(__linux__) || defined(_WIN32)
+
 } // namespace
 
 #if defined(__linux__)
@@ -854,10 +902,13 @@ CursorCollectResult RemovableCursorSource::collect(TarDatabase& db,
     // R-003: derive attach_set mutations from the RETAINED snapshot so a
     // prior tick's failed commit replays correctly here too.
     for (const auto& ev : pending) {
-        if (ev.action == "attached")
+        if (ev.action == "attached") {
             st.attach_set[ev.device_key] = true;
-        else if (ev.action == "detached")
+            begin_attach_session(st, ev.device_key); // PR #4023 review blocker
+        } else if (ev.action == "detached") {
             st.attach_set.erase(ev.device_key);
+            end_attach_session(st, ev.device_key); // PR #4023 review blocker
+        }
     }
     events.insert(events.end(), pending.begin(), pending.end());
 
@@ -917,6 +968,7 @@ CursorCollectResult RemovableCursorSource::collect(TarDatabase& db,
             }
             events.push_back(std::move(re));
             st.attach_set[key.device_key] = true;
+            begin_attach_session(st, key.device_key); // PR #4023 review blocker
             linux_known_devices_[name] = key.device_key;
         }
     }
@@ -938,6 +990,7 @@ CursorCollectResult RemovableCursorSource::collect(TarDatabase& db,
         re.record_key = next_seq_record_key("reconcile_rm", it->second);
         events.push_back(std::move(re));
         st.attach_set.erase(it->second);
+        end_attach_session(st, it->second); // PR #4023 review blocker
         linux_device_roots_.erase(
            std::remove_if(linux_device_roots_.begin(), linux_device_roots_.end(),
                           [&](const auto& p) { return p.first == it->second; }),
@@ -1234,9 +1287,16 @@ std::vector<WindowsVolumeIdentity> windows_snapshot_removable_volumes() {
 
         WindowsVolumeIdentity v;
         v.drive_letter = std::string(1, static_cast<char>('A' + i)) + ":";
-        v.vendor = safe_descriptor_cstr(buf, ret, desc->VendorIdOffset);
-        v.product = safe_descriptor_cstr(buf, ret, desc->ProductIdOffset);
-        v.serial = safe_descriptor_cstr(buf, ret, desc->SerialNumberOffset);
+        // trim_trailing_scsi_padding (PR #4023 review, should-fix): these are
+        // SCSI-INQUIRY fixed-width fields, space-padded to their declared
+        // width -- measured on real hardware reporting
+        // product="STORE N GO      " (6 trailing spaces) where the event-log
+        // leg's XML-sourced field for the SAME device carried none, splitting
+        // one physical device across two device_keys despite a matching
+        // trusted serial.
+        v.vendor = trim_trailing_scsi_padding(safe_descriptor_cstr(buf, ret, desc->VendorIdOffset));
+        v.product = trim_trailing_scsi_padding(safe_descriptor_cstr(buf, ret, desc->ProductIdOffset));
+        v.serial = trim_trailing_scsi_padding(safe_descriptor_cstr(buf, ret, desc->SerialNumberOffset));
 
         // R-014: prefer the volume's own GUID path — durable per-volume
         // identity that survives a drive-letter or physical-drive-number
@@ -1331,6 +1391,72 @@ CursorCollectResult RemovableCursorSource::collect(TarDatabase& db,
     const std::unordered_map<std::string, bool> prev_attach_set(st.attach_set.begin(),
                                                                  st.attach_set.end());
 
+    // Both the initial-backfill and continuation branches below classify a
+    // batch of Partition/Diagnostic XML identically -- extracted to ONE
+    // lambda so two review-driven fixes (PR #4023) cannot silently diverge
+    // between what were previously two hand-duplicated copies of this loop:
+    //  - shared_serials_in_batch() downgrades a serial two DIFFERENT PnP
+    //    ParentIds both reported in this same batch to the anonymous-fallback
+    //    key, instead of letting compute_device_key collapse two physically
+    //    distinct USBSTOR LUNs (a multi-format card reader, real hardware)
+    //    onto one device_key;
+    //  - begin_attach_session()/end_attach_session() stamp/clear
+    //    attach_epoch (and forget exec_seen on detach) at the point this leg
+    //    actually decides attach_set -- attach_epoch was written on NO
+    //    Windows code path before this fix, so exec_from_removable was
+    //    silently dead here (the blocker).
+    // Two passes over the batch (parse-and-filter, THEN classify) rather than
+    // one: shared_serials_in_batch needs to see every record's parent_id
+    // before ANY of them can be classified, since the untrustworthy-serial
+    // decision depends on the WHOLE batch, not one record in isolation.
+    auto classify_partition_batch = [&](const std::vector<std::string>& xml_records,
+                                        const char* channel_key) {
+        std::vector<PartitionDiagnosticRecord> records;
+        records.reserve(xml_records.size());
+        for (const auto& xml : xml_records) {
+            auto rec = parse_partition_diagnostic_xml(xml);
+            // R-006: same cutoff applied universally, not only on a first-run
+            // batch — a backlog longer than one tick's cap must stay bounded
+            // by removable_lookback_seconds across every continuation tick.
+            if (rec && rec->ts >= cutoff && is_removable_bus_type(rec->bus_type))
+                records.push_back(std::move(*rec));
+        }
+        const auto shared_serials = shared_serials_in_batch(records);
+        for (const auto& rec : records) {
+            const bool serial_shared_this_batch =
+               !rec.serial_number.empty() &&
+               shared_serials.count(rec.manufacturer + "\x1f" + rec.model + "\x1f" +
+                                    rec.serial_number) != 0;
+            const auto key = compute_device_key(
+               rec.manufacturer, rec.model,
+               serial_shared_this_batch ? std::string_view{} : std::string_view(rec.serial_number),
+               rec.parent_id);
+            RemovableEvent re;
+            re.ts = rec.ts;
+            re.device_key = key.device_key;
+            re.vendor = rec.manufacturer;
+            re.product = rec.model;
+            re.serial = key.used_serial ? rec.serial_number : "";
+            re.bus = rec.bus_type;
+            const bool is_attach =
+               classify_partition_transition(rec) == PartitionTransition::kAttach;
+            re.action = is_attach ? "attached" : "detached";
+            re.size_bytes = rec.capacity;
+            re.evidence = "win:Microsoft-Windows-Partition/Diagnostic:EventRecordID=" +
+                         std::to_string(rec.event_record_id) +
+                         (key.used_serial ? "" : ":anonymous-serial-fallback");
+            re.record_key = removable_channel_record_key(channel_key, rec.event_record_id);
+            if (is_attach) {
+                st.attach_set[key.device_key] = true;
+                begin_attach_session(st, key.device_key);
+            } else {
+                st.attach_set.erase(key.device_key);
+                end_attach_session(st, key.device_key);
+            }
+            events.push_back(std::move(re));
+        }
+    };
+
     for (const auto& ch : kWinChannels) {
         const bool never_initialized = !st.channels.count(ch.key);
 
@@ -1373,36 +1499,8 @@ CursorCollectResult RemovableCursorSource::collect(TarDatabase& db,
                 failing_channels.push_back(ch.key);
                 continue;
             }
-            if (std::string_view(ch.key) == kChannelPartition) {
-                for (const auto& xml : outcome.xml_records) {
-                    auto rec = parse_partition_diagnostic_xml(xml);
-                    if (!rec || rec->ts < cutoff || !is_removable_bus_type(rec->bus_type))
-                        continue;
-                    const auto key =
-                       compute_device_key(rec->manufacturer, rec->model, rec->serial_number,
-                                         rec->parent_id);
-                    RemovableEvent re;
-                    re.ts = rec->ts;
-                    re.device_key = key.device_key;
-                    re.vendor = rec->manufacturer;
-                    re.product = rec->model;
-                    re.serial = key.used_serial ? rec->serial_number : "";
-                    re.bus = rec->bus_type;
-                    const bool is_attach =
-                       classify_partition_transition(*rec) == PartitionTransition::kAttach;
-                    re.action = is_attach ? "attached" : "detached";
-                    re.size_bytes = rec->capacity;
-                    re.evidence = "win:Microsoft-Windows-Partition/Diagnostic:EventRecordID=" +
-                                 std::to_string(rec->event_record_id) +
-                                 (key.used_serial ? "" : ":anonymous-serial-fallback");
-                    re.record_key = removable_channel_record_key(ch.key, rec->event_record_id);
-                    if (is_attach)
-                        st.attach_set[key.device_key] = true;
-                    else
-                        st.attach_set.erase(key.device_key);
-                    events.push_back(std::move(re));
-                }
-            }
+            if (std::string_view(ch.key) == kChannelPartition)
+                classify_partition_batch(outcome.xml_records, ch.key);
             st.channels[ch.key].record_id = outcome.last_record_id;
             continue;
         }
@@ -1441,37 +1539,8 @@ CursorCollectResult RemovableCursorSource::collect(TarDatabase& db,
             failing_channels.push_back(ch.key);
             continue;
         }
-        if (std::string_view(ch.key) == kChannelPartition) {
-            for (const auto& xml : outcome.xml_records) {
-                auto rec = parse_partition_diagnostic_xml(xml);
-                // R-006: same cutoff as the initial backfill above — applied
-                // universally, not only on the first-run branch.
-                if (!rec || rec->ts < cutoff || !is_removable_bus_type(rec->bus_type))
-                    continue;
-                const auto key = compute_device_key(rec->manufacturer, rec->model,
-                                                    rec->serial_number, rec->parent_id);
-                RemovableEvent re;
-                re.ts = rec->ts;
-                re.device_key = key.device_key;
-                re.vendor = rec->manufacturer;
-                re.product = rec->model;
-                re.serial = key.used_serial ? rec->serial_number : "";
-                re.bus = rec->bus_type;
-                const bool is_attach =
-                   classify_partition_transition(*rec) == PartitionTransition::kAttach;
-                re.action = is_attach ? "attached" : "detached";
-                re.size_bytes = rec->capacity;
-                re.evidence = "win:Microsoft-Windows-Partition/Diagnostic:EventRecordID=" +
-                             std::to_string(rec->event_record_id) +
-                             (key.used_serial ? "" : ":anonymous-serial-fallback");
-                re.record_key = removable_channel_record_key(ch.key, rec->event_record_id);
-                if (is_attach)
-                    st.attach_set[key.device_key] = true;
-                else
-                    st.attach_set.erase(key.device_key);
-                events.push_back(std::move(re));
-            }
-        }
+        if (std::string_view(ch.key) == kChannelPartition)
+            classify_partition_batch(outcome.xml_records, ch.key);
         st.channels[ch.key].record_id = outcome.last_record_id;
     }
 
@@ -1539,6 +1608,7 @@ CursorCollectResult RemovableCursorSource::collect(TarDatabase& db,
             events.push_back(std::move(re));
         }
         st.attach_set[key.device_key] = true;
+        begin_attach_session(st, key.device_key); // PR #4023 review blocker
     }
     st.baseline_done = true;
     // R-001: a device the channels never reported disappearing, but the
@@ -1556,6 +1626,7 @@ CursorCollectResult RemovableCursorSource::collect(TarDatabase& db,
         re.record_key = next_seq_record_key("reconcile_rm", key);
         events.push_back(std::move(re));
         st.attach_set.erase(key);
+        end_attach_session(st, key); // PR #4023 review blocker
     }
 
     append_exec_from_removable(events, st, attached_roots);

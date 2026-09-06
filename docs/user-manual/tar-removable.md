@@ -57,7 +57,7 @@ opt-in, it is a stronger duty to disclose, not a weaker one.
   `attached`/`detached` row, evidenced `...:reconcile:...`, rather than
   drifting the two states out of sync indefinitely.
 
-## Device identity and its one known limitation
+## Device identity and its known limitations
 
 Every row carries a `device_key` — a stable identifier for one physical
 device, used to group its attach/detach/exec history and to decide which
@@ -78,7 +78,7 @@ volumes are "currently attached" for `exec_from_removable` correlation.
   uses the `/sys/block` device symlink target plus WWID where the controller
   exposes one.
 
-**Known limitation**: the anonymous-serial fallback is not a hardware
+**Known limitation 1**: the anonymous-serial fallback is not a hardware
 identity, only a topology one. Two physically different, generic-serial
 devices attached to the *same port/instance path at different times* (e.g.
 two identical cheap USB sticks used one after another in the same port) can
@@ -86,6 +86,20 @@ be assigned the **same** `device_key`, appearing in the history as one
 continuous device. Every row produced via the fallback path is marked in its
 `evidence` column (`...anonymous-serial-fallback`), so this ambiguity is
 always visible in the data, never silent.
+
+**Known limitation 2**: a *non*-generic serial can still be shared —
+measured on real hardware, a multi-format card reader whose several LUNs all
+report one controller-level serial. A LUN reported in the same collection
+batch as another LUN sharing its serial is correctly told apart by its
+platform instance id (Windows: PnP `ParentId`), so this is not the common
+case. The residual is a LUN that first attaches long enough after its sibling
+to land in a *different* batch: nothing persists "this serial is shared"
+across that gap, so it is not caught. Unlike limitation 1, no evidence-column
+marker names this case specifically — a row affected by it looks like an
+ordinary trusted-serial row. Closing it durably would mean persisting a
+shared-serial registry across restarts, which has not been justified against
+how rare this device class is in a managed fleet; revisit if it proves
+otherwise.
 
 ## Hybrid capture model
 
@@ -127,6 +141,18 @@ same `DiskId`) carries all-zero geometry fields and
 (USB = `7`) — **not** by event ID; the same channel logs BusType `17`
 (NVMe) rows for every internal disk, on the same event ID, and those are
 excluded before anything reaches the database.
+
+**A single physical eject can log more than one Partition/Diagnostic
+transition.** Measured on real hardware (PR #4023 review): one eject produced
+four Partition/Diagnostic records — all sharing one `DiskId` — inside under a
+second, which the classifier correctly reads as three attach/detach
+flip-flops rather than one clean detach. This is Windows' own partition-manager
+teardown churn on the SAME physical removal, not a parser defect: every
+record's payload is genuinely what it claims, the final state is correct, and
+no row is fabricated. It means the raw forensic log for one eject can
+legitimately show more than a single `detached` row for that device — worth
+knowing before reading a burst of transitions on one `DiskId` as a hardware
+fault or a capture bug.
 
 `Kernel-PnP/Configuration` is a circular buffer and **will wrap** — a real
 capture on the-rig observed it evict from 1432 to 1352 retained records
@@ -193,16 +219,29 @@ Same shape as every other TAR cursor-model source
 | `removable_enabled` | `true` | Master on/off switch. **Default-on** — see above. |
 | `removable_lookback_seconds` | `604800` (7 days) | First-run Windows backfill window. `0` = forward-only, no pre-enablement history. |
 
-## Hardware checks needed from you
+## Hardware checks
 
 The device-**present** path (an actual USB mass-storage device attached and
-then removed) is built and fixture-tested against a REAL Windows capture
+then removed) was built and fixture-tested against a REAL Windows capture
 (the-rig, 2026-09-04 — a Kingston DataTraveler 3.0), but that capture was
 taken on a desktop with no removable device *attached during the automated
-test run itself*: `HKLM\...\USBSTOR` is absent and the live snapshot leg sees
-zero removable volumes on that host, so CI and every local gate exercise only
-the honest-empty / no-device path. If you have a Windows machine (laptop or
-desktop) you can attach a USB stick to:
+test run itself*, so CI and every local gate exercised only the honest-empty
+/ no-device path.
+
+**It has since been run on a real Windows laptop with real removable
+hardware** (an HP ZBook Firefly, PR #4023 review), and the run earned its
+keep — it found three real defects no fixture had covered: `attach_epoch` was
+never populated on Windows or Linux at all, so `exec_from_removable` silently
+produced zero rows on either platform; the laptop's built-in multi-format
+card reader exposes two physically distinct LUNs that report one shared,
+non-generic serial, which collapsed both onto one `device_key`; and
+`STORAGE_DEVICE_DESCRIPTOR`'s SCSI-INQUIRY fields carry trailing space
+padding the event-log leg's XML fields do not, splitting one physical device
+across two `device_key`s despite a matching trusted serial. All three are
+fixed.
+
+To repeat the check — on a Windows machine (laptop or desktop), attach a USB
+stick to:
 
 1. Attach a USB mass-storage device, wait a few seconds, then safely eject
    it.
@@ -222,6 +261,14 @@ desktop) you can attach a USB stick to:
    - Both rows carry `BusType=7`.
    - `Manufacturer`, `Model`, and `SerialNumber` are populated (not `NULL`/
      empty) on both rows.
+   - **Exactly ONE `attached` row per physical stick, not two.** If your
+     device is a multi-slot card reader, each slot is a separate physical
+     device and gets its own pair of rows — but two events sharing an
+     identical `SerialNumber` are the SAME device only if they also share the
+     same `ParentId`; a shared serial with two different `ParentId`s is the
+     multi-LUN case this doc's Hardware checks section above names, and must
+     still resolve to two independent identities in the capture database, not
+     one collapsed pair.
    - The automated test suite's explicit no-device `SKIP`
      (`test_tar_removable.cpp`, "no removable device attached on this host —
      device-present leg not exercised") does **NOT** appear when you run the
@@ -229,10 +276,11 @@ desktop) you can attach a USB stick to:
      signal the real device-present leg executed and was asserted, not
      skipped.
 
-Until that capture lands, the device-present path is **not** described as
-"verified" anywhere in this source's docs, changelog, or capability
-declaration — only the no-device path (which is what every CI/local run
-actually exercises) is. The fixture seam
+The device-present path is now described as verified in this source's docs
+and changelog — on Windows; macOS and Linux remain live-only with no
+comparable capture venue in any run so far, and are documented as such
+wherever this source's per-OS status is stated. The fixture seam
 (`tests/unit/test_tar_removable.cpp`) accepts a pasted real capture as a
 drop-in replacement for the current trimmed the-rig fixtures without any
-test reshaping.
+test reshaping, which is how the PR #4023 review's own findings became
+fixtures.
