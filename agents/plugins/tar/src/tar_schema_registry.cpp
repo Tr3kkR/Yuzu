@@ -1092,6 +1092,65 @@ const std::vector<CaptureSourceDef>& build_sources() {
                 },
             },
         },
+        // ── Usage (Wave 7 PR7.2) — DERIVED from `process`: a transactional fold
+        // (tar_usage.cpp run_usage_fold) pairs started/stopped by (pid, exe_key)
+        // into runs; usage_live holds OPEN runs (deleted when closed), usage_daily
+        // the per-executable daily aggregate. No collector, no rollup_sql; the
+        // fold is driven from collect_fast after the process insert and carries
+        // its own gap check against process_live's row-cap prune. DEFAULT-ON
+        // per Alex's 2026-09-04 ruling (see docs/user-manual/tar.md). The two
+        // UNIQUE indexes (usage_live(pid, exe_key), usage_daily(day_ts, exe_key))
+        // are created by tar_db.cpp's v6 migration, NOT here.
+        {
+            .name = "usage",
+            .dollar_name = "Usage",
+            .default_enabled = true,
+            .os_support = {
+                {"windows", OsSupportStatus::kSupported, "derived_process",
+                 "Derived from the process source (ETW feeder); names-only, no cmdline."},
+                {"linux",   OsSupportStatus::kSupported, "derived_process",
+                 "Derived from the process source (/proc); comm names are 15-char truncated."},
+                {"macos",   OsSupportStatus::kSupportedConstrained, "derived_process",
+                 "Derived from the process source; inherits its ES-or-poll granularity."},
+            },
+            .granularities = {
+                {
+                    .suffix = "live",
+                    .retention_type = RetentionType::kRowCount,
+                    // Backstop only. The fold bounds the open set itself
+                    // (cap_open_runs, 20000, oldest closed as `capped` and
+                    // ACCOUNTED in expired_runs); this generic prune firing
+                    // would delete open runs unaccounted, so it is set far
+                    // above the fold's cap and must never be the operative bound.
+                    .retention_default = 200000,
+                    .columns = {
+                        {"ts",          "INTEGER"},
+                        {"snapshot_id", "INTEGER"},
+                        {"action",      "TEXT"},
+                        {"pid",         "INTEGER"},
+                        {"exe_key",     "TEXT"},
+                        {"user",        "TEXT"},
+                        {"start_ts",    "INTEGER"},
+                    },
+                },
+                {
+                    .suffix = "daily",
+                    .retention_type = RetentionType::kTimeBased,
+                    .retention_default = 2678400, // 31 days, as process_daily
+                    .columns = {
+                        {"day_ts",          "INTEGER"},
+                        {"exe_key",         "TEXT"},
+                        {"run_count",       "INTEGER"},
+                        {"total_seconds",   "INTEGER"},
+                        {"first_seen",      "INTEGER"},
+                        {"last_seen",       "INTEGER"},
+                        {"distinct_users",  "INTEGER"},
+                        {"superseded_runs", "INTEGER"},
+                        {"expired_runs",    "INTEGER"},
+                    },
+                },
+            },
+        },
     };
     return sources;
 }
