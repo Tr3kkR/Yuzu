@@ -43,6 +43,8 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -461,4 +463,27 @@ TEST_CASE("custom_properties_routes: GET properties degrades to 503 (never a fal
     CHECK(r->status == 503);
     auto j = body(r->body);
     CHECK(j["error"]["message"] == "custom properties store degraded");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Wiring tripwire: every case above proves register_custom_properties_routes'
+// OWN handlers are correct, but nothing above reads server.cpp — a future
+// edit that drops the production `register_custom_properties_routes(...)`
+// call at server.cpp's registration site would leave every case above green
+// while the real server 404s all 5 routes. The deleted source-text tripwire
+// in test_agent_properties_scope_authz.cpp (this module's pre-extraction
+// home) had exactly this side effect; this is its narrower replacement,
+// scoped only to "the call still exists somewhere in server.cpp" (adversarial
+// review finding, #2542 PR-4).
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("wiring: server.cpp still calls register_custom_properties_routes",
+          "[server][routes][custom_properties_routes]") {
+#ifndef YUZU_SERVER_SRC_DIR
+#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
+#endif
+    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
+    REQUIRE(in.is_open());
+    std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    CHECK(src.find("register_custom_properties_routes(") != std::string::npos);
 }
