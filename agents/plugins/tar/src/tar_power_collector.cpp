@@ -162,10 +162,32 @@ CursorCollectResult mac_power_collect_impl(TarDatabase& db,
     // fixtures/power-macos-pmset.txt).
     auto status = yuzu::tar::classify_subprocess_capture(res.tool_ran, res.timed_out,
                                                           res.output_truncated, res.exit_code);
-    if (!status.complete) {
+    // TRUNCATION IS NOT TRANSIENT, and rule 1 is the wrong response to it.
+    //
+    // Every other incomplete reason here -- the tool missing, a deadline, a
+    // non-zero exit -- is a genuine transient: throwing retains the cursor and
+    // the next tick may well succeed. Truncation is not. `pmset -g log` is
+    // read from the start, so once the log exceeds the cap EVERY tick reads
+    // the same first N bytes, classifies incomplete, and throws again: the
+    // cursor never moves, no capture_gap is ever written, and the source is
+    // permanently dead with a repeating log line as the only symptom. The log
+    // grows monotonically with assertion churn, so this is a matter of time on
+    // a long-lived host rather than a hypothetical.
+    //
+    // Rule 2 is the honest classification: the read cannot be trusted relative
+    // to our stored position, so say so with a capture_gap and re-baseline
+    // forward on what we did manage to read. The key is stable for the
+    // condition, so a host that stays truncated shows ONE standing row rather
+    // than one per tick.
+    const bool truncated = res.output_truncated;
+    if (!status.complete && !truncated) {
         spdlog::error("TAR: power snapshot incomplete (pmset {}) -- retrying next tick",
                       status.reason);
         throw IncompleteCaptureError("TAR: pmset capture incomplete: " + status.reason);
+    }
+    if (truncated) {
+        spdlog::error("TAR: power pmset output exceeded the read cap -- reporting a capture gap "
+                      "and re-baselining; sleep/wake history beyond the cap is not recoverable");
     }
 
     auto entries = parse_pmset_log(res.lines);
@@ -174,6 +196,16 @@ CursorCollectResult mac_power_collect_impl(TarDatabase& db,
     std::optional<MacPowerCursor> cursor;
     if (had_prior_cursor)
         cursor = decode_mac_power_cursor(*cursor_json);
+
+    // A truncated read forces the gap-and-re-baseline path even when no
+    // re-enable did. If BOTH apply, the re-enable reason wins -- it is the more
+    // specific statement and the operator needs the pause named.
+    if (truncated && !forced_gap_reason.has_value()) {
+        forced_gap_reason =
+           "pmset -g log exceeded the agent's read cap, so this read could not be trusted "
+           "relative to the stored position -- re-baselined forward; sleep/wake history beyond "
+           "the cap was not captured";
+    }
 
     auto decision = decide_mac_power_collect(entries, had_prior_cursor, cursor,
                                              power_lookback_seconds(db), now_epoch_seconds(),

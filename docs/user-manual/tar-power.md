@@ -41,7 +41,7 @@ platform:
 |---|---|---|---|
 | **macOS** | `pmset -g log` (polled, parsed, replayed via an exact-tail cursor) | Yes — honours `power_lookback_seconds` on first enable | Yes |
 | **Windows** | `PowerRegisterSuspendResumeNotification` + `PowerSettingRegisterNotification` (live callbacks only) | **No — no OS history API exists** | Yes, from the moment the source starts |
-| **Linux** | sleep/wake: systemd-logind `PrepareForSleep` sd-bus signal (live only). AC: polled `/sys/class/power_supply` each tick | **No history for sleep/wake.** AC state has no "history" concept — it is read fresh every tick | Yes |
+| **Linux** | sleep/wake: systemd-logind `PrepareForSleep` sd-bus signal (live only), **and only where the agent was built with libsystemd** — a build without it, or a host where logind is unreachable, cannot capture sleep or wake at all. The source says so rather than staying quiet: it writes a single standing `capture_gap` naming the unarmed window, so an empty result is never mistaken for "nothing happened". AC attach/detach is unaffected — it is a polled `/sys/class/power_supply` read. AC: polled `/sys/class/power_supply` each tick | **No history for sleep/wake.** AC state has no "history" concept — it is read fresh every tick | Yes |
 
 **This means a host's own history is only as deep as its platform allows.**
 macOS is the only platform where enabling `power` on a machine that has been

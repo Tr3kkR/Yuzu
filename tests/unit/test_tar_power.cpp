@@ -1106,8 +1106,16 @@ TEST_CASE("mac_power_collect_impl: a deadline timeout throws IncompleteCaptureEr
                       yuzu::tar::IncompleteCaptureError);
 }
 
-TEST_CASE("mac_power_collect_impl: an output-cap truncation throws IncompleteCaptureError",
-          "[tar_power][collect][macos]") {
+TEST_CASE("mac_power_collect_impl: an output-cap truncation reports a gap and re-baselines, it "
+          "does NOT throw forever",
+          "[tar_power][collect][macos][truncation]") {
+    // Truncation is NOT transient, so rule 1 is the wrong response. pmset -g log
+    // is read from the start, so once the log exceeds the cap every tick reads
+    // the same first N bytes, classifies incomplete and throws again: the cursor
+    // never moves, no capture_gap is ever written, and the source is dead with a
+    // repeating log line as the only symptom. Rule 2 is the honest answer -- the
+    // read cannot be trusted relative to the stored position, so say so and
+    // re-baseline forward.
     auto t = make_test_db();
     auto fake_run = [](const std::vector<std::string>&, const yuzu::agent::SubprocessOptions&) {
         yuzu::agent::SubprocessResult res;
@@ -1115,6 +1123,30 @@ TEST_CASE("mac_power_collect_impl: an output-cap truncation throws IncompleteCap
         res.exit_code = 0;
         res.output_truncated = true;
         res.lines = {"2026-08-28 08:00:00 +0100 Wake                \tsomething"};
+        return res;
+    };
+
+    yuzu::tar::CursorCollectResult out;
+    REQUIRE_NOTHROW(out = mac_power_collect_impl(t.db, std::nullopt, fake_run));
+    CHECK(out.outcome == yuzu::tar::CursorOutcome::CursorLost);
+    CHECK(out.events_emitted >= 1); // the capture_gap
+
+    // The cursor MOVED, which is what stops the permanent wedge: a second tick
+    // is not a repeat of the first.
+    auto c = t.db.get_cursor("power");
+    REQUIRE(c.has_value());
+    CHECK(c->has_value());
+}
+
+TEST_CASE("mac_power_collect_impl: a DEADLINE is still transient and still throws",
+          "[tar_power][collect][macos][truncation]") {
+    // The reclassification above is narrow: every other incomplete reason is a
+    // genuine transient where retaining the cursor and retrying is correct.
+    auto t = make_test_db();
+    auto fake_run = [](const std::vector<std::string>&, const yuzu::agent::SubprocessOptions&) {
+        yuzu::agent::SubprocessResult res;
+        res.tool_ran = true;
+        res.timed_out = true;
         return res;
     };
     REQUIRE_THROWS_AS(mac_power_collect_impl(t.db, std::nullopt, fake_run),
