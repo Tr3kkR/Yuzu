@@ -276,8 +276,11 @@ tracked separately below)
   a decision PR-5's sign-off can revisit, not an unexamined default. Today, absent this,
   the local rotating log file (`main.cpp`'s `rotating_file_sink_mt`) is the only egress
   for these counters, forever, unless a customer's own log-shipping tails it.
-- **#2839 - CONFIRMED and FIXED in PR-2c; Windows evidence CAPTURED (corrected
-  2026-09-04).** `push_retiring` took the owning `unique_ptr` by value and pushed before
+- **#2839 - CONFIRMED and FIXED in PR-2c; Windows evidence CAPTURED (corrected 2026-09-04;
+  further corrected 2026-09-05/06: ASan-infeasibility claim retracted and real Windows ASan
+  evidence verified clean in isolated repro on `dev` HEAD - the CI dispatch itself timed out,
+  #4018).** `push_retiring` took the owning `unique_ptr` by
+  value and pushed before
   allocating, so a `bad_alloc` destroyed a `DirWatch` whose `ReadDirectoryChangesW` was
   still outstanding. Review found three further gaps beyond the original reorder: the
   gauge-crossing log runs after the transfer and can itself throw, `release_ancestor` is a
@@ -314,14 +317,211 @@ tracked separately below)
   this same hardware before the wedge-idiom rewrite). Worktree left at
   `C:/Users/daver/yuzu-3848-zombie` for reuse.
 
-  **MSVC `/fsanitize=address` was separately confirmed INFEASIBLE**
-  under this repo's current toolchain (a real, general finding, not specific to this PR): an
-  ASan-instrumented build compiles clean but fails to LINK, 1266 `LNK2038` mismatches,
-  because vcpkg's binary-cache grpc/protobuf/abseil aren't ASan-instrumented and no triplet
-  rebuilds them with matching instrumentation - a substantial, separate, not-yet-scoped
-  prerequisite if Windows ASan is ever wanted. So the evidence above is real MSVC-compiled,
-  real-kernel-I/O red/green verification, genuinely NOT ASan proof, described honestly as
-  such.
+  **Correction (2026-09-05): the INFEASIBLE claim below is false - retracted.** It was written
+  from a one-off scratch build's 1266 `LNK2038` link failures and concluded MSVC ASan could not
+  be made to work at all under this toolchain. That conclusion does not hold: a working,
+  coverage-limited Windows ASan CI leg has existed and run green since 2026-07-08
+  (`.github/workflows/nightly.yml`'s `windows-asan` job). It reuses the standard,
+  non-instrumented `x64-windows` vcpkg triplet and passes `-D_DISABLE_STRING_ANNOTATION
+  -D_DISABLE_VECTOR_ANNOTATION` - the documented MSVC workaround for exactly the LNK2038 class
+  the scratch build hit - and its own header comment records: "spiked 2026-07-08 on DGRHP: full
+  agent suite green, zero ASan reports, both with and without this flag pair changing anything
+  except making the link succeed." This leg DOES catch heap/stack-buffer-overflow and
+  use-after-free - the exact class `#2839`'s defect is (a `DirWatch` UAF while Windows still
+  owns an outstanding `ReadDirectoryChangesW`) - so `#2839`'s own test
+  (`tests/unit/test_spark_mechanism.cpp`, inside the `_WIN32` section) is already part of
+  `yuzu_agent_tests`, the exact binary this job builds and runs, and needed no new wiring. It
+  does NOT catch STL container-overflow, because the annotation-disable flags turn that
+  checking off globally, not just for the vendored deps - that gap is `#2016`'s separate,
+  correctly-deferred, from-source-instrumented-triplet project, and is irrelevant to `#2839`'s
+  UAF-class defect. Root cause of the scratch build's failure confirmed directly (its worktree
+  was still on disk at `C:/Users/daver/yuzu-2839-asan-check`, `build-windows-asan-addr`): its
+  meson configure log shows `b_sanitize=address` set but **no** `cpp_args` entry at all - the
+  `-D_DISABLE_STRING_ANNOTATION -D_DISABLE_VECTOR_ANNOTATION` workaround was simply never
+  passed - and its compile log's 1268 `LNK2038` lines (close to, though not identical to, the
+  retracted claim's cited 1266 - both are exact counts, not a rounding artifact, and the
+  2-line gap is unexplained)
+  are all `mismatch detected for 'annotate_string'/'annotate_vector': value '0' doesn't match
+  value '1'` - exactly the container-annotation mismatch those flags exist to suppress. Not "a
+  different build config" as speculated originally: the one thing that would have fixed it was
+  omitted. The recipe's own nightly history independently confirms it links and passes on
+  `main`; the real run recorded immediately below confirms it also passes on `dev` HEAD in
+  isolation from CI. The CI dispatch's own 240s timeout is a separate, unresolved finding
+  recorded below - not attributed here to the recipe itself. Original (retracted) text,
+  kept for the record:
+
+  > MSVC `/fsanitize=address` was separately confirmed INFEASIBLE under this repo's current
+  > toolchain (a real, general finding, not specific to this PR): an ASan-instrumented build
+  > compiles clean but fails to LINK, 1266 `LNK2038` mismatches, because vcpkg's binary-cache
+  > grpc/protobuf/abseil aren't ASan-instrumented and no triplet rebuilds them with matching
+  > instrumentation - a substantial, separate, not-yet-scoped prerequisite if Windows ASan is
+  > ever wanted. So the evidence above is real MSVC-compiled, real-kernel-I/O red/green
+  > verification, genuinely NOT ASan proof, described honestly as such.
+
+  **Real Windows ASan evidence for #2839 (2026-09-05/06) - clean pass on `dev` HEAD, after
+  a CI-only timeout that does not reproduce in isolation.** The commits, run URL, timings and
+  SHAs below are a 2026-09-05/06 point-in-time snapshot - re-verify against current CI history
+  before relying on them if reading this much later. Dispatched `nightly.yml` via `workflow_dispatch`
+  against `origin/dev`
+  HEAD (`1e7a5346c70a3b6d85f6c1924a6fb4858ebb4265`, at/after the required `8355d4cb2b8`):
+  <https://github.com/Tr3kkR/Yuzu/actions/runs/33997171977>. This is the **first-ever
+  `windows-asan` execution against `dev`**: checking `nightly.yml`'s full run history (143 runs
+  via the GitHub API, not just the most recent page) shows only three runs ever targeted `dev` -
+  two on 2026-05-15, both before the `windows-asan` job existed (added 2026-07-08, confirmed
+  absent from those two runs' job lists) - and this dispatch. So the established "green since
+  2026-07-08" history is entirely against `main` (currently `88f9397d355ef18794da3f7d8c7ca1b47ded8742`,
+  confirmed still green on the very next regularly-scheduled nightly, 2026-09-06T06:22Z) - it
+  proves the disable-macro recipe links and runs clean on `main`'s code, not that `dev`'s
+  current, larger HEAD passes under it.
+
+  The job's `Test` step **timed out at 240.16s** (meson's 240s ceiling for this suite, chosen
+  per `tests/meson.build`'s own comment on the `agent` suite's `timeout:` (line number drifts;
+  search for "is ~8x headroom") as ~8x the plain, non-ASan-instrumented,
+  `[tsan-heavy]`-excluded baseline of ~28s - but that 8x is headroom over the PLAIN baseline,
+  not the ASan-instrumented one; the DGRHP reruns below put a clean ASan run at ~135-139s on
+  dedicated, uncontended hardware, so the real headroom this ceiling gives an ASan run is only
+  ~1.7-1.8x even there, not 8x - and the one data point actually observed on the shared,
+  contended Wee Tam pool is this same run, which didn't finish inside it at all)
+  with `Ok: 0, Fail: 0, Timeout: 1`, so this run gives
+  **no** pass/fail signal for `#2839`'s own tests specifically. Downloaded the complete,
+  non-truncated `meson-testlog-windows-asan` artifact (`testlog.txt` - meson's own
+  `--print-errorlogs` dump shows only the last 100 lines in GitHub's log view; the full artifact
+  has the same content, confirming it isn't a truncation artifact) to check whether this is a
+  genuine stall or a suite that now legitimately runs past 240s. Correlating the binary's own
+  spdlog timestamps against the step's GHA-UTC timestamps (first app log line `23:55:35.988`
+  local against the step's `22:55:35.858Z` launch - a clean +1h offset, i.e. the runner's local
+  clock, not a divergent one) puts the last captured line
+  (`KvStore opened: ...yuzu_test_page-..._367`) at UTC `22:58:34.049`, then **~61.9 seconds of
+  complete silence** before the forced kill at `22:59:35.962`. That line is from the `PageRig`
+  fixture (`test_guardian_spark_runtime.cpp:412-413`; verified absent from `main` via
+  `git show origin/main:tests/unit/test_guardian_spark_runtime.cpp` - the file doesn't exist
+  there at all, so this is `dev`-only code, added for item 7 PR-Ag C5 Guardian-outbox-paging).
+  This build's Catch2 defaults to `--order rand` (confirmed via `--help`, not assumed) - test
+  execution order is reshuffled every run from a fresh seed, so which specific `TEST_CASE` was
+  executing could not be identified from CI's log alone; the order-matched repro below pins it
+  down: `_366` and `_367` are the two store-opening `PageRig`-fixture `TEST_CASE`s in that
+  stretch of the run order (`test_guardian_spark_runtime.cpp`; five silent, non-store-opening
+  tests run between them, so "consecutive" means consecutive stores, not consecutive tests) -
+  `"page_into_window prunes an expired batch before replaying (boot barrier)"` (line 3534) at
+  `_366`, then `"concurrent persist + page + prune + drain do not race (TSan checkpoint,
+  QE-1)"` (line 3864, tagged `[tsan][tsan-heavy]`) at `_367`, the last thing CI's log shows.
+  Going completely silent for over a minute looked like a stall rather than ordinary slowness,
+  but resolving contention-vs-code needed an isolated repro away from the shared, 4-runner-per-box
+  Wee Tam pool - including, since order is seed-dependent, one attempt using the SAME seed CI's
+  own run printed, so as to run under CI's own order rather than a merely different random one.
+
+  **Isolated repro on dedicated hardware (2026-09-06, DGRHP)**, same commit and recipe as the
+  CI job (`--buildtype=debugoptimized -Db_sanitize=address -Dcpp_args="-D_DISABLE_STRING_ANNOTATION
+  -D_DISABLE_VECTOR_ANNOTATION"`, `x64-windows` triplet, `ASAN_OPTIONS=halt_on_error=1`),
+  `yuzu_agent_tests.exe` run directly with a 20-minute cap instead of meson's 240s one (running
+  an ASan-instrumented binary directly, outside `meson test`'s wrapper, needs the MSVC toolchain's
+  `bin\Hostx64\x64` dir on `PATH` for `clang_rt.asan_dynamic-x86_64.dll`, in addition to the
+  usual `agents\core` DLL-dependency dir).
+  First pass, default `--order rand` (a fresh, different seed from CI's): completed cleanly in
+  ~139s, exit code 0 - a real result, but a weaker one on its own, since a different random
+  shuffle could simply have avoided whatever CI's specific order hit. Second and third passes
+  both used `--rng-seed 1414877821` (the exact seed CI's own run printed, `testlog.txt` line 12,
+  confirmed echoed back correctly: "Randomness seeded to: 1414877821"), which - per Catch2's
+  order mechanism below - means both ran under CI's own order, not just CI's seed value. Second
+  pass: also completed cleanly, exit code 0, ~136s (this pass's own output capture was lossy -
+  a PowerShell `Register-ObjectEvent`/`BeginOutputReadLine` async stdout capture raced its own
+  writer and lost most lines - so only the exit code and a handful of surviving lines are from
+  this run specifically). Third pass, same seed again,
+  this time with a synchronous `*>` redirect to get a complete, correctly-ordered capture: **also
+  completed cleanly, ~135s, exit code 0** ("All tests passed (52387 assertions in 2636 test
+  cases)") - and this complete capture is what lets the order match be checked directly rather
+  than assumed.
+  Verified Catch2 v3.13.0's `--order rand` mechanism from its own source
+  (`src/catch2/internal/catch_test_case_registry_impl.cpp` + `catch_test_case_info_hasher.cpp`,
+  tag `v3.13.0`): it computes an FNV-1a hash of each test's `name` + `className` + tags XORed
+  with the seed, then sorts by that hash - registration order and cross-TU link order play no
+  role except as an exact-hash-collision tie-break - so an identical set of registered tests
+  (same commit, same recipe here) plus an identical seed should deterministically produce an
+  identical order. Confirmed this empirically too, not just by trusting the mechanism: diffed
+  this third pass's complete `KvStore opened: ...` sequence against CI's `testlog.txt`,
+  normalizing away the per-process PID and the SYSTEM-vs-`daver` temp-dir username. **All 242 of
+  CI's opens match, in the same order, with the same fixture-type-and-counter value at every
+  position** - not a sample, the full set. Both start identically too: `SparkEngine stopped` x2,
+  the same `Trigger 'does-not-exist' not found` warning, then `KvStore opened` for
+  `guardian_reconcile` at global counter `_1`. **This is the same test order as CI's run, not
+  merely the same seed value.**
+
+  Past CI's last logged event is where the two runs diverge. CI went silent for the ~61.9s
+  described above and was killed at the 240s timeout. DGRHP's order-matched third pass shows
+  what ran in that exact window, and got through all of it in ~136ms with no delay: the `_367`
+  test itself - `"concurrent persist + page + prune + drain do not race (TSan checkpoint,
+  QE-1)"` - is the most obvious candidate on its own description alone (a multi-threaded
+  concurrency stress test, explicitly a TSan checkpoint, running on a box shared 4-ways with
+  other CI jobs competing for the same CPUs is a plausible place for contention to bite even
+  though it finished instantly here). After it, before the next KvStore opens at `_369` at
+  `12:18:32.399` (~136ms after `_367` at `12:18:32.263`), the log shows a trigger
+  register/unregister, a `disk_actions` plugin load, a `SparkEngine` file-watch arm/fault/recover/
+  stop cycle, a `sync: software_licensing` HMAC-persist warning, a skipped `http_client`
+  descriptor test (DLL not present in this build), and a `TriggerEngine` start/stop - lower on
+  suspicion than the concurrency test but not ruled out, since which of these actually stalled on
+  Wee Tam cannot be determined from CI's log, which recorded nothing after `_367`. The whole
+  suite finished clean roughly 12s after `_367` (`_367` at `12:18:32.263`, last KvStore `_417` at
+  `12:18:44.326`; total wall time for the full 2636-case run was ~135s end to end). This narrows
+  CI's silent window to a named `TEST_CASE` and a short, named list of what follows it, rather
+  than leaving it at an unidentified "position 367."
+
+  **Conclusion: running the SAME test order as CI's own run, on dedicated hardware, sails
+  straight through the exact point CI stalled at, with no slowdown. This does NOT resolve #4018
+  - it stays open, and neither it nor #4019 blocks #2839** (see the closing summary below for
+  the full statement of that). This is materially
+  stronger than "a different random order also passed" - it rules out the possibility that
+  DGRHP's clean runs just got lucky with an order that happened to avoid whatever CI's order hit,
+  since this run used CI's own order and still didn't hit anything. It does not identify what
+  Wee Tam-specific factor caused the 240s timeout (contention from the shared 4-runner pool is
+  the leading candidate given CLAUDE.md's documented always-shared-box architecture - both
+  self-hosted CI pools run 4 runner agents as one shared OS identity on one box - and the
+  concurrency-stress-test candidate named above, but it wasn't directly observed - no process
+  inventory was captured on Wee Tam at the time), and a single clean pass under CI's order
+  cannot rule out a rare intermittent race independent of environment; this dispatch is also the
+  FIRST-EVER `windows-asan` execution against `dev` (established above), so there is no
+  recurrence-rate data yet to say whether this was a one-off or something that fails on some
+  fraction of future `dev` runs. But three clean runs on
+  the same commit and recipe - one under a different random order, two under CI's own seed and
+  therefore CI's own order (the third of the three confirmed by a complete capture matching all
+  242 of CI's opens) - is strong evidence against a reliably-reproducing, order-dependent
+  code-level hang, and is the practical limit of what an isolated repro without Wee Tam's own
+  process-level telemetry can establish.
+
+  The same dispatch's Linux `sanitize-asan` and `sanitize-tsan` legs also failed, but this is a
+  separate finding, not corroboration of the above: both failed in the SAME two files
+  (`test_guardian_engine_spark_reconcile.cpp`, `test_subprocess_runner.cpp`; not
+  `test_guardian_spark_runtime.cpp`/`PageRig`) with the SAME assertion lines under both
+  independent sanitizers - a deterministic signature, not sanitizer flakiness - but neither
+  file is `[tsan-heavy]`-tagged and `ci.yml`'s plain (non-sanitizer) build was green at this
+  exact commit, so these are real but narrower in scope: something specific to running under
+  sanitizer instrumentation (e.g. `test_subprocess_runner.cpp`'s `run_bounded_subprocess` case
+  got `termination_reason == 4` where `exited (0)` was expected - a spawned child behaving
+  differently, or being killed, under instrumentation). A deterministic cross-sanitizer failure
+  is at least as consistent with a genuine defect the plain build's coverage happens to miss as
+  with instrumentation-only fragility - #4019 does not presume which, and root
+  causing it is exactly what that issue is for. Not a `dev` merge regression and not
+  the same failure as today's `main` nightly's unrelated Linux ASan failure (a `server`-binary
+  test, different file, different exit code). Filed as **#4019**, separate from `#2839`
+  and from the Windows finding above (filed as **#4018**). (A concurrent, unrelated macOS runner-inventory drift,
+  `#2301`, also surfaced while checking CI history and is noted only to rule it out - it does
+  not touch Wee Tam or Big Tam.)
+
+  `#2839`'s specific tests now pass clean under real Windows ASan on `dev` HEAD (three DGRHP
+  isolated runs above, two under CI's own seed/order, one confirmed by a complete 242-open
+  capture match). The "genuinely NOT ASan proof" caveat from the original claim no longer
+  applies. What caused the specific CI timeout
+  remains unidentified but narrowed to a named `TEST_CASE` - `"concurrent persist + page + prune
+  + drain do not race (TSan checkpoint, QE-1)"`, the test whose `KvStore` open was CI's last
+  logged line - and a short, named list of what runs immediately after it (leading theory for
+  the environment factor: Wee Tam pool contention, not directly observed) - filed as **#4018**,
+  as is the separate Linux sanitizer-environment finding whose own root cause (genuine defect
+  vs. instrumentation artifact) is undetermined (**#4019**) - neither is a `#2839` blocker, and
+  neither is resolved by anything in this entry: this dispatch is the first-ever `windows-asan`
+  run against `dev`, so recurrence rate is unknown, and this ASan coverage - real, but limited
+  to heap/stack-overflow and UAF, not STL container-overflow, and not yet demonstrated to run to
+  completion in CI against `dev` even once (it has run green against `main` since 2026-07-08,
+  per the retraction above) - is not a complete safety net against future Windows-specific
+  defects in this code.
 - Owner: not assigned in source material.
 - Milestone: PR-2c DONE for #2815 / #2833 / #2839; **PR-2d owed for #2818 before PR-5**.
 - Revisit trigger: fired. #2818 escalated per the rule.

@@ -53,6 +53,7 @@ SHIM
 # Windows-only TUs worth checking. Extend as new ones land.
 tus=(
     agents/plugins/disk_actions/src/disk_actions_win.cpp
+    agents/plugins/power_health/src/power_health_plugin.cpp
     agents/plugins/tar/src/tar_removable_collector.cpp
 )
 [ "$#" -gt 0 ] && tus+=("$@")
