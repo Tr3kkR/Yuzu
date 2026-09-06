@@ -202,6 +202,20 @@ TEST_CASE("power_health plugin: battery action — real leg, explicit SKIP on no
         INFO("row: " << r);
         CHECK(percent >= 0);
         CHECK(percent <= 100);
+        // A present battery must carry a state the OS actually reported.
+        // `unknown` is the "we could not read it" sentinel and is never a
+        // legitimate answer here — that is the whole point of this assertion.
+        //
+        // Pinned to the CLOSED set rather than only excluding `unknown`: a
+        // future state added to the enum but never described in the user manual
+        // or the YAML schema would otherwise slip through this check silently,
+        // which is how `not_charging` came to be missing in the first place —
+        // real hardware reported `battery|1|unknown|99|-1|-1|-1` and only an
+        // out-of-band laptop run caught it (PR #4009 review). CI hosts have no
+        // battery, so this loop SKIPs above and cannot catch it either.
+        const bool known_state = f[2] == "charging" || f[2] == "discharging" ||
+                                 f[2] == "full" || f[2] == "not_charging";
+        CHECK(known_state);
         CHECK(f[2] != "unknown");
     }
 }

@@ -23,8 +23,12 @@ One row per power source:
 battery|<present>|<state>|<percent>|<time_to_empty_min>|<cycle_count>|<health_percent>
 ```
 
-`state` is one of `charging`, `discharging`, `full`, `ac_no_battery`,
-`unknown`. `percent`/`time_to_empty_min`/`cycle_count`/`health_percent` are
+`state` is one of `charging`, `discharging`, `full`, `not_charging`,
+`ac_no_battery`, `unknown`. **`not_charging` is a reported state, not a failed
+read**: a present battery on AC that is neither charging nor discharging and
+below 100% — the firmware is holding at a charge stop threshold (commonly
+80-95%) to preserve cell life, which is the ordinary state of a docked laptop.
+`unknown` means the opposite — the OS declined to answer, or the read failed. `percent`/`time_to_empty_min`/`cycle_count`/`health_percent` are
 `-1` when the platform's mechanism has no honest source for that field —
 never a fabricated value.
 
@@ -141,8 +145,10 @@ battery hardware** (only a desktop, which correctly reports
 3. **Pass criteria** (ALL must hold — the no-battery `SKIP` below must be
    ABSENT):
    - At least one row shows `present=1`.
-   - That row's `state` is `charging`, `discharging`, or `full` — **never**
-     `unknown`.
+   - That row's `state` is `charging`, `discharging`, `full`, or
+     `not_charging` — **never** `unknown`. A plugged-in laptop resting at a
+     firmware charge threshold reports `not_charging`, and that is a PASS: it
+     is a state the OS reported, not a failure to read one.
    - That row's `percent` is between `0` and `100` — **never** the `-1`
      unknown sentinel.
    - If on battery power, `time_to_empty_min` is a plausible positive
@@ -161,7 +167,8 @@ battery-PRESENT path is fixture-tested too. It is a separate ask from the
 Windows one above — neither covers the other.
 
 Run the same `battery` dispatch against a macOS agent on a MacBook and apply
-the identical pass criteria (`present=1`; `state` never `unknown`; `percent`
+the identical pass criteria (`present=1`; `state` never `unknown`, with
+`not_charging` an accepted answer; `percent`
 in `0`-`100`, never `-1`; the no-battery `SKIP` absent from the suite run).
 
 Worth knowing while you check: this leg reads `IOPSCopyPowerSourcesInfo`

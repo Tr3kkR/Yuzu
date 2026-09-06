@@ -32,12 +32,16 @@ metadata:
   version: 1.0.0
   description: >
     Reports one row per power source: present, state (charging/discharging/
-    full/ac_no_battery/unknown), percent, time-to-empty in minutes, cycle
-    count, and health percent — the latter two are -1 (unknown) wherever the
-    platform's mechanism has no honest source for them (Windows and macOS,
-    given the acquisition this plugin uses; Linux reports them when the
-    kernel driver exposes CHARGE_FULL/CHARGE_FULL_DESIGN/CYCLE_COUNT). On a
-    Windows host with no system battery (desktops), BatteryFlag=128 reports
+    full/not_charging/ac_no_battery/unknown), percent, time-to-empty in
+    minutes, cycle count, and health percent. not_charging is a REPORTED
+    state, not a failed read: a present battery on AC, neither charging nor
+    discharging and below 100%, held at a firmware charge threshold — the
+    ordinary state of a docked laptop. The latter two are -1 (unknown)
+    wherever the platform's mechanism has no honest source for them (Windows
+    and macOS, given the acquisition this plugin uses; Linux reports them
+    when the kernel driver exposes CHARGE_FULL/CHARGE_FULL_DESIGN/
+    CYCLE_COUNT). On a Windows host with no system battery (desktops),
+    BatteryFlag=128 reports
     present=false, state=ac_no_battery — measured live, not inferred. The
     battery-PRESENT path is fixture-tested through an injected boundary and
     UNVERIFIED on real battery hardware pending a reviewer's laptop run —
@@ -200,7 +204,14 @@ spec:
       - name: friendly_name
         type: string
       - name: active
-        type: boolean
+        # string, NOT boolean: this column is a tri-state "0"/"1"/"-", and the
+        # "-" is load-bearing (see the note above — every scheme enumerated but
+        # the active-scheme read failed). Declaring it boolean made the schema
+        # dishonest to exactly the machine consumers a typed schema exists for
+        # (agentic-first A5 item 4); a generated client would reject or
+        # misparse the "-" row. Modelled as string like users.yaml's analogous
+        # tri-state rather than fabricating a 0.
+        type: string
       - name: status
         type: string
 

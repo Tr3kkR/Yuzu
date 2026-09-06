@@ -677,3 +677,87 @@ TEST_CASE("set_power_plan row: every branch emits exactly four fields after the 
     CHECK(set_failed == "set_power_plan|error|set_failed|{prev}|-");
     CHECK(field_count(set_failed) == 4);
 }
+
+TEST_CASE("classify_windows_battery: present + AC + neither charging nor discharging is "
+          "not_charging — REAL CAPTURE, HP ZBook Firefly, PR #4009 review",
+          "[power_health][battery][windows]") {
+    // The row the reviewer's physical laptop produced, which this plugin used
+    // to report as `unknown`: battery|1|unknown|99|-1|-1|-1. Every fact in it
+    // came from the OS — present, on AC, not charging, not discharging, 99% —
+    // so `unknown` (the "the OS told us nothing" sentinel) was wrong, and wrong
+    // in the modal state of a plugged-in laptop rather than a corner case.
+    // Windows firmware defers charging at a stop threshold to preserve cells.
+    WindowsBatteryRaw raw;
+    raw.ac_line_status = 1; // on AC
+    raw.battery_flag = 1;   // high, no charging bit
+    raw.battery_life_percent = 99;
+    raw.battery_life_time = -1;
+    raw.nt_info_valid = true;
+    raw.nt_battery_present = true;
+    raw.nt_charging = false;
+    raw.nt_discharging = false;
+
+    const auto row = classify_windows_battery(raw);
+    CHECK(row.present);
+    CHECK(row.state == BatteryState::not_charging);
+    CHECK(to_string(row.state) != "unknown");
+    CHECK(row.percent == 99);
+}
+
+TEST_CASE("classify_windows_battery: resting with NO known power source stays unknown",
+          "[power_health][battery][windows]") {
+    // ACLineStatus 255 is the OS declining to say whether we are on AC. A
+    // battery that is neither charging nor discharging, with no known power
+    // source, genuinely is unclassifiable — so `not_charging` must NOT widen
+    // to cover it. This is the boundary that keeps `unknown` meaningful.
+    WindowsBatteryRaw raw;
+    raw.ac_line_status = 255; // unknown
+    raw.battery_flag = 1;
+    raw.battery_life_percent = 99;
+    raw.nt_info_valid = true;
+    raw.nt_battery_present = true;
+    raw.nt_charging = false;
+    raw.nt_discharging = false;
+
+    const auto row = classify_windows_battery(raw);
+    CHECK(row.present);
+    CHECK(row.state == BatteryState::unknown);
+}
+
+TEST_CASE("classify_windows_battery: the legacy BatteryFlag path reports the same resting state",
+          "[power_health][battery][windows]") {
+    // Same firmware charge-hold, reached through the no-NT-info fallback: it
+    // used to land on `unknown` for exactly the same reason.
+    WindowsBatteryRaw raw;
+    raw.ac_line_status = 1;
+    raw.battery_flag = 1; // high, charging bit (0x08) clear
+    raw.battery_life_percent = 80;
+    raw.nt_info_valid = false;
+
+    const auto row = classify_windows_battery(raw);
+    CHECK(row.present);
+    CHECK(row.state == BatteryState::not_charging);
+
+    // ...and the same fallback with no known power source is still unknown.
+    raw.ac_line_status = 255;
+    CHECK(classify_windows_battery(raw).state == BatteryState::unknown);
+}
+
+TEST_CASE("interpret_iops_source: present + AC + not charging + below full is not_charging",
+          "[power_health][battery][macos]") {
+    // The macOS analogue of the ZBook row — macOS surfaces this in its own UI
+    // as "Battery Not Charging". IOPS answered present/charging/AC, so this
+    // branch can never be `unknown`.
+    IopsSourceView v;
+    v.present = true;
+    v.is_charging = false;
+    v.is_ac_power = true;
+    v.current_capacity = 88;
+    v.max_capacity = 100;
+
+    const auto row = interpret_iops_source(v);
+    CHECK(row.present);
+    CHECK(row.state == BatteryState::not_charging);
+    CHECK(to_string(row.state) != "unknown");
+    CHECK(row.percent == 88);
+}

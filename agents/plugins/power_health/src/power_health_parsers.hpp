@@ -52,7 +52,20 @@ namespace yuzu::power_health {
 /// cycle_count/health_percent on every OS, so those two fields are -1
 /// wherever the underlying leg has no real source for them — never derived
 /// from a proxy value.
-enum class BatteryState { charging, discharging, full, ac_no_battery, unknown };
+/// `not_charging` is a REPORTED state, not a failure to read one.
+///
+/// A present battery sitting on AC, neither charging nor discharging and not at
+/// 100%, is the ordinary state of a plugged-in laptop — Windows and macOS both
+/// defer charging at a firmware stop threshold (commonly 80-95%) to preserve
+/// cell life. Every one of those facts came from the OS. Reporting it as
+/// `unknown`, the sentinel this enum reserves for "the OS told us nothing",
+/// makes the modal state of a docked fleet indistinguishable from a broken
+/// read — verified on real hardware (an HP ZBook Firefly reported
+/// `battery|1|unknown|99|-1|-1|-1`, PR #4009 review).
+///
+/// So `unknown` must stay narrow: it means the read failed or the OS declined
+/// to answer. Anything the OS did tell us gets a state of its own.
+enum class BatteryState { charging, discharging, full, not_charging, ac_no_battery, unknown };
 
 [[nodiscard]] constexpr std::string_view to_string(BatteryState s) {
     switch (s) {
@@ -62,6 +75,8 @@ enum class BatteryState { charging, discharging, full, ac_no_battery, unknown };
         return "discharging";
     case BatteryState::full:
         return "full";
+    case BatteryState::not_charging:
+        return "not_charging";
     case BatteryState::ac_no_battery:
         return "ac_no_battery";
     case BatteryState::unknown:
@@ -141,6 +156,12 @@ struct WindowsBatteryRaw {
 
     row.present = true;
 
+    // ACLineStatus: 0 = offline, 1 = online, 255 = unknown. Only an explicit 1
+    // licenses `not_charging` — 255 means the OS declined to say whether we are
+    // on AC, and a battery that is neither charging nor discharging with no
+    // known power source genuinely is `unknown`.
+    const bool on_ac = raw.ac_line_status == 1;
+
     if (raw.nt_info_valid) {
         if (raw.nt_charging)
             row.state = BatteryState::charging;
@@ -148,18 +169,27 @@ struct WindowsBatteryRaw {
             row.state = BatteryState::discharging;
         else if (raw.battery_life_percent == 100)
             row.state = BatteryState::full;
+        else if (on_ac)
+            // Present, on AC, neither charging nor discharging, below 100%:
+            // the firmware is holding at a charge stop threshold. This is the
+            // MODAL state of a docked laptop, not a corner case, and it was
+            // reported as `unknown` until PR #4009's review caught it on real
+            // hardware (`battery|1|unknown|99|-1|-1|-1`).
+            row.state = BatteryState::not_charging;
         else
             row.state = BatteryState::unknown;
     } else {
         // Fall back to the legacy BatteryFlag bits: 0x08 = charging.
         if (raw.battery_flag & 0x08)
             row.state = BatteryState::charging;
-        else if (raw.battery_life_percent == 100 && raw.ac_line_status == 1)
+        else if (raw.battery_life_percent == 100 && on_ac)
             row.state = BatteryState::full;
         else if (raw.ac_line_status == 0)
             row.state = BatteryState::discharging;
+        else if (on_ac)
+            row.state = BatteryState::not_charging; // same resting case, legacy path
         else
-            row.state = BatteryState::unknown;
+            row.state = BatteryState::unknown; // ACLineStatus 255 — no power source known
     }
 
     row.percent = raw.battery_life_percent <= 100 ? static_cast<int>(raw.battery_life_percent) : -1;
@@ -212,7 +242,12 @@ struct IopsSourceView {
     else if (!v.is_ac_power)
         row.state = BatteryState::discharging;
     else
-        row.state = BatteryState::unknown;
+        // On AC, present, not charging, not at 100% — the same firmware
+        // charge-hold Windows shows, and macOS's own "Battery Not Charging".
+        // IOPS answered all three questions, so this is never `unknown`; that
+        // sentinel is reserved for a read that told us nothing, and no branch
+        // here qualifies.
+        row.state = BatteryState::not_charging;
 
     row.time_to_empty_min = v.time_to_empty_min >= 0 ? v.time_to_empty_min : -1;
     // cycle_count/health_percent: IOPSKeys.h has no public key for either
