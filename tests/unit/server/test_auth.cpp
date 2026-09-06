@@ -5,6 +5,7 @@
  *         enrollment tokens, pending agents, config persistence.
  */
 
+#include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
 
@@ -559,6 +560,8 @@ TEST_CASE("get_user_role fails closed (not cached-admin) when AuthDB is pool-sat
 
     AuthManager mgr;
     mgr.set_auth_db(auth_db.get());
+    yuzu::MetricsRegistry metrics;
+    mgr.set_metrics_registry(&metrics);
     REQUIRE(mgr.upsert_user("cora", "password1234", Role::admin));
     REQUIRE(mgr.get_user_role("cora") == Role::admin);
 
@@ -570,9 +573,15 @@ TEST_CASE("get_user_role fails closed (not cached-admin) when AuthDB is pool-sat
     }
 
     REQUIRE_FALSE(mgr.get_user_role("cora").has_value()); // NOT Role::admin from cache
+    // Gate 5 chaos-injector CH-3/UP-6 follow-up: the ONE caller-visible signal
+    // that a legacy-token-authenticated request is about to be floored to
+    // Role::user must fire, not just a log line invisible under load.
+    CHECK(metrics.counter("yuzu_auth_get_user_role_store_error_total").value() == 1);
 
     held.clear();
     REQUIRE(mgr.get_user_role("cora") == Role::admin); // recovers once the pool frees
+    // Recovery must not add a spurious second sample.
+    CHECK(metrics.counter("yuzu_auth_get_user_role_store_error_total").value() == 1);
 }
 
 TEST_CASE("get_user_role stays cache-only in config-file (no AuthDB) mode",
@@ -750,6 +759,55 @@ TEST_CASE("a hydrated entry is superseded by a later in-process role change (#40
     role = cold_mgr.verify_password("cora", "password1234");
     REQUIRE(role.has_value());
     REQUIRE(*role == Role::admin);
+}
+
+TEST_CASE("a demote landing between the recheck's own DB read and its cache "
+          "write is never reverted (Gate 5 chaos-injector CH-1)",
+          "[pg][auth][session][cold_cache]") {
+    // Deterministic reproduction of the ABA race chaos-injector traced: this
+    // call's own AuthDB re-read observes the role AS IT WAS AT READ TIME
+    // (here: admin), but a concurrent update_role() then lands - demoting the
+    // user AND bumping the cache's role_version - before this call takes
+    // mu_. A role-VALUE compare-guard (the first, since-hardened fix) cannot
+    // see that anything happened here (nothing in this scenario round-trips
+    // back to the pre_check_role, so it isn't even the coincidental case that
+    // guard missed) - what actually matters is proving the version guard
+    // trusts the fresher cache write rather than blindly reapplying its own
+    // now-stale read.
+    yuzu::test::AuthDbPg auth_db;
+
+    AuthManager warm_mgr;
+    warm_mgr.set_auth_db(auth_db.get());
+    REQUIRE(warm_mgr.upsert_user("cora", "password1234", Role::admin));
+
+    AuthManager cold_mgr;
+    cold_mgr.set_auth_db(auth_db.get());
+    cold_mgr.set_role_recheck_race_hook_for_test([&] {
+        // Fires after cold_mgr's own recheck read (observes "admin") but
+        // before it takes mu_ - simulates a concurrent demote landing in
+        // exactly that window.
+        REQUIRE(cold_mgr.update_role("cora", Role::user));
+    });
+
+    auto token = cold_mgr.authenticate("cora", "password1234");
+    REQUIRE(token.has_value());
+
+    // The cache must reflect the DEMOTE (the fresher write), never get
+    // reverted back to this call's own stale "admin" read.
+    CHECK(cold_mgr.cached_role_for_test("cora") == Role::user);
+    CHECK(cold_mgr.get_user_role("cora") == Role::user); // DB-authoritative, same answer
+
+    // Accepted, disclosed residual (NOT what this test is proving fixed):
+    // this specific call's own read happened before the demote landed, so
+    // the session IT mints still carries the stale "admin" role - an
+    // inherent check-then-mint gap no non-serialized recheck can close
+    // (the window is the time between one DB round-trip and a mutex
+    // acquire - sub-millisecond in practice, not the ~100-200ms PBKDF2
+    // window promote/demote flapping needs to land in to reach this call's
+    // OWN read at all).
+    auto session = cold_mgr.validate_session(*token);
+    REQUIRE(session.has_value());
+    CHECK(session->role == Role::admin);
 }
 
 // ── Authentication ───────────────────────────────────────────────────────────

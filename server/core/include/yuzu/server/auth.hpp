@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
@@ -88,6 +89,16 @@ struct UserEntry {
     /// SSO identity auto-provisioned by `AuthDB::upsert_sso_identity`. Not
     /// populated by every list/read path — see the call site's doc comment.
     std::string identity_source{"local"};
+    /// Gate 5 chaos-injector CH-1 (#4020 follow-up): monotonic counter bumped
+    /// on every in-place cache write of `.role` (update_role(), upsert_user(),
+    /// recheck_role_after_credential_check()'s own write). Comparing THIS
+    /// instead of `.role` itself in the recheck compare-guard closes an ABA
+    /// hole a role-VALUE compare cannot: a promote-then-demote back to the
+    /// same role value inside one PBKDF2 window would satisfy a value-equality
+    /// guard and let a stale read win over the demote that already landed. A
+    /// version can coincidentally repeat only via u64 wraparound, not via any
+    /// realistic role flap.
+    std::uint64_t role_version{0};
 };
 
 struct Session {
@@ -482,6 +493,27 @@ public:
     /// NOT call this — no caller in `server/core/src/**` references it. A
     /// no-op if `token` is not a live session.
     void expire_session_for_test(const std::string& token, std::chrono::seconds offset);
+
+    /// TEST-ONLY: installs a callback fired inside
+    /// `recheck_role_after_credential_check`, after its own AuthDB re-read
+    /// returns but BEFORE it acquires `mu_` to conditionally write the cache
+    /// - the exact window Gate 5 chaos-injector's CH-1 traced for the cache
+    /// ABA race (a concurrent `update_role()` landing between this call's own
+    /// read and its cache write). Lets a test deterministically simulate that
+    /// interleaving instead of racing real threads. Production code MUST NOT
+    /// call this - no caller in `server/core/src/**` references it. A no-op
+    /// (nullptr) by default.
+    void set_role_recheck_race_hook_for_test(std::function<void()> hook);
+
+    /// TEST-ONLY: raw `users_` cache peek, bypassing AuthDB entirely (unlike
+    /// `get_user_role()`, which is DB-authoritative and so cannot observe
+    /// cache staleness at all). Lets a test confirm the version-guard in
+    /// `recheck_role_after_credential_check` actually left the cache alone
+    /// rather than clobbering it with a stale read (Gate 5 CH-1 regression).
+    /// Returns nullopt if the username isn't cached (cold or evicted).
+    /// Production code MUST NOT call this - no caller in `server/core/src/**`
+    /// references it.
+    [[nodiscard]] std::optional<Role> cached_role_for_test(const std::string& username) const;
 
     /// Derive a cache `Session`'s adjudication deadlines from the DB-authored
     /// timestamps and the AUTHORITY clock `now_ms` (Postgres `now()` for a durable
@@ -892,17 +924,25 @@ private:
     /// Shared by authenticate()/verify_password(): the post-password-check
     /// re-read of AuthDB (already firing to catch a soft-deleted user) made
     /// authoritative for role too (#4020 Gate 2 adversarial-review/governance
-    /// follow-up), hardened per a Gate 3 cpp-expert finding: the cache write is
-    /// guarded against clobbering a NEWER write from a concurrent update_role()
-    /// racing this call. `pre_check_role` is the role `find_user_or_hydrate`
-    /// returned for THIS call, captured before any DB re-read - the cache is
-    /// overwritten only when it still holds that exact value; a divergence
-    /// means some other write already landed since this call last observed the
-    /// cache, and that write must never be reverted by this call's now-stale
-    /// read (interleaving: this call reads AuthDB pre-demotion, a concurrent
-    /// update_role() commits the demotion and its own cache write, THEN this
-    /// call's unconditional write would silently revert the cache back to the
-    /// pre-demotion role — the guard below closes exactly that ordering).
+    /// follow-up), hardened per a Gate 3 cpp-expert finding and then a Gate 5
+    /// chaos-injector finding (CH-1): the cache write is guarded against
+    /// clobbering a NEWER write from a concurrent update_role() racing this
+    /// call. `pre_check_role`/`pre_check_version` are the role and
+    /// `UserEntry::role_version` `find_user_or_hydrate` returned for THIS
+    /// call, captured before any DB re-read - the cache is overwritten only
+    /// when its version still matches; a divergence means some other write
+    /// already landed since this call last observed the cache, and that write
+    /// must never be reverted by this call's now-stale read. The guard
+    /// compares VERSION, not role value (a cpp-expert compare-by-role-value
+    /// guard shipped first and closed the simple case, but chaos-injector
+    /// found the ABA hole it left: this call reads AuthDB mid-demotion and
+    /// observes a PROMOTED role, a concurrent update_role() then commits a
+    /// DEMOTION back to this call's ORIGINAL pre_check_role and bumps the
+    /// cache to that value, and a role-value guard reads "cache still matches
+    /// what I started with" as "safe" and overwrites it right back to the
+    /// promoted value it read - reverting the demotion that had already
+    /// landed. A monotonic version can't be spuriously re-matched by a
+    /// round-trip back to the same role value the way the role field can.
     ///
     /// Returns the current role on success (cfg-file mode, no `auth_db_`,
     /// trivially returns `pre_check_role` unchanged - there's no DB to
@@ -922,7 +962,13 @@ private:
     /// must NOT hold `mu_`.
     [[nodiscard]] std::optional<Role>
     recheck_role_after_credential_check(const std::string& username, Role pre_check_role,
+                                        std::uint64_t pre_check_version,
                                         std::string_view context);
+
+    /// Backing field for `set_role_recheck_race_hook_for_test` - see that
+    /// method's doc. Invoked (if set) from inside
+    /// `recheck_role_after_credential_check`.
+    std::function<void()> role_recheck_race_hook_for_test_;
 
     // ── Durable session store integration (HA WS-1/1a) ─────────────────────────
     // These are all no-ops / pure-in-memory when `session_store_ == nullptr`.

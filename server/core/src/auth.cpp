@@ -729,6 +729,7 @@ AuthManager::find_user_or_hydrate(const std::string& username) {
 
 std::optional<Role>
 AuthManager::recheck_role_after_credential_check(const std::string& username, Role pre_check_role,
+                                                  std::uint64_t pre_check_version,
                                                   std::string_view context) {
     if (!auth_db_)
         return pre_check_role; // cfg-file mode: users_ IS the truth, nothing to re-check
@@ -754,14 +755,23 @@ AuthManager::recheck_role_after_credential_check(const std::string& username, Ro
         }
         return std::nullopt;
     }
+    // TEST-ONLY seam (see set_role_recheck_race_hook_for_test's doc): fires
+    // exactly in the window Gate 5 CH-1 traced, after our own DB read but
+    // before we take mu_ - a no-op (nullptr) in production.
+    if (role_recheck_race_hook_for_test_)
+        role_recheck_race_hook_for_test_();
     std::unique_lock lock(mu_);
     // Guard against clobbering a NEWER write from a concurrent update_role():
-    // only overwrite when the cache still holds the exact role this call
-    // observed before its own DB re-read (see this method's header doc for the
-    // interleaving this closes). A divergence means some other write already
-    // landed and must win over this call's now-stale observation.
-    if (auto it = users_.find(username); it != users_.end() && it->second.role == pre_check_role)
+    // only overwrite when the cache's role_version still matches what this
+    // call observed before its own DB re-read (see this method's header doc
+    // for the ABA interleaving a role-VALUE compare would miss). A divergence
+    // means some other write already landed and must win over this call's
+    // now-stale observation.
+    if (auto it = users_.find(username);
+        it != users_.end() && it->second.role_version == pre_check_version) {
         it->second.role = db_user->role;
+        ++it->second.role_version;
+    }
     // Gate 3 authdb follow-up: this refreshes ONLY `.role` from `db_user`, never
     // `.salt_hex`/`.hash_hex` - currently safe (verified: no AuthDB/AuthManager
     // method changes an existing user's password; `upsert_user` is
@@ -820,7 +830,8 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
     // this the authoritative role for the session about to be minted (#4020 +
     // Gate 2/3 governance follow-ups — see recheck_role_after_credential_check's
     // doc for the full rationale, including the race the compare-guard closes).
-    auto current_role = recheck_role_after_credential_check(username, entry->role, "Auth failed");
+    auto current_role = recheck_role_after_credential_check(username, entry->role,
+                                                             entry->role_version, "Auth failed");
     if (!current_role)
         return std::nullopt;
     entry->role = *current_role;
@@ -889,8 +900,8 @@ std::optional<Role> AuthManager::verify_password(const std::string& username,
     // Re-verify against AuthDB: catches a soft-deleted/removed user AND makes
     // this the authoritative role for the caller (same rationale as
     // authenticate() — see recheck_role_after_credential_check's doc).
-    auto current_role =
-        recheck_role_after_credential_check(username, entry->role, "verify_password failed");
+    auto current_role = recheck_role_after_credential_check(
+        username, entry->role, entry->role_version, "verify_password failed");
     if (!current_role)
         return std::nullopt;
     auto role = *current_role;
@@ -1189,6 +1200,18 @@ void AuthManager::expire_session_for_test(const std::string& token, std::chrono:
     it->second.expires_at -= offset;
     it->second.steady_expires -=
         std::chrono::duration_cast<std::chrono::steady_clock::duration>(offset);
+}
+
+void AuthManager::set_role_recheck_race_hook_for_test(std::function<void()> hook) {
+    role_recheck_race_hook_for_test_ = std::move(hook);
+}
+
+std::optional<Role> AuthManager::cached_role_for_test(const std::string& username) const {
+    std::shared_lock lock(mu_);
+    auto it = users_.find(username);
+    if (it == users_.end())
+        return std::nullopt;
+    return it->second.role;
 }
 
 std::expected<int, std::string> AuthManager::revoke_user_elevations(const std::string& username) {
@@ -1610,12 +1633,18 @@ bool AuthManager::upsert_user(const std::string& username, const std::string& pa
     // Check if role is changing for an existing user
     auto it = users_.find(username);
     bool role_changed = it != users_.end() && it->second.role != role;
+    // Gate 5 CH-1: carry forward + bump rather than let the wholesale
+    // entry-replace below silently reset the ABA-guard counter to 0 - a reset
+    // could coincidentally re-match a stale in-flight authenticate()'s
+    // pre_check_version and reopen the exact race this counter exists to close.
+    const std::uint64_t next_version = (it != users_.end() ? it->second.role_version : 0) + 1;
 
     UserEntry entry;
     entry.username = username;
     entry.role = role;
     entry.salt_hex = salt_hex;
     entry.hash_hex = hash;
+    entry.role_version = next_version;
     users_[username] = std::move(entry);
 
     if (role_changed) {
@@ -1796,10 +1825,23 @@ std::optional<Role> AuthManager::get_user_role(const std::string& username) cons
             // attempt is never logged as a false store-error, masking a
             // genuine outage during exactly that attack.
             if (db_user.error() != yuzu::server::AuthDBError::UserNotFound &&
-                db_user.error() != yuzu::server::AuthDBError::InvalidUsername)
+                db_user.error() != yuzu::server::AuthDBError::InvalidUsername) {
                 spdlog::error("get_user_role: AuthDB lookup for '{}' failed (store error, not "
                              "a genuine miss) - returning nullopt",
                              username);
+                // Gate 5 chaos-injector CH-3/UP-6 follow-up: a log line alone is
+                // invisible exactly while the store is already stressed (the
+                // scenario that matters). This is the ONLY caller-visible signal
+                // that auth_routes.cpp's `.value_or(Role::user)` is about to
+                // floor a legacy-token-authenticated request's role down - narrows
+                // the observability gap; the honest fix (this call returning
+                // std::expected so callers can distinguish "not found" from
+                // "store degraded" and respond accordingly, e.g. 503 instead of a
+                // silent floor) touches 6 call sites and is a follow-up, not this
+                // metric.
+                if (metrics_)
+                    metrics_->counter("yuzu_auth_get_user_role_store_error_total").increment();
+            }
             return std::nullopt;
         }
         return db_user->role;
@@ -1830,6 +1872,7 @@ bool AuthManager::update_role(const std::string& username, Role new_role) {
         auto it = users_.find(username);
         if (it != users_.end()) {
             it->second.role = new_role;
+            ++it->second.role_version; // Gate 5 CH-1: invalidate a racing recheck's stale read
         }
 
         // Invalidate sessions so the user picks up the new role on next login
@@ -1851,6 +1894,7 @@ bool AuthManager::update_role(const std::string& username, Role new_role) {
         return false;
     }
     it->second.role = new_role;
+    ++it->second.role_version; // Gate 5 CH-1: same ABA guard as the AuthDB-backed branch above
 
     // Invalidate sessions so the user picks up the new role on next login
     // Prevents stale session role from granting old privileges
