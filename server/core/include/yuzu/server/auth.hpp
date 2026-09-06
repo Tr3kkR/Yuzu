@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <expected>
@@ -89,15 +90,29 @@ struct UserEntry {
     /// SSO identity auto-provisioned by `AuthDB::upsert_sso_identity`. Not
     /// populated by every list/read path — see the call site's doc comment.
     std::string identity_source{"local"};
-    /// Gate 5 chaos-injector CH-1 (#4020 follow-up): monotonic counter bumped
-    /// on every in-place cache write of `.role` (update_role(), upsert_user(),
-    /// recheck_role_after_credential_check()'s own write). Comparing THIS
-    /// instead of `.role` itself in the recheck compare-guard closes an ABA
-    /// hole a role-VALUE compare cannot: a promote-then-demote back to the
-    /// same role value inside one PBKDF2 window would satisfy a value-equality
-    /// guard and let a stale read win over the demote that already landed. A
-    /// version can coincidentally repeat only via u64 wraparound, not via any
-    /// realistic role flap.
+    /// Gate 5 chaos-injector CH-1 (#4020 follow-up): a stamp from
+    /// `AuthManager::next_role_version_()`'s single PROCESS-WIDE monotonic
+    /// counter, taken every time ANY entry (any username) is created or has
+    /// `.role` mutated in place - NOT a per-username counter starting at 0.
+    /// Comparing this stamp instead of `.role` itself in the recheck
+    /// compare-guard closes an ABA hole a role-VALUE compare cannot: a
+    /// promote-then-demote back to the same role value inside one PBKDF2
+    /// window would satisfy a value-equality guard and let a stale read win
+    /// over the demote that already landed. A cpp-safety re-review of the
+    /// first version of this fix (which used a per-username counter
+    /// carried forward across `upsert_user`/reactivate) found that a
+    /// PER-USERNAME scheme reopens the identical class through a different
+    /// door: `remove_user()` erases the cache entry outright, and
+    /// `reactivate_user()`/a fresh cold hydrate then reinstalls a NEW entry
+    /// whose counter restarts at a low value (typically 0) - a stale
+    /// in-flight call's `pre_check_version`, captured before the
+    /// removal, can coincidentally match that reset value. A single
+    /// process-wide source stamped at EVERY write (including first
+    /// creation, not just later mutation) makes any two equal stamps
+    /// observed by this process mean the exact same write event, full stop
+    /// - erase/reinsert included. Only a u64 wraparound (~2^64 writes across
+    /// every username combined, over one process's lifetime) could
+    /// theoretically repeat a stamp, which is not a realistic concern.
     std::uint64_t role_version{0};
 };
 
@@ -515,6 +530,25 @@ public:
     /// references it.
     [[nodiscard]] std::optional<Role> cached_role_for_test(const std::string& username) const;
 
+    /// TEST-ONLY: raw `users_` cache peek of `role_version` - the version-side
+    /// twin of `cached_role_for_test`. Returns nullopt if the username isn't
+    /// cached. Production code MUST NOT call this - no caller in
+    /// `server/core/src/**` references it.
+    [[nodiscard]] std::optional<std::uint64_t>
+    cached_role_version_for_test(const std::string& username) const;
+
+    /// TEST-ONLY: thin public forwarder to the private
+    /// `recheck_role_after_credential_check`, letting a test drive that
+    /// method directly with an explicitly-constructed `pre_check_role`/
+    /// `pre_check_version` pair instead of needing to land a real interleaving
+    /// inside `authenticate()`'s live PBKDF2 window (which only the ONE
+    /// existing race-hook injection point, after this method's own DB read,
+    /// can reach - not the earlier "something changed while PBKDF2 was
+    /// running" half of the CH-1 interleaving). Production code MUST NOT call
+    /// this - no caller in `server/core/src/**` references it.
+    [[nodiscard]] std::optional<Role> recheck_role_after_credential_check_for_test(
+        const std::string& username, Role pre_check_role, std::uint64_t pre_check_version);
+
     /// Derive a cache `Session`'s adjudication deadlines from the DB-authored
     /// timestamps and the AUTHORITY clock `now_ms` (Postgres `now()` for a durable
     /// session; this host's wall clock for the legacy no-store path). Sets the
@@ -921,6 +955,11 @@ private:
     [[nodiscard]] std::expected<UserEntry, UserLookupMiss>
     find_user_or_hydrate(const std::string& username);
 
+    /// A fresh, process-wide-unique stamp for `UserEntry::role_version` - see
+    /// that field's doc comment. Cheap (single atomic increment), callable
+    /// with or without `mu_` held (the counter is independent of it).
+    [[nodiscard]] std::uint64_t next_role_version_();
+
     /// Shared by authenticate()/verify_password(): the post-password-check
     /// re-read of AuthDB (already firing to catch a soft-deleted user) made
     /// authoritative for role too (#4020 Gate 2 adversarial-review/governance
@@ -969,6 +1008,12 @@ private:
     /// method's doc. Invoked (if set) from inside
     /// `recheck_role_after_credential_check`.
     std::function<void()> role_recheck_race_hook_for_test_;
+
+    /// Backing counter for `next_role_version_()` - see `UserEntry::role_version`'s
+    /// doc for why this is process-wide, not per-username. `std::atomic` since
+    /// it's incremented both under `mu_` (most call sites) and without it
+    /// (none today, but the method's own contract doesn't require the lock).
+    std::atomic<std::uint64_t> role_version_epoch_{1};
 
     // ── Durable session store integration (HA WS-1/1a) ─────────────────────────
     // These are all no-ops / pure-in-memory when `session_store_ == nullptr`.

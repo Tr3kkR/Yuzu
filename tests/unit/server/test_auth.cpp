@@ -822,6 +822,91 @@ TEST_CASE("a demote landing between the recheck's own DB read and its cache "
     CHECK(session->role == Role::admin);
 }
 
+TEST_CASE("a promote-then-demote round trip back to the ORIGINAL role is never "
+          "reverted (Gate 5 chaos-injector CH-1, the discriminating case)",
+          "[pg][auth][session][cold_cache]") {
+    // The test above proves the version guard trusts a fresher write when the
+    // role ends up DIFFERENT from pre_check_role - a case the PRIOR (Gate 3)
+    // role-VALUE guard also handled correctly, since cache.role != pre_check_role
+    // there too. THIS test proves the case that guard actually missed (cpp-expert
+    // Gate 5 re-review follow-up): a round trip back to the SAME role value
+    // pre_check_role captured, which a value compare cannot distinguish from
+    // "nothing changed." Drives recheck_role_after_credential_check directly via
+    // its test-only forwarder rather than racing PBKDF2 timing - the live race
+    // hook can only inject AFTER the recheck's own DB read, one window too late
+    // to make that read itself observe an intervening promote.
+    yuzu::test::AuthDbPg auth_db;
+
+    AuthManager warm_mgr;
+    warm_mgr.set_auth_db(auth_db.get());
+    REQUIRE(warm_mgr.upsert_user("cora", "password1234", Role::user));
+
+    AuthManager cold_mgr;
+    cold_mgr.set_auth_db(auth_db.get());
+    REQUIRE(cold_mgr.authenticate("cora", "password1234").has_value()); // hydrates cache=user
+    auto pre_check_role = cold_mgr.cached_role_for_test("cora");
+    auto pre_check_version = cold_mgr.cached_role_version_for_test("cora");
+    REQUIRE(pre_check_role == Role::user);
+    REQUIRE(pre_check_version.has_value());
+
+    // T2: promote (this is the "lands during PBKDF2" half of the interleaving -
+    // no live seam reaches it, so it's driven directly instead of raced).
+    REQUIRE(cold_mgr.update_role("cora", Role::admin));
+
+    // T3: demote back to the ORIGINAL value, landing between the recheck's own
+    // DB read (about to observe "admin" from T2) and its lock acquire.
+    cold_mgr.set_role_recheck_race_hook_for_test(
+        [&] { REQUIRE(cold_mgr.update_role("cora", Role::user)); });
+
+    auto current_role = cold_mgr.recheck_role_after_credential_check_for_test(
+        "cora", *pre_check_role, *pre_check_version);
+    REQUIRE(current_role.has_value());
+    CHECK(*current_role == Role::admin); // this call's own (stale) read - accepted residual
+
+    // The guard must NOT revert the cache to "admin" just because the role
+    // value happens to round-trip back to pre_check_role. A role-VALUE guard
+    // would: at compare time cache.role("user") == pre_check_role("user") - the
+    // round trip lands EXACTLY on the value the old guard compared against -
+    // so it would read "unchanged" and overwrite with this call's stale "admin"
+    // read, reverting T3's demote. The version guard isn't fooled: T2 and T3
+    // both bumped role_version past what this call captured.
+    CHECK(cold_mgr.cached_role_for_test("cora") == Role::user);
+    CHECK(cold_mgr.get_user_role("cora") == Role::user);
+}
+
+TEST_CASE("reactivate_user() draws a fresh process-wide version stamp, never a "
+          "reset that could re-match an earlier in-flight call's captured version "
+          "(Gate 5 CH-1 re-review follow-up)",
+          "[pg][auth][cold_cache]") {
+    // security-guardian, authdb, cpp-safety and cpp-expert independently found
+    // the same gap in this fix's first shape: a PER-USERNAME counter (carried
+    // forward + bumped by upsert_user(), but NOT by reactivate_user(), which
+    // wholesale-replaces the cache entry with a fresh AuthDB read that knows
+    // nothing about role_version) resets to 0 across remove_user()+
+    // reactivate_user() - a value a stale in-flight call's pre_check_version
+    // could realistically already hold. The fix: a single process-wide
+    // monotonic stamp (next_role_version_()), drawn fresh on every write
+    // including reactivate_user()'s, so the post-reactivate version can never
+    // equal ANY version this process has ever stamped before - not just "not
+    // equal to 0."
+    yuzu::test::AuthDbPg auth_db;
+
+    AuthManager mgr;
+    mgr.set_auth_db(auth_db.get());
+    REQUIRE(mgr.upsert_user("cora", "password1234", Role::admin));
+    REQUIRE(mgr.authenticate("cora", "password1234").has_value()); // hydrate + recheck bump
+    auto version_before_removal = mgr.cached_role_version_for_test("cora");
+    REQUIRE(version_before_removal.has_value());
+
+    REQUIRE(mgr.remove_user("cora"));
+    REQUIRE_FALSE(mgr.cached_role_version_for_test("cora").has_value()); // erased
+
+    REQUIRE(mgr.reactivate_user("cora"));
+    auto version_after_reactivate = mgr.cached_role_version_for_test("cora");
+    REQUIRE(version_after_reactivate.has_value());
+    CHECK(*version_after_reactivate > *version_before_removal);
+}
+
 // ── Authentication ───────────────────────────────────────────────────────────
 
 TEST_CASE("authenticate succeeds with correct password", "[auth][session]") {

@@ -717,6 +717,11 @@ AuthManager::find_user_or_hydrate(const std::string& username) {
         return std::unexpected(UserLookupMiss::DbError);
     }
 
+    // Gate 5 CH-1 re-review follow-up: stamp BEFORE the possible emplace, not
+    // after - try_emplace no-ops if a concurrent write already installed an
+    // entry, and this call must never touch that entry's version once it
+    // exists (see the no-op comment below).
+    db_user->role_version = next_role_version_();
     std::unique_lock lock(mu_);
     // try_emplace, never insert_or_assign: an upsert_user (new password) or
     // reactivate_user that landed while the read above was in flight has already
@@ -770,7 +775,7 @@ AuthManager::recheck_role_after_credential_check(const std::string& username, Ro
     if (auto it = users_.find(username);
         it != users_.end() && it->second.role_version == pre_check_version) {
         it->second.role = db_user->role;
-        ++it->second.role_version;
+        it->second.role_version = next_role_version_();
     }
     // Gate 3 authdb follow-up: this refreshes ONLY `.role` from `db_user`, never
     // `.salt_hex`/`.hash_hex` - currently safe (verified: no AuthDB/AuthManager
@@ -1214,6 +1219,25 @@ std::optional<Role> AuthManager::cached_role_for_test(const std::string& usernam
     return it->second.role;
 }
 
+std::optional<std::uint64_t>
+AuthManager::cached_role_version_for_test(const std::string& username) const {
+    std::shared_lock lock(mu_);
+    auto it = users_.find(username);
+    if (it == users_.end())
+        return std::nullopt;
+    return it->second.role_version;
+}
+
+std::optional<Role> AuthManager::recheck_role_after_credential_check_for_test(
+    const std::string& username, Role pre_check_role, std::uint64_t pre_check_version) {
+    return recheck_role_after_credential_check(username, pre_check_role, pre_check_version,
+                                                "test");
+}
+
+std::uint64_t AuthManager::next_role_version_() {
+    return role_version_epoch_.fetch_add(1, std::memory_order_relaxed);
+}
+
 std::expected<int, std::string> AuthManager::revoke_user_elevations(const std::string& username) {
     if (session_store_) {
         // Durable clear FIRST (bumps the generation → every replica drops the
@@ -1633,18 +1657,18 @@ bool AuthManager::upsert_user(const std::string& username, const std::string& pa
     // Check if role is changing for an existing user
     auto it = users_.find(username);
     bool role_changed = it != users_.end() && it->second.role != role;
-    // Gate 5 CH-1: carry forward + bump rather than let the wholesale
-    // entry-replace below silently reset the ABA-guard counter to 0 - a reset
-    // could coincidentally re-match a stale in-flight authenticate()'s
-    // pre_check_version and reopen the exact race this counter exists to close.
-    const std::uint64_t next_version = (it != users_.end() ? it->second.role_version : 0) + 1;
 
     UserEntry entry;
     entry.username = username;
     entry.role = role;
     entry.salt_hex = salt_hex;
     entry.hash_hex = hash;
-    entry.role_version = next_version;
+    // Gate 5 CH-1 re-review follow-up: a process-wide stamp, not a carried-
+    // forward per-username counter - see UserEntry::role_version's doc for why
+    // a per-username scheme (this call's first shape) still let the wholesale
+    // entry-replace below reopen the ABA hole through remove_user()+
+    // reactivate_user()/a cold re-hydrate, which reset the OLD counter to 0.
+    entry.role_version = next_role_version_();
     users_[username] = std::move(entry);
 
     if (role_changed) {
@@ -1755,6 +1779,14 @@ bool AuthManager::reactivate_user(const std::string& username) {
                       username);
         return false;
     }
+
+    // Gate 5 CH-1 re-review follow-up (cpp-safety + cpp-expert, converged
+    // independently): AuthDB::get_user() has no knowledge of role_version, so
+    // `*entry` defaults it to 0 - a wholesale entry-replace exactly like
+    // upsert_user()'s, and needs the same process-wide stamp for the same
+    // reason (a stale in-flight recheck's pre_check_version could otherwise
+    // coincidentally re-match a reset-to-0 value).
+    entry->role_version = next_role_version_();
 
     std::unique_lock lock(mu_);
     users_[username] = *entry;
@@ -1872,7 +1904,7 @@ bool AuthManager::update_role(const std::string& username, Role new_role) {
         auto it = users_.find(username);
         if (it != users_.end()) {
             it->second.role = new_role;
-            ++it->second.role_version; // Gate 5 CH-1: invalidate a racing recheck's stale read
+            it->second.role_version = next_role_version_(); // Gate 5 CH-1: invalidate a racing recheck's stale read
         }
 
         // Invalidate sessions so the user picks up the new role on next login
@@ -1894,7 +1926,7 @@ bool AuthManager::update_role(const std::string& username, Role new_role) {
         return false;
     }
     it->second.role = new_role;
-    ++it->second.role_version; // Gate 5 CH-1: same ABA guard as the AuthDB-backed branch above
+    it->second.role_version = next_role_version_(); // Gate 5 CH-1: same ABA guard as the AuthDB-backed branch above
 
     // Invalidate sessions so the user picks up the new role on next login
     // Prevents stale session role from granting old privileges
