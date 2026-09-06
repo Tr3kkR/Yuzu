@@ -3932,9 +3932,17 @@ void SettingsRoutes::register_routes(
     //
     // Authorization: now PluginSigning:Read (dedicated securable, minted by
     // #4028 — Administrator-only via the rbac_store.cpp seed, floored in
-    // authz_topology_floor.hpp so an RBAC-off deployment stays admin-gated,
-    // the same practical posture the prior admin_fn_ gate already had). The
-    // bundle PEM holds X.509 certificates (no private keys) so the security
+    // authz_topology_floor.hpp so an RBAC-off deployment stays admin-gated).
+    // That flooring alone is NOT the same practical posture the prior
+    // admin_fn_ (require_admin) gate had for an MCP-tier token: require_admin
+    // rejects every mcp_tier session outright regardless of role, while the
+    // topology floor's legacy-role fallback admits an admin-owned MCP token
+    // exactly like an interactive admin session (mcp_policy.hpp's tier_allows()
+    // comment). The actual parity fix is at that chokepoint: TlsConfig/
+    // PluginSigning/ServerConfig/AnalyticsConfig are denied at every MCP tier
+    // there, so an MCP token 403s before it ever reaches this route's
+    // perm_fn_ call. The bundle PEM holds X.509 certificates (no private
+    // keys) so the security
     // blast radius of disclosure is small, but a non-admin token holder
     // learning when the trust anchor rotates (sha256 changes) is useful
     // reconnaissance for a supply-chain attacker. CC6.1 least-privilege

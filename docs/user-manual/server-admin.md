@@ -1664,7 +1664,7 @@ Plugin signature verification ships in two parts: an agent-side CMS verifier and
 
 **New audit actions.** `plugin_signing.bundle.uploaded`, `plugin_signing.bundle.cleared`, `plugin_signing.require.changed` — see `audit-log.md` for the result and detail conventions. SIEM rules already filtering on `success`/`failure`/`denied` will pick these up unchanged; no new vocabulary tokens.
 
-**Operator distribution.** The server hosts the bundle at `GET /api/v1/agent/plugin-policy` (admin-only). Agents are pointed at a local copy via `--plugin-trust-bundle <path>`; the manual workflow today is `curl` + `jq` + write the JSON's `trust_bundle_pem` field to disk on each agent host. Automatic agent-side fetch is a forthcoming change.
+**Operator distribution.** The server hosts the bundle at `GET /api/v1/agent/plugin-policy` (`PluginSigning:Read`, Administrator-only; unreachable by any MCP token at any tier as of #4028). Agents are pointed at a local copy via `--plugin-trust-bundle <path>`; the manual workflow today is `curl` + `jq` + write the JSON's `data.trust_bundle_pem` field to disk on each agent host (the response nests under a `data` envelope as of #4028 — a pre-#4028 pipeline reading the top-level field needs updating). Automatic agent-side fetch is a forthcoming change.
 
 **Fleet-suicide caveat.** The Yuzu release pipeline does not yet sign the 44 in-tree plugins under `agents/plugins/`. **Do NOT enable "Require signed plugins" until you have signed every plugin your fleet uses, including the in-tree ones.** Use the transitional mode (bundle uploaded, Require off) during rollout. The Settings card surfaces this warning inline.
 

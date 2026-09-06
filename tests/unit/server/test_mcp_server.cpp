@@ -317,6 +317,29 @@ TEST_CASE("MCP Policy: unknown tier denies everything", "[mcp][policy]") {
     CHECK(!tier_allows("bogus", "Tag", "Write"));
 }
 
+// #4028/#520 security regression guard: server-administration securables
+// (TLS, plugin-signing, server-process config, analytics/ClickHouse config)
+// must stay unreachable by an MCP token at EVERY tier, including
+// readonly/supervised Read — otherwise an admin-owned MCP token would fall
+// through to require_permission's topology-floor legacy-role check and
+// reach settings data require_admin's own #520 comment names by name. See
+// mcp_policy.hpp's tier_allows() comment for the full mechanism.
+TEST_CASE("MCP Policy: no tier admits the #4028 server-administration securables",
+          "[mcp][policy][security]") {
+    for (const std::string_view securable :
+         {"TlsConfig", "PluginSigning", "ServerConfig", "AnalyticsConfig"}) {
+        CAPTURE(securable);
+        CHECK_FALSE(tier_allows("readonly", securable, "Read"));
+        CHECK_FALSE(tier_allows("operator", securable, "Read"));
+        CHECK_FALSE(tier_allows("supervised", securable, "Read"));
+        // Not just Read — no operation on these securables is tier-admitted.
+        CHECK_FALSE(tier_allows("supervised", securable, "Write"));
+    }
+    // An empty tier (not an MCP token at all) is unaffected — RBAC/legacy
+    // role checks alone gate ordinary sessions and non-MCP API tokens.
+    CHECK(tier_allows("", "TlsConfig", "Read"));
+}
+
 TEST_CASE("MCP Policy: readonly never requires approval", "[mcp][policy]") {
     CHECK(!requires_approval("readonly", "Infrastructure", "Read"));
     CHECK(!requires_approval("readonly", "Execution", "Execute"));

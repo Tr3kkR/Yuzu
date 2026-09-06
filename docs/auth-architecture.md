@@ -2493,9 +2493,20 @@ MCP twins).
    RBAC-enabled enforcement; only the RBAC-off legacy posture changes (see
    below).
 2. **The topology floor itself**: `{AccessReview:Read, UserManagement:Read,
-   EnginePrincipal:Read}` require the `admin` session role regardless of
-   the RBAC on/off toggle, via `authz_topology_floor.hpp`'s
-   `topology_floor_applies()`. It is consulted **only** inside the legacy
+   EnginePrincipal:Read}` — plus, as of #4028, `{TlsConfig:Read,
+   PluginSigning:Read, ServerConfig:Read, AnalyticsConfig:Read}` (see
+   "Settings read-twins" below) — require the `admin` session role
+   regardless of the RBAC on/off toggle, via `authz_topology_floor.hpp`'s
+   `topology_floor_applies()`. The two groups are different categories that
+   happen to share this one mechanism: the original three are
+   authorization-topology reads (the RBAC role graph, the engine-principal
+   grant graph, the access-review export) that intentionally stay reachable
+   by an admin-owned session on ANY transport, MCP tokens included, per the
+   legacy-role-fallback note below; the #4028 four are
+   server-administration reads that #520 additionally excludes from every
+   MCP tier outright (`mcp_policy.hpp`'s `tier_allows()`), so an admin-owned
+   MCP token cannot reach them even though it would otherwise satisfy this
+   same floor check. It is consulted **only** inside the legacy
    (RBAC-off) fallback of `require_permission`/`require_scoped_permission`
    — never ahead of, or instead of, the live-RBAC branch. That ordering is
    load-bearing, not incidental: #2324 cut the dedicated `AccessReview`
@@ -2592,6 +2603,31 @@ read-only settings visibility as a meaningfully different exposure than the flee
 was written to keep MCP confined to, but one that still requires its own reviewed amendment to #520
 rather than a side effect of a routine twin PR. See [MCP Server](mcp-server.md) for the policy
 itself.
+
+Shipping no MCP *tool* is not, by itself, sufficient to preserve #520's intent, because these eight
+routes are also reachable over REST, and an MCP *token* can call any REST route its tier and role
+admit — an MCP tool registration and an MCP token's REST reach are two independent things. The
+topology floor above requires `admin` role in the RBAC-off legacy fallback, but `require_permission`
+does not otherwise distinguish an admin-owned MCP token from an ordinary admin session: an MCP token
+carries its **creator's** real legacy role there by design (see "The authorization topology floor"
+above), so an admin-owned MCP token — at any tier, including `readonly` — would satisfy the floor
+exactly like an interactive admin session would, unless something stops it earlier. Hardening
+`GET /api/v1/agent/plugin-policy` off `require_admin` (which rejected every `mcp_tier` token
+outright, regardless of role) onto `require_permission` would have silently reopened this route to
+admin-owned MCP tokens without an explicit second control. #4028's actual enforcement point is
+`mcp_policy.hpp`'s `tier_allows()`: `TlsConfig`, `PluginSigning`, `ServerConfig`, and
+`AnalyticsConfig` are denied at **every** tier there (readonly/operator/supervised) for **every**
+operation, so `require_permission`'s tier check 403s an MCP token before it ever reaches the
+topology-floor/legacy-role fallback that would otherwise admit it. This deliberately puts these four
+securables in a different category from the pre-existing three topology-floor pairs
+(`AccessReview`/`UserManagement`/`EnginePrincipal`), which keep the admin-owned-MCP-token
+reachability described above by design (see the topology floor section) — those are
+authorization-topology reads, not server-administration reads, and #520's language is specific to
+the latter. Coverage: `test_mcp_server.cpp` ("no tier admits the #4028 server-administration
+securables") pins `tier_allows()` directly; `test_auth_routes.cpp` ("no MCP tier ... reaches the
+#4028 settings-administration securables") exercises the same guarantee through the real
+`require_permission()` end-to-end path, with an admin-owned readonly-tier token and RBAC disabled —
+the exact combination that would otherwise have passed.
 
 **Analytics also fixed a leak, not just added RBAC.** `render_analytics_fragment` (and the new
 `GET /api/v1/settings/analytics` twin) previously rendered the ClickHouse URL verbatim, masking only
