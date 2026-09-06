@@ -60,6 +60,11 @@ jobs:
   # part that needs the PR's own diff and body.
   plugin-readme-touch-rule:
     name: Plugin README touch rule
+    # pull_request only: the override lives in the PR body, which a push event
+    # has no access to — on push (a merge to dev/main) the rule would re-run
+    # against BEFORE_SHA with an empty body and turn a legitimately overridden
+    # PR into a red mainline run. Merged content was already gated at PR time.
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -73,13 +78,11 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.sha }}
-          BEFORE_SHA: ${{ github.event.before }}
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
           set -euo pipefail
           case "$EVENT_NAME" in
             pull_request) BASE="$BASE_SHA" ;;
-            push)         BASE="$BEFORE_SHA" ;;
             *)            echo "Unmodelled event '$EVENT_NAME' -- nothing to compare, skipping."; exit 0 ;;
           esac
           if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ] \

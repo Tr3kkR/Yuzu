@@ -107,7 +107,6 @@
     }
   ],
   "description": "Firewall status and rule listing",
-  "first_commit": "2026-06-24",
   "how_it_works": "Both actions are reads; the plugin has no rule-mutation surface despite its name. `state` reports whether the host firewall is on, per profile or per backend. `rules` lists the rule set the same backend exposes. On Windows both go through the `INetFwPolicy2` COM interface: `state` asks each of the Domain, Private and Public profiles for `FirewallEnabled`; `rules` enumerates `INetFwRules` and stops after 100 rules with a `truncated|true` marker row. On macOS `state` reads the Application Firewall global state through `socketfilterfw --getglobalstate` (the firewall a Mac administrator means), adds a `mode|block_all` row when block-all is set, then reads the pf packet-filter status through `pfctl -s info` as a secondary row; `rules` lists pf rules through `pfctl -s rules`. On Linux the plugin probes backends in a fixed order and stops at the first that answers: firewalld over sd-bus, then nftables over `NETLINK_NETFILTER` dumps, then `ufw status numbered`, then `iptables -S`, else `backend|none`.\n\nEvery subprocess runs through the bounded runner with a fixed deadline; every parse is a pure function in `firewall_parsers.hpp`. The honest-status invariant holds on every leg: empty, truncated or unrecognised output parses to `unknown` (state) or no rows (rules), never to a false-safe \"disabled\" or a fabricated rule. Once nftables has answered the table dump, a later chain or rule dump failure reports `unknown` and stops rather than falling through to a different backend's answer.",
   "inputs": [],
   "kind": {
@@ -220,8 +219,8 @@
   "privileges": [
     {
       "grant": "None. `INetFwPolicy2` profile and rule reads need no elevation.",
-      "if_refused": "`error",
-      "measured": "COM path shipped with the rung-1 migration; CI exercises the Windows leg on every MSVC run",
+      "if_refused": "true` marker",
+      "measured": "2026-09-06 on the-rig (Windows 11 Pro 10.0.26200), elevated SSH session: three profiles read `enabled`, 100 rule rows plus the `truncated",
       "os": "Windows",
       "runs_as": "agent service account (LocalSystem today, #1442)"
     },
@@ -250,6 +249,47 @@
     }
   ],
   "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "state",
+          "not_captured": null,
+          "params": "",
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "backend|none",
+            "state|unknown"
+          ]
+        },
+        {
+          "action": "rules",
+          "not_captured": null,
+          "params": "",
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "backend|none"
+          ]
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-06",
+        "host_class": "container",
+        "leg_hash": "8ef7b004fc8a",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    },
     "macos": {
       "actions": [
         {

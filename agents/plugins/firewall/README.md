@@ -4,7 +4,7 @@
 | | |
 |---|---|
 | **What it does** | Firewall status and rule listing |
-| **Version** | 0.4.0 · first commit 2026-06-24 |
+| **Version** | 0.4.0 |
 | **Kind** | Collector · read-only · gathered (security.firewall.state, security.firewall.rules) |
 | **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
 | **Actions** | `rules` (definition `security.firewall.rules`) · `state` (definition `security.firewall.state`) |
@@ -44,7 +44,7 @@ flowchart LR
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | agent service account (LocalSystem today, #1442) | None. `INetFwPolicy2` profile and rule reads need no elevation. | COM path shipped with the rung-1 migration; CI exercises the Windows leg on every MSVC run | `error|com_init` or `error|policy2_create:<hresult>` row; profile rows read `error:<hresult>` |
+| Windows | agent service account (LocalSystem today, #1442) | None. `INetFwPolicy2` profile and rule reads need no elevation. | 2026-09-06 on the-rig (Windows 11 Pro 10.0.26200), elevated SSH session: three profiles read `enabled`, 100 rule rows plus the `truncated|true` marker | `error|com_init` or `error|policy2_create:<hresult>` row; profile rows read `error:<hresult>` |
 | macOS | LaunchDaemon (root today) | None for the primary Application Firewall read (`socketfilterfw --getglobalstate` is unprivileged). The secondary pf read opens `/dev/pf` and needs root; the plugin deliberately does not ride the quarantine plugin's `pfctl` sudoers grant. | 2026-09-06 at euid 501 on this host: `state|disabled`, `pf|unknown`, no pf rule rows | `pf|unknown` (state), no rows (rules), never a false-safe value |
 | Linux | agent service account | `firewall-cmd --state` is an unprivileged D-Bus query. The nftables netlink dump conventionally needs `CAP_NET_ADMIN` (verified 2026-08-23 with the capability present); `ufw status` and `iptables -S` need root. No sudoers entry is granted for any of them. | nftables verified 2026-08-23 in an Ubuntu 26.04 container with `CAP_NET_ADMIN`; the unprivileged denial path is reasoned from the `chains_ok && rules_ok` gate, not measured | a refused table dump falls through to the next backend; a refused chain or rule dump after a successful table dump reports `state|unknown` / `rules|unknown`; a host with no readable backend reports `backend|none` |
 
@@ -135,6 +135,19 @@ pf|unknown
 [result_status] UNDECLARED / UNKNOWN
 
 == action=rules
+[result_status] UNDECLARED / UNKNOWN
+```
+
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 8ef7b004fc8a
+
+```
+== action=state
+backend|none
+state|unknown
+[result_status] UNDECLARED / UNKNOWN
+
+== action=rules
+backend|none
 [result_status] UNDECLARED / UNKNOWN
 ```
 <!-- END GENERATED -->

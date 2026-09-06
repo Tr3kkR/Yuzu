@@ -6,16 +6,16 @@ The skeleton to copy is `docs/templates/plugin-README.md`. The generator is `too
 
 ## The standard, in ten rules
 
-1. **One `README.md` per plugin directory** — `agents/plugins/<name>/README.md`. It is the plugin's single human-facing document. `docs/user-manual/agent-plugins.md` is a generated index that links here; it carries no per-plugin prose of its own.
+1. **One `README.md` per plugin directory** — `agents/plugins/<name>/README.md`. It is the plugin's single human-facing document. `docs/user-manual/agent-plugins.md` carries a generated index that links here; the retrospective sweep moves its remaining per-plugin prose into the READMEs, after which the catalog carries none of its own.
 2. **Eight sections, fixed order, fixed headings** (the section contract below). A reader finds the same thing in the same place on every plugin page. All eight are mandatory. A section with nothing to say states that in one line ("Neither action takes parameters") and is never omitted.
 3. **Generated fences are never hand-edited.** Everything between `<!-- BEGIN GENERATED: plugin-doc-gen <block> -->` and `<!-- END GENERATED -->` is emitted by the generator from code-adjacent sources: the CI-verified capability-matrix block in `docs/os-capability-matrix.md` (the plugin's declared per-OS legs), `content/definitions/<name>.yaml`, `server/core/src/capability_decls/*.hpp`, and the plugin directory itself. CI byte-diffs the fences. To change one, change its source and regenerate.
 4. **Hand-written sections describe the code as it is today, not the intent.** Present tense. "Planned" and "will" appear only under Caveats and known gaps. A claim that cannot be verified by reading the cited source, or by running the capture, does not go in.
-5. **Sample output is a real capture on every leg the descriptor declares `supported` or `constrained`**, produced by `plugin-capture` through the agent's real `LocalDispatcher`, stored at `agents/plugins/<name>/docs/samples/<os>.txt` and spliced by the generator. The first line is the stamp: `captured: <os> <os-version> · <host-class> · <date> · <privilege> · leg-hash <hash>`. Host class is `bare-metal`, `vm` or `container`. Unsupported legs show the placeholder row the plugin actually emits. No fabricated rows, ever.
+5. **Sample output is a real capture on every leg the descriptor declares `supported` or `constrained`**, produced by `plugin-capture` through the agent's real `LocalDispatcher`, stored at `agents/plugins/<name>/docs/samples/<os>.txt` and spliced by the generator. The first line is the stamp: `captured: <os> <os-version> · <host-class> · <date> · <privilege> · leg-hash <hash>`. Host class is `bare-metal`, `vm` or `container`. Unsupported legs show the placeholder row the plugin actually emits. An action that must never be executed on a live host (a destructive mutator) is recorded as `== action=<name>` followed by one line `[not captured] <DispatchClass>/<Mutability>: <reason>` and no result-status line; the generator and the gate accept that marker as the sample. No fabricated rows, ever.
 6. **The leg-hash on a capture stamp must match the current legs and column schema.** The generator computes it from the plugin's declared legs (support, rung, mechanism per action per OS) and its definitions' `result.columns` (name, type); the descriptor's fallback prose is excluded so a wording edit never forces a recapture. A mismatch fails the gate until the leg is recaptured. `leg-hash pending` is accepted with a warning for a hand-authored capture that predates regeneration. Plugin versions are not used as the freshness signal because they are bumped inconsistently.
 7. **Touch rule.** A pull request that changes `agents/plugins/<name>/src/**` must also change `agents/plugins/<name>/README.md`, or carry a line `docs-unchanged: <section it would have touched> — <reason>` in its body. The override is visible to the reviewer and is named in the review. A plugin that has no README yet is exempt until it gains one; the README-existence ratchet in `tests/test_plugin_readmes.py` governs that count and may only shrink.
 8. **Output field tables come from the definition YAML.** `spec.result.columns[]` accepts four optional keys documented in `docs/yaml-dsl-spec.md`: `description`, `values` (the closed vocabulary a column may carry), `example`, and `platforms` (a list drawn from `windows`, `linux`, `darwin`). A missing key renders as `-`. The server ignores keys it does not read.
 9. **Regenerate with one command and no build.** `python3 tools/plugin-doc-gen/plugin_doc_gen.py --all` rewrites every README fence, the catalog index, the site navigation fragment and the manifests from the committed sources; `meson compile -C <builddir> docs-regen` wraps it. Only captures need a built plugin, and only on that leg's operating system. The capability-matrix block itself is regenerated on its canonical Linux host, as before.
-10. **The README is the source of the machine manifest; the eight headings are the parse contract.** The generator writes `content/plugin-docs/<name>.json` (`manifest_version` 1) from the generated blocks and from the hand-written sections, which it locates by heading. The server embeds those files at build time and serves them as `GET /api/v1/discover/plugin-docs` and the MCP resource `yuzu://plugin-docs`, and joins a per-plugin summary into `discover_plugins`. Renaming a heading, or nesting a section differently, breaks that parse and fails the gate.
+10. **The README is the source of the machine manifest; the eight headings are the parse contract.** The generator writes `content/plugin-docs/<name>.json` (`manifest_version` 1) from the generated blocks and from the hand-written sections, which it locates by heading. The server embeds those files at build time and serves them as `GET /api/v1/discover/plugin-docs` and the MCP resource `yuzu://plugin-docs`, and joins a per-plugin summary into `discover_plugins`. Renaming a heading, or nesting a section differently, breaks that parse and fails the gate. There is deliberately no dedicated MCP tool for the manifests: the REST route + byte-identical resource pair follows the specs-as-resources precedent (`yuzu://scope-dsl`), and the tool-level entry point is the `docs` summary `discover_plugins` already carries.
 
 ## Section contract
 
@@ -36,7 +36,7 @@ Tone: concise plain English readable at senior-executive level, present tense, n
 
 | Key | From | Shape |
 |---|---|---|
-| `manifest_version`, `name`, `version`, `description`, `first_commit` | header | scalars |
+| `manifest_version`, `name`, `version`, `description` | header | scalars — read from the checked-out tree only, never from git history, so the byte-gate is host-independent |
 | `kind` | capability rows | `{"collector": bool, "mutating": bool, "gathered": bool}` |
 | `platforms` | capability-matrix block | `{"windows"\|"linux"\|"macos": "supported"\|"constrained"\|"planned"\|"unsupported"}` (best support across actions) |
 | `security` | `capability_decls` | `[{"action","securable","operation","risk_tier","dispatch_class","mutability","execute_gate"}]` |
@@ -48,10 +48,11 @@ Tone: concise plain English readable at senior-executive level, present tense, n
 | `privileges` | README §4 table | `[{"os","runs_as","grant","measured","if_refused"}]` |
 | `result_status` | README §5 table | `[{"status","completeness","provenance","when"}]` |
 | `where_the_data_goes` | README §5 bullets | `[string]` |
-| `samples` | samples files | `{"<os>": {"stamp": {...}, "actions": [{"action","params","rows":[first 5],"row_count","result_status"}]}}` |
+| `samples` | samples files | `{"<os>": {"stamp": {...}, "actions": [{"action","params","rows":[first 5],"row_count","result_status","not_captured"}]}}` |
 | `caveats` | README §7 | `[string]` |
 | `source` | source block | `{"plugin":[…],"definitions":[…],"capability_rows":[…],"tests":[…],"privilege_row":bool,"changelog":[…]}` |
 | `readme` | path | `agents/plugins/<name>/README.md` |
+| `leg_hash` | computed | the 12-hex digest of rule 6, so a consumer can tell which legs a sample stamp was taken against |
 
 ## Authoring a README before the generator has run
 

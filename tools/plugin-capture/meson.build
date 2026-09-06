@@ -16,7 +16,7 @@ if meson.can_run_host_binaries()
     'plugin-capture',
     'plugin_capture.cpp',
     include_directories: [include_directories('../../agents/core/src')],
-    dependencies: [yuzu_sdk_dep, yuzu_agent_core_dep],
+    dependencies: [yuzu_sdk_dep, yuzu_agent_core_dep, spdlog_dep],
     install: false,
   )
 endif

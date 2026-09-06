@@ -4,7 +4,7 @@
 | | |
 |---|---|
 | **What it does** | Reports physical drive health and the mapping between drives and the logical volumes they back |
-| **Version** | 1.0.0 · first commit 2026-09-03 |
+| **Version** | 1.0.0 |
 | **Kind** | Collector · read-only · on-demand |
 | **Platforms** | Windows ✅ · macOS 🟡 constrained · Linux ⛔ unsupported |
 | **Actions** | `smart` (definition `crossplatform.storage.smart`) · `volumes` (definition `crossplatform.storage.volumes`) |
@@ -160,6 +160,18 @@ volume|disk2s1|-|disk0|-|5368664064|-
 volume|disk2s2|-|disk0|-|5368664064|-
 … 12 of 19 rows shown
 [result_status] UNDECLARED / UNKNOWN
+```
+
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash f062fb9a3dfd
+
+```
+== action=smart
+smart|-|-|unknown|unknown|unsupported|-|-|drive health is not implemented on Linux in this release; no mechanism was bound against real hardware
+[result_status] UNAVAILABLE / PARTIAL / linux:smart
+
+== action=volumes
+volume|-|-|-|-|-|physical-to-logical volume mapping is not implemented on Linux in this release; it ships with the smart leg it exists to support
+[result_status] UNAVAILABLE / PARTIAL / linux:volumes
 ```
 <!-- END GENERATED -->
 

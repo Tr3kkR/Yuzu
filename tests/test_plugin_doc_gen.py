@@ -294,7 +294,7 @@ class Rendering(unittest.TestCase):
     def _doc(self):
         m = g.parse_matrix_block(MATRIX)
         rows = g.parse_capability_fragment(FRAGMENT, "frag.hpp")
-        return g.PluginDoc(name="alpha", version="1.2.3", description="Probes", first_commit="2026-01-01",
+        return g.PluginDoc(name="alpha", version="1.2.3", description="Probes",
                            legs=m["alpha"], cap_rows=[r for r in rows if r.plugin == "alpha"],
                            definitions=_defs([{"name": "c", "type": "string", "values": ["x"],
                                                "example": "x", "platforms": ["darwin"],

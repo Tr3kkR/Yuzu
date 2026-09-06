@@ -37,18 +37,23 @@ const PluginDocsIndex& plugin_docs_index() {
         PluginDocsIndex out;
         for (const auto& text : kBundledPluginDocs) {
             auto m = json::parse(text, nullptr, /*allow_exceptions=*/false);
+            // The generator always writes name, platforms and readme; a manifest
+            // missing any of them is not one it produced, so it is skipped and
+            // counted rather than repaired here (the path rule has one home:
+            // plugin_doc_gen.py).
             if (m.is_discarded() || !m.is_object() || !m.contains("name") ||
-                !m["name"].is_string()) {
+                !m["name"].is_string() || !m.contains("readme") || !m["readme"].is_string() ||
+                !m.contains("platforms") || !m["platforms"].is_object()) {
                 ++out.skipped_invalid;
                 spdlog::warn("discover/plugin-docs: skipping an embedded manifest that is not a "
-                             "JSON object with a string name");
+                             "JSON object with string name/readme and an object platforms");
                 continue;
             }
             const std::string name = m["name"].get<std::string>();
             json summary = {
                 {"summary", m.value("description", std::string{})},
-                {"platforms", m.contains("platforms") ? m["platforms"] : json::object()},
-                {"readme", m.value("readme", "agents/plugins/" + name + "/README.md")},
+                {"platforms", m["platforms"]},
+                {"readme", m["readme"]},
                 {"resource", "yuzu://plugin-docs"},
             };
             out.summary_by_name.emplace(name, std::move(summary));

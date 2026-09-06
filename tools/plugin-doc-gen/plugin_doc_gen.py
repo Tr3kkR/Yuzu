@@ -17,6 +17,10 @@ navigation fragment ``site/src/nav.plugins.mjs`` and the machine manifests
 * the plugin directory itself (identity regex over the plugin TU, samples,
   source listing) plus ``tests/`` and ``changelog.d/`` by name.
 
+Everything is read from the checked-out tree — never from git history or a
+running process — so the byte-gate produces the same bytes on every host
+and on a shallow clone.
+
 No build is required. Only captures (``tools/plugin-capture``) need a built
 plugin, and only on that leg's OS.
 
@@ -30,9 +34,7 @@ import argparse
 import difflib
 import hashlib
 import json
-import os
 import re
-import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -44,7 +46,6 @@ except ImportError:  # pragma: no cover - surfaced as a clear error at runtime
     yaml = None
 
 MANIFEST_VERSION = 1
-BEGIN_RE = re.compile(r"<!-- BEGIN GENERATED: plugin-doc-gen (\w+) -->")
 END_MARK = "<!-- END GENERATED -->"
 README_BLOCKS = ("header", "capability", "inputs", "outputs", "samples", "source")
 OS_ORDER = ("windows", "macos", "linux")
@@ -118,7 +119,6 @@ class Sample:
     os: str
     stamp: dict
     actions: list[dict]
-    raw: str
 
 
 @dataclass
@@ -126,7 +126,6 @@ class PluginDoc:
     name: str
     version: str
     description: str
-    first_commit: str
     legs: dict[str, dict[str, Leg]]           # action -> os -> Leg
     cap_rows: list[CapRow]
     definitions: list[Definition]
@@ -169,9 +168,6 @@ def parse_matrix_block(text: str) -> dict[str, dict[str, dict[str, Leg]]]:
     return out
 
 
-_CAP_FIELDS = ("plugin", "action", "dispatch_class", "mutability", "securable", "operation",
-               "risk_tier", "execute_gate")
-_CAP_ROW_RE = re.compile(r"\{\s*\.plugin\s*=(.*?)\}\s*,", re.DOTALL)
 _CAP_FIELD_RE = re.compile(r"\.(\w+)\s*=\s*([^,]+?)\s*(?:,|$)", re.DOTALL)
 
 
@@ -312,7 +308,7 @@ def parse_sample(text: str, os_name: str) -> Sample:
                                             "provenance": sm.group("prov").strip()}
         elif current is not None and line.strip():
             current["rows"].append(line)
-    return Sample(os=os_name, stamp=stamp, actions=actions, raw=text)
+    return Sample(os=os_name, stamp=stamp, actions=actions)
 
 
 def leg_hash(legs: dict[str, dict[str, Leg]], definitions: list[Definition]) -> str:
@@ -430,16 +426,6 @@ def load_capability_rows(repo: Path) -> dict[str, list[CapRow]]:
     return by_plugin
 
 
-def first_commit_date(repo: Path, rel_dir: str) -> str:
-    try:
-        out = subprocess.run(["git", "-C", str(repo), "log", "--reverse", "--format=%cs", "--", rel_dir],
-                             capture_output=True, text=True, timeout=30, check=False)
-        first = out.stdout.strip().splitlines()
-        return first[0] if first else "-"
-    except (OSError, subprocess.SubprocessError):
-        return "-"
-
-
 def collect_source(repo: Path, name: str, definitions: list[Definition],
                    cap_rows: list[CapRow]) -> dict:
     pdir = repo / "agents" / "plugins" / name
@@ -487,7 +473,6 @@ def load_plugin(repo: Path, name: str, matrix: dict, defs: dict, caps: dict) -> 
     return PluginDoc(
         name=declared, version=identity["version"] or "-",
         description=identity["description"] or "-",
-        first_commit=first_commit_date(repo, f"agents/plugins/{name}"),
         legs=legs, cap_rows=cap_rows, definitions=definitions, samples=samples,
         source=collect_source(repo, name, definitions, cap_rows),
         readme_path=f"agents/plugins/{name}/README.md", warnings=warnings,
@@ -542,7 +527,7 @@ def render_header(doc: PluginDoc) -> str:
     auth_roles = sorted({x for d in doc.definitions for x in d.author_roles})
     rows = [
         ("**What it does**", doc.description),
-        ("**Version**", f"{doc.version} · first commit {doc.first_commit}"),
+        ("**Version**", doc.version),
         ("**Kind**", kind_line(doc.cap_rows, doc.definitions)),
         ("**Platforms**", platforms_line(doc.legs)),
         ("**Actions**", " · ".join(actions) or "-"),
@@ -590,9 +575,10 @@ def render_inputs(doc: PluginDoc) -> str:
             rows.append((d.id, pname, str(spec.get("type", "-")), "yes" if pname in required else "no",
                          str(spec.get("default", "-")), " ".join(str(spec.get("description", "-")).split())))
     if not rows:
-        n = len(doc.definitions)
-        subject = "Neither action takes" if n == 2 else ("The action takes" if n == 1 else "No definition takes")
-        return f"{subject} no parameters." if n == 1 else f"{subject} parameters."
+        n = len(doc.legs)
+        if n == 1:
+            return "The action takes no parameters."
+        return ("Neither action takes" if n == 2 else "No action takes") + " parameters."
     lines = ["| Definition | Parameter | Type | Required | Default | Description |", "|---|---|---|---|---|---|"]
     lines += ["| " + " | ".join(_esc(c) for c in (f"`{r[0]}`", f"`{r[1]}`", *r[2:])) + " |" for r in rows]
     return "\n".join(lines)
@@ -714,7 +700,6 @@ def build_manifest(doc: PluginDoc, readme: str) -> dict:
     return {
         "manifest_version": MANIFEST_VERSION,
         "name": doc.name, "version": doc.version, "description": doc.description,
-        "first_commit": doc.first_commit,
         "kind": {"collector": not any(r.dispatch_class in ("Mutating", "Destructive") for r in doc.cap_rows),
                  "mutating": any(r.dispatch_class in ("Mutating", "Destructive") for r in doc.cap_rows),
                  "gathered": any(d.gather for d in doc.definitions)},

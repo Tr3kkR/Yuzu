@@ -5300,6 +5300,38 @@ TEST_CASE("MCP plugin-docs: yuzu://plugin-docs denies without Infrastructure:Rea
     }
 }
 
+TEST_CASE("MCP plugin-docs: discover_plugins outputSchema types the per-plugin docs summary",
+          "[mcp][plugin_docs][integration]") {
+    // The #2986 completeness case guards top-level keys only; the item-level
+    // `docs` property (object-or-null, always present — the catalog 2 -> 3
+    // change) is pinned here so a revert of the schema hunk fails a test.
+    McpTestServer ts;
+    ts.start("readonly");
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":39})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    bool found = false;
+    for (const auto& t : body["result"]["tools"]) {
+        if (t.value("name", "") != "discover_plugins")
+            continue;
+        found = true;
+        REQUIRE(t.contains("outputSchema"));
+        const auto& items = t["outputSchema"]["properties"]["plugins"]["items"];
+        REQUIRE(items.contains("properties"));
+        REQUIRE(items["properties"].contains("docs"));
+        const auto& docs = items["properties"]["docs"];
+        CHECK(docs["type"] == nlohmann::json::array({"object", "null"}));
+        CHECK(docs["properties"].contains("summary"));
+        CHECK(docs["properties"].contains("platforms"));
+        CHECK(docs["properties"].contains("readme"));
+        CHECK(docs["properties"].contains("resource"));
+        const auto& required = items["required"];
+        CHECK(std::find(required.begin(), required.end(), "docs") != required.end());
+    }
+    CHECK(found);
+}
+
 // ── 11. Unknown method — verify kMethodNotFound ─────────────────────────────
 
 TEST_CASE("MCP Integration: unknown method returns MethodNotFound", "[mcp][integration]") {

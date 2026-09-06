@@ -99,7 +99,6 @@
     }
   ],
   "description": "Reports physical drive health and the mapping between drives and the logical volumes they back",
-  "first_commit": "2026-09-03",
   "how_it_works": "Both actions are reads. `smart` enumerates the physical drives the OS knows about and asks each for identity (model, transport, SSD or HDD). On Windows, NVMe drives additionally answer with SMART log page 0x02, which the plugin decodes into a wear percentage, available spare and a health verdict. `volumes` enumerates logical volumes and resolves two things for each: the physical drive that backs it and the mount points it serves.\n\n`volumes` is deliberately not a third volume inventory. `hardware.disks` already lists physical devices and `filesystem_posture.mounts` already lists mounts. This action carries only the join between them, which is what lets a failing-drive alert name the drive letters or mount points it affects.\n\nEvery mechanism was bound by a spike against real hardware before the leg was written. Where a mechanism could not be bound (Linux) or is only reachable through a private OS interface (macOS health), the leg says so in its result rather than guessing.",
   "inputs": [],
   "kind": {
@@ -340,6 +339,46 @@
     }
   ],
   "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "smart",
+          "not_captured": null,
+          "params": "",
+          "result_status": {
+            "completeness": "PARTIAL",
+            "provenance": "linux:smart",
+            "status": "UNAVAILABLE"
+          },
+          "row_count": 1,
+          "rows": [
+            "smart|-|-|unknown|unknown|unsupported|-|-|drive health is not implemented on Linux in this release; no mechanism was bound against real hardware"
+          ]
+        },
+        {
+          "action": "volumes",
+          "not_captured": null,
+          "params": "",
+          "result_status": {
+            "completeness": "PARTIAL",
+            "provenance": "linux:volumes",
+            "status": "UNAVAILABLE"
+          },
+          "row_count": 1,
+          "rows": [
+            "volume|-|-|-|-|-|physical-to-logical volume mapping is not implemented on Linux in this release; it ships with the smart leg it exists to support"
+          ]
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-06",
+        "host_class": "container",
+        "leg_hash": "f062fb9a3dfd",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    },
     "macos": {
       "actions": [
         {

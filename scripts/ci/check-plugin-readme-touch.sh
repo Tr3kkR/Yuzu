@@ -35,8 +35,9 @@ CHANGED="$(git diff --name-only "$BASE" "$HEAD" --)"
 
 override=""
 if [ -n "$BODY" ] && [ -f "$BODY" ]; then
-  # First matching line wins; the text after the colon must be non-empty.
-  override="$(grep -m1 -E '^[[:space:]]*docs-unchanged:[[:space:]]*[^[:space:]]' "$BODY" || true)"
+  # First matching line wins; the text after the colon must be non-empty. A
+  # leading list marker ("- " / "* ") is allowed so the line can sit in a bullet.
+  override="$(grep -m1 -E '^[[:space:]]*([-*][[:space:]]+)?docs-unchanged:[[:space:]]*[^[:space:]]' "$BODY" || true)"
 fi
 
 # Plugins whose src/ changed, deduplicated.

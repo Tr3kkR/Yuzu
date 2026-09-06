@@ -23,15 +23,14 @@
  *
  * `--param` binds to the most recent `--action`. A value containing spaces
  * is written double-quoted on the action line so a sample stays reproducible.
+ *
+ * The agent core's logger (the plugin loader's "Loaded plugin …" line, a
+ * plugin's own spdlog warnings) is routed to stderr before anything is
+ * loaded, so a capture written to stdout is exactly the sample and nothing
+ * else; `--out` writes the same bytes to a file.
  */
 
-#include <yuzu/agent/plugin_loader.hpp>
-#include <yuzu/plugin.h>
-
-#include "local_dispatcher.hpp"
-
 #include <chrono>
-#include <cstdio>
 #include <ctime>
 #include <fstream>
 #include <iostream>
@@ -44,6 +43,14 @@
 #if !defined(_WIN32)
 #include <unistd.h>
 #endif
+
+#include <spdlog/sinks/stdout_sinks.h>
+#include <spdlog/spdlog.h>
+
+#include <yuzu/agent/plugin_loader.hpp>
+#include <yuzu/plugin.h>
+
+#include "local_dispatcher.hpp"
 
 namespace {
 
@@ -147,9 +154,13 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    // stdout is the sample; every log line goes to stderr (see the header).
+    spdlog::set_default_logger(spdlog::stderr_logger_mt("plugin-capture"));
+
     auto loaded = yuzu::agent::PluginHandle::load(lib);
     if (!loaded) {
-        std::cerr << "plugin-capture: failed to load " << lib << "\n";
+        std::cerr << "plugin-capture: failed to load " << lib << ": " << loaded.error().reason
+                  << "\n";
         return 1;
     }
     const YuzuPluginDescriptor* desc = loaded->descriptor();

@@ -3883,7 +3883,12 @@ McpServer::HandlerFn McpServer::build_handler(
             constexpr std::string_view kResourceTierRemediation =
                 "this MCP token's tier does not permit the operation; use a higher-tier "
                 "MCP token (operator or supervised), or the REST API / dashboard";
-            if (uri == "yuzu://openapi") {
+            // The compiled-in catalogs share ONE shape — tier gate, then perm gate,
+            // then the text as a single application/json content entry — kept as
+            // one local so a further static resource cannot drift from the
+            // tier-then-perm order. Each caller names its source; the bytes are
+            // whatever that builder serves to its REST twin.
+            auto serve_compiled_json_resource = [&](std::string_view text) {
                 if (!tier_allows(session->mcp_tier, "Infrastructure", "Read")) {
                     res.set_content(
                         error_response_a4(id, kTierDenied, "MCP tier does not allow this operation",
@@ -3894,61 +3899,29 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "Infrastructure", "Read"))
                     return;
-                // Compiled-in — no store dependency. Raw openapi_spec_json(): byte-identical
-                // to REST GET /api/v1/openapi.json, a different projection than
-                // discover_routes (see the block comment above).
                 JArr contents;
-                contents.add(JObj()
-                                 .add("uri", uri)
-                                 .add("mimeType", "application/json")
-                                 .add("text", yuzu::server::openapi_spec_json()));
+                contents.add(
+                    JObj().add("uri", uri).add("mimeType", "application/json").add("text", text));
                 res.set_content(success_response(id, JObj().raw("contents", contents.str()).str()),
                                 "application/json");
+            };
+            if (uri == "yuzu://openapi") {
+                // Raw openapi_spec_json(): byte-identical to REST GET /api/v1/openapi.json,
+                // a different projection than discover_routes (see the block comment above).
+                serve_compiled_json_resource(yuzu::server::openapi_spec_json());
                 return;
             }
             if (uri == "yuzu://scope-dsl") {
-                if (!tier_allows(session->mcp_tier, "Infrastructure", "Read")) {
-                    res.set_content(
-                        error_response_a4(id, kTierDenied, "MCP tier does not allow this operation",
-                                          yuzu::server::detail::make_correlation_id(),
-                                          kResourceTierRemediation),
-                        "application/json");
-                    return;
-                }
-                if (!perm_fn(req, res, "Infrastructure", "Read"))
-                    return;
-                // Compiled-in — no store dependency, same builder as REST
-                // /api/v1/discover/scope-kinds and discover_scope_kinds.
-                const auto& doc = yuzu::server::scope_kinds_catalog();
-                JArr contents;
-                contents.add(
-                    JObj().add("uri", uri).add("mimeType", "application/json").add("text", doc.json));
-                res.set_content(success_response(id, JObj().raw("contents", contents.str()).str()),
-                                "application/json");
+                // Same builder as REST /api/v1/discover/scope-kinds and discover_scope_kinds.
+                serve_compiled_json_resource(yuzu::server::scope_kinds_catalog().json);
                 return;
             }
             if (uri == "yuzu://plugin-docs") {
-                // Plugin README standard (docs/plugin-readme-standard.md rule 10):
-                // the build-embedded per-plugin manifests, byte-identical to REST
-                // GET /api/v1/discover/plugin-docs — same static builder, same
-                // tier-then-perm order as yuzu://scope-dsl above. Compiled-in
-                // content only, never fleet-derived.
-                if (!tier_allows(session->mcp_tier, "Infrastructure", "Read")) {
-                    res.set_content(
-                        error_response_a4(id, kTierDenied, "MCP tier does not allow this operation",
-                                          yuzu::server::detail::make_correlation_id(),
-                                          kResourceTierRemediation),
-                        "application/json");
-                    return;
-                }
-                if (!perm_fn(req, res, "Infrastructure", "Read"))
-                    return;
-                const auto& doc = yuzu::server::plugin_docs_catalog();
-                JArr contents;
-                contents.add(
-                    JObj().add("uri", uri).add("mimeType", "application/json").add("text", doc.json));
-                res.set_content(success_response(id, JObj().raw("contents", contents.str()).str()),
-                                "application/json");
+                // Plugin README standard (docs/plugin-readme-standard.md rule 10): the
+                // build-embedded per-plugin manifests, byte-identical to REST
+                // GET /api/v1/discover/plugin-docs. Compiled-in content only, never
+                // fleet-derived.
+                serve_compiled_json_resource(yuzu::server::plugin_docs_catalog().json);
                 return;
             }
 

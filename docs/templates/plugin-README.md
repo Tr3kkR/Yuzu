@@ -4,7 +4,7 @@
 | | |
 |---|---|
 | **What it does** | <descriptor description> |
-| **Version** | <version> · first commit <date> |
+| **Version** | <version> |
 | **Kind** | Collector · read-only · on-demand |
 | **Platforms** | Windows ✅ · macOS 🟡 constrained · Linux ⛔ unsupported |
 | **Actions** | `<action>` (definition `<id>`) |
