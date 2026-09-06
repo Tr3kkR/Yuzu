@@ -13110,6 +13110,181 @@ private:
                 .increment();
         });
 
+        // -- Extracted route modules ------------------------------------------------
+        // Common callback lambdas shared by all extracted route modules.
+        HttplibRouteSink inline_sink{*web_server_};
+        auto auth_fn = [this](const httplib::Request& req,
+                              httplib::Response& res) -> std::optional<auth::Session> {
+            return require_auth(req, res);
+        };
+        auto perm_fn = [this](const httplib::Request& req, httplib::Response& res,
+                              const std::string& type, const std::string& op) -> bool {
+            return require_permission(req, res, type, op);
+        };
+        // Per-device tier + management-group scope gate (wraps
+        // require_scoped_permission). Used by DeviceRoutes' per-device routes so an
+        // operator can only open / read / live-query a device inside their scope.
+        auto scoped_perm_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                     const std::string& type, const std::string& op,
+                                     const std::string& agent_id) -> bool {
+            return require_scoped_permission(req, res, type, op, agent_id);
+        };
+        // ADR-0017 admit-then-filter list-read gate (wraps require_list_read).
+        // The fleet guaranteed-state status route's SOLE authorization gate —
+        // never stacked with perm_fn (see rest_api_v1.cpp's route comment).
+        auto list_read_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                   const std::string& type,
+                                   const std::string& op) -> yuzu::server::ListReadGate {
+            return require_list_read(req, res, type, op);
+        };
+        // #3290 Phase 2 admit-then-filter fleet-read gate (wraps
+        // require_fleet_read). GET /api/v1/inventory/software's SOLE
+        // authorization gate — never stacked with perm_fn (see
+        // rest_api_v1.cpp's route comment; same BLOCKING rule as list_read_fn
+        // above). Shared, byte-identical, with the MCP query_installed_software
+        // twin's set_fleet_read_fn wiring below — one conversion, two surfaces.
+        auto fleet_read_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                    const std::string& type,
+                                    const std::string& op) -> yuzu::server::authz::FleetReadGate {
+            return require_fleet_read(req, res, type, op);
+        };
+        // Visible-agent SET resolver for filtering device-id-rendering lists (DEX
+        // device drills). SAME policy as get_visible_agents_json / the /devices list:
+        // nullopt = caller sees the whole fleet (global Infrastructure:Read OR RBAC
+        // off); else the caller's management-group members. The global-read branch is
+        // load-bearing — a bare get_visible_agents would blank an admin in no group.
+        //
+        // #2703 Gate 7: gate on rbac_enforcement_in_effect (NOT raw is_rbac_enabled())
+        // — the latter can read stale-false while RBAC is durably enabled elsewhere (a
+        // degraded generation-refresh cache), which would silently disclose the whole
+        // fleet to a confined operator. Mirrors get_visible_agents_json's identical
+        // fix immediately above.
+        auto visible_set_fn =
+            [this](const std::string& username) -> std::optional<std::set<std::string>> {
+            if (mgmt_group_store_ && rbac_enforcement_in_effect(rbac_store_.get())) {
+                bool global_read = rbac_store_ && rbac_store_->is_open() &&
+                                   rbac_store_->check_permission(username, "Infrastructure", "Read");
+                if (!global_read) {
+                    // ADR-0042: get_visible_agents nullopt means the mgmt-store
+                    // DEGRADED — return an EMPTY confined set (fail-closed: sees
+                    // nothing), NOT nullopt here (which means "sees all fleet").
+                    auto v = mgmt_group_store_->get_visible_agents(username);
+                    if (!v)
+                        return std::set<std::string>{};
+                    return std::set<std::string>(v->begin(), v->end());
+                }
+            }
+            return std::nullopt; // global read or RBAC disabled → sees all
+        };
+        // D3: the dashboard facet/scope surfaces' Response:Read-visible set
+        // (dashboard_routes.hpp VisibleSetFn) — deliberately NOT built on
+        // mgmt_group_store_->get_visible_agents the way visible_set_fn above
+        // is. That join is permission-AGNOSTIC (it returns agents reachable
+        // via ANY management-group role the caller holds), so a user with
+        // Response:Read scoped to group G1 and some unrelated role on group
+        // G2 would leak/materialise G2's agents into these dropdowns/groups.
+        // Instead this resolves through visible_agents_for_permission — the
+        // set-form of the SAME resolve_perm_groups/expand_visible_set
+        // resolver that check_scoped_permission and authorize_list_read use
+        // for admission — so the set is permission-specific, deny-aware,
+        // hierarchy-expanded, and set-equivalent to the committed per-agent
+        // predicate response_agent_in_scope (server.cpp) by shared
+        // construction. This is the RbacStore PRIMITIVE, not the
+        // authorize_list_read transport gate — the dashboard routes' flat
+        // perm_fn_ admission gates are untouched by this resolver.
+        auto response_visible_set_fn =
+            [this](const std::string& username) -> std::optional<std::set<std::string>> {
+            if (!rbac_enforcement_in_effect(rbac_store_.get())) return std::nullopt;
+            bool global_read = rbac_store_ && rbac_store_->is_open() &&
+                               rbac_store_->check_permission(username, "Response", "Read");
+            if (global_read) return std::nullopt; // global Response:Read sees all, #1715(b)
+            if (!rbac_store_ || !mgmt_group_store_) {
+                return std::set<std::string>{}; // fail-closed, no store to resolve against
+            }
+            auto v = rbac_store_->visible_agents_for_permission(username, "Response", "Read",
+                                                                 mgmt_group_store_.get());
+            if (!v) return std::set<std::string>{}; // degrade → fail-closed, never nullopt
+            return std::set<std::string>(v->begin(), v->end());
+        };
+        auto audit_fn = [this](const httplib::Request& req, const std::string& action,
+                               const std::string& result, const std::string& target_type,
+                               const std::string& target_id, const std::string& detail) -> bool {
+            return audit_log(req, action, result, target_type, target_id, detail);
+        };
+
+        // Shared command-dispatch closure — sends a CommandRequest to agents via
+        // gRPC. Hoisted here (was inline in the WorkflowRoutes block) so every
+        // background consumer drives the EXACT same dispatch path.
+        //
+        // PLAN-006 (caller list corrected per #3133 round-2 review — it used to
+        // claim PolicyEvaluator was the only caller): the production consumers
+        // are PolicyEvaluator (compliance-check tick), PreflightRunner +
+        // PreflightRoutes (read-only preflight dispatch/re-dispatch), and the
+        // DexRoutes / DeviceRoutes live-info panels' canned read-only queries.
+        // All are either genuine background engines with no Session in the
+        // loop, or pre-existing read-only surfaces behind their own scoped
+        // gates (the latter tracked for caller-widening as a follow-up — see
+        // the #3133 round-1/2 review minors). It constructs
+        // `DispatchCaller{.system = true}` explicitly rather than leaving
+        // `principal` merely empty by default: a background dispatch is a
+        // deliberate, greppable statement.
+        auto command_dispatch_fn =
+            [this](const std::string& plugin, const std::string& action,
+                   const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+                   const std::unordered_map<std::string, std::string>& parameters,
+                   const std::string& execution_id) -> yuzu::server::ConfinedDispatchOutcome {
+            // Background engines + legacy callers dispatch as SYSTEM (unfiltered):
+            // exec_visible = nullopt (DispatchCaller's default). Operator surfaces
+            // that must confine call command_dispatch_caller_fn / the caller-typed
+            // sibling below instead. Both funnel through the ONE dispatch_confined
+            // seam. broadcast_on_none=false: an unnamed target here reaches nobody
+            // (#2500), never the fleet.
+            return dispatch_confined(plugin, action, agent_ids, scope_expr, parameters,
+                                     execution_id, yuzu::server::DispatchCaller{.system = true},
+                                     /*broadcast_on_none=*/false);
+        };
+
+        // #1788 / CDX-R7-02 / K-R7-02: the operator-facing confined entry.
+        // Identical to command_dispatch_fn but carries the caller (identity +
+        // Execution:Execute visible set) so every operator dispatch surface —
+        // REST v1, dashboard, workflow, MCP — narrows to it, exactly as
+        // /api/command does. Same seam (dispatch_confined), one extra parameter.
+        //
+        // PR1.9c: there used to be a second, bare-VisibleSet sibling here
+        // (`command_dispatch_confined_fn`) kept only because
+        // `RestApiV1::CommandDispatchFn` had not been widened. It built a
+        // `DispatchCaller` with an EMPTY principal, which
+        // `build_classified_command` refuses as `AnonymousOperator` before the
+        // legacy-open bypass — so every REST v1 dispatch was undeliverable.
+        // REST now takes the caller like everyone else and that closure is
+        // deleted; there is deliberately only ONE confined entry point again.
+        auto command_dispatch_caller_fn =
+            [this](const std::string& plugin, const std::string& action,
+                   const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+                   const std::unordered_map<std::string, std::string>& parameters,
+                   const std::string& execution_id,
+                   const yuzu::server::DispatchCaller& caller)
+                -> yuzu::server::ConfinedDispatchOutcome {
+            return dispatch_confined(plugin, action, agent_ids, scope_expr, parameters,
+                                     execution_id, caller, /*broadcast_on_none=*/false);
+        };
+
+        // ADR-1007 — a deliberate SIBLING of command_dispatch_caller_fn, not
+        // a widening of it (see workflow_routes.hpp's ConcurrencyDispatchFn
+        // doc comment for why). Routes through the identical dispatch_confined
+        // seam, two extra trailing arguments.
+        auto command_dispatch_concurrency_fn =
+            [this](const std::string& plugin, const std::string& action,
+                   const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+                   const std::unordered_map<std::string, std::string>& parameters,
+                   const std::string& execution_id, const yuzu::server::DispatchCaller& caller,
+                   const std::string& definition_id, const std::string& concurrency_mode)
+                -> yuzu::server::ConfinedDispatchOutcome {
+            return dispatch_confined(plugin, action, agent_ids, scope_expr, parameters,
+                                     execution_id, caller, /*broadcast_on_none=*/false,
+                                     definition_id, concurrency_mode);
+        };
+
         // -- Prometheus metrics endpoint ----------------------------------------
         web_server_->Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
             // Refresh management group gauges before serializing
@@ -18560,180 +18735,6 @@ private:
                                 .dump(),
                             "application/json");
         });
-
-        // -- Extracted route modules ------------------------------------------------
-        // Common callback lambdas shared by all extracted route modules.
-        auto auth_fn = [this](const httplib::Request& req,
-                              httplib::Response& res) -> std::optional<auth::Session> {
-            return require_auth(req, res);
-        };
-        auto perm_fn = [this](const httplib::Request& req, httplib::Response& res,
-                              const std::string& type, const std::string& op) -> bool {
-            return require_permission(req, res, type, op);
-        };
-        // Per-device tier + management-group scope gate (wraps
-        // require_scoped_permission). Used by DeviceRoutes' per-device routes so an
-        // operator can only open / read / live-query a device inside their scope.
-        auto scoped_perm_fn = [this](const httplib::Request& req, httplib::Response& res,
-                                     const std::string& type, const std::string& op,
-                                     const std::string& agent_id) -> bool {
-            return require_scoped_permission(req, res, type, op, agent_id);
-        };
-        // ADR-0017 admit-then-filter list-read gate (wraps require_list_read).
-        // The fleet guaranteed-state status route's SOLE authorization gate —
-        // never stacked with perm_fn (see rest_api_v1.cpp's route comment).
-        auto list_read_fn = [this](const httplib::Request& req, httplib::Response& res,
-                                   const std::string& type,
-                                   const std::string& op) -> yuzu::server::ListReadGate {
-            return require_list_read(req, res, type, op);
-        };
-        // #3290 Phase 2 admit-then-filter fleet-read gate (wraps
-        // require_fleet_read). GET /api/v1/inventory/software's SOLE
-        // authorization gate — never stacked with perm_fn (see
-        // rest_api_v1.cpp's route comment; same BLOCKING rule as list_read_fn
-        // above). Shared, byte-identical, with the MCP query_installed_software
-        // twin's set_fleet_read_fn wiring below — one conversion, two surfaces.
-        auto fleet_read_fn = [this](const httplib::Request& req, httplib::Response& res,
-                                    const std::string& type,
-                                    const std::string& op) -> yuzu::server::authz::FleetReadGate {
-            return require_fleet_read(req, res, type, op);
-        };
-        // Visible-agent SET resolver for filtering device-id-rendering lists (DEX
-        // device drills). SAME policy as get_visible_agents_json / the /devices list:
-        // nullopt = caller sees the whole fleet (global Infrastructure:Read OR RBAC
-        // off); else the caller's management-group members. The global-read branch is
-        // load-bearing — a bare get_visible_agents would blank an admin in no group.
-        //
-        // #2703 Gate 7: gate on rbac_enforcement_in_effect (NOT raw is_rbac_enabled())
-        // — the latter can read stale-false while RBAC is durably enabled elsewhere (a
-        // degraded generation-refresh cache), which would silently disclose the whole
-        // fleet to a confined operator. Mirrors get_visible_agents_json's identical
-        // fix immediately above.
-        auto visible_set_fn =
-            [this](const std::string& username) -> std::optional<std::set<std::string>> {
-            if (mgmt_group_store_ && rbac_enforcement_in_effect(rbac_store_.get())) {
-                bool global_read = rbac_store_ && rbac_store_->is_open() &&
-                                   rbac_store_->check_permission(username, "Infrastructure", "Read");
-                if (!global_read) {
-                    // ADR-0042: get_visible_agents nullopt means the mgmt-store
-                    // DEGRADED — return an EMPTY confined set (fail-closed: sees
-                    // nothing), NOT nullopt here (which means "sees all fleet").
-                    auto v = mgmt_group_store_->get_visible_agents(username);
-                    if (!v)
-                        return std::set<std::string>{};
-                    return std::set<std::string>(v->begin(), v->end());
-                }
-            }
-            return std::nullopt; // global read or RBAC disabled → sees all
-        };
-        // D3: the dashboard facet/scope surfaces' Response:Read-visible set
-        // (dashboard_routes.hpp VisibleSetFn) — deliberately NOT built on
-        // mgmt_group_store_->get_visible_agents the way visible_set_fn above
-        // is. That join is permission-AGNOSTIC (it returns agents reachable
-        // via ANY management-group role the caller holds), so a user with
-        // Response:Read scoped to group G1 and some unrelated role on group
-        // G2 would leak/materialise G2's agents into these dropdowns/groups.
-        // Instead this resolves through visible_agents_for_permission — the
-        // set-form of the SAME resolve_perm_groups/expand_visible_set
-        // resolver that check_scoped_permission and authorize_list_read use
-        // for admission — so the set is permission-specific, deny-aware,
-        // hierarchy-expanded, and set-equivalent to the committed per-agent
-        // predicate response_agent_in_scope (server.cpp) by shared
-        // construction. This is the RbacStore PRIMITIVE, not the
-        // authorize_list_read transport gate — the dashboard routes' flat
-        // perm_fn_ admission gates are untouched by this resolver.
-        auto response_visible_set_fn =
-            [this](const std::string& username) -> std::optional<std::set<std::string>> {
-            if (!rbac_enforcement_in_effect(rbac_store_.get())) return std::nullopt;
-            bool global_read = rbac_store_ && rbac_store_->is_open() &&
-                               rbac_store_->check_permission(username, "Response", "Read");
-            if (global_read) return std::nullopt; // global Response:Read sees all, #1715(b)
-            if (!rbac_store_ || !mgmt_group_store_) {
-                return std::set<std::string>{}; // fail-closed, no store to resolve against
-            }
-            auto v = rbac_store_->visible_agents_for_permission(username, "Response", "Read",
-                                                                 mgmt_group_store_.get());
-            if (!v) return std::set<std::string>{}; // degrade → fail-closed, never nullopt
-            return std::set<std::string>(v->begin(), v->end());
-        };
-        auto audit_fn = [this](const httplib::Request& req, const std::string& action,
-                               const std::string& result, const std::string& target_type,
-                               const std::string& target_id, const std::string& detail) -> bool {
-            return audit_log(req, action, result, target_type, target_id, detail);
-        };
-
-        // Shared command-dispatch closure — sends a CommandRequest to agents via
-        // gRPC. Hoisted here (was inline in the WorkflowRoutes block) so every
-        // background consumer drives the EXACT same dispatch path.
-        //
-        // PLAN-006 (caller list corrected per #3133 round-2 review — it used to
-        // claim PolicyEvaluator was the only caller): the production consumers
-        // are PolicyEvaluator (compliance-check tick), PreflightRunner +
-        // PreflightRoutes (read-only preflight dispatch/re-dispatch), and the
-        // DexRoutes / DeviceRoutes live-info panels' canned read-only queries.
-        // All are either genuine background engines with no Session in the
-        // loop, or pre-existing read-only surfaces behind their own scoped
-        // gates (the latter tracked for caller-widening as a follow-up — see
-        // the #3133 round-1/2 review minors). It constructs
-        // `DispatchCaller{.system = true}` explicitly rather than leaving
-        // `principal` merely empty by default: a background dispatch is a
-        // deliberate, greppable statement.
-        auto command_dispatch_fn =
-            [this](const std::string& plugin, const std::string& action,
-                   const std::vector<std::string>& agent_ids, const std::string& scope_expr,
-                   const std::unordered_map<std::string, std::string>& parameters,
-                   const std::string& execution_id) -> yuzu::server::ConfinedDispatchOutcome {
-            // Background engines + legacy callers dispatch as SYSTEM (unfiltered):
-            // exec_visible = nullopt (DispatchCaller's default). Operator surfaces
-            // that must confine call command_dispatch_caller_fn / the caller-typed
-            // sibling below instead. Both funnel through the ONE dispatch_confined
-            // seam. broadcast_on_none=false: an unnamed target here reaches nobody
-            // (#2500), never the fleet.
-            return dispatch_confined(plugin, action, agent_ids, scope_expr, parameters,
-                                     execution_id, yuzu::server::DispatchCaller{.system = true},
-                                     /*broadcast_on_none=*/false);
-        };
-
-        // #1788 / CDX-R7-02 / K-R7-02: the operator-facing confined entry.
-        // Identical to command_dispatch_fn but carries the caller (identity +
-        // Execution:Execute visible set) so every operator dispatch surface —
-        // REST v1, dashboard, workflow, MCP — narrows to it, exactly as
-        // /api/command does. Same seam (dispatch_confined), one extra parameter.
-        //
-        // PR1.9c: there used to be a second, bare-VisibleSet sibling here
-        // (`command_dispatch_confined_fn`) kept only because
-        // `RestApiV1::CommandDispatchFn` had not been widened. It built a
-        // `DispatchCaller` with an EMPTY principal, which
-        // `build_classified_command` refuses as `AnonymousOperator` before the
-        // legacy-open bypass — so every REST v1 dispatch was undeliverable.
-        // REST now takes the caller like everyone else and that closure is
-        // deleted; there is deliberately only ONE confined entry point again.
-        auto command_dispatch_caller_fn =
-            [this](const std::string& plugin, const std::string& action,
-                   const std::vector<std::string>& agent_ids, const std::string& scope_expr,
-                   const std::unordered_map<std::string, std::string>& parameters,
-                   const std::string& execution_id,
-                   const yuzu::server::DispatchCaller& caller)
-                -> yuzu::server::ConfinedDispatchOutcome {
-            return dispatch_confined(plugin, action, agent_ids, scope_expr, parameters,
-                                     execution_id, caller, /*broadcast_on_none=*/false);
-        };
-
-        // ADR-1007 — a deliberate SIBLING of command_dispatch_caller_fn, not
-        // a widening of it (see workflow_routes.hpp's ConcurrencyDispatchFn
-        // doc comment for why). Routes through the identical dispatch_confined
-        // seam, two extra trailing arguments.
-        auto command_dispatch_concurrency_fn =
-            [this](const std::string& plugin, const std::string& action,
-                   const std::vector<std::string>& agent_ids, const std::string& scope_expr,
-                   const std::unordered_map<std::string, std::string>& parameters,
-                   const std::string& execution_id, const yuzu::server::DispatchCaller& caller,
-                   const std::string& definition_id, const std::string& concurrency_mode)
-                -> yuzu::server::ConfinedDispatchOutcome {
-            return dispatch_confined(plugin, action, agent_ids, scope_expr, parameters,
-                                     execution_id, caller, /*broadcast_on_none=*/false,
-                                     definition_id, concurrency_mode);
-        };
 
         // PolicyEvaluator — drives the compliance check -> verdict pipeline.
         // A background thread ticks it: dispatch due policies' check
