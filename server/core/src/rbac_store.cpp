@@ -556,7 +556,7 @@ void RbacStore::seed_defaults() {
          "ON CONFLICT (key) DO NOTHING");
 
     // Securable types.
-    const std::array<std::string_view, 26> types = {
+    const std::array<std::string_view, 27> types = {
         "Infrastructure",  "UserManagement",  "InstructionDefinition",
         "InstructionSet",  "Execution",       "Schedule",
         "Approval",        "Tag",             "AuditLog",
@@ -578,7 +578,12 @@ void RbacStore::seed_defaults() {
         // config/secret/kill-switch plane and the upload-grant lifecycle.
         "PluginConfig",   // plugin kill-switch config (PluginConfig:Write)
         "PluginSecret",   // plugin secret material — never Operator-readable
-        "UploadGrant"};   // upload-grant mint/revoke lifecycle
+        "UploadGrant",    // upload-grant mint/revoke lifecycle
+        // Wave 6 W1B: power_health's set_power_plan (the plugin's only
+        // mutating action). Administrator-only via the CRUD loop below —
+        // same PluginConfig/UploadGrant precedent, deliberately absent from
+        // the explicit Viewer read-list further down this function.
+        "PowerManagement"};
     for (auto t : types)
         exec("INSERT INTO rbac_store.securable_types (name, is_system) VALUES ($1, TRUE) "
              "ON CONFLICT (name) DO NOTHING",

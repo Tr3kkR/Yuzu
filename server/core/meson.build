@@ -498,6 +498,7 @@ yuzu_server_core_lib = static_library(
     'src/dashboard_routes.cpp',
     'src/workflow_routes.cpp',
     'src/notification_routes.cpp',
+    'src/command_routes.cpp',
     'src/webhook_routes.cpp',
     'src/offload_routes.cpp',
     'src/discovery_routes.cpp',

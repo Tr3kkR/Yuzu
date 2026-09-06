@@ -136,14 +136,41 @@ private:
 
 } // namespace detail
 
+/// Why a caller sometimes needs more than `std::nullopt`.
+///
+/// bounded_call() collapses two very different outcomes into one empty
+/// optional: the call TIMED OUT (a detached thread is still running fn(), and
+/// may still be touching whatever fn() captured), or it was REJECTED at the
+/// outstanding-call ceiling (fn() was never invoked and no thread was ever
+/// created, so nothing has touched anything). A caller holding an OS handle
+/// that fn() uses must treat those oppositely: after a timeout, closing the
+/// handle races a live call and it has to be leaked; after a rejection,
+/// closing it is unconditionally safe. Rejection is also the case that
+/// arrives in BURSTS, precisely when the agent is already loaded, so leaking
+/// on it is both unnecessary and unbounded.
+enum class BoundedCallStatus {
+    Completed, ///< fn() ran and returned within the timeout.
+    TimedOut,  ///< fn() is still running on a detached thread. Assume it is
+               ///< still using anything it captured.
+    Rejected,  ///< the ceiling refused the call. fn() was NEVER invoked and no
+               ///< thread exists; anything it would have captured is untouched.
+};
+
 template <typename Fn>
-auto bounded_call(std::chrono::milliseconds timeout, Fn fn)
-    -> std::optional<std::invoke_result_t<Fn>> {
+struct BoundedCallResult {
+    std::optional<std::invoke_result_t<Fn>> value;
+    BoundedCallStatus status{BoundedCallStatus::Rejected};
+};
+
+/// bounded_call() with the outcome distinguished. bounded_call() below is a
+/// thin wrapper over this, so the two can never diverge in behaviour.
+template <typename Fn>
+auto bounded_call_ex(std::chrono::milliseconds timeout, Fn fn) -> BoundedCallResult<Fn> {
     using Result = std::invoke_result_t<Fn>;
 
     auto guard = detail::OutstandingCallGuard::try_acquire();
     if (!guard)
-        return std::nullopt; // at the ceiling — degrade like a timeout, never block
+        return {std::nullopt, BoundedCallStatus::Rejected}; // at the ceiling — never block
 
     struct State {
         std::mutex mtx;
@@ -151,9 +178,26 @@ auto bounded_call(std::chrono::milliseconds timeout, Fn fn)
         bool done = false;
         Result value{};
     };
-    auto state = std::make_shared<State>();
+    // Setting the call UP can itself throw: make_shared under memory pressure,
+    // and std::thread's constructor with std::system_error when pthread_create
+    // fails at the process thread limit. Neither is inside the worker's own
+    // try/catch below, so before this guard they propagated out of the caller --
+    // and this primitive is reached from plugin entry points whose SDK
+    // trampoline is `extern "C"` with no catch of its own, so the exception
+    // would cross a C ABI and terminate the agent. Resource exhaustion must
+    // degrade to the SAME typed rejection the outstanding-call ceiling already
+    // produces, not take the process down. (The counter itself was already
+    // safe: OutstandingCallGuard's RAII releases the slot on these paths --
+    // that was a separate, earlier fix, and it is not this one.)
+    std::shared_ptr<State> state;
+    try {
+        state = std::make_shared<State>();
+    } catch (...) {
+        return {std::nullopt, BoundedCallStatus::Rejected};
+    }
 
-    std::thread([fn = std::move(fn), state, guard = std::move(*guard)]() mutable {
+    try {
+        std::thread([fn = std::move(fn), state, guard = std::move(*guard)]() mutable {
         try {
             Result v = fn();
             std::lock_guard<std::mutex> lock(state->mtx);
@@ -163,16 +207,29 @@ auto bounded_call(std::chrono::milliseconds timeout, Fn fn)
             // fn() throwing must not std::terminate() a detached thread.
             // Leave `done` false — a still-waiting caller simply times out.
         }
-        state->cv.notify_all();
-        // `guard` (captured by move) is destroyed with this lambda at the
-        // end of this scope, releasing the outstanding-call slot -- whether
-        // fn() returned normally or threw above.
-    }).detach();
+            state->cv.notify_all();
+            // `guard` (captured by move) is destroyed with this lambda at the
+            // end of this scope, releasing the outstanding-call slot -- whether
+            // fn() returned normally or threw above.
+        }).detach();
+    } catch (...) {
+        // Thread creation failed. `guard` was moved INTO the lambda, so on this
+        // path the thread object never took ownership and the moved-from guard
+        // in this scope releases the slot as it unwinds -- no leak, and fn()
+        // was never invoked, which is exactly the Rejected contract.
+        return {std::nullopt, BoundedCallStatus::Rejected};
+    }
 
     std::unique_lock<std::mutex> lock(state->mtx);
     if (state->cv.wait_for(lock, timeout, [&] { return state->done; }))
-        return std::move(state->value);
-    return std::nullopt; // timed out; the detached thread finishes on its own time
+        return {std::move(state->value), BoundedCallStatus::Completed};
+    return {std::nullopt, BoundedCallStatus::TimedOut}; // the detached thread finishes on its own time
+}
+
+template <typename Fn>
+auto bounded_call(std::chrono::milliseconds timeout, Fn fn)
+    -> std::optional<std::invoke_result_t<Fn>> {
+    return bounded_call_ex(timeout, std::move(fn)).value;
 }
 
 } // namespace yuzu::shared

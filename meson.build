@@ -470,6 +470,7 @@ if build_agent
     subdir('agents/plugins/wol')
     subdir('agents/plugins/discovery')
     subdir('agents/plugins/license_scan')
+    subdir('agents/plugins/power_health')
   endif
 endif
 
