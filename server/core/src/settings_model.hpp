@@ -73,7 +73,14 @@ namespace yuzu::server::settings_model {
 /// `url.find("://")`, which a later adversarial-review round showed could
 /// match a scheme-shaped substring embedded arbitrarily far into a query
 /// value, e.g. `?ssl_ca=https://ca.example/root.pem`, pushing the computed
-/// boundary past real userinfo and suppressing the strip entirely).
+/// boundary past real userinfo and suppressing the strip entirely). The
+/// ALPHA-first requirement is load-bearing, not decorative: a still-later
+/// adversarial-review round (CDX-01) found an implementation that allowed
+/// the scan to START on a digit (or `+`/`-`/`.`) preserved a schemeless
+/// credential's digit-led "username" verbatim when it was immediately
+/// followed by "://" — e.g. `9name://pass@host:9000/db` kept `9name` in
+/// the output. The scan must reject any prefix that does not start with a
+/// letter.
 ///
 /// The query string and fragment are dropped unconditionally (rather than
 /// selectively redacted — that would need to enumerate every driver's own

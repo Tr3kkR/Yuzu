@@ -208,6 +208,46 @@ TEST_CASE("sanitize_url_userinfo strips a query-string credential form entirely"
           "http://host:8123/");
 }
 
+// #4028 round-3 adversarial-review finding CDX-01 (/home/dgr/advrev-4028) —
+// regression coverage for the digit-/symbol-leading pseudo-scheme bypass.
+// RFC 3986 §3.1 requires a scheme to start with ALPHA; a scan that instead
+// accepts DIGIT/'+'/'-'/'.' as the first byte wrongly treats a schemeless
+// credential's scheme-shaped "username" as a real scheme, preserving it in
+// the output instead of stripping it as userinfo.
+
+TEST_CASE("sanitize_url_userinfo strips a digit-leading pseudo-scheme "
+          "(CDX-01: ALPHA-first, not alnum-first)",
+          "[settings][settings_model][security]") {
+    // "9name" looks scheme-shaped (alnum run immediately followed by
+    // "://") but cannot be a real RFC 3986 scheme -- schemes must start
+    // with a letter. The round-3 fix that only checked "the first char is
+    // alnum" wrongly preserved "9name://" as if it were a genuine scheme,
+    // leaking the digit-led "username" in the output
+    // ("9name://host:9000/db"). The correct reading has no scheme at all:
+    // "9name" is part of the userinfo up to the real '@', and must be
+    // stripped along with it.
+    CHECK(sm::sanitize_url_userinfo("9name://pass@host:9000/db") == "host:9000/db");
+}
+
+TEST_CASE("sanitize_url_userinfo strips a hyphen-leading pseudo-scheme (CDX-01)",
+          "[settings][settings_model][security]") {
+    CHECK(sm::sanitize_url_userinfo("-bad://evil@host:1/db") == "host:1/db");
+}
+
+TEST_CASE("sanitize_url_userinfo strips a dot-leading pseudo-scheme (CDX-01)",
+          "[settings][settings_model][security]") {
+    CHECK(sm::sanitize_url_userinfo(".bad://evil@host:1/db") == "host:1/db");
+}
+
+TEST_CASE("sanitize_url_userinfo still recognizes an ordinary ALPHA-first scheme "
+          "(CDX-01 regression guard)",
+          "[settings][settings_model][security]") {
+    // The ALPHA-first fix must not regress the ordinary case: a real
+    // scheme name may still contain digits after its first letter.
+    CHECK(sm::sanitize_url_userinfo("s3proxy2://admin:s3cr3t@host:9000/db") ==
+          "s3proxy2://host:9000/db");
+}
+
 // ── build_analytics_settings — the security-fix regression coverage ─────
 
 TEST_CASE("build_analytics_settings sanitizes the ClickHouse URL and never emits the raw password",

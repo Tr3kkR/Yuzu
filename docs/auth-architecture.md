@@ -2635,29 +2635,47 @@ the separate `clickhouse_password` field — a URL with embedded userinfo creden
 (`clickhouse://user:pass@host:9000/db`) leaked the credential regardless. The shared builder now
 strips URL userinfo unconditionally (`settings_model::sanitize_url_userinfo`) before either surface
 ever sees it, and never reads the raw password into a response at all — only a
-`clickhouse_password_set` bool. Fix-round hardening (governance Gate 2-8, two rounds) found the
-initial strip itself incomplete: an unescaped `@`, `/`, or `?` inside the userinfo let part or all
-of a credential through, and a query-string credential form (`?password=...`, no `@` at all) was
-not modeled. A first attempt tried to locate the authority boundary (the path-starting `/`) and
-search for `@` only within it, widening past an embedded `/` via a "does this look like a
-`host[:port]`" heuristic — governance re-review found that unfixable (a digit-only password
-segment before the `/` is lexically identical to a real port, so the heuristic cannot tell them
-apart) and it shipped a regression on top of the bypass it was meant to close. `sanitize_url_userinfo`
-now finds the userinfo delimiter as simply the LAST `@` anywhere in the URL, with no boundary
-computation at all, and drops any query string or fragment afterward. This deliberately
-over-strips when the path itself contains a later, harmless `@` (`.../db@table` becomes
-`.../table`) — an accepted trade-off, since the alternative is a heuristic that can be fooled into
-leaving a real credential in place.
-**Not fully closed as of this writing**: two independent Gate 8b reviewers each found a
-DIFFERENT remaining bypass in this second design — a schemeless URL whose query string contains
-a nested `://` can fool scheme-boundary detection into skipping the strip entirely, and a query
-string that itself contains an `@` can make the query-strip (which runs against the
-already-userinfo-stripped string) miss its own delimiter and leave a password fragment exposed.
-Both are recorded `open`, HIGH/BLOCKING, in the governance ledger
-(`governance.d/4028-settings-read-twins.BAbeot.jsonl`) rather than fixed — the session reached its
-fix-round cap after two full redesigns of this function each surfaced new bypasses on review, and
-judged a third rushed patch higher-risk than stopping to flag it for deliberate, unhurried review.
-Treat this sanitizer as materially improved over the pre-#4028 state, not as fully hardened.
+`clickhouse_password_set` bool. Fix-round hardening (governance Gate 2-8, three rounds, plus two
+external adversarial-review passes, `/home/dgr/advrev-4028`) found the initial strip itself
+incomplete: an unescaped `@`, `/`, or `?` inside the userinfo let part or all of a credential
+through, and a query-string credential form (`?password=...`, no `@` at all) was not modeled. A
+first attempt tried to locate the authority boundary (the path-starting `/`) and search for `@`
+only within it, widening past an embedded `/` via a "does this look like a `host[:port]`"
+heuristic — governance re-review found that unfixable (a digit-only password segment before the
+`/` is lexically identical to a real port, so the heuristic cannot tell them apart) and it shipped
+a regression on top of the bypass it was meant to close. A second design deleted that heuristic
+entirely — the userinfo delimiter became simply the LAST `@` anywhere in the URL, with the query
+string or fragment dropped afterward — which deliberately over-strips when the path itself
+contains a later, harmless `@` (`.../db@table` becomes `.../table`), an accepted trade-off since
+the alternative is a heuristic that can be fooled into leaving a real credential in place. That
+second design itself shipped with two further bypasses an adversarial-review round found: a
+schemeless URL whose query string contains a nested `://` could fool scheme-boundary detection
+into skipping the strip entirely, and a query string that itself contains an `@` could make the
+query-strip (which ran against the already-userinfo-stripped string) miss its own delimiter and
+leave a password fragment exposed.
+
+**Current (third) design closes both, plus one further gap the fix itself introduced.**
+`sanitize_url_userinfo` bounds the scheme scan to a genuine RFC 3986 §3.1 grammar match
+(`ALPHA *(ALPHA/DIGIT/"+"/"-"/".")` immediately followed by `"://"`, evaluated from position 0
+only — never an unbounded search), and computes both the userinfo-ending `@` and the
+query/fragment-start cut points against the ORIGINAL string, unioning the two removal ranges
+rather than mutating sequentially; when the two ranges overlap (an inherently ambiguous shape —
+a real `?`-corrupted password vs. no userinfo at all with the query containing its own `@`), it
+over-strips to the scheme prefix, the same conservative resolution the design already applies
+elsewhere. A subsequent adversarial-review round of this exact fix (finding CDX-01) found the
+scheme scan itself accepted a DIGIT (or `+`/`-`/`.`) as the *first* scheme byte, contrary to RFC
+3986's ALPHA-first requirement — a schemeless credential URL whose "username" happened to be
+scheme-shaped and digit-led (e.g. `9name://pass@host:9000/db`) had that digit-led prefix wrongly
+preserved as if it were a real scheme. Requiring the first scheme byte be a letter closed this.
+All three findings (`g8b-sanitizer-scheme-boundary`, `g8b-sanitizer-query-at-ordering`, and
+CDX-01) are closed and verified — compiled, linked against the real object, and exercised against
+every adversarial shape either external reviewer or this fix round constructed, including a
+2,000,000-case fuzz run under ASan/UBSan. Regression tests for all three shapes live in
+`tests/unit/server/test_settings_model.cpp`. Treat this sanitizer as a hand-rolled, adversarially
+verified deny-list transform, not an RFC-3986-conformant parser — it has been through four design
+iterations and three rounds of independent review specifically because ad hoc string surgery on
+URLs is a narrow, easy-to-misjudge problem; a future editor changing this function should read its
+full round-by-round history in `settings_model.cpp`'s header comment before touching it again.
 
 ## On-behalf-of assertions rejected (ADR-1005 Interim rules)
 

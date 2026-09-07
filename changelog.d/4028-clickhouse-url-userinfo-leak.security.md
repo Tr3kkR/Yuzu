@@ -23,4 +23,9 @@
   happens to contain a literal `@` (e.g. `.../db@table` now becomes `.../table`), and — new in this
   round — a URL where a `?`/`#` appears at or before the apparent userinfo-ending `@` now drops
   everything past the scheme (that shape is lexically indistinguishable from a query string that
-  itself contains a later `@`, so it is resolved the same conservative way).
+  itself contains a later `@`, so it is resolved the same conservative way). A follow-up
+  adversarial-review pass on this exact fix then found the scheme scan itself accepted a
+  digit/`+`/`-`/`.` as the first scheme byte instead of requiring RFC 3986's mandatory leading
+  letter, so a schemeless credential URL whose "username" happened to be scheme-shaped and
+  digit-led (e.g. `9name://pass@host:9000/db`) had that prefix wrongly preserved — closed by
+  requiring the scheme scan's first byte be alphabetic.

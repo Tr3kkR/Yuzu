@@ -75,15 +75,41 @@ std::string sanitize_url_userinfo(std::string_view url) {
     //         so -- consistent with round 2's own over-strip philosophy --
     //         the only string-safe resolution is to drop everything from
     //         the authority boundary to the end of the string.
+    //
+    //   Round 3's own scheme scan shipped one further defect (CDX-01, found
+    //   by adversarial review of round 3 itself, /home/dgr/advrev-4028):
+    //   it accepted a DIGIT (or '+'/'-'/'.') as the FIRST scheme byte,
+    //   contrary to the RFC 3986 grammar it claimed to implement (scheme
+    //   requires ALPHA first). A schemeless credential URL whose "username"
+    //   happens to be scheme-shaped and digit-led -- e.g.
+    //   "9name://pass@host:9000/db" -- was wrongly granted a scheme match,
+    //   preserving "9name" verbatim in the output. Closed in the scan below
+    //   by requiring the first byte be ALPHA before scanning the rest.
     std::size_t authority_start = 0;
     {
+        // RFC 3986 §3.1: scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )
+        // -- the FIRST byte must be a letter; only later bytes may also be a
+        // digit or +/-/.. Adversarial-review finding CDX-01: an earlier
+        // version of this scan accepted an alnum-led run (`std::isalnum` at
+        // byte 0 too), so a digit-, '+'-, '-'-, or '.'-leading run
+        // immediately followed by "://" was wrongly treated as a scheme --
+        // e.g. "9name://pass@host:9000/db" (a schemeless credential URL
+        // whose "username" happens to look scheme-shaped) had "9name"
+        // preserved verbatim in the output instead of being swept up as
+        // userinfo. Requiring ALPHA at byte 0 closes this: such input now
+        // correctly finds no scheme, `authority_start` stays 0, and the
+        // whole "9name" prefix is stripped along with the rest of the
+        // userinfo.
         std::size_t i = 0;
-        while (i < url.size() && (std::isalnum(static_cast<unsigned char>(url[i])) ||
-                                  url[i] == '+' || url[i] == '-' || url[i] == '.')) {
+        if (i < url.size() && std::isalpha(static_cast<unsigned char>(url[i]))) {
             ++i;
+            while (i < url.size() && (std::isalnum(static_cast<unsigned char>(url[i])) ||
+                                      url[i] == '+' || url[i] == '-' || url[i] == '.')) {
+                ++i;
+            }
+            if (url.substr(i, 3) == "://")
+                authority_start = i + 3;
         }
-        if (i > 0 && url.substr(i, 3) == "://")
-            authority_start = i + 3;
     }
 
     const auto at_pos = url.find_last_of('@');
