@@ -11,15 +11,16 @@
 //     through the `add_store` seam with recording/throwing/failing fakes (no
 //     database needed);
 //   * a real-store fan-out ([pg][decommission][software_licensing]) — populate
-//     all five stores (all born-on-PG), decommission one agent, and assert its
-//     rows are gone from EVERY store while a bystander survives, with the new
-//     software_licensing store included.
+//     all six stores (all born-on-PG), decommission one agent, and assert its
+//     rows are gone from EVERY store while a bystander survives, including the
+//     app_usage store (Forensics; Wave 7 PR7.2).
 
 #include <catch2/catch_test_macros.hpp>
 
 #include "agent_decommission.hpp"
 
 #include "app_perf_daily_store.hpp"
+#include "app_usage_store.hpp"
 #include "device_inventory_store.hpp"
 #include "inventory_ingest_outcome.hpp"
 #include "inventory_store.hpp"
@@ -241,12 +242,12 @@ TEST_CASE("AgentDecommission null-store constructor registers every store as Ski
     // The all-null construction (a deployment that configured no per-agent
     // stores) fans to nothing but still audits one line per store.
     AgentDecommission cascade{AgentDecommissionStores{}};
-    CHECK(cascade.target_count() == 5); // inventory + 4 typed projections
+    CHECK(cascade.target_count() == 6); // inventory + 4 typed projections + app_usage
 
     const auto result = cascade.decommission("agent-x");
     CHECK(result.deleted == 0);
     CHECK(result.failed == 0);
-    CHECK(result.skipped == 5);
+    CHECK(result.skipped == 6);
     // The Decision-11 store is present in the audit even when unconfigured.
     const auto* sl = find_store(result, "software_licensing");
     REQUIRE(sl != nullptr);
@@ -323,7 +324,9 @@ void seed_agent(const std::string& agent_id, yuzu::server::InventoryStore& inv,
                 yuzu::server::SoftwareInventoryStore& soft,
                 yuzu::server::AppPerfDailyStore& perf,
                 yuzu::server::DeviceInventoryStore& dev,
-                yuzu::server::SoftwareLicensingStore& lic) {
+                yuzu::server::SoftwareLicensingStore& lic,
+                yuzu::server::AppUsageStore& usage) {
+    using yuzu::server::AgentLastUsedRow;
     using yuzu::server::AgentLicenseRow;
     using yuzu::server::AppPerfDailyRow;
     using yuzu::server::DeviceCiRecord;
@@ -368,6 +371,17 @@ void seed_agent(const std::string& agent_id, yuzu::server::InventoryStore& inv,
     lr.user_scope = "user";
     lr.user_ref = "a1b2c3d4e5f60718"; // keyed-HMAC pseudonym — personal data (Recital 26)
     REQUIRE(lic.replace_agent_licenses(agent_id, {lr}, "lichash-" + agent_id, "hash"));
+
+    // App-usage last-used projection (Forensics; Wave 7 PR7.2) — the sixth store.
+    AgentLastUsedRow ur;
+    ur.exe_key = "chrome.exe";
+    ur.first_seen = 1000;
+    ur.last_seen = 2000;
+    ur.run_count_30d = 5;
+    ur.total_seconds_30d = 300;
+    ur.collected_at = 2000;
+    REQUIRE(usage.replace_agent_last_used(agent_id, {ur}, "usagehash-" + agent_id));
+    REQUIRE(usage.touch(agent_id));
 }
 
 } // namespace
@@ -385,15 +399,17 @@ TEST_CASE("AgentDecommission erases an agent from every real store; a bystander 
     yuzu::server::AppPerfDailyStore app_perf_daily{pool};
     yuzu::server::DeviceInventoryStore device_inventory{pool};
     yuzu::server::SoftwareLicensingStore software_licensing{pool};
+    yuzu::server::AppUsageStore app_usage{pool};
     REQUIRE(software_inventory.is_open());
     REQUIRE(app_perf_daily.is_open());
     REQUIRE(device_inventory.is_open());
     REQUIRE(software_licensing.is_open());
+    REQUIRE(app_usage.is_open());
 
     seed_agent("agent-del", inventory, software_inventory, app_perf_daily, device_inventory,
-               software_licensing);
+               software_licensing, app_usage);
     seed_agent("agent-bystander", inventory, software_inventory, app_perf_daily, device_inventory,
-               software_licensing);
+               software_licensing, app_usage);
 
     AgentDecommission cascade{AgentDecommissionStores{
         .inventory = &inventory,
@@ -401,18 +417,22 @@ TEST_CASE("AgentDecommission erases an agent from every real store; a bystander 
         .app_perf_daily = &app_perf_daily,
         .device_inventory = &device_inventory,
         .software_licensing = &software_licensing,
+        .app_usage = &app_usage,
     }};
 
     const auto result = cascade.decommission("agent-del");
 
-    // One decommission call fanned to all five stores, all Deleted.
-    CHECK(result.deleted == 5);
+    // One decommission call fanned to all six stores, all Deleted.
+    CHECK(result.deleted == 6);
     CHECK(result.skipped == 0);
     CHECK(result.failed == 0);
     CHECK(result.ok());
     const auto* sl = find_store(result, "software_licensing");
     REQUIRE(sl != nullptr);
-    CHECK(sl->outcome == DecommissionOutcome::Deleted); // the new SLE store IS included
+    CHECK(sl->outcome == DecommissionOutcome::Deleted); // the SLE store IS included
+    const auto* au = find_store(result, "app_usage");
+    REQUIRE(au != nullptr);
+    CHECK(au->outcome == DecommissionOutcome::Deleted); // the app-usage store IS included
 
     // agent-del is gone from EVERY store.
     auto inv_del = inventory.get_agent_inventory("agent-del");
@@ -438,6 +458,13 @@ TEST_CASE("AgentDecommission erases an agent from every real store; a bystander 
     REQUIRE(lic_hash.has_value());
     CHECK_FALSE(lic_hash->has_value()); // state row gone
 
+    auto usage_del = app_usage.get_agent_last_used("agent-del");
+    REQUIRE(usage_del.has_value());
+    CHECK(usage_del->empty());
+    auto usage_hash = app_usage.stored_hash("agent-del");
+    REQUIRE(usage_hash.has_value());
+    CHECK_FALSE(usage_hash->has_value()); // state row gone (both tables, one txn — P23)
+
     // The bystander is untouched in EVERY store (agent-scoped deletes).
     auto inv_by = inventory.get_agent_inventory("agent-bystander");
     REQUIRE(inv_by.has_value());
@@ -458,6 +485,10 @@ TEST_CASE("AgentDecommission erases an agent from every real store; a bystander 
     auto lic_by = software_licensing.agent_licenses("agent-bystander");
     REQUIRE(lic_by.has_value());
     CHECK(lic_by->size() == 1);
+
+    auto usage_by = app_usage.get_agent_last_used("agent-bystander");
+    REQUIRE(usage_by.has_value());
+    CHECK(usage_by->size() == 1);
 }
 
 TEST_CASE("AgentDecommission over real stores skips an unconfigured store, still erases the rest",
@@ -485,7 +516,7 @@ TEST_CASE("AgentDecommission over real stores skips an unconfigured store, still
 
     const auto result = cascade.decommission("agent-del");
     CHECK(result.deleted == 1);
-    CHECK(result.skipped == 4);
+    CHECK(result.skipped == 5);
     CHECK(result.failed == 0);
     CHECK(result.ok());
 
@@ -496,35 +527,36 @@ TEST_CASE("AgentDecommission over real stores skips an unconfigured store, still
 
 // ─────────────────────────── DRIFT GUARD (the root cause) ───────────────────────
 //
-// The erasure route's authorization gate is a CONJUNCTION over the securables the
-// cascade erases THROUGH — today SoftwareLicensing + Inventory + GuaranteedState
-// (sle_routes.cpp). That gate is hand-maintained, and NOTHING structurally ties it
-// to this store list: the first cut of the conjunction shipped covering four of the
-// five stores because `app_perf_daily` (GuaranteedState, DEX behavioural PII) was
-// silently unaccounted for, while the docs asserted "full blast radius".
+// The erasure route's authorization gate is now the single, fixed securable
+// `Decommission:Delete` (ADR-0024 Decision 9, amended Wave 7 PR7.2) — it no longer
+// changes as stores are added, which is the whole point of the promotion (the
+// hand-maintained conjunction it replaced stopped scaling the moment a fourth
+// securable, Forensics via AppUsageStore, joined the cascade — the repo's own STOP
+// rule). But the securable being fixed does NOT mean the blast radius is: adding a
+// store still widens what ONE Decommission:Delete grant destroys, so this test
+// ties the store list to the documented radius instead of to a conjunction.
 //
 // This test is the tie. It fails the moment a store joins AgentDecommissionStores,
-// forcing whoever adds it to answer: WHICH SECURABLE GOVERNS THE NEW STORE'S DATA,
-// and is that securable's Delete in the DELETE route's conjunction?
+// forcing whoever adds it to answer: is the new store's governing securable's READ
+// listed in the blast-radius docs (sle_routes.hpp/.cpp, rest_api_v1.cpp's delete
+// block, ADR-0024 Decisions 9/11, rest-api.md)?
 //
 // If you are here because this test failed:
-//   1. Add the new store's governing securable to the conjunction in sle_routes.cpp
-//      (unless an existing conjunct already governs it — say which, in a comment).
-//   2. Update kCascadeStoreCount below, and the enumerations in sle_routes.hpp,
+//   1. Update kCascadeStoreCount below.
+//   2. Add the store to the blast-radius lists in sle_routes.hpp/.cpp,
 //      agent_decommission.hpp, the OpenAPI `delete` block in rest_api_v1.cpp, and
-//      ADR-0024 Decisions 9/11.
-//   3. If the conjunction reaches a FOURTH securable, stop and promote it to the
-//      device-level `Decommission` securable ADR-0024 Decision 9 records as the
-//      rejected-for-now option — at that width the conjunction is the wrong shape.
-TEST_CASE("decommission cascade: store list is pinned to the DELETE route's authz gate",
+//      ADR-0024 Decisions 9/11 — naming the securable that governs its READ.
+//   3. The gate itself (`Decommission:Delete`) does NOT change — that is the
+//      reversal this promotion delivered.
+TEST_CASE("decommission cascade: store list is pinned to the DELETE route's documented radius",
           "[decommission][authz]") {
     // Every store null → all registered targets report Skipped, so target_count()
     // is the cascade's registered-store count without needing a live store.
     AgentDecommission cascade{AgentDecommissionStores{}};
 
-    constexpr std::size_t kCascadeStoreCount = 5; // inventory, software_inventory,
+    constexpr std::size_t kCascadeStoreCount = 6; // inventory, software_inventory,
                                                   // app_perf_daily, device_inventory,
-                                                  // software_licensing
+                                                  // software_licensing, app_usage
     CHECK(cascade.target_count() == kCascadeStoreCount);
 
     const auto result = cascade.decommission("agent-x");

@@ -6,6 +6,7 @@
 #include <spdlog/spdlog.h>
 
 #include "app_perf_daily_store.hpp"
+#include "app_usage_store.hpp"
 #include "device_inventory_store.hpp"
 #include "inventory_store.hpp"
 #include "software_inventory_store.hpp"
@@ -63,6 +64,15 @@ AgentDecommission::AgentDecommission(const AgentDecommissionStores& stores) {
     targets_.push_back({"software_licensing",
                         stores.software_licensing
                             ? Fn([p = stores.software_licensing](std::string_view id) {
+                                  return p->delete_agent(id);
+                              })
+                            : nullptr});
+    // Appended last (fixed order — every existing ordered result stays stable).
+    // Forensics-governed (P0); its two-table single-txn delete (P23) means it can
+    // never be half-erased inside one attempt.
+    targets_.push_back({"app_usage",
+                        stores.app_usage
+                            ? Fn([p = stores.app_usage](std::string_view id) {
                                   return p->delete_agent(id);
                               })
                             : nullptr});

@@ -166,9 +166,11 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        Only the erasure verb is REST-only; this is not a capability-wide
        twin gap.
      - **The exception relaxes no control.** The REST route keeps the
-       per-device-scoped `SoftwareLicensing:Delete` **and** `Inventory:Delete`
-       **and** `GuaranteedState:Delete` conjunction (the cascade erases through
-       all three securables, so it authorizes for all three),
+       per-device-scoped `Decommission:Delete` securable (ADR-0024
+       Decision 9, amended Wave 7 PR7.2 — one grant authorizing for the
+       cascade's whole blast radius, in place of the earlier
+       `SoftwareLicensing:Delete`/`Inventory:Delete`/`GuaranteedState:Delete`
+       conjunction),
        audit-before-erase that **fails closed** (an
        attempt row that cannot persist means no erasure — an unaudited
        erasure would destroy its own evidence), and truthful per-store

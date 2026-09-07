@@ -8520,13 +8520,13 @@ public:
     /// skipped.
     ///
     /// PRODUCTION TRIGGER — LIVE: the operator decommission surface that calls this
-    /// is `DELETE /api/v1/sle/agents/{id}` (sle_routes.cpp), gated on a SCOPED
-    /// CONJUNCTION over every securable the cascade erases through —
-    /// `SoftwareLicensing:Delete` AND `Inventory:Delete` AND `GuaranteedState:Delete`
-    /// (app_perf_daily is DEX behavioural PII) — plus audit-before-erase fail-closed
-    /// (Decision 11). ADDING A STORE BELOW? Add its governing securable's Delete to
-    /// that conjunction too; the drift guard in test_agent_decommission.cpp fails
-    /// until you do.
+    /// is `DELETE /api/v1/sle/agents/{id}` (sle_routes.cpp), gated on ONE scoped
+    /// securable, `Decommission:Delete` (ADR-0024 Decision 9, amended Wave 7
+    /// PR7.2) — a device-level erasure grant covering the cascade's whole blast
+    /// radius — plus audit-before-erase fail-closed (Decision 11). ADDING A STORE
+    /// BELOW? Add it to `AgentDecommissionStores`, `agent_decommission.cpp`'s
+    /// registration list, and `kCascadeStoreCount` — the securable no longer
+    /// changes.
     /// Today's OTHER agent-removal paths (registry session teardown, enrollment
     /// deny/remove, cert revocation) are non-durable-data by design and deliberately
     /// do NOT auto-erase (a revoked-for-compromise agent's forensic rows must
@@ -8538,6 +8538,7 @@ public:
             .app_perf_daily = app_perf_daily_store_.get(),
             .device_inventory = device_inventory_store_.get(),
             .software_licensing = software_licensing_store_.get(),
+            .app_usage = app_usage_store_.get(),
         }};
         return cascade.decommission(agent_id);
     }

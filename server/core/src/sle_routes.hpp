@@ -25,23 +25,30 @@
 ///     convention) and FAILS CLOSED (503 + `Sec-Audit-Failed`) when the access-audit
 ///     row cannot persist.
 ///   * `/sle/agents/{agent_id}` (DELETE) — the audited durable-erasure trigger
-///     (ADR-0024 Decision 11): SCOPED `SoftwareLicensing:Delete` **AND** SCOPED
-///     `Inventory:Delete` — a CONJUNCTION, because the cascade's blast radius is
-///     wider than its name. It erases five per-agent stores, and three of them
-///     (`InventoryStore`, `SoftwareInventoryStore`, `DeviceInventoryStore`) are
-///     ADR-0016 stores governed by the `Inventory` securable, not by
-///     `SoftwareLicensing`. Gating on the licensing securable alone would let a
-///     custom role holding `SoftwareLicensing:Delete` WITHOUT `Inventory:Delete`
-///     erase inventory data it cannot otherwise touch — latent under the seeded
-///     matrix (Administrator + ITServiceOwner hold full CRUD on both), but RBAC is
-///     operator-editable, so the conjunction is the fail-closed posture. Both checks
-///     are per-device scoped, so a group-confined holder cannot erase out of scope.
-///     AUDIT-BEFORE-ERASE fail-closed (`sle.agent.decommission|attempt`), then the
-///     per-store outcome (`success`/`partial`). Because each store's `delete_agent`
-///     now returns committed status (`[[nodiscard]] bool`, false → `Failed`, #1947),
-///     `DecommissionResult` is honest — `r.ok()` means every store's DELETE
-///     committed, a `Failed` store yields 500 (the cascade is idempotent; re-issue
-///     the DELETE).
+///     (ADR-0024 Decision 9, amended Wave 7 PR7.2; Decision 11): ONE SCOPED
+///     securable, `Decommission:Delete` — a device-level erasure grant that
+///     authorizes for the cascade's WHOLE blast radius, not the individual
+///     securables that govern each store's READ. It erases SIX per-agent stores:
+///     `InventoryStore`, `SoftwareInventoryStore`, `DeviceInventoryStore` (ADR-0016,
+///     read-gated by `Inventory`), `AppPerfDailyStore` (DEX behavioural PII,
+///     read-gated by `GuaranteedState`), `SoftwareLicensingStore` (read-gated by
+///     `SoftwareLicensing`), and `AppUsageStore` (read-gated by `Forensics`, P0/Wave
+///     7). This was originally a hand-maintained conjunction over the per-store
+///     securables (rejected as of Decision 9's reversal — see the ADR): it stopped
+///     scaling once a fourth securable (`Forensics`, via `AppUsageStore`) joined the
+///     cascade, per the repo's own STOP rule. Compat: the seeded matrix is
+///     unchanged (Administrator + ITServiceOwner keep the ability with no
+///     migration, via `seed_defaults()`); an operator-authored custom role that had
+///     assembled the old per-store Delete grants is refused (403 naming
+///     `Decommission:Delete`) until granted the new securable — breaking by design.
+///     The old per-store Delete grants are NOT revoked and keep gating their own
+///     stores' other routes. Scoped, so a group-confined holder cannot erase out of
+///     scope. AUDIT-BEFORE-ERASE fail-closed (`sle.agent.decommission|attempt`),
+///     then the per-store outcome (`success`/`partial`). Because each store's
+///     `delete_agent` now returns committed status (`[[nodiscard]] bool`, false →
+///     `Failed`, #1947), `DecommissionResult` is honest — `r.ok()` means every
+///     store's DELETE committed, a `Failed` store yields 500 (the cascade is
+///     idempotent; re-issue the DELETE).
 ///
 /// FAIL-CLOSED GATE (ADR-0024 Decision 10): server.cpp builds `scoped_perm_fn` on
 /// the `rbac_enforcement_in_effect()` primitive, NOT the raw `is_rbac_enabled()`
