@@ -36,11 +36,16 @@ diverge across replicas. **WS-7 (HA Postgres) is NOT in this set** — it gates 
 SPOF / RPO=0), not the second *server* replica (which is safe against a single Postgres). The
 "Gates 2nd replica?" column below encodes this per row.
 
-## Is the presentation/core split a prerequisite? — CLOSED: no, decoupled (2026-09-07)
+## Is the presentation/core split a prerequisite? — PROVISIONALLY decoupled, pending ADR-1005-owner ratification (2026-09-07)
 
-- **Resolution:** monolith active-active is the target; the presentation/core split is a **parallel
-  programme, not a gate** for a 2nd replica. The single in-process thing that can't go active-active
-  (the direct agent `Subscribe` stream) is solved by **gateway-fronting (WS-4)**, not the split.
+- **Working position (NOT yet owner-ratified):** monolith active-active is the target; the
+  presentation/core split is a **parallel programme, not a gate** for a 2nd replica. The single
+  in-process thing that can't go active-active (the direct agent `Subscribe` stream) is solved by
+  **gateway-fronting (WS-4)**, not the split. **This is not final** — the position was reached by a
+  self-run three-model review and ratified in planning, but **the ADR-1005 owner (Dave Rae) has not
+  ratified it.** Until they do (tracked as WS-0 in the split matrix), treat as *provisionally
+  decoupled*: Phase-B HA work proceeds on the monolith track, but if the owner rules the split is a
+  prerequisite, Phase B reshuffles onto it.
 - **Kimi's dissent (recorded, rebutted):** Kimi called the split a hard safety prerequisite. Every
   safety property it could mean — singleton double-dispatch (WS-3), in-memory sessions (WS-1a, **done**),
   stream routing (WS-4) — is closed in the monolith. What the split buys is presentation scale-out +
@@ -88,7 +93,8 @@ Prio is build-effort; the **safe-to-scale gate** above is the real constraint. P
 2. **Phase B — Multi-instance safety mechanisms (ALL required before a 2nd replica):**
    `WS-3` (fenced leader), `WS-4` (gateway routing), `WS-5` (presence), `WS-6` (PKI), `WS-8`-readyz,
    `WS-13` (agent gateway-front rollout, for gateway-fronted fleets). **Confirm the split question
-   before starting** (see above).
+   with the ADR-1005 owner (Dave Rae) before starting** — §1c is *provisionally* decoupled, not yet
+   ratified (see above).
 3. **Phase C — Enable, validate, operate:**
    flip on the second replica; `WS-9` runs continuously throughout B/C; `WS-11` (observability) ships
    *with* the second replica; `WS-12` (cutover/DR), `WS-14` (security/capacity). `WS-2b` (spine) and
