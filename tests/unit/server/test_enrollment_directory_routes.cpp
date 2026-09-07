@@ -35,6 +35,7 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -61,6 +62,7 @@ struct EnrollmentDirectoryRouteHarness {
     auth::AutoApproveEngine auto_approve;
     auth::AuthManager auth_mgr;
     Config cfg;
+    std::shared_mutex oidc_mu;
     DirectorySync* directory_sync{nullptr};
 
     bool perm_grant{true};
@@ -96,7 +98,7 @@ struct EnrollmentDirectoryRouteHarness {
         };
 
         routes.register_routes(sink, auth_fn, perm_fn, audit_fn, directory_sync, &auto_approve,
-                               &auth_mgr, &cfg);
+                               &auth_mgr, &cfg, oidc_mu);
     }
 };
 
@@ -252,7 +254,8 @@ TEST_CASE("REST enrollment/directory: auto-approve-rules 503s when the engine is
                        const std::string&, const std::string&, const std::string&) {
         return true;
     };
-    routes2.register_routes(sink2, auth_fn, perm_fn, audit_fn, nullptr, nullptr, nullptr, &h.cfg);
+    routes2.register_routes(sink2, auth_fn, perm_fn, audit_fn, nullptr, nullptr, nullptr, &h.cfg,
+                            h.oidc_mu);
     auto res = sink2.Get("/api/v1/enrollment/auto-approve-rules");
     REQUIRE(res);
     CHECK(res->status == 503);
@@ -272,7 +275,8 @@ TEST_CASE("REST enrollment/directory: pending-agents 503s when auth_mgr is null 
                        const std::string&, const std::string&, const std::string&) {
         return true;
     };
-    routes2.register_routes(sink2, auth_fn, perm_fn, audit_fn, nullptr, nullptr, nullptr, &h.cfg);
+    routes2.register_routes(sink2, auth_fn, perm_fn, audit_fn, nullptr, nullptr, nullptr, &h.cfg,
+                            h.oidc_mu);
     auto res = sink2.Get("/api/v1/enrollment/pending-agents");
     REQUIRE(res);
     CHECK(res->status == 503);
@@ -293,7 +297,7 @@ TEST_CASE("REST enrollment/directory: settings/oidc 503s when cfg is null "
         return true;
     };
     routes2.register_routes(sink2, auth_fn, perm_fn, audit_fn, nullptr, &h.auto_approve,
-                            &h.auth_mgr, nullptr);
+                            &h.auth_mgr, nullptr, h.oidc_mu);
     auto res = sink2.Get("/api/v1/settings/oidc");
     REQUIRE(res);
     CHECK(res->status == 503);
@@ -435,7 +439,7 @@ TEST_CASE("REST enrollment/directory[pg]: directory/users returns an empty list 
         return true;
     };
     routes2.register_routes(sink2, auth_fn, perm_fn, audit_fn, ds.get(), &h.auto_approve,
-                            &h.auth_mgr, &h.cfg);
+                            &h.auth_mgr, &h.cfg, h.oidc_mu);
 
     auto res = sink2.Get("/api/v1/directory/users");
     REQUIRE(res);
@@ -467,8 +471,9 @@ TEST_CASE("REST enrollment/directory[pg]: directory/users fails closed (503) whe
     auth::AutoApproveEngine auto_approve;
     auth::AuthManager auth_mgr;
     Config cfg;
+    std::shared_mutex oidc_mu;
     routes2.register_routes(sink2, auth_fn, perm_fn, audit_fn, ds.get(), &auto_approve,
-                            &auth_mgr, &cfg);
+                            &auth_mgr, &cfg, oidc_mu);
 
     auto res = sink2.Get("/api/v1/directory/users");
     REQUIRE(res);
@@ -495,7 +500,7 @@ TEST_CASE("REST enrollment/directory[pg]: directory/status returns provider/stat
         return true;
     };
     routes2.register_routes(sink2, auth_fn, perm_fn, audit_fn, ds.get(), &h.auto_approve,
-                            &h.auth_mgr, &h.cfg);
+                            &h.auth_mgr, &h.cfg, h.oidc_mu);
 
     auto res = sink2.Get("/api/v1/directory/status");
     REQUIRE(res);

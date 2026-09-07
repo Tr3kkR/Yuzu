@@ -47,6 +47,7 @@
 
 #include <functional>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 
 namespace yuzu::server {
@@ -72,16 +73,27 @@ public:
 
     /// Production entry point — wraps `svr` in HttplibRouteSink and delegates
     /// to the testable overload below (mirrors DiscoveryRoutes/DexRoutes).
+    ///
+    /// `oidc_mu` guards `cfg`'s `oidc_*` fields (SettingsRoutes' POST
+    /// /api/settings/oidc handler takes `std::unique_lock(*oidc_mu_)` before
+    /// reassigning them, settings_routes.cpp) — this class's GET
+    /// /api/v1/settings/oidc handler takes `std::shared_lock` on the SAME
+    /// mutex before reading them (Gate 5 chaos-injector finding, #4031
+    /// hardening round: the original handler read these plain
+    /// `std::string` fields with zero synchronization, a genuine data race
+    /// under concurrent read/write — not merely a "no lock exists" gap,
+    /// since ServerImpl already owns and threads this exact mutex into
+    /// SettingsRoutes/AuthRoutes for this exact purpose).
     void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
                          DirectorySync* directory_sync, auth::AutoApproveEngine* auto_approve,
-                         auth::AuthManager* auth_mgr, Config* cfg);
+                         auth::AuthManager* auth_mgr, Config* cfg, std::shared_mutex& oidc_mu);
 
     /// HttpRouteSink overload — used by tests to register routes against an
     /// in-process TestRouteSink and dispatch synthesised requests directly
     /// (no httplib::Server acceptor thread, the #438 TSan trap).
     void register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
                          DirectorySync* directory_sync, auth::AutoApproveEngine* auto_approve,
-                         auth::AuthManager* auth_mgr, Config* cfg);
+                         auth::AuthManager* auth_mgr, Config* cfg, std::shared_mutex& oidc_mu);
 };
 
 } // namespace yuzu::server

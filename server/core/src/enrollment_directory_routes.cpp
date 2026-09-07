@@ -42,17 +42,19 @@ void EnrollmentDirectoryRoutes::register_routes(httplib::Server& svr, AuthFn aut
                                                 PermFn perm_fn, AuditFn audit_fn,
                                                 DirectorySync* directory_sync,
                                                 auth::AutoApproveEngine* auto_approve,
-                                                auth::AuthManager* auth_mgr, Config* cfg) {
+                                                auth::AuthManager* auth_mgr, Config* cfg,
+                                                std::shared_mutex& oidc_mu) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
-                    directory_sync, auto_approve, auth_mgr, cfg);
+                    directory_sync, auto_approve, auth_mgr, cfg, oidc_mu);
 }
 
 void EnrollmentDirectoryRoutes::register_routes(HttpRouteSink& sink, AuthFn /*auth_fn*/,
                                                 PermFn perm_fn, AuditFn audit_fn,
                                                 DirectorySync* directory_sync,
                                                 auth::AutoApproveEngine* auto_approve,
-                                                auth::AuthManager* auth_mgr, Config* cfg) {
+                                                auth::AuthManager* auth_mgr, Config* cfg,
+                                                std::shared_mutex& oidc_mu) {
     // ── GET /api/v1/directory/users — Directory:Read ────────────────────
     // Genuinely PII (email/UPN/group membership) — REST fails CLOSED on an
     // audit-persist failure (docs/api-twin-recipe.md §4), matching the
@@ -182,8 +184,19 @@ void EnrollmentDirectoryRoutes::register_routes(HttpRouteSink& sink, AuthFn /*au
     // client secret is never disclosed by oidc_config_json in the first
     // place (masked to a bool), so this route carries no secret-leak risk
     // an audit-failure posture would need to compensate for.
+    //
+    // Gate 5 chaos-injector finding (#4031 hardening round): the original
+    // handler read cfg->oidc_* (plain std::string fields) with ZERO
+    // synchronization while POST /api/settings/oidc
+    // (settings_routes.cpp:4092) takes std::unique_lock(*oidc_mu_) before
+    // reassigning the SAME fields -- a genuine data race under concurrent
+    // read/write, not a "no lock exists" gap (the mutex already exists and
+    // is threaded into SettingsRoutes/AuthRoutes for exactly this purpose;
+    // this route just wasn't given it). std::shared_lock here matches the
+    // writer's std::unique_lock on the same mutex.
     sink.Get("/api/v1/settings/oidc",
-            [perm_fn, audit_fn, cfg](const httplib::Request& req, httplib::Response& res) {
+            [perm_fn, audit_fn, cfg, &oidc_mu](const httplib::Request& req,
+                                               httplib::Response& res) {
                 if (!perm_fn(req, res, "OidcConfig", "Read"))
                     return;
                 if (!cfg) {
@@ -192,7 +205,12 @@ void EnrollmentDirectoryRoutes::register_routes(HttpRouteSink& sink, AuthFn /*au
                 }
                 (void)detail::try_persist_audit(audit_fn, req, "settings.oidc.view", "success",
                                                 "OidcConfig", "", "REST v1 OIDC config read");
-                res.set_content(ok_json(oidc_config_json(*cfg)), "application/json");
+                nlohmann::json data;
+                {
+                    std::shared_lock lock(oidc_mu);
+                    data = oidc_config_json(*cfg);
+                }
+                res.set_content(ok_json(data), "application/json");
             });
 }
 
