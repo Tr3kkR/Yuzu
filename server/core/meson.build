@@ -264,7 +264,8 @@ content_embed = custom_target(
 
 # Build-time embed of the curated CPE map (PR 3, ADR-0018). Lives under
 # content/cpe-map/ deliberately — embed_content.py above globs ONLY
-# content/{definitions,packs}/**/*.yaml, so this CSV is NOT swept into the
+# content/{definitions,packs}/**/*.yaml and content/plugin-docs/*.json, so
+# this CSV is NOT swept into the
 # Instruction-Engine bundle; it is embedded on its own as a std::string_view
 # (kCuratedCpeMap) that CpeIdentityResolver parses at construction.
 #
@@ -444,6 +445,7 @@ yuzu_server_core_lib = static_library(
     'src/quarantine_reapply.cpp',
     'src/quarantine_containment_reconciler.cpp',
     'src/result_set_store.cpp',
+    'src/result_set_routes.cpp',
     'src/result_set_matcher.cpp',
     'src/policy_store.cpp',
     'src/policy_evaluator.cpp',

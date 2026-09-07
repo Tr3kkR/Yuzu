@@ -922,6 +922,7 @@ if build_server
       'unit/server/test_page_routes.cpp',
       'unit/server/test_dashboard_api_routes.cpp',
       'unit/server/test_nvd_routes.cpp',
+      'unit/server/test_result_set_routes.cpp',
       'unit/server/test_agent_service_impl.cpp',
       'unit/server/test_analytics_event.cpp',
       'unit/server/test_agent_health_store.cpp',
@@ -2066,6 +2067,24 @@ test('capability gate consistency',
   timeout: 30,
 )
 
+# Plugin README standard (docs/plugin-readme-standard.md): unit tests of the
+# generator's pure functions, then the tree gate — README-existence ratchet,
+# section contract, generated fences/index/nav/manifests byte-match the
+# sources, every supported leg has a parseable capture with a current
+# leg-hash. Hermetic — parses sources, builds nothing.
+test('plugin doc-gen unit',
+  _python3_test,
+  args: [files('test_plugin_doc_gen.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+test('plugin readme gate',
+  _python3_test,
+  args: [files('test_plugin_readmes.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+
 # Prometheus alert-rule unit tests (#2553). The same script the docs-lint
 # workflow runs, so self-hosted legs and /test exercise the same code path CI
 # does -- WHEREVER A USABLE PROMTOOL IS PRESENT. No CI leg sets the opt-in below
@@ -2180,6 +2199,14 @@ if _bash_test.found()
   test('plugin-spawn lexical gate selftest',
     _bash_test,
     args: [files('../scripts/ci/check-plugin-spawn-lexical.sh'), '--selftest'],
+    suite: 'docs',
+    timeout: 60,
+  )
+  # docs/plugin-readme-standard.md rule 7 — the README touch rule's own
+  # fixture run (a fake `git` on PATH; no repository, no network).
+  test('plugin readme touch-rule selftest',
+    _bash_test,
+    args: [files('../scripts/ci/check-plugin-readme-touch.sh'), '--selftest'],
     suite: 'docs',
     timeout: 60,
   )
