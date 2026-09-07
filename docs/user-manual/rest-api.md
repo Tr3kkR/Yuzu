@@ -7678,7 +7678,8 @@ once the underlying condition clears.
 
 #### `POST /api/nvd/sync`
 
-Trigger a manual NVD database sync. Admin only. Runs asynchronously and returns immediately.
+Trigger a manual NVD database sync. Requires `Infrastructure:Execute` (held by Administrator
+and ITServiceOwner, not Administrator alone). Runs asynchronously and returns immediately.
 
 #### `POST /api/nvd/match`
 

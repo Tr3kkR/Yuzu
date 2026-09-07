@@ -1198,7 +1198,7 @@ Each rung is an independently-governed PR on `dev`, run through the full
        rarely throws (#2278). #2797 is the reconcile-side half split out of #2270 -
        #2270 itself closes only the strong-guarantee half, so closing #2270 does not
        discharge this gate.
-     - **#2818 gates PR-2 too.** The engine tears down a whole spark key
+     - **#2818 gated PR-2 too, now FIXED (PR-2d).** At the time this was written, the engine tore down a whole spark key
        (`SparkEngine::drop_key_locked`) while `GuardianSparkRuntime` arms one shared
        subscription per key on the 0->1 edge (`guardian_spark_runtime.cpp:159-166`),
        and nothing tells the consumer its subscription died: Guardian goes on

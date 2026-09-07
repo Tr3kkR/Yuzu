@@ -458,6 +458,7 @@ yuzu_server_core_lib = static_library(
     'src/dex_alert_router.cpp',
     'src/dex_blast_radius.cpp',
     'src/custom_properties_store.cpp',
+    'src/custom_properties_routes.cpp',
     'src/mcp_server.cpp',
     'src/mcp_input_schema.cpp',
     'src/mcp_orientation.cpp',
@@ -501,6 +502,8 @@ yuzu_server_core_lib = static_library(
     'src/notification_routes.cpp',
     'src/command_routes.cpp',
     'src/page_routes.cpp',
+    'src/dashboard_api_routes.cpp',
+    'src/nvd_routes.cpp',
     'src/webhook_routes.cpp',
     'src/offload_routes.cpp',
     'src/discovery_routes.cpp',
@@ -562,6 +565,7 @@ yuzu_server_core_lib = static_library(
     # header-only; canary_main.cpp is the separate yuzu_pg_canary exe below.
     'src/pg/pg_pool.cpp',
     'src/pg/pg_migration_runner.cpp',
+    'src/pg/pg_retention_guard.cpp',
     # SecretCodec (ADR-0010, #1320 PR 4): app-side envelope encryption for
     # secret columns. Depends on the yuzu_key_provider leaf target above.
     'src/pg/secret_codec.cpp',
