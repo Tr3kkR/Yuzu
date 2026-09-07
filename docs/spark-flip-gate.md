@@ -287,28 +287,36 @@ grown substantially, largely from PR #3821's rework); drift is called out per ro
 **Not one of #2233's 10 items above, and not part of this doc's own PR-1 → PR-2a..e →
 PR-4 → PR-5 (flip) → PR-6 (evidence closeout) numbering** - a separate body of work,
 recorded here because it occupies the same calendar slot this doc's own ladder tracks:
-**after PR-2c/PR-2d (both DONE per row 3 and row 9's #3848 entries above) and before
-PR-5 (the flip)**. Full design: `docs/spark-stage2-guardian-consumer-design.md`
-§Async-arm acknowledgment (R5); intentional-delta row:
-`docs/spark-legacy-delta-registry.md` A3.
+**after PR-2c/PR-2d and before PR-5 (the flip)**. PR-2c is DONE (row 9 above, #3848
+merged). **PR-2d is NOT yet fully landed as of this row** - per the Sign-off cell
+above: its fix is complete, governed, and merged with `origin/dev` on branch
+`fix/2818-subscription-death-notification`, but that branch has not yet been pushed or
+opened as a PR, and #2818 itself is still open on GitHub. This track's own sequencing
+("after PR-2c/PR-2d") is therefore not yet satisfied on its second half - re-check at
+this track's own PR-1 start rather than treat "after PR-2c/PR-2d" as already true.
+Full design: `docs/spark-stage2-guardian-consumer-design.md` §Async-arm acknowledgment
+(R5); intentional-delta row: `docs/spark-legacy-delta-registry.md` A3.
 
 Decouples `GuardianEngine::apply_rules()`'s rearm window from OS-watch confirmation -
 closes the ~55 ms spark-vs-legacy gap the #3990 diagnostic measured (spark 127-140 ms
 vs legacy 70-86 ms on a 62-rule cohort). Lands dormant behind `prefer_spark_=false`,
 same posture as every PR tracked elsewhere in this doc. Its own ladder is **PR-0**
 (this docs change) through **PR-6** (a Service-mechanism positive-initial-readiness
-signal) - six external review rounds against the design (Astra/Codex ×4, Fable
-×multiple, Kimi K3 ×2), 2026-09-07, none of which have run this repo's own
-`/governance` pipeline yet (that runs per-PR as the ladder lands, same as every other
-row in this document).
+signal) - reviewed against the design document across seven rounds (Astra/Codex ×4,
+Fable ×multiple, Kimi K3 ×2, plus a round-7 adversarial review of this doc's own PR-0
+commit), 2026-09-07, none of which have run this repo's own `/governance` pipeline yet
+(that runs per-PR as the ladder lands, same as every other row in this document).
 
 **Why it doesn't gate on #2233 or appear in the row-3/row-9 evidence above**: this
-track's own PR-5 (fault wiring) and PR-6 (the Service signal) are themselves named as
-prerequisites of *this document's* PR-5 (the `prefer_spark` flip) by the design's own
-decision 8 - both must land before the flip proceeds, the same way #3816/#3831 (row 3)
-and #2818/#3848 (row 9) do. Do not read "not tracked by #2233" as "not gating" - it
-gates on the same criterion (§2) through a different, newer document, not through
-#2233's checklist.
+track's own PR-5 (fault wiring) and PR-6 (the Service signal) are themselves ruled
+(Dave, 2026-09-07) as prerequisites of *this document's* PR-5 (the `prefer_spark`
+flip) — a ruling from this design's own review history, not yet transcribed as a
+numbered decision inside the committed R5 section itself (R5 carries no numbered
+decisions at all today; do not cite "decision 8" against R5 until one is added) -
+both must land before the flip proceeds, the same way #3816/#3831 (row 3) and
+#2818/#3848 (row 9) do. Do not read "not tracked by #2233" as "not gating" - it gates
+on the same criterion (§2) through a different, newer document, not through #2233's
+checklist.
 
 ## 4. #2340 scenario contract
 

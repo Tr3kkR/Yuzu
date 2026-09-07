@@ -8,7 +8,7 @@ tracks: #1939 (Stage-2 readiness checklist), #2011, #2014, #1938, #1929, #1933, 
 governance:
   - original design - 9-agent /governance pipeline, 2026-07-11 (report local, not committed to git); hardening round folded all findings into the sections below.
   - rung 9a addition (the §Rung-2 decision record + inner ladder) - 4-agent pipeline (security-guardian, docs-writer, architect, consistency-auditor), 2026-07-17; every embedded code-claim verified against origin/dev; security MEDIUMs on the F3 blast radius and intra-class lane exhaustion folded in.
-  - rung 9c addition (§Async-arm acknowledgment / R5) - the design itself went through six external review rounds (Astra/Codex ×4, Fable ×multiple, Kimi K3 ×2), 2026-09-07, against the plan document, not this doc directly; this PR-0 write-up has NOT itself been through `/governance` yet - that runs when this PR is opened, per the standard gate.
+  - rung 9c addition (§Async-arm acknowledgment / R5) - the design itself went through six external review rounds (Astra/Codex ×4, Fable ×multiple, Kimi K3 ×2), 2026-09-07, against the plan document, not this doc directly; a seventh round (round 7, 2026-09-07) then adversarially reviewed this PR-0 write-up itself (Kimi + Codex, two HIGH findings against the transcription, folded in - see A3's Epistemic cell and the H-section citation fix); this PR-0 write-up has NOT itself been through `/governance` yet - that runs when this PR is opened, per the standard gate.
 history:
   - 2026-07-11 - initial design; 2 governance rounds; landed as PR #2051.
   - 2026-07-17 - rung 9a - §Rung-2 decision record (R1-R4) + the inner-ladder
@@ -262,9 +262,10 @@ persisted before the exit, then read, reported and cleared on the next boot.
 
 Sequenced after PR-2c (#3848) and before the `prefer_spark` flip (PR-5) — lands dormant
 behind `prefer_spark_=false`, same posture as every other pre-flip PR in this document.
-Settled 2026-09-07 after six external review rounds (Astra/Codex ×4, Fable ×multiple,
-Kimi K3 ×2) against `docs/spark-legacy-delta-registry.md` row A3 and the flip-gate
-ladder slot recorded in `docs/spark-flip-gate.md`.
+Settled 2026-09-07 after seven external review rounds (Astra/Codex ×4, Fable
+×multiple, Kimi K3 ×2, plus a round-7 adversarial review of this doc's own committed
+PR-0 text) against the plan document, transcribed into this doc as §R5, into the
+registry as row A3, and into the flip-gate as §3a.
 
 ### R5 - Accepted is not acknowledged: `apply_rules` never waits for an OS watch
 
@@ -293,11 +294,16 @@ faster.
 counter is a reconcile trigger only, never a compliance signal — deferring
 acknowledgment past `apply_rules()`'s own return is therefore consistent with the
 counter's designed meaning, not a reinterpretation of it. Two further facts confirm no
-wire surface needs to change: `GuardianEngine::get_status()` is dead in production
+new wire surface is needed: `GuardianEngine::get_status()` is dead in production
 (never dispatched; a fallback that reports every rule `errored`), and a solicited
-`__guard__` reply is dropped by the server on arrival. `yuzu.guardian_generation` was
-already the only channel a client's arm state reaches the server through, and reporting
-the *acknowledged* value on that same existing tag is a purely internal change.
+`__guard__` reply on the direct agent-to-server path is dropped by the server on
+arrival (gateway-connected agents' solicited replies ARE correlated and answered
+server-side — a different path, unaffected by this design either way).
+`yuzu.guardian_generation` was already the only channel a client's arm state reaches
+the server's *reconcile/acknowledgment* logic through (the server separately ingests an
+unsolicited `guard.armed` lifecycle stream, a different channel, D2 in the delta
+registry) — reporting the *acknowledged* value on the existing reconcile tag is a
+purely internal change.
 
 **R5.1 - Executor: a non-waiting dispatch form.** `GuardianIoExecutor` gains a
 `submit()` overload alongside the existing `run()`: the backend call still executes on
@@ -306,9 +312,21 @@ completion callback on the worker thread instead, with the admission-time quota/
 single-flight-key checks (`Stopped`/`AlreadyRunning`/`CapacityExhausted`) unchanged and
 still synchronous. Today's quota/`active_worker_count()` accounting conflates "holds a
 quota slot" with "counts toward the orphan-exit grace"; those become two independent
-counts, since a non-waiting call can dispatch a fresh operation on completion, and that
-refill must not itself be starved by its own predecessor's still-unreleased slot. A new
-`GuardianDetachedWorkerRole` thread-local marker extends the existing
+counts. **The quota slot and single-flight key release when the backend call (`fn()`)
+itself returns — before the completion callback runs, not after.** A worker wedged
+*inside* the real OS call therefore still holds its slot and key for as long as it
+stays wedged; the existing dead-target bulkhead against a hung backend call is
+unaffected by this change. The window this design actually widens is *after* `fn()`
+returns but before the worker thread fully exits — while the completion callback runs
+— since a non-waiting call can dispatch a fresh operation on completion, and that
+refill must not itself be starved by its own predecessor's still-unreleased slot. **A slow or wedged completion callback frees its
+quota slot while its thread stays alive, so quota alone no longer bounds the total
+count of simultaneously-alive detached workers** — `GuardianIoExecutor` therefore also
+enforces a separate physical ceiling on total alive workers (strictly greater than the
+sum of all quotas; exact value pinned in the implementing PR's description, per this
+document's own §7.7b item 5, which already required this for any two-count split):
+admission is refused once that ceiling is reached, regardless of quota availability. A
+new `GuardianDetachedWorkerRole` thread-local marker extends the existing
 `WorkerHostileMutex` tripwire (`guardian_engine.cpp`'s `abort_if_worker_thread()`) to
 executor worker threads, so nothing dispatched this way can ever take
 `GuardianEngine::mtx_` — enforced in debug/sanitizer builds, not only by review.
@@ -333,7 +351,14 @@ marker. What stays deferred: same-type mechanism serialization (`mech_ops_mu_by_
 sibling arms of the same type, and that remains a distinct, already-tracked liveness
 question, not one this design resolves.
 
-**R5.3 - Ack model: accepted vs. acknowledged.** `apply_rules()` tracks, per accepted
+**R5.3 - Ack model: accepted vs. acknowledged.** "Accepted" means
+`reconcile_rule_locked()` returned `Accepted` specifically — the async-arm outcome, as
+opposed to `Armed` (an inline type or already-committed shared watcher, resolved
+synchronously with no ack tracking needed), `Failed`, or `Inert` (a legacy-guard rule,
+unrelated to spark). An `Inert` outcome never enters the pending-arm set at all, exactly
+as it does not today — the ack predicate is structurally blind to it, so a push whose
+rules are entirely `Inert` (all legacy) satisfies the predicate immediately, with
+nothing to wait on. `apply_rules()` tracks, per accepted
 rule, whether its arm has resolved. The policy generation advances (and is persisted)
 only once every rule accepted under it has either armed or been quarantined per the
 K-bound below — never on acceptance alone. A same-generation re-push (the server's 25 s
@@ -357,9 +382,12 @@ heartbeat-thread stall.
 real, confirmed backend commit — never on acceptance alone, matching today's contract
 exactly. What changes is timing: that commit now happens asynchronously relative to
 `apply_rules()`'s own return, so the interval between a rule being accepted and its
-"armed" record being durably staged widens from effectively immediate to up to one
-heartbeat tick (~30 s). A refused, withdrawn, or expired arm still produces no "armed"
-record at all — silence on failure is unchanged.
+"armed" record being durably staged widens from effectively immediate to at least one
+heartbeat tick (~30 s) — and, for a completion queued behind R5.3's own per-tick drain
+cap, however many additional ticks the drain needs to reach it (R5.3's "drains over
+several heartbeat ticks"; not a flat one-tick bound for every rule in a large push, only
+for one selected on its first tick). A refused, withdrawn, or expired arm still produces
+no "armed" record at all — silence on failure is unchanged.
 
 **R5.5 - Shutdown.** `GuardianEngine::stop()` no longer parks under `mtx_` waiting on an
 in-flight arm, since `apply_rules()` itself no longer blocks there either — a hung
