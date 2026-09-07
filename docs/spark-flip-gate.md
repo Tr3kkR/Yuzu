@@ -282,6 +282,34 @@ grown substantially, largely from PR #3821's rework); drift is called out per ro
 | 9 | Focused TSan + shutdown/fault-injection | **Test BUILT in PR-2c (#3848); rerun still owed by PR-6** | The issue cites a single "instantaneous fake backend" TSan test at `test_guardian_spark_runtime.cpp:598–643`. The file has grown to 3551 lines and that range no longer holds a TSan test. There are now **three** TSan-checkpoint test cases (`grep TEST_CASE.*tsan`): `:1530` ("concurrent attach/detach/evaluate/drain do not race"), `:3061` ("concurrent pagers + a drainer do not race"), `:3293` ("concurrent persist + page + prune + drain do not race, QE-1"). None of the three arms `FakeBackend`'s `hang_next_arm`/`hang_next_disarm` gate (added for item 3's own fix, confirmed present and used at `:1744` onward across 10 distinct deterministic single-scenario `TEST_CASE`s) - so the issue's core finding still holds under the current code: concurrency is proven race-free only against an instantaneous fake, not against a backend that can actually block. This is the literal scope #2224's approval was conditioned on. Tracked fresh as **#3848** (PR-2c scope). PR-2c builds the deterministic per-issue scenario seams first (§5), then this rerun executes against that tree. **PR-2c status:** the missing test now exists - `"concurrent attach/detach/evaluate/drain do not race when the backend and the send callback BLOCK (TSan checkpoint, #3848)"`, tagged `[spark][runtime][liveness][tsan][tsan-heavy]`, which parks `FakeBackend`'s arm, its disarm AND the drain send callback via a `BlockingGate` built as an epoch/pulse extension of the very `hang_next_arm`/`hang_next_disarm` idiom this row names as unused by the other three. It reconciles every subscription id handed out against every id released, and requires the executor's `rejected_key`/`rejected_capacity` to be zero (via a new `GuardianSparkRuntime::io_executor_stats_for_test()`) so that reconciliation is a proof rather than a likelihood. **What it can and cannot show, stated because the framing changed under review:** `attach_rule`'s worker already self-disarms a late arm success via its `still_wanted` re-check, so a leaked subscription is NOT reachable on this tree - the census is a NO-REGRESSION check on that contract, not a leak detector. Verified by mutation: removing that self-disarm fails the census (27 live subscriptions against 6 armed keys). **This row does NOT close on PR-2c** - the criterion is the RERUN against the flip tree, and §2 criterion 2 records that its evidence can only ever be a local TSan build. |
 | 10 | Doc drift | **Fixed in this PR** | `docs/spark-stage2-guardian-consumer-design.md` - the issue cited line 500; the actual current line (file has grown) was 949, still reading "observe rung (2) defaults to the spark path", stale against the re-sequenced ladder (this is impl-rung-7 in current terminology). Corrected as part of this PR - see the diff on that file. |
 
+## 3a. Async-arm acknowledgment track (R5, rung 9c)
+
+**Not one of #2233's 10 items above, and not part of this doc's own PR-1 → PR-2a..e →
+PR-4 → PR-5 (flip) → PR-6 (evidence closeout) numbering** - a separate body of work,
+recorded here because it occupies the same calendar slot this doc's own ladder tracks:
+**after PR-2c/PR-2d (both DONE per row 3 and row 9's #3848 entries above) and before
+PR-5 (the flip)**. Full design: `docs/spark-stage2-guardian-consumer-design.md`
+§Async-arm acknowledgment (R5); intentional-delta row:
+`docs/spark-legacy-delta-registry.md` A3.
+
+Decouples `GuardianEngine::apply_rules()`'s rearm window from OS-watch confirmation -
+closes the ~55 ms spark-vs-legacy gap the #3990 diagnostic measured (spark 127-140 ms
+vs legacy 70-86 ms on a 62-rule cohort). Lands dormant behind `prefer_spark_=false`,
+same posture as every PR tracked elsewhere in this doc. Its own ladder is **PR-0**
+(this docs change) through **PR-6** (a Service-mechanism positive-initial-readiness
+signal) - six external review rounds against the design (Astra/Codex ×4, Fable
+×multiple, Kimi K3 ×2), 2026-09-07, none of which have run this repo's own
+`/governance` pipeline yet (that runs per-PR as the ladder lands, same as every other
+row in this document).
+
+**Why it doesn't gate on #2233 or appear in the row-3/row-9 evidence above**: this
+track's own PR-5 (fault wiring) and PR-6 (the Service signal) are themselves named as
+prerequisites of *this document's* PR-5 (the `prefer_spark` flip) by the design's own
+decision 8 - both must land before the flip proceeds, the same way #3816/#3831 (row 3)
+and #2818/#3848 (row 9) do. Do not read "not tracked by #2233" as "not gating" - it
+gates on the same criterion (§2) through a different, newer document, not through
+#2233's checklist.
+
 ## 4. #2340 scenario contract
 
 Canonical home for this contract as of this PR - a local (uncommitted) delivery-plan draft

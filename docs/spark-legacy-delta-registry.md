@@ -119,6 +119,17 @@ never invent a rationale for what isn't ruled yet.
 | **Verify at** | `reconcile_rule_locked`'s `RulePlacement::Arm` branch (`guardian_engine.cpp`). |
 | **Epistemic** | verified b16e5836d |
 
+### A3 — Push acknowledgment is asynchronous under spark
+
+| | |
+|---|---|
+| **Legacy** | `apply_rules` acknowledges the policy generation synchronously: every legacy guard's `start()` call runs inline, so by the time `apply_rules` returns, every rule that will ever arm this generation already has. A rule whose guard fails to start is acknowledged anyway, silently stranded `Inert` — legacy has no mechanism to hold the acknowledgment on a failed arm. |
+| **Spark** | `apply_rules` accepts a push immediately and returns without waiting for any backend OS call — the rearm window this design exists to shrink. The policy generation reported to the server (`policy_generation()`) is the *acknowledged* value, which only advances once every accepted rule's arm has resolved: `Armed` (committed), or `Quarantined` after K=3 identical same-generation re-applies of a genuinely wedged/expired key (the durable fleet signal is `yuzu.guardian_arm_failed>0`; a wedged key stays quarantined until its worker returns or the agent restarts — a later policy change re-evaluates the rule but cannot by itself re-attempt the arm). A plain arm refusal (backend refused, worker threw, queue full) holds the acknowledgment indefinitely, unlike legacy's silent `Inert` strand. |
+| **Why deliberate** | ADR-0021 Decision 8: "The generation counter is a reconcile trigger only, never a compliance signal" — the warrant for treating acceptance and acknowledgment as genuinely separate. Confirmed zero-wire-protocol-change: `get_status()` is dead in production and solicited `__guard__` replies are dropped by the server, so `yuzu.guardian_generation` was already the only channel that mattered. |
+| **Operator symptom** | A push may take up to several heartbeat ticks (bounded drain, matching the existing lifecycle-journal 4-batch/1024-record shape) to acknowledge after `apply_rules` returns, rather than acknowledging in the same call. `yuzu.guardian_arm_pending` / `yuzu.guardian_arm_failed` (new heartbeat tags) surface this window; a rule quarantined via K stays reported as failed on the health tag even after the generation acknowledges, so a K-waived acknowledgment can never silently zero the fleet-visible failure signal. |
+| **Verify at** | `GuardianSparkRuntime::attach_rule`'s per-key state machine (`guardian_spark_runtime.cpp`) and `GuardianEngine::apply_rules`'s accepted-vs-acknowledged bookkeeping (`guardian_engine.cpp`) — both not yet implemented as of this row; see the design doc's PR ladder. |
+| **Epistemic** | design-approved, not yet implemented — six external review rounds against `docs/spark-stage2-guardian-consumer-design.md` §R5 (Astra ×4, Fable, Kimi K3 ×2), 2026-09-07; re-stamp `verified <SHA>` once the design's own PR-1 through PR-6 land. |
+
 ---
 
 ## B. Enforcement
@@ -181,7 +192,7 @@ never invent a rationale for what isn't ruled yet.
 | | |
 |---|---|
 | **Legacy** | Emits no lifecycle events. |
-| **Spark** | Durable KV-backed journal (`__guardian_journal__` namespace, keys `lc:<ts13>:<nonce>:<seq12>`). Replayed on boot (first pass runs unconditionally), on reconnect (a kick, not a page — sets the drain worker's `force_page_`), and on a headroom-refill re-arm. An ordinary (non-forced) pass **skips** any batch already carrying a durable sent-label — so steady state does not re-offer delivered batches; only a forced pass (boot/reconnect/refill) re-offers them, and the sent-label gates re-paging, never deletion. Bounds: 0.1 batch/s refill, burst 5, ≤128 batches/pass, 7-day / 1000-batch / 32 MiB retention, 30 s page / 120 s prune cadence. `guard.errored` is a declared-but-unproduced lifecycle kind; `unsupported` is **not** a lifecycle kind at all (it's the C1 heartbeat gauge instead). |
+| **Spark** | Durable KV-backed journal (`__guardian_journal__` namespace, keys `lc:<ts13>:<nonce>:<seq12>`). Replayed on boot (first pass runs unconditionally), on reconnect (a kick, not a page — sets the drain worker's `force_page_`), and on a headroom-refill re-arm. An ordinary (non-forced) pass **skips** any batch already carrying a durable sent-label — so steady state does not re-offer delivered batches; only a forced pass (boot/reconnect/refill) re-offers them, and the sent-label gates re-paging, never deletion. Bounds: 0.1 batch/s refill, burst 5, ≤128 batches/pass, 7-day / 1000-batch / 32 MiB retention, 30 s page / 120 s prune cadence. `guard.errored` is a declared-but-unproduced lifecycle kind; `unsupported` is **not** a lifecycle kind at all (it's the C1 heartbeat gauge instead). **Once the async-arm-acknowledgment design (§A3) lands, the "armed" record's durability window widens from effectively-immediate to up to one heartbeat tick** — the record is still staged only on a real backend commit (never on acceptance alone), but that commit now happens asynchronously, so the interval between "rule accepted" and "armed record durably staged" goes from ~0 to ~30 s. |
 | **Why deliberate** | #2297: "honest process-crash-durable, duplicate-tolerant, bounded-retry — not audit-grade at-least-once. Every loss channel is a counted metric, never silent." #2448 (batch-key timestamp) made the maintenance passes O(work) instead of O(journal size). |
 | **Operator symptom** | Server absorbs duplicates silently and cheaply: `insert_event_classified` runs the row insert under its own `SAVEPOINT`; on SQLSTATE `23505` it rolls back to the savepoint (un-aborting the whole transaction, a Postgres-specific need) and byte-compares 13 agent-supplied columns. A match → `Redelivered` (debug-logged, no new row, DEX/blast-radius observers deliberately NOT re-fired — a redelivery must not re-trigger them); a mismatch → `Conflict` (warn-logged, dropped). Nothing is returned to the agent either way — the agent never sees a rejection for a legitimate replay. The batch insert path (`insert_events`) is explicitly forbidden for replays — it aborts the whole batch on any collision, unlike the one-at-a-time path. Traffic bounds: `yuzu_fleet_guardian_journal_*` — `_pages` (activity denominator), `_records_paged`, `_evicted_no_send_evidence` (the CC7.3-relevant integrity-gap counter), `_page_stale_seconds_max` (expect ~30 s), `_prune_stale_seconds_max` (expect ~120 s) — all absent while `prefer_spark` is off. |
 | **Verify at** | `guardian_lifecycle_journal.hpp` `page_into_window`/`replay_sent`; `guardian_outbox_drain_worker.cpp` `force_page_` triggers; `guaranteed_state_store.cpp` `insert_event_classified` (SAVEPOINT + `23505` + `stored_event_matches`) and `insert_events`' header comment forbidding batch-path replay; `docs/user-manual/guaranteed-state.md` "Reconnect replay traffic". |
@@ -416,6 +427,30 @@ doc just makes sure they're findable rather than rediscovered from scratch.
   that loads governance agents onto Spark-touching changes goes stale in the exact same
   way this doc exists to track, and it's higher-stakes than the items above since
   CLAUDE.md imports this row as standing authority for every `/governance` run.
+- **Different trigger, recorded here anyway so it isn't lost the same way: these go
+  stale at async-arm-acknowledgment's own implementation (§A3), not at the flip** —
+  they describe today's synchronous `attach_rule`/`apply_rules` behavior and become
+  false the moment that design's PR-2/PR-3 ship, regardless of `prefer_spark`'s value
+  (the design lands dormant, same posture as everything else in this doc, but the
+  COMMENTS describe the code shape, which changes at implementation time). Do not
+  fold these into F14's own sweep — a different PR owns them.
+  - `agents/core/src/guardian_spark_runtime.cpp:300` — "this key off-lock (unreachable
+    via GuardianEngine's mtx_-serialised production callers)" describes the
+    `arming_keys_` single-slot busy-rejection guard (`backend_op_busy_`, `:308`) as
+    unreachable in production. True only because every `attach_rule` call is
+    serialized behind `GuardianEngine::mtx_` today; false once arm/disarm stop
+    blocking that lock and a second call can genuinely land mid-flight.
+  - `agents/core/src/guardian_spark_runtime.cpp:1615` — "already holds mtx_ across a
+    DIFFERENT blocking section calling `begin_stop()`" and its neighboring "2x
+    deadline" sequencing comment describe `detach_all()`'s current sequential,
+    synchronous disarm-then-arm ordering. Both go stale once disarm and arm are
+    decoupled from the caller's wait and ordering is enforced structurally instead
+    (the per-key `waiters` queue), not by blocking sequencing.
+  - `agents/core/src/guardian_engine.cpp:642` — "this deadlocks against `stop()`,
+    which holds mtx_ while joining" (the `WorkerHostileMutex` abort-message text)
+    stays accurate in shape, but the design adds a SECOND role
+    (`GuardianDetachedWorkerRole`) the same tripwire must also cover — the comment
+    should be extended, not replaced, once that role exists.
 
 ---
 

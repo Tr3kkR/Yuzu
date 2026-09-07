@@ -8,6 +8,7 @@ tracks: #1939 (Stage-2 readiness checklist), #2011, #2014, #1938, #1929, #1933, 
 governance:
   - original design - 9-agent /governance pipeline, 2026-07-11 (report local, not committed to git); hardening round folded all findings into the sections below.
   - rung 9a addition (the §Rung-2 decision record + inner ladder) - 4-agent pipeline (security-guardian, docs-writer, architect, consistency-auditor), 2026-07-17; every embedded code-claim verified against origin/dev; security MEDIUMs on the F3 blast radius and intra-class lane exhaustion folded in.
+  - rung 9c addition (§Async-arm acknowledgment / R5) - the design itself went through six external review rounds (Astra/Codex ×4, Fable ×multiple, Kimi K3 ×2), 2026-09-07, against the plan document, not this doc directly; this PR-0 write-up has NOT itself been through `/governance` yet - that runs when this PR is opened, per the standard gate.
 history:
   - 2026-07-11 - initial design; 2 governance rounds; landed as PR #2051.
   - 2026-07-17 - rung 9a - §Rung-2 decision record (R1-R4) + the inner-ladder
@@ -15,6 +16,11 @@ history:
     PR #2224; the 7.7a/7.7b/8/10/11/12 remainder). Records what was previously held
     only in commit messages and a local plan; the full as-built rewrite is rung 9b,
     after 7.7b.
+  - 2026-09-07 - rung 9c - §Async-arm acknowledgment (R5): decouples Guardian's rearm
+    window (`apply_rules`) from OS-watch confirmation, closing the ~55ms spark-vs-legacy
+    gap the #3990 diagnostic measured. Independent of 9b; sequenced after PR-2c (#3848)
+    and before the `prefer_spark` flip (PR-5). Matching rows added to
+    `docs/spark-legacy-delta-registry.md` (A3) and `docs/spark-flip-gate.md`.
 ---
 
 # Spark Stage 2 — Guardian as the first SparkEngine consumer
@@ -251,6 +257,141 @@ without which the server cannot tell which backend a device is running or distin
 **The F3 hard-exit signal cannot be a live heartbeat.** `hard_exit()` skips teardown by
 design; the process is gone before anything could be sent. It is a best-effort marker
 persisted before the exit, then read, reported and cleared on the next boot.
+
+## Async-arm acknowledgment (rung 9c)
+
+Sequenced after PR-2c (#3848) and before the `prefer_spark` flip (PR-5) — lands dormant
+behind `prefer_spark_=false`, same posture as every other pre-flip PR in this document.
+Settled 2026-09-07 after six external review rounds (Astra/Codex ×4, Fable ×multiple,
+Kimi K3 ×2) against `docs/spark-legacy-delta-registry.md` row A3 and the flip-gate
+ladder slot recorded in `docs/spark-flip-gate.md`.
+
+### R5 - Accepted is not acknowledged: `apply_rules` never waits for an OS watch
+
+**Ruled:** `GuardianEngine::apply_rules()` and `GuardianSparkRuntime::attach_rule()`/
+`detach_all()` stop blocking on the real backend OS call (`CreateFileW`,
+`RegOpenKeyExW`, the SCM enqueue). Acceptance and acknowledgment become two distinct
+events: `apply_rules()` returns as soon as a push is *accepted* (queued for arming),
+and the policy generation reported to the server on `yuzu.guardian_generation` only
+*advances* once every accepted rule's arm has actually resolved.
+
+**Motivation.** The #3990 diagnostic measured Guardian's synchronous rearm window
+(window B: from "full_sync cleared N prior rule(s)" to "apply_rules ok") on a 62-rule
+cohort: legacy median 70-86 ms, spark 127-140 ms. The gap splits roughly evenly between
+teardown (spark 39 ms vs legacy 11-13 ms) and the rearm span itself (spark 85-92 ms vs
+legacy 59-71 ms). Root cause: `attach_rule()` already dispatches each rule's
+`backend->arm()` onto a detached `GuardianIoExecutor` worker, but the caller blocks on
+`cv.wait_until` for the result while `apply_rules()` holds `mtx_`, and `detach_all()`
+blocks the same way per disarm. Legacy's guards return as soon as their own thread is
+spawned; spark pays the full OS-watch establishment cost inside the window legacy
+never does. The requirement is that the rearm window returns fast, not that
+time-to-watch-live shrinks — those are different quantities, and this design closes
+the gap between them by decoupling the two, not by making the underlying OS calls
+faster.
+
+**Warrant: zero wire-protocol change.** ADR-0021 Decision 8 states the generation
+counter is a reconcile trigger only, never a compliance signal — deferring
+acknowledgment past `apply_rules()`'s own return is therefore consistent with the
+counter's designed meaning, not a reinterpretation of it. Two further facts confirm no
+wire surface needs to change: `GuardianEngine::get_status()` is dead in production
+(never dispatched; a fallback that reports every rule `errored`), and a solicited
+`__guard__` reply is dropped by the server on arrival. `yuzu.guardian_generation` was
+already the only channel a client's arm state reaches the server through, and reporting
+the *acknowledged* value on that same existing tag is a purely internal change.
+
+**R5.1 - Executor: a non-waiting dispatch form.** `GuardianIoExecutor` gains a
+`submit()` overload alongside the existing `run()`: the backend call still executes on
+a detached worker, but the caller does not block for the result — it is handed to a
+completion callback on the worker thread instead, with the admission-time quota/
+single-flight-key checks (`Stopped`/`AlreadyRunning`/`CapacityExhausted`) unchanged and
+still synchronous. Today's quota/`active_worker_count()` accounting conflates "holds a
+quota slot" with "counts toward the orphan-exit grace"; those become two independent
+counts, since a non-waiting call can dispatch a fresh operation on completion, and that
+refill must not itself be starved by its own predecessor's still-unreleased slot. A new
+`GuardianDetachedWorkerRole` thread-local marker extends the existing
+`WorkerHostileMutex` tripwire (`guardian_engine.cpp`'s `abort_if_worker_thread()`) to
+executor worker threads, so nothing dispatched this way can ever take
+`GuardianEngine::mtx_` — enforced in debug/sanitizer builds, not only by review.
+
+**R5.2 - Runtime: a per-key claim/queue state machine.** Each spark key gets a single
+entry tracking its current claim (an in-flight arm or disarm, or none) and a FIFO queue
+of siblings waiting behind it. A key that is already quarantined (see R5.3) rejects a
+new claim immediately, before any backend call is attempted. A second rule attaching to
+a key that is mid-arm queues behind the in-flight owner rather than issuing a redundant
+backend call; on the owner's success every queued sibling commits inline against the
+same subscription (Guardian's existing shared-watcher reuse, unchanged); on the owner's
+genuine failure every sibling fails with it, since the underlying key genuinely
+couldn't be armed. A disarm claim is retained until it actually executes or is
+terminally superseded — never silently dropped for capacity reasons — which is what
+makes "a key's disarm completes before its own rearm dispatches" true by construction
+rather than by a separately-maintained ordering rule. An arm attempt that never
+returns (a genuinely wedged OS call) is bounded by a deadline; past it, the key is
+marked quarantined and every waiter on it fails without a further backend attempt,
+until the original wedged worker's call eventually completes (if ever) and clears the
+marker. What stays deferred: same-type mechanism serialization (`mech_ops_mu_by_type_`,
+#2012/#3840) is unchanged by this design — a single stalled `watch()` can still delay
+sibling arms of the same type, and that remains a distinct, already-tracked liveness
+question, not one this design resolves.
+
+**R5.3 - Ack model: accepted vs. acknowledged.** `apply_rules()` tracks, per accepted
+rule, whether its arm has resolved. The policy generation advances (and is persisted)
+only once every rule accepted under it has either armed or been quarantined per the
+K-bound below — never on acceptance alone. A same-generation re-push (the server's 25 s
+`full_sync=true` heartbeat retry) is a no-op while every episode for that generation is
+still genuinely pending and within its deadline, and only triggers a full re-apply once
+something has actually failed, expired, or the push's content has changed underneath
+it. **A wedged or expired key is K-bounded, not held forever**: after three identical
+same-generation re-applies whose only unresolved rules are already-quarantined or
+already-expired, the generation acknowledges anyway, leaving
+`yuzu.guardian_arm_failed>0` as the durable fleet signal — a wedged key stays
+quarantined until its own worker returns or the agent restarts; a later policy change
+re-evaluates the rule but cannot by itself re-attempt the arm. A genuine refusal
+(backend refused, worker threw, arm queue full) is a different case and holds the
+acknowledgment indefinitely — K only bounds the wedged/expired case, never a live
+refusal. The drain that resolves pending arms against incoming results is bounded
+per tick, matching the existing lifecycle-journal's 4-batch/1024-record shape, so a
+large outstanding batch drains over several heartbeat ticks rather than risking a
+heartbeat-thread stall.
+
+**R5.4 - Audit and durability.** The "armed" audit record is still staged only on a
+real, confirmed backend commit — never on acceptance alone, matching today's contract
+exactly. What changes is timing: that commit now happens asynchronously relative to
+`apply_rules()`'s own return, so the interval between a rule being accepted and its
+"armed" record being durably staged widens from effectively immediate to up to one
+heartbeat tick (~30 s). A refused, withdrawn, or expired arm still produces no "armed"
+record at all — silence on failure is unchanged.
+
+**R5.5 - Shutdown.** `GuardianEngine::stop()` no longer parks under `mtx_` waiting on an
+in-flight arm, since `apply_rules()` itself no longer blocks there either — a hung
+backend call can no longer delay agent shutdown the way it can today. In-flight workers
+finish on their own schedule after `stop()` returns; a late-arriving success is
+disarmed rather than left live. Queued (not yet dispatched) work is dropped with a
+counted total. The existing F3 hard-exit contract (`active_io_workers()`, orphan grace)
+is unchanged — this design's non-waiting dispatch path is covered by the same
+accounting the state-read and existing arm/disarm executors already use.
+
+**R5.6 - Legacy asymmetry.** Legacy acknowledges synchronously and unconditionally,
+including a rule whose guard failed to start — that rule is silently stranded `Inert`,
+logged but not held against the generation. Spark's acknowledgment holds on a genuine
+refusal, and is K-bounded (never unconditional) on a wedged/expired key. This is a
+deliberate, documented delta (`docs/spark-legacy-delta-registry.md` row A3), not an
+oversight to reconcile — spark's stricter acknowledgment is the point of this design,
+and legacy's asymmetry pre-dates it and is out of scope to change here.
+
+**R5.7 - Re-measurement methodology.** Window B (`T1 - T0`, the existing #3990
+measurement) remains valid for direct comparison with prior runs, but it is a
+log-to-log interval, not proof of `apply_rules()`'s actual return latency:
+`apply_rules()` constructs a rollback guard whose destructor performs unbounded
+lifecycle-journal persistence on scope exit, and that destructor runs *after* the T1
+log line — so under this design, a smaller B does not by itself prove a faster actual
+function return, since work can now be staged asynchronously before T1 while the
+destructor's own persistence work still happens after it. Re-measurement must add a
+second timestamp, T2, taken from the runtime's own arm-confirmation commit (a new log
+line) — not from `SparkEngine`'s own "armed" log, which fires before the real OS call
+completes and is not a valid proxy for it. The diagnostic script's completeness check
+(confirming every expected arm actually happened) must also exclude a no-op re-push's
+own log line from that count, since a no-op returns the same `rules_size()` figure
+without a single real arm occurring.
 
 ## 7.7b split — pre-cutover hardening (settled 2026-07-18)
 
@@ -1322,6 +1463,11 @@ Each rung is an independently-governed PR on `dev`, run through the full
    - **9b.** The full as-built rewrite of this §Rung-2 decision record and the ladder
      against the shipped 7.7a/7.7b/10 code, folding R3's resolved mechanism and R2's
      `unsupported`-vocab reconciliation. Docs-only; lands after 7.7b.
+   - **9c.** §Async-arm acknowledgment (R5) - decouples Guardian's rearm window from
+     OS-watch confirmation. Independent of 9b; sequenced after PR-2c (#3848) and before
+     the `prefer_spark` flip (PR-5), lands dormant. Own PR ladder, PR-0 (this docs
+     change) through PR-6 - see `docs/spark-flip-gate.md` for the ladder slot between
+     PR-2d and the flip.
 
    **F3 × `Restart=always` (must be answered in 7.7a).** `deploy/systemd/yuzu-agent.service`
    sets `Restart=always` + `RestartSec=10` and **no `StartLimitIntervalSec`/`StartLimitBurst`**,
