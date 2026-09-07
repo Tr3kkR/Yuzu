@@ -9,15 +9,21 @@ specifies nothing beyond that sentence - no measurand, sample size, or neutralit
 Everything below that isn't a direct quote of the ruling is this run's own definition, stated
 as such rather than attributed to source.
 
-**Headline result, read this first**: the intended legacy-vs-spark comparison could not be
-completed at the pre-registered sample size (K=5). The reason is itself the load-bearing
-finding of this diagnostic: **repeated `full_sync` triggers spaced 45-100 seconds apart caused
-the large majority of individual triggers (roughly 80-90%, on BOTH backends) to take
-substantially longer than a 60-90 second observation budget to complete**, even at a tiny
-62-rule cohort with zero failing rules. The handful of triggers that DID complete fast did so
-in 55-82ms on both backends - so the mechanism this diagnostic can actually speak to is a
-**pile-up/queueing effect under closely-spaced mutations**, not a slow steady-state per-trigger
-cost. See "Phase B / B2" and "The stall/queueing finding" below.
+**Headline result, read this first, CORRECTED after this doc's own first draft overclaimed
+it** (see "Retraction" below the fold in "The driver's T1-detection gap" section - kept
+in-doc rather than silently edited away, since the wrong version was briefly the working
+conclusion): the intended legacy-vs-spark comparison could not be completed at the
+pre-registered sample size (K=5). The reason is a **bug in this run's own driver script's T1
+(completion-marker) detection**, confirmed by correlating EVERY `full_sync` trigger in the
+complete agent log (not a sample) against its own completion line: across the whole
+~5.5-hour session, all 84 real triggers that ran to completion did so in **8.3 seconds or
+less** - most in under 100ms at the clean 62-rule cohort, and a consistent ~7.5-7.9s at the
+5652-rule leftover-catalogue scale (Phase A). There is no gap anywhere in the log approaching
+even one minute, on either backend. The driver's own poll logic nonetheless recorded most
+clean-cohort attempts as `t1_not_found` (timed out waiting) or `t0_not_found` (never saw the
+trigger at all) - a tooling gap in THIS run's instrument, not a property of the system under
+test. See "The driver's T1-detection gap" below for the full evidence and what remains
+unexplained about the bug itself.
 
 ## What was measured, and how
 
@@ -41,7 +47,12 @@ the handful of non-void repeats; not enough data to say anything general about i
 **Instrument**: `fullsync_blackout_diag.py` (this directory), a new committed driver reusing
 `generate_resgate_load.py`'s HTTP/baseline helpers. Subcommands: `inventory`, `purge`,
 `ensure`, `run`, `report`, `teardown-cohort`. See that file for the full mechanism; this doc is
-the record of what it measured, not a restatement of how.
+the record of what it measured, not a restatement of how. The complete raw per-repeat output
+is committed as `fullsync-blackout-results.jsonl` in this directory - every field this doc's
+tables summarize, including the void repeats, is there in full; its `t0`/`t1` fields are the
+driver's own raw timestamps and carry the UTC-mislabeling defect described in correction #2
+below (harmless for the B values themselves, a same-host subtraction; do not trust their
+absolute `+00:00` tag as real UTC).
 
 **Build**: agent core AND all plugins rebuilt at `origin/dev@65f2938156a19` plus the single
 flip one-liner at `agents/core/src/agent.cpp:836`:
@@ -138,11 +149,13 @@ catalogue at an irregular cadence (roughly 5s-90s apart depending on how recentl
 activity had occurred) via a mechanism this session did NOT fully diagnose - `failed=0` and
 `applied=total` throughout every observed window, so this is NOT the "failed rules hold the
 generation" mechanism the original plan text assumed (that assumption is corrected here: no
-persistently-failing rule was present in this catalogue at measurement time). In hindsight,
-given the pile-up finding below, the likeliest explanation is that this "ambient storm" was
-itself residue from this same session's own preceding test activity (the `ensure` call and
-earlier smoke-test deploys) still draining, not a truly independent, permanently-recurring
-mechanism - not confirmed either way, left as an open question.
+persistently-failing rule was present in this catalogue at measurement time). The likeliest
+explanation is that this "ambient storm" was itself residue from this same session's own
+preceding test activity (the `ensure` call and earlier smoke-test deploys, plus genuine
+heartbeat-reconcile pushes - the server-side audit log for this window shows real
+`guaranteed_state.reconcile` rows, not just deploy-triggered pushes) still draining, not a
+truly independent, permanently-recurring mechanism - not confirmed either way, left as an
+open question.
 
 | Backend | window | B (ms) | applied | failed | total |
 |---|---|---|---|---|---|
@@ -168,91 +181,103 @@ its own. This is the real-world shape of the risk the original plan's own "Risks
 anticipated ("Phase A legacy at N~5800 may exhaust threads/handles ... that is itself a
 recorded effect, not a void of Phase B") - recorded here as a genuine, if uncharacterized,
 resource-contention effect specific to legacy's one-thread-per-guard design at this scale, not
-present (by construction) under spark. Given the stall/queueing finding below turned out to
-recur even at N=62, this large-N stall may be a special case of the same broader phenomenon
-rather than a purely scale-driven one - not established either way.
+present (by construction) under spark. **Correction**: an earlier draft of this doc speculated
+this might be "a special case of the same broader phenomenon" as a clean-cohort pile-up effect
+described further below - that downstream effect was retracted (see "The driver's
+T1-detection gap"), so this N=5652 legacy silence stands as its own, separate, still-real
+observation with no established connection to anything at the clean N=62 scale.
 
-## The stall/queueing finding (the actual headline result)
+## The driver's T1-detection gap (why so few clean-cohort repeats counted)
 
-At the clean N=62 cohort, with a healthy agent (no failing rules, no thread exhaustion - 92-99
-threads throughout), triggering repeated `full_sync`s roughly 45-110 seconds apart produced a
-consistent, large majority of individual triggers that never completed within a 60-90 second
-observation window:
+**Retraction.** This section originally claimed a "queueing/pile-up effect" causing 80-90% of
+clean-cohort triggers to take minutes to resolve on both backends, and framed that as this
+diagnostic's real headline finding. That claim did not survive verification against the
+complete evidence and is withdrawn. It is documented here, rather than silently deleted,
+because the wrong conclusion was briefly the working state of this doc and a future reader
+tracing history should be able to see what was claimed, why it looked plausible at the time,
+and exactly what evidence disproved it.
 
-| Phase | Backend | Trigger | Attempts | Valid | Void: t1 not found (T0 seen, T1 never) | Void: t0 not found (no T0 at all) |
+**What the void reasons actually were**, from the driver's own raw per-repeat output
+(`fullsync-blackout-results.jsonl`, committed alongside this doc):
+
+| Phase | Backend | Attempts | Valid | `double_full_sync` | `t0_not_found` | `t1_not_found` |
 |---|---|---|---|---|---|---|
-| B  | legacy | deploy      | 10 | 2 | 8 | 0 |
-| B2 | legacy | rule-create | 10 | 2 | 8 | 0 |
-| B  | spark  | deploy      | 10 | 1 | 9 | 0 |
-| B2 | spark  | rule-create | 4* | 0 | 4 | 0 |
+| A  | spark  | 6  | 3 | 3  | 0  | 0 |
+| A  | legacy | 3  | 3 | 0  | 0  | 0 |
+| B  | legacy | 30 | 2 | 10 | 10 | 8 |
+| B  | spark  | 10 | 1 | 0  | 0  | 9 |
+| B2 | legacy | 10 | 2 | 0  | 0  | 8 |
+| B2 | spark  | 14 | 0 | 0  | 11 | 3 |
 
-\* B2/spark's first 10-attempt batch (not counted above) hit the rule-id-collision bug
-(correction #4) and produced 10/10 `t0_not_found` for a different, driver-side reason; the 4
-attempts counted here used deliberately-unique rule ids and are the ones that genuinely
-exercised the trigger.
+(Phase B/legacy's 30 attempts are three separate `run` invocations - the driver was fixed and
+re-run twice after its first two attempts came back 0/10 valid; corrections #2-#4 below explain
+why. Phase B2/spark's 14 include the 10-attempt id-collision batch, correction #4.)
+
+**Correlating every one of these against the complete agent log (not a sample) settles the
+question.** `agent.log` for this session runs from 19:37:36 on 2026-09-06 (before this
+diagnostic's own rebuild) through to teardown at ~01:14 on 2026-09-07, 345,343 lines,
+containing every `full_sync` this agent process (across all its restarts) ever handled: **87
+`Guardian: full_sync cleared` (T0) lines, 84 matching `Guardian: apply_rules ok ...
+full_sync=true` (T1) completions.** Pairing each T0 with its next same-thread T1 gives a
+**maximum observed gap of 8.261 seconds, and a median of 0.1ms**, across the ENTIRE session -
+the large gaps (7.5-8.3s) are exclusively the six Phase A windows at N=5652; every clean-cohort
+(N=62) pair completed in under 100ms. The 3 T0s with no matching T1 all fall exactly at the
+three points this session restarted the agent to switch phase/backend - the in-flight request
+died with the process, not with a stall. **There is no gap anywhere in the complete log
+approaching even one minute**, on either backend, at any point in this session. The doc's
+original claim of "several that took 3-6+ minutes" cannot be reproduced from the evidence that
+was supposedly the basis for it, and is now believed to have been an unverified inference,
+not a checked observation, despite being written as though it were checked.
+
+**Conclusion: every `double_full_sync`, `t0_not_found`, and `t1_not_found` void in this run was
+a false positive of the driver's own trigger-detection logic, not a real system delay.**
+`double_full_sync` is already explained by correction #2 below (UTC-mislabeled timestamps
+causing the tool to "re-find" up to an hour of old history as a spurious second trigger) - a
+direct global scan for genuinely overlapping full_syncs (a second `full_sync cleared` with no
+intervening completion, ANYWHERE in the whole log, any thread) found **zero** real
+occurrences; the only three T0-after-T0 sequences found are the same three restart-boundary
+artifacts already accounted for above. `t0_not_found`/`t1_not_found` persisting even in the
+corrected (post-#2/#3/#4) runs means at least one further driver bug in the T0/T1 log-window
+or polling logic was never identified - **this diagnostic does not have a root cause for the
+residual detection gap**, only proof that it is a detection gap and not a system-side delay.
 
 **The valid (non-void) B values, on both backends and both trigger kinds, are all in the same
-tight 55-82ms band** - legacy 55, 56, 57, 63ms (4 samples); spark 82ms (1 sample). Nothing in
-that small set suggests either backend is dramatically slower than the other on a
-trigger that actually completes promptly.
+tight 55-82ms band** - legacy 55, 56, 57, 63ms (4 samples); spark 82ms (1 sample). This is
+consistent with, not evidence against, the "no real delay" conclusion above: a healthy trigger
+was always fast, on both backends, every time one was correctly detected.
 
-**What "void" meant here, checked directly against the live agent, not assumed**:
-- The agent was never crashed or unresponsive to `Get-Process` - it stayed alive throughout
-  every void.
-- CPU usage during a void was consistently near-zero (e.g. 0.09-0.17s of CPU time accumulated
-  over an 8-15 second sampling window) - not a busy spin.
-- The pending `full_sync` was NOT lost: every one checked was eventually found to have
-  completed once the log was re-checked minutes later (generation always caught up to the
-  server's current value eventually), including several that took 3-6+ minutes past their
-  trigger before their own `apply_rules ok` line appeared.
-- The server-side `yuzu_agents_connected` gauge stayed `1` throughout.
-
-This is consistent with a **queueing/serialization effect**: `apply_rules` holds `mtx_` for its
-entire duration on the SAME thread that also handles the Subscribe stream (confirmed in
-`docs/spark-rebuild-baselines/fullsync_blackout_diag.py`'s own citations, `agent.cpp:2938-2984`
-- the `__guard__` dispatch runs inline, bypassing the thread pool), so a second push arriving
-while the agent is still finishing an earlier one cannot even begin processing until the first
-is fully done. If completing one full_sync AND flushing its own deferred journal/rollback work
-occasionally takes much longer than the ~55-80ms fast-path (this diagnostic did not identify
-why - candidates not eliminated: disk I/O contention on the journal write, some interaction
-with the agent's own heartbeat/metrics cadence, or a genuinely slow rare path inside
-`GuardianRollback`'s function-exit work), then closely-spaced subsequent triggers pile up
-behind it, and each one's OWN wait time is inflated by everything still ahead of it in the
-queue - which would explain both backends showing a similar ~80-90% void rate under this
-specific "repeated triggering every 45-110s" access pattern, and both backends' successfully-
-completed triggers still landing in the same fast 55-82ms band.
-
-**This finding directly explains why ruling-13 excluded rule-mutation churn from CH-5-UAT's own
-sampling in the first place** - "the verdict stays a clean read... not entangled with #3990's
-separately-tracked full_sync-storm defect" - the exclusion was well-founded: this diagnostic's
-own attempt to measure "one baseline deploy" cleanly was itself repeatedly disrupted by exactly
-that entanglement once measurement required more than a single isolated trigger.
-
-**Not established, explicitly**: a root cause; whether the pile-up is specific to this rig's
-current load/disk/thread state or would reproduce on different hardware; whether it recurs on
-a truly isolated single trigger with no preceding activity for many minutes (not tested - every
-attempt in this run followed on from recent prior activity, by the nature of running K
-repeats); whether it differs in severity between backends (the sample sizes are too small - 4
-legacy valid vs 1 spark valid - to support any comparative claim). No new GitHub issue filed
-for this from within this diagnostic - flagged here for Dave to decide whether it warrants one,
-given its direct relevance to #3990 and to the broader #2469/#2278/#2279 package this doc's §5
-entry sits next to.
+**Not established, explicitly**: the exact remaining driver bug behind the residual
+`t0_not_found`/`t1_not_found` false voids; whether ruling-13's original rationale for excluding
+rule-mutation churn from CH-5-UAT (a real, separately-confirmed mechanism - Phase A's own
+ambient reconcile activity, and #3990's filed description) has any bearing on THIS specific
+tooling gap, which does not exist beyond this one script. No GitHub issue filed for the driver
+bug - it is local, uncommitted-elsewhere tooling, not a product defect; the committed script's
+docstring should carry a known-issues note for whoever next reuses it.
 
 ## Phase B - clean cohort, baseline re-deploy trigger
 
 See the combined table above. Legacy: 2/5 valid (56, 57ms; median 56.5ms). Spark: 1/5 valid
 (82ms; no median - a single sample). Both phases are **inconclusive** against the K=5
-pre-registration - not enough valid samples exist to compute a reliable median comparison,
-for the reason documented above (the void rate, not a difficulty measuring a completed
-trigger).
+pre-registration - not enough valid samples exist to compute a reliable median comparison, for
+the reason documented above (a driver detection-logic gap, confirmed by the complete-log
+correlation - not a difficulty measuring a completed trigger, and not any property of the
+system under test).
 
 ## Phase B2 - clean cohort, bare rule-create trigger (#3990's literal shape)
 
 Legacy: 2/3 valid (55, 63ms; median 59ms). Spark: 0/3 valid on the corrected (unique-id) runs -
-every attempt voided `t1_not_found` even after the id-collision bug was fixed and even after
-confirming the server's `policy_generation` had fully caught up to a quiescent state
-immediately beforehand. Create-to-T0 lag (informational, cross-host, non-verdict-bearing per
-the plan) was not usably captured given how few Phase B2 repeats completed at all.
+voided `t1_not_found`/`t0_not_found` even after the id-collision bug was fixed. The
+complete-log correlation (87 T0s total, 84 completions, max gap 8.3s, all attributable to
+Phase A or restart boundaries) accounts for every full_sync this agent process ever logged
+across the whole session - it does not distinguish, for any single spark B2 attempt, between
+"the driver missed a T0 that really happened" and "the reconcile trigger never fired at all in
+the observation window" (e.g. the rule-create's generation bump not yet being trailed by the
+agent's heartbeat when the driver gave up) - both are plausible and this run doesn't have the
+per-attempt detail to tell them apart. Either way this is a driver/timing gap in how the
+trigger was observed, not evidence of a spark-specific completion failure - no case exists
+anywhere in the log of a real T0 that took unusually long to complete. Create-to-T0 lag
+(informational, cross-host, non-verdict-bearing per the plan) was not usably captured given
+how few Phase B2 repeats completed at all.
 
 ## Decision rule and outcome
 
@@ -264,20 +289,21 @@ rules).
 **Outcome: INCONCLUSIVE.** Neither backend reached the pre-registered K=5 valid-repeat floor
 for Phase B (legacy 2/5, spark 1/5), so the decision rule cannot be honestly applied - a median
 over 1-2 samples is not a basis for a non-inferiority claim at either backend, let alone a
-comparison between them. This is NOT a "neutral/not neutral" verdict, and it is explicitly NOT
-evidence that spark is worse, better, or equivalent to legacy on B specifically - the small
-samples that DID complete (4 legacy, 1 spark) all landed in the same 55-82ms band with no
-visible separation, but that observation is far too thin to promote to a finding.
+comparison between them. This is not a "neutral" or "not neutral" verdict of any kind, in
+either direction - it is a statement that the collected evidence is insufficient to conclude
+anything comparative. The small samples that DID complete (4 legacy, 1 spark) all landed in
+the same 55-82ms band with no visible separation, but that observation is far too thin to
+promote to a finding.
 
-**What this diagnostic DOES establish, which is arguably more useful to the flip-gate decision
-than the originally-intended B comparison would have been**: a real, reproducible, previously
-uncharacterized queueing/pile-up effect under repeated close-interval `full_sync` triggers,
-affecting BOTH backends at a comparable rate, independent of the legacy-vs-spark question this
-diagnostic set out to answer. Whether this satisfies ruling-13's requirement well enough for
-#3990 to be cited in §5 as "accepted-neutral" is Dave's call, not asserted here - the honest
-summary is "neutral in the very limited comparison the collected samples support, but the
-diagnostic surfaced a bigger, shared reliability question neither this doc nor #3990's own
-scope was set up to answer."
+**What this diagnostic DOES establish**: every full_sync actually observed to complete, on
+either backend, at either scale tested (N=62 clean cohort or N=5652 leftover catalogue),
+completed within 8.3 seconds, most within 100ms - directly contradicting this doc's own
+earlier (retracted) claim of a multi-minute pile-up effect. The low Phase B/B2 valid-repeat
+count is attributable to an unresolved bug in this run's own driver script, not to any
+backend behavior. Whether the evidence actually collected here is sufficient for Dave to cite
+#3990 in §5 as "accepted-neutral" per ruling-13's wording, or whether the diagnostic needs to
+be re-run with a fixed driver to actually reach K=5, is his call - not asserted either way by
+this document.
 
 ## Does NOT claim
 
@@ -289,17 +315,21 @@ scope was set up to answer."
   disclosed above.
 - That the recurring "ambient storm" observed passively in Phase A is mechanistically
   identical to #3990's own described trigger (a rule mutation amplified via heartbeat
-  reconcile), or to the stall/queueing effect found in Phase B/B2 - plausibly related, not
-  confirmed either way.
+  reconcile) - plausibly related (both involve reconcile-driven pushes), not confirmed either
+  way.
+- **A queueing/pile-up effect under repeated triggers - this was claimed in an earlier draft
+  of this document and is explicitly retracted above, with the evidence that disproved it.**
+  Do not cite this document as evidence of such an effect.
 - A neutrality finding in the sense the original CH-5-UAT ruling text explicitly disclaimed
   ("NOT a finding that #3990 is neutral ... in effect, only in mechanism") - the sample sizes
   actually obtained are too small to support even the limited comparison this document set out
   to make, let alone a broader one.
-- A root cause for the stall/queueing effect, or a claim about which specific step inside
-  `apply_rules`/its deferred rollback work is slow - not diagnosed in this session.
-- That legacy and spark are equally affected by the stall/queueing effect - the observed void
-  rates (80% legacy Phase B, 90% spark Phase B) are too close together and too small in sample
-  count to support a comparative claim between backends on THIS effect either.
+- A root cause for the residual driver detection-logic gap in Phase B/B2's T0/T1 matching -
+  not diagnosed in this session, and not a product-code question (the bug is in
+  `fullsync_blackout_diag.py`, not in anything under `agents/` or `server/`).
+- The N=5652 legacy-only ~6-minute silence observed in Phase A (see that section) as anything
+  more than a single, unreplicated, uncharacterized observation - it was not investigated
+  further and no connection to any other finding in this document is established.
 
 ## Teardown
 

@@ -18,6 +18,21 @@ YUZU_ADMIN_PASS (defaults match generate_resgate_load.py's UAT defaults -
 override for a non-default rig). YUZU_DGRHP_SSH (ssh destination for the
 agent-log reads, e.g. "-S /tmp/sock -i ~/.ssh/key user@host" as a single
 pre-built arg string), YUZU_AGENT_LOG (default C:\\rigA\\logs\\agent.log).
+
+KNOWN ISSUE, not fixed as of the 2026-09-06/07 run (see
+docs/spark-rebuild-baselines/3990-fullsync-blackout-run.md, "The driver's
+T1-detection gap"): `run`'s T0/T1 log-window detection has an unresolved
+bug causing most clean-cohort (small-N) attempts to falsely void as
+t0_not_found/t1_not_found even when the underlying full_sync completed
+normally and fast (confirmed by correlating the complete agent log against
+every void: no case of a real trigger taking longer than ~8s was ever
+found, at any N tested). Symptoms already fixed in this file: a UTC/local
+timezone mislabeling of agent-log timestamps, and a cross-host clock-drift
+window-start bug (both described in the run doc's "Methodology corrections"
+section) - fixing those did NOT eliminate the residual false-void rate, so
+at least one more bug remains in this same area, not yet isolated. Anyone
+reusing this script to actually reach K=5 should expect to need to debug
+`run`'s window/poll logic further before trusting its void classification.
 """
 
 import argparse
