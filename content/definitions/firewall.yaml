@@ -56,11 +56,13 @@ spec:
       - name: state
         type: string
         description: >-
-          Windows profile rows: enabled, disabled, unknown or error:<hresult>.
-          Linux "state" rows: running (firewalld), active, inactive or unknown.
-          macOS "state" rows: enabled, disabled or unknown; "pf" rows the same;
-          "mode" row is block_all. "backend" rows name the backend (appfirewall,
-          firewalld, nftables, ufw, iptables, none).
+          The remainder of the row after the key (the server clamps this plugin
+          to two fields). Windows "profile" rows: "<Domain|Private|Public>|<enabled|
+          disabled|unknown|error:<hresult>>" — the profile name first, then its
+          state. Linux "state" rows: running (firewalld), active, inactive or
+          unknown. macOS "state" rows: enabled, disabled or unknown; "pf" rows
+          the same; "mode" row is block_all. "backend" rows name the backend
+          (appfirewall, firewalld, nftables, ufw, iptables, none).
         example: enabled
     aggregation:
       groupBy: [state]
@@ -113,7 +115,7 @@ metadata:
   description: >
     List firewall rules on the endpoint. On Windows, enumerates the
     Windows Firewall rule set through the INetFwPolicy2 COM interface
-    (capped at 100 rules, with a truncated marker row when the cap is hit)
+    (capped at 100 rules, with a truncated marker row only when a genuine 101st rule exists)
     with rule name, enabled state, direction, action, and profile mask. On
     Linux, uses the detected backend: firewalld zones and services over
     D-Bus, nftables chains and rule handles over netlink, or the structured
@@ -140,9 +142,13 @@ spec:
       - name: rule_name
         type: string
         description: >-
-          Windows: the rule's display name. Linux ufw: the numbered index;
-          firewalld: the zone; nftables: the chain or rule handle row; macOS:
-          the raw pf rule line.
+          The field after "rule". Windows: the rule's display name. Linux: the
+          backend literal "firewalld" (then zone, "service", service name) or
+          "nftables" (then family, table, chain, hook and policy — or "handle"
+          and the handle number); the numbered index for ufw; the entry kind
+          for iptables (policy, new_chain, append; then chain and rule spec).
+          macOS: the raw pf rule line. The server clamps the row to two fields,
+          so the remainder lands in the value column.
         example: Core Networking - DNS (UDP-Out)
       - name: enabled
         type: string

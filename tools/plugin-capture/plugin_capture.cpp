@@ -6,14 +6,17 @@
  *   plugin-capture <plugin.{dylib,so,dll}> --os <windows|linux|macos>
  *                  --host-class <bare-metal|vm|container>
  *                  --action <name> [--param k=v ...] [--action <name> ...]
- *                  [--os-version <text>] [--privilege <text>] [--out <file>]
+ *                  [--config k=v ...] [--os-version <text>] [--privilege <text>]
+ *                  [--out <file>]
  *
  * Output (stdout, or --out):
  *
  *   captured: <os> <os-version> · <host-class> · <YYYY-MM-DD> · <privilege> · leg-hash pending
  *   == action=<name> [key=value ...]
  *   <rows exactly as the plugin wrote them>
+ *   [truncated] ...            (only when the capture hit the dispatcher byte cap)
  *   [result_status] <STATUS> / <COMPLETENESS> / <provenance>
+ *   [rc] <n>                   (only when the plugin returned non-zero)
  *
  * The leg-hash is filled in afterwards by `plugin_doc_gen.py --stamp <plugin> <os>`
  * so the hash is computed in exactly one place. Nothing here is hand-typed:
@@ -21,16 +24,32 @@
  * plugin's own `write_output` calls, and the status line is the CC-07 typed
  * result the plugin reported through `set_result_status`.
  *
+ * Lifecycle: the plugin's `init` runs once before the first action with a
+ * real plugin context (`yuzu::agent::StandalonePluginContext` — the
+ * configuration map from `--config k=v`, no KV store, no trigger engine),
+ * and `shutdown` runs after the last, the same order the agent host uses.
+ * A plugin whose init needs the agent's KV store or the server (tags, tar,
+ * content_dist, …) therefore fails closed here exactly as it would under a
+ * host without those services; such a leg is recorded with a
+ * `[not captured] agent-context: …` line instead (rule 5).
+ *
  * `--param` binds to the most recent `--action`. A value containing spaces
  * is written double-quoted on the action line so a sample stays reproducible.
  *
  * The agent core's logger (the plugin loader's "Loaded plugin …" line, a
  * plugin's own spdlog warnings) is routed to stderr before anything is
  * loaded, so a capture written to stdout is exactly the sample and nothing
- * else; `--out` writes the same bytes to a file.
+ * else; `--out` writes the same bytes to a file. Both are written in binary
+ * mode (LF line endings on every OS) and are checked after the write.
+ *
+ * Exit status: 0 = the sample was written in full (a non-zero plugin rc is
+ * still a valid capture — the `[rc]` line says what happened and stderr
+ * repeats it); 1 = the plugin could not be loaded, its init refused, or the
+ * output could not be written in full; 2 = usage error.
  */
 
 #include <chrono>
+#include <cstdlib>
 #include <ctime>
 #include <fstream>
 #include <iostream>
@@ -38,9 +57,15 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#include <fcntl.h>
+#include <io.h>
+#include <windows.h>
+#else
 #include <unistd.h>
 #endif
 
@@ -87,14 +112,39 @@ std::string today() {
 #else
     localtime_r(&now, &tm);
 #endif
-    char buf[16];
+    char buf[16]{};
     std::strftime(buf, sizeof buf, "%Y-%m-%d", &tm);
     return buf;
 }
 
+#if defined(_WIN32)
+std::string utf8_from_wide(const wchar_t* ws) {
+    const int n = WideCharToMultiByte(CP_UTF8, 0, ws, -1, nullptr, 0, nullptr, nullptr);
+    if (n <= 1) return {};
+    std::string out(static_cast<std::size_t>(n - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, ws, -1, out.data(), n, nullptr, nullptr);
+    return out;
+}
+#endif
+
+// The measured privilege the stamp records when --privilege is not given:
+// the effective uid on POSIX; the token's user and elevation state on Windows.
 std::string default_privilege() {
 #if defined(_WIN32)
-    return "-";
+    std::string user = "-";
+    wchar_t name[256]{};
+    DWORD len = static_cast<DWORD>(std::size(name));
+    if (GetUserNameW(name, &len)) user = utf8_from_wide(name);
+    std::string elevation = "elevation unknown";
+    HANDLE raw = nullptr;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw)) {
+        TOKEN_ELEVATION te{};
+        DWORD got = 0;
+        if (GetTokenInformation(raw, TokenElevation, &te, sizeof te, &got))
+            elevation = te.TokenIsElevated ? "elevated" : "not elevated";
+        CloseHandle(raw);
+    }
+    return user + " (" + elevation + ")";
 #else
     return "euid " + std::to_string(static_cast<long>(geteuid()));
 #endif
@@ -108,9 +158,17 @@ std::string quote_if_needed(const std::string& v) {
 int usage(const char* argv0) {
     std::cerr << "usage: " << argv0
               << " <plugin-library> --os <windows|linux|macos> --host-class <bare-metal|vm|container>"
-                 " --action <name> [--param k=v ...] [--action <name> ...]"
+                 " --action <name> [--param k=v ...] [--action <name> ...] [--config k=v ...]"
                  " [--os-version <text>] [--privilege <text>] [--out <file>]\n";
     return 2;
+}
+
+bool split_kv(const std::string& kv, std::string& k, std::string& v) {
+    const auto eq = kv.find('=');
+    if (eq == std::string::npos || eq == 0) return false;
+    k = kv.substr(0, eq);
+    v = kv.substr(eq + 1);
+    return true;
 }
 
 } // namespace
@@ -120,32 +178,41 @@ int main(int argc, char** argv) {
     std::string lib = argv[1];
     std::string os_name, host_class, os_version = "-", privilege = default_privilege(), out_path;
     std::vector<ActionSpec> actions;
+    std::unordered_map<std::string, std::string> config;
     for (int i = 2; i < argc; ++i) {
-        std::string_view a = argv[i];
-        auto need = [&](const char* flag) -> const char* {
-            if (i + 1 >= argc) {
-                std::cerr << "plugin-capture: " << flag << " requires a value\n";
-                std::exit(2);
-            }
-            return argv[++i];
-        };
-        if (a == "--os") os_name = need("--os");
-        else if (a == "--host-class") host_class = need("--host-class");
-        else if (a == "--os-version") os_version = need("--os-version");
-        else if (a == "--privilege") privilege = need("--privilege");
-        else if (a == "--out") out_path = need("--out");
-        else if (a == "--action") actions.push_back({need("--action"), {}});
-        else if (a == "--param") {
-            std::string kv = need("--param");
-            auto eq = kv.find('=');
-            if (actions.empty() || eq == std::string::npos) {
-                std::cerr << "plugin-capture: --param k=v must follow an --action\n";
+        const std::string_view flag = argv[i];
+        const bool known = flag == "--os" || flag == "--host-class" || flag == "--os-version" ||
+                           flag == "--privilege" || flag == "--out" || flag == "--action" ||
+                           flag == "--param" || flag == "--config";
+        if (!known) {
+            std::cerr << "plugin-capture: unknown argument " << flag << "\n";
+            return usage(argv[0]);
+        }
+        if (i + 1 >= argc) {
+            std::cerr << "plugin-capture: " << flag << " requires a value\n";
+            return 2;
+        }
+        const std::string value = argv[++i];
+        if (flag == "--os") os_name = value;
+        else if (flag == "--host-class") host_class = value;
+        else if (flag == "--os-version") os_version = value;
+        else if (flag == "--privilege") privilege = value;
+        else if (flag == "--out") out_path = value;
+        else if (flag == "--action") actions.push_back({value, {}});
+        else {
+            std::string k, v;
+            if (!split_kv(value, k, v)) {
+                std::cerr << "plugin-capture: " << flag << " takes key=value, got " << value << "\n";
                 return 2;
             }
-            actions.back().params.emplace_back(kv.substr(0, eq), kv.substr(eq + 1));
-        } else {
-            std::cerr << "plugin-capture: unknown argument " << a << "\n";
-            return usage(argv[0]);
+            if (flag == "--config") {
+                config[k] = v;
+            } else if (actions.empty()) {
+                std::cerr << "plugin-capture: --param k=v must follow an --action\n";
+                return 2;
+            } else {
+                actions.back().params.emplace_back(std::move(k), std::move(v));
+            }
         }
     }
     if (os_name.empty() || host_class.empty() || actions.empty()) return usage(argv[0]);
@@ -169,12 +236,27 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Lifecycle as the agent host runs it: init once with a real context,
+    // every dispatch, then shutdown. `ctx` is declared after `loaded` so the
+    // library outlives the context, and every dispatch below happens between
+    // init and shutdown.
+    yuzu::agent::StandalonePluginContext ctx(desc->name ? desc->name : "", std::move(config));
+    if (desc->init) {
+        const int rc = desc->init(ctx.get());
+        if (rc != 0) {
+            std::cerr << "plugin-capture: " << lib << ": init returned " << rc
+                      << " — the plugin refused to start under this host (missing agent context?);"
+                         " record the leg as `[not captured] agent-context: <reason>` instead\n";
+            return 1;
+        }
+    }
+
     std::ostringstream out;
     out << "captured: " << os_name << ' ' << os_version << " · " << host_class << " · " << today()
         << " · " << privilege << " · leg-hash pending\n";
 
     yuzu::agent::LocalDispatcher dispatcher;
-    int worst_rc = 0;
+    int last_nonzero_rc = 0;
     for (const auto& spec : actions) {
         std::vector<YuzuParam> params;
         params.reserve(spec.params.size());
@@ -194,23 +276,43 @@ int main(int argc, char** argv) {
             << '\n';
         if (result.rc != 0) {
             out << "[rc] " << result.rc << '\n';
-            worst_rc = result.rc;
+            last_nonzero_rc = result.rc;
         }
         out << '\n';
     }
+    if (desc->shutdown) desc->shutdown(ctx.get());
 
+    // A short write (disk full, closed pipe) must never leave a partial sample
+    // behind with a zero exit: the parser would accept the prefix as a whole
+    // capture. Flush, then check the stream.
+    const std::string sample = out.str();
     if (out_path.empty()) {
-        std::cout << out.str();
+#if defined(_WIN32)
+        _setmode(_fileno(stdout), _O_BINARY); // LF, not CRLF, like --out
+#endif
+        std::cout << sample;
+        std::cout.flush();
+        if (!std::cout) {
+            std::cerr << "plugin-capture: writing the sample to stdout failed\n";
+            return 1;
+        }
     } else {
         std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
         if (!f) {
-            std::cerr << "plugin-capture: cannot write " << out_path << "\n";
+            std::cerr << "plugin-capture: cannot open " << out_path << " for writing\n";
             return 1;
         }
-        f << out.str();
+        f << sample;
+        f.flush();
+        if (!f) {
+            std::cerr << "plugin-capture: writing " << out_path << " failed — the file is incomplete\n";
+            return 1;
+        }
     }
     // A non-zero plugin rc is still a valid capture (the row says what
     // happened); report it on stderr so a scripted run can notice.
-    if (worst_rc != 0) std::cerr << "plugin-capture: one or more actions returned rc " << worst_rc << "\n";
+    if (last_nonzero_rc != 0)
+        std::cerr << "plugin-capture: an action returned rc " << last_nonzero_rc
+                  << " (see its [rc] line)\n";
     return 0;
 }

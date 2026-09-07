@@ -191,8 +191,13 @@ _CAP_FIELD_RE = re.compile(r"\.(\w+)\s*=\s*([^,]+?)\s*(?:,|$)", re.DOTALL)
 def parse_capability_fragment(text: str, fragment: str) -> list[CapRow]:
     """Every ``CommandCapability`` designated-initialiser row in one fragment."""
     rows: list[CapRow] = []
-    for m in re.finditer(r"\{\s*(\.plugin\s*=.*?)\}", text, re.DOTALL):
-        body = re.sub(r"//[^\n]*", "", m.group(1))  # a trailing line comment is not a value
+    # Line comments are stripped from the whole fragment first: a comment
+    # between `{` and `.plugin` (the rationale line many rows open with) or
+    # after a field's value is never part of a value, and a comment-led row
+    # left unmatched would silently drop the plugin's security row.
+    stripped = re.sub(r"//[^\n]*", "", text)
+    for m in re.finditer(r"\{\s*(\.plugin\s*=.*?)\}", stripped, re.DOTALL):
+        body = m.group(1)
         fields: dict[str, str] = {}
         for fm in _CAP_FIELD_RE.finditer(body):
             key, raw = fm.group(1), fm.group(2).strip()
@@ -253,6 +258,33 @@ def parse_plugin_identity(text: str) -> dict[str, str | None]:
         description = _unescape_cpp("".join(_LITERAL_RE.findall(m.group(1))))
     return {"name": name, "version": version, "description": description}
 
+_SCALAR = (str, int, float, bool)
+
+
+def _check_column_docs(c: dict, definition_id: str, path: str) -> None:
+    """The four optional documentation keys of ``spec.result.columns[]``
+    (docs/yaml-dsl-spec.md): the server ignores them, so nothing else would
+    ever notice a scalar where a list was meant — and the manifest would then
+    carry the wrong shape into ``yuzu://plugin-docs``."""
+    where = f"{path}: {definition_id}.{c.get('name', '?')}"
+    if c.get("description") is not None and not isinstance(c["description"], str):
+        raise ValueError(f"{where}: `description` must be a string")
+    values = c.get("values")
+    if values is not None:
+        if not isinstance(values, list) or not all(isinstance(v, _SCALAR) for v in values):
+            raise ValueError(f"{where}: `values` must be a list of scalars")
+        if str(c.get("type", "")) != "string":
+            raise ValueError(f"{where}: `values` (a closed vocabulary) is only meaningful on a string column")
+    if c.get("example") is not None and not isinstance(c["example"], _SCALAR):
+        raise ValueError(f"{where}: `example` must be a scalar")
+    platforms = c.get("platforms")
+    if platforms is not None:
+        if not isinstance(platforms, list) or not all(isinstance(pl, str) for pl in platforms):
+            raise ValueError(f"{where}: `platforms` must be a list")
+        bad = [pl for pl in platforms if pl not in YAML_PLATFORM]
+        if bad:
+            raise ValueError(f"{where}: `platforms` accepts {sorted(YAML_PLATFORM)}, not {bad}")
+
 
 def parse_definition_docs(docs: Iterable[dict], path: str) -> list[Definition]:
     """InstructionDefinition documents (already YAML-loaded) -> Definition rows."""
@@ -272,6 +304,7 @@ def parse_definition_docs(docs: Iterable[dict], path: str) -> list[Definition]:
         columns = []
         for c in result.get("columns") or []:
             if isinstance(c, dict):
+                _check_column_docs(c, str(meta.get("id", "")), path)
                 columns.append({
                     "name": str(c.get("name", "")),
                     "type": str(c.get("type", "")),
@@ -343,6 +376,16 @@ def parse_sample(text: str, os_name: str) -> Sample:
                                             "provenance": sm.group("prov").strip()}
         elif current is not None and line.strip():
             current["rows"].append(line)
+    if not actions:
+        raise ValueError(f"{os_name}: no `== action=` block in the sample")
+    for a in actions:
+        # plugin-capture always closes an executed action with its status
+        # line; a block without one is a short write (disk full, killed
+        # process) or a hand-typed sample, and either must not pass as a
+        # whole capture (rule 5).
+        if a["not_captured"] is None and a["result_status"] is None:
+            raise ValueError(f"{os_name}: action '{a['action']}' has no [result_status] line — "
+                             "the capture is incomplete; recapture with plugin-capture")
     return Sample(os=os_name, stamp=stamp, actions=actions)
 
 
@@ -445,7 +488,7 @@ def load_definitions(repo: Path) -> dict[str, list[Definition]]:
     if yaml is None:
         raise RuntimeError("PyYAML is required: pip install pyyaml")
     by_plugin: dict[str, list[Definition]] = {}
-    for path in sorted((repo / "content" / "definitions").glob("*.yaml")):
+    for path in sorted((repo / "content" / "definitions").glob("*.yaml"), key=lambda q: q.as_posix()):
         docs = list(yaml.safe_load_all(_read(path)))
         rel = path.relative_to(repo).as_posix()
         for d in parse_definition_docs(docs, rel):
@@ -455,7 +498,7 @@ def load_definitions(repo: Path) -> dict[str, list[Definition]]:
 
 def load_capability_rows(repo: Path) -> dict[str, list[CapRow]]:
     by_plugin: dict[str, list[CapRow]] = {}
-    for path in sorted(repo.glob(CAPDECL_GLOB)):
+    for path in sorted(repo.glob(CAPDECL_GLOB), key=lambda q: q.as_posix()):
         rel = path.relative_to(repo).as_posix()
         for row in parse_capability_fragment(_read(path), rel):
             by_plugin.setdefault(row.plugin, []).append(row)
@@ -488,7 +531,7 @@ def load_plugin(repo: Path, name: str, matrix: dict, defs: dict, caps: dict) -> 
     pdir = repo / "agents" / "plugins" / name
     identity = {"name": None, "version": None, "description": None}
     warnings: list[str] = []
-    for tu in sorted((pdir / "src").glob("*.cpp")):
+    for tu in sorted((pdir / "src").glob("*.cpp"), key=lambda q: q.as_posix()):
         ident = parse_plugin_identity(_read(tu))
         if ident["name"]:
             identity = ident
@@ -504,6 +547,13 @@ def load_plugin(repo: Path, name: str, matrix: dict, defs: dict, caps: dict) -> 
         warnings.append(f"{name}: no rows in the capability-matrix block (regenerate it?)")
     definitions = defs.get(declared, [])
     cap_rows = caps.get(declared, [])
+    cap_actions = {r.action for r in cap_rows}
+    for action in sorted(legs):
+        if action not in cap_actions:
+            warnings.append(f"error: {name}: action '{action}' is in the capability-matrix block but no "
+                            f"CommandCapability row was parsed for it from {CAPDECL_GLOB} — every "
+                            "dispatchable action has one (tests/test_capability_catalogue_complete.py), so "
+                            "the fragment parser missed the row; check the initialiser's layout")
     samples: dict[str, Sample] = {}
     for os_name in OS_ORDER:
         sp = pdir / "docs" / "samples" / f"{os_name}.txt"
@@ -607,6 +657,39 @@ def render_capability(doc: PluginDoc) -> str:
     return "\n".join(lines)
 
 
+def _scalar_cell(v) -> str:
+    """A YAML scalar as a reader expects it: `true`, not Python's `True`."""
+    if v is None:
+        return "-"
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    return str(v)
+
+
+_CONSTRAINT_ORDER = ("enum", "pattern", "minLength", "maxLength", "minimum", "maximum",
+                     "minItems", "maxItems", "format")
+
+
+def constraints_text(spec: dict) -> str:
+    """The parameter's ``validation`` block (docs/yaml-dsl-spec.md §3.1) as one
+    cell: `enum: a, b · pattern: ^x$ · minLength 1`. Unknown keys are kept."""
+    v = spec.get("validation")
+    if not isinstance(v, dict) or not v:
+        return "-"
+    parts = []
+    for key in list(_CONSTRAINT_ORDER) + sorted(k for k in v if k not in _CONSTRAINT_ORDER):
+        if key not in v:
+            continue
+        val = v[key]
+        if isinstance(val, list):
+            parts.append(f"{key}: " + ", ".join(_scalar_cell(x) for x in val))
+        elif key in ("pattern", "format"):
+            parts.append(f"{key}: {val}")
+        else:
+            parts.append(f"{key} {_scalar_cell(val)}")
+    return " · ".join(parts)
+
+
 def render_inputs(doc: PluginDoc) -> str:
     rows = []
     for d in sorted(doc.definitions, key=lambda d: d.id):
@@ -615,13 +698,15 @@ def render_inputs(doc: PluginDoc) -> str:
         for pname, spec in props.items():
             spec = spec if isinstance(spec, dict) else {}
             rows.append((d.id, pname, str(spec.get("type", "-")), "yes" if pname in required else "no",
-                         str(spec.get("default", "-")), " ".join(str(spec.get("description", "-")).split())))
+                         _scalar_cell(spec.get("default")), constraints_text(spec),
+                         " ".join(str(spec.get("description", "-")).split())))
     if not rows:
         n = len(doc.legs)
         if n == 1:
             return "The action takes no parameters."
         return ("Neither action takes" if n == 2 else "No action takes") + " parameters."
-    lines = ["| Definition | Parameter | Type | Required | Default | Description |", "|---|---|---|---|---|---|"]
+    lines = ["| Definition | Parameter | Type | Required | Default | Constraints | Description |",
+             "|---|---|---|---|---|---|---|"]
     lines += ["| " + " | ".join(_esc(c) for c in (f"`{r[0]}`", f"`{r[1]}`", *r[2:])) + " |" for r in rows]
     return "\n".join(lines)
 
@@ -730,6 +815,16 @@ def render_nav(docs: list[PluginDoc]) -> str:
             "// <!-- END GENERATED -->\n")
 
 
+# Every top-level key build_manifest emits — tests/test_plugin_readmes.py binds
+# this to the "Manifest schema" table in docs/plugin-readme-standard.md, so a
+# key added to one without the other fails the docs suite.
+MANIFEST_KEYS = frozenset({
+    "manifest_version", "name", "version", "description", "kind", "platforms", "security",
+    "actions", "definitions", "inputs", "outputs", "leg_hash", "how_it_works", "outputs_note",
+    "privileges", "result_status", "where_the_data_goes", "caveats", "samples", "source", "readme",
+})
+
+
 def build_manifest(doc: PluginDoc, readme: str) -> dict:
     hand = hand_sections_to_manifest(readme)
     by_action_defs: dict[str, list[str]] = {}
@@ -764,7 +859,9 @@ def build_manifest(doc: PluginDoc, readme: str) -> dict:
                          "gather": d.gather} for d in sorted(doc.definitions, key=lambda d: d.id)],
         "inputs": [{"definition_id": d.id, "name": n, "type": str(s.get("type", "")),
                     "required": n in set((d.parameters or {}).get("required") or []),
-                    "default": s.get("default"), "description": s.get("description")}
+                    "default": s.get("default"),
+                    "constraints": s.get("validation") if isinstance(s.get("validation"), dict) else None,
+                    "description": s.get("description")}
                    for d in sorted(doc.definitions, key=lambda d: d.id)
                    for n, s in ((d.parameters or {}).get("properties") or {}).items()
                    if isinstance(s, dict)],
@@ -880,22 +977,28 @@ def apply(repo: Path, outcome: Outcome) -> None:
     for rel, (_, new) in outcome.changed.items():
         path = repo / rel
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(new, encoding="utf-8")
+        path.write_text(new, encoding="utf-8", newline="\n")
 
 
 def stamp(repo: Path, name: str, os_name: str) -> str:
     """Replace ``leg-hash pending`` (or a stale hash) in a sample stamp with the
     current hash. Returns the hash written."""
+    if name not in plugin_dirs(repo):
+        raise ValueError(f"{name}: no such plugin directory under agents/plugins/")
+    if os_name not in OS_ORDER:
+        raise ValueError(f"{os_name}: OS must be one of {', '.join(OS_ORDER)}")
     matrix = parse_matrix_block(_read(repo / "docs" / "os-capability-matrix.md"))
     doc = load_plugin(repo, name, matrix, load_definitions(repo), load_capability_rows(repo))
     path = repo / "agents" / "plugins" / name / "docs" / "samples" / f"{os_name}.txt"
+    if not path.exists():
+        raise ValueError(f"{path.relative_to(repo).as_posix()}: no capture to stamp — run plugin-capture first")
     text = _read(path)
     h = leg_hash(doc.legs, doc.definitions)
     first, _, rest = text.partition("\n")
     if not _STAMP_RE.match(first.strip()):
         raise ValueError(f"{path}: first line is not a capture stamp")
     first = re.sub(r"leg-hash\s+\w+\s*$", f"leg-hash {h}", first)
-    path.write_text(first + "\n" + rest, encoding="utf-8")
+    path.write_text(first + "\n" + rest, encoding="utf-8", newline="\n")
     return h
 
 
@@ -921,18 +1024,24 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--stamp", nargs=2, metavar=("NAME", "OS"), help="write the current leg-hash into a capture stamp")
     args = ap.parse_args(argv)
     repo = Path(args.repo_root).resolve() if args.repo_root else Path(__file__).resolve().parents[2]
-    if args.stamp:
-        print(f"leg-hash {stamp(repo, *args.stamp)}")
-        return 0
+    try:
+        if args.stamp:
+            print(f"leg-hash {stamp(repo, *args.stamp)}")
+            return 0
+        if args.check:
+            errors, warnings = check_repo(repo)
+        else:
+            outcome = generate(repo, only=args.plugin)
+    except ValueError as e:  # a malformed source file, named
+        print(f"error: {e}", file=sys.stderr)
+        return 1
     if args.check:
-        errors, warnings = check_repo(repo)
         for w in warnings:
             print(f"warning: {w}", file=sys.stderr)
         for e in errors:
             print(f"error: {e}", file=sys.stderr)
         print(f"plugin-doc-gen --check: {len(errors)} error(s), {len(warnings)} warning(s)")
         return 1 if errors else 0
-    outcome = generate(repo, only=args.plugin)
     for w in outcome.warnings:
         print(f"warning: {w}", file=sys.stderr)
     for e in outcome.errors:

@@ -2,11 +2,14 @@
 # (docs/plugin-readme-standard.md rule 5).
 #
 # Host tool: loads one built plugin shared library through the agent's own
-# PluginHandle::load and drives its actions through LocalDispatcher, writing
-# the stamped sample file tools/plugin-doc-gen splices into the plugin's
-# README. Links libyuzu_agent_core (the dispatcher and loader live there) —
-# never a stubbed yuzu_ctx_* host, so the rows are exactly what the real
-# agent host would capture.
+# PluginHandle::load, runs its init with a StandalonePluginContext (config
+# only — no KV store, no trigger engine, no server), drives its actions
+# through LocalDispatcher, then runs its shutdown, writing the stamped sample
+# file tools/plugin-doc-gen splices into the plugin's README. Links
+# libyuzu_agent_core (the dispatcher, loader and context live there) — never
+# a stubbed yuzu_ctx_* host, so a row is what the agent host captures for a
+# plugin that needs no store or server; a plugin that does fails closed here
+# the same way it would under a host without them (see the tool's header).
 #
 # Guarded like capmatrix-gen: under cross-compilation the build machine cannot
 # run a target-machine binary, so the tool is skipped rather than built as an

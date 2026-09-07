@@ -170,12 +170,24 @@ def main() -> int:
         if not isinstance(manifest, dict) or manifest.get("name") != mf.stem:
             bad_manifests.append((str(mf), "top-level object with name == file stem required"))
             continue
+        # The keys the server's index reads (discover_routes.cpp) must have the
+        # shape it expects; a wrong-typed key must fail HERE, at build time.
+        shape_errors = [
+            f"{key} must be a string" for key in ("description", "readme")
+            if not isinstance(manifest.get(key), str)
+        ]
+        if not isinstance(manifest.get("platforms"), dict):
+            shape_errors.append("platforms must be an object")
+        if shape_errors:
+            bad_manifests.append((str(mf), "; ".join(shape_errors)))
+            continue
         plugin_docs_json.append(json.dumps(manifest, sort_keys=True, separators=(",", ":")))
     if bad_manifests:
         print(
             f"ERROR: embed_content.py: {len(bad_manifests)} plugin-docs manifest(s) "
             "failed validation (content/plugin-docs/<name>.json must be a JSON object "
-            "whose name matches the file stem — regenerate with tools/plugin-doc-gen):",
+            "whose name matches the file stem, with string description/readme and an "
+            "object platforms — regenerate with tools/plugin-doc-gen):",
             file=sys.stderr,
         )
         for path, reason in bad_manifests:
@@ -283,26 +295,37 @@ def main() -> int:
     # delimiter — chosen for impossibility in any sane content YAML.
     DELIM = "BCT"
 
-    # MSVC caps a single string-literal token at 16380 bytes (error C2026), so a
-    # large envelope (a verbose definition's yaml_source + parameter_schema) is
-    # split into several ADJACENT raw-string literals — the compiler concatenates
-    # them into one std::string element, transparently. Safe because the whole
-    # envelope is verified free of the `)BCT"` delimiter below, so no chunk can
-    # contain it and no chunk boundary can synthesise it (chunks are separate
-    # literals; only their VALUES are concatenated). Chunk well under the cap.
-    CHUNK = 12000
+    # MSVC has TWO string-literal limits. A single literal token is capped at
+    # 16380 bytes (error C2026), so a large envelope (a verbose definition's
+    # yaml_source + parameter_schema, a plugin-docs manifest) is split into
+    # several ADJACENT raw-string literals the compiler concatenates. The
+    # CONCATENATED literal is then capped at 65535 bytes (error C1091), so
+    # adjacent chunks are grouped well under that and, when an element needs
+    # more than one group, the groups are joined with std::string's operator+
+    # instead — a std::string expression is a valid vector<std::string>
+    # initialiser element and carries no literal-length limit. Both limits are
+    # enforced by construction here, on every host, so an oversize element can
+    # never surface only on the Windows CI leg. Safe because the whole
+    # envelope is verified free of the `)BCT"` delimiter below, so no chunk
+    # can contain it and no chunk boundary can synthesise it (chunks are
+    # separate literals; only their VALUES are concatenated).
+    CHUNK = 12000           # bytes per literal token, well under 16380
+    CHUNKS_PER_GROUP = 4    # 48000 bytes per concatenated literal, well under 65535
 
     def emit_literal(j: str) -> bytes:
         # Sanity check: rule out delimiter collision in the JSON envelope.
         if f"){DELIM}\"" in j:
             raise ValueError("JSON envelope contains raw-string delimiter")
-        parts = [j[i:i + CHUNK] for i in range(0, len(j), CHUNK)] or [""]
-        line = b"    "
-        for k, part in enumerate(parts):
-            if k:
-                line += b" "
-            line += b'R"' + DELIM.encode() + b"(" + part.encode("utf-8") + b")" + DELIM.encode() + b'"'
-        return line + b",\n"
+        raw = j.encode("utf-8")
+        parts = [raw[i:i + CHUNK] for i in range(0, len(raw), CHUNK)] or [b""]
+        groups = [parts[i:i + CHUNKS_PER_GROUP] for i in range(0, len(parts), CHUNKS_PER_GROUP)]
+        rendered = [
+            b" ".join(b'R"' + DELIM.encode() + b"(" + part + b")" + DELIM.encode() + b'"' for part in group)
+            for group in groups
+        ]
+        if len(rendered) == 1:
+            return b"    " + rendered[0] + b",\n"
+        return b"    std::string(" + rendered[0] + b")\n      + " + b"\n      + ".join(rendered[1:]) + b",\n"
 
     out = bytearray()
     out += f"// AUTO-GENERATED from {root.name}/ by embed_content.py — do not edit.\n".encode("utf-8")

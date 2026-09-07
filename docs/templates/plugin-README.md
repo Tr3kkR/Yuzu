@@ -53,8 +53,8 @@ flowchart LR
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-| Definition | Parameter | Type | Required | Default | Description |
-|---|---|---|---|---|---|
+| Definition | Parameter | Type | Required | Default | Constraints | Description |
+|---|---|---|---|---|---|---|
 <!-- END GENERATED -->
 
 ### Outputs

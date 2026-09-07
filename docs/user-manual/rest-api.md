@@ -4403,7 +4403,7 @@ Returns the OpenAPI/Swagger specification for the v1 API as JSON.
 
 Agentic-first discovery family (roadmap Issue 17.1, `docs/agentic-first-principle.md` §A2): "an agentic worker should be able to learn what is possible from the live server alone, without a side-channel doc fetch." Unlike `GET /api/v1/openapi.json` above, every endpoint here is **authenticated** and gates `Infrastructure:Read` (`/discover/instructions` gates `InstructionDefinition:Read` instead). Each response body IS the catalog object directly — no `data`/`meta` envelope wrapper, matching the `GET /api/v1/guaranteed-state/schemas` discovery precedent this family is modeled on.
 
-All five share the same caching contract: a content-derived `ETag` header + `Cache-Control: public, max-age=300`; send `If-None-Match: <etag>` to get a cheap `304 Not Modified` instead of re-downloading. Each is also mirrored as a read-only MCP tool of the same name (`discover_permissions`, `discover_instructions`, `discover_routes`, `discover_scope_kinds`, `discover_plugins`) — REST and MCP share the same builder functions internally, so they cannot drift from each other.
+All six share the same revalidation contract: a content-derived `ETag` header; send `If-None-Match: <etag>` to get a cheap `304 Not Modified` instead of re-downloading. `instructions`, `routes`, `scope-kinds` and `plugin-docs` are `Cache-Control: public, max-age=300`; `permissions` and `plugins` are `private` with a `Vary` header because their bodies depend on the caller. Five are mirrored as read-only MCP tools of the same name (`discover_permissions`, `discover_instructions`, `discover_routes`, `discover_scope_kinds`, `discover_plugins`); `/discover/plugin-docs` is mirrored as the MCP resource `yuzu://plugin-docs` instead. REST and MCP share the same builder functions internally, so they cannot drift from each other.
 
 #### `GET /api/v1/discover/permissions`
 
@@ -4603,6 +4603,7 @@ Per-plugin documentation as data: one manifest per agent plugin that has adopted
       "inputs": [],
       "outputs": [{"definition_id": "crossplatform.storage.smart", "columns": [{"name": "health", "type": "string", "values": ["ok", "warning", "failing", "unknown", "unsupported"], "example": "ok", "platforms": ["windows"]}]}],
       "how_it_works": "Both actions are reads. ...",
+      "outputs_note": "Pipe-delimited rows, one per drive or volume. Field 0 is a literal discriminator ...",
       "privileges": [{"os": "Windows", "runs_as": "...", "grant": "None. ...", "measured": "...", "if_refused": "..."}],
       "result_status": [{"status": "`CONSTRAINED`", "completeness": "partial", "provenance": "`macos:iokit:health_unread`", "when": "..."}],
       "where_the_data_goes": ["**Instruction result only.** ..."],
@@ -4616,7 +4617,7 @@ Per-plugin documentation as data: one manifest per agent plugin that has adopted
 }
 ```
 
-Same ETag / `Cache-Control: public, max-age=300` / `If-None-Match` → `304` contract as the other discovery catalogs.
+Same ETag / `Cache-Control: public, max-age=300` / `If-None-Match` → `304` contract as `/discover/scope-kinds` (the body is identical for every caller). `inputs[]` entries carry `{definition_id, name, type, required, default, constraints, description}`, where `constraints` is the parameter's DSL `validation` object or `null`; the key set of each manifest is the "Manifest schema" table in `docs/plugin-readme-standard.md`, which the docs suite binds to the generator.
 
 ---
 

@@ -70,7 +70,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
           persist-credentials: false
 
       - name: Enforce README touch rule
@@ -85,13 +84,15 @@ jobs:
             pull_request) BASE="$BASE_SHA" ;;
             *)            echo "Unmodelled event '$EVENT_NAME' -- nothing to compare, skipping."; exit 0 ;;
           esac
-          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ] \
-             || ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
             echo "Base commit unavailable -- cannot diff, skipping (the docs suite still byte-checks the fences)."
             exit 0
           fi
-          printf '%s' "${PR_BODY:-}" > /tmp/pr-body.txt
-          scripts/ci/check-plugin-readme-touch.sh "$BASE" "$HEAD_SHA" /tmp/pr-body.txt
+          # A two-tree diff needs only the base commit itself, not the whole
+          # history (the changelog-fragments job above does the same).
+          git fetch --depth=1 origin "$BASE"
+          printf '%s' "${PR_BODY:-}" > "$RUNNER_TEMP/pr-body.txt"
+          scripts/ci/check-plugin-readme-touch.sh "$BASE" "$HEAD_SHA" "$RUNNER_TEMP/pr-body.txt"
 
   # Changelog fragment convention (changelog.d/ — see changelog.d/README.md):
   # PRs add uniquely-named fragment files instead of editing CHANGELOG.md's

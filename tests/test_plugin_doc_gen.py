@@ -89,7 +89,7 @@ row|x
 [rc] 1
 """
 
-README = """# alpha
+README = r"""# alpha
 
 <!-- BEGIN GENERATED: plugin-doc-gen header -->
 old
@@ -389,6 +389,111 @@ class Rendering(unittest.TestCase):
         self.assertIn("| `alpha` | ✅ 🟡 ⛔ | Probes | [README](../../agents/plugins/alpha/README.md) |", idx)
         nav = g.render_nav([self._doc()])
         self.assertIn("{ file: 'agents/plugins/alpha/README', slug: 'plugins/alpha', title: 'alpha' }", nav)
+
+
+class CommentLedRows(unittest.TestCase):
+    def test_comment_between_brace_and_plugin_is_not_a_row_boundary(self):
+        # 14 of the 193 shipped rows open with a rationale comment on the line
+        # after `{`; the parser used to skip every one of them silently.
+        frag = """
+inline constexpr std::array<CommandCapability, 2> kRows{{
+    {
+        // Overwrites the file in place — Irreversible, not Reversible.
+        .plugin = "gamma", .action = "write",
+        .dispatch_class = DispatchClass::Destructive, .mutability = Mutability::Irreversible,
+        .securable = "Filesystem", // the fs securable
+        .operation = authz::Operation::Write, .risk_tier = authz::RiskTier::High,
+        .execute_gate = ExecuteGate::AlwaysApproval,
+    },
+    {
+        .plugin = "gamma", .action = "read",
+        .dispatch_class = DispatchClass::ReadOnly, .mutability = Mutability::None,
+        .securable = "Filesystem", .operation = authz::Operation::Read,
+        .risk_tier = authz::RiskTier::Low, .execute_gate = ExecuteGate::None,
+    },
+}};
+"""
+        rows = g.parse_capability_fragment(frag, "frag.hpp")
+        self.assertEqual([(r.action, r.dispatch_class, r.securable) for r in rows],
+                         [("write", "Destructive", "Filesystem"), ("read", "ReadOnly", "Filesystem")])
+
+
+class TruncatedSamples(unittest.TestCase):
+    def test_action_without_status_line_is_rejected(self):
+        # A short write (disk full) leaves the last action without its
+        # [result_status] line; the file must not parse as a whole capture.
+        cut = SAMPLE.split("[result_status] CONSTRAINED")[0]
+        with self.assertRaisesRegex(ValueError, "probe.*no \\[result_status\\] line"):
+            g.parse_sample(cut, "macos")
+
+    def test_not_captured_marker_needs_no_status_line(self):
+        s = g.parse_sample(SAMPLE, "macos")
+        self.assertIsNone(s.actions[1]["result_status"])
+        self.assertTrue(s.actions[1]["not_captured"])
+
+    def test_stamp_only_file_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "no `== action=` block"):
+            g.parse_sample(SAMPLE.splitlines()[0] + "\n", "macos")
+
+
+class ColumnDocKeys(unittest.TestCase):
+    def _doc(self, column):
+        return [{"kind": "InstructionDefinition", "metadata": {"id": "x.a"},
+                 "spec": {"execution": {"plugin": "alpha", "action": "probe"},
+                          "result": {"columns": [column]}}}]
+
+    def test_scalar_platforms_rejected(self):
+        with self.assertRaisesRegex(ValueError, "x.a.c: `platforms` must be a list"):
+            g.parse_definition_docs(self._doc({"name": "c", "type": "string", "platforms": "windows"}), "p.yaml")
+
+    def test_unknown_platform_rejected(self):
+        with self.assertRaisesRegex(ValueError, "not \\['macos'\\]"):
+            g.parse_definition_docs(self._doc({"name": "c", "type": "string", "platforms": ["macos"]}), "p.yaml")
+
+    def test_values_only_on_string_columns(self):
+        with self.assertRaisesRegex(ValueError, "only meaningful on a string column"):
+            g.parse_definition_docs(self._doc({"name": "n", "type": "int64", "values": [1, 2]}), "p.yaml")
+
+    def test_well_formed_keys_pass(self):
+        defs = g.parse_definition_docs(self._doc({"name": "c", "type": "string", "values": ["a", "b"],
+                                                  "example": "a", "platforms": ["windows", "darwin"],
+                                                  "description": "d"}), "p.yaml")
+        self.assertEqual(defs[0].columns[0]["platforms"], ["windows", "darwin"])
+
+
+class InputsRendering(unittest.TestCase):
+    def _doc(self):
+        d = _defs([])[0]
+        d.parameters = {"type": "object", "required": ["mode"], "properties": {
+            "mode": {"type": "string", "description": "Startup mode",
+                     "validation": {"enum": ["automatic", "manual"]}},
+            "name": {"type": "string", "description": "Unit name",
+                     "validation": {"minLength": 1, "maxLength": 256, "pattern": "^[a-z.]+$"}},
+            "dry_run": {"type": "boolean", "default": False, "description": "Plan only"},
+        }}
+        m = g.parse_matrix_block(MATRIX)
+        return g.PluginDoc(name="alpha", version="1", description="P", legs=m["alpha"], cap_rows=[],
+                           definitions=[d], samples={}, source={}, readme_path="agents/plugins/alpha/README.md")
+
+    def test_constraints_column_and_yaml_scalars(self):
+        table = g.render_inputs(self._doc())
+        self.assertIn("| Definition | Parameter | Type | Required | Default | Constraints | Description |", table)
+        self.assertIn("| `x.alpha.probe` | `mode` | string | yes | - | enum: automatic, manual | Startup mode |", table)
+        self.assertIn("| pattern: ^[a-z.]+$ · minLength 1 · maxLength 256 |", table)
+        self.assertIn("| `dry_run` | boolean | no | false | - | Plan only |", table)
+
+    def test_manifest_carries_constraints(self):
+        m = g.build_manifest(self._doc(), README)
+        by_name = {i["name"]: i for i in m["inputs"]}
+        self.assertEqual(by_name["mode"]["constraints"], {"enum": ["automatic", "manual"]})
+        self.assertIsNone(by_name["dry_run"]["constraints"])
+        self.assertIs(by_name["dry_run"]["default"], False)
+
+
+class ManifestKeySet(unittest.TestCase):
+    def test_build_manifest_emits_exactly_the_declared_keys(self):
+        doc = Rendering()._doc()
+        self.assertEqual(set(g.build_manifest(doc, README)), set(g.MANIFEST_KEYS))
 
 
 if __name__ == "__main__":

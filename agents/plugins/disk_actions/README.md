@@ -55,8 +55,8 @@ flowchart LR
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | agent service account (LocalSystem today, #1442) | None. Device and volume handles are opened with zero access rights, not `GENERIC_READ`; both IOCTLs are `FILE_ANY_ACCESS`. Keeps working after #1442 moves the agent off LocalSystem. | 2026-09-03 on the-rig as `NT AUTHORITY\LOCAL SERVICE` | result status `PERMISSION_DENIED`, provenance names the device |
-| macOS | agent daemon, unprivileged | None. IOKit property reads only; no user client is opened. | 2026-09-03 and 2026-09-06 at euid 501 | result status `PERMISSION_DENIED` |
+| Windows | agent service account (LocalSystem today, #1442) | None measured for `smart`: the device handle is opened with zero access rights, not `GENERIC_READ`, and both IOCTLs are `FILE_ANY_ACCESS`, so it keeps working after #1442 moves the agent off LocalSystem. `volumes` opens each volume handle the same way, but that path has not been measured under an unprivileged account (`disk_actions_win.cpp`, U1); a refusal there is reported as denied, never as "the device did not answer". | `smart`: 2026-09-03 on the-rig as `NT AUTHORITY\LOCAL SERVICE`. `volumes`: elevated only (2026-09-06 on the-rig) | result status `PERMISSION_DENIED` / partial, provenance `windows:physicaldrive:denied` (a device handle) or `windows:volume_enum:denied` (a volume handle or the volume enumeration) |
+| macOS | LaunchDaemon (root today; `docs/agent-privilege-model.md`) | None. IOKit property reads only; no user client is opened, so the leg needs nothing root has. | 2026-09-03 and 2026-09-06 at euid 501 (an unprivileged user, a stricter test than the daemon's) | never `PERMISSION_DENIED`: the macOS legs report a refused or failed IOKit read as `CONSTRAINED` (partial, `macos:iokit` / `macos:iomedia` and their sub-tokens) or, when the service match itself fails, `UNAVAILABLE` |
 | Linux | n/a | n/a, leg not implemented | — | always `UNAVAILABLE` |
 
 No external binaries, no subprocesses, no network access. Do not "fix" the Windows open to `GENERIC_READ`; that is the change that breaks the leg under an unprivileged account.
@@ -71,7 +71,7 @@ Neither action takes parameters.
 
 ### Outputs
 
-Pipe-delimited rows, one per drive or volume. Field 0 is a literal discriminator (`smart` or `volume`) that precedes the columns below; every row of a kind has the same field count, with `-` where a value is inapplicable or was not read. `-` never means zero. A leg that finds nothing still emits one placeholder row so zero rows can never be misread as "no disks": a `smart` placeholder carries `health=unsupported`, a `volume` placeholder carries `volume=-`, and both are accompanied by a typed status, which is the authoritative signal.
+Pipe-delimited rows, one per drive or volume. Field 0 is a literal discriminator (`smart` or `volume`) that precedes the columns below; every row of a kind has the same field count, with `-` where a value is inapplicable or was not read. `-` never means zero. Every field passes through `safe_output_field`, which rewrites `\` as `/`, so Windows volume GUID paths read `//?/Volume{…}/` and drive letters `C:/`. A leg that finds nothing still emits one placeholder row so zero rows can never be misread as "no disks": a `smart` placeholder carries `health=unsupported`, a `volume` placeholder carries `volume=-`, and both are accompanied by a typed status, which is the authoritative signal.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
 **`crossplatform.storage.smart` — `device|model|bus|media|health|pct_used|spare_pct|detail`**
@@ -106,13 +106,13 @@ Surfaced as `plugin_result_status` on the command response.
 | Status | Completeness | Provenance | When |
 |---|---|---|---|
 | `OK` (derived from `UNDECLARED`) | — | — | clean read: `volumes` on Windows and macOS, `smart` on Windows |
-| `CONSTRAINED` | partial | `macos:iokit:health_unread` | every macOS `smart` run: identity read, health not |
-| `UNAVAILABLE` | partial | `linux:smart` · `linux:volumes` | Linux, always |
-| `PERMISSION_DENIED` | partial | device or volume name | a handle open was refused; outranks every other degradation |
+| `CONSTRAINED` | partial | Windows: `windows:physicaldrive` · `windows:physicaldrive_cap` · `windows:storage_device_property` · `windows:nvme_health` · `windows:volume_enum` · `windows:volume_extents:unread` · `windows:volume_extents:truncated` · `windows:volume_mount_paths` · `windows:volume_information`. macOS: `macos:iokit` · `macos:iokit:no_bsd_name` · `macos:iokit:health_unread` · `macos:iomedia` · `macos:iomedia:no_bsd_name` · `macos:provider_walk` · `macos:getmntinfo_r_np` | a per-device read degraded and the row carries `-` for what was not read; every macOS `smart` run reports `macos:iokit:health_unread` (identity read, health not); `windows:physicaldrive_cap` means more than `kMaxPhysicalDrives` drives exist |
+| `UNAVAILABLE` | partial | `linux:smart` · `linux:volumes` · `windows:physicaldrive` · `macos:iokit` · `macos:iomedia` | Linux, always (placeholder row); Windows or macOS when the drive or media enumeration itself fails, so no device was read at all |
+| `PERMISSION_DENIED` | partial | `windows:physicaldrive:denied` · `windows:volume_enum:denied` | Windows only: a device or volume handle open, or the volume enumeration, was refused; outranks every other degradation. The macOS legs never report it |
 
 ### Where the data goes
 
-- **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response, land in the ResponseStore (90-day default retention), and are queryable at `/api/responses/{id}`, aggregatable (`smart` by `health`, `volumes` by `device`) and exportable to ClickHouse or Splunk.
+- **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response, land in the ResponseStore (90-day default retention), and are queryable at `/api/responses/{id}`, aggregatable (`smart` by `health`, `volumes` by `device`) and exportable as JSON from `/api/responses/{id}/export`.
 - **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics. Nothing runs on a schedule.
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("crossplatform.storage.smart")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 - **Siblings:** `device.hardware.disks` (physical inventory), `crossplatform.storage.mounts` (logical mounts, true filesystem capacity), `crossplatform.storage.free`.

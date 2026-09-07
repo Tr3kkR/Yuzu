@@ -2120,6 +2120,14 @@ if _bash_test.found()
     suite: 'docs',
     timeout: 60,
   )
+  # docs/plugin-readme-standard.md rule 7 — the README touch rule's own
+  # fixture run (a fake `git` on PATH; no repository, no network).
+  test('plugin readme touch-rule selftest',
+    _bash_test,
+    args: [files('../scripts/ci/check-plugin-readme-touch.sh'), '--selftest'],
+    suite: 'docs',
+    timeout: 60,
+  )
 endif
 
 # QE-INFO / build-ci B3: tests/shell/test_capability_matrix_gate.sh (PR1.1

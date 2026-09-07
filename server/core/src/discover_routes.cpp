@@ -1,6 +1,7 @@
 #include "discover_routes.hpp"
 
 #include "agent_registry.hpp"
+#include "bundled_content.hpp"
 #include "http_route_sink.hpp"
 #include "openapi_spec_access.hpp"
 #include "rest_a4_envelope_http.hpp"
@@ -10,12 +11,6 @@
 #include <unordered_map>
 
 namespace yuzu::server {
-
-// Build-time embed of content/plugin-docs/*.json (bundled_content.cpp, emitted
-// by server/core/scripts/embed_content.py) — the per-plugin documentation
-// manifests tools/plugin-doc-gen generates from each plugin's README
-// (docs/plugin-readme-standard.md rule 10).
-extern const std::vector<std::string> kBundledPluginDocs;
 
 namespace {
 
@@ -37,21 +32,28 @@ const PluginDocsIndex& plugin_docs_index() {
         PluginDocsIndex out;
         for (const auto& text : kBundledPluginDocs) {
             auto m = json::parse(text, nullptr, /*allow_exceptions=*/false);
-            // The generator always writes name, platforms and readme; a manifest
-            // missing any of them is not one it produced, so it is skipped and
-            // counted rather than repaired here (the path rule has one home:
-            // plugin_doc_gen.py).
-            if (m.is_discarded() || !m.is_object() || !m.contains("name") ||
-                !m["name"].is_string() || !m.contains("readme") || !m["readme"].is_string() ||
-                !m.contains("platforms") || !m["platforms"].is_object()) {
+            // The generator always writes name, description, platforms and
+            // readme; a manifest missing any of them is not one it produced, so
+            // it is skipped and counted rather than repaired here (the path
+            // rule has one home: plugin_doc_gen.py). Every key this index reads
+            // is checked here — nlohmann's value() throws on a present key of
+            // the wrong type, and a throw from this initialiser would 500 all
+            // four discovery surfaces on every request.
+            const auto is_str = [&m](const char* key) {
+                return m.contains(key) && m[key].is_string();
+            };
+            if (m.is_discarded() || !m.is_object() || !is_str("name") || !is_str("readme") ||
+                !is_str("description") || !m.contains("platforms") ||
+                !m["platforms"].is_object()) {
                 ++out.skipped_invalid;
                 spdlog::warn("discover/plugin-docs: skipping an embedded manifest that is not a "
-                             "JSON object with string name/readme and an object platforms");
+                             "JSON object with string name/description/readme and an object "
+                             "platforms");
                 continue;
             }
             const std::string name = m["name"].get<std::string>();
             json summary = {
-                {"summary", m.value("description", std::string{})},
+                {"summary", m["description"]},
                 {"platforms", m["platforms"]},
                 {"readme", m["readme"]},
                 {"resource", "yuzu://plugin-docs"},

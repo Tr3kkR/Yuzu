@@ -5266,6 +5266,7 @@ TEST_CASE("MCP plugin-docs: yuzu://plugin-docs matches plugin_docs_catalog()",
     REQUIRE(got["plugins"].is_array());
     CHECK(got["plugin_count"].get<std::size_t>() == got["plugins"].size());
     CHECK(got["skipped_invalid"] == 0);
+    CHECK(got["plugin_count"].get<std::size_t>() >= 2); // the pilots; never vacuous
     for (const auto& m : got["plugins"]) {
         CHECK(m["manifest_version"].is_number_integer());
         CHECK(m["name"].is_string());

@@ -1440,8 +1440,11 @@ static const ToolDef kTools[] = {
      "Plugin/action catalog observed across currently-connected agents. Each action carries an "
      "inline parameter_schema when it has a published InstructionDefinition (so you learn HOW to "
      "call it, not just that it exists); actions without one are name+description only — "
-     "discover_instructions is the full schema-bearing catalog. NOT a build-time manifest. New to "
-     "the fleet? Read the yuzu://operating-model and yuzu://capabilities resources first to orient "
+     "discover_instructions is the full schema-bearing catalog. NOT a build-time manifest. Each "
+     "plugin carries docs — {summary, platforms, readme, resource} when its README has adopted the "
+     "plugin documentation standard, else null; read the yuzu://plugin-docs resource for the full "
+     "per-plugin manifest (how it works, privileges, output columns, sample rows). New to the "
+     "fleet? Read the yuzu://operating-model and yuzu://capabilities resources first to orient "
      "before acting. Read-only catalog.",
      R"({"type":"object","properties":{}})",
      // #2986: build_plugins_catalog's envelope + per-plugin/per-action keys

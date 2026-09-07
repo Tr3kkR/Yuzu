@@ -816,9 +816,13 @@ TEST_CASE("discover.plugin-docs: static manifest catalog shape + ETag revalidati
     REQUIRE(j["plugins"].is_array());
     CHECK(j["plugin_count"].get<std::size_t>() == j["plugins"].size());
     CHECK(j["skipped_invalid"] == 0);
+    // The two pilots ship with this tree; an empty table would make the loop
+    // below vacuous, so the count is asserted, not just the shape.
+    CHECK(j["plugin_count"].get<std::size_t>() >= 2);
     for (const auto& m : j["plugins"]) {
         CHECK(m["manifest_version"].is_number_integer());
         CHECK(m["name"].is_string());
+        CHECK(m["description"].is_string());
         CHECK(m["actions"].is_array());
         CHECK(m["platforms"].is_object());
         CHECK(m["readme"].is_string());
@@ -852,10 +856,15 @@ TEST_CASE("discover.plugins: docs summary joined by plugin name, null when undoc
           "[discovery][plugins][plugin_docs][pg]") {
     DiscoverHarness h;
     auto info = make_agent_info("agent-1", "windows", "WIN-TESTBOX");
-    // A plugin whose README has adopted the standard (content/plugin-docs/
-    // disk_actions.json ships with this tree) and one that has not.
+    // A plugin whose README has adopted the standard — whichever manifest the
+    // embedded catalog lists first, so the case does not depend on which
+    // pilots ship — and one that has not.
+    const auto catalog = nlohmann::json::parse(yuzu::server::plugin_docs_catalog().json);
+    REQUIRE(catalog["plugins"].is_array());
+    REQUIRE_FALSE(catalog["plugins"].empty());
+    const std::string documented_name = catalog["plugins"][0]["name"].get<std::string>();
     auto* documented = info.add_plugins();
-    documented->set_name("disk_actions");
+    documented->set_name(documented_name);
     documented->set_version("1.0.0");
     documented->set_description("drive health");
     documented->add_capabilities("smart");
@@ -868,7 +877,7 @@ TEST_CASE("discover.plugins: docs summary joined by plugin name, null when undoc
 
     // The join reads the same index the catalog serves — a manifest present
     // there MUST surface as a summary here, and vice versa.
-    REQUIRE(yuzu::server::plugin_docs_summary("disk_actions") != nullptr);
+    REQUIRE(yuzu::server::plugin_docs_summary(documented_name) != nullptr);
     CHECK(yuzu::server::plugin_docs_summary("no_such_plugin_for_docs") == nullptr);
 
     auto res = h.sink.Get("/api/v1/discover/plugins");
@@ -879,13 +888,13 @@ TEST_CASE("discover.plugins: docs summary joined by plugin name, null when undoc
     bool saw_documented = false, saw_undocumented = false;
     for (const auto& pl : j["plugins"]) {
         REQUIRE(pl.contains("docs")); // always present: object or explicit null
-        if (pl["name"] == "disk_actions") {
+        if (pl["name"] == documented_name) {
             saw_documented = true;
             REQUIRE(pl["docs"].is_object());
             CHECK(pl["docs"]["summary"].is_string());
             CHECK_FALSE(pl["docs"]["summary"].get<std::string>().empty());
             CHECK(pl["docs"]["platforms"].is_object());
-            CHECK(pl["docs"]["readme"] == "agents/plugins/disk_actions/README.md");
+            CHECK(pl["docs"]["readme"] == "agents/plugins/" + documented_name + "/README.md");
             CHECK(pl["docs"]["resource"] == "yuzu://plugin-docs");
         } else if (pl["name"] == "no_such_plugin_for_docs") {
             saw_undocumented = true;
