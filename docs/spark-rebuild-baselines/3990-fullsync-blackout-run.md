@@ -9,26 +9,29 @@ specifies nothing beyond that sentence - no measurand, sample size, or neutralit
 Everything below that isn't a direct quote of the ruling is this run's own definition, stated
 as such rather than attributed to source.
 
-**Headline result, read this first, CORRECTED TWICE since this doc's own first draft** (see
-"Retraction" below the fold in "The driver's T1-detection gap" for the first correction, and
-"Decision rule and outcome" for the second - both kept in-doc rather than silently edited
-away, since each wrong version was briefly the working conclusion): the 2026-09-06/07 attempt
-could not complete the intended legacy-vs-spark comparison at the pre-registered sample size.
-The reason was a **flush-lag gap in the agent's own `--log-file` output** (confirmed against
-the vendored spdlog source - see "T1 detection: the real root cause" below), not a stall in
-the system under test: correlating EVERY `full_sync` trigger in that session's complete agent
-log against its own completion line showed all 84 real triggers that ran to completion did so
-in **8.3 seconds or less**, most under 100ms at the clean 62-rule cohort - but the log's own
-bytes could sit unflushed on disk for up to ~108s before any external reader, including the
-diagnostic's own polling, could see them, causing most clean-cohort attempts to time out
-waiting for a completion that had, in truth, already happened. A 2026-09-07 re-run with a
-widened polling timeout collected enough samples to compute the intended B comparison (both
-backends land within the predeclared margin) - **but a SEPARATE, unrelated gap (a
-never-wired-up functional-validity check in the driver, plus 2 of 5 targeted Windows services
-having an unstable running state on this rig) means the samples do not satisfy the diagnostic's
-own pre-registered decision rule.** The FORMAL outcome is therefore still **inconclusive /
-invalid by cohort design**, not a pass - see "Decision rule and outcome" for the full,
-three-part breakdown of what is and isn't established.
+**Headline result, read this first, CORRECTED THREE TIMES since this doc's own first draft**
+(see "Retraction" below the fold in "The driver's T1-detection gap" for the first correction,
+"Decision rule and outcome" for the second and third - all kept in-doc rather than silently
+edited away, since each wrong version was briefly the working conclusion): the 2026-09-06/07
+attempt could not complete the intended legacy-vs-spark comparison at the pre-registered sample
+size (a flush-lag gap in the agent's own `--log-file` output, since root-caused). A 2026-09-07
+re-run collected enough samples to compute the numeric B comparison, but a separate,
+never-wired-up functional-validity check meant none of those samples satisfied the full
+pre-registered decision rule - formal outcome INCONCLUSIVE/INVALID BY COHORT DESIGN.
+
+**2026-09-07, same day, third correction: a genuine pre-registered PASS.** Both bugs behind the
+inconclusive result were fixed - `cmd_run()`'s `functional_valid` check wired into
+`void_reason` (it was computed but never gated on), and 5 of 20 service-watch cohort rules
+swapped for services confirmed live as Running+Automatic (`LSM`/`DcomLaunch`/`RpcEptMapper`/
+`nsi`/`SamSs`, replacing `Spooler`/`Themes`/`BITS`/`wuauserv`/`W32Time`, which were confirmed
+Stopped). A clean re-run (devrig2 reset to the same base commit, full clean rebuild after the
+build directory was shared with an unrelated session in between - see "Decision rule and
+outcome" for that incident) reached the pre-registered K=5/K=3 floor on every phase/backend,
+with **every one of the 16 counted repeats independently satisfying `failed=0` AND
+functional-validity** - the full rule, not a partial check. Both phases land within the
+predeclared non-inferiority margin. This is this diagnostic's first genuine pass against its
+own pre-registered rule - see "Decision rule and outcome" for the full record, including the
+two prior wrong conclusions kept visible.
 
 ## What was measured, and how
 
@@ -392,6 +395,14 @@ attempts, first try** (73, 76, 77, 80, 91ms; median 77ms) - by the driver's part
 counted repeats too. **None of these 10 also satisfy functional-validity** - see "Decision
 rule and outcome": the pre-registered K=5 floor, taken in full, was NOT reached.
 
+**2026-09-07 clean re-run (`functional_valid` wiring + corrected service targets, label
+`clean-v2`, commit `53929ee2c` + this doc's update)**: **legacy 5/5 valid, first try** (73, 70,
+68, 67, 96ms; median 70ms), **spark 5/5 valid, first try** (127, 130, 119, 136, 120ms; median
+127ms) - every repeat `failed=0`, `applied=total=62`, `n_arm_lines=62`, AND
+`functional_valid=True` (the full rule, not the partial check above). Raw data appended to
+`fullsync-blackout-results.jsonl` under `label="clean-v2"`, independently re-derived from that
+file (not taken on the executing agent's word) before being recorded here.
+
 ## Phase B2 - clean cohort, bare rule-create trigger (#3990's literal shape)
 
 **2026-09-06/07 attempt**: legacy 2/3 valid (55, 63ms; median 59ms), spark 0/3 valid on the
@@ -403,6 +414,12 @@ driver's partial check, same caveat as Phase B above; `n_arm_lines=62` on every 
 counted repeats too, and none of the 6 also satisfy functional-validity. Create-to-T0 lag
 (informational, cross-host, non-verdict-bearing per the plan) was not specifically re-examined
 in the re-run - not load-bearing for the decision rule either way.
+
+**2026-09-07 clean re-run (label `clean-v2`)**: **legacy 3/3 valid, first try** (70, 86, 89ms;
+median 86ms), **spark 3/3 valid in 6 attempts** (140, 143, 120ms; median 140ms - 3 prior
+attempts voided `t0_not_found`, an ordinary trigger-not-yet-visible timeout, not a
+functional-validity or push-counter failure; well inside the driver's own 10-attempt cap).
+Every counted repeat: `failed=0`, `applied=total=62`, `functional_valid=True`.
 
 ## Decision rule and outcome
 
@@ -452,24 +469,69 @@ judgment call. That is procedurally unsound, for two reasons found on review, no
   explicitly waive the functional-validity precondition as a recorded protocol deviation -
   that is his call to make, not a conclusion this document reaches on its own.
 
-**Path to an actual pre-registered pass, not just a relaxation**: re-run Phase B/B2 with a
-cohort whose service-watch rules target services confirmed running and held stable for the
-whole run (closes the gap for `svc-01/02/15` definitively; `svc-04/05`'s intermittent-service
-behavior, per the correction above, may resolve on its own with a better-chosen or
-externally-pinned service, or may need one more iteration to confirm). The measurand, cohort
-size, purge/ensure mechanics, and driver timeout are otherwise proven to work as of this
-re-run - only the functional-validity wiring (a `cmd_run()` fix, not attempted here) and the
-service selection need to change for a clean pass.
+**2026-09-07, same day, clean re-run (Dave: "Fix cmd_run's functional_valid wiring and
+re-run"), commit `53929ee2c`: genuine pre-registered PASS.** Both defects behind the
+INCONCLUSIVE outcome above were fixed at the source: `run_repeat()` now folds
+`functional_valid` into `void_reason` itself for phases B/B2 (the counting loop in `cmd_run()`
+needed no change - the bug was that the precondition was computed but never fed into the one
+field the loop reads), and 5 of the cohort's 20 service-watch targets were replaced
+(`Spooler`/`Themes`/`BITS`/`wuauserv`/`W32Time`, confirmed Stopped on DGRHP via live
+`Get-Service`, swapped for `LSM`/`DcomLaunch`/`RpcEptMapper`/`nsi`/`SamSs`, confirmed
+Running+Automatic and not already used elsewhere in the cohort). Wiring the check alone would
+not have been enough - the prior 5 services were confirmed Stopped, not merely slow to
+observe, so `functional_valid` was unsatisfiable by cohort design regardless of the wiring fix.
 
-**Open, needs Dave**: two separate decisions this document deliberately does not make for
-itself. (1) Whether to accept the pre-registered rule's failure as final, or fix `cmd_run()`'s
-functional-validity wiring and re-run with better-behaved service targets for a genuine pass
-(previous paragraph). (2) Whether the agent `--log-file` flush-policy gap (no `flush_on` call,
-`spdlog` default `flush_level_=off`, `main.cpp`) should be filed as its own product issue -
-it's real, reproducible, and affects any external near-real-time log tailing, not just this
-diagnostic's driver, but fixing it here was deliberately out of scope (it would alter the
-executable under measurement). Not filed yet; this document is not the place to decide that on
-its own.
+Executing the re-run surfaced a real, unplanned rig-state conflict, resolved before any
+measurement ran: devrig2 (the same checkout this diagnostic builds from) was found at a
+different git HEAD with an uncommitted 36-line scratch diff and a recent unrelated test
+rebuild - traced, via `SendMessage` coordination with every other active session on the
+machine, to an already-finished live-diagnosis session for an unrelated Windows CI flake
+(PR #4077/#2818), which explicitly confirmed the state was disposable. devrig2 was reset to
+this diagnostic's own base commit (`65f2938156a19`) and the one-line flip patch reapplied
+(verified via `git diff --stat`: 1 file, 1 insertion, 1 deletion, and a raw UTF-8 byte check
+after a first patch attempt was found to have corrupted non-ASCII characters via an
+unencoded PowerShell read/write round-trip - caught before it was trusted, reverted, redone
+with explicit UTF-8 encoding). Because the shared build directory had briefly held another
+session's differently-configured build, a full clean rebuild (wipe + reconfigure, not
+incremental) was done rather than trust an incremental compile - consistent with this
+document's own earlier "Execution correction" lesson about partial rebuilds leaving stale
+binaries. None of this touched the measurement itself; it is recorded here because it
+materially changed how much to trust "same rig/build" continuity across this document's
+rounds - the agent binary for this round is a distinct build from the 2026-09-07 INCONCLUSIVE
+round above, at the same source commit + patch but not bit-identical.
+
+**Results** (raw data in `fullsync-blackout-results.jsonl`, `label="clean-v2"`, independently
+recomputed from that file - medians and per-repeat `failed`/`applied`/`total`/
+`functional_valid` values all re-derived directly, not taken from any report):
+
+| | legacy median | spark median | margin (max(1000, legacy median)) | threshold | numeric result |
+|---|---|---|---|---|---|
+| B  | 70.0 ms | 127.0 ms | 1000 ms | 1070.0 ms | 127.0 <= 1070.0 -> within margin |
+| B2 | 86.0 ms | 140.0 ms | 1000 ms | 1086.0 ms | 140.0 <= 1086.0 -> within margin |
+
+**Correct statement of the outcome, in the same three-part framing used for the INCONCLUSIVE
+round above, since this round did not just meet the numeric margin but also the precondition
+that round failed on**:
+- **Numeric observation**: both phases land within the predeclared non-inferiority margin,
+  table above.
+- **Formal pre-registered decision**: **PASS.** All 16 counted repeats (5+3 legacy, 5+3 spark)
+  independently satisfy `failed=0` AND functional-validity - the full rule as written, not a
+  partial check and not a relaxation. This is the diagnostic's first round to actually meet its
+  own pre-registered criteria.
+- **Accepted-neutral status for §5**: a pre-registered non-inferiority pass on one rig, one
+  cohort, two trigger shapes, is evidence FOR citing #3990 as accepted-neutral in §5 under this
+  document's own margin - but whether that's sufficient, and how to word the §5 entry, is still
+  Dave's call, not one this document makes unilaterally. The scope limits below ("Does NOT
+  claim") still apply in full: this is one rig, not fleet scale; two specific triggers, not
+  every mutation kind; B as defined here, not end-to-end detection blackout.
+
+**Open, needs Dave**: (1) whether this pass, on top of the scope limits below, is sufficient
+to cite #3990 as accepted-neutral in §5, and how to word that entry. (2) Whether the agent
+`--log-file` flush-policy gap (no `flush_on` call, `spdlog` default `flush_level_=off`,
+`main.cpp`) should be filed as its own product issue - it's real, reproducible, and affects any
+external near-real-time log tailing, not just this diagnostic's driver, but fixing it here was
+deliberately out of scope (it would alter the executable under measurement). Not filed yet;
+this document is not the place to decide that on its own.
 
 ## Does NOT claim
 
@@ -487,27 +549,34 @@ its own.
   of this document and is explicitly retracted above, with the evidence that disproved it.**
   Do not cite this document as evidence of such an effect.
 - A neutrality finding in the sense the original CH-5-UAT ruling text explicitly disclaimed
-  ("NOT a finding that #3990 is neutral ... in effect, only in mechanism") - even after the
-  2026-09-07 re-run collected the intended sample counts, the pre-registered decision rule's
-  own functional-validity precondition is not met by any repeat (see "Decision rule and
-  outcome"), so the FORMAL outcome remains inconclusive/invalid by cohort design, not a pass.
+  ("NOT a finding that #3990 is neutral ... in effect, only in mechanism") - the clean-v2
+  round's PASS (see "Decision rule and outcome") is a pre-registered non-inferiority result on
+  ONE rig under this document's own margin, not a claim that #3990's underlying mechanism (a
+  fleet-wide storm from any rule mutation) is absent or safe in general; whether it's enough
+  for the §5 accepted-neutral citation is Dave's call, stated as open above, not decided here.
 - That the agent's `--log-file` flush-lag finding (up to ~108s observed) has been measured
   systematically, characterized as a distribution, fully attributed as the SOLE cause of every
   historical void, or reproduced on a differently-loaded rig - one deliberate live reproduction
   plus the 2026-09-07 re-run's attempt/void pattern are the only evidence; no minimum/maximum/
   typical lag is established beyond what was observed, and 3 of 8 legacy Phase B attempts still
   voided even after the timeout was widened to 240s.
-- That the "5/5"/"3/3" sample counts in this document represent a pass against the
-  pre-registered decision rule - they do not; they represent the driver's own PARTIAL check
-  (`failed=0`/`applied=total`/arm-count/push-counter only), because `cmd_run()` never wires
-  `functional_valid` into its counting logic (confirmed by reading the code, not assumed).
-- That `blackout-svc-01/02/04/05/15` are all equally and consistently non-compliant - only
-  `svc-01/02/15` are (16/16 repeats); `svc-04/05` are intermittent (14/16 and 11/16), meaning
-  something external to this diagnostic started and stopped their target services during the
-  run - not characterized further here.
+- That the "5/5"/"3/3" sample counts under `label="clean"` (the 2026-09-07 re-run BEFORE the
+  wiring fix) represent a pass against the pre-registered decision rule - they do not; they
+  represent the driver's own PARTIAL check from that round (`failed=0`/`applied=total`/
+  arm-count/push-counter only), since `cmd_run()` didn't yet wire `functional_valid` into its
+  counting logic at that point. This does NOT apply to `label="clean-v2"`'s 5/5"/"3/3" counts
+  (the fixed re-run, below) - those genuinely do satisfy the full rule, verified directly.
+- That `blackout-svc-01/02/04/05/15` (as configured under `label="clean"`, the pre-fix cohort)
+  were all equally and consistently non-compliant - only `svc-01/02/15` were (16/16 repeats);
+  `svc-04/05` were intermittent (14/16 and 11/16). This describes that cohort's ORIGINAL
+  service targets only - `label="clean-v2"`'s cohort uses different underlying services at
+  those same rule_ids (see "Decision rule and outcome"), all confirmed live and consistently
+  compliant.
 - That `cmd_report`'s output can be trusted if re-run against the combined
-  `fullsync-blackout-results.jsonl` as committed - its grouping key does not distinguish the
-  retracted run's rows from this re-run's, and would silently pool both under `label="clean"`.
+  `fullsync-blackout-results.jsonl` as committed without first checking labels - its grouping
+  key does not distinguish two runs sharing the SAME label (e.g. two separate attempts both
+  run with `label="clean"`, which is why the clean-v2 round used a distinct label instead of
+  reusing "clean" - a real, if narrow, mitigation of this known bug, not a fix to the code).
 - The N=5652 legacy-only ~6-minute silence observed in Phase A (see that section) as anything
   more than a single, unreplicated, uncharacterized observation - it was not investigated
   further and no connection to any other finding in this document is established.
@@ -528,6 +597,20 @@ is left at `origin/dev@65f2938156a19` + the flip one-liner (not reverted) - this
 rig's new baseline state, recorded here rather than restored to the pre-diagnostic
 `7c3c7d3fa`-era build. `run_agent_legacy.ps1` (a scratch copy used for the legacy-backend
 phases) is left on-box alongside the pre-existing scratch scripts; not committed.
+
+**2026-09-07 clean re-run (`clean-v2`) teardown**: same `teardown-cohort` call. The spark
+Phase B2 run's 3 voided `t0_not_found` attempts consumed `hbr-01..03` before its 3 valid
+repeats landed on `hbr-04..06` - outside the driver's teardown loop's default `1-3` id range
+(a known limitation, not newly discovered). Found via a raw REST rule listing after the
+default teardown (`blackout-hbr-04/05/06` still present alongside the protected rule) and
+deleted individually. Final `inventory`, independently re-run by the orchestrator (not taken
+on the executing fork's word): `total_rules=1`, `riga_rules=0`, `riga_baselines=0`, both
+protected artifacts present. Agent stopped and relaunched on **spark** via WMI Create
+(`run_agent2.ps1`, unmodified, `--log-file`); confirmed alive (PID 17136, boot line `detection
+backend = spark` at 10:39:47) both by the fork and independently by the orchestrator reading
+the raw agent log directly. devrig2 unchanged from the state above (`65f2938156a19` + flip
+one-liner) - this round's build is a distinct compile of that same source state, not a source
+change.
 
 **2026-09-07 re-run teardown**: same `teardown-cohort` call (baselines + cohort/trigger rules,
 no `blackout-hbr-*` collision this time - each backend's B2 `hbr-01..03` ids were explicitly
