@@ -118,18 +118,69 @@ TEST_CASE("sanitize_url_userinfo strips a password containing an unescaped '/' e
           "clickhouse://host:9000/yuzu");
 }
 
-TEST_CASE("sanitize_url_userinfo strips a password containing an unescaped '?'",
+TEST_CASE("sanitize_url_userinfo over-strips when a '?' precedes the real userinfo '@' "
+          "(round 3: ambiguous vs. a genuine query, deliberate over-strip)",
           "[settings][settings_model][security]") {
     // Round 1 regression (security-guardian, Gate 8): round 1 dropped the
     // query string/fragment from the RAW url before ever searching for
     // '@', so an unescaped '?' inside the password truncated the string
     // before the real delimiter was found, leaking the username and a
-    // password prefix ("clickhouse://admin:p"). Round 2 runs the query/
-    // fragment drop AFTER the '@'-based strip, against the already-
-    // sanitized string, so a '?' inside a since-removed password can never
-    // be mistaken for a real query start.
-    CHECK(sm::sanitize_url_userinfo("clickhouse://admin:p?ss@host:9000/yuzu") ==
-          "clickhouse://host:9000/yuzu");
+    // password prefix ("clickhouse://admin:p"). Round 2 fixed THIS shape
+    // by running the query/fragment drop AFTER the '@'-based strip,
+    // against the already-sanitized string -- but that sequential-mutation
+    // design was itself the root cause of the g8b-sanitizer-query-at-
+    // ordering bypass fixed in round 3 (see the two tests below). Round 3
+    // computes both cut points against the ORIGINAL string and unions
+    // them; when a '?'/'#' occurs AT OR BEFORE the last '@' (as it does
+    // here -- the '?' sits inside what turns out to be the password), that
+    // shape is LEXICALLY IDENTICAL to "no real userinfo, and the '?' is a
+    // genuine query start whose own content happens to contain a later
+    // '@'" (see g8b-sanitizer-query-at-ordering below) -- the two cannot be
+    // told apart from the string alone. Consistent with round 2's own
+    // over-strip philosophy, round 3 resolves the ambiguity by dropping
+    // everything from the authority boundary onward rather than guessing:
+    // this input now returns just the scheme, not "clickhouse://host:9000/yuzu".
+    CHECK(sm::sanitize_url_userinfo("clickhouse://admin:p?ss@host:9000/yuzu") == "clickhouse://");
+}
+
+// #4028 round 3 (adversarial-review hardening, /home/dgr/advrev-4028) --
+// regression coverage for the two governance-ledger BLOCKING findings that
+// round 2 shipped with (governance.d/4028-settings-read-twins.BAbeot.jsonl:
+// g8b-sanitizer-scheme-boundary, g8b-sanitizer-query-at-ordering). Both were
+// independently reproduced by two external adversarial reviewers (Kimi,
+// Codex) against the compiled round-2 object before this fix landed.
+
+TEST_CASE("sanitize_url_userinfo does not leak userinfo when a later query value embeds "
+          "its own \"://\" (g8b-sanitizer-scheme-boundary)",
+          "[settings][settings_model][security]") {
+    // Round 2 regression: `url.find("://")` matched the FIRST "://"
+    // anywhere in the string -- including one embedded in a later query
+    // value -- pushing the computed authority boundary past the real
+    // userinfo and suppressing the strip entirely. This schemeless input
+    // (no real scheme at all) was returned COMPLETELY UNCHANGED by round 2,
+    // leaking "myuser:mypassword" in full. Round 3 bounds the scheme scan
+    // to a plain prefix walk from position 0, so the nested "https://"
+    // deep in the query string can never be mistaken for the real scheme.
+    CHECK(sm::sanitize_url_userinfo(
+              "myuser:mypassword@10.0.0.5:9000/db?ssl_ca=https://ca.corp.example/root.pem") ==
+          "10.0.0.5:9000/db");
+}
+
+TEST_CASE("sanitize_url_userinfo does not leak a query-embedded password when the query "
+          "itself contains an '@' (g8b-sanitizer-query-at-ordering)",
+          "[settings][settings_model][security]") {
+    // Round 2 regression: the userinfo strip's unbounded "last '@'" search
+    // picked up the '@' inside "admin@corp.com" (a query VALUE, not real
+    // userinfo), discarding the real '?' delimiter along with it before
+    // the query-strip step -- which ran second, against the already-
+    // mutated string -- ever got a chance to find it. Round 2 returned
+    // "clickhouse://corp.com&password=s3cr3t", leaking the password in
+    // plaintext. Round 3 computes the query start against the ORIGINAL
+    // string; since it falls before the apparent "last '@'", the two
+    // removal ranges are unioned and the whole tail is dropped.
+    CHECK(sm::sanitize_url_userinfo(
+              "clickhouse://host:9000/yuzu?user=admin@corp.com&password=s3cr3t") ==
+          "clickhouse://");
 }
 
 TEST_CASE("sanitize_url_userinfo strips real userinfo even when the path also contains an '@'",

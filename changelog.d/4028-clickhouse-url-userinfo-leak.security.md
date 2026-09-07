@@ -6,22 +6,21 @@
   either surface renders it for the common shapes (a bare `user@`/`user:pass@` authority, a
   password containing an unescaped `@`, `/`, or `?`, and a query-string credential form
   `?user=...&password=...`), and the raw password is never read into a response at all (only
-  whether it is set). Fix-round hardening (governance Gate 2-8, two rounds) rewrote the sanitizer
-  twice: a boundary-first approach with a "does this look like a host" heuristic proved unfixable
+  whether it is set). Fix-round hardening (governance Gate 2-8, three rounds, plus an independent
+  two-model adversarial-review pass) rewrote the sanitizer twice before landing on the current
+  design: a boundary-first approach with a "does this look like a host" heuristic proved unfixable
   (a digit-only password segment before a `/` is lexically identical to a real `host:port`, so no
-  heuristic patch could tell them apart) and was replaced with a simpler rule — the LAST `@`
-  anywhere in the URL ends userinfo, and any query string or fragment is dropped afterward. This
-  deliberately over-strips a URL whose path also happens to contain a literal `@` (e.g.
-  `.../db@table` now becomes `.../table`).
-  **Known residual gap, NOT closed by this change (governance ledger
-  `governance.d/4028-settings-read-twins.BAbeot.jsonl`, findings
-  `g8b-sanitizer-scheme-boundary` and the query-vs-userinfo ordering finding, both `open`):** a
-  schemeless URL whose query string itself contains a nested `://` can fool scheme-boundary
-  detection into skipping the strip entirely, and a query string that itself contains an `@` can
-  cause the query-strip to run against the wrong (already-mutated) string and leave a password
-  fragment exposed. Two independent governance reviewers found these; the fix (very likely
-  requires computing both cut points against the ORIGINAL string and unioning them, rather than
-  sequential string mutation) was not applied this session — the fix-round cap was reached after
-  two full redesigns of this function each surfaced new bypasses, and a third rushed patch was
-  judged higher-risk than stopping to flag it for deliberate review. Do not treat this sanitizer as
-  fully hardened; treat it as materially improved over the pre-#4028 state.
+  heuristic patch could tell them apart); the LAST-`@`-ends-userinfo replacement then shipped with
+  two further bypasses an adversarial-review round found (a schemeless URL whose query string
+  embeds a nested `://` could fool scheme-boundary detection into skipping the strip entirely, and
+  a query string containing its own `@` could cause the query-strip to run against the wrong,
+  already-mutated string and leave a password fragment exposed — both independently reproduced by
+  two external reviewers against the compiled object, `/home/dgr/advrev-4028`). The current design
+  closes both: the scheme boundary is a bounded RFC-3986-shaped prefix scan from position 0 (never
+  an unbounded search for `://` anywhere in the string), and both cut points — the userinfo `@`
+  and the query/fragment start — are computed against the ORIGINAL string and unioned, never
+  sequentially against a once-mutated result. This deliberately over-strips a URL whose path also
+  happens to contain a literal `@` (e.g. `.../db@table` now becomes `.../table`), and — new in this
+  round — a URL where a `?`/`#` appears at or before the apparent userinfo-ending `@` now drops
+  everything past the scheme (that shape is lexically indistinguishable from a query string that
+  itself contains a later `@`, so it is resolved the same conservative way).
