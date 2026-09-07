@@ -207,6 +207,15 @@ implementation is.
 | antivirus | av_exclusions | linux | unsupported | - | - | Windows-only concept |
 | antivirus | av_exclusions | macos | unsupported | - | - | Windows-only concept |
 | antivirus | av_exclusions | windows | supported | 1 | win32_registry | permission_denied sentinel on ACL'd key, never a silent empty list |
+| app_usage | summary | linux | supported | 1 | tar.db usage_daily (derived from TAR process/procfs) | - |
+| app_usage | summary | macos | constrained | 1 | tar.db usage_daily (derived from TAR process/endpoint_security or sysctl poll) | inherits the process source's names-only constraint; ES entitlement absent -> poll granularity |
+| app_usage | summary | windows | supported | 1 | tar.db usage_daily (derived from TAR process/etw) | - |
+| app_usage | last_used | linux | supported | 1 | tar.db usage_daily (derived from TAR process/procfs) | - |
+| app_usage | last_used | macos | constrained | 1 | tar.db usage_daily (derived from TAR process/endpoint_security or sysctl poll) | inherits the process source's names-only constraint; ES entitlement absent -> poll granularity |
+| app_usage | last_used | windows | supported | 1 | tar.db usage_daily (derived from TAR process/etw) | - |
+| app_usage | foreground | linux | constrained | 1 | not captured | foreground/focus time and per-session attribution are not captured; promoted by the user-context-bridge roadmap without a schema change |
+| app_usage | foreground | macos | constrained | 1 | not captured | foreground/focus time and per-session attribution are not captured; promoted by the user-context-bridge roadmap without a schema change |
+| app_usage | foreground | windows | constrained | 1 | not captured | foreground/focus time and per-session attribution are not captured; promoted by the user-context-bridge roadmap without a schema change |
 | asset_tags | sync | linux | supported | 1 | local_json_store | - |
 | asset_tags | sync | macos | supported | 1 | local_json_store | - |
 | asset_tags | sync | windows | supported | 1 | local_json_store | - |
