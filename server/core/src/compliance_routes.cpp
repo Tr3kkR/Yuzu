@@ -11,7 +11,7 @@
 #include "policy_evaluator.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_denial/a4_error/ensure_correlation_id — mints/
                                      // reuses X-Correlation-Id so header and body always agree
-#include "rest_audit.hpp"           // detail::try_persist_audit (#1647, #4034)
+#include "rest_audit.hpp"           // detail::emit_behavioral_audit (#1647, #4034 follow-up)
 #include "store_errors.hpp"
 #include "web_utils.hpp"
 
@@ -1230,12 +1230,13 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
     // `perm_fn_`: its per-agent status list is a fan-out read of per-agent
     // data, so the routed-concerns RBAC row requires `fleet_read_fn_`
     // (require_fleet_read) as its SOLE gate instead — never stacked with
-    // perm_fn_. None of the five audit (matching the legacy routes' existing
-    // unaudited posture — compliance/policy status is not per-device
-    // behavioural PII the way DEX/device-live data is); the one exception is
-    // /api/v1/compliance/{id}'s per-agent list, which DOES name agent_ids
-    // fleet-wide, so it gets a light, non-blocking (set-and-proceed, not
-    // fail-closed) audit trail — see that route's own comment.
+    // perm_fn_. The other four (aggregate/definition reads, no per-agent
+    // identity data) stay unaudited, matching the legacy routes' existing
+    // posture. `GET /api/v1/compliance/{id}` is the one exception on BOTH
+    // axes: its per-agent list names agent_ids fleet-wide AND its
+    // `check_result` field can carry raw, unrestricted agent-instruction
+    // output, so it gets a FAIL-CLOSED (503) `emit_behavioral_audit` trail,
+    // not a set-and-proceed one — see that route's own comment.
 
     // GET /api/v1/policy-fragments -- list all fragments (MCP twin:
     // list_policy_fragments)
@@ -1469,21 +1470,46 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
             for (const auto& s : confined.visible)
                 agents_arr.push_back(policy_agent_status_json(s));
 
-            // Light, non-blocking (set-and-proceed) audit trail: compliance/
-            // policy status is not per-device behavioural PII the way DEX/
-            // device-live data is (routed-concerns "Compliance evaluation
-            // pipeline" row) — so this is NOT emit_behavioral_audit's
-            // fail-closed posture — but the per-agent list DOES name
-            // agent_ids fleet-wide, which the legacy (unaudited) route never
-            // did in an A4/versioned surface, so #4034's PR records a
-            // proportionate trail (matching GET /api/v1/inventory/software's
-            // posture for the same "names agent_ids, not behavioural PII"
-            // reasoning) rather than staying silent.
-            const bool audit_ok = detail::try_persist_audit(
-                audit_fn_, req, "compliance.agent_statuses.view", "success", "Policy", policy_id,
-                "agents=" + std::to_string(agents_arr.size()) + " cid=" + cid);
-            if (!audit_ok)
-                res.set_header("Sec-Audit-Failed", "true");
+            // #4034 follow-up: fail CLOSED on audit-persist failure, matching
+            // this codebase's own documented REST-JSON contract
+            // (rest_audit.hpp's header comment, #1647: "REST JSON
+            // integrations FAIL CLOSED (503)") — the same posture GET
+            // /api/v1/guaranteed-state/events' dex.device.view audit uses
+            // (rest_api_v1.cpp). Reclassified from the original set-and-
+            // proceed posture this route shipped with: `check_result`
+            // (policy_agent_status_json) carries up to 1000 bytes of the RAW
+            // output of whatever instruction the bound fragment's
+            // check_instruction names — free-form, operator-authored at
+            // fragment-creation time, and not restricted to a
+            // non-behavioural content class (e.g. a fragment bound to
+            // processes/list_hashed would put process names/paths here), so
+            // this route cannot make the same "not behavioural PII" claim
+            // GET /api/v1/inventory/software genuinely can (that route's
+            // data is machine-scope by construction, ADR-0016 §8; this
+            // route's is not, since check_instruction is unconstrained).
+            // Refusing to serve on a KNOWN audit-persist failure is the
+            // conservative, documented-contract-conformant choice. The MCP
+            // twin (get_policy_agent_statuses) is unaffected by this change —
+            // it already follows ITS OWN documented convention (surfacing
+            // the gap via an `audit_persisted:false` body field rather than
+            // a header/status code), which is what rest_audit.hpp prescribes
+            // for MCP specifically ("MCP wraps the kernel itself and
+            // surfaces the gap through its own body field").
+            if (!detail::emit_behavioral_audit(
+                    audit_fn_, req, res, "compliance.agent_statuses.view", "success", "Policy",
+                    policy_id, "agents=" + std::to_string(agents_arr.size()) + " cid=" + cid)) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res,
+                                     "audit subsystem unavailable; refusing to serve per-agent "
+                                     "compliance status without durable evidence",
+                                     detail::A4ErrorOpts{.retry_after_ms = 5000}),
+                    "application/json");
+                spdlog::warn(
+                    "compliance.agent_statuses.view audit fail-closed (503) policy_id={} cid={}",
+                    policy_id, cid);
+                return;
+            }
 
             nlohmann::json data;
             data["policy_id"] = policy_id;

@@ -463,3 +463,73 @@ TEST_CASE("GET /api/v1/policy-fragments: limit clamps and page_size reflects the
     CHECK(j["data"].size() == 1);
     CHECK(j["pagination"]["page_size"].get<int64_t>() == 1);
 }
+
+// ═════════════════════════════════════════════════════════════════════════
+// #4034 follow-up — GET /api/v1/compliance/{id}'s audit-failure posture,
+// reclassified from set-and-proceed to fail-closed (503). See that route's
+// own comment in compliance_routes.cpp for the full rationale.
+// ═════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("GET /api/v1/compliance/{id}: audit-persist failure fails CLOSED (503), "
+          "no per-agent data served — replaces the old set-and-proceed posture",
+          "[compliance][rest][pg][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+
+    auto frag = store.create_fragment(kFragmentYaml);
+    REQUIRE(frag.has_value());
+    auto pol = store.create_policy(make_policy_yaml(frag.value(), "Audit Test Policy"));
+    REQUIRE(pol.has_value());
+    REQUIRE(store.update_agent_status(pol.value(), "agent-1", "compliant").has_value());
+
+    ComplianceHarness h{&store};
+    h.fleet_admitted = true;
+    h.audit_ok = false; // simulate a dropped audit row
+
+    auto res = h.sink.Get("/api/v1/compliance/" + pol.value());
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    // No per-agent data leaked on the known-audit-failure path.
+    CHECK(res->body.find("agent-1") == std::string::npos);
+
+    bool saw_attempt = false;
+    for (const auto& c : h.audit_calls)
+        if (c.action == "compliance.agent_statuses.view")
+            saw_attempt = true;
+    CHECK(saw_attempt); // the audit was attempted (and reported failed), not skipped
+}
+
+TEST_CASE("GET /api/v1/compliance/{id}: audit succeeds -> 200 with the per-agent list "
+          "and a confined summary tally",
+          "[compliance][rest][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+
+    auto frag = store.create_fragment(kFragmentYaml);
+    REQUIRE(frag.has_value());
+    auto pol = store.create_policy(make_policy_yaml(frag.value(), "Audit Success Policy"));
+    REQUIRE(pol.has_value());
+    REQUIRE(store.update_agent_status(pol.value(), "agent-1", "compliant").has_value());
+    REQUIRE(store.update_agent_status(pol.value(), "agent-2", "non_compliant").has_value());
+
+    ComplianceHarness h{&store};
+    h.fleet_admitted = true;
+    h.audit_ok = true;
+
+    auto res = h.sink.Get("/api/v1/compliance/" + pol.value());
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["agents"].size() == 2);
+    CHECK(j["data"]["summary"]["compliant"].get<int64_t>() == 1);
+    CHECK(j["data"]["summary"]["non_compliant"].get<int64_t>() == 1);
+
+    bool saw_success = false;
+    for (const auto& c : h.audit_calls)
+        if (c.action == "compliance.agent_statuses.view" && c.result == "success")
+            saw_success = true;
+    CHECK(saw_success);
+}
