@@ -623,13 +623,26 @@ def _strip_comments(text: str) -> str:
     return _COMMENT_RE.sub("", text)
 
 
+_ADJACENT_LITERALS_RE = re.compile(r'"((?:[^"\\]|\\.)*)"(\s*"(?:[^"\\]|\\.)*")+')
+
+
+def _join_adjacent_literals(text: str) -> str:
+    """C++ concatenates adjacent string literals at compile time
+    (`"macos" ":" "not_root"` is one string); a provenance token built that
+    way is invisible to a scanner that only looks inside a single pair of
+    quotes. Collapse every such run into one literal before matching."""
+    def repl(m: re.Match) -> str:
+        return '"' + "".join(_LITERAL_RE.findall(m.group(0))) + '"'
+    return _ADJACENT_LITERALS_RE.sub(repl, text)
+
+
 def provenance_literals(repo: Path, name: str) -> set[str]:
     out: set[str] = set()
     includes: set[str] = set()
     for src in sorted((repo / "agents" / "plugins" / name / "src").glob("*"), key=lambda q: q.as_posix()):
         if not (src.is_file() and src.suffix in (".cpp", ".hpp", ".h", ".mm")):
             continue
-        text = _strip_comments(_read(src))
+        text = _join_adjacent_literals(_strip_comments(_read(src)))
         for call in _STATUS_CALL_RE.findall(text):
             out.update(_PROVENANCE_TOKEN_RE.findall(call))
         out.update(_OS_LITERAL_RE.findall(text))
@@ -1173,8 +1186,11 @@ def generate(repo: Path, only: str | None = None) -> Outcome:
                                   f"recapture: plugin-capture … --out agents/plugins/{doc.name}/docs/samples/{os_name}.txt, "
                                   f"then plugin_doc_gen.py --stamp {doc.name} {os_name}, then --all")
         manifest_path = f"content/plugin-docs/{doc.name}.json"
-        manifest = json.dumps(build_manifest(doc, new), indent=2, sort_keys=True, ensure_ascii=False,
-                              allow_nan=False) + "\n"
+        try:
+            manifest = json.dumps(build_manifest(doc, new), indent=2, sort_keys=True, ensure_ascii=False,
+                                  allow_nan=False) + "\n"
+        except ValueError as e:  # NaN/Infinity in a column example, a default, or similar
+            raise ValueError(f"{doc.name}: manifest is not valid JSON: {e}") from None
         old_manifest = _read(repo / manifest_path) if (repo / manifest_path).exists() else ""
         if manifest != old_manifest:
             out.changed[manifest_path] = (old_manifest, manifest)

@@ -48,17 +48,32 @@ check() {
     # leading list marker ("- " / "* ") is allowed so the line can sit in a
     # bullet. Fenced code blocks and HTML comments are skipped: the override
     # must be visible to the reviewer on the rendered page.
+    # A GFM fence closes only on a run of the SAME character at least as
+    # long as the one that opened it (a 4-backtick fence is not closed by a
+    # nested 3-backtick line) — matching that asymmetrically is what let a
+    # decoy inner fence re-expose text that still renders hidden on GitHub.
     override="$(tr -d '\r' < "$BODY" | awk '
-      /^[[:space:]]*(```|~~~)/ { fence = !fence; next }
-      fence { next }
-      { line = $0
+      function run_len(s, ch,    n) { n = 0; while (substr(s, n + 1, 1) == ch) n++; return n }
+      {
+        raw = $0; t = raw; sub(/^[ \t]{0,3}/, "", t); ch = substr(t, 1, 1)
+        is_fence = 0; len = 0
+        if (ch == "\140" || ch == "~") {
+          len = run_len(t, ch)
+          if (len >= 3 && (ch == "~" || index(substr(t, len + 1), "\140") == 0)) is_fence = 1
+        }
+        if (fence) {
+          if (is_fence && ch == fchar && len >= flen) fence = 0
+          next
+        } else if (is_fence) { fence = 1; fchar = ch; flen = len; next }
+        line = raw
         while (1) {
           if (comment) { i = index(line, "-->"); if (!i) next; line = substr(line, i + 3); comment = 0 }
           i = index(line, "<!--"); if (!i) break
           rest = substr(line, i + 4); j = index(rest, "-->")
           if (j) { line = substr(line, 1, i - 1) substr(rest, j + 3) } else { line = substr(line, 1, i - 1); comment = 1; break }
         }
-        print line }' | grep -m1 -E '^[[:space:]]*([-*][[:space:]]+)?docs-unchanged:[[:space:]]*[^[:space:]]' || true)"
+        print line
+      }' | grep -m1 -E '^[[:space:]]*([-*][[:space:]]+)?docs-unchanged:[[:space:]]*[^[:space:]]' || true)"
   fi
 
   # Plugins whose src/ changed, deduplicated.
@@ -146,6 +161,9 @@ FAKE
   run "override inside an HTML comment is invisible" 1 $'agents/plugins/alpha/src/a.cpp' "$with_readme" $'<!--\ndocs-unchanged: Caveats — hidden\n-->\n'
   run "override on a CRLF body" 0 $'agents/plugins/alpha/src/a.cpp' "$with_readme" $'Summary\r\ndocs-unchanged: Caveats — comment-only\r\n'
   run "override after a closed fence" 0 $'agents/plugins/alpha/src/a.cpp' "$with_readme" $'```\nx\n```\ndocs-unchanged: Caveats — comment-only\n'
+  run "decoy 3-backtick line inside a 4-backtick fence stays hidden" 1 $'agents/plugins/alpha/src/a.cpp' "$with_readme" $'````\n```\ndocs-unchanged: Caveats — hidden\n```\n````\n'
+  run "override after the real close of a 4-backtick fence" 0 $'agents/plugins/alpha/src/a.cpp' "$with_readme" $'````\nx\n````\ndocs-unchanged: Caveats — comment-only\n'
+  run "tilde fence does not close on a backtick decoy" 1 $'agents/plugins/alpha/src/a.cpp' "$with_readme" $'~~~\n```\ndocs-unchanged: Caveats — hidden\n```\n~~~\n'
   run "src changed, no README at HEAD (exempt)" 0 $'agents/plugins/beta/src/b.cpp' "$commits"
   run "two plugins, one satisfied one not" 1 $'agents/plugins/alpha/src/a.cpp\nagents/plugins/gamma/src/g.cpp\nagents/plugins/gamma/README.md' "$with_readme"$'\nhead1:agents/plugins/gamma/README.md'
   run "base commit unavailable fails closed" 1 $'agents/plugins/alpha/src/a.cpp' $'head1\nhead1:agents/plugins/alpha/README.md'
