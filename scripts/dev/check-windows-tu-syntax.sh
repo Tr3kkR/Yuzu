@@ -46,6 +46,7 @@ template <class... A> void warn(std::string_view, A&&...) {}
 template <class... A> void info(std::string_view, A&&...) {}
 template <class... A> void error(std::string_view, A&&...) {}
 template <class... A> void debug(std::string_view, A&&...) {}
+template <class... A> void critical(std::string_view, A&&...) {}
 }
 SHIM
 
@@ -53,16 +54,46 @@ SHIM
 tus=(
     agents/plugins/disk_actions/src/disk_actions_win.cpp
     agents/plugins/power_health/src/power_health_plugin.cpp
+    agents/plugins/tar/src/tar_removable_collector.cpp
 )
 [ "$#" -gt 0 ] && tus+=("$@")
+
+# tar_removable_collector.cpp pulls in tar_removable_parsers.hpp, which uses
+# nlohmann::json for real (encode/decode of the whole cursor structure, not a
+# handful of calls a small stub could faithfully cover the way the spdlog
+# stub above does) — so unlike every TU above, this one needs the real
+# header. It is genuinely header-only and triplet-independent, so ANY
+# populated vcpkg_installed tree's copy is a valid stand-in; this script
+# still does not require one to exist (its own header comment's promise), it
+# just skips that ONE TU gracefully when none is bootstrapped, rather than
+# failing the whole check or attempting a hand-rolled JSON-library shim.
+nlohmann_include=""
+for candidate in vcpkg_installed/*/include; do
+    if [ -d "$candidate/nlohmann" ]; then
+        nlohmann_include="$candidate"
+        break
+    fi
+done
 
 rc=0
 for tu in "${tus[@]}"; do
     [ -f "$tu" ] || { echo "  SKIP  $tu (not present)"; continue; }
     src_dir=$(dirname "$tu")
+    extra_inc=()
+    # Scoped to the TU's OWN directory (its sibling headers), not a repo-wide
+    # glob — disk_actions_win.cpp must stay shim-only even though some
+    # unrelated plugin elsewhere in the tree uses nlohmann.
+    if grep -lq "nlohmann/json.hpp" "$src_dir"/*.hpp "$src_dir"/*.cpp 2>/dev/null; then
+        if [ -z "$nlohmann_include" ]; then
+            echo "  SKIP  $tu (needs nlohmann/json.hpp — bootstrap vcpkg_installed to check it)"
+            continue
+        fi
+        extra_inc=(-I "$nlohmann_include")
+    fi
     if "$CXX" -std=c++23 -fsyntax-only -fno-elide-constructors \
-        -I "$shim" -I "$src_dir" -I agents/shared -I sdk/include \
-        "$tu" 2>"$shim/err.log"; then
+        -DWIN32_LEAN_AND_MEAN -DNOMINMAX \
+        -I "$shim" -I "$src_dir" -I agents/shared -I sdk/include -I agents/core/include \
+        "${extra_inc[@]}" "$tu" 2>"$shim/err.log"; then
         echo "  ok    $tu"
     else
         echo "  FAIL  $tu"
