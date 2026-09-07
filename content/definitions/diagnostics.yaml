@@ -33,7 +33,7 @@ spec:
       - name: log_level
         type: string
         description: The agent's current spdlog log level, read verbatim from agent.log_level.
-        values: [trace, debug, info, warn, error, critical, off]
+        values: [trace, debug, info, warn, error, critical, 'off']
         example: "info"
         platforms: [windows, linux, darwin]
 

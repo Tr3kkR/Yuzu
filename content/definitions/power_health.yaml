@@ -42,7 +42,7 @@ metadata:
     when the kernel driver exposes CHARGE_FULL/CHARGE_FULL_DESIGN/
     CYCLE_COUNT). On a Windows host with no system battery (desktops),
     BatteryFlag=128 reports
-    present=false, state=ac_no_battery — measured live, not inferred. The
+    present=0, state=ac_no_battery — measured live, not inferred. The
     battery-PRESENT path is verified on real Windows hardware (HP ZBook
     Firefly); on macOS it is still fixture-tested through an injected
     boundary and UNVERIFIED on real battery hardware — see
@@ -68,8 +68,8 @@ spec:
       - name: present
         type: boolean
         description: Whether a power source was found by the platform mechanism.
-        values: "true, false"
-        example: false
+        values: "1 (battery present), 0 (none) — a digit, never true/false"
+        example: "0"
         platforms: [windows, linux, darwin]
       - name: state
         type: string

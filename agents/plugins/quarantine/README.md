@@ -79,14 +79,14 @@ Every action writes pipe-delimited `key|value` pairs via `ctx.write_output` — 
 
 | Field | Type | Values | Available | Example |
 |---|---|---|---|---|
-| `status` | string | `quarantined`, `quarantined_partial`, `failed`, `busy` | windows, linux, darwin | `quarantined` |
+| `status` | string | `quarantined`, `quarantined_partial`, `failed`, `busy` | windows, linux, darwin | `quarantined` (not observed — `quarantine` was never executed for these samples) |
 | `rules_applied` | int32 | integer ≥ 0 | windows, linux, darwin | `4` |
 
 **`unquarantine` — `status|<value>[|note|<text>]`** (or `error|<message>` on macOS, if both restore paths fail)
 
 | Field | Type | Values | Available | Example |
 |---|---|---|---|---|
-| `status` | string | `released`, `release_uncertain` | windows, linux, darwin | `released` |
+| `status` | string | `released`, `release_uncertain` | windows, linux, darwin | `released` (not observed — `unquarantine` was never executed for these samples) |
 
 **`status` — `state|<value>[|note|<text>]`, then (only when `state` != `inactive`) `whitelist|<comma-list>[|note|<text>]`**
 

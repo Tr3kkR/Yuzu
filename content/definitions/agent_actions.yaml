@@ -49,7 +49,7 @@ spec:
       - name: level
         type: string
         description: The log level the agent applied — a lowercased echo of the level parameter.
-        values: [trace, debug, info, warn, error, critical, off]
+        values: [trace, debug, info, warn, error, critical, 'off']
         example: "info"
         platforms: [windows, linux, darwin]
 

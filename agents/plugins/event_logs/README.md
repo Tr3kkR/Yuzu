@@ -91,8 +91,8 @@ Pipe-delimited rows, one per event; field 0 is a literal discriminator (`error` 
 | Field | Type | Values | Available | Example |
 |---|---|---|---|---|
 | `timestamp` | string | same per-OS formats as `errors.timestamp` | W, L, M | `2026-09-06T14:55:55Z` (W) |
-| `level` | enum, Windows only | `Critical` `Error` `Warning` `Information` `Verbose` `Level<n>` (unmapped numeric level) | W only | `Information` |
-| `event_id` | int, or `-` | Windows `<EventID>` text | W only | `1000` |
+| `level` | enum, Windows only | `Critical` `Error` `Warning` `Information` `Verbose` `Level<n>` (unmapped numeric level) | W only | not observed in any capture — the Windows `query` run matched no rows; the `errors` row format carries no level field |
+| `event_id` | int, or `-` | Windows `<EventID>` text | W only | `6008` (Windows `errors` sample; `query` matched no rows) |
 | `source` | string, or `-` | Windows provider name; on Linux/macOS this position holds `unit`/`process` instead (see `errors` above) | W: provider · L/M: unit/process | `Kernel-General` (W) |
 | `message` | string, or `-` | matched keyword filter applies here (case-insensitive substring) | W, L, M | see Sample output |
 <!-- END GENERATED -->

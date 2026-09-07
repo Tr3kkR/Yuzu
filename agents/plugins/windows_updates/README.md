@@ -140,7 +140,7 @@ placeholder.
 | `ip` | string | resolved IP, or the DNS error text when `dns_ok=false` | W, L, M | `128.85.102.70` |
 | `tcp_ok` | bool | `true` `false` | W, L, M | `true` |
 | `tcp_ms` | int32 | milliseconds | W, L, M | `160` |
-| `tcp_error` | string | free text; row omits this pair entirely when the connect succeeded | W, L, M | `connection refused` |
+| `tcp_error` | string | free text; row omits this pair entirely when the connect succeeded | W, L, M | not observed in any capture (every probe connected); free text from the socket error |
 | `targets_tested` | int32 | count | W, L, M | `3` |
 | `targets_reachable` | int32 | count | W, L, M | `3` |
 | `targets_failed` | int32 | count | W, L, M | `0` |

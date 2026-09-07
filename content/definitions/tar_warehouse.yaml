@@ -824,7 +824,9 @@ metadata:
   description: >
     Force an immediate rollup aggregation cycle (normally runs every 15 minutes).
     Aggregates live data into hourly, daily, and monthly summary tables and
-    enforces retention limits on each tier.
+    then permanently deletes rows older than each tier's retention limit.
+    Classified Destructive/Irreversible with no approval gate: an operator
+    who can dispatch it deletes history immediately and cannot undo it.
   tags: [tar, warehouse, rollup, aggregation]
 
 spec:

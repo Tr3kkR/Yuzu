@@ -84,7 +84,7 @@ Pipe-delimited rows via `write_output()`, one line per record. `thermal`'s field
 
 | Field | Type | Values | Available | Example |
 |---|---|---|---|---|
-| `present` | boolean | true, false | W, M, L | `false` |
+| `present` | int flag | `1` (battery present), `0` (none) — emitted as a digit, not `true`/`false` (`power_health_parsers.hpp:99`) | W, M, L | `0` |
 | `state` | string | `charging` `discharging` `full` `not_charging` `ac_no_battery` `unknown` | W, M, L | `ac_no_battery` |
 | `percent` | int64 | 0-100 or `-1` (unknown) | W, M, L | `-1` |
 | `time_to_empty_min` | int64 | non-negative or `-1` (unknown) | W, M, L | `-1` |

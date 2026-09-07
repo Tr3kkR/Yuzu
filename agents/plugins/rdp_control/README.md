@@ -70,10 +70,10 @@ Each action's result is a set of independent `key|value` lines — one per gate 
 
 | Field | Type | Values | Available | Example |
 |---|---|---|---|---|
-| `reg_status` | string | `ok`, `error:<win32 code>` | W | `ok` |
-| `firewall_status` | string | `ok`, `error:com_init`, `error:group_not_found`, `error:0x<hresult>` | W | `ok` |
-| `service_status` | string | `running` (enable, confirmed), `untouched` (disable), `error:<win32 code>` | W | `running` |
-| `overall` | string | `ok`, `error` | W | `ok` |
+| `reg_status` | string | `ok`, `error:<win32 code>` | W | `ok` (not observed in any capture — only the rejection path was run) |
+| `firewall_status` | string | `ok`, `error:com_init`, `error:group_not_found`, `error:0x<hresult>` | W | `ok` (not observed in any capture) |
+| `service_status` | string | `running` (enable, confirmed), `untouched` (disable), `error:<win32 code>` | W | `running` (not observed in any capture) |
+| `overall` | string | `ok`, `error` | W | `ok` (not observed in any capture) |
 
 **`status` — `deny_ts_connections|firewall_group|term_service|rdp`**
 
@@ -81,7 +81,7 @@ Each action's result is a set of independent `key|value` lines — one per gate 
 |---|---|---|---|---|
 | `deny_ts_connections` | string | `0` or `1` (raw registry DWORD), or `error:<win32 code>` | W | `0` |
 | `firewall_group` | string | `enabled`, `disabled`, `group_not_found`, `error:com_init`, `error:0x<hresult>` | W | `enabled` |
-| `term_service` | string | `running` `start_pending` `stopped` `stop_pending` `paused` `pause_pending` `continue_pending` `unknown`, or `error:<win32 code>` | W | `running` |
+| `term_service` | string | `running` `start_pending` `stopped` `stop_pending` `paused` `pause_pending` `continue_pending` `unknown`, or `error:<win32 code>` | W | `running` (not observed in any capture) |
 | `rdp` | string | `on`, `off`, `unknown` | W | `on` |
 <!-- END GENERATED -->
 
