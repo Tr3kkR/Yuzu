@@ -17,6 +17,7 @@
 
 #include <yuzu/server/auth_db.hpp>
 
+#include "background_jobs.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "acquire_retry.hpp"
@@ -499,6 +500,7 @@ AuthDB::AuthDB(pg::PgPool& pool, pg::SecretCodec& secret_codec, int cleanup_inte
         return;
     }
 
+    YUZU_ASSERT_BACKGROUND_JOB("auth_db.cleanup_provisional_mfa"); // WS-10 ReplicaSafe (idempotent)
 #ifdef __cpp_lib_jthread
     impl_->cleanup_thread = std::jthread([this, interval = impl_->cleanup_interval_secs](
                                              std::stop_token stop) {
