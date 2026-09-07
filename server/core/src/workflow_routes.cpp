@@ -1719,7 +1719,14 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // metered, 400 — and execute() is never invoked. dispatch_fn's own
         // per-step gate stays in place as defense-in-depth for a workflow
         // definition mutated between this preflight and execute(), or a future
-        // dispatch_fn caller that skips this preflight.
+        // dispatch_fn caller that skips this preflight — BR4-001 (round 4)
+        // closed that specific race's own audit/metric gap: dispatch_fn now
+        // reports a late refusal back to this route via the
+        // late_targeting_denied/late_targeting_reason pair declared just above
+        // the dispatch_fn definition below, so a definition mutated in the
+        // window between this preflight and dispatch_fn's re-read still gets a
+        // denied audit event and the rejection metric, instead of the blanket
+        // "success" this route audits once execute() returns an execution id.
         //
         // Unwired instruction_store/capability_registry: skip the preflight
         // entirely rather than fail closed on a structural absence neither of
@@ -1819,13 +1826,28 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             }
         }
 
+        // BR4-001 (branch-review round 4): dispatch_fn's per-step gate below is the
+        // correct backstop for a workflow/instruction definition mutated between this
+        // route's own preflight (above) and execute() reaching this step — it still
+        // refuses the actual agent dispatch — but that refusal reaches
+        // WorkflowEngine::execute as an ordinary failed-step result, indistinguishable
+        // from any other step failure, and this route unconditionally audits
+        // "workflow.execute"/"success" once execute() returns an execution id
+        // regardless of what happened inside. execute() runs dispatch_fn synchronously
+        // on THIS thread (no background thread, no async handoff — the whole step loop
+        // completes before execute() returns below), so a plain by-reference capture
+        // set inside dispatch_fn is safely observable here immediately after execute()
+        // returns, with no cross-thread lifetime concern.
+        bool late_targeting_denied = false;
+        std::string late_targeting_reason;
+
         // Create a dispatch function that uses the real command dispatch.
         // caller is captured by value (workflow_engine->execute invokes this
         // synchronously below, but a value capture is lifetime-safe
         // regardless) so every step narrows to AND identifies the operator.
         auto dispatch_fn =
             [instruction_store, &cmd_dispatch, &cmd_dispatch_concurrency, caller,
-             capability_registry](  // BR2-001
+             capability_registry, &late_targeting_denied, &late_targeting_reason](  // BR2-001/BR4-001
                 const std::string& instruction_id, const std::string& agent_ids_json,
                 const std::string& parameters_json) -> std::expected<std::string, std::string> {
             // Look up the instruction definition to get plugin + action
@@ -1915,6 +1937,13 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 case yuzu::server::DestructiveTargetingVerdict::Targeted:
                     break;
                 case yuzu::server::DestructiveTargetingVerdict::RefuseUntargeted:
+                    // BR4-001: surfaced to the route below so a refusal reached via a
+                    // late (post-preflight) definition mutation still gets the denied
+                    // audit event and rejection metric a step-level failure alone
+                    // cannot carry (dispatch_fn has no audit_fn/metrics of its own —
+                    // see the capture-site comment above).
+                    late_targeting_denied = true;
+                    late_targeting_reason = std::string(gate.refusal_reason);
                     return std::unexpected<std::string>(std::string(gate.refusal_message));
                 }
             }
@@ -1972,8 +2001,39 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
             return;
         }
-        audit_fn(req, "workflow.execute", "success", "workflow", workflow_id,
-                 "execution_id=" + *result);
+        if (late_targeting_denied) {
+            // BR4-001: at least one step's dispatch was refused by the SAME
+            // evaluate_destructive_targeting chokepoint the preflight above uses —
+            // just reached late, via a definition that changed after the preflight
+            // read it. The dispatch itself was correctly blocked (dispatch_fn's
+            // return), but that alone leaves no denied audit event and no rejection
+            // metric — docs/observability-conventions.md: "Denied operations MUST
+            // emit an audit event." Counted on the SAME series/route label as the
+            // preflight's own denial so the two paths are equally visible.
+            if (metrics) {
+                try {
+                    metrics
+                        ->counter("yuzu_server_dispatch_target_rejected_total",
+                                  {{"route", "workflow"}, {"reason", late_targeting_reason}})
+                        .increment();
+                } catch (const std::exception& e) {
+                    spdlog::error(
+                        "dispatch_target_rejected_total counter threw for late workflow "
+                        "targeting refusal (reason={}): {}",
+                        late_targeting_reason, e.what());
+                } catch (...) {
+                    spdlog::error(
+                        "dispatch_target_rejected_total counter threw for late workflow "
+                        "targeting refusal (reason={})",
+                        late_targeting_reason);
+                }
+            }
+            audit_fn(req, "workflow.execute", "denied", "workflow", workflow_id,
+                     "reason=" + late_targeting_reason + " (late; execution_id=" + *result + ")");
+        } else {
+            audit_fn(req, "workflow.execute", "success", "workflow", workflow_id,
+                     "execution_id=" + *result);
+        }
         emit_fn("workflow.executed", req);
         res.set_header(
             "HX-Trigger",

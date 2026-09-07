@@ -171,6 +171,15 @@ struct ExecHarness {
     /// non-default values.
     std::string dispatch_cmd_override;
     int dispatch_sent_override{0};
+    /// BR4-001 regression net: fires synchronously from inside cmd_dispatch,
+    /// after that step's dispatch is captured, so a test can mutate an
+    /// instruction definition BETWEEN one step's dispatch and the NEXT step's
+    /// dispatch_fn re-read of it — reproducing, deterministically and on one
+    /// thread, the same "definition changed after the route's preflight but
+    /// before dispatch_fn's own re-read" window a genuine concurrent editor
+    /// would race into. Default empty (no-op) so no pre-existing test using
+    /// cmd_dispatch is affected.
+    std::function<void()> dispatch_side_effect;
     /// #3424/#3511 Gate 8 round-4 (quality-engineer): override the zero-reach
     /// discriminator fields the stub's ConfinedDispatchOutcome carries, so a
     /// test can exercise each of the 4-way 503 split's branches instead of
@@ -363,6 +372,8 @@ struct ExecHarness {
             // into dispatch.
             last_dispatch_exec_visible = caller.exec_visible;
             last_dispatch_caller = caller;
+            if (dispatch_side_effect)
+                dispatch_side_effect();
             return {.sent = dispatch_sent_override,
                    .scope_parse_error = dispatch_scope_parse_error_override,
                    .denied_quarantined_count = dispatch_denied_quarantined_count_override,
@@ -460,6 +471,31 @@ struct ExecHarness {
                                  "  steps:\n"
                                  "    - instruction: " +
                                  instruction_id + "\n";
+        auto id = workflows->create_workflow(yaml);
+        REQUIRE(id.has_value());
+        return *id;
+    }
+
+    /// BR4-001: two-step workflow, one step per instruction id, both
+    /// executed in order — needed to reproduce the late-mutation race
+    /// (mutate the SECOND step's instruction from a dispatch_side_effect
+    /// fired while dispatching the FIRST).
+    std::string make_workflow2(const std::string& display_name,
+                                const std::string& instruction_id_1,
+                                const std::string& instruction_id_2) {
+        REQUIRE(workflows);
+        const std::string yaml = "kind: Workflow\n"
+                                 "metadata:\n"
+                                 "  displayName: " +
+                                 display_name +
+                                 "\n"
+                                 "spec:\n"
+                                 "  steps:\n"
+                                 "    - instruction: " +
+                                 instruction_id_1 +
+                                 "\n"
+                                 "    - instruction: " +
+                                 instruction_id_2 + "\n";
         auto id = workflows->create_workflow(yaml);
         REQUIRE(id.has_value());
         return *id;
@@ -2535,6 +2571,86 @@ TEST_CASE("BR2-001 — a workflow step naming an unclassified instruction is una
     CHECK(res->status == 202);
     CHECK(h.dispatch_calls == 1);
     REQUIRE(h.last_dispatch_agent_ids.size() == 2);
+}
+
+// BR4-001 (round-4 branch review): BR3-001's preflight (above) reads each
+// step's instruction definition ONCE, before WorkflowEngine::execute() runs
+// at all. If a definition changes AFTER that read but BEFORE dispatch_fn's
+// own re-read of the SAME instruction — a concurrent PATCH to the
+// instruction landing mid-execution — the preflight's classification is
+// stale. dispatch_fn's per-step gate (BR2-001) still correctly refuses the
+// actual dispatch on its fresh re-read, so no forbidden send ever reaches an
+// agent; the gap was purely in the route's own audit/metric: it still
+// unconditionally logged "workflow.execute"/"success" and returned 202,
+// because WorkflowEngine::execute() reports a per-step dispatch refusal as
+// an ordinary failed step, not as a targeting denial. This reproduces the
+// race deterministically, single-threaded, via dispatch_side_effect: step 1
+// dispatches successfully, and AS PART OF that dispatch the test mutates
+// step 2's instruction from unclassified to Forensics — a change the
+// preflight (which ran before either step dispatched) could never have
+// seen.
+TEST_CASE("BR4-001 — a step mutated to Forensics between preflight and its own dispatch is "
+          "denied with an audit event and the rejection metric, not a bare success/202",
+          "[pg][workflow][executions][execute][targeting][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true);
+    h.make_def("def-BR4-1a", "Step one (unclassified)");
+    h.make_def("def-BR4-1b", "Step two (unclassified at preflight time)");
+    auto wf_id = h.make_workflow2("wf-br4-1", "def-BR4-1a", "def-BR4-1b");
+    h.dispatch_cmd_override = "cmd-br4-1";
+    h.dispatch_sent_override = 2;
+
+    h.dispatch_side_effect = [&h]() {
+        // Only step 1 (def-BR4-1a, still "test"/"list") should ever reach
+        // cmd_dispatch — step 2 must be refused by dispatch_fn's own gate
+        // before it gets this far. Mutate step 2's definition here, exactly
+        // between step 1's dispatch and step 2's dispatch_fn re-read.
+        auto current = h.instructions->get_definition("def-BR4-1b");
+        REQUIRE(current.has_value());
+        REQUIRE(current->has_value());
+        auto def = **current;
+        def.plugin = "app_usage";
+        def.action = "summary"; // Forensics — single-target rule
+        auto updated = h.instructions->update_definition(def);
+        REQUIRE(updated.has_value());
+    };
+
+    auto res =
+        h.sink.Post("/api/workflows/" + wf_id + "/execute", R"({"agent_ids":["agent-A","agent-B"]})");
+    REQUIRE(res);
+    // The request was admitted and an execution was created — this is an
+    // async-accepted endpoint, and the underlying dispatch was genuinely
+    // blocked, so 202 stands; what must change is the audit/metric record of
+    // WHAT happened inside.
+    CHECK(res->status == 202);
+    // Exactly one real dispatch (step 1) — step 2 never reaches cmd_dispatch.
+    CHECK(h.dispatch_calls == 1);
+
+    bool found_success_audit = false;
+    bool found_denied_audit = false;
+    for (const auto& call : h.audit_calls) {
+        if (call.action != "workflow.execute")
+            continue;
+        if (call.result == "success")
+            found_success_audit = true;
+        if (call.result == "denied") {
+            found_denied_audit = true;
+            CHECK(call.target_type == "workflow");
+            CHECK(call.target_id == wf_id);
+            CHECK(call.detail.find("reason=forensic_untargeted") != std::string::npos);
+        }
+    }
+    // The whole point of BR4-001: the late refusal is audited as "denied",
+    // and the route does NOT ALSO claim "success" for the same request.
+    CHECK(found_denied_audit);
+    CHECK_FALSE(found_success_audit);
+
+    CHECK(h.metrics
+              .counter("yuzu_server_dispatch_target_rejected_total",
+                       {{"route", "workflow"}, {"reason", "forensic_untargeted"}})
+              .value() == 1.0);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
