@@ -1,6 +1,8 @@
 #include "workflow_routes.hpp"
 
+#include "command_capability.hpp"        // CommandCapability / ClassificationError / CommandCapabilityRegistry
 #include "compliance_eval.hpp"
+#include "dispatch_destructive_gate.hpp" // BR-001: evaluate_destructive_targeting / requires_explicit_targets
 #include "dispatch_target_shape.hpp" // check_targeting_shape — the omitted-vs-supplied rule (#2500)
 #include "event_bus.hpp"
 #include "execution_event_bus.hpp"
@@ -143,6 +145,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     auto* response_store = deps.response_store;
     auto* execution_event_bus = deps.execution_event_bus;
     auto* metrics = deps.metrics;
+    auto* capability_registry = deps.capability_registry; // BR-001
     auto cmd_dispatch = std::move(deps.command_dispatch_fn);
     auto cmd_dispatch_concurrency = std::move(deps.command_dispatch_fn_concurrency);
     // K-R7-02 / PLAN-006: per-request DispatchCaller derivation. A missing
@@ -1896,7 +1899,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                                        instruction_store, cmd_dispatch,
                                                        cmd_dispatch_concurrency, caller_fn,
                                                        execution_tracker, approval_manager,
-                                                       metrics](const httplib::Request& req,
+                                                       metrics,
+                                                       capability_registry](const httplib::Request& req,
                                                                 httplib::Response& res) {
         if (!perm_fn(req, res, "Execution", "Execute"))
             return;
@@ -2111,6 +2115,94 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // a non-array `agent_ids` and a non-string `scope` are refused above, so
         // reaching this point empty now means the caller genuinely named no
         // target rather than named one the parser threw away.
+        //
+        // BR-001 (branch review) — the ONE exception to the broadcast contract
+        // just stated: a `def.plugin`/`def.action` classified Destructive or
+        // Forensics (`dispatch_destructive_gate.hpp`'s `requires_explicit_
+        // targets`) refuses an omitted/broadcast/multi-agent target instead of
+        // reaching every agent. This route resolves a free-form plugin.action
+        // pair and can fan it out exactly like the three siblings the same
+        // header already documents (`/api/command` [command_routes.cpp], MCP
+        // `execute_instruction` [mcp_server.cpp], the exec console
+        // [dashboard_routes.cpp]) — it was simply the fourth real
+        // CommandRequest producer nobody had wired yet. SAME chokepoint, not a
+        // copy: `evaluate_destructive_targeting` and both refusal strings come
+        // from `dispatch_destructive_gate.hpp` unchanged, so this surface
+        // cannot drift from the other three.
+        {
+            const auto gate = yuzu::server::evaluate_destructive_targeting(
+                capability_registry->classify(def.plugin, def.action),
+                /*valid_nonempty_agent_ids=*/!agent_ids.empty(),
+                // scope_expr is already the post-validation shape the
+                // header's caller contract requires (check_targeting_shape
+                // above refused a supplied-but-empty scope as `scope_empty`),
+                // never a raw extraction result.
+                /*scope_key_present=*/!scope_expr.empty(),
+                /*agent_id_count=*/agent_ids.size());
+            // Exhaustive, no `default:` — the same switch shape the other
+            // three callers use over this enum (ClassifyMiss is an
+            // enumerator the caller must handle, never a skippable `if`).
+            switch (gate.verdict) {
+            case yuzu::server::DestructiveTargetingVerdict::NotDestructive:
+                // ReadOnly/Mutating, non-Forensics: this gate does not apply
+                // and dispatch proceeds exactly as before this fix.
+                break;
+            case yuzu::server::DestructiveTargetingVerdict::ClassifyMiss:
+                // Policy B, same choice as the other three callers
+                // (dispatch_destructive_gate.hpp's file doc comment): this
+                // route has no downstream classify-based backstop of its
+                // own, so an early denial here would be a NEW policy rather
+                // than a shared one — out of scope for a fix that closes the
+                // targeting gap for a row that DOES classify as Destructive/
+                // Forensics. An Unclassified/Ambiguous plugin.action keeps
+                // today's (pre-fix) behaviour unchanged.
+                break;
+            case yuzu::server::DestructiveTargetingVerdict::Targeted:
+                // Explicit target(s) named correctly for this capability's
+                // class — proceed to dispatch below. The shared
+                // dispatch_confined seam (#1788), reached via cmd_dispatch/
+                // cmd_dispatch_concurrency, still narrows agent_ids to the
+                // operator's visible set downstream exactly as it does for
+                // every other dispatch arm through this route.
+                break;
+            case yuzu::server::DestructiveTargetingVerdict::RefuseUntargeted: {
+                // Counted on the SAME series as the /api/command, MCP and
+                // dashboard refusals, with this surface's own `route` label.
+                if (metrics) {
+                    try {
+                        metrics
+                            ->counter("yuzu_server_dispatch_target_rejected_total",
+                                      {{"route", "instruction_execute"},
+                                       {"reason", std::string(gate.refusal_reason)}})
+                            .increment();
+                    } catch (const std::exception& e) {
+                        spdlog::error("dispatch_target_rejected_total counter threw for {}:{} "
+                                     "(reason={}): {}",
+                                     def.plugin, def.action, gate.refusal_reason, e.what());
+                    } catch (...) {
+                        spdlog::error("dispatch_target_rejected_total counter threw for {}:{} "
+                                     "(reason={})",
+                                     def.plugin, def.action, gate.refusal_reason);
+                    }
+                }
+                if (audit_fn) {
+                    audit_fn(req, "instruction.execute", "denied", "instruction", def_id,
+                             std::string("reason=") + std::string(gate.refusal_reason));
+                }
+                // Same envelope shape this route already answers with for
+                // every other targeting refusal above (#2500) — never a new
+                // response shape for this fifth reason string.
+                res.status = 400;
+                res.set_content(
+                    nlohmann::json({{"error", {{"code", 400},
+                                               {"message", std::string(gate.refusal_message)}}},
+                                    {"meta", {{"api_version", "v1"}}}})
+                        .dump(),
+                    "application/json");
+                return;
+            }
+            }
+        }
 
         // PR 2: create the execution row BEFORE dispatch so the
         // execution_id is known when cmd_dispatch generates command_id —
