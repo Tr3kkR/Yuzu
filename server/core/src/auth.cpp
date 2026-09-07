@@ -1076,9 +1076,11 @@ std::string AuthManager::create_local_session(const std::string& username, Role 
     }
     // #4107 check-then-mint gap: see post_mint_role_recheck's own doc. This
     // function's `role` parameter can be arbitrarily stale by the time this
-    // point is reached (its callers include the MFA step-up route, which
-    // reads a role from an earlier verify_password() call across an entire
-    // TOTP-verification round trip) - the fresh re-read here closes the gap
+    // point is reached (its callers include /login/mfa's TOTP/recovery-code
+    // verify, which reads a role from an earlier verify_password() call
+    // across an entire TOTP-verification round trip, NOT /login/mfa/stepup -
+    // that route re-proves MFA on an existing session and never calls this
+    // function) - the fresh re-read here closes the gap
     // regardless of how wide that earlier window was. Same empty-token
     // fail-safe contract as the durable-write-failure branch above: no
     // session, degrades to "not authenticated" at the caller's cookie set.

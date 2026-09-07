@@ -3022,8 +3022,9 @@ public:
                           "counter");
         // #4107 — the local-auth analogue of the OIDC/SAML post-mint
         // recheck above, with one more undifferentiated cause than those:
-        // AuthManager::create_local_session (password login, MFA step-up,
-        // MFA enrollment-confirm) returns its caller-facing empty-string
+        // AuthManager::create_local_session (password login, MFA login-
+        // challenge TOTP/recovery verify at /login/mfa, MFA enrollment-
+        // confirm) returns its caller-facing empty-string
         // sentinel on EITHER a plain SessionStore persist failure (an
         // ordinary availability event, unrelated to any role check) OR a
         // post_mint_role_recheck denial (role diverged from AuthDB during
@@ -3037,8 +3038,9 @@ public:
         // authdb Gate 8: an earlier draft of this text asserted only the
         // post_mint_role_recheck causes).
         metrics_.describe("yuzu_auth_login_session_mint_denied_total",
-                          "TOTAL local-auth logins (password, MFA step-up, MFA enrollment-"
-                          "confirm) whose session mint was denied - EITHER an ordinary "
+                          "TOTAL local-auth logins (password, MFA login-challenge TOTP/"
+                          "recovery verify, MFA enrollment-confirm) whose session mint was "
+                          "denied - EITHER an ordinary "
                           "SessionStore persist failure OR a post_mint_role_recheck denial "
                           "(#4107 role-recheck: role diverged from AuthDB during the "
                           "check-then-mint window, or the post-mint AuthDB read hit a store "

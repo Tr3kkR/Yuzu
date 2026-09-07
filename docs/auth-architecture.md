@@ -3697,9 +3697,11 @@ normally, then a **post-mint re-check** (`AuthManager::post_mint_role_recheck`)
 immediately re-verifies the just-minted role against a fresh AuthDB read and,
 on divergence or a store error, revokes the session (`invalidate_user_sessions`)
 and denies. Wired into both `authenticate()` and `create_local_session()` —
-the latter also closes the same gap for the MFA step-up and enrollment-
-confirm routes, whose caller-supplied role can be stale across an entire
-TOTP round trip, a wider window than `authenticate()`'s own.
+the latter also closes the same gap for the MFA login-challenge (TOTP/
+recovery verify at `/login/mfa`) and enrollment-confirm routes, whose
+caller-supplied role can be stale across an entire TOTP round trip, a
+wider window than `authenticate()`'s own — NOT `/login/mfa/stepup`, which
+re-proves MFA on an existing session and never calls `create_local_session`.
 
 **The honest guarantee.** For the SAME-PROCESS/single-primary-Postgres case
 this is airtight, not merely narrowed: a racing `update_role()` commits its
