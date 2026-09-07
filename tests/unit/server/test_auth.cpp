@@ -905,19 +905,31 @@ TEST_CASE("the row lock genuinely blocks a concurrent update_role() until "
             writer_update_ok = cold_mgr.update_role("cora", Role::user);
             writer_finished = true;
         });
-        // Bounded poll (up to 2s, 5ms interval) for a backend on this test
-        // database genuinely WAITING on a lock while running an UPDATE
-        // against auth.users - i.e. the writer thread above, blocked inside
-        // Postgres on the row this recheck is holding. This is a direct
-        // observation of the blocking mechanism, not an inference from
-        // timing: if the row lock were broken (e.g. FOR UPDATE silently
-        // dropped), the writer's UPDATE would never appear in this state -
-        // it would complete before ever showing up as waiting.
-        for (int i = 0; i < 400 && !writer_observed_blocked; ++i) {
+        // Bounded poll (up to 3s, 5ms interval - authdb Gate 8: padded a
+        // beat above kWriteTimeout's own 2s so this poll's own budget can
+        // never be the reason a genuinely-blocked writer goes unobserved)
+        // for a backend on this test database genuinely WAITING on a lock
+        // while running an UPDATE against auth.users - i.e. the writer
+        // thread above, blocked inside Postgres on the row this recheck is
+        // holding. This is a direct observation of the blocking mechanism,
+        // not an inference from timing: if the row lock were broken (e.g.
+        // FOR UPDATE silently dropped), the writer's UPDATE would never
+        // appear in this state - it would complete before ever showing up
+        // as waiting.
+        for (int i = 0; i < 600 && !writer_observed_blocked; ++i) {
+            // cpp-safety Gate 8 catch: scoped to THIS test's own database and
+            // excludes this polling connection's own backend - pg_stat_activity
+            // is CLUSTER-wide, and this repo runs many [pg] test shards
+            // concurrently against one Postgres instance (each with its own
+            // per-test database, but the same 'yuzu' role and the same
+            // auth.users table name) - an unscoped query could match an
+            // unrelated shard's own lock contention and report a false
+            // positive even if THIS test's row lock were silently broken.
             yuzu::server::pg::PgResult res = yuzu::server::pg::exec_params(
                 watch_conn.get(),
                 "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
-                "AND query ILIKE '%UPDATE auth.users%'",
+                "AND query ILIKE '%UPDATE auth.users%' AND datname = current_database() "
+                "AND pid <> pg_backend_pid()",
                 std::vector<std::string>{});
             if (res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) == 1 &&
                 std::string(PQgetvalue(res.get(), 0, 0)) != "0") {
@@ -926,16 +938,25 @@ TEST_CASE("the row lock genuinely blocks a concurrent update_role() until "
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
-        // Give the confirmed-blocked writer a little extra time held against
-        // the lock (belt-and-suspenders against a lock acquired-then-
-        // immediately-released race), then release the row lock by
-        // returning from this hook.
-        if (writer_observed_blocked)
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        // authdb Gate 8: no extra hold here (an earlier draft slept 50ms
+        // after observing the block) - pg_stat_activity reflects live
+        // backend state synchronously, not an MVCC snapshot, so a positive
+        // count above is already a real-time fact; padding it further
+        // proves nothing more. Returning now releases the row lock.
     });
 
     auto token = cold_mgr.authenticate("cora", "password1234");
-    writer.join(); // BEFORE any assertion that could throw - see the hook's own comment above.
+    // cpp-safety Gate 8 catch: several recheck_role_locked early-return paths
+    // (lease-acquire timeout, the new SET LOCAL lock_timeout failure, a
+    // failed/empty SELECT) skip the hook entirely, leaving `writer` still
+    // default-constructed (non-joinable) - join() on a non-joinable thread
+    // throws std::system_error, which would otherwise abort this test with a
+    // confusing "unexpected exception" instead of a clean assertion failure
+    // under exactly the pool-contention conditions this commit hardens
+    // against. Still runs BEFORE any assertion that could throw for the
+    // NORMAL (hook-fired) path - see the hook's own comment above.
+    if (writer.joinable())
+        writer.join();
     REQUIRE(token.has_value());
     // Primary evidence: pg_stat_activity directly observed the writer's
     // UPDATE waiting on the row lock - not a wall-clock proxy for it.
@@ -959,6 +980,62 @@ TEST_CASE("the row lock genuinely blocks a concurrent update_role() until "
     // BLOCKING mechanism (asserted above), not to also pin an outcome that's
     // inherently non-deterministic for a different, disclosed reason.
     CHECK(cold_mgr.get_user_role("cora") == Role::user); // DB-authoritative, unaffected by the sweep race
+}
+
+TEST_CASE("recheck_role_locked's own SET LOCAL lock_timeout fails the "
+          "recheck closed well under the pooled connection's 10s default "
+          "when the row lock is already held elsewhere (#4107 Gate 8 "
+          "coverage gap - authdb: nothing previously proved this path fires "
+          "at all, only that it compiles)",
+          "[pg][auth][session][cold_cache]") {
+    yuzu::test::AuthDbPg auth_db;
+
+    AuthManager warm_mgr;
+    warm_mgr.set_auth_db(auth_db.get());
+    REQUIRE(warm_mgr.upsert_user("greta", "password1234", Role::admin));
+
+    AuthManager cold_mgr;
+    cold_mgr.set_auth_db(auth_db.get());
+    REQUIRE(cold_mgr.authenticate("greta", "password1234").has_value()); // hydrates cache
+
+    // Hold a real row lock on greta's row from a SEPARATE, un-pooled
+    // connection - never committed until after the timed call below
+    // returns. This connection's own session-level lock_timeout stays at
+    // the pool's 10000ms default (AuthDbPg's pool never overrides it) -
+    // only recheck_role_locked's SET LOCAL inside its own transaction is
+    // under test here.
+    yuzu::server::pg::PgConn holder{PQconnectdb(auth_db.dsn().c_str())};
+    REQUIRE(PQstatus(holder.get()) == CONNECTION_OK);
+    {
+        yuzu::server::pg::PgResult begin_res =
+            yuzu::server::pg::exec_params(holder.get(), "BEGIN", std::vector<std::string>{});
+        REQUIRE(begin_res.status() == PGRES_COMMAND_OK);
+        yuzu::server::pg::PgResult lock_res = yuzu::server::pg::exec_params(
+            holder.get(), "SELECT 1 FROM auth.users WHERE username = $1 FOR UPDATE",
+            std::vector<std::string>{"greta"});
+        REQUIRE(lock_res.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(lock_res.get()) == 1);
+    }
+
+    const auto call_start = std::chrono::steady_clock::now();
+    auto token = cold_mgr.authenticate("greta", "password1234");
+    const auto call_duration = std::chrono::steady_clock::now() - call_start;
+
+    // Release the held lock - cleanup, taken after the timing measurement so
+    // it can't shorten the window under test.
+    yuzu::server::pg::exec_params(holder.get(), "ROLLBACK", std::vector<std::string>{});
+
+    // Fails CLOSED: recheck_role_locked's own SELECT ... FOR UPDATE can't
+    // get the lock, and its SET LOCAL lock_timeout (2000ms, matching
+    // kWriteTimeout) fires and denies the login rather than hanging toward
+    // the connection's much larger 10000ms pooled default.
+    CHECK_FALSE(token.has_value());
+    // Bounded well under the connection's 10s default (proves the SET LOCAL
+    // actually took effect, not just compiled), comfortably above near-zero
+    // (proves the call genuinely waited on the lock and hit the timeout,
+    // rather than failing instantly for some unrelated faster reason).
+    CHECK(call_duration >= std::chrono::milliseconds(1500));
+    CHECK(call_duration < std::chrono::milliseconds(6000));
 }
 
 TEST_CASE("a concurrent remove_user() that completes before the recheck "

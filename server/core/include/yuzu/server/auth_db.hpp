@@ -347,13 +347,20 @@ public:
     /// when this call runs, it genuinely serializes against a concurrent
     /// `reactivate_user()` exactly like `update_role()` (either blocks
     /// behind that UPDATE's in-flight lock, or that UPDATE blocks behind
-    /// this one). But if the row is ALREADY inactive at read time (no writer
-    /// in flight), this SELECT's own filter simply excludes it — zero rows,
-    /// `UserNotFound`, immediately, with nothing to wait on. That's not a
-    /// missed serialization, it's the correct fail-closed answer (a recheck
-    /// on an inactive account should deny), but it means this call never
-    /// blocks a *fresh* `reactivate_user()` call that starts against an
-    /// already-inactive row — there is no lock to contend for at that point.
+    /// this one). But if the row's last-COMMITTED state is already inactive,
+    /// this SELECT's `is_active = TRUE` qualifier excludes it under its own
+    /// READ COMMITTED snapshot — zero rows, `UserNotFound`, immediately, with
+    /// nothing to wait on. That holds regardless of whether a
+    /// `reactivate_user()` happens to be concurrently uncommitted at that
+    /// exact instant (authdb Gate 8 correction: an earlier draft attributed
+    /// this to "no writer in flight," which isn't the actual discriminator —
+    /// READ COMMITTED never sees another transaction's uncommitted write in
+    /// the first place, so the row's last-committed value is what decides
+    /// this, not in-flight timing). That's not a missed serialization, it's
+    /// the correct fail-closed answer (a recheck on an inactive account
+    /// should deny), but it means this call never blocks a *fresh*
+    /// `reactivate_user()` call starting against an already-inactive row —
+    /// there is no lock to contend for at that point.
     ///
     /// `under_row_lock` runs WHILE the row lock is held, immediately before
     /// this call commits (releasing the lock) — use it to update
