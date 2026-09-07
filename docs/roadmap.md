@@ -1992,8 +1992,9 @@ workstream states below are **as of dev @ `d295db964` (2026-09-07)** and drift w
 before acting on any "open" / "in progress" claim:
 
 1. **ADR-1005 Phase 7 — NVD/vuln UCE strangler migration.** Next up, not started — PRs A–D are
-   unblocked; PR E (the server-side deletion) is gated on Phase 6 **and** the M3 parity/confinement
-   gates per `docs/adr-1005-execution-plan.md`, so "next" means A–D, not the whole phase. Re-homes the
+   unblocked; PR E (the server-side deletion) is gated on the M3 parity + Decision 14 confinement
+   gates and the Phase 0.3 deprecation window per `docs/adr-1005-execution-plan.md` (Phase 6 precedes
+   it on the ladder), so "next" means A–D, not the whole phase. Re-homes the
    server-side NVD sync + CVE matching capability (and the grandfathered ADR-0023/ADR-4001 additions)
    into the vulnerability-management use-case engine module; deletes `server/core/src/nvd_db.cpp`,
    the **last server-side SQLite store** — closing out the Postgres substrate migration. Unblocks
