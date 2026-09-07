@@ -529,11 +529,17 @@ Decision numbers are stable, since other documents cite them.
 
 15. **Usage metering and reclamation — deferred to the SAM UCE module. [UCE]** The
     reclamation verdicts (categories, candidates, coverage) join usage with entitlement
-    data for a purpose, so they are UCE interpretation. The **usage collection** half — an
-    opt-in (`--usage-sync-enable`, default off) machine-scope daily-sync source reading
-    the agent's TAR warehouse locally through the plugin's sandboxed read-only `sql`
-    action, user dimension dropped on-device — is agent-side fact collection and, if/when
-    it ships, ships in-server as **mechanism only**; it is out of §27 v1. Recorded as
+    data for a purpose, so they are UCE interpretation. *The usage-collection half's
+    mechanism, superseded 2026-09-06 (Wave 7 PR7.2): originally recorded here as an
+    opt-in (`--usage-sync-enable`, default off) daily-sync source reading the agent's TAR
+    warehouse through the plugin's sandboxed read-only `sql` action. It shipped instead
+    as a dedicated `usage` TAR capture source (a transactional fold over the existing
+    `process` source, default-ON per the works-council-class posture `power`/`removable`
+    established) feeding a dedicated `app_usage` daily-sync source and server-side
+    `app_usage_store` — not the generic `sql` action, and not opt-in. The UCE-deferral
+    boundary this decision states is unchanged: reclamation interpretation (categories,
+    candidates, coverage-driven policy) still ships later in UCE; only the collection
+    mechanism's shape and default posture changed.* Recorded as
     module design input: usage **categories** (Used ≤30 d, Rarely 31–90 d, Unused >90 d,
     **Unreported** = no data) are policy-computed at read time so a threshold change never
     forces re-sync and **reclamation never fires on missing data**; reclamation surfaces

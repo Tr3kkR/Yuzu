@@ -238,7 +238,7 @@ TEST_CASE("hash: app_usage_raw_hash is sha256 over the RAW received bytes",
 
 // ── ingest: not-due / malformed report guards ───────────────────────────────
 
-TEST_CASE("ingest: an empty agent_id is a no-op", "[app_usage_ingest]") {
+TEST_CASE("ingest: an empty agent_id is a no-op", "[app_usage_ingest][pg]") {
     AUSG_INGEST_SHARED(store, pool);
     agentpb::InventoryReport rpt = full_report("claim", sample_blob());
     agentpb::InventoryAck ack;
