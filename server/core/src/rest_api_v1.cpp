@@ -5425,8 +5425,12 @@ void RestApiV1::register_routes(
     // (mcp_server.cpp), so REST and MCP cannot drift from each other by
     // construction. Audit: content/catalog definition reads, matching the
     // majority unaudited posture already on all five underlying legacy routes
-    // (docs/api-twin-recipe.md §4's "reads" table; no emit_behavioral_audit
-    // here — this is not per-agent behavioural PII). MCP's twins still call the
+    // -- no emit_behavioral_audit here, this is not per-agent behavioural PII.
+    // (Gate 6 compliance-officer correction: the audit-tier rationale for
+    // "not per-agent PII -> no REST audit needed" is docs/api-twin-recipe.md
+    // §8's SoftwareDeployment worked example, NOT §4 -- §4 is the per-surface
+    // FAILURE-mode table for an audit call that already exists, it has no
+    // "when is REST unaudited at all" row.) MCP's twins still call the
     // generic `mcp.<tool_name>` audit (list_definitions/get_definition already
     // did before this PR; export_definition/list_product_packs/
     // get_product_pack now do the same for consistency) — that MCP-side audit
