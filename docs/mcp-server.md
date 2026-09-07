@@ -14,7 +14,7 @@ CLAUDE.md keeps only the load-bearing invariants (embed point, tier-before-RBAC 
 
 ## Security Model
 
-- **Three authorization tiers** enforced *before* RBAC: `readonly` (read only), `operator` (+ tag writes, auto-approved executions **except the ~42 `plugin.action` pairs a compiled `ExecuteGate` marks `AdminOrApproval`/`AlwaysApproval` (#1398)** — those still deny `operator`-tier execute_instruction with no approval provenance, at the shared dispatch chokepoint below the MCP-tier layer), `supervised` (all ops via approval workflow).
+- **Three authorization tiers** enforced *before* RBAC: `readonly` (read only), `operator` (+ tag writes, auto-approved executions **except the ~42 `plugin.action` pairs a compiled `ExecuteGate` marks `AdminOrApproval`/`AlwaysApproval` (#1398)** — those still deny `operator`-tier execute_instruction with no approval provenance, at the shared dispatch chokepoint below the MCP-tier layer), `supervised` (all ops via approval workflow) — **except the #520/#4031 server-administration set (`Enrollment`, `OidcConfig`), denied Read at every tier including `supervised`** (see the bullet below).
 - **MCP tokens** use the existing API token system (`api_token_store`) with a new `mcp_tier` column. MCP tokens require mandatory expiration (max 90 days).
 - **Approval workflow** — Operations that `requires_approval(tier, type, op)` returns true for are routed to the `ApprovalManager`. Admins approve/reject via Settings UI or REST API. All admins see all pending approvals (both AI-initiated and human-initiated).
 - **Kill switch:** `--mcp-disable` rejects all `/mcp/v1/` requests with `kMcpDisabled` JSON-RPC error. `--mcp-read-only` blocks non-read tools.

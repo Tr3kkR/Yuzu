@@ -513,7 +513,16 @@ Their built-in-role grants are **not symmetric**, unlike `EnginePrincipal`:
   inheriting directory-user PII visibility from a `Viewer`-equivalent grant
   set should check whether that matters for its use — this is a genuine
   **widening** of what `Viewer`-derived roles can see, not a like-for-like
-  securable split the way `EnginePrincipal:Read` was.
+  securable split the way `EnginePrincipal:Read` was. **RBAC-enabled
+  deployments get more than a widening here, though:** `Directory` was
+  never seeded to *any* role before this release, despite `GET
+  /api/directory/users`/`/directory/status`/`/directory/sync` already
+  gating on it — under RBAC-**enabled** enforcement this denied **every**
+  role, including `Administrator`, not just non-`Viewer` custom roles. If
+  your RBAC-enabled deployment could never reach the legacy directory-sync
+  routes even as an admin, this release fixes that dead zone; the "Viewer
+  gains new PII visibility" framing above only tells the RBAC-**disabled**
+  half of the story.
 - `Enrollment:Read` and `OidcConfig:Read` are seeded to `Administrator`
   **only** — `Viewer` deliberately does NOT gain either, since these gate
   the fleet's enrollment admission policy and SSO configuration rather than

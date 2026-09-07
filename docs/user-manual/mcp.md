@@ -265,6 +265,15 @@ offline/unreachable agent also produces (CLOSED by #3687 for
 `execute_instruction`, widened to `execute_bundle` and `quarantine_device` —
 every MCP tool that can reach this chokepoint — by #3893). See
 `docs/mcp-server.md` "Security Model" for the full gate list.
+
+[^4031]: Except `Enrollment` and `OidcConfig` (#4031) — MCP tokens must
+never administer the server itself (settings, users, TLS, OIDC — #520), so
+these two securables are denied Read at **every** tier including
+`supervised`, not just `readonly`/`operator`. This is why the enrollment
+auto-approve-rules, pending-agents, and OIDC-config REST v1 routes have no
+MCP tool twin. `Directory` (AD/Entra directory-sync) is unaffected — it has
+real MCP twins (`list_directory_users`/`get_directory_status`) by design.
+
 ## Authorization Tiers
 
 MCP tokens use a **tier** system that restricts what operations are available,
@@ -274,9 +283,9 @@ all writes.
 
 | Tier | Read | Tag Write/Delete | Execute Instructions | Policy/Security/Group Write | Delete (any) |
 |---|---|---|---|---|---|
-| `readonly` | Yes | No | No | No | No |
-| `operator` | Yes | Yes | Yes (auto-approved)[^1398] | No | Tags only (via approval) |
-| `supervised` | Yes | Yes | Yes (via approval) | Yes (via approval) | Yes (via approval) |
+| `readonly` | Yes[^4031] | No | No | No | No |
+| `operator` | Yes[^4031] | Yes | Yes (auto-approved)[^1398] | No | Tags only (via approval) |
+| `supervised` | Yes[^4031] | Yes | Yes (via approval) | Yes (via approval) | Yes (via approval) |
 
 ### Tier details
 
@@ -567,7 +576,9 @@ for the tool to execute.
 > `approval_id` + `status_url`, and after an admin approves, a re-call with the
 > `approval_id` argument performs the revoke. `list_issued_certs` is read-only
 > (`Security:Read`) and works on **every** tier including `readonly` (the
-> `readonly` tier permits all Read operations). Exposing both keeps MCP at parity
+> `readonly` tier permits Read on `Security`, along with every other
+> securable except the #520 server-administration set — see the tier
+> table's footnote below). Exposing both keeps MCP at parity
 > with the dashboard/REST CA surface (agentic-first principle A1).
 
 > **`assign_engine_role`/`unassign_engine_role` tier behavior (PR 4.2):** both

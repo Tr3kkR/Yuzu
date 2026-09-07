@@ -2133,7 +2133,9 @@ constexpr std::string_view kRbacOps[] = {"Read",   "Write",  "Execute", "Delete"
 // Closed RBAC securable-type catalogue — mirrors rbac_store.cpp's seeded
 // `types[]` (MOVE TOGETHER; same binding test). A typo'd TYPE is the same
 // fail-open class as a typo'd op: supervised tier_allows() permits every
-// type and requires_approval() exact-matches type strings, so e.g.
+// type EXCEPT Enrollment/OidcConfig (#520/#4031's explicit server-
+// administration deny, applied before any tier branch) and
+// requires_approval() exact-matches type strings, so e.g.
 // {"quarantine_device", {"Securty", "Execute"}} would silently skip its
 // approval rule (governance UP-6).
 //

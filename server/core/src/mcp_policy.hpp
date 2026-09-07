@@ -9,9 +9,13 @@ namespace yuzu::server::mcp {
 /// Tier check runs BEFORE RBAC: even if the token's RBAC role is Administrator,
 /// a "readonly" tier blocks all writes/executes/deletes.
 ///
-///   readonly   — read-only access to all data
+///   readonly   — read-only access to all data, EXCEPT the #520/#4031
+///                server-administration set (Enrollment, OidcConfig — denied
+///                at every tier below, not just readonly)
 ///   operator   — readonly + tag writes + auto-approved instruction execution
-///   supervised — operator + all executions + destructive ops (via approval workflow)
+///   supervised — operator + all executions + destructive ops (via approval
+///                workflow), EXCEPT the same #520/#4031 server-administration
+///                set, which stays denied even at this tier
 
 /// Returns true if the MCP tier permits (securable_type, operation).
 /// An empty tier string means "not an MCP token" → allow everything (defer to RBAC).
@@ -22,14 +26,17 @@ inline bool tier_allows(std::string_view mcp_tier,
 
     // ── #520/#4031: MCP tokens must never administer the server itself ───
     //
-    // `AuthRoutes::require_admin()` (auth_routes.cpp) unconditionally denies
-    // ANY non-empty mcp_tier before it even looks at role — "MCP tokens are
-    // for fleet management (queries, instruction execution) and must not be
-    // used to administer the server itself (settings, users, TLS, OIDC)".
-    // That function's own comment claims tier enforcement applies "on all
-    // transports... so a token cannot bypass the tier by switching
-    // endpoints" — true for the admin_fn_-gated dashboard routes it guards,
-    // but NOT true here: this function (the chokepoint every REST/MCP
+    // `AuthRoutes::require_admin()` (auth_routes.cpp:577-606) unconditionally
+    // denies ANY non-empty mcp_tier before it even looks at role — "MCP
+    // tokens are for fleet management (queries, instruction execution) and
+    // must not be used to administer the server itself (settings, users,
+    // TLS, OIDC)" (that function's own comment). A DIFFERENT function,
+    // `AuthRoutes::require_permission()` (auth_routes.cpp:638-, the one that
+    // actually calls THIS function), separately promises tier enforcement
+    // "applies on all transports... so a token cannot bypass the tier by
+    // switching endpoints" — but that promise is only as strong as
+    // `tier_allows()` itself, which it delegates to. It did NOT hold for
+    // Enrollment/OidcConfig: this function (the chokepoint every REST/MCP
     // permission check funnels through, per the ROUND-3 FINDING below) had
     // no securable-type awareness at any tier, so a "readonly"-tier token —
     // or "supervised", which allows everything unconditionally further down

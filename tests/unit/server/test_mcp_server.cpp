@@ -334,9 +334,10 @@ TEST_CASE("MCP Policy: #4031/#520 Enrollment and OidcConfig are denied at "
     CHECK_FALSE(tier_allows("readonly", "OidcConfig", "Read"));
     CHECK_FALSE(tier_allows("operator", "Enrollment", "Read"));
     CHECK_FALSE(tier_allows("operator", "OidcConfig", "Read"));
-    // supervised tier allows everything else (see the test above) — this is
-    // the one carve-out, matching require_admin()'s unconditional posture
-    // for the equivalent admin_fn_-gated dashboard surface.
+    // supervised tier allows everything else (see "MCP Policy: supervised
+    // tier allows everything except server self-administration" above) —
+    // this is the one carve-out, matching require_admin()'s unconditional
+    // posture for the equivalent admin_fn_-gated dashboard surface.
     CHECK_FALSE(tier_allows("supervised", "Enrollment", "Read"));
     CHECK_FALSE(tier_allows("supervised", "OidcConfig", "Read"));
     CHECK_FALSE(tier_allows("supervised", "Enrollment", "Write"));

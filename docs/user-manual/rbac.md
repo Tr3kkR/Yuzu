@@ -175,11 +175,11 @@ operational data, and require the `admin` session role no matter how the
 
 **Why this exists.** With RBAC **disabled**, the legacy fallback described
 above allows any authenticated non-engine session to perform every `Read` —
-that includes these three. On a default install (RBAC ships disabled) that
+that includes these five. On a default install (RBAC ships disabled) that
 handed a plain `user` session read access to the authorization topology
 itself: who holds what role, and the complete access-review grant
 population that is supposed to *be* SOC 2 CC6.2 evidence of controlled
-access. The floor closes that gap by denying these three reads to a
+access. The floor closes that gap by denying these five reads to a
 non-admin whenever the legacy fallback is the branch in effect — never by
 changing behavior under a live RBAC grant.
 
