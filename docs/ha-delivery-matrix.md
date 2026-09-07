@@ -36,18 +36,20 @@ diverge across replicas. **WS-7 (HA Postgres) is NOT in this set** — it gates 
 SPOF / RPO=0), not the second *server* replica (which is safe against a single Postgres). The
 "Gates 2nd replica?" column below encodes this per row.
 
-## Is the presentation/core split a prerequisite? (the reviewers split on this)
+## Is the presentation/core split a prerequisite? — CLOSED: no, decoupled (2026-09-07)
 
-- **Fable / Sol:** No — active-active is achievable on the **monolith** once the seams above are
-  externalized. The single in-process thing that can't go active-active (the direct agent `Subscribe`
-  stream) is solved by **gateway-fronting (WS-4)**, not the split. The split's only true artifacts —
-  the **core→presentation event spine** and **tier-split `/readyz`** — are *no-ops on the monolith*
-  (presentation+core co-located) and correctly defer to ADR-1005.
-- **Kimi (dissent):** the split is a hard safety prerequisite.
-- **Working position (this matrix):** monolith active-active is the target; the split is an
-  optimization, **not** a gate. The seam deliverables that only matter post-split (WS-2b spine,
-  WS-8 tier-split readyz) are marked *defers to ADR-1005*. **This is the #1 item to confirm with the
-  ADR-1005 owners before Phase B starts** — if Kimi is right, Phase B reshuffles onto the split.
+- **Resolution:** monolith active-active is the target; the presentation/core split is a **parallel
+  programme, not a gate** for a 2nd replica. The single in-process thing that can't go active-active
+  (the direct agent `Subscribe` stream) is solved by **gateway-fronting (WS-4)**, not the split.
+- **Kimi's dissent (recorded, rebutted):** Kimi called the split a hard safety prerequisite. Every
+  safety property it could mean — singleton double-dispatch (WS-3), in-memory sessions (WS-1a, **done**),
+  stream routing (WS-4) — is closed in the monolith. What the split buys is presentation scale-out +
+  separate readiness signals: **capacity, not safety.**
+- **One-way dependency (the split consumes HA, never the reverse):** the split *inherits* WS-1 sessions,
+  *rides* WS-2a's durable `event_outbox` for its core→presentation event spine, and takes MCP replay
+  durability from WS-2b. WS-2b spine and WS-8 tier-split `/readyz` are no-ops on the monolith and land
+  with the split. Split delivery is tracked in its own control plane —
+  `docs/presentation-core-split-delivery-matrix.md` (the `/split` skill) — not here.
 
 ## Status legend
 
