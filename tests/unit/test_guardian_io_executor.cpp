@@ -15,6 +15,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <expected>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -50,6 +51,21 @@ struct Gate {
 // spin_until / kSpinScale promoted to yuzu::test (test_helpers.hpp) — #2238 adversarial
 // review follow-up (CON-S4 third user, missed by the original promotion).
 using yuzu::test::spin_until;
+
+// A functor whose COPY constructor throws - passed as an LVALUE (forcing run()'s
+// `std::decay_t<F>(std::forward<F>(fn))` capture-init to copy, not move), this
+// throws AFTER run()'s wait_lk is acquired (guardian_io_executor.hpp:375) but
+// still inside the worker-lambda's own construction - the owns_lock()==true path
+// through run()'s outer catch block, distinct from the pre-lock
+// set_throw_before_wait_lock_for_test seam.
+struct ThrowOnCopyFunctor {
+    ThrowOnCopyFunctor() = default;
+    ThrowOnCopyFunctor(const ThrowOnCopyFunctor&) {
+        throw std::runtime_error("fn copy boom (test seam)");
+    }
+    ThrowOnCopyFunctor(ThrowOnCopyFunctor&&) = default;
+    int operator()() const { return 1; }
+};
 
 constexpr std::size_t kFile = io_class_index(IoClass::File);
 constexpr std::size_t kSvc = io_class_index(IoClass::Service);
@@ -362,6 +378,278 @@ TEST_CASE("a slot and its key are reclaimed after a timed-out worker finally fin
     REQUIRE(r2.has_value());
     CHECK(*r2 == 3);
     CHECK(spin_until([&] { return ex.active_worker_count() == 0; }));
+}
+
+// --- #3816: exactly-once result delivery (on_abandoned) ---------------------
+
+TEST_CASE("run: a late result after Timeout is delivered to on_abandoned exactly once",
+          "[spark][ioexecutor]") {
+    GuardianIoExecutor ex;
+    auto gate = std::make_shared<Gate>();
+    auto abandoned_calls = std::make_shared<std::atomic<int>>(0);
+    auto abandoned_value = std::make_shared<std::atomic<int>>(-1);
+    auto r = ex.run(
+        IoClass::File, "k", 30ms,
+        [gate]() -> int {
+            gate->wait();
+            return 99;
+        },
+        [abandoned_calls, abandoned_value](int&& v) {
+            abandoned_calls->fetch_add(1);
+            abandoned_value->store(v);
+        });
+    CHECK_FALSE(r.has_value());
+    CHECK(r.error() == IoFailure::Timeout);
+    CHECK(abandoned_calls->load() == 0); // worker still parked, on_abandoned not yet called
+    gate->release();
+    REQUIRE(spin_until([&] { return abandoned_calls->load() == 1; }));
+    CHECK(abandoned_value->load() == 99);
+    CHECK(spin_until([&] { return ex.active_worker_count() == 0; }));
+    CHECK(ex.stats().counters[kFile].timed_out == 1);
+    CHECK(ex.stats().counters[kFile].abandoned == 1);
+}
+
+TEST_CASE("run: a late FAILED (not thrown) result also reaches on_abandoned, counted the same",
+          "[spark][ioexecutor]") {
+    // The executor is T-agnostic (agents/core/src/guardian_io_executor.hpp:
+    // Counters::abandoned's own doc): a late result that fn() RETURNED (never
+    // threw) is routed to on_abandoned regardless of whether T itself represents
+    // a success or failure - the success/failure distinction only exists one
+    // layer up, at a consumer that knows what T means (GuardianSparkRuntime's
+    // backend_op_late_arms_, tested in test_guardian_spark_runtime.cpp). This
+    // case proves that at THIS layer, an inner-failure result is delivered to
+    // on_abandoned exactly the same as an inner-success one - not silently
+    // dropped for having the "wrong" has_value().
+    GuardianIoExecutor ex;
+    auto gate = std::make_shared<Gate>();
+    auto abandoned_calls = std::make_shared<std::atomic<int>>(0);
+    auto abandoned_had_value = std::make_shared<std::atomic<bool>>(true);
+    using T = std::expected<int, std::string>;
+    auto r = ex.run(
+        IoClass::File, "k", 30ms,
+        [gate]() -> T {
+            gate->wait();
+            return std::unexpected(std::string{"backend arm failed"});
+        },
+        [abandoned_calls, abandoned_had_value](T&& v) {
+            abandoned_calls->fetch_add(1);
+            abandoned_had_value->store(v.has_value());
+        });
+    CHECK_FALSE(r.has_value());
+    CHECK(r.error() == IoFailure::Timeout);
+    CHECK(abandoned_calls->load() == 0); // worker still parked, on_abandoned not yet called
+    gate->release();
+    REQUIRE(spin_until([&] { return abandoned_calls->load() == 1; }));
+    CHECK_FALSE(abandoned_had_value->load()); // on_abandoned DID fire, with the inner failure
+    CHECK(spin_until([&] { return ex.active_worker_count() == 0; }));
+    CHECK(ex.stats().counters[kFile].timed_out == 1);
+    // The executor's own T-agnostic counter increments for a late FAILURE exactly
+    // as it does for a late success - see this file's other on_abandoned tests.
+    CHECK(ex.stats().counters[kFile].abandoned == 1);
+}
+
+TEST_CASE("run: a result published before the deadline never invokes on_abandoned",
+          "[spark][ioexecutor]") {
+    GuardianIoExecutor ex;
+    auto abandoned_calls = std::make_shared<std::atomic<int>>(0);
+    auto r = ex.run(
+        IoClass::File, "k", 5s, [] { return 7; },
+        [abandoned_calls](int&&) { abandoned_calls->fetch_add(1); });
+    REQUIRE(r.has_value());
+    CHECK(*r == 7);
+    CHECK(spin_until([&] { return ex.active_worker_count() == 0; }));
+    CHECK(abandoned_calls->load() == 0);
+    CHECK(ex.stats().counters[kFile].abandoned == 0);
+}
+
+TEST_CASE("run: stop() during the wait routes a still-in-flight late result to on_abandoned",
+          "[spark][ioexecutor]") {
+    GuardianIoExecutor ex;
+    auto gate = std::make_shared<Gate>();
+    auto abandoned_calls = std::make_shared<std::atomic<int>>(0);
+    std::promise<IoResult<int>> pr;
+    auto fut = pr.get_future();
+    std::thread caller([&] {
+        pr.set_value(ex.run(
+            IoClass::File, "k", 30s,
+            [gate]() -> int {
+                gate->wait();
+                return 42;
+            },
+            [abandoned_calls](int&&) { abandoned_calls->fetch_add(1); }));
+    });
+    REQUIRE(spin_until([&] { return ex.active_worker_count() == 1; }));
+    ex.stop();
+    REQUIRE(fut.wait_for(2s) == std::future_status::ready);
+    CHECK(fut.get().error() == IoFailure::Stopped);
+    CHECK(abandoned_calls->load() == 0); // worker still parked
+    gate->release();
+    REQUIRE(spin_until([&] { return abandoned_calls->load() == 1; }));
+    caller.join();
+    CHECK(spin_until([&] { return ex.active_worker_count() == 0; }));
+}
+
+TEST_CASE("run: a throwing on_abandoned is contained, counted, and does not stop key reclamation",
+          "[spark][ioexecutor]") {
+    GuardianIoExecutor ex;
+    auto gate = std::make_shared<Gate>();
+    auto r = ex.run(
+        IoClass::File, "k", 20ms,
+        [gate]() -> int {
+            gate->wait();
+            return 1;
+        },
+        [](int&&) -> void { throw std::runtime_error("on_abandoned boom"); });
+    CHECK(r.error() == IoFailure::Timeout);
+    gate->release();
+    REQUIRE(spin_until([&] { return ex.active_worker_count() == 0; }));
+    CHECK(ex.stats().counters[kFile].abandoned == 1);
+    CHECK(ex.stats().counters[kFile].abandonment_cleanup_failures == 1);
+    // The key was still reclaimed despite the throwing callback.
+    auto r2 = ex.run(IoClass::File, "k", 5s, [] { return 2; });
+    REQUIRE(r2.has_value());
+    CHECK(*r2 == 2);
+    CHECK(spin_until([&] { return ex.active_worker_count() == 0; }));
+}
+
+TEST_CASE("run: the single-flight key is held until on_abandoned returns, then reclaimed",
+          "[spark][ioexecutor]") {
+    GuardianIoExecutor ex;
+    auto gate = std::make_shared<Gate>();
+    auto cleanup_gate = std::make_shared<Gate>();
+    auto cleanup_entered = std::make_shared<std::promise<void>>();
+    auto cleanup_entered_fut = cleanup_entered->get_future();
+    auto r = ex.run(
+        IoClass::File, "k", 20ms,
+        [gate]() -> int {
+            gate->wait();
+            return 1;
+        },
+        [cleanup_gate, cleanup_entered](int&&) {
+            cleanup_entered->set_value();
+            cleanup_gate->wait(); // hold the key open until the test releases it
+        });
+    CHECK(r.error() == IoFailure::Timeout);
+    gate->release();
+    REQUIRE(cleanup_entered_fut.wait_for(5s) == std::future_status::ready);
+
+    // The cleanup callback is still running - the key is still held.
+    auto dup = ex.run(IoClass::File, "k", 20ms, [] { return 2; });
+    CHECK(dup.error() == IoFailure::AlreadyRunning);
+
+    cleanup_gate->release();
+    REQUIRE(spin_until([&] { return ex.active_worker_count() == 0; }));
+
+    // Reclaimed: a fresh same-key read now runs.
+    auto r2 = ex.run(IoClass::File, "k", 5s, [] { return 3; });
+    REQUIRE(r2.has_value());
+    CHECK(*r2 == 3);
+    CHECK(spin_until([&] { return ex.active_worker_count() == 0; }));
+}
+
+TEST_CASE("run: on_abandoned never fires for a worker exception or an alloc-starved null box",
+          "[spark][ioexecutor]") {
+    GuardianIoExecutor ex;
+    auto abandoned_calls = std::make_shared<std::atomic<int>>(0);
+    auto r = ex.run(
+        IoClass::Service, "k", 5s, []() -> int { throw std::runtime_error("boom"); },
+        [abandoned_calls](int&&) { abandoned_calls->fetch_add(1); });
+    CHECK_FALSE(r.has_value());
+    CHECK(r.error() == IoFailure::WorkerThrew);
+    CHECK(spin_until([&] { return ex.active_worker_count() == 0; }));
+    CHECK(abandoned_calls->load() == 0);
+    CHECK(ex.stats().counters[kSvc].abandoned == 0);
+}
+
+TEST_CASE("run: the wait-lock throw seam is a pre-launch LaunchFailed, no worker ever ran",
+          "[spark][ioexecutor]") {
+    GuardianIoExecutor ex;
+    auto spawns = std::make_shared<std::atomic<int>>(0);
+    ex.set_throw_before_wait_lock_for_test(true);
+    auto r = ex.run(IoClass::File, "k", 5s, [spawns] {
+        spawns->fetch_add(1);
+        return 1;
+    });
+    CHECK_FALSE(r.has_value());
+    CHECK(r.error() == IoFailure::LaunchFailed);
+    CHECK(ex.active_worker_count() == 0); // rolled back, not leaked
+    CHECK(ex.stats().counters[kFile].launch_failures == 1);
+    CHECK(spawns->load() == 0); // fn() never ran - the throw fires before spawn_detached
+
+    // The key was freed by the rollback: a real read for the same key now succeeds.
+    ex.set_throw_before_wait_lock_for_test(false);
+    auto r2 = ex.run(IoClass::File, "k", 5s, [spawns] {
+        spawns->fetch_add(1);
+        return 2;
+    });
+    REQUIRE(r2.has_value());
+    CHECK(*r2 == 2);
+    CHECK(spawns->load() == 1);
+    CHECK(spin_until([&] { return ex.active_worker_count() == 0; }));
+}
+
+TEST_CASE("run: a throw during post-lock worker-capture construction is the "
+          "owns_lock()==true catch path, and rolls back cleanly",
+          "[spark][ioexecutor]") {
+    GuardianIoExecutor ex;
+    ThrowOnCopyFunctor fn_obj; // named lvalue: run()'s capture-init copies it, not moves
+    auto r = ex.run(IoClass::File, "k", 5s, fn_obj);
+    CHECK_FALSE(r.has_value());
+    CHECK(r.error() == IoFailure::LaunchFailed); // same outcome as the pre-lock seam -
+                                                  // both are launch-time failures from
+                                                  // the caller's point of view
+    CHECK(ex.active_worker_count() == 0);        // rolled back, not leaked
+    CHECK(ex.stats().counters[kFile].launch_failures == 1);
+
+    // The key was freed by the rollback (the owns_lock()==true branch correctly
+    // unlocks wait_lk on unwind before TicketCore's destructor tries to acquire
+    // the same mutex - a wrong declaration order here would self-deadlock this
+    // very call): a real read for the same key now succeeds.
+    auto r2 = ex.run(IoClass::File, "k", 5s, [] { return 2; });
+    REQUIRE(r2.has_value());
+    CHECK(*r2 == 2);
+    CHECK(spin_until([&] { return ex.active_worker_count() == 0; }));
+}
+
+TEST_CASE("the executor may be destroyed while on_abandoned cleanup is still pending (no UAF)",
+          "[spark][ioexecutor]") {
+    auto gate = std::make_shared<Gate>();
+    auto cleanup_gate = std::make_shared<Gate>();
+    auto cleanup_entered = std::make_shared<std::promise<void>>();
+    auto cleanup_entered_fut = cleanup_entered->get_future();
+    auto done = std::make_shared<std::promise<void>>();
+    auto fut = done->get_future();
+    {
+        GuardianIoExecutor ex;
+        auto r = ex.run(
+            IoClass::File, "k", 20ms,
+            [gate]() -> int {
+                gate->wait();
+                return 1;
+            },
+            [cleanup_gate, cleanup_entered, done](int&&) {
+                cleanup_entered->set_value(); // proves on_abandoned itself is running,
+                                               // not merely that fn() unblocked
+                cleanup_gate->wait();
+                done->set_value();
+            });
+        CHECK(r.error() == IoFailure::Timeout);
+        CHECK(ex.active_worker_count() == 1);
+        gate->release();
+        // Wait for the worker to genuinely be INSIDE on_abandoned before destroying
+        // ex - without this barrier, destruction could race ahead of the worker
+        // resuming from gate->wait(), degenerating into the plain "destroyed while
+        // blocked" case above rather than exercising mid-cleanup destruction.
+        REQUIRE(cleanup_entered_fut.wait_for(5s) == std::future_status::ready);
+        // ex is destroyed here while the worker is confirmed mid-cleanup (parked in
+        // on_abandoned, past cleanup_entered); State stays alive through the
+        // worker's own shared_ptr, so its later cleanup + ticket release do not
+        // use-after-free.
+    }
+    cleanup_gate->release();
+    REQUIRE(fut.wait_for(5s) == std::future_status::ready);
+    std::this_thread::sleep_for(50ms);
+    SUCCEED("worker released after executor destruction, mid-cleanup, without UAF");
 }
 
 TEST_CASE("the same key string under different IoClass values is independent",

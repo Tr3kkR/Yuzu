@@ -9,6 +9,7 @@ __declspec(allocate(".CRT$XCB"))
     [[maybe_unused]] static void(__cdecl* p_dll_diag)() = diag_dll_static_init;
 #endif
 
+#include <yuzu/agent/detached_signature.hpp>
 #include <yuzu/agent/agent.hpp>
 #include <yuzu/agent/agent_csr.hpp>
 #include <yuzu/agent/cert_discovery.hpp>
@@ -492,6 +493,19 @@ int dispatch_with_capture(const YuzuPluginDescriptor* descriptor, const char* ac
     if (result_provenance_out)
         *result_provenance_out = ctx_impl.result_provenance;
     return rc;
+}
+
+// StandalonePluginContext (local_dispatcher.hpp): the one way a non-daemon
+// host obtains a real PluginContextImpl for descriptor->init/shutdown. Kept
+// here for the same reason as dispatch_with_capture — PluginContextImpl is
+// this TU's private type.
+StandalonePluginContext::StandalonePluginContext(std::string plugin_name,
+                                                 std::unordered_map<std::string, std::string> config)
+    : impl_(new PluginContextImpl{std::move(config), nullptr, nullptr, std::move(plugin_name)},
+            [](void* p) { delete static_cast<PluginContextImpl*>(p); }) {}
+
+YuzuPluginContext* StandalonePluginContext::get() const noexcept {
+    return reinterpret_cast<YuzuPluginContext*>(impl_.get());
 }
 
 // cpp-expert A4 test seam (no public header — same convention as
@@ -1938,7 +1952,12 @@ public:
                 // Publish the fresh Updater, then work through the LOCAL copy — the slot can
                 // be re-read by Agent::stop() on another thread at any moment.
                 auto updater = std::make_shared<Updater>(
-                    UpdateConfig{cfg_.auto_update, cfg_.update_check_interval}, cfg_.agent_id,
+                    UpdateConfig{.enabled = cfg_.auto_update,
+                                 .check_interval = cfg_.update_check_interval,
+                                 .signature_trust_bundle = cfg_.update_trust_bundle,
+                                 .require_signature = cfg_.update_require_signature,
+                                 .metrics = &metrics_},
+                    cfg_.agent_id,
                     std::string{yuzu::kFullVersionString}, kAgentOs, kAgentArch,
                     current_executable_path());
                 set_updater(updater);
@@ -2308,6 +2327,30 @@ public:
                                 metrics_.counter("yuzu_agent_dedup_record_errors_total").value()));
                             tags["yuzu.dedup_release_errors"] = std::to_string(static_cast<int64_t>(
                                 metrics_.counter("yuzu_agent_dedup_release_errors_total").value()));
+                            // OTA signature refusals (#416/#3807). Carried on the
+                            // heartbeat for the same reason as the dedup counters
+                            // above: the agent has no /metrics endpoint, so this
+                            // is the ONLY channel by which an operator learns that
+                            // an endpoint is refusing updates. Without it a
+                            // fleet-wide refusal is discovered when machines stop
+                            // patching, which is exactly the failure the signing
+                            // work exists to make visible.
+                            {
+                                // Summed over the SHARED reason list, not a
+                                // hardcoded copy: a reason added in updater.cpp
+                                // and forgotten here would be counted by neither
+                                // this tag nor the fleet gauge derived from it.
+                                double refused = 0.0;
+                                for (const auto reason :
+                                     yuzu::agent::kSignatureRefusalReasons) {
+                                    refused += metrics_
+                                                   .counter("yuzu_agent_ota_signature_refused_total",
+                                                            {{"reason", std::string(reason)}})
+                                                   .value();
+                                }
+                                tags["yuzu.ota_signature_refused"] =
+                                    std::to_string(static_cast<int64_t>(refused));
+                            }
                             tags["yuzu.os"] = kAgentOs;
                             tags["yuzu.arch"] = kAgentArch;
                             tags["yuzu.agent_version"] = std::string{yuzu::kFullVersionString};
@@ -3361,12 +3404,17 @@ private:
     // Subscribe stream, mirroring emit_guardian_event but returning a SendResult so
     // the drain can retain-and-retry: Retain when the stream is down (pre-network arm
     // or a reconnect gap) or the Write fails, Sent on a successful Write. Capturing
-    // `this` is lifetime-safe: the drain worker thread is synchronously joined by
-    // guardian_->stop() before ~AgentImpl, and stream_write_mu_/guardian_sink_stream_
-    // are declared before guardian_ so they outlive that stop() (same ordering the
-    // legacy guardian sink relies on). NOTE: at 7.7a prefer_spark is false, so no rule
-    // arms, the outbox is always empty, and this callback is never actually invoked in
-    // production - the mapping is proven by unit tests ([sendmap]) ahead of rung 7.7b.
+    // `this` is lifetime-safe, but NOT via a synchronous join (#2233 item 4, revised):
+    // this callback runs on GuardianOutboxSendExecutor's DETACHED worker
+    // (guardian_outbox_send_executor.hpp), which guardian_->stop() does NOT join. Safety
+    // instead rests on the orphan-exit contract - active_send_workers() is summed into
+    // GuardianEngine::active_io_workers() (guardian_engine.cpp), and main.cpp/
+    // service_win.cpp's hard_exit.hpp guard refuses normal C++ teardown of AgentImpl
+    // (and therefore of stream_write_mu_/guardian_sink_stream_, which this callback
+    // touches) while that count is nonzero - hard_exit()ing instead after a bounded
+    // grace. NOTE: at 7.7a prefer_spark is false, so no rule arms, the outbox is always
+    // empty, and this callback is never actually invoked in production - the mapping is
+    // proven by unit tests ([sendmap]) ahead of rung 7.7b.
     SendResult send_guardian_outbox_entry(const OutboxEntry& e) {
         static constexpr std::string_view kHostPlatform =
 #if defined(_WIN32)

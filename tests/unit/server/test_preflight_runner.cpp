@@ -105,9 +105,9 @@ TEST_CASE("PreflightRunner tick: a degraded response-store read does not overwri
         .dispatch_fn =
             [&](const std::string&, const std::string&, const std::vector<std::string>&,
                 const std::string&, const std::unordered_map<std::string, std::string>&,
-                const std::string&) -> std::pair<std::string, int> {
+                const std::string&) -> yuzu::server::ConfinedDispatchOutcome {
             ++dispatch_calls;
-            return {"cmd-x", 1};
+            return {.sent = 1, .command_id = "cmd-x"};
         },
         .now_ms_fn = [t] { return t + 1000; },
         .retention_days = 14,
@@ -150,9 +150,9 @@ TEST_CASE("PreflightRunner tick: a genuinely pending (not degraded) check still 
         .dispatch_fn =
             [&](const std::string&, const std::string&, const std::vector<std::string>&,
                 const std::string&, const std::unordered_map<std::string, std::string>&,
-                const std::string&) -> std::pair<std::string, int> {
+                const std::string&) -> yuzu::server::ConfinedDispatchOutcome {
             ++dispatch_calls;
-            return {"cmd-x", 1};
+            return {.sent = 1, .command_id = "cmd-x"};
         },
         .now_ms_fn = [t] { return t + 1000; },
         .retention_days = 14,
@@ -223,9 +223,9 @@ TEST_CASE("PreflightRunner tick: stops starting further runs once should_stop() 
         .dispatch_fn =
             [&](const std::string&, const std::string&, const std::vector<std::string>& agent_ids,
                 const std::string&, const std::unordered_map<std::string, std::string>&,
-                const std::string&) -> std::pair<std::string, int> {
+                const std::string&) -> yuzu::server::ConfinedDispatchOutcome {
             calls.push_back(agent_ids);
-            return {"cmd-x", 1};
+            return {.sent = 1, .command_id = "cmd-x"};
         },
         .now_ms_fn = [t] { return t + 1000; },
         .retention_days = 14,
@@ -307,9 +307,9 @@ TEST_CASE("PreflightRunner tick: an unset should_stop processes every run, "
         .dispatch_fn =
             [&](const std::string&, const std::string&, const std::vector<std::string>& agent_ids,
                 const std::string&, const std::unordered_map<std::string, std::string>&,
-                const std::string&) -> std::pair<std::string, int> {
+                const std::string&) -> yuzu::server::ConfinedDispatchOutcome {
             calls.push_back(agent_ids);
-            return {"cmd-x", 1};
+            return {.sent = 1, .command_id = "cmd-x"};
         },
         .now_ms_fn = [t] { return t + 1000; },
         .retention_days = 14,

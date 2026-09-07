@@ -20,6 +20,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -242,6 +243,91 @@ TEST_CASE("the periodic bound drains even without an explicit enqueue-wake",
 
     REQUIRE(spin_until([&] { return sink.count() >= 1; }, 2s)); // the backstop did
     worker.stop();
+}
+
+TEST_CASE("#3953 item 6: stop() closes both lane executors before publishing sig_->stopping "
+          "does not admit a send in the gap",
+          "[spark][guardian][drain][chaos]") {
+    // Never start()ed: offer()'s one-caller contract holds on THIS test thread, so
+    // calling wrapped_send_for_test() directly from inside the hook is deterministic -
+    // no real thread scheduling involved, matching the send_executor file's own
+    // pre_launch_race_hook_for_test_ pattern.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = std::make_shared<GuardianSparkRuntime>(r, b);
+    std::atomic<int> invocations{0};
+    auto sink = [&](const OutboxEntry&) -> SendResult {
+        invocations.fetch_add(1);
+        return SendResult::Sent;
+    };
+    GuardianOutboxDrainWorker worker(*rt, sink);
+
+    auto entry = OutboxEntry::lifecycle("r1", 1, "e1", 1'700'000'000'000'000'000, "armed");
+    std::optional<SendResult> observed;
+    worker.set_stop_race_hook_for_test(
+        [&] { observed = worker.wrapped_send_for_test(entry); });
+
+    worker.stop();
+
+    REQUIRE(observed.has_value());
+    CHECK(*observed == SendResult::Retain);
+    CHECK(invocations.load() == 0);
+    // On TODAY's order this test's own admitted send launches a REAL detached thread
+    // (the executor hasn't been told to stop yet when the hook fires) - spin_until,
+    // don't assert active_send_workers()==0 synchronously: a real worker is in
+    // flight, only its eventual thread-exit decrement makes the count read 0.
+    CHECK(spin_until([&] { return worker.active_send_workers() == 0; }, 3s));
+}
+
+TEST_CASE("#3953 item 6 follow-up: the gap BETWEEN the two lane executors' own stop() "
+          "calls still admits a compliance send after lifecycle already refuses",
+          "[spark][guardian][drain][chaos]") {
+    // Governance Gate 4 unhappy-path (UP-4): stop() calls lifecycle_send_exec_.stop()
+    // THEN compliance_send_exec_.stop() - a real, tolerated (per the orphan-exit
+    // contract) admission window exists between the two calls, and nothing previously
+    // exercised it in isolation. Never start()ed: offer()'s one-caller contract holds
+    // on THIS test thread.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = std::make_shared<GuardianSparkRuntime>(r, b);
+    std::atomic<int> compliance_invocations{0};
+    std::atomic<int> lifecycle_invocations{0};
+    auto sink = [&](const OutboxEntry& e) -> SendResult {
+        // Sent, not Retain: wrapped_send()'s .value_or(Retain) makes Retain ambiguous
+        // between "refused" and "sent but retained" - Sent disambiguates admission.
+        if (e.domain == OutboxDomain::Lifecycle)
+            lifecycle_invocations.fetch_add(1);
+        else
+            compliance_invocations.fetch_add(1);
+        return SendResult::Sent;
+    };
+    GuardianOutboxDrainWorker worker(*rt, sink);
+
+    auto lifecycle_entry = OutboxEntry::lifecycle("r1", 1, "e-lifecycle",
+                                                   1'700'000'000'000'000'000, "armed");
+    GuardDrift drift;
+    drift.rule_id = "r2";
+    auto compliance_entry =
+        OutboxEntry::compliance("r2", 1, "e-compliance", 1'700'000'000'000'000'000, drift);
+
+    std::optional<SendResult> compliance_result;
+    std::optional<SendResult> lifecycle_result;
+    // Fires between lifecycle_send_exec_.stop() and compliance_send_exec_.stop(): at
+    // this instant lifecycle's lane already refuses, compliance's does not yet.
+    worker.set_between_lane_stops_hook_for_test([&] {
+        compliance_result = worker.wrapped_send_for_test(compliance_entry);
+        lifecycle_result = worker.wrapped_send_for_test(lifecycle_entry);
+    });
+
+    worker.stop();
+
+    REQUIRE(compliance_result.has_value());
+    REQUIRE(lifecycle_result.has_value());
+    CHECK(*compliance_result == SendResult::Sent);  // compliance's lane not yet stopped
+    CHECK(*lifecycle_result == SendResult::Retain); // lifecycle's lane already stopped
+    CHECK(compliance_invocations.load() == 1);
+    CHECK(lifecycle_invocations.load() == 0);
+    CHECK(spin_until([&] { return worker.active_send_workers() == 0; }, 3s));
 }
 
 TEST_CASE("stop() is idempotent and joins cleanly with nothing pending",
@@ -1020,11 +1106,29 @@ TEST_CASE("the drain-worker role marker is set on that thread and nowhere else",
     JournalRig rig;
     CHECK_FALSE(on_guardian_joined_thread()); // the test thread is not the worker
 
-    std::atomic<bool> marker_inside{false};
+    // A separate, directly-constructed marker proves the TRUE case (on_guardian_joined_
+    // thread() reads true while GuardianJoinedThreadRole is alive on the calling thread),
+    // independent of the drain worker - #2233 item 4 moved the injected `send` off the
+    // joined thread entirely (see below), so the worker's own loop() no longer has any
+    // externally-observable point that is both "marked" and test-injectable.
+    std::atomic<bool> marked_true{false};
+    std::thread marked_thread([&] {
+        GuardianJoinedThreadRole role_marker;
+        marked_true.store(on_guardian_joined_thread());
+    });
+    marked_thread.join();
+    CHECK(marked_true.load());
+
+    std::atomic<bool> marker_inside{true}; // default true so a missed callback fails loudly
     std::atomic<bool> observed{false};
     auto observing_send = [&](const OutboxEntry&) -> SendResult {
-        // The INJECTED send is exactly the exposure the marker exists for: an arbitrary
-        // std::function supplied by agent.cpp, running here on a thread stop() joins.
+        // #2233 item 4: `send` now runs on GuardianOutboxSendExecutor's DETACHED worker,
+        // not on this class's own joined thread (guardian_outbox_send_executor.hpp) - so
+        // it correctly reads false here. That is the point of the fix: stop() no longer
+        // joins whatever thread `send` happens to be running on, so send() taking
+        // GuardianEngine::mtx_ can no longer deadlock stop() the way it could before -
+        // the exposure this marker exists to catch is why an injected `send` was ever the
+        // vehicle for this test.
         marker_inside.store(on_guardian_joined_thread());
         observed.store(true);
         return SendResult::Sent;
@@ -1034,7 +1138,7 @@ TEST_CASE("the drain-worker role marker is set on that thread and nowhere else",
     worker.start();
     rig.rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
     CHECK(spin_until([&] { return observed.load(); }));
-    CHECK(marker_inside.load());
+    CHECK_FALSE(marker_inside.load());
     worker.stop();
     CHECK_FALSE(on_guardian_joined_thread()); // still false here after the join
 }
@@ -1434,12 +1538,14 @@ TEST_CASE("CH-3b: the compliance reserve survives pathological denominators",
 
 TEST_CASE("CH-1: a slow send does not make stop() additionally run a full maintenance pass",
           "[spark][guardian][drain][maint][chaos]") {
-    // UP-1's unbounded in-flight send is PRE-EXISTING (stop() already held mtx_ across the
-    // join before C0) and no bound in this change can interrupt a blocked syscall - so this
-    // deliberately does NOT assert that stop() beats a blocked send, which would hang the
-    // suite on a known-open issue. What it does assert is C0's own contribution: once the
-    // in-flight send returns, the join completes promptly rather than paying for a full
-    // maintenance pass on a large journal first.
+    // #2233 item 4 / #3847 (revised): before that fix, an in-flight send was UNBOUNDED and
+    // no mechanism in this class could beat a blocked syscall, so this test deliberately did
+    // not assert that stop() beats a blocked send. drain_bounded() now routes send through
+    // GuardianOutboxSendExecutor (guardian_outbox_send_executor.hpp), which detaches the
+    // call - so stop() no longer waits on it at all. This asserts THAT property directly: the
+    // send sleeps 800 ms (well past kGuardianSendOfferWait's 200 ms and past a maintenance
+    // pass over 200 batches, so a pass-swallowed-into-the-join failure mode would also fail
+    // this bound), yet stop() returns in a small fraction of that.
     JournalRig rig;
     rig.journal->set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/10'000,
                                                /*max_bytes=*/static_cast<std::size_t>(-1),
@@ -1450,7 +1556,7 @@ TEST_CASE("CH-1: a slow send does not make stop() additionally run a full mainte
     std::atomic<bool> in_send{false};
     auto slow_send = [&](const OutboxEntry&) -> SendResult {
         in_send.store(true);
-        std::this_thread::sleep_for(200ms);
+        std::this_thread::sleep_for(800ms);
         return SendResult::Sent;
     };
 
@@ -1467,9 +1573,193 @@ TEST_CASE("CH-1: a slow send does not make stop() additionally run a full mainte
     worker.stop();
     const auto elapsed = std::chrono::steady_clock::now() - t0;
 
-    // Generous: one in-flight 200 ms send plus prompt teardown. If the stopping_ gates were
-    // removed, the join would additionally absorb full prune+page scans over 200 batches.
-    CHECK(elapsed < 3s);
+    CHECK(elapsed < 400ms); // decoupled from the 800 ms send entirely, not merely bounded below it
+
+    // The detached send is still running past stop() (that's the point) - it captures
+    // `in_send` by reference into THIS stack frame, so the frame must not unwind while it is
+    // still alive. Wait for it to finish before returning (exercises active_send_workers(),
+    // the same orphan-exit observable production wires into GuardianEngine::active_io_workers()).
+    REQUIRE(spin_until([&] { return worker.active_send_workers() == 0; }, 3s));
+}
+
+// ---------------------------------------------------------------------------
+// #2233 item 4 / #3847: the drain worker's next tick proceeds while a prior
+// send is artificially stalled - the acceptance bar the two tests above only
+// partially cover (they prove stop() decouples; these prove the LIVE worker
+// keeps making progress, not just that shutdown is prompt).
+// ---------------------------------------------------------------------------
+
+TEST_CASE("item 4: journal maintenance keeps advancing while a send is stalled",
+          "[spark][guardian][drain][maint][chaos]") {
+    JournalRig rig;
+    rig.persist("seed"); // a real durable record, so a page pass has something to place
+    rig.rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); // enqueues "armed"
+
+    std::mutex send_mu;
+    std::condition_variable send_cv;
+    bool release{false};
+    std::atomic<int> invocations{0};
+    auto stalling_send = [&](const OutboxEntry&) -> SendResult {
+        invocations.fetch_add(1);
+        std::unique_lock<std::mutex> lk{send_mu};
+        send_cv.wait(lk, [&] { return release; });
+        return SendResult::Sent;
+    };
+
+    GuardianOutboxDrainWorker worker(*rig.rt, stalling_send, /*periodic_bound_ms=*/20,
+                                     {.journal = rig.journal, .page_interval = 0ms,
+                                      .prune_interval = 0ms});
+    worker.start();
+    REQUIRE(spin_until([&] { return invocations.load() >= 1; }, 3s)); // the send is now stuck
+
+    // Sample the stamps at the moment the send is confirmed stuck, then prove they advance
+    // PAST that point - i.e. a LATER pass ran maintenance - while the send is still blocked.
+    // Before the fix this worker thread would itself be inside send(), so neither could move.
+    const auto page_at_stall = worker.last_page_success_steady_ms();
+    const auto prune_at_stall = worker.last_prune_success_steady_ms();
+    CHECK(spin_until([&] { return worker.last_page_success_steady_ms() > page_at_stall; }, 3s));
+    CHECK(spin_until([&] { return worker.last_prune_success_steady_ms() > prune_at_stall; }, 3s));
+
+    {
+        std::lock_guard<std::mutex> lk{send_mu};
+        release = true;
+    }
+    send_cv.notify_all();
+    // Wait for the detached send to actually finish before this frame's captures (send_mu,
+    // send_cv, release, invocations) unwind - GuardianOutboxSendExecutor does not join it.
+    REQUIRE(spin_until([&] { return worker.active_send_workers() == 0; }, 3s));
+    worker.stop();
+}
+
+TEST_CASE("item 4: a stalled send is single-flight, never resubmitted while in flight",
+          "[spark][guardian][drain][chaos]") {
+    JournalRig rig;
+    rig.rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+
+    std::mutex send_mu;
+    std::condition_variable send_cv;
+    bool release{false};
+    std::atomic<int> invocations{0};
+    auto stalling_send = [&](const OutboxEntry&) -> SendResult {
+        invocations.fetch_add(1);
+        std::unique_lock<std::mutex> lk{send_mu};
+        send_cv.wait(lk, [&] { return release; });
+        return SendResult::Sent;
+    };
+
+    // A fast periodic bound forces many worker ticks while the one send stays stuck - if the
+    // wrapper ever resubmitted instead of retaining, this would show up as invocations > 1.
+    GuardianOutboxDrainWorker worker(*rig.rt, stalling_send, /*periodic_bound_ms=*/5);
+    worker.start();
+    REQUIRE(spin_until([&] { return invocations.load() >= 1; }, 3s));
+
+    std::this_thread::sleep_for(150ms); // many ticks at a 5ms periodic bound
+    CHECK(invocations.load() == 1);
+
+    {
+        std::lock_guard<std::mutex> lk{send_mu};
+        release = true;
+    }
+    send_cv.notify_all();
+    REQUIRE(spin_until([&] { return worker.active_send_workers() == 0; }, 3s));
+    CHECK(invocations.load() == 1); // still exactly one send for the one entry
+    worker.stop();
+}
+
+TEST_CASE("#3953 item 3: an internal re-check bounds detection latency for a send that "
+          "finishes between the per-attempt offer wait and the periodic backstop",
+          "[spark][guardian][drain][chaos]") {
+    // A 1-hour periodic bound - matching R4's own config - so only the internal
+    // re-check (kGuardianSendRecheckInterval) can make progress inside this test's
+    // window; without it, the second entry sits behind loop()'s full 1-hour sleep and
+    // this test times out. Default GuardianMaintenanceConfig (journal=nullptr) means no
+    // maintenance pass runs regardless of interval, so this exercises send cadence only.
+    JournalRig rig;
+    std::atomic<int> sent_count{0};
+    auto sink = [&](const OutboxEntry&) -> SendResult {
+        // Only the FIRST send stalls - long enough to exceed kGuardianSendOfferWait
+        // (200ms) several times over, so the margin against scheduling jitter is wide
+        // (Fable's review: a tighter stall left too little slack against two 200ms
+        // offer waits).
+        if (sent_count.fetch_add(1) == 0)
+            std::this_thread::sleep_for(1s);
+        return SendResult::Sent;
+    };
+    GuardianOutboxDrainWorker worker(*rig.rt, sink, /*periodic_bound_ms=*/3'600'000);
+    worker.start();
+
+    rig.rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    rig.rt->attach_rule("r2", file_spec("/b"), file_exists_rule("r2"), true);
+
+    CHECK(spin_until([&] { return sent_count.load() >= 2; }, 5s));
+    worker.stop();
+}
+
+TEST_CASE("item 4 regression: a stalled lifecycle send does not starve compliance delivery",
+          "[spark][guardian][drain][chaos]") {
+    // #3847/#2233 item 4, governance Gate 4 unhappy-path finding UP-1 (BLOCKING, found in
+    // this fix's first draft): GuardianOutboxDrainWorker used ONE shared
+    // GuardianOutboxSendExecutor across BOTH the lifecycle log and the compliance/health
+    // log. A slow-but-succeeding lifecycle send made the compliance drain_log_unlocked call
+    // hit the SAME executor's mismatch-orphan branch and return Retain WITHOUT EVER
+    // invoking the compliance send - silent, repeated starvation of an entire audit lane,
+    // not just the stalled entry. Exercises the real GuardianOutboxDrainWorker wiring
+    // (unlike test_guardian_outbox_send_executor.cpp's isolated single-lane coverage),
+    // since the bug lived in the TWO-CALL structure this class routes through, not in the
+    // executor class itself. Fixed by giving each lane its own executor instance.
+    //
+    // Lifecycle is stalled INDEFINITELY (CV-gated, not a fixed sleep): a bounded stall long
+    // enough to exceed kGuardianSendOfferWait once still lets compliance ship as soon as
+    // lifecycle's OWN send finally resolves and its single shared slot frees up - both the
+    // single-executor and two-executor designs would eventually satisfy that. The property
+    // that actually distinguishes them is compliance shipping WHILE lifecycle's send is
+    // STILL provably running - which the single-executor design can never do (the shared
+    // slot stays occupied for the send's whole duration, however long that is).
+    JournalRig rig;
+
+    std::mutex lifecycle_mu;
+    std::condition_variable lifecycle_cv;
+    bool release_lifecycle{false};
+    std::atomic<int> lifecycle_invocations{0};
+    std::atomic<int> compliance_invocations{0};
+    auto send = [&](const OutboxEntry& e) -> SendResult {
+        if (e.domain == OutboxDomain::Lifecycle) {
+            lifecycle_invocations.fetch_add(1);
+            std::unique_lock<std::mutex> lk{lifecycle_mu};
+            lifecycle_cv.wait(lk, [&] { return release_lifecycle; });
+            return SendResult::Sent;
+        }
+        compliance_invocations.fetch_add(1);
+        return SendResult::Sent; // instant
+    };
+
+    GuardianOutboxDrainWorker worker(*rig.rt, send, /*periodic_bound_ms=*/20);
+    worker.start();
+
+    // Lifecycle entry: attach_rule enqueues an "armed" lifecycle entry immediately.
+    rig.rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    REQUIRE(spin_until([&] { return lifecycle_invocations.load() >= 1; }, 3s)); // now stuck
+
+    // Compliance entry: a real drift verdict on a SEPARATE rule, enqueued only AFTER
+    // lifecycle is confirmed stuck - a real drain pass has to run the compliance phase
+    // while lifecycle's slot is still occupied for this to prove anything.
+    REQUIRE(rig.rt->attach_rule("cmp", file_spec("/cmp"), file_exists_rule("cmp"), true));
+    rig.reader->file = read_known(FileSnapshot{.exists = false});
+    rig.rt->evaluate_key(spark_key(file_spec("/cmp")), EvalReason::Convergence);
+
+    // THE regression: compliance ships WHILE lifecycle is still parked (never released).
+    // Pre-fix (one shared executor) this times out - the compliance send is never even
+    // attempted while the shared slot is held by lifecycle's still-running worker.
+    CHECK(spin_until([&] { return compliance_invocations.load() >= 1; }, 3s));
+    CHECK(lifecycle_invocations.load() == 1); // lifecycle's send never resolved during that wait
+
+    {
+        std::lock_guard<std::mutex> lk{lifecycle_mu};
+        release_lifecycle = true;
+    }
+    lifecycle_cv.notify_all();
+    REQUIRE(spin_until([&] { return worker.active_send_workers() == 0; }, 3s));
+    worker.stop();
 }
 
 // ---------------------------------------------------------------------------

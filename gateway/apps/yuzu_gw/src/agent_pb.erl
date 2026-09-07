@@ -149,7 +149,8 @@
         sha256                  => unicode:chardata(), % = 3, optional
         mandatory               => boolean() | 0 | 1, % = 4, optional
         eligible                => boolean() | 0 | 1, % = 5, optional
-        file_size               => integer()        % = 6, optional, 64 bits
+        file_size               => integer(),       % = 6, optional, 64 bits
+        update_signature        => iodata()         % = 7, optional
        }.
 
 -type 'yuzu.agent.v1.DownloadUpdateRequest'() ::
@@ -926,15 +927,26 @@ encode_msg(Msg, MsgName, Opts) ->
                  end;
              _ -> B4
          end,
+    B6 = case M of
+             #{file_size := F6} ->
+                 begin
+                     TrF6 = id(F6, TrUserData),
+                     if TrF6 =:= 0 -> B5;
+                        true -> e_type_int64(TrF6, <<B5/binary, 48>>, TrUserData)
+                     end
+                 end;
+             _ -> B5
+         end,
     case M of
-        #{file_size := F6} ->
+        #{update_signature := F7} ->
             begin
-                TrF6 = id(F6, TrUserData),
-                if TrF6 =:= 0 -> B5;
-                   true -> e_type_int64(TrF6, <<B5/binary, 48>>, TrUserData)
+                TrF7 = id(F7, TrUserData),
+                case iolist_size(TrF7) of
+                    0 -> B6;
+                    _ -> e_type_bytes(TrF7, <<B6/binary, 58>>, TrUserData)
                 end
             end;
-        _ -> B5
+        _ -> B6
     end.
 
 'encode_msg_yuzu.agent.v1.DownloadUpdateRequest'(Msg, TrUserData) -> 'encode_msg_yuzu.agent.v1.DownloadUpdateRequest'(Msg, <<>>, TrUserData).
@@ -2754,102 +2766,114 @@ decode_msg_2_doit('yuzu.common.v1.ScopeCombinator', Bin, TrUserData) -> id('deco
 'skip_64_yuzu.agent.v1.CheckForUpdateRequest'(<<_:64, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, TrUserData) -> 'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateRequest'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, TrUserData).
 
 'decode_msg_yuzu.agent.v1.CheckForUpdateResponse'(Bin, TrUserData) ->
-    'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(Bin, 0, 0, 0, id(false, TrUserData), id(<<>>, TrUserData), id(<<>>, TrUserData), id(false, TrUserData), id(false, TrUserData), id(0, TrUserData), TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(Bin, 0, 0, 0, id(false, TrUserData), id(<<>>, TrUserData), id(<<>>, TrUserData), id(false, TrUserData), id(false, TrUserData), id(0, TrUserData), id(<<>>, TrUserData), TrUserData).
 
-'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(<<8, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
-    'd_field_yuzu.agent.v1.CheckForUpdateResponse_update_available'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(<<18, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
-    'd_field_yuzu.agent.v1.CheckForUpdateResponse_latest_version'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(<<26, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
-    'd_field_yuzu.agent.v1.CheckForUpdateResponse_sha256'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(<<32, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
-    'd_field_yuzu.agent.v1.CheckForUpdateResponse_mandatory'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(<<40, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
-    'd_field_yuzu.agent.v1.CheckForUpdateResponse_eligible'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(<<48, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
-    'd_field_yuzu.agent.v1.CheckForUpdateResponse_file_size'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(<<>>, 0, 0, _, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, _) -> #{update_available => F@_1, latest_version => F@_2, sha256 => F@_3, mandatory => F@_4, eligible => F@_5, file_size => F@_6};
-'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(Other, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) -> 'dg_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(Other, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData).
+'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(<<8, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
+    'd_field_yuzu.agent.v1.CheckForUpdateResponse_update_available'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(<<18, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
+    'd_field_yuzu.agent.v1.CheckForUpdateResponse_latest_version'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(<<26, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
+    'd_field_yuzu.agent.v1.CheckForUpdateResponse_sha256'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(<<32, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
+    'd_field_yuzu.agent.v1.CheckForUpdateResponse_mandatory'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(<<40, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
+    'd_field_yuzu.agent.v1.CheckForUpdateResponse_eligible'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(<<48, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
+    'd_field_yuzu.agent.v1.CheckForUpdateResponse_file_size'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(<<58, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
+    'd_field_yuzu.agent.v1.CheckForUpdateResponse_update_signature'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(<<>>, 0, 0, _, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, _) ->
+    #{update_available => F@_1, latest_version => F@_2, sha256 => F@_3, mandatory => F@_4, eligible => F@_5, file_size => F@_6, update_signature => F@_7};
+'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(Other, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
+    'dg_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(Other, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData).
 
-'dg_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 32 - 7 ->
-    'dg_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'dg_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(<<0:1, X:7, Rest/binary>>, N, Acc, _, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
+'dg_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) when N < 32 - 7 ->
+    'dg_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'dg_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(<<0:1, X:7, Rest/binary>>, N, Acc, _, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
     Key = X bsl N + Acc,
     case Key of
-        8 -> 'd_field_yuzu.agent.v1.CheckForUpdateResponse_update_available'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-        18 -> 'd_field_yuzu.agent.v1.CheckForUpdateResponse_latest_version'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-        26 -> 'd_field_yuzu.agent.v1.CheckForUpdateResponse_sha256'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-        32 -> 'd_field_yuzu.agent.v1.CheckForUpdateResponse_mandatory'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-        40 -> 'd_field_yuzu.agent.v1.CheckForUpdateResponse_eligible'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-        48 -> 'd_field_yuzu.agent.v1.CheckForUpdateResponse_file_size'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
+        8 -> 'd_field_yuzu.agent.v1.CheckForUpdateResponse_update_available'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+        18 -> 'd_field_yuzu.agent.v1.CheckForUpdateResponse_latest_version'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+        26 -> 'd_field_yuzu.agent.v1.CheckForUpdateResponse_sha256'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+        32 -> 'd_field_yuzu.agent.v1.CheckForUpdateResponse_mandatory'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+        40 -> 'd_field_yuzu.agent.v1.CheckForUpdateResponse_eligible'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+        48 -> 'd_field_yuzu.agent.v1.CheckForUpdateResponse_file_size'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+        58 -> 'd_field_yuzu.agent.v1.CheckForUpdateResponse_update_signature'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
         _ ->
             case Key band 7 of
-                0 -> 'skip_varint_yuzu.agent.v1.CheckForUpdateResponse'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-                1 -> 'skip_64_yuzu.agent.v1.CheckForUpdateResponse'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-                2 -> 'skip_length_delimited_yuzu.agent.v1.CheckForUpdateResponse'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-                3 -> 'skip_group_yuzu.agent.v1.CheckForUpdateResponse'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-                5 -> 'skip_32_yuzu.agent.v1.CheckForUpdateResponse'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData)
+                0 -> 'skip_varint_yuzu.agent.v1.CheckForUpdateResponse'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+                1 -> 'skip_64_yuzu.agent.v1.CheckForUpdateResponse'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+                2 -> 'skip_length_delimited_yuzu.agent.v1.CheckForUpdateResponse'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+                3 -> 'skip_group_yuzu.agent.v1.CheckForUpdateResponse'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+                5 -> 'skip_32_yuzu.agent.v1.CheckForUpdateResponse'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData)
             end
     end;
-'dg_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(<<>>, 0, 0, _, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, _) -> #{update_available => F@_1, latest_version => F@_2, sha256 => F@_3, mandatory => F@_4, eligible => F@_5, file_size => F@_6}.
+'dg_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(<<>>, 0, 0, _, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, _) ->
+    #{update_available => F@_1, latest_version => F@_2, sha256 => F@_3, mandatory => F@_4, eligible => F@_5, file_size => F@_6, update_signature => F@_7}.
 
-'d_field_yuzu.agent.v1.CheckForUpdateResponse_update_available'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 57 ->
-    'd_field_yuzu.agent.v1.CheckForUpdateResponse_update_available'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'d_field_yuzu.agent.v1.CheckForUpdateResponse_update_available'(<<0:1, X:7, Rest/binary>>, N, Acc, F, _, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
+'d_field_yuzu.agent.v1.CheckForUpdateResponse_update_available'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) when N < 57 ->
+    'd_field_yuzu.agent.v1.CheckForUpdateResponse_update_available'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'d_field_yuzu.agent.v1.CheckForUpdateResponse_update_available'(<<0:1, X:7, Rest/binary>>, N, Acc, F, _, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
     {NewFValue, RestF} = {id(X bsl N + Acc =/= 0, TrUserData), Rest},
-    'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(RestF, 0, 0, F, NewFValue, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(RestF, 0, 0, F, NewFValue, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData).
 
-'d_field_yuzu.agent.v1.CheckForUpdateResponse_latest_version'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 57 ->
-    'd_field_yuzu.agent.v1.CheckForUpdateResponse_latest_version'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'d_field_yuzu.agent.v1.CheckForUpdateResponse_latest_version'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, _, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
+'d_field_yuzu.agent.v1.CheckForUpdateResponse_latest_version'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) when N < 57 ->
+    'd_field_yuzu.agent.v1.CheckForUpdateResponse_latest_version'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'d_field_yuzu.agent.v1.CheckForUpdateResponse_latest_version'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, _, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
     {NewFValue, RestF} = begin Len = X bsl N + Acc, <<Bytes:Len/binary, Rest2/binary>> = Rest, Bytes2 = binary:copy(Bytes), {id(Bytes2, TrUserData), Rest2} end,
-    'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(RestF, 0, 0, F, F@_1, NewFValue, F@_3, F@_4, F@_5, F@_6, TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(RestF, 0, 0, F, F@_1, NewFValue, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData).
 
-'d_field_yuzu.agent.v1.CheckForUpdateResponse_sha256'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 57 ->
-    'd_field_yuzu.agent.v1.CheckForUpdateResponse_sha256'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'d_field_yuzu.agent.v1.CheckForUpdateResponse_sha256'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, _, F@_4, F@_5, F@_6, TrUserData) ->
+'d_field_yuzu.agent.v1.CheckForUpdateResponse_sha256'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) when N < 57 ->
+    'd_field_yuzu.agent.v1.CheckForUpdateResponse_sha256'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'d_field_yuzu.agent.v1.CheckForUpdateResponse_sha256'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, _, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
     {NewFValue, RestF} = begin Len = X bsl N + Acc, <<Bytes:Len/binary, Rest2/binary>> = Rest, Bytes2 = binary:copy(Bytes), {id(Bytes2, TrUserData), Rest2} end,
-    'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(RestF, 0, 0, F, F@_1, F@_2, NewFValue, F@_4, F@_5, F@_6, TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(RestF, 0, 0, F, F@_1, F@_2, NewFValue, F@_4, F@_5, F@_6, F@_7, TrUserData).
 
-'d_field_yuzu.agent.v1.CheckForUpdateResponse_mandatory'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 57 ->
-    'd_field_yuzu.agent.v1.CheckForUpdateResponse_mandatory'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'d_field_yuzu.agent.v1.CheckForUpdateResponse_mandatory'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, _, F@_5, F@_6, TrUserData) ->
+'d_field_yuzu.agent.v1.CheckForUpdateResponse_mandatory'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) when N < 57 ->
+    'd_field_yuzu.agent.v1.CheckForUpdateResponse_mandatory'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'d_field_yuzu.agent.v1.CheckForUpdateResponse_mandatory'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, _, F@_5, F@_6, F@_7, TrUserData) ->
     {NewFValue, RestF} = {id(X bsl N + Acc =/= 0, TrUserData), Rest},
-    'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(RestF, 0, 0, F, F@_1, F@_2, F@_3, NewFValue, F@_5, F@_6, TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(RestF, 0, 0, F, F@_1, F@_2, F@_3, NewFValue, F@_5, F@_6, F@_7, TrUserData).
 
-'d_field_yuzu.agent.v1.CheckForUpdateResponse_eligible'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 57 ->
-    'd_field_yuzu.agent.v1.CheckForUpdateResponse_eligible'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'d_field_yuzu.agent.v1.CheckForUpdateResponse_eligible'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, _, F@_6, TrUserData) ->
+'d_field_yuzu.agent.v1.CheckForUpdateResponse_eligible'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) when N < 57 ->
+    'd_field_yuzu.agent.v1.CheckForUpdateResponse_eligible'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'d_field_yuzu.agent.v1.CheckForUpdateResponse_eligible'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, _, F@_6, F@_7, TrUserData) ->
     {NewFValue, RestF} = {id(X bsl N + Acc =/= 0, TrUserData), Rest},
-    'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(RestF, 0, 0, F, F@_1, F@_2, F@_3, F@_4, NewFValue, F@_6, TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(RestF, 0, 0, F, F@_1, F@_2, F@_3, F@_4, NewFValue, F@_6, F@_7, TrUserData).
 
-'d_field_yuzu.agent.v1.CheckForUpdateResponse_file_size'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 57 ->
-    'd_field_yuzu.agent.v1.CheckForUpdateResponse_file_size'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'d_field_yuzu.agent.v1.CheckForUpdateResponse_file_size'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, _, TrUserData) ->
+'d_field_yuzu.agent.v1.CheckForUpdateResponse_file_size'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) when N < 57 ->
+    'd_field_yuzu.agent.v1.CheckForUpdateResponse_file_size'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'d_field_yuzu.agent.v1.CheckForUpdateResponse_file_size'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, _, F@_7, TrUserData) ->
     {NewFValue, RestF} = {begin <<Res:64/signed-native>> = <<(X bsl N + Acc):64/unsigned-native>>, id(Res, TrUserData) end, Rest},
-    'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(RestF, 0, 0, F, F@_1, F@_2, F@_3, F@_4, F@_5, NewFValue, TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(RestF, 0, 0, F, F@_1, F@_2, F@_3, F@_4, F@_5, NewFValue, F@_7, TrUserData).
 
-'skip_varint_yuzu.agent.v1.CheckForUpdateResponse'(<<1:1, _:7, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
-    'skip_varint_yuzu.agent.v1.CheckForUpdateResponse'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'skip_varint_yuzu.agent.v1.CheckForUpdateResponse'(<<0:1, _:7, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
-    'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData).
+'d_field_yuzu.agent.v1.CheckForUpdateResponse_update_signature'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) when N < 57 ->
+    'd_field_yuzu.agent.v1.CheckForUpdateResponse_update_signature'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'d_field_yuzu.agent.v1.CheckForUpdateResponse_update_signature'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, _, TrUserData) ->
+    {NewFValue, RestF} = begin Len = X bsl N + Acc, <<Bytes:Len/binary, Rest2/binary>> = Rest, Bytes2 = binary:copy(Bytes), {id(Bytes2, TrUserData), Rest2} end,
+    'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(RestF, 0, 0, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, NewFValue, TrUserData).
 
-'skip_length_delimited_yuzu.agent.v1.CheckForUpdateResponse'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 57 ->
-    'skip_length_delimited_yuzu.agent.v1.CheckForUpdateResponse'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'skip_length_delimited_yuzu.agent.v1.CheckForUpdateResponse'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
+'skip_varint_yuzu.agent.v1.CheckForUpdateResponse'(<<1:1, _:7, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
+    'skip_varint_yuzu.agent.v1.CheckForUpdateResponse'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'skip_varint_yuzu.agent.v1.CheckForUpdateResponse'(<<0:1, _:7, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
+    'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData).
+
+'skip_length_delimited_yuzu.agent.v1.CheckForUpdateResponse'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) when N < 57 ->
+    'skip_length_delimited_yuzu.agent.v1.CheckForUpdateResponse'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'skip_length_delimited_yuzu.agent.v1.CheckForUpdateResponse'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
     Length = X bsl N + Acc,
     <<_:Length/binary, Rest2/binary>> = Rest,
-    'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(Rest2, 0, 0, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(Rest2, 0, 0, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData).
 
-'skip_group_yuzu.agent.v1.CheckForUpdateResponse'(Bin, _, Z2, FNum, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
+'skip_group_yuzu.agent.v1.CheckForUpdateResponse'(Bin, _, Z2, FNum, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
     {_, Rest} = read_group(Bin, FNum),
-    'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(Rest, 0, Z2, FNum, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(Rest, 0, Z2, FNum, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData).
 
-'skip_32_yuzu.agent.v1.CheckForUpdateResponse'(<<_:32, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
-    'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData).
+'skip_32_yuzu.agent.v1.CheckForUpdateResponse'(<<_:32, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
+    'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData).
 
-'skip_64_yuzu.agent.v1.CheckForUpdateResponse'(<<_:64, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
-    'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData).
+'skip_64_yuzu.agent.v1.CheckForUpdateResponse'(<<_:64, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
+    'dfp_read_field_def_yuzu.agent.v1.CheckForUpdateResponse'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData).
 
 'decode_msg_yuzu.agent.v1.DownloadUpdateRequest'(Bin, TrUserData) -> 'dfp_read_field_def_yuzu.agent.v1.DownloadUpdateRequest'(Bin, 0, 0, 0, id(<<>>, TrUserData), id(<<>>, TrUserData), id('$undef', TrUserData), TrUserData).
 
@@ -3998,10 +4022,15 @@ merge_msgs(Prev, New, MsgName, Opts) ->
              {#{eligible := PFeligible}, _} -> S5#{eligible => PFeligible};
              _ -> S5
          end,
+    S7 = case {PMsg, NMsg} of
+             {_, #{file_size := NFfile_size}} -> S6#{file_size => NFfile_size};
+             {#{file_size := PFfile_size}, _} -> S6#{file_size => PFfile_size};
+             _ -> S6
+         end,
     case {PMsg, NMsg} of
-        {_, #{file_size := NFfile_size}} -> S6#{file_size => NFfile_size};
-        {#{file_size := PFfile_size}, _} -> S6#{file_size => PFfile_size};
-        _ -> S6
+        {_, #{update_signature := NFupdate_signature}} -> S7#{update_signature => NFupdate_signature};
+        {#{update_signature := PFupdate_signature}, _} -> S7#{update_signature => PFupdate_signature};
+        _ -> S7
     end.
 
 -compile({nowarn_unused_function,'merge_msg_yuzu.agent.v1.DownloadUpdateRequest'/3}).
@@ -4632,12 +4661,17 @@ verify_msg(Msg, MsgName, Opts) ->
         #{file_size := F6} -> v_type_int64(F6, [file_size | Path], TrUserData);
         _ -> ok
     end,
+    case M of
+        #{update_signature := F7} -> v_type_bytes(F7, [update_signature | Path], TrUserData);
+        _ -> ok
+    end,
     lists:foreach(fun (update_available) -> ok;
                       (latest_version) -> ok;
                       (sha256) -> ok;
                       (mandatory) -> ok;
                       (eligible) -> ok;
                       (file_size) -> ok;
+                      (update_signature) -> ok;
                       (OtherKey) -> mk_type_error({extraneous_key, OtherKey}, M, Path)
                   end,
                   maps:keys(M)),
@@ -5218,7 +5252,8 @@ get_msg_defs() ->
        #{name => sha256, fnum => 3, rnum => 4, type => string, occurrence => optional, opts => []},
        #{name => mandatory, fnum => 4, rnum => 5, type => bool, occurrence => optional, opts => []},
        #{name => eligible, fnum => 5, rnum => 6, type => bool, occurrence => optional, opts => []},
-       #{name => file_size, fnum => 6, rnum => 7, type => int64, occurrence => optional, opts => []}]},
+       #{name => file_size, fnum => 6, rnum => 7, type => int64, occurrence => optional, opts => []},
+       #{name => update_signature, fnum => 7, rnum => 8, type => bytes, occurrence => optional, opts => []}]},
      {{msg, 'yuzu.agent.v1.DownloadUpdateRequest'},
       [#{name => agent_id, fnum => 1, rnum => 2, type => string, occurrence => optional, opts => []},
        #{name => version, fnum => 2, rnum => 3, type => string, occurrence => optional, opts => []},
@@ -5393,7 +5428,8 @@ find_msg_def('yuzu.agent.v1.CheckForUpdateResponse') ->
      #{name => sha256, fnum => 3, rnum => 4, type => string, occurrence => optional, opts => []},
      #{name => mandatory, fnum => 4, rnum => 5, type => bool, occurrence => optional, opts => []},
      #{name => eligible, fnum => 5, rnum => 6, type => bool, occurrence => optional, opts => []},
-     #{name => file_size, fnum => 6, rnum => 7, type => int64, occurrence => optional, opts => []}];
+     #{name => file_size, fnum => 6, rnum => 7, type => int64, occurrence => optional, opts => []},
+     #{name => update_signature, fnum => 7, rnum => 8, type => bytes, occurrence => optional, opts => []}];
 find_msg_def('yuzu.agent.v1.DownloadUpdateRequest') ->
     [#{name => agent_id, fnum => 1, rnum => 2, type => string, occurrence => optional, opts => []},
      #{name => version, fnum => 2, rnum => 3, type => string, occurrence => optional, opts => []},

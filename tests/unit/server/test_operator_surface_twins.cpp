@@ -276,9 +276,9 @@ struct Harness {
                          const std::vector<std::string>&, const std::string&,
                          const std::unordered_map<std::string, std::string>&,
                          const std::string&,
-                         const DispatchCaller&) -> std::pair<std::string, int> {
+                         const DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
                       dispatched_actions.push_back(plugin + "." + action);
-                      return {"cmd-" + std::to_string(dispatched_actions.size()), 1};
+                      return {.sent = 1, .command_id = "cmd-" + std::to_string(dispatched_actions.size())};
                   },
               // #3133 review fix: resolve_caller re-resolves a real caller
               // from the schedule's creator at fire time — see

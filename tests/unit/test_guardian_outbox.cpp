@@ -252,6 +252,41 @@ TEST_CASE("enqueue/enqueue_all reject a Lifecycle-domain entry", "[spark][outbox
     REQUIRE(ob.size() == 0); // both-or-neither: the compliance entry is not buffered either
 }
 
+TEST_CASE("#3953 item 4: GuardianLifecycleLog::enqueue rejects a non-Lifecycle entry",
+          "[spark][outbox][chaos]") {
+    // The mirror-image check of GuardianOutbox::enqueue's own Lifecycle rejection
+    // above - previously enforced only by convention (three construction sites),
+    // not asserted. A future misrouted entry (a new OutboxDomain value routed here
+    // by mistake) would otherwise silently reintroduce the cross-lane starvation
+    // class the two-lane split exists to prevent.
+    GuardianLifecycleLog log{8};
+    REQUIRE_FALSE(log.enqueue(comp("a", 1, "e1", 100, "x")));
+    REQUIRE_FALSE(
+        log.enqueue(OutboxEntry::health("a", 1, "h1", 101, /*healthy=*/true, "detail")));
+    CHECK(log.size() == 0);
+    CHECK(log.backpressure_drops() == 0); // a routing bug, not a capacity condition
+
+    // A genuine Lifecycle entry still succeeds.
+    REQUIRE(log.enqueue(
+        OutboxEntry::lifecycle("a", 1, "l1", 102, "armed", "file", "n")));
+    CHECK(log.size() == 1);
+}
+
+TEST_CASE("#3953 item 4: the domain check runs BEFORE the capacity check",
+          "[spark][outbox][chaos]") {
+    // Ordering matters: without it, a wrong-domain entry offered while the log
+    // happens to be at capacity would silently pass wrong-domain rejection off as
+    // a capacity rejection (backpressure_drops_ would bump for a caller bug, not
+    // a real capacity condition).
+    GuardianLifecycleLog log{1};
+    REQUIRE(log.enqueue(OutboxEntry::lifecycle("a", 1, "l1", 100, "armed", "file", "n")));
+    CHECK(log.size() == 1); // at capacity now
+
+    REQUIRE_FALSE(log.enqueue(comp("b", 1, "e1", 101, "x")));
+    CHECK(log.size() == 1); // unchanged
+    CHECK(log.backpressure_drops() == 0); // still a routing bug, NOT counted as capacity
+}
+
 TEST_CASE("stamp_provenance withholds last-in-batch unless the whole batch is windowed",
           "[spark][guardian][outbox][chaos]") {
     // A record can be journalled but never windowed: the arm path stages to the journal

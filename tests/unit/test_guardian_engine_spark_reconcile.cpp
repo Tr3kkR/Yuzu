@@ -12,6 +12,7 @@
 #include "guardian_backend.hpp" // guardian_backend_from_state/label (#2298 F13)
 #include "guardian_convergence_scheduler.hpp" // ConvergenceScheduler (started_for_test, #2238)
 #include "guardian_journal_format.hpp" // kJournalNamespace, parse_journal_batch (item 7 PR-Ag)
+#include "guardian_joined_thread_role.hpp" // GuardianJoinedThreadRole (death test below)
 #include "guardian_journal_heartbeat.hpp" // emit_guardian_journal_heartbeat_tags (aggregate inertness)
 #include "guardian_lifecycle_journal.hpp" // GuardianLifecycleJournal (for the _for_test fault seam)
 #include "guardian_outbox.hpp" // OutboxEntry, SendResult - full definitions for the test's send_fn
@@ -63,11 +64,14 @@ using yuzu::agent::make_registry_mechanism;
 using yuzu::agent::make_service_mechanism;
 using yuzu::agent::OutboxEntry;
 using yuzu::agent::SendResult;
+using yuzu::agent::ServiceSparkParams; // #2818 pin: the raw sibling's spec
 using yuzu::agent::SparkData;
 using yuzu::agent::SparkEmitFn;
 using yuzu::agent::SparkEngine;
+using yuzu::agent::SparkEvent; // #2818 pin: the raw sibling's queued handler
 using yuzu::agent::SparkFaultFn;
 using yuzu::agent::SparkParams;
+using yuzu::agent::SparkSpec; // #2818 pin
 using yuzu::agent::SparkType;
 
 namespace {
@@ -97,6 +101,7 @@ public:
     void start(SparkEmitFn, SparkFaultFn) override {}
     std::expected<void, std::string> watch(const std::string& key, const SparkParams&) override {
         bool hang = false;
+        bool do_throw = false;
         {
             std::lock_guard<std::mutex> lk{mu_};
             if (fail_next_watch_) {
@@ -105,6 +110,8 @@ public:
             }
             hang = hang_next_watch_;
             hang_next_watch_ = false;
+            do_throw = throw_next_watch_;
+            throw_next_watch_ = false;
         }
         // #2233 item 3: the gate wait is deliberately OUTSIDE mu_ so release_hang()
         // (which only touches gate_mu_, never mu_) can never deadlock against a
@@ -119,6 +126,15 @@ public:
             gate_cv_.notify_all();
             gate_cv_.wait(gate_lk, [this] { return released_; });
         }
+        // #2818 pin: THROW rather than return std::unexpected, and do it AFTER the hang
+        // gate. Both halves matter. `fail_next_watch_` is checked before the gate and
+        // returns immediately, so it cannot produce the state that pin needs — a watch
+        // still IN FLIGHT (key committed in armed_, teardown not yet run) while a second
+        // consumer dedups onto it, which only THEN fails. Throwing also routes the
+        // failure through watch_guarded's catch arm, the shape a real mechanism produces
+        // under memory pressure.
+        if (do_throw)
+            throw std::runtime_error("forced watch throw");
         std::lock_guard<std::mutex> lk{mu_};
         watched_.insert(key);
         return {};
@@ -143,6 +159,12 @@ public:
     void set_fail_next_watch() {
         std::lock_guard<std::mutex> lk{mu_};
         fail_next_watch_ = true;
+    }
+    /// #2818 pin: next watch() THROWS (after the hang gate, if one is armed) instead of
+    /// returning std::unexpected. See watch() for why the distinction is load-bearing.
+    void set_throw_next_watch() {
+        std::lock_guard<std::mutex> lk{mu_};
+        throw_next_watch_ = true;
     }
     /// Next watch() blocks until release_hang() is called, from inside watch() with
     /// this mechanism's own mu_ released (mirrors the real contract: SparkEngine calls
@@ -185,6 +207,7 @@ private:
     std::mutex mu_;
     std::set<std::string> watched_;
     bool fail_next_watch_{false};
+    bool throw_next_watch_{false};
     bool hang_next_watch_{false};
     bool hang_next_unwatch_{false};
     // Gate is a SEPARATE lock from mu_ (see watch()'s comment) - release_hang() must
@@ -329,6 +352,84 @@ struct SparkReconcileFixture {
 };
 
 } // namespace
+
+TEST_CASE("#2818 — Guardian is notified when a sibling's failed watch kills their shared "
+          "key, and reports the rule errored instead of still-armed",
+          "[spark][guardian][reconcile]") {
+    // The engine-level halves of this fix are pinned in test_spark_mechanism.cpp. THIS
+    // case is the one that says why it matters: it shows the notification landing on
+    // GUARDIAN, the real consumer, and shows what Guardian now reports afterwards.
+    //
+    // Guardian cannot be its own sibling — GuardianSparkRuntime's arming_keys_ plus the
+    // executor's AlreadyRunning rejection make two concurrent Guardian arms of one key
+    // impossible. So the sibling here is a RAW SparkEngine consumer, which is exactly the
+    // situation Stage 2 creates the moment anything other than Guardian arms a spark.
+    SparkReconcileFixture f;
+
+    // A raw consumer arms the SAME spec Guardian derives from make_service_rule("r1")
+    // — SparkType::Service + service_name "Spooler" — and parks inside watch().
+    auto raw = f.spark_engine.register_consumer("raw-sibling-2818", [](const SparkEvent&) {});
+    REQUIRE(raw.has_value());
+    const SparkSpec spec{SparkType::Service, ServiceSparkParams{"Spooler"}};
+
+    f.mechanism->hang_next_watch();     // park mid-watch: key committed, watch in flight
+    f.mechanism->set_throw_next_watch(); // …and fail once released
+    std::expected<SparkEngine::SubscriptionId, std::string> raw_sub;
+    std::thread armer([&] { raw_sub = f.spark_engine.arm(*raw, spec); });
+    // cpp-safety Gate 3 finding (same class as the "hung watch()/unwatch() wedges
+    // stop()" tests above): a REQUIRE between a thread spawn and its join can throw
+    // and unwind past a still-joinable std::thread -> std::terminate() on the WHOLE
+    // binary. Guard releases the hang and joins `armer` on any unwind path; harmless
+    // no-op on the happy path below (release_hang() only matters once, join() on an
+    // already-joined thread is a no-op via the joinable() check).
+    struct ArmerGuard {
+        FakeServiceMechanism* mech;
+        std::thread* t;
+        ~ArmerGuard() {
+            mech->release_hang();
+            if (t->joinable())
+                t->join();
+        }
+    } armer_guard{f.mechanism, &armer};
+    REQUIRE(f.mechanism->wait_entered_hang(std::chrono::seconds{5}));
+
+    // Guardian now applies its rule. It derives the same spark key, dedups onto the raw
+    // consumer's in-flight entry, and is handed a real subscription id. From Guardian's
+    // side this is an ordinary, successful arm.
+    f.apply(make_service_rule("r1"));
+    CHECK(f.engine->spark_armed_rule_count() == 1);
+    CHECK(f.spark_engine.stats().subscriptions == 2); // raw + Guardian
+    CHECK(f.spark_engine.stats().armed_sparks == 1);
+
+    // Release: the raw consumer's watch throws, and arm_impl tears down the WHOLE key.
+    f.mechanism->release_hang();
+    armer.join();
+    CHECK_FALSE(raw_sub.has_value()); // the raw consumer learns its arm failed
+
+    // Nothing is armed and nothing is watched at the engine level…
+    CHECK(f.spark_engine.stats().armed_sparks == 0);
+    CHECK(f.spark_engine.stats().subscriptions == 0);
+    CHECK(f.mechanism->watching_count() == 0);
+    // …and Guardian is now told, asynchronously (the Lost notification crosses its own
+    // "guardian-spark" consumer's dispatch thread), and detaches the rule as errored
+    // rather than continuing to report it armed.
+    REQUIRE(yuzu::test::spin_until([&] { return f.engine->spark_armed_rule_count() == 0; }));
+    // No self-heal in this PR (Dave's call, 2026-09-06): the rule sits errored until the
+    // next server-issued PushRules or an agent restart re-attaches it.
+    // The legacy path does NOT pick the rule up either — this is not a silent fallback to
+    // IGuard, it stays a genuine, honestly-reported detection hole until re-attached.
+    CHECK(f.engine->armed_guard_count() == 0);
+
+    // The lifecycle audit reflects WHY the rule stopped being enforced: "errored", not
+    // "disarmed" (guardian_outbox.hpp's documented vocabulary) — Guardian didn't
+    // withdraw the rule, its enforcement broke out from under it.
+    REQUIRE(yuzu::test::spin_until([&] {
+        std::lock_guard<std::mutex> lk{f.sent_mu};
+        return std::any_of(f.sent.begin(), f.sent.end(), [](const OutboxEntry& e) {
+            return e.rule_id == "r1" && e.lifecycle_kind == "errored";
+        });
+    }));
+}
 
 TEST_CASE("a supported type arms via spark, never in legacy guards_",
           "[spark][guardian][reconcile]") {
@@ -1342,9 +1443,14 @@ TEST_CASE("a worker-thread mtx_ acquisition aborts the process (death test)",
     // abort itself never executed - so this proves the actual failure mode, in a subprocess,
     // because a passing run necessarily kills the process it happens in.
     //
-    // The hostile call is placed in the INJECTED SEND, deliberately: that is the real
-    // exposure (an arbitrary std::function supplied from agent.cpp), not the journal pointer
-    // the first hardening round guarded.
+    // The hostile call used to be placed in the INJECTED SEND (an arbitrary std::function
+    // supplied from agent.cpp) - but #2233 item 4 moved `send` onto GuardianOutboxSendExecutor's
+    // detached worker (guardian_outbox_send_executor.hpp), which stop() does NOT join, so a
+    // send taking mtx_ can no longer produce this deadlock and is no longer the exposure this
+    // test needs. This drives the hostile call directly from a thread wearing
+    // GuardianJoinedThreadRole instead - the same marker the REAL worker loop wears
+    // (guardian_outbox_drain_worker.cpp) - which proves the abort mechanism itself independent
+    // of which production call graph currently reaches the joined thread.
     if constexpr (!yuzu::agent::worker_mutex_guard_enabled()) {
         SUCCEED("WorkerHostileMutex is compiled out in this build; nothing to prove");
         return;
@@ -1370,34 +1476,24 @@ TEST_CASE("a worker-thread mtx_ acquisition aborts the process (death test)",
             ::_exit(90); // distinct codes so the parent can tell setup failure from no-abort
         KvStore kv{std::move(*opened)};
 
-        SparkEngine spark_engine;
-        auto mech = std::make_unique<FakeServiceMechanism>();
-        if (!spark_engine.register_mechanism(SparkType::Service, std::move(mech)))
-            ::_exit(91);
-        spark_engine.start();
-
+        // No SparkEngine/wire_spark_engine needed - the hostile call below is driven directly,
+        // not through the drain worker's own call graph (see the comment above).
         GuardianEngine engine{&kv, "agent-death", /*prefer_spark=*/true};
         if (!engine.start_local())
             ::_exit(92);
 
-        // The send runs ON the worker thread and reaches for mtx_ via journal_stats().
-        engine.wire_spark_engine(&spark_engine, /*spark_disabled_by_config=*/false,
-                                 [&engine](const OutboxEntry&) {
-                                     (void)engine.journal_stats(); // takes mtx_ -> must abort
-                                     return SendResult::Sent;
-                                 });
-        if (engine.spark_availability() != GuardianEngine::SparkAvailability::Available)
-            ::_exit(93);
+        // A thread wearing the SAME marker the real drain worker's loop() wears, taking mtx_
+        // via journal_stats() - must abort. GuardianJoinedThreadRole's ctor runs on entry to
+        // the thread body, so this thread is "joined" for its entire lifetime, matching how
+        // loop() wears it for the worker's entire lifetime (guardian_outbox_drain_worker.cpp).
+        std::thread hostile([&engine] {
+            yuzu::agent::GuardianJoinedThreadRole role_marker;
+            (void)engine.journal_stats(); // takes mtx_ -> must abort
+        });
+        hostile.join(); // unreachable if the guard fires - the process aborts inside the thread
 
-        // Arm a rule so an "armed" lifecycle entry enters the outbox and the worker drains it
-        // through the hostile send.
-        gpb::GuaranteedStatePush p;
-        p.set_full_sync(true);
-        *p.add_rules() = make_service_rule("r1");
-        (void)yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, p.SerializeAsString());
-
-        // If the guard works we never get here - the worker aborts the whole process. Give it
-        // a bounded window, then report "no abort" with a distinct code.
+        // If the guard works we never get here - the process aborts. Give it a bounded window,
+        // then report "no abort" with a distinct code.
         std::this_thread::sleep_for(std::chrono::seconds(5));
         ::_exit(94);
     }
@@ -1802,10 +1898,16 @@ TEST_CASE("a production-order restart into each degraded spark posture: cached r
 
 TEST_CASE("prefer_spark=true: pending records are durable BEFORE stop() joins the drain worker",
           "[spark][guardian][reconcile][journal][chaos]") {
-    // stop() joins the drain worker, and that join is a blocking wait on a send that may be
-    // blackholed. A persist placed only AFTER the join never runs if a supervisor's stop
-    // timeout or an operator kill lands in that window, and the staged records are destroyed -
-    // real loss of an audit record, not the at-least-once redelivery the design guarantees.
+    // stop() joins the drain worker. Before #2233 item 4, that join was an unbounded blocking
+    // wait on whatever thread the injected send happened to be running on; since item 4
+    // (guardian_outbox_send_executor.hpp) the worker's own wait on a stalled send is bounded to
+    // kGuardianSendOfferWait, so the join this test parks against is now bounded too - but a
+    // bound is not zero, and a persist placed only AFTER the join still never runs if a
+    // supervisor's stop timeout or an operator kill lands in that (now much shorter) window,
+    // destroying the staged records - real loss of an audit record, not the at-least-once
+    // redelivery the design guarantees. The property under test - persist-before-join, not
+    // persist-only-after - is unchanged by item 4; only how long "still blocked" stays
+    // observable changed (bounded ~200ms now, not indefinite).
     //
     // The observable has to be taken WHILE the join is still blocked; asserting after stop()
     // returns cannot tell the two orderings apart, because the post-join flush persists the

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "dispatch_confined_arms.hpp" // #3424/#3511: ConfinedDispatchOutcome -- DispatchFn/CommandDispatchFn return type
+
 /// @file tar_tree_routes.hpp
 /// The TAR process-tree viewer route module — Frame 3 of the `/tar` dashboard page.
 /// Picks ONE live host, dispatches two canned read-only `tar.sql` queries to it
@@ -78,7 +80,7 @@ public:
     /// caller-aware signature — deliberately NOT sharing `DexRoutes::DispatchFn` with
     /// `DeviceRoutes` (the device-live-info panel), whose read-only, pre-existing
     /// system dispatch is a separate, non-blocking finding from the same review.
-    using DispatchFn = std::function<std::pair<std::string, int>(
+    using DispatchFn = std::function<yuzu::server::ConfinedDispatchOutcome(
         const std::string& plugin, const std::string& action,
         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
         const std::unordered_map<std::string, std::string>& parameters,

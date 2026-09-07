@@ -264,7 +264,8 @@ content_embed = custom_target(
 
 # Build-time embed of the curated CPE map (PR 3, ADR-0018). Lives under
 # content/cpe-map/ deliberately — embed_content.py above globs ONLY
-# content/{definitions,packs}/**/*.yaml, so this CSV is NOT swept into the
+# content/{definitions,packs}/**/*.yaml and content/plugin-docs/*.json, so
+# this CSV is NOT swept into the
 # Instruction-Engine bundle; it is embedded on its own as a std::string_view
 # (kCuratedCpeMap) that CpeIdentityResolver parses at construction.
 #
@@ -389,6 +390,7 @@ yuzu_server_core_lib = static_library(
     'src/cpe_identity_resolver.cpp',
     'src/nvd_client.cpp',
     'src/nvd_sync.cpp',
+    'src/ota_signature_sidecar.cpp',
     'src/update_registry.cpp',
     'src/response_store.cpp',
     'src/bundle_service.cpp',
@@ -403,7 +405,10 @@ yuzu_server_core_lib = static_library(
     'src/data_export.cpp',
     'src/instruction_store.cpp',
     'src/instruction_yaml.cpp',
+    'src/instruction_routes.cpp',
     'src/execution_tracker.cpp',
+    'src/execution_routes.cpp',
+    'src/leader_elector.cpp',
     'src/execution_event_bus.cpp',
     'src/fleet_topology_store.cpp',
     'src/heartbeat_ingestion.cpp',
@@ -442,6 +447,7 @@ yuzu_server_core_lib = static_library(
     'src/quarantine_reapply.cpp',
     'src/quarantine_containment_reconciler.cpp',
     'src/result_set_store.cpp',
+    'src/result_set_routes.cpp',
     'src/result_set_matcher.cpp',
     'src/policy_store.cpp',
     'src/policy_evaluator.cpp',
@@ -456,6 +462,7 @@ yuzu_server_core_lib = static_library(
     'src/dex_alert_router.cpp',
     'src/dex_blast_radius.cpp',
     'src/custom_properties_store.cpp',
+    'src/custom_properties_routes.cpp',
     'src/mcp_server.cpp',
     'src/mcp_input_schema.cpp',
     'src/mcp_orientation.cpp',
@@ -497,6 +504,10 @@ yuzu_server_core_lib = static_library(
     'src/dashboard_routes.cpp',
     'src/workflow_routes.cpp',
     'src/notification_routes.cpp',
+    'src/command_routes.cpp',
+    'src/page_routes.cpp',
+    'src/dashboard_api_routes.cpp',
+    'src/nvd_routes.cpp',
     'src/webhook_routes.cpp',
     'src/offload_routes.cpp',
     'src/discovery_routes.cpp',
@@ -558,6 +569,7 @@ yuzu_server_core_lib = static_library(
     # header-only; canary_main.cpp is the separate yuzu_pg_canary exe below.
     'src/pg/pg_pool.cpp',
     'src/pg/pg_migration_runner.cpp',
+    'src/pg/pg_retention_guard.cpp',
     # SecretCodec (ADR-0010, #1320 PR 4): app-side envelope encryption for
     # secret columns. Depends on the yuzu_key_provider leaf target above.
     'src/pg/secret_codec.cpp',

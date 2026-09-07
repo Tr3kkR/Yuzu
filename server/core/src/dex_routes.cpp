@@ -3203,7 +3203,9 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             return;
         }
         std::unordered_map<std::string, std::string> params{{"sql", kDexPerfSql}};
-        const auto [command_id, sent] = dispatch_fn_("tar", "sql", {id}, "", params);
+        const auto dispatch_outcome = dispatch_fn_("tar", "sql", {id}, "", params);
+        const auto& command_id = dispatch_outcome.command_id;
+        const auto sent = dispatch_outcome.sent;
         // Surface a dropped evidence row on this usage-class dispatch via
         // Sec-Audit-Failed; HTML surface still renders. Shared #1647 chokepoint so a
         // throwing audit_fn is caught here too (catch-arm parity), not just returns-false.
@@ -3329,7 +3331,9 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                  const std::string w = window_token(window_to_days(
                      req.has_param("window") ? req.get_param_value("window") : "7d"));
                  std::unordered_map<std::string, std::string> params{{"sql", dex_procperf_sql()}};
-                 const auto [command_id, sent] = dispatch_fn_("tar", "sql", {id}, "", params);
+                 const auto dispatch_outcome = dispatch_fn_("tar", "sql", {id}, "", params);
+                 const auto& command_id = dispatch_outcome.command_id;
+                 const auto sent = dispatch_outcome.sent;
                  // The procperf probe is usage-class (works-council-relevant); surface a
                  // dropped evidence row via Sec-Audit-Failed; HTML surface still renders.
                  // Shared #1647 chokepoint adds catch-arm parity for a throwing audit_fn.

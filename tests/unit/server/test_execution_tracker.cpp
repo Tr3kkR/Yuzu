@@ -6,6 +6,7 @@
  */
 
 #include "execution_tracker.hpp"
+#include "execution_event_bus.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "test_execution_tracker_pg_helper.hpp"
@@ -1995,6 +1996,8 @@ struct OutboxRow {
     std::string data;
     bool is_terminal{false};
     long long created_at{0};
+    unsigned long long w_xid{0};   // WS-2a-2 settle-horizon xid8
+    std::string origin_replica;    // WS-2a-2 skip-own stamp
 };
 
 // Reads event_outbox rows for one execution, oldest event_id first, over a
@@ -2005,7 +2008,8 @@ std::vector<OutboxRow> fetch_outbox(pg::PgPool& pool, const std::string& executi
     REQUIRE(lease);
     pg::PgResult r = pg::exec_params(
         lease.get(),
-        "SELECT event_id, execution_id, event_type, data, is_terminal, created_at "
+        "SELECT event_id, execution_id, event_type, data, is_terminal, created_at, "
+        "       w_xid::text, origin_replica "
         "FROM execution_tracker.event_outbox WHERE execution_id=$1 ORDER BY event_id",
         std::vector<std::string>{execution_id});
     REQUIRE(r.status() == PGRES_TUPLES_OK);
@@ -2018,9 +2022,58 @@ std::vector<OutboxRow> fetch_outbox(pg::PgPool& pool, const std::string& executi
         row.data = PQgetvalue(r.get(), i, 3);
         row.is_terminal = std::string(PQgetvalue(r.get(), i, 4)) == "t";
         row.created_at = std::strtoll(PQgetvalue(r.get(), i, 5), nullptr, 10);
+        row.w_xid = std::strtoull(PQgetvalue(r.get(), i, 6), nullptr, 10);
+        row.origin_replica = PQgetvalue(r.get(), i, 7);
         rows.push_back(std::move(row));
     }
     return rows;
+}
+
+// Simulates ANOTHER replica durably appending an event: a direct autocommit
+// INSERT with an explicit foreign origin_replica (so this replica's poll does
+// not skip it) and the w_xid column DEFAULT filling in the insert txn's xid.
+// Returns the durable event_id the poll must re-publish under.
+std::uint64_t insert_other_replica_event(pg::PgPool& pool, const std::string& execution_id,
+                                         const std::string& origin, const std::string& event_type,
+                                         const std::string& data, bool is_terminal = false) {
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    pg::PgResult r = pg::exec_params(
+        lease.get(),
+        "INSERT INTO execution_tracker.event_outbox "
+        "(execution_id, event_type, data, is_terminal, created_at, origin_replica) "
+        "VALUES ($1, $2, $3, $4, extract(epoch FROM now())::bigint, $5) RETURNING event_id",
+        std::vector<std::string>{execution_id, event_type, data, is_terminal ? "true" : "false",
+                                 origin});
+    REQUIRE(r.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(r.get()) == 1);
+    return static_cast<std::uint64_t>(std::strtoll(PQgetvalue(r.get(), 0, 0), nullptr, 10));
+}
+
+// Drives poll_event_outbox_once() until `channel` holds at least `expected`
+// events, or a bounded budget elapses; returns the total re-published.
+//
+// The poll's settle-horizon is the SERVER-GLOBAL all-committed xmin
+// (pg_snapshot_xmin) — so a CONCURRENT test's still-open transaction on the
+// shared test PostgreSQL pins that horizon BELOW a just-inserted outbox row and
+// the poll correctly withholds the row until that unrelated txn commits (the
+// head-of-line behaviour the design documents; in production the server owns its
+// PG and only its own short txns can pin it). A single poll is therefore racy
+// under parallel [pg] shards even though the delivery is guaranteed to arrive —
+// so the test polls until it drains. Budget generous (~15s) but the common path
+// resolves in one or two iterations; it is a safety cap, not the expected wait.
+int poll_until(ExecutionTracker& tracker, ExecutionEventBus& bus, const std::string& channel,
+               std::size_t expected) {
+    int total = 0;
+    for (int attempt = 0; attempt < 150; ++attempt) {
+        auto got = tracker.poll_event_outbox_once();
+        REQUIRE(got.has_value());
+        total += *got;
+        if (bus.snapshot(channel).size() >= expected)
+            return total;
+        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+    }
+    return total;
 }
 } // namespace
 
@@ -2069,6 +2122,178 @@ TEST_CASE("ExecutionTracker: WS-2a a completed execution durably appends "
     auto exec = tracker.get_execution(*id);
     REQUIRE(exec.has_value());
     CHECK(exec->status == "succeeded");
+}
+
+TEST_CASE("ExecutionTracker: WS-2a-2 the durable append stamps origin_replica + a "
+          "settle-horizon w_xid, and the live bus keeps the reconnect-safe "
+          "per-channel counter id (Option A — durable id is outbox-only)",
+          "[pg][execution_tracker][outbox]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+    ExecutionEventBus bus;
+    tracker.set_event_bus(&bus);
+
+    auto id = tracker.create_execution(make_execution());
+    REQUIRE(id.has_value());
+    REQUIRE(tracker.set_agents_targeted(*id, 1));
+
+    AgentExecStatus as;
+    as.agent_id = "agent-1";
+    as.status = "success";
+    as.completed_at = 1002;
+    tracker.update_agent_status(*id, as); // agent-transition + progress + completed
+
+    auto rows = fetch_outbox(tracker_bundle.pool(), *id);
+    REQUIRE(rows.size() == 3);
+
+    // Option A (self-adversarial K1): the LIVE bus id is the per-channel counter
+    // assigned in PUBLISH order under the channel mutex (1, 2, 3 here), NOT the
+    // durable outbox event_id — so buffer order == id order and a Last-Event-ID
+    // reconnect is never stranded by a commit-order inversion. The durable
+    // event_id lives in the outbox (rows below), for the poll cursor + slice-2
+    // durable replay.
+    auto published = bus.snapshot(*id);
+    REQUIRE(published.size() == 3);
+    CHECK(published[0].id == 1);
+    CHECK(published[1].id == 2);
+    CHECK(published[2].id == 3);
+    // The durable outbox ids are a large fleet-wide IDENTITY sequence, NOT the
+    // small per-channel counter — i.e. deliberately different from the bus ids.
+    CHECK(rows[0].event_id >= 1);
+    CHECK(rows[0].event_id < rows[1].event_id);
+    CHECK(rows[1].event_id < rows[2].event_id);
+
+    // skip-own: every append is stamped with this process's non-empty replica id,
+    // identical across all three rows (one process). A peer replica's poll
+    // excludes rows whose origin_replica != its own; this replica's poll skips
+    // its own rows because they equal its id.
+    REQUIRE_FALSE(rows[0].origin_replica.empty());
+    CHECK(rows[0].origin_replica == rows[1].origin_replica);
+    CHECK(rows[1].origin_replica == rows[2].origin_replica);
+
+    // w_xid — the settle-horizon the cross-replica poll cursors on — is populated
+    // by the column DEFAULT pg_current_xact_id() to the appending txn's xid, a
+    // non-zero xid8. The two refresh_counts rows share one txn's xid; the
+    // agent-transition row is a separate earlier txn, so its xid is <= theirs.
+    CHECK(rows[0].w_xid > 0);
+    CHECK(rows[1].w_xid > 0);
+    CHECK(rows[1].w_xid == rows[2].w_xid);           // progress + completed: one txn
+    CHECK(rows[0].w_xid <= rows[1].w_xid);           // transition committed first
+}
+
+TEST_CASE("ExecutionTracker: WS-2a-2 the poll re-publishes another replica's "
+          "durable events onto this replica's bus, once, with a reconnect-safe "
+          "local counter id (Option A)",
+          "[pg][execution_tracker][outbox]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+    ExecutionEventBus bus;
+    tracker.set_event_bus(&bus);
+
+    // The horizon was initialized at CONSTRUCTION (C1 fix), so this first poll is
+    // a real pass over an empty window — it delivers nothing because no foreign
+    // event has committed yet.
+    auto init = tracker.poll_event_outbox_once();
+    REQUIRE(init.has_value());
+    CHECK(*init == 0);
+
+    // Another replica appends a durable event (its own foreign origin id). e1 is
+    // its durable OUTBOX event_id — NOT the id it will carry on this bus.
+    auto e1 = insert_other_replica_event(tracker_bundle.pool(), "exec-x", "other-replica-aaaa",
+                                         "agent-transition", R"({"status":"running"})");
+
+    CHECK(poll_until(tracker, bus, "exec-x", 1) == 1);
+    auto snap = bus.snapshot("exec-x");
+    REQUIRE(snap.size() == 1);
+    CHECK(snap[0].id == 1); // re-published under a LOCAL per-channel counter id, not e1
+    CHECK(snap[0].event_type == "agent-transition");
+
+    // Poll again: the horizon advanced past e1 — no re-delivery (dedup by cursor).
+    auto again = tracker.poll_event_outbox_once();
+    REQUIRE(again.has_value());
+    CHECK(*again == 0);
+    CHECK(bus.snapshot("exec-x").size() == 1);
+
+    // A NEW foreign event after the cursor advanced is still delivered.
+    auto e2 = insert_other_replica_event(tracker_bundle.pool(), "exec-x", "other-replica-bbbb",
+                                         "execution-completed", R"({"status":"succeeded"})",
+                                         /*is_terminal=*/true);
+    CHECK(poll_until(tracker, bus, "exec-x", 2) == 1);
+    auto snap2 = bus.snapshot("exec-x");
+    REQUIRE(snap2.size() == 2);
+    CHECK(snap2[1].id == 2);            // second local counter id, monotonic on the bus
+    CHECK(snap2[1].event_type == "execution-completed");
+    CHECK(e2 > e1);                     // the DURABLE outbox ids are globally monotonic
+}
+
+TEST_CASE("ExecutionTracker: WS-2a-2 the poll SKIPS this replica's own rows "
+          "(already published in-process) — no duplicate re-publish",
+          "[pg][execution_tracker][outbox]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+    ExecutionEventBus bus;
+    tracker.set_event_bus(&bus);
+
+    // Init the horizon BEFORE the own-append, so the own rows fall inside the
+    // poll window and are candidates the skip-own filter must exclude.
+    REQUIRE(tracker.poll_event_outbox_once().has_value());
+
+    auto id = tracker.create_execution(make_execution());
+    REQUIRE(id.has_value());
+    REQUIRE(tracker.set_agents_targeted(*id, 1));
+    AgentExecStatus as;
+    as.agent_id = "agent-1";
+    as.status = "success";
+    as.completed_at = 1002;
+    tracker.update_agent_status(*id, as); // in-process publish of 3 own events
+
+    auto before = bus.snapshot(*id);
+    REQUIRE(before.size() == 3);
+
+    // A FOREIGN event appended AFTER the own rows, on a different channel. When
+    // the poll delivers it, every earlier row (the own rows) is also below the
+    // settle-horizon — so they were candidates the skip-own filter had to reject.
+    // This is what makes the "== 3" assertion below meaningful rather than
+    // vacuously true under a transiently-pinned xmin (see poll_until).
+    auto foreign = insert_other_replica_event(tracker_bundle.pool(), "witness-chan",
+                                              "other-replica-cccc", "agent-transition",
+                                              R"({"status":"running"})");
+    CHECK(poll_until(tracker, bus, "witness-chan", 1) == 1); // only the foreign row, never the 3 own
+    auto wsnap = bus.snapshot("witness-chan");
+    REQUIRE(wsnap.size() == 1);
+    CHECK(wsnap[0].id == 1); // local counter id on this bus (foreign's durable id is outbox-only)
+    CHECK(wsnap[0].event_type == "agent-transition");
+    CHECK(bus.snapshot(*id).size() == 3); // own channel unchanged — skip-own held
+    (void)foreign;
+}
+
+TEST_CASE("ExecutionTracker: WS-2a-2 the poll surfaces a query failure as `unexpected` "
+          "(distinguishable degrade, cursor not advanced) rather than a silent no-op",
+          "[pg][execution_tracker][outbox]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+    ExecutionEventBus bus;
+    tracker.set_event_bus(&bus);
+
+    // Establish the horizon on the healthy store first (so the degraded pass
+    // exercises the main query path, not the init path).
+    REQUIRE(tracker.poll_event_outbox_once().has_value());
+
+    // Break the poll's SELECT deterministically by dropping the table it reads —
+    // the same fault-injection the atomicity test uses. A degrade MUST return
+    // `unexpected` (so the maint thread counts yuzu_exec_outbox_store_degrade_total
+    // and, critically, does NOT advance poll_horizon_ — the window is re-read next
+    // tick), never a silent `0` that reads as "nothing to deliver".
+    {
+        auto lease = tracker_bundle.pool().acquire();
+        REQUIRE(lease);
+        auto drop = pg::exec_params(lease.get(), "DROP TABLE execution_tracker.event_outbox",
+                                    std::vector<std::string>{});
+        REQUIRE(drop.status() == PGRES_COMMAND_OK);
+    }
+
+    auto degraded = tracker.poll_event_outbox_once();
+    CHECK_FALSE(degraded.has_value()); // query failure surfaced as a degrade, not swallowed
 }
 
 TEST_CASE("ExecutionTracker: WS-2a the state write and its event append are "

@@ -756,15 +756,17 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
             note(res, "Live device query unavailable on this server.");
             return;
         }
-        const auto [command_id, sent] =
+        const auto dispatch_outcome =
             dispatch_fn_(lk->plugin, lk->action, {id}, "", {});
+        const auto& command_id = dispatch_outcome.command_id;
+        const auto sent = dispatch_outcome.sent;
         // Optional SECONDARY dispatch joined at render (process_tree -> connections).
         // Dispatched to the SAME device; the result route polls it best-effort.
         std::string command_id2;
         if (!lk->plugin2.empty() && sent > 0) {
-            const auto [cid2, sent2] = dispatch_fn_(lk->plugin2, lk->action2, {id}, "", {});
-            if (sent2 > 0)
-                command_id2 = cid2;
+            const auto outcome2 = dispatch_fn_(lk->plugin2, lk->action2, {id}, "", {});
+            if (outcome2.sent > 0)
+                command_id2 = outcome2.command_id;
         }
         // Audit the DISPATCH (post-dispatch "dispatched"/"no_agents"). HIGH-1 (review
         // #1585): AuditFn is bool-returning — surface Sec-Audit-Failed so an audit-store

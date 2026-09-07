@@ -1,5 +1,7 @@
 #pragma once
 
+#include "dispatch_confined_arms.hpp" // #3424/#3511: ConfinedDispatchOutcome -- DispatchFn/CommandDispatchFn return type
+
 /// @file dex_routes.hpp
 /// DEX (Digital Employee Experience) dashboard — the RELIABILITY lens over the
 /// 110-signal catalogue (crashes, hangs, service failures, device stability,
@@ -369,7 +371,7 @@ public:
     /// A4: dispatch a plugin command to specific agents (same 5-param shape as
     /// DashboardRoutes' DispatchFn). Used ONLY for the canned `tar.sql` device
     /// perf query. May be empty → the perf panel renders "unavailable".
-    using DispatchFn = std::function<std::pair<std::string, int>(
+    using DispatchFn = std::function<yuzu::server::ConfinedDispatchOutcome(
         const std::string& plugin, const std::string& action,
         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
         const std::unordered_map<std::string, std::string>& parameters)>;

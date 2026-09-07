@@ -153,9 +153,9 @@ struct ExecHarness {
             [this](const std::string& plugin, const std::string& action,
                    const std::vector<std::string>& ids, const std::string& scope,
                    const std::unordered_map<std::string, std::string>&,
-                   const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+                   const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
             calls.push_back({plugin, action, scope, ids});
-            return {"cmd-" + std::to_string(calls.size()), 1};
+            return {.sent = 1, .command_id = "cmd-" + std::to_string(calls.size())};
         };
 
         routes.register_routes(sink, auth_fn, perm_fn, audit_fn,

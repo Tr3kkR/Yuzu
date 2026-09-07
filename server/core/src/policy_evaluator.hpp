@@ -1,5 +1,7 @@
 #pragma once
 
+#include "dispatch_confined_arms.hpp" // #3424/#3511: ConfinedDispatchOutcome -- DispatchFn/CommandDispatchFn return type
+
 /// @file policy_evaluator.hpp
 /// Drives the compliance CHECK -> VERDICT pipeline that was previously dead.
 ///
@@ -82,7 +84,7 @@ public:
     /// Same shape as WorkflowRoutes::CommandDispatchFn — the server hands the
     /// evaluator the one shared dispatch lambda so checks travel the exact same
     /// path as operator-initiated commands.
-    using CommandDispatchFn = std::function<std::pair<std::string, int>(
+    using CommandDispatchFn = std::function<yuzu::server::ConfinedDispatchOutcome(
         const std::string& plugin, const std::string& action,
         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
         const std::unordered_map<std::string, std::string>& parameters,

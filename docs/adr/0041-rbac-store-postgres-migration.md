@@ -245,3 +245,98 @@ chokepoint, `generation_view_stale_locked()`). One disambiguation this addendum 
 unrelated stampede-prevention/metrics-only interval governing how often a refresh may even be
 attempted). Never shipped to dev/main; no SOC 2 assessment period or deployed fleet carried the
 gap.
+
+## Update (2026-09-03) — `migrate_from_sqlite()` retired
+
+ADR-0009's fresh-start-by-default amendment (2026-08-25) establishes that no production Yuzu
+fleet has ever run a pre-Postgres build of any store — the mandatory, `rbac_enabled`-flag-first,
+read-back-verified backfill this ADR designed (RBAC's own catastrophic-fail-open-if-lost flag
+transfer, above) was real, working code that never had real legacy data to protect.
+
+`RbacStore::migrate_from_sqlite()` and its private helpers (`legacy_has_table`, `sqlite_text`,
+`bool_lit`, `sha256_hex`, `kSourcelessFingerprint`, `append_field`, `LType`/`LRole`/`LPerm`/
+`LPrincipal`/`LGroup`/`LMember`, `LegacySnapshot`, `read_legacy_snapshot`,
+`canonicalize_legacy_snapshot`, `fingerprint_legacy_snapshot`, `legacy_rbac_fingerprint`) are
+removed (`chore/retire-migrate-from-sqlite-batch-a`, tracking issue #3623). `rbac_meta` — the
+durable k/v table that also holds the live `rbac_enabled` flag and `write_generation` counter —
+is NOT dropped, and (unlike the other 5 stores in this retirement, all of which DROP their
+whole marker table) its two backfill-only rows (`backfill_complete`,
+`backfill_source_fingerprint`) are NOT deleted either — they are POISONED in place, via a
+version-bumped v4 migration appended after the already-shipped v1-v3 rather than edited in
+place: this store IS constructed in production, so v1-v3 have actually run against real
+dev/UAT databases. `kRevokeCoordLockSql` (the seed/revoke advisory-lock coordination) stays —
+`seed_defaults()` and `remove_permission()` both still use it; only its former third writer
+(the backfill's F1 revoke block) is gone.
+
+**Poison, not delete — a real defect caught by governance unhappy-path (2026-09-03) in the
+first version of this migration, `{4, "DELETE FROM rbac_meta WHERE key IN (...)"}`.** The
+retired `migrate_from_sqlite()`'s own idempotency check (`marker_present`, now-deleted code,
+recoverable via `git show e2f745606:server/core/src/rbac_store.cpp`) treats marker ABSENCE as
+"never migrated" and, in that case, falls through past its own fingerprint-verification safety
+net straight to step 4 — an unconditional `INSERT ... ON CONFLICT (key) DO UPDATE SET value =
+EXCLUDED.value` on `rbac_enabled`, sourced from whatever a local legacy `rbac.db` file's
+`rbac_config.enabled` column holds. Deleting the marker rows made a pre-#3623 binary rolling
+back see exactly that "never migrated" state on ANY replica whose own local legacy file was
+never migrated-and-moved-aside on ITS OWN disk (a real scenario on a multi-replica deployment:
+one replica already fully migrated and renamed its legacy file, another rolled back or freshly
+joined the fleet still has its own untouched copy) — silently overwriting the live fleet-wide
+RBAC-enabled flag from stale rollback data, with no error and no operator-visible signal. The
+other 5 stores don't share this failure mode: their marker is a whole TABLE, and a `DROP TABLE`
+makes an old binary's marker `SELECT` fail outright (`42P01 undefined_table`, verified: all 5
+of `CaStore`/`ManagementGroupStore`/`QuarantineStore`/`InventoryStore`/`WebhookStore`'s retired
+marker-lookup code checks `status() != PGRES_TUPLES_OK` and refuses to boot on it) rather than
+silently reading as "0 rows, proceed as never-migrated" — the loud-outage-not-silent-corruption
+risk class user decision #4 (see the session record) actually intended to accept fleet-wide.
+RbacStore's DELETE-based approach reproduced a SILENT failure mode instead, on a false premise
+that it shared the other 5 stores' safety property.
+
+The fix poisons `backfill_source_fingerprint` to `'sourceless'` — the EXACT literal the retired
+code's own `kSourcelessFingerprint` constant held — so an old binary rolling back sees
+`marker_present=true` and takes ITS OWN existing fail-closed branches instead: no local legacy
+file present → returns immediately, silent, safe (the ordinary case, matching every other
+store); a local legacy file WITH real content present → refuses to auto-migrate ("no legacy
+rbac.db has been migrated for this fleet yet... refusing"), the same loud outage already
+accepted for the other 5 stores, never the silent overwrite. `backfill_complete` only needs to
+exist (the retired code checked its presence, never its value). See `rbac_store.cpp`'s v4
+migration comment for the full trace. **Epistemic status: `likely`, not `verified`** — this was
+traced against the retired code's actual source (not run) via `git show`; no old binary was
+booted against a poisoned database as part of this fix. The fix is not unit-testable from
+inside this codebase (the code it defends against no longer exists here) — the shipped
+regression test (`test_rbac_store.cpp`) covers only that the migration produces the intended
+poisoned state, not the old binary's resulting behavior against it.
+
+**Deliberate side effect, assessed and accepted (governance Gate 6, compliance-officer,
+2026-09-04):** v4's `INSERT ... ON CONFLICT (key) DO UPDATE` unconditionally overwrites
+`backfill_source_fingerprint`, so on the rare database that reached this migration already
+holding a REAL (non-sourceless) fingerprint from a genuine completed backfill — only possible
+on a dev/UAT database per ADR-0009's "no production fleet" premise — that fingerprint's value
+is destroyed rather than preserved. This was considered and accepted, not overlooked: the
+fingerprint's only two consumers (the retired `migrate_from_sqlite()` idempotency check itself,
+and `docs/ops-runbooks/rbac-store-backfill-recovery.md`) are both deleted by this same PR, so
+nothing left in this codebase reads the value either way, and a real fingerprint is not a
+customer-facing evidence artifact — it never appeared in the SOC 2 evidence index. Preserving
+it conditionally (only overwrite when absent) was considered and rejected: it would leave two
+possible post-v4 states for the same migration step with no remaining reader to distinguish
+them, added complexity for a value nothing reads.
+
+**Fixed a real gap in the original per-store probe table list, caught by an external review
+pass before merge:** an early draft of `server.cpp`'s replacement `warn_if_legacy_rows` call
+listed only `roles`/`role_permissions`/`principal_roles`/`groups`/`group_members` — omitting
+`rbac_config`, the actual legacy SQLite table `migrate_from_sqlite()` read the `rbac_enabled`
+flag from (see `read_legacy_snapshot`'s `has_table("rbac_config")` branch above; the Postgres
+side always stored the flag as a `rbac_meta` row, a different name, which is presumably how the
+gap was introduced). Without `rbac_config` in the probe list, a real legacy file with
+`rbac_enabled=true` would never trigger a warning — silently defeating the one detect-and-warn
+signal this retirement depends on for the store this ADR itself calls "the load-bearing
+invariant." The shipped probe list includes `rbac_config`, `securable_types`, and `operations`
+(also read into `LegacySnapshot` by the retired backfill) alongside the five originally listed.
+
+`server.cpp`'s boot path now runs `legacy_sqlite_probe::warn_if_legacy_rows` over those eight
+legacy tables instead of the backfill — WARN-only (never refuse-boot) on a real legacy row
+found, the same posture as every other store in this retirement batch, despite RBAC's own
+"catastrophic fail-open" framing for a lost enabled flag: the WARN-only decision was reopened
+and explicitly reconsidered for this store specifically (not defaulted by uniformity with the
+others) before being confirmed, on the grounds that the underlying no-production-fleet fact this
+whole retirement rests on applies identically here, and a boot refusal on a false premise would
+itself be a fleet-wide authorization-substrate outage. An operator who sees the warning should
+check `rbac_enabled` after boot, not assume it carried over.

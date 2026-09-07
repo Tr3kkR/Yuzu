@@ -156,11 +156,11 @@ struct Harness {
                          const std::vector<std::string>&, const std::string& scope,
                          const std::unordered_map<std::string, std::string>& params,
                          const std::string& execution_id,
-                         const DispatchCaller& caller) -> std::pair<std::string, int> {
+                         const DispatchCaller& caller) -> yuzu::server::ConfinedDispatchOutcome {
                       if (throw_on_dispatch)
                           throw std::runtime_error("dispatch boom");
                       calls.push_back({plugin, action, scope, execution_id, caller, params});
-                      return {"cmd-" + std::to_string(calls.size()), reach};
+                      return {.sent = reach, .command_id = "cmd-" + std::to_string(calls.size())};
                   },
               // ADR-1007 (finding #3, reviewer): before this, NO test ever
               // wired dispatch_fn_concurrency — a reverted fix, a swapped
@@ -177,13 +177,15 @@ struct Harness {
                                    const std::unordered_map<std::string, std::string>&,
                                    const std::string& execution_id, const DispatchCaller&,
                                    const std::string& definition_id,
-                                   const std::string& concurrency_mode) -> std::pair<std::string, int> {
+                                   const std::string& concurrency_mode)
+                                -> yuzu::server::ConfinedDispatchOutcome {
                                 if (throw_on_dispatch)
                                     throw std::runtime_error("dispatch boom");
                                 concurrency_calls.push_back({plugin, action, scope, execution_id,
                                                              definition_id, concurrency_mode});
-                                return {"cmd-concurrency-" + std::to_string(concurrency_calls.size()),
-                                       reach};
+                                return {.sent = reach,
+                                       .command_id = "cmd-concurrency-" +
+                                                     std::to_string(concurrency_calls.size())};
                             }}
                       : ScheduleRunner::ConcurrencyDispatchFn{},
               // #3133 review fix: resolve_caller re-resolves a real,
@@ -895,9 +897,9 @@ TEST_CASE("ScheduleRunner: an unset should_stop fires every due schedule, "
                 const std::vector<std::string>&, const std::string& scope,
                 const std::unordered_map<std::string, std::string>& params,
                 const std::string& execution_id,
-                const DispatchCaller& caller) -> std::pair<std::string, int> {
+                const DispatchCaller& caller) -> yuzu::server::ConfinedDispatchOutcome {
             calls.push_back({plugin, action, scope, execution_id, caller, params});
-            return {"cmd-" + std::to_string(calls.size()), 1};
+            return {.sent = 1, .command_id = "cmd-" + std::to_string(calls.size())};
         },
         .resolve_caller =
             [](const std::string& username) {

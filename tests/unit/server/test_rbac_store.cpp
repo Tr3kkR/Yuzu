@@ -5,11 +5,11 @@
  * assignments, group membership, check_permission, deny-overrides-allow,
  * RBAC toggle, check_scoped_permission.
  *
- * No legacy-SQLite backfill test coverage: the dedicated [backfill] TEST_CASE
- * suite (2026-08-25) was removed as part of a fresh-start-by-default policy
- * change (ADR-0009 amendment) — no production fleet has ever run a
- * pre-Postgres build. RbacStore::migrate_from_sqlite() itself is UNCHANGED
- * and still present — its removal is a separate, later step.
+ * No legacy-SQLite backfill test coverage: `RbacStore::migrate_from_sqlite()` itself was
+ * retired (chore/retire-migrate-from-sqlite-batch-a, #3623, ADR-0041 Update, 2026-09-03) -- no
+ * production fleet has ever run a pre-Postgres build, so the mandatory backfill never had real
+ * legacy data to protect. `server.cpp` now runs `legacy_sqlite_probe::warn_if_legacy_rows` over
+ * the legacy tables (incl. `rbac_config`, the one that held the enabled flag) instead.
  */
 
 #include "management_group_store.hpp"
@@ -97,6 +97,48 @@ void seed_group_raw(PgPool& pool, const std::string& name, const std::string& de
     RbacStore store_var{rbac_pool_fx_};                                                             \
     REQUIRE(store_var.is_open())
 
+TEST_CASE("RbacStore migration lands at v4 and poisons (not deletes) the backfill marker rows "
+          "(#3623, governance unhappy-path fix)",
+          "[rbac_store][pg][migration]") {
+    // v4 does NOT delete backfill_complete/backfill_source_fingerprint -- an earlier revision
+    // did, which let a pre-#3623 binary rolling back treat marker ABSENCE as "never migrated"
+    // and fall through to an unconditional overwrite of the live rbac_enabled flag from a local
+    // legacy rbac.db file, skipping that old binary's own fingerprint-verification safety net
+    // entirely (governance unhappy-path, 2026-09-03). The fix poisons backfill_source_fingerprint
+    // to the exact "sourceless" sentinel the retired code's own marker_present branch checks for,
+    // so an old binary rolling back sees the marker as present and takes its existing fail-closed
+    // path instead (refuses to auto-migrate when a real legacy file exists; silent no-op when it
+    // doesn't) -- the same loud-outage-not-silent-corruption risk class already accepted for the
+    // other 5 retired stores' DROP TABLE approach, see this migration's own comment in
+    // rbac_store.cpp for the full trace.
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    RbacStore store{pool};
+    REQUIRE(store.is_open());
+
+    pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    pg::PgResult ver{PQexec(conn.get(), "SELECT version FROM public.schema_meta WHERE store = "
+                                        "'rbac_store'")};
+    REQUIRE(ver.ok());
+    REQUIRE(PQntuples(ver.get()) == 1);
+    CHECK(std::string(PQgetvalue(ver.get(), 0, 0)) == "4");
+
+    // rbac_meta stays (it still holds rbac_enabled/write_generation) — the two one-time
+    // backfill marker rows are PRESENT (poisoned), not gone.
+    pg::PgResult rows{PQexec(conn.get(),
+                             "SELECT key, value FROM rbac_store.rbac_meta WHERE key IN "
+                             "('backfill_complete', 'backfill_source_fingerprint') ORDER BY key")};
+    REQUIRE(rows.ok());
+    REQUIRE(PQntuples(rows.get()) == 2);
+    CHECK(std::string(PQgetvalue(rows.get(), 0, 0)) == "backfill_complete");
+    CHECK_FALSE(std::string(PQgetvalue(rows.get(), 0, 1)).empty()); // presence-only, value unread
+    CHECK(std::string(PQgetvalue(rows.get(), 1, 0)) == "backfill_source_fingerprint");
+    // Must match the retired code's kSourcelessFingerprint literal EXACTLY -- this is the
+    // string an old binary's marker_present branch compares against.
+    CHECK(std::string(PQgetvalue(rows.get(), 1, 1)) == "sourceless");
+}
+
 // ── Lifecycle ────────────────────────────────────────────────────────────────
 
 TEST_CASE("RbacStore: open in-memory", "[rbac_store][db][pg]") {
@@ -129,7 +171,7 @@ TEST_CASE("RbacStore: seed data — securable types", "[rbac_store][pg]") {
     // +SoftwareLicensing (ADR-0024) +AccessReview (SOC 2 CC6.2) +EnginePrincipal
     // (#2376, cut away from Security:Read) +PluginConfig +PluginSecret
     // +UploadGrant (PR1.9a, peer finding PLAN-001) = 26.
-    REQUIRE(types.size() == 26);
+    REQUIRE(types.size() == 27);
 
     auto has = [&](const std::string& t) {
         return std::find(types.begin(), types.end(), t) != types.end();
@@ -189,16 +231,17 @@ TEST_CASE("RbacStore: seeded catalogues match the MCP C8 validator mirrors",
 TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_store][pg]") {
     RBAC_STORE(store);
     auto perms = store.get_role_permissions("Administrator");
-    // 26 types * 5 CRUD ops = 130 permissions, plus a single targeted Push
-    // grant on GuaranteedState (= 131), plus a single AccessReview:Attest grant
-    // (Periodic Access Reviews, CC6.2, = 132), plus a single ApiToken:Rotate
-    // grant (P2 #11, SOC 2 CC6.3) = 133 permissions total. Push, Attest, and
+    // 27 types * 5 CRUD ops = 135 permissions, plus a single targeted Push
+    // grant on GuaranteedState (= 136), plus a single AccessReview:Attest grant
+    // (Periodic Access Reviews, CC6.2, = 137), plus a single ApiToken:Rotate
+    // grant (P2 #11, SOC 2 CC6.3) = 138 permissions total. Push, Attest, and
     // Rotate are deliberately NOT cross-seeded on other securables — see the
-    // rationale in rbac_store.cpp seed_defaults(). (26th-24th: UploadGrant/
+    // rationale in rbac_store.cpp seed_defaults(). (27th: PowerManagement, Wave 6
+    // power_health set_power_plan; 26th-24th: UploadGrant/
     // PluginSecret/PluginConfig, PR1.9a peer finding PLAN-001; 23rd:
     // EnginePrincipal, #2376; 22nd: AccessReview, SOC 2 CC6.2; 21st:
     // SoftwareLicensing, ADR-0024.)
-    CHECK(perms.size() == 133);
+    CHECK(perms.size() == 138);
     for (auto& p : perms)
         CHECK(p.effect == "allow");
 

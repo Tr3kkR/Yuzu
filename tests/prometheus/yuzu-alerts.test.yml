@@ -2256,6 +2256,58 @@ tests:
           - labels: '{route="command", reason="agent_ids_empty"}'
             value: 15
 
+  # ── YuzuDispatchTargetRejected: the reason="unknown_plugin" exclusion
+  # (#3424/#3511) ────────────────────────────────────────────────────────────
+  #
+  # #3511's plugin-presence filter routes the same counter family's
+  # reason="unknown_plugin" through this rule too. Withholding a dispatch to a
+  # plugin absent from every target's inventory is a caller mistake (typo,
+  # stale automation), not a fleet outage — same rationale CASE 61 established
+  # for reason="quarantined". Without the exclusion, one misconfigured
+  # automation looping against an uninstalled plugin clears 3 in 15m on its
+  # own and pages a warning for a working control.
+  #
+  # Mutate the rule -- drop `unknown_plugin` from the exclusion regex -- and
+  # CASE 61b goes red, same evidentiary shape as CASE 61.
+
+  # CASE 61b -- a misconfigured automation retries against an absent plugin:
+  # 40 withheld dispatches in one run, silent.
+  - interval: 1m
+    name: dispatch target rejected - unknown-plugin denials never fire the targeting alert
+    input_series:
+      - series: 'yuzu_server_dispatch_target_rejected_total{job="yuzu",instance="s1",route="command",reason="unknown_plugin"}'
+        values: "0 0 0 40x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDispatchTargetRejected"}'
+        eval_time: 10m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuDispatchTargetRejected"}'
+        eval_time: 25m
+        exp_samples: []
+
+  # CASE 62b -- a real targeting mistake still fires alongside BOTH excluded
+  # reasons on the same route, so neither exclusion widened into a silencer.
+  - interval: 1m
+    name: dispatch target rejected - a real targeting mistake still fires alongside both exclusions
+    input_series:
+      - series: 'yuzu_server_dispatch_target_rejected_total{job="yuzu",instance="s1",route="command",reason="agent_ids_empty"}'
+        values: "0 0 0 0+1x30"
+      - series: 'yuzu_server_dispatch_target_rejected_total{job="yuzu",instance="s1",route="command",reason="quarantined"}'
+        values: "0 0 0 40x30"
+      - series: 'yuzu_server_dispatch_target_rejected_total{job="yuzu",instance="s1",route="command",reason="unknown_plugin"}'
+        values: "0 0 0 40x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDispatchTargetRejected", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDispatchTargetRejected", alertstate="firing", route="command", reason="agent_ids_empty", severity="warning"}'
+            value: 1
+      - expr: 'sum by (route, reason) (increase(yuzu_server_dispatch_target_rejected_total{reason!~"quarantined|unknown_plugin"}[15m]))'
+        eval_time: 20m
+        exp_samples:
+          - labels: '{route="command", reason="agent_ids_empty"}'
+            value: 15
+
   # ── YuzuQuarantineGateFailClosed (#881) ───────────────────────────────────
   #
   # `increase(yuzu_server_quarantine_gate_total{outcome="fail_closed"}[5m]) > 0`,

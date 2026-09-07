@@ -4,14 +4,12 @@
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
-#include "sqlite_raii.hpp"
 #include "typed_inventory_sources.hpp"
 
 #include <yuzu/metrics.hpp>
 
 #include <libpq-fe.h>
 #include <spdlog/spdlog.h>
-#include <sqlite3.h>
 
 #include <algorithm>
 #include <atomic>
@@ -20,7 +18,6 @@
 #include <cctype>
 #include <cstdint>
 #include <string_view>
-#include <system_error>
 #include <utility>
 
 namespace yuzu::server {
@@ -41,10 +38,6 @@ constexpr int kQueryRowCap = 100000;
 // Bound bytes returned by libpq as well as row count. Generic plugin blobs can
 // be multi-MiB; a row-only cap still permits a single query to OOM the server.
 constexpr std::int64_t kQueryByteCap = 8 * 1024 * 1024;
-// A single legacy row must also be bounded before it is copied into process
-// memory. Values above the read budget cannot be returned by query() as a
-// complete record and are filed as malformed during the one-time backfill.
-constexpr int kLegacyBlobByteCap = 8 * 1024 * 1024;
 
 // Read-degrade reason labels (mirror SoftwareInventoryStore / DeviceInventoryStore
 // / the alert taxonomy). Shared counter, distinguished by the "source" label.
@@ -74,12 +67,11 @@ const std::vector<pg::PgMigration>& migrations() {
             "CREATE INDEX inventory_data_plugin_idx ON inventory_data (plugin);"
             "CREATE INDEX inventory_data_collected_idx ON inventory_data (collected_at);"},
         {2,
-         // Backfill stamp (ADR-0009/0037): a single-row sentinel so
-         // migrate_from_sqlite() is a cheap no-op on every boot after the
-         // first. `legacy_rows` records rows ACTUALLY inserted (not the size
-         // of the in-memory legacy row list — see migrate_from_sqlite).
-         // Keep this published v2 shape immutable. Later reconciliation terms
-         // are append-only migrations below.
+         // Backfill stamp (ADR-0009/0037) — retired, #3623 (v5 below drops the
+         // table; its sole writer, migrate_from_sqlite, is gone). Kept
+         // unmodified for the historical migration ladder: v2's published
+         // shape stays immutable, later reconciliation terms are append-only
+         // migrations, same rule that applied while this was live.
          "CREATE TABLE backfill_state ("
          "  id           INT PRIMARY KEY,"
          "  migrated_at  BIGINT NOT NULL,"
@@ -91,6 +83,11 @@ const std::vector<pg::PgMigration>& migrations() {
             "ADD COLUMN skipped_typed BIGINT NOT NULL DEFAULT 0;"},
         {4, "ALTER TABLE backfill_state "
             "ADD COLUMN IF NOT EXISTS skipped_bad BIGINT NOT NULL DEFAULT 0;"},
+        // migrate_from_sqlite() retired (#3623, ADR-0037 Update) — backfill_state was its
+        // sole idempotency marker. Appended at the next free slot, never renumbering v1-v4
+        // (PgMigrationRunner applies only version > current — renumbering an already-shipped
+        // version re-applies it against a database that already ran it).
+        {5, "DROP TABLE IF EXISTS backfill_state;"},
     };
     return kMigrations;
 }
@@ -102,9 +99,9 @@ std::int64_t now_secs() {
 }
 
 // True when `s` is empty or contains only whitespace — the GDPR orphan guard
-// (UP-7): a blank agent_id/plugin must never be written (upsert) or backfilled
-// (migrate_from_sqlite), because the decommission cascade's empty-id
-// short-circuit could never reach it, leaving an un-erasable row.
+// (UP-7): a blank agent_id/plugin must never be written (upsert), because the
+// decommission cascade's empty-id short-circuit could never reach it, leaving
+// an un-erasable row.
 bool is_blank(std::string_view s) {
     return std::all_of(s.begin(), s.end(), [](unsigned char c) { return std::isspace(c) != 0; });
 }
@@ -183,279 +180,6 @@ InventoryStore::InventoryStore(pg::PgPool& pool) : pool_(pool) {
         return;
     }
     open_ = true;
-}
-
-// ── Backfill (ADR-0009/0037) ─────────────────────────────────────────────────
-
-bool InventoryStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path) {
-    legacy_db_path_ = legacy_db_path;
-    if (!open_)
-        return false;
-
-    // Idempotency check on a short-lived lease, released BEFORE any legacy
-    // SQLite I/O or the write transaction below — holding two connections
-    // from this call at once would deadlock a size-1 pool (e.g. a test pool).
-    {
-        auto lease = pool_.acquire();
-        if (!lease) {
-            spdlog::error("InventoryStore: migrate_from_sqlite: no database connection ({})",
-                          pool_.last_error());
-            return false;
-        }
-        pg::PgResult stamp_check = pg::exec_params(
-            lease.get(), "SELECT 1 FROM inventory_store.backfill_state WHERE id = 1",
-            std::vector<std::string>{});
-        if (stamp_check.status() != PGRES_TUPLES_OK) {
-            spdlog::error("InventoryStore: migrate_from_sqlite: backfill_state lookup failed: {}",
-                          PQerrorMessage(lease.get()));
-            return false;
-        }
-        if (PQntuples(stamp_check.get()) > 0) {
-            spdlog::debug("InventoryStore: migrate_from_sqlite already completed, skipping");
-            return true;
-        }
-    }
-
-    std::error_code ec;
-    const bool legacy_exists = std::filesystem::exists(legacy_db_path, ec);
-    if (ec) {
-        spdlog::error("InventoryStore: migrate_from_sqlite: cannot stat legacy path {}: {}",
-                      legacy_db_path.string(), ec.message());
-        return false;
-    }
-
-    struct LegacyRow {
-        std::string agent_id;
-        std::string plugin;
-        std::string data_json;
-        std::int64_t collected_at{0};
-    };
-    SqliteDb legacy;
-    SqliteStmt legacy_stmt;
-
-    if (legacy_exists) {
-        // Keep one SQLite row live at a time while the PostgreSQL transaction
-        // consumes it. This bounds upgrade memory independently of total
-        // legacy blob volume. Both owners remain alive until the transaction
-        // finishes; `legacy_stmt` finalizes before `legacy` closes.
-        const int rc = sqlite3_open_v2(legacy_db_path.string().c_str(), legacy.addr(),
-                                       SQLITE_OPEN_READONLY, nullptr);
-        if (rc != SQLITE_OK) {
-            spdlog::error("InventoryStore: migrate_from_sqlite: failed to open legacy db {}: {}",
-                          legacy_db_path.string(),
-                          legacy ? sqlite3_errmsg(legacy.get()) : "open failed");
-            return false;
-        }
-        const char* sql = "SELECT agent_id, plugin, data_json, collected_at FROM inventory_data";
-        if (sqlite3_prepare_v2(legacy.get(), sql, -1, legacy_stmt.addr(), nullptr) != SQLITE_OK) {
-            spdlog::error("InventoryStore: migrate_from_sqlite: legacy prepare failed: {}",
-                          sqlite3_errmsg(legacy.get()));
-            return false;
-        }
-    }
-
-    // One transaction: insert every legacy row, then stamp completion,
-    // atomically. Each row's INSERT runs under its own SAVEPOINT (IB2, UP-1):
-    // a single BAD ROW (encoding/constraint violation) rolls back to the
-    // savepoint and is SKIPPED — it does NOT abort the whole backfill/boot,
-    // because this store is fail-soft/self-healing (the agent re-pushes) and
-    // a permanently bricked server over one malformed legacy blob would be
-    // strictly worse than a skipped row. A `ROLLBACK TO SAVEPOINT` that
-    // itself fails to execute means the connection/transaction is broken at
-    // the INFRASTRUCTURE level (not a per-row problem) — THAT aborts the
-    // whole backfill (fail-closed). Rows stream from SQLite, so peak memory is
-    // bounded to one legacy blob plus the statement results.
-    std::int64_t inserted = 0;
-    std::int64_t source_rows = 0;
-    std::int64_t conflicts = 0;
-    std::int64_t skipped_bad = 0;
-    std::int64_t skipped_blank_key = 0;
-    std::int64_t skipped_typed = 0;
-    const bool ok = pool_.with_txn([&](PGconn* c) -> bool {
-        int legacy_rc = SQLITE_DONE;
-        while (legacy_exists && (legacy_rc = sqlite3_step(legacy_stmt.get())) == SQLITE_ROW) {
-            const auto col_text = [&](int i) {
-                const auto* value = sqlite3_column_text(legacy_stmt.get(), i);
-                return value ? std::string(reinterpret_cast<const char*>(value)) : std::string{};
-            };
-            LegacyRow r{.agent_id = col_text(0),
-                        .plugin = col_text(1),
-                        .collected_at = sqlite3_column_int64(legacy_stmt.get(), 3)};
-            ++source_rows;
-            // GDPR orphan guard (IS5/UP-7): never backfill a row the
-            // decommission cascade's empty-id short-circuit could never
-            // reach.
-            if (is_blank(r.agent_id) || is_blank(r.plugin)) {
-                ++skipped_blank_key;
-                spdlog::warn("InventoryStore: migrate_from_sqlite: skipping legacy row with a "
-                             "blank agent_id/plugin");
-                continue;
-            }
-            // Typed projections have their own securables. Copying their
-            // legacy blobs into this Infrastructure:Read store would expose
-            // them through a weaker permission after upgrade.
-            if (is_typed_inventory_source(r.plugin)) {
-                ++skipped_typed;
-                spdlog::info("InventoryStore: migrate_from_sqlite: skipping typed legacy source "
-                             "agent_id={} plugin={}",
-                             r.agent_id, r.plugin);
-                continue;
-            }
-            // Read the SQLite-owned pointer/length before constructing the
-            // std::string. This prevents one pathological legacy blob from
-            // allocating up to SQLite's global length limit during boot.
-            const int data_bytes = sqlite3_column_bytes(legacy_stmt.get(), 2);
-            if (data_bytes < 0 || data_bytes > kLegacyBlobByteCap) {
-                ++skipped_bad;
-                spdlog::warn("InventoryStore: migrate_from_sqlite: skipping oversized legacy "
-                             "blob agent_id={} plugin={} ({} bytes, cap={})",
-                             r.agent_id, r.plugin, data_bytes, kLegacyBlobByteCap);
-                continue;
-            }
-            const auto* data = sqlite3_column_text(legacy_stmt.get(), 2);
-            if (!data && sqlite3_column_type(legacy_stmt.get(), 2) != SQLITE_NULL) {
-                spdlog::error("InventoryStore: migrate_from_sqlite: legacy blob conversion "
-                              "failed for agent_id={} plugin={}: {}",
-                              r.agent_id, r.plugin, sqlite3_errmsg(legacy.get()));
-                return false;
-            }
-            r.data_json.assign(data ? reinterpret_cast<const char*>(data) : "",
-                               static_cast<std::size_t>(data_bytes));
-
-            pg::PgResult sp =
-                pg::exec_params(c, "SAVEPOINT legacy_row_backfill", std::vector<std::string>{});
-            if (sp.status() != PGRES_COMMAND_OK) {
-                spdlog::error("InventoryStore: migrate_from_sqlite: SAVEPOINT failed (infra "
-                              "error, aborting backfill): {}",
-                              PQerrorMessage(c));
-                return false; // infra-level failure: fail closed
-            }
-
-            pg::PgResult ins = pg::exec_params(
-                c,
-                "INSERT INTO inventory_store.inventory_data "
-                "(agent_id, plugin, data_json, collected_at) "
-                "VALUES ($1, $2, $3, $4::bigint) ON CONFLICT (agent_id, plugin) DO NOTHING",
-                // Clamp the legacy timestamp too (governance round-2 LOW):
-                // a far-future-skewed row written by a pre-clamp deployment
-                // would otherwise survive the backfill and suppress honest
-                // upserts until wall-clock catches up — the same class the
-                // sibling store's #1685 migration v3 clamp closed for
-                // retrofitted rows.
-                std::vector<std::string>{r.agent_id, r.plugin, r.data_json,
-                                         std::to_string(std::min(r.collected_at, now_secs()))});
-            if (ins.status() == PGRES_COMMAND_OK) {
-                pg::PgResult rel_ok = pg::exec_params(c, "RELEASE SAVEPOINT legacy_row_backfill",
-                                                      std::vector<std::string>{});
-                if (rel_ok.status() != PGRES_COMMAND_OK) {
-                    // LOW (governance): checked like every neighbouring
-                    // statement — a failed RELEASE is an infra-level signal.
-                    spdlog::error("InventoryStore: migrate_from_sqlite: RELEASE SAVEPOINT failed "
-                                  "(infra error, aborting backfill): {}",
-                                  PQerrorMessage(c));
-                    return false;
-                }
-                const auto affected = affected_rows(ins);
-                inserted += affected;
-                if (affected == 0)
-                    ++conflicts;
-                continue;
-            }
-
-            // Per-row failure. Governance H1 (2026-07-29): "rollback
-            // succeeded" is NOT a discriminator between a malformed row and
-            // a RECOVERABLE INFRASTRUCTURE error — statement_timeout (57014,
-            // the pool pins statement_timeout=30000 on every connection),
-            // deadlock (40P01), serialization failure (40001) and
-            // lock_not_available (55P03) are all per-statement AND
-            // savepoint-recoverable by design, and all reachable during a
-            // loaded first-boot backfill. Filing one of those as a "bad row"
-            // loses the row PERMANENTLY and SILENTLY (the completion stamp
-            // below short-circuits every later boot). Read the SQLSTATE and
-            // skip ONLY genuine row-data classes: 22xxx (data exception),
-            // 23xxx (integrity constraint), and 54xxx (a row-specific program
-            // limit such as an oversized blob). Everything else — class 40
-            // (txn rollback), 53 (insufficient resources), 55 (object state),
-            // 57 (operator intervention/timeout), 58 (system error),
-            // XX (internal), and anything unrecognised — fails the backfill
-            // closed so the next boot retries with the marker unstamped
-            // (the header's own contract: "FAILS CLOSED only on a genuine
-            // INFRASTRUCTURE error ... never on a single bad row").
-            const std::string row_err =
-                ins.get() ? PQresultErrorMessage(ins.get()) : PQerrorMessage(c);
-            const char* sqlstate_p =
-                ins.get() ? PQresultErrorField(ins.get(), PG_DIAG_SQLSTATE) : nullptr;
-            const std::string sqlstate = sqlstate_p ? sqlstate_p : "";
-            const bool row_data_error =
-                sqlstate.size() == 5 && (sqlstate.starts_with("22") || sqlstate.starts_with("23") ||
-                                         sqlstate.starts_with("54"));
-            // 54xxx (program_limit_exceeded: oversized field/statement) is
-            // row-data by construction — a legacy data_json blob bigger than
-            // Postgres will take fails on THAT row every boot; treating it as
-            // infra would make one pathological blob a permanent boot loop
-            // (Gate 4 UP-1).
-            pg::PgResult back = pg::exec_params(c, "ROLLBACK TO SAVEPOINT legacy_row_backfill",
-                                                std::vector<std::string>{});
-            if (back.status() != PGRES_COMMAND_OK) {
-                // The recovery itself failed — the connection/transaction is
-                // broken at the infrastructure level, not a per-row problem.
-                // Fail closed rather than silently losing more rows.
-                spdlog::error("InventoryStore: migrate_from_sqlite: ROLLBACK TO SAVEPOINT failed "
-                              "after a bad row (infra error, aborting backfill): {}",
-                              PQerrorMessage(c));
-                return false;
-            }
-            if (!row_data_error) {
-                spdlog::error("InventoryStore: migrate_from_sqlite: row insert failed with "
-                              "non-row-data SQLSTATE '{}' (agent_id={} plugin={}): {} — treating "
-                              "as an infrastructure error and aborting the backfill unstamped; "
-                              "the next boot retries",
-                              sqlstate.empty() ? "<none>" : sqlstate, r.agent_id, r.plugin,
-                              row_err);
-                return false;
-            }
-            pg::PgResult rel = pg::exec_params(c, "RELEASE SAVEPOINT legacy_row_backfill",
-                                               std::vector<std::string>{});
-            if (rel.status() != PGRES_COMMAND_OK) {
-                spdlog::error("InventoryStore: migrate_from_sqlite: RELEASE SAVEPOINT failed "
-                              "(infra error, aborting backfill): {}",
-                              PQerrorMessage(c));
-                return false;
-            }
-            ++skipped_bad;
-            spdlog::warn("InventoryStore: migrate_from_sqlite: skipping bad legacy row "
-                         "agent_id={} plugin={} (SQLSTATE {}): {}",
-                         r.agent_id, r.plugin, sqlstate, row_err);
-        }
-        if (legacy_exists && legacy_rc != SQLITE_DONE) {
-            spdlog::error("InventoryStore: migrate_from_sqlite: legacy read failed (rc={})",
-                          legacy_rc);
-            return false;
-        }
-        pg::PgResult stamp = pg::exec_params(
-            c,
-            "INSERT INTO inventory_store.backfill_state "
-            "(id, migrated_at, legacy_rows, skipped_bad, source_rows, conflicts, "
-            "skipped_blank_key, skipped_typed) "
-            "VALUES (1, $1::bigint, $2::bigint, $3::bigint, $4::bigint, $5::bigint, "
-            "$6::bigint, $7::bigint) ON CONFLICT (id) DO NOTHING",
-            std::vector<std::string>{std::to_string(now_secs()), std::to_string(inserted),
-                                     std::to_string(skipped_bad), std::to_string(source_rows),
-                                     std::to_string(conflicts), std::to_string(skipped_blank_key),
-                                     std::to_string(skipped_typed)});
-        return stamp.status() == PGRES_COMMAND_OK;
-    });
-    if (!ok) {
-        spdlog::error("InventoryStore: migrate_from_sqlite: backfill transaction failed for {}",
-                      legacy_db_path.string());
-        return false;
-    }
-
-    spdlog::info("InventoryStore: migrate_from_sqlite scanned {} legacy row(s) from {}; inserted "
-                 "{}, conflicts {}, skipped {} bad, {} blank-key, {} typed",
-                 source_rows, legacy_db_path.string(), inserted, conflicts, skipped_bad,
-                 skipped_blank_key, skipped_typed);
-    return true;
 }
 
 // ── Upsert (fail-soft ingest) ────────────────────────────────────────────────
@@ -786,46 +510,6 @@ bool InventoryStore::delete_agent(const std::string& agent_id) {
     if (res.status() != PGRES_COMMAND_OK) {
         spdlog::debug("InventoryStore: delete_agent failed for agent={}: {}", agent_id,
                       PQerrorMessage(lease.get()));
-        return false;
-    }
-    // Do not retain a shared-pool lease across filesystem/SQLite work. The
-    // PostgreSQL delete is idempotent, so a later SQLite failure returns false
-    // and the decommission cascade can safely retry both halves.
-    res.reset();
-    lease.reset();
-
-    if (legacy_db_path_.empty())
-        return true;
-    std::error_code ec;
-    const bool legacy_exists = std::filesystem::exists(legacy_db_path_, ec);
-    if (ec) {
-        spdlog::error("InventoryStore: delete_agent cannot stat retained legacy db {}: {}",
-                      legacy_db_path_.string(), ec.message());
-        return false;
-    }
-    if (!legacy_exists)
-        return true;
-
-    SqliteDb legacy;
-    const int open_rc = sqlite3_open_v2(legacy_db_path_.string().c_str(), legacy.addr(),
-                                        SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nullptr);
-    if (open_rc != SQLITE_OK) {
-        spdlog::error("InventoryStore: delete_agent failed to open retained legacy db {}: {}",
-                      legacy_db_path_.string(),
-                      legacy ? sqlite3_errmsg(legacy.get()) : "open failed");
-        return false;
-    }
-    SqliteStmt stmt;
-    if (sqlite3_prepare_v2(legacy.get(), "DELETE FROM inventory_data WHERE agent_id = ?", -1,
-                           stmt.addr(), nullptr) != SQLITE_OK) {
-        spdlog::error("InventoryStore: delete_agent failed to prepare retained legacy delete: {}",
-                      sqlite3_errmsg(legacy.get()));
-        return false;
-    }
-    sqlite3_bind_text(stmt.get(), 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
-    if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
-        spdlog::error("InventoryStore: delete_agent failed in retained legacy db for agent={}: {}",
-                      agent_id, sqlite3_errmsg(legacy.get()));
         return false;
     }
     return true;

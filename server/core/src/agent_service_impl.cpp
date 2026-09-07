@@ -1,5 +1,7 @@
 #include "agent_service_impl.hpp"
 
+#include "ota_signature_sidecar.hpp"
+
 #include "ota_audit_key.hpp"
 
 #include "on_behalf_guard.hpp"
@@ -1437,7 +1439,7 @@ grpc::Status AgentServiceImpl::Subscribe(
                         .observe(static_cast<double>(total_ms) / 1000.0);
                     bus_.publish("timing", "<strong id=\"stat-total\" hx-swap-oob=\"true\">" +
                                                std::to_string(total_ms) + " ms</strong>");
-                    cmd_send_times_.erase(it);
+                    erase_send_time_locked(it);
                 }
                 cmd_first_seen_.erase(resp.command_id());
             }
@@ -1476,6 +1478,29 @@ void AgentServiceImpl::record_send_time(const std::string& command_id) {
     std::lock_guard lock(cmd_times_mu_);
     cmd_send_times_[command_id] = std::chrono::steady_clock::now();
     output_row_count_.store(0, std::memory_order_relaxed);
+    publish_send_times_gauge_locked();
+}
+
+// -- discard_send_time (#2557) -------------------------------------------------
+
+void AgentServiceImpl::erase_send_time_locked(
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point>::iterator it) {
+    cmd_send_times_.erase(it);
+    publish_send_times_gauge_locked();
+}
+
+void AgentServiceImpl::publish_send_times_gauge_locked() {
+    metrics_.gauge("yuzu_cmd_send_times_pending")
+        .set(static_cast<double>(cmd_send_times_.size()));
+}
+
+bool AgentServiceImpl::discard_send_time(const std::string& command_id) {
+    std::lock_guard lock(cmd_times_mu_);
+    auto it = cmd_send_times_.find(command_id);
+    if (it == cmd_send_times_.end())
+        return false;
+    erase_send_time_locked(it);
+    return true;
 }
 
 // -- resolve_execution_id (HA WS-1(1b), ADR-2002 section 5) ------------------
@@ -1702,7 +1727,7 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
                     .observe(static_cast<double>(total_ms) / 1000.0);
                 bus_.publish("timing", "<strong id=\"stat-total\" hx-swap-oob=\"true\">" +
                                            std::to_string(total_ms) + " ms</strong>");
-                cmd_send_times_.erase(it);
+                erase_send_time_locked(it);
             }
             cmd_first_seen_.erase(resp.command_id());
         }
@@ -2081,6 +2106,42 @@ grpc::Status AgentServiceImpl::CheckForUpdate(grpc::ServerContext* context,
     response->set_mandatory(latest->mandatory);
     response->set_eligible(eligible);
     response->set_file_size(latest->file_size);
+
+    // The detached signature, when the operator uploaded one (#416/#3807).
+    //
+    // Read fresh from the sidecar rather than cached: it is a few KB against an
+    // RPC an agent makes every six hours, and a cache would be one more place
+    // for the signature to go stale relative to the binary it covers. A missing
+    // sidecar is the ordinary unsigned case, not an error — the AGENT decides
+    // whether that is acceptable, since this server is not the authority on its
+    // own packages' authenticity.
+    {
+        const auto sig_path = update_registry_->signature_path(*latest);
+        std::string sig;
+        switch (read_signature_sidecar(sig_path, sig)) {
+        case SidecarOutcome::kServed:
+            response->set_update_signature(std::move(sig));
+            break;
+        case SidecarOutcome::kAbsent:
+            break; // the ordinary unsigned case
+        case SidecarOutcome::kOverCap:
+            // NOT "missing" — an absent sidecar is the separate, deliberately
+            // silent kAbsent branch above. Naming it here sends an operator
+            // investigating an oversized or irregular file looking for one that
+            // is not there.
+            spdlog::error("CheckForUpdate: signature sidecar for {} is unusable (over the {} "
+                          "byte cap, or not a regular file); serving as unsigned",
+                          latest->filename, kMaxSignatureBytes);
+            break;
+        case SidecarOutcome::kUnreadable:
+            // Present but unreadable is worth a log: the operator believes this
+            // package is signed and every agent will be told it is not.
+            spdlog::warn("CheckForUpdate: signature sidecar for {} exists but is unreadable; "
+                         "serving the package as unsigned",
+                         latest->filename);
+            break;
+        }
+    }
 
     spdlog::info("CheckForUpdate: agent {} v{} -> v{} (eligible={}, mandatory={})",
                  request->agent_id(), request->current_version(), latest->version, eligible,

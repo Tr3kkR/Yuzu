@@ -190,4 +190,25 @@ public:
 /// where arm(Service) is then rejected per the platform contract above.
 [[nodiscard]] YUZU_EXPORT std::unique_ptr<ISparkMechanism> make_service_mechanism();
 
+/// Test seam (#2839): make the NEXT retire of a cancelled DirWatch run `hook` immediately
+/// before the file mechanism grows `retiring_` to take ownership of it — the one statement
+/// in that transfer that can allocate, and so the one place a std::bad_alloc could once
+/// destroy a DirWatch with a live kernel read still pointing at its buffer and OVERLAPPED.
+///
+/// A FREE FUNCTION AT THE TU BOUNDARY, not a member, because WindowsFileMechanism lives in
+/// spark_file.cpp's anonymous namespace: there is no per-mechanism header to hang a
+/// `*_for_test` method on, and adding one would export an implementation detail from a
+/// file whose whole point is that it stays private to its translation unit. Same "fault
+/// phase" contract as SparkEngine::set_arm_fault_hook_for_test — the hook exists so a test
+/// can AIM an allocation failure at one statement, which a real std::bad_alloc cannot be.
+///
+/// Returns true if the hook was installed — i.e. `mech` really is the Windows file
+/// mechanism. FALSE on every non-Windows platform (where make_file_mechanism() returns
+/// nullptr and there is nothing to hook) and for any other mechanism type, so a caller
+/// that forgets to check gets a visible false rather than a silent no-op. Pass a null
+/// `hook` to clear. Single-shot: the hook is consumed by the retire it fires on. Same
+/// set-then-use contract as the engine's seams — no concurrent-access support.
+[[nodiscard]] YUZU_EXPORT bool
+set_file_retire_fault_hook_for_test(ISparkMechanism& mech, std::function<void()> hook);
+
 } // namespace yuzu::agent

@@ -39,3 +39,9 @@ netconn	macos	planned	oslog
 mapdrive	windows	supported	wnet
 mapdrive	linux	constrained	procfs
 mapdrive	macos	constrained	getfsstat
+power	windows	constrained	powerbroadcast
+power	linux	constrained	logind
+power	macos	supported	pmset_log
+removable	windows	supported	wevtapi
+removable	linux	constrained	udev_netlink
+removable	macos	constrained	diskarbitration

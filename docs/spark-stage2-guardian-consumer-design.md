@@ -677,6 +677,16 @@ call inside `backend_->arm()` can still block a sibling arm/disarm of the SAME
 mechanism type at the `SparkEngine` layer until this caller's own deadline elapses.
 The Pre-Stage-3 dependency above is otherwise unchanged by this landing.
 
+**#3816 (landed)**: item 3's bounded-wait deadline left a residual - a backend arm
+that succeeds just after its caller gives up can mint a live subscription nothing
+tracks. `GuardianIoExecutor::run()` now delivers every result `fn()` returns
+normally exactly once, to either the caller's return value or an
+`on_abandoned(T&&)` callback (a thrown `fn()`/`WorkerThrew` has no `T` to
+deliver and correctly reaches neither), so
+`GuardianSparkRuntime`'s arm consumer can disarm a late success instead of leaking
+it; the state reader needs no callback (a late read is wasted work, nothing
+escapes). See `docs/spark-flip-gate.md` §3 row 3.
+
 ## Health / status surface — the #1939 checklist
 
 Per ADR-1005 (headless platform) a new capability lands on REST **and** MCP, or
@@ -1188,7 +1198,7 @@ Each rung is an independently-governed PR on `dev`, run through the full
        rarely throws (#2278). #2797 is the reconcile-side half split out of #2270 -
        #2270 itself closes only the strong-guarantee half, so closing #2270 does not
        discharge this gate.
-     - **#2818 gates PR-2 too.** The engine tears down a whole spark key
+     - **#2818 gated PR-2 too, now FIXED (PR-2d).** At the time this was written, the engine tore down a whole spark key
        (`SparkEngine::drop_key_locked`) while `GuardianSparkRuntime` arms one shared
        subscription per key on the 0->1 edge (`guardian_spark_runtime.cpp:159-166`),
        and nothing tells the consumer its subscription died: Guardian goes on

@@ -49,6 +49,13 @@ struct Config {
     std::filesystem::path plugin_trust_bundle;  // --plugin-trust-bundle (PEM CA bundle for code-sig)
     bool plugin_require_signature{false};       // --plugin-require-signature
 
+    /// OTA update signing (#416/#3807). Deliberately SEPARATE from the plugin
+    /// bundle above: a site may trust one signer for plugins and another for
+    /// agent builds, and collapsing them would silently widen whichever is
+    /// narrower. Point both at the same file if that is what you want.
+    std::filesystem::path update_trust_bundle;  // --update-trust-bundle
+    bool update_require_signature{false};       // --update-require-signature
+
     // OTA updates
     bool auto_update{true};                               // --no-auto-update disables
     std::chrono::seconds update_check_interval{6 * 3600}; // --update-check-interval

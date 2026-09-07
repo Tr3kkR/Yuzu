@@ -85,14 +85,14 @@ struct LiveHarness {
         auto dispatch = [this](const std::string& plugin, const std::string& action,
                                const std::vector<std::string>& ids, const std::string&,
                                const std::unordered_map<std::string, std::string>&)
-            -> std::pair<std::string, int> {
+            -> yuzu::server::ConfinedDispatchOutcome {
             ++dispatched;
             seen_plugin = plugin;
             seen_action = action;
             seen_id = ids.empty() ? "" : ids.front();
             seen_dispatches.emplace_back(plugin, action);
             // command_id prefix MUST be <plugin>- so the result route accepts it.
-            return {plugin + "-test", fake_sent};
+            return {.sent = fake_sent, .command_id = plugin + "-test"};
         };
         auto responses = [this](const std::string& cmd, const std::string& /*agent_id*/) {
             // #1634: production scopes by agent_id at the store seam; the stub returns
@@ -753,9 +753,9 @@ TEST_CASE("device routes: out-of-scope device is not listed/openable/live-querya
     auto dispatch = [&dispatched](const std::string& plugin, const std::string&,
                                   const std::vector<std::string>&, const std::string&,
                                   const std::unordered_map<std::string, std::string>&)
-        -> std::pair<std::string, int> {
+        -> yuzu::server::ConfinedDispatchOutcome {
         ++dispatched;
-        return {plugin + "-x", 1};
+        return {.sent = 1, .command_id = plugin + "-x"};
     };
     auto responses = [](const std::string&, const std::string&) {
         return std::vector<DexAgentResponse>{};

@@ -239,23 +239,13 @@ static bool break_glass_user_valid(yuzu::server::AuthDB& db, const std::string& 
 // Open the Postgres audit store for a one-shot break-glass CLI path, and bring
 // it to a state where writing an evidence row is SAFE.
 //
-// ADR-0040 order contract: a native audit row must never be written before the
-// `backfill_complete` marker exists. The server honours that at boot by running
-// the legacy backfill before anything can log (server.cpp). A one-shot never
-// reaches boot, so it runs the same idempotent, resumable backfill itself — on
-// an upgraded host, skipping it leaves a native row + no marker + a legacy
-// audit.db, and the prefix proof then refuses EVERY later boot, with a
-// remediation that would destroy the very break-glass row this path exists to
-// write. On a fresh install the backfill is the cheap no-legacy stamp.
-//
-// No MetricsRegistry is wired here (there is no /metrics in a one-shot), so
-// yuzu_server_audit_backfill_total does not move on this path — the boot log is
-// the record. Returns nullptr, having logged and printed, when the store is
-// unusable; `refuse_action` names the mutation being refused.
+// No legacy-backfill gate (retired: ADR-0009 hard-cutover Update, 2026-09-04) —
+// AuditStore is born-on-PG with no migration path held open, same as every
+// other retired store. Returns nullptr, having logged and printed, when the
+// store is unusable; `refuse_action` names the mutation being refused.
 static std::unique_ptr<yuzu::server::AuditStore>
-open_one_shot_audit(yuzu::server::pg::PgPool& pool, const std::filesystem::path& legacy_audit_db,
-                    int retention_days, std::string_view flag, std::string_view refuse_action,
-                    std::string_view extra_remediation = {}) {
+open_one_shot_audit(yuzu::server::pg::PgPool& pool, int retention_days, std::string_view flag,
+                    std::string_view refuse_action, std::string_view extra_remediation = {}) {
     // Retention comes from config, NOT the constructor default: a site running
     // --audit-retention-days=90 would otherwise get break-glass evidence rows on
     // a 365-day horizon — the highest-stakes rows outliving the policy that
@@ -267,22 +257,6 @@ open_one_shot_audit(yuzu::server::pg::PgPool& pool, const std::filesystem::path&
                       flag, refuse_action, extra_remediation);
         std::cerr << "error: audit store unavailable; refusing to " << refuse_action
                   << " without an audit record\n";
-        return nullptr;
-    }
-    // Sourceless::Refuse — a one-shot may COMPLETE a real backfill, but it must
-    // never declare the migration complete merely because THIS host holds no
-    // legacy audit.db. That stamps the marker over an empty table, and the host
-    // that DOES hold the trail then skips the mandatory backfill on that marker
-    // and reports success (Gate 3 architect A-4).
-    if (!audit->migrate_from_sqlite(legacy_audit_db,
-                                    yuzu::server::AuditStore::Sourceless::Refuse)) {
-        spdlog::error("{}: the one-time legacy audit backfill from {} did not complete (see prior "
-                      "log lines); refusing to {}. Writing an audit row ahead of the backfill "
-                      "marker would block every later server boot (ADR-0040). Resolve the backfill "
-                      "first — the diagnostic above carries the remediation — then retry.",
-                      flag, legacy_audit_db.string(), refuse_action);
-        std::cerr << "error: legacy audit backfill incomplete; refusing to " << refuse_action
-                  << "\n";
         return nullptr;
     }
     return audit;
@@ -1479,15 +1453,12 @@ int main(int argc, char* argv[]) {
         // it isn't, refuse to proceed rather than silently clear a second factor
         // with no record (H-1). This also gives the operator an actionable error
         // instead of a buried warning during a stressful recovery.
-        // ADR-0040: AuditStore is Postgres-backed now. Reuse the already-open,
+        // ADR-0040: AuditStore is Postgres-backed. Reuse the already-open,
         // validated break-glass PgPool (auth_pg_pool is non-null here — this
         // block is guarded by `if (!auth_db)` above, and auth_db only exists
-        // when auth_pg_pool is valid). The helper also runs the legacy backfill:
-        // this one-shot writes a NATIVE row, and doing that ahead of the marker
-        // is what blocks every later boot (see open_one_shot_audit).
+        // when auth_pg_pool is valid).
         auto audit = open_one_shot_audit(
-            *auth_pg_pool, cfg.db_dir() / "audit.db", cfg.audit_retention_days, "--mfa-reset",
-            "clear MFA",
+            *auth_pg_pool, cfg.audit_retention_days, "--mfa-reset", "clear MFA",
             " Or perform the reset via your documented break-glass SQL path (which you must then "
             "record in change management).");
         if (!audit)
@@ -1565,11 +1536,9 @@ int main(int argc, char* argv[]) {
         // Audit is MANDATORY (CC6.6): verify the audit store is WRITABLE before
         // arming, so the exemption is never granted without a record.
         // ADR-0040: Postgres-backed AuditStore; reuse the validated PgPool
-        // (auth_pg_pool non-null — guarded by `if (!auth_db)` above). The helper
-        // also completes the legacy backfill first (order contract).
-        auto audit = open_one_shot_audit(*auth_pg_pool, cfg.db_dir() / "audit.db",
-                                         cfg.audit_retention_days, "--break-glass-arm",
-                                         "arm break-glass");
+        // (auth_pg_pool non-null — guarded by `if (!auth_db)` above).
+        auto audit = open_one_shot_audit(*auth_pg_pool, cfg.audit_retention_days,
+                                         "--break-glass-arm", "arm break-glass");
         if (!audit)
             return EXIT_FAILURE;
         auto armed = auth_db->arm_break_glass(cfg.break_glass_user, cfg.break_glass_window_secs);

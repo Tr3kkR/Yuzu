@@ -39,15 +39,19 @@
 ///    degrade (503 / banner), never `.value_or({})` it into a silent empty —
 ///    that re-opens the fail-open hole ADR-0016 §7 / the playbook's
 ///    anti-patterns list forbid.
-///  - **`delete_agent`**: erases both PostgreSQL and the retained rollback
-///    SQLite copy, when present. It returns false unless both deletes commit,
-///    so the decommission cascade never reports a false "erased" result.
-///  - **`migrate_from_sqlite`**: the one-time first-boot backfill (ADR-0009).
-///    FAILS CLOSED — see its own doc comment below.
+///  - **`delete_agent`**: erases PostgreSQL rows for the agent. Returns false
+///    if the delete does not commit, so the decommission cascade can retry.
+///
+/// `migrate_from_sqlite()` retired (#3623, ADR-0037 Update): no production fleet ever ran a
+/// pre-Postgres build of this store, so the one-time first-boot backfill it implemented never
+/// had real legacy data to protect. `server.cpp` now runs
+/// `legacy_sqlite_probe::warn_if_legacy_rows` over `inventory_data` instead — silent unless
+/// real rows are found, never blocks boot. `delete_agent` no longer erases anything from a
+/// legacy `inventory.db`: a leftover legacy file is never read and never scrubbed by this
+/// store — see `docs/user-manual/upgrading.md`'s InventoryStore section for the operator note.
 
 #include <cstdint>
 #include <expected>
-#include <filesystem>
 #include <optional>
 #include <string>
 #include <vector>
@@ -121,56 +125,6 @@ public:
     /// every emit site is null-guarded.
     void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
 
-    /// One-time, idempotent first-boot backfill from the legacy SQLite
-    /// `inventory.db` (ADR-0009/0037). Call once at startup, before serving.
-    ///
-    /// Contract:
-    ///  - If the backfill has already completed (stamped in this schema's
-    ///    `backfill_state` table), returns true immediately — every boot
-    ///    after the first is a cheap single-row lookup.
-    ///  - If `legacy_db_path` does not exist, stamps "nothing to backfill"
-    ///    and returns true (a fresh install never had a legacy file).
-    ///  - Otherwise opens the legacy SQLite file READ-ONLY (via RAII owners —
-    ///    no manual finalize/close), reads every row of its `inventory_data`
-    ///    table, skips sources promoted to typed stores, and inserts each
-    ///    remaining row into `inventory_store.inventory_data`
-    ///    via `INSERT ... ON CONFLICT (agent_id, plugin) DO NOTHING` (never
-    ///    clobbers a row a live agent has already re-reported since this boot
-    ///    sequence started), each under its own SAVEPOINT inside one overall
-    ///    transaction, then stamps completion. The backfill itself does not
-    ///    modify the legacy file; during the one-release rollback window only
-    ///    `delete_agent` may remove rows so an erasure cannot be resurrected
-    ///    by rollback.
-    ///  - A single BAD ROW (a legacy value that violates encoding/constraints —
-    ///    e.g. invalid UTF-8) does NOT abort the backfill: its SAVEPOINT is
-    ///    rolled back, the row is logged at warn + counted skipped, and the
-    ///    loop continues. Skippable row-data failures are SQLSTATE classes
-    ///    22, 23, and 54; every other/unknown class aborts unstamped. A row
-    ///    with an empty/blank `agent_id` or `plugin` is
-    ///    skipped the same way (never backfilled as an un-erasable orphan —
-    ///    the decommission cascade's empty-id guard could never reach it).
-    ///    This store is FAIL-SOFT / self-healing (the agent re-pushes), so one
-    ///    malformed legacy blob must not permanently brick the server.
-    ///    A generic blob over 8 MiB is skipped before copying into process
-    ///    memory and counted in `skipped_bad`.
-    ///  - FAILS CLOSED on a genuine INFRASTRUCTURE error — the initial
-    ///    connection/lease, the backfill transaction's own BEGIN/SAVEPOINT/
-    ///    COMMIT, a non-row-data/unknown INSERT SQLSTATE, or a `ROLLBACK TO
-    ///    SAVEPOINT` that itself fails (the signal that the connection, not
-    ///    just one row, is broken). The caller MUST treat `false` as fatal
-    ///    error (`startup_failed_ = true` in `server.cpp`) — per ADR-0009, the
-    ///    server refuses to start rather than serve against an unreachable
-    ///    database.
-    ///  - This pre-serving, one-time operation is ADR-0012's documented
-    ///    lease-discipline exception: its PostgreSQL transaction remains open
-    ///    while one size-capped SQLite row at a time is stepped so inserts and
-    ///    the completion/reconciliation stamp commit atomically.
-    ///  - The `backfill_state.legacy_rows` stamp records the count of rows
-    ///    actually inserted (per-statement affected-row count via
-    ///    `PQcmdTuples`), not the size of the in-memory legacy row list —
-    ///    skipped/orphaned/conflicting rows are not counted as inserted.
-    [[nodiscard]] bool migrate_from_sqlite(const std::filesystem::path& legacy_db_path);
-
     /// Upsert inventory data for an agent+plugin pair. FAIL-SOFT ingest: a
     /// lease/query failure is logged and this returns without throwing — the
     /// agent's next changed/full report re-sends the same blob (a drop bumps
@@ -218,9 +172,8 @@ public:
     [[nodiscard]] std::optional<std::vector<InventoryRecord>>
     get_agent_inventory(const std::string& agent_id, bool* truncated = nullptr) const;
 
-    /// Delete inventory data for an agent from PostgreSQL and from the retained
-    /// legacy SQLite rollback file, if it exists. Idempotent; returns false if
-    /// either backing delete fails so the decommission cascade can retry and
+    /// Delete inventory data for an agent from PostgreSQL. Idempotent; returns
+    /// false if the delete fails so the decommission cascade can retry and
     /// cannot report a false "erased".
     [[nodiscard]] bool delete_agent(const std::string& agent_id);
 
@@ -232,9 +185,6 @@ private:
     pg::PgPool& pool_;
     bool open_{false};
     yuzu::MetricsRegistry* metrics_{nullptr};
-    // Set by migrate_from_sqlite() during startup, before serving. Read later
-    // by delete_agent(); there is no concurrent writer after startup.
-    std::filesystem::path legacy_db_path_;
 };
 
 } // namespace yuzu::server

@@ -35,6 +35,17 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   `nightly-broken` issue. **Discipline norm: no merge to main while a
   `nightly-broken` issue is open.**
 
+  **Scheduled nightlies always run the DEFAULT branch's copy of the workflow**
+  (currently `main`) — `dev` gets zero nightly ASan/TSan/coverage coverage
+  outside a manual `workflow_dispatch` (#4018). `workflow_dispatch.inputs.jobs`
+  (choice `all`/`windows-asan`, default `all`) exists so a `windows-asan`-only
+  recurrence check can be dispatched against `dev` without paying for the full
+  Big Tam matrix each time: it skips `sanitize-asan`/`sanitize-tsan`/`coverage`
+  and — so a diagnostic dev-branch dispatch never touches the shared
+  `nightly-broken` discipline gate — also skips `alert`/`close-on-green`. A
+  plain `jobs=all` dispatch (or the omitted-input schedule trigger) is
+  unaffected and runs exactly as before.
+
   The TSan leg preloads `$RUNNER_TEMP/libgai_sync_shim.so` to replace glibc's
   `getaddrinfo_a()` async DNS path with synchronous `getaddrinfo()` on the
   calling thread. Required because cpp-httplib enables
@@ -134,6 +145,26 @@ required check; remediation is either moving the call into the
 registered allowlist (if it is a legitimate, reviewed acquisition
 path) or removing the raw spawn in favour of the sanctioned subprocess
 runner.
+
+### Plugin README gates (`docs` suite + `docs-lint.yml`, `docs/plugin-readme-standard.md`)
+
+Two gates keep each plugin's `agents/plugins/<name>/README.md` honest. The
+meson `docs` suite runs `tests/test_plugin_readmes.py` on every leg: the
+README-existence ratchet (the count of plugin directories without a README
+may only fall), the section contract, and a byte-diff of every generated
+artefact — the README fences, the user-manual plugin index,
+`site/src/nav.plugins.mjs` and the `content/plugin-docs/*.json` manifests —
+against what `tools/plugin-doc-gen` produces from the committed sources
+(the same contract `check-capability-matrix.sh` enforces for the
+capability matrix, and it needs no build). A stale sample leg-hash fails
+it too; regenerate with `python3 tools/plugin-doc-gen/plugin_doc_gen.py
+--all`. The `plugin-readme-touch-rule` job in `docs-lint.yml` (pull
+requests only, not a required check today) runs
+`scripts/ci/check-plugin-readme-touch.sh`: a change under
+`agents/plugins/<name>/src/**` must also touch that README, or the PR body
+must carry a visible `docs-unchanged: <section> — <reason>` line, which
+the job prints. Both scripts carry a fixture self-test that the `docs`
+suite also runs.
 
 ### ClusterFuzzLite (`cflite-pr.yml` + `cflite-batch.yml`)
 
@@ -428,6 +459,13 @@ leaks a slot) that caps concurrent heavy test phases to **2 per box** (the
 (one consolidated invocation now covers what used to be five separate
 suites plus the four non-pg server shards).
 
+`nightly.yml`'s `windows-asan` job now joins this same `with-test-slot.sh 2`
+gate and carries `--timeout-multiplier 2` (#4018) — previously it ran
+ungated, with no multiplier, on the shared 4-runner Wee Tam box. It shares
+the script's default slot namespace with `ci.yml`'s Windows legs above (no
+`YUZU_TEST_SLOT_NAME` override on either side), so a nightly run and a
+concurrent PR/push genuinely compete for the same 2 slots.
+
 **Staged widening — the decision rule (stated once here; each push's
 paragraph below references it, doesn't restate it).** The pg-shards step
 widens `2 → 4 → 6 → 8` in separate, individually-measured pushes, never
@@ -659,9 +697,13 @@ draft's justification overclaiming a settled near-term timeline.
 that drains over time, not a contract"), and completing that ladder is
 architecturally more likely to GROW the `[pg]` population than shrink it:
 each store that migrates onto Postgres adds its own `[pg]`-tagged
-CRUD/behaviour cases (exactly what shards E/I/G/J already carry), while only
-each store's narrow, already-thin `migrate_from_sqlite` backfill suite
-becomes prunable. The margin bought here is a plain safety cushion on top of
+CRUD/behaviour cases (exactly what shards E/I/G/J already carry), while each
+store's narrow, already-thin `migrate_from_sqlite` backfill suite was only
+ever prunable once — that pruning has since landed for all 19 already-migrated
+stores (#3623, `AuditStore` the last to lose it), so it is no longer a
+standing offset against future growth the way it was
+when this section was written. The margin bought here is a plain safety
+cushion on top of
 what the split alone already earns (every new shard's real-diagnostic-scaled
 estimate lands well under 700s even 2-wide paired).
 
@@ -1391,14 +1433,23 @@ exact-hit on a repo doing ~75 commits/day, so every run saved a fresh multi-GB
 entry, the pool ran 7x over GitHub's 10 GB repo quota, and LRU eviction both
 degraded the canary (8-20 min rebuilds from week-old entries) and starved every
 other cache (measured 2026-09-01). One entry per 3-day bucket per scope now
-(~2-3 live, bounded by the cap below AND by `restore-keys` naming only the
-specific previous bucket — an open-ended prefix fallback defeats this bound
-by keeping any dead entry alive forever, since every fallback hit refreshes
-GitHub's last-accessed clock; measured 2026-09-02, `ci.yml`'s canary ccache
-restore step); ccache's own preprocessed-input hashing
+(~2-3 live — bounded from growing WITHOUT limit by `restore-keys` naming
+only the specific previous bucket, not bounded to a guaranteed total: an
+open-ended prefix fallback would defeat even that, keeping any dead entry
+alive forever since every fallback hit refreshes GitHub's last-accessed
+clock, measured 2026-09-02 in `ci.yml`'s canary ccache restore step).
+
+A job-level `CCACHE_MAXSIZE` caps each entry's own size (2G originally,
+raised to 3G 2026-09-03 after the 2G estimate proved low against measured
+2.2-2.6 GB working sets), but that is a per-entry cap, not a pool-wide
+guarantee: the WORST-CASE aggregate — live-entry count x per-entry cap x
+ccache's own measured overshoot past that cap, plus the separate
+vcpkg-canary entry — can exceed the shared 10 GB repo quota outright, not
+merely run close to it. See `ci.yml`'s "Compute ccache time bucket" step
+comment for the current arithmetic and #3889 for the tracked observability
+gap. ccache's own preprocessed-input hashing
 absorbs intra-bucket source drift, so hit-rate decay is capped at ~3 days of dev
-churn, and a job-level `CCACHE_MAXSIZE: 2G` keeps each entry from growing
-without bound. The ccache save is gated on the Build step having run, pass or
+churn. The ccache save is gated on the Build step having run, pass or
 fail — a cancelled run leaves no thin entry, at the accepted cost that an early
 hard Build failure can occupy the bucket's key with a thin one (#3269,
 documented at the restore step); the vcpkg save is gated more strictly, on its

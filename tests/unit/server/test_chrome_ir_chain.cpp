@@ -128,9 +128,9 @@ struct ChromeIrHarness {
                    const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                    const std::unordered_map<std::string, std::string>& params,
                    const std::string& exec_id,
-                   const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+                   const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
             calls.push_back({plugin, action, scope_expr, agent_ids, params, exec_id});
-            return {"cmd-" + std::to_string(calls.size()), dispatch_sent};
+            return {.sent = dispatch_sent, .command_id = "cmd-" + std::to_string(calls.size())};
         };
 
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,

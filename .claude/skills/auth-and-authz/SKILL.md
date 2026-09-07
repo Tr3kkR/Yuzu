@@ -157,6 +157,11 @@ and workflow steps 1–2 were de-SQLite'd; (4) the Open hardening backlog issue
 states. **Every other "SHIPPED" cell still rests on the `ef4582be` stamp — treat
 those as up to ~6 weeks stale and re-grep the symbol before relying on it.**
 
+> **⚠️ Standing instruction — update on close.** Every PR that closes or materially
+> changes the status of an item in this gap matrix MUST update that item's status
+> **and** re-stamp the Verified line in the SAME PR. Treat status drift as a
+> review-blocking defect, exactly like a stale doc comment.
+
 **Item 11 re-verified 2026-08-10, targeted, not wholesale** — against
 `feat/auth-human-token-rotation` @ `e1bf2d86` (a pre-merge integration
 branch off `origin/dev`, not yet on `dev`), by reading

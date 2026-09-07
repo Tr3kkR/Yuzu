@@ -2651,7 +2651,7 @@ Out of scope for this migration, flagged not fixed (none newly reachable by this
 
 **Third migration (#1634, this ADR-0017 continuation).** Closes the systemic gap #1634 tracked since 2026-06-23: the legacy REST `/api/responses/{id}/aggregate`/`/export`/catch-all-list routes (`server.cpp`), MCP `query_responses`/`aggregate_responses`, and REST `GET /api/v1/executions/{id}/visualization` all carried a per-row post-filter (`response_agent_in_scope`/`response_scope_fn`) that sat BEHIND a still-flat global gate — the exact "inert filter" shape #1711/#1550 shipped and this ADR names as the systemic defect. All five migrated onto `require_fleet_read`/`fleet_read_fn_` as their sole gate; the response list/export routes and `query_responses` additionally push the resolved visible-agent set into `ResponseStore::query`/`query_by_execution` as SQL `agent_id = ANY(...)` **before** `LIMIT`/`OFFSET` (a new optional scope parameter, ADR-0017 INV-3) rather than post-filtering a capped/paginated read — the INV-3-compliant fix an adversarial review (Kimi + Codex) found the first migration pass had missed. `GET /api/v1/executions/{id}` (REST final-state lookup), `GET /api/v1/events` (REST SSE), `GET /sse/executions/{id}` (dashboard SSE — closing the #3699 gap above), and MCP `get_execution_status`/`list_executions` also migrated: all four collapse an invisible execution to the same 404/not-found shape a genuinely nonexistent one gets (no existence oracle), and a confined non-dispatcher's view is a redacted projection (recomputed per-agent counts from only the visible agent-status rows, `scope_expression`/`parameter_values` replaced with a fixed placeholder) — dispatcher ownership admits VISIBILITY only (avoids a false 404 on a just-dispatched execution with zero responses yet) and never bypasses this projection, a distinction the same adversarial-review round caught the first attempt getting wrong. `list_executions` has a weaker mechanism than the others — execution rows carry no single `agent_id` to filter by, so a confined caller is restricted to `dispatched_by = session->username` (`ExecutionQuery::dispatched_by`) rather than a real visible-agent intersection. As of the PR #3793 review round, `agents_targeted`/`agents_responded` on this route ARE now projected (a batched, non-N+1 `get_agent_statuses_for_executions` call) the same way `get_execution_status` projects them, closing that specific gap; the confinement AXIS itself remains own-dispatches-only, not a real visible-agent intersection. **Disclosure gap (found in the same review round, not fixed):** `dispatched_by = session->username` is scoped to the minting principal, not intersected against a service-scoped token's own service-tag scope — an admitted service token sees its minting user's full dispatch-history metadata (status/timing/lineage, no agent identities), not narrowed to its own service. Recorded here as disclosed, not fixed. The two SSE routes share one event projector (`execution_event_scope.hpp`): `agent-transition` events are filtered by `agent_id`, `execution-progress` is dropped for confined subscribers (execution-wide counts, no `agent_id`), and `execution-completed` is sanitized (real `status` field preserved, counts stripped) rather than dropped, so the client still closes its stream. `query_responses`/`aggregate_responses`/`get_execution_status`/`list_executions` are reclassified `ServiceScopeClass::confined` (`kToolSecurityRows`), matching the real `fleet_read_fn_` mechanism they now have.
 
-**Fourth migration (#3789, this ADR-0017 continuation).** Closes the gap #1634's own Gate 2 review found and deliberately deferred: the legacy pre-v1 `/api/executions` (list), `/{id}` (detail), `/{id}/summary`, `/{id}/agents`, `/{id}/children`, `POST /{id}/rerun`, and `POST /{id}/cancel` routes (`server.cpp`) carried NO management-group confinement at all — a bare `require_permission(Execution, Read/Execute)`, unlike every other execution-reading surface migrated above. All five GET routes now gate on `require_fleet_read(..., "Read")`, mirroring the `GET /api/v1/executions/{id}` shape: an invisible or nonexistent execution collapses to one 404 (no oracle) for EVERY caller — but the audit row is written only when the caller's scope was actually engaged (`gate.scope`). A confined caller failing this check writes `execution.read`/`denied`; an unconfined caller's genuinely-nonexistent id is ordinary "not found", not a confinement decision, and writes no row at all — auditing it as `denied` would have inflated the CC7.2 denial-rate metric with routine 404 traffic (compliance-officer, #3789 Gate 6 finding F2, corrected before merge). The caller-visible 404 response is identical either way; only the server-side audit trail distinguishes the two. A confined view redacts `scope_expression`/`parameter_values` and recomputes the four agent counts from only the in-scope, terminal-status rows. `/agents` — the worst pre-migration leak, returning raw agent identities and `error_detail` fleet-wide — filters its row list to `authz::in_scope`. `/children` does NOT inherit the detail route's "keep lineage truthful" precedent: a visible parent does not authorize enumerating separate child execution records, so each child is checked against the same visibility predicate independently. The LIST route goes further than every sibling migrated above (including `list_executions`, next paragraph): rather than a post-fetch drop or an own-dispatches-only filter, the confinement predicate is pushed into the `WHERE` clause itself, before `LIMIT` (ADR-0017 INV-3) — `dispatched_by = $owner OR EXISTS (SELECT 1 FROM agent_exec_status WHERE agent_id = ANY($visible))`, one statement, no N+1 (`ExecutionTracker::query_executions_checked`'s new `ExecutionScope` parameter). The owner disjunct is load-bearing, not cosmetic: `agent_exec_status` rows are written only on response arrival, so an agent-membership-only predicate would make a caller's own just-dispatched execution invisible to them until the first agent replies.
+**Fourth migration (#3789, this ADR-0017 continuation).** Closes the gap #1634's own Gate 2 review found and deliberately deferred: the legacy pre-v1 `/api/executions` (list), `/{id}` (detail), `/{id}/summary`, `/{id}/agents`, `/{id}/children`, `POST /{id}/rerun`, and `POST /{id}/cancel` routes (`execution_routes.cpp` as of #2542 PR-7, extracted from `server.cpp`) carried NO management-group confinement at all — a bare `require_permission(Execution, Read/Execute)`, unlike every other execution-reading surface migrated above. All five GET routes now gate on `require_fleet_read(..., "Read")`, mirroring the `GET /api/v1/executions/{id}` shape: an invisible or nonexistent execution collapses to one 404 (no oracle) for EVERY caller — but the audit row is written only when the caller's scope was actually engaged (`gate.scope`). A confined caller failing this check writes `execution.read`/`denied`; an unconfined caller's genuinely-nonexistent id is ordinary "not found", not a confinement decision, and writes no row at all — auditing it as `denied` would have inflated the CC7.2 denial-rate metric with routine 404 traffic (compliance-officer, #3789 Gate 6 finding F2, corrected before merge). The caller-visible 404 response is identical either way; only the server-side audit trail distinguishes the two. A confined view redacts `scope_expression`/`parameter_values` and recomputes the four agent counts from only the in-scope, terminal-status rows. `/agents` — the worst pre-migration leak, returning raw agent identities and `error_detail` fleet-wide — filters its row list to `authz::in_scope`. `/children` does NOT inherit the detail route's "keep lineage truthful" precedent: a visible parent does not authorize enumerating separate child execution records, so each child is checked against the same visibility predicate independently. The LIST route goes further than every sibling migrated above (including `list_executions`, next paragraph): rather than a post-fetch drop or an own-dispatches-only filter, the confinement predicate is pushed into the `WHERE` clause itself, before `LIMIT` (ADR-0017 INV-3) — `dispatched_by = $owner OR EXISTS (SELECT 1 FROM agent_exec_status WHERE agent_id = ANY($visible))`, one statement, no N+1 (`ExecutionTracker::query_executions_checked`'s new `ExecutionScope` parameter). The owner disjunct is load-bearing, not cosmetic: `agent_exec_status` rows are written only on response arrival, so an agent-membership-only predicate would make a caller's own just-dispatched execution invisible to them until the first agent replies.
 
 The two mutating routes (`rerun`/`cancel`) keep `require_permission(Execution, Execute)` ahead of the fleet gate — `require_fleet_read` structurally rejects any operation but `Read` (its legacy-open `AdmitAll` branch has no MCP approval-ticket check, so a mutation must never reach it) — then additionally take `require_fleet_read(..., "Read")` purely for scope. Mutation admission is stricter than read visibility: an adversarial review (external model, Sol/gpt-5.6-sol) found that "every EXISTING agent-status row is in scope" is a false-admission path, because those rows are response-arrival-seeded — an execution targeting agents A and B can have only A's row while B, still pending, might be out of scope. The rule implemented instead: zero status rows (the just-dispatched window) admits ONLY the dispatcher; one or more rows requires the row count to equal `agents_targeted` (a complete ledger) AND every row's agent to be in scope — dispatcher ownership is not a bypass once rows exist. Nonexistent, zero-visible, partial-visibility, and incomplete-ledger all collapse to the identical 404 + non-distinguishing audit detail (a distinct status for "partial visibility" would itself be a hidden-cohort disclosure). `mark_cancelled`'s pre-existing false-success-on-nonexistent-id behavior (an `UPDATE` matching zero rows still reports `PGRES_COMMAND_OK`) is fixed as a side effect: an explicit existence check now runs before every cancel attempt, for confined and unconfined callers alike.
 
@@ -2972,6 +2972,22 @@ walkthrough.
   grant, or a full securable × operation wildcard grant). Fails closed
   (`503`, "cannot verify") rather than reporting a false `ok:true` if RBAC
   reference data can't be resolved.
+- **Audit-persist posture (#2466/#2406 + #3937, ADR-1005 "mutations fail closed
+  on audit failure"):** every *mutating* engine-principal REST route fails closed
+  — `503` + `Sec-Audit-Failed: true` — if its audit row cannot persist, so a
+  privileged mutation never reports success on an unrecorded action (mint/rotate
+  additionally withhold the one-time secret). **Since #3937 the MCP mutation twins
+  fail closed too** — a JSON-RPC `503` error (with `audit_persisted:false` in
+  `error.data`, not on a success result), matching the REST posture and the
+  in-MCP plugin-config precedent; mint/rotate withhold the secret there as well.
+  (The human-token twins + the ~20 other set-and-proceed MCP write tools are a
+  separate, tracked decision.) The *reads* instead set the header
+  and proceed: they commit no state and disclose only authorization **topology
+  metadata** (principal ids, owners, role grants), not per-person behavioural
+  PII — so the fail-closed-on-read posture that governs the device/network PII
+  reads (which exists to keep individual-identifying data off an unaudited
+  response) does not apply. Full contract: `docs/user-manual/rest-api.md`
+  "Engine Principals" → *Audit-persist failure*.
 - **Owner-delete interlock (two-mode enforcement):** a user who owns an
   active engine principal must not be silently removed, or the principal's
   audit trail loses its named responsible human. Enforcement mode is chosen
@@ -3761,91 +3777,33 @@ schema-level `CHECK` constraint on `rbac_meta.value` for this key rejects a
 non-canonical write outright as defense in depth; the application-level
 strict parse is what refuses to boot if a bad value ever lands regardless.
 
-**Mandatory backfill (ADR-0009/0041).** Unlike the AuthDB fresh-start cutover,
-RBAC state is irreducible operator-authored config that **cannot be
-re-derived** — custom roles, every principal→role grant, groups, and
-membership — so the migration performs a one-time, single-shot, idempotent
-(retried from scratch on interruption — not a cursor-resumed stream, unlike
-AuditStore's larger dataset), reconciled, **fail-CLOSED** backfill from the
-legacy `rbac.db` (seed defaults first, then backfill operator rows via `ON CONFLICT DO NOTHING`;
-operator edits to seeded permissions are preserved via `DO UPDATE`). A
-built-in default permission the operator explicitly revoked (`remove_permission`)
-before upgrading is **deleted** — matching legacy exactly, a plain absent row
-— scoped to (role, securable_type, operation) triples legacy's own catalogue
-actually knew about, so a securable a later `seed_defaults()` adds (e.g.
-`EnginePrincipal`, #2376) or an operation added to an existing role+type pair
-(e.g. `ApiToken:Rotate` — fjarvis #2703 re-review, C1) is untouched (fjarvis
-#2703 F1). The revocation is
-recorded SEPARATELY, as pure reseed-suppression bookkeeping in a dedicated
-`revoked_seed_defaults` table — consulted ONLY by `seed_defaults()`'s grant
-helper, never by any authorization-decision code path — so `seed_defaults()`'s
-unconditional every-boot reseed cannot silently resurrect the revoked default
-without ever making it a real authorization fact again. This mirrors
-`remove_permission()`'s own permanent mechanism for the identical hazard
-beyond the one-time cutover. THREE earlier versions of this fix each
-reintroduced a hazard, all caught by governance before merge (none ever
-pushed to `origin`): a plain `DELETE` with no marker resurrects on the very
-next restart (verified empirically — a second `RbacStore` construction
-against the same database brought the revoked permission back); an
-`effect='deny'` tombstone avoids that but is a REAL authorization fact —
-`check_permission()` / `check_scoped_permission()` / `authorize_list_read()`
-all apply "deny overrides everything, across ALL of a principal's held
-roles" (pre-existing, identical in the legacy store), so the tombstone
-silently changed the authorization OUTCOME for any principal holding a
-second role that independently grants the same permission — on both the
-global and the management-group-scoped read paths (verified empirically
-both ways); the DELETE+marker design that fixes both has its own
-concurrency hazard (**CHAOS-1**) — `seed_defaults()`'s `grant()` fixes its
-READ COMMITTED snapshot at statement start, so if a concurrent revoke's
-marker-insert commits WHILE `grant()` is blocked on the `ON CONFLICT`
-arbiter waiting for that same revoke's uncommitted `DELETE`, Postgres only
-re-checks the conflict target after unblocking — never the `WHERE NOT
-EXISTS` subquery — and `grant()`'s already-computed row lands anyway,
-resurrecting the permission with the marker present but ineffective. Most
-likely during a fleet-wide rolling restart (many replicas' `seed_defaults()`
-calls racing another replica's one-time backfill). Closed with a
-`pg_advisory_xact_lock`, acquired in its own statement strictly BEFORE the
-check-and-mutate statement, in an explicit transaction, in all three writers
-(`grant()`, `remove_permission()`, the backfill's own revoke step) —
-verified empirically with two real Postgres connections, and safe for any
-replica boot ordering. Reconciliation counts roles + grants + groups +
-members and refuses the completion marker on any shortfall (fail-closed →
-refuse boot, retry next start). **The `rbac_enabled` flag is migrated first
-and read-back-verified** before the store is considered open (losing it is
-the single most dangerous outcome); a flag-backfill failure fails the whole
-backfill closed. The legacy `rbac.db` is moved aside only after a verified
-backfill.
-
-**Cross-replica marker fingerprinting (governance re-review, #2703).** The
-shared Postgres `backfill_complete` marker alone cannot distinguish
-"genuinely no legacy data anywhere" from "a fileless replica happened to
-check first" — stamping it from local absence alone let a fileless replica
-permanently foreclose migration for a sibling genuinely holding the real
-`rbac.db` (matches the anti-pattern `docs/postgres-store-playbook.md`
-documents for `AuditStore`, #2697). The fix: a SHA-256 content fingerprint
-of the legacy file (length-prefixed, injective encoding over every migrated
-row — not a delimiter join, which cannot safely disambiguate unconstrained
-operator free-text) is stamped alongside the marker, in the same
-transaction, derived from the exact rows actually migrated (no second file
-read — the trust anchor and the migrated data come from one shared
-in-memory snapshot). Any later replica that still holds a local legacy file
-re-derives its own fingerprint and verifies it against the stored value
-before trusting an existing marker: a genuine match skips (safe); anything
-else fails closed, with a distinct diagnostic for each of a stored
-`"sourceless"` value (no real migration has happened yet, but this later
-boot cannot bound what live post-cutover mutations — e.g. IdP group
-reconciliation — a fresh auto-migration might clobber), a genuinely
-different real fingerprint, and an absent fingerprint from a marker that
-predates this mechanism. None of the fail-closed cases auto-retry; a
-genuine prior migration under live operator changes since cannot be told
-apart from a different replica's completion this file was never part of.
-Promotion of a stored `"sourceless"` value to a real fingerprint happens
-only at STAMP TIME, inside a replica's own migration (a monotonic upsert in
-`stamp_complete`) — by then that replica's writes are already durably
-committed, so correcting the trust anchor cannot clobber anything; a later
-boot's mismatch is a materially different, unbounded situation and always
-refuses. Operator-facing failure modes and recovery:
-`docs/ops-runbooks/rbac-store-backfill-recovery.md`.
+**`migrate_from_sqlite()` retired (2026-09-03, #3623, ADR-0041 Update).** No production Yuzu
+fleet has ever run a pre-Postgres build of this store (ADR-0009's 2026-08-25
+fresh-start-by-default amendment), so the mandatory, single-shot, fingerprint-verified backfill
+this section previously described in full — seed-then-backfill via `ON CONFLICT DO NOTHING`,
+the `rbac_enabled`-flag-first read-back-verified transfer, the `revoked_seed_defaults`
+suppression table (still live and unaffected by this retirement — `seed_defaults()`'s reseed
+still consults it), the CHAOS-1 concurrency fix (`pg_advisory_xact_lock`, still live —
+`seed_defaults()` and
+`remove_permission()` both still take it, only the backfill's third writer is gone), and the
+SHA-256 cross-replica marker fingerprinting — is gone. `RbacStore::migrate_from_sqlite()` and
+its backfill-only helpers are removed; the two backfill-only rows in `rbac_meta`
+(`backfill_complete`/`backfill_source_fingerprint`) are POISONED, not dropped, via a
+version-bumped migration — `backfill_source_fingerprint` is forced to the retired code's own
+`kSourcelessFingerprint` sentinel (`"sourceless"`), never deleted; `rbac_meta` itself stays,
+still holding `rbac_enabled`/`write_generation`. This is the one store in the retirement batch
+whose marker is ROWS rather than a whole table, and a bare `DELETE` (the first version of this
+migration, caught by governance unhappy-path before merge) would have let a pre-#3623 binary
+rolling back read the resulting absence as "never migrated" and fall straight through its own
+fingerprint-verification safety net into an unconditional overwrite of the live `rbac_enabled`
+flag from a local legacy file — see ADR-0041's Update for the full trace. `server.cpp`'s boot
+path now runs `legacy_sqlite_probe::warn_if_legacy_rows` over `rbac_config` (the legacy table
+that held the enabled flag), `securable_types`, `operations`, `roles`, `role_permissions`,
+`principal_roles`, `groups`, and `group_members` instead — WARN-only, never refuse-boot, a
+posture reopened and explicitly reconfirmed for this store given the enabled-flag stakes rather
+than defaulted by uniformity with the rest of this retirement batch (see ADR-0041's Update for
+the full reasoning). `docs/ops-runbooks/rbac-store-backfill-recovery.md`, which documented this
+mechanism's failure modes, is deleted along with it.
 
 **Metrics.** `yuzu_server_rbac_read_degrade_total{reason}` — three
 DENYING reasons (`pool_acquire_timeout` / `query_error` /
@@ -3856,10 +3814,9 @@ Two OBSERVE-ONLY reasons share the same metric but deny nothing — the read
 still proceeds — and are deliberately excluded from that alert:
 `rbac_enabled_non_canonical` (a periodic refresh saw a non-canonical value;
 the cached enabled-state is left unchanged rather than coerced) and
-`stale_beyond_accepted_bound` (see the cross-replica coherence paragraph
-above). Also `yuzu_server_rbac_backfill_total{result}` (result ∈ `fresh` /
-`completed` / `failed`). See `docs/user-manual/metrics.md` and the
-`YuzuRbacReadDegraded` alert in `docs/prometheus/yuzu-alerts.yml`.
+`stale_beyond_accepted_bound` (the bounded-stale-serve paragraph above). See
+`docs/user-manual/metrics.md` and the `YuzuRbacReadDegraded` alert in
+`docs/prometheus/yuzu-alerts.yml`.
 
 **Read split for reviewers.** The plain `bool` authz checks fail closed
 (deny-on-error) so no chokepoint can regress to fail-open; the tri-state

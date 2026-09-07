@@ -20,9 +20,9 @@ sha256, filename, mandatory flag, and rollout percentage. It backs the gRPC `Che
 ladder only ever tracked `*Store` classes plus the auth DB — because it predates the `Store`
 naming convention; found alongside six siblings on 2026-08-27 (#1328/#1325/#3653).
 
-This is the smallest and lowest-risk of the seven: one table, four DB-touching methods
-(`upsert_package`/`remove_package`/`list_packages`/`latest_for`), no cross-table joins, no
-secrets, no background thread. It is deliberately ordered first as the template-proving
+This is the smallest and lowest-risk of the seven: one table, five DB-touching methods
+(`upsert_package`/`update_rollout_checked`/`remove_package`/`list_packages`/`latest_for`), no
+cross-table joins, no secrets, no background thread. It is deliberately ordered first as the template-proving
 migration for the batch.
 
 ## Decision
@@ -84,9 +84,14 @@ here per that rule's own requirement: applying the reviewer test to every read/w
   update this heartbeat asks again on the next one (agents poll continuously) — nothing is
   granted, targeted, enforced, or inverted by a false negative here; it is a missed opportunity,
   self-healing on retry.
-- `list_packages` (feeds the admin Updates page and the delete/rollout routes' package lookup): a
+- `list_packages` (feeds the admin Updates page and the delete route's package lookup): a
   degraded read returns an empty vector, which an admin reads as "no packages configured" and can
   re-check. No downstream branch treats an empty list as an authorization or enforcement signal.
+  The **rollout route is the exception and no longer reads through this method** (#3692): it audits
+  its outcome, so an empty-on-degrade read would assert in the evidence record that a package which
+  exists did not. It calls `update_rollout_checked` instead, which reports a degraded store as
+  distinct from absence — and, because the audited `from=` names the value the write replaced, does
+  its read and write in ONE row-locked transaction rather than two autocommit statements.
 - `upsert_package`/`remove_package`: already fire-and-forget in the SQLite era (no return value,
   errors logged only) — unchanged.
 

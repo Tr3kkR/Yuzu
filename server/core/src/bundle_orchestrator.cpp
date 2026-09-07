@@ -90,8 +90,7 @@ BundleOrchestrator::dispatch(const std::string& agent_id, const std::vector<Bund
         std::string command_id;
         bool ok = false;
         try {
-            int sent = 0;
-            std::tie(command_id, sent) =
+            const auto outcome =
                 // governance UP-8: thread the CALLER's exec_visible through
                 // unchanged rather than hardcoding an unfiltered set here — the
                 // wrapper (REST scoped_perm_fn / MCP in_scope) already confined
@@ -119,7 +118,8 @@ BundleOrchestrator::dispatch(const std::string& agent_id, const std::vector<Bund
                                                        .exec_visible = exec_visible,
                                                        .principal_is_admin = principal_is_admin,
                                                        .approval_provenance = approval_provenance});
-            ok = sent > 0 && !command_id.empty();
+            command_id = outcome.command_id;
+            ok = outcome.sent > 0 && !command_id.empty();
         } catch (const std::exception& e) {
             spdlog::warn("BundleOrchestrator: dispatch threw for step {}.{} ({}): {}", s.plugin,
                          s.action, correlation, e.what());

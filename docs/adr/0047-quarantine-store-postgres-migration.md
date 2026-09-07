@@ -393,10 +393,12 @@ note.
   backfill pattern** (built into `RbacStore`/`DiscoveryStore`/every store using this shape, not
   unique to quarantine) — this migration faithfully follows the established, precedent-set
   pattern; fixing the pattern itself is out of this PR's scope and blast radius. Documented here so
-  an operator considering rollback-then-reupgrade is warned (see `upgrading.md` and the
-  `quarantine-store-backfill-recovery.md` runbook, both fixed in the Gate 6 hardening round), and
-  to be filed as a follow-up against the shared pattern (`docs/postgres-store-playbook.md`'s
-  ADR-0040 section) in this run's post-merge follow-up batch, not fixed for this store alone.
+  an operator considering rollback-then-reupgrade is warned (see `upgrading.md` and the (retired,
+  #3623) `quarantine-store-backfill-recovery.md` runbook, both fixed in the Gate 6 hardening
+  round). Moot for this store specifically since `migrate_from_sqlite()` itself was retired
+  (2026-09-03, see this ADR's own Update) — no rollback-then-reupgrade replay path remains; the
+  class-level gap in the shared ADR-0040 pattern may still apply to a sibling store that has not
+  yet retired its own backfill.
 - **UP-9: a connection dying after a write commits but before the client receives the
   acknowledgement is answered on retry as a business error** (`"device is already
   quarantined"`/`"device is not quarantined"`, both 400) rather than distinguished from a caller
@@ -453,3 +455,34 @@ reasoning was "recorded in the ADR" for these items — it was not; this subsect
   is disproportionate for one NICE-tier assertion. The audit call itself was empirically verified
   correct by direct code inspection (Gate 8 security-guardian, compliance-officer) even without a
   test exercising it; a future harness change that adds this seam should also add the assertion.
+
+## Update (2026-09-03) — `migrate_from_sqlite()` retired
+
+ADR-0009's fresh-start-by-default amendment (2026-08-25) establishes that no production Yuzu
+fleet has ever run a pre-Postgres build of any store — the mandatory, fingerprint-verified,
+advisory-locked backfill this ADR designed (including the no-natural-per-row-key transaction
+shape described above) was real, working code that never had real legacy data to protect.
+
+`QuarantineStore::migrate_from_sqlite()` and its private helpers (`kSourcelessFingerprint`,
+`kMaxBackfillRows`, `kBackfillLockSql`, `sha256_hex`, `legacy_has_table`, `sqlite_text`,
+`LRecord`, `read_legacy_snapshot`, `append_field`, `canonicalize_legacy_snapshot`,
+`fingerprint_legacy_snapshot`, `legacy_quarantine_fingerprint`, `BackfillOutcome`,
+`commit_backfill`) are removed (`chore/retire-migrate-from-sqlite-batch-a`, tracking issue
+#3623). `read_record()` — which the backfill-only anonymous-namespace block sat alongside but
+never used — stays: `get_status`/`list_quarantined`/`get_history` all call it on the live read
+path. `quarantine_meta` — whose entire purpose was the backfill idempotency markers
+(`backfill_complete`, `backfill_row_count`, `backfill_source_fingerprint`) — is dropped via a
+version-bumped `{3, "DROP TABLE IF EXISTS quarantine_meta;"}` migration, appended after the
+already-shipped v1/v2 rather than edited in place: this store IS constructed in production, so
+v1/v2 have actually run against real dev/UAT databases. `server.cpp`'s boot path now runs
+`legacy_sqlite_probe::warn_if_legacy_rows` over `quarantine_records` instead of the backfill —
+WARN-only (never refuse-boot) on a real legacy row found, the same posture as every other store
+in this retirement batch. This is a deliberate, explicit choice for this store despite an active
+quarantine record being live security containment state: a real legacy file surviving to this
+point contradicts the established program-wide fact this amendment rests on, and a boot refusal
+would itself be a denial-of-service on the containment surface it exists to protect. An operator
+who sees the warning should treat it as an anomaly investigation, not a routine recovery path —
+the server's view of containment does not include whatever the warning names, though agent-side
+firewall enforcement (§11.7, out of scope for this store) may still be independently in effect.
+The ADR-0012 §2(b) documented exception for a one-time legacy backfill's atomic
+insert-plus-completion stamp is no longer exercised by this store.

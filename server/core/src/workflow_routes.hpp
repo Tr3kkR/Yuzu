@@ -1,5 +1,7 @@
 #pragma once
 
+#include "dispatch_confined_arms.hpp" // #3424/#3511: ConfinedDispatchOutcome -- DispatchFn/CommandDispatchFn return type
+
 #include "stream_budget.hpp"
 
 #include <yuzu/metrics.hpp>
@@ -66,7 +68,7 @@ public:
     /// dispatch narrows to it AND records who asked, via the shared
     /// `dispatch_confined` seam, exactly as /api/command and MCP do.
     /// `exec_visible` nullopt == unfiltered (background/system callers only).
-    using CommandDispatchFn = std::function<std::pair<std::string, int>(
+    using CommandDispatchFn = std::function<yuzu::server::ConfinedDispatchOutcome(
         const std::string& plugin, const std::string& action,
         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
         const std::unordered_map<std::string, std::string>& parameters,
@@ -84,7 +86,7 @@ public:
     /// only a second, additive PARAMETER LIST for the two call sites that
     /// have a resolved `InstructionDefinition` (and therefore a
     /// `concurrency_mode`) in hand.
-    using ConcurrencyDispatchFn = std::function<std::pair<std::string, int>(
+    using ConcurrencyDispatchFn = std::function<yuzu::server::ConfinedDispatchOutcome(
         const std::string& plugin, const std::string& action,
         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
         const std::unordered_map<std::string, std::string>& parameters,

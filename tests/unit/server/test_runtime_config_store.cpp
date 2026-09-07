@@ -188,12 +188,14 @@ TEST_CASE("warn_if_legacy_data_present restricts the legacy file AND its WAL/SHM
           "0600",
           "[runtime_config][detect-and-warn]") {
     // External adversarial-review finding: WebhookStore::migrate_from_sqlite_impl
-    // forces 0600 on a legacy plaintext-secret-bearing file AND its -wal/-shm
-    // sidecars before ever reading it (test_webhook_store.cpp's analogous test);
-    // this store's detect-and-warn path opened the legacy file read-only without
-    // ever doing either, leaving a real deployment's -wal sidecar (the
-    // pre-migration store ran journal_mode=WAL unconditionally) at whatever mode
-    // it already had -- exactly as sensitive as the main file it belongs to.
+    // (retired #3623 -- its 0600+sidecar logic lives on as the shared
+    // legacy_sqlite_probe::harden_legacy_file_0600, test_legacy_sqlite_probe.cpp's
+    // analogous tests) forced 0600 on a legacy plaintext-secret-bearing file AND
+    // its -wal/-shm sidecars before ever reading it; this store's detect-and-warn
+    // path opened the legacy file read-only without ever doing either, leaving a
+    // real deployment's -wal sidecar (the pre-migration store ran
+    // journal_mode=WAL unconditionally) at whatever mode it already had -- exactly
+    // as sensitive as the main file it belongs to.
     yuzu::test::TempDbFile legacy{"yuzu_test_rtcfg_wal_"};
     {
         yuzu::server::SqliteDb raw;

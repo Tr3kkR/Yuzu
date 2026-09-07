@@ -29,6 +29,7 @@
 
 using yuzu::server::SqliteDb;
 using yuzu::server::SqliteErrMsg;
+using yuzu::server::legacy_sqlite_probe::harden_legacy_file_0600;
 using yuzu::server::legacy_sqlite_probe::warn_if_legacy_rows;
 
 TEST_CASE("legacy_sqlite_probe: silent when the legacy file does not exist",
@@ -250,5 +251,190 @@ TEST_CASE("legacy_sqlite_probe: warns (does not silently skip) when the legacy p
     // THIS (whole-file stat() failure) branch specifically.
     CHECK(text.find("could not be checked") != std::string::npos);
     CHECK(text.find("table '") == std::string::npos);
+}
+
+// ── harden_legacy_file_0600 (#3623, generalized from WebhookStore's own inline
+// 0600+sidecar block, PR #3563) ──────────────────────────────────────────────
+
+TEST_CASE("legacy_sqlite_probe: harden_legacy_file_0600 restricts the main file and all three "
+          "sidecars to owner-only",
+          "[legacy_sqlite_probe]") {
+    // Covers `-wal`/`-shm` (WAL mode) AND `-journal` (rollback-journal mode) -- a secret-bearing
+    // store's legacy SQLite file could be left in either journal mode depending on how it was
+    // last closed, and only WAL-mode sidecars were covered before this test (external PR review,
+    // 2026-09-04).
+    auto legacy_path = yuzu::test::unique_temp_path("yuzu_test_legacyprobe_harden_") += ".db";
+    std::ofstream(legacy_path) << "dummy-content";
+    std::vector<std::filesystem::path> sidecars;
+    for (const char* suffix : {"-wal", "-shm", "-journal"}) {
+        auto side = legacy_path;
+        side += suffix;
+        std::ofstream(side) << "dummy-sidecar-content";
+        sidecars.push_back(side);
+    }
+    struct Cleanup {
+        std::vector<std::filesystem::path> paths;
+        ~Cleanup() {
+            std::error_code ec;
+            for (const auto& p : paths)
+                std::filesystem::remove(p, ec);
+        }
+    } cleanup{{legacy_path, sidecars[0], sidecars[1], sidecars[2]}};
+
+    // Group/world-readable to start, matching the unclean-shutdown-leftover
+    // shape the real code path defends against.
+    const auto wide_open = std::filesystem::perms::owner_read | std::filesystem::perms::owner_write |
+                           std::filesystem::perms::group_read | std::filesystem::perms::others_read;
+    for (const auto& p : {legacy_path, sidecars[0], sidecars[1], sidecars[2]})
+        std::filesystem::permissions(p, wide_open, std::filesystem::perm_options::replace);
+
+    harden_legacy_file_0600(legacy_path, "TestStore");
+
+    const auto owner_only =
+        std::filesystem::perms::owner_read | std::filesystem::perms::owner_write;
+    for (const auto& p : {legacy_path, sidecars[0], sidecars[1], sidecars[2]}) {
+        std::error_code st_ec;
+        const auto perms = std::filesystem::status(p, st_ec).permissions();
+        REQUIRE_FALSE(st_ec);
+        CHECK((perms & std::filesystem::perms::mask) == owner_only);
+    }
+}
+
+TEST_CASE("legacy_sqlite_probe: harden_legacy_file_0600 is a silent no-op when the legacy "
+          "file and its sidecars are absent",
+          "[legacy_sqlite_probe]") {
+    auto path = yuzu::test::unique_temp_path("yuzu_test_legacyprobe_harden_absent_");
+    REQUIRE_FALSE(std::filesystem::exists(path));
+
+    yuzu::test::LogCapture cap;
+    harden_legacy_file_0600(path, "TestStore"); // must not throw
+    cap.stop();
+    // Genuinely silent -- not just missing a since-removed literal prefix (this function's log
+    // lines are now store_name-prefixed, like warn_if_legacy_rows', so a stale substring check
+    // here would vacuously pass even if a warning HAD fired).
+    CHECK(cap.text().empty());
+}
+
+TEST_CASE("legacy_sqlite_probe: harden_legacy_file_0600 hardens the resolved target when the "
+          "legacy path is a symlink",
+          "[legacy_sqlite_probe]") {
+    // Superseded 2026-09-03 (adversarial review): an earlier revision REFUSED to touch a
+    // symlinked path, which left the real secret-bearing target ungated even though
+    // `warn_if_legacy_rows` follows the same symlink moments later and reads it. The fd-based
+    // rewrite below resolves the symlink via `open()` (exactly like that later probe open does)
+    // and hardens the resulting descriptor, so the real target ends up 0600 either way.
+    auto target = yuzu::test::unique_temp_path("yuzu_test_legacyprobe_harden_symtarget_") += ".db";
+    std::ofstream(target) << "dummy-content";
+    auto link = yuzu::test::unique_temp_path("yuzu_test_legacyprobe_harden_symlink_") += ".db";
+    REQUIRE(::symlink(target.string().c_str(), link.string().c_str()) == 0);
+    struct Cleanup {
+        std::filesystem::path target, link;
+        ~Cleanup() {
+            std::error_code ec;
+            std::filesystem::remove(target, ec);
+            std::filesystem::remove(link, ec);
+        }
+    } cleanup{target, link};
+
+    const auto wide_open = std::filesystem::perms::owner_read | std::filesystem::perms::owner_write |
+                           std::filesystem::perms::group_read | std::filesystem::perms::others_read;
+    std::filesystem::permissions(target, wide_open, std::filesystem::perm_options::replace);
+
+    harden_legacy_file_0600(link, "TestStore");
+
+    const auto owner_only =
+        std::filesystem::perms::owner_read | std::filesystem::perms::owner_write;
+    std::error_code st_ec;
+    const auto target_perms = std::filesystem::status(target, st_ec).permissions();
+    REQUIRE_FALSE(st_ec);
+    // Target hardened — resolved through the symlink, not left wide-open.
+    CHECK((target_perms & std::filesystem::perms::mask) == owner_only);
+
+    // The link itself is untouched by the chmod (fchmod acts on the target's inode, not the
+    // link) and remains a symlink.
+    std::error_code lstat_ec;
+    const auto link_status = std::filesystem::symlink_status(link, lstat_ec);
+    REQUIRE_FALSE(lstat_ec);
+    CHECK(link_status.type() == std::filesystem::file_type::symlink);
+}
+
+TEST_CASE("legacy_sqlite_probe: harden_legacy_file_0600 cannot widen or redirect a chmod onto "
+          "a file it does not own",
+          "[legacy_sqlite_probe]") {
+    // Pins the ownership-gate half of the security argument in this header's doc comment: a
+    // symlink to a file this process does NOT own must fail the fchmod (EPERM, best-effort,
+    // logged, boot proceeds) rather than ever changing that file's mode -- the property that
+    // makes following the symlink (see the test above) safe against an attacker-planted link to
+    // an arbitrary file. Skipped (not just "as root") wherever the ownership premise doesn't
+    // hold -- root can chmod anything, but so can a UID-remapped/rootless-container euid that
+    // happens to already own /etc/passwd -- either way the fchmod would SUCCEED, mutating a real
+    // system file instead of demonstrating the gate. Both checked before touching anything.
+    if (::geteuid() == 0)
+        SKIP("running as root -- the ownership gate does not apply, nothing to assert");
+    else {
+        const std::filesystem::path root_owned = "/etc/passwd"; // world-readable, root-owned
+        struct stat owner_check{};
+        REQUIRE(::stat(root_owned.c_str(), &owner_check) == 0);
+        if (owner_check.st_uid == ::geteuid())
+            SKIP("this process already owns /etc/passwd -- the ownership gate does not apply "
+                 "here, nothing to assert");
+
+        std::error_code st_ec;
+        const auto before = std::filesystem::status(root_owned, st_ec);
+        REQUIRE_FALSE(st_ec);
+        REQUIRE(before.type() == std::filesystem::file_type::regular);
+        const auto before_perms = before.permissions() & std::filesystem::perms::mask;
+
+        auto link = yuzu::test::unique_temp_path("yuzu_test_legacyprobe_harden_noowner_") += ".db";
+        REQUIRE(::symlink(root_owned.c_str(), link.string().c_str()) == 0);
+        struct Cleanup {
+            std::filesystem::path link;
+            ~Cleanup() {
+                std::error_code ec;
+                std::filesystem::remove(link, ec);
+            }
+        } cleanup{link};
+
+        yuzu::test::LogCapture cap;
+        harden_legacy_file_0600(link, "TestStore"); // must not throw, must not touch /etc/passwd's mode
+        cap.stop();
+
+        std::error_code after_ec;
+        const auto after_perms =
+            std::filesystem::status(root_owned, after_ec).permissions() & std::filesystem::perms::mask;
+        REQUIRE_FALSE(after_ec);
+        CHECK(after_perms == before_perms); // unchanged -- the fchmod failed closed
+        CHECK(cap.text().find("could not set 0600") != std::string::npos);
+        // Pins the store_name parameter's actual effect (not just that call sites compile with
+        // it) -- a future edit reordering or dropping the format argument on any of the three
+        // chmod_owner_only call sites would otherwise go undetected (governance Gate 3,
+        // quality-engineer, 2026-09-04).
+        CHECK(cap.text().find("TestStore") != std::string::npos);
+    }
+}
+
+TEST_CASE("legacy_sqlite_probe: harden_legacy_file_0600 leaves a non-regular path (a FIFO) "
+          "untouched without blocking",
+          "[legacy_sqlite_probe]") {
+    // Guards the O_NONBLOCK choice: a plain open() on a FIFO with no writer blocks
+    // indefinitely, the same hazard warn_if_legacy_rows avoids via is_regular_file(). Wrapped in
+    // the same async+wait_for bound as the sibling FIFO test above (rather than calling
+    // synchronously) so a regression here fails this test with a clear message instead of
+    // hanging the whole suite -- see that test's file-header comment for why the process itself
+    // can still block past this bound on unwind even so.
+    auto fifo_path = yuzu::test::unique_temp_path("yuzu_test_legacyprobe_harden_fifo_");
+    REQUIRE(::mkfifo(fifo_path.string().c_str(), 0600) == 0);
+    struct Cleanup {
+        std::filesystem::path path;
+        ~Cleanup() {
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+        }
+    } cleanup{fifo_path};
+
+    auto fut =
+        std::async(std::launch::async, [&] { harden_legacy_file_0600(fifo_path, "TestStore"); });
+    const auto status = fut.wait_for(std::chrono::seconds(3));
+    REQUIRE(status == std::future_status::ready); // else: regressed off O_NONBLOCK, hung on open()
 }
 #endif // _WIN32

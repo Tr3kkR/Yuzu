@@ -232,3 +232,33 @@ opens:
   migration adds a defensive hard ceiling (`kQueryRowCap`, matching the sibling stores'
   pattern) independent of the callers' existing 1000-row REST-level caps, purely as
   belt-and-braces against a future uncapped caller.
+
+## Update (2026-09-03) — `migrate_from_sqlite()` retired
+
+ADR-0009's fresh-start-by-default amendment (2026-08-25) establishes that no production Yuzu
+fleet has ever run a pre-Postgres build of any store — the one-time first-boot backfill this ADR
+designed was real, working code that never had real legacy data to protect. This also disposes
+of the "Backfill is row-by-row, not batched" follow-up above and the "legacy `inventory.db`
+stays on disk... removal is a follow-up" line in "Consequences" — there is no backfill left to
+batch, and nothing left reading the legacy file at all.
+
+`InventoryStore::migrate_from_sqlite()` is removed (`chore/retire-migrate-from-sqlite-batch-a`,
+tracking issue #3623) — this store had no separate legacy-introspection helper functions (unlike
+RbacStore/QuarantineStore/ManagementGroupStore); its SQLite reading logic was entirely inline in
+the one function. `backfill_state` — whose entire purpose was the backfill idempotency stamp —
+is dropped via a version-bumped `{5, "DROP TABLE IF EXISTS backfill_state;"}` migration, appended
+after the already-shipped v1-v4 rather than edited in place: this store IS constructed in
+production, so v1-v4 have actually run against real dev/UAT databases.
+
+**`delete_agent()`'s retained-legacy-file erasure branch is also retired**, along with the
+`legacy_db_path_` member that fed it (its sole writer was `migrate_from_sqlite`). This is a
+deliberate, explicit decision, not an oversight: a leftover legacy `inventory.db` is now never
+read and never scrubbed by this store. Unlike the protective-control stores in this same
+retirement batch (Rbac/ManagementGroup/Quarantine), a stale row here is recoverable inventory
+data, not lost security state — an operator who needs it gone must delete the file manually. See
+`docs/user-manual/upgrading.md`'s new InventoryStore section for the operator-facing note.
+
+`server.cpp`'s boot path now runs `legacy_sqlite_probe::warn_if_legacy_rows` over
+`inventory_data` instead of the backfill — WARN-only, never refuse-boot, same posture as every
+other store in this retirement batch. No dedicated backfill metric or alert existed for this
+store, so none is removed.

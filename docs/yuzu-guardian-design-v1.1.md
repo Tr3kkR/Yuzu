@@ -2463,16 +2463,28 @@ Guardian ladder must check these.
   `stop()` holds `mtx_` across its whole body AND joins BOTH the
   `ConvergenceScheduler` lanes and the outbox drain worker inside it, so an
   `mtx_` acquisition on any of those threads is a lock-vs-join deadlock — a hung
-  agent shutdown, fleet-wide. Everything those threads run is in scope: the
-  journal's prune/page maintenance, the convergence sweeps, and the INJECTED
-  `send`, which is an arbitrary `std::function` supplied from `agent.cpp` and is
-  the easiest place to reintroduce it. Collaborators are handed to the workers as
-  pre-resolved handles at construction, never re-read off the engine under its
-  lock. `mtx_` is a `WorkerHostileMutex` that ABORTS on violation in
-  debug/sanitizer builds, keyed on the thread-local marker in
-  `guardian_joined_thread_role.hpp` — but the abort is a backstop, not a licence
-  to reason loosely, and it compiles out of a plain release build. (C0, #2298
-  gate 1 + Gate 4.)
+  agent shutdown, fleet-wide. In scope: the journal's prune/page maintenance and
+  the convergence sweeps, both of which run directly on a joined thread.
+  Collaborators are handed to the workers as pre-resolved handles at
+  construction, never re-read off the engine under its lock. `mtx_` is a
+  `WorkerHostileMutex` that ABORTS on violation in debug/sanitizer builds, keyed
+  on the thread-local marker in `guardian_joined_thread_role.hpp` — but the abort
+  is a backstop, not a licence to reason loosely, and it compiles out of a plain
+  release build. (C0, #2298 gate 1 + Gate 4.)
+  **NOT in scope since #3961**: the drain worker's INJECTED `send` (an arbitrary
+  `std::function` supplied from `agent.cpp`) no longer runs on the joined thread
+  — `GuardianOutboxDrainWorker::wrapped_send()` bounces every send through a
+  per-lane `GuardianOutboxSendExecutor`, which runs it on its own DETACHED
+  worker instead. That detached worker is covered by a separate invariant, the
+  ORPHAN-EXIT CONTRACT (`guardian_outbox_send_executor.hpp`'s header comment):
+  a worker wedged in a blocking syscall cannot be joined or force-cancelled, so
+  `active_send_workers()` — summed into `GuardianEngine::active_io_workers()`
+  (`guardian_engine.cpp`) alongside the state-reader and arm/disarm executors —
+  is what keeps `main.cpp`/`service_win.cpp` from tearing down the state `send`
+  captures while a detached send is still running, `hard_exit()`ing instead
+  after a bounded grace. A source left out of that sum would silently reinstate
+  the use-after-free the joined-thread rule used to prevent by a different
+  mechanism.
 - **Journal maintenance is paced by TIME, never by wake count.** The drain
   worker wakes on every outbox enqueue, and a paging pass is a full
   `list_entries` + parse + `validate_record` sweep of the journal.
@@ -2527,6 +2539,28 @@ Guardian ladder must check these.
   the agent cannot enforce (or silently drops one it can), and nothing else in
   the build catches the divergence.
 
+- **`full_sync`'s KV teardown clears `rule:` keys ONLY, never `baseline:`
+  records (#4021).** A `file-hash-equals` rule authored with no `expected_hash`
+  captures a baseline on arm; that capture is persisted per `rule_id` under
+  `__guardian__`/`baseline:` (fingerprint = assertion type + authored path,
+  schema-versioned separately from the fingerprint content so a future schema
+  bump cannot silently mass-invalidate every existing record as "a genuine
+  retarget"), and re-seeded at both arm sites (legacy
+  `start_guard_for_rule_locked`, Spark's `reconcile_rule_locked`). A future
+  blanket `kv_->clear(kKvNamespace)` — or a new key type added under this
+  namespace without updating the scoped delete — silently reinstates the
+  #4021 laundering (a genuinely drifted rule's baseline reset to whatever the
+  target currently holds, with no remediation and no visible action). Absence
+  from one push is not deletion — the server omits disabled/out-of-scope rules
+  from every push, so a rule_id's baseline record is never swept merely for
+  being absent from a full_sync. `guardian_persist_baseline` additionally
+  refuses to overwrite a well-formed, same-fingerprint record (a write reaching
+  that state can only mean a failed seed lookup — adversarial-review K1/C2-1).
+  Spark's own first-ever baseline capture is NOT yet wired to this store
+  (tracked as #4045) — under `prefer_spark_=true` (not the shipping default), a
+  rule never armed via legacy still relaunders on full_sync/restart exactly as
+  before this fix.
+
 ## 25. Lifecycle-audit journal (ADR-0021 Stage 2, item 7)
 
 Guardian's spark-backed rule engine keeps a durable audit trail of `guard.armed` /
@@ -2539,7 +2573,9 @@ names and buckets changed during implementation and that doc is a point-in-time
 design record, not maintained against the code afterward.
 
 **The guarantee.** Process-crash-durable, duplicate-tolerant, bounded-retry delivery
-of armed/disarmed lifecycle events. Once persisted, an event survives a process
+of armed/disarmed/errored lifecycle events (`"errored"` gained the same durable
+treatment as the other two in #2818/PR-2d, which fixed a replay-validation allowlist
+that had quarantined it as tampered on any restart until then). Once persisted, an event survives a process
 crash or restart and is re-sent on every reconnect/restart — regardless of any
 possible prior acceptance (acceptance is unknowable; there is no ack) — until it
 ages out of retention. A local gRPC `Write()` returning true is never delivery
@@ -2603,6 +2639,7 @@ heartbeat tags unless noted (sparse-emit: a zero counter ships no tag; writer
 | maintenance exception | a persist/prune/page throw was firewalled and swallowed | `maint_exceptions` | integrity gap, alert |
 | lifecycle backpressure drop | a lifecycle entry was rejected at outbox enqueue for capacity (a staging loss, distinct from `stage_dropped`) | `guardian_journal_backpressure_drops` | integrity gap, alert |
 | drain/send exception | a per-entry drain send threw; the head is retained and that log's drain stops | `guardian_drain_exceptions` / `guardian_send_exceptions` | integrity gap, alert |
+| send stall / orphan-exception (#3953) | a `GuardianOutboxSendExecutor` send (either lane) exceeded its stall threshold before completing/reclaiming, or a reclaimed orphan's result was a thrown exception discarded for lack of anywhere correct to attribute it | `guardian_send_stalls` / `guardian_send_orphan_exceptions` | monitor (stall); diagnostic, not a loss (orphan-exception) |
 
 Two related counters are reported alongside but are **not** journal loss channels:
 `guardian_sweep_exceptions` (a firewalled convergence-sweep throw — drift
@@ -2619,9 +2656,11 @@ zero — a dead worker must not read identically to a healthy idle one). A third
 
 **Not claimed:** end-to-end at-least-once (there is no server ack of an individual
 lifecycle event, by design — Option A per the source doc); deterministic sub-second
-ordering. `guard.errored` has no lifecycle-journal producer today (scope is
-armed/disarmed only). All fleet counters are unlabelled or low-cardinality —
-never keyed by raw `agent_id`.
+ordering. `guard.errored` has exactly ONE lifecycle-journal producer today (#2818:
+`GuardianSparkRuntime::on_subscription_lost`/`revalidate_subscriptions`, a spark
+subscription-death detach) — dormant while `prefer_spark_=false`; other `errored`-status
+paths (arm/boot failures) still journal nothing. All fleet counters are unlabelled or
+low-cardinality — never keyed by raw `agent_id`.
 
 **Standing invariant** (also recorded in §24): journal maintenance is paced by
 time, not by wake count — the drain worker wakes on every outbox enqueue, and a

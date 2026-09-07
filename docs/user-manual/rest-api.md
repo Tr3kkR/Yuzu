@@ -86,6 +86,7 @@ A separate, narrower shape applies to ordinary mutation routes that audit a chan
   - [OpenAPI Spec](#openapi-spec)
   - [Discovery (A2)](#discovery-a2)
   - [Inventory](#inventory)
+  - [Result Sets](#result-sets)
   - [Software Licensing (SLE)](#software-licensing-sle)
   - [Execution Statistics](#execution-statistics)
   - [Live-Query Bundles](#live-query-bundles)
@@ -942,6 +943,12 @@ Engine principals are the durable identities behind autonomous use-case-engine m
 
 **Storage failure:** if the engine-principal store failed to open at startup (no PostgreSQL configured, or a migration failure), every route on this surface returns `503 service unavailable`.
 
+**Audit-persist failure (fail closed on mutations):** these routes emit a privileged-action audit row, and a mutation that cannot record it must never look like a clean success. If the audit-store write itself fails, every **mutating** route (create, revoke, transfer-owner, `credentials`/`credentials/rotate`/`credentials/confirm`, and the role assign/unassign routes documented later) **fails closed** — it returns `503` with a `Sec-Audit-Failed: true` header instead of its normal `2xx` (ADR-1005 "mutations fail closed on audit failure"). The mutation may already have taken effect (the audit is emitted after the store write), so treat such a `503` as *unconfirmed* and reconcile via a read. This is a stricter posture than the software-package/deployment mutations elsewhere in this API, which set-and-proceed (stay `2xx` with `Sec-Audit-Failed`) on the same audit-drop: engine-principal management is a privileged-identity surface, so ADR-1005 holds it to fail-closed rather than proceed-and-signal.
+
+The credential **mint** and **rotate** routes additionally **withhold the one-time secret** on this path — nothing is placed in the `503` body. Recovery differs by route: a **mint** whose audit dropped leaves a credential that exists but is unusable (no one holds its secret) — `GET` the principal to see it, then **rotate** it (mints an audited successor you can then confirm) to obtain a usable secret; a **rotate** whose reveal-audit dropped can be **rotated again within the overlap window** to re-serve the *same* successor secret (an audited re-serve, not a new credential). Note the compounding case under a *sustained* audit outage: repeated mint/rotate failures can leave two unconfirmed credentials, at which point the store's ≤2-active guard blocks further rotation — recover by revoking one unconfirmed credential and re-minting once the audit store is healthy.
+
+The **read** routes (`GET`/list, `GET /{id}`, `GET /audit/no-admin`, `GET /{id}/roles`) and the engine-session denial above instead set the same `Sec-Audit-Failed: true` header but still serve their response — matching the MCP twins' `audit_persisted:false` body field. Reads proceed (rather than fail closed like the behavioural-PII device/network reads) because they commit no state and disclose only authorization **topology metadata** — principal ids, owners, role grants — not per-person behavioural PII; the fail-closed-on-read posture exists specifically to keep individual-identifying data off an unaudited response, which does not apply here. Alert on `Sec-Audit-Failed: true` from this surface as a SOC 2 CC7.2 evidence-gap signal (the same alert that covers the behavioural-PII routes fires on it), while noting the serve behaviour differs: these reads still return data, those withhold it.
+
 **`{id}` convention:** on every route below (`GET /{id}`, `DELETE /{id}`, the `credentials`/`credentials/rotate`/`credentials/confirm`/`transfer-owner` sub-resources), `{id}` is the **full** `principal_id`, i.e. `engine:<slug>` (e.g. `GET /api/v1/engine-principals/engine:vuln-uce`) — none of these routes prepend the `engine:` prefix themselves. This is the opposite convention from the `.../{id}/roles` role-assignment sub-resource documented later in this file, where `{id}` is the **bare slug** and the server reconstructs the full id internally — don't assume the two sections share one convention.
 
 #### `POST /api/v1/engine-principals`
@@ -982,6 +989,7 @@ Create a new engine-principal identity. `principal_id` is derived server-side as
 | `owner_username` empty or does not reference an existing user | `400` — `owner_username must reference an existing user` |
 | `classification` missing or not `internal`/`external` | `400` — store validation error |
 | `justification` empty | `400` — store validation error (`justification cannot be empty`) |
+| The create audit row could not persist | `503` + `Sec-Audit-Failed: true` — the principal may already have been created (audit is emitted after the store write); reconcile via `GET` (see *Audit-persist failure* above) |
 
 **Response (201):**
 
@@ -1057,7 +1065,7 @@ Terminal, irreversible revoke. Every active credential is revoked **first**, the
 }
 ```
 
-**Errors:** `404` — engine principal not found. `503` — a genuine store failure at any step of the sequence (the principal lookup, the credential-store revoke, or the identity revoke itself) — never an idempotent no-op; credentials are revoked strictly before the identity, so a `503` here never leaves the identity flipped to `revoked` while a credential is still live.
+**Errors:** `404` — engine principal not found. `503` — a genuine store failure at any step of the sequence (the principal lookup, the credential-store revoke, or the identity revoke itself) — never an idempotent no-op; credentials are revoked strictly before the identity, so a `503` here never leaves the identity flipped to `revoked` while a credential is still live. `503` + `Sec-Audit-Failed: true` — the revoke audit row could not persist (see *Audit-persist failure* above); the revoke may already have taken effect, so reconcile via `GET`.
 
 ---
 
@@ -1086,7 +1094,7 @@ Mint the **first** credential for an engine principal. The raw secret is returne
 
 `token` is the raw secret (shown once); `token_id` and `expires_at` let a pure-REST caller correlate the credential it just minted without a follow-up `GET`.
 
-**Errors:** `404` — engine principal not found. `409` — engine principal is not active (revoked), **or** the principal already has an active credential (mint is single-shot; use `credentials/rotate` instead). `400` — `ttl_days` out of range. `503` — CSPRNG failure or any other store failure (a CSPRNG failure also sets `Retry-After: 5` and increments `yuzu_secure_random_failure_total{reason="prng_failure",site="engine_principal"}`).
+**Errors:** `404` — engine principal not found. `409` — engine principal is not active (revoked), **or** the principal already has an active credential (mint is single-shot; use `credentials/rotate` instead). `400` — `ttl_days` out of range. `503` — CSPRNG failure or any other store failure (a CSPRNG failure also sets `Retry-After: 5` and increments `yuzu_secure_random_failure_total{reason="prng_failure",site="engine_principal"}`). `503` + `Sec-Audit-Failed: true` — the mint audit row could not persist: the credential was created but its **one-time secret is withheld** (never in the body), so the credential exists but is unusable — see *Audit-persist failure* above for recovery.
 
 ---
 
@@ -1124,6 +1132,7 @@ Overlap-pair rotation (design doc §7): mints a successor credential while the e
 | No active credential found for this principal to rotate | `503` — **not** `400`/`404`. Deliberately conflated with a transient read failure: the internal read that finds "no active credential" cannot be told apart from a silently-failed read, so a genuine "nothing to rotate" is classified as retryable (503) rather than a definitive client error — treating it as 400 could otherwise mislead a caller into minting a redundant second credential during what was actually a transient outage. |
 | A non-engine-kind active credential is present for this principal (defensive check) | `503` |
 | Advisory-lock acquire failure, CSPRNG failure, the engine-referent check itself being unreachable, or a mint/stamp write that did not persist | `503` — retryable store failure |
+| The reveal audit row could not persist | `503` + `Sec-Audit-Failed: true` — the successor was minted but its **one-time secret is withheld**; rotate again within the overlap window to re-serve the *same* audited successor secret (see *Audit-persist failure* above) |
 | MFA step-up not satisfied | `401` |
 | Missing `Security:Write`, or the caller's own session is engine-classed (structural deny belt) | `403` |
 
@@ -1176,6 +1185,7 @@ Like `credentials/rotate` above, this route never looks up `{id}` via a `get()` 
 | No active credentials, or exactly two that aren't a recognized rotation pair | `503` — **not** `400`. Ambiguity-avoidance: an empty read can't be distinguished from a silently-failed read, and a malformed pair is kept conservative, so these stay retryable rather than a definitive client error. |
 | A non-engine-kind active credential is present for this principal (defensive check) | `400` — `principal has a non-engine active credential` |
 | **The presented `secret` does not hash-match the pending successor's stored secret (#3015 proof of possession)** — reached only after ownership/pair-state/the `token_id` pin/the initiator binding above have all passed | `403` — `rotation secret mismatch — the presented secret does not verify against the pending successor` |
+| The confirm audit row could not persist | `503` + `Sec-Audit-Failed: true` — the rotation was confirmed (predecessor retired) but its audit row did not persist (see *Audit-persist failure* above); a retried confirm returns the terminal `409` (the rotation is already resolved — the replay row above), which itself confirms the mutation took effect |
 | The authoritative successor row could not be re-read to verify the secret (should not happen under the lock already held; fails closed rather than assume a match) | `503` — `failed to verify rotation secret` |
 | Advisory-lock acquire failure, or the confirm/predecessor-revoke/successor-clear write did not persist | `503` — retryable store failure |
 | MFA step-up not satisfied | `401` |
@@ -1206,7 +1216,7 @@ Reassign the named responsible owner of an active engine principal. Admin-forced
 }
 ```
 
-**Errors:** `400` — `new_owner must reference an existing user`. `404` — engine principal not found. `409` — engine principal is not active. `503` — the transfer call itself failed.
+**Errors:** `400` — `new_owner must reference an existing user`. `404` — engine principal not found. `409` — engine principal is not active. `503` — the transfer call itself failed. `503` + `Sec-Audit-Failed: true` — the transfer audit row could not persist (see *Audit-persist failure* above); the transfer may already have taken effect, so reconcile via `GET`.
 
 ---
 
@@ -1580,10 +1590,11 @@ Quarantine a device.
 >   this route validates `whitelist` at write time (`400` instead of `201`
 >   for a malformed value), the same rule MCP's `quarantine_device` already
 >   enforced — so a fresh write here can no longer land in this state. A
->   `validation_failed` reconcile now points at a record migrated from the
->   legacy `quarantine.db` (ADR-0047 backfill, which copies `whitelist`
->   verbatim with no validation) or one written via this route before
->   `d1f71c58f` shipped, not a fresh call. Either way, every reconcile
+>   `validation_failed` reconcile now points at a record written via this
+>   route before `d1f71c58f` shipped, or — on a fleet with pre-#3623 history
+>   — one migrated from a legacy `quarantine.db` by the since-retired
+>   `migrate_from_sqlite` backfill (ADR-0047, which copied `whitelist`
+>   verbatim with no validation), not a fresh call. Either way, every reconcile
 >   attempt then counts `validation_failed` and nothing is ever dispatched.
 >   That failure is loud, not silent — the device stays in
 >   `yuzu_server_quarantine_endpoint_unconfirmed{reachability="connected"}`
@@ -1609,33 +1620,67 @@ Quarantine a device.
 > [Audit Log](audit-log.md)).
 >
 > **`POST /api/command` reports what it withheld.** The success body carries
-> `withheld_quarantined` — always present, `0` on a clean dispatch — so
-> `agents_reached: 97` on a 100-device group is distinguishable from three
-> devices being offline. The dashboard toast says the same.
+> `withheld_quarantined` and (#3424/#3511) `withheld_unknown_plugin` — both
+> always present, `0` on a clean dispatch — so `agents_reached: 97` on a
+> 100-device group is distinguishable from three devices being offline, and a
+> MIXED partial dispatch (some reached, some plugin-absent) is never silently
+> invisible in the response. The success body also carries `audit_emitted`
+> (#2557), the same field every denial arm that calls `emit_behavioral_audit`
+> on this route already carries (the body-type, targeting-shape,
+> Destructive-untargeted, Destructive-no-visible-target, no-target-named and
+> classification-denial 400/403/404 arms) — NOT the scope-parse 400 (an
+> unrelated JSON shape with no audit call at all) or the sent==0 503 family,
+> neither of which ever carried it — present and `false` only when the paired `command.dispatch`
+> `result=success` audit row failed to persist (the response also sets
+> `Sec-Audit-Failed: true` in that case), omitted entirely when no audit
+> store is configured. Before #2557 the success path's audit call was
+> unguarded against a throwing sink and never reported this field at all —
+> the one response shape most likely to be read as "everything is fine" was
+> also the one place a silent audit-persist failure was invisible to the
+> caller. The dashboard's own execute console
+> (`/api/dashboard/execute`, a separate HTML-fragment handler, not this route)
+> now names the same containment/quarantine/plugin-absence causes on a
+> zero-agents-reached dispatch; it does not yet surface withheld counts on a
+> MIXED partial dispatch the way this route's success body does — tracked as a
+> follow-up.
 >
-> **Its `503` now names the cause.** Three conditions previously shared one
-> body ("failed to send command to any agent"), and one of them is a
-> fleet-wide policy state rather than a transport failure:
+> **Its `503` now names the cause.** Four conditions previously shared one
+> body ("failed to send command to any agent"), and two of them are
+> fleet-wide/request-wide states rather than a transport failure:
 >
 > | `error.reason` | Meaning | `retry_after_ms` |
 > |---|---|---|
 > | `containment_unreadable` | The gate is failing closed: containment state cannot be read, so **every** target on **every** dispatch is refused. A server condition, not a device one. | `5000` |
 > | `quarantined` | Every target named is contained. The dispatch was withheld, not attempted. | `null` — retrying will not help until the device is released |
+> | `plugin_not_found` (#3511) | The dispatched plugin is absent from every target's reported inventory — a command guaranteed to fail, withheld before dispatch rather than reported as a false success. Permanent for the current plugin name. If the plugin name and spelling are correct and it genuinely is installed on the target, the agent's REPORTED inventory is stale: it is populated once at registration and does not refresh until the agent's management connection next re-registers (a reconnect — daemon restart, or any dropped/re-established connection) — this reason can persist until then even after installation completes. | `null` — retrying will not help; check the plugin name/spelling instead, or trigger a reconnect on the target agent if the plugin was only just installed |
 > | *(absent)* | Genuinely no agent reachable — the pre-existing meaning. | *(absent)* |
 >
 > `reason` is a top-level key on the error object, not part of the A4
-> `error.data` envelope. The versioned dispatch routes
-> (`POST /api/instructions/{id}/execute`, the bundle and result-set producers)
-> do **not** yet carry this split — they answer their existing
-> "no agents reached" shapes for all three conditions, because the shared
-> dispatch closure returns only a sent count. Tracked as #3424. ADR-1007 added
-> a fourth cause to that same undifferentiated message on
-> `POST /api/instructions/{id}/execute`: for a `per-device` definition, every
-> named target may have been excluded by an already-open concurrency claim
-> rather than being unreachable at all — the response text now says so, and
-> points at the `yuzu_server_dispatch_concurrency_skipped_total` metric, but
-> this is still prose inside the one undifferentiated 503 body, not a fourth
-> structured `error.reason` value — the same #3424 gap applies to it. The quarantine
+> `error.data` envelope. `POST /api/instructions/{id}/execute` carries the
+> same three-`reason` `503` split as `POST /api/command` above
+> (`containment_unreadable` / `quarantined` / `plugin_not_found`, same
+> `retry_after_ms` values) — closed alongside the architect finding that its
+> response-building code
+> was reading `dispatch_outcome.command_id`/`.sent` only, discarding the
+> richer fields already available on the same struct.
+>
+> **A fourth, structurally distinct condition — `invalid_scope` — is `400`,
+> not part of the `503` table above.** This route (unlike `POST
+> /api/command`) accepts a caller-supplied `scope` expression; a malformed
+> one is a client mistake, not a fleet-state fact, so it reports
+> `error.reason: "invalid_scope"` at `400` with `retry_after_ms: null`,
+> checked before the `503` cascade so a bad expression is never shadowed by
+> `containment_unreadable`. Its generic catch-all
+> (no `reason` key, matching the *(absent)* row above) additionally covers
+> ADR-1007's per-device concurrency-claim exclusion, unique to this route
+> since it — unlike `/api/command` — accepts a `concurrency_mode`: for a
+> `per-device` definition, every named target may have been excluded by an
+> already-open claim rather than being unreachable at all; the message
+> points at `yuzu_server_dispatch_concurrency_skipped_total`. The bundle and
+> result-set producers still do **not** carry this split — their own
+> response-building code was not extended to surface the richer per-arm
+> result their shared dispatch closure now carries (a separate, smaller
+> follow-up per route). The quarantine
 > plugin's own four actions (`quarantine`, `unquarantine`, `status`,
 > `whitelist`) are exempt so that release stays reachable, and so are three
 > server-internal pushes that are not operator dispatch —
@@ -2109,7 +2154,9 @@ role is admin/built-in/otherwise rejected by `validate_assignment` (design
 non-revoked) engine principal exists at `{id}`; `503` — the RBAC or
 engine-principal store is unavailable. A rejected assignment is audited
 `engine_principal.role.assigned` with `result=denied`; success with
-`result=success`.
+`result=success`. `503` + `Sec-Audit-Failed: true` — the assignment audit row
+could not persist (see *Audit-persist failure* above): the grant may already be
+in effect, so reconcile via `GET /{id}/roles`.
 
 ---
 
@@ -2131,7 +2178,9 @@ Unassign a fleet-wide role from an engine principal.
 **Errors:** `400` — the role was not assigned to this principal (store-returned
 error); `401`/`403` — not authenticated, missing `Security:Write`, or MFA
 step-up required/failed; `503` — the RBAC store is unavailable. Audited
-`engine_principal.role.unassigned` on success.
+`engine_principal.role.unassigned` on success. `503` + `Sec-Audit-Failed: true`
+— the unassign audit row could not persist (see *Audit-persist failure* above):
+the grant may already be removed, so reconcile via `GET /{id}/roles`.
 
 ---
 
@@ -3699,7 +3748,7 @@ See [Audit log](audit-log.md) for the `detail` contract, which differs for secre
 
 ### Custom Properties
 
-Custom properties are operator-defined key-value pairs on agents, separate from tags. Properties can have schemas that enforce type, allowed values, and validation rules. Properties are available for use in scope expressions via the `props.<key>` prefix.
+Custom properties are operator-defined key-value pairs on agents, separate from tags. Properties can have schemas that enforce a value type (`string`/`int`/`bool`/`datetime`) and an optional regex-pattern validation rule. Properties are available for use in scope expressions via the `props.<key>` prefix.
 
 #### `GET /api/agents/:id/properties`
 
@@ -3721,21 +3770,26 @@ properties."
 {"error":{"code":503,"message":"custom properties store degraded"},"meta":{"api_version":"v1"}}
 ```
 
-**Response:**
+**Response:** a flat, unwrapped body — this legacy route family predates the `data`/`meta` v1
+envelope and has not been migrated onto it.
 
 ```json
 {
-  "data": [
+  "agent_id": "agent-042",
+  "properties": [
     {
       "key": "department",
-      "value": "Engineering"
+      "value": "Engineering",
+      "type": "string",
+      "updated_at": "2026-08-01T12:00:00Z"
     },
     {
       "key": "cost_center",
-      "value": "CC-4200"
+      "value": "CC-4200",
+      "type": "string",
+      "updated_at": "2026-07-15T09:30:00Z"
     }
-  ],
-  "meta": { "api_version": "v1" }
+  ]
 }
 ```
 
@@ -3752,30 +3806,35 @@ is unchanged). A degraded
 confinement check (management-group store unavailable) denies with `403`, distinct from the `503`
 below for a degraded properties-store write.
 
-**Request body:**
+**Request body:** `type` is optional (default `"string"`) and IS persisted, but a schema on this
+key (below) takes precedence — if one exists, its own `type` overrides whatever the request sent
+before the write, so the stored (and later `GET`-returned) `type` reflects the caller's value only
+when no schema is registered for the key.
 
 ```json
 {
-  "value": "Engineering"
+  "value": "Engineering",
+  "type": "string"
 }
 ```
 
-**Response:**
+**Response:** flat, unwrapped (same family caveat as `GET` above).
 
 ```json
 {
-  "data": { "set": true },
-  "meta": { "api_version": "v1" }
+  "agent_id": "agent-042",
+  "key": "department",
+  "value": "Engineering",
+  "type": "string"
 }
 ```
 
-**Error (400) -- schema validation failure:**
+**Error (400) -- schema validation failure:** the message depends on which schema constraint
+failed -- a type mismatch (`int`/`bool`) or a `validation_regex` mismatch (`GET
+/api/property-schemas` below):
 
 ```json
-{
-  "error": "value 'bogus' not allowed for property 'department'; allowed: Engineering, Sales, Operations, Support",
-  "meta": { "api_version": "v1" }
-}
+{"error": "value does not match validation pattern for 'department'"}
 ```
 
 **Error (503) -- store outage:**
@@ -3809,12 +3868,12 @@ confinement check (management-group store unavailable) denies with `403` -- dist
 degrade conflation noted below, which is a property-store issue on the delete path itself, not the
 authorization check.
 
-**Response:**
+**Response:** flat, unwrapped (same family caveat as `GET`/`PUT` above).
 
 ```json
 {
-  "data": { "deleted": true },
-  "meta": { "api_version": "v1" }
+  "deleted": true,
+  "key": "department"
 }
 ```
 
@@ -3834,37 +3893,39 @@ List all property schemas. Schemas define the allowed keys, types, and validatio
 **Permission:** `Infrastructure:Read`
 
 **Note on database degrade:** a transient database failure during this list currently surfaces as
-a `200` with an empty `data` array — indistinguishable from "no schemas configured." Not yet
+a `200` with an empty `schemas` array — indistinguishable from "no schemas configured." Not yet
 type-widened, predates the Postgres migration. Unlike `PUT`/`POST` above (fixed to a
 distinguishable `503`), this route's underlying `list_schemas` was deliberately left unwidened —
 it's an admin-surface read, not scope/dispatch-feeding, matching `custom_properties_store.hpp`'s
 documented posture — so this stays a tracked gap rather than a fixed one.
 
-**Response:**
+**Response:** flat, unwrapped (same family caveat as the agent-properties routes above).
 
 ```json
 {
-  "data": [
+  "schemas": [
     {
       "key": "department",
       "display_name": "Department",
       "type": "string",
-      "allowed_values": ["Engineering", "Sales", "Operations", "Support"],
-      "required": false
+      "description": "The employee's department",
+      "validation_regex": ""
     },
     {
       "key": "cost_center",
       "display_name": "Cost Center",
       "type": "string",
-      "allowed_values": [],
-      "required": true
+      "description": "",
+      "validation_regex": "^CC-[0-9]{4}$"
     }
-  ],
-  "meta": { "api_version": "v1" }
+  ]
 }
 ```
 
-Schemas with an empty `allowed_values` array accept free-form values.
+`type` is one of `string`, `int`, `bool`, `datetime` -- `int`/`bool` values are type-checked on
+write; `string`/`datetime` accept any text. A non-empty `validation_regex` (RE2 syntax, max 256
+characters) is additionally applied via `RE2::FullMatch` regardless of `type`. An empty
+`validation_regex` accepts any value of the declared type.
 
 ---
 
@@ -3878,11 +3939,11 @@ Create or update a property schema. If a schema with the given key already exist
 
 ```json
 {
-  "key": "department",
-  "display_name": "Department",
+  "key": "cost_center",
+  "display_name": "Cost Center",
   "type": "string",
-  "allowed_values": ["Engineering", "Sales", "Operations", "Support"],
-  "required": false
+  "description": "The agent's billing cost center",
+  "validation_regex": "^CC-[0-9]{4}$"
 }
 ```
 
@@ -3890,16 +3951,21 @@ Create or update a property schema. If a schema with the given key already exist
 |---|---|---|---|
 | `key` | string | Yes | Property key (unique identifier) |
 | `display_name` | string | No | Human-readable label |
-| `type` | string | No | Value type: `string` (default), `integer`, `boolean` |
-| `allowed_values` | array | No | Restrict values to this set (empty = free-form) |
-| `required` | boolean | No | Whether every agent must have this property |
+| `type` | string | No | Value type: `string` (default), `int`, `bool`, `datetime` |
+| `description` | string | No | Free-text description |
+| `validation_regex` | string | No | RE2 pattern (max 256 chars) values must fully match; empty = no pattern constraint |
 
-**Response (201):**
+**Response (201):** flat, unwrapped (same family caveat as the routes above) -- echoes the
+stored schema back, including any server-applied default (`type` defaults to `"string"` if
+omitted).
 
 ```json
 {
-  "data": { "created": true, "key": "department" },
-  "meta": { "api_version": "v1" }
+  "key": "cost_center",
+  "display_name": "Cost Center",
+  "type": "string",
+  "description": "The agent's billing cost center",
+  "validation_regex": "^CC-[0-9]{4}$"
 }
 ```
 
@@ -3978,13 +4044,16 @@ Create a new webhook subscription.
 
 If a `secret` is provided, each delivery includes an `X-Yuzu-Signature` header containing the HMAC-SHA256 hex digest of the request body.
 
-**Security — secret storage and the legacy-file retention window.** A configured signing secret
+**Security — secret storage, and a legacy file's disposal.** A configured signing secret
 is envelope-encrypted at rest (AES-256-GCM, ADR-0010) — a stolen database backup alone cannot
 recover it. There is no rotation endpoint today: to change a secret, delete the webhook and
-recreate it. Deployments that upgraded from a release before the Postgres cutover retain the
-pre-cutover SQLite `webhooks.db` file for one release as a rollback net (ADR-0009); that file
-still holds signing secrets in **plaintext**. If your backup posture for that one-release window
-is unknown, rotate (delete-and-recreate) every webhook's secret once the window has closed.
+recreate it. No production fleet ever ran a pre-Postgres build of this store (#3623), so a
+legacy SQLite `webhooks.db` genuinely holding real data should not exist — but if one is
+somehow found on disk at boot (hardened to 0600, main file and any `-wal`/`-shm`/`-journal` sidecars, and
+warned about in the log), it still holds any signing secrets in **plaintext** and is never
+automatically deleted or rotated. If you find one and don't need it, delete it yourself; if any
+webhook it names might still be relying on that secret, rotate (delete-and-recreate) the
+corresponding webhook's secret via this store first.
 
 **Cleartext HTTP warning.** When `url` is `http://` (not `https://`), the delivered event
 payload is transmitted in cleartext. Production deployments should use `https://` only. The
@@ -4351,7 +4420,7 @@ Returns the OpenAPI/Swagger specification for the v1 API as JSON.
 
 Agentic-first discovery family (roadmap Issue 17.1, `docs/agentic-first-principle.md` §A2): "an agentic worker should be able to learn what is possible from the live server alone, without a side-channel doc fetch." Unlike `GET /api/v1/openapi.json` above, every endpoint here is **authenticated** and gates `Infrastructure:Read` (`/discover/instructions` gates `InstructionDefinition:Read` instead). Each response body IS the catalog object directly — no `data`/`meta` envelope wrapper, matching the `GET /api/v1/guaranteed-state/schemas` discovery precedent this family is modeled on.
 
-All five share the same caching contract: a content-derived `ETag` header + `Cache-Control: public, max-age=300`; send `If-None-Match: <etag>` to get a cheap `304 Not Modified` instead of re-downloading. Each is also mirrored as a read-only MCP tool of the same name (`discover_permissions`, `discover_instructions`, `discover_routes`, `discover_scope_kinds`, `discover_plugins`) — REST and MCP share the same builder functions internally, so they cannot drift from each other.
+All six share the same revalidation contract: a content-derived `ETag` header; send `If-None-Match: <etag>` to get a cheap `304 Not Modified` instead of re-downloading. `instructions`, `routes`, `scope-kinds` and `plugin-docs` are `Cache-Control: public, max-age=300`; `permissions` and `plugins` are `private` with a `Vary` header because their bodies depend on the caller. Five are mirrored as read-only MCP tools of the same name (`discover_permissions`, `discover_instructions`, `discover_routes`, `discover_scope_kinds`, `discover_plugins`); `/discover/plugin-docs` is mirrored as the MCP resource `yuzu://plugin-docs` instead. REST and MCP share the same builder functions internally, so they cannot drift from each other.
 
 #### `GET /api/v1/discover/permissions`
 
@@ -4503,7 +4572,7 @@ Plugin/action catalog observed across currently-connected agents (deduplicated b
 **Response:**
 ```json
 {
-  "version": 2,
+  "version": 3,
   "description": "Plugin/action catalog observed across currently-connected agents ...",
   "limitation": "An action carries an inline parameter_schema only when it has a published InstructionDefinition (matched on plugin+action) AND the caller holds InstructionDefinition:Read; otherwise name+description only. GET /api/v1/discover/instructions is the full schema-bearing catalog.",
   "actions_enriched_with_schema": 1,
@@ -4518,7 +4587,54 @@ Plugin/action catalog observed across currently-connected agents (deduplicated b
 
 An action carries an inline `parameter_schema` **only** when it has a published `InstructionDefinition` (matched on plugin + action) **and** the caller holds `InstructionDefinition:Read`; a caller with only `Infrastructure:Read` gets each action's `name` + `description` and no schema. The top-level `actions_enriched_with_schema` counts how many actions were enriched. For the complete schema-bearing catalog, use [`GET /api/v1/discover/instructions`](#get-apiv1discoverinstructions).
 
-> **Consumer note:** this catalog is now `"version": 2` (was `1` — v2 adds the inline `parameter_schema` and top-level `actions_enriched_with_schema` fields). The revision is additive; treat `version` as a **minimum** (`>= 1`), not `== 1`, so future additive revisions do not break your client.
+> **Consumer note:** this catalog is now `"version": 3` (was `1`; v2 added the inline `parameter_schema` and top-level `actions_enriched_with_schema` fields). The revision is additive; treat `version` as a **minimum** (`>= 1`), not `== 1`, so future additive revisions do not break your client.
+
+Each plugin entry also carries `docs`: a build-embedded documentation summary `{summary, kind, platforms, readme, resource}` (`kind` = `{collector, mutating, gathered}`) when the plugin has adopted the README standard (`docs/plugin-readme-standard.md`), or an explicit `null` when it has not (catalog `version` 2 → 3). The full manifest is the endpoint below.
+
+#### `GET /api/v1/discover/plugin-docs`
+
+Per-plugin documentation as data: one manifest per agent plugin that has adopted the README standard, generated by `tools/plugin-doc-gen` from `agents/plugins/<name>/README.md` and embedded at build time (`docs/plugin-readme-standard.md` rule 10). Each manifest carries how the plugin works, per-OS support/rung/mechanism per action (from the CI-verified capability matrix), privileges, inputs, output columns with vocabularies and examples, sample rows per OS, caveats and source paths. Fully static — compiled-in content only, never fleet-derived — so it answers during warmup like `/discover/scope-kinds`, and it is byte-identical to the MCP resource `yuzu://plugin-docs`. A plugin absent here has not adopted the standard yet.
+
+**Permission:** `Infrastructure:Read`
+
+**Response:**
+```json
+{
+  "catalog": "plugin-docs",
+  "version": 1,
+  "source": "build-embedded",
+  "description": "Per-plugin documentation as data ...",
+  "plugin_count": 2,
+  "skipped_invalid": 0,
+  "plugins": [
+    {
+      "manifest_version": 1,
+      "name": "disk_actions",
+      "version": "1.0.0",
+      "description": "Reports physical drive health and the mapping between drives and the logical volumes they back",
+      "kind": {"collector": true, "mutating": false, "gathered": false},
+      "platforms": {"windows": "supported", "macos": "constrained", "linux": "unsupported"},
+      "security": [{"action": "smart", "securable": "Inventory", "operation": "Read", "risk_tier": "Low", "dispatch_class": "ReadOnly", "mutability": "None", "execute_gate": "None"}],
+      "actions": [{"action": "smart", "definition_ids": ["crossplatform.storage.smart"], "legs": {"windows": {"support": "supported", "rung": "1", "mechanism": "IOCTL_STORAGE_QUERY_PROPERTY ...", "fallback": "..."}}}],
+      "definitions": [{"id": "crossplatform.storage.smart", "display_name": "Drive Health", "platforms": ["windows", "darwin"], "approval_mode": "auto", "execute_roles": ["endpoint-admin", "endpoint-operator"]}],
+      "inputs": [],
+      "outputs": [{"definition_id": "crossplatform.storage.smart", "columns": [{"name": "health", "type": "string", "values": ["ok", "warning", "failing", "unknown", "unsupported"], "example": "ok", "platforms": ["windows"]}]}],
+      "how_it_works": "Both actions are reads. ...",
+      "outputs_note": "Pipe-delimited rows, one per drive or volume. Field 0 is a literal discriminator ...",
+      "privileges": [{"os": "Windows", "runs_as": "...", "grant": "None. ...", "measured": "...", "if_refused": "..."}],
+      "result_status": [{"status": "`CONSTRAINED`", "completeness": "partial", "provenance": "`macos:iokit:health_unread`", "when": "..."}],
+      "where_the_data_goes": ["**Instruction result only.** ..."],
+      "samples": {"macos": {"stamp": {"os": "macos", "os_version": "macOS 26.6.2 arm64", "host_class": "bare-metal", "date": "2026-09-07", "privilege": "euid 501", "leg_hash": "f062fb9a3dfd"}, "actions": [{"action": "smart", "rows": ["smart|disk0|APPLE SSD AP0512Z|nvme|ssd|unknown|-|-|..."], "row_count": 2, "result_status": {"status": "CONSTRAINED", "completeness": "PARTIAL", "provenance": "macos:iokit:health_unread"}}]}},
+      "caveats": ["**Health is NVMe-only on Windows.** ..."],
+      "source": {"plugin": ["agents/plugins/disk_actions/src/disk_actions_plugin.cpp"], "tests": ["tests/unit/test_disk_actions_local_dispatcher.cpp"]},
+      "readme": "agents/plugins/disk_actions/README.md",
+      "leg_hash": "f062fb9a3dfd"
+    }
+  ]
+}
+```
+
+Same ETag / `Cache-Control: public, max-age=300` / `If-None-Match` → `304` contract as `/discover/scope-kinds` (the body is identical for every caller). `inputs[]` entries carry `{definition_id, name, type, required, default, constraints, description}`, where `constraints` is the parameter's DSL `validation` object or `null`; the key set of each manifest is the "Manifest schema" table in `docs/plugin-readme-standard.md`, which the docs suite binds to the generator.
 
 ---
 
@@ -4778,6 +4894,181 @@ On a `503` the store (or the confinement check itself) could not be read; do **n
 
 ---
 
+### Result Sets
+
+The result-set lifecycle routes (list/create/inspect/pin/delete). See [scope-walking-design.md](../scope-walking-design.md) for the full design and the four **producer** routes documented above under [Inventory](#inventory) (`POST /api/v1/result-sets/from-inventory-query`, `from-tar-query`, `from-instruction-result`, `{id}/re-eval`). `ResultSetStore` (ADR-0036) is always constructed in a running server (Postgres is mandatory; a construction failure halts startup rather than degrading serving, ADR-0012 §1) — these routes are always registered.
+
+`ResultSet` is not a seeded RBAC securable; every route below is session-authenticated and **owner-scoped** instead (a result set is only readable/mutable by the principal that created it). A service-scoped API token is denied outright on every route (`403`): ownership keys on `session->username`, which for a service token is the **minting operator's** identity, not the token's own service tag — without this deny, any other service token the same operator holds could reach the same owner-scoped result sets.
+
+**Example `ResultSet` object** (returned by several routes below):
+
+```json
+{
+  "id": "rs_a1b2c3d4e5f6",
+  "name": "Ubuntu fleet, patched",
+  "owner_principal": "alice",
+  "created_at": 1711900800,
+  "ttl_at": 1712505600,
+  "last_used_at": 1711900800,
+  "pinned": false,
+  "parent_id": "",
+  "source_kind": "manual_curate",
+  "status": "materialized",
+  "source_execution_id": "",
+  "device_count": 42
+}
+```
+
+`parent_id` is `""` when the set has no parent. `source_kind` is one of `manual_curate` (direct `POST /result-sets`), `inventory_query`, `tar_query`, or `instruction_result`. `status` is `pending` until an asynchronous producer's dispatch responses land, then `materialized` (or `failed` if the dispatch could not be materialized).
+
+#### `GET /api/v1/result-sets`
+
+List the caller's owned result sets, most recently used first (`last_used_at` then `created_at`, both descending — not creation order).
+
+**Permission:** Session-authenticated (owner-scoped; no RBAC permission).
+
+**Query parameters:**
+
+| Param | Type | Description |
+|---|---|---|
+| `cursor` | string | Opaque pagination cursor from a previous response |
+| `limit` | integer | Max results (default 50, max 500) |
+
+**Response:**
+
+```json
+{
+  "data": { "result_sets": [ { "...": "ResultSet objects, see above" } ], "next_cursor": "" },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Errors:**
+
+| Status | Reason |
+|---|---|
+| 403 | Service-scoped API token — result-set listing cannot be confined to the token's service |
+
+A store-level read failure is not surfaced as an error on this route — `ResultSetStore::list_by_owner` deliberately returns a plain (possibly empty) container rather than `std::expected` (ADR-0036 "not yet widened" class), so a degraded store answers `200` with an empty `result_sets` array, not a `503`.
+
+#### `POST /api/v1/result-sets`
+
+Create a result set directly from a pre-computed device-id list (e.g. an operator with a CSV of device ids). Synchronous — lands `materialized` immediately, no dispatch involved.
+
+**Permission:** Session-authenticated (owner-scoped).
+
+**Request body:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `name` | string | No | Human-readable name |
+| `source_kind` | string | No | Defaults to `manual_curate` |
+| `source_payload` | object | No | Stored as JSON; defaults to `{}` |
+| `parent_id` | string | No | Must reference a set the caller owns (else `404`) |
+| `device_ids` | array of string | No | The initial member set |
+
+**Response (201):** A `ResultSet` object (see above).
+
+**Errors:**
+
+| Status | Reason |
+|---|---|
+| 400 | `RESULT_SET_TOO_MANY_MEMBERS` (`device_ids` exceeds the per-set cap), or another `ResultSetError` (every non-quota `create_materialized` failure — including a store-level error — maps to `400`, not `503`) |
+| 403 | Service-scoped API token |
+| 404 | `parent_id` supplied but not owned/found |
+| 429 | `RESULT_SET_QUOTA` — owner is at the per-owner set cap |
+
+#### `GET /api/v1/result-sets/{id}`
+
+Fetch one result set by id.
+
+**Permission:** Session-authenticated (owner-scoped, `load_owned`).
+
+**Response (200):** A `ResultSet` object (see above).
+
+**Errors:**
+
+| Status | Reason |
+|---|---|
+| 403 | Service-scoped API token |
+| 404 | `RESULT_SET_NOT_FOUND` — no such set, or not owned by the caller (identical body either way — no enumeration oracle) |
+| 503 | Result-set store unavailable |
+
+#### `DELETE /api/v1/result-sets/{id}`
+
+Delete a result set.
+
+**Permission:** Session-authenticated (owner-scoped, `load_owned`).
+
+**Response:** `{"data": {"deleted": true}, "meta": {"api_version": "v1"}}`
+
+**Errors:**
+
+| Status | Reason |
+|---|---|
+| 403 | Service-scoped API token |
+| 404 | No such set, or not owned by the caller. Also returned if the delete itself fails after ownership is confirmed (e.g. a store write error) — that failure is not currently distinguished from not-found. |
+| 409 | `RESULT_SET_PINNED` — unpin the set before deleting it |
+| 503 | Result-set store unavailable (ownership lookup only) |
+
+#### `GET /api/v1/result-sets/{id}/members`
+
+Page through a result set's member device ids.
+
+**Permission:** Session-authenticated (owner-scoped, `load_owned`).
+
+**Query parameters:**
+
+| Param | Type | Description |
+|---|---|---|
+| `cursor` | string | Opaque pagination cursor |
+| `limit` | integer | Max results (default 1000, max 10000) |
+
+**Response:** `{"data": {"device_ids": [...], "next_cursor": ""}, "meta": {"api_version": "v1"}}`
+
+**Errors:**
+
+| Status | Reason |
+|---|---|
+| 403 | Service-scoped API token |
+| 404 | No such set, or not owned by the caller |
+| 503 | Result-set store unavailable |
+
+#### `GET /api/v1/result-sets/{id}/lineage`
+
+Read a result set's ancestor chain (walks `parent_id` links up to the root).
+
+**Permission:** Session-authenticated (owner-scoped, `load_owned`).
+
+**Response:** `{"data": {"chain": [{"id": "...", "name": "...", "source_kind": "...", "device_count": 0}]}, "meta": {"api_version": "v1"}}`
+
+**Errors:**
+
+| Status | Reason |
+|---|---|
+| 403 | Service-scoped API token |
+| 404 | No such set, or not owned by the caller |
+| 503 | Result-set store unavailable |
+
+#### `POST /api/v1/result-sets/{id}/pin`<br>`POST /api/v1/result-sets/{id}/unpin`
+
+Pin (exempt from TTL expiry) or unpin a result set.
+
+**Permission:** Session-authenticated (owner-scoped, `load_owned`).
+
+**Response (200):** The updated `ResultSet` object (`pinned` flipped).
+
+**Errors:**
+
+| Status | Reason |
+|---|---|
+| 403 | Service-scoped API token |
+| 404 | No such set, or not owned by the caller. Also returned if the pin/unpin write itself fails after ownership is confirmed (e.g. a store write error) — that failure is not currently distinguished from not-found. |
+| 409 | `PIN_LIMIT` — owner is at the per-owner pin cap (pin only) |
+| 503 | Result-set store unavailable (ownership lookup only) |
+
+---
+
 ### Software Licensing (SLE)
 
 The **detected software-licence** discovery surface (ADR-0024; per its "Placement under ADR-1005" only the discovery mechanism is in-server — the compliance/entitlement/posture reads ship with the SAM use-case-engine module). Data is collected by the agent `license_scan` plugin and synced daily into `SoftwareLicensingStore`; see [Software licence detection](software-licensing.md) for what is collected and the per-user privacy carve-out. **Not** Yuzu's own product licence (that is [License Management](#license-management)).
@@ -4859,7 +5150,7 @@ Per-store outcomes: `deleted` (the DELETE **committed**), `skipped` (store not c
 | 503 + `Sec-Audit-Failed` | The attempt audit row could not persist — fail-closed, **nothing was erased** |
 | 503 | Scope gate or cascade not configured (A4 envelope) |
 
-A `200` with `decommissioned: true` is confirmed erasure across every configured store; deleting an unknown `agent_id` is a no-op `200` (nothing to erase). Erasure does not unenroll the agent — a still-enrolled device re-syncs on its next daily cycle, so decommission the device first.
+A `200` with `decommissioned: true` is confirmed erasure across every configured store; deleting an unknown `agent_id` is a no-op `200` (nothing to erase). Erasure does not unenroll the agent — a still-enrolled device re-syncs on its next daily cycle, so decommission the device first. This guarantee is scoped to the stores the cascade actually fans across — a leftover legacy `inventory.db` on disk (only possible outside ADR-0009's "no fleet ever ran pre-Postgres" assumption) was never part of it: `InventoryStore::delete_agent()` stopped scrubbing that file when its one-time backfill was retired (#3623), since the erasure branch existed only to serve the backfill.
 
 ---
 
@@ -6746,8 +7037,17 @@ is then confined to their currently visible agents (management-group scope); an 
 confines to nothing returns:
 
 ```json
-{"error": {"code": 404, "message": "no reachable in-scope agent"}, "meta": {"api_version": "v1"}}
+{"error": {"code": 404, "message": "no reachable in-scope agent"}, "meta": {"api_version": "v1"}, "audit_emitted": true}
 ```
+
+(#2557) This 404 is now counted
+(`yuzu_server_dispatch_target_rejected_total{route="command",reason="destructive_no_visible_target"}`)
+and audited (`command.dispatch`, `result=denied`, same `audit_emitted` convention as every other
+denial on this route) — previously it carried neither, so an incident review of "an operator
+tried to dispatch a Destructive action at devices they cannot see" found nothing at all.
+Distinct from `destructive_untargeted` above: that reason means the caller named no target at
+all; `destructive_no_visible_target` means a non-empty `agent_ids` list WAS supplied, but every
+named id fell outside the caller's visible-agent confinement.
 
 A `plugin.action` pair the registry cannot classify (`Unclassified`/`Ambiguous`) is **not**
 independently denied by this gate — it falls through to the same dispatch chokepoint that denies
@@ -7425,7 +7725,8 @@ once the underlying condition clears.
 
 #### `POST /api/nvd/sync`
 
-Trigger a manual NVD database sync. Admin only. Runs asynchronously and returns immediately.
+Trigger a manual NVD database sync. Requires `Infrastructure:Execute` (held by Administrator
+and ITServiceOwner, not Administrator alone). Runs asynchronously and returns immediately.
 
 #### `POST /api/nvd/match`
 
@@ -7479,6 +7780,8 @@ inline drawer's live updates on the **Instructions → Executions** tab.
 **Management-group confinement (#1634).** Gated by `require_fleet_read`/`fleet_read_fn` (ADR-0017 admit-then-filter), not a flat global `Execution:Read` check — a management-group-confined operator is admitted and then sees only their in-scope agents' events. The caller who **dispatched** the execution is always admitted to the stream (visibility only — avoids a false 404 on a just-dispatched execution with zero responses yet), but that ownership never bypasses the per-event redaction below. RBAC-off → unrestricted (legacy-open). **This gate is evaluated once, at subscribe time** — it is not re-checked for the life of the connection. If your scope is narrowed, or your session is revoked, mid-stream, an already-open subscription is not automatically disconnected (tracked: #3788); a full server restart is the only thing that currently drops every live stream.
 
 **Reconnect / replay:** the server keeps a per-execution ring buffer of up to 1000 events covering ~30 seconds of activity. Browsers' `EventSource` automatically sends `Last-Event-ID` on reconnect; the server replays events whose monotonic id is greater than that value before resuming live publication.
+
+**Cross-replica delivery (HA WS-2a-2).** On a multi-replica HA deployment, events that originate on another server replica are delivered onto this replica's live stream by a ~2s cross-replica poll, so a subscriber sees live progress driven from any replica; this delivery is at-least-once (a duplicate may be re-sent, never dropped). The `id:` field is unchanged — it stays a per-channel monotonic value assigned in publish order, so `Last-Event-ID` / `?since` reconnect works exactly as before on the replica you are connected to. Reconnect *across* replicas after a failover is not yet loss-free — see `docs/executions-history-ladder.md`. Single-replica deployments are unaffected.
 
 **Event types:**
 

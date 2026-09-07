@@ -197,6 +197,91 @@ struct ArmDispatchResult {
     /// only arms `claim_fn` is ever applied to (ADR-1007: Broadcast/None are
     /// a documented non-goal).
     std::vector<std::string> not_sent;
+    /// #3424/#3511: ids that were REACHABLE (survived #1788 + containment)
+    /// but withheld because the target agent's own reported plugin inventory
+    /// does not include the dispatched plugin -- a command guaranteed to fail
+    /// with "plugin not found" on that agent, indistinguishable from a real
+    /// success until this filter existed (#3511). Checked AFTER `contained`:
+    /// a quarantined-and-plugin-absent agent is reported quarantined, the
+    /// stronger and more actionable of the two facts, matching the ordering
+    /// `denied_quarantined` already uses relative to `not_sent`.
+    std::vector<std::string> unknown_plugin;
+    /// How many were withheld for plugin absence, always -- same
+    /// count-vs-identities split as `denied_quarantined_count`, though unlike
+    /// quarantine there is no fail-closed mode here to make the two diverge;
+    /// kept as a separate field anyway so every consumer of this struct reads
+    /// counts the same way regardless of which reason produced them.
+    std::size_t unknown_plugin_count = 0;
+};
+
+/// Outcome of `resolve_and_dispatch_confined` (dispatch_scope_ladder.hpp) --
+/// declared here rather than there so every `DispatchFn` typedef across the
+/// codebase (mcp_server.hpp, bundle_orchestrator.hpp, dashboard_routes.hpp,
+/// deployment_engine.hpp, dex_routes.hpp, preflight_routes.hpp,
+/// tar_tree_routes.hpp -- #3424/#3511) can include this lighter header
+/// instead of dispatch_scope_ladder.hpp's much heavier dependency list. `sent`
+/// is the count actually dispatched; `scope_parse_error` is set only when the
+/// Scope arm's resolved expression failed to parse -- the one distinction a
+/// caller with an HTTP response to shape might still act on differently than
+/// reaching nobody.
+///
+/// #881: `denied_quarantined` carries every reachable id the quarantine gate
+/// withheld OUT of this function, so the caller can audit it -- without this
+/// field the majority of dispatch (MCP, workflows, schedules, REST v1, all
+/// of which route through `wire_and_dispatch_confined`) would enforce
+/// quarantine but audit nothing. `command_id` rides along for the same
+/// reason: once the return type stopped being a bare `std::pair<std::string,
+/// int>`, the caller needed a way to correlate `denied_quarantined` entries
+/// with the dispatch that produced them without re-deriving it.
+///
+/// `command_id` is populated ONLY by `wire_and_dispatch_confined` (it takes
+/// the id as a parameter and assigns it on return); `resolve_and_dispatch_confined`
+/// has no command id to give it and leaves the field default-constructed
+/// (empty). A caller of `resolve_and_dispatch_confined` directly -- today only
+/// dispatch_scope_ladder's own tests -- must not read `command_id` off its
+/// result.
+///
+/// `unknown_plugin` / `unknown_plugin_count` (#3511) mirror `ArmDispatchResult`'s
+/// own fields of the same name -- see that struct's doc comments above for
+/// what each means. Kept as separate fields here (not derived from
+/// `denied_quarantined_count`/etc. at read time) so every one of the 7
+/// `DispatchFn` consumers reads the same shape regardless of which layer
+/// produced it. `containment_unreadable` (#3424) has NO counterpart on
+/// `ArmDispatchResult` -- that struct has no concept of "the gate itself
+/// degraded" separate from a specific-quarantine denial (both fold into its
+/// `denied_quarantined_count`); this field is derived here, at the
+/// `resolve_and_dispatch_confined`/`wire_and_dispatch_confined` layer, as
+/// `gate.enforced && gate.fail_closed` -- see its own doc comment below.
+struct ConfinedDispatchOutcome {
+    int sent = 0;
+    std::optional<std::string> scope_parse_error;
+    /// The ids withheld, for audit rows that name a device. **Empty on a
+    /// fail-closed denial** -- see `denied_quarantined_count`.
+    std::vector<std::string> denied_quarantined;
+    /// How many were withheld, always. Report counts from THIS, never from
+    /// `denied_quarantined.size()`, which differs under fail-closed. See
+    /// `ArmDispatchResult` for why the two are separate.
+    std::size_t denied_quarantined_count = 0;
+    std::string command_id;
+    /// ADR-1007: ids whose claim (taken by `claim_fn` before the send) was
+    /// never actually delivered -- mirrors `ArmDispatchResult::not_sent`, see
+    /// its doc comment for why the collection happens there and the release
+    /// happens at `wire_and_dispatch_confined` instead. Empty whenever no
+    /// concurrency claim was in effect for this dispatch.
+    std::vector<std::string> not_sent;
+    /// #3424: true when the quarantine gate itself failed closed (containment
+    /// state unreadable) rather than a specific device being quarantined --
+    /// `gate.enforced && gate.fail_closed`, threaded out here because
+    /// `dispatch_confined_arms` reports every fail-closed denial as a
+    /// `denied_quarantined_count` increment with no way for a caller to tell
+    /// "the gate is degraded" from "these specific devices are contained"
+    /// without also being handed `gate` itself.
+    bool containment_unreadable = false;
+    /// #3511: ids withheld because the dispatched plugin is not in the
+    /// target's reported inventory -- mirrors `denied_quarantined` /
+    /// `denied_quarantined_count` exactly; see `ArmDispatchResult::unknown_plugin`.
+    std::vector<std::string> unknown_plugin;
+    std::size_t unknown_plugin_count = 0;
 };
 
 /// #881: case-insensitive predicate for the quarantine control-channel
@@ -499,12 +584,25 @@ struct QuarantineDegradationResult {
 /// field instead) would let a future caller silently opt out of quarantine
 /// enforcement by omission, which is exactly the per-route drift this
 /// header's doc comment exists to prevent for #1788 and now also for #881.
-[[nodiscard]] inline ArmDispatchResult dispatch_confined_arms(DispatchArm arm,
-                                                              const ConfinedDispatchTargets& targets,
-                                                              const authz::VisibleSet& exec_visible,
-                                                              bool broadcast_on_none,
-                                                              const ContainmentGate& gate,
-                                                              const ConfinedDispatchSink& sink) {
+///
+/// `plugin_missing` (#3424/#3511) is DIFFERENT from `gate` on exactly one
+/// point, deliberately: it IS defaulted, to the empty set. `gate`'s empty
+/// constructor was deleted because the empty/omitted state was the dangerous
+/// one (containment silently off). Omitting `plugin_missing` is safe by
+/// contrast: an empty set withholds nothing, which is exactly the pre-#3511
+/// behaviour every existing caller already has, not a new bypass. A caller
+/// that supplies it gets the filter; a caller (or test) that does not keeps
+/// compiling and keeps today's semantics. The set names ids POSITIVELY known
+/// to lack the dispatched plugin — built once per dispatch by
+/// `AgentRegistry::ids_missing_plugin`, which itself fails open (see that
+/// function) on an agent with no reported inventory at all, so a
+/// freshly-registered or gateway-relayed agent is never wrongly withheld for
+/// absence of DATA rather than absence of the plugin.
+[[nodiscard]] inline ArmDispatchResult
+dispatch_confined_arms(DispatchArm arm, const ConfinedDispatchTargets& targets,
+                       const authz::VisibleSet& exec_visible, bool broadcast_on_none,
+                       const ContainmentGate& gate, const ConfinedDispatchSink& sink,
+                       const std::unordered_set<std::string>& plugin_missing = {}) {
     ArmDispatchResult result;
 
     // #881: the ONE per-id containment check every arm applies AFTER the
@@ -542,6 +640,19 @@ struct QuarantineDegradationResult {
         return false;
     };
 
+    // #3424/#3511: the plugin-presence sibling of `contained` above, same
+    // shape -- checked AFTER containment (a quarantined+absent agent reports
+    // quarantined, not absent) and BEFORE the send. No fail-closed mode: the
+    // registry read behind `plugin_missing` is an in-memory snapshot with no
+    // degraded state to fail closed against, unlike the quarantine store.
+    const auto plugin_absent = [&](const std::string& aid) -> bool {
+        if (!plugin_missing.contains(aid))
+            return false;
+        result.unknown_plugin.push_back(aid);
+        ++result.unknown_plugin_count;
+        return true;
+    };
+
     // Broadcast narrowed to the caller's visible set. Unfiltered (nullopt)
     // authority keeps the fast send-to-all path ONLY while containment is not
     // enforced: `send_to_all_unfiltered()` has no per-id hook at all, so
@@ -564,12 +675,21 @@ struct QuarantineDegradationResult {
     // what #881 buys here; a single-snapshot `send_to_all_except(...)` sink
     // operation would restore it but is a larger change than this gate
     // package carries.
+    // #3424/#3511: the fast path additionally requires `plugin_missing` to be
+    // EMPTY. `send_to_all_unfiltered()` has no per-id hook, so it cannot skip
+    // a specific agent -- exactly the same reason `gate.enforced` gates it
+    // above. An empty `plugin_missing` set means no known agent lacks the
+    // plugin, so skipping the walk changes nothing (there is nothing for the
+    // walk to find); a non-empty set forces the same per-id walk containment
+    // already forces, trading the single-snapshot send for a per-id one on
+    // exactly the dispatches where it matters, never on the common case where
+    // every agent has the plugin.
     const auto confined_broadcast = [&]() -> int {
-        if (!exec_visible && !gate.enforced)
+        if (!exec_visible && !gate.enforced && plugin_missing.empty())
             return sink.send_to_all_unfiltered();
         int n = 0;
         for (const auto& aid : authz::filter_to_scope(sink.known_agent_ids(), exec_visible))
-            if (!contained(aid) && sink.send_to(aid))
+            if (!contained(aid) && !plugin_absent(aid) && sink.send_to(aid))
                 ++n;
         return n;
     };
@@ -580,7 +700,7 @@ struct QuarantineDegradationResult {
         // exemption — and, per #881, not a containment exemption either.
         if (targets.group_members)
             for (const auto& aid : *targets.group_members) {
-                if (!authz::in_scope(exec_visible, aid) || contained(aid))
+                if (!authz::in_scope(exec_visible, aid) || contained(aid) || plugin_absent(aid))
                     continue;
                 if (sink.send_to(aid))
                     ++result.sent;
@@ -592,7 +712,7 @@ struct QuarantineDegradationResult {
         // Null == the caller aborted resolution and already audited it.
         if (targets.scope_matched)
             for (const auto& aid : authz::filter_to_scope(*targets.scope_matched, exec_visible)) {
-                if (contained(aid))
+                if (contained(aid) || plugin_absent(aid))
                     continue;
                 if (sink.send_to(aid))
                     ++result.sent;
@@ -603,7 +723,7 @@ struct QuarantineDegradationResult {
     case DispatchArm::Ids:
         if (targets.agent_ids)
             for (const auto& aid : authz::filter_to_scope(*targets.agent_ids, exec_visible)) {
-                if (contained(aid))
+                if (contained(aid) || plugin_absent(aid))
                     continue;
                 if (sink.send_to(aid))
                     ++result.sent;

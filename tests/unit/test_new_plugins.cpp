@@ -334,11 +334,13 @@ DESCRIPTOR_TEST("storage", "storage", 5, "set", "get", "delete", "list", "clear"
 DESCRIPTOR_TEST("registry", "registry", 9, "get_value", "set_value", "delete_value", "delete_key", "key_exists", "enumerate_keys", "enumerate_values", "get_user_value", "list_profiles")
 DESCRIPTOR_TEST("wmi", "wmi", 2, "query", "get_instance")
 DESCRIPTOR_TEST("rdp_control", "rdp_control", 2, "set_state", "status")
+DESCRIPTOR_TEST("disk_actions", "disk_actions", 2, "smart", "volumes")
 DESCRIPTOR_TEST("disk_space", "disk_space", 1, "free")
 DESCRIPTOR_TEST("antivirus", "antivirus", 3, "products", "status", "av_exclusions")
 DESCRIPTOR_TEST("firewall", "firewall", 2, "state", "rules")
 DESCRIPTOR_TEST("windows_updates", "windows_updates", 4, "installed", "missing", "pending_reboot", "patch_connectivity")
 DESCRIPTOR_TEST("sccm", "sccm", 2, "client_version", "site")
+DESCRIPTOR_TEST("filesystem_posture", "filesystem_posture", 3, "mounts", "quotas", "snapshots")
 
 // ============================================================================
 // Section 2: URL validation (mirrors http_client anonymous namespace)

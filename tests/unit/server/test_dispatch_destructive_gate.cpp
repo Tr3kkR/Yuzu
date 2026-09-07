@@ -40,6 +40,9 @@
 #include "capability_decls/plugin_action_catalogue_c.hpp"
 #include "capability_decls/plugin_action_catalogue_content_dist.hpp"
 #include "capability_decls/plugin_action_catalogue_d.hpp"
+#include "capability_decls/plugin_action_catalogue_disk_actions.hpp"
+#include "capability_decls/plugin_action_catalogue_filesystem_posture.hpp"
+#include "capability_decls/plugin_action_catalogue_power_health.hpp"
 #include "command_capability.hpp"
 #include "dispatch_caller.hpp"
 
@@ -334,12 +337,15 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 17,
           "[server][dispatch][security]") {
     namespace capdecls = yuzu::server::capdecls;
 
-    const std::array<std::span<const CommandCapability>, 6> sources{{
+    const std::array<std::span<const CommandCapability>, 9> sources{{
         capdecls::plugin_action_catalogue_content_dist(),
         capdecls::plugin_action_catalogue_a(),
         capdecls::plugin_action_catalogue_b(),
         capdecls::plugin_action_catalogue_c(),
         capdecls::plugin_action_catalogue_d(),
+        capdecls::plugin_action_catalogue_disk_actions(),
+        capdecls::plugin_action_catalogue_power_health(),
+        capdecls::plugin_action_catalogue_filesystem_posture(),
         capdecls::core_dispatch_capabilities(),
     }};
 
@@ -360,7 +366,11 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 17,
             CHECK_FALSE(row.system_reserved);
         }
     }
-    CHECK(destructive_count == 17);
+    // 18, not 17: power_health's set_power_plan is a Destructive row and the
+// mirror must include it, or a FUTURE Destructive row in that fragment
+// lands with the aggregate tripwire still passing -- which is exactly the
+// drift this test's own title forbids.
+    CHECK(destructive_count == 18);
     // D4's rationale (dispatch_destructive_gate.hpp doc comment): exactly
     // the four Execution:Execute rows rely on the chokepoint's
     // AdminOrApproval gate as their elevation ceiling. This sub-claim WAS
@@ -371,7 +381,7 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 17,
     CHECK(destructive_execution_securable_count == 4);
 
     // Composability spot check — mirrors test_capability_catalogue.cpp's own
-    // `build_registry`: the same six spans compose into a real registry
+    // `build_registry`: the same eight spans compose into a real registry
     // exactly as the production composition site does, and a known
     // Destructive row still resolves through it.
     CommandCapabilityRegistry registry{
@@ -380,6 +390,9 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 17,
         capdecls::plugin_action_catalogue_b(),
         capdecls::plugin_action_catalogue_c(),
         capdecls::plugin_action_catalogue_d(),
+        capdecls::plugin_action_catalogue_disk_actions(),
+        capdecls::plugin_action_catalogue_power_health(),
+        capdecls::plugin_action_catalogue_filesystem_posture(),
         capdecls::core_dispatch_capabilities(),
     };
     auto classified = registry.classify("tar", "purge_source");
@@ -462,22 +475,29 @@ TEST_CASE("#3685 composition: /api/command's require_permission call is present 
           "pin (a runtime bind is awkward here: both live on ServerImpl/agent_registry.hpp "
           "internals with no test-reachable seam of their own)",
           "[server][dispatch][security]") {
-    const std::string server_cpp = read_src_file("server.cpp");
+    // #2557: the Destructive-gate composition moved from server.cpp's inline
+    // /api/command handler to command_routes.cpp (the HttpRouteSink
+    // extraction) — this scan follows it there. `require_permission` itself
+    // became `deps.perm_fn` at the extraction boundary (every ServerImpl
+    // method call in the handler became a `Deps` closure call), so the
+    // literal this test looks for changed to match — the SEMANTIC property
+    // being pinned (a caller-owned re-check, textually distinct from the
+    // chokepoint's `has_permission` callback) is unchanged.
+    const std::string command_routes_cpp = read_src_file("command_routes.cpp");
 
     // The Destructive-gate call site itself must still exist.
-    const auto gate_pos = server_cpp.find("evaluate_destructive_targeting(");
+    const auto gate_pos = command_routes_cpp.find("evaluate_destructive_targeting(");
     REQUIRE(gate_pos != std::string::npos);
 
     // Within a bounded window after the gate call, /api/command's own
-    // JIT-elevation-aware require_permission(cap.securable, cap.operation)
-    // re-check must still be present — this is D3/D4's "do not collapse the
-    // two" invariant: the caller keeps its own authorization call, never
-    // folded into or replaced by the chokepoint's has_permission callback.
+    // JIT-elevation-aware perm_fn(cap.securable, cap.operation) re-check
+    // must still be present — this is D3/D4's "do not collapse the two"
+    // invariant: the caller keeps its own authorization call, never folded
+    // into or replaced by the chokepoint's has_permission callback.
     constexpr std::size_t kWindow = 4000;
-    const std::string window =
-        server_cpp.substr(gate_pos, std::min(kWindow, server_cpp.size() - gate_pos));
-    CHECK(window.find("require_permission(req, res, std::string(cap.securable)") !=
-          std::string::npos);
+    const std::string window = command_routes_cpp.substr(
+        gate_pos, std::min(kWindow, command_routes_cpp.size() - gate_pos));
+    CHECK(window.find("deps.perm_fn(req, res, std::string(cap.securable)") != std::string::npos);
 
     // And the chokepoint's own has_permission callback usage
     // (agent_registry.hpp) is a TEXTUALLY DISTINCT call — a different
@@ -492,4 +512,91 @@ TEST_CASE("#3685 composition: /api/command's require_permission call is present 
     // a future rename that made them collide would have to touch this
     // assertion, not silently pass it.)
     CHECK(std::string("require_permission") != std::string("has_permission"));
+}
+
+// ─────────────────────────────────────── Wave 6 W1B (power_health) — P-009 ──
+
+namespace {
+
+// A locally-constructed Destructive+Reversible row (power_health's real
+// set_power_plan row is Destructive/Reversible/PowerManagement/Write/
+// AdminOrApproval — see plugin_action_catalogue_power_health.hpp; not
+// included here, this fixture is deliberately independent of the real
+// catalogue, same as kFixture above).
+inline constexpr std::array<CommandCapability, 1> kReversibleDestructiveFixture{{
+    {
+        .plugin = "power_health",
+        .action = "set_power_plan",
+        .dispatch_class = DispatchClass::Destructive,
+        .mutability = Mutability::Reversible,
+        .securable = "PowerManagement",
+        .operation = yuzu::server::authz::Operation::Write,
+        .risk_tier = yuzu::server::authz::RiskTier::Medium,
+        .system_reserved = false,
+        .execute_gate = ExecuteGate::AdminOrApproval,
+    },
+}};
+
+} // namespace
+
+TEST_CASE("Destructive+Reversible row gates identically to Destructive+Irreversible: the gate is "
+          "class-driven, mutability-independent (P-009)",
+          "[server][dispatch][security]") {
+    CommandCapabilityRegistry registry{std::span<const CommandCapability>(kReversibleDestructiveFixture)};
+    auto classified = registry.classify("power_health", "set_power_plan");
+    REQUIRE(classified.has_value());
+    REQUIRE(classified->mutability == Mutability::Reversible);
+
+    // Same targeting-shape matrix kFixture's Irreversible tar.purge_source
+    // row exercises above: Targeted, RefuseUntargeted (no ids), and
+    // RefuseUntargeted (ids + scope both present) — the verdict must match
+    // in every case, because evaluate_destructive_targeting keys off
+    // DispatchClass::Destructive alone, never Mutability.
+    {
+        const auto gate = evaluate_destructive_targeting(classified,
+                                                          /*valid_nonempty_agent_ids=*/true,
+                                                          /*scope_key_present=*/false);
+        CHECK(gate.verdict == DestructiveTargetingVerdict::Targeted);
+        REQUIRE(gate.capability.has_value());
+        CHECK(gate.capability->mutability == Mutability::Reversible);
+        CHECK_FALSE(gate.miss.has_value());
+    }
+    {
+        const auto gate = evaluate_destructive_targeting(classified,
+                                                          /*valid_nonempty_agent_ids=*/false,
+                                                          /*scope_key_present=*/false);
+        CHECK(gate.verdict == DestructiveTargetingVerdict::RefuseUntargeted);
+        CHECK_FALSE(gate.miss.has_value());
+    }
+    {
+        const auto gate = evaluate_destructive_targeting(classified,
+                                                          /*valid_nonempty_agent_ids=*/true,
+                                                          /*scope_key_present=*/true);
+        CHECK(gate.verdict == DestructiveTargetingVerdict::RefuseUntargeted);
+        CHECK_FALSE(gate.miss.has_value());
+    }
+}
+
+TEST_CASE("power_health.set_power_plan: the REAL catalogue row (not the independent P-009 "
+          "fixture above) is security-classified as Destructive/Reversible/PowerManagement/Write/"
+          "AdminOrApproval and gates identically to a targeted Destructive dispatch — guards "
+          "against the shipped row silently becoming permissive (e.g. downgraded to ReadOnly or "
+          "ExecuteGate::None) while kReversibleDestructiveFixture's independent, class-driven "
+          "assertions above continue to pass on their own (PH-006)",
+          "[server][dispatch][security]") {
+    CommandCapabilityRegistry registry{yuzu::server::capdecls::plugin_action_catalogue_power_health()};
+    auto classified = registry.classify("power_health", "set_power_plan");
+    REQUIRE(classified.has_value());
+
+    CHECK(classified->dispatch_class == DispatchClass::Destructive);
+    CHECK(classified->mutability == Mutability::Reversible);
+    CHECK(classified->securable == "PowerManagement");
+    CHECK(classified->operation == yuzu::server::authz::Operation::Write);
+    CHECK(classified->risk_tier == yuzu::server::authz::RiskTier::Medium);
+    CHECK(classified->execute_gate == ExecuteGate::AdminOrApproval);
+
+    const auto gate = evaluate_destructive_targeting(classified,
+                                                      /*valid_nonempty_agent_ids=*/false,
+                                                      /*scope_key_present=*/false);
+    CHECK(gate.verdict == DestructiveTargetingVerdict::RefuseUntargeted);
 }

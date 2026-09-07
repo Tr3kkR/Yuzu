@@ -438,7 +438,9 @@ if build_agent
     subdir('agents/plugins/processes')
     subdir('agents/plugins/services')
     subdir('agents/plugins/filesystem')
+    subdir('agents/plugins/filesystem_posture')
     subdir('agents/plugins/windows_updates')
+    subdir('agents/plugins/disk_actions')
     subdir('agents/plugins/disk_space')
     subdir('agents/plugins/event_logs')
     subdir('agents/plugins/sccm')
@@ -468,6 +470,7 @@ if build_agent
     subdir('agents/plugins/wol')
     subdir('agents/plugins/discovery')
     subdir('agents/plugins/license_scan')
+    subdir('agents/plugins/power_health')
   endif
 endif
 
@@ -506,7 +509,23 @@ endif
 # that were never going to exist).
 if build_agent and build_examples
   subdir('tools/capmatrix-gen')
+  # plugin-capture (docs/plugin-readme-standard.md rule 5): same guard, same
+  # reason — it exists to run the built plugins.
+  subdir('tools/plugin-capture')
 endif
+
+# docs-regen: rewrite every plugin README fence, the user-manual plugin index,
+# the site nav fragment and the content/plugin-docs manifests from the
+# committed sources (docs/plugin-readme-standard.md rule 9). Pure Python over
+# the checked-in tree — no build products are read, so it is a run_target
+# rather than a custom_target and never enters the default build graph.
+run_target('docs-regen',
+  command: [
+    find_program('python3', 'python'),
+    files('tools/plugin-doc-gen/plugin_doc_gen.py'),
+    '--all', '--repo-root', meson.project_source_root(),
+  ],
+)
 
 # ── Erlang Gateway (optional — requires rebar3 + Erlang/OTP) ─────────────
 _rebar3 = find_program('rebar3', required: false)

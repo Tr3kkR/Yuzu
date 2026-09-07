@@ -106,20 +106,24 @@ void GuardianSparkRuntime::submit_disarm_off_lock(const DisarmWork& work) {
     // awaited for success even in the old inline call this replaces (see the
     // header doc).
     //
-    // Gate 4 unhappy-path re-review (PR #3821 scoped governance): io_executor_.run()
-    // itself can throw std::system_error from its own internal "second lock
-    // acquisition" (the UP-1 gap documented at attach_rule's own bounded-arm call
-    // site - a pre-existing property of the shared GuardianIoExecutor class, not
-    // introduced here). Every caller of THIS function treats a disarm as best-
-    // effort and never awaited for success anyway (see the comment above); letting
-    // that same best-effort posture extend to "the attempt itself threw" - rather
-    // than letting the exception propagate out of a caller that has already
-    // committed unrelated state (e.g. attach_rule's own new generation, already
-    // live in rules_/keys_/index_ by the time it calls this on the normal-exit
-    // path) - is strictly more consistent than leaving exactly one of this
-    // function's several call sites exposed. Swallow-and-log, not swallow-and-
-    // silence: an operator debugging a stuck key still has a log line, unlike a
-    // silently dropped exception would give them.
+    // #3816: io_executor_.run() no longer has an internal throwing wait-path (its
+    // one remaining pre-launch mutex-lock failure returns IoFailure::LaunchFailed
+    // rather than throwing - see guardian_io_executor.hpp's INVARIANTS block). This
+    // try/catch is NOT dead code even so: `work.key` copies into run()'s by-value
+    // `std::string key` parameter as part of evaluating this call expression, in
+    // THIS function's own frame, before run() is ever entered - a bad_alloc there
+    // is the live trigger now, the same class of "argument evaluation, not the
+    // callee's own body" hazard as attach_rule's arming_rollback guard. Every
+    // caller of THIS function treats a disarm as best-effort and never awaited for
+    // success anyway (see the comment above); letting that same best-effort
+    // posture extend to "the attempt itself threw" - rather than letting the
+    // exception propagate out of a caller that has already committed unrelated
+    // state (e.g. attach_rule's own new generation, already live in
+    // rules_/keys_/index_ by the time it calls this on the normal-exit path) - is
+    // strictly more consistent than leaving exactly one of this function's several
+    // call sites exposed. Swallow-and-log, not swallow-and-silence: an operator
+    // debugging a stuck key still has a log line, unlike a silently dropped
+    // exception would give them.
     std::expected<int, IoFailure> result;
     try {
         result = io_executor_.run(work.io_class, work.key, cfg_.backend_op_deadline,
@@ -420,85 +424,46 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
     // outcome (timeout/capacity/etc, IoFailure), the INNER is backend_->arm()'s own
     // synchronous refusal, exactly as returned before this call moved off-lock.
     //
-    // C1/c1 (adversarial review, both reviewers independently HIGH): GuardianIoExecutor
-    // itself documents that a result arriving after the caller's deadline is simply
-    // discarded ("the late worker write is discarded" - guardian_io_executor.hpp).
-    // That is safe for a STATE READ (idempotent, re-read next sweep) but NOT for arm():
-    // a late SUCCESS mints a real, live SparkEngine subscription that would otherwise
-    // be permanently untracked - no keys_/rules_ entry ever references it, so nothing
-    // ever disarms it. The check below closes the common case: arming_keys_[key] is
-    // the authoritative "is anyone still waiting for THIS episode" signal, erased by
-    // this function's own post-wait commit UNCONDITIONALLY (every outcome branch)
-    // under registry_mu_ - so a late-arriving success that finds its own (rule_id,
-    // generation) no longer there (this episode already concluded, or a NEWER
-    // episode - possibly a RETRY of the SAME rule_id, see InFlightArm::generation's
-    // doc - has since claimed the key) self-disarms instead of leaking. This is NOT
-    // airtight: there is a narrow residual window between the submitter's
-    // cv.wait_until deciding Timeout (inside io_executor_'s own internals) and this
-    // function reaching the erase below, during which this check can still see
-    // "present" and hand back a subscription the submitter has already stopped
-    // waiting for. Closing that requires io_executor_ itself to expose an
-    // abandonment signal synchronized with its own internal cell/cv decision point -
-    // a GuardianIoExecutor API extension, out of scope for this fix (tracked: needs
-    // its own design, shared by GuardianStateReader too). This reduces a GUARANTEED
-    // leak on every timeout-then-late-success to a rare scheduling race, which is
-    // the honest claim - not "fixed".
-    // self_keepalive, NOT `this`: this lambda can still be running on a detached
-    // io_executor_ worker after ~GuardianSparkRuntime() runs (the whole reason
+    // #3816: GuardianIoExecutor itself now owns the "caller gave up before the
+    // backend call finished" decision (exactly-once result delivery, see that
+    // class's INVARIANTS block) - a late-succeeding arm is routed to the
+    // on_abandoned callback below instead of ever reaching a still_wanted-style
+    // self-check on this side. That means `fn` itself needs nothing from this
+    // runtime any more (no self_keepalive, no registry_mu_, no arming_keys_) - it
+    // is the bare backend call. on_abandoned disarms a late SUCCESS (there is
+    // nothing to clean up for a late FAILURE - the inner expected already holds no
+    // live subscription) and counts it separately from an ordinary timeout
+    // (backend_op_late_arms_, #3813's own distinction, kept at the source here
+    // rather than folded into backend_op_timeouts_).
+    //
+    // self_keepalive, NOT `this`, in on_abandoned: it can still run on a detached
+    // io_executor_ worker after ~GuardianSparkRuntime() (the whole reason
     // io_executor_'s workers are detached, not joined - a wedged OS call cannot be
-    // cancelled). A raw `this` capture would use-after-free registry_mu_/arming_keys_
+    // cancelled). A raw `this` capture would use-after-free backend_op_late_arms_
     // the moment the worker finally returns past that destruction. Matches the
     // class's own established pattern for every other off-thread-executing capture
     // (make_handler's shared_ptr<GuardianSparkRuntime>, this file's header doc).
     //
-    // UP-1 (unhappy-path, adversarial-review-class finding): GuardianIoExecutor::
-    // run()'s own outer try/catch does not cover its second lock acquisition (the
-    // `cv.wait_until` wait site) - a std::system_error from THAT construction would
-    // otherwise propagate out of this function with arming_keys_[key] never erased,
-    // permanently orphaning the key (every future attach on it fails-fast "busy"
-    // forever, no self-heal). Pre-existing gap in the shared executor class itself
-    // (GuardianStateReader's own callers are equally unguarded) - not fixed here,
-    // but this function's OWN new state must not leak because of it.
-    // apply_rules' existing per-rule exception firewall already catches whatever
-    // this rethrows, so the agent does not crash either way; the guard below closes
-    // the orphaned-key gap specifically. Nested std::expected in the return type:
-    // the OUTER layer is io_executor_'s own bounded-wait outcome (IoFailure); the
-    // INNER is backend_->arm()'s own synchronous refusal, matching this function's
-    // own doc a few lines above.
-    //
-    // arming_rollback (declared at function scope above, #3831) is committed just below
-    // once io_executor_.run() has returned without throwing. If it DOES throw, the
-    // guard's destructor fires during that unwind and undoes phase 1's
-    // arming_keys_/index_ bookkeeping - its fn was assigned back at function scope,
-    // before arming_keys_.emplace() ran, so a bad_alloc during that assignment itself
-    // (the original defect) has nothing left to leak. This in-memory cleanup is all
-    // THIS function needs to do: run()'s own worker lambda re-checks arming_keys_
-    // under registry_mu_ before treating a late success as still-wanted (still_wanted
-    // below) and self-disarms if not, so an abandoned-but-still-completing arm is
-    // covered independently of why the caller abandoned it. That self-disarm race is
-    // NOT airtight against every throw site inside io_executor_.run() itself (e.g. a
-    // std::mutex::lock() failure on its own post-launch wait, after the worker is
-    // already detached and running, is outside run()'s own try/catch) - a narrow,
-    // pre-existing gap in GuardianIoExecutor unrelated to #3831 and not fixed here.
+    // arming_rollback (declared at function scope above, #3831) is committed just
+    // below once io_executor_.run() has returned without throwing. run() itself no
+    // longer has a throwing wait-path to propagate (a wait-lock failure now folds
+    // into a plain IoFailure::LaunchFailed return - see guardian_io_executor.hpp),
+    // but this call expression's own ARGUMENT evaluation - `spec`'s copy into fn's
+    // capture, `shared_from_this()`'s documented bad_weak_ptr thrown while building
+    // on_abandoned's own capture list - still runs in THIS function's frame, before
+    // run() is even entered, and is still a live trigger for arming_rollback's
+    // guard, same reasoning as submit_disarm_off_lock's own try/catch a few
+    // functions above.
     auto io_result = io_executor_.run(
         *io_class, key, cfg_.backend_op_deadline,
-        [self_keepalive = shared_from_this(), backend = backend_, spec, key, rule_id,
-         gen]() -> std::expected<std::uint64_t, std::string> {
-            auto armed = backend->arm(spec);
-            if (!armed)
-                return armed;
-            bool still_wanted = false;
-            {
-                std::lock_guard<std::mutex> lk{self_keepalive->registry_mu_};
-                const auto it = self_keepalive->arming_keys_.find(key);
-                still_wanted = it != self_keepalive->arming_keys_.end() &&
-                              it->second.rule_id == rule_id && it->second.generation == gen;
+        [backend = backend_, spec]() -> std::expected<std::uint64_t, std::string> {
+            return backend->arm(spec);
+        },
+        [backend = backend_, self_keepalive = shared_from_this()](auto&& r) {
+            if (r) {
+                backend->disarm(*r); // off-lock: this worker thread never held registry_mu_ for it
+                self_keepalive->backend_op_late_arms_.fetch_add(1, std::memory_order_relaxed);
             }
-            if (!still_wanted) {
-                backend->disarm(*armed); // off-lock: this worker thread never held registry_mu_ for it
-                return std::unexpected(std::string{"arm succeeded after abandonment"});
-            }
-            return armed;
         });
     arming_rollback.committed = true;
 
@@ -534,11 +499,13 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
                 // arm is still resolving, and a genuinely-succeeding-but-late arm
                 // can race it - a real, not merely inherited, expansion of the
                 // no-audit-entry window from "exceptional" to "ordinary". (The
-                // SEPARATE timeout-then-late-success case is handled entirely by
-                // the worker lambda's own still_wanted self-disarm check above -
-                // that generation never reaches this function's post-wait commit
-                // at all.) No MISLEADING entry is ever written either way (silence
-                // reads as "not armed", which stays accurate),
+                // SEPARATE timeout-then-late-success case never reaches this
+                // function's post-wait commit at all - #3816: a timed-out
+                // io_executor_.run() call always returns IoFailure::Timeout as ITS
+                // own outer result, so `armed_live` above is false regardless of
+                // what the executor's on_abandoned callback later does with the
+                // worker's actual result.) No MISLEADING entry is ever written
+                // either way (silence reads as "not armed", which stays accurate),
                 // but the window is wider than before this PR.
                 stale_disarm = DisarmWork{*io_class, key, **io_result};
             }
@@ -665,7 +632,7 @@ void GuardianSparkRuntime::detach_all() {
 }
 
 std::optional<GuardianSparkRuntime::DisarmWork>
-GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id) {
+GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id, std::string_view lifecycle_kind) {
     // #2233 item 3: rule_id belongs to a key whose FIRST arm is still resolving
     // off-lock (attach_rule released registry_mu_ before the backend call) - it has
     // no rules_/keys_ entry to withdraw yet. Mark the in-flight episode withdrawn so
@@ -721,13 +688,152 @@ GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id) {
             kit->second->pending_initial.erase(rule_id);
     }
     if (known)
-        enqueue_lifecycle_locked(rule_id, gen, "disarmed", guard_type, rule_name);
+        enqueue_lifecycle_locked(rule_id, gen, std::string(lifecycle_kind), guard_type, rule_name);
     return work;
 }
 
+void GuardianSparkRuntime::on_subscription_lost(const std::string& key,
+                                                 std::uint64_t subscription_id,
+                                                 const std::string& detail) {
+    // #2818: the underlying watch for `key` was torn down entirely - every rule
+    // currently on it lost its enforcement, not just withdrew from it. Report each as
+    // "errored" (guardian_outbox.hpp's documented vocabulary) rather than "disarmed" -
+    // no immediate self-heal in this PR (Dave's call, 2026-09-06: smaller, safer diff,
+    // no new blocking-retry policy).
+    //
+    // RECOVERY PATH, STATED PRECISELY (governance Gate 4 unhappy-path UP-4 - an
+    // earlier version of this comment overclaimed "the next server-issued
+    // PushRules"): a subscription dying is LOCAL to this agent and never changes the
+    // server's policy generation, so server.cpp's heartbeat reconcile gate
+    // (`if (agent_gen >= current) ...`, i.e. it re-pushes only when the SERVER's
+    // generation has moved past what the agent last reported) is NOT triggered by
+    // this event on its own. The two things that DO recover an errored rule are an
+    // UNRELATED rule/policy edit bumping the server generation (whatever its cause),
+    // or an agent restart (whose boot re-arm calls reconcile_rule_locked for every
+    // persisted rule unconditionally). Absent either, an errored rule can sit
+    // un-enforced for the life of the deployment with no proactive operator signal
+    // beyond the "errored" audit entry itself - a real, undocumented-until-now
+    // residual, tracked as a hardening candidate before the prefer_spark_ flip.
+    std::function<void()> outbox_waker;
+    {
+        std::lock_guard<std::mutex> lk{registry_mu_};
+        if (stopping_)
+            return;
+        const auto kit = keys_.find(key);
+        // Staleness guard: a fresh re-arm may have already superseded this
+        // notification by the time it's dispatched (async queue hop) - subscription_id
+        // pins it to the EXACT dead id the engine told us about, mirroring
+        // evaluate_key's own shared_ptr-identity re-check for the ordinary Fired case.
+        if (kit == keys_.end() || kit->second->subscription != subscription_id)
+            return;
+        // enterprise-readiness Gate 6: the mechanism's failure reason (SparkEvent::detail)
+        // was being silently dropped entirely - unretrievable by engineering or a customer
+        // reading their own journal, since the "errored" audit entry itself has no free-text
+        // field for it. Logged here rather than added to the wire payload: extending the
+        // Lifecycle wire event's schema is a protocol change, deliberately deferred (folded
+        // into this doc's pre-PR-5 list) rather than made under a hardening round's time
+        // pressure. This log line is the interim "why", for local debugging only.
+        const std::vector<std::string> rule_ids = index_->rules_for(key); // copy: mutates below
+        try {
+            spdlog::warn("Guardian spark: key '{}' subscription {} lost ({}) - detaching {} "
+                         "rule(s) as errored",
+                         key, subscription_id, detail.empty() ? "no reason given" : detail,
+                         rule_ids.size());
+        } catch (...) {
+        }
+        for (const auto& rid : rule_ids)
+            detach_rule_locked(rid, "errored"); // DisarmWork discarded: the guard above
+                                                 // already proves this id is dead, so any
+                                                 // resulting disarm() is a guaranteed,
+                                                 // already-idempotent no-op
+        outbox_waker = outbox_enqueue_waker_;
+    }
+    if (outbox_waker)
+        outbox_waker();
+}
+
+void GuardianSparkRuntime::on_subscription_faulted(const std::string& key,
+                                                    std::uint64_t subscription_id, bool faulted,
+                                                    const std::string& detail) {
+    // #2818: the watch reported itself unhealthy (or recovered) WITHOUT the key being
+    // torn down - Armed still exists at the engine level, so unlike Lost this does NOT
+    // touch keys_/rules_/index_. Just surfaces a Health-domain entry per active rule.
+    std::vector<OutboxEntry> entries;
+    std::function<void()> outbox_waker;
+    {
+        std::lock_guard<std::mutex> lk{registry_mu_};
+        if (stopping_)
+            return;
+        const auto kit = keys_.find(key);
+        if (kit == keys_.end() || kit->second->subscription != subscription_id)
+            return; // stale - same guard as on_subscription_lost
+        const auto now_wall = std::chrono::system_clock::now().time_since_epoch();
+        const std::int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now_wall).count();
+        const std::int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(now_wall).count();
+        const std::string agent_id = agent_id_fn_ ? agent_id_fn_() : std::string{};
+        for (const auto& rid : index_->rules_for(key)) {
+            const auto rit = rules_.find(rid);
+            if (rit == rules_.end() || !rit->second->active)
+                continue;
+            const auto& rg = rit->second;
+            entries.push_back(OutboxEntry::health(
+                rid, rg->generation, make_event_id(rid, ms, agent_id), ns,
+                /*healthy=*/!faulted, faulted ? detail : std::string{},
+                guard_type_for(rg->assertion.kind), rg->assertion.rule_name));
+        }
+        if (!entries.empty()) {
+            std::lock_guard<std::mutex> ob{outbox_mu_};
+            outbox_.enqueue_all(std::move(entries)); // best-effort, same posture as
+                                                      // evaluate_key's own enqueue - a
+                                                      // rejected (full) enqueue is dropped
+            outbox_waker = outbox_enqueue_waker_;
+        }
+    }
+    if (outbox_waker)
+        outbox_waker();
+}
+
+void GuardianSparkRuntime::revalidate_subscriptions() {
+    // Snapshot under registry_mu_, query health with it released (subscription_health()
+    // is cheap/lock-only on a DIFFERENT mutex, but this keeps the same
+    // snapshot-then-act discipline the rest of this file uses rather than nesting
+    // locks). on_subscription_lost re-validates staleness itself before acting, so a
+    // fresh re-arm landing between this snapshot and that call is still handled
+    // correctly - no duplicated detach logic here.
+    std::vector<std::pair<std::string, std::uint64_t>> snapshot;
+    {
+        std::lock_guard<std::mutex> lk{registry_mu_};
+        if (stopping_)
+            return;
+        snapshot.reserve(keys_.size());
+        for (const auto& [key, pk] : keys_)
+            snapshot.emplace_back(key, pk->subscription);
+    }
+    for (const auto& [key, subscription_id] : snapshot) {
+        if (backend_->subscription_health(subscription_id) == SubscriptionHealth::Dead)
+            on_subscription_lost(key, subscription_id, "detected dead by the poll backstop "
+                                                        "(revalidate_subscriptions) - no push "
+                                                        "notification ever confirmed, or one "
+                                                        "was silently dropped");
+    }
+}
+
 void GuardianSparkRuntime::on_event(const SparkEvent& ev) {
-    // The event is an invalidation HINT; evaluate_key re-reads live state.
-    evaluate_key(ev.key, EvalReason::Event);
+    switch (ev.kind) {
+    case SparkEventKind::Fired:
+        // The event is an invalidation HINT; evaluate_key re-reads live state.
+        evaluate_key(ev.key, EvalReason::Event);
+        return;
+    case SparkEventKind::Lost:
+        on_subscription_lost(ev.key, ev.subscription_id, ev.detail);
+        return;
+    case SparkEventKind::Faulted:
+        on_subscription_faulted(ev.key, ev.subscription_id, /*faulted=*/true, ev.detail);
+        return;
+    case SparkEventKind::Recovered:
+        on_subscription_faulted(ev.key, ev.subscription_id, /*faulted=*/false, ev.detail);
+        return;
+    }
 }
 
 void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason reason) {
@@ -1342,7 +1448,9 @@ std::size_t GuardianSparkRuntime::drain(const std::function<SendResult(const Out
     // UP-3). Both logs now drain every pass; failure isolation beats strict ordering.
     // Residual (documented NICE): a reconnect flap between the two phases, or a concurrent
     // arm during the compliance phase, can still send a drift a pass ahead of its "armed".
-    // The watertight fix (merge-drain by global sequence) is a tracked follow-up.
+    // THIS residual is sequential/next-pass in shape (phase N+1 relative to phase N) - a
+    // DIFFERENT, same-pass residual exists too, see drain_bounded()'s own note below;
+    // #3972 tracks the watertight fix (merge-drain by global sequence) for both.
     DrainLimits unbounded;
     return drain_bounded(send, unbounded).sent;
 }
@@ -1350,6 +1458,15 @@ std::size_t GuardianSparkRuntime::drain(const std::function<SendResult(const Out
 GuardianSparkRuntime::DrainOutcome
 GuardianSparkRuntime::drain_bounded(const std::function<SendResult(const OutboxEntry&)>& send,
                                     const DrainLimits& limits) {
+    // Production caller: GuardianOutboxDrainWorker::drain_bounded() (#3847/#3961), which
+    // routes `send` through TWO INDEPENDENTLY SCHEDULED GuardianOutboxSendExecutor
+    // instances (one per lane), each on its own bounded per-attempt wait and its own
+    // detached worker thread. This makes a SAME-PASS cross-lane wire reordering reachable
+    // that the prior single shared executor structurally prevented: a compliance/health
+    // event can land on the wire between two lifecycle entries within this one call, if
+    // the lifecycle lane's send is still detached past its own bounded wait while the
+    // compliance/health lane's completes. Distinct from drain()'s own disclosed residual
+    // above, which is sequential/next-pass, not same-pass - #3972 tracks the fix for both.
     std::lock_guard<std::mutex> dg{drain_mu_};
     DrainOutcome out;
 

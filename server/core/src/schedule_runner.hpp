@@ -1,5 +1,7 @@
 #pragma once
 
+#include "dispatch_confined_arms.hpp" // #3424/#3511: ConfinedDispatchOutcome -- DispatchFn/CommandDispatchFn return type
+
 /// @file schedule_runner.hpp
 /// Drives the recurring-instruction schedules that were previously dead.
 ///
@@ -80,7 +82,7 @@ public:
     /// bypassing the classify+authorize chokepoint's per-action check
     /// entirely. Widened to actually match the shape this comment always
     /// claimed.
-    using CommandDispatchFn = std::function<std::pair<std::string, int>(
+    using CommandDispatchFn = std::function<yuzu::server::ConfinedDispatchOutcome(
         const std::string& plugin, const std::string& action,
         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
         const std::unordered_map<std::string, std::string>& parameters,
@@ -93,7 +95,7 @@ public:
     /// wires into dashboard/REST/MCP too, so widening it would ripple far
     /// beyond this file. Default-constructed (unwired) ⇒ `dispatch_tracked`
     /// falls back to `dispatch_fn` with no concurrency gate.
-    using ConcurrencyDispatchFn = std::function<std::pair<std::string, int>(
+    using ConcurrencyDispatchFn = std::function<yuzu::server::ConfinedDispatchOutcome(
         const std::string& plugin, const std::string& action,
         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
         const std::unordered_map<std::string, std::string>& parameters,

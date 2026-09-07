@@ -1,5 +1,7 @@
 #pragma once
 
+#include "dispatch_confined_arms.hpp" // #3424/#3511: ConfinedDispatchOutcome -- DispatchFn/CommandDispatchFn return type
+
 /// @file dashboard_routes.hpp
 /// HTMX fragment routes for the dashboard: filterable/sortable results,
 /// group creation from filtered results, scope panel with groups,
@@ -62,7 +64,7 @@ public:
     /// execute surface narrows to it AND records who asked, via the shared
     /// `dispatch_confined` seam, exactly as /api/command and MCP do.
     /// `exec_visible` nullopt == unfiltered.
-    using DispatchFn = std::function<std::pair<std::string, int>(
+    using DispatchFn = std::function<yuzu::server::ConfinedDispatchOutcome(
         const std::string& plugin, const std::string& action,
         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
         const std::unordered_map<std::string, std::string>& parameters,

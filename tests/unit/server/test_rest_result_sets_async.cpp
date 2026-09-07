@@ -175,12 +175,12 @@ struct AsyncHarness {
                                  const std::unordered_map<std::string, std::string>& params,
                                  const std::string& exec_id,
                                  const yuzu::server::DispatchCaller& caller)
-                -> std::pair<std::string, int> {
+                -> yuzu::server::ConfinedDispatchOutcome {
                 calls.push_back(
                     {plugin, action, scope_expr, agent_ids, params, exec_id, caller.exec_visible});
                 if (dispatch_throws)
                     throw std::runtime_error("simulated dispatch failure");
-                return {"cmd-" + std::to_string(calls.size()), dispatch_sent};
+                return {.sent = dispatch_sent, .command_id = "cmd-" + std::to_string(calls.size())};
             };
         }
 

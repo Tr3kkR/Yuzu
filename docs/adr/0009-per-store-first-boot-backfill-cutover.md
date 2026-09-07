@@ -217,3 +217,35 @@ data).
   to re-apply it, which is exactly the class of bug #3623's own `ProductPackStore` fix corrected
   (a version-bumped `DROP` was mistakenly inserted at an already-shipped store's used slot,
   renumbering its content to a higher version instead of being appended after it).
+
+  **Update (production-code removal completed, 2026-09-03):** two sentences above are now
+  superseded by completed work, not merely by intent. The parenthetical at "its production
+  `migrate_from_sqlite()` stays for now, same as the others" (`WebhookStore`) is superseded —
+  its production `migrate_from_sqlite()` was retired in `chore/retire-migrate-from-sqlite-batch-a`
+  (#3623), see ADR-0057's own Update. And "removing their already-built `migrate_from_sqlite()`
+  is a separate decision (tracked as ongoing cleanup, not mandated by this ADR)" is superseded
+  for the full set: `chore/retire-migrate-from-sqlite-batch-b` (#3898, merged 2026-09-02) retired
+  12 stores' production code, and `chore/retire-migrate-from-sqlite-batch-a` (#3623) retired the
+  remaining 6 (`WebhookStore`, `CaStore`, `InventoryStore`, `RbacStore`, `ManagementGroupStore`,
+  `QuarantineStore`) — each per that store's own risk profile, not a copy-paste of the mechanical
+  template, per the original tracking issue's own acceptance criteria. That closes all 18 stores
+  named in #3623. `AuditStore` remains the sole exception, unaffected by either PR — see the
+  "This default is conditional on the fact, not permanent policy" paragraph above for why. A
+  future store's own retirement, if one is ever added to the ladder after this ADR's amendment,
+  should follow the version-bumped-append shape these two PRs established, not re-derive it.
+
+  **Update (hard cutover — the `AuditStore` exception withdrawn, 2026-09-04):** the paragraph
+  above beginning "`AuditStore` (already migrated, ADR-0040, backfill built and shipped) is the
+  one store where this would matter most if the premise ever flips retroactively" is superseded.
+  That paragraph reasoned from the premise holding ("no production fleet has ever run a
+  pre-Postgres build") and kept `AuditStore`'s backfill as insurance against the premise being
+  locally wrong for evidence specifically. The operator's direction inverted the question: not
+  "is the premise still true," but a deliberate policy choice regardless — no migration path
+  held open, for any store, full stop, accepting permanent audit-trail loss as the failure mode
+  if the premise is ever wrong for this store. `AuditStore::migrate_from_sqlite()` was retired
+  in `chore/retire-migrate-from-sqlite-auditstore` (#3623) — see ADR-0040's own Update for the
+  full trace, including why this is a plain `DELETE` of the marker rows rather than `RbacStore`'s
+  poison. This closes the 19th and last store on the ladder; #3623 is now fully resolved with no
+  store carrying a live `migrate_from_sqlite()`. A leftover `audit.db` still gets a boot-time
+  WARN (`legacy_sqlite_probe::warn_if_legacy_rows`) — this Update withdraws the backfill, not
+  the detect-and-warn obligation every other retired store already carries.

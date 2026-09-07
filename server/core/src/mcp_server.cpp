@@ -1,5 +1,6 @@
 #include "mcp_server.hpp"
 
+#include "http_route_sink.hpp" // HttpRouteSink / HttplibRouteSink — #2542 PR-6 seam migration
 #include "mcp_server_testonly.hpp" // decls for the tool_*_for_test() defs below
 #include "engine_store_error_class.hpp" // shared REST/MCP store-error classifier
 #include "mcp_agentic_catalog.hpp" // agentic demo catalog: incident playbooks
@@ -822,7 +823,19 @@ static const ToolDef kTools[] = {
      "error.data.reason is one of the six machine-readable values \"unclassified\", "
      "\"ambiguous\", \"anonymous_operator\", \"forbidden\", \"approval_required\", "
      "\"kill_switched\" - branch on this field, not on error.message text, which is prose and may "
-     "change.",
+     "change. "
+     "ZERO-AGENTS DISCRIMINATION (#3424/#3511): a SUCCESS envelope with agents_reached=0 also "
+     "carries a status enum, not just \"no_agents_reached\" - branch on status, not message text. "
+     "\"invalid_scope\" and \"quarantined\" and \"plugin_not_found\" are PERMANENT: retrying "
+     "the same request will not help (retry_after_ms is null on all three) - \"invalid_scope\" "
+     "means the scope expression itself could not be parsed, a caller error, not a fleet fact. "
+     "\"containment_unreadable\" is a transient systemic gate "
+     "failure - retry_after_ms names the wait. \"no_agents_reached\" is the generic case (offline "
+     "device, or a residual approval-required race) - retry_after_ms is non-null here too, since "
+     "the offline-device case within it is retryable and a mixed cause must not be understated as "
+     "permanent. agents_quarantined/agents_unknown_plugin are "
+     "present on every zero-agents response with the exact counts, regardless of which status "
+     "matched, for a mixed-cause dispatch.",
      // NOTE (governance): these maxLength/maxItems bounds are the MCP SCHEMA
      // contract (A5 materiality backfill), and since #2437 they are ENFORCED
      // SERVER-SIDE ON EVERY PATH — the handler re-checks each one against the
@@ -841,16 +854,38 @@ static const ToolDef kTools[] = {
      R"j("scope":{"type":"string","maxLength":8192,"description":"Scope expression. Use __all__ for all agents, group:<id> for a group, or a scope DSL expression. Omit BOTH this and agent_ids to target all agents; supplying either one empty is rejected rather than widened to __all__. EXCEPTION (#3685): for a Destructive-classified plugin.action pair, supplying scope AT ALL - including __all__ alongside agent_ids - is refused; explicit agent_ids is the only way to target one."},)j"
      R"j("agent_ids":{"type":"array","minItems":1,"maxItems":10000,"items":{"type":"string","maxLength":128},"description":"Specific agent IDs to target. EXCLUSIVE with scope - supplying both is rejected, because the old precedence discarded this list in favour of the broader scope. Omit entirely to target all agents; an EMPTY array is rejected, because a target list that resolves to nothing must not silently widen to the whole fleet. EXCEPTION (#3685): a Destructive-classified plugin.action pair requires this field, non-empty - omitting it is refused rather than treated as target-all."})j"
      R"j(},"required":["plugin","action"]})j",
-     // #2712: two fully self-contained, mutually-exclusive branches - each
+     // #2712: fully self-contained, mutually-exclusive branches - each
      // declares its OWN complete properties/required/additionalProperties:false
      // rather than sharing top-level properties with per-branch const/required,
-     // which would let the zero-agents document also satisfy the normal branch
+     // which would let a zero-agents document also satisfy the normal branch
      // (its required set is a strict subset of the zero-agents fields). Same
      // class of gap an adversarial review of batch 1 found in validate_scope's
      // looser oneOf - fixed there too in this commit.
+     //
+     // #3424/#3511: the single "no_agents_reached" zero-agents branch is now
+     // FIVE - one per status value the handler can emit (see the priority
+     // cascade at the dispatch site; "invalid_scope" added in the PR review
+     // fix round — scope_parse_error existed on ConfinedDispatchOutcome since
+     // #881 but this schema, like the handler, never surfaced it). retry_after_ms is a per-branch `const`,
+     // matching the exact literal the handler emits for that status - 5000 for
+     // the TWO retryable branches (containment_unreadable's systemic
+     // degradation, and no_agents_reached's own catch-all, which mixes a
+     // possible permanent approval-denial race with a possible genuinely
+     // offline device and so must not claim `null`/not-retryable either),
+     // null for the three permanent branches (invalid_scope, quarantined,
+     // plugin_not_found) - not a generic integer, so a client
+     // schema-validating the response catches drift between this contract and
+     // the handler the same way `agents_reached`'s own const already does.
+     // agents_quarantined/agents_unknown_plugin ride on every zero-agents
+     // branch (not just the one each "belongs" to) so a caller reading a
+     // mixed failure never has to infer a count from which branch matched.
      R"j({"oneOf":[)j"
      R"j({"type":"object","properties":{"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"type":"integer","minimum":1},"plugin":{"type":"string"},"action":{"type":"string"}},"required":["command_id","execution_id","agents_reached","plugin","action"],"additionalProperties":false},)j"
-     R"j({"type":"object","properties":{"status":{"const":"no_agents_reached"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message"],"additionalProperties":false})j"
+     R"j({"type":"object","properties":{"status":{"const":"invalid_scope"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":null},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin"],"additionalProperties":false},)j"
+     R"j({"type":"object","properties":{"status":{"const":"containment_unreadable"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":5000},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin"],"additionalProperties":false},)j"
+     R"j({"type":"object","properties":{"status":{"const":"quarantined"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":null},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin"],"additionalProperties":false},)j"
+     R"j({"type":"object","properties":{"status":{"const":"plugin_not_found"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":null},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin"],"additionalProperties":false},)j"
+     R"j({"type":"object","properties":{"status":{"const":"no_agents_reached"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":5000},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin"],"additionalProperties":false})j"
      R"j(]})j"},
 
     // ── Live-query bundle (ADR-0011) — MCP/REST parity for /api/v1/bundles ─────
@@ -1406,8 +1441,11 @@ static const ToolDef kTools[] = {
      "Plugin/action catalog observed across currently-connected agents. Each action carries an "
      "inline parameter_schema when it has a published InstructionDefinition (so you learn HOW to "
      "call it, not just that it exists); actions without one are name+description only — "
-     "discover_instructions is the full schema-bearing catalog. NOT a build-time manifest. New to "
-     "the fleet? Read the yuzu://operating-model and yuzu://capabilities resources first to orient "
+     "discover_instructions is the full schema-bearing catalog. NOT a build-time manifest. Each "
+     "plugin carries docs — {summary, kind, platforms, readme, resource} when its README has adopted the "
+     "plugin documentation standard, else null; read the yuzu://plugin-docs resource for the full "
+     "per-plugin manifest (how it works, privileges, output columns, sample rows). New to the "
+     "fleet? Read the yuzu://operating-model and yuzu://capabilities resources first to orient "
      "before acting. Read-only catalog.",
      R"({"type":"object","properties":{}})",
      // #2986: build_plugins_catalog's envelope + per-plugin/per-action keys
@@ -1415,7 +1453,7 @@ static const ToolDef kTools[] = {
      // and fixed; only actions[].parameter_schema is conditional (present
      // only when the action has a matching published InstructionDefinition),
      // typed generically for the same reason as discover_instructions above.
-     R"j({"type":"object","properties":{"version":{"type":"integer"},"description":{"type":"string"},"limitation":{"type":"string"},"actions_enriched_with_schema":{"type":"integer"},"plugins":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"version":{"type":"string"},"description":{"type":"string"},"actions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"description":{"type":"string"},"parameter_schema":{"type":"object","description":"Present only when the action has a matching published InstructionDefinition"}},"required":["name","description"]}}},"required":["name","version","description","actions"]}},"commands":{"type":"array","items":{"type":"string"}}},"required":["version","description","limitation","actions_enriched_with_schema","plugins","commands"]})j"},
+     R"j({"type":"object","properties":{"version":{"type":"integer"},"description":{"type":"string"},"limitation":{"type":"string"},"actions_enriched_with_schema":{"type":"integer"},"plugins":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"version":{"type":"string"},"description":{"type":"string"},"docs":{"type":["object","null"],"description":"Build-embedded documentation summary {summary, kind, platforms, readme, resource} when the plugin has adopted the README standard; null when it has not. kind says whether the plugin is a read-only collector or mutates state and whether it runs on a gather schedule. The full manifest is the yuzu://plugin-docs resource.","properties":{"summary":{"type":"string"},"kind":{"type":"object","properties":{"collector":{"type":"boolean"},"mutating":{"type":"boolean"},"gathered":{"type":"boolean"}},"required":["collector","mutating","gathered"]},"platforms":{"type":"object","properties":{"windows":{"type":"string","enum":["supported","constrained","planned","unsupported","undeclared"]},"macos":{"type":"string","enum":["supported","constrained","planned","unsupported","undeclared"]},"linux":{"type":"string","enum":["supported","constrained","planned","unsupported","undeclared"]}},"required":["windows","macos","linux"]},"readme":{"type":"string"},"resource":{"type":"string"}},"required":["summary","kind","platforms","readme","resource"]},"actions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"description":{"type":"string"},"parameter_schema":{"type":"object","description":"Present only when the action has a matching published InstructionDefinition"}},"required":["name","description"]}}},"required":["name","version","description","docs","actions"]}},"commands":{"type":"array","items":{"type":"string"}}},"required":["version","description","limitation","actions_enriched_with_schema","plugins","commands"]})j"},
     {"query_software_licenses",
      "Query a single agent's discovered software licences (ADR-0024 discovery plane) — the "
      "MCP twin of GET /api/v1/sle/agents/{id}. Returns each detected licence's product, "
@@ -2093,7 +2131,8 @@ constexpr std::string_view kRbacSecurables[] = {
     "Security",       "Policy",             "DeviceToken",           "SoftwareDeployment",
     "License",        "FileRetrieval",      "GuaranteedState",       "Inventory",
     "AccessReview",   "SoftwareLicensing",  "EnginePrincipal",       "PluginConfig",
-    "PluginSecret",   "UploadGrant"};
+    "PluginSecret",   "UploadGrant",
+    "PowerManagement"};
 
 // Borrowed (name, input_schema_json) row for the registration validator's
 // 4th sequence (#2405). Views are valid only for the duration of the call.
@@ -2514,6 +2553,12 @@ static const ResourceDef kResources[] = {
     {"yuzu://scope-dsl", "Scope DSL Reference",
      "Scope-kind and comparison-operator catalog — same builder as GET "
      "/api/v1/discover/scope-kinds and the discover_scope_kinds tool",
+     "application/json"},
+    {"yuzu://plugin-docs", "Plugin Documentation Manifests",
+     "Per-plugin documentation as data — how each agent plugin works, on which OS, "
+     "what it needs and what it emits (generated from agents/plugins/<name>/README.md) — "
+     "same builder as GET /api/v1/discover/plugin-docs; discover_plugins carries a "
+     "per-plugin summary that points here",
      "application/json"},
 };
 
@@ -3842,7 +3887,12 @@ McpServer::HandlerFn McpServer::build_handler(
             constexpr std::string_view kResourceTierRemediation =
                 "this MCP token's tier does not permit the operation; use a higher-tier "
                 "MCP token (operator or supervised), or the REST API / dashboard";
-            if (uri == "yuzu://openapi") {
+            // The compiled-in catalogs share ONE shape — tier gate, then perm gate,
+            // then the text as a single application/json content entry — kept as
+            // one local so a further static resource cannot drift from the
+            // tier-then-perm order. Each caller names its source; the bytes are
+            // whatever that builder serves to its REST twin.
+            auto serve_compiled_json_resource = [&](std::string_view text) {
                 if (!tier_allows(session->mcp_tier, "Infrastructure", "Read")) {
                     res.set_content(
                         error_response_a4(id, kTierDenied, "MCP tier does not allow this operation",
@@ -3853,37 +3903,29 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "Infrastructure", "Read"))
                     return;
-                // Compiled-in — no store dependency. Raw openapi_spec_json(): byte-identical
-                // to REST GET /api/v1/openapi.json, a different projection than
-                // discover_routes (see the block comment above).
                 JArr contents;
-                contents.add(JObj()
-                                 .add("uri", uri)
-                                 .add("mimeType", "application/json")
-                                 .add("text", yuzu::server::openapi_spec_json()));
+                contents.add(
+                    JObj().add("uri", uri).add("mimeType", "application/json").add("text", text));
                 res.set_content(success_response(id, JObj().raw("contents", contents.str()).str()),
                                 "application/json");
+            };
+            if (uri == "yuzu://openapi") {
+                // Raw openapi_spec_json(): byte-identical to REST GET /api/v1/openapi.json,
+                // a different projection than discover_routes (see the block comment above).
+                serve_compiled_json_resource(yuzu::server::openapi_spec_json());
                 return;
             }
             if (uri == "yuzu://scope-dsl") {
-                if (!tier_allows(session->mcp_tier, "Infrastructure", "Read")) {
-                    res.set_content(
-                        error_response_a4(id, kTierDenied, "MCP tier does not allow this operation",
-                                          yuzu::server::detail::make_correlation_id(),
-                                          kResourceTierRemediation),
-                        "application/json");
-                    return;
-                }
-                if (!perm_fn(req, res, "Infrastructure", "Read"))
-                    return;
-                // Compiled-in — no store dependency, same builder as REST
-                // /api/v1/discover/scope-kinds and discover_scope_kinds.
-                const auto& doc = yuzu::server::scope_kinds_catalog();
-                JArr contents;
-                contents.add(
-                    JObj().add("uri", uri).add("mimeType", "application/json").add("text", doc.json));
-                res.set_content(success_response(id, JObj().raw("contents", contents.str()).str()),
-                                "application/json");
+                // Same builder as REST /api/v1/discover/scope-kinds and discover_scope_kinds.
+                serve_compiled_json_resource(yuzu::server::scope_kinds_catalog().json);
+                return;
+            }
+            if (uri == "yuzu://plugin-docs") {
+                // Plugin README standard (docs/plugin-readme-standard.md rule 10): the
+                // build-embedded per-plugin manifests, byte-identical to REST
+                // GET /api/v1/discover/plugin-docs. Compiled-in content only, never
+                // fleet-derived.
+                serve_compiled_json_resource(yuzu::server::plugin_docs_catalog().json);
                 return;
             }
 
@@ -8920,9 +8962,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 // re-derived here.
                 std::string command_id;
                 int agents_reached = 0;
+                yuzu::server::ConfinedDispatchOutcome dispatch_outcome;
                 try {
-                    std::tie(command_id, agents_reached) = dispatch_fn(
-                        plugin, action, agent_ids, scope, params, execution_id, caller);
+                    dispatch_outcome = dispatch_fn(plugin, action, agent_ids, scope, params,
+                                                   execution_id, caller);
+                    command_id = dispatch_outcome.command_id;
+                    agents_reached = dispatch_outcome.sent;
                 } catch (const std::exception& e) {
                     spdlog::error("MCP execute_instruction: dispatch failed: {}", e.what());
                     // 2f PR 3a: unwind the bridge record FIRST (unsubscribe waits
@@ -8967,70 +9012,135 @@ McpServer::HandlerFn McpServer::build_handler(
                         spdlog::error("mcp_server: mark_cancelled failed for execution_id={}",
                                       execution_id);
                     }
+                    // #3424/#3511: "reachable" is no longer the only reason
+                    // this can be zero — a target that is QUARANTINED is
+                    // withheld by the containment gate, the gate itself can
+                    // fail closed (containment state unreadable), or the
+                    // dispatched plugin can be absent from every target's
+                    // reported inventory — three permanent-or-degraded
+                    // reasons a caller must not treat like a plain offline
+                    // device. #1398 (governance Gate 6 enterprise-readiness
+                    // finding) used to add a FOURTH cause here —
+                    // ExecuteGate::AdminOrApproval/AlwaysApproval denying a
+                    // non-admin, non-ticketed caller reached this exact code
+                    // path too. #3687 closes that for the ORDINARY case: the
+                    // pre-dispatch authorization dry run above
+                    // (authorize_dispatch_fn_) now denies
+                    // Unclassified/Ambiguous/AnonymousOperator/Forbidden/
+                    // ApprovalRequired/KillSwitched with a discriminated
+                    // JSON-RPC error BEFORE dispatch_fn is ever called, so
+                    // this code path is no longer reached for any of those
+                    // six reasons on a request whose RBAC/approval/
+                    // kill-switch state is unchanged between the dry run and
+                    // the real dispatch a moment later — the residual race
+                    // (state changing in that narrow window) still folds into
+                    // `no_agents_reached` below, same as before #3424/#3511.
+                    //
+                    // PRIORITY, matching /api/command's own cascade
+                    // (server.cpp): containment_unreadable first (a systemic
+                    // gate failure, not a per-target fact) — then
+                    // quarantined — then plugin_not_found — then the
+                    // generic catch-all. `> 0`, not `== agent_ids.size()`:
+                    // a MIXED failure (some quarantined, some plugin-absent,
+                    // some genuinely offline) is still not "just offline",
+                    // and understating a permanent reason as retryable is the
+                    // worse mistake in either direction.
+                    std::string zero_status;
+                    std::string zero_message;
+                    std::string zero_retry_after_ms_json = "null";
+                    if (dispatch_outcome.scope_parse_error) {
+                        // #3424/#3511 fix-round (PR review): this field has
+                        // existed since #881/dispatch_scope_ladder.hpp, set by
+                        // wire_and_dispatch_confined for a malformed Scope-arm
+                        // expression, but this cascade never read it — a bad
+                        // scope silently fell into the generic
+                        // `no_agents_reached` catch-all and was reported as
+                        // retryable, when it is a caller input error that will
+                        // never succeed unchanged. Checked FIRST: it is a
+                        // request-shape defect, not a fact about fleet state,
+                        // so it must not be shadowed by containment_unreadable
+                        // even though both are theoretically possible together
+                        // (a bad expression is never evaluated against the
+                        // registry, so it cannot be).
+                        zero_status = "invalid_scope";
+                        zero_message = "No agents reached: the scope expression could not be "
+                                       "parsed (" +
+                                       *dispatch_outcome.scope_parse_error +
+                                       "). This is a caller error, not a fleet-state fact — "
+                                       "retrying the same scope will not help; fix the "
+                                       "expression and resubmit.";
+                        zero_retry_after_ms_json = "null";
+                    } else if (dispatch_outcome.containment_unreadable) {
+                        zero_status = "containment_unreadable";
+                        zero_message =
+                            "No agents reached: the quarantine containment gate's state is "
+                            "unreadable, so dispatch is failing closed rather than guessing who "
+                            "is quarantined. Retryable — the gate typically recovers within "
+                            "seconds once the containment store is reachable again.";
+                        zero_retry_after_ms_json = "5000";
+                    } else if (dispatch_outcome.denied_quarantined_count > 0) {
+                        zero_status = "quarantined";
+                        zero_message =
+                            "No agents reached: every target was withheld by the quarantine "
+                            "containment gate. This is a permanent policy denial, not "
+                            "unreachability — retrying will not help. Check quarantine status, "
+                            "or release the device, before retrying.";
+                        zero_retry_after_ms_json = "null";
+                    } else if (dispatch_outcome.unknown_plugin_count > 0) {
+                        zero_status = "plugin_not_found";
+                        zero_message =
+                            "No agents reached: the dispatched plugin is not in any target "
+                            "agent's reported inventory, so the command was guaranteed to fail "
+                            "and was withheld before dispatch. This is permanent for the current "
+                            "plugin name — retrying will not help. Check discover_plugins for "
+                            "the correct name, or confirm the plugin is installed on the "
+                            "target(s).";
+                        zero_retry_after_ms_json = "null";
+                    } else {
+                        // Deliberately non-null, unlike its two permanent siblings
+                        // above: this catch-all is a MIX of "an approval denial
+                        // raced the dry run" (permanent) and "the device is
+                        // genuinely offline" (retryable), and the message itself
+                        // says so — it cannot promise retrying will help, but it
+                        // also must not claim retrying WON'T, which a `null` here
+                        // would (the convention this schema documents: `null` =
+                        // not retryable, non-null = retryable). 5000ms matches
+                        // this file's other retryable-condition branches.
+                        zero_status = "no_agents_reached";
+                        zero_message =
+                            "No agents reached: every target was either unreachable or denied "
+                            "approval-required by the dispatch gate (a residual race — see the "
+                            "authorize_dispatch_fn_ dry run above, #3687). An approval denial is "
+                            "a permanent policy refusal and retrying will not help; an offline "
+                            "device may reconnect — poll query_responses or dispatch via "
+                            "POST /api/instructions/{id}/execute, before retrying.";
+                        zero_retry_after_ms_json = "5000";
+                    }
                     // governance R1 unhappy-UP-7: structured signal so
                     // the agentic worker can branch on `status` without
                     // parsing the free-text message. The text content
                     // stays for backwards compatibility with workers
                     // that parse it; the status field is the stable
-                    // programmatic surface.
+                    // programmatic surface. Counts ride along on EVERY
+                    // branch (not only the branch each count "belongs" to)
+                    // so `status` is a hint a caller can act on immediately,
+                    // never the only source of truth for a mixed failure.
                     const std::string zero_payload =
                         JObj()
-                            .add("status", "no_agents_reached")
+                            .add("status", zero_status)
                             .add("command_id", command_id)
                             .add("execution_id", execution_id)
                             .add("agents_reached", 0)
                             .add("plugin", plugin)
                             .add("action", action)
-                            // #881: "reachable" is no longer the only reason
-                            // this can be zero — a target that is QUARANTINED
-                            // is withheld by the containment gate before
-                            // dispatch, which is a permanent policy denial,
-                            // not transient unreachability. #1398 (governance
-                            // Gate 6 enterprise-readiness finding) used to add
-                            // a THIRD cause here — ExecuteGate::AdminOrApproval
-                            // /AlwaysApproval denying a non-admin, non-ticketed
-                            // caller reached this exact code path too, since
-                            // mcp_server.cpp had no classify_and_authorize_
-                            // dispatch call of its own and the shared
-                            // dispatch_fn's internal chokepoint denial
-                            // surfaced as command_id/sent=0, same as offline
-                            // or quarantined. #3687 closes that for the
-                            // ORDINARY case: the pre-dispatch authorization
-                            // dry run above (authorize_dispatch_fn_) now
-                            // denies Unclassified/Ambiguous/AnonymousOperator/
-                            // Forbidden/ApprovalRequired/KillSwitched with a
-                            // discriminated JSON-RPC error BEFORE dispatch_fn
-                            // is ever called, so this code path is no longer
-                            // reached for any of those six reasons on a
-                            // request whose RBAC/approval/kill-switch state
-                            // is unchanged between the dry run and the real
-                            // dispatch a moment later. The message below still
-                            // names approval-required as a POSSIBLE cause
-                            // because that race — state changing in the
-                            // narrow window between the two checks — is not
-                            // eliminated, only made rare; a wider DispatchFn
-                            // return (never landing on this issue — see
-                            // #3687's own scope note) would be needed to
-                            // discriminate it from quarantine/offline
-                            // programmatically even in that residual case.
-                            // The authoritative answer for the common case is
-                            // now the discriminated pre-dispatch error itself;
-                            // for the residual race, it remains the
-                            // quarantine.dispatch_denied audit row,
-                            // yuzu_server_dispatch_target_rejected_total
-                            // {reason="quarantined"}, or
-                            // yuzu_server_dispatch_denied_total
-                            // {reason="approval_required"}.
-                            .add("message",
-                                 "No agents reached: every target was either unreachable, "
-                                 "withheld by the quarantine containment gate, or denied "
-                                 "approval-required by the dispatch gate. A quarantine or "
-                                 "approval denial is a permanent policy refusal and retrying "
-                                 "will not help — check quarantine status, or dispatch via "
-                                 "POST /api/instructions/{id}/execute, before retrying.")
+                            .add("message", zero_message)
+                            .raw("retry_after_ms", zero_retry_after_ms_json)
+                            .add("agents_quarantined",
+                                 static_cast<int64_t>(dispatch_outcome.denied_quarantined_count))
+                            .add("agents_unknown_plugin",
+                                 static_cast<int64_t>(dispatch_outcome.unknown_plugin_count))
                             .str();
-                    mcp_audit("failure",
-                              std::string("no_agents_reached execution_id=") + execution_id);
+                    mcp_audit("failure", zero_status + " execution_id=" + execution_id);
                     res.set_content(
                         success_response(id, tool_result(zero_payload, kObjectOutputSchema)),
                         "application/json");
@@ -10032,10 +10142,25 @@ McpServer::HandlerFn McpServer::build_handler(
                         *quarantine_store, agent_id,
                         [&](const std::unordered_map<std::string, std::string>& params)
                             -> std::pair<std::string, int> {
-                            return dispatch_fn ? dispatch_fn("quarantine", "quarantine",
-                                                             {agent_id}, /*scope=*/"", params,
-                                                             /*execution_id=*/"", quarantine_caller)
-                                                : std::pair<std::string, int>{};
+                            // ReapplyDispatchFn's narrower pair shape is deliberate --
+                            // see its own doc comment. `is_quarantine_control_plugin`
+                            // exempts the quarantine plugin's own actions from the
+                            // CONTAINMENT gate only (dispatch_confined_arms.hpp's
+                            // `compose_containment_gate`) -- it does NOT exempt them
+                            // from #3511's plugin-presence filter, which is sourced
+                            // unconditionally from `AgentRegistry::ids_missing_plugin`.
+                            // A reapply to an agent genuinely missing the quarantine
+                            // plugin is still withheld (correctly -- it would fail
+                            // regardless), it just can't be DISCRIMINATED as such
+                            // through this narrower return shape; see the caller's
+                            // `agents_reached == 0` handling, which reads this as an
+                            // ordinary unreached/retry case, not a permanent one.
+                            if (!dispatch_fn)
+                                return {};
+                            const auto outcome = dispatch_fn("quarantine", "quarantine", {agent_id},
+                                                             /*scope=*/"", params,
+                                                             /*execution_id=*/"", quarantine_caller);
+                            return {outcome.command_id, outcome.sent};
                         },
                         stored);
                     if (!reapply_res) {
@@ -10095,9 +10220,11 @@ McpServer::HandlerFn McpServer::build_handler(
                         // #1398: quarantine_caller (defined above this if/else,
                         // shared with the reapply branch) already carries
                         // principal_is_admin/approval_provenance.
-                        std::tie(command_id, agents_reached) =
+                        const auto outcome =
                             dispatch_fn("quarantine", "quarantine", {agent_id}, /*scope=*/"",
                                         qparams, /*execution_id=*/"", quarantine_caller);
+                        command_id = outcome.command_id;
+                        agents_reached = outcome.sent;
                     } catch (const std::exception& e) {
                         dispatch_threw = true;
                         spdlog::error("MCP quarantine_device: isolation dispatch failed: {}",
@@ -11374,8 +11501,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 // lose one that did.
                 //
                 // Scope: the FIVE plugin-config/secret/kill-switch mutations
-                // this PR introduces. The ~20 pre-existing MCP write tools keep
-                // their mutate-then-disclose posture; changing those is a
+                // this PR introduces. (#3937 has since converted the eight
+                // engine-principal mutation twins to fail-closed too — via the
+                // audit-AFTER-commit + 503 shape their REST siblings use, not this
+                // audit-BEFORE-mutate one.) The other pre-existing MCP write tools
+                // keep their mutate-then-disclose posture; changing those is a
                 // separate, separately-reviewed decision.
                 if (!audit_fn(req, "plugin_config.set", "attempted", "PluginConfig",
                               plugin + "." + key, "len=" + std::to_string(value.size()))) {
@@ -11978,12 +12108,25 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                bool audit_ok = audit_fn(req, "engine_principal.role.assigned", "success",
-                                         "EnginePrincipal", principal_id, role_name);
+                bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "engine_principal.role.assigned", "success", "EnginePrincipal",
+                    principal_id, role_name);
+                if (!audit_ok) {
+                    // #3937: fail closed (parity with REST #2466 + plugin-config MCP
+                    // precedent). The grant committed but its audit row did not
+                    // persist — reconcile via a read, do not retry.
+                    mcp_audit("error", "audit_persist_failed");
+                    res.set_content(
+                        a4_error(503,
+                                 "the role was assigned but its audit record could not be "
+                                 "persisted; treat as unconfirmed and reconcile via a read",
+                                 "verify via a read; do not retry the mutation",
+                                 /*retry_after_ms=*/-1, /*cid_override=*/{}, /*audit_ok=*/false),
+                        "application/json");
+                    return;
+                }
                 nlohmann::json payload = {
                     {"assigned", true}, {"principal_id", principal_id}, {"role", role_name}};
-                if (!audit_ok)
-                    payload["audit_persisted"] = false;
                 mcp_audit("success");
                 res.set_content(success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
                                 "application/json");
@@ -12034,12 +12177,25 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                bool audit_ok = audit_fn(req, "engine_principal.role.unassigned", "success",
-                                         "EnginePrincipal", principal_id, role_name);
+                bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "engine_principal.role.unassigned", "success", "EnginePrincipal",
+                    principal_id, role_name);
+                if (!audit_ok) {
+                    // #3937: fail closed (parity with REST #2466 + plugin-config MCP
+                    // precedent). The grant was removed but its audit row did not
+                    // persist — reconcile via a read, do not retry.
+                    mcp_audit("error", "audit_persist_failed");
+                    res.set_content(
+                        a4_error(503,
+                                 "the role was unassigned but its audit record could not be "
+                                 "persisted; treat as unconfirmed and reconcile via a read",
+                                 "verify via a read; do not retry the mutation",
+                                 /*retry_after_ms=*/-1, /*cid_override=*/{}, /*audit_ok=*/false),
+                        "application/json");
+                    return;
+                }
                 nlohmann::json payload = {
                     {"unassigned", true}, {"principal_id", principal_id}, {"role", role_name}};
-                if (!audit_ok)
-                    payload["audit_persisted"] = false;
                 mcp_audit("success");
                 res.set_content(success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
                                 "application/json");
@@ -12204,9 +12360,24 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                const bool audit_ok =
-                    audit_fn(req, "engine_principal.create", "success", "EnginePrincipal",
-                            principal_id, "owner=" + owner_username);
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "engine_principal.create", "success", "EnginePrincipal",
+                    principal_id, "owner=" + owner_username);
+                if (!audit_ok) {
+                    // #3937: fail closed — parity with the REST twin (#2466) and the
+                    // in-MCP plugin-config precedent. The mutation committed but its
+                    // audit row did not persist, so do not report success; the caller
+                    // must treat it as unconfirmed and reconcile via a read.
+                    mcp_audit("error", "audit_persist_failed");
+                    res.set_content(
+                        a4_error(503,
+                                 "the engine principal was created but its audit record could not "
+                                 "be persisted; treat as unconfirmed and reconcile via a read",
+                                 "verify via a read; do not retry the mutation",
+                                 /*retry_after_ms=*/-1, /*cid_override=*/{}, /*audit_ok=*/false),
+                        "application/json");
+                    return;
+                }
                 JObj payload;
                 payload.add("principal_id", created->principal_id)
                     .add("display_name", created->display_name)
@@ -12214,8 +12385,6 @@ McpServer::HandlerFn McpServer::build_handler(
                     .add("classification", created->classification)
                     .add("lifecycle_state", created->lifecycle_state)
                     .add("created_at", created->created_at);
-                if (!audit_ok)
-                    payload.add("audit_persisted", false);
                 mcp_audit("success", principal_id);
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");
@@ -12439,14 +12608,27 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                const bool audit_ok = audit_fn(req, "engine_principal.revoke", "success",
-                                               "EnginePrincipal", principal_id, reason);
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "engine_principal.revoke", "success", "EnginePrincipal",
+                    principal_id, reason);
+                if (!audit_ok) {
+                    // #3937: fail closed (parity with REST #2466 + plugin-config MCP
+                    // precedent). The principal + its credentials were revoked but the
+                    // audit row did not persist — reconcile via a read, do not retry.
+                    mcp_audit("error", "audit_persist_failed");
+                    res.set_content(
+                        a4_error(503,
+                                 "the engine principal was revoked but its audit record could not "
+                                 "be persisted; treat as unconfirmed and reconcile via a read",
+                                 "verify via a read; do not retry the mutation",
+                                 /*retry_after_ms=*/-1, /*cid_override=*/{}, /*audit_ok=*/false),
+                        "application/json");
+                    return;
+                }
                 JObj payload;
                 payload.add("revoked", true)
                     .add("principal_id", principal_id)
                     .add("credentials_revoked", static_cast<int64_t>(credentials_revoked));
-                if (!audit_ok)
-                    payload.add("audit_persisted", false);
                 mcp_audit("success", principal_id);
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");
@@ -12537,17 +12719,32 @@ McpServer::HandlerFn McpServer::build_handler(
                         found_newest = true;
                     }
                 }
-                const bool audit_ok = audit_fn(req, "engine_principal.credential.mint", "success",
-                                               "EnginePrincipal",
-                                               found_newest ? newest.token_id : principal_id,
-                                               "principal=" + principal_id);
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "engine_principal.credential.mint", "success", "EnginePrincipal",
+                    found_newest ? newest.token_id : principal_id, "principal=" + principal_id);
+                if (!audit_ok) {
+                    // #3937: fail closed — the credential was minted but its audit row
+                    // did not persist, so the one-time secret is WITHHELD (never built
+                    // into the response below). Parity with the REST twin (#2466) +
+                    // the plugin-config MCP precedent; the credential exists but is
+                    // unusable — list it and rotate it to obtain an audited secret.
+                    mcp_audit("error", "audit_persist_failed");
+                    res.set_content(
+                        a4_error(503,
+                                 "the credential was minted but its audit record could not be "
+                                 "persisted; the one-time secret was withheld. The credential "
+                                 "exists but is unusable: list it and rotate it to obtain an "
+                                 "audited secret",
+                                 "list the credential and rotate it; do not retry the mint",
+                                 /*retry_after_ms=*/-1, /*cid_override=*/{}, /*audit_ok=*/false),
+                        "application/json");
+                    return;
+                }
                 JObj payload;
                 payload.add("token_id", found_newest ? newest.token_id : "")
                     .add("raw_token", *minted)
                     .add("principal_id", principal_id)
                     .add("expires_at", expires_at);
-                if (!audit_ok)
-                    payload.add("audit_persisted", false);
                 mcp_audit("success", principal_id);
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");
@@ -12653,17 +12850,34 @@ McpServer::HandlerFn McpServer::build_handler(
                 // (never folded into one "rotation succeeded" row), so a replay is
                 // never invisible in the audit trail. This handler runs fresh on
                 // every JSON-RPC call, so a replay naturally produces its own row.
-                const bool reveal_audit_ok = audit_fn(
-                    req, "engine_principal.credential.reveal", "success", "EnginePrincipal",
-                    found_successor ? successor.token_id : principal_id,
+                const bool reveal_audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "engine_principal.credential.reveal", "success",
+                    "EnginePrincipal", found_successor ? successor.token_id : principal_id,
                     "principal=" + principal_id + " action=rotate");
+                if (!reveal_audit_ok) {
+                    // #3937: fail closed — the reveal IS this route's success audit, so
+                    // a dropped reveal-audit would let the raw secret leave the server
+                    // with no audit-chain row. The one-time secret is WITHHELD (never
+                    // built into the response below). Parity with the REST twin (#2466)
+                    // + the plugin-config MCP precedent; within the overlap window a
+                    // re-rotate re-serves the same successor once the audit persists.
+                    mcp_audit("error", "audit_persist_failed");
+                    res.set_content(
+                        a4_error(503,
+                                 "the credential was rotated but its reveal audit record could not "
+                                 "be persisted; the one-time secret was withheld. Rotate again "
+                                 "within the overlap window to re-serve the same audited successor "
+                                 "secret",
+                                 "rotate again within the overlap window; do not retry immediately",
+                                 /*retry_after_ms=*/-1, /*cid_override=*/{}, /*audit_ok=*/false),
+                        "application/json");
+                    return;
+                }
                 JObj payload;
                 payload.add("token_id", found_successor ? successor.token_id : "")
                     .add("raw_token", *rotated)
                     .add("principal_id", principal_id)
                     .add("overlap_expires_at", found_successor ? successor.overlap_expires_at : 0);
-                if (!reveal_audit_ok)
-                    payload.add("audit_persisted", false);
                 mcp_audit("success", principal_id);
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");
@@ -12753,13 +12967,28 @@ McpServer::HandlerFn McpServer::build_handler(
                 // store validated confirm_token_id equals the pending
                 // successor's token_id, so this is server-verified (not a
                 // caller-supplied echo) and it is not the raw secret.
-                const bool audit_ok = audit_fn(req, "engine_principal.credential.confirm", "success",
-                                               "EnginePrincipal", principal_id,
-                                               "token_id=" + confirm_token_id);
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "engine_principal.credential.confirm", "success",
+                    "EnginePrincipal", principal_id, "token_id=" + confirm_token_id);
+                if (!audit_ok) {
+                    // #3937: fail closed (parity with REST #2466 + plugin-config MCP
+                    // precedent). The rotation was confirmed (predecessor retired) but
+                    // its audit row did not persist — verify via a read and do NOT
+                    // re-confirm (the rotation is already resolved).
+                    mcp_audit("error", "audit_persist_failed");
+                    res.set_content(
+                        a4_error(503,
+                                 "the rotation was confirmed but its audit record could not be "
+                                 "persisted; verify state via a read and reconcile the audit gap "
+                                 "out-of-band -- do NOT re-confirm (the rotation is already "
+                                 "resolved)",
+                                 "verify via a read; do not re-confirm",
+                                 /*retry_after_ms=*/-1, /*cid_override=*/{}, /*audit_ok=*/false),
+                        "application/json");
+                    return;
+                }
                 JObj payload;
                 payload.add("confirmed", true).add("principal_id", principal_id);
-                if (!audit_ok)
-                    payload.add("audit_persisted", false);
                 mcp_audit("success", principal_id);
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");
@@ -13196,15 +13425,27 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                const bool audit_ok = audit_fn(req, "engine_principal.transfer_owner", "success",
-                                               "EnginePrincipal", principal_id,
-                                               "new_owner=" + new_owner);
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "engine_principal.transfer_owner", "success", "EnginePrincipal",
+                    principal_id, "new_owner=" + new_owner);
+                if (!audit_ok) {
+                    // #3937: fail closed (parity with REST #2466 + plugin-config MCP
+                    // precedent). Ownership transferred but the audit row did not
+                    // persist — reconcile via a read, do not retry.
+                    mcp_audit("error", "audit_persist_failed");
+                    res.set_content(
+                        a4_error(503,
+                                 "ownership was transferred but its audit record could not be "
+                                 "persisted; treat as unconfirmed and reconcile via a read",
+                                 "verify via a read; do not retry the mutation",
+                                 /*retry_after_ms=*/-1, /*cid_override=*/{}, /*audit_ok=*/false),
+                        "application/json");
+                    return;
+                }
                 JObj payload;
                 payload.add("transferred", true)
                     .add("principal_id", principal_id)
                     .add("new_owner", new_owner);
-                if (!audit_ok)
-                    payload.add("audit_persisted", false);
                 mcp_audit("success", principal_id);
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");
@@ -13840,8 +14081,17 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!perm_fn(req, res, "Infrastructure", "Read"))
                     return;
                 if (!agent_registry) {
-                    res.set_content(error_response(id, kInternalError, "Agent registry unavailable"),
-                                    "application/json");
+                    // A4-shaped (PR #4112 review, should-fix): this branch used to call the
+                    // bare error_response(), with no correlation_id/retry_after_ms/remediation
+                    // at all -- an inconsistency within this same function, since the
+                    // tier_allows denial three lines up already goes through a4_error.
+                    // Registry-unavailable is transient, so it gets the same named retry
+                    // floor as the comparable degraded-read path below (kMcpStoreFaultRetryMs).
+                    mcp_audit("failure", "agent registry unavailable");
+                    res.set_content(
+                        a4_error(kInternalError, "Agent registry unavailable", {},
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
                     return;
                 }
                 // Least-privilege (gov Gate 2 security-guardian MEDIUM / UP-7):
@@ -14091,37 +14341,85 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 std::size_t mcp_max_streams_per_principal,
                                 StreamPrincipalAuditFn principal_audit_fn,
                                 CallerFn caller_fn) {
+    HttplibRouteSink sink(svr);
+    register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
+                    std::move(agents_fn), rbac_store, instruction_store, execution_tracker,
+                    response_store, audit_store, tag_store, inventory_store, policy_store,
+                    mgmt_store, approval_manager, schedule_engine, read_only_mode, mcp_disabled,
+                    std::move(dispatch_fn), ca_store, std::move(publish_crl_fn),
+                    guaranteed_state_store, std::move(dex_perf_fn), std::move(net_perf_fn),
+                    std::move(response_scope_fn), software_inventory_store, metrics,
+                    std::move(app_perf_providers), quarantine_store, std::move(tag_push_fn),
+                    agent_registry, std::move(scoped_perm_fn), sessions, mcp_streaming_disabled,
+                    mcp_streamed_post_enabled, std::move(allowed_origins),
+                    software_licensing_store, engine_principal_store, access_review_store,
+                    auth_db, directory_sync, stream_budget, std::move(revalidate_fn),
+                    mcp_max_streams_per_principal, std::move(principal_audit_fn),
+                    std::move(caller_fn));
+}
+
+void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
+                                AuditFn audit_fn, AgentsJsonFn agents_fn, RbacStore* rbac_store,
+                                InstructionStore* instruction_store,
+                                ExecutionTracker* execution_tracker, ResponseStore* response_store,
+                                AuditStore* audit_store, TagStore* tag_store,
+                                InventoryStore* inventory_store, PolicyStore* policy_store,
+                                ManagementGroupStore* mgmt_store, ApprovalManager* approval_manager,
+                                ScheduleEngine* schedule_engine, const bool& read_only_mode,
+                                const bool& mcp_disabled, DispatchFn dispatch_fn, CaStore* ca_store,
+                                PublishCrlFn publish_crl_fn,
+                                GuaranteedStateStore* guaranteed_state_store,
+                                DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn,
+                                ResponseScopeFn response_scope_fn,
+                                SoftwareInventoryStore* software_inventory_store,
+                                yuzu::MetricsRegistry* metrics,
+                                AppPerfProviders app_perf_providers,
+                                QuarantineStore* quarantine_store, TagPushFn tag_push_fn,
+                                yuzu::server::detail::AgentRegistry* agent_registry,
+                                ScopedPermFn scoped_perm_fn, McpSessionRegistry* sessions,
+                                const bool* mcp_streaming_disabled,
+                                const bool* mcp_streamed_post_enabled,
+                                std::vector<std::string> allowed_origins,
+                                SoftwareLicensingStore* software_licensing_store,
+                                EnginePrincipalStore* engine_principal_store,
+                                AccessReviewStore* access_review_store, AuthDB* auth_db,
+                                DirectorySync* directory_sync,
+                                yuzu::server::detail::StreamBudget* stream_budget,
+                                StreamRevalidateFn revalidate_fn,
+                                std::size_t mcp_max_streams_per_principal,
+                                StreamPrincipalAuditFn principal_audit_fn,
+                                CallerFn caller_fn) {
     // GET + DELETE first: they COPY auth_fn / audit_fn / allowed_origins, which
     // build_handler std::move()s below. &mcp_disabled is a live pointer into the
     // cfg_ member (outlives the handlers).
-    svr.Get("/mcp/v1/", build_get_handler(auth_fn, audit_fn, &mcp_disabled, mcp_streaming_disabled,
-                                          sessions, allowed_origins, stream_budget, revalidate_fn,
-                                          metrics, mcp_max_streams_per_principal,
-                                          principal_audit_fn));
-    svr.Delete("/mcp/v1/", build_delete_handler(auth_fn, audit_fn, &mcp_disabled,
-                                                mcp_streaming_disabled, sessions, allowed_origins));
+    sink.Get("/mcp/v1/", build_get_handler(auth_fn, audit_fn, &mcp_disabled, mcp_streaming_disabled,
+                                           sessions, allowed_origins, stream_budget, revalidate_fn,
+                                           metrics, mcp_max_streams_per_principal,
+                                           principal_audit_fn));
+    sink.Delete("/mcp/v1/", build_delete_handler(auth_fn, audit_fn, &mcp_disabled,
+                                                 mcp_streaming_disabled, sessions, allowed_origins));
 
-    svr.Post("/mcp/v1/",
-             build_handler(std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
-                           std::move(agents_fn), rbac_store, instruction_store, execution_tracker,
-                           response_store, audit_store, tag_store, inventory_store, policy_store,
-                           mgmt_store, approval_manager, schedule_engine, read_only_mode,
-                           mcp_disabled, std::move(dispatch_fn), ca_store,
-                           std::move(publish_crl_fn), guaranteed_state_store,
-                           std::move(dex_perf_fn), std::move(net_perf_fn),
-                           std::move(response_scope_fn), software_inventory_store, metrics,
-                           std::move(app_perf_providers), quarantine_store,
-                           std::move(tag_push_fn), agent_registry, std::move(scoped_perm_fn),
-                           sessions, mcp_streaming_disabled, mcp_streamed_post_enabled,
-                           std::move(allowed_origins),
-                           software_licensing_store, engine_principal_store, access_review_store,
-                           auth_db, directory_sync, std::move(caller_fn),
-                           // 2f PR 3b: the streamed-POST arm leases from the SAME
-                           // budget as the GET channel above (which COPIED these, so
-                           // moving here is safe) - one arithmetic for every
-                           // held-open worker, whichever verb pinned it.
-                           stream_budget, std::move(revalidate_fn),
-                           std::move(principal_audit_fn)));
+    sink.Post("/mcp/v1/",
+              build_handler(std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
+                            std::move(agents_fn), rbac_store, instruction_store, execution_tracker,
+                            response_store, audit_store, tag_store, inventory_store, policy_store,
+                            mgmt_store, approval_manager, schedule_engine, read_only_mode,
+                            mcp_disabled, std::move(dispatch_fn), ca_store,
+                            std::move(publish_crl_fn), guaranteed_state_store,
+                            std::move(dex_perf_fn), std::move(net_perf_fn),
+                            std::move(response_scope_fn), software_inventory_store, metrics,
+                            std::move(app_perf_providers), quarantine_store,
+                            std::move(tag_push_fn), agent_registry, std::move(scoped_perm_fn),
+                            sessions, mcp_streaming_disabled, mcp_streamed_post_enabled,
+                            std::move(allowed_origins),
+                            software_licensing_store, engine_principal_store, access_review_store,
+                            auth_db, directory_sync, std::move(caller_fn),
+                            // 2f PR 3b: the streamed-POST arm leases from the SAME
+                            // budget as the GET channel above (which COPIED these, so
+                            // moving here is safe) - one arithmetic for every
+                            // held-open worker, whichever verb pinned it.
+                            stream_budget, std::move(revalidate_fn),
+                            std::move(principal_audit_fn)));
 
     // Streaming is ON only when a registry is wired AND the kill switch is off —
     // report the true state, not just the kill-switch bit (governance arch/sre NICE).

@@ -69,6 +69,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <unordered_map>
 #include <vector>
@@ -152,6 +153,19 @@ public:
     virtual ~ISparkBackend() = default;
     virtual std::expected<std::uint64_t, std::string> arm(const SparkSpec& spec) = 0;
     virtual void disarm(std::uint64_t subscription) = 0;
+
+    /// #2818 poll backstop: cheap, lock-only, no I/O (see SubscriptionHealth's own doc
+    /// comment, spark.hpp). Non-pure so no pre-existing implementation (production or
+    /// test fake) is forced to change — a double not exercising #2818 simply reports
+    /// every subscription Healthy, which is the correct "not modeling this" default.
+    /// ANY NEW PRODUCTION `ISparkBackend` MUST override this: an unoverridden default
+    /// makes `revalidate_subscriptions()`'s poll backstop silently inert (fails open)
+    /// for that backend, rather than failing loudly (governance Gate 2 finding, PR-2d)
+    /// — `GuardianSparkEngineBackend` (guardian_spark_backend.hpp), the only production
+    /// implementation today, does override it correctly.
+    virtual SubscriptionHealth subscription_health(std::uint64_t /*subscription*/) {
+        return SubscriptionHealth::Healthy;
+    }
 };
 
 /// Injected monotonic clock (steady). Tests supply a deterministic source; the
@@ -278,6 +292,27 @@ public:
     /// eval path for all reasons. Serialised per key; commits a verdict to the
     /// outbox (or a health event on Unknown). No-op if stopping or the key is gone.
     void evaluate_key(const std::string& key, EvalReason reason);
+
+    /// #2818 poll backstop: scan every armed key and query the backend's
+    /// subscription_health() for it, cheaply (no I/O). A Dead subscription is
+    /// reported "errored" exactly like a delivered Lost notification would have -
+    /// this is the delivery-guarantee backstop for TWO ways a genuine Lost
+    /// notification can fail to land, not an independent detection path:
+    ///   (1) a full Queued consumer channel silently drops it (queued_dropped_total);
+    ///   (2) a dedup-race window (governance Gate 4 unhappy-path UP-4): a sibling
+    ///       dedups onto a key whose first arm is still in flight off-lock
+    ///       (attach_rule's bounded arm); if that first arm then fails and delivers
+    ///       Lost BEFORE attach_rule's own commit re-acquires registry_mu_ and writes
+    ///       keys_[key], on_subscription_lost's staleness guard sees no keys_ entry
+    ///       yet, treats the notification as stale, and discards it - the commit that
+    ///       follows then persists a subscription that is already dead, with its one
+    ///       Lost already consumed. This sweep is what actually recovers that case,
+    ///       bounded by its own cadence rather than instant.
+    /// Intended to be driven off GuardianConvergenceScheduler's existing ~5s priority
+    /// lane - no new thread. Scoped to Dead only: a missed Faulted/Recovered toggle is
+    /// health-reporting-only (no enforcement break, no keys_ mutation), lower
+    /// severity, and not backstopped here.
+    void revalidate_subscriptions();
 
     /// Drain buffered emits through `send`. `send(const OutboxEntry&) -> SendResult`.
     /// Drains the Lifecycle audit log FIRST, then (only if it fully cleared) the
@@ -468,12 +503,45 @@ public:
     [[nodiscard]] std::uint64_t backend_op_busy() const noexcept {
         return backend_op_busy_.load(std::memory_order_relaxed);
     }
+    /// #3816: attach_rule's on_abandoned callback fired with a live subscription -
+    /// the caller already timed out, but backend_->arm() went on to succeed. The
+    /// executor's own Counters::abandoned counts every routed-to-callback result
+    /// (success or failure of the inner backend call alike, T-agnostic); THIS
+    /// counter is the runtime's own late-SUCCESS-specific view (#3813's distinction
+    /// kept at the source), incremented only when the callback actually disarms a
+    /// live subscription. Lock-free.
+    [[nodiscard]] std::uint64_t backend_op_late_arms() const noexcept {
+        return backend_op_late_arms_.load(std::memory_order_relaxed);
+    }
     /// Live backend I/O workers for #2233 item 3's bounded arm/disarm executor - a
     /// second source GuardianEngine::active_io_workers() must sum alongside the
     /// state reader's own count for the process orphan-exit contract to stay
     /// accurate (hard_exit.hpp / guardian_io_executor.hpp).
     [[nodiscard]] std::size_t active_backend_op_workers() const {
         return io_executor_.active_worker_count();
+    }
+
+    /// Test seam (#3848): the bounded arm/disarm executor's own per-class counters,
+    /// which this class otherwise never surfaces anywhere.
+    ///
+    /// WHY A TEST NEEDS THEM. backend_op_timeouts() counts ONLY IoFailure::Timeout. An
+    /// arm or disarm the executor refuses outright - AlreadyRunning (the (class, key)
+    /// single-flight ticket is still held) or CapacityExhausted (the per-class quota is
+    /// full) - is counted NOWHERE at this surface, and submit_disarm_off_lock in
+    /// particular drops such a refusal silently. A concurrency test that reconciles
+    /// "every id armed" against "every id disarmed" therefore cannot distinguish a
+    /// genuinely leaked subscription from a disarm the executor simply declined to run:
+    /// both present as a surplus. Reading rejected_key/rejected_capacity and requiring
+    /// them ZERO is what turns that reconciliation from "the lane partition made a
+    /// collision unlikely" into an actual proof.
+    ///
+    /// TEST-ONLY ON PURPOSE, and the production gap is real and SEPARATE: the runtime
+    /// still has no egress for these counters, and a dropped AlreadyRunning /
+    /// CapacityExhausted disarm is still invisible to an operator. Already tracked as
+    /// #3415 (docs/spark-legacy-delta-registry.md) - do NOT read this accessor as
+    /// having closed it.
+    [[nodiscard]] GuardianIoExecutor::Stats io_executor_stats_for_test() const {
+        return io_executor_.stats();
     }
 
     /// Phase 1 of shutdown: set the stopping flag and mark every generation
@@ -645,17 +713,21 @@ private:
     /// the arm's completion abandons + disarms instead of committing a rule nobody
     /// wants any more.
     ///
-    /// `generation` (adversarial review C1/c1 follow-up, security-guardian F2 /
-    /// cpp-safety HIGH): the worker's own self-disarm check (attach_rule) must
-    /// match BOTH rule_id AND this episode's generation, not rule_id alone. A
-    /// same-rule_id RETRY - which this PR's own policy_generation-hold-and-retry
-    /// behavior causes ordinarily, not just as a rare race - re-populates
-    /// arming_keys_[key] with a FRESH InFlightArm for the SAME rule_id while the
-    /// ORIGINAL (still-wedged) worker is still running. Without the generation
-    /// check, that stale worker's self-disarm check would match the RETRY's own
-    /// marker (same rule_id) and wrongly conclude "still wanted", handing a live
-    /// subscription back to a caller that already gave up on it - reopening the
-    /// abandonment-leak window on every retry, not once.
+    /// `generation`: no longer read by any timeout-then-late-success path (#3816
+    /// moved that decision entirely into GuardianIoExecutor, which needs no
+    /// rule_id/generation - it decides purely from whether ITS OWN caller is still
+    /// waiting). Still load-bearing for arming_rollback's own undo (attach_rule):
+    /// on a throw during this call's own argument evaluation, arming_rollback must
+    /// erase arming_keys_[key] ONLY if it still holds the SAME episode that
+    /// rollback's fn was built for - matching BOTH rule_id AND generation, not
+    /// rule_id alone, so a same-rule_id RETRY that has since re-populated
+    /// arming_keys_[key] with a FRESH InFlightArm (this PR's own
+    /// policy_generation-hold-and-retry behavior causes this ordinarily, not just
+    /// as a rare race) is not mistaken for the episode being rolled back. Without
+    /// the generation check, an earlier episode's rollback could erase a DIFFERENT,
+    /// still-live episode's marker for the same key - matters for a caller that
+    /// invokes this class directly across threads without GuardianEngine's own
+    /// mtx_ serialization (tests), same caveat as the busy-check above.
     struct InFlightArm {
         std::string rule_id;
         std::uint64_t generation{0};
@@ -675,7 +747,30 @@ private:
     /// registry_mu_ held. Returns backend work still owed (a watcher disarm on the
     /// rule's key ->0 edge) for the CALLER to submit off-lock once it unlocks - see
     /// the class comment above and attach_rule/detach_rule/detach_all's own docs.
-    std::optional<DisarmWork> detach_rule_locked(const std::string& rule_id);
+    /// `lifecycle_kind` names the audit entry ("disarmed" | "errored" -
+    /// guardian_outbox.hpp's documented vocabulary): #2818's on_subscription_lost
+    /// passes "errored" - the rule wasn't withdrawn, its enforcement broke - every
+    /// other call site keeps the default. std::string_view per this file's own
+    /// convention for a non-owning string ref (cpp-conventions.md) - both current
+    /// callers pass string literals, but the type itself doesn't privilege that.
+    std::optional<DisarmWork> detach_rule_locked(const std::string& rule_id,
+                                                  std::string_view lifecycle_kind = "disarmed");
+    /// #2818: `key`'s watch died entirely (SparkEventKind::Lost, or revalidate_
+    /// subscriptions() finding it Dead). Staleness-guarded on `subscription_id`
+    /// against keys_[key]->subscription: a fresh re-arm superseding this key between
+    /// the detection and this call means there is nothing to do. Detaches every rule
+    /// on the key as "errored". `detail` is the mechanism's failure text (from
+    /// SparkEvent::detail on the push path) or a synthetic reason (the poll backstop) -
+    /// logged only (journal-only, not on the wire - enterprise-readiness Gate 6: a
+    /// wire-payload extension is deliberately deferred, see spark-flip-gate.md).
+    void on_subscription_lost(const std::string& key, std::uint64_t subscription_id,
+                               const std::string& detail);
+    /// #2818: `key`'s watch toggled health WITHOUT being torn down (B1 Faulted/
+    /// Recovered) - same staleness guard, but does NOT touch keys_/rules_/index_,
+    /// since the key is still armed. Surfaces a Health-domain outbox entry per active
+    /// rule on the key.
+    void on_subscription_faulted(const std::string& key, std::uint64_t subscription_id,
+                                  bool faulted, const std::string& detail);
     /// Submit a disarm and discard/count its outcome - detach's audit trail and
     /// confirmed-state mutation are already committed by the time this runs (see
     /// DisarmWork's doc); this is best-effort teardown of the OS watcher only,
@@ -786,6 +881,7 @@ private:
     GuardianIoExecutor io_executor_;
     std::atomic<std::uint64_t> backend_op_timeouts_{0};   ///< arm/disarm calls that hit cfg_.backend_op_deadline
     std::atomic<std::uint64_t> backend_op_busy_{0};       ///< attach_rule rejected: key already arming
+    std::atomic<std::uint64_t> backend_op_late_arms_{0};  ///< #3816: late-succeeding arm disarmed by on_abandoned
 
     mutable std::mutex outbox_mu_;
     GuardianOutbox outbox_;

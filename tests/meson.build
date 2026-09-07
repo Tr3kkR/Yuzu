@@ -187,9 +187,16 @@ echo_argv_fixture = executable(
 #     -fvisibility=default that lets every symbol cross the DLL boundary
 #     without __declspec(dllexport). So libyuzu_agent_core.dll's import
 #     lib does not surface proto symbols and the test binary must link
-#     yuzu_proto.lib directly. Same proto archive, double-registered —
-#     but ASan isn't part of the Windows MSVC build matrix, so the
-#     duplicate-descriptor CHECK that drove #572 doesn't fire here.
+#     yuzu_proto.lib directly. Same proto archive, double-registered — the
+#     nightly windows-asan job (.github/workflows/nightly.yml) builds and
+#     runs this exact configuration under MSVC ASan, so whatever the
+#     underlying reason, the duplicate-descriptor CHECK that drove #572
+#     does not fire here either — not, as previously stated here, because
+#     ASan is absent from Windows MSVC coverage entirely (it isn't — it
+#     runs as nightly.yml's standalone windows-asan job; it genuinely IS
+#     absent from ci.yml's own build matrix, a separate and narrower term
+#     per docs/ci-architecture.md). See that job's own run history for
+#     current pass/fail status per ref.
 #
 # Without this split, Windows MSVC fails LNK2019 on every .pb.o symbol
 # in test_guardian_engine.cpp (the canary that surfaces the broken link).
@@ -222,6 +229,9 @@ agent_test_exe = executable(
     # real return value; see unit/test_runner_main.cpp and catch2_nomain_dep
     # above.
     'unit/test_runner_main.cpp',
+    'unit/test_progress_listener.cpp', # #4018 per-test START/END progress log, env-gated
+    'unit/test_detached_signature.cpp', # shared detached-CMS verifier (#416/#3807)
+    'unit/test_updater_signature.cpp', # OTA signature gate, end to end (#416/#3807)
     'unit/test_plugin_loader.cpp',
     'unit/test_capability_registry_tables.cpp',
     'unit/test_sdk_utilities.cpp',
@@ -282,12 +292,14 @@ agent_test_exe = executable(
     'unit/test_guardian_state_reader.cpp',
     'unit/test_guardian_convergence_scheduler.cpp',
     'unit/test_guardian_io_executor.cpp',
+    'unit/test_guardian_outbox_send_executor.cpp',
     'unit/test_guardian_outbox_drain_worker.cpp',
     'unit/test_guardian_engine_spark_reconcile.cpp',
     'unit/test_new_plugins.cpp',
     'unit/test_netprobe_stats.cpp',
     'unit/test_antivirus_parsers.cpp',
     'unit/test_firewall_parsers.cpp',
+    'unit/test_disk_actions_local_dispatcher.cpp', # Wave 6 PR6.1-a-1: real disk_actions dylib/.so/.dll
     'unit/test_firewall_local_dispatcher.cpp',
     'unit/test_agent_csr.cpp',
     'unit/test_cert_discovery.cpp',
@@ -437,9 +449,20 @@ agent_test_exe = executable(
                                                 # driven end to end via LocalDispatcher
                                                 # (installed_count only; the Windows leg covers the
                                                 # native rung-1 Uninstall-key registry read)
-    'unit/test_license_scan_actions.cpp',     # Wave 4 PR4.3b: real license_scan.dylib/.so driven
+    'unit/test_license_scan_actions.cpp',    # Wave 4 PR4.3b: real license_scan.dylib/.so driven
                                                 # end to end via LocalDispatcher after the Linux-leg
                                                 # runner migration (POSIX-only, a no-op TU on Windows)
+    'unit/test_filesystem_posture_parsers.cpp', # Wave 6 PR6.1-b: pure /proc/self/mountinfo, quotactl
+                                                # errno classification, fs_snapshot_list attrlist walk,
+                                                # and the legs.hpp pure row formatters
+    'unit/test_filesystem_posture_local_dispatcher.cpp', # Wave 6 PR6.1-b: real filesystem_posture dylib
+                                                # driven end to end via LocalDispatcher (POSIX-only; a no-op
+                                                # TU on Windows via the file's own #ifndef _WIN32 guard)
+    'unit/test_power_health_parsers.cpp',        # Wave 6 PR6.2-a: pure power_health parser/decision tests, fixture-driven, no OS calls
+    'unit/test_power_health_local_dispatcher.cpp', # Wave 6 PR6.2-a: real power_health dylib/.so via
+                                                # LocalDispatcher. Deliberately NOT platform-guarded — it
+                                                # runs on every OS, and on a host with no battery it emits an
+                                                # explicit named SKIP rather than passing silently.
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -447,6 +470,8 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/antivirus/src'),  # antivirus_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/firewall/src'),   # firewall_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/installed_apps/src'),  # installed_apps_registry_utf8.hpp (#1662 test)
+    include_directories('../agents/plugins/disk_actions/src'), # disk_actions_legs.hpp (pure formatters)
+    include_directories('../agents/plugins/power_health/src'),  # power_health_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/license_scan/src'),    # licensing_parsers.hpp / licensing_record.hpp (pure, SLE PR1)
     include_directories('../agents/plugins/wifi/src'),            # wifi_corewlan.hpp (pure connected-record formatter)
     include_directories('../agents/plugins/interaction/src'),     # interaction_parsers.hpp (pure helpers)
@@ -473,6 +498,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/windows_updates/src'), # windows_updates_parsers.hpp (Wave 3 pure parser)
     include_directories('../agents/plugins/sccm/src'),           # sccm_parsers.hpp (Wave 3 PR33d pure parser)
     include_directories('../agents/plugins/software_actions/src'), # software_actions_parsers.hpp (Wave 4 PR4.3b pure parser)
+    include_directories('../agents/plugins/filesystem_posture/src'), # filesystem_posture_parsers.hpp / _legs.hpp (Wave 6 PR6.1-b pure headers)
   ],
   # agent_platform_args carries -DYUZU_HAVE_LIBSYSTEMD (Linux + libsystemd found)
   # so Linux real-mechanism Service spark tests can compile-gate on it, exactly
@@ -550,9 +576,11 @@ agent_test_exe = executable(
   link_depends: [
                 abi3_fixture_plugin,
                 content_dist_plugin_lib,
+                disk_actions_plugin_lib,
                 device_identity_plugin_lib,
                 echo_argv_fixture,
                 event_logs_plugin_lib,
+                filesystem_posture_plugin_lib,
                 hardware_plugin_lib,
                 installed_apps_plugin_lib,
                 invalid_name_fixture_plugin,
@@ -570,31 +598,35 @@ agent_test_exe = executable(
                 software_actions_plugin_lib,
                 users_plugin_lib,
                 wifi_plugin_lib,
+                power_health_plugin_lib,
                 windows_updates_plugin_lib,
                 ],
 )
-# Two agent tests are [tsan-heavy]: concurrency STRESS checkpoints that spin four to five
-# threads on real SQLite I/O with no throttle. Their wall time is contention-dominated - it
-# ballooned under Big Tam filesystem contention (four CI jobs sharing one host's /tmp), where
-# one stalled ~8 minutes and timed the whole agent suite out (#2345). In a PLAIN build they
-# detect nothing (no instrumentation), so that cost buys no signal there - skip them. A
-# sanitizer build runs everything (ASan for use-after-free in the concurrent teardown, TSan
-# for the races they exist for), where the ~10x-larger job budget absorbs their cost as it did
-# before this change. The OTHER four [tsan] tests are cheap and bounded (no real SQLite, or a
-# fixed sleep) and stay in every build. A coverage build (b_coverage, no sanitizer) also skips
-# the two heavy tests; their concurrent code paths are line-covered by the sequential
-# prune/page/gauge tests and the cheap concurrent tests, so no meaningful line coverage is lost.
-# The residual risk that these two balloon on the shared Big Tam pool even under the sanitizer
-# budget is tracked in #2373 (split/redesign), not papered over with a wall-clock cap here -
-# that route introduced its own flakiness (a busy main thread starving the workers it waited on)
-# and was backed out.
+# Three agent tests are [tsan-heavy] (#3848 added the third, a concurrency soak against a
+# BLOCKING Spark backend/send callback - not a SQLite spin-loop, but genuinely contention-
+# dominated in the same way, ~4-15s under TSan): concurrency STRESS checkpoints that spin
+# four to five threads with no throttle, two of them on real SQLite I/O. Their wall time is
+# contention-dominated - it ballooned under Big Tam filesystem contention (four CI jobs
+# sharing one host's /tmp), where one stalled ~8 minutes and timed the whole agent suite out
+# (#2345), and the same mechanism recurred on Wee Tam/Windows under ASan (#4018). In a PLAIN
+# build they detect nothing (no instrumentation), so that cost buys no signal there - skip
+# them. A sanitizer build runs everything, but as of #2373's split (below) NOT in this same
+# entry: they get their OWN test() with its own budget, so a stall here no longer risks
+# timing out the other fast cases sharing this entry's ceiling. The OTHER four [tsan]
+# tests are cheap and bounded (no real SQLite, or a fixed sleep) and stay in every build. A
+# coverage build (b_coverage, no sanitizer) also skips the two heavy tests; their concurrent
+# code paths are line-covered by the sequential prune/page/gauge tests and the cheap
+# concurrent tests, so no meaningful line coverage is lost.
+# #2373 (split/redesign) is now acted on directly below, not merely tracked: a wall-clock cap
+# on these tests was tried and backed out (a busy main thread starving the workers it waited
+# on), so the fix is a separately-budgeted entry, never a tighter deadline on this one.
 # ── #2270 allocation-budget probe (separate binary, deliberately) ────────────
 # test_spark_alloc_budget.cpp REPLACES the global operator new/delete to count
 # allocations, which is process-wide and cannot be scoped to one test. Two
 # reasons it is not a source of yuzu_agent_tests:
 #   * a sanitizer owns the allocator, so the replacement must be ABSENT from
 #     those binaries, not merely disabled inside them;
-#   * a global allocator replacement has no business in the 1500-case agent
+#   * a global allocator replacement has no business in the agent test
 #     binary that gates every push.
 # Executable-side interposition for libyuzu_agent_core.so is an ELF/libstdc++
 # property (measured on Linux, and it does hold) — not a portable contract, so
@@ -617,15 +649,54 @@ if host_machine.system() == 'linux' and get_option('b_sanitize') == 'none'
   )
 endif
 
-agent_test_args = (get_option('b_sanitize') == 'none') ? ['~[tsan-heavy]'] : []
+# [tsan-heavy] is now ALWAYS excluded from this entry (previously only in a plain build) -
+# see the #2373 split comment above and the dedicated 'agent tsan-heavy checkpoints' entry
+# below, which is the only place a sanitizer build runs them now.
+agent_test_args = ['~[tsan-heavy]']
 test(
   'agent unit tests',
   agent_test_exe,
   args: agent_test_args,
   suite: 'agent',
-  timeout: 240, # restored after moving the two [tsan-heavy] spin-loop tests to sanitizer-only (#2345): plain suite is ~28s, so 240s is ~8x headroom and surfaces a genuine hang rather than absorbing it into a loose ceiling.
+  timeout: 240, # restored after moving the (now three, #3848) [tsan-heavy] tests to sanitizer-only (#2345): plain suite is ~28s, so 240s is ~8x headroom and surfaces a genuine hang rather than absorbing it into a loose ceiling.
   depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin, abi3_fixture_plugin],
 )
+
+if get_option('b_sanitize') != 'none'
+  # #2373's split, acted on: these three [tsan-heavy] checkpoints are contention-dominated
+  # (two spin unthrottled real SQLite I/O; #2345 measured one stalling ~8 minutes on Big Tam
+  # under shared-filesystem contention, and #4018 saw the same mechanism recur on Wee
+  # Tam/Windows ASan). Their own entry means a stall here times out AT ITS OWN BUDGET,
+  # classifiably, instead of either being absorbed into the fast suite's tight 240s ceiling
+  # (windows-asan's prior state, #4018) or dragging the whole fast suite down with
+  # it. 600s is sized off the measured ~480s (8-minute) stall with headroom, not the plain
+  # suite's ~28s baseline; nightly's own --timeout-multiplier 2 (Linux legs) / the
+  # windows-asan job's now-added multiplier scale this to 1200s under sanitizer instrumentation
+  # plus contention. Do NOT replace this with a wall-clock cap inside the tests themselves -
+  # that was tried and backed out (comment above): a busy main thread starves the worker
+  # threads whose progress it is waiting on.
+  #
+  # is_parallel: false on Windows ONLY (governance Gate 4/6, #4018 hardening round):
+  # neither this entry nor 'agent unit tests' caps --num-processes, so meson's own
+  # scheduler is free to run both as concurrent OS processes sharing suite: 'agent' -
+  # exactly the shared-disk/Defender-minifilter contention docs/ci-architecture.md's
+  # "Windows test-phase concurrency gate" measures as real ACROSS jobs, now possible
+  # WITHIN one job between these two sibling entries. A barrier is nearly free on
+  # windows-asan (its only sibling under --suite agent is the ~28s-baseline fast
+  # entry) but must NOT apply on Linux's unfiltered `meson test` (sanitize-asan/tsan):
+  # forcing a full drain-then-run-alone there adds real critical-path time to legs
+  # already sized close to their timeout-minutes budget.
+  tsan_heavy_checkpoints_is_parallel = host_machine.system() != 'windows'
+  test(
+    'agent tsan-heavy checkpoints',
+    agent_test_exe,
+    args: ['[tsan-heavy]'],
+    suite: 'agent',
+    timeout: 600,
+    is_parallel: tsan_heavy_checkpoints_is_parallel,
+    depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin, abi3_fixture_plugin],
+  )
+endif
 
 # ── cert_store macOS honest-unsupported unit test (A-1.20 / P8; BR-001/BR-003
 #    branch-review fix) ────────────────────────────────────────────────────
@@ -659,6 +730,7 @@ endif
 # ── TAR plugin unit tests ────────────────────────────────────────────────────
 tar_test_deps = [yuzu_agent_core_dep, yuzu_sdk_dep, nlohmann_dep, spdlog_dep, sqlite3_dep, catch2_dep]
 tar_test_cpp_args = []
+tar_test_objcpp_args = []
 if host_machine.system() == 'windows'
   # tar_perf.cpp (compiled directly into this exe) → GetIfTable2 / FreeMibTable
   tar_test_deps += cxx.find_library('iphlpapi')
@@ -670,6 +742,22 @@ if host_machine.system() == 'windows'
   tar_test_deps += cxx.find_library('ws2_32')   # winsock2 symbols the iphlpapi/netioapi headers in tar_netqual_boot.cpp pull in
   tar_test_deps += cxx.find_library('mpr')      # tar_mapdrive_collector.cpp WNet outbound
   tar_test_deps += cxx.find_library('netapi32') # tar_mapdrive_collector.cpp NetSessionEnum inbound
+  tar_test_deps += cxx.find_library('powrprof') # tar_power_collector.cpp PowerRegisterSuspendResumeNotification
+elif host_machine.system() == 'linux'
+  # tar_power_collector.cpp is compiled DIRECTLY into this exe, and its Linux
+  # sleep/wake leg is compile-gated on YUZU_HAVE_LIBSYSTEMD. That define was
+  # added to the plugin's args only, so the whole sd-bus leg -- and the two test
+  # cases that exercise it -- compiled OUT of this binary on Linux, where the
+  # #else branch SUCCEEDs with a "skipped" message. The suite stayed green while
+  # testing nothing, on the one platform that is this leg's enforcement point.
+  # Mirror the plugin's block (agents/plugins/tar/meson.build) so the tests
+  # compile in wherever the plugin's leg does.
+  libsystemd_test_dep = dependency('libsystemd', required: get_option('systemd_guard'),
+                                   include_type: 'system')
+  if libsystemd_test_dep.found()
+    tar_test_deps += libsystemd_test_dep
+    tar_test_cpp_args += '-DYUZU_HAVE_LIBSYSTEMD'
+  endif
 elif host_machine.system() == 'darwin'
   # tar_proc_es.cpp (compiled directly into this exe) → Endpoint Security client +
   # audit-token helpers, gated on the framework being present (full Xcode SDK).
@@ -683,6 +771,17 @@ elif host_machine.system() == 'darwin'
     # -fblocks required for the ES block literal in tar_proc_es.cpp (see plugin meson).
     tar_test_cpp_args += ['-DYUZU_HAVE_ENDPOINT_SECURITY', '-fblocks']
   endif
+  # Wave 6 PR6.3: test_tar_removable.cpp calls make_removable_cursor_source(), so
+  # this exe compiles the removable collector — which on darwin needs its
+  # DiskArbitration Objective-C++ TU and framework, exactly as the plugin does.
+  tar_test_deps += dependency('appleframeworks', modules: ['DiskArbitration', 'Foundation'],
+                              include_type: 'system')
+  tar_test_objcpp_args += apple_objcpp_args
+endif
+
+tar_test_removable_darwin_sources = []
+if host_machine.system() == 'darwin'
+  tar_test_removable_darwin_sources = files('../agents/plugins/tar/src/tar_removable_diskarb.mm')
 endif
 
 tar_test_exe = executable(
@@ -709,8 +808,16 @@ tar_test_exe = executable(
     'unit/test_tar_arp.cpp',       # Wave 5 PR5.2: pure /proc/net/arp parser + macOS record mapping (fixture-fed)
     'unit/test_tar_capture_status.cpp', # BR-001 remediation: pure subprocess-capture completeness predicate
     'unit/test_tar_win_raii_guards.cpp', # Gate 3 remediation: injectable-closer RAII guard coverage (Windows-only body, empty TU elsewhere)
+    'unit/test_tar_cursor.cpp',                  # Wave 6: cursor-source seam — lifecycle + persistence, atomic event+cursor commit, record_key dedupe, ack-by-sequence incl. the R-005 overflow regression (on-disk TarDb via unique_temp_path)
+    'unit/test_tar_power.cpp',                   # Wave 6 PR6.2-b: pmset parser + exact-tail cursor/gap decisions, REAL-CAPTURE fixtures, RunFn-injected
+    'unit/test_tar_removable.cpp',               # Wave 6 PR6.3: event-log channel parsers + identity + per-channel cursors, REAL-CAPTURE fixtures
     'unit/test_fleet_snapshot.cpp',
     '../agents/plugins/tar/src/tar_db.cpp',
+    # Wave 6: the cursor seam's factory AND lookback_seconds_or_forward_only,
+    # the fail-closed reader for the lookback privacy control (tar_cursor.hpp
+    # rule 5). Linking it also means the suite exercises the real factory
+    # rather than a test-local stand-in.
+    '../agents/plugins/tar/src/tar_cursor_sources.cpp',
     '../agents/plugins/tar/src/tar_sql_executor.cpp',
     '../agents/plugins/tar/src/tar_diff.cpp',
     '../agents/plugins/tar/src/tar_software_core.cpp',
@@ -730,13 +837,19 @@ tar_test_exe = executable(
     '../agents/plugins/tar/src/tar_arp_collector.cpp',     # Wave 5 PR5.2 Finding 4: real enumerate_arp() macOS smoke test
     '../agents/plugins/tar/src/tar_service_collector.cpp', # Wave 5 PR5.2 Finding 3: real enumerate_services() argv-assertion tests
     '../agents/plugins/tar/src/tar_fleet_snapshot.cpp',
-  ),
+    # Wave 6 PR6.2-b: test_tar_power.cpp drives mac_power_collect_impl with an
+    # injected runner, so the real collector links into this exe.
+    '../agents/plugins/tar/src/tar_power_collector.cpp',
+    # Wave 6 PR6.3: the TU exercises the real CursorSource via the factory.
+    '../agents/plugins/tar/src/tar_removable_collector.cpp',
+  ) + tar_test_removable_darwin_sources,
   include_directories: [
     include_directories('../agents/plugins/tar/src'),
     include_directories('../agents/shared'),  # win_str.hpp — tar_module_etw.cpp is compiled into this test exe (#1681, relocated plugins/shared -> agents/shared)
     include_directories('../agents/core/src'),        # sync_source_app_perf.hpp — app_perf rollup-query integration test
   ],
   cpp_args: tar_test_cpp_args,
+  objcpp_args: tar_test_objcpp_args,
   dependencies: tar_test_deps,
 )
 test('tar unit tests', tar_test_exe, suite: 'tar', timeout: 90)
@@ -771,6 +884,7 @@ if build_server
       'unit/server/test_runtime_config_store.cpp',
       'unit/server/test_nvd.cpp',
       'unit/server/test_cpe_identity_resolver.cpp',
+      'unit/server/test_ota_signature_sidecar.cpp', # server half of OTA signature delivery (#416/#3807)
       'unit/server/test_update_registry.cpp',
       'unit/server/test_legacy_sqlite_probe.cpp',
       'unit/server/test_https_config.cpp',
@@ -788,6 +902,8 @@ if build_server
       'unit/server/test_bundle_orchestrator.cpp',
       'unit/server/test_rest_bundle.cpp',
       'unit/server/test_audit_store.cpp',
+      'unit/server/test_background_jobs.cpp',
+      'unit/server/test_pg_retention_guard.cpp',
       'unit/server/test_audit_retention_rules.cpp',
       'unit/server/test_sqlite_raii.cpp',
       'unit/server/test_rest_audit_sample.cpp',
@@ -800,13 +916,23 @@ if build_server
       'unit/server/test_sensitive_instruction_params.cpp',
       'unit/server/test_workflow_routes.cpp',
       'unit/server/test_compliance_routes.cpp',
+      'unit/server/test_verify_routes.cpp',
+      'unit/server/test_notification_routes.cpp',
+      'unit/server/test_command_routes.cpp',
+      'unit/server/test_page_routes.cpp',
+      'unit/server/test_dashboard_api_routes.cpp',
+      'unit/server/test_nvd_routes.cpp',
+      'unit/server/test_result_set_routes.cpp',
       'unit/server/test_agent_service_impl.cpp',
       'unit/server/test_analytics_event.cpp',
       'unit/server/test_agent_health_store.cpp',
       'unit/server/test_instruction_store.cpp',
       'unit/server/test_instruction_store_signing.cpp',
       'unit/server/test_instruction_yaml.cpp',
+      'unit/server/test_instruction_routes.cpp', # #2542 PR-7: the 13-route Instruction Definitions + Instruction Sets API, extracted onto the HttpRouteSink seam
       'unit/server/test_execution_tracker.cpp',
+      'unit/server/test_execution_routes.cpp', # #2542 PR-7: the 7-route legacy pre-v1 Executions API, extracted onto the HttpRouteSink seam
+      'unit/server/test_leader_elector.cpp',
       'unit/server/test_execution_event_bus.cpp',
       'unit/server/test_approval_manager.cpp',
       'unit/server/test_schedule_engine.cpp',
@@ -878,6 +1004,7 @@ if build_server
       'unit/server/test_quarantine_store.cpp',
       'unit/server/test_quarantine_dispatch_decision.cpp', # #3127: pure write/response classification — no Postgres, no MCP transport, no agent
       'unit/server/test_quarantine_dispatch_gate.cpp',     # #881: containment gate at the dispatch chokepoint — pure arm/degradation logic, no store
+      'unit/server/test_plugin_presence_dispatch_gate.cpp', # #3424/#3511: plugin-presence filter at the dispatch chokepoint — mirrors test_quarantine_dispatch_gate.cpp
       'unit/server/test_quarantine_reapply.cpp',           # #3425: shared stored-containment re-dispatch recipe (Layer A) — pure, no store
       'unit/server/test_quarantine_containment_reconciler.cpp', # #3425: reconnect re-application state machine — real store/registry, mock dispatch
       'unit/server/test_result_set_store.cpp',
@@ -921,6 +1048,7 @@ if build_server
       'unit/server/test_compliance_eval.cpp',
       'unit/server/test_cel_eval.cpp',
       'unit/server/test_custom_properties_store.cpp',
+      'unit/server/test_custom_properties_routes.cpp', # #2542 PR-4: the 5-route Custom Properties API (7.6), extracted onto the HttpRouteSink seam
       'unit/server/test_props_scope_authz.cpp',
       'unit/server/test_tag_scope_authz.cpp',
       'unit/server/test_notification_store.cpp',
@@ -952,6 +1080,7 @@ if build_server
       'unit/server/test_dispatch_destructive_gate.cpp', # #3685: Destructive targeting gate — pure verdict + confinement + refusal-string pins
       'unit/server/test_dashboard_destructive_gate.cpp', # PR6.0b: the same gate wired into POST /api/dashboard/execute
       'unit/server/test_default_certs.cpp',
+      'unit/server/test_mcp_route_registration.cpp', # #2542 PR-6: McpServer register_routes(HttpRouteSink&, ...) seam — registration shape + kill-switch-before-auth ordering + server.cpp wiring tripwire
       'unit/server/test_mcp_server.cpp',
       'unit/server/test_mcp_session.cpp',
       'unit/server/test_mcp_stream.cpp',
@@ -975,6 +1104,7 @@ if build_server
       'unit/server/test_rest_tag_routes.cpp',   # K-05: REST tag-route authz wiring (CDX-03/CDX-R4-02/B4)
       'unit/server/test_rest_quarantine_routes.cpp',   # CDX-P1-02: REST quarantine-route authz wiring
       'unit/server/test_rest_api_events.cpp',
+      'unit/server/test_openapi_spec_completeness.cpp',   # #3991 F1: ADR-0031 INV-31-4 / #842 unit-test half
       'unit/server/test_rest_software_packages.cpp',
       'unit/server/test_rest_inventory_software.cpp',
       'unit/server/test_rest_sessions.cpp',
@@ -999,6 +1129,7 @@ if build_server
       'unit/server/test_insecure_tls_gate.cpp',
       'unit/server/test_settings_routes_users.cpp',
       'unit/server/test_settings_routes_dex_alerts.cpp',
+      'unit/server/test_settings_routes_ota_audit.cpp',
       'unit/server/test_settings_routes_management_groups.cpp', # stored-XSS regression (mgmt-group name/id escaping)
       'unit/server/test_settings_routes_oidc.cpp',
       'unit/server/test_plugin_signing_helpers.cpp',
@@ -1918,7 +2049,7 @@ test('changelog order',
 )
 
 # PR1.9 data-gate: every plugin action has exactly one capability-catalogue row
-# across the five fragment headers, and no fragment claims an action no plugin
+# across the six fragment headers, and no fragment claims an action no plugin
 # declares. Hermetic — parses sources, builds nothing.
 test('capability catalogue completeness',
   _python3_test,
@@ -1937,6 +2068,24 @@ test('capability gate consistency',
   args: [files('test_capability_gate_consistency.py')],
   suite: 'docs',
   timeout: 30,
+)
+
+# Plugin README standard (docs/plugin-readme-standard.md): unit tests of the
+# generator's pure functions, then the tree gate — README-existence ratchet,
+# section contract, generated fences/index/nav/manifests byte-match the
+# sources, every supported leg has a parseable capture with a current
+# leg-hash. Hermetic — parses sources, builds nothing.
+test('plugin doc-gen unit',
+  _python3_test,
+  args: [files('test_plugin_doc_gen.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+test('plugin readme gate',
+  _python3_test,
+  args: [files('test_plugin_readmes.py')],
+  suite: 'docs',
+  timeout: 60,
 )
 
 # Prometheus alert-rule unit tests (#2553). The same script the docs-lint
@@ -2053,6 +2202,14 @@ if _bash_test.found()
   test('plugin-spawn lexical gate selftest',
     _bash_test,
     args: [files('../scripts/ci/check-plugin-spawn-lexical.sh'), '--selftest'],
+    suite: 'docs',
+    timeout: 60,
+  )
+  # docs/plugin-readme-standard.md rule 7 — the README touch rule's own
+  # fixture run (a fake `git` on PATH; no repository, no network).
+  test('plugin readme touch-rule selftest',
+    _bash_test,
+    args: [files('../scripts/ci/check-plugin-readme-touch.sh'), '--selftest'],
     suite: 'docs',
     timeout: 60,
   )

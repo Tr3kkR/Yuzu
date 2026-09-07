@@ -1359,6 +1359,18 @@ std::shared_ptr<AgentSession> AgentRegistry::get_session(const std::string& agen
     return it != agents_.end() ? it->second : nullptr;
 }
 
+std::unordered_set<std::string> AgentRegistry::ids_missing_plugin(std::string_view plugin) const {
+    std::unordered_set<std::string> missing;
+    std::lock_guard lock(mu_);
+    for (const auto& [id, s] : agents_) {
+        if (s->plugin_names.empty())
+            continue; // no reported inventory -- unknown, not absent; fail open
+        if (std::ranges::find(s->plugin_names, plugin) == s->plugin_names.end())
+            missing.insert(id);
+    }
+    return missing;
+}
+
 // Collect every from_result_set:<id> reference in a scope expression so the
 // resolver can preload owner-checked membership once per set. The scope AST is
 // a variant of Condition | Combinator (scope_engine.hpp); walk it recursively.
@@ -1850,7 +1862,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     std::array<double, kNGuardianJournalAgeMetrics> gja_max{};
     std::array<bool, kNGuardianJournalAgeMetrics> gja_reported{};
     // Meta-signals ABOUT the rollup (guardian_journal_fleet_tags.hpp). Published
-    // unconditionally, including at 0, unlike the 30 - they are server-owned counts
+    // unconditionally, including at 0, unlike the 32 - they are server-owned counts
     // that always have a true value, so 0 is a measurement, not a fabricated zero.
     // `gj_reporting` is the coverage denominator absence otherwise hides; without it a
     // dark telemetry pipeline is indistinguishable from a healthy quiet fleet.
@@ -1861,7 +1873,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     int gj_tag_rejected = 0;
     // std::string twins of the table's C-string tag keys: get_view takes
     // const std::string&, so passing the char* directly would heap-construct a
-    // temporary key per lookup - 30 per agent per sweep. Built once (same pattern,
+    // temporary key per lookup - 32 per agent per sweep. Built once (same pattern,
     // and the same governance finding, as spark_mech_metric_keys above). It IS
     // registered for static destruction (non-trivial destructor), which is safe only
     // because health_recompute_thread_ - the sole production reader - is joined in
@@ -1907,6 +1919,8 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         return os.empty() ? "unknown" : "other";
     };
 
+    int ota_signature_refusing = 0;
+
     for (const auto& [id, snap] : snapshots_) {
         ++healthy_count;
 
@@ -1914,6 +1928,13 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
             auto it = snap.status_tags.find(key);
             return it != snap.status_tags.end() ? it->second : "";
         };
+
+        // Read via find() rather than get(): the comment below explains that get()
+        // memcpy's every value it touches, on every agent, on every sweep. We need
+        // only "is this non-zero", so compare in place and copy nothing.
+        if (auto it = snap.status_tags.find("yuzu.ota_signature_refused");
+            it != snap.status_tags.end() && !it->second.empty() && it->second != "0")
+            ++ota_signature_refusing;
 
         // Non-copying accessor. Every tag VALUE is fully agent-controlled and bounded only
         // by the 4 MB gRPC frame, so `get()` above memcpy's it on every lookup, on every
@@ -2204,6 +2225,15 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
             ++gh_reporting;
     }
 
+    // OTA signature refusals (#416/#3807). Counts AGENTS currently reporting a
+    // non-zero refusal total, not the refusals themselves — one wedged agent
+    // retrying every six hours would otherwise dominate the number and hide how
+    // many endpoints are affected, which is the question an operator actually
+    // has. This is the only server-side surface for that state: the update path
+    // has no status-report RPC and the agent has no /metrics endpoint, so
+    // without this the refusal is invisible outside a per-endpoint log.
+    metrics.gauge("yuzu_fleet_ota_signature_refusing_agents")
+        .set(static_cast<double>(ota_signature_refusing));
     metrics.gauge("yuzu_fleet_agents_healthy").set(static_cast<double>(healthy_count));
     metrics.gauge("yuzu_fleet_agents_dex_observer_disarmed")
         .set(static_cast<double>(dex_observer_disarmed));

@@ -56,11 +56,12 @@ struct FakeDispatch {
                       const std::vector<std::string>& agent_ids, const std::string& /*scope*/,
                       const std::unordered_map<std::string, std::string>& /*params*/,
                       const std::string& correlation,
-                      const yuzu::server::DispatchCaller& caller) -> std::pair<std::string, int> {
+                      const yuzu::server::DispatchCaller& caller)
+            -> yuzu::server::ConfinedDispatchOutcome {
             calls.push_back(Call{plugin, action, correlation, agent_ids, caller.exec_visible,
                                  caller.principal, caller.principal_is_admin,
                                  caller.approval_provenance});
-            return {"cmd-" + plugin + "-" + action, sent};
+            return {.sent = sent, .command_id = "cmd-" + plugin + "-" + action};
         };
     }
 };
@@ -354,10 +355,11 @@ TEST_CASE("orchestrator: a throwing dispatch step is isolated, manifest still st
     BundleOrchestrator::DispatchFn throwing =
         [&n](const std::string& plugin, const std::string& action, const std::vector<std::string>&,
              const std::string&, const std::unordered_map<std::string, std::string>&,
-             const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+             const std::string&, const yuzu::server::DispatchCaller&)
+            -> yuzu::server::ConfinedDispatchOutcome {
         if (++n == 2)
             throw std::runtime_error("gRPC write failed");
-        return {"cmd-" + plugin + "-" + action, 1};
+        return {.sent = 1, .command_id = "cmd-" + plugin + "-" + action};
     };
     BundleOrchestrator orch(throwing, &store, fixed_id("abc"));
     auto specs = validate_bundle_steps(

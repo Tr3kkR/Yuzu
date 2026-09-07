@@ -23,12 +23,11 @@
  * case uses plain YUZU_REQUIRE_PG_DB, per the plain-migration-test carve-out
  * documented on that macro.
  *
- * No legacy-SQLite backfill test coverage: the dedicated migrate_from_sqlite
- * TEST_CASE suite was removed as part of a fresh-start-by-default policy
- * change (ADR-0009 amendment) -- no production fleet has ever run a
- * pre-Postgres build. QuarantineStore::migrate_from_sqlite() itself is
- * UNCHANGED and still present in production code; only this file's test
- * coverage of it was removed.
+ * No legacy-SQLite backfill test coverage: `QuarantineStore::migrate_from_sqlite()` itself was
+ * retired (chore/retire-migrate-from-sqlite-batch-a, #3623, ADR-0047 Update, 2026-09-03) -- no
+ * production fleet has ever run a pre-Postgres build, so the mandatory fingerprint-verified
+ * backfill never had real legacy data to protect. `server.cpp` now runs
+ * `legacy_sqlite_probe::warn_if_legacy_rows` over `quarantine_records` instead.
  */
 
 #include "quarantine_store.hpp"
@@ -487,4 +486,25 @@ TEST_CASE("QuarantineStore: a genuine v1->v2 upgrade (real ALTER against a popul
     REQUIRE(after.has_value());
     REQUIRE(after->has_value());
     CHECK((*after)->last_applied_at == 5000);
+
+    // v3 (#3623, migrate_from_sqlite retired): the same construction call also runs the
+    // DROP TABLE against quarantine_meta — seeded by the v1 DDL above but never touched by
+    // v2's ALTER, so this is the only ladder test that actually exercises the drop landing
+    // against a populated (not merely fresh-templated) database.
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult ver{PQexec(conn.get(),
+                            "SELECT version FROM public.schema_meta WHERE store = "
+                            "'quarantine_store'")};
+        REQUIRE(ver.ok());
+        REQUIRE(PQntuples(ver.get()) == 1);
+        CHECK(std::string(PQgetvalue(ver.get(), 0, 0)) == "3");
+        PgResult tbl{PQexec(conn.get(),
+                            "SELECT COUNT(*) FROM information_schema.tables WHERE "
+                            "table_schema = 'quarantine_store' AND table_name = "
+                            "'quarantine_meta'")};
+        REQUIRE(tbl.ok());
+        CHECK(std::string(PQgetvalue(tbl.get(), 0, 0)) == "0");
+    }
 }

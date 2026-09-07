@@ -103,13 +103,13 @@ struct MockDispatch {
         return [this](const std::string& plugin, const std::string& action,
                      const std::vector<std::string>& agent_ids, const std::string&,
                      const std::unordered_map<std::string, std::string>& parameters,
-                     const std::string&) -> std::pair<std::string, int> {
+                     const std::string&) -> yuzu::server::ConfinedDispatchOutcome {
             calls.push_back({plugin, action, agent_ids, parameters});
             if (on_dispatch)
                 on_dispatch();
             if (next_throws)
                 throw std::runtime_error("dispatch failed");
-            return {"cmd-" + std::to_string(calls.size()), next_agents_reached};
+            return {.sent = next_agents_reached, .command_id = "cmd-" + std::to_string(calls.size())};
         };
     }
 };

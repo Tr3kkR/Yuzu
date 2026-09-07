@@ -797,6 +797,22 @@ public:
     // Get a session by agent_id (for scope evaluation).
     std::shared_ptr<AgentSession> get_session(const std::string& agent_id) const;
 
+    // #3424/#3511: ids POSITIVELY known to lack `plugin`, for
+    // dispatch_confined_arms's plugin-presence filter. One locked pass over
+    // every session, same shape as all_ids() above. An agent with an EMPTY
+    // plugin_names (never registered with a plugin list -- a fresh
+    // registration race, a degraded AgentInfo, or any future caller that
+    // legitimately omits it) is never included: absence of DATA is not
+    // evidence of absence of the PLUGIN, and the caller-visible effect of a
+    // false positive here (a dispatch silently withheld from a real, present
+    // agent) is worse than the caller-visible effect of a false negative (the
+    // pre-existing #3511 behaviour: the agent finds out itself, same as
+    // today). plugin_names is populated once at register_agent from the
+    // agent's self-reported inventory and never refreshed until the agent's
+    // next re-register -- a plugin installed since is not visible here until
+    // then; documented at the call site, not re-litigated per caller.
+    std::unordered_set<std::string> ids_missing_plugin(std::string_view plugin) const;
+
     // Evaluate a scope expression against all agents, return matching agent IDs.
     // `rs_store` resolves the `from_result_set:<id>` scope kind (capability §30)
     // to per-device membership, scoped to `principal`: a referenced set that

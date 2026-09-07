@@ -1,5 +1,7 @@
 #pragma once
 
+#include "dispatch_confined_arms.hpp" // #3424/#3511: ConfinedDispatchOutcome -- DispatchFn/CommandDispatchFn return type
+
 /// @file preflight_runner.hpp
 /// Background lifecycle driver for `/auto` pre-flight runs — the
 /// re-dispatch-on-reconnect loop. Mirrors PolicyEvaluator: this owns only the
@@ -35,7 +37,7 @@ class PreflightRunner {
 public:
     /// Same 6-param shape as the shared command_dispatch_fn (execution_id
     /// carried, so responses correlate via query_by_execution).
-    using CommandDispatchFn = std::function<std::pair<std::string, int>(
+    using CommandDispatchFn = std::function<yuzu::server::ConfinedDispatchOutcome(
         const std::string& plugin, const std::string& action,
         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
         const std::unordered_map<std::string, std::string>& parameters,
