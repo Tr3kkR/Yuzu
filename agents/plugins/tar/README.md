@@ -19,7 +19,19 @@ snapshot against the previous baseline and append change events to a local SQLit
 (`tar.db`): `collect_fast` (process + network, default 60s), `collect_slow` (service + user
 session, default 300s), `collect_perf` (device CPU/memory/disk/network counters, default 30s) and
 `collect_software` (installed-software inventory, default hourly) — all four triggers are
-registered in `init()` (`tar_plugin.cpp:601-644`). `rollup` runs every 15 minutes: it always
+registered in `init()` (`tar_plugin.cpp:601-644`). `collect_slow` also drives a generic cursor-model
+loop (`tar_plugin.cpp:2122-2130`) over the sources `make_cursor_sources()` constructs
+(`tar_cursor_sources.cpp:30-35`): `power` (sleep/wake/AC-power transitions — Windows
+`PowerRegisterSuspendResumeNotification`/`WM_POWERBROADCAST`, Linux `systemd-logind`
+PrepareForSleep + power-supply sysfs/udev, macOS `pmset -g log` replay) and `removable`
+(removable-media attach/detach plus exec-from-removable correlation — Windows `EvtQuery` over the
+Partition/Diagnostic and Kernel-PnP channels, Linux a udev netlink monitor, macOS DiskArbitration
+`DADiskAppeared`/`Disappeared`; `tar_removable_diskarb.mm`). Both are the first
+works-council-class sources shipped **on by default** (`tar_schema_registry.cpp:976-992`,
+"ALEX RULING 2026-09-04") — every other opt-in source added since 1.5 (procperf, netqual, module,
+software, arp, dns, netconn, mapdrive) still defaults off; the plugin now has 15 registered
+capture sources, 7 on by default (the five always-on machine-scope sources plus `power` and
+`removable`) and 8 opt-in. `rollup` runs every 15 minutes: it always
 aggregates live rows into hourly/daily/monthly tiers first, then unconditionally enforces
 retention on every tier, deleting aged rows (`tar_plugin.cpp:3619-3627`) — the ordering is
 load-bearing and the reason the capability declaration marks this action Destructive/Irreversible.
@@ -145,9 +157,9 @@ anywhere in the plugin's 48 source files.
 | `crossplatform.tar.configure` | `arp_enabled` | string | no | `false` | `true \| false` | Enable/disable the ARP/neighbour-table capture source; native on every OS (see OS capability). |
 | `crossplatform.tar.configure` | `dns_enabled` | string | no | `false` | `true \| false` | Enable/disable the DNS resolver-cache capture source; Windows-only collector today. |
 | `crossplatform.tar.configure` | `mapdrive_enabled` | string | no | `false` | `true \| false` | Enable/disable the mapped-drive capture source (`$MapDrive_*`); Windows + Linux; macOS planned. |
-| `crossplatform.tar.configure` | `power_enabled` | string | no | `true` | `true \| false` | Enable/disable the sleep/wake/AC-power transition source (`$Power_Live`); **no collector is registered in this release** — the table stays queryable-empty. |
-| `crossplatform.tar.configure` | `power_lookback_seconds` | string | no | `604800` | `0-7776000` | Pre-enablement lookback for the power source. |
-| `crossplatform.tar.configure` | `removable_enabled` | string | no | `true` | `true \| false` | Enable/disable the removable-media attach/detach source (`$Removable_Live`); no collector is registered yet. |
+| `crossplatform.tar.configure` | `power_enabled` | string | no | `true` | `true \| false` | Enable/disable the sleep/wake/AC-power transition source (`$Power_Live`, cursor-model); **on by default** — the first works-council-class source to ship enabled (ALEX RULING 2026-09-04). All three legs implemented: Windows `powerbroadcast`, Linux `logind`, macOS `pmset_log` (`tar_power_collector.cpp`). |
+| `crossplatform.tar.configure` | `power_lookback_seconds` | string | no | `604800` | `0-7776000` | Pre-enablement lookback for the power source; effective on macOS only (Windows/Linux have no power-history API). |
+| `crossplatform.tar.configure` | `removable_enabled` | string | no | `true` | `true \| false` | Enable/disable the removable-media attach/detach source (`$Removable_Live`, cursor-model); **on by default**, same divergence as `power`. All three legs implemented (`tar_removable_collector.cpp`, `tar_removable_diskarb.mm`): Windows `wevtapi` (supported), Linux `udev_netlink` (constrained), macOS `diskarbitration` (constrained). Queried via `tar.sql` only; `tar.query`/`tar.export` do not surface it. |
 | `crossplatform.tar.configure` | `removable_lookback_seconds` | string | no | `604800` | `0-7776000` | Pre-enablement lookback for the removable source. |
 | `crossplatform.tar.configure` | `network_capture_method` | string | no | `polling` | `polling`, or a host-valid future method | TCP capture mechanism; only `polling` is wired today regardless of the configured value. |
 | `crossplatform.tar.configure` | `process_stabilization_exclusions` | string | no | (empty) | JSON array, ≤256 elements ≤256 chars, effective substring ≥3 chars | Case-insensitive substring patterns matched against the process name; matches are dropped before the diff. |
@@ -276,10 +288,11 @@ same convention. `purge_source` writes a single JSON line,
 `{"source":"<name>","rows_deleted":<n>,"status":"purged"}` (`tar_plugin.cpp:3037-3038`), or an
 `error|` line if the named source is unknown or still enabled.
 
-**Empty-result / not-yet-collected convention.** Several `configure` sources (`power`, `removable`)
-ship their schema and config key now with no collector registered yet — their tables stay
-queryable and empty, which means "not yet collecting," never "nothing happened"
-(`tar.yaml:588-592,638-642`).
+**Empty-result / not-yet-collected convention.** `module` (image-load capture) ships its schema and
+config key with no collector registered yet — the `$Module_*` tables stay queryable and empty,
+which means "not yet collecting," never "nothing happened" (`tar.yaml` `module_enabled`
+description). `power` and `removable` were in this state until PRs #4017/#4023 landed real
+collectors for all three OSes on both (`tar_schema_registry.cpp:969-1094`); see How it works.
 
 ### Result status
 
@@ -558,9 +571,10 @@ three broken legs; it is one chokepoint. See Caveats item 1.
    `tar_software_collector.cpp` is a stub returning empty. `netconn` and `dns` are likewise
    `planned` (no-op) on Linux and macOS. A `planned` leg's table is queryable and empty, which
    means "not yet collecting," never "nothing happened."
-5. **Cursor-model sources never silently replay or wipe.** A lost/invalid cursor or a wrapped log
-   emits a `capture_gap` event and re-baselines forward at the log's current end rather than
-   replaying from zero (`tar_cursor.hpp:25-75`); a transient read failure throws
+5. **Cursor-model sources never silently replay or wipe.** `power` and `removable` are the first
+   two live `CursorSource` instances (`tar_cursor_sources.cpp:30-35`); a lost/invalid cursor or a
+   wrapped log emits a `capture_gap` event and re-baselines forward at the log's current end rather
+   than replaying from zero (`tar_cursor.hpp:25-75`); a transient read failure throws
    `IncompleteCaptureError` and retains the cursor instead. The same discipline applies to bulk
    deletes: `run_retention`'s clock guard *declines* a pass that looks like a wall-clock jump
    (counted in `retention_guard_declines_total`) rather than deleting on an implausible reading,
@@ -586,8 +600,11 @@ three broken legs; it is one chokepoint. See Caveats item 1.
   `tar_mapdrive_collector.cpp` / `tar_mapdrive_macos_parsers.hpp` ·
   `tar_service_collector.cpp` / `tar_service_parsers.hpp` ·
   `tar_software_collector.cpp` / `tar_software_core.{hpp,cpp}` · `tar_user_collector.cpp` ·
-  `tar_perf.{hpp,cpp}` / `tar_proc_perf.{hpp,cpp}` · `tar_win_raii_guards.hpp` · `tar_version.hpp` ·
-  `meson.build`
+  `tar_perf.{hpp,cpp}` / `tar_proc_perf.{hpp,cpp}` ·
+  `tar_power_collector.cpp` / `tar_power_parsers.hpp` (power, cursor-model) ·
+  `tar_removable_collector.cpp` / `tar_removable_diskarb.mm` / `tar_removable_parsers.hpp`
+  (removable, cursor-model) ·
+  `tar_win_raii_guards.hpp` · `tar_version.hpp` · `meson.build`
 - Definitions: `content/definitions/tar.yaml` (status, query, snapshot, export, configure,
   collect_fast, collect_slow, compatibility, fleet_snapshot) · `content/definitions/tar_warehouse.yaml`
   (sql, rollup, and 14 canned warehouse queries)
@@ -599,6 +616,7 @@ three broken legs; it is one chokepoint. See Caveats item 1.
   `test_tar_netconn.cpp` · `test_tar_netqual_nstat.cpp` · `test_tar_perf.cpp` ·
   `test_tar_proc_es.cpp` · `test_tar_proc_etw.cpp` · `test_tar_proc_perf.cpp` ·
   `test_tar_schema_registry.cpp` · `test_tar_service.cpp` · `test_tar_software.cpp` ·
+  `test_tar_power.cpp` · `test_tar_removable.cpp` ·
   `test_tar_store.cpp` · `test_tar_warehouse.cpp` · `test_tar_win_raii_guards.cpp` ·
   `tests/unit/server/test_dashboard_tar_fragments.cpp` · `test_dashboard_tar_retention.cpp` ·
   `test_dispatch_target_shape.cpp` · `test_offload_target_store.cpp` ·
@@ -620,5 +638,6 @@ three broken legs; it is one chokepoint. See Caveats item 1.
   `3424-3511-dispatch-plugin-presence.security.md` · `3685-destructive-dispatch-gate.security.md`
   · `3885-dashboard-destructive-targeting.security.md` · `5.2-tar-arp-posix.added.md` ·
   `5.2-tar-mapdrive-macos.added.md` · `5.2-tar-popen-rehome.changed.md` ·
-  `6.2b-tar-cursor-seam.added.md`
+  `6.2b-tar-cursor-seam.added.md` · `6.2b-tar-power-source.added.md` ·
+  `6.3-tar-removable-source.added.md`
 <!-- END GENERATED -->
