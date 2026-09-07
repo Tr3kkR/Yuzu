@@ -71,8 +71,17 @@ struct ScheduleQuery {
 /// /api/v1/schedules` and MCP `list_schedules` were built on the older
 /// method and could not tell their caller "the store failed" from "there are
 /// no schedules" — see docs/user-manual/rest-api.md's schedules section.
+///
+/// `truncated` is a second, independent #4030 review finding: the query is
+/// hard-capped at `kScheduleListCap` rows (schedule_engine.cpp) with no
+/// caller-visible limit/cursor, so a fleet with more schedules than the cap
+/// silently loses the alphabetical tail. `truncated` tells REST/MCP callers
+/// when that happened so they can say so (precedent: MCP query_responses's
+/// `result_truncated_by_cap`) instead of presenting the capped count as the
+/// true total.
 struct ScheduleListResult {
     std::vector<InstructionSchedule> schedules;
+    bool truncated{false};
 };
 
 class ScheduleEngine {

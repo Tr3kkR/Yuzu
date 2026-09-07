@@ -512,9 +512,11 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{"executions":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"definition_name":{"type":"string"},"status":{"type":"string"},"dispatched_by":{"type":"string"},"dispatched_at":{"type":"integer"},"agents_targeted":{"type":"integer"},"agents_responded":{"type":"integer"},"agents_success":{"type":"integer"},"agents_failure":{"type":"integer"},"completed_at":{"type":"integer"},"rerun_of":{"type":"string"},"error_preview":{"type":"string"}},"required":["id","definition_id","status","dispatched_by","dispatched_at","agents_targeted","agents_responded"]}}},"required":["executions"]})j"},
 
     {"list_schedules", "List scheduled (recurring) instructions. #4030: rows now also "
-     "carry execution_count, matching the dashboard fragment's field set.",
+     "carry execution_count, matching the dashboard fragment's field set. The query is "
+     "hard-capped at 100 rows with no limit/cursor parameter; a result hitting that cap "
+     "sets result_truncated_by_cap:true rather than presenting a partial list as complete.",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"schedules":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"definition_id":{"type":"string"},"frequency_type":{"type":"string"},"enabled":{"type":"boolean"},"next_execution_at":{"type":"integer"},"execution_count":{"type":"integer"}},"required":["id","name","definition_id","frequency_type","enabled","next_execution_at","execution_count"]}}},"required":["schedules"]})j"},
+     R"j({"type":"object","properties":{"schedules":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"definition_id":{"type":"string"},"frequency_type":{"type":"string"},"enabled":{"type":"boolean"},"next_execution_at":{"type":"integer"},"execution_count":{"type":"integer"}},"required":["id","name","definition_id","frequency_type","enabled","next_execution_at","execution_count"]}},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when the 100-row cap dropped rows; absent otherwise."}},"required":["schedules"]})j"},
 
     {"list_workflows", "List multi-step workflows (WorkflowEngine — a different data model "
      "from a single-instruction Execution; see get_workflow_execution). Requires "
@@ -7130,11 +7132,22 @@ McpServer::HandlerFn McpServer::build_handler(
                 for (const auto& s : schedules_result->schedules)
                     arr.add_raw(schedule_row_json(s).dump());
                 mcp_audit("success");
+                // #4030 review finding (blocking): the underlying query is
+                // hard-capped at 100 rows with no limit/cursor parameter on
+                // this tool; result_truncated_by_cap (declared in the output
+                // schema above, precedent: query_responses's identical flag)
+                // tells a caller when this response is a partial page rather
+                // than the complete schedule list. content[].text stays the
+                // bare `schedules` array unchanged for backward compat — the
+                // flag lives only in structuredContent, same split as
+                // query_responses.
+                JObj structured;
+                structured.raw("schedules", arr.str());
+                if (schedules_result->truncated)
+                    structured.add("result_truncated_by_cap", true);
                 res.set_content(
-                    success_response(id,
-                                      tool_result_split(arr.str(),
-                                                         JObj().raw("schedules", arr.str()).str(),
-                                                         kObjectOutputSchema)),
+                    success_response(
+                        id, tool_result_split(arr.str(), structured.str(), kObjectOutputSchema)),
                     "application/json");
                 return;
             }

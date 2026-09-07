@@ -27,6 +27,12 @@ constexpr const char* kStoreName = "schedule_engine";
 constexpr std::chrono::milliseconds kReadTimeout{1500};
 constexpr std::chrono::milliseconds kWriteTimeout{2000};
 
+// query_schedules()/query_schedules_checked() row cap. No creation-side
+// ceiling exists (create_schedule has no count check), so a fleet can
+// legitimately exceed this — query_schedules_checked() detects and reports
+// it via ScheduleListResult::truncated (#4030 review finding).
+constexpr int kScheduleListCap = 100;
+
 std::string generate_id() {
     static thread_local std::mt19937_64 rng(std::random_device{}());
     std::uniform_int_distribution<uint64_t> dist;
@@ -209,7 +215,7 @@ std::vector<InstructionSchedule> ScheduleEngine::query_schedules(const ScheduleQ
     if (q.enabled_only) {
         sql += " AND enabled = TRUE";
     }
-    sql += " ORDER BY name ASC LIMIT 100";
+    sql += " ORDER BY name ASC LIMIT " + std::to_string(kScheduleListCap);
 
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
     if (res.status() != PGRES_TUPLES_OK) {
@@ -253,7 +259,14 @@ ScheduleEngine::query_schedules_checked(const ScheduleQuery& q) const {
     if (q.enabled_only) {
         sql += " AND enabled = TRUE";
     }
-    sql += " ORDER BY name ASC LIMIT 100";
+    // #4030 review finding (blocking): query one row PAST the cap so a real
+    // fleet size of exactly kScheduleListCap is never misreported as
+    // truncated -- the simpler "returned == limit" heuristic used by MCP
+    // query_responses's hit_cap would false-positive on that boundary here,
+    // since (unlike query_responses) this query has no caller-supplied limit
+    // to compare against, only the one fixed cap. The sentinel row is
+    // trimmed back off below, never returned to the caller.
+    sql += " ORDER BY name ASC LIMIT " + std::to_string(kScheduleListCap + 1);
 
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
     if (res.status() != PGRES_TUPLES_OK)
@@ -261,8 +274,10 @@ ScheduleEngine::query_schedules_checked(const ScheduleQuery& q) const {
 
     ScheduleListResult out;
     const int rows = PQntuples(res.get());
-    out.schedules.reserve(static_cast<std::size_t>(rows));
-    for (int i = 0; i < rows; ++i)
+    out.truncated = rows > kScheduleListCap;
+    const int take = out.truncated ? kScheduleListCap : rows;
+    out.schedules.reserve(static_cast<std::size_t>(take));
+    for (int i = 0; i < take; ++i)
         out.schedules.push_back(row_to_schedule(res.get(), i));
     return out;
 }

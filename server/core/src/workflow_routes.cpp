@@ -2168,10 +2168,22 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 // #4030 Gate 8 fix (sre, Gate 6): X-Correlation-Id parity
                 // with the success path (see GET /api/v1/workflows above).
                 detail::ensure_correlation_id(res);
+                // #4030 review finding (blocking): `total` below is the
+                // COUNT RETURNED, not necessarily the fleet's true count --
+                // query_schedules_checked() hard-caps at kScheduleListCap
+                // rows with no way for this route to page past it. Before
+                // this fix `total` silently asserted completeness even when
+                // truncated; now a truncated response says so explicitly
+                // (precedent: MCP query_responses's result_truncated_by_cap)
+                // instead of the caller having no way to tell.
+                nlohmann::json pagination{
+                    {"total", arr.size()}, {"start", 0}, {"page_size", 50}};
+                if (scheds_result->truncated)
+                    pagination["result_truncated_by_cap"] = true;
                 res.set_content(
                     nlohmann::json(
                         {{"data", arr},
-                         {"pagination", {{"total", arr.size()}, {"start", 0}, {"page_size", 50}}},
+                         {"pagination", pagination},
                          {"meta", {{"api_version", "v1"}}}})
                         .dump(),
                     "application/json");
