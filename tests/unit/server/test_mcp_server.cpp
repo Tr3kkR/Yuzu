@@ -3527,7 +3527,9 @@ TEST_CASE("MCP Integration: discover_plugins wired vs unwired", "[mcp][integrati
     CHECK(got == expected);
     REQUIRE(got.contains("limitation"));
 
-    // Unwired (AgentRegistry left null) — JSON-RPC tool error.
+    // Unwired (AgentRegistry left null) — JSON-RPC tool error, A4-shaped
+    // (PR #4112 review, should-fix): correlation_id + a non-null,
+    // transient-failure retry_after_ms, not a bare {code,message}.
     McpTestServer ts_unwired;
     ts_unwired.start("readonly");
     auto res2 = ts_unwired.call(
@@ -3535,6 +3537,11 @@ TEST_CASE("MCP Integration: discover_plugins wired vs unwired", "[mcp][integrati
     REQUIRE(res2);
     auto body2 = nlohmann::json::parse(res2->body);
     CHECK(body2.contains("error"));
+    REQUIRE(body2["error"].contains("data"));
+    CHECK(body2["error"]["data"].contains("correlation_id"));
+    CHECK_FALSE(body2["error"]["data"]["correlation_id"].get<std::string>().empty());
+    REQUIRE(body2["error"]["data"].contains("retry_after_ms"));
+    CHECK_FALSE(body2["error"]["data"]["retry_after_ms"].is_null());
 }
 
 TEST_CASE("MCP: all five discover_* tools are advertised in tools/list",
@@ -5114,7 +5121,7 @@ TEST_CASE("MCP Integration: resources/list returns the expected resources", "[mc
     REQUIRE(result.contains("resources"));
     auto& resources = result["resources"];
     REQUIRE(resources.is_array());
-    CHECK(resources.size() == 11); // existing 9 + 2g PR4 specs-as-resources
+    CHECK(resources.size() == 12); // existing 9 + 2g PR4 specs-as-resources + plugin-docs
 
     // The Guardian schema discovery resource is advertised on the MCP plane.
     std::set<std::string> uris;
@@ -5128,6 +5135,7 @@ TEST_CASE("MCP Integration: resources/list returns the expected resources", "[mc
     CHECK(uris.count("yuzu://golden-prompts/enterprise-it-v1") == 1);
     CHECK(uris.count("yuzu://openapi") == 1);
     CHECK(uris.count("yuzu://scope-dsl") == 1);
+    CHECK(uris.count("yuzu://plugin-docs") == 1);
 
     // Each resource should have uri, name, description, mimeType
     for (const auto& r : resources) {
@@ -5230,6 +5238,106 @@ TEST_CASE("MCP 2g PR4: yuzu://openapi and yuzu://scope-dsl deny at an unrecogniz
     auto body2 = nlohmann::json::parse(res_scope_dsl->body);
     REQUIRE(body2.contains("error"));
     CHECK(body2["error"]["code"] == yuzu::server::mcp::kTierDenied);
+}
+
+// ── Plugin README standard (docs/plugin-readme-standard.md rule 10):
+// yuzu://plugin-docs — the build-embedded per-plugin documentation manifests,
+// same static builder as GET /api/v1/discover/plugin-docs, same tier-then-perm
+// gate as the two 2g PR4 resources above.
+
+TEST_CASE("MCP plugin-docs: yuzu://plugin-docs matches plugin_docs_catalog()",
+          "[mcp][plugin_docs][integration]") {
+    McpTestServer ts;
+    ts.start("readonly");
+
+    const auto expected = nlohmann::json::parse(yuzu::server::plugin_docs_catalog().json);
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"resources/read","id":36,"params":{"uri":"yuzu://plugin-docs"}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto& contents = body["result"]["contents"];
+    REQUIRE(contents.is_array());
+    REQUIRE(contents.size() == 1);
+    CHECK(contents[0]["uri"] == "yuzu://plugin-docs");
+    CHECK(contents[0]["mimeType"] == "application/json");
+    auto got = nlohmann::json::parse(contents[0]["text"].get<std::string>());
+    CHECK(got == expected);
+
+    // Envelope shape — the manifests themselves are content, not asserted here
+    // beyond the contract every entry must satisfy.
+    CHECK(got["catalog"] == "plugin-docs");
+    CHECK(got["source"] == "build-embedded");
+    REQUIRE(got["plugins"].is_array());
+    CHECK(got["plugin_count"].get<std::size_t>() == got["plugins"].size());
+    CHECK(got["skipped_invalid"] == 0);
+    CHECK(got["plugin_count"].get<std::size_t>() >= 2); // the pilots; never vacuous
+    for (const auto& m : got["plugins"]) {
+        CHECK(m["manifest_version"].is_number_integer());
+        CHECK(m["name"].is_string());
+        CHECK(m["actions"].is_array());
+        CHECK(m["readme"].is_string());
+    }
+}
+
+TEST_CASE("MCP plugin-docs: yuzu://plugin-docs denies without Infrastructure:Read and at an "
+          "unrecognized tier",
+          "[mcp][plugin_docs][integration]") {
+    {
+        McpTestServer ts;
+        ts.perm_override_for_test = [](const std::string& securable, const std::string& operation) {
+            return !(securable == "Infrastructure" && operation == "Read");
+        };
+        ts.start("readonly");
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"resources/read","id":37,"params":{"uri":"yuzu://plugin-docs"}})");
+        REQUIRE(res);
+        CHECK(res->status != 200);
+    }
+    {
+        McpTestServer ts;
+        ts.start("bogus-unrecognized-tier");
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"resources/read","id":38,"params":{"uri":"yuzu://plugin-docs"}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kTierDenied);
+    }
+}
+
+TEST_CASE("MCP plugin-docs: discover_plugins outputSchema types the per-plugin docs summary",
+          "[mcp][plugin_docs][integration]") {
+    // The #2986 completeness case guards top-level keys only; the item-level
+    // `docs` property (object-or-null, always present — the catalog 2 -> 3
+    // change) is pinned here so a revert of the schema hunk fails a test.
+    McpTestServer ts;
+    ts.start("readonly");
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":39})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    bool found = false;
+    for (const auto& t : body["result"]["tools"]) {
+        if (t.value("name", "") != "discover_plugins")
+            continue;
+        found = true;
+        REQUIRE(t.contains("outputSchema"));
+        const auto& items = t["outputSchema"]["properties"]["plugins"]["items"];
+        REQUIRE(items.contains("properties"));
+        REQUIRE(items["properties"].contains("docs"));
+        const auto& docs = items["properties"]["docs"];
+        CHECK(docs["type"] == nlohmann::json::array({"object", "null"}));
+        CHECK(docs["properties"].contains("summary"));
+        CHECK(docs["properties"].contains("platforms"));
+        CHECK(docs["properties"].contains("readme"));
+        CHECK(docs["properties"].contains("resource"));
+        const auto& required = items["required"];
+        CHECK(std::find(required.begin(), required.end(), "docs") != required.end());
+    }
+    CHECK(found);
 }
 
 // ── 11. Unknown method — verify kMethodNotFound ─────────────────────────────

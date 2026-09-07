@@ -107,6 +107,19 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      gauge-family PR cites this entry instead of relitigating (governance
      Gate-3 architect, spark rung-1 re-land).
 
+   - **2026-09-07 — class-level entry: a compiled-in specification surfaced as
+     REST route + MCP resource, with no MCP tool, satisfies the twin.** The
+     plugin documentation manifests (`GET /api/v1/discover/plugin-docs` and
+     `yuzu://plugin-docs`, byte-identical, `docs/plugin-readme-standard.md`
+     rule 10) follow the 2g PR4 specs-as-resources shape: the resource is
+     enumerable through `resources/list`, gated tier-then-permission like
+     its REST twin, and the tool-level entry point is the `docs` summary
+     `discover_plugins` already carries. Decision 4 asks for REST and MCP;
+     a resource IS the MCP surface for static content. Recorded class-level
+     so the next compiled-in catalog cites this entry (governance Gate-3
+     architect + Gate-4 consistency-auditor, PR D.1 of the plugin docs
+     programme).
+
    - **2026-07-08 — SCIM v2 provisioning (`/scim/v2/*`, PR #2018).** REST-only,
      no MCP twin, and absent from route discovery (A2/A3) — a "no" on
      Decision 1/4's twin-surface requirement. Recorded rather than fixed
