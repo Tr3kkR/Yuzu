@@ -405,15 +405,33 @@ TEST_CASE("result_set_routes: [pg] create round trip from pasted device IDs, "
     CHECK(sets[0].owner_principal == "alice");
 }
 
+// Regression-pins the claim the next comment block relies on: an
+// oversized POST body is rejected by httplib's own payload-size cap
+// BEFORE this route (or its `TooManyMembers` validation) ever runs --
+// this used to be a one-time manual observation, not an assertion (Gate
+// 3 quality-engineer finding).
+TEST_CASE("result_set_routes: create's device_ids parsing is unreachable "
+          "past httplib's own form-payload size cap -- 413, not 200",
+          "[server][routes][result_set_routes]") {
+    Harness h;
+    h.wire();
+
+    std::string oversized = "device_ids=" + std::string(8193, 'a');
+    auto r = h.sink.Post("/fragments/result-sets/create", oversized,
+                         "application/x-www-form-urlencoded");
+    REQUIRE(r);
+    CHECK(r->status == 413);
+    CHECK(h.audits.empty()); // rejected before the handler ever runs
+}
+
 // NOTE ON THE TWO create_materialized ERROR KINDS THIS SUITE DOES NOT
 // TRIGGER: `TooManyMembers` (>kMaxMembersPerSet=100000 distinct ids) is
 // UNREACHABLE via this HTTP route in both production and this harness —
 // httplib's own `CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH` (8192
 // bytes) rejects the request with 413 BEFORE `device_ids` is ever parsed
 // into `req.params`, and 8192 bytes cannot encode 100001 distinct
-// comma-separated ids (verified empirically: the first attempt at this test
-// used a ~700KB body and got 413, not 200 — a genuine finding, not a
-// hypothetical one). `QuotaExceeded` (kMaxPerOwner=10000 existing sets for
+// comma-separated ids -- pinned by the TEST_CASE directly above, not just
+// asserted in prose. `QuotaExceeded` (kMaxPerOwner=10000 existing sets for
 // one owner) is reachable in principle but prohibitively expensive to set
 // up (10000 rows) — expensive enough that even test_result_set_store.cpp's
 // own comprehensive suite does not test it. The "ALWAYS denied, regardless
