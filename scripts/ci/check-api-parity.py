@@ -103,8 +103,18 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # stated reason, raise) this in the SAME change that changes the real count -
 # see check-capability-matrix.sh's CDX-P2-006 comment for why an un-adjusted
 # baseline is not a real ratchet.
-BASELINE_UNTWINNED = 257  # #4028: 8 settings rows (tls/https/gateway/server-config/mcp/
-                          # data-retention/analytics/plugin-signing) flipped planned:#2146 -> twinned
+BASELINE_UNTWINNED = 265  # #4028: 8 settings rows (tls/https/gateway/server-config/mcp/
+                          # data-retention/analytics/plugin-signing) corrected from
+                          # planned:#2146 -> exception:#520. An earlier round of this PR
+                          # flipped these straight to "twinned" (rule 2 above only
+                          # validates that a CLAIMED twin exists -- it accepts either
+                          # rest_v1_twin or mcp_twin alone, since it is not this script's
+                          # job to adjudicate ADR-1005's both-surfaces policy, only ledger
+                          # self-consistency), which understated the untwinned count by 8
+                          # and recorded no exception-ledger entry for the deliberate #520
+                          # REST-only decision. See
+                          # docs/adr/1005-headless-platform-use-case-engines.md's exception
+                          # ledger for the recorded entry.
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.

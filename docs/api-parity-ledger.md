@@ -115,7 +115,7 @@ plus `$ref` validity) - the #842 companion to this whole-tree script.
 | scope-result-sets | 1 | 0 | 1 |
 | instructions | 24 | 0 | 24 |
 | compliance-policy | 19 | 1 | 18 |
-| settings | 15 | 8 | 7 |
+| settings | 15 | 0 | 15 |
 | rbac | 8 | 0 | 8 |
 | auth-mfa | 7 | 0 | 7 |
 | engine-principals | 1 | 0 | 1 |
@@ -124,11 +124,11 @@ plus `$ref` validity) - the #842 companion to this whole-tree script.
 | ota | 15 | 0 | 15 |
 | enrollment | 19 | 0 | 19 |
 | other | 74 | 0 | 74 |
-| **Total** | **278** | **21** | **257** |
+| **Total** | **278** | **13** | **265** |
 
 Registered `/api/v1/*` routes: 180. OpenAPI `paths` entries: 179. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 91.
 
-Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 257.
+Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 265.
 
 <!-- END GENERATED -->
 
