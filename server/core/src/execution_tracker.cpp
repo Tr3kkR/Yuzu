@@ -15,6 +15,7 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <chrono>
@@ -620,7 +621,17 @@ ExecutionTracker::query_executions_checked(const ExecutionQuery& q,
     // #3789: MUST precede ORDER BY/LIMIT below — ADR-0017 INV-3.
     append_execution_scope_clause(sql, params, idx, scope);
     sql += " ORDER BY dispatched_at DESC LIMIT $" + std::to_string(idx++);
-    params.push_back(std::to_string(q.limit));
+    // #4030 review finding (should-fix): a schema-legal non-positive
+    // q.limit (no caller validates it before this point -- MCP
+    // list_executions's input schema declares no minimum) previously
+    // reached Postgres verbatim; Postgres rejects a negative LIMIT outright,
+    // which query_executions() (the unchecked wrapper) silently collapsed to
+    // a false-empty success. Clamp here, matching
+    // WorkflowEngine::list_workflows's identical "Clamp to at least 1"
+    // comment/fix (workflow_engine.cpp) — this protects every caller of
+    // query_executions[_checked], not just the one MCP handler that
+    // triggered the finding.
+    params.push_back(std::to_string(std::max(q.limit, 1)));
 
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
     if (res.status() != PGRES_TUPLES_OK) {
