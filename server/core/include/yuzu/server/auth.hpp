@@ -1041,36 +1041,47 @@ private:
     ///    DB commit landed here but who has not yet reached its OWN `mu_` -
     ///    so `role_version` hasn't moved - is still invisible to it, and this
     ///    call still writes+returns its (by then stale) re-read. Same defect
-    ///    class as the case-2 residual below, just narrowed to this
-    ///    function's own re-read-to-relock span (a single unlocked DB call
-    ///    plus one uncontended mutex acquisition) instead of the whole
-    ///    pre-lock window spanning back to before PBKDF2.
+    ///    class as the case-2 residual below, confined to this function's own
+    ///    re-read-to-relock span (a single unlocked DB call plus one
+    ///    uncontended mutex acquisition).
     ///
-    ///    Still open, same class, wider: the case-2 branch above (no version
-    ///    divergence observed) - a racing writer's DB commit can land in this
-    ///    call's own read-to-lock window without yet reaching ITS OWN lock,
-    ///    so the version counter shows no change and this call still trusts
-    ///    its own now-stale `db_user->role`. Neither this branch nor case-3's
-    ///    narrower instance above is closeable by "just re-read again": an
-    ///    authdb re-review (Gate 8, #4020 third round) caught an earlier
-    ///    draft of this doc overclaiming that an unconditional second read
-    ///    would close case-2 at the cost of a round trip - false. ANY
-    ///    read-then-lock check has its own read-to-lock window, and a writer
-    ///    whose DB commit lands there without yet reaching its own lock is
-    ///    invisible to the version compare no matter how many times the read
-    ///    is repeated; only the WIDTH of that window shrinks. Full closure
-    ///    needs an actual serialization primitive (a DB row lock or CAS held
-    ///    across both the read and the write), not more reads. A session
-    ///    minted via either gap carries the stale role for its FULL LIFETIME,
-    ///    not one request - `validate_session` performs no per-request
-    ///    re-verification, and the demote's own session sweep (`update_role`'s
-    ///    `std::erase_if(sessions_, ...)`) runs before this session even
-    ///    exists, so it cannot catch it either. Both instances tracked as
-    ///    issue #4107 (scoped to the actual remedy - a serialization
-    ///    primitive - not the refuted "read again" one), disposition (fix vs.
-    ///    accept) pending review by someone other than this fix's author, per
-    ///    this project's standing rule against self-authored risk acceptance
-    ///    on a HIGH-derived finding.
+    ///    Still open, same class, same width, MORE LIKELY: the case-2 branch
+    ///    above (no version divergence observed) - a racing writer's DB
+    ///    commit can land in this call's own [db_user re-read, mu_ lock]
+    ///    window without yet reaching ITS OWN lock, so the version counter
+    ///    shows no change and this call still trusts its own now-stale
+    ///    `db_user->role`. That window is the SAME width/shape as case-3's
+    ///    (one DB call plus one mutex acquisition, not "back to before
+    ///    PBKDF2" - `pre_check_version` is only the comparison BASELINE,
+    ///    captured before PBKDF2 to detect drift since then; a write landing
+    ///    in that wider span either gets caught as a divergence (routing to
+    ///    case-3) or is already reflected in this call's own re-read, neither
+    ///    of which is the gap here - a security-guardian Gate 8 re-review,
+    ///    #4020 fourth round, corrected an earlier draft of this doc that got
+    ///    the window width wrong). The actual case-2 vs. case-3 distinction
+    ///    is LIKELIHOOD, not window size: case-2 is the COMMON path (every
+    ///    login takes it), case-3 only runs after a divergence is already
+    ///    detected (i.e. two overlapping racing writers, not one). Neither
+    ///    branch is closeable by "just re-read again": an authdb re-review
+    ///    (Gate 8, #4020 third round) caught an earlier draft of this doc
+    ///    overclaiming that an unconditional second read would close case-2
+    ///    at the cost of a round trip - false. ANY read-then-lock check has
+    ///    its own read-to-lock window, and a writer whose DB commit lands
+    ///    there without yet reaching its own lock is invisible to the
+    ///    version compare no matter how many times the read is repeated.
+    ///    Full closure needs an actual serialization primitive (a DB row
+    ///    lock or CAS held across both the read and the write), not more
+    ///    reads. A session minted via either gap carries the stale role for
+    ///    its FULL LIFETIME, not one request - `validate_session` performs no
+    ///    per-request re-verification, and the demote's own session sweep
+    ///    (`update_role`'s `std::erase_if(sessions_, ...)`) runs before this
+    ///    session even exists, so it cannot catch it either (self-healing in
+    ///    the rare reverse ordering). Both instances tracked as issue #4107
+    ///    (scoped to the actual remedy - a serialization primitive - not the
+    ///    refuted "read again" one), disposition (fix vs. accept) pending
+    ///    review by someone other than this fix's author, per this project's
+    ///    standing rule against self-authored risk acceptance on a
+    ///    HIGH-derived finding.
     ///    The cross-replica case (a demotion committed on a DIFFERENT server,
     ///    invisible to this process's local version counter) is a separate,
     ///    harder residual, not closed here either.
@@ -1079,18 +1090,27 @@ private:
     ///    the stale pre-removal role - the account cannot be confirmed active
     ///    right now, so the caller denies rather than mints a session for it.
     ///
-    /// PRE-EXISTING CALLER-SIDE NOTE (present since the original C1 fix,
-    /// disclosed here not fixed): every `nullopt` this function returns,
-    /// including both fail-closed race paths above, is indistinguishable
-    /// from a genuine bad password to `verify_password`'s REST caller
-    /// (`auth_routes.cpp`), which counts ANY `nullopt` toward the account
-    /// lockout threshold (`AuthDB::record_failed_login`). Several concurrent
-    /// LEGITIMATE logins racing one of these paths could each count as a
-    /// failed attempt. Distinguishing "denied by a detected race, retry" from
-    /// "wrong password" would need a richer return type than
-    /// `std::optional<Role>` threaded through both callers - out of scope for
-    /// this fix, not tracked as its own issue (same shape as an already-
-    /// shipped, already-approved case).
+    /// PRE-EXISTING CALLER-SIDE NOTE (the underlying nullopt-returning
+    /// mechanism predates this round, present since the original C1 fix;
+    /// this specific LOCKOUT consequence is being disclosed for the first
+    /// time here, per a security-guardian Gate 8 re-review correction - it
+    /// has not previously been reviewed or accepted by anyone, so it is NOT
+    /// "already-approved," just newly surfaced and judged low-severity on
+    /// its own merits below): every `nullopt` this function returns is
+    /// indistinguishable from a genuine bad password to `verify_password`'s
+    /// REST caller (`auth_routes.cpp`), which counts ANY `nullopt` toward the
+    /// account lockout threshold (`AuthDB::record_failed_login`). The
+    /// trigger is broader than a role-change race: case-2's OWN successful
+    /// write bumps `role_version` on EVERY login, so 3+ concurrent password
+    /// logins for the SAME principal (no role change needed at all) can land
+    /// a case-3 divergence on the third. Human `/login` only (API tokens
+    /// bypass this path; break-glass is lockout-exempt); still no new
+    /// capability for an attacker (this only affects legitimate concurrent
+    /// logins of the SAME already-authenticating principal), so LOW
+    /// availability impact, disclose-don't-fix is proportionate.
+    /// Distinguishing "denied by a detected race, retry" from "wrong
+    /// password" would need a richer return type than `std::optional<Role>`
+    /// threaded through both callers - out of scope for this fix.
     ///
     /// `context` is the log-message prefix ("Auth failed" / "verify_password
     /// failed") so both callers keep their existing distinct wording. Caller
