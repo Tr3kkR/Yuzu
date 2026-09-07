@@ -1660,9 +1660,22 @@ std::string GuardianRoutes::render_baseline_page_fragment(const std::string& bas
     std::unordered_set<std::string> online;
     online.reserve(online_os.size());
     for (const auto& [aid, aos] : online_os) online.insert(aid);
-    const auto by_rule = (store_ && store_->is_open())
-                             ? rollup_by_rule(store_->agent_rule_statuses().value_or(std::vector<GuardianAgentRuleStatus>{}), online)
-                             : std::unordered_map<std::string, StateRollup>{};
+    // ADR-0038 fix (governance finding SEC-2, ledger
+    // governance.d/4037-guardian-read-twins.*.jsonl): a degraded read now
+    // returns the same "store degraded" placeholder the top-of-function
+    // guards already use, instead of folding to an empty rollup via
+    // value_or and rendering every member as compliance-blank —
+    // indistinguishable from a baseline with no reported status at all.
+    // `!store_->is_open()` (store never wired) is a SEPARATE, pre-existing,
+    // deliberately unchanged case — this page still renders Baseline
+    // metadata with an empty rollup when GuaranteedStateStore isn't wired.
+    std::unordered_map<std::string, StateRollup> by_rule;
+    if (store_ && store_->is_open()) {
+        auto statuses = store_->agent_rule_statuses();
+        if (!statuses)
+            return stub("Guardian store degraded");
+        by_rule = rollup_by_rule(*statuses, online);
+    }
 
     // One list_rules() into a rid->row map (reused for enforcement_mode + os_target +
     // the member labels below) so the page does not issue a get_rule() per member.
@@ -1959,32 +1972,22 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
         std::unordered_set<std::string> seen;  // agent_ids that already have a status row
         // #4037: same shared builder as the REST/MCP twins
         // (guardian_model.hpp::guardian_rule_agent_status_rows), so all three
-        // surfaces compute this census identically. Pre-existing degrade
-        // posture of this fragment, PRE-EXISTING and deliberately UNCHANGED by
-        // this refactor (this loop already collapsed a degraded read to empty
-        // via value_or before this commit; this refactor only swapped the
-        // store call it wraps): KNOWN, CONFIRMED CONTRADICTION of ADR-0038
-        // (docs/adr/0038-guaranteed-state-store-postgres-migration.md, "Posture"
-        // section) — that ADR names `agent_rule_statuses`/
-        // `agent_rule_statuses_for_agent` explicitly in its catastrophic-read
-        // set and states "status reads feeding the enforce-gate/dashboard stay
-        // degrade-distinguishable (empty != unknown)". This fragment does not:
-        // it folds nullopt-on-degrade back to an empty vector and renders as
-        // "no devices report this guard", indistinguishable from a genuinely
-        // unreported guard. Not fixed here — #4037 is scoped to building REST/MCP
-        // read twins, not remediating a pre-existing ADR-0038 gap in the
-        // dashboard fragment (which the REST/MCP twins DO honor: they fail
-        // closed/error on the same nullopt). Not fixed here — out of #4037's
-        // scope; needs its own issue (searched for an existing one, 2026-09-06,
-        // found none). A sibling site with the identical pattern also exists,
-        // untouched by #4037: render_baseline_page_fragment's
-        // rollup_by_rule(store_->agent_rule_statuses().value_or(...)) call
-        // above in this file. The main guards-overview route (this file,
-        // ~line 399) and the per-device Guardian lens (device_routes.cpp)
-        // both already guard this correctly (placeholder on nullopt) —
-        // this gap is specific to the two per-item detail fragments.
-        for (const auto& s : yuzu::server::guardian_rule_agent_status_rows(*store_, guard_id)
-                                  .value_or(std::vector<yuzu::server::GuardianRuleAgentStatusRow>{})) {
+        // surfaces compute this census identically. ADR-0038 fix (governance
+        // finding SEC-2, ledger governance.d/4037-guardian-read-twins.*.jsonl):
+        // a degraded read (nullopt) now returns a distinct placeholder BELOW,
+        // instead of folding to an empty vector via value_or and rendering
+        // "no devices report this guard" — indistinguishable from a genuinely
+        // unreported guard. Matches the main guards-overview route's existing
+        // posture (this file, ~line 401) and the per-device Guardian lens
+        // (device_routes.cpp). See the sibling fix in
+        // render_baseline_page_fragment's by_rule computation above in this
+        // file for the same class of gap on the baseline detail page.
+        auto status_rows = yuzu::server::guardian_rule_agent_status_rows(*store_, guard_id);
+        if (!status_rows)
+            return "<a class=\"gp-back\" href=\"/guardian\">&larr; All guards</a>"
+                   "<div class=\"gp-placeholder\"><b>Guard status degraded</b><br>"
+                   "Check server /healthz.</div>";
+        for (const auto& s : *status_rows) {
             seen.insert(s.agent_id);
             DevRow d;
             d.online = hostname.count(s.agent_id) > 0;
