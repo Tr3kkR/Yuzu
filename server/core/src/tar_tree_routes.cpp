@@ -337,8 +337,15 @@ bool TarTreeRoutes::deny_fleet_wide_device_enumeration(const httplib::Request& r
                                                        std::optional<auth::Session>* out_session) {
     auto session = auth_fn_(req, res);
     if (!session) {
-        res.status = 401;
-        res.set_content("auth required", "text/plain");
+        // #4027 fix (adversarial review round 1, CDX-P1-03/K2): `auth_fn_`
+        // (require_auth) already wrote a correct A4 JSON 401 body onto `res`
+        // — do NOT overwrite it with plain text here. This helper feeds both
+        // the pre-existing HTML fragment routes and the new `/api/v1/tar/*`
+        // JSON REST twins; the fragments already accept a JSON error body on
+        // their 403 path (see `deny_fleet_wide_device_enumeration`'s own 403
+        // branch just below, and `/fragments/results`' identical convention
+        // in dashboard_routes.cpp), so this is not a new content-type
+        // surprise for an HTMX consumer — just a return-without-overwrite.
         return true;
     }
     if (!session->token_scope_service.empty()) {
