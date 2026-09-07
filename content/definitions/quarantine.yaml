@@ -61,7 +61,7 @@ spec:
           action was already in flight). An aborted run before any
           mutation instead emits an error field with no status field.
         values: [quarantined, quarantined_partial, failed, busy]
-        example: "quarantined"
+        example: "not observed — quarantine was never executed for these samples"
         platforms: [windows, linux, darwin]
       - name: rules_applied
         type: int32
@@ -140,7 +140,7 @@ spec:
           pre-quarantine policy existed to replay; a macOS failure before
           either restore path succeeds emits an error field instead.
         values: [released, release_uncertain]
-        example: "released"
+        example: "not observed — unquarantine was never executed for these samples"
         platforms: [windows, linux, darwin]
 
   readablePayload: "Release device from quarantine"

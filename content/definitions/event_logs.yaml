@@ -200,13 +200,13 @@ spec:
           Windows event level display name derived from the numeric
           `<Level>`. Not populated on Linux or macOS.
         values: "Critical, Error, Warning, Information, Verbose, or Level<n> for an unmapped numeric level"
-        example: "Information"
+        example: "not observed in any capture (the Windows query run matched no rows)"
         platforms: [windows]
       - name: event_id
         type: string
         description: Windows numeric Event ID. Not populated on Linux or macOS.
         values: integer
-        example: "1000"
+        example: "6008 (from the errors sample; the query run matched no rows)"
         platforms: [windows]
       - name: source
         type: string

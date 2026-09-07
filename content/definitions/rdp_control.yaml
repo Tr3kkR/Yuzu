@@ -73,25 +73,25 @@ spec:
         type: string
         description: Outcome of writing HKLM fDenyTSConnections; ok or a Win32 error code.
         values: "ok, error:<win32 code> (e.g. error:5 = ERROR_ACCESS_DENIED)"
-        example: "ok"
+        example: "not observed in any capture" # only the rejection path was run
         platforms: [windows]
       - name: firewall_status
         type: string
         description: Outcome of toggling the Remote Desktop firewall rule group via INetFwPolicy2.
         values: "ok, error:com_init, error:group_not_found, error:0x<hresult>"
-        example: "ok"
+        example: "not observed in any capture"
         platforms: [windows]
       - name: service_status
         type: string
         description: TermService outcome — running once start is confirmed by polling (enable), untouched (disable), or a Win32 error.
         values: "running, untouched, error:<win32 code>"
-        example: "running"
+        example: "not observed in any capture"
         platforms: [windows]
       - name: overall
         type: string
         description: Terminal verdict for the whole set_state call; ok only when every step above succeeded.
         values: "ok, error"
-        example: "ok"
+        example: "not observed in any capture"
         platforms: [windows]
   readablePayload: "Set Remote Desktop state to ${state}"
   approval:
@@ -150,7 +150,7 @@ spec:
         type: string
         description: Current SCM state name for TermService, or a Win32 error if the query failed.
         values: "running, start_pending, stopped, stop_pending, paused, pause_pending, continue_pending, unknown, error:<win32 code>"
-        example: "running"
+        example: "not observed in any capture"
         platforms: [windows]
       - name: rdp
         type: string
