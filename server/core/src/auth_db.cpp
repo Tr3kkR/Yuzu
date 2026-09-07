@@ -906,6 +906,55 @@ std::expected<void, AuthDBError> AuthDB::update_role(const std::string& username
     return {};
 }
 
+std::expected<void, AuthDBError>
+AuthDB::recheck_role_locked(const std::string& username,
+                            const std::function<void(auth::Role)>& under_row_lock) {
+    // is_valid_principal, NOT is_valid_username: this is called on the exact
+    // same path as get_user() (via AuthManager::recheck_role_after_credential_
+    // check, reachable with an SSO-prefixed principal) - see get_user()'s own
+    // header comment for the full rationale.
+    if (!is_valid_principal(username))
+        return std::unexpected(AuthDBError::InvalidUsername);
+
+    // #4107: SELECT ... FOR UPDATE serializes this read against any
+    // concurrent update_role()/reactivate_user() write - same technique as
+    // mfa_verify_login_code's replay guard above. kWriteTimeout (not
+    // kReadTimeout) because FOR UPDATE takes a write-class lock, matching
+    // that precedent. with_txn_for does a SINGLE bounded try_acquire_for
+    // (no #2396 retry loop), so this stays safe under the /login stripe
+    // mutex this call runs inside (auth_routes.cpp's login_lock_for) - the
+    // same acquire-shape discipline the stripe already requires of every
+    // call in this critical section.
+    std::optional<AuthDBError> err;
+    const bool committed = impl_->pool.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        pg::PgResult sel = pg::exec_params(
+            conn, "SELECT role FROM auth.users WHERE username = $1 AND is_active = TRUE FOR UPDATE",
+            std::vector<std::string>{username});
+        if (sel.status() != PGRES_TUPLES_OK) {
+            err = AuthDBError::QueryFailed;
+            return false;
+        }
+        if (PQntuples(sel.get()) == 0) {
+            // No active row - either never existed, or a concurrent
+            // remove_user() already committed its soft-delete UPDATE (which
+            // took this SAME row lock for its own transaction, so this
+            // SELECT either saw it directly or waited for it) before this
+            // SELECT ran.
+            err = AuthDBError::UserNotFound;
+            return false;
+        }
+        // under_row_lock runs here, still holding the row lock - see the
+        // header doc: fast, local, in-process work only, no further DB I/O.
+        under_row_lock(auth::string_to_role(col_str(sel.get(), 0, 0)));
+        return true; // commit - releases the row lock; no DB mutation to persist
+    });
+    if (err)
+        return std::unexpected(*err);
+    if (!committed)
+        return std::unexpected(AuthDBError::QueryFailed);
+    return {};
+}
+
 std::expected<void, AuthDBError> AuthDB::set_elevation_eligible(const std::string& username,
                                                                bool eligible) {
     if (!is_valid_principal(username)) {

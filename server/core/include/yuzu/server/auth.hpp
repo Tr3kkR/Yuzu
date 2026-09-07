@@ -523,15 +523,36 @@ public:
     void expire_session_for_test(const std::string& token, std::chrono::seconds offset);
 
     /// TEST-ONLY: installs a callback fired inside
-    /// `recheck_role_after_credential_check`, after its own AuthDB re-read
-    /// returns but BEFORE it acquires `mu_` to conditionally write the cache
-    /// - the exact window Gate 5 chaos-injector's CH-1 traced for the cache
-    /// ABA race (a concurrent `update_role()` landing between this call's own
-    /// read and its cache write). Lets a test deterministically simulate that
-    /// interleaving instead of racing real threads. Production code MUST NOT
-    /// call this - no caller in `server/core/src/**` references it. A no-op
-    /// (nullptr) by default.
+    /// `recheck_role_after_credential_check`, BEFORE it starts its row-locked
+    /// AuthDB re-check (`AuthDB::recheck_role_locked`). Originally fired
+    /// between an unlocked DB read and a plain `mu_` acquire (Gate 5
+    /// chaos-injector's CH-1 window); #4107's row-locking rewrite moved the
+    /// firing point earlier, because a hook that synchronously called
+    /// `update_role()` at the OLD point would now self-deadlock (this
+    /// thread would go on to hold the row lock its own hook is blocked
+    /// trying to acquire). A hook that needs to simulate a GENUINE
+    /// concurrent write racing the row lock must spawn a separate
+    /// `std::thread` to do it (join it before the test ends) - see
+    /// `tests/unit/server/test_auth.cpp` for the pattern. Production code
+    /// MUST NOT call this - no caller in `server/core/src/**` references it.
+    /// A no-op (nullptr) by default.
     void set_role_recheck_race_hook_for_test(std::function<void()> hook);
+
+    /// TEST-ONLY: installs a callback fired INSIDE
+    /// `recheck_role_after_credential_check`'s `AuthDB::recheck_role_locked`
+    /// callback - i.e. while AuthDB genuinely holds the row lock, immediately
+    /// before the in-process cache write. Lets a test spawn a writer thread
+    /// here and confirm its `update_role()` call genuinely blocks (proving
+    /// the row lock is real, not just documented) before letting this hook
+    /// return, which lets the enclosing transaction commit and the writer
+    /// unblock. Must NOT synchronously call anything that itself needs this
+    /// row's lock (self-deadlock - same reason
+    /// `set_role_recheck_race_hook_for_test` moved its own firing point) -
+    /// spawn a thread and join it AFTER `recheck_role_after_credential_check`
+    /// returns, never inside this callback. Production code MUST NOT call
+    /// this - no caller in `server/core/src/**` references it. A no-op
+    /// (nullptr) by default.
+    void set_role_recheck_inside_lock_hook_for_test(std::function<void()> hook);
 
     /// TEST-ONLY: raw `users_` cache peek, bypassing AuthDB entirely (unlike
     /// `get_user_role()`, which is DB-authoritative and so cannot observe
@@ -976,141 +997,74 @@ private:
     /// Shared by authenticate()/verify_password(): the post-password-check
     /// re-read of AuthDB (already firing to catch a soft-deleted user) made
     /// authoritative for role too (#4020 Gate 2 adversarial-review/governance
-    /// follow-up), hardened per a Gate 3 cpp-expert finding and then a Gate 5
-    /// chaos-injector finding (CH-1): the cache write is guarded against
-    /// clobbering a NEWER write from a concurrent update_role() racing this
-    /// call. `pre_check_role`/`pre_check_version` are the role and
-    /// `UserEntry::role_version` `find_user_or_hydrate` returned for THIS
-    /// call, captured before any DB re-read - the cache is overwritten only
-    /// when its version still matches; a divergence means some other write
-    /// already landed since this call last observed the cache, and that write
-    /// must never be reverted by this call's now-stale read. The guard
-    /// compares VERSION, not role value (a cpp-expert compare-by-role-value
-    /// guard shipped first and closed the simple case, but chaos-injector
-    /// found the ABA hole it left: this call reads AuthDB mid-demotion and
-    /// observes a PROMOTED role, a concurrent update_role() then commits a
-    /// DEMOTION back to this call's ORIGINAL pre_check_role and bumps the
-    /// cache to that value, and a role-value guard reads "cache still matches
-    /// what I started with" as "safe" and overwrites it right back to the
-    /// promoted value it read - reverting the demotion that had already
-    /// landed. A monotonic version can't be spuriously re-matched by a
-    /// round-trip back to the same role value the way the role field can.
+    /// follow-up). Went through several hardening rounds against increasingly
+    /// subtle same-process races (compare-by-role-value -> compare-by-version
+    /// -> return-value-follows-the-guard -> re-verify-on-divergence -> this
+    /// one) - see `git log -p` on this function for the blow-by-blow if the
+    /// history matters; this comment describes only the CURRENT mechanism.
+    ///
+    /// #4107: re-verifies via `AuthDB::recheck_role_locked`, which takes a
+    /// `SELECT ... FOR UPDATE` row lock and holds it across the callback
+    /// below (where the in-process cache write happens) before committing.
+    /// This SERIALIZES against any concurrent `update_role()`/
+    /// `reactivate_user()` write to this user's row - by construction, not by
+    /// detecting a race after the fact - closing the whole class of
+    /// same-process divergence residuals every EARLIER version of this
+    /// function's version-counter guard could only narrow, never eliminate
+    /// (a version counter can tell you something changed since you looked;
+    /// it cannot make your look happen atomically with the change). No more
+    /// case-2/case-3 split, no more `pre_check_version` comparison - a role
+    /// this call observes under the row lock is provably not stale relative
+    /// to any OTHER writer's commit, full stop. `pre_check_version` stays in
+    /// the signature (now used only by the cfg-file-mode early return above,
+    /// which doesn't touch it either) rather than reworking both call sites
+    /// in the same round as this rewrite - signature cleanup is a follow-up.
+    ///
+    /// What this does NOT close: the gap between THIS function returning and
+    /// the caller (`authenticate()`/`verify_password()`) actually minting a
+    /// session via `persist_new_session` - a separate, later step that is not
+    /// itself inside the row lock. A demote committing in that specific
+    /// window still mints a stale session, surviving that demote's own sweep
+    /// (`update_role`'s `std::erase_if(sessions_, ...)`, which already ran
+    /// before the new session existed). External adversarial review
+    /// (fjarvis, PR #4076, "C1") named this the "inherent check-then-mint gap
+    /// no non-serialized recheck can close" - true of every version of this
+    /// function including this one; only serializing all the way through
+    /// session creation would close it, which is a materially bigger change
+    /// (would need `persist_new_session`, and its own DB write in HA mode, to
+    /// run inside the same transaction/lock). Also not closed: the
+    /// cross-replica case (a demotion committed on a DIFFERENT server,
+    /// invisible to a single process's row lock the same way it was invisible
+    /// to the old version counter). Both are the CURRENT scope of issue
+    /// #4107 (re-scoped from its original case-2/case-3 framing, which this
+    /// commit closes) - `validate_session` still performs no per-request
+    /// AuthDB re-verification, so a session minted via either remaining gap
+    /// still carries a stale role for its full lifetime, not one request.
     ///
     /// Returns the current role on success (cfg-file mode, no `auth_db_`,
     /// trivially returns `pre_check_role` unchanged - there's no DB to
-    /// re-check against). Returns nullopt if AuthDB reports the user no longer
-    /// active (soft-deleted/removed) - in which case the stale cache entry is
-    /// ALSO evicted, mirroring remove_user()'s own eviction: a removal made
-    /// through a DIFFERENT AuthManager never touches this process's map, so
-    /// without this a removed principal stays "active, role R" forever in
-    /// any consumer of that stale `users_` entry - reachable via a still-valid
-    /// API token, since remove_user() only wipes sessions, never tokens.
-    /// (get_user_role() itself is no longer such a consumer - a later fix
-    /// made it AuthDB-authoritative on every call, independent of this
-    /// eviction entirely; this comment's original wording named it as the
-    /// example before that fix landed.)
+    /// re-check against). Returns nullopt if AuthDB reports the user no
+    /// longer active (soft-deleted/removed) - in which case the stale cache
+    /// entry is ALSO evicted, mirroring remove_user()'s own eviction: a
+    /// removal made through a DIFFERENT AuthManager never touches this
+    /// process's map, so without this a removed principal stays "active,
+    /// role R" forever in any consumer of that stale `users_` entry -
+    /// reachable via a still-valid API token, since remove_user() only wipes
+    /// sessions, never tokens. (get_user_role() itself is no longer such a
+    /// consumer - a later fix made it AuthDB-authoritative on every call,
+    /// independent of this eviction entirely.)
     ///
-    /// External adversarial review (fjarvis, PR #4076 review round, "C1"):
-    /// the RETURN VALUE follows the same freshness rule as the cache write,
-    /// not this call's own single DB read, in two cases the version guard
-    /// above detects but an earlier version of this function ignored for its
-    /// return value specifically:
-    ///  - Version diverged (a concurrent update_role()/reactivate_user()
-    ///    landed in this call's own read-to-lock window): re-verifies against
-    ///    AuthDB directly rather than trusting either this call's own
-    ///    now-superseded read OR the cache's current value. A first version
-    ///    of this fix trusted the cache here on the theory that "every writer
-    ///    updates `.role` and `.role_version` together, so a moved version
-    ///    means a DB-confirmed write already landed" - a Gate 3 re-review
-    ///    (security-guardian + authdb, converged independently) showed that
-    ///    theory false: the write that moved the cache can be ANOTHER
-    ///    concurrent call's OWN case-2 branch above, persisting its own
-    ///    stale read, so the cache is not provably DB-confirmed either.
-    ///    Closes that stale-cache-propagation instance: the old unconditional
-    ///    `return db_user->role` let a session get minted at a role a
-    ///    same-process demote had already committed, surviving that demote's
-    ///    own session-invalidation sweep; the intermediate (cache-trusting)
-    ///    fix could relay a DIFFERENT call's stale read instead. If a THIRD
-    ///    write's CACHE half lands while this re-verify is itself in flight
-    ///    (detected by re-checking `role_version` once more after the
-    ///    re-read), this function fails closed (`nullopt`) rather than
-    ///    returning the now-also-superseded re-read - that branch is already
-    ///    on the rare, post-divergence path, so failing closed there is
-    ///    nearly free. That check does NOT fully close this sub-window
-    ///    though (advisor catch, same round as the fix): a third writer whose
-    ///    DB commit landed here but who has not yet reached its OWN `mu_` -
-    ///    so `role_version` hasn't moved - is still invisible to it, and this
-    ///    call still writes+returns its (by then stale) re-read. Same defect
-    ///    class as the case-2 residual below, confined to this function's own
-    ///    re-read-to-relock span (a single unlocked DB call plus one
-    ///    uncontended mutex acquisition).
-    ///
-    ///    Still open, same class, same width, MORE LIKELY: the case-2 branch
-    ///    above (no version divergence observed) - a racing writer's DB
-    ///    commit can land in this call's own [db_user re-read, mu_ lock]
-    ///    window without yet reaching ITS OWN lock, so the version counter
-    ///    shows no change and this call still trusts its own now-stale
-    ///    `db_user->role`. That window is the SAME width/shape as case-3's
-    ///    (one DB call plus one mutex acquisition, not "back to before
-    ///    PBKDF2" - `pre_check_version` is only the comparison BASELINE,
-    ///    captured before PBKDF2 to detect drift since then; a write landing
-    ///    in that wider span either gets caught as a divergence (routing to
-    ///    case-3) or is already reflected in this call's own re-read, neither
-    ///    of which is the gap here - a security-guardian Gate 8 re-review,
-    ///    #4020 fourth round, corrected an earlier draft of this doc that got
-    ///    the window width wrong). The actual case-2 vs. case-3 distinction
-    ///    is LIKELIHOOD, not window size: case-2 is the COMMON path (every
-    ///    login takes it), case-3 only runs after a divergence is already
-    ///    detected (i.e. two overlapping racing writers, not one). Neither
-    ///    branch is closeable by "just re-read again": an authdb re-review
-    ///    (Gate 8, #4020 third round) caught an earlier draft of this doc
-    ///    overclaiming that an unconditional second read would close case-2
-    ///    at the cost of a round trip - false. ANY read-then-lock check has
-    ///    its own read-to-lock window, and a writer whose DB commit lands
-    ///    there without yet reaching its own lock is invisible to the
-    ///    version compare no matter how many times the read is repeated.
-    ///    Full closure needs an actual serialization primitive (a DB row
-    ///    lock or CAS held across both the read and the write), not more
-    ///    reads. A session minted via either gap carries the stale role for
-    ///    its FULL LIFETIME, not one request - `validate_session` performs no
-    ///    per-request re-verification, and the demote's own session sweep
-    ///    (`update_role`'s `std::erase_if(sessions_, ...)`) runs before this
-    ///    session even exists, so it cannot catch it either (self-healing in
-    ///    the rare reverse ordering). Both instances tracked as issue #4107
-    ///    (scoped to the actual remedy - a serialization primitive - not the
-    ///    refuted "read again" one), disposition (fix vs. accept) pending
-    ///    review by someone other than this fix's author, per this project's
-    ///    standing rule against self-authored risk acceptance on a
-    ///    HIGH-derived finding.
-    ///    The cross-replica case (a demotion committed on a DIFFERENT server,
-    ///    invisible to this process's local version counter) is a separate,
-    ///    harder residual, not closed here either.
-    ///  - Entry vanished (a concurrent `remove_user()`'s own erase landed in
-    ///    the same window): returns `std::nullopt` (fail closed) rather than
-    ///    the stale pre-removal role - the account cannot be confirmed active
-    ///    right now, so the caller denies rather than mints a session for it.
-    ///
-    /// PRE-EXISTING CALLER-SIDE NOTE (the underlying nullopt-returning
-    /// mechanism predates this round, present since the original C1 fix;
-    /// this specific LOCKOUT consequence is being disclosed for the first
-    /// time here, per a security-guardian Gate 8 re-review correction - it
-    /// has not previously been reviewed or accepted by anyone, so it is NOT
-    /// "already-approved," just newly surfaced and judged low-severity on
-    /// its own merits below): every `nullopt` this function returns is
-    /// indistinguishable from a genuine bad password to `verify_password`'s
-    /// REST caller (`auth_routes.cpp`), which counts ANY `nullopt` toward the
-    /// account lockout threshold (`AuthDB::record_failed_login`). The
-    /// trigger is broader than a role-change race: case-2's OWN successful
-    /// write bumps `role_version` on EVERY login, so 3+ concurrent password
-    /// logins for the SAME principal (no role change needed at all) can land
-    /// a case-3 divergence on the third. Human `/login` only (API tokens
-    /// bypass this path; break-glass is lockout-exempt); still no new
-    /// capability for an attacker (this only affects legitimate concurrent
-    /// logins of the SAME already-authenticating principal), so LOW
-    /// availability impact, disclose-don't-fix is proportionate.
-    /// Distinguishing "denied by a detected race, retry" from "wrong
-    /// password" would need a richer return type than `std::optional<Role>`
-    /// threaded through both callers - out of scope for this fix.
+    /// CALLER-SIDE NOTE: every `nullopt` this function returns (store error,
+    /// or a genuine `UserNotFound`) is indistinguishable from a genuine bad
+    /// password to `verify_password`'s REST caller (`auth_routes.cpp`), which
+    /// counts ANY `nullopt` toward the account lockout threshold
+    /// (`AuthDB::record_failed_login`). Pre-existing (present since the
+    /// original C1 fix), not this round's concern; no new capability for an
+    /// attacker (only affects legitimate concurrent operations on the SAME
+    /// already-authenticating principal), so LOW availability impact,
+    /// disclose-don't-fix is proportionate. Distinguishing "denied by a
+    /// detected race, retry" from "wrong password" would need a richer
+    /// return type than `std::optional<Role>` threaded through both callers.
     ///
     /// `context` is the log-message prefix ("Auth failed" / "verify_password
     /// failed") so both callers keep their existing distinct wording. Caller
@@ -1124,6 +1078,15 @@ private:
     /// method's doc. Invoked (if set) from inside
     /// `recheck_role_after_credential_check`.
     std::function<void()> role_recheck_race_hook_for_test_;
+
+    /// Backing field for `set_role_recheck_inside_lock_hook_for_test` - see
+    /// that method's doc. Invoked (if set) from inside
+    /// `recheck_role_after_credential_check`'s `AuthDB::recheck_role_locked`
+    /// callback, i.e. while the row lock is held. Same shape/lifetime/
+    /// production-reachability as `role_recheck_race_hook_for_test_` above -
+    /// see that field's Resource Ledger entry, which covers this one too.
+    std::function<void()> role_recheck_inside_lock_hook_for_test_;
+    /// see that field's Resource Ledger entry, which covers this one too.
 
     /// Backing counter for `next_role_version_()` - see `UserEntry::role_version`'s
     /// doc for why this is process-wide, not per-username. `std::atomic` since

@@ -28,6 +28,7 @@
 #include <chrono>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -325,6 +326,49 @@ public:
         const std::string& username,
         auth::Role new_role
     );
+
+    /// Row-locked role re-check (#4107): `SELECT role FROM auth.users WHERE
+    /// username = $1 AND is_active FOR UPDATE`, same technique
+    /// `mfa_verify_login_code` already uses to close ITS OWN replay race.
+    /// Serializes against ANY concurrent `update_role()`/`reactivate_user()`
+    /// write to this row: if one is already committed, this call's SELECT
+    /// sees it directly; if one is mid-flight (issued, not yet committed),
+    /// this call's SELECT FOR UPDATE blocks until it commits, then reads the
+    /// fresh row (standard Postgres row-lock semantics — a plain `UPDATE`
+    /// already takes an equivalent row lock for its own transaction's
+    /// duration, so the writer side needs no changes). Either way, the value
+    /// handed to `under_row_lock` is never a value some OTHER writer's
+    /// already-in-flight commit could invalidate a moment later.
+    ///
+    /// `under_row_lock` runs WHILE the row lock is held, immediately before
+    /// this call commits (releasing the lock) — use it to update
+    /// AuthManager's in-process cache under `mu_` before the lock is
+    /// released, so nothing else can commit a role change to this row while
+    /// the cache write is happening. Do NOT do any additional DB I/O inside
+    /// the callback (same rule `with_txn_on`'s doc states for its own
+    /// callers) — only fast, local, in-process work.
+    ///
+    /// This closes the SAME-PROCESS divergence residual (#4107) that an
+    /// in-memory-only version counter could only detect after the fact, not
+    /// prevent — but it does NOT close the separate, narrower "check-then-
+    /// mint" gap between this call returning and the caller actually minting
+    /// a session (`persist_new_session`): that gap is inherent to any
+    /// recheck that isn't ITSELF serialized all the way through session
+    /// creation, which this is not (external adversarial review, fjarvis,
+    /// PR #4076 — "an inherent check-then-mint gap no non-serialized recheck
+    /// can close").
+    ///
+    /// Returns `UserNotFound` (callback not invoked) if the account is not
+    /// active — mirrors `get_user()`'s filter, including for a
+    /// `remove_user()` that lands first (its soft-delete UPDATE sets
+    /// `is_active = FALSE`, participating in the SAME row-lock protocol, so
+    /// this SELECT's `WHERE ... AND is_active` correctly sees zero rows once
+    /// a concurrent removal has committed, or blocks until one in flight
+    /// does). `InvalidUsername` / `QueryFailed` on the usual input/store
+    /// failures, callback not invoked either way.
+    std::expected<void, AuthDBError>
+    recheck_role_locked(const std::string& username,
+                        const std::function<void(auth::Role)>& under_row_lock);
 
     /// Set/clear the per-user JIT-elevation eligibility flag (SOC 2 CC6.3/CC6.6):
     /// who may activate a time-boxed admin elevation via POST /api/v1/elevate,
