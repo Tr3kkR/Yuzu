@@ -1,5 +1,7 @@
 #include "mcp_stream_bridge.hpp"
 
+#include "background_jobs.hpp"
+
 #include "mcp_jsonrpc.hpp"
 #include "mcp_session.hpp"
 #include "mcp_stream.hpp"
@@ -133,6 +135,7 @@ McpStreamBridge::McpStreamBridge(ExecutionEventBus* bus, McpSessionRegistry* ses
 McpStreamBridge::McpStreamBridge(ExecutionEventBus* bus, McpSessionRegistry* sessions,
                                  yuzu::MetricsRegistry* metrics, AuditFn audit, Config cfg)
     : bus_(bus), sessions_(sessions), metrics_(metrics), audit_(std::move(audit)), cfg_(cfg) {
+    YUZU_ASSERT_BACKGROUND_JOB("mcp_stream_bridge.run_projector"); // WS-10 ReplicaSafe (per-replica)
     projector_ = std::thread([this] { run_projector(); });
 }
 
