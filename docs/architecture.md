@@ -350,18 +350,27 @@ Registrations outside the sink are pre-existing debt, not a precedent to copy: a
 extraction (`page_routes.{hpp,cpp}`, PR-2, 25 routes registered against `inline_sink`), a #2542
 follow-up (`dashboard_api_routes.{hpp,cpp}` + `nvd_routes.{hpp,cpp}`, 10 more scattered routes
 registered against the same `inline_sink`), the Custom Properties API extraction
-(`custom_properties_routes.{hpp,cpp}`, 5 routes, #2542 PR-4), and the Result Sets fragment
-extraction (`result_set_routes.{hpp,cpp}`, PR-5, 6 routes, also against `inline_sink`) —
-`mcp_server.cpp` is the only remaining route owner registering directly on a raw
-`svr.{Get,Post,Delete}` (3 registrations) — plus `server.cpp`'s own 58 inline routes, which are not
-a route-owner class and are untouched by this migration; 61 registrations remain outside the sink
-in total. Count these with the anchored pattern `grep -cE '^\s*web_server_->(Get|Post|Put|Delete|Patch|Options)\('
+(`custom_properties_routes.{hpp,cpp}`, 5 routes, #2542 PR-4), the Result Sets fragment
+extraction (`result_set_routes.{hpp,cpp}`, PR-5, 6 routes, also against `inline_sink`), and the
+3-route MCP JSON-RPC endpoint (`mcp_server.{hpp,cpp}`, #2542 PR-6 — `McpServer::register_routes`
+gained the `HttpRouteSink&` overload; its `httplib::Server&` overload is now the thin wrapper,
+matching every other owning-class route module (`DeviceRoutes`, `ComplianceRoutes`, `DexRoutes`,
+...) rather than the free-function `Deps`-struct + `inline_sink` pattern the four modules above
+use — `server.cpp` still calls `mcp_server_->register_routes(*web_server_, ...)` unchanged, exactly
+as it does for every other owning-class module) — `server.cpp`'s own 58 inline routes are the only
+registrations left outside the sink, and they are not a route-owner class, so no further campaign
+PR touches them. Count these with the anchored pattern `grep -cE '^\s*web_server_->(Get|Post|Put|Delete|Patch|Options)\('
 server/core/src/server.cpp`, not a bare `grep -c` of the receiver-agnostic pattern above — the
 unanchored form over-counts by picking up at least one comment-line false match, which is how a
 105/106 figure was previously published here; the anchored count was 104 immediately before the
-page-shell extraction (independently re-verified during that extraction), 79 after it, 64 after the
-`dashboard_api_routes`/`nvd_routes` follow-up (-10) and the Custom Properties API extraction (-5)
-landed together, and is 58 now that the Result Sets fragment extraction (-6) has also landed.
+page-shell extraction (independently re-verified during that extraction), 79 after it, 64 once both
+the `dashboard_api_routes`/`nvd_routes` follow-up (-10) and the Custom Properties API extraction
+(-5) had landed together, 58 once the Result Sets fragment extraction (-6) also landed, and stays
+58 after the MCP extraction (#2542 PR-6) — that PR removed the last 3 raw `svr.{Get,Post,Delete}`
+registrations in `mcp_server.cpp` (verify with
+`grep -cE '\bsvr\.(Get|Post|Put|Delete|Patch|Options)\(' server/core/src/mcp_server.cpp`, now 0),
+which were never counted by the `web_server_->` pattern above in the first place since they were
+never inline in `server.cpp`. 58 registrations remain outside the sink in total.
 
 ## Storage Architecture
 
