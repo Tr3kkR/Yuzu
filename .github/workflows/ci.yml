@@ -805,7 +805,16 @@ jobs:
       # tools/plugin-capture must reject a --os that does not match the
       # platform it was compiled for, or a wrong-platform capture becomes
       # gate-certified, embedded, and served as truth.
+      #
+      # CodeQL (CWE-349, actions/cache-poisoning): this self-hosted job's
+      # persistent VCPKG_DEFAULT_BINARY_CACHE/ccache disk state is already
+      # isolated to a run-id-scoped temp path under trusted-fork-ci dispatch
+      # (see the VCPKG_DEFAULT_BINARY_CACHE ternary above) -- skipping this
+      # step under the same condition keeps it consistent with that existing
+      # isolation boundary rather than adding a step CodeQL's reachability
+      # analysis has to newly reason about on the low-trust dispatch path.
       - name: Plugin-capture OS guard
+        if: needs.preflight.outputs.trusted_execution != 'true'
         run: |
           bash scripts/ci/check-plugin-capture-os-guard.sh \
             "build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}"
@@ -1555,8 +1564,10 @@ jobs:
         run: meson compile -C build-windows-${{ matrix.build_type }} -j "$YUZU_BUILD_JOBS"
 
       # Cross-OS capture certification guard (PR #4112 review, blocker): see
-      # the linux job's identical step for the full rationale.
+      # the linux job's identical step for the full rationale, including the
+      # CodeQL (CWE-349) trusted_execution gate.
       - name: Plugin-capture OS guard
+        if: needs.preflight.outputs.trusted_execution != 'true'
         run: |
           bash scripts/ci/check-plugin-capture-os-guard.sh "build-windows-${{ matrix.build_type }}"
 
@@ -1998,8 +2009,10 @@ jobs:
         run: meson compile -C build-macos -j "${YUZU_BUILD_JOBS:-6}"
 
       # Cross-OS capture certification guard (PR #4112 review, blocker): see
-      # the linux job's identical step for the full rationale.
+      # the linux job's identical step for the full rationale, including the
+      # CodeQL (CWE-349) trusted_execution gate.
       - name: Plugin-capture OS guard
+        if: needs.preflight.outputs.trusted_execution != 'true'
         run: bash scripts/ci/check-plugin-capture-os-guard.sh build-macos
 
       # Link-provenance assertion (#1331 review HIGH-2): hosted macOS images can
