@@ -136,6 +136,11 @@ revise the section; a matrix derived from a stale checkout is worse than no
 matrix (this revision corrected four items that a 571-commit-behind tree had
 reported as unbuilt).
 
+> **⚠️ Standing instruction — update on close.** Every PR that closes or materially
+> changes the status of an item in this gap matrix MUST update that item's status
+> **and** re-stamp the Verified line in the SAME PR. Treat status drift as a
+> review-blocking defect, exactly like a stale doc comment.
+
 **Item 11 re-verified 2026-08-10, targeted, not wholesale** — against
 `feat/auth-human-token-rotation` @ `e1bf2d86` (a pre-merge integration
 branch off `origin/dev`, not yet on `dev`), by reading

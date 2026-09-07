@@ -264,7 +264,8 @@ content_embed = custom_target(
 
 # Build-time embed of the curated CPE map (PR 3, ADR-0018). Lives under
 # content/cpe-map/ deliberately — embed_content.py above globs ONLY
-# content/{definitions,packs}/**/*.yaml, so this CSV is NOT swept into the
+# content/{definitions,packs}/**/*.yaml and content/plugin-docs/*.json, so
+# this CSV is NOT swept into the
 # Instruction-Engine bundle; it is embedded on its own as a std::string_view
 # (kCuratedCpeMap) that CpeIdentityResolver parses at construction.
 #
