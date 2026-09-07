@@ -186,13 +186,13 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
     {"audit_store.cleanup_once", "AuditStore::cleanup_thread_", BackgroundJobClass::ReplicaSafe,
      "clock-guarded + advisory lock (the canonical retention reference impl)"},
     {"analytics_event_store.drain_batch", "AnalyticsEventStore::drain_thread_",
-     BackgroundJobClass::ReplicaSafe, "per-replica local buffer drain to the operator-supplied sink"},
+     BackgroundJobClass::ReplicaSafe, "SHARED-PG outbox, advisory-lock SINGLE-SWEEPER: a pg_try_advisory_xact_lock claim + UPDATE...RETURNING claims a batch (drained=true), then delivers to the registered sink(s) with NO lease held (revert-on-failure) — concurrent replicas serialize on the lock, one sweeper per tick"},
     {"nvd_sync.do_sync", "NvdSyncManager::sync_thread_", BackgroundJobClass::DisabledUntilFixed,
      "engine-tier migration pending (ADR-1005 Phase 7 / ADR-0023); only a process-local single-flight (sync_active_ CAS), not cross-replica — must move to the engine tier or be leader-gated before a 2nd replica"},
 
     // ---- other dedicated component threads (added by the 2026-09-07 exhaustive sweep) ----
     {"cert_reloader.run_loop", "CertReloader::thread_", BackgroundJobClass::ReplicaSafe,
-     "per-replica: polls THIS replica's on-disk cert/key mtimes and hot-swaps its own in-process SSL_CTX; the audit append is idempotent"},
+     "per-replica: polls THIS replica's on-disk cert/key mtimes and hot-swaps its own in-process SSL_CTX; each reload also writes ONE audit row (an unconditional INSERT, not deduplicated — per-replica audit observations are expected to differ)"},
     {"software_catalog_rollup.refresh_catalog_rollup", "SoftwareCatalogRollup::thread_",
      BackgroundJobClass::ReplicaSafe,
      "SHARED-PG, SINGLE-WRITER: refresh_catalog_rollup ALREADY takes a transaction-scoped pg_try_advisory_xact_lock (skip-if-held) before its one-txn DELETE+INSERT atomic replace of the catalogue rollup tables, and is keep-last-good on failure — so concurrent replicas serialize on the lock (a loser skips), never racing the unique-key replace"},
@@ -203,7 +203,7 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
     {"mcp_stream_bridge.run_projector", "McpStreamBridge::projector_", BackgroundJobClass::ReplicaSafe,
      "per-replica in-process: projects ExecutionEventBus progress/terminal frames to the MCP SSE listeners connected to THIS replica; MUST run per-replica; no shared state (terminals are durably re-fetchable)"},
     {"store_worker_pool.worker_loop", "StoreWorkerPool::workers_", BackgroundJobClass::ReplicaSafe,
-     "per-replica in-process delivery-queue drain (WebhookStore + OffloadTargetStore delivery_pool_): POSTs the events THIS replica enqueued via submit(); MUST run per-replica. CAVEAT/tracked: the pass itself is replica-local, but whether a given logical event is enqueued once-per-fleet or once-per-replica is an EMIT-SITE concern (verify webhook/offload emit sites are per-replica-origin before a 2nd replica, or a fleet-triggered emit double-delivers)"},
+     "per-replica in-process delivery-queue drain (WebhookStore + OffloadTargetStore delivery_pool_): POSTs the events THIS replica enqueued via submit(); MUST run per-replica. CAVEAT/tracked: the pass itself is replica-local, but whether a given logical event is enqueued once-per-fleet or once-per-replica is an EMIT-SITE concern (verify webhook/offload emit sites are per-replica-origin before a 2nd replica, or a fleet-triggered emit double-delivers; tracked #4098)"},
 });
 
 /// Index of `pass` in kBackgroundJobs, or -1 if absent. consteval so a site

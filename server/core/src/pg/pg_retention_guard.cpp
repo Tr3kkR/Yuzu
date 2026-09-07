@@ -278,7 +278,8 @@ ClockGuardedPruneOutcome run_clock_guarded_prune(PgPool& pool, const ClockGuarde
     // surfaces a decline, not just a hard failure). A DECLINE means retention is
     // PAUSED this pass on a possible clock anomaly — the operator-actionable
     // signal, so warn. A lock-skip is routine under >1 replica (debug). A normal
-    // drain is info. (Prometheus counters for these are a tracked follow-up.)
+    // drain is info. (Prometheus decline/skip/delete counters are a tracked
+    // follow-up, #4095 — until then a sustained decline pages nobody.)
     if (out.skipped_lock)
         spdlog::debug("clock_guarded_prune[{}]: skipped — another replica holds the lock this tick",
                       spec.store_label);
