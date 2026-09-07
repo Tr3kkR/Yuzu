@@ -86,16 +86,16 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
     // ---- app_perf_rollup_thread_ (1h tick) ----
     {"app_perf_rollup.roll_window", "app_perf_rollup_thread_", BackgroundJobClass::ReplicaSafe,
      "idempotent upsert (ON CONFLICT (app_name,version,day) DO UPDATE)"},
-    {"app_perf_fleet_store.prune", "app_perf_rollup_thread_", BackgroundJobClass::ReplicaSafe,
+    {"app_perf_fleet_store.run_retention_prune", "app_perf_rollup_thread_", BackgroundJobClass::ReplicaSafe,
      "clock-guarded + advisory lock (WS-10 10.2)"},
 
     // ---- preflight_runner_thread_ (60s tick) ----
     {"preflight_runner.redispatch_readonly_checks", "preflight_runner_thread_",
      BackgroundJobClass::ReplicaSafe,
      "read-only/idempotent check re-dispatch to a frozen cohort (routed concern: safe ONLY while read-only)"},
-    {"preflight_run_store.prune_older_than", "preflight_runner_thread_", BackgroundJobClass::ReplicaSafe,
+    {"preflight_run_store.run_retention_prune", "preflight_runner_thread_", BackgroundJobClass::ReplicaSafe,
      "clock-guarded + advisory lock (WS-10 10.2)"},
-    {"deployment_run_store.prune_older_than", "preflight_runner_thread_", BackgroundJobClass::ReplicaSafe,
+    {"deployment_run_store.run_retention_prune", "preflight_runner_thread_", BackgroundJobClass::ReplicaSafe,
      "clock-guarded + advisory lock (WS-10 10.2); piggybacks the preflight thread"},
 
     // ---- policy_eval_thread_ (10s tick) ----

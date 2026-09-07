@@ -18517,10 +18517,11 @@ private:
                             std::chrono::duration_cast<std::chrono::seconds>(
                                 std::chrono::system_clock::now().time_since_epoch())
                                 .count();
+                        YUZU_ASSERT_BACKGROUND_JOB("app_perf_rollup.roll_window"); // WS-10 ReplicaSafe
                         app_perf_rollup_->roll_window(now);
-                        const std::int64_t today = (now / 86400) * 86400;
-                        app_perf_fleet_store_->prune(
-                            today -
+                        // WS-10: the store clock-guards + reads Postgres now() itself; pass the window (secs).
+                        YUZU_ASSERT_BACKGROUND_JOB("app_perf_fleet_store.run_retention_prune");
+                        app_perf_fleet_store_->run_retention_prune(
                             static_cast<std::int64_t>(AppPerfFleetStore::kRetentionDays) * 86400);
                     } catch (const std::exception& e) {
                         spdlog::error("app_perf_rollup: tick threw ({}) — thread continuing",
@@ -18577,12 +18578,10 @@ private:
                 // unbounded (#governance H2/CAP-1).
                 if (deployment_run_store_ && deployment_run_store_->is_open()) {
                     try {
-                        const auto cutoff =
-                            std::chrono::duration_cast<std::chrono::milliseconds>(
-                                std::chrono::system_clock::now().time_since_epoch())
-                                .count() -
-                            14LL * 24 * 60 * 60 * 1000;
-                        deployment_run_store_->prune_older_than(cutoff);
+                        // WS-10: clock-guarded, single-writer; the store reads Postgres now()
+                        // itself (shared clock) — pass the 14-day retention WINDOW in ms.
+                        YUZU_ASSERT_BACKGROUND_JOB("deployment_run_store.run_retention_prune");
+                        deployment_run_store_->run_retention_prune(14LL * 24 * 60 * 60 * 1000);
                     } catch (const std::exception& e) {
                         spdlog::error("deployment prune threw ({}) — thread continuing", e.what());
                     } catch (...) {

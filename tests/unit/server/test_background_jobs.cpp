@@ -56,9 +56,9 @@ TEST_CASE("background-job table classifies every audited pass correctly",
         CHECK(poll->cls == BackgroundJobClass::ReplicaSafe);
     }
     SECTION("the four #2508 clock-guard targets are ReplicaSafe (single-writer via guard)") {
-        for (std::string_view p : {"app_perf_fleet_store.prune",
-                                   "preflight_run_store.prune_older_than",
-                                   "deployment_run_store.prune_older_than",
+        for (std::string_view p : {"app_perf_fleet_store.run_retention_prune",
+                                   "preflight_run_store.run_retention_prune",
+                                   "deployment_run_store.run_retention_prune",
                                    "execution_tracker.reconcile_stale_concurrency_claims"}) {
             auto* j = find(p);
             INFO("missing/misclassified: " << p);
