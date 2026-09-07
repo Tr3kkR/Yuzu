@@ -760,8 +760,8 @@ grpc::Status AgentServiceImpl::ReportInventory(grpc::ServerContext* context,
     //
     // INTENTIONAL ASYMMETRY (gov architect A-1 / consistency S1): neither direct path
     // upserts *generic* (non-typed) plugin_data keys into the generic InventoryStore.
-    // The live sources (installed_software, app_perf, device_ci, software_licensing)
-    // are TYPED and routed through their typed seams on both paths, so the two paths
+    // The live sources (installed_software, app_perf, device_ci, software_licensing,
+    // app_usage) are TYPED and routed through their typed seams on both paths, so the two paths
     // stay symmetric;
     // a future GENERIC source must fold its upsert into ingest_inventory_report (pass the
     // InventoryStore&), not add a parallel loop here.

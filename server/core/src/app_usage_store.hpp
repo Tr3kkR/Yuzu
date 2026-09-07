@@ -42,13 +42,12 @@
 /// `stored_hash(agent)` is nullopt AND `get_agent_last_used(agent)` is an
 /// empty vector (not nullopt).
 ///
-/// Registered in the agent-decommission cascade (agent_decommission.hpp) —
-/// the DELETE /api/v1/sle/agents/{id} route erases this store under
-/// Decommission:Delete (ADR-0024 Decision 9 as amended, Wave 7 PR7.2). NOT
-/// wired into `AgentDecommissionStores` by THIS package — P26 (wave 4) does
-/// that, behind the promoted `Decommission:Delete` securable, moving
-/// kCascadeStoreCount 5→6. This store only provides the honest two-table
-/// `delete_agent` the cascade will call.
+/// Registered in the agent-decommission cascade (agent_decommission.hpp,
+/// AgentDecommissionStores::app_usage, the sixth and last store) — the
+/// DELETE /api/v1/sle/agents/{id} route erases this store under the scoped
+/// `Decommission:Delete` securable (ADR-0024 Decision 9 as amended). This
+/// header provides the honest two-table `delete_agent` the cascade calls;
+/// see agent_decommission.cpp's registration list for the wiring.
 
 #include <cstdint>
 #include <expected>
