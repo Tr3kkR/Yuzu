@@ -21,10 +21,11 @@
 ///     GET/POST/DELETE /mcp/v1/.
 ///   - The --mcp-disable kill switch answers on all three verbs BEFORE
 ///     auth_fn (and therefore before any RBAC check) ever runs -- the
-///     standing kill-switch-before-auth ordering invariant
-///     (docs/mcp-server.md's "Kill switch" bullet; CLAUDE.md's MCP routed
-///     concern) -- proven end-to-end through the REGISTERED sink dispatch,
-///     not just at the handler-construction level test_mcp_server.cpp
+///     standing kill-switch-before-auth ordering invariant (the rejection
+///     itself is docs/mcp-server.md's "Kill switch" bullet; the specific
+///     before-auth ordering is CLAUDE.md's MCP routed concern) -- proven
+///     end-to-end through the REGISTERED sink dispatch, not just at the
+///     handler-construction level test_mcp_server.cpp
 ///     already covers.
 ///   - A non-vacuousness check: with the kill switch off, every verb is
 ///     still reachable (405/reaches auth_fn), so the disabled-path
