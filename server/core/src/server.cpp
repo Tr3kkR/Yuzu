@@ -122,6 +122,8 @@
 #include "json_extract.hpp" // #2557: shared JSON body-extraction helpers (was 7 ServerImpl statics)
 #include "command_routes.hpp" // #2557: POST /api/command, extracted onto the HttpRouteSink seam
 #include "page_routes.hpp" // #2542: page-shell/static-asset routes, extracted onto the HttpRouteSink seam
+#include "dashboard_api_routes.hpp" // #2542 follow-up: /api/me, /api/agents, /api/audit, /api/export/json-to-csv, /api/scope/validate, /api/analytics/{status,recent}
+#include "nvd_routes.hpp" // #2542 follow-up: /api/nvd/{status,sync,match}, extracted onto the HttpRouteSink seam
 #include "custom_properties_routes.hpp" // #2542 PR-4: the 5-route Custom Properties API (7.6), extracted onto the HttpRouteSink seam
 #include "command_capability.hpp" // PR1.9c: CommandCapabilityRegistry — the dispatch classification vocabulary
 #include "command_capability_parsers.hpp" // PR1.9c: encode_dispatch_tag / compute_plan_hash
@@ -13110,6 +13112,13 @@ private:
                               const std::string& type, const std::string& op) -> bool {
             return require_permission(req, res, type, op);
         };
+        // dashboard_api_routes' /api/agents seam onto get_visible_agents_json.
+        // The method itself (server.cpp:11293) has a second live caller (DEX
+        // device-list, ~line 19349) and stays exactly where it is — this
+        // closure is the only thing that moved.
+        auto visible_agents_json_fn = [this](const std::string& username) {
+            return get_visible_agents_json(username);
+        };
 
         // #2542: page-shell/static-asset routes (25), extracted onto inline_sink
         // (this call's own HttpRouteSink seam) rather than any per-owner sink —
@@ -13121,6 +13130,29 @@ private:
             .viz_disabled = &viz_disabled_,
             .registry = &registry_,
         });
+
+        // #2542 follow-up: 7 dashboard/API routes with no single owning store
+        // (/api/me, /api/agents, /api/audit, /api/export/json-to-csv,
+        // /api/scope/validate, /api/analytics/{status,recent}), extracted
+        // onto the same inline_sink seam.
+        yuzu::server::dashboard_api::register_dashboard_api_routes(
+            inline_sink, yuzu::server::dashboard_api::Deps{
+                             .auth_fn = auth_fn,
+                             .perm_fn = perm_fn,
+                             .visible_agents_json_fn = visible_agents_json_fn,
+                             .rbac_store = rbac_store_.get(),
+                             .audit_store = audit_store_.get(),
+                             .analytics_store = analytics_store_.get(),
+                         });
+
+        // #2542 follow-up: the 3 NVD CVE-feed routes (/api/nvd/status,
+        // /api/nvd/sync, /api/nvd/match), extracted onto the same inline_sink
+        // seam.
+        yuzu::server::nvd::register_nvd_routes(inline_sink, yuzu::server::nvd::Deps{
+                                                                 .perm_fn = perm_fn,
+                                                                 .nvd_db = nvd_db_.get(),
+                                                                 .nvd_sync = nvd_sync_.get(),
+                                                             });
 
         // Per-device tier + management-group scope gate (wraps
         // require_scoped_permission). Used by DeviceRoutes' per-device routes so an
@@ -14228,40 +14260,6 @@ private:
                 "application/json");
         });
 
-        // -- Current user info (/api/me) --------------------------------------
-        web_server_->Get("/api/me", [this](const httplib::Request& req, httplib::Response& res) {
-            auto session = require_auth(req, res);
-            if (!session)
-                return;
-            // #1837: `username` is the STABLE authorization principal (an
-            // opaque `oidc:<iss>#<sub>` id for SSO sessions) — never render
-            // it alone as the nav-bar identity. `display_name` is the
-            // human-readable label consumed by every page's nav/context
-            // bar JS below; falls back to `username` for a legacy session
-            // created before this field existed.
-            auto j = nlohmann::json(
-                {{"username", session->username},
-                {"display_name",
-                 session->display_name.empty() ? session->username : session->display_name},
-                {"role", auth::role_to_string(session->role)}});
-            // Add RBAC role if enabled
-            if (rbac_store_ && rbac_store_->is_rbac_enabled()) {
-                j["rbac_enabled"] = true;
-                auto roles = rbac_store_->get_principal_roles("user", session->username);
-                if (!roles.empty()) {
-                    j["rbac_role"] = roles[0].role_name;
-                } else {
-                    // Fallback: map legacy role to RBAC role name
-                    j["rbac_role"] =
-                        session->role == auth::Role::admin ? "Administrator" : "Viewer";
-                }
-            } else {
-                j["rbac_enabled"] = false;
-                j["rbac_role"] = session->role == auth::Role::admin ? "Administrator" : "Viewer";
-            }
-            res.set_content(j.dump(), "application/json");
-        });
-
         // Issue #253 fragment route lives in dashboard_routes.cpp now (#589).
 
         // PR2 — MFA step-up gate. Single shared closure (governance Gate 2
@@ -14440,113 +14438,7 @@ private:
                     }));
         });
 
-        // -- Agent listing API ------------------------------------------------
-
-        web_server_->Get("/api/agents", [this](const httplib::Request& req,
-                                               httplib::Response& res) {
-            if (!require_permission(req, res, "Infrastructure", "Read"))
-                return;
-            auto session = require_auth(req, res);
-            if (!session)
-                return;
-            res.set_content(get_visible_agents_json(session->username).dump(), "application/json");
-        });
-
         // /fragments/scope-list — moved to DashboardRoutes (with groups support)
-
-        // -- NVD CVE feed endpoints -------------------------------------------
-
-        web_server_->Get("/api/nvd/status",
-                         [this](const httplib::Request& req, httplib::Response& res) {
-                             if (!require_permission(req, res, "Infrastructure", "Read"))
-                                 return;
-                             if (!nvd_db_ || !nvd_db_->is_open()) {
-                                 res.set_content(R"({"enabled":false})", "application/json");
-                                 return;
-                             }
-                             nlohmann::json j;
-                             // "enabled" reflects whether the sync manager exists, not
-                             // merely whether the DB file is open: under --no-nvd-sync the
-                             // catalog DB is still open (for matching) but sync is off, so
-                             // reporting enabled=true then 503-ing POST /api/nvd/sync was
-                             // contradictory (#1889 review r2).
-                             j["enabled"] = (nvd_sync_ != nullptr);
-                             j["total_cves"] = nvd_db_->total_cve_count();
-                             if (nvd_sync_) {
-                                 auto st = nvd_sync_->status();
-                                 j["syncing"] = st.syncing;
-                                 j["last_sync_time"] = st.last_sync_time;
-                                 j["last_error"] = st.last_error;
-                                 j["backfill_complete"] = st.backfill_complete;
-                                 j["backfill_oldest_published"] = st.backfill_oldest_published;
-                             }
-                             res.set_content(j.dump(), "application/json");
-                         });
-
-        web_server_->Post("/api/nvd/sync", [this](const httplib::Request& req,
-                                                  httplib::Response& res) {
-            if (!require_permission(req, res, "Infrastructure", "Execute"))
-                return;
-            if (!nvd_sync_) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"NVD sync not enabled"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            // Ask the background loop to sync at its next wake and return at once.
-            // (A detached thread here could outlive the manager and use-after-free
-            // db_/fetcher_ during the hours-long backfill — governance BLOCKING.)
-            nvd_sync_->request_sync();
-            res.set_content(R"({"status":"sync_started"})", "application/json");
-        });
-
-        web_server_->Post("/api/nvd/match", [this](const httplib::Request& req,
-                                                   httplib::Response& res) {
-            if (!require_permission(req, res, "Infrastructure", "Read"))
-                return;
-            if (!nvd_db_ || !nvd_db_->is_open()) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"NVD database not available"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            // Parse inventory: JSON body with an "inventory" array of {name, version}.
-            std::vector<SoftwareItem> inventory;
-            try {
-                auto body = nlohmann::json::parse(req.body);
-                if (body.contains("inventory") && body["inventory"].is_array()) {
-                    for (const auto& item : body["inventory"]) {
-                        SoftwareItem si;
-                        si.name = item.value("name", "");
-                        si.version = item.value("version", "");
-                        if (!si.name.empty())
-                            inventory.push_back(std::move(si));
-                    }
-                }
-            } catch (...) {
-                res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"invalid JSON body"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            auto matches = nvd_db_->match_inventory(inventory);
-            nlohmann::json arr = nlohmann::json::array();
-            for (const auto& m : matches) {
-                arr.push_back({{"cve_id", m.cve_id},
-                               {"severity", m.severity},
-                               {"description", m.description},
-                               {"product", m.product},
-                               {"installed_version", m.installed_version},
-                               {"fixed_in", m.fixed_in},
-                               {"source", m.source}});
-            }
-            res.set_content(nlohmann::json({{"findings", arr}, {"count", arr.size()}}).dump(),
-                            "application/json");
-        });
 
         // -- Generic command dispatch API -------------------------------------
 
@@ -15065,101 +14957,6 @@ private:
                                {"error_detail", r.error_detail}});
             }
             res.set_content(nlohmann::json({{"responses", arr}, {"count", arr.size()}}).dump(),
-                            "application/json");
-        });
-
-        // -- Audit API -----------------------------------------------------------
-        web_server_->Get("/api/audit", [this](const httplib::Request& req, httplib::Response& res) {
-            if (!require_permission(req, res, "AuditLog", "Read"))
-                return;
-
-            if (!audit_store_ || !audit_store_->is_open()) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"audit store not available"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            AuditQuery q;
-            if (req.has_param("principal"))
-                q.principal = req.get_param_value("principal");
-            if (req.has_param("action"))
-                q.action = req.get_param_value("action");
-            if (req.has_param("target_type"))
-                q.target_type = req.get_param_value("target_type");
-            if (req.has_param("target_id"))
-                q.target_id = req.get_param_value("target_id");
-            try {
-                if (req.has_param("since"))
-                    q.since = std::stoll(req.get_param_value("since"));
-                if (req.has_param("until"))
-                    q.until = std::stoll(req.get_param_value("until"));
-                if (req.has_param("limit"))
-                    q.limit = std::stoi(req.get_param_value("limit"));
-                if (req.has_param("offset"))
-                    q.offset = std::stoi(req.get_param_value("offset"));
-            } catch (const std::exception&) {
-                res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            // Range, not just parseability: a negative limit would otherwise
-            // reach PG as `LIMIT -1`, error, and be reported as an audit-store
-            // DEGRADE — 503 plus the read-degrade counter the availability
-            // alert pages on — rather than the client error it is (Gate 2
-            // security). A negative offset is already inert at the store, but
-            // it is a client error here too, so say so.
-            if (q.limit < 1 || q.offset < 0) {
-                res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"limit must be >= 1 and offset >= 0"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            // ADR-0040: reads are degrade-distinguishable. A store/pool failure
-            // returns nullopt — surface 503, NEVER a false-empty 200 (an audit
-            // blip must not read as "no activity" — evidence integrity).
-            auto results = audit_store_->query(q);
-            if (!results) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"audit store degraded"},"data":null})",
-                    "application/json");
-                return;
-            }
-
-            nlohmann::json arr = nlohmann::json::array();
-            for (const auto& e : *results) {
-                arr.push_back({{"id", e.id},
-                               {"timestamp", e.timestamp},
-                               {"principal", e.principal},
-                               {"principal_role", e.principal_role},
-                               {"action", e.action},
-                               {"target_type", e.target_type},
-                               {"target_id", e.target_id},
-                               {"detail", e.detail},
-                               {"source_ip", e.source_ip},
-                               {"result", e.result}});
-            }
-            // Total is a best-effort adornment now that the page rows are in
-            // hand: it takes a SECOND, independent lease, so it can degrade while
-            // the page rows are perfectly good. Do not answer a second 503 —
-            // but do NOT substitute the page size either. That reads as
-            // `count == total`, i.e. "this page is the whole trail", which is
-            // plausible and wrong on the one store whose entire posture in this
-            // change is that a blip must never read as an absence (Gate 3
-            // cpp-expert + Gate 2 security; the old `0` was at least obviously
-            // wrong). `null` is the honest answer and JSON has it.
-            auto total = audit_store_->total_count();
-            res.set_content(nlohmann::json({{"events", arr},
-                                            {"count", arr.size()},
-                                            {"total", total ? nlohmann::json(*total)
-                                                            : nlohmann::json(nullptr)}})
-                                .dump(),
                             "application/json");
         });
 
@@ -15700,24 +15497,6 @@ private:
                 res.set_content(render_result_sets_sidebar(sets, created->id),
                                 "text/html; charset=utf-8");
             });
-
-        // -- Generic JSON-to-CSV export -----------------------------------------
-        web_server_->Post("/api/export/json-to-csv", [this](const httplib::Request& req,
-                                                            httplib::Response& res) {
-            if (!require_permission(req, res, "Response", "Read"))
-                return;
-
-            auto csv = data_export::json_array_to_csv(req.body);
-            if (csv.empty()) {
-                res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"invalid JSON array"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            res.set_header("Content-Disposition", "attachment; filename=\"export.csv\"");
-            res.set_content(csv, "text/csv; charset=utf-8");
-        });
 
         // -- Instruction Definitions API --------------------------------------
 
@@ -17449,85 +17228,6 @@ private:
             res.set_content(R"({"status":"rejected"})", "application/json");
         });
 
-        // -- Analytics API ---------------------------------------------------------
-
-        web_server_->Get("/api/analytics/status",
-                         [this](const httplib::Request& req, httplib::Response& res) {
-                             if (!require_permission(req, res, "Infrastructure", "Read"))
-                                 return;
-
-                             nlohmann::json j;
-                             if (analytics_store_) {
-                                 // Degrade-distinguishable seam (ADR-0049): a
-                                 // transient PG blip 503s rather than
-                                 // rendering pending_count=0, which would be
-                                 // indistinguishable from a genuinely empty
-                                 // buffer.
-                                 auto pending = analytics_store_->pending_count();
-                                 if (!pending) {
-                                     res.status = 503;
-                                     res.set_content(
-                                         R"({"error":{"code":503,"message":)"
-                                         R"("analytics store degraded"},)"
-                                         R"("meta":{"api_version":"v1"}})",
-                                         "application/json");
-                                     return;
-                                 }
-                                 j["enabled"] = true;
-                                 j["pending_count"] = *pending;
-                                 j["total_emitted"] = analytics_store_->total_emitted();
-                             } else {
-                                 j["enabled"] = false;
-                                 j["pending_count"] = 0;
-                                 j["total_emitted"] = 0;
-                             }
-                             res.set_content(j.dump(), "application/json");
-                         });
-
-        web_server_->Get(
-            "/api/analytics/recent", [this](const httplib::Request& req, httplib::Response& res) {
-                if (!require_permission(req, res, "Infrastructure", "Read"))
-                    return;
-
-                int limit = 50;
-                if (req.has_param("limit")) {
-                    try {
-                        limit = std::stoi(req.get_param_value("limit"));
-                    } catch (...) {}
-                }
-                // A non-positive limit isn't a client-error worth a 400 (this
-                // route has always silently ignored a malformed value), but
-                // unlike SQLite's LIMIT -1 = "unlimited" idiom the old store
-                // relied on, Postgres's LIMIT REJECTS a negative bind
-                // outright — which query_recent() below can only report as
-                // nullopt (degraded), and this route would then 503
-                // "analytics store degraded" for a client-supplied bad
-                // parameter, not an actual store problem (governance Gate 4
-                // unhappy-path finding, 2026-08-16, following up on the
-                // happy-path reviewer's flagged lead). Clamp instead.
-                if (limit <= 0)
-                    limit = 50;
-                if (!analytics_store_) {
-                    res.set_content(R"({"events":[],"count":0})", "application/json");
-                    return;
-                }
-                auto events = analytics_store_->query_recent(limit);
-                if (!events) {
-                    res.status = 503;
-                    res.set_content(R"({"error":{"code":503,"message":)"
-                                    R"("analytics store degraded"},)"
-                                    R"("meta":{"api_version":"v1"}})",
-                                    "application/json");
-                    return;
-                }
-                nlohmann::json arr = nlohmann::json::array();
-                for (const auto& e : *events) {
-                    arr.push_back(e);
-                }
-                res.set_content(nlohmann::json({{"events", arr}, {"count", arr.size()}}).dump(),
-                                "application/json");
-            });
-
         // -- HTMX Fragment Routes for Instructions UI -------------------------
 
         web_server_->Get(
@@ -18023,32 +17723,6 @@ private:
                 }
                 res.set_content(html, "text/html; charset=utf-8");
             });
-
-        // -- Scope API --------------------------------------------------------
-        web_server_->Post("/api/scope/validate", [this](const httplib::Request& req,
-                                                        httplib::Response& res) {
-            auto session = require_auth(req, res);
-            if (!session)
-                return;
-
-            auto expression = extract_json_string(req.body, "expression");
-            if (expression.empty()) {
-                res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"expression required"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            auto result = yuzu::scope::validate(expression);
-            if (result) {
-                res.set_content(R"({"valid":true})", "application/json");
-            } else {
-                res.set_content(
-                    nlohmann::json({{"valid", false}, {"error", result.error()}}).dump(),
-                    "application/json");
-            }
-        });
 
         // -- Inventory REST endpoints (Issue 7.17) --------------------------------
 
