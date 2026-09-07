@@ -508,7 +508,7 @@ static const ToolDef kTools[] = {
      "single agent_id to filter by. #4030: rows now also carry the resolved definition "
      "name, the agents_success/agents_failure split, and a truncated error preview — "
      "reconciled onto the dashboard fragment's fuller field set.",
-     R"({"type":"object","properties":{"definition_id":{"type":"string"},"status":{"type":"string"},"limit":{"type":"integer","default":50}}})",
+     R"({"type":"object","properties":{"definition_id":{"type":"string","maxLength":256},"status":{"type":"string","maxLength":64},"limit":{"type":"integer","default":50,"minimum":1,"maximum":500}}})",
      R"j({"type":"object","properties":{"executions":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"definition_name":{"type":"string"},"status":{"type":"string"},"dispatched_by":{"type":"string"},"dispatched_at":{"type":"integer"},"agents_targeted":{"type":"integer"},"agents_responded":{"type":"integer"},"agents_success":{"type":"integer"},"agents_failure":{"type":"integer"},"completed_at":{"type":"integer"},"rerun_of":{"type":"string"},"error_preview":{"type":"string"}},"required":["id","definition_id","status","dispatched_by","dispatched_at","agents_targeted","agents_responded"]}}},"required":["executions"]})j"},
 
     {"list_schedules", "List scheduled (recurring) instructions. #4030: rows now also "
@@ -521,13 +521,13 @@ static const ToolDef kTools[] = {
     {"list_workflows", "List multi-step workflows (WorkflowEngine — a different data model "
      "from a single-instruction Execution; see get_workflow_execution). Requires "
      "Workflow:Read.",
-     R"({"type":"object","properties":{"name":{"type":"string","description":"Optional name filter"},"limit":{"type":"integer","default":100}}})",
-     R"j({"type":"object","properties":{"workflows":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"description":{"type":"string"},"steps":{"type":"array"},"step_count":{"type":"integer"},"created_at":{"type":"integer"},"updated_at":{"type":"integer"}},"required":["id","name","steps","step_count","created_at","updated_at"]}}},"required":["workflows"]})j"},
+     R"({"type":"object","properties":{"name":{"type":"string","description":"Optional name filter","maxLength":256},"limit":{"type":"integer","default":100,"minimum":1,"maximum":500}}})",
+     R"j({"type":"object","properties":{"workflows":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"description":{"type":"string"},"steps":{"type":"array","items":{"type":"object","properties":{"index":{"type":"integer"},"instruction_id":{"type":"string"},"condition":{"type":"string"},"retry_count":{"type":"integer"},"retry_delay_seconds":{"type":"integer"},"foreach":{"type":"string"},"label":{"type":"string"},"on_failure":{"type":"string"}},"required":["index","instruction_id"]}},"step_count":{"type":"integer"},"created_at":{"type":"integer"},"updated_at":{"type":"integer"}},"required":["id","name","steps","step_count","created_at","updated_at"]}}},"required":["workflows"]})j"},
 
     {"get_workflow", "Fetch a single multi-step workflow's full definition, including its "
      "source YAML. Requires Workflow:Read.",
      R"({"type":"object","properties":{"workflow_id":{"type":"string","minLength":1}},"required":["workflow_id"]})",
-     R"j({"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"description":{"type":"string"},"yaml_source":{"type":"string"},"steps":{"type":"array"},"step_count":{"type":"integer"},"created_at":{"type":"integer"},"updated_at":{"type":"integer"}},"required":["id","name","yaml_source","steps","step_count","created_at","updated_at"]})j"},
+     R"j({"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"description":{"type":"string"},"yaml_source":{"type":"string"},"steps":{"type":"array","items":{"type":"object","properties":{"index":{"type":"integer"},"instruction_id":{"type":"string"},"condition":{"type":"string"},"retry_count":{"type":"integer"},"retry_delay_seconds":{"type":"integer"},"foreach":{"type":"string"},"label":{"type":"string"},"on_failure":{"type":"string"}},"required":["index","instruction_id"]}},"step_count":{"type":"integer"},"created_at":{"type":"integer"},"updated_at":{"type":"integer"}},"required":["id","name","yaml_source","steps","step_count","created_at","updated_at"]})j"},
 
     {"get_workflow_execution", "Fetch one workflow execution's status and per-step results "
      "— WorkflowEngine's own multi-step run record, a DIFFERENT data model from "
@@ -539,7 +539,7 @@ static const ToolDef kTools[] = {
      "workflow_execution.detail.fetch (set-and-proceed, audit_persisted:false on an admitted "
      "read whose audit row was dropped) — a genuinely nonexistent id writes no audit row.",
      R"({"type":"object","properties":{"execution_id":{"type":"string","minLength":1}},"required":["execution_id"]})",
-     R"j({"type":"object","properties":{"id":{"type":"string"},"workflow_id":{"type":"string"},"status":{"type":"string"},"agent_ids":{"type":"array","items":{"type":"string"}},"current_step":{"type":"integer"},"started_at":{"type":"integer"},"completed_at":{"type":"integer"},"steps":{"type":"array"}},"required":["id","workflow_id","status","agent_ids","current_step","started_at","completed_at","steps"]})j"},
+     R"j({"type":"object","properties":{"id":{"type":"string"},"workflow_id":{"type":"string"},"status":{"type":"string"},"agent_ids":{"type":"array","items":{"type":"string"}},"current_step":{"type":"integer"},"started_at":{"type":"integer"},"completed_at":{"type":"integer"},"steps":{"type":"array","items":{"type":"object","properties":{"step_index":{"type":"integer"},"instruction_id":{"type":"string"},"status":{"type":"string"},"result":{},"started_at":{"type":"integer"},"completed_at":{"type":"integer"},"attempt":{"type":"integer"}},"required":["step_index","instruction_id","status"]}},"audit_persisted":{"type":"boolean","description":"Present and false only when the confinement-denied or success audit row failed to persist (set-and-proceed — the read still succeeds)."}},"required":["id","workflow_id","status","agent_ids","current_step","started_at","completed_at","steps"]})j"},
 
     {"validate_scope",
      "Validate a scope expression without executing it. Returns parse errors if invalid.",
