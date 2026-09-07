@@ -44,6 +44,8 @@ supersedes: >-
 
 # 0028 — Agent-Side Component Inventory Collection (Bundled & Filesystem-Resident Dependencies)
 
+> **Implementation status (2026-09-07 ADR reconciliation):** Accepted — deferred, not started. Zero `sync_source_component*` files in `agents/core/src`. Deferred, not started; agent-side mechanism — stays core under ADR-1005, not use-case-engine scope (#4099).
+
 > **Naming note (resolved during grill-with-docs review, 2026-07-07):** this capability is called
 > the **component inventory**, not "SBOM." **SBOM** (CycloneDX/SPDX) is a standardized *export/import
 > document format* — a possible future projection of this data (Decision 6) — not the name of the
