@@ -942,12 +942,12 @@ AuthDB::recheck_role_locked(const std::string& username,
     // FOR UPDATE's own row-lock WAIT is bounded by PgPool::connect_one's
     // per-connection `lock_timeout` (10000ms default, pg_pool.hpp) unless
     // overridden - a contended lock could otherwise block ~5x longer than
-    // this call's own acquire bound. SET LOCAL below closes that: it scopes
-    // to this transaction only (no leak back to the pooled connection) and
-    // matches the wait bound to kWriteTimeout itself, so a genuinely stuck
-    // writer fails this call closed (QueryFailed, via the SQLSTATE 55P03
-    // lock_timeout error surfacing as a non-PGRES_COMMAND_OK/TUPLES_OK
-    // status) well inside the caller's own expectations.
+    // this call's own acquire bound. The set_config() call below closes
+    // that: it scopes to this transaction only (no leak back to the pooled
+    // connection) and matches the wait bound to kWriteTimeout itself, so a
+    // genuinely stuck writer fails this call closed (QueryFailed, via the
+    // SQLSTATE 55P03 lock_timeout error surfacing as a non-PGRES_COMMAND_OK/
+    // TUPLES_OK status) well inside the caller's own expectations.
     std::optional<AuthDBError> err;
     const bool committed = impl_->pool.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
         // Bound parameter, not string interpolation (authdb review contract,
