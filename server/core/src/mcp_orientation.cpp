@@ -108,8 +108,14 @@ constexpr std::string_view kAgenticHelpers[] = {"get_fleet_posture_fast",
 constexpr std::string_view kDiscovery[] = {"discover_permissions", "discover_instructions",
                                            "discover_routes", "discover_scope_kinds",
                                            "discover_plugins"};
+// #4031: AD/Entra directory-sync user listing + the OIDC SSO config status
+// read — both Directory:Read, deliberately their own family rather than
+// folded into Fleet & agents (directory users are IdP-sourced identity
+// records, not managed endpoints) or Engine principals (unrelated identity
+// axis).
+constexpr std::string_view kDirectory[] = {"list_directory_users", "get_directory_status"};
 
-constexpr std::array<ToolFamily, 24> kFamilies{{
+constexpr std::array<ToolFamily, 25> kFamilies{{
     {"Fleet & agents", "connected agents, their OS/arch/version, and details", kFleet},
     {"Tags", "read and write agent tags, and find agents by tag", kTags},
     {"Instructions & schedules", "instruction definitions and recurring schedules", kDefinitions},
@@ -151,6 +157,8 @@ constexpr std::array<ToolFamily, 24> kFamilies{{
      kAgenticHelpers},
     {"Discovery", "enumerate permissions, instructions, routes, scope kinds, and plugins",
      kDiscovery},
+    {"Directory & identity", "AD/Entra directory-synced users and OIDC SSO config status",
+     kDirectory},
 }};
 
 }  // namespace

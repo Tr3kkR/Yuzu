@@ -170,8 +170,11 @@ TEST_CASE("RbacStore: seed data — securable types", "[rbac_store][pg]") {
     auto types = store.list_securable_types();
     // +SoftwareLicensing (ADR-0024) +AccessReview (SOC 2 CC6.2) +EnginePrincipal
     // (#2376, cut away from Security:Read) +PluginConfig +PluginSecret
-    // +UploadGrant (PR1.9a, peer finding PLAN-001) = 26.
-    REQUIRE(types.size() == 27);
+    // +UploadGrant (PR1.9a, peer finding PLAN-001) +PowerManagement (Wave 6) = 27,
+    // +Directory +Enrollment +OidcConfig (#4031 prerequisite fix — Directory was
+    // referenced by discovery_routes.cpp but never seeded; Enrollment/OidcConfig
+    // are the two new #4031 route securables) = 30.
+    REQUIRE(types.size() == 30);
 
     auto has = [&](const std::string& t) {
         return std::find(types.begin(), types.end(), t) != types.end();
@@ -197,6 +200,9 @@ TEST_CASE("RbacStore: seed data — securable types", "[rbac_store][pg]") {
     CHECK(has("UploadGrant"));  // PR1.9a: upload-grant mint/revoke lifecycle
     CHECK(has("EnginePrincipal")); // Engine-principal inventory + grant-graph reads (#2376),
                                    // cut away from the over-broad Security:Read
+    CHECK(has("Directory"));   // #4031 prerequisite fix — AD/Entra directory-sync
+    CHECK(has("Enrollment"));  // #4031: auto-approve rules + pending-agent visibility
+    CHECK(has("OidcConfig"));  // #4031: OIDC SSO config read (deliberately not "Directory")
 }
 
 TEST_CASE("RbacStore: seed data — operations", "[rbac_store][pg]") {
@@ -231,17 +237,18 @@ TEST_CASE("RbacStore: seeded catalogues match the MCP C8 validator mirrors",
 TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_store][pg]") {
     RBAC_STORE(store);
     auto perms = store.get_role_permissions("Administrator");
-    // 27 types * 5 CRUD ops = 135 permissions, plus a single targeted Push
-    // grant on GuaranteedState (= 136), plus a single AccessReview:Attest grant
-    // (Periodic Access Reviews, CC6.2, = 137), plus a single ApiToken:Rotate
-    // grant (P2 #11, SOC 2 CC6.3) = 138 permissions total. Push, Attest, and
+    // 30 types * 5 CRUD ops = 150 permissions, plus a single targeted Push
+    // grant on GuaranteedState (= 151), plus a single AccessReview:Attest grant
+    // (Periodic Access Reviews, CC6.2, = 152), plus a single ApiToken:Rotate
+    // grant (P2 #11, SOC 2 CC6.3) = 153 permissions total. Push, Attest, and
     // Rotate are deliberately NOT cross-seeded on other securables — see the
-    // rationale in rbac_store.cpp seed_defaults(). (27th: PowerManagement, Wave 6
+    // rationale in rbac_store.cpp seed_defaults(). (30th-28th: Directory/
+    // Enrollment/OidcConfig, #4031; 27th: PowerManagement, Wave 6
     // power_health set_power_plan; 26th-24th: UploadGrant/
     // PluginSecret/PluginConfig, PR1.9a peer finding PLAN-001; 23rd:
     // EnginePrincipal, #2376; 22nd: AccessReview, SOC 2 CC6.2; 21st:
     // SoftwareLicensing, ADR-0024.)
-    CHECK(perms.size() == 138);
+    CHECK(perms.size() == 153);
     for (auto& p : perms)
         CHECK(p.effect == "allow");
 
@@ -272,8 +279,11 @@ TEST_CASE("RbacStore: seed data — Viewer has read-only", "[rbac_store][pg]") {
     RBAC_STORE(store);
     auto perms = store.get_role_permissions("Viewer");
     // 21 types * Read only (everything except Infrastructure; incl. Inventory +
-    // SoftwareLicensing, ADR-0024, + EnginePrincipal, #2376)
-    CHECK(perms.size() == 21);
+    // SoftwareLicensing, ADR-0024, + EnginePrincipal, #2376), +1 Directory
+    // (#4031 — AD/Entra directory-sync PII, same precedent as UserManagement)
+    // = 22. Enrollment/OidcConfig deliberately do NOT join Viewer's list —
+    // see the seeding comment in rbac_store.cpp's Viewer read-loop.
+    CHECK(perms.size() == 22);
     for (auto& p : perms) {
         CHECK(p.operation == "Read");
         CHECK(p.effect == "allow");
