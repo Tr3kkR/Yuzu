@@ -208,7 +208,22 @@ public:
     /// of the REST/MCP surface re-deriving it. Public (unlike the private renderer
     /// above) — `McpServer` calls it via a `DashboardRoutes*` threaded in through
     /// server.cpp, the same pattern other route classes use for cross-class access.
-    TarRetentionPausedScan gather_tar_retention_paused(const std::string& username) const;
+    ///
+    /// `extra_scope` (#4027 fix round, CDX-P1-01/K4): an ADDITIONAL visibility
+    /// constraint ORed into the existing per-response `visible_set` check —
+    /// nullopt (default) preserves the pre-fix behavior exactly (the HTML
+    /// fragment renderer's caller passes nothing). The REST/MCP twins pass
+    /// `fleet_read_fn_`'s/McpServer's own `FleetReadGate::scope` here so a
+    /// dropped-for-scope row is folded into `agents_filtered_out_of_scope`
+    /// the SAME way an existing out-of-management-scope row is — NOT applied
+    /// as a post-hoc filter over the returned `rows`, which would leave
+    /// `agents_responded` counting agents whose rows were silently discarded
+    /// (the exact "silently incomplete" class both round-1 reviewers flagged
+    /// on a different finding — this function's honesty counters must not
+    /// repeat it).
+    TarRetentionPausedScan
+    gather_tar_retention_paused(const std::string& username,
+                                const authz::VisibleSet& extra_scope = std::nullopt) const;
 
 private:
     std::vector<std::string> csrf_trusted_origins_;

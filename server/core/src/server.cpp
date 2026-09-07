@@ -20435,6 +20435,18 @@ private:
                 return yuzu::server::DispatchCaller{
                     .exec_visible = yuzu::server::authz::deny_all()};
             });
+        // #4027 fix round (CDX-P1-01/K4) — the SAME fleet_read_fn lambda wired
+        // into dashboard_routes_/mcp_server_ below/elsewhere (#3290 Phase 2), so
+        // the two REST device-picker twins (`GET /api/v1/tar/process-tree`,
+        // `GET /api/v1/tar/capture-sources`) apply the real ADR-0017
+        // admit-then-filter chokepoint instead of the bare `require_permission`
+        // they shipped with. Injected via setter (not a register_routes param)
+        // so this doesn't churn the call above or any test fixture's call —
+        // an un-set fn fails closed (503 unwired), same contract as
+        // DashboardRoutes'/McpServer's own fleet_read_fn seam. The two
+        // pre-existing `/fragments/tar/...` HTML routes stay on perm_fn_ this
+        // round — see the recorded-exception comment at their registration.
+        tar_tree_routes_->set_fleet_read_fn(fleet_read_fn);
 
         // VizRoutes — /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology
         // (PR 3 of feat/viz-engine ladder)
@@ -21941,12 +21953,18 @@ private:
             mcp_server_->set_fleet_read_fn(fleet_read_fn);
             // #4027 — the SAME devices_fn lambda TarTreeRoutes' REST/fragment
             // routes use (registered above), so list_tar_process_tree_devices/
-            // list_tar_capture_sources_devices apply the identical per-operator
-            // management-group narrowing REST already does, rather than a fresh
-            // unscoped binding (contrast list_agents' agents_fn, a deliberate
-            // pre-existing exception this twin does not extend). dashboard_routes_
-            // is guaranteed constructed by this point (registered well above, in
-            // the same function, before MCP setup begins).
+            // list_tar_capture_sources_devices/list_tar_retention_paused read
+            // through the identical operator-scoped data source REST already
+            // does (contrast list_agents' agents_fn, a deliberate pre-existing
+            // exception this twin does not extend). #4027 fix round
+            // (CDX-P1-01/K4): the RBAC/management-group AXIS for these three
+            // tools is now the fleet_read_fn_ already wired above (the SAME
+            // instance query_installed_software uses) — devices_fn's own
+            // internal narrowing is retained underneath as an intersection, not
+            // the sole gate; see tar_tree_routes.cpp's REST-twin comment for the
+            // full rationale. dashboard_routes_ is guaranteed constructed by
+            // this point (registered well above, in the same function, before
+            // MCP setup begins).
             mcp_server_->set_tar_devices_fn(devices_fn);
             mcp_server_->set_dashboard_routes(dashboard_routes_.get());
             // PR1.5c/1.6c (p14) — ADR-0031 operator surface MCP twins,

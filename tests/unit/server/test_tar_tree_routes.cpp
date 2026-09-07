@@ -10,6 +10,7 @@
 ///   * the cache token is CSPRNG and an entropy failure fails closed (no cache entry),
 ///   * preset/os are neutralized in the audit detail.
 
+#include "authz_gates.hpp" // authz::FleetReadGate (#4027 fix round, CDX-P1-01/K4)
 #include "authz_model.hpp"
 #include "secure_random.hpp"
 #include "tar_tree_routes.hpp"
@@ -59,6 +60,12 @@ struct TarHarness {
     std::string device = "dev-A";
     std::string session_user = "alice";
     bool allow_read = true;
+    // #4027 fix round (CDX-P1-01/K4): the REST device-picker twins now gate on
+    // fleet_read_fn_, not perm_fn_. Default mirrors `allow_read`'s admit/deny so
+    // every existing test (driven off `allow_read`) needs no changes; set
+    // `fleet_scope` to exercise the ADR-0017 admit-then-filter narrowing itself
+    // (nullopt = unfiltered/TOP, matching a global grant or RBAC-off).
+    std::optional<std::vector<std::string>> fleet_scope;
     bool allow_execute = true;
     // #4027: operator-scoped device list the /api/v1/tar/process-tree +
     // /api/v1/tar/capture-sources REST twins (and the fragment frames) render.
@@ -100,6 +107,25 @@ struct TarHarness {
             if (!allow_read)
                 res.status = 403;
             return allow_read;
+        };
+        // #4027 fix round (CDX-P1-01/K4): fleet_read_fn_ stub — the REST twins'
+        // sole gate. Mirrors `allow_read` for admit/deny by default (so tests
+        // driven off `allow_read` need no changes) and additionally applies
+        // `fleet_scope` as the gate's composed VisibleSet (nullopt/unset = TOP,
+        // matching a global grant).
+        auto fleet_read = [this](const httplib::Request&, httplib::Response& res,
+                                 const std::string&,
+                                 const std::string&) -> authz::FleetReadGate {
+            if (!allow_read) {
+                res.status = 403;
+                return authz::FleetReadGate{false, authz::deny_all()};
+            }
+            if (fleet_scope) {
+                return authz::FleetReadGate{
+                    true, authz::VisibleSet(std::unordered_set<std::string>(
+                              fleet_scope->begin(), fleet_scope->end()))};
+            }
+            return authz::FleetReadGate{true, std::nullopt}; // TOP — unfiltered
         };
         // Scoped gate: Execute toggled by allow_execute, Read by allow_read; a non-empty
         // scope_device denies any other device (mirrors a management-scope miss → 403).
@@ -166,6 +192,7 @@ struct TarHarness {
         };
         routes.register_routes(sink, auth, perm, scoped, devices, lookup, dispatch, responses, audit,
                                caller_fn);
+        routes.set_fleet_read_fn(fleet_read); // #4027 fix round — REST twins' sole gate
     }
 
     // Drive /result directly (skips /run; the result route reads pcmd/tcmd from the
@@ -745,6 +772,67 @@ TEST_CASE("TAR device picker REST twins: happy path returns the A4-enveloped "
     auto cap_json = nlohmann::json::parse(cap->body, nullptr, false);
     REQUIRE_FALSE(cap_json.is_discarded());
     CHECK(cap_json["data"]["devices"].size() == 2);
+}
+
+// #4027 fix round (CDX-P1-01/K4 falsifier): a caller admitted with a SCOPED
+// (non-TOP) VisibleSet — the shape a management-group-scoped-only RBAC grant
+// produces via require_fleet_read/authorize_list_read — must be admitted
+// (200, not the pre-fix 403) AND see only the agents in scope, never the
+// unfiltered fleet. This is the concrete regression test for the finding: a
+// bare perm_fn_/require_permission gate cannot produce this shape at all (it
+// is binary admit-unfiltered-or-deny), so a test that never exercises a
+// non-TOP gate can't tell the fixed gate from the old one.
+TEST_CASE("TAR device picker REST twins: group-scoped grant is ADMITTED and "
+          "filtered to exactly its VisibleSet, both surfaces",
+          "[tar][tree][routes][rest][security]") {
+    TarHarness h;
+    h.devices_list = {
+        DeviceRow{.agent_id = "dev-A", .hostname = "host-a", .os = "linux",
+                  .arch = "x86_64", .agent_version = "1.2.3", .online = true},
+        DeviceRow{.agent_id = "dev-B", .hostname = "host-b", .os = "windows",
+                  .arch = "arm64", .agent_version = "1.2.3", .online = true},
+    };
+    // A group-scoped-only grant: allow_read stays true (some grant admits),
+    // but the composed VisibleSet is narrowed to dev-A only — exactly what
+    // require_fleet_read would return for an operator whose Infrastructure:Read
+    // exists only via a management-group role assignment covering dev-A.
+    h.fleet_scope = std::vector<std::string>{"dev-A"};
+
+    auto tree = h.sink.Get("/api/v1/tar/process-tree");
+    REQUIRE(tree);
+    CHECK(tree->status == 200); // NOT 403 — the pre-fix behavior for this exact grant shape
+    auto tree_json = nlohmann::json::parse(tree->body, nullptr, false);
+    REQUIRE_FALSE(tree_json.is_discarded());
+    const auto& tree_devices = tree_json["data"]["devices"];
+    REQUIRE(tree_devices.size() == 1);
+    CHECK(tree_devices[0]["agent_id"] == "dev-A");
+
+    auto cap = h.sink.Get("/api/v1/tar/capture-sources");
+    REQUIRE(cap);
+    CHECK(cap->status == 200);
+    auto cap_json = nlohmann::json::parse(cap->body, nullptr, false);
+    REQUIRE_FALSE(cap_json.is_discarded());
+    const auto& cap_devices = cap_json["data"]["devices"];
+    REQUIRE(cap_devices.size() == 1);
+    CHECK(cap_devices[0]["agent_id"] == "dev-A");
+}
+
+TEST_CASE("TAR device picker REST twins: fleet_read_fn_ unwired fails closed (503, "
+          "not the pre-fix perm_fn_ path)",
+          "[tar][tree][routes][rest][security]") {
+    TarHarness h;
+    h.devices_list = {DeviceRow{.agent_id = "dev-A", .hostname = "host-a", .online = true}};
+    h.routes.set_fleet_read_fn(nullptr); // simulate a misconfigured call site
+
+    auto tree = h.sink.Get("/api/v1/tar/process-tree");
+    REQUIRE(tree);
+    CHECK(tree->status == 503);
+    CHECK(tree->body.find("dev-A") == std::string::npos);
+
+    auto cap = h.sink.Get("/api/v1/tar/capture-sources");
+    REQUIRE(cap);
+    CHECK(cap->status == 503);
+    CHECK(cap->body.find("dev-A") == std::string::npos);
 }
 
 // #4027 shared builders (api-twin-recipe.md Rule 1): pure, no route/store needed.

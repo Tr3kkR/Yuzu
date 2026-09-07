@@ -369,11 +369,18 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"}},"required":["agent_id","hostname","os","arch","agent_version"]}}},"required":["agents"]})j"},
 
     // ── #4027 API-parity read twins: TAR process-tree / capture-sources device
-    // pickers + retention-paused source list. Requires Infrastructure:Read (same
-    // gate as their REST/fragment siblings). Unlike list_agents' agents_fn (fleet-
-    // wide, no per-operator narrowing), these three read through the SAME
-    // operator-scoped provider (tar_devices_fn_) / DashboardRoutes gatherer their
-    // REST twins use — see set_tar_devices_fn/set_dashboard_routes (mcp_server.hpp).
+    // pickers + retention-paused source list. Requires Infrastructure:Read,
+    // enforced via fleet_read_fn_ (#4027 fix round, CDX-P1-01/K4 — the ADR-0017
+    // admit-then-filter chokepoint; SAME gate their REST twins use, NOT the two
+    // pre-existing HTML fragment siblings, which stay on the legacy bare
+    // require_permission gate this round — see tar_tree_routes.cpp's
+    // recorded-exception comments at their registration). Unlike list_agents'
+    // agents_fn (fleet-wide, no per-operator narrowing), these three read
+    // through the SAME operator-scoped provider (tar_devices_fn_) /
+    // DashboardRoutes gatherer their REST twins use — see
+    // set_tar_devices_fn/set_dashboard_routes (mcp_server.hpp) — with
+    // fleet_read_fn_'s own VisibleSet applied as an additional intersection
+    // filter on top (same rationale as the REST twins' comment).
     // GET /fragments/tar/process-tree/result and .../detail are DELIBERATELY NOT
     // twinned by #4027 (see tar_tree_routes.hpp's file comment) — no REST/MCP-only
     // path exists to mint their required pcmd/tcmd/token inputs today.
@@ -1890,8 +1897,15 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // Phase 1 read-only tools
     {"list_agents", {"Infrastructure", "Read"}},
     // #4027 — default (2-element) form, matching list_agents: service-scoped
-    // tokens are structurally denied at the generic C8 chokepoint, same as
-    // their REST twins' deny_fleet_wide_device_enumeration guard.
+    // tokens are structurally denied at the generic C8 chokepoint. #4027 fix
+    // round (CDX-P1-01/K4): the handlers below migrated from tier_allows+
+    // perm_fn to fleet_read_fn_ for the RBAC/management-group axis, but this
+    // C8 classification is DELIBERATELY UNCHANGED — parity with the two
+    // device-picker REST twins' deny_fleet_wide_device_enumeration guard and
+    // the retention twin's own explicit service-scope 403
+    // (dashboard_routes.cpp) — none of the six #4027 surfaces admits a
+    // service-scoped caller; this fix round closes the management-group gap
+    // only, never widens the service-scope one.
     {"list_tar_process_tree_devices", {"Infrastructure", "Read"}},
     {"list_tar_capture_sources_devices", {"Infrastructure", "Read"}},
     {"list_tar_retention_paused", {"Infrastructure", "Read"}},
@@ -5471,27 +5485,53 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             // ── #4027 read twins: TAR process-tree / capture-sources device
-            // pickers + retention-paused source list. All three: tier_allows +
-            // perm_fn (Infrastructure:Read, same as list_agents above), then the
-            // SAME shared builder their REST twin calls (api-twin-recipe.md Rule
-            // 1). Unaudited-on-success posture for the two device pickers would
-            // match their REST siblings, but every other MCP tool in this file
-            // (including list_agents just above) calls mcp_audit("success") as
-            // baseline MCP-transport access logging regardless of the REST-side
-            // audit decision — followed here for consistency rather than
-            // introducing a fourth posture into an already-three-posture table
+            // pickers + retention-paused source list. #4027 fix round
+            // (CDX-P1-01/K4): all three now gate SOLELY on fleet_read_fn_
+            // (require_fleet_read, the ADR-0017 admit-then-filter chokepoint),
+            // NOT the former tier_allows+perm_fn pair — fleet_read_fn_ already
+            // covers the MCP tier axis internally (authz_gates.cpp's
+            // mcp::tier_allows check precedes its RBAC branch), exactly mirroring
+            // query_installed_software's established migration a few hundred
+            // lines above ("fleet_read_fn_ is now the SOLE gate... no separate
+            // tier_allows/perm_fn call here"). Service-scoped tokens are
+            // unaffected by this migration — all three tools keep their default
+            // `ServiceScopeClass::denied` classification in kToolSecurityRows
+            // below, so the generic C8 chokepoint still denies them before this
+            // code is ever reached (parity with the REST retention twin's own
+            // explicit deny — see dashboard_routes.cpp). Then the SAME shared
+            // builder their REST twin calls (api-twin-recipe.md Rule 1), with
+            // gate.scope applied as an additional intersection filter — see the
+            // REST twins' own comment in tar_tree_routes.cpp for why this is an
+            // intersection with tar_devices_fn_'s/gather_tar_retention_paused's
+            // existing narrowing, not a replacement. Unaudited-on-success
+            // posture for the two device pickers would match their REST
+            // siblings, but every other MCP tool in this file (including
+            // list_agents just above) calls mcp_audit("success") as baseline
+            // MCP-transport access logging regardless of the REST-side audit
+            // decision — followed here for consistency rather than introducing
+            // a fourth posture into an already-three-posture table
             // (docs/api-twin-recipe.md §4). ──
             if (tool_name == "list_tar_process_tree_devices") {
-                if (!tier_allows(tier, "Infrastructure", "Read")) {
-                    res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
-                        "application/json");
+                if (!fleet_read_fn_) {
+                    spdlog::error("list_tar_process_tree_devices: fleet_read_fn_ unwired — "
+                                  "misconfigured call site; failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "Infrastructure", "Read"))
-                    return;
-                const std::vector<DeviceRow> devices =
+                auto gate = fleet_read_fn_(req, res, "Infrastructure", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the A4 error body + status
+                std::vector<DeviceRow> devices =
                     tar_devices_fn_ ? tar_devices_fn_(session->username) : std::vector<DeviceRow>{};
+                if (gate.scope) {
+                    std::vector<DeviceRow> visible;
+                    visible.reserve(devices.size());
+                    for (auto& d : devices)
+                        if (authz::in_scope(gate.scope, d.agent_id))
+                            visible.push_back(std::move(d));
+                    devices.swap(visible);
+                }
                 const std::string devices_json = tar_process_tree_frame_json(devices);
                 mcp_audit("success");
                 res.set_content(
@@ -5504,16 +5544,26 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             if (tool_name == "list_tar_capture_sources_devices") {
-                if (!tier_allows(tier, "Infrastructure", "Read")) {
-                    res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
-                        "application/json");
+                if (!fleet_read_fn_) {
+                    spdlog::error("list_tar_capture_sources_devices: fleet_read_fn_ unwired — "
+                                  "misconfigured call site; failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "Infrastructure", "Read"))
-                    return;
-                const std::vector<DeviceRow> devices =
+                auto gate = fleet_read_fn_(req, res, "Infrastructure", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the A4 error body + status
+                std::vector<DeviceRow> devices =
                     tar_devices_fn_ ? tar_devices_fn_(session->username) : std::vector<DeviceRow>{};
+                if (gate.scope) {
+                    std::vector<DeviceRow> visible;
+                    visible.reserve(devices.size());
+                    for (auto& d : devices)
+                        if (authz::in_scope(gate.scope, d.agent_id))
+                            visible.push_back(std::move(d));
+                    devices.swap(visible);
+                }
                 const std::string devices_json = tar_capture_sources_devices_json(devices);
                 mcp_audit("success");
                 res.set_content(
@@ -5526,14 +5576,16 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             if (tool_name == "list_tar_retention_paused") {
-                if (!tier_allows(tier, "Infrastructure", "Read")) {
-                    res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
-                        "application/json");
+                if (!fleet_read_fn_) {
+                    spdlog::error("list_tar_retention_paused: fleet_read_fn_ unwired — "
+                                  "misconfigured call site; failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "Infrastructure", "Read"))
-                    return;
+                auto gate = fleet_read_fn_(req, res, "Infrastructure", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the A4 error body + status
                 if (!dashboard_routes_) {
                     res.set_content(
                         a4_error(kInternalError, "TAR retention-paused surface unavailable",
@@ -5543,7 +5595,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const std::string payload = tar_retention_paused_json(
-                    dashboard_routes_->gather_tar_retention_paused(session->username));
+                    dashboard_routes_->gather_tar_retention_paused(session->username, gate.scope));
                 mcp_audit("success");
                 res.set_content(success_response(id, tool_result(payload, kObjectOutputSchema)),
                                 "application/json");

@@ -26,9 +26,13 @@
 ///
 /// REST + MCP twins (api-parity programme, issue #4027): `GET /api/v1/tar/process-tree`
 /// (device picker) and `GET /api/v1/tar/capture-sources` (device picker) are twinned
-/// here, over the SAME `Infrastructure:Read` gate + service-scoped-token guard as
-/// their fragment siblings, via the shared pure builders below (api-twin-recipe.md
-/// Rule 1). `GET /fragments/tar/process-tree/result` and `.../detail` are
+/// here, over the SAME `Infrastructure:Read` requirement + service-scoped-token guard
+/// as their fragment siblings, via the shared pure builders below (api-twin-recipe.md
+/// Rule 1) — but NOT the same gate primitive: the two REST twins (and their MCP
+/// counterparts) enforce that requirement via `fleet_read_fn_`, the ADR-0017
+/// admit-then-filter chokepoint (#4027 fix round, CDX-P1-01/K4), while the fragment
+/// siblings stay on the legacy bare `perm_fn_` this round (recorded exception — see
+/// each fragment route's own registration comment). `GET /fragments/tar/process-tree/result` and `.../detail` are
 /// DELIBERATELY NOT twinned by #4027 — scope, not impossibility. `/detail`'s
 /// cache `token` is a CSPRNG value minted and cached ONLY by `/result` itself
 /// (`cache_render_detail`/`ReconEntry`, principal-bound) — no other path mints
@@ -47,6 +51,7 @@
 
 #include <yuzu/server/auth.hpp>
 
+#include "authz_gates.hpp"     // yuzu::server::authz::FleetReadGate (#4027 fix round — CDX-P1-01/K4)
 #include "dex_routes.hpp"      // DexRoutes::ResponsesFn/AuditFn + DexAgentResponse
 #include "device_routes.hpp"   // DeviceRow
 #include "dispatch_caller.hpp" // DispatchCaller
@@ -142,16 +147,43 @@ std::string tar_retention_paused_json(const TarRetentionPausedScan& scan);
 ///
 /// #4027 adds two REST v1 twins registered by the SAME `register_routes` call:
 /// `GET /api/v1/tar/process-tree` and `GET /api/v1/tar/capture-sources`, both device
-/// picker lists gated identically to their fragment siblings (`Infrastructure:Read`
-/// + the service-scoped-token fleet-wide-enumeration guard, deduplicated into
+/// picker lists requiring `Infrastructure:Read` + the service-scoped-token
+/// fleet-wide-enumeration guard (deduplicated into
 /// `deny_fleet_wide_device_enumeration` below rather than left as two, now
-/// three-going-on-four, copies of the same inline check).
+/// three-going-on-four, copies of the same inline check) — same REQUIREMENT as
+/// their fragment siblings, but not the same gate PRIMITIVE: since the #4027 fix
+/// round (CDX-P1-01/K4) the REST twins enforce `Infrastructure:Read` via
+/// `fleet_read_fn_` (set post-registration, `set_fleet_read_fn`), the ADR-0017
+/// admit-then-filter chokepoint, while the fragment siblings stay on `perm_fn_`
+/// this round (recorded exception).
 class TarTreeRoutes {
 public:
     using AuthFn =
         std::function<std::optional<auth::Session>(const httplib::Request&, httplib::Response&)>;
     using PermFn = std::function<bool(const httplib::Request&, httplib::Response&,
                                       const std::string& securable_type, const std::string& op)>;
+    /// #4027 fix round (adversarial review CDX-P1-01/K4) — the ADR-0017
+    /// admit-then-filter chokepoint for the two REST device-picker twins
+    /// (`GET /api/v1/tar/process-tree`, `GET /api/v1/tar/capture-sources`),
+    /// injected the same way `DashboardRoutes::set_fleet_read_fn` /
+    /// `McpServer::set_fleet_read_fn` are (a post-`register_routes` setter,
+    /// not a constructor/`register_routes` param, so handlers read the
+    /// member live per request and a test fixture that never wires it fails
+    /// closed at the unwired-503 branch rather than failing to compile).
+    /// MUST be the SOLE authorization gate on a route it guards — never
+    /// stacked with `perm_fn_` for the same `(securable_type, operation)`
+    /// (see `AuthRoutes::require_fleet_read`'s own doc comment for why
+    /// pairing them is the exact bug this migration exists to fix). The two
+    /// pre-existing HTML fragment routes (`/fragments/tar/process-tree`,
+    /// `/fragments/tar/capture-sources`) deliberately stay on `perm_fn_` —
+    /// out of scope for this round; see the route-registration comment
+    /// where each fragment is registered.
+    using FleetReadFn =
+        std::function<authz::FleetReadGate(const httplib::Request&, httplib::Response&,
+                                           const std::string& securable_type,
+                                           const std::string& operation)>;
+    void set_fleet_read_fn(FleetReadFn fn) { fleet_read_fn_ = std::move(fn); }
+
     using ScopedPermFn =
         std::function<bool(const httplib::Request&, httplib::Response&,
                            const std::string& securable_type, const std::string& op,
@@ -247,6 +279,7 @@ private:
 
     AuthFn auth_fn_;
     PermFn perm_fn_;
+    FleetReadFn fleet_read_fn_; ///< #4027 fix round — see set_fleet_read_fn's doc comment.
     ScopedPermFn scoped_perm_fn_;
     DevicesFn devices_fn_;
     LookupFn lookup_fn_;

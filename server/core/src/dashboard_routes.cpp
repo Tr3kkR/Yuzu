@@ -1461,16 +1461,40 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
             });
 
     // -- REST v1 twin: same per-operator scan/paused-source list, JSON (#4027).
-    // Same gate + per-operator-scoped Cache-Control posture as the fragment above;
+    // Per-operator-scoped Cache-Control posture as the fragment above;
     // unaudited on the success path — scan/config metadata, not per-device
     // behavioral content (matches this fragment's own today-unaudited posture; see
     // docs/api-twin-recipe.md's list_software_deployments worked example for the
-    // same "metadata, not behavioral PII" reasoning). --
+    // same "metadata, not behavioral PII" reasoning).
+    //
+    // #4027 fix round (CDX-P1-01/K4): gate migrated from bare perm_fn_
+    // (require_permission — a GLOBAL grant check that 403s a management-group
+    // -scoped Infrastructure:Read holder before gather_tar_retention_paused
+    // ever runs) to fleet_read_fn_ (require_fleet_read, the ADR-0017
+    // admit-then-filter chokepoint) — same seam this class already wires for
+    // /fragments/results above. The explicit service-scoped-token 403 BELOW is
+    // deliberately kept even though fleet_read_fn_ would otherwise admit a
+    // correctly-confined service-scoped caller here: this route previously
+    // denied EVERY service-scoped token outright (perm_fn_'s empty
+    // kServiceScopeGlobalSafe default-deny), matching this tool's own
+    // list_tar_retention_paused MCP twin (C8 ServiceScopeClass::denied) and the
+    // two REST device-picker twins (deny_fleet_wide_device_enumeration) — this
+    // fix round repairs the management-group-scope gap, not a decision to
+    // widen service-token access on this one surface while its twins stay
+    // denied.
     sink.Get("/api/v1/tar/retention-paused",
             [this](const httplib::Request& req, httplib::Response& res) {
                 const auto cid = detail::make_correlation_id();
                 res.set_header("X-Correlation-Id", cid);
-                if (!perm_fn_(req, res, "Infrastructure", "Read")) {
+                auto session = auth_fn_(req, res);
+                if (!session) return; // auth_fn_ already wrote the A4 401 body
+                if (!session->token_scope_service.empty()) {
+                    res.status = 403;
+                    res.set_content(
+                        detail::a4_denial(
+                            res, 403,
+                            "service-scoped tokens may not read the fleet-wide retention scan"),
+                        "application/json");
                     if (metrics_) {
                         metrics_->counter("yuzu_tar_dashboard_view_total",
                                           {{"frame", "retention_rest"},
@@ -1478,13 +1502,28 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                     }
                     return;
                 }
-                auto session = auth_fn_(req, res);
-                if (!session) return;
+                if (!fleet_read_fn_) {
+                    spdlog::error("tar.retention_paused: fleet_read_fn_ unwired — "
+                                  "misconfigured call site; failing closed; cid={}", cid);
+                    res.status = 503;
+                    res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                    "application/json");
+                    return;
+                }
+                auto gate = fleet_read_fn_(req, res, "Infrastructure", "Read");
+                if (!gate.admitted) {
+                    if (metrics_) {
+                        metrics_->counter("yuzu_tar_dashboard_view_total",
+                                          {{"frame", "retention_rest"},
+                                           {"result", "denied"}}).increment();
+                    }
+                    return; // gate already wrote the A4 error body + status
+                }
                 // Per-operator scoped data — see the fragment route's UP-11 comment.
                 res.set_header("Cache-Control", "no-store, private");
                 res.set_header("Vary", "Cookie");
                 const TarRetentionPausedScan scan =
-                    gather_tar_retention_paused(session->username);
+                    gather_tar_retention_paused(session->username, gate.scope);
                 res.set_content(
                     std::string("{\"data\":") + tar_retention_paused_json(scan) +
                         ",\"meta\":{\"api_version\":\"v1\"}}",
@@ -2800,7 +2839,8 @@ std::string DashboardRoutes::render_scope_list(const std::string& selected,
 // renderer's empty-state branch, or the JSON builder) doesn't need the distinction,
 // only "was this data trustworthy."
 TarRetentionPausedScan
-DashboardRoutes::gather_tar_retention_paused(const std::string& username) const {
+DashboardRoutes::gather_tar_retention_paused(const std::string& username,
+                                             const authz::VisibleSet& extra_scope) const {
     TarRetentionPausedScan scan;
     {
         std::lock_guard<std::mutex> lk(tar_scan_mu_);
@@ -2880,7 +2920,13 @@ DashboardRoutes::gather_tar_retention_paused(const std::string& username) const 
         // Visibility gate: drop responses from agents the operator cannot
         // see. If mgmt_group_store_ is unavailable, fail closed (drop all
         // — operator sees an empty list rather than unscoped data).
-        if (!visible_set.contains(resp.agent_id)) {
+        // #4027 fix round: `extra_scope` (nullopt/TOP for the HTML fragment
+        // caller, `FleetReadGate::scope` for the REST/MCP twins) is ANDed in
+        // here — a row dropped by either axis counts toward
+        // `agents_filtered_out_of_scope` the same way, so the honesty
+        // counters never silently disagree with what `rows` actually holds.
+        if (!visible_set.contains(resp.agent_id) ||
+            !authz::in_scope(extra_scope, resp.agent_id)) {
             ++scan.agents_filtered_out_of_scope;
             continue;
         }
