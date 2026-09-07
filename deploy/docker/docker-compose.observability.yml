@@ -1,0 +1,36 @@
+# Observability overlay — wires docs/prometheus/yuzu-alerts.yml into a
+# running Prometheus so the shipped alert rules are actually evaluated by a
+# live system rather than only promtool fixtures (#2857).
+#
+# Usage (layer on top of the base UAT rig — do NOT run standalone, it has no
+# `services:` of its own beyond the override below):
+#   cd deploy/docker
+#   docker compose -f docker-compose.uat.yml -f docker-compose.observability.yml up -d
+#   docker compose -f docker-compose.uat.yml -f docker-compose.observability.yml config
+#     # confirm `rule_files:` + the rules mount are present in the merged
+#     # prometheus service before trusting `up -d` above.
+#
+# What this does: replaces the `prometheus` service's config-file mount
+# (same container-internal target path, ../prometheus/prometheus-uat.yml ->
+# prometheus-observability.yml, which is prometheus-uat.yml's scrape_configs
+# plus `rule_files:`) and adds a second mount publishing
+# docs/prometheus/yuzu-alerts.yml read-only into the rules glob Prometheus
+# already watches.
+#
+# Scope: only docker-compose.uat.yml is overlaid today. The same two-line
+# addition applies to docker-compose.full-uat.yml (its own
+# prometheus-full-uat.yml + a matching overlay service) — not done here
+# pending a decision on whether full-uat needs its own overlay file or
+# should share this one via a second `docker compose -f` layer; see the
+# question left in docs/enterprise-readiness-soc2-first-customer.md WS-D.
+#
+# Out of scope, tracked as follow-ups (see #2857): an Alertmanager (the
+# `severity:` labels below still route nowhere without one) and a version
+# marker/checksum on yuzu-alerts.yml so a deployed copy's drift from the
+# shipped file is detectable.
+
+services:
+  prometheus:
+    volumes:
+      - ./prometheus-observability.yml:/etc/prometheus/prometheus.yml:ro
+      - ../../docs/prometheus/yuzu-alerts.yml:/etc/prometheus/rules/yuzu-alerts.yml:ro

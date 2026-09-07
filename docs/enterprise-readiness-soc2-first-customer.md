@@ -69,7 +69,7 @@ Yuzu has strong product depth (agent/server/gateway architecture, RBAC, policy e
 - Enforce OIDC SSO for production admin access.
 - Disable local-password fallback in hardened mode (or tightly constrain break-glass account policy).
 - Add **2FA/TOTP for high-risk approvals** (aligned with roadmap hardening).
-- Session management controls: revocation **shipped** (`DELETE /api/v1/sessions` admin force-logout, `DELETE /api/v1/sessions/me` self-revoke including API tokens; audit actions `session.revoke_all` / `session.revoke_all.self`; Prometheus counter `yuzu_auth_sessions_revoked_total`). Expiration in place via the existing 8-hour cookie max-age. Inactivity timeout and explicit secure-cookie-attribute review remain open.
+- Session management controls: revocation **shipped** (`DELETE /api/v1/sessions` admin force-logout, `DELETE /api/v1/sessions/me` self-revoke including API tokens; audit actions `session.revoke_all` / `session.revoke_all.self`; Prometheus counter `yuzu_auth_sessions_revoked_total`). Expiration in place via the existing 8-hour cookie max-age. **Inactivity (idle) timeout — shipped** (`--session-inactivity-secs`, sliding idle anchor durably mirrored to the session store — `session_store.hpp` `last_activity_ms`, surviving restart/replica failover; `docs/security-reviews/inactivity-timeout-2026-06-30.md`). **Secure cookie attributes — shipped**: every session cookie is set with `HttpOnly; SameSite=Lax`, plus `Secure` whenever HTTPS is enabled (`AuthRoutes::session_cookie_attrs`, `server/core/src/auth_routes.cpp:1299-1305`) — verified directly in code (2026-09-07); no standalone dedicated security-review document exists for this specific attribute set the way one does for the inactivity timeout, so cite the code + `docs/auth-architecture.md` rather than a review doc that doesn't exist.
 - API token governance: scoped permissions, expiration defaults, rotation process, token inventory.
 - **Residual (#1836):** OIDC IdP-group→RBAC deprovisioning (#1832) propagates on the user's **next SSO login**, not immediately on IdP-side group removal — a live session/cookie or an already-issued token retains its prior roles until re-authentication. Session revocation (above) is the operator's manual mitigation in the interim; automatic mid-session role re-check is tracked in #1836.
 - **UCE surface (forward ref):** the use-case-engine host inherits SSO transitively through this server's OIDC (`docs/uce-host-requirements.md` §4.6/NF-9 — Yuzu-as-identity-provider). This **doubles #1836's blast surface**: a stale IdP group also gates UCE artifact-minting until the operator's Yuzu session is force-revoked or the ≤5-min artifact TTL / NF-9(d) liveness floor expires, and it adds a second login-event stream **outside** the server's audit perimeter (`uce-host-requirements.md` NF-6). An access-control reviewer working from this section must follow NF-9 for the second surface.
@@ -287,6 +287,29 @@ gate. Credit affirmatively as a CC6.1/CC6.3 control now, citing
 
 - Monitoring dashboards, incident tickets/postmortems, backup logs, restore drill reports.
 
+**Status (2026-09-07).** SLO definitions for the five required signals
+(server-listener availability, command dispatch latency, agent heartbeat
+freshness, audit write success, PostgreSQL substrate degrade events) —
+each backed by a metric verified present in the codebase and, where one
+ships, the exact Prometheus alert that pages on it: `docs/ops-runbooks/slo.md`.
+A first backup/restore drill has been **executed** (not merely documented)
+against the `pg_dump`/`pg_restore`/`tar` procedure already in
+`docker-compose.reference.yml`'s header, with measured RTO (42s, this run)
+and an explicit RPO framing (= backup cadence — see the gap below), plus a
+post-restore row-count and audit-chain integrity check:
+`docs/ops-runbooks/restore-drill-2026-09.md`. That drill surfaced two
+concrete gaps carried forward rather than closed: **(1) no scheduled backup
+job exists** (the procedure is a documented manual/scriptable command, not
+a cron/systemd-timer unit), and **(2) `docs/prometheus/yuzu-alerts.yml`'s
+61 alert rules were, until this change, evaluated by no shipped Prometheus
+stack at all** — closed for the UAT rig by the new
+`deploy/docker/docker-compose.observability.yml` overlay (issue #2857;
+`promtool check rules` passes, `docker compose ... config` confirms the
+rules load). The Alertmanager-routing and alerts-file-checksum halves of
+#2857 remain open follow-ups, not addressed by this change. Incident
+response lifecycle and capacity plans for 1k/5k/10k+ agents remain
+undocumented — not addressed by this change, still open.
+
 ---
 
 ## 3.5 Workstream E — Data Governance and Privacy
@@ -499,11 +522,29 @@ The DEX read model (`guardian_observations` + the `/dex` dashboard) is the first
 
 ### Deliverables
 
-- Security whitepaper and architecture overview.
-- Standard CAIQ-style questionnaire responses.
-- Pen-test executive summary and remediation statement.
-- DPA/security addendum templates.
-- Shared responsibility matrix (vendor vs customer responsibilities).
+- **Security whitepaper and architecture overview — shipped 2026-09-07:**
+  `docs/assurance/security-whitepaper.md`. Every section cites the doc it
+  summarises; sections 5, 8, and 9 explicitly flag the controls that are
+  planned rather than shipped (second-replica HA, direct `/readyz` probe,
+  scheduled backups, MCP session concept) rather than presenting them as
+  live.
+- **Standard CAIQ-style questionnaire responses — external input, not yet
+  started.** Requires a CSA CAIQ template and someone to answer it against
+  the whitepaper/matrix above; propose filing a tracking issue ("CAIQ
+  questionnaire response set") rather than treating this bullet as closed by
+  the whitepaper alone.
+- **Pen-test executive summary and remediation statement — external input,
+  not yet started.** Requires a contracted third-party penetration test;
+  propose filing a tracking issue ("Contract + execute first third-party
+  pen-test") — nothing in this repo substitutes for one.
+- **DPA/security addendum templates — external input, not yet started.**
+  Requires counsel; propose filing a tracking issue ("Draft DPA/security
+  addendum templates") rather than attempting a legal template from this
+  codebase.
+- **Shared responsibility matrix (vendor vs customer responsibilities) —
+  shipped 2026-09-07:** `docs/assurance/shared-responsibility-matrix.md`,
+  split three ways (Yuzu / operator / infrastructure provider), each row
+  cited.
 - Forward pointer: the MCP surface gains a session concept (in-memory only, principal-bound ≥128-bit ids, TTL/caps, revocation cuts live streams) via ADR-1005 execution-plan Decision 15 / track 2f — fold its security pre-commitments into the questionnaire/whitepaper once 2f ships.
 - Forward pointer: track 2g (ADR-1005 Decision 16, `docs/agentic-first-principle.md` A5) delivers a near-fully self-describing MCP tool/resource surface — typed schemas, truthful safety annotations, a handshake orientation blob, and OpenAPI/scope-DSL specs discoverable via `resources/list` rather than tool-by-tool, with one narrow tracked residual (streamed-final fallback envelope, #2990 — `retry_after_ms` closed 2026-08 by #3344). Cite this in the security whitepaper / CAIQ responses as evidence of a machine-verifiable, not merely documented, agentic contract — a differentiator against peers whose AI integrations (if any) are undocumented or prose-only; disclose the residuals rather than overclaiming completeness to a technical reviewer.
 - Known-limitations disclosure (#3481, gov Gate 6 enterprise-readiness, 2026-08-24): two tracked, filed, non-blocking `ProductPackStore` residuals worth surfacing in a technical security/reliability review rather than presenting only as public GH issues — #3523 (two concurrent installs of an identical product-pack bundle can cross-couple a `Policy` to an unrelated pack's `Fragment`; no attacker required, an automation/GitOps race is sufficient) and #3524 (a large duplicate-item-id bundle drives an unbounded, synchronous compensation pass over sibling-store locks — a `ProductPack:Write`-privileged-caller resource-exhaustion question a CAIQ-style review would reasonably ask). Both are data-integrity/availability class, not credential/RCE; neither derived BLOCKING under this repo's severity schema.
