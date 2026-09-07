@@ -209,6 +209,27 @@ TEST_CASE("capability catalogue: every Destructive row is Irreversible unless ex
     }
 }
 
+/// Exact-row pin for `autoruns` (P15 Arbiter action). Both its actions are
+/// ReadOnly/None with no Destructive row to protect via the allowlist above,
+/// so this pins their classification directly, the same way
+/// `kReversibleDestructive` protects `power_health.set_power_plan`'s fields
+/// from a silent future change.
+TEST_CASE("capability catalogue: autoruns.list and autoruns.catalog pin their exact "
+          "classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_autoruns();
+    for (const auto action : {"list", "catalog"}) {
+        const auto it =
+            std::find_if(rows.begin(), rows.end(), [&](const auto& r) { return r.action == action; });
+        REQUIRE(it != rows.end());
+        CHECK(it->dispatch_class == DispatchClass::ReadOnly);
+        CHECK(it->mutability == Mutability::None);
+        CHECK(it->securable == "Security");
+        CHECK(it->operation == authz::Operation::Read);
+        CHECK(it->execute_gate == ExecuteGate::None);
+    }
+}
+
 TEST_CASE("capability catalogue: system_reserved is true only for core_dispatch_capabilities.hpp "
           "rows",
           "[server][dispatch][capability]") {
