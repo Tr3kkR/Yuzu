@@ -857,13 +857,17 @@ AuthManager::recheck_role_after_credential_check(const std::string& username, Ro
         return std::nullopt; // removed while the re-verify read was in flight
     if (it->second.role_version != version_before_reread) {
         // Gate 8 re-review (security-guardian, #4020 third round): a THIRD
-        // write landed while we were re-verifying - `reread` is itself now
-        // superseded, the identical shape as the defect this whole re-verify
-        // exists to close, one level deeper. Unlike the case-2 hot-path gap
-        // (disclosed, not fixed - re-verifying there costs every login a
-        // second DB round-trip), this branch is already on the rare,
-        // post-divergence path, so failing closed here is nearly free and
-        // avoids ever relaying a value this call cannot prove is current.
+        // write's CACHE half landed while we were re-verifying - `reread` is
+        // itself now superseded, the identical shape as the defect this
+        // whole re-verify exists to close, one level deeper. This branch is
+        // already on the rare, post-divergence path, so failing closed here
+        // is nearly free. NOTE (advisor catch, same round): this does NOT
+        // close the sub-window in full - a third writer whose DB commit
+        // landed here but who has NOT YET reached its own mu_ (so
+        // role_version hasn't moved) is still invisible to this check and
+        // falls through to the write below, same class as the case-2 gap,
+        // just narrowed to this function's own reread-to-relock span instead
+        // of the whole pre-lock window. See the header doc.
         // The caller (authenticate()/verify_password()) denies on nullopt,
         // same as the entry-vanished case above; a legitimate concurrent
         // login simply retries.

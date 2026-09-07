@@ -1031,38 +1031,46 @@ private:
     ///    same-process demote had already committed, surviving that demote's
     ///    own session-invalidation sweep; the intermediate (cache-trusting)
     ///    fix could relay a DIFFERENT call's stale read instead. If a THIRD
-    ///    write lands while this re-verify is itself in flight (detected by
-    ///    re-checking `role_version` once more after the re-read), this
-    ///    function fails closed (`nullopt`) rather than returning the
-    ///    now-also-superseded re-read - that branch is already on the rare,
-    ///    post-divergence path, so failing closed there is nearly free,
-    ///    unlike the case below.
+    ///    write's CACHE half lands while this re-verify is itself in flight
+    ///    (detected by re-checking `role_version` once more after the
+    ///    re-read), this function fails closed (`nullopt`) rather than
+    ///    returning the now-also-superseded re-read - that branch is already
+    ///    on the rare, post-divergence path, so failing closed there is
+    ///    nearly free. That check does NOT fully close this sub-window
+    ///    though (advisor catch, same round as the fix): a third writer whose
+    ///    DB commit landed here but who has not yet reached its OWN `mu_` -
+    ///    so `role_version` hasn't moved - is still invisible to it, and this
+    ///    call still writes+returns its (by then stale) re-read. Same defect
+    ///    class as the case-2 residual below, just narrowed to this
+    ///    function's own re-read-to-relock span (a single unlocked DB call
+    ///    plus one uncontended mutex acquisition) instead of the whole
+    ///    pre-lock window spanning back to before PBKDF2.
     ///
-    ///    Still open, same class, narrower: the case-2 branch above (no
-    ///    version divergence observed) - a racing writer's DB commit can land
-    ///    in this call's own read-to-lock window without yet reaching ITS OWN
-    ///    lock, so the version counter shows no change and this call still
-    ///    trusts its own now-stale `db_user->role`. Not closed, and NOT
-    ///    closeable by "just re-read again": an authdb re-review (Gate 8,
-    ///    #4020 third round) caught this fix's own doc text overclaiming that
-    ///    an unconditional second read would close it at the cost of a round
-    ///    trip - false. Any read-then-lock check has its OWN read-to-lock
-    ///    window, and a writer whose commit lands there without yet reaching
-    ///    its own lock is invisible to the version compare regardless of how
-    ///    many times the read is repeated (case 3's re-read narrows this to a
-    ///    single local-mutex-acquisition-wide window, which is why it's
-    ///    closeable there and this branch's much wider one - spanning back to
-    ///    before PBKDF2 - is not, without also restructuring the read
-    ///    timing). Full closure needs an actual serialization primitive (a DB
-    ///    row lock or CAS held across both the read and the write), not more
-    ///    reads. A session minted this way carries the stale role for its
-    ///    FULL LIFETIME, not one request - `validate_session` performs no
-    ///    per-request re-verification, and the demote's own session sweep
-    ///    (`update_role`'s `std::erase_if(sessions_, ...)`) runs before this
-    ///    session even exists, so it cannot catch it either. Tracked as
-    ///    issue #4107, disposition (fix vs. accept) pending review by someone
-    ///    other than this fix's author, per this project's standing rule
-    ///    against self-authored risk acceptance on a HIGH-derived finding.
+    ///    Still open, same class, wider: the case-2 branch above (no version
+    ///    divergence observed) - a racing writer's DB commit can land in this
+    ///    call's own read-to-lock window without yet reaching ITS OWN lock,
+    ///    so the version counter shows no change and this call still trusts
+    ///    its own now-stale `db_user->role`. Neither this branch nor case-3's
+    ///    narrower instance above is closeable by "just re-read again": an
+    ///    authdb re-review (Gate 8, #4020 third round) caught an earlier
+    ///    draft of this doc overclaiming that an unconditional second read
+    ///    would close case-2 at the cost of a round trip - false. ANY
+    ///    read-then-lock check has its own read-to-lock window, and a writer
+    ///    whose DB commit lands there without yet reaching its own lock is
+    ///    invisible to the version compare no matter how many times the read
+    ///    is repeated; only the WIDTH of that window shrinks. Full closure
+    ///    needs an actual serialization primitive (a DB row lock or CAS held
+    ///    across both the read and the write), not more reads. A session
+    ///    minted via either gap carries the stale role for its FULL LIFETIME,
+    ///    not one request - `validate_session` performs no per-request
+    ///    re-verification, and the demote's own session sweep (`update_role`'s
+    ///    `std::erase_if(sessions_, ...)`) runs before this session even
+    ///    exists, so it cannot catch it either. Both instances tracked as
+    ///    issue #4107 (scoped to the actual remedy - a serialization
+    ///    primitive - not the refuted "read again" one), disposition (fix vs.
+    ///    accept) pending review by someone other than this fix's author, per
+    ///    this project's standing rule against self-authored risk acceptance
+    ///    on a HIGH-derived finding.
     ///    The cross-replica case (a demotion committed on a DIFFERENT server,
     ///    invisible to this process's local version counter) is a separate,
     ///    harder residual, not closed here either.
@@ -1070,6 +1078,19 @@ private:
     ///    the same window): returns `std::nullopt` (fail closed) rather than
     ///    the stale pre-removal role - the account cannot be confirmed active
     ///    right now, so the caller denies rather than mints a session for it.
+    ///
+    /// PRE-EXISTING CALLER-SIDE NOTE (present since the original C1 fix,
+    /// disclosed here not fixed): every `nullopt` this function returns,
+    /// including both fail-closed race paths above, is indistinguishable
+    /// from a genuine bad password to `verify_password`'s REST caller
+    /// (`auth_routes.cpp`), which counts ANY `nullopt` toward the account
+    /// lockout threshold (`AuthDB::record_failed_login`). Several concurrent
+    /// LEGITIMATE logins racing one of these paths could each count as a
+    /// failed attempt. Distinguishing "denied by a detected race, retry" from
+    /// "wrong password" would need a richer return type than
+    /// `std::optional<Role>` threaded through both callers - out of scope for
+    /// this fix, not tracked as its own issue (same shape as an already-
+    /// shipped, already-approved case).
     ///
     /// `context` is the log-message prefix ("Auth failed" / "verify_password
     /// failed") so both callers keep their existing distinct wording. Caller
