@@ -1311,28 +1311,35 @@ public:
                               {"reason", std::string(yuzu::server::kReasonBodyType)}});
         }
         // #3685: Destructive-class targeting refusal. Seeded on `command`
-        // (REST `/api/command`) and `mcp` (MCP `execute_instruction`, both
+        // (REST `/api/command`), `mcp` (MCP `execute_instruction`, both
         // the C8 pre-mint gate and the main-handler backstop share this one
-        // label — mutually exclusive per request, so no double-count) —
-        // deliberately NOT `instruction_execute`: that route has no
-        // Destructive gate yet (tracked as a residual parity follow-up), and
-        // seeding it here would publish a series claiming a reachability
-        // that does not exist, which is exactly what the per-route seeding
-        // above exists to avoid.
+        // label — mutually exclusive per request, so no double-count),
+        // `dashboard`, and — since Wave 7 PR7.2's BR-001 fix wired
+        // `evaluate_destructive_targeting` into `/api/instructions/{id}/execute`
+        // (workflow_routes.cpp) — `instruction_execute` too (the exclusion
+        // this comment used to state, "that route has no Destructive gate
+        // yet", is stale: it does now; BR3-002, round-3 branch review).
+        // `workflow` (BR3-001, same round-3 branch review): the SAME
+        // evaluate_destructive_targeting call, now run as a whole-request
+        // preflight over every step of `/api/workflows/{id}/execute` before
+        // WorkflowEngine::execute() is invoked at all — a genuinely NEW
+        // emission point, not a relabeling of the per-step dispatch_fn refusal
+        // BR2-001 already gated (that refusal has no metrics/audit_fn/req
+        // access and stays a silent failed-step result by construction).
         // "dashboard" seeded alongside the other two (PR6.0b): a series created
         // only on first use reads as ABSENT until the first refusal, which is
         // exactly the absent()-alerting break the single-array discipline exists
         // to prevent -- and three docs tell operators to alert on this series.
-        for (const char* route : {"command", "mcp", "dashboard"})
+        for (const char* route : {"command", "mcp", "dashboard", "instruction_execute", "workflow"})
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                              {{"route", route},
                               {"reason", std::string(yuzu::server::kReasonDestructiveUntargeted)}});
-        // Wave 7 PR7.2: the Forensics single-target refusal — same three
-        // routes as its Destructive sibling above, since
-        // `evaluate_destructive_targeting` is called generically for any
-        // classified capability on all three (a Forensics row is never
-        // Destructive, but reaches the same gate).
-        for (const char* route : {"command", "mcp", "dashboard"})
+        // Wave 7 PR7.2: the Forensics single-target refusal — same routes as
+        // its Destructive sibling above, since `evaluate_destructive_targeting`
+        // is called generically for any classified capability on all of them
+        // (a Forensics row is never Destructive, but reaches the same gate).
+        // `workflow` added alongside BR3-001 above.
+        for (const char* route : {"command", "mcp", "dashboard", "instruction_execute", "workflow"})
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                              {{"route", route},
                               {"reason", std::string(yuzu::server::kReasonForensicUntargeted)}});
