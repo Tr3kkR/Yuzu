@@ -3771,7 +3771,7 @@ properties."
 ```
 
 **Response:** a flat, unwrapped body — this legacy route family predates the `data`/`meta` v1
-envelope and has not been migrated onto it (tracked: #4079).
+envelope and has not been migrated onto it.
 
 ```json
 {
@@ -3806,9 +3806,10 @@ is unchanged). A degraded
 confinement check (management-group store unavailable) denies with `403`, distinct from the `503`
 below for a degraded properties-store write.
 
-**Request body:** `type` is optional (default `"string"`) and only meaningful when the value must
-be re-typed on a future read; the write itself does not persist a per-property type beyond what a
-matching schema (below) validates against.
+**Request body:** `type` is optional (default `"string"`) and IS persisted, but a schema on this
+key (below) takes precedence — if one exists, its own `type` overrides whatever the request sent
+before the write, so the stored (and later `GET`-returned) `type` reflects the caller's value only
+when no schema is registered for the key.
 
 ```json
 {
@@ -3817,7 +3818,7 @@ matching schema (below) validates against.
 }
 ```
 
-**Response:** flat, unwrapped (same family caveat as `GET` above, #4079).
+**Response:** flat, unwrapped (same family caveat as `GET` above).
 
 ```json
 {
@@ -3867,7 +3868,7 @@ confinement check (management-group store unavailable) denies with `403` -- dist
 degrade conflation noted below, which is a property-store issue on the delete path itself, not the
 authorization check.
 
-**Response:** flat, unwrapped (same family caveat as `GET`/`PUT` above, #4079).
+**Response:** flat, unwrapped (same family caveat as `GET`/`PUT` above).
 
 ```json
 {
@@ -3898,7 +3899,7 @@ distinguishable `503`), this route's underlying `list_schemas` was deliberately 
 it's an admin-surface read, not scope/dispatch-feeding, matching `custom_properties_store.hpp`'s
 documented posture — so this stays a tracked gap rather than a fixed one.
 
-**Response:** flat, unwrapped (same family caveat as the agent-properties routes above, #4079).
+**Response:** flat, unwrapped (same family caveat as the agent-properties routes above).
 
 ```json
 {
@@ -3954,7 +3955,7 @@ Create or update a property schema. If a schema with the given key already exist
 | `description` | string | No | Free-text description |
 | `validation_regex` | string | No | RE2 pattern (max 256 chars) values must fully match; empty = no pattern constraint |
 
-**Response (201):** flat, unwrapped (same family caveat as the routes above, #4079) -- echoes the
+**Response (201):** flat, unwrapped (same family caveat as the routes above) -- echoes the
 stored schema back, including any server-applied default (`type` defaults to `"string"` if
 omitted).
 
