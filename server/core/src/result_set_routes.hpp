@@ -101,10 +101,16 @@
 ///     exists yet). `QuotaExceeded`/`TooManyMembers` additionally increment
 ///     `yuzu_result_set_quota_rejected` (guarded on `deps.metrics` being
 ///     non-null — see the Deps::metrics doc comment).
-///   - pin/unpin/delete/create SUCCESS: all four audit `"success"`, set
-///     `HX-Trigger: resultSetsChanged`, and re-render fresh state (detail
-///     pane for pin/unpin, the empty detail pane for delete, the sidebar
-///     for create).
+///   - pin/unpin/delete/create SUCCESS: all four audit `"success"` first, but
+///     `HX-Trigger: resultSetsChanged` is NOT uniformly guaranteed after
+///     that. Delete and create set it unconditionally. Pin/unpin delegate
+///     to the shared `rs_detail_after` closure, which does a SECOND
+///     `rs_get_owned` read post-mutation to build the fresh detail pane —
+///     if that re-read fails (a transient ADR-0036 DbError, or a
+///     concurrent delete racing the just-completed pin/unpin), it renders
+///     `detail_empty()` and returns BEFORE the `HX-Trigger` line, so the
+///     audit row says "success" but the sidebar never reloads. Pre-existing
+///     (verbatim), not introduced by this move (governance Gate 2 finding).
 ///   - GET sidebar/detail: never audited (pure reads), matching every prior
 ///     extraction's read/write audit split.
 ///

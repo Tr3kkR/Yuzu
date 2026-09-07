@@ -15,10 +15,15 @@
 ///     the scoped-deny gate, before the store is touched), and the
 ///     documented THREE-WAY null-store degrade asymmetry (see
 ///     result_set_routes.hpp's header comment) all run WITHOUT Postgres.
-///   - The CRUD round trips, the ownership-fold behaviour (ADR-0036 —
-///     not-found / not-owned / DbError all collapse to the same "empty"
-///     render), and the per-mutation audit/toast asymmetries (pin's
-///     PinLimit-vs-failure split, delete's unaudited failure) are `[pg]`,
+///   - The CRUD round trips, the ownership-fold behaviour (ADR-0036 — only
+///     the not-found and not-owned legs of `rs_get_owned`'s three-way fold
+///     are exercised below; the third leg, a genuine DbError from `get()`
+///     itself, is NOT independently tested here -- the DROP-TABLE case
+///     further down forces a DbError through `create_materialized` instead,
+///     a different store method `rs_get_owned` never calls, so it does not
+///     cover this fold's DbError branch), and the per-mutation audit/toast
+///     asymmetries (pin's PinLimit-vs-failure split, delete's unaudited
+///     failure) are `[pg]`,
 ///     gated behind YUZU_TEST_POSTGRES_DSN via a pre-migrated
 ///     PgTestTemplate shared with test_result_set_store.cpp (same "resultset"
 ///     template key — see that file's `result_set_tpl` doc comment on why
