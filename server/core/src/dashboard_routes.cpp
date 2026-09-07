@@ -1489,12 +1489,21 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 auto session = auth_fn_(req, res);
                 if (!session) return; // auth_fn_ already wrote the A4 401 body
                 if (!session->token_scope_service.empty()) {
+                    // #4027 fix round 2 (adversarial review CDX-P2-08): the
+                    // gate this replaced (perm_fn_/require_permission) audited
+                    // this exact denial via AuthRoutes::audit_log (its
+                    // service-scope default-deny branch, auth_routes.cpp). This
+                    // explicit check must not silently drop that durable
+                    // evidence row — a metric alone carries no principal/request
+                    // detail and cannot serve as audit evidence.
                     res.status = 403;
                     res.set_content(
                         detail::a4_denial(
                             res, 403,
                             "service-scoped tokens may not read the fleet-wide retention scan"),
                         "application/json");
+                    audit_fn_(req, "tar.retention_paused.view", "denied", "Infrastructure", "",
+                             "service-scoped token denied fleet-wide retention scan read");
                     if (metrics_) {
                         metrics_->counter("yuzu_tar_dashboard_view_total",
                                           {{"frame", "retention_rest"},
