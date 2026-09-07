@@ -421,7 +421,12 @@ TEST_CASE("result_set_routes: create's device_ids parsing is unreachable "
                          "application/x-www-form-urlencoded");
     REQUIRE(r);
     CHECK(r->status == 413);
-    CHECK(h.audits.empty()); // rejected before the handler ever runs
+    // Pin "rejected before the handler ever runs" directly, not just via
+    // audits.empty() -- that alone would also pass if the handler ran and
+    // hit its own null-store early return (Gate 4 happy-path finding).
+    CHECK_FALSE(h.deny_scoped_fn_called);
+    CHECK_FALSE(h.auth_fn_called);
+    CHECK(h.audits.empty());
 }
 
 // NOTE ON THE TWO create_materialized ERROR KINDS THIS SUITE DOES NOT
