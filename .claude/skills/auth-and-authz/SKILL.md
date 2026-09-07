@@ -42,8 +42,9 @@ skill claims anything is "done."
 | Capability | Status | Source of truth |
 |---|---|---|
 | Local password auth (PBKDF2-SHA256) | Shipped (v0.10) | `auth.cpp:69` `pbkdf2_sha256()` (OpenSSL `PKCS5_PBKDF2_HMAC` + BCrypt path) |
-| Persistent auth store (`auth.db`, SQLite) | Shipped (v0.12) | `auth_db.cpp:222-236` chmod 0600 + L402 `MigrationRunner::run`; agent-doc `.claude/agents/authdb.md` |
+| Persistent auth store — **Postgres, schema `auth`** (SQLite `auth.db` retired) | Shipped (v0.12 SQLite → migrated to PG, ADR-0006) | `auth_db.cpp` born-on-Postgres `AuthDB(pg::PgPool&, pg::SecretCodec&)`, `pg::PgMigrationRunner::run(lease, "auth", …)`; `mfa_totp_secret` is a `SecretCodec` envelope column (ADR-0010 first consumer); agent-doc `.claude/agents/authdb.md` |
 | Session-cookie auth (HTMX dashboard) | Shipped | `auth_routes.cpp:43,386` (`extract_session_cookie`, `Set-Cookie: yuzu_session=…`) |
+| Durable operator sessions — Postgres `SessionStore` (HA WS-1/1a, ADR-2002 §4) | Shipped | `session_store.{hpp,cpp}` (schema-migrated PG store, authoritative); `AuthManager` write-through with the in-memory `sessions_` map as a **generation-gated validate cache**; DB-clock authority (#3715) — durable timestamps authored from Postgres `now()`, adjudicated on a local monotonic `steady_clock` deadline via `derive_session_deadlines`. A session survives replica restart/failover and validates identically on any replica. |
 | API tokens — Bearer + `X-Yuzu-Token` | Shipped | `api_token_store.cpp` (store); both header forms parsed at `auth_routes.cpp:108-119` |
 | Owner-scoped token revocation (#222) | Shipped | `rest_api_v1.cpp:1058-1082` (owner-vs-admin check at L1060) |
 | Granular RBAC — 7 roles (adds `Reviewer`, access-review attestation) × **23** securable types × **8** ops (adds `Attest`, gated via the dedicated `AccessReview` securable — NOT `AuditLog`; the rationale lives in **#2324**, the access-reviews PR, not #2225, which is the governance-gate-check PR that ran alongside it — and `Rotate`, P2 #11 SOC 2 CC6.3, ApiToken-specific self-service human-token rotation, seeded only to `Administrator`/`ApiTokenManager`, deliberately distinct from `Write`) | Shipped (Phase 3 + P2 #11) | `rbac_store.cpp:260-295,397` — types: Infrastructure, UserManagement, InstructionDefinition, InstructionSet, Execution, Schedule, Approval, Tag, AuditLog, Response, ManagementGroup, ApiToken, Security, Policy, DeviceToken, SoftwareDeployment, License, FileRetrieval, GuaranteedState, Inventory, AccessReview, SoftwareLicensing, EnginePrincipal (#2376 — cut away from the over-broad Security:Read); ops: Read/Write/Execute/Delete/Approve/Push/Attest/Rotate |
@@ -62,7 +63,7 @@ skill claims anything is "done."
 | Metrics endpoint localhost-only-no-auth | Shipped | `server.cpp:1621` (loopback always unauthenticated; remote behavior toggled by `cfg.metrics_require_auth`) |
 | Account lockout after N failed local-password logins | Shipped (SOC 2 CC6.3) | `auth.db` v3 columns + `AuthDB::lockout_status`/`record_failed_login`/`clear_failed_logins` (`auth_db.cpp`); `POST /login` pre-check + record/clear (`auth_routes.cpp`); admin unlock `POST /api/v1/users/<name>/unlock` (`rest_api_v1.cpp`); `--auth-lockout-threshold`/`--auth-lockout-window-secs` (`main.cpp`). Generic-401 (no enum/oracle), auto-expiring window, audit `auth.lockout.applied`/`.cleared`. Ref: `docs/auth-architecture.md` "Account lockout". |
 | MFA / TOTP — full ladder (enrollment + login challenge + recovery codes; step-up on 11 high-risk surfaces; enforcement modes + OIDC `amr` short-circuit + login-time enrollment bootstrap) | Shipped (v0.12–v0.13, SOC 2 CC6.6) | `server/core/src/totp.{hpp,cpp}` (RFC 6238 + base32); `AuthDB::mfa_*` accessors; `POST /login` 202-branches + `POST /login/mfa`, `/login/mfa/stepup`, `/login/mfa/enroll` at `auth_routes.cpp`; `require_mfa_step_up` + `amr_asserts_mfa` at `mfa_step_up.{hpp,cpp}`; `--mfa-enforcement` at `main.cpp`; Settings panel + self-target disable guard at `settings_routes.cpp`. Remaining: at-rest TOTP-secret encryption — **mechanism decided by ADR-0010** (SecretCodec envelope encryption at the `auth` store's Postgres migration; the `auth_kv` scaffolding will NOT be used). Full reference: `docs/auth-mfa-design.md`. |
-| SCIM v2 provisioning — auto-create/deactivate/reactivate operators from an IdP, plus Groups→role mapping (`/scim/v2/*`, Users and Groups) | Shipped (SOC 2 CC6.2/CC6.7/CC6.8) | `server/core/include/yuzu/server/scim_store.hpp` (storage: `scim_resources`/`scim_tokens` inside `auth.db`, own `"scim"` migration component) + `scim_json.hpp` (JSON codec/discovery) + `scim_routes.{hpp,cpp}` (routes); provenance guard via `AuthDB::set_provisioning_source`/`get_provisioning_source` (`users.provisioning_source`, auth.db migration v7), now also re-checking `role == "user"`. `--scim-admin-group` grants `role=admin` to a SCIM-provisioned user currently in that group (Model A: IdP membership is authoritative, a manual role change is reverted on the next membership recompute). See `docs/auth-architecture.md` "SCIM v2 provisioning". |
+| SCIM v2 provisioning — auto-create/deactivate/reactivate operators from an IdP, plus Groups→role mapping (`/scim/v2/*`, Users and Groups) | Shipped (SOC 2 CC6.2/CC6.7/CC6.8) | `server/core/include/yuzu/server/scim_store.hpp` (born-on-Postgres, schema `scim_store` — `scim_resources`/`scim_tokens`, `pg::PgMigrationRunner`; migrated off the retired `auth.db`, PR #2394) + `scim_json.hpp` (JSON codec/discovery) + `scim_routes.{hpp,cpp}` (routes); provenance guard via `AuthDB::set_provisioning_source`/`get_provisioning_source` (`auth.users.provisioning_source`), now also re-checking `role == "user"`. `--scim-admin-group` grants `role=admin` to a SCIM-provisioned user currently in that group (Model A: IdP membership is authoritative, a manual role change is reverted on the next membership recompute). See `docs/auth-architecture.md` "SCIM v2 provisioning". |
 | SCIM ↔ OIDC/SAML identity linkage + credential revoke on deprovision (ADR-2001) | OIDC: Shipped PR1+PR2+PR3 (SOC 2 CC6.8). SAML: Shipped PR4a+PR4b (SOC 2 CC6.8) | Login-time link (`oidc::link_oidc_login_to_scim`, `ScimStore::identity_links`/`--oidc-scim-link-claim`, default `sub`, allow-list `{sub,oid}`) + deprovision-time revoke across slug + every linked `oidc:` principal (`deprovision_revoke.{hpp,cpp}`, `oidc_principal.hpp`), credentials-first, fail-closed on non-persist. D1 (`yuzu_scim_deprovision_role_refused_with_active_link_total` + `scim.user.deprovision_role_refused_with_link` audit, `result=failure` — AuditStore has no severity column, so the ADR's "kCritical audit" language is realized as an *optional* `Severity::kCritical` AnalyticsEvent gated on analytics collection being enabled, never the audit row itself) covers an externally-elevated SCIM admin (#2021 guard still applies; a human must revoke that identity's tokens manually). D2 (`yuzu_scim_deprovision_unlinked_total`) covers a federated user who logged in but no link formed (misconfigured `--oidc-scim-link-claim`, or an IdP whose `externalId` shares no claim with any OIDC token Yuzu trusts — genuinely unrevocable via SCIM in that case); login records BOTH the `sub` and `oid` observation candidates (`oidc_login_observations`, keyed `(iss,sub,claim_name)`), so D2 reliably fires on a misconfigured link-claim (an `externalId` matching the *other*, unconfigured claim is still detected). Revocation is durable within ~60s (`ApiTokenStore` validate-cache TTL), not instant. Two residuals: (a) the migration-v3 partial-unique index on `scim_resources.external_id` is fail-closed — a server carrying a pre-existing duplicate non-empty `external_id` refuses to boot (dedup pre-upgrade, see `docs/user-manual/server-admin.md` Upgrade Notes); (b) a login racing an in-flight deprovision (TOCTOU) — now closed by the shipped PR3 deny-at-login (`ScimStore::linked_resource_active` + `oidc_login_denied_deprovisioned`, `auth.oidc.deprovisioned_denied` audit): re-login after a *completed* deprovision is fully closed, the in-flight microsecond race narrowed (not eliminated) by a post-mint re-check. **SAML (PR4a+PR4b):** the same shape, keyed on the stable `saml:<entity_id>#<NameID>` principal (`saml::saml_principal_id`, `saml_principal.hpp`), a dedicated `saml_identity_links` table (`ScimStore` migration v4, `saml_scim_link.{hpp,cpp}`), and a link forming ONLY for a stable NameID Format (`persistent`/SAML-1.1 `emailAddress` — never `transient`/unspecified, `saml::is_linkable_name_id_format`); since SAML mints no API/MCP tokens, deprovision-revoke for a SAML principal is session-invalidation only. **PR4b (#3066, the SAML analogue of PR3) SHIPPED** — `ScimStore::saml_linked_resource_active` (the SAML analogue of `linked_resource_active`, same LEFT-join/fail-closed/orphan-reprovision tri-state) + `saml::saml_login_denied_deprovisioned`, wired as a primary pre-mint check and a post-mint re-check in `/saml/acs`, exactly mirroring OIDC's two call sites; denies redirect to the byte-identical `/login?error=saml`, audit `auth.saml.deprovisioned_denied`, metric `yuzu_auth_saml_deprovisioned_denied_total`. Same honest scope as OIDC's PR3: re-login after a *completed* SAML deprovision is fully closed; the in-flight microsecond race is narrowed (not eliminated) by the post-mint re-check, and — since SAML mints no tokens — a slipped session is bounded by its own TTL rather than the ~60s token-cache window. See `docs/auth-architecture.md` "SCIM ↔ OIDC identity linkage for deprovision" + "SAML ↔ SCIM identity linkage" and `docs/adr/2001-scim-oidc-identity-linkage.md` (incl. its SAML addendum, item 8). |
 
 ---
@@ -79,11 +80,11 @@ SOC 2 alignment: CC6.1 (logical access), CC6.2 (provisioning), CC6.3
 
 | Feature | Workstream B line | SOC 2 link | Gap class |
 |---|---|---|---|
-| **MFA / 2FA / TOTP — full ladder** (PR 1 enrollment + login challenge; PR 2 step-up on 11 surfaces; PR 3 enforcement modes `admin-only`/`required` + OIDC `amr` short-circuit + login-time enrollment bootstrap; `docs/auth-mfa-design.md`) | "2FA/TOTP for high-risk approvals" | CC6.6 | **SHIPPED — ladder complete; only the at-rest TOTP-secret encryption follow-up remains (mechanism: ADR-0010 SecretCodec, rides the `auth` Postgres migration)** |
+| **MFA / 2FA / TOTP — full ladder** (PR 1 enrollment + login challenge; PR 2 step-up on 11 surfaces; PR 3 enforcement modes `admin-only`/`required` + OIDC `amr` short-circuit + login-time enrollment bootstrap; `docs/auth-mfa-design.md`) | "2FA/TOTP for high-risk approvals" | CC6.6 | **SHIPPED — ladder complete; the at-rest TOTP-secret encryption tail has also shipped (PR #2394: `auth.users.mfa_totp_secret` is an ADR-0010 `SecretCodec` envelope column, fail-closed decrypt)** |
 | **Hardened-mode local-password disable** | "Disable local-password fallback in hardened mode" | CC6.3 | **SHIPPED** — `--auth-mode=sso-only` (`Config::auth_mode`) disables local-password login fleet-wide (only OIDC mints a session); boot **fails closed** without OIDC. Gate in `auth_routes.cpp` `POST /login` returns the same generic 401 (no oracle); denial is metric-only (`yuzu_auth_local_disabled_total`). See `docs/auth-architecture.md` "Hardened mode". |
 | **Break-glass account policy** (constrained, audited, rotated) | "or tightly constrain break-glass account policy" | CC6.6 | **SHIPPED** — `--break-glass-user` exempt from sso-only **only while armed** (`users.break_glass_armed_until`, migration v4, auto-expiring `--break-glass-window-secs` default 24h); **mandatory MFA** enforced fail-closed at boot AND forced at login; armed out-of-band via the host CLI `--break-glass-arm` (audited `auth.breakglass.armed`, OS-principal-attributed); use audits `auth.breakglass.login` + metric `yuzu_auth_break_glass_login_total`. |
 | **SAML 2.0 SP** (some enterprises require SAML, not OIDC) | implicit ("SSO enforcement") | CC6.1 | **PARTIAL (thin slice + group→role mapping + AuthnRequest signing shipped)** — SP-initiated login (HTTP-Redirect binding), assertion-signature validation against a pinned IdP cert, replay-protected (`InResponseTo` single-use), ephemeral session (`auth_source="saml"`, `role=admin` via exact-match IdP-attested group membership — `--saml-group-attribute`/`--saml-admin-group`, mirrors the OIDC `--oidc-admin-group` guard — else `role=user`), Linux/macOS only (Windows *server* is out of scope — not a targeted server platform — so SAML-on-Windows-server is a NON-GAP, not remaining work). Admins are now reachable via SAML without a local account. **AuthnRequest signing has since SHIPPED** — optional `--saml-sp-key` (RSA-only PEM) signs AuthnRequests over the Redirect binding (RSA PKCS#1v1.5+SHA-256), fail-closed on a bad/non-RSA key, unsigned-by-default otherwise. **AttributeStatement display-name/email parsing has since SHIPPED (PR #3698, MERGED into `dev` @ commit `548f19476`, verified 2026-09-03)** — `--saml-name-attribute`/`--saml-email-attribute` derive session display name→email→NameID from the same XSW-verified assertion node, session-enrichment only (never identity/authz/SCIM-linkage; admin still only from the group attribute). Deferred (still open): IdP-metadata auto-fetch, Settings-UI reconfigure. (Windows-*server* support is deliberately out of scope, NOT deferred — see the item-6 note below.) **SCIM linkage + deprovision-revoke has since SHIPPED (ADR-2001 PR4a+PR4b, incl. deny-at-login)** — see the "SCIM ↔ OIDC/SAML identity linkage" row in Section 1 above. See `docs/auth-architecture.md` "SAML 2.0 SP". |
-| **SCIM v2 provisioning** (auto-provision/deprovision from IdP) | "Periodic access reviews" automation | CC6.2/6.7/6.8 | **SHIPPED (Users + Groups→role mapping)** — `--scim-enable`/`YUZU_SCIM_TOKEN` (preferred over `--scim-token`, which is `ps`-visible; fail-closed: refuses to start without a token, or with `--no-https`); every `/scim/v2/*` route (including discovery) bearer-authed constant-time, its own `scim-service` audit principal. `POST /scim/v2/Users` provisions at the fixed `role=user` (SSO login, discarded local password; reviving a deactivated same-`userName` account rather than `409` — returning-employee reprovision); `PATCH`/`PUT .../{id}` `active:false`/`active:true` deprovisions (soft-delete + session-revoke cascade) / reactivates (lockout cleared, MFA NOT restored). **`userName` must be a slug** (no `@`) — a stock Okta/Entra `userName=email` mapping 400s until remapped. **Provenance guard** (`users.provisioning_source`, auth.db migration v7) makes every deactivate/reactivate/delete/update re-verify `provisioning_source == "scim"` **and** `role == "user"` before mutating, refusing `404` (never `403`) on either mismatch — a locally-created admin, the break-glass account, or a since-promoted former-SCIM account can never be touched by an IdP push. **Groups→role mapping (#2021):** `/scim/v2/Groups` (`POST`/`GET`/`PUT`/`PATCH`/`DELETE`, `displayName`-keyed exact-case match, whitespace-trimmed `--scim-admin-group`, bounded `members[]`, `409` on a `displayName` collision or rename-onto-existing) reuses `resolve_role_from_groups` — a SCIM-provisioned user is `role=admin` **iff** currently a member of `--scim-admin-group`; there is no other field or code path to `role=admin`, so a compromised IdP can elevate only as far as that one configured group. **Model A: IdP membership is authoritative** — a manual dashboard role change on a SCIM account is reverted on the next membership-recomputing event (Group mutation or User reprovision), not on a plain deactivate/restart/flag change; `deprovision_role_ok` is a demote-before-delete ordering gate (blocks deprovisioning a non-`user` account), not a permanent-elevation guarantee. Audit `success`/`failure`/`denied` results incl. new `scim.auth.denied`/`scim.group.*`/`scim.user.role_changed`; metrics `yuzu_scim_requests_total{op,status}` + `yuzu_scim_role_changes_total` + `yuzu_scim_role_change_failures_total` + 3 more (see `docs/auth-architecture.md`). Storage rides `auth.db` (own `"scim"` migration component, a recorded ADR-0006 SQLite exception), not a new store. **Deferred:** native email-`userName` support, `userName` rename, per-route rate-limiting, and **not** SCIM-token-at-rest encryption — struck as a non-gap (2026-07-25): `scim_store.cpp:192,243` stores a verify-only SHA-256, the ADR-0010-correct posture for a bearer credential the server only ever compares. Do NOT "fix" it into a SecretCodec envelope. **API-token revocation on user delete/deactivate has since SHIPPED (ADR-2001)** — see the "SCIM ↔ OIDC identity linkage + credential revoke on deprovision" row in Section 1 above for the honest scope (D1/D2 residuals, ~60s window, PR3 deny-at-login not shipped). See `docs/auth-architecture.md` "SCIM v2 provisioning" and Section 3 item 7. |
+| **SCIM v2 provisioning** (auto-provision/deprovision from IdP) | "Periodic access reviews" automation | CC6.2/6.7/6.8 | **SHIPPED (Users + Groups→role mapping)** — `--scim-enable`/`YUZU_SCIM_TOKEN` (preferred over `--scim-token`, which is `ps`-visible; fail-closed: refuses to start without a token, or with `--no-https`); every `/scim/v2/*` route (including discovery) bearer-authed constant-time, its own `scim-service` audit principal. `POST /scim/v2/Users` provisions at the fixed `role=user` (SSO login, discarded local password; reviving a deactivated same-`userName` account rather than `409` — returning-employee reprovision); `PATCH`/`PUT .../{id}` `active:false`/`active:true` deprovisions (soft-delete + session-revoke cascade) / reactivates (lockout cleared, MFA NOT restored). **`userName` must be a slug** (no `@`) — a stock Okta/Entra `userName=email` mapping 400s until remapped. **Provenance guard** (`users.provisioning_source`, auth.db migration v7) makes every deactivate/reactivate/delete/update re-verify `provisioning_source == "scim"` **and** `role == "user"` before mutating, refusing `404` (never `403`) on either mismatch — a locally-created admin, the break-glass account, or a since-promoted former-SCIM account can never be touched by an IdP push. **Groups→role mapping (#2021):** `/scim/v2/Groups` (`POST`/`GET`/`PUT`/`PATCH`/`DELETE`, `displayName`-keyed exact-case match, whitespace-trimmed `--scim-admin-group`, bounded `members[]`, `409` on a `displayName` collision or rename-onto-existing) reuses `resolve_role_from_groups` — a SCIM-provisioned user is `role=admin` **iff** currently a member of `--scim-admin-group`; there is no other field or code path to `role=admin`, so a compromised IdP can elevate only as far as that one configured group. **Model A: IdP membership is authoritative** — a manual dashboard role change on a SCIM account is reverted on the next membership-recomputing event (Group mutation or User reprovision), not on a plain deactivate/restart/flag change; `deprovision_role_ok` is a demote-before-delete ordering gate (blocks deprovisioning a non-`user` account), not a permanent-elevation guarantee. Audit `success`/`failure`/`denied` results incl. new `scim.auth.denied`/`scim.group.*`/`scim.user.role_changed`; metrics `yuzu_scim_requests_total{op,status}` + `yuzu_scim_role_changes_total` + `yuzu_scim_role_change_failures_total` + 3 more (see `docs/auth-architecture.md`). Storage is now a born-on-Postgres `ScimStore` (schema `scim_store`, PR #2394 — off the retired SQLite `auth.db`; the earlier ADR-0006 SQLite exception is closed). **Deferred:** native email-`userName` support, `userName` rename, per-route rate-limiting, and **not** SCIM-token-at-rest encryption — struck as a non-gap (2026-07-25): `scim_store.cpp:192,243` stores a verify-only SHA-256, the ADR-0010-correct posture for a bearer credential the server only ever compares. Do NOT "fix" it into a SecretCodec envelope. **API-token revocation on user delete/deactivate has since SHIPPED (ADR-2001)** — see the "SCIM ↔ OIDC identity linkage + credential revoke on deprovision" row in Section 1 above for the honest scope (D1/D2 residuals, ~60s window, PR3 deny-at-login not shipped). See `docs/auth-architecture.md` "SCIM v2 provisioning" and Section 3 item 7. |
 | **Just-in-time admin elevation** (time-boxed role promotion + audit) | "Role-based least privilege and separation of duties" | CC6.6 | **SHIPPED** — `POST /api/v1/elevate` (`--jit-max-elevation-secs`); see priority item 9 below |
 | **Inactivity session timeout** | "inactivity timeout" | CC6.3 | **SHIPPED** — `--session-inactivity-secs` (default 0 = disabled, opt-in). Sliding idle window enforced in `AuthManager::validate_session` on the in-memory `Session` (monotonic `last_activity_at`), under the absolute 8h lifetime; cookie sessions only (API/MCP tokens exempt). Best-effort throttled `auth.db` mirror via `AuthDB::touch_session_activity`. See `docs/auth-architecture.md` "Inactivity session timeout". |
 | **Session revocation REST surface** | "expiration, revocation" | CC6.3 | **SHIPPED** — `DELETE /api/v1/sessions?username=<name>` (admin) + `DELETE /api/v1/sessions/me` (self) in `rest_api_v1.cpp` (audit `session.revoke_all`/`session.revoke_all.self`, step-up, self-target guard), over `AuthDB::invalidate_all_sessions()` |
@@ -112,10 +113,18 @@ must check them:
 - All SQL parameterised; no string interpolation.
 - Self-target principal-destruction guard applied to any new
   destructive/demoting endpoint.
-- `auth.db` 0600 / restricted ACL at create.
-- `MigrationRunner::run` for any new schema migration.
-- `unique_ptr<AuthDB>` lifetime spans `Server::create()`.
-- `yuzu-server.cfg` is a one-shot first-boot seed, not a live source.
+- `unique_ptr<AuthDB>` lifetime spans `Server::create()` — still true; the
+  constructor now takes `pg::PgPool&` + `pg::SecretCodec&` (born-on-Postgres,
+  schema `auth`), not a SQLite path.
+- `yuzu-server.cfg` is a one-shot first-boot seed, not a live source — still
+  true; it now seeds the `auth` Postgres schema via `seed_admin_if_empty`
+  (a seed error is FATAL), not a SQLite `auth.db`.
+- **(Retired, do NOT reintroduce as invariants):** the former `auth.db` 0600 /
+  restricted-ACL-at-create and `MigrationRunner::run(sqlite3*, …)` bullets are
+  SQLite-era and no longer apply — AuthDB creates no file and migrates via
+  `pg::PgMigrationRunner::run(lease, "auth", migrations())`. A NEW auth schema
+  migration uses `pg::PgMigrationRunner`; file-permission hardening is not a
+  concern for a Postgres-resident store.
 - `POST /api/settings/users` `role` field stays ignored; role changes only
   via the dedicated endpoint.
 - `require_admin` emits `auth.admin_required` denied audit on every 403.
@@ -129,12 +138,24 @@ must check them:
 Recommended order for closing gaps. Each block stands alone; pick whichever
 matches the customer ask.
 
-**Verified against `origin/dev` @ `ef4582be` (2026-07-25)** — every "SHIPPED"
-status below was re-confirmed by reading the named file/route on that tree,
-not by trusting a design doc's status header. Re-stamp this line whenever you
-revise the section; a matrix derived from a stale checkout is worse than no
-matrix (this revision corrected four items that a 571-commit-behind tree had
-reported as unbuilt).
+**Last WHOLESALE verification: `origin/dev` @ `ef4582be` (2026-07-25)** — every
+"SHIPPED" status was re-confirmed by reading the named file/route on that tree,
+not by trusting a design doc's status header (that pass corrected four items a
+571-commit-behind tree had reported as unbuilt). Re-stamp whenever you revise;
+a matrix derived from a stale checkout is worse than no matrix.
+
+**Targeted refresh 2026-09-07 against `origin/dev` @ `7997a799e` — NOT a
+wholesale re-verification.** This pass re-verified only: (1) the engine-principal
+audit-fail-close cluster is now fully closed (REST #2466/#2406 PR #3944 + MCP
+twin #3937 PR #3971, merge `6d40b399` confirmed an ancestor of dev; #3937 issue
+awaiting its `security`-label §5.1 human close); (2) the durable-`SessionStore`
++ DB-clock-authority landing (HA WS-1/1a, ADR-2002 §4, #3715) — items 8 & 9 and
+the session-durability wording were corrected accordingly; (3) the AuthDB +
+ScimStore Postgres migration (schema `auth` / `scim_store`, SQLite `auth.db`
+retired, PR #2394) — Section 1's persistent-store row, the hard-invariants list,
+and workflow steps 1–2 were de-SQLite'd; (4) the Open hardening backlog issue
+states. **Every other "SHIPPED" cell still rests on the `ef4582be` stamp — treat
+those as up to ~6 weeks stale and re-grep the symbol before relying on it.**
 
 **Item 11 re-verified 2026-08-10, targeted, not wholesale** — against
 `feat/auth-human-token-rotation` @ `e1bf2d86` (a pre-merge integration
@@ -203,15 +224,15 @@ duplicate `10`; the one live cross-reference to the old numbering
    the full 3-PR ladder shipped: TOTP enrollment + login challenge +
    recovery codes, step-up on 11 high-risk surfaces, enforcement modes
    (`admin-only`/`required`) with login-time enrollment bootstrap, and the
-   OIDC `amr` short-circuit. See `docs/auth-mfa-design.md`. **One tail
-   remains, and it is IN FLIGHT, not unstarted:** at-rest TOTP-secret
-   encryption rides **PR #2394** (auth + SCIM → Postgres), where
-   `users.mfa_totp_secret` becomes a SecretCodec envelope column per ADR-0010
-   — auth is the platform's first SecretCodec consumer. The decrypt path is
-   **fail-closed**: a decrypt failure must surface as an error, NEVER as "no
-   MFA enrolled". The `auth_kv` scaffolding is NOT used and is dropped by that
-   migration. Until #2394 merges, TOTP secrets are plaintext columns in
-   `auth.db` — say so plainly in any customer security questionnaire.
+   OIDC `amr` short-circuit. See `docs/auth-mfa-design.md`. **The at-rest
+   TOTP-secret encryption tail has since SHIPPED (PR #2394, auth + SCIM →
+   Postgres; verified on `origin/dev` 2026-09-07):** `auth.users.mfa_totp_secret`
+   is now a `pg::SecretCodec` **envelope-encrypted column** per ADR-0010 — auth
+   is the platform's first SecretCodec consumer. The decrypt path is
+   **fail-closed**: a decrypt failure surfaces as an error, NEVER as "no MFA
+   enrolled". The `auth_kv` scaffolding was not used and was dropped by that
+   migration. TOTP secrets are no longer plaintext — a customer security
+   questionnaire can state at-rest encryption for the MFA secret.
 2. ~~**Account lockout after N failed logins.**~~ **DONE** — `auth.db` v3
    columns (`failed_login_count`/`last_failed_login_at`/`locked_until`) +
    `AuthDB::lockout_status`/`record_failed_login`/`clear_failed_logins`;
@@ -373,10 +394,12 @@ duplicate `10`; the one live cross-reference to the old numbering
    "SCIM-token-at-rest encryption" — `scim_store.cpp:192,243` stores a
    verify-only `sha256_hex`, which is the ADR-0010-correct posture for a
    bearer credential the server only ever compares. It is not a gap; do NOT
-   "fix" it into a SecretCodec envelope. **In flight:** PR #2394 moves this
-   storage off `auth.db` onto a born-on-PG `ScimStore` (schema
-   `scim_store`); the verify-only hash posture is preserved across that move.
-   See `docs/auth-architecture.md` "SCIM v2 provisioning".
+   "fix" it into a SecretCodec envelope. **Storage moved to Postgres (SHIPPED,
+   PR #2394; verified on `origin/dev` 2026-09-07):** `ScimStore` is now
+   born-on-Postgres (schema `scim_store`, `pg::PgPool`, no `sqlite3*`/`db_mtx_`,
+   migrated via `pg::PgMigrationRunner`), off the retired `auth.db` — a fresh
+   start with no SQLite backfill; the verify-only `sha256_hex` token posture is
+   preserved. See `docs/auth-architecture.md` "SCIM v2 provisioning".
    **API-token revocation on user delete/deactivate has since SHIPPED
    (ADR-2001) — do NOT list it as a gap.** Deprovision now revokes the SCIM
    slug's tokens AND every OIDC identity durably linked to it at login
@@ -421,16 +444,27 @@ duplicate `10`; the one live cross-reference to the old numbering
 8. ~~**Inactivity session timeout**~~ **DONE** — `--session-inactivity-secs`
    (`YUZU_SESSION_INACTIVITY_SECS`, `Config::session_inactivity_secs`), **default
    0 = disabled** (opt-in; existing deployments unaffected; recommended 900).
-   Enforced in `AuthManager::validate_session` against the in-memory `Session`
-   (the authoritative read path — `auth.db` sessions are v1 dead-writes): a
-   **monotonic `steady_clock` `last_activity_at`** is bumped on each
-   authenticated touch (sliding window) and the session is rejected + evicted
-   once idle past the window, *under* the absolute 8h `kSessionDuration`. Cookie
-   sessions only — API/MCP tokens resolve via `synthesize_token_session`, never
-   `validate_session`, so they are **never idle-timed-out**. The `auth.db`
-   `last_activity_at` mirror is best-effort + throttled (`touch_session_activity`,
-   ≤1 write/session/60s, off `mu_`). See `docs/auth-architecture.md` "Inactivity
-   session timeout"; `tests/unit/server/test_auth.cpp` `[idle]`.
+   Enforced in `AuthManager::validate_session`, which now branches by whether a
+   durable session store is wired. **Store-backed (HA) path — the production
+   posture since HA WS-1/1a (durable `SessionStore`, ADR-2002 §4):** idle is
+   decided in `validate_session_durable` against a **monotonic `steady_clock`
+   deadline derived from the DB-clock-authored `last_activity` + `db_now_ms`**
+   (`derive_session_deadlines`, #3715), and the sliding touch is mirrored
+   durably via `SessionStore::touch_activity` (stamps Postgres `now()`,
+   GREATEST-clamped, no generation bump, throttled) — so idle survives a replica
+   restart/failover and adjudicates identically on any replica. A cache-hit idle
+   verdict re-checks the authoritative row before evicting (a touch may have
+   landed on another replica). **Store-less (legacy config-file-only) path:**
+   the old byte-for-byte in-memory body still runs — idle against the in-memory
+   `Session.last_activity_at`. Either way: *under* the absolute 8h
+   `kSessionDuration`, cookie sessions only (API/MCP tokens resolve via
+   `synthesize_token_session`, never `validate_session`, so they are **never
+   idle-timed-out**). See `docs/auth-architecture.md` "Inactivity session
+   timeout" + the AuthDB routed row (`.claude/agents/authdb.md`);
+   `tests/unit/server/test_auth.cpp` `[idle]`. (Stale in-tree comments in
+   `auth_db.hpp` ~L15-18 and `rest_api_v1.cpp:4462` still call the in-memory map
+   the sole/only session store — they predate `SessionStore`; #2343 is the
+   related cleanup.)
 9. ~~**JIT admin elevation**~~ **DONE** — `POST /api/v1/elevate` `{justification,
    duration_secs}` promotes the caller's **effective role** to admin for a
    bounded window (`--jit-max-elevation-secs`, default 1h), then auto-reverts.
@@ -447,10 +481,17 @@ duplicate `10`; the one live cross-reference to the old numbering
    never consults a local namesake account's TOTP enrollment, and
    `--no-jit-oidc-amr-elevation` blocks OIDC sessions from elevating entirely
    (they cannot present a local TOTP step-up).
-   `auth::effective_role(session)` (admin while
-   `now < elevated_until`) is honoured by `require_admin` + the permission gates;
-   the window is monotonic `steady_clock`, in-memory per **cookie** session
-   (restart/logout drops it; API/MCP tokens can never elevate). Audits
+   `auth::effective_role(session)` (admin while `is_elevated`) is honoured by
+   `require_admin` + the permission gates. **The elevation window is now DURABLE
+   in `SessionStore` on the store-backed (HA) path** — `elevate_session` calls
+   `SessionStore::set_elevation`, which authors `elevation_issued`/`elevated_until
+   = LEAST(now()+duration, expires_at)` **in SQL** (the "never past absolute
+   expiry" clamp is atomic in-DB, no TOCTOU), bumps the durable generation, and
+   the local cache re-derives a monotonic `steady_elevated_until` via
+   `derive_session_deadlines` (with the H2 width/future-dated clamps). So an
+   elevation survives failover and is seen on any replica. Only the store-less
+   legacy path keeps the old purely-in-memory-per-cookie window. Either way it
+   is cookie-session-only — API/MCP tokens can never elevate. Audits
    `role.elevation.{granted,denied,revoked,expired}` + `user.elevation_eligibility.set`;
    `POST /api/v1/elevate/revoke` for step-down. Passive expiry is now audited
    too — lazily, at the `AuthRoutes::resolve_session` cookie chokepoint on the
@@ -608,12 +649,12 @@ duplicate `10`; the one live cross-reference to the old numbering
     **Remaining: Phase 5 (delegation).** RFC 8693 token exchange and
     write-back are still design-only, as is 2c's Decision-14 confinement
     choice; both consume `docs/auth-engine-principals-design.md` as their
-    reference. Post-ship hardening issues are open — **#2454** (a global
-    revoke generation disables the liveness cache for *all* principals during
-    write churn), **#2466**/**#2406** (REST engine-principal routes are silent
-    on audit-store failure, unlike their MCP twins), **#2343**
-    (consolidate the engine-session discriminator onto `Session::is_engine()`),
-    **#2374** (regression test for MCP stream revocation).
+    reference. Post-ship hardening: the engine-principal audit-fail-close
+    cluster has since CLOSED (**#2454** liveness-cache global-revoke; the REST
+    **#2466**/**#2406** and MCP-twin **#3937** audit-fail-close, PRs #3944/#3971
+    — see the Open hardening backlog note). Still open: **#2343** (consolidate
+    the engine-session discriminator onto `Session::is_engine()`), **#2374**
+    (regression test for MCP stream revocation).
 
 ### Priority 3 — defer
 
@@ -626,28 +667,18 @@ duplicate `10`; the one live cross-reference to the old numbering
 
 Not gaps in the feature matrix — accepted debt on shipped surfaces. Ranked by
 what a security reviewer would flag first. (Reconciled against `dev`
-2026-09-01: **#1973** engine-principal interlock, **#2376** grant-graph
-topology floor, **#2396** login/PG-degrade, **#2395** KEK rotation, **#2397**
-auth-recovery docs, **#2399** MFA-store robustness — TOTP counter double-use,
-shipped #3764 — and **#2407** pre-auth body cap have all landed and are dropped
-from this list. Added 2026-09-03: the **engine-principal REST audit cluster**
-(#2466/#2406) and the **doc-overstatement** item (#2485), all still open and
-security-relevant — see below.)
+2026-09-07: the **engine-principal audit cluster is now fully closed** —
+**#2466/#2406** (REST fail-closed, PR #3944) and its MCP twin **#3937** (PR
+#3971 merged 2026-09-04, verified an ancestor of `origin/dev`, awaiting the
+`security`-label §5.1 human close) have landed, along with **#2454** (engine
+liveness-cache global-revoke), **#3777** (MFA enroll-race audit branch),
+**#3762**/**#3764** (MFA counter/recovery-code guards); all dropped from this
+list. Earlier-landed items dropped 2026-09-01: **#1973** engine-principal
+interlock, **#2376** grant-graph topology floor, **#2396** login/PG-degrade,
+**#2395** KEK rotation, **#2397** auth-recovery docs, **#2399** MFA-store
+robustness, **#2407** pre-auth body cap. What remains below is all OPEN and
+security- or evidence-relevant.)
 
-- **#2466 + #2406** — the REST engine-principal routes are **silent on
-  audit-store write failure**: an evidence-bearing audit row on the
-  highest-privilege principal class can fail to persist (`audit_persisted:false`)
-  while the route still returns success, whereas the **MCP twins fail closed**.
-  The fix is to adopt the `Sec-Audit-Failed` / fail-closed `rest_audit.hpp`
-  posture the PII routes already use. Ranked first: a live audit-integrity
-  (CC7.2) defect on a privileged surface, and a REST-vs-MCP inconsistency
-  governance will flag. **Next up (planned 2026-09-03).**
-- **#3777** — the concurrent-enroll / disable-race MFA-enrollment loser is
-  audited as a generic "code rejected" (and a benign concurrent `mfa_disable`
-  trips a false "store unavailable" 503 + secret-unavailable degrade metric +
-  kCritical audit). Give `MfaAlreadyEnrolled` its own audit branch at the route
-  consumers — the other live audit-fidelity (CC7.2) defect here alongside
-  #2466/#2406. Follow-up from #3762.
 - **#2485** — CLAUDE.md + `.claude/routed-concerns*.md` **overstate**
   engine-principal authorization: they describe grants as "scoped" (they are
   fleet-wide only — `PrincipalRole` has no per-assignment scope field) and cite
@@ -668,6 +699,15 @@ security-relevant — see below.)
 - **#3783** — nightly TSan leg for the live-PG MFA concurrency regressions
   (`test_auth_db_pg.cpp`) — test-hardening; the concurrency guards are checked
   by inspection today. Follow-up from #3762.
+- **#3969 / #3970 / #3938** — deferred follow-ups from the now-shipped #3937
+  MCP fail-close: **#3969** the create/revoke/transfer engine-principal twins
+  share a byte-identical fail-close block but lack *direct* `[audit_failclose]`
+  coverage (mint/rotate/confirm/assign/unassign got the 5 new cases); **#3970**
+  agentic-first polish — served tool descriptions + a `token_id` in the mint 503
+  so a caller can reconcile the withheld-secret mint; **#3938** the
+  `YuzuAuditPersistFailures` alert description omits the engine-principal
+  management surface. All three are `governance-deferred` / `roadmap` polish, not
+  live defects.
 
 ---
 
@@ -681,11 +721,14 @@ For every feature in Section 3:
      invariants.
    - `docs/enterprise-readiness-soc2-first-customer.md` §3.2 for the
      enterprise/SOC 2 framing.
-   - `.claude/agents/authdb.md` if the feature touches `auth.db`.
+   - `.claude/agents/authdb.md` if the feature touches the `auth` Postgres
+     schema (the former SQLite `auth.db`) or the durable `SessionStore`.
    - `docs/mcp-server.md` if the feature touches the MCP surface.
 
 2. **Plan.** Produce a short plan covering:
-   - Schema changes (must use `MigrationRunner`).
+   - Schema changes (server stores use `pg::PgMigrationRunner` against their
+     own schema — auth is `auth`; the legacy SQLite `MigrationRunner` survives
+     only for the agent-side and NVD SQLite stores).
    - REST surface additions and the RBAC permission required.
    - Audit actions (always emit on the `require_admin` gate side and on
      every state mutation).
