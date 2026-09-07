@@ -530,8 +530,12 @@ static const ToolDef kTools[] = {
     {"get_workflow_execution", "Fetch one workflow execution's status and per-step results "
      "— WorkflowEngine's own multi-step run record, a DIFFERENT data model from "
      "get_execution_status's single-instruction fan-out Execution. Requires Workflow:Read. "
-     "Confined: a caller with a fleet-read scope sees only the in-scope agent_ids in the "
-     "response.",
+     "Record-level confined (#4030 Gate 8 fix): a caller with no agent visible in the "
+     "execution's agent_ids gets the same not-found error as a nonexistent id, not a "
+     "narrower-but-still-present record; an admitted confined caller's agent_ids is narrowed "
+     "to their visible agents and each step's result.agents_reached is stripped. Audited as "
+     "workflow_execution.detail.fetch (set-and-proceed, audit_persisted:false on an admitted "
+     "read whose audit row was dropped) — a genuinely nonexistent id writes no audit row.",
      R"({"type":"object","properties":{"execution_id":{"type":"string","minLength":1}},"required":["execution_id"]})",
      R"j({"type":"object","properties":{"id":{"type":"string"},"workflow_id":{"type":"string"},"status":{"type":"string"},"agent_ids":{"type":"array","items":{"type":"string"}},"current_step":{"type":"integer"},"started_at":{"type":"integer"},"completed_at":{"type":"integer"},"steps":{"type":"array"}},"required":["id","workflow_id","status","agent_ids","current_step","started_at","completed_at","steps"]})j"},
 

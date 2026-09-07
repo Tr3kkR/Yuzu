@@ -4379,6 +4379,12 @@ results. `404` for an unknown execution id; `503` on a genuine store degrade (AD
 Execution history survives its workflow being deleted — this route stays readable for an
 execution whose workflow was later soft-deleted.
 
+**Permission:** `Workflow:Read`, fleet-read confined as of #4030 — same record-level gate and
+`agent_ids`/`agents_reached` narrowing as the v1 twin below (a caller with no agent visible in
+the execution's `agent_ids` gets the same `404` as a nonexistent id). Unlike the v1 twin and the
+MCP tool, this legacy route writes **no audit row on any path** (pre-existing; out of scope for
+the #4030 confinement fix).
+
 **Usage guide:**
 
 1. Define a workflow with ordered steps (each step maps to an instruction definition).
