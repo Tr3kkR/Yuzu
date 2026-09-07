@@ -105,9 +105,19 @@ Siblings become compliant store-by-store as they migrate to Postgres.
 
 ### Still issuing bare wall-clock deletes
 
-None. The last three (`app_perf_*`, `PreflightRunStore`, `DeploymentRunStore`,
-**#2508**) adopted the guarded shape via `pg::run_clock_guarded_prune` in WS-10 —
-see the register entry above.
+The three tracked **#2508** background sweeps (`app_perf_fleet_store`,
+`PreflightRunStore`, `DeploymentRunStore`) adopted the guarded shape via
+`pg::run_clock_guarded_prune` in WS-10 — see the register entry above.
+
+One lower-exposure bare wall-clock delete remains, OUT of the #2508 background-sweep
+scope: `app_perf_daily_store.cpp`'s `apply_daily` does a per-agent
+`DELETE ... WHERE agent_id=$1 AND day < cutoff` (cutoff from `system_clock::now()`)
+INLINE during that agent's own daily-perf ingest — not a background bulk sweep. Its
+blast radius is one agent's own rows, bounded by the retention window, and it is
+driven by that agent's data arriving rather than a timer, so a wrong server clock
+cannot wipe the fleet's history in one pass. Whether to bring it under the guard (or
+a bounded per-agent variant) is a tracked follow-up, not part of WS-10's
+background-sweep scope.
 
 ### `api_token_store` — first store to DECLINE part 1's would-wipe half
 

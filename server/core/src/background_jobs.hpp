@@ -27,15 +27,23 @@
 ///   - DisabledUntilFixed   — not yet replica-safe and not yet leader-gated; must
 ///                            not run per-replica until its named fix lands.
 ///
-/// HOW "NOTHING ESCAPES" IS ENFORCED. This array is the single compile-time
-/// source of truth (git-auditable, CI-compiled). Every pass dispatch site
-/// asserts its membership via `YUZU_ASSERT_BACKGROUND_JOB(...)` (a consteval
-/// lookup — an unregistered symbol is a BUILD FAILURE, the `command_capability.hpp`
-/// ExecuteGate precedent), and `tests/unit/server/test_background_jobs.cpp`
-/// asserts the array is internally consistent and complete against the audited
-/// inventory. A NEW pass is a diff against THIS array + the routed-concern review
-/// (cpp-safety+sre+compliance-officer), never a silent addition. Adding a
-/// side-effecting pass without an entry does not compile.
+/// HOW CLASSIFICATION IS ENFORCED — and the honest limit of it. This array is the
+/// single compile-time source of truth (git-auditable, CI-compiled), and
+/// `tests/unit/server/test_background_jobs.cpp` pins its internal consistency +
+/// completeness against the audited inventory (a count tripwire). Every
+/// CATASTROPHIC-CLASS site carries `YUZU_ASSERT_BACKGROUND_JOB(...)` — a consteval
+/// lookup that makes removing/renaming its table entry a BUILD FAILURE (the
+/// `command_capability.hpp` ExecuteGate precedent): all FencedLeaderOnly and
+/// DisabledUntilFixed passes (schedule/policy/quarantine dispatch, ca.publish_crl,
+/// nvd_sync), plus the load-bearing ReplicaSafe ones (the event-outbox poll, the
+/// concurrency reconciler, the three retention prunes, the app_perf rollup
+/// upsert). This proves
+/// named⇒classified for those sites. It does NOT yet prove pass⇒named for every
+/// read-only ReplicaSafe gauge/reap site (a consteval sweep visiting ALL dispatch
+/// sites is a tracked follow-up), so completeness across those rests on THIS array
+/// plus the routed-concern review (cpp-safety+sre+compliance-officer on any new
+/// background pass). A new side-effecting pass is a diff against THIS array, never
+/// a silent addition.
 
 #include <array>
 #include <cstddef>

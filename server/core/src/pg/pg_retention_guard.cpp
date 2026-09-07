@@ -7,6 +7,7 @@
 #include <spdlog/spdlog.h>
 
 #include <charconv>
+#include <cstdint>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -82,6 +83,10 @@ ClockGuardedPruneOutcome run_clock_guarded_prune(PgPool& pool, const ClockGuarde
             return false;
         }
         const std::int64_t now_unit = to_i64(PQgetvalue(now_res.get(), 0, 0));
+        // A backward clock skew SMALLER than big_step_floor is deliberately left
+        // unflagged: it only pushes `cutoff` further into the past, so this pass
+        // deletes FEWER rows, never more — self-protecting, not a wipe risk. A
+        // backward jump LARGER than the floor is caught by big_step (part 7).
         const std::int64_t cutoff = now_unit - spec.retention_window;
         const std::int64_t future_ceiling = now_unit + spec.implausibility_bound;
 
@@ -246,6 +251,21 @@ ClockGuardedPruneOutcome run_clock_guarded_prune(PgPool& pool, const ClockGuarde
     out.declined = declined;
     out.anomaly = anomaly;
     out.deleted = deleted;
+
+    // Outcome visibility (sibling convention: every clock-guarded retention pass
+    // surfaces a decline, not just a hard failure). A DECLINE means retention is
+    // PAUSED this pass on a possible clock anomaly — the operator-actionable
+    // signal, so warn. A lock-skip is routine under >1 replica (debug). A normal
+    // drain is info. (Prometheus counters for these are a tracked follow-up.)
+    if (out.skipped_lock)
+        spdlog::debug("clock_guarded_prune[{}]: skipped — another replica holds the lock this tick",
+                      spec.store_label);
+    else if (out.declined)
+        spdlog::warn("clock_guarded_prune[{}]: DECLINED (anomaly={}) — retention paused this pass, "
+                     "deleted 0 (possible clock anomaly)",
+                     spec.store_label, static_cast<int>(out.anomaly));
+    else if (out.deleted > 0)
+        spdlog::info("clock_guarded_prune[{}]: deleted {} row(s)", spec.store_label, out.deleted);
     return out;
 }
 

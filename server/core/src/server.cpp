@@ -7668,6 +7668,7 @@ public:
                         const bool stale =
                             !latest || (latest->next_update - now_epoch) < 24 * 3600;
                         if (stale) {
+                            YUZU_ASSERT_BACKGROUND_JOB("ca.publish_crl"); // WS-10 FencedLeaderOnly (crlNumber)
                             if (publish_crl())
                                 spdlog::info(
                                     "PKI: CRL re-published for freshness (nextUpdate window)");

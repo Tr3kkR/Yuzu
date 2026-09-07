@@ -25,23 +25,32 @@ table disagree, the table wins.
 ## The unit is the PASS, not the thread
 
 One thread multiplexes many passes of different classes — `result_set_maint_thread_`
-runs 11 (the per-replica poll, several advisory-locked reaps, gauge refreshes),
-`health_recompute_thread_` ~9 (read-only gauges, a fleet-wide CRL re-publish, a
-per-replica stream teardown). Classifying a thread wholesale would falsely certify
-an unsafe pass riding a mostly-safe thread, so each `kBackgroundJobs` entry is one
-unit of work.
+runs ~11 (the per-replica poll, several advisory-locked reaps, gauge refreshes) and
+`health_recompute_thread_` a cluster of read-only fleet gauges plus a fleet-wide CRL
+re-publish and a per-replica stream teardown. Classifying a thread wholesale would
+falsely certify an unsafe pass riding a mostly-safe thread, so each `kBackgroundJobs`
+entry is one unit of work — with the caveat that the many trivially-identical
+read-only gauge passes on `health_recompute_thread_` are folded into a single
+`health_store.recompute_metrics` entry (they are all ReplicaSafe; the CRL publish and
+the stream teardown, which are NOT, are enumerated separately).
 
-## How "nothing silently escapes"
+## How classification is enforced — and its honest limit
 
-- `kBackgroundJobs` is the checked-in, git-auditable, CI-compiled inventory.
-- Each catastrophic-class pass dispatch site carries `YUZU_ASSERT_BACKGROUND_JOB(...)`
-  — a `consteval` lookup that makes an unclassified pass a **build failure** (the
-  `command_capability.hpp` ExecuteGate precedent).
-- `tests/unit/server/test_background_jobs.cpp` pins internal consistency,
-  completeness (a count tripwire), and the load-bearing per-pass classes.
-- Adding a background pass is therefore a diff against `kBackgroundJobs` plus the
-  routed-concern review (`cpp-safety` + `sre` + `compliance-officer`), never a
-  silent addition.
+- `kBackgroundJobs` is the checked-in, git-auditable, CI-compiled inventory, and
+  `tests/unit/server/test_background_jobs.cpp` pins its internal consistency +
+  completeness (a count tripwire) and the load-bearing per-pass classes.
+- Every **catastrophic-class** site carries `YUZU_ASSERT_BACKGROUND_JOB(...)` — a
+  `consteval` lookup that makes removing/renaming its table entry a **build failure**
+  (the `command_capability.hpp` ExecuteGate precedent): all FencedLeaderOnly and
+  DisabledUntilFixed passes, plus the load-bearing ReplicaSafe ones (the
+  event-outbox poll, the concurrency reconciler, the three retention prunes, the
+  app_perf rollup upsert).
+- That proves **named⇒classified** for those sites. It does **not** yet prove
+  **pass⇒named** for every read-only ReplicaSafe gauge/reap site — a `consteval`
+  sweep visiting *all* dispatch sites is a tracked follow-up — so completeness there
+  rests on this table plus the routed-concern review (`cpp-safety` + `sre` +
+  `compliance-officer` on any new background pass). A new side-effecting pass is a
+  diff against `kBackgroundJobs`, never a silent addition.
 
 ## Clock-guarded retention (the #2508 residue, WS-10 10.2)
 

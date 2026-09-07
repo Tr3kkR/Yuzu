@@ -151,8 +151,13 @@ TEST_CASE("retention guard: a held advisory lock makes the pass SKIP",
     YUZU_REQUIRE_PG_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     setup_schema(pool);
+    // Set the store up so that, ABSENT the lock, this pass would DELETE (not decline):
+    // 4 expired + 1 recent (→ not would_wipe), past bootstrap, with a fresh plausible
+    // anchor (→ no Step). The ONLY reason nothing happens is the held lock.
     seed(pool, 4, 3'600'000);
-    set_meta(pool, "t_bootstrap_settled", "1"); // past bootstrap so it would otherwise delete
+    seed(pool, 1, 0);
+    set_meta(pool, "t_bootstrap_settled", "1");
+    set_meta(pool, "t_last_pass_now", std::to_string(now_ms()));
 
     // Hold the SAME advisory-lock key (session-scoped) on an independent backend.
     PgConn holder{PQconnectdb(db.dsn().c_str())};
@@ -163,7 +168,7 @@ TEST_CASE("retention guard: a held advisory lock makes the pass SKIP",
     auto r = run_clock_guarded_prune(pool, spec(60'000, 100, MissingAnchorPolicy::Decline), 2000ms);
     CHECK(r.skipped_lock);
     CHECK(r.deleted == 0);
-    CHECK(count_rows(pool) == 4); // untouched — the holder wins the tick
+    CHECK(count_rows(pool) == 5); // untouched — the holder wins the tick
     PQexec(holder.get(), "SELECT pg_advisory_unlock(hashtext('rg_test:t_prune'))");
 }
 
@@ -258,4 +263,23 @@ TEST_CASE("retention guard: a pass persists the anchor (survives restart)",
     });
     CHECK_FALSE(anchor.empty());
     CHECK(std::stoll(anchor) > 946'684'800'000); // a plausible present-day ms epoch
+}
+
+TEST_CASE("retention guard: a failed txn reports error and deletes nothing",
+          "[pg][store][retention-guard]") {
+    // Gate on PG being ENABLED (keeps this in the [pg] suite), but the failure path
+    // needs no live schema: a parseable-but-unreachable conninfo makes every
+    // connection attempt fail, so with_txn_for returns false and the helper must
+    // surface error=true / deleted=0 (its documented best-effort contract) rather
+    // than throw or silently "succeed" with nothing done.
+    YUZU_REQUIRE_PG_DB(db);
+    (void)db;
+    PgPool bad{{.conninfo = "host=127.0.0.1 port=1 dbname=nope user=nobody connect_timeout=1",
+                .size = 1}};
+    REQUIRE(bad.valid()); // the conninfo PARSES — the failure is at connect time
+    auto r = run_clock_guarded_prune(bad, spec(60'000, 100, MissingAnchorPolicy::Decline), 1000ms);
+    CHECK(r.error);
+    CHECK(r.deleted == 0);
+    CHECK_FALSE(r.declined);
+    CHECK_FALSE(r.skipped_lock);
 }
