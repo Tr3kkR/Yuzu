@@ -947,7 +947,7 @@ TEST_CASE("the row lock genuinely blocks a concurrent update_role() until "
 
     auto token = cold_mgr.authenticate("cora", "password1234");
     // cpp-safety Gate 8 catch: several recheck_role_locked early-return paths
-    // (lease-acquire timeout, the new SET LOCAL lock_timeout failure, a
+    // (lease-acquire timeout, the new set_config() lock_timeout failure, a
     // failed/empty SELECT) skip the hook entirely, leaving `writer` still
     // default-constructed (non-joinable) - join() on a non-joinable thread
     // throws std::system_error, which would otherwise abort this test with a
@@ -982,7 +982,7 @@ TEST_CASE("the row lock genuinely blocks a concurrent update_role() until "
     CHECK(cold_mgr.get_user_role("cora") == Role::user); // DB-authoritative, unaffected by the sweep race
 }
 
-TEST_CASE("recheck_role_locked's own SET LOCAL lock_timeout fails the "
+TEST_CASE("recheck_role_locked's own set_config() lock_timeout fails the "
           "recheck closed well under the pooled connection's 10s default "
           "when the row lock is already held elsewhere (#4107 Gate 8 "
           "coverage gap - authdb: nothing previously proved this path fires "
@@ -1006,7 +1006,8 @@ TEST_CASE("recheck_role_locked's own SET LOCAL lock_timeout fails the "
     // connection never itself waits on a lock. What's under test is
     // cold_mgr's OWN pooled connection: its `lock_timeout` stays at that
     // pool's 10000ms default except inside recheck_role_locked's own
-    // transaction, where its SET LOCAL narrows it to kWriteTimeout.
+    // transaction, where its set_config('lock_timeout', ..., true) call
+    // (SET LOCAL's parameterized equivalent) narrows it to kWriteTimeout.
     yuzu::server::pg::PgConn holder{PQconnectdb(auth_db.dsn().c_str())};
     REQUIRE(PQstatus(holder.get()) == CONNECTION_OK);
     {
@@ -1029,11 +1030,11 @@ TEST_CASE("recheck_role_locked's own SET LOCAL lock_timeout fails the "
     yuzu::server::pg::exec_params(holder.get(), "ROLLBACK", std::vector<std::string>{});
 
     // Fails CLOSED: recheck_role_locked's own SELECT ... FOR UPDATE can't
-    // get the lock, and its SET LOCAL lock_timeout (2000ms, matching
+    // get the lock, and its set_config()-set lock_timeout (2000ms, matching
     // kWriteTimeout) fires and denies the login rather than hanging toward
     // the connection's much larger 10000ms pooled default.
     CHECK_FALSE(token.has_value());
-    // Bounded well under the connection's 10s default (proves the SET LOCAL
+    // Bounded well under the connection's 10s default (proves set_config()
     // actually took effect, not just compiled), comfortably above near-zero
     // (proves the call genuinely waited on the lock and hit the timeout,
     // rather than failing instantly for some unrelated faster reason).
