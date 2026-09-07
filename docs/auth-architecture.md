@@ -2493,10 +2493,15 @@ MCP twins).
    RBAC-enabled enforcement; only the RBAC-off legacy posture changes (see
    below).
 2. **The topology floor itself**: `{AccessReview:Read, UserManagement:Read,
-   EnginePrincipal:Read}` require the `admin` session role regardless of
-   the RBAC on/off toggle, via `authz_topology_floor.hpp`'s
-   `topology_floor_applies()`. It is consulted **only** inside the legacy
-   (RBAC-off) fallback of `require_permission`/`require_scoped_permission`
+   EnginePrincipal:Read, Enrollment:Read, OidcConfig:Read}` require the
+   `admin` session role regardless of the RBAC on/off toggle, via
+   `authz_topology_floor.hpp`'s `topology_floor_applies()`. (The last two
+   entries were added by #4031 for the same reason as `EnginePrincipal`
+   above — see that PR's REST v1 routes migrating `Enrollment`/`OidcConfig`
+   off `admin_fn_` onto `perm_fn_`; `Directory` deliberately has no floor
+   entry, since it was never `admin_fn_`-gated to begin with.) It is
+   consulted **only** inside the legacy (RBAC-off) fallback of
+   `require_permission`/`require_scoped_permission`
    — never ahead of, or instead of, the live-RBAC branch. That ordering is
    load-bearing, not incidental: #2324 cut the dedicated `AccessReview`
    securable specifically so a non-admin `Reviewer` role could be seeded

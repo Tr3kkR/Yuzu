@@ -161,7 +161,7 @@ enabled = true
 
 ## The authorization topology floor (#2376)
 
-Three reads are treated as **authorization topology** rather than ordinary
+Five reads are treated as **authorization topology** rather than ordinary
 operational data, and require the `admin` session role no matter how the
 `[rbac] enabled` toggle is set:
 
@@ -170,6 +170,8 @@ operational data, and require the `admin` session role no matter how the
 | `AccessReview:Read` | The fleet-wide access-review grant export (SOC 2 CC6.2 evidence), `GET /api/v1/access-reviews*` |
 | `UserManagement:Read` | `GET /api/v1/rbac/roles` and the rest of the RBAC role graph |
 | `EnginePrincipal:Read` | The engine-principal inventory and grant graph, `GET /api/v1/engine-principals*` and the `list_engine_principals`/`get_engine_principal`/`list_engine_roles` MCP tools |
+| `Enrollment:Read` (#4031) | Auto-approve enrollment rules and pending-agent visibility, `GET /api/v1/enrollment/auto-approve-rules` and `GET /api/v1/enrollment/pending-agents` |
+| `OidcConfig:Read` (#4031) | OIDC SSO configuration status, `GET /api/v1/settings/oidc` |
 
 **Why this exists.** With RBAC **disabled**, the legacy fallback described
 above allows any authenticated non-engine session to perform every `Read` —
@@ -188,7 +190,7 @@ particular, a non-admin holding the seeded `Reviewer` role (`AccessReview:Read`
 + `AccessReview:Attest`) continues to reach the access-review export exactly
 as before — the floor never overrides that grant.
 
-**If you are relying on a non-admin reaching one of these three reads on an
+**If you are relying on a non-admin reaching one of these five reads on an
 RBAC-disabled install,** that access is now denied. The supported remedy is
 to enable RBAC and grant the appropriate role rather than to expect a
 non-admin session to reach authorization topology while RBAC is off:
@@ -202,6 +204,13 @@ non-admin session to reach authorization topology while RBAC is off:
   **custom** role that was granted `Security:Read` specifically to reach
   these routes must be re-granted `EnginePrincipal:Read` — see "Upgrade
   Notes" in [`server-admin.md`](server-admin.md)).
+- For the enrollment auto-approve-rules/pending-agents reads: enable RBAC
+  and grant `Enrollment:Read` — no built-in non-admin role holds it
+  (`Administrator` only; unlike `EnginePrincipal`/`Directory`, `Viewer`
+  deliberately does not, since these surfaces gate the fleet's enrollment
+  admission policy).
+- For the OIDC SSO config status read: enable RBAC and grant
+  `OidcConfig:Read` — `Administrator`-only for the same reason.
 
 The floor is deliberately **not configurable** — there is no setting that
 widens it back open. It is keyed on `(securable, operation)`, not on route
