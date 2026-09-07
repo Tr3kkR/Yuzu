@@ -45,11 +45,12 @@
 /// `"success"` — and additionally emit an `approval.approved`/
 /// `approval.rejected` event on success only (never on denial).
 ///
-/// `log_safe` (used by approve/reject's denial-path log line) moved to
-/// `log_safe.hpp` as part of this same PR — it had a second, still-inline
-/// caller in server.cpp's instruction YAML update/create handlers, so it is
-/// promoted to a shared free function rather than duplicated here
-/// (mirroring `json_extract.hpp`'s #2557 precedent).
+/// `log_safe` (used by approve/reject's denial-path log line) reuses the
+/// existing `web_utils.hpp` promotion from #2542 PR-7 (`instruction_routes.cpp`
+/// needed the same helper first) rather than a second, competing promotion —
+/// this PR originally promoted it into its own `log_safe.hpp`, but that
+/// collided with PR-7's independent promotion of the identical function into
+/// a different header; reconciled at merge time by dropping this PR's copy.
 
 #include <yuzu/server/auth.hpp>
 

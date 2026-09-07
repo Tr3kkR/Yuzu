@@ -3,7 +3,7 @@
 #include "approval_manager.hpp"
 #include "http_route_sink.hpp"
 #include "json_extract.hpp" // extract_json_string
-#include "log_safe.hpp"
+#include "web_utils.hpp" // log_safe (#2542 PR-7 promotion, reused not duplicated)
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
