@@ -13,12 +13,14 @@ on:
     paths:
       - 'site/**'
       - 'docs/**'
+      - 'agents/plugins/**/README.md'
       - '.github/workflows/docs-site.yml'
   pull_request:
     branches: [main, dev]
     paths:
       - 'site/**'
       - 'docs/**'
+      - 'agents/plugins/**/README.md'
       - '.github/workflows/docs-site.yml'
   workflow_dispatch:
 
