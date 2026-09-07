@@ -801,6 +801,15 @@ jobs:
       - name: Build
         run: meson compile -C build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -j "$YUZU_BUILD_JOBS"
 
+      # Cross-OS capture certification guard (PR #4112 review, blocker):
+      # tools/plugin-capture must reject a --os that does not match the
+      # platform it was compiled for, or a wrong-platform capture becomes
+      # gate-certified, embedded, and served as truth.
+      - name: Plugin-capture OS guard
+        run: |
+          bash scripts/ci/check-plugin-capture-os-guard.sh \
+            "build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}"
+
       # #2204 capability-matrix drift gate (PR1.1). Runs right after Build so
       # capmatrix-gen and every agents/plugins/*/ shared object already
       # exist — the script discovers the full plugin set from the source
@@ -1545,6 +1554,12 @@ jobs:
         # pass the runner's 16-thread CCD width unconditionally.
         run: meson compile -C build-windows-${{ matrix.build_type }} -j "$YUZU_BUILD_JOBS"
 
+      # Cross-OS capture certification guard (PR #4112 review, blocker): see
+      # the linux job's identical step for the full rationale.
+      - name: Plugin-capture OS guard
+        run: |
+          bash scripts/ci/check-plugin-capture-os-guard.sh "build-windows-${{ matrix.build_type }}"
+
       # Link-provenance assertion (#1331 review HIGH-2): on Windows libpq is
       # DELIBERATELY dynamic (triplet static override = grpc stack only; the
       # release zip's vcpkg-DLL sweep ships libpq.dll like sqlite3/openssl —
@@ -1981,6 +1996,11 @@ jobs:
         # bounded even if the var is unset (unlike the bare Linux/Windows form,
         # because macOS is the only pool where uncontrolled -j risks OOM here).
         run: meson compile -C build-macos -j "${YUZU_BUILD_JOBS:-6}"
+
+      # Cross-OS capture certification guard (PR #4112 review, blocker): see
+      # the linux job's identical step for the full rationale.
+      - name: Plugin-capture OS guard
+        run: bash scripts/ci/check-plugin-capture-os-guard.sh build-macos
 
       # Link-provenance assertion (#1331 review HIGH-2): hosted macOS images can
       # carry a system PostgreSQL, so prove the canary linked vcpkg's static

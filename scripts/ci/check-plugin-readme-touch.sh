@@ -73,7 +73,7 @@ check() {
           if (j) { line = substr(line, 1, i - 1) substr(rest, j + 3) } else { line = substr(line, 1, i - 1); comment = 1; break }
         }
         print line
-      }' | grep -m1 -E '^[[:space:]]*([-*][[:space:]]+)?docs-unchanged:[[:space:]]*[^[:space:]]' || true)"
+      }' | grep -m1 -E '^[[:space:]]*([-*][[:space:]]+)?docs-unchanged:[[:space:]]*[^[:space:]].*[[:space:]](—|-)[[:space:]]+[^[:space:]]' || true)"
   fi
 
   # Plugins whose src/ changed, deduplicated.
@@ -168,6 +168,10 @@ FAKE
   run "src changed, override in body" 0 $'agents/plugins/alpha/src/a.cpp' "$with_readme" $'Summary\n\ndocs-unchanged: Caveats — comment-only change\n'
   run "src changed, override in a bullet" 0 $'agents/plugins/alpha/src/a.cpp' "$with_readme" $'- docs-unchanged: Caveats — comment-only change\n'
   run "src changed, empty override is no override" 1 $'agents/plugins/alpha/src/a.cpp' "$with_readme" $'docs-unchanged:\n'
+  # PR #4112 review, minor: content-free text (no <section> — <reason> shape)
+  # is not a real override, even though it is non-empty.
+  run "src changed, content-free override text is no override" 1 $'agents/plugins/alpha/src/a.cpp' "$with_readme" $'docs-unchanged: x\n'
+  run "src changed, plain-hyphen separator is accepted" 0 $'agents/plugins/alpha/src/a.cpp' "$with_readme" $'docs-unchanged: Caveats - comment-only change\n'
   run "override inside a code fence is invisible" 1 $'agents/plugins/alpha/src/a.cpp' "$with_readme" $'```\ndocs-unchanged: Caveats — hidden\n```\n'
   run "override inside an HTML comment is invisible" 1 $'agents/plugins/alpha/src/a.cpp' "$with_readme" $'<!--\ndocs-unchanged: Caveats — hidden\n-->\n'
   run "override on a CRLF body" 0 $'agents/plugins/alpha/src/a.cpp' "$with_readme" $'Summary\r\ndocs-unchanged: Caveats — comment-only\r\n'

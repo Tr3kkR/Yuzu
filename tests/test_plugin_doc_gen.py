@@ -277,6 +277,19 @@ class Splitting(unittest.TestCase):
         self.assertEqual(g._unescape_cpp('Gr\u00f6\u00dfen \\"x\\" a\\\\b'), 'Größen "x" a\\b')
 
 
+    def test_capability_row_field_value_containing_a_closing_brace(self):
+        # PR #4112 review, minor: a `}` inside a quoted field value must not
+        # terminate the row early -- the naive first-`}` regex this replaced
+        # silently truncated there, defaulting every field after the
+        # truncation point (execute_gate included) to '-' with no warning.
+        frag = ('{ .plugin = "z", .action = "q", .securable = "Config}Store", '
+               '.execute_gate = ExecuteGate::AlwaysApproval }')
+        rows = g.parse_capability_fragment(frag, "f")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].securable, "Config}Store")
+        self.assertEqual(rows[0].execute_gate, "AlwaysApproval")
+
+
 class LegHash(unittest.TestCase):
     def test_stable_and_sensitive_to_mechanism_not_fallback(self):
         m = g.parse_matrix_block(MATRIX)
@@ -535,6 +548,29 @@ class SampleSanity(unittest.TestCase):
                             "agent-context: init needs the KV store")
         self.assertEqual(g.parse_sample(ok, "macos").actions[1]["not_captured"],
                          "agent-context: init needs the KV store")
+
+    def test_not_captured_block_with_row_or_status_data_is_rejected(self):
+        # PR #4112 review, minor: [not captured] (never executed) and
+        # row/status/rc data (only producible by an executed run) are
+        # mutually exclusive -- a block claiming both is self-contradictory.
+        with_row = SAMPLE.replace(
+            "[not captured] Destructive/Irreversible: not executed on a live host",
+            "[not captured] Destructive/Irreversible: not executed on a live host\nrow|unexpected")
+        with self.assertRaisesRegex(ValueError, "has `\\[not captured\\]` but also carries"):
+            g.parse_sample(with_row, "macos")
+
+        with_status = SAMPLE.replace(
+            "[not captured] Destructive/Irreversible: not executed on a live host",
+            "[not captured] Destructive/Irreversible: not executed on a live host\n"
+            "[result_status] OK / FULL / ")
+        with self.assertRaisesRegex(ValueError, "has `\\[not captured\\]` but also carries"):
+            g.parse_sample(with_status, "macos")
+
+        with_rc = SAMPLE.replace(
+            "[not captured] Destructive/Irreversible: not executed on a live host",
+            "[not captured] Destructive/Irreversible: not executed on a live host\n[rc] 1")
+        with self.assertRaisesRegex(ValueError, "has `\\[not captured\\]` but also carries"):
+            g.parse_sample(with_rc, "macos")
 
     def test_marker_before_any_action_and_duplicate_action_rejected(self):
         lines = SAMPLE.splitlines()

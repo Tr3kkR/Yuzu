@@ -3527,7 +3527,9 @@ TEST_CASE("MCP Integration: discover_plugins wired vs unwired", "[mcp][integrati
     CHECK(got == expected);
     REQUIRE(got.contains("limitation"));
 
-    // Unwired (AgentRegistry left null) — JSON-RPC tool error.
+    // Unwired (AgentRegistry left null) — JSON-RPC tool error, A4-shaped
+    // (PR #4112 review, should-fix): correlation_id + a non-null,
+    // transient-failure retry_after_ms, not a bare {code,message}.
     McpTestServer ts_unwired;
     ts_unwired.start("readonly");
     auto res2 = ts_unwired.call(
@@ -3535,6 +3537,11 @@ TEST_CASE("MCP Integration: discover_plugins wired vs unwired", "[mcp][integrati
     REQUIRE(res2);
     auto body2 = nlohmann::json::parse(res2->body);
     CHECK(body2.contains("error"));
+    REQUIRE(body2["error"].contains("data"));
+    CHECK(body2["error"]["data"].contains("correlation_id"));
+    CHECK_FALSE(body2["error"]["data"]["correlation_id"].get<std::string>().empty());
+    REQUIRE(body2["error"]["data"].contains("retry_after_ms"));
+    CHECK_FALSE(body2["error"]["data"]["retry_after_ms"].is_null());
 }
 
 TEST_CASE("MCP: all five discover_* tools are advertised in tools/list",

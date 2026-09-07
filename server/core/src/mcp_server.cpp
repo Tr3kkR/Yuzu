@@ -1452,7 +1452,7 @@ static const ToolDef kTools[] = {
      // and fixed; only actions[].parameter_schema is conditional (present
      // only when the action has a matching published InstructionDefinition),
      // typed generically for the same reason as discover_instructions above.
-     R"j({"type":"object","properties":{"version":{"type":"integer"},"description":{"type":"string"},"limitation":{"type":"string"},"actions_enriched_with_schema":{"type":"integer"},"plugins":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"version":{"type":"string"},"description":{"type":"string"},"docs":{"type":["object","null"],"description":"Build-embedded documentation summary {summary, kind, platforms, readme, resource} when the plugin has adopted the README standard; null when it has not. kind says whether the plugin is a read-only collector or mutates state and whether it runs on a gather schedule. The full manifest is the yuzu://plugin-docs resource.","properties":{"summary":{"type":"string"},"kind":{"type":"object","properties":{"collector":{"type":"boolean"},"mutating":{"type":"boolean"},"gathered":{"type":"boolean"}},"required":["collector","mutating","gathered"]},"platforms":{"type":"object"},"readme":{"type":"string"},"resource":{"type":"string"}}},"actions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"description":{"type":"string"},"parameter_schema":{"type":"object","description":"Present only when the action has a matching published InstructionDefinition"}},"required":["name","description"]}}},"required":["name","version","description","docs","actions"]}},"commands":{"type":"array","items":{"type":"string"}}},"required":["version","description","limitation","actions_enriched_with_schema","plugins","commands"]})j"},
+     R"j({"type":"object","properties":{"version":{"type":"integer"},"description":{"type":"string"},"limitation":{"type":"string"},"actions_enriched_with_schema":{"type":"integer"},"plugins":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"version":{"type":"string"},"description":{"type":"string"},"docs":{"type":["object","null"],"description":"Build-embedded documentation summary {summary, kind, platforms, readme, resource} when the plugin has adopted the README standard; null when it has not. kind says whether the plugin is a read-only collector or mutates state and whether it runs on a gather schedule. The full manifest is the yuzu://plugin-docs resource.","properties":{"summary":{"type":"string"},"kind":{"type":"object","properties":{"collector":{"type":"boolean"},"mutating":{"type":"boolean"},"gathered":{"type":"boolean"}},"required":["collector","mutating","gathered"]},"platforms":{"type":"object","properties":{"windows":{"type":"string","enum":["supported","constrained","planned","unsupported","undeclared"]},"macos":{"type":"string","enum":["supported","constrained","planned","unsupported","undeclared"]},"linux":{"type":"string","enum":["supported","constrained","planned","unsupported","undeclared"]}},"required":["windows","macos","linux"]},"readme":{"type":"string"},"resource":{"type":"string"}},"required":["summary","kind","platforms","readme","resource"]},"actions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"description":{"type":"string"},"parameter_schema":{"type":"object","description":"Present only when the action has a matching published InstructionDefinition"}},"required":["name","description"]}}},"required":["name","version","description","docs","actions"]}},"commands":{"type":"array","items":{"type":"string"}}},"required":["version","description","limitation","actions_enriched_with_schema","plugins","commands"]})j"},
     {"query_software_licenses",
      "Query a single agent's discovered software licences (ADR-0024 discovery plane) — the "
      "MCP twin of GET /api/v1/sle/agents/{id}. Returns each detected licence's product, "
@@ -14080,8 +14080,17 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!perm_fn(req, res, "Infrastructure", "Read"))
                     return;
                 if (!agent_registry) {
-                    res.set_content(error_response(id, kInternalError, "Agent registry unavailable"),
-                                    "application/json");
+                    // A4-shaped (PR #4112 review, should-fix): this branch used to call the
+                    // bare error_response(), with no correlation_id/retry_after_ms/remediation
+                    // at all -- an inconsistency within this same function, since the
+                    // tier_allows denial three lines up already goes through a4_error.
+                    // Registry-unavailable is transient, so it gets the same named retry
+                    // floor as the comparable degraded-read path below (kMcpStoreFaultRetryMs).
+                    mcp_audit("failure", "agent registry unavailable");
+                    res.set_content(
+                        a4_error(kInternalError, "Agent registry unavailable", {},
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
                     return;
                 }
                 // Least-privilege (gov Gate 2 security-guardian MEDIUM / UP-7):

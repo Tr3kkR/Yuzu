@@ -189,6 +189,49 @@ def parse_matrix_block(text: str) -> dict[str, dict[str, dict[str, Leg]]]:
 _CAP_FIELD_RE = re.compile(r"\.(\w+)\s*=\s*([^,]+?)\s*(?:,|$)", re.DOTALL)
 
 
+def _find_capability_row_bodies(text: str) -> list[str]:
+    """Every ``{...}`` designated-initialiser row body, honoring string
+    literals and nested braces -- PR #4112 review, minor: the regex this
+    replaces (``\\{\\s*(\\.plugin\\s*=.*?)\\}``) matches up to the FIRST
+    literal ``}``, with no brace-depth or string-literal awareness. A ``}``
+    inside a quoted field value (a rationale/description string) silently
+    truncated the row there, defaulting every field after the truncation
+    point to ``-`` with no warning of any kind -- worse than a warning, a
+    silently wrong security-relevant row (securable/risk_tier/execute_gate
+    all default that way). Depth-tracking also protects any future
+    aggregate-typed field the same way.
+    """
+    rows: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] == "{":
+            j = i + 1
+            while j < n and text[j].isspace():
+                j += 1
+            if text[j:j + 7] == ".plugin":
+                depth, k, in_str = 1, i + 1, False
+                while k < n and depth > 0:
+                    c = text[k]
+                    if in_str:
+                        if c == "\\":
+                            k += 1  # skip the escaped character, incl. \"
+                        elif c == '"':
+                            in_str = False
+                    elif c == '"':
+                        in_str = True
+                    elif c == "{":
+                        depth += 1
+                    elif c == "}":
+                        depth -= 1
+                    k += 1
+                if depth == 0:
+                    rows.append(text[i + 1:k - 1])
+                    i = k
+                    continue
+        i += 1
+    return rows
+
+
 def parse_capability_fragment(text: str, fragment: str) -> list[CapRow]:
     """Every ``CommandCapability`` designated-initialiser row in one fragment."""
     rows: list[CapRow] = []
@@ -197,8 +240,7 @@ def parse_capability_fragment(text: str, fragment: str) -> list[CapRow]:
     # after a field's value is never part of a value, and a comment-led row
     # left unmatched would silently drop the plugin's security row.
     stripped = re.sub(r"//[^\n]*", "", text)
-    for m in re.finditer(r"\{\s*(\.plugin\s*=.*?)\}", stripped, re.DOTALL):
-        body = m.group(1)
+    for body in _find_capability_row_bodies(stripped):
         fields: dict[str, str] = {}
         for fm in _CAP_FIELD_RE.finditer(body):
             key, raw = fm.group(1), fm.group(2).strip()
@@ -438,6 +480,14 @@ def parse_sample(text: str, os_name: str) -> Sample:
         if a["not_captured"] is None and a["result_status"] is None:
             raise ValueError(f"{os_name}: action '{a['action']}' has no [result_status] line — "
                              "the capture is incomplete; recapture with plugin-capture")
+        # PR #4112 review, minor: the inverse contradiction -- a leg marked
+        # [not captured] (never executed) that ALSO carries row/status/rc
+        # data (only producible by an executed run) is self-contradictory,
+        # and was previously accepted silently.
+        if a["not_captured"] is not None and (a["rows"] or a["result_status"] is not None or a["rc"]):
+            raise ValueError(f"{os_name}: action '{a['action']}' has `[not captured]` but also "
+                             "carries row/status/rc data — a leg is either not captured or "
+                             "captured, never both")
     return Sample(os=os_name, stamp=stamp, actions=actions)
 
 
@@ -766,14 +816,19 @@ def load_plugin(repo: Path, name: str, matrix: dict, defs: dict, caps: dict) -> 
             identity = ident
             break
     if not identity["name"]:
-        warnings.append(f"{name}: no name() override found under src/ — identity rendered as '-'")
+        # PR #4112 review, minor: "error:"-prefixed, matching the two
+        # adjacent conditions in this same function (lines below) -- a
+        # missing identity silently rendering as "-" is not a lesser defect
+        # than the ones that already fail the gate.
+        warnings.append(f"error: {name}: no name() override found under src/ — identity rendered as '-'")
     declared = identity["name"] or name
     if declared != name:
         warnings.append(f"error: {name}: plugin declares name() '{declared}' but lives in agents/plugins/{name}/ — "
                         "the gate keys legs, definitions and samples by directory; rename one of them")
     legs = matrix.get(declared, {})
     if not legs:
-        warnings.append(f"{name}: no rows in the capability-matrix block (regenerate it?)")
+        # PR #4112 review, minor: "error:"-prefixed, same rationale as above.
+        warnings.append(f"error: {name}: no rows in the capability-matrix block (regenerate it?)")
     definitions = defs.get(declared, [])
     cap_rows = caps.get(declared, [])
     cap_actions = {r.action for r in cap_rows}

@@ -216,6 +216,22 @@ std::string default_os_version() {
 #endif
 }
 
+// The OS this binary was actually compiled for -- the only trustworthy check
+// that --os is honest. --os is caller-supplied and used verbatim in the
+// published stamp (docs/plugin-readme-standard.md rule 5); left unchecked
+// against the compiled platform, a Linux build told "--os windows" silently
+// certifies a capture that never ran on Windows at all (PR #4112 review,
+// blocker).
+constexpr const char* compile_time_os() {
+#if defined(_WIN32)
+    return "windows";
+#elif defined(__APPLE__)
+    return "macos";
+#else
+    return "linux";
+#endif
+}
+
 std::string quote_if_needed(const std::string& v) {
     if (v.find(' ') == std::string::npos && !v.empty()) return v;
     return "\"" + v + "\"";
@@ -290,6 +306,13 @@ int main(int argc, char** argv) {
     if (os_name.empty() || host_class.empty() || actions.empty()) return usage(argv[0]);
     if (os_name != "windows" && os_name != "linux" && os_name != "macos") {
         std::cerr << "plugin-capture: --os must be windows, linux or macos\n";
+        return 2;
+    }
+    if (os_name != compile_time_os()) {
+        std::cerr << "plugin-capture: --os " << os_name
+                  << " does not match this binary's compiled platform (" << compile_time_os()
+                  << ") -- a capture must run on the OS it certifies, never cross-compiled or "
+                     "cross-run (docs/plugin-readme-standard.md rule 5)\n";
         return 2;
     }
     if (host_class != "bare-metal" && host_class != "vm" && host_class != "container") {
