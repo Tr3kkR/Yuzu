@@ -531,6 +531,52 @@ TEST_CASE("preflight routes: GET /api/v1/preflight/runs 503s when the run "
     CHECK(res->status == 503);
 }
 
+TEST_CASE("preflight routes: GET /api/v1/preflight/runs 503s (not an empty "
+          "200) when the run store's connection pool is exhausted, #4036 "
+          "hardening round",
+          "[pg][preflight][routes][rest]") {
+    // A store-level fault must not read as "you have zero saved runs" —
+    // list_runs' plain accessor collapsed a pool-acquire timeout into the
+    // same empty vector as a genuinely-empty rail; list_runs_checked
+    // distinguishes them, and this route must surface the distinction as
+    // 503 rather than 200 + {"data":[]}. Same pool-starvation recipe as
+    // test_api_token_store.cpp's "an EXHAUSTED connection pool is
+    // kUnavailable, not kInvalid".
+    YUZU_REQUIRE_PG_DB_TPL(db, preflight_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}}; // sole connection, held below
+    PreflightRunStore run_store{pool};
+    REQUIRE(run_store.is_open());
+
+    const auto t = now_ms();
+    auto run = make_run("run-starved-1", t);
+    run.created_by = "alice";
+    REQUIRE(run_store.create_run(run, {{"agent-1", "host-1", "windows"}}));
+
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        auth::Session s;
+        s.username = "alice";
+        return std::optional<auth::Session>(s);
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+
+    PreflightRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    routes.register_routes(sink, okAuth, okPerm, /*devices_fn=*/{}, /*groups_fn=*/{},
+                           /*group_members_fn=*/{}, /*dispatch_fn=*/{}, /*collect_fn=*/{},
+                           /*audit_fn=*/{}, &run_store);
+
+    // Hold the pool's only connection with a longer timeout than the store's
+    // own kReadTimeout (2s), so the route's internal acquire times out first.
+    auto hog = pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(hog); // we now hold the only connection
+
+    auto res = sink.Get("/api/v1/preflight/runs");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->body.find("run-starved-1") == std::string::npos);
+}
+
 TEST_CASE("preflight routes: GET /api/v1/preflight/runs 400s on an invalid limit",
           "[pg][preflight][routes][rest]") {
     YUZU_REQUIRE_PG_DB_TPL(db, preflight_tpl);

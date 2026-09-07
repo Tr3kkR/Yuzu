@@ -586,8 +586,26 @@ void PreflightRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                 return;
             }
         }
-        auto rows = run_store_->list_runs(session->username, /*is_admin=*/false,
-                                          static_cast<int>(limit));
+        // #4036 hardening round: `list_runs_checked`, not `list_runs` — the
+        // plain accessor collapses a store-level fault (pool exhausted, query
+        // error) into a silently-empty vector, indistinguishable from
+        // "genuinely zero saved runs". That's an accepted fail-soft posture for
+        // the pre-existing HTML rail (an "honest note" a human can just
+        // refresh) but is a wrong-result-presented-as-correct outcome for a
+        // machine-readable `200 {"data":[]}` response — a caller cannot tell
+        // "you have no runs" from "we couldn't ask". 503 here matches the
+        // published contract (rest-api.md's "Pre-flight run store
+        // unavailable → 503" already covers this route, not just the
+        // unwired-pointer case above).
+        auto rows_or = run_store_->list_runs_checked(session->username, /*is_admin=*/false,
+                                                     static_cast<int>(limit));
+        if (!rows_or) {
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "pre-flight run store is unavailable on this server"),
+                            "application/json");
+            return;
+        }
+        const auto& rows = *rows_or;
         nlohmann::json arr = nlohmann::json::array();
         for (const auto& r : rows)
             arr.push_back(preflight_run_row_json(r));

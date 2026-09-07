@@ -5499,7 +5499,7 @@ share).
 
 | Name | In | Required | Description |
 |---|---|---|---|
-| `limit` | query | No | Max runs to return (default 12, matching the dashboard rail; capped at 100) |
+| `limit` | query | No | Max runs to return (default 12, matching the dashboard rail; capped at 100; a 0 or negative value is silently clamped to 1, not rejected) |
 
 **Response:**
 
@@ -5530,7 +5530,7 @@ share).
 
 | Condition | Response |
 |---|---|
-| `limit` is not a positive integer | `400` |
+| `limit` cannot be parsed as an integer (e.g. non-numeric) | `400` — a parseable but out-of-range value (0, negative, or > 100) is clamped, not rejected |
 | A service-scoped API token — this owner-scoped read cannot be confined to the token's service | `403`, audited under `preflight.run.view` (a distinct verb from `preflight.run`, the run-**creation** verb — see the audit note below) |
 | Pre-flight run store unavailable | `503` |
 

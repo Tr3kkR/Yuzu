@@ -334,11 +334,22 @@ TEST_CASE("deployment routes: GET /api/v1/deployments/preview is owner-scoped "
     REQUIRE(missing);
     CHECK(missing->status == 400);
 
-    // Someone else's run -> 404, not distinguishable from not-found (no
-    // existence oracle) — the fragment's own posture.
+    // A genuinely nonexistent run -> 404.
     auto other = sink.Get("/api/v1/deployments/preview?run=does-not-exist");
     REQUIRE(other);
     CHECK(other->status == 404);
+
+    // A run that EXISTS but belongs to someone else -> the SAME 404, not
+    // distinguishable from not-found (no existence oracle) — the fragment's
+    // own posture. This is the case the "does-not-exist" id above cannot
+    // prove: a real row, owned by bob, requested by alice's session.
+    auto bob_run_id = std::string("run-preview-bob-1");
+    auto bob_run = make_run(bob_run_id, "bob", t);
+    REQUIRE(preflight_store.create_run(bob_run, {{"agent-2", "host-2", "linux"}}));
+    auto not_yours = sink.Get("/api/v1/deployments/preview?run=" + bob_run_id);
+    REQUIRE(not_yours);
+    CHECK(not_yours->status == 404);
+    CHECK(not_yours->body.find(bob_run_id) == std::string::npos);
 }
 
 TEST_CASE("deployment routes: GET /api/v1/deployments/preview denies a "
@@ -381,6 +392,55 @@ TEST_CASE("deployment routes: GET /api/v1/deployments/preview denies a "
     CHECK(res->body.find(run_id) == std::string::npos);
     REQUIRE(audit_log.size() == 1);
     CHECK(audit_log[0] == "deployment.config.view|denied");
+}
+
+TEST_CASE("deployment routes: GET /api/v1/deployments/preview 503s (not 404) "
+          "when the pre-flight store's connection pool is exhausted, "
+          "#4036 hardening round",
+          "[pg][deployment][routes][rest]") {
+    // A store-level fault must not read as "not found" — get_run's plain
+    // accessor collapsed a pool-acquire timeout into the same nullopt as a
+    // genuine miss/not-yours; get_run_checked distinguishes them, and this
+    // route must surface the distinction as 503, matching rest-api.md's
+    // published "Pre-flight run store unavailable → 503" contract for this
+    // route (previously only true for the unwired-pointer case).
+    YUZU_REQUIRE_PG_DB_TPL(predb, preflight_routes_tpl);
+    // A pool of exactly one, whose sole connection this test holds for the
+    // duration — same recipe as test_api_token_store.cpp's "an EXHAUSTED
+    // connection pool is kUnavailable, not kInvalid".
+    PgPool pre_pool{{.conninfo = predb.dsn(), .size = 1}};
+    PreflightRunStore preflight_store(pre_pool);
+    REQUIRE(preflight_store.is_open());
+
+    const auto t = now_ms();
+    const std::string run_id = "run-preview-starved-1";
+    auto run = make_run(run_id, "alice", t);
+    REQUIRE(preflight_store.create_run(run, {{"agent-1", "host-1", "windows"}}));
+
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        auth::Session s;
+        s.username = "alice";
+        return std::optional<auth::Session>(s);
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+
+    DeploymentRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    routes.register_routes(sink, okAuth, okPerm, /*devices_fn=*/{}, /*dispatch_fn=*/{},
+                           /*poll_fn=*/{}, /*audit_fn=*/{}, &preflight_store,
+                           /*deploy_store=*/nullptr);
+
+    // Hold the pool's only connection with a longer timeout than the store's
+    // own kReadTimeout (2s), so the route's internal acquire is the one that
+    // times out first.
+    auto hog = pre_pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(hog); // we now hold the only connection
+
+    auto res = sink.Get("/api/v1/deployments/preview?run=" + run_id);
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->body.find(run_id) == std::string::npos);
 }
 
 TEST_CASE("deployment routes: GET /api/v1/deployments/preview 503s when the "

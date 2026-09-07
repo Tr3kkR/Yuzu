@@ -503,9 +503,24 @@ void DeploymentRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, Perm
                             "application/json");
             return;
         }
-        // Owner-scoped: a not-yours run reads as not-found (no existence
-        // oracle) — same posture as the fragment.
-        auto run = preflight_store_->get_run(run_id, session->username);
+        // #4036 hardening round: `get_run_checked`, not `get_run` — the plain
+        // accessor collapses a store-level fault (pool exhausted, query error)
+        // into the SAME nullopt as a genuine miss/not-yours, so a transient
+        // Postgres hiccup would read as a permanent 404 rather than a
+        // retryable 503, matching rest-api.md's published "Pre-flight run
+        // store unavailable → 503" contract for this route (previously only
+        // true for the unwired-pointer case above). Owner-scoped: a
+        // not-yours run STILL reads as not-found (no existence oracle) —
+        // that ambiguity is deliberate and preserved; only the store-fault
+        // case is now distinguished from it.
+        auto run_or = preflight_store_->get_run_checked(run_id, session->username);
+        if (!run_or) {
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "pre-flight run store is unavailable on this server"),
+                            "application/json");
+            return;
+        }
+        const auto& run = *run_or;
         if (!run) {
             res.status = 404;
             res.set_content(detail::a4_error(res, "pre-flight run not found"), "application/json");

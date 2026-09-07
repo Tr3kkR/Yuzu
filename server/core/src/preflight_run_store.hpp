@@ -37,6 +37,7 @@
 #include "preflight_parse.hpp" // preflight::PreflightTarget
 
 #include <cstdint>
+#include <expected>
 #include <optional>
 #include <string>
 #include <vector>
@@ -96,13 +97,44 @@ public:
     /// the read is OWNER-SCOPED at the seam: a not-yours run reads as nullopt, same
     /// as not-found — closes the existence oracle on the result route. Empty
     /// `created_by` = unscoped (internal callers).
+    ///
+    /// Thin wrapper over `get_run_checked` that DISCARDS the store-error channel —
+    /// preserves the original fail-soft contract (a transient lease timeout or
+    /// query error reads the same as absent) for the pre-existing HTML-fragment
+    /// callers (`/fragments/auto/deploy` et al.), which render an "honest note"
+    /// either way and were never meant to distinguish the two (see the file
+    /// header). New callers that need to tell "genuinely absent" apart from "the
+    /// store faulted" (e.g. an API twin that should 503 rather than silently claim
+    /// not-found) MUST use `get_run_checked` instead (#4036 hardening round).
     [[nodiscard]] std::optional<PreflightRunRow> get_run(const std::string& run_id,
                                                          const std::string& created_by = "");
 
+    /// Authoritative variant of `get_run` — distinguishes a genuine miss
+    /// (`std::optional` engaged, `nullopt` inside) from a store-level failure
+    /// (`std::unexpected`, store not open / pool acquire timeout / query error).
+    /// Same posture as `RbacStore`'s `_checked` accessors. An empty `run_id` is
+    /// treated as a genuine miss, not a store error — callers are expected to
+    /// validate presence themselves (both #4036 REST/MCP twins already 400 on an
+    /// empty run_id before reaching the store).
+    [[nodiscard]] std::expected<std::optional<PreflightRunRow>, std::string>
+    get_run_checked(const std::string& run_id, const std::string& created_by = "");
+
     /// A viewer's recent runs (created_by = viewer, or all when `is_admin`),
     /// newest first, capped at `limit`.
+    ///
+    /// Thin wrapper over `list_runs_checked` that DISCARDS the store-error
+    /// channel — same rationale as `get_run` above: preserves the pre-existing
+    /// fail-soft rail-rendering contract for `/fragments/auto`. New callers that
+    /// need to 503 rather than silently claim "zero runs" on a store fault MUST
+    /// use `list_runs_checked` instead (#4036 hardening round).
     [[nodiscard]] std::vector<PreflightRunRow> list_runs(const std::string& viewer, bool is_admin,
                                                          int limit);
+
+    /// Authoritative variant of `list_runs` — `std::unexpected` on a store-level
+    /// failure (not open / pool acquire timeout / query error) rather than a
+    /// silently-empty vector indistinguishable from "genuinely zero runs".
+    [[nodiscard]] std::expected<std::vector<PreflightRunRow>, std::string>
+    list_runs_checked(const std::string& viewer, bool is_admin, int limit);
 
     /// Every `running` run — the runner's per-tick worklist.
     [[nodiscard]] std::vector<PreflightRunRow> list_running();

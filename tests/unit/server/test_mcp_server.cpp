@@ -10944,6 +10944,95 @@ TEST_CASE("MCP C8: list_preflight_runs and get_deployment_preview deny a "
               .value() == 1.0);
 }
 
+// #4036 hardening round: a store-level fault (pool exhausted) must surface as
+// a genuinely retryable kInternalError, not the same permanent-looking
+// classification as "you have zero runs" / "run not found" — see the
+// identical REST-twin tests (test_preflight_routes.cpp /
+// test_deployment_routes.cpp). Same pool-starvation recipe as
+// test_api_token_store.cpp's "an EXHAUSTED connection pool is kUnavailable,
+// not kInvalid".
+TEST_CASE("MCP list_preflight_runs: an exhausted pool answers kInternalError "
+          "+ retry_after_ms, never a silent empty list, #4036 hardening round",
+          "[pg][mcp][integration][operator_surface]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_preflight_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 1}}; // sole connection, held below
+    yuzu::server::PreflightRunStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::server::PreflightRunRow run;
+    run.run_id = "mcp-run-starved-1";
+    run.execution_id = "preflight-mcp-run-starved-1";
+    run.created_by = "test-user";
+    run.name = "starved-pool run";
+    run.scope_label = "all visible devices";
+    run.config_json = R"({"app_name":"","min_gib":20})";
+    run.window_seconds = 300;
+    run.created_at_ms = 1000;
+    run.deadline_at_ms = 301000;
+    REQUIRE(store.create_run(run, {{"agent-1", "host-1", "windows"}}));
+
+    McpTestServer ts;
+    ts.preflight_run_store_for_test = &store;
+    ts.start();
+
+    // Hold the pool's only connection with a longer timeout than the store's
+    // own kReadTimeout (2s), so the tool's internal acquire times out first.
+    auto hog = pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(hog); // we now hold the only connection
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"list_preflight_runs",)"
+        R"("arguments":{}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["data"]["retry_after_ms"].get<int>() ==
+          mcp::kMcpStoreFaultShortRetryMs); // A5: genuinely retryable
+    CHECK(res->body.find("mcp-run-starved-1") == std::string::npos);
+}
+
+TEST_CASE("MCP get_deployment_preview: an exhausted pool answers "
+          "kInternalError + retry_after_ms, never the same kInvalidParams as "
+          "a genuine not-found, #4036 hardening round",
+          "[pg][mcp][integration][operator_surface]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_preflight_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    yuzu::server::PreflightRunStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::server::PreflightRunRow run;
+    run.run_id = "mcp-preview-starved-1";
+    run.execution_id = "preflight-mcp-preview-starved-1";
+    run.created_by = "test-user";
+    run.name = "starved-pool preview run";
+    run.scope_label = "all visible devices";
+    run.config_json = R"({"app_name":"","min_gib":20})";
+    run.window_seconds = 300;
+    run.created_at_ms = 1000;
+    run.deadline_at_ms = 301000;
+    REQUIRE(store.create_run(run, {{"agent-1", "host-1", "windows"}}));
+
+    McpTestServer ts;
+    ts.preflight_run_store_for_test = &store;
+    ts.start();
+
+    auto hog = pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(hog); // we now hold the only connection
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"get_deployment_preview",)"
+        R"("arguments":{"run_id":"mcp-preview-starved-1"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["data"]["retry_after_ms"].get<int>() ==
+          mcp::kMcpStoreFaultShortRetryMs); // A5: genuinely retryable, NOT
+                                            // the kInvalidParams a genuine
+                                            // miss returns.
+}
+
 // ── Live-query bundle MCP tools (ADR-0011) ──────────────────────────────────
 // execute_bundle (async dispatch) + get_bundle_result (collate) wrap the SAME
 // BundleOrchestrator as POST/GET /api/v1/bundles — MCP/REST parity by

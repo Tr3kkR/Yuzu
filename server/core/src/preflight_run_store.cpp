@@ -195,11 +195,24 @@ bool PreflightRunStore::create_run(const PreflightRunRow& run,
 
 std::optional<PreflightRunRow> PreflightRunStore::get_run(const std::string& run_id,
                                                          const std::string& created_by) {
-    if (!open_ || run_id.empty())
-        return std::nullopt;
+    auto r = get_run_checked(run_id, created_by);
+    // Discard the store-error channel — see the header's doc comment: this
+    // wrapper exists to preserve the pre-#4036 fail-soft contract for the
+    // HTML-fragment callers, which never distinguished "absent" from "store
+    // faulted". A checked caller error also degrades to nullopt here (never
+    // throws), same shape as every other pre-existing call site.
+    return r.value_or(std::nullopt);
+}
+
+std::expected<std::optional<PreflightRunRow>, std::string>
+PreflightRunStore::get_run_checked(const std::string& run_id, const std::string& created_by) {
+    if (run_id.empty())
+        return std::optional<PreflightRunRow>{std::nullopt}; // caller-input miss, not a store fault
+    if (!open_)
+        return std::unexpected("preflight run store not open");
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return std::nullopt;
+        return std::unexpected("pool acquire timeout");
     std::string sql =
         std::string("SELECT ") + kRunCols + " FROM preflight_run_store.runs WHERE run_id = $1";
     std::vector<std::string> params{run_id};
@@ -208,19 +221,28 @@ std::optional<PreflightRunRow> PreflightRunStore::get_run(const std::string& run
         params.push_back(created_by);
     }
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
-    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
-        return std::nullopt;
-    return read_run(res.get(), 0);
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string("query failed: ") + PQerrorMessage(lease.get()));
+    if (PQntuples(res.get()) == 0)
+        return std::optional<PreflightRunRow>{std::nullopt};
+    return std::optional<PreflightRunRow>{read_run(res.get(), 0)};
 }
 
 std::vector<PreflightRunRow> PreflightRunStore::list_runs(const std::string& viewer, bool is_admin,
                                                           int limit) {
-    std::vector<PreflightRunRow> out;
+    auto r = list_runs_checked(viewer, is_admin, limit);
+    // Discard the store-error channel — same rationale as get_run above:
+    // preserves the pre-#4036 fail-soft rail-rendering contract.
+    return r.value_or(std::vector<PreflightRunRow>{});
+}
+
+std::expected<std::vector<PreflightRunRow>, std::string>
+PreflightRunStore::list_runs_checked(const std::string& viewer, bool is_admin, int limit) {
     if (!open_)
-        return out;
+        return std::unexpected("preflight run store not open");
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return out;
+        return std::unexpected("pool acquire timeout");
     const int cap = (limit > 0 && limit < kRunListCap) ? limit : kRunListCap;
     const std::string sql_admin =
         std::string("SELECT ") + kRunCols +
@@ -235,7 +257,8 @@ std::vector<PreflightRunRow> PreflightRunStore::list_runs(const std::string& vie
                  : pg::exec_params(lease.get(), sql_owner.c_str(),
                                    std::vector<std::string>{viewer, std::to_string(cap)});
     if (res.status() != PGRES_TUPLES_OK)
-        return out;
+        return std::unexpected(std::string("query failed: ") + PQerrorMessage(lease.get()));
+    std::vector<PreflightRunRow> out;
     const int rows = PQntuples(res.get());
     out.reserve(static_cast<std::size_t>(rows));
     for (int i = 0; i < rows; ++i)

@@ -12036,10 +12036,21 @@ McpServer::HandlerFn McpServer::build_handler(
                     limit = 1;
                 if (limit > 100)
                     limit = 100;
-                auto rows = preflight_run_store_->list_runs(session->username, /*is_admin=*/false,
-                                                            static_cast<int>(limit));
+                // #4036 hardening round: `list_runs_checked`, not `list_runs` —
+                // see the REST twin's identical comment (preflight_routes.cpp).
+                // A store-level fault (pool exhausted, query error) must not
+                // read as "you have zero saved runs".
+                auto rows_or = preflight_run_store_->list_runs_checked(
+                    session->username, /*is_admin=*/false, static_cast<int>(limit));
+                if (!rows_or) {
+                    res.set_content(a4_error(kInternalError, "pre-flight run store unavailable",
+                                             "retry once the server reports ready",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                                    "application/json");
+                    return;
+                }
                 nlohmann::json arr = nlohmann::json::array();
-                for (const auto& r : rows)
+                for (const auto& r : *rows_or)
                     arr.push_back(preflight_run_row_json(r));
                 nlohmann::json payload = {{"data", arr}};
                 mcp_audit("success");
@@ -12077,7 +12088,19 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto run = preflight_run_store_->get_run(run_id, session->username);
+                // #4036 hardening round: `get_run_checked`, not `get_run` — see
+                // the REST twin's identical comment (deployment_routes.cpp). A
+                // store-level fault must surface as a retryable error, not the
+                // same permanent "not found" as a genuine miss/not-yours.
+                auto run_or = preflight_run_store_->get_run_checked(run_id, session->username);
+                if (!run_or) {
+                    res.set_content(a4_error(kInternalError, "pre-flight run store unavailable",
+                                             "retry once the server reports ready",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                                    "application/json");
+                    return;
+                }
+                const auto& run = *run_or;
                 if (!run) {
                     res.set_content(a4_error(kInvalidParams, "pre-flight run not found"),
                                     "application/json");
