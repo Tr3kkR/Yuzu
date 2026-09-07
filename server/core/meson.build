@@ -444,6 +444,7 @@ yuzu_server_core_lib = static_library(
     'src/quarantine_reapply.cpp',
     'src/quarantine_containment_reconciler.cpp',
     'src/result_set_store.cpp',
+    'src/result_set_routes.cpp',
     'src/result_set_matcher.cpp',
     'src/policy_store.cpp',
     'src/policy_evaluator.cpp',

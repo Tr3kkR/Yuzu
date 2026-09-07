@@ -878,6 +878,7 @@ if build_server
       'unit/server/test_notification_routes.cpp',
       'unit/server/test_command_routes.cpp',
       'unit/server/test_page_routes.cpp',
+      'unit/server/test_result_set_routes.cpp',
       'unit/server/test_agent_service_impl.cpp',
       'unit/server/test_analytics_event.cpp',
       'unit/server/test_agent_health_store.cpp',
