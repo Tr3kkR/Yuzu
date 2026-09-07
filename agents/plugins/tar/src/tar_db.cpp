@@ -1207,9 +1207,19 @@ std::expected<void, TarDatabase::CursorInsertError> TarDatabase::insert_removabl
                 // Same rule as the power twin: snapshot_id is per-tick
                 // collection metadata and never participates, and ts is
                 // identity for a real attach/detach but only "when we noticed"
-                // for a capture_gap.
-                const bool is_gap = ev.action == "capture_gap";
-                if ((is_gap || sqlite3_column_int64(dup.get(), 0) == ev.ts) &&
+                // for a capture_gap. present_at_baseline joins that second
+                // group too (PR #4023 review round 2, blocker #2):
+                // removable_baseline_record_key() already keys ONLY on
+                // device_key, deliberately excluding ts, because a CursorLost
+                // re-baseline re-emits the identical baseline row with a
+                // fresh wall-clock ts -- if ts still participated here that
+                // re-emission would collide against the original row on every
+                // retry forever, permanently wedging the source on a
+                // corrupted-cursor recovery path that exists specifically to
+                // UN-wedge it.
+                const bool ts_is_not_identity =
+                    ev.action == "capture_gap" || ev.action == "present_at_baseline";
+                if ((ts_is_not_identity || sqlite3_column_int64(dup.get(), 0) == ev.ts) &&
                     col(2) == ev.action && col(3) == ev.device_key && col(4) == ev.vendor &&
                     col(5) == ev.product && col(6) == ev.serial && col(7) == ev.bus &&
                     col(8) == ev.volume && sqlite3_column_int64(dup.get(), 9) == ev.size_bytes &&
