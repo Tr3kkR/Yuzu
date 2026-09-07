@@ -818,10 +818,12 @@ TEST_CASE("a demote whose cache write already landed before the recheck takes "
     // sweep (which already ran before this new session existed) -
     // effectively un-revoking a same-process demotion. External adversarial
     // review (fjarvis, C1) correctly argued this was closeable, not inherent:
-    // on version divergence, return the cache's now-fresher role (which the
-    // racing writer already committed under the same lock) instead of this
-    // call's own superseded read. Now closed - the minted session must also
-    // reflect "user", not "admin".
+    // on version divergence, re-verify against AuthDB directly and return the
+    // DB-confirmed role, instead of this call's own superseded read (an
+    // earlier fix draft returned the CACHE's current value on the theory that
+    // it must be DB-confirmed - Gate 3 re-review showed that theory false,
+    // see this function's header doc). Now closed - the minted session must
+    // also reflect "user", not "admin".
     auto session = cold_mgr.validate_session(*token);
     REQUIRE(session.has_value());
     CHECK(session->role == Role::user);
@@ -867,8 +869,8 @@ TEST_CASE("a promote-then-demote round trip back to the ORIGINAL role is never "
         "cora", *pre_check_role, *pre_check_version);
     REQUIRE(current_role.has_value());
     // Previously returned Role::admin (this call's own stale read) - now
-    // returns the cache's current, fresher value on version divergence
-    // (external adversarial review, fjarvis C1).
+    // re-verifies against AuthDB directly on version divergence and returns
+    // the DB-confirmed value (external adversarial review, fjarvis C1).
     CHECK(*current_role == Role::user);
 
     // The guard must NOT revert the cache to "admin" just because the role

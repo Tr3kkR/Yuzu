@@ -1030,16 +1030,39 @@ private:
     ///    `return db_user->role` let a session get minted at a role a
     ///    same-process demote had already committed, surviving that demote's
     ///    own session-invalidation sweep; the intermediate (cache-trusting)
-    ///    fix could relay a DIFFERENT call's stale read instead. Still open,
-    ///    same class, narrower: the case-2 branch above (no version
-    ///    divergence observed) - a racing writer's DB commit can land in this
-    ///    call's own read-to-lock window without yet reaching ITS OWN lock,
-    ///    so the version counter shows no change and this call still trusts
-    ///    its own now-stale `db_user->role`. Not closed - re-verifying on
-    ///    every call would add an unconditional second DB round-trip to the
-    ///    common (non-divergent) path, defeating the version-guard's purpose.
-    ///    Disclosed and tracked (issue TBD - see PR #4076), same footing as
-    ///    the cross-replica case below.
+    ///    fix could relay a DIFFERENT call's stale read instead. If a THIRD
+    ///    write lands while this re-verify is itself in flight (detected by
+    ///    re-checking `role_version` once more after the re-read), this
+    ///    function fails closed (`nullopt`) rather than returning the
+    ///    now-also-superseded re-read - that branch is already on the rare,
+    ///    post-divergence path, so failing closed there is nearly free,
+    ///    unlike the case below.
+    ///
+    ///    Still open, same class, narrower: the case-2 branch above (no
+    ///    version divergence observed) - a racing writer's DB commit can land
+    ///    in this call's own read-to-lock window without yet reaching ITS OWN
+    ///    lock, so the version counter shows no change and this call still
+    ///    trusts its own now-stale `db_user->role`. Not closed, and NOT
+    ///    closeable by "just re-read again": an authdb re-review (Gate 8,
+    ///    #4020 third round) caught this fix's own doc text overclaiming that
+    ///    an unconditional second read would close it at the cost of a round
+    ///    trip - false. Any read-then-lock check has its OWN read-to-lock
+    ///    window, and a writer whose commit lands there without yet reaching
+    ///    its own lock is invisible to the version compare regardless of how
+    ///    many times the read is repeated (case 3's re-read narrows this to a
+    ///    single local-mutex-acquisition-wide window, which is why it's
+    ///    closeable there and this branch's much wider one - spanning back to
+    ///    before PBKDF2 - is not, without also restructuring the read
+    ///    timing). Full closure needs an actual serialization primitive (a DB
+    ///    row lock or CAS held across both the read and the write), not more
+    ///    reads. A session minted this way carries the stale role for its
+    ///    FULL LIFETIME, not one request - `validate_session` performs no
+    ///    per-request re-verification, and the demote's own session sweep
+    ///    (`update_role`'s `std::erase_if(sessions_, ...)`) runs before this
+    ///    session even exists, so it cannot catch it either. Tracked as
+    ///    issue #4107, disposition (fix vs. accept) pending review by someone
+    ///    other than this fix's author, per this project's standing rule
+    ///    against self-authored risk acceptance on a HIGH-derived finding.
     ///    The cross-replica case (a demotion committed on a DIFFERENT server,
     ///    invisible to this process's local version counter) is a separate,
     ///    harder residual, not closed here either.

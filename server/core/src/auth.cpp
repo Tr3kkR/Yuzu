@@ -842,7 +842,7 @@ AuthManager::recheck_role_after_credential_check(const std::string& username, Ro
             spdlog::warn("{}: user '{}' not active in AuthDB (re-verify after detecting a "
                          "concurrent write)",
                          context, username);
-            std::unique_lock lock2(mu_);
+            lock.lock();
             users_.erase(username);
         } else {
             spdlog::error("{}: AuthDB re-verify for '{}' failed after detecting a concurrent "
@@ -851,20 +851,26 @@ AuthManager::recheck_role_after_credential_check(const std::string& username, Ro
         }
         return std::nullopt;
     }
-    std::unique_lock lock2(mu_);
+    lock.lock();
     it = users_.find(username);
     if (it == users_.end())
         return std::nullopt; // removed while the re-verify read was in flight
-    if (it->second.role_version == version_before_reread) {
-        it->second.role = reread->role;
-        it->second.role_version = next_role_version_();
+    if (it->second.role_version != version_before_reread) {
+        // Gate 8 re-review (security-guardian, #4020 third round): a THIRD
+        // write landed while we were re-verifying - `reread` is itself now
+        // superseded, the identical shape as the defect this whole re-verify
+        // exists to close, one level deeper. Unlike the case-2 hot-path gap
+        // (disclosed, not fixed - re-verifying there costs every login a
+        // second DB round-trip), this branch is already on the rare,
+        // post-divergence path, so failing closed here is nearly free and
+        // avoids ever relaying a value this call cannot prove is current.
+        // The caller (authenticate()/verify_password()) denies on nullopt,
+        // same as the entry-vanished case above; a legitimate concurrent
+        // login simply retries.
+        return std::nullopt;
     }
-    // Else: yet another write landed while we were re-verifying. Don't
-    // clobber it - return the DB-confirmed value we just read either way,
-    // since it's still strictly fresher than either of this call's two now-
-    // superseded observations, but leave the cache to whatever the newer
-    // write left it (this call has no way to prove ITS OWN reread is fresher
-    // than that write without looping indefinitely under contention).
+    it->second.role = reread->role;
+    it->second.role_version = next_role_version_();
     return reread->role;
 }
 
