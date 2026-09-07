@@ -258,6 +258,34 @@ TEST_CASE("DeploymentRunStore succeeded_agents_for_run (cross-deployment dedup)"
     CHECK(store.succeeded_agents_for_run("other", "alice").empty()); // run-scoped
 }
 
+// WS-10 10.2 (#2508): run_retention_prune is the shared clock-guarded, single-writer,
+// capped prune (pg::run_clock_guarded_prune). This binds the store's own wiring of it:
+// it takes the retention WINDOW (not a cutoff), reads Postgres now() itself, and the
+// part-6 Decline policy makes the FIRST pass on a store with data but no persisted
+// anchor DECLINE (records the anchor + settled marker, deletes nothing); the next
+// pass proceeds. The catastrophic-code details are exercised in test_pg_retention_guard.
+TEST_CASE("DeploymentRunStore prune removes old deployments (clock-guarded, bootstrap-declines once)",
+          "[pg][deployment][store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, deprun_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    DeploymentRunStore store{pool};
+    REQUIRE(store.is_open());
+
+    const auto t = now_ms();
+    REQUIRE(store.create_deployment(make_dep("dNew", "carol", t), {tgt("n1")}));
+    REQUIRE(store.create_deployment(make_dep("dOld", "carol", t - 100000), {tgt("o1")})); // 100s ago
+
+    // 75s window sits between dOld (100s) and dNew (~now). dNew keeps this from being
+    // would_wipe, so the ONLY first-pass decline is the part-6 bootstrap NoAnchor.
+    CHECK(store.run_retention_prune(75000) == 0); // bootstrap decline
+    int n = store.run_retention_prune(75000);
+    CHECK(n >= 1);
+    CHECK_FALSE(store.get_deployment("dOld").has_value()); // pruned
+    CHECK(store.get_devices("dOld").empty());              // FK ON DELETE CASCADE
+    CHECK(store.get_deployment("dNew").has_value());       // newer deployment survives
+}
+
 // ADR-0012 §1: construction must be fail-CLOSED — a reachable DB whose schema can't
 // migrate leaves the store !is_open() (server.cpp → startup_failed_).
 TEST_CASE("DeploymentRunStore reports !is_open on a migration failure",
