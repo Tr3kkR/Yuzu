@@ -1,4 +1,4 @@
-captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash pending
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-07 · euid 0 · leg-hash pending
 == action=get_value hive=HKLM key="SOFTWARE\Microsoft\Windows NT\CurrentVersion" name=ProductName
 registry|unsupported|Windows registry is not available on this platform
 [result_status] UNDECLARED / UNKNOWN / 
@@ -30,7 +30,7 @@ registry|unsupported|Windows registry is not available on this platform
 registry|unsupported|Windows registry is not available on this platform
 [result_status] UNDECLARED / UNKNOWN / 
 
-== action=get_user_value key=Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced\Hidden
+== action=get_user_value username=alex key=Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced name=Hidden
 registry|unsupported|Windows registry is not available on this platform
 [result_status] UNDECLARED / UNKNOWN / 
 

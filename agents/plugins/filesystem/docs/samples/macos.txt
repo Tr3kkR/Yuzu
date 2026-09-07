@@ -91,12 +91,12 @@ size|213
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=create_temp
-path|/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu-CoxeGy.tmp
+path|/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu-ayE16A.tmp
 persist|true
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=create_temp_dir
-path|/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu-v4uEu9
+path|/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu-R7qEuY
 persist|true
 [result_status] UNDECLARED / UNKNOWN / 
 
@@ -130,7 +130,7 @@ match|/private/etc/hosts|213
 matches_found|1
 [result_status] UNDECLARED / UNKNOWN / 
 
-== action=search_dir root=/etc pattern=hosts
+== action=search_dir root=/etc pattern=*hosts*
 total_matches|0
 [result_status] UNDECLARED / UNKNOWN / 
 
@@ -138,31 +138,34 @@ total_matches|0
 version_status|not_available
 [result_status] UNDECLARED / UNKNOWN / 
 
-== action=search path=/etc pattern=hosts
-error|path is not a regular file
+== action=search path=/etc/hosts pattern=localhost
+match|4|# localhost is used to configure the loopback interface
+match|7|127.0.0.1	localhost
+match|9|::1             localhost
+total_matches|3
 [result_status] UNDECLARED / UNKNOWN / 
-[rc] 1
 
-== action=replace path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T/yuzu_capture_h8zzfku8/yuzu_capture_tmp.txt search=yuzu-capture replace=yuzu-replaced
+== action=replace path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T/yuzu_capture_8s9wf1vr/yuzu_capture_tmp.txt search=yuzu-capture replace=yuzu-replaced
 replacements_made|2
 file_size_before|40
 file_size_after|16
 [result_status] UNDECLARED / UNKNOWN / 
 
-== action=write_content path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T/yuzu_capture_h8zzfku8/yuzu_capture_tmp.txt content="yuzu-capture written"
-error|file exists and overwrite=false
-[result_status] UNDECLARED / UNKNOWN / 
-[rc] 1
-
-== action=append path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T/yuzu_capture_h8zzfku8/yuzu_capture_tmp.txt content="yuzu-capture appended"
+== action=write_content path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T/yuzu_capture_8s9wf1vr/yuzu_capture_tmp.txt content="yuzu-capture written" overwrite=true
 status|ok
-bytes_appended|21
-total_size|16
+bytes_written|20
+path|/private/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T/yuzu_capture_8s9wf1vr/yuzu_capture_tmp.txt
 [result_status] UNDECLARED / UNKNOWN / 
 
-== action=delete_lines path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T/yuzu_capture_h8zzfku8/yuzu_capture_tmp.txt start_line=1 end_line=1
+== action=append path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T/yuzu_capture_8s9wf1vr/yuzu_capture_tmp.txt content="yuzu-capture appended"
+status|ok
+bytes_appended|22
+total_size|20
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=delete_lines path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T/yuzu_capture_8s9wf1vr/yuzu_capture_tmp.txt start_line=1 end_line=1
 lines_deleted|1
-total_lines_before|3
-total_lines_after|2
+total_lines_before|2
+total_lines_after|1
 [result_status] UNDECLARED / UNKNOWN / 
 

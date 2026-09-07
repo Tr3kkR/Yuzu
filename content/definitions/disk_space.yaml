@@ -36,7 +36,9 @@ spec:
         displayName: Volume Path
         description: >
           Directory or volume root to measure (e.g. "C:\", "/", "/var").
-          Defaults to the platform root if omitted.
+          Defaults to the platform root if omitted (C:\ on Windows, / on
+          Linux and macOS); reported free space is the caller-usable figure,
+          not raw free blocks.
         validation:
           maxLength: 4096
 
@@ -49,12 +51,28 @@ spec:
     columns:
       - name: path
         type: string
+        description: The resolved path that was measured, echoed back verbatim from the request.
+        values: free text
+        example: "/"
+        platforms: [windows, linux, darwin]
       - name: total_bytes
         type: int64
+        description: Raw volume capacity in bytes.
+        values: integer
+        example: "494384795648"
+        platforms: [windows, linux, darwin]
       - name: free_bytes
         type: int64
+        description: Space usable by an ordinary caller, not raw free blocks (FreeBytesAvailableToCaller on Windows, f_bavail on POSIX).
+        values: integer
+        example: "313557938176"
+        platforms: [windows, linux, darwin]
       - name: percent_used
         type: int32
+        description: Percent of total_bytes currently used, truncated to an integer 0-100.
+        values: integer
+        example: "36"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Get free disk space for ${path}"
 

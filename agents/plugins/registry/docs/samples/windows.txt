@@ -157,10 +157,11 @@ value|RegisteredOwner|REG_SZ
 value|InstallTime|REG_QWORD
 [result_status] UNDECLARED / UNKNOWN / 
 
-== action=get_user_value key=Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced\Hidden
-error|missing required parameters: username or sid
+== action=get_user_value username=alex key=Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced name=Hidden
+username|alex
+value|1
+type|REG_DWORD
 [result_status] UNDECLARED / UNKNOWN / 
-[rc] 1
 
 == action=list_profiles
 S-1-5-21-571721511-16201247-3531262703-1001|Alex|C:\Users\Alex|loaded

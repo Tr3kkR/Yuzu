@@ -21,12 +21,12 @@ size|1405
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=create_temp
-path|D:\yuzu-dev\tmp\yuzu-964a901bfe197402d93f51a7653b0697.tmp
+path|D:\yuzu-dev\tmp\yuzu-14298277ed7220950c97d6a97a2e8180.tmp
 persist|true
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=create_temp_dir
-path|D:\yuzu-dev\tmp\yuzu-3849a33da8fc555d407ac0f2c67356f9
+path|D:\yuzu-dev\tmp\yuzu-2342ff50ffda6cdc156dbde1418407c0
 persist|true
 [result_status] UNDECLARED / UNKNOWN / 
 
@@ -91,7 +91,7 @@ match|C:\Windows\System32\drivers\etc\hosts|1405
 matches_found|1
 [result_status] UNDECLARED / UNKNOWN / 
 
-== action=search_dir root=C:\Windows\System32\drivers\etc pattern=hosts
+== action=search_dir root=C:\Windows\System32\drivers\etc pattern=*hosts*
 total_matches|0
 [result_status] UNDECLARED / UNKNOWN / 
 
@@ -106,31 +106,34 @@ product_name|Microsoft® Windows® Operating System
 legal_copyright|© Microsoft Corporation. All rights reserved.
 [result_status] UNDECLARED / UNKNOWN / 
 
-== action=search path=C:\Windows\System32\drivers\etc pattern=hosts
-error|path is not a regular file
+== action=search path=C:\Windows\System32\drivers\etc\hosts pattern=localhost
+match|19|# localhost name resolution is handled within DNS itself.
+match|20|#	127.0.0.1       localhost
+match|21|#	::1             localhost
+total_matches|3
 [result_status] UNDECLARED / UNKNOWN / 
-[rc] 1
 
-== action=replace path=C:\WINDOWS\TEMP\yuzu_capture_87gld9cd\yuzu_capture_tmp.txt search=yuzu-capture replace=yuzu-replaced
+== action=replace path=C:\WINDOWS\TEMP\yuzu_capture_bs7ucomo\yuzu_capture_tmp.txt search=yuzu-capture replace=yuzu-replaced
 replacements_made|2
 file_size_before|42
 file_size_after|18
 [result_status] UNDECLARED / UNKNOWN / 
 
-== action=write_content path=C:\WINDOWS\TEMP\yuzu_capture_87gld9cd\yuzu_capture_tmp.txt content="yuzu-capture written"
-error|file exists and overwrite=false
-[result_status] UNDECLARED / UNKNOWN / 
-[rc] 1
-
-== action=append path=C:\WINDOWS\TEMP\yuzu_capture_87gld9cd\yuzu_capture_tmp.txt content="yuzu-capture appended"
+== action=write_content path=C:\WINDOWS\TEMP\yuzu_capture_bs7ucomo\yuzu_capture_tmp.txt content="yuzu-capture written" overwrite=true
 status|ok
-bytes_appended|21
-total_size|18
+bytes_written|20
+path|C:\Windows\Temp\yuzu_capture_bs7ucomo\yuzu_capture_tmp.txt
 [result_status] UNDECLARED / UNKNOWN / 
 
-== action=delete_lines path=C:\WINDOWS\TEMP\yuzu_capture_87gld9cd\yuzu_capture_tmp.txt start_line=1 end_line=1
+== action=append path=C:\WINDOWS\TEMP\yuzu_capture_bs7ucomo\yuzu_capture_tmp.txt content="yuzu-capture appended"
+status|ok
+bytes_appended|22
+total_size|20
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=delete_lines path=C:\WINDOWS\TEMP\yuzu_capture_bs7ucomo\yuzu_capture_tmp.txt start_line=1 end_line=1
 lines_deleted|1
-total_lines_before|3
-total_lines_after|2
+total_lines_before|2
+total_lines_after|1
 [result_status] UNDECLARED / UNKNOWN / 
 

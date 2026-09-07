@@ -34,10 +34,22 @@ spec:
     columns:
       - name: installed
         type: bool
+        description: Whether the registry reports a ProductVersion for the SCCM client (Windows only; always false off-Windows).
+        values: "true, false"
+        example: "false"
+        platforms: [windows, linux]
       - name: version
         type: string
+        description: The installed SCCM client version from HKLM\SOFTWARE\Microsoft\SMS\Mobile Client\ProductVersion, or "-" if not present.
+        values: free text or "-"
+        example: "-"
+        platforms: [windows]
       - name: service_status
         type: string
+        description: The ccmexec Windows service state from a live SCM query (OpenSCManagerW/OpenServiceW/QueryServiceStatusEx).
+        values: "running, stopped, exists, not_found, unavailable"
+        example: not_found
+        platforms: [windows]
 
   readablePayload: "Query SCCM client version and status"
 
@@ -89,8 +101,16 @@ spec:
     columns:
       - name: site_code
         type: string
+        description: The assigned SCCM site code, from the registry, the enumerated CCM\Authority subkey, or the Microsoft.SMS.Client COM fallback; "not_configured" if none resolve.
+        values: free text or not_configured
+        example: not_configured
+        platforms: [windows]
       - name: management_point
         type: string
+        description: The current SCCM management point hostname, from the registry, the enumerated CCM\Authority subkey, or the Microsoft.SMS.Client COM fallback; "unknown" if none resolve.
+        values: free text or unknown
+        example: unknown
+        platforms: [windows]
 
   readablePayload: "Query SCCM site assignment"
 

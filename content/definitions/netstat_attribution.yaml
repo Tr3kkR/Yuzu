@@ -49,22 +49,75 @@ spec:
     columns:
       - name: proto
         type: string
+        description: Transport protocol and IP version of the socket.
+        values: [tcp, tcp6, udp, udp6]
+        example: "tcp"
+        platforms: [windows, linux, darwin]
       - name: local_addr
         type: string
+        description: The connection's local IP address, in the address family matching proto.
+        values: free text (IPv4 or IPv6 address)
+        example: "100.109.177.77"
+        platforms: [windows, linux, darwin]
       - name: local_port
         type: int32
+        description: The connection's local TCP or UDP port number.
+        values: integer, 0-65535
+        example: 52882
+        platforms: [windows, linux, darwin]
       - name: remote_addr
         type: string
+        description: >
+          The connection's remote IP address. UDP sockets report the literal
+          '*' on macOS and Windows (no fixed peer); Linux instead parses the
+          real value from /proc/net/udp* (normally 0.0.0.0).
+        values: free text (IPv4 or IPv6 address) or "*"
+        example: "100.123.53.121"
+        platforms: [windows, linux, darwin]
       - name: remote_port
         type: int32
+        description: The connection's remote port; always 0 for UDP (no fixed peer).
+        values: integer, 0-65535
+        example: 22
+        platforms: [windows, linux, darwin]
       - name: state
         type: string
+        description: >
+          TCP connection state name; always empty for UDP rows (never a
+          fabricated LISTEN). The exact name set differs slightly per OS.
+        values: "ESTABLISHED, SYN_SENT, SYN_RECV, FIN_WAIT1, FIN_WAIT2, TIME_WAIT, CLOSE_WAIT, LAST_ACK, LISTEN, CLOSING, UNKNOWN, CLOSE (Linux only), CLOSED/DELETE_TCB (Windows only), or empty (UDP)"
+        example: "ESTABLISHED"
+        platforms: [windows, linux, darwin]
       - name: pid
         type: int32
+        description: >
+          PID of the process holding the socket, or -1 (Linux only) when no
+          matching /proc/[pid]/fd inode was found.
+        values: integer, or -1 on Linux
+        example: 9653
+        platforms: [windows, linux, darwin]
       - name: process_name
         type: string
+        description: >
+          Name of the process owning the socket (Linux: /proc/[pid]/comm;
+          macOS: libproc proc_name, 16-char truncated; Windows: basename of
+          the QueryFullProcessImageNameW path). Pipe and CR/LF characters
+          are escaped/stripped. Empty when the owning process could not be
+          resolved.
+        values: free text, or empty when unresolved
+        example: "ssh"
+        platforms: [windows, linux, darwin]
       - name: process_path
         type: string
+        description: >
+          Full executable path of the owning process (Linux: /proc/[pid]/exe
+          symlink target; macOS: libproc proc_pidpath; Windows:
+          QueryFullProcessImageNameW). Pipe and CR/LF characters are
+          escaped/stripped. Empty when the owning process could not be
+          resolved.
+        values: free text (absolute path), or empty when unresolved
+        example: "/usr/bin/ssh"
+        platforms: [windows, linux, darwin]
     aggregation:
       groupBy:
         - process_name

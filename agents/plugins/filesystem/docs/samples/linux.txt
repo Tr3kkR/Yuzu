@@ -1,4 +1,4 @@
-captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash pending
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-07 · euid 0 · leg-hash pending
 == action=exists path=/etc/hosts
 exists|true
 type|file
@@ -91,18 +91,18 @@ entry|protocols|file|3144
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=file_hash path=/etc/hosts
-hash|6e26c7d87b8a6153bfdb353ddb6ed87bc3e4c674e63cc11b3b9517f6b02fa684
+hash|60aae00e788a173131b105d5694045ac736b668be86396d4991d1dbe3d70ef38
 algorithm|sha256
 size|172
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=create_temp
-path|/tmp/yuzu-271hb7.tmp
+path|/tmp/yuzu-UPhb03.tmp
 persist|true
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=create_temp_dir
-path|/tmp/yuzu-HpfqA4
+path|/tmp/yuzu-7OcS9w
 persist|true
 [result_status] UNDECLARED / UNKNOWN / 
 
@@ -113,7 +113,7 @@ line|3|fe00::	ip6-localnet
 line|4|ff00::	ip6-mcastprefix
 line|5|ff02::1	ip6-allnodes
 line|6|ff02::2	ip6-allrouters
-line|7|172.17.0.4	42cdcca6b409
+line|7|172.17.0.3	5bd4336fc14e
 total_lines|7
 file_size|172
 [result_status] UNDECLARED / UNKNOWN / 
@@ -134,7 +134,7 @@ error|code signature verification is not supported on this platform
 matches_found|0
 [result_status] UNDECLARED / UNKNOWN / 
 
-== action=search_dir root=/etc pattern=hosts
+== action=search_dir root=/etc pattern=*hosts*
 total_matches|0
 [result_status] UNDECLARED / UNKNOWN / 
 
@@ -143,10 +143,11 @@ error|version info extraction is not supported on this platform
 [result_status] UNDECLARED / UNKNOWN / 
 [rc] 1
 
-== action=search path=/etc pattern=hosts
-error|path is not a regular file
+== action=search path=/etc/hosts pattern=localhost
+match|1|127.0.0.1	localhost
+match|2|::1	localhost ip6-localhost ip6-loopback
+total_matches|2
 [result_status] UNDECLARED / UNKNOWN / 
-[rc] 1
 
 == action=replace path=/tmp/yuzu_capture/yuzu_capture_tmp.txt search=yuzu-capture replace=yuzu-replaced
 replacements_made|2
@@ -154,10 +155,11 @@ file_size_before|40
 file_size_after|16
 [result_status] UNDECLARED / UNKNOWN / 
 
-== action=write_content path=/tmp/yuzu_capture/yuzu_capture_tmp.txt content="yuzu-capture written"
-error|file exists and overwrite=false
+== action=write_content path=/tmp/yuzu_capture/yuzu_capture_tmp.txt content="yuzu-capture written" overwrite=true
+status|ok
+bytes_written|20
+path|/tmp/yuzu_capture/yuzu_capture_tmp.txt
 [result_status] UNDECLARED / UNKNOWN / 
-[rc] 1
 
 == action=append path=/tmp/yuzu_capture/yuzu_capture_tmp.txt content="yuzu-capture appended"
 status|ok

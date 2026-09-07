@@ -13,10 +13,9 @@ check_interval|300
 change_count|0
 [result_status] UNDECLARED / UNKNOWN / 
 
-== action=get key=yuzu_capture_tmp
-error|unknown category: yuzu_capture_tmp
+== action=get key=role
+tag|role|
 [result_status] UNDECLARED / UNKNOWN / 
-[rc] 1
 
 == action=changes
 changes|none

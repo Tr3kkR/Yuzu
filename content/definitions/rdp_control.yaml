@@ -62,19 +62,37 @@ spec:
       state:
         type: string
         displayName: RDP State
-        description: enable allows Remote Desktop connections; disable blocks them.
+        description: >
+          enable allows Remote Desktop connections; disable blocks them
+          (e.g. state: enable).
         validation:
           enum: ["enable", "disable"]
   result:
     columns:
       - name: reg_status
         type: string
+        description: Outcome of writing HKLM fDenyTSConnections; ok or a Win32 error code.
+        values: "ok, error:<win32 code> (e.g. error:5 = ERROR_ACCESS_DENIED)"
+        example: "ok"
+        platforms: [windows]
       - name: firewall_status
         type: string
+        description: Outcome of toggling the Remote Desktop firewall rule group via INetFwPolicy2.
+        values: "ok, error:com_init, error:group_not_found, error:0x<hresult>"
+        example: "ok"
+        platforms: [windows]
       - name: service_status
         type: string
+        description: TermService outcome — running once start is confirmed by polling (enable), untouched (disable), or a Win32 error.
+        values: "running, untouched, error:<win32 code>"
+        example: "running"
+        platforms: [windows]
       - name: overall
         type: string
+        description: Terminal verdict for the whole set_state call; ok only when every step above succeeded.
+        values: "ok, error"
+        example: "ok"
+        platforms: [windows]
   readablePayload: "Set Remote Desktop state to ${state}"
   approval:
     mode: role-gated
@@ -118,12 +136,28 @@ spec:
     columns:
       - name: deny_ts_connections
         type: string
+        description: Raw fDenyTSConnections registry value (0 = RDP allowed, 1 = RDP denied), or a Win32 error if the read failed.
+        values: "0, 1, error:<win32 code>"
+        example: "0"
+        platforms: [windows]
       - name: firewall_group
         type: string
+        description: Whether the Remote Desktop firewall rule group is enabled, or why it could not be read.
+        values: "enabled, disabled, group_not_found, error:com_init, error:0x<hresult>"
+        example: "enabled"
+        platforms: [windows]
       - name: term_service
         type: string
+        description: Current SCM state name for TermService, or a Win32 error if the query failed.
+        values: "running, start_pending, stopped, stop_pending, paused, pause_pending, continue_pending, unknown, error:<win32 code>"
+        example: "running"
+        platforms: [windows]
       - name: rdp
         type: string
+        description: Derived RDP posture — on only when all three gates are readable and open, unknown when any gate could not be read, off otherwise.
+        values: "on, off, unknown"
+        example: "on"
+        platforms: [windows]
   approval:
     mode: auto
   permissions:
