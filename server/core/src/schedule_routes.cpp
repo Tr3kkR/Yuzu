@@ -118,6 +118,20 @@ void register_schedule_routes(HttpRouteSink& sink, Deps deps) {
             }
             sched.parameter_values = *canon_params;
 
+            // KNOWN GAP (#4131, pre-existing, not introduced by this extraction —
+            // verified byte-identical against origin/dev's pre-extraction inline
+            // code): this is a SECOND, non-atomic resolve_session call, independent
+            // of the Schedule:Write/Execution:Execute perm_fn gates' own internal
+            // session resolution above. If THIS call returns nullopt (a concurrent
+            // session eviction, or a Postgres session-store brownout past the 30s
+            // stale-serve bound) while the gates above already succeeded,
+            // `created_by` silently stays "" rather than failing the request
+            // closed — and "" can never match a real username, so the schedule
+            // becomes permanently un-deletable/un-disableable via the owner-scoped
+            // API, and (under RBAC legacy-open) still arms and fires unattended
+            // forever with no kill switch. Do not silently fix this here; see
+            // #4131 for the real remedy (reuse the identity the gate already
+            // validated instead of re-resolving).
             if (auto session = deps.resolve_session_fn(req))
                 sched.created_by = session->username;
 
@@ -163,8 +177,11 @@ void register_schedule_routes(HttpRouteSink& sink, Deps deps) {
         // M-01 (#1806): owner-scoped delete — a Schedule:Delete grant
         // deletes only schedules the caller created, not the whole
         // fleet's. deps.resolve_session_fn, not require_permission's
-        // session (already consumed) — this call cannot fail auth since
-        // require_permission above already proved a valid session exists.
+        // session (already consumed) — a SECOND, non-atomic resolution
+        // (#4131), same shape as the create route's own known gap above.
+        // Here the failure mode is benign: a nullopt yields an empty `user`
+        // that matches no real owner, so the delete is a harmless no-op
+        // rather than a wrong deletion.
         auto session = deps.resolve_session_fn(req);
         auto user = session ? session->username : std::string();
         bool deleted = deps.schedule_engine->delete_schedule(id, user);

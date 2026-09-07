@@ -13,7 +13,7 @@
 /// server.cpp; the changes are the receiver (`web_server_->` -> `sink.`),
 /// the gate closure (`require_permission` -> `deps.perm_fn`), the post-gate
 /// session lookup (`auth_routes_->resolve_session` ->
-/// `deps.resolve_session_fn`, a NEW deps field — see below), the audit call
+/// `deps.resolve_session_fn` — see below), the audit call
 /// (`audit_log(...)` -> `deps.audit_fn(...)`), and the member access
 /// (`schedule_engine_.` -> `deps.schedule_engine->`). `Deps::AuditFn` (like
 /// every other #2542 module's) takes all 6 positional arguments with no
@@ -52,17 +52,28 @@
 /// no session/permission/store dependency) — and keeps its own direct unit
 /// coverage unchanged.
 ///
-/// NEW DEPS FIELD — `resolve_session_fn`: the first #2542 extraction whose
-/// routes call `AuthRoutes::resolve_session` directly, rather than
-/// `require_auth`/the hoisted `auth_fn`'s `(req,res)->optional<Session>`
-/// shape (which gates and writes a 401 on failure). `resolve_session` takes
-/// ONLY `req` (no `res`) and is used strictly as a post-gate "who is
-/// calling" lookup, after `perm_fn`/`require_permission` above it has
-/// already proven a valid session exists — see `auth_routes.hpp`'s own doc
-/// comment on the method. No existing hoisted server.cpp closure wraps this
-/// narrower shape, so this extraction adds `resolve_session_fn`, a NEW
-/// closure defined alongside `auth_fn`/`perm_fn`/`audit_fn` at
-/// `start_web_server()` time.
+/// `resolve_session_fn`: routes call `AuthRoutes::resolve_session` directly,
+/// rather than `require_auth`/the hoisted `auth_fn`'s
+/// `(req,res)->optional<Session>` shape (which gates and writes a 401 on
+/// failure). `resolve_session` takes ONLY `req` (no `res`) and is used
+/// strictly as a post-gate "who is calling" lookup, after
+/// `perm_fn`/`require_permission` above it has already proven a valid
+/// session exists — see `auth_routes.hpp`'s own doc comment on the method.
+/// This closure is shared with PR-7's `instruction_routes.cpp`/
+/// `execution_routes.cpp` (hoisted once, alongside `auth_fn`/`perm_fn`/
+/// `audit_fn`, in server.cpp's shared closure block at `start_web_server()`
+/// time) — no module-local closure is defined here.
+///
+/// KNOWN GAP (#4131, pre-existing, confirmed byte-identical on origin/dev
+/// before this extraction): the create route calls this closure a SECOND
+/// time, independent of `perm_fn`'s own internal session resolution used for
+/// the gate check. On `nullopt` (a concurrent session eviction, or a
+/// Postgres session-store brownout), `created_by` silently stays `""`
+/// rather than failing closed — and `""` can never match a real username,
+/// so the owner-scoped DELETE/enable routes below can never reach that row
+/// again, and (under RBAC legacy-open) it still arms and fires unattended
+/// forever with no kill switch. Not fixed by this mechanical move; see
+/// #4131 for the real remedy.
 ///
 /// Routes (4) — gate in parens, all backed by `deps.schedule_engine` (null
 /// -> 503 on every route; no `is_open()` check anywhere in this module —
@@ -128,8 +139,8 @@ struct Deps {
     using PermFn = std::function<bool(const httplib::Request&, httplib::Response&,
                                        const std::string&, const std::string&)>;
     /// Wraps `AuthRoutes::resolve_session` — see this file's header comment
-    /// ("NEW DEPS FIELD") for why this is a new closure shape rather than a
-    /// reused one.
+    /// for why this differs from `auth_fn`'s shape, and for the closure's
+    /// shared ownership with PR-7's instruction/execution modules.
     using ResolveSessionFn = std::function<std::optional<auth::Session>(const httplib::Request&)>;
     /// Bool-returning audit contract, same shape as
     /// `custom_properties::Deps::AuditFn` / `result_set::Deps::AuditFn` —

@@ -377,7 +377,7 @@ pattern `grep -cE '^\s*web_server_->(Get|Post|Put|Delete|Patch|Options)\('
 server/core/src/server.cpp`, not a bare `grep -c` of the receiver-agnostic pattern above — the
 unanchored form over-counts by picking up at least one comment-line false match, which is how a
 105/106 figure was previously published here; the anchored count was 104 immediately before the
-page-shell extraction (independently re-verified during that extraction), 79 once both
+page-shell extraction (independently re-verified during that extraction), 79 after it, 64 once both
 the `dashboard_api_routes`/`nvd_routes` follow-up (-10) and the Custom Properties API extraction
 (-5) had landed together, 58 once the Result Sets fragment extraction (-6) also landed, stayed 58
 after the MCP extraction (#2542 PR-6) — that PR removed the last 3 raw `svr.{Get,Post,Delete}`
