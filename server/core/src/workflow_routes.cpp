@@ -1568,7 +1568,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                                     workflow_engine, instruction_store,
                                                     cmd_dispatch, cmd_dispatch_concurrency,
                                                     caller_fn, approval_manager,
-                                                    capability_registry](  // BR2-001
+                                                    capability_registry, metrics](  // BR2-001/BR3-001
                                                         const httplib::Request& req,
                                                         httplib::Response& res) {
         if (!perm_fn(req, res, "Workflow", "Execute"))
@@ -1697,6 +1697,124 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                             "application/json");
                         return;
                     }
+                }
+            }
+        }
+
+        // --- BR3-001 (branch-review round 3): preflight destructive/forensic --
+        // targeting for EVERY step before workflow_engine->execute() is called
+        // at all. BR2-001 (below, inside dispatch_fn) correctly gates the
+        // per-step dispatch on evaluate_destructive_targeting, so a bad-target
+        // Forensics/Destructive step genuinely reaches zero agents — but
+        // dispatch_fn has no metrics/audit_fn/req/res (it returns
+        // std::expected<std::string,std::string>, consumed internally by
+        // WorkflowEngine::execute), so that refusal was silently absorbed into
+        // the one step's own failed-step result while THIS route
+        // unconditionally audited "workflow.execute"/"success" once execute()
+        // returned — regardless of whether every step actually ran.
+        // docs/observability-conventions.md: "Denied operations MUST emit an
+        // audit event." Preflighting every step against the SAME
+        // evaluate_destructive_targeting call closes that gap: any step that
+        // would be refused refuses the WHOLE request up front — audited,
+        // metered, 400 — and execute() is never invoked. dispatch_fn's own
+        // per-step gate stays in place as defense-in-depth for a workflow
+        // definition mutated between this preflight and execute(), or a future
+        // dispatch_fn caller that skips this preflight.
+        //
+        // Unwired instruction_store/capability_registry: skip the preflight
+        // entirely rather than fail closed on a structural absence neither of
+        // this route's other checks treats as fatal — dispatch_fn's own guards
+        // ("instruction store not available" / "capability registry not
+        // available") remain the backstop for that case, unchanged from today.
+        if (instruction_store && instruction_store->is_open() && capability_registry) {
+            auto preflight_wf = workflow_engine->get_workflow(workflow_id);
+            if (!preflight_wf) {
+                res.status = 503;
+                res.set_content(
+                    nlohmann::json(
+                        {{"error", {{"code", 503},
+                                    {"message", yuzu::server::genericize_db_error(
+                                                    "get_workflow", preflight_wf.error())}}},
+                         {"meta", {{"api_version", "v1"}}}})
+                        .dump(),
+                    "application/json");
+                return;
+            }
+            // Not-found falls through unchanged, same as the approval
+            // pre-validation above — execute() below reports the canonical
+            // "workflow not found" error this preflight would otherwise skip
+            // ahead of.
+            if (*preflight_wf) {
+                for (const auto& step : (*preflight_wf)->steps) {
+                    // ADR-0058: get_definition returns std::expected — a
+                    // genuine DB error fails the WHOLE request closed (503);
+                    // "no such instruction" is not a targeting decision this
+                    // preflight can make, so it defers to the existing per-step
+                    // handling (the approval block above, or dispatch_fn's own
+                    // "unknown instruction" failure) as the backstop.
+                    auto step_def_result = instruction_store->get_definition(step.instruction_id);
+                    if (!step_def_result) {
+                        res.status = 503;
+                        res.set_content(
+                            nlohmann::json(
+                                {{"error",
+                                  {{"code", 503},
+                                   {"message", yuzu::server::genericize_db_error(
+                                                   "workflow preflight instruction lookup",
+                                                   step_def_result.error())}}},
+                                 {"meta", {{"api_version", "v1"}}}})
+                                .dump(),
+                            "application/json");
+                        return;
+                    }
+                    if (!*step_def_result)
+                        continue;
+                    const auto& step_def = **step_def_result;
+                    // SAME chokepoint dispatch_fn's own per-step gate below
+                    // uses — evaluate_destructive_targeting from
+                    // dispatch_destructive_gate.hpp, not a copy. scope_key_present
+                    // is always false: WorkflowStep carries no per-step scope
+                    // field, exactly matching dispatch_fn's own derivation.
+                    const auto gate = yuzu::server::evaluate_destructive_targeting(
+                        capability_registry->classify(step_def.plugin, step_def.action),
+                        /*valid_nonempty_agent_ids=*/!agent_ids.empty(),
+                        /*scope_key_present=*/false,
+                        /*agent_id_count=*/agent_ids.size());
+                    if (gate.verdict != yuzu::server::DestructiveTargetingVerdict::RefuseUntargeted)
+                        continue;
+                    // Counted on the SAME series as the instruction-execute,
+                    // /api/command, MCP and dashboard refusals, with this
+                    // route's own `route="workflow"` label — a NEW emission
+                    // point, not a reuse of "instruction_execute".
+                    if (metrics) {
+                        try {
+                            metrics
+                                ->counter("yuzu_server_dispatch_target_rejected_total",
+                                          {{"route", "workflow"},
+                                           {"reason", std::string(gate.refusal_reason)}})
+                                .increment();
+                        } catch (const std::exception& e) {
+                            spdlog::error(
+                                "dispatch_target_rejected_total counter threw for {}:{} "
+                                "(reason={}): {}",
+                                step_def.plugin, step_def.action, gate.refusal_reason, e.what());
+                        } catch (...) {
+                            spdlog::error(
+                                "dispatch_target_rejected_total counter threw for {}:{} "
+                                "(reason={})",
+                                step_def.plugin, step_def.action, gate.refusal_reason);
+                        }
+                    }
+                    audit_fn(req, "workflow.execute", "denied", "workflow", workflow_id,
+                             "reason=" + std::string(gate.refusal_reason));
+                    res.status = 400;
+                    res.set_content(
+                        nlohmann::json({{"error", {{"code", 400},
+                                                   {"message", std::string(gate.refusal_message)}}},
+                                        {"meta", {{"api_version", "v1"}}}})
+                            .dump(),
+                        "application/json");
+                    return;
                 }
             }
         }

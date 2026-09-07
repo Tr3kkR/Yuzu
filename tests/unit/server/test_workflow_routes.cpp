@@ -2417,9 +2417,22 @@ TEST_CASE("BR-001 — a non-Forensics/non-Destructive (unclassified) instruction
 // cmd_dispatch directly via dispatch_fn, bypassing BR-001's route-level gate
 // entirely. These pin that the SAME evaluate_destructive_targeting call now
 // runs inside dispatch_fn itself, so no sibling route can rediscover this gap.
+//
+// BR3-001 (round-3 branch review): BR2-001's per-step gate genuinely refuses
+// dispatch, but dispatch_fn has no metrics/audit_fn/req/res of its own, so the
+// refusal was silently absorbed into that ONE step's failed-step result while
+// the outer route still unconditionally audited "workflow.execute"/"success"
+// once WorkflowEngine::execute() returned. The fix preflights every step
+// against the SAME evaluate_destructive_targeting call BEFORE execute() is
+// ever invoked, so a would-be-refused step now refuses the WHOLE request up
+// front — audited, metered, 400 — rather than becoming a quietly-swallowed
+// per-step failure inside a 202. The first test below is updated in place to
+// assert the new outer-refusal shape; it previously asserted 202 (the
+// per-step-only refusal BR2-001 shipped).
 // ═══════════════════════════════════════════════════════════════════════════
 
-TEST_CASE("BR2-001 — a workflow step naming a Forensics instruction with 2 agent_ids is refused",
+TEST_CASE("BR3-001 — a workflow step naming a Forensics instruction with 2 agent_ids is refused "
+          "up front, audited and metered, before WorkflowEngine::execute runs",
           "[pg][workflow][executions][execute][targeting][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -2433,13 +2446,33 @@ TEST_CASE("BR2-001 — a workflow step naming a Forensics instruction with 2 age
     auto res =
         h.sink.Post("/api/workflows/" + wf_id + "/execute", R"({"agent_ids":["agent-A","agent-B"]})");
     REQUIRE(res);
-    // The route itself still accepts (202) — the refusal happens inside the
-    // per-step dispatch_fn closure, surfaced as a failed step, not a route-
-    // level 4xx. The load-bearing assertion is dispatch_calls == 0: the
-    // mocked cmd_dispatch_concurrency/cmd_dispatch must never be reached.
-    CHECK(res->status == 202);
+    // BR3-001: the preflight now refuses the WHOLE request (400) before
+    // WorkflowEngine::execute() is ever called — dispatch_calls == 0 because
+    // the per-step dispatch_fn closure (BR2-001's own gate) is never reached
+    // at all this time, not merely because it refused internally.
+    CHECK(res->status == 400);
     CHECK(h.dispatch_calls == 0);
     CHECK(h.last_dispatch_agent_ids.empty());
+
+    // An audit row for the denial — this is the whole point of BR3-001: a
+    // security-relevant refusal must not be silently absorbed into a 202.
+    bool found_denied_audit = false;
+    for (const auto& call : h.audit_calls) {
+        if (call.action == "workflow.execute" && call.result == "denied") {
+            found_denied_audit = true;
+            CHECK(call.target_type == "workflow");
+            CHECK(call.target_id == wf_id);
+            CHECK(call.detail == "reason=forensic_untargeted");
+        }
+    }
+    CHECK(found_denied_audit);
+
+    // The rejection metric fired on the NEW `route="workflow"` series — a new
+    // emission point, distinct from `route="instruction_execute"`.
+    CHECK(h.metrics
+              .counter("yuzu_server_dispatch_target_rejected_total",
+                       {{"route", "workflow"}, {"reason", "forensic_untargeted"}})
+              .value() == 1.0);
 }
 
 TEST_CASE("BR2-001 — a workflow step naming a Forensics instruction with exactly 1 agent_id dispatches",
