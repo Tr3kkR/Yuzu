@@ -496,5 +496,71 @@ class ManifestKeySet(unittest.TestCase):
         self.assertEqual(set(g.build_manifest(doc, README)), set(g.MANIFEST_KEYS))
 
 
+class DefinitionShapes(unittest.TestCase):
+    def _doc(self, **spec):
+        base = {"execution": {"plugin": "alpha", "action": "probe"}}
+        base.update(spec)
+        return [{"kind": "InstructionDefinition", "metadata": {"id": "x.a"}, "spec": base}]
+
+    def test_scalar_platforms_and_roles_rejected(self):
+        with self.assertRaisesRegex(ValueError, "x.a: spec.platforms must be a list, not str"):
+            g.parse_definition_docs(self._doc(platforms="windows"), "p.yaml")
+        with self.assertRaisesRegex(ValueError, "spec.permissions.executeRoles must be a list"):
+            g.parse_definition_docs(self._doc(permissions={"executeRoles": "endpoint-admin"}), "p.yaml")
+
+    def test_scalar_columns_and_list_parameters_rejected(self):
+        with self.assertRaisesRegex(ValueError, "spec.result.columns must be a list"):
+            g.parse_definition_docs(self._doc(result={"columns": "kind"}), "p.yaml")
+        with self.assertRaisesRegex(ValueError, "spec.parameters must be an object"):
+            g.parse_definition_docs(self._doc(parameters=["a", "b"]), "p.yaml")
+        with self.assertRaisesRegex(ValueError, "every spec.result.columns entry must be an object"):
+            g.parse_definition_docs(self._doc(result={"columns": [7]}), "p.yaml")
+
+
+class SampleSanity(unittest.TestCase):
+    def test_stamp_os_must_match_the_file(self):
+        with self.assertRaisesRegex(ValueError, "stamp says os 'macos' but the file is windows.txt"):
+            g.parse_sample(SAMPLE, "windows")
+
+    def test_host_class_is_closed(self):
+        with self.assertRaisesRegex(ValueError, "host class 'laptop' is not one of"):
+            g.parse_sample(SAMPLE.replace("bare-metal", "laptop", 1), "macos")
+
+    def test_not_captured_class_is_closed(self):
+        bad = SAMPLE.replace("[not captured] Destructive/Irreversible: not executed on a live host",
+                             "[not captured] whatever")
+        with self.assertRaisesRegex(ValueError, "must read .*agent-context.*hardware-absent"):
+            g.parse_sample(bad, "macos")
+        ok = SAMPLE.replace("Destructive/Irreversible: not executed on a live host",
+                            "agent-context: init needs the KV store")
+        self.assertEqual(g.parse_sample(ok, "macos").actions[1]["not_captured"],
+                         "agent-context: init needs the KV store")
+
+    def test_marker_before_any_action_and_duplicate_action_rejected(self):
+        lines = SAMPLE.splitlines()
+        with self.assertRaisesRegex(ValueError, "before any `== action=`"):
+            g.parse_sample(lines[0] + "\n[not captured] agent-context: x\n" + "\n".join(lines[1:]) + "\n", "macos")
+        dup = SAMPLE + "== action=probe\nrow|again\n[result_status] OK / FULL / \n"
+        with self.assertRaisesRegex(ValueError, "action 'probe' appears twice"):
+            g.parse_sample(dup, "macos")
+
+
+class ShapeChecks(unittest.TestCase):
+    def test_structural_lints(self):
+        problems = g.readme_shape_problems(README, "alpha", "agents/plugins/alpha/README.md", ["windows:x:denied"])
+        joined = "\n".join(problems)
+        # The fixture README has one privileges row, two caveats, two bullets, no
+        # inputs/samples/source fences, and no `windows:x:denied` in Result status.
+        self.assertIn("has no macOS row", joined)
+        self.assertIn("has no Linux row", joined)
+        self.assertIn("does not list it", joined)
+        self.assertNotIn("Caveats and known gaps' has", joined)
+        self.assertNotIn("Where the data goes' needs", joined)
+
+    def test_index_total_caption(self):
+        idx = g.render_index([Rendering()._doc()], 51)
+        self.assertTrue(idx.startswith("1 of 51 plugins document themselves this way"))
+
+
 if __name__ == "__main__":
     unittest.main()

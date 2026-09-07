@@ -50,6 +50,7 @@ END_MARK = "<!-- END GENERATED -->"
 README_BLOCKS = ("header", "capability", "inputs", "outputs", "samples", "source")
 OS_ORDER = ("windows", "macos", "linux")
 OS_LABEL = {"windows": "Windows", "macos": "macOS", "linux": "Linux"}
+HOST_CLASSES = ("bare-metal", "vm", "container")
 YAML_PLATFORM = {"windows": "windows", "linux": "linux", "darwin": "macos"}
 SUPPORT_ICON = {"supported": "✅", "constrained": "🟡", "planned": "🟡", "unsupported": "⛔",
                 "undeclared": "⛔"}
@@ -261,6 +262,26 @@ def parse_plugin_identity(text: str) -> dict[str, str | None]:
 _SCALAR = (str, int, float, bool)
 
 
+def _check_definition_shapes(spec: dict, perms: dict, result: dict, definition_id: str, path: str) -> None:
+    """A scalar where the DSL wants a list renders letter-by-letter and ships a
+    garbage manifest with a green gate; refuse it at the source, by file."""
+    where = f"{path}: {definition_id}"
+    for label, value in (("spec.platforms", spec.get("platforms")),
+                         ("spec.permissions.executeRoles", perms.get("executeRoles")),
+                         ("spec.permissions.authorRoles", perms.get("authorRoles")),
+                         ("spec.result.columns", result.get("columns"))):
+        if value is not None and not isinstance(value, list):
+            raise ValueError(f"{where}: {label} must be a list, not {type(value).__name__}")
+    if spec.get("parameters") is not None and not isinstance(spec.get("parameters"), dict):
+        raise ValueError(f"{where}: spec.parameters must be an object")
+    props = (spec.get("parameters") or {}).get("properties")
+    if props is not None and not isinstance(props, dict):
+        raise ValueError(f"{where}: spec.parameters.properties must be an object")
+    for col in result.get("columns") or []:
+        if not isinstance(col, dict):
+            raise ValueError(f"{where}: every spec.result.columns entry must be an object")
+
+
 def _check_column_docs(c: dict, definition_id: str, path: str) -> None:
     """The four optional documentation keys of ``spec.result.columns[]``
     (docs/yaml-dsl-spec.md): the server ignores them, so nothing else would
@@ -299,12 +320,14 @@ def parse_definition_docs(docs: Iterable[dict], path: str) -> list[Definition]:
         action = execution.get("action") or spec.get("action")
         if not plugin or not action:
             continue
+        defn_id = str(meta.get("id", ""))
         perms = spec.get("permissions") or {}
         result = spec.get("result") or {}
+        _check_definition_shapes(spec, perms, result, defn_id, path)
         columns = []
         for c in result.get("columns") or []:
             if isinstance(c, dict):
-                _check_column_docs(c, str(meta.get("id", "")), path)
+                _check_column_docs(c, defn_id, path)
                 columns.append({
                     "name": str(c.get("name", "")),
                     "type": str(c.get("type", "")),
@@ -335,7 +358,13 @@ _STAMP_RE = re.compile(
     r"\s+·\s+(?P<priv>.*?)\s+·\s+leg-hash\s+(?P<hash>\w+)\s*$")
 _ACTION_LINE_RE = re.compile(r"^== action=(?P<name>\S+)(?P<params>.*)$")
 _STATUS_LINE_RE = re.compile(r"^\[result_status\]\s*(?P<status>\w+)\s*/\s*(?P<comp>\w+)\s*/\s*(?P<prov>.*)$")
-_NOT_CAPTURED_RE = re.compile(r"^\[not captured\]\s*(?P<why>.+)$")
+_NOT_CAPTURED_RE = re.compile(r"^\[not captured\]\s*(?P<why>.*)$")
+# The marker's class is a closed set (docs/plugin-readme-standard.md rule 5):
+# `<DispatchClass>/<Mutability>` for a mutator never run live, `agent-context`
+# when init needs services plugin-capture has no way to provide, or
+# `hardware-absent`. Anything else is a typo the sweep would multiply.
+_NOT_CAPTURED_CLASS_RE = re.compile(
+    r"^(?P<cls>[A-Z][A-Za-z]+/[A-Z][A-Za-z]+|agent-context|hardware-absent):\s*(?P<reason>\S.*)$")
 _TRUNCATED_RE = re.compile(r"^\[truncated\]\s*(?P<why>.*)$")
 _RC_RE = re.compile(r"^\[rc\]\s*(?P<rc>-?\d+)\s*$")
 
@@ -350,19 +379,30 @@ def parse_sample(text: str, os_name: str) -> Sample:
         raise ValueError(f"{os_name}: first line is not a capture stamp: {lines[0]!r}")
     stamp = {"os": m.group("os"), "os_version": m.group("osver"), "host_class": m.group("host"),
              "date": m.group("date"), "privilege": m.group("priv"), "leg_hash": m.group("hash")}
+    if stamp["os"] != os_name:
+        raise ValueError(f"{os_name}: the stamp says os {stamp['os']!r} but the file is {os_name}.txt")
+    if stamp["host_class"] not in HOST_CLASSES:
+        raise ValueError(f"{os_name}: host class {stamp['host_class']!r} is not one of {', '.join(HOST_CLASSES)}")
     actions: list[dict] = []
     current: dict | None = None
     for line in lines[1:]:
         if am := _ACTION_LINE_RE.match(line):
+            if any(a["action"] == am.group("name") for a in actions):
+                raise ValueError(f"{os_name}: action {am.group('name')!r} appears twice")
             current = {"action": am.group("name"), "params": am.group("params").strip(),
                        "rows": [], "result_status": None, "not_captured": None,
                        "truncated": False, "rc": 0}
             actions.append(current)
         elif nm := _NOT_CAPTURED_RE.match(line):
-            # A mutating action deliberately not executed on a live host
-            # (docs/plugin-readme-standard.md rule 5): the marker is the sample.
-            if current is not None:
-                current["not_captured"] = nm.group("why").strip()
+            # A leg deliberately not executed (docs/plugin-readme-standard.md
+            # rule 5): the marker is the sample, and its class is a closed set.
+            if current is None:
+                raise ValueError(f"{os_name}: `[not captured]` before any `== action=` line")
+            cm = _NOT_CAPTURED_CLASS_RE.match(nm.group("why").strip())
+            if not cm:
+                raise ValueError(f"{os_name}: action {current['action']!r}: `[not captured]` must read "
+                                 "`[not captured] <DispatchClass>/<Mutability>|agent-context|hardware-absent: <reason>`")
+            current["not_captured"] = nm.group("why").strip()
         elif tm := _TRUNCATED_RE.match(line):
             if current is not None:
                 current["truncated"] = True
@@ -478,20 +518,139 @@ def hand_sections_to_manifest(readme: str) -> dict:
     }
 
 
+# ── README shape and sample coverage (the gate's checks, importable) ──────────
+
+DATA_CONTRACT_ORDER = ("### Inputs", "### Outputs", "### Result status", "### Where the data goes")
+HAND_TABLE_WIDTHS = (("## Privileges and prerequisites", 5), ("### Result status", 4))
+_PROVENANCE_LITERAL_RE = re.compile(r'"((?:windows|macos|linux):[a-z0-9_:]+)"')
+_CAVEAT_ITEM_RE = re.compile(r"^\*\*[^*]+\*\*")  # parse_bullets has stripped the `1. `
+
+
+def _heading_lines(text: str) -> list[str]:
+    out, in_fence = [], False
+    for line in text.splitlines():
+        if line.startswith("```"):
+            in_fence = not in_fence
+        elif not in_fence and (line.startswith("## ") or line.startswith("### ")):
+            out.append(line.strip())
+    return out
+
+
+def _ordered_subsequence(haystack: list[str], needles: Iterable[str]) -> bool:
+    it = iter(haystack)
+    return all(any(h == n for h in it) for n in needles)
+
+
+def readme_shape_problems(text: str, name: str, rel: str, provenance_literals: Iterable[str] = ()) -> list[str]:
+    """Rule 2 / rule 10 shape checks for one README; empty when it conforms.
+    ``provenance_literals`` are the `<os>:<token>` strings the plugin source
+    emits through set_result_status — each must be named in `### Result status`."""
+    problems = []
+    first = next((l for l in text.splitlines() if l.strip()), "")
+    if first.strip() != f"# {name}":
+        problems.append(f"{rel}: first line must be '# {name}', got {first!r}")
+    heads = _heading_lines(text)
+    if not _ordered_subsequence(heads, HEADINGS):
+        problems.append(f"{rel}: the seven `##` section headings must appear in order {list(HEADINGS)}; found {heads}")
+    if not _ordered_subsequence(heads, DATA_CONTRACT_ORDER):
+        problems.append(f"{rel}: Data contract subsections must appear in order {list(DATA_CONTRACT_ORDER)}")
+    sections = split_sections(text)
+    for hand in HAND_SECTIONS:
+        if not strip_generated(sections.get(hand, "")).strip():
+            problems.append(f"{rel}: hand-written section '{hand}' is empty")
+    for block in README_BLOCKS:
+        if f"<!-- BEGIN GENERATED: plugin-doc-gen {block} -->" not in text:
+            problems.append(f"{rel}: missing fence 'plugin-doc-gen {block}'")
+    # Hand tables feed the manifest positionally: an unescaped `|` in a cell
+    # shifts every field after it, deterministically, so the byte gate cannot
+    # see it — the contracted column count can.
+    for heading, width in HAND_TABLE_WIDTHS:
+        for row in parse_md_table(sections.get(heading, "")):
+            if len(row) != width:
+                problems.append(f"{rel}: '{heading}' row has {len(row)} cells, contract is {width} "
+                                f"(escape a literal pipe as \\|): {row[0][:40]!r}")
+    priv_os = {row[0].strip() for row in parse_md_table(sections.get("## Privileges and prerequisites", ""))}
+    for os_label in OS_LABEL.values():
+        if os_label not in priv_os:
+            problems.append(f"{rel}: '## Privileges and prerequisites' has no {os_label} row (one row per OS, "
+                            "'n/a' where the leg does not exist)")
+    caveats = parse_bullets(sections.get("## Caveats and known gaps", ""))
+    if not 1 <= len(caveats) <= 5:
+        problems.append(f"{rel}: '## Caveats and known gaps' has {len(caveats)} items; the contract is 1–5")
+    for item in caveats:
+        if not _CAVEAT_ITEM_RE.match(item):
+            problems.append(f"{rel}: caveat does not open with a bold lead ('1. **Lead.** …'): {item[:50]!r}")
+    if len(parse_bullets(sections.get("### Where the data goes", ""))) < 2:
+        problems.append(f"{rel}: '### Where the data goes' needs at least the instruction-result bullet and the "
+                        "'Not consumed by' bullet")
+    status_text = sections.get("### Result status", "")
+    for lit in sorted(set(provenance_literals)):
+        if f"`{lit}`" not in status_text:
+            problems.append(f"{rel}: the source emits result provenance `{lit}` but '### Result status' does not "
+                            "list it (every provenance literal is named, grouped by status)")
+    return problems
+
+
+def provenance_literals(repo: Path, name: str) -> set[str]:
+    out: set[str] = set()
+    for src in (repo / "agents" / "plugins" / name / "src").glob("*"):
+        if src.is_file() and src.suffix in (".cpp", ".hpp", ".h", ".mm"):
+            out.update(_PROVENANCE_LITERAL_RE.findall(_read(src)))
+    return out
+
+
+def sample_coverage_problems(doc: "PluginDoc") -> list[str]:
+    """Rule 5, per leg: every (action, OS) declared supported or constrained is
+    captured, or carries a `[not captured]` marker, and a sample names no
+    action the descriptor does not declare."""
+    problems = []
+    for os_name in OS_ORDER:
+        wanted = sorted(a for a, per_os in doc.legs.items()
+                        if per_os.get(os_name) and per_os[os_name].support in ("supported", "constrained"))
+        sample = doc.samples.get(os_name)
+        if sample is None:
+            if wanted:
+                problems.append(f"{doc.name}: {os_name} declares {wanted} supported/constrained but "
+                                f"docs/samples/{os_name}.txt is missing or unparseable (rule 5)")
+            continue
+        present = {a["action"] for a in sample.actions}
+        for action in wanted:
+            if action not in present:
+                problems.append(f"{doc.name}/{os_name}: action '{action}' is {doc.legs[action][os_name].support} "
+                                f"on {os_name} but docs/samples/{os_name}.txt has no `== action={action}` "
+                                "block (capture it, or record `[not captured] <class>: <reason>`)")
+        for action in sorted(present - set(doc.legs)):
+            problems.append(f"{doc.name}/{os_name}: docs/samples/{os_name}.txt captures action '{action}', "
+                            "which the descriptor does not declare")
+    return problems
+
+
 # ── repository loading ────────────────────────────────────────────────────────
 
 def _read(path: Path) -> str:
-    return path.read_text(encoding="utf-8")
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as e:
+        raise ValueError(f"{path.as_posix()}: not UTF-8 ({e.reason} at byte {e.start})") from None
+    except OSError as e:
+        raise ValueError(f"{path.as_posix()}: {e.strerror}") from None
 
 
 def load_definitions(repo: Path) -> dict[str, list[Definition]]:
     if yaml is None:
         raise RuntimeError("PyYAML is required: pip install pyyaml")
     by_plugin: dict[str, list[Definition]] = {}
+    seen_ids: dict[str, str] = {}
     for path in sorted((repo / "content" / "definitions").glob("*.yaml"), key=lambda q: q.as_posix()):
-        docs = list(yaml.safe_load_all(_read(path)))
         rel = path.relative_to(repo).as_posix()
+        try:
+            docs = list(yaml.safe_load_all(_read(path)))
+        except yaml.YAMLError as e:
+            raise ValueError(f"{rel}: not valid YAML: {str(e).splitlines()[0]}") from None
         for d in parse_definition_docs(docs, rel):
+            if d.id in seen_ids:
+                raise ValueError(f"{rel}: definition id {d.id!r} is already defined in {seen_ids[d.id]}")
+            seen_ids[d.id] = rel
             by_plugin.setdefault(d.plugin, []).append(d)
     return by_plugin
 
@@ -561,7 +720,9 @@ def load_plugin(repo: Path, name: str, matrix: dict, defs: dict, caps: dict) -> 
             try:
                 samples[os_name] = parse_sample(_read(sp), os_name)
             except ValueError as e:
-                warnings.append(f"{name}: {e}")
+                # An unparseable capture is an error, not a note: the coverage
+                # check would otherwise report the leg as merely missing.
+                warnings.append(f"error: {name}: docs/samples/{os_name}.txt: {e}")
     return PluginDoc(
         name=declared, version=identity["version"] or "-",
         description=identity["description"] or "-",
@@ -795,8 +956,12 @@ RENDERERS = {
 }
 
 
-def render_index(docs: list[PluginDoc]) -> str:
-    lines = ["| Plugin | Platforms | What it does | Docs |", "|---|---|---|---|"]
+def render_index(docs: list[PluginDoc], total: int | None = None) -> str:
+    lines = []
+    if total is not None:
+        lines += [f"{len(docs)} of {total} plugins document themselves this way; the rest are described in the "
+                  "prose below until their README lands.", ""]
+    lines += ["| Plugin | Platforms | What it does | Docs |", "|---|---|---|---|"]
     for d in sorted(docs, key=lambda d: d.name):
         plats = " ".join(SUPPORT_ICON[best_support(d.legs, o)] for o in OS_ORDER)
         lines.append(f"| `{d.name}` | {plats} | {_esc(d.description)} | [README](../../{d.readme_path}) |")
@@ -916,6 +1081,8 @@ def documented_plugins(repo: Path) -> list[str]:
 def generate(repo: Path, only: str | None = None) -> Outcome:
     """Compute every generated artefact. Nothing is written; ``apply`` does that."""
     out = Outcome()
+    if not (repo / "agents" / "plugins").is_dir() or not (repo / "docs" / "os-capability-matrix.md").is_file():
+        raise ValueError(f"{repo.as_posix()}: not a Yuzu repository root (no agents/plugins/ or docs/os-capability-matrix.md)")
     matrix = parse_matrix_block(_read(repo / "docs" / "os-capability-matrix.md"))
     defs = load_definitions(repo)
     caps = load_capability_rows(repo)
@@ -932,6 +1099,8 @@ def generate(repo: Path, only: str | None = None) -> Outcome:
         out.warnings += [w for w in doc.warnings if not w.startswith("error:")]
         readme_path = repo / doc.readme_path
         readme = _read(readme_path)
+        out.errors += readme_shape_problems(readme, name, doc.readme_path, provenance_literals(repo, name))
+        out.errors += sample_coverage_problems(doc)
         blocks = {b: RENDERERS[b](doc) for b in README_BLOCKS}
         new, missing = splice(readme, blocks, README_BLOCKS)
         for b in missing:
@@ -944,9 +1113,12 @@ def generate(repo: Path, only: str | None = None) -> Outcome:
             if h == "pending":
                 out.warnings.append(f"{doc.name}/{os_name}: capture stamp leg-hash pending (run --stamp after capture)")
             elif h != current_hash:
-                out.errors.append(f"{doc.name}/{os_name}: capture leg-hash {h} is stale (legs/columns now {current_hash}) — recapture")
+                out.errors.append(f"{doc.name}/{os_name}: capture leg-hash {h} is stale (legs/columns now {current_hash}) — "
+                                  f"recapture: plugin-capture … --out agents/plugins/{doc.name}/docs/samples/{os_name}.txt, "
+                                  f"then plugin_doc_gen.py --stamp {doc.name} {os_name}, then --all")
         manifest_path = f"content/plugin-docs/{doc.name}.json"
-        manifest = json.dumps(build_manifest(doc, new), indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+        manifest = json.dumps(build_manifest(doc, new), indent=2, sort_keys=True, ensure_ascii=False,
+                              allow_nan=False) + "\n"
         old_manifest = _read(repo / manifest_path) if (repo / manifest_path).exists() else ""
         if manifest != old_manifest:
             out.changed[manifest_path] = (old_manifest, manifest)
@@ -956,7 +1128,7 @@ def generate(repo: Path, only: str | None = None) -> Outcome:
     # Whole-tree artefacts: the catalog index, the site nav fragment.
     catalog_path = "docs/user-manual/agent-plugins.md"
     catalog = _read(repo / catalog_path)
-    new_catalog, missing = splice(catalog, {"index": render_index(docs)}, ["index"])
+    new_catalog, missing = splice(catalog, {"index": render_index(docs, len(plugin_dirs(repo)))}, ["index"])
     for b in missing:
         out.errors.append(f"{catalog_path}: missing fence `plugin-doc-gen {b}`")
     if new_catalog != catalog:

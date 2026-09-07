@@ -33,6 +33,12 @@
  * host without those services; such a leg is recorded with a
  * `[not captured] agent-context: …` line instead (rule 5).
  *
+ * `--os-version` defaults to the host's product name, version and machine
+ * architecture (RtlGetVersion / kern.osproductversion / os-release + uname);
+ * `--privilege` defaults to a measured role — `euid N` on POSIX, on Windows
+ * the well-known service account or "interactive user" plus the token's
+ * elevation state — never an account name, because the stamp is published.
+ *
  * `--param` binds to the most recent `--action`. A value containing spaces
  * is written double-quoted on the action line so a sample stays reproducible.
  *
@@ -61,12 +67,18 @@
 #include <utility>
 #include <vector>
 
+#include <cstdio>
+
 #if defined(_WIN32)
 #include <fcntl.h>
 #include <io.h>
 #include <windows.h>
 #else
+#include <sys/utsname.h>
 #include <unistd.h>
+#endif
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
 #endif
 
 #include <spdlog/sinks/stdout_sinks.h>
@@ -128,13 +140,14 @@ std::string utf8_from_wide(const wchar_t* ws) {
 #endif
 
 // The measured privilege the stamp records when --privilege is not given:
-// the effective uid on POSIX; the token's user and elevation state on Windows.
+// the effective uid on POSIX; on Windows the token's elevation state plus the
+// ROLE it runs under — a well-known service account by name, any other
+// account as "interactive user". The stamp is published (repository, docs
+// site, the served manifests), so it never carries a person's account name
+// (docs/plugin-readme-standard.md rule 5).
 std::string default_privilege() {
 #if defined(_WIN32)
-    std::string user = "-";
-    wchar_t name[256]{};
-    DWORD len = static_cast<DWORD>(std::size(name));
-    if (GetUserNameW(name, &len)) user = utf8_from_wide(name);
+    std::string role = "interactive user";
     std::string elevation = "elevation unknown";
     HANDLE raw = nullptr;
     if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw)) {
@@ -142,11 +155,63 @@ std::string default_privilege() {
         DWORD got = 0;
         if (GetTokenInformation(raw, TokenElevation, &te, sizeof te, &got))
             elevation = te.TokenIsElevated ? "elevated" : "not elevated";
+        alignas(TOKEN_USER) unsigned char buf[sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE]{};
+        if (GetTokenInformation(raw, TokenUser, buf, sizeof buf, &got)) {
+            PSID sid = reinterpret_cast<TOKEN_USER*>(buf)->User.Sid;
+            if (IsWellKnownSid(sid, WinLocalSystemSid)) role = "LocalSystem";
+            else if (IsWellKnownSid(sid, WinLocalServiceSid)) role = "NT AUTHORITY\\LOCAL SERVICE";
+            else if (IsWellKnownSid(sid, WinNetworkServiceSid)) role = "NT AUTHORITY\\NETWORK SERVICE";
+        }
         CloseHandle(raw);
     }
-    return user + " (" + elevation + ")";
+    return role + " (" + elevation + ")";
 #else
     return "euid " + std::to_string(static_cast<long>(geteuid()));
+#endif
+}
+
+// The OS version the stamp records when --os-version is not given: the
+// product name and version plus the architecture, so a reader can tell a
+// container's kernel from its userland and an arm64 host from x86-64.
+std::string default_os_version() {
+#if defined(_WIN32)
+    using RtlGetVersionFn = LONG(WINAPI*)(PRTL_OSVERSIONINFOW);
+    std::string out = "Windows";
+    if (HMODULE ntdll = GetModuleHandleW(L"ntdll.dll")) {
+        if (auto fn = reinterpret_cast<RtlGetVersionFn>(GetProcAddress(ntdll, "RtlGetVersion"))) {
+            RTL_OSVERSIONINFOW v{};
+            v.dwOSVersionInfoSize = sizeof v;
+            if (fn(&v) == 0)
+                out += " " + std::to_string(v.dwMajorVersion) + "." + std::to_string(v.dwMinorVersion) + "." +
+                       std::to_string(v.dwBuildNumber);
+        }
+    }
+    SYSTEM_INFO si{};
+    GetNativeSystemInfo(&si);
+    out += si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_ARM64 ? " arm64" : " x86_64";
+    return out;
+#else
+    std::string out;
+#if defined(__APPLE__)
+    char ver[64]{};
+    std::size_t len = sizeof ver;
+    if (sysctlbyname("kern.osproductversion", ver, &len, nullptr, 0) == 0 && len > 0) out = std::string("macOS ") + ver;
+#else
+    std::ifstream rel("/etc/os-release");
+    for (std::string line; std::getline(rel, line);) {
+        if (line.rfind("PRETTY_NAME=", 0) == 0) {
+            out = line.substr(12);
+            if (out.size() >= 2 && out.front() == '"' && out.back() == '"') out = out.substr(1, out.size() - 2);
+            break;
+        }
+    }
+#endif
+    utsname u{};
+    if (uname(&u) == 0) {
+        if (out.empty()) out = std::string(u.sysname) + " " + u.release;
+        out += std::string(" ") + u.machine;
+    }
+    return out.empty() ? "-" : out;
 #endif
 }
 
@@ -176,7 +241,8 @@ bool split_kv(const std::string& kv, std::string& k, std::string& v) {
 int main(int argc, char** argv) {
     if (argc < 2) return usage(argv[0]);
     std::string lib = argv[1];
-    std::string os_name, host_class, os_version = "-", privilege = default_privilege(), out_path;
+    std::string os_name, host_class, os_version = default_os_version(), privilege = default_privilege(),
+                out_path;
     std::vector<ActionSpec> actions;
     std::unordered_map<std::string, std::string> config;
     for (int i = 2; i < argc; ++i) {
@@ -193,6 +259,11 @@ int main(int argc, char** argv) {
             return 2;
         }
         const std::string value = argv[++i];
+        if (value.find_first_of("\r\n") != std::string::npos) {
+            // A newline inside a value would forge a row or a stamp field.
+            std::cerr << "plugin-capture: " << flag << " value must not contain a newline\n";
+            return 2;
+        }
         if (flag == "--os") os_name = value;
         else if (flag == "--host-class") host_class = value;
         else if (flag == "--os-version") os_version = value;
@@ -220,6 +291,10 @@ int main(int argc, char** argv) {
         std::cerr << "plugin-capture: --os must be windows, linux or macos\n";
         return 2;
     }
+    if (host_class != "bare-metal" && host_class != "vm" && host_class != "container") {
+        std::cerr << "plugin-capture: --host-class must be bare-metal, vm or container\n";
+        return 2;
+    }
 
     // stdout is the sample; every log line goes to stderr (see the header).
     spdlog::set_default_logger(spdlog::stderr_logger_mt("plugin-capture"));
@@ -234,6 +309,17 @@ int main(int argc, char** argv) {
     if (!desc) {
         std::cerr << "plugin-capture: " << lib << " has no descriptor\n";
         return 1;
+    }
+    // Every requested action must be one the descriptor declares; a typo would
+    // otherwise be captured as the plugin's "unknown action" row and pass.
+    for (const auto& spec : actions) {
+        bool declared = false;
+        for (std::size_t k = 0; k < desc->action_descriptor_count && !declared; ++k)
+            declared = desc->action_descriptors[k].action && spec.name == desc->action_descriptors[k].action;
+        if (!declared && desc->action_descriptor_count > 0) {
+            std::cerr << "plugin-capture: " << lib << " declares no action named '" << spec.name << "'\n";
+            return 2;
+        }
     }
 
     // Lifecycle as the agent host runs it: init once with a real context,
@@ -305,7 +391,9 @@ int main(int argc, char** argv) {
         f << sample;
         f.flush();
         if (!f) {
-            std::cerr << "plugin-capture: writing " << out_path << " failed — the file is incomplete\n";
+            f.close();
+            std::remove(out_path.c_str()); // never leave a partial sample behind
+            std::cerr << "plugin-capture: writing " << out_path << " failed — the partial file was removed\n";
             return 1;
         }
     }

@@ -27,7 +27,7 @@ flowchart LR
   EX --> MAC[macOS leg<br/>socketfilterfw · pfctl<br/>bounded subprocess]
   EX --> LIN[Linux leg<br/>firewalld sd-bus → nftables netlink<br/>→ ufw → iptables → none]
   WIN & MAC & LIN --> ROWS[pipe rows<br/>state · rule · backend]
-  ROWS -- CommandResponse --> RS[(ResponseStore<br/>90-day retention)]
+  ROWS -- CommandResponse --> RS[(ResponseStore<br/>90-day default retention)]
   RS --> API[REST /api/responses<br/>fleet pie by state]
 ```
 
@@ -46,7 +46,7 @@ flowchart LR
 |---|---|---|---|---|
 | Windows | agent service account (LocalSystem today, #1442) | None. `INetFwPolicy2` profile and rule reads need no elevation. | 2026-09-06 on the-rig (Windows 11 Pro 10.0.26200), elevated SSH session: three profiles read `enabled`, 100 rule rows plus the `truncated\|true` marker | `error\|com_init` or `error\|policy2_create:<hresult>` row; profile rows read `error:<hresult>` |
 | macOS | LaunchDaemon (root today) | None for the primary Application Firewall read (`socketfilterfw --getglobalstate` is unprivileged). The secondary pf read opens `/dev/pf` and needs root; the plugin deliberately does not ride the quarantine plugin's `pfctl` sudoers grant. | 2026-09-06 at euid 501 on this host: `state\|disabled`, `pf\|unknown`, no pf rule rows | `pf\|unknown` (state), no rows (rules), never a false-safe value |
-| Linux | agent service account | `firewall-cmd --state` is an unprivileged D-Bus query. The nftables netlink dump conventionally needs `CAP_NET_ADMIN` (verified 2026-08-23 with the capability present); `ufw status` and `iptables -S` need root. No sudoers entry is granted for any of them. | nftables verified 2026-08-23 in an Ubuntu 26.04 container with `CAP_NET_ADMIN`; the unprivileged denial path is reasoned from the `chains_ok && rules_ok` gate, not measured | a refused nftables table dump falls through to the next backend; a refused chain or rule dump after a successful table dump reports `state\|unknown` / `rules\|unknown`; a refused `ufw` falls through to iptables; a refused `iptables -S` (the last backend) reports `backend\|iptables` + `state\|unknown` / `rules\|unknown`; `backend\|none` appears only when neither `/usr/sbin/ufw` nor `/usr/sbin/iptables` exists |
+| Linux | agent service account | `firewall-cmd --state` is an unprivileged D-Bus query. The nftables netlink dump conventionally needs `CAP_NET_ADMIN` (verified 2026-08-23 with the capability present); `ufw status` and `iptables -S` need root. No sudoers entry is granted for any of them. | nftables verified 2026-08-23 in an Ubuntu 26.04 container with `CAP_NET_ADMIN`; the unprivileged denial path is reasoned from the `chains_ok && rules_ok` gate, not measured | a refused nftables table dump falls through to the next backend; a refused chain or rule dump after a successful table dump reports `state\|unknown` / `rules\|unknown`; a refused `ufw` falls through to iptables; a refused `iptables -S` (the last backend) reports `backend\|iptables` + `state\|unknown` / `rules\|unknown`; `backend\|none` appears only when no backend ran at all — neither `/usr/sbin/ufw` nor `/usr/sbin/iptables` exists, or `ufw` was refused and `iptables` is absent |
 
 Subprocesses: `socketfilterfw`, `pfctl` (macOS), `ufw`, `iptables` (Linux), each as an argv vector through the bounded runner (rung 2), never a shell. Windows and the firewalld and nftables legs are native (rung 1). No network access.
 
@@ -60,7 +60,7 @@ Neither action takes parameters.
 
 ### Outputs
 
-Pipe-delimited key rows; the first field is the row kind. `state` emits `profile|<Domain|Private|Public>|<enabled|disabled|unknown|error:0x…>` on Windows, and `backend|<name>`, `state|<value>`, optional `mode|block_all` and `pf|<value>` rows on macOS and Linux. `rules` emits `rule|<name>|<enabled|disabled>|<in|out|unknown>|<allow|block|unknown>|<profile mask>` on Windows (plus `truncated|true` after 100 rules), `rule|<raw pf line>` on macOS, and per backend on Linux: `rule|firewalld|<zone>|service|<service>`, `rule|nftables|<family>|<table>|<chain>|<hook>|<policy>` and `rule|nftables|<family>|<table>|<chain>|handle|<n>`, `rule|<index>|<to>|<action>|<from>` for ufw, and `rule|<policy|new_chain|append>|<chain>|<spec>` for iptables — so on Linux the field after `rule` is the backend name for firewalld and nftables, a numeric index for ufw and the entry kind for iptables. A backend that answers `backend|<name>` but whose rule dump is refused emits `rules|unknown`. The server parses this plugin as key/value rows (`profile_or_backend`, `state`), so the value column carries the remainder of each row verbatim. A run that reads nothing emits no `rule` rows and, for state, `unknown` values; it never fabricates a row.
+Pipe-delimited key rows; the first field is the row kind. `state` emits `profile|<Domain|Private|Public>|<enabled|disabled|unknown|error:0x…>` on Windows, and `backend|<name>`, `state|<value>`, optional `mode|block_all` and `pf|<value>` rows on macOS and Linux. `rules` emits `rule|<name>|<enabled|disabled>|<in|out|unknown>|<allow|block|unknown>|<profile mask>` on Windows (plus `truncated|true` after 100 rules), `rule|<raw pf line>` on macOS, and per backend on Linux: `rule|firewalld|<zone>|service|<service>`, `rule|nftables|<family>|<table>|<chain>|<hook>|<policy>` and `rule|nftables|<family>|<table>|<chain>|handle|<n>`, `rule|<index>|<to>|<action>|<from>` for ufw, and `rule|<policy|new_chain|append>|<chain>|<spec>` for iptables — so on Linux the field after `rule` is the backend name for firewalld and nftables, a numeric index for ufw and the entry kind for iptables. A backend that answers `backend|<name>` but whose rule dump is refused emits `rules|unknown`. The server parses this plugin as key/value rows (`profile_or_backend`, `state`), so the value column carries the remainder of each row verbatim. Windows rules sharing a display name (one per profile, protocol or direction, e.g. six `ChatGPT` rows) are each real rules, not a capture defect. A run that reads nothing emits no `rule` rows and, for state, `unknown` values; it never fabricates a row.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
 **`security.firewall.rules` — `rule_name|enabled|direction|action|profiles`**
@@ -93,13 +93,14 @@ The plugin does not call `set_result_status`; every run reports `UNDECLARED`, fr
 
 - **Instruction result only.** Rows land in the ResponseStore (90-day default retention), queryable at `/api/responses/{id}`; `security.firewall.state` aggregates by `state` and drives the fleet pie "Firewall profile state across the fleet" (profile rows, labelled by value).
 - **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics. Both definitions carry a gather TTL (120 s and 300 s) but no schedule; they run when dispatched.
+- **Sensitivity.** `rules` rows name installed applications on the host (Windows rule display names are application names — an installed-software inventory by another route) and, on Linux, the host's network policy; `state` rows carry nothing beyond the device id.
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("security.firewall.state")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 - **Siblings:** `quarantine` (mutates firewall state through its own sudoers-granted `pfctl` anchor and Windows firewall rules), `rdp_control` (toggles the Remote Desktop rule group through `INetFwPolicy2`), `network_config`.
 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Windows 11 Pro 10.0.26200 · bare-metal · 2026-09-07 · Alex (elevated) · leg-hash 8ef7b004fc8a
+**Windows** — captured: windows Windows 11 Pro 10.0.26200 · bare-metal · 2026-09-07 · interactive user (elevated) · leg-hash 8ef7b004fc8a
 
 ```
 == action=state
@@ -125,7 +126,7 @@ rule|Microsoft Edge (mDNS-In)|enabled|in|allow|2147483647
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos 26.6.2 · bare-metal · 2026-09-07 · euid 501 · leg-hash 8ef7b004fc8a
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 · leg-hash 8ef7b004fc8a
 
 ```
 == action=state
@@ -168,7 +169,7 @@ rule|nftables|ip|filter|DOCKER-USER|handle|2
 
 1. **Row shape is a key/value contract, not the YAML column list.** `result_parsing.hpp` clamps this plugin to two fields, so a `profile|Domain|enabled` row reaches the dashboard as key `profile`, value `Domain|enabled`. Splitting the value into its own axes is tracked under #626.
 2. **macOS rules are the raw pf lines** and the pf reads need root; under the least-privilege model both `pf|` state and the rules list degrade to unknown or empty on purpose.
-3. **The Linux unprivileged denial path is reasoned, not measured.** The nftables leg was verified with `CAP_NET_ADMIN` present; on a non-firewalld host without that capability the probe falls through to `ufw`, then `iptables -S`, and a root-only iptables reports `backend|iptables` + `state|unknown` — `backend|none` only when neither binary exists. Tracked for the Linux parity sweep.
+3. **The Linux unprivileged denial path is reasoned, not measured.** The nftables leg was verified with `CAP_NET_ADMIN` present; on a non-firewalld host without that capability the probe falls through to `ufw`, then `iptables -S`, and a root-only iptables reports `backend|iptables` + `state|unknown`; `backend|none` only when no backend ran at all (neither binary exists, or `ufw` was refused and `iptables` is absent). Tracked for the Linux parity sweep.
 4. **Windows rules stop at 100.** The `truncated|true` row is emitted only when a genuine 101st rule exists, so a host with exactly 100 rules is not marked truncated.
 5. **A mixed fleet shows two macOS shapes.** Agents older than the Application Firewall change report pf as the sole state source (`backend|pf`); current agents report `backend|appfirewall` plus a `pf|` row.
 

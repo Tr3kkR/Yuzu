@@ -894,6 +894,10 @@ TEST_CASE("discover.plugins: docs summary joined by plugin name, null when undoc
             CHECK(pl["docs"]["summary"].is_string());
             CHECK_FALSE(pl["docs"]["summary"].get<std::string>().empty());
             CHECK(pl["docs"]["platforms"].is_object());
+            REQUIRE(pl["docs"]["kind"].is_object());
+            CHECK(pl["docs"]["kind"]["collector"].is_boolean());
+            CHECK(pl["docs"]["kind"]["mutating"].is_boolean());
+            CHECK(pl["docs"]["kind"]["gathered"].is_boolean());
             CHECK(pl["docs"]["readme"] == "agents/plugins/" + documented_name + "/README.md");
             CHECK(pl["docs"]["resource"] == "yuzu://plugin-docs");
         } else if (pl["name"] == "no_such_plugin_for_docs") {

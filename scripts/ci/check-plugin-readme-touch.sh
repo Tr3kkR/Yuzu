@@ -45,8 +45,20 @@ check() {
   local override=""
   if [ -n "$BODY" ] && [ -f "$BODY" ]; then
     # First matching line wins; the text after the colon must be non-empty. A
-    # leading list marker ("- " / "* ") is allowed so the line can sit in a bullet.
-    override="$(grep -m1 -E '^[[:space:]]*([-*][[:space:]]+)?docs-unchanged:[[:space:]]*[^[:space:]]' "$BODY" || true)"
+    # leading list marker ("- " / "* ") is allowed so the line can sit in a
+    # bullet. Fenced code blocks and HTML comments are skipped: the override
+    # must be visible to the reviewer on the rendered page.
+    override="$(tr -d '\r' < "$BODY" | awk '
+      /^[[:space:]]*(```|~~~)/ { fence = !fence; next }
+      fence { next }
+      { line = $0
+        while (1) {
+          if (comment) { i = index(line, "-->"); if (!i) next; line = substr(line, i + 3); comment = 0 }
+          i = index(line, "<!--"); if (!i) break
+          rest = substr(line, i + 4); j = index(rest, "-->")
+          if (j) { line = substr(line, 1, i - 1) substr(rest, j + 3) } else { line = substr(line, 1, i - 1); comment = 1; break }
+        }
+        print line }' | grep -m1 -E '^[[:space:]]*([-*][[:space:]]+)?docs-unchanged:[[:space:]]*[^[:space:]]' || true)"
   fi
 
   # Plugins whose src/ changed, deduplicated.
@@ -130,6 +142,10 @@ FAKE
   run "src changed, override in body" 0 $'agents/plugins/alpha/src/a.cpp' "$with_readme" $'Summary\n\ndocs-unchanged: Caveats — comment-only change\n'
   run "src changed, override in a bullet" 0 $'agents/plugins/alpha/src/a.cpp' "$with_readme" $'- docs-unchanged: Caveats — comment-only change\n'
   run "src changed, empty override is no override" 1 $'agents/plugins/alpha/src/a.cpp' "$with_readme" $'docs-unchanged:\n'
+  run "override inside a code fence is invisible" 1 $'agents/plugins/alpha/src/a.cpp' "$with_readme" $'```\ndocs-unchanged: Caveats — hidden\n```\n'
+  run "override inside an HTML comment is invisible" 1 $'agents/plugins/alpha/src/a.cpp' "$with_readme" $'<!--\ndocs-unchanged: Caveats — hidden\n-->\n'
+  run "override on a CRLF body" 0 $'agents/plugins/alpha/src/a.cpp' "$with_readme" $'Summary\r\ndocs-unchanged: Caveats — comment-only\r\n'
+  run "override after a closed fence" 0 $'agents/plugins/alpha/src/a.cpp' "$with_readme" $'```\nx\n```\ndocs-unchanged: Caveats — comment-only\n'
   run "src changed, no README at HEAD (exempt)" 0 $'agents/plugins/beta/src/b.cpp' "$commits"
   run "two plugins, one satisfied one not" 1 $'agents/plugins/alpha/src/a.cpp\nagents/plugins/gamma/src/g.cpp\nagents/plugins/gamma/README.md' "$with_readme"$'\nhead1:agents/plugins/gamma/README.md'
   run "base commit unavailable fails closed" 1 $'agents/plugins/alpha/src/a.cpp' $'head1\nhead1:agents/plugins/alpha/README.md'

@@ -29,6 +29,9 @@ import re
 import sys
 from pathlib import Path
 
+# Raw-string delimiter for every embedded literal: R"BCT(...)BCT".
+DELIM = "BCT"
+
 # PyYAML is a hard build dependency. Bundled content is the *only* path
 # by which shipped InstructionDefinitions reach the server's runtime
 # (no filesystem fallback — see CLAUDE.md "Instruction Engine"), so a
@@ -164,7 +167,7 @@ def main() -> int:
     for mf in sorted((root / "plugin-docs").glob("*.json")):
         try:
             manifest = json.loads(mf.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as e:
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
             bad_manifests.append((str(mf), str(e)))
             continue
         if not isinstance(manifest, dict) or manifest.get("name") != mf.stem:
@@ -181,7 +184,15 @@ def main() -> int:
         if shape_errors:
             bad_manifests.append((str(mf), "; ".join(shape_errors)))
             continue
-        plugin_docs_json.append(json.dumps(manifest, sort_keys=True, separators=(",", ":")))
+        try:
+            compact = json.dumps(manifest, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        except ValueError as e:  # NaN/Infinity: not JSON, and the server's parser would drop the manifest
+            bad_manifests.append((str(mf), str(e)))
+            continue
+        if f"){DELIM}\"" in compact:
+            bad_manifests.append((str(mf), "contains the raw-string delimiter sequence"))
+            continue
+        plugin_docs_json.append(compact)
     if bad_manifests:
         print(
             f"ERROR: embed_content.py: {len(bad_manifests)} plugin-docs manifest(s) "
@@ -291,9 +302,8 @@ def main() -> int:
         return 1
 
     # Emit C++. Each JSON string becomes a raw string literal in a
-    # std::vector<std::string>. Picking ")BCT(" as the raw-string
-    # delimiter — chosen for impossibility in any sane content YAML.
-    DELIM = "BCT"
+    # std::vector<std::string> (DELIM, module scope, is the raw-string
+    # delimiter — chosen for impossibility in any sane content YAML).
 
     # MSVC has TWO string-literal limits. A single literal token is capped at
     # 16380 bytes (error C2026), so a large envelope (a verbose definition's

@@ -42,18 +42,24 @@ const PluginDocsIndex& plugin_docs_index() {
             const auto is_str = [&m](const char* key) {
                 return m.contains(key) && m[key].is_string();
             };
+            const auto is_obj = [&m](const char* key) {
+                return m.contains(key) && m[key].is_object();
+            };
             if (m.is_discarded() || !m.is_object() || !is_str("name") || !is_str("readme") ||
-                !is_str("description") || !m.contains("platforms") ||
-                !m["platforms"].is_object()) {
+                !is_str("description") || !is_obj("platforms") || !is_obj("kind")) {
                 ++out.skipped_invalid;
-                spdlog::warn("discover/plugin-docs: skipping an embedded manifest that is not a "
-                             "JSON object with string name/description/readme and an object "
-                             "platforms");
+                spdlog::warn("discover/plugin-docs: skipping embedded manifest #{} ({}…): not a JSON "
+                             "object with string name/description/readme and object platforms/kind",
+                             out.manifests.size() + out.skipped_invalid, text.substr(0, 64));
                 continue;
             }
             const std::string name = m["name"].get<std::string>();
+            // The summary is what discover_plugins joins per plugin: enough for
+            // an agentic caller to decide whether to read the full resource —
+            // what it is, whether it mutates, where it runs, where the README is.
             json summary = {
                 {"summary", m["description"]},
+                {"kind", m["kind"]},
                 {"platforms", m["platforms"]},
                 {"readme", m["readme"]},
                 {"resource", "yuzu://plugin-docs"},

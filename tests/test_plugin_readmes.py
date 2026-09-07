@@ -43,90 +43,22 @@ import plugin_doc_gen as g  # noqa: E402
 # this as READMEs land; it cannot be increased without a reviewed decision.
 RATCHET_BASELINE_MISSING = 49
 
-TITLE_ORDER = list(g.HEADINGS)
-DATA_CONTRACT_ORDER = ["### Inputs", "### Outputs", "### Result status", "### Where the data goes"]
-TABLE_WIDTHS = (("## Privileges and prerequisites", 5), ("### Result status", 4))
-
-
-def _heading_lines(text: str) -> list[str]:
-    out, in_fence = [], False
-    for line in text.splitlines():
-        if line.startswith("```"):
-            in_fence = not in_fence
-        elif not in_fence and (line.startswith("## ") or line.startswith("### ")):
-            out.append(line.strip())
-    return out
-
-
-def _ordered_subsequence(haystack: list[str], needles: list[str]) -> bool:
-    it = iter(haystack)
-    return all(any(h == n for h in it) for n in needles)
-
-
 def missing_readmes(repo: Path) -> list[str]:
     return [n for n in g.plugin_dirs(repo) if not (repo / "agents" / "plugins" / n / "README.md").exists()]
 
 
 def readme_problems(repo: Path, name: str) -> list[str]:
-    """Rule 2 / rule 10 shape checks for one README; empty when it conforms."""
+    """Rule 2 / rule 10 shape checks for one README (plugin_doc_gen owns them
+    so `--check` is the same gate); empty when it conforms."""
     path = repo / "agents" / "plugins" / name / "README.md"
-    text = path.read_text(encoding="utf-8")
-    rel = path.relative_to(repo).as_posix()
-    problems = []
-    first = next((l for l in text.splitlines() if l.strip()), "")
-    if first.strip() != f"# {name}":
-        problems.append(f"{rel}: first line must be '# {name}', got {first!r}")
-    heads = _heading_lines(text)
-    if not _ordered_subsequence(heads, TITLE_ORDER):
-        problems.append(f"{rel}: the seven `##` section headings must appear in order {TITLE_ORDER}; found {heads}")
-    if not _ordered_subsequence(heads, DATA_CONTRACT_ORDER):
-        problems.append(f"{rel}: Data contract subsections must appear in order {DATA_CONTRACT_ORDER}")
-    sections = g.split_sections(text)
-    for hand in g.HAND_SECTIONS:
-        body = g.strip_generated(sections.get(hand, ""))
-        if not body.strip():
-            problems.append(f"{rel}: hand-written section '{hand}' is empty")
-    for block in g.README_BLOCKS:
-        if f"<!-- BEGIN GENERATED: plugin-doc-gen {block} -->" not in text:
-            problems.append(f"{rel}: missing fence 'plugin-doc-gen {block}'")
-    # Hand tables feed the manifest positionally: an unescaped `|` in a
-    # cell shifts every field after it, deterministically, so the byte
-    # gate cannot see it — the contracted column count can.
-    for heading, width in TABLE_WIDTHS:
-        for row in g.parse_md_table(sections.get(heading, "")):
-            if len(row) != width:
-                problems.append(f"{rel}: '{heading}' row has {len(row)} cells, contract is {width} "
-                                f"(escape a literal pipe as \\|): {row[0][:40]!r}")
-    return problems
+    return g.readme_shape_problems(path.read_text(encoding="utf-8"), name,
+                                   path.relative_to(repo).as_posix(), g.provenance_literals(repo, name))
 
 
 def sample_problems(repo: Path, matrix: dict, name: str) -> list[str]:
-    """Rule 5, per leg: every (action, OS) declared supported or constrained is
-    captured, or carries a `[not captured]` marker, in docs/samples/<os>.txt."""
-    legs = matrix.get(name, {})
-    problems = []
-    for os_name in g.OS_ORDER:
-        wanted = sorted(a for a, per_os in legs.items()
-                        if per_os.get(os_name) and per_os[os_name].support in ("supported", "constrained"))
-        if not wanted:
-            continue
-        sp = repo / "agents" / "plugins" / name / "docs" / "samples" / f"{os_name}.txt"
-        if not sp.exists():
-            problems.append(f"{name}: {os_name} declares {wanted} supported/constrained but "
-                            f"docs/samples/{os_name}.txt is missing (rule 5)")
-            continue
-        try:
-            s = g.parse_sample(sp.read_text(encoding="utf-8"), os_name)
-        except ValueError as e:
-            problems.append(f"{name}: {e}")
-            continue
-        present = {a["action"] for a in s.actions}
-        for action in wanted:
-            if action not in present:
-                problems.append(f"{name}/{os_name}: action '{action}' is {legs[action][os_name].support} "
-                                f"on {os_name} but docs/samples/{os_name}.txt has no `== action={action}` "
-                                "block (capture it, or record `[not captured] <class>: <reason>`)")
-    return problems
+    """Rule 5, per leg, on the parsed samples of one plugin."""
+    doc = g.load_plugin(repo, name, matrix, g.load_definitions(repo), g.load_capability_rows(repo))
+    return [w for w in doc.warnings if w.startswith("error:")] + g.sample_coverage_problems(doc)
 
 
 def standard_manifest_keys(repo: Path) -> set[str]:
@@ -268,6 +200,8 @@ Reads things.
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
 | Windows | svc | none | 2026-09-01 | `error\\|com_init` row |
+| macOS | daemon | none | 2026-09-01 | `error\\|iokit` row |
+| Linux | n/a | n/a | — | always `UNAVAILABLE` |
 
 ## Data contract
 
@@ -292,6 +226,7 @@ Rows are `kind|value`.
 ### Where the data goes
 
 - **Instruction result.** store
+- **Not consumed by** anything else.
 
 ## Sample output
 
@@ -476,17 +411,18 @@ class GateSelfTest(unittest.TestCase):
         # An action captured on one OS only: the other supported leg is named.
         self._edit(self.macos, "== action=probe", "== action=other")
         problems = sample_problems(self.tmp, matrix, "alpha")
-        self.assertEqual(len(problems), 1)
+        self.assertEqual(len(problems), 2, problems)
         self.assertIn("alpha/macos: action 'probe' is constrained on macos but docs/samples/macos.txt has no "
                       "`== action=probe` block", problems[0])
+        self.assertIn("captures action 'other', which the descriptor does not declare", problems[1])
         # A missing sample file on a supported OS.
         self.macos.unlink()
         problems = sample_problems(self.tmp, matrix, "alpha")
-        self.assertIn("docs/samples/macos.txt is missing (rule 5)", problems[0])
+        self.assertIn("docs/samples/macos.txt is missing or unparseable (rule 5)", problems[0])
         # A truncated capture (no status line) is reported through the parser.
         _write(self.macos, _SYNTH_SAMPLE.format(os="macos").split("[result_status]")[0])
         problems = sample_problems(self.tmp, matrix, "alpha")
-        self.assertIn("action 'probe' has no [result_status] line", problems[0])
+        self.assertTrue(any("action 'probe' has no [result_status] line" in p for p in problems), problems)
         # Linux declares nothing supported, so no Linux sample is required.
         self.assertFalse(any("linux" in p for p in problems))
 

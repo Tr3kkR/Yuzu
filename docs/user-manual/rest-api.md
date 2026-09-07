@@ -4572,7 +4572,7 @@ An action carries an inline `parameter_schema` **only** when it has a published 
 
 > **Consumer note:** this catalog is now `"version": 3` (was `1`; v2 added the inline `parameter_schema` and top-level `actions_enriched_with_schema` fields). The revision is additive; treat `version` as a **minimum** (`>= 1`), not `== 1`, so future additive revisions do not break your client.
 
-Each plugin entry also carries `docs`: a build-embedded documentation summary `{summary, platforms, readme, resource}` when the plugin has adopted the README standard (`docs/plugin-readme-standard.md`), or an explicit `null` when it has not (catalog `version` 2 → 3). The full manifest is the endpoint below.
+Each plugin entry also carries `docs`: a build-embedded documentation summary `{summary, kind, platforms, readme, resource}` (`kind` = `{collector, mutating, gathered}`) when the plugin has adopted the README standard (`docs/plugin-readme-standard.md`), or an explicit `null` when it has not (catalog `version` 2 → 3). The full manifest is the endpoint below.
 
 #### `GET /api/v1/discover/plugin-docs`
 
@@ -4607,7 +4607,7 @@ Per-plugin documentation as data: one manifest per agent plugin that has adopted
       "privileges": [{"os": "Windows", "runs_as": "...", "grant": "None. ...", "measured": "...", "if_refused": "..."}],
       "result_status": [{"status": "`CONSTRAINED`", "completeness": "partial", "provenance": "`macos:iokit:health_unread`", "when": "..."}],
       "where_the_data_goes": ["**Instruction result only.** ..."],
-      "samples": {"macos": {"stamp": {"os": "macos", "os_version": "26.5.1", "host_class": "bare-metal", "date": "2026-09-06", "privilege": "euid 501", "leg_hash": "f062fb9a3dfd"}, "actions": [{"action": "smart", "rows": ["smart|disk0|APPLE SSD AP0512Z|nvme|ssd|unknown|-|-|..."], "row_count": 2, "result_status": {"status": "CONSTRAINED", "completeness": "PARTIAL", "provenance": "macos:iokit:health_unread"}}]}},
+      "samples": {"macos": {"stamp": {"os": "macos", "os_version": "macOS 26.6.2 arm64", "host_class": "bare-metal", "date": "2026-09-07", "privilege": "euid 501", "leg_hash": "f062fb9a3dfd"}, "actions": [{"action": "smart", "rows": ["smart|disk0|APPLE SSD AP0512Z|nvme|ssd|unknown|-|-|..."], "row_count": 2, "result_status": {"status": "CONSTRAINED", "completeness": "PARTIAL", "provenance": "macos:iokit:health_unread"}}]}},
       "caveats": ["**Health is NVMe-only on Windows.** ..."],
       "source": {"plugin": ["agents/plugins/disk_actions/src/disk_actions_plugin.cpp"], "tests": ["tests/unit/test_disk_actions_local_dispatcher.cpp"]},
       "readme": "agents/plugins/disk_actions/README.md",

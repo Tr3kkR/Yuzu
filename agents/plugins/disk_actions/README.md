@@ -29,7 +29,7 @@ flowchart LR
   EX --> MAC[macOS leg<br/>IOKit IOBlockStorageDevice / IOMedia<br/>getmntinfo_r_np]
   EX --> LIN[Linux leg<br/>placeholder row + UNAVAILABLE]
   WIN & MAC & LIN --> ROWS[pipe rows +<br/>typed result status]
-  ROWS -- CommandResponse --> RS[(ResponseStore<br/>90-day retention)]
+  ROWS -- CommandResponse --> RS[(ResponseStore<br/>90-day default retention)]
   RS --> API[REST /api/responses<br/>aggregate · export]
 ```
 
@@ -114,13 +114,14 @@ Surfaced as `plugin_result_status` on the command response.
 
 - **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response, land in the ResponseStore (90-day default retention), and are queryable at `/api/responses/{id}`, aggregatable (`smart` by `health`, `volumes` by `device`) and exportable as JSON from `/api/responses/{id}/export`.
 - **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics. Nothing runs on a schedule.
+- **Sensitivity.** Rows identify hardware, not people: drive models, volume GUIDs and BSD names are stable device identifiers (asset-inventory class, like `device_ci`), and nothing in them names a user, a file or an application.
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("crossplatform.storage.smart")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 - **Siblings:** `device.hardware.disks` (physical inventory), `crossplatform.storage.mounts` (logical mounts, true filesystem capacity), `crossplatform.storage.free`.
 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Windows 11 Pro 10.0.26200 · bare-metal · 2026-09-07 · Alex (elevated) · leg-hash f062fb9a3dfd
+**Windows** — captured: windows Windows 11 Pro 10.0.26200 · bare-metal · 2026-09-07 · interactive user (elevated) · leg-hash f062fb9a3dfd
 
 ```
 == action=smart
@@ -137,7 +138,7 @@ volume|//?/Volume{b188886e-39bb-4915-a893-d61a3ca3c707}/|-|PhysicalDrive0|FAT32|
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos 26.6.2 · bare-metal · 2026-09-07 · euid 501 · leg-hash f062fb9a3dfd
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 · leg-hash f062fb9a3dfd
 
 ```
 == action=smart
