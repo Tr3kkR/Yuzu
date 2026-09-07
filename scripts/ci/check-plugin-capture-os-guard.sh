@@ -19,8 +19,16 @@ if [ $# -ne 1 ]; then
 fi
 BUILDDIR="$1"
 
-capture="$BUILDDIR/tools/plugin-capture/plugin-capture"
-[ -x "$capture" ] || capture="$BUILDDIR/tools/plugin-capture/plugin-capture.exe"
+# Check .exe FIRST: on MSYS2/Cygwin bash (this repo's self-hosted Windows
+# runner shell), `test -x <extensionless-path>` can return true by silently
+# resolving to the co-located `<name>.exe` even though that exact
+# extensionless string is not itself executable -- so invoking "$capture"
+# later (not test -x "$capture") fails with rc=127 (exec format error),
+# confirmed against the real Windows CI leg. Checking .exe first means the
+# variable is only ever set to a path that is BOTH test -x true and
+# directly invocable.
+capture="$BUILDDIR/tools/plugin-capture/plugin-capture.exe"
+[ -x "$capture" ] || capture="$BUILDDIR/tools/plugin-capture/plugin-capture"
 if [ ! -x "$capture" ]; then
   echo "::error::plugin-capture binary not found/executable under $BUILDDIR/tools/plugin-capture/ — did the Build step run first?" >&2
   exit 1
