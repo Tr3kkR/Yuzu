@@ -2837,15 +2837,178 @@ TEST_CASE("GET /api/v1/workflow-executions/:id: confines agent_ids to the caller
     CHECK(std::find(ids.begin(), ids.end(), "agent-A") != ids.end());
     CHECK(std::find(ids.begin(), ids.end(), "agent-B") == ids.end());
 
+    // #4030 Gate 8 fix: `agents_reached` is the raw fleet-wide dispatch
+    // count for the step's FULL target-agent list, not the confined
+    // caller's visible subset (agent-A only, 1 of 2 targets) -- must be
+    // stripped, not emitted verbatim (would disclose the true out-of-scope
+    // agent count by simple arithmetic).
+    REQUIRE(body["data"]["steps"].is_array());
+    REQUIRE(body["data"]["steps"].size() == 1);
+    CHECK_FALSE(body["data"]["steps"][0]["result"].contains("agents_reached"));
+
     // #4030: audited (workflow_execution.detail.fetch) — operator-supplied
     // step parameters/output are worth the same posture as instruction
     // executions.
-    bool audited = false;
+    bool audited_success = false;
     for (const auto& c : h.audit_calls) {
-        if (c.action == "workflow_execution.detail.fetch" && c.target_id == exec_id)
-            audited = true;
+        if (c.action == "workflow_execution.detail.fetch" && c.target_id == exec_id &&
+            c.result == "success")
+            audited_success = true;
     }
-    CHECK(audited);
+    CHECK(audited_success);
+}
+
+TEST_CASE("GET /api/v1/workflow-executions/:id: zero-overlap confined caller "
+          "gets the same not-found body as a nonexistent id (#4030 Gate 8 fix)",
+          "[pg][workflow][v1][twins][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true);
+    h.make_def("def-V1WFX0", "v1wfx0");
+    auto wf_id = h.make_workflow("v1-exec-workflow-zero", "def-V1WFX0");
+    h.dispatch_cmd_override = "cmd-v1wfx0";
+    h.dispatch_sent_override = 1;
+
+    auto exec_res = h.sink.Post("/api/workflows/" + wf_id + "/execute",
+                                R"({"agent_ids":["agent-A"]})");
+    REQUIRE(exec_res);
+    REQUIRE(exec_res->status == 202);
+    auto exec_body = nlohmann::json::parse(exec_res->body);
+    auto exec_id = exec_body["execution_id"].get<std::string>();
+
+    // Confine the caller to agent-Z -- disjoint from the execution's only
+    // target agent (agent-A).
+    h.fleet_read_scope = yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-Z"}};
+
+    auto invisible = h.sink.Get("/api/v1/workflow-executions/" + exec_id);
+    auto missing = h.sink.Get("/api/v1/workflow-executions/wfexec-does-not-exist-at-all");
+    REQUIRE(invisible);
+    REQUIRE(missing);
+    // PRE-fix this returned 200 with the full unfiltered record (status/
+    // steps/results) and an empty agent_ids array as the only outward sign
+    // of "confinement" (security-guardian, Gate 2 HIGH).
+    CHECK(invisible->status == 404);
+    CHECK(missing->status == 404);
+    // Byte-identical EXCEPT correlation_id (freshly minted per call, per
+    // rest_a4_envelope.hpp -- no code path echoes an incoming request's own
+    // X-Correlation-Id header, confirmed by grep) -- anti-enumeration is
+    // about the rest of the shape, not the cid (chaos-injector, chaos_test 1).
+    auto invisible_json = nlohmann::json::parse(invisible->body);
+    auto missing_json = nlohmann::json::parse(missing->body);
+    // correlation_id lives under "error" (error_json_a4's actual shape:
+    // {"error":{code,message,correlation_id,...},"meta":{...}}).
+    invisible_json["error"].erase("correlation_id");
+    missing_json["error"].erase("correlation_id");
+    CHECK(invisible_json == missing_json);
+
+    // Denied distinctly from success -- never folded into "success" (Gate 4
+    // unhappy-path finding UP-1 / chaos_test 2): no success row for this
+    // exec_id, and a denied row exists.
+    bool denied = false, success = false;
+    for (const auto& c : h.audit_calls) {
+        if (c.action != "workflow_execution.detail.fetch" || c.target_id != exec_id)
+            continue;
+        if (c.result == "denied")
+            denied = true;
+        if (c.result == "success")
+            success = true;
+    }
+    CHECK(denied);
+    CHECK_FALSE(success);
+}
+
+// Legacy sibling of the two tests above: predates "Workflow" existing as a
+// cataloged RBAC securable at all (this PR's own rbac_store.cpp seeding
+// commit is what makes it reachable to confined, non-admin roles for the
+// first time, security-guardian Gate 2 finding #2) and, unlike the v1 twin,
+// had NO scope filtering whatsoever before this fix -- not even the
+// field-level agent_ids redaction.
+TEST_CASE("GET /api/workflow-executions/:id (legacy): zero-overlap confined "
+          "caller gets the same 404 as a nonexistent id (#4030 Gate 8 fix)",
+          "[pg][workflow][legacy][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true);
+    h.make_def("def-LEGWFX0", "legwfx0");
+    auto wf_id = h.make_workflow("legacy-exec-workflow-zero", "def-LEGWFX0");
+    h.dispatch_cmd_override = "cmd-legwfx0";
+    h.dispatch_sent_override = 1;
+
+    auto exec_res = h.sink.Post("/api/workflows/" + wf_id + "/execute",
+                                R"({"agent_ids":["agent-A"]})");
+    REQUIRE(exec_res);
+    REQUIRE(exec_res->status == 202);
+    auto exec_body = nlohmann::json::parse(exec_res->body);
+    auto exec_id = exec_body["execution_id"].get<std::string>();
+
+    h.fleet_read_scope = yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-Z"}};
+
+    auto invisible = h.sink.Get("/api/workflow-executions/" + exec_id);
+    auto missing = h.sink.Get("/api/workflow-executions/wfexec-does-not-exist-at-all");
+    REQUIRE(invisible);
+    REQUIRE(missing);
+    // PRE-fix this returned 200 with the FULL unfiltered record AND the
+    // full, unfiltered agent_ids array (this route did not even do the
+    // v1 twin's field-level filtering) -- the worst case of the Gate 2
+    // finding.
+    CHECK(invisible->status == 404);
+    CHECK(missing->status == 404);
+    // The legacy route's not-found body is a static literal string (no
+    // correlation_id or other per-call-varying field) -- true byte
+    // equality is directly assertable here, unlike the v1/A4 sibling.
+    CHECK(invisible->body == missing->body);
+}
+
+TEST_CASE("GET /api/workflow-executions/:id (legacy): malformed result_json "
+          "does not leak the <discarded> sentinel into the response body "
+          "(#4030 Gate 8 fix)",
+          "[pg][workflow][legacy]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true);
+    h.make_def("def-LEGWFXM", "legwfxm");
+    auto wf_id = h.make_workflow("legacy-exec-workflow-malformed", "def-LEGWFXM");
+    h.dispatch_cmd_override = "cmd-legwfxm";
+    h.dispatch_sent_override = 1;
+
+    auto exec_res = h.sink.Post("/api/workflows/" + wf_id + "/execute",
+                                R"({"agent_ids":["agent-A"]})");
+    REQUIRE(exec_res);
+    REQUIRE(exec_res->status == 202);
+    auto exec_body = nlohmann::json::parse(exec_res->body);
+    auto exec_id = exec_body["execution_id"].get<std::string>();
+
+    // Corrupt the stored result_json from a second connection -- simulates
+    // a legacy/pre-migration row or a partial write, not something the
+    // live dispatch path can itself produce (Gate 4 unhappy-path finding
+    // UP-2's reachability caveat).
+    {
+        PgConn saboteur{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(saboteur.get()) == CONNECTION_OK);
+        std::string sql =
+            "UPDATE workflow_engine.workflow_step_results SET result_json = 'not json{{{' "
+            "WHERE execution_id = '" +
+            exec_id + "'";
+        PgResult upd{PQexec(saboteur.get(), sql.c_str())};
+        REQUIRE(upd.ok());
+    }
+
+    auto res = h.sink.Get("/api/workflow-executions/" + exec_id);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    // The literal defect this test pins: an un-guarded
+    // nlohmann::json::parse(..., false) embeds the discarded sentinel as
+    // literal, invalid-JSON text when dump()'d.
+    CHECK(res->body.find("<discarded>") == std::string::npos);
+    auto parsed = nlohmann::json::parse(res->body, nullptr, /*allow_exceptions=*/false);
+    CHECK_FALSE(parsed.is_discarded());
+    REQUIRE(parsed.contains("steps"));
+    REQUIRE(parsed["steps"].is_array());
+    REQUIRE(parsed["steps"].size() == 1);
+    CHECK(parsed["steps"][0]["result"].is_null());
 }
 
 TEST_CASE("GET /api/v1/workflow-executions/:id: 403 when fleet_read_fn denies",

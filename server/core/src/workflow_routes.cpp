@@ -1831,11 +1831,30 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     });
 
     // GET /api/workflow-executions/:id -- get execution status
-    sink.Get(R"(/api/workflow-executions/([^/]+))", [perm_fn,
+    sink.Get(R"(/api/workflow-executions/([^/]+))", [fleet_read_fn,
                                                      workflow_engine](const httplib::Request& req,
                                                                       httplib::Response& res) {
-        if (!perm_fn(req, res, "Workflow", "Read"))
+        // #4030 Gate 8 fix: was `perm_fn` (plain permission check, no
+        // confinement at all) -- swapped for `fleet_read_fn`, the SAME
+        // gate the v1 twin below uses, per FleetReadFn's own doc comment
+        // ("MUST be that route's SOLE authorization gate -- never stacked
+        // with perm_fn for the same securable/operation"). This route
+        // predates "Workflow" existing as a cataloged RBAC securable at
+        // all (rbac_store.cpp, this same PR's seeding commit) -- under
+        // RBAC-enabled deployments it was previously unreachable to ANY
+        // role, including Administrator. This PR's own seeding is what
+        // makes it reachable to confined, non-admin roles for the first
+        // time (security-guardian Gate 2 finding #2).
+        if (!fleet_read_fn) {
+            res.status = 503;
+            res.set_content(
+                R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
+                "application/json");
             return;
+        }
+        auto gate = fleet_read_fn(req, res, "Workflow", "Read");
+        if (!gate.admitted)
+            return; // gate already wrote the response.
         if (!workflow_engine) {
             res.status = 503;
             res.set_content(
@@ -1865,13 +1884,28 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         const auto& exec = **exec_result;
+        // #4030 Gate 8 fix: record-level confinement gate -- no audit call
+        // existed on this route before this fix (unlike the v1 twin,
+        // which audits every fetch) and none is added here; adding a
+        // first-ever audit call to this route is a separate, unrelated
+        // decision, out of scope for this fix. Denial 404-collapses
+        // identically to the not-found body above (byte-identical -- same
+        // literal string, anti-enumeration).
+        if (!workflow_execution_visible(exec, gate.scope)) {
+            res.status = 404;
+            res.set_content(
+                R"({"error":{"code":404,"message":"execution not found"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            return;
+        }
 
         nlohmann::json steps_arr = nlohmann::json::array();
         for (const auto& sr : exec.step_results) {
             steps_arr.push_back({{"step_index", sr.step_index},
                                  {"instruction_id", sr.instruction_id},
                                  {"status", sr.status},
-                                 {"result", nlohmann::json::parse(sr.result_json, nullptr, false)},
+                                 {"result", confined_workflow_step_result_json(
+                                                sr.result_json, static_cast<bool>(gate.scope))},
                                  {"started_at", sr.started_at},
                                  {"completed_at", sr.completed_at},
                                  {"attempt", sr.attempt}});
@@ -1880,8 +1914,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         res.set_content(nlohmann::json({{"id", exec.id},
                                         {"workflow_id", exec.workflow_id},
                                         {"status", exec.status},
-                                        {"agent_ids", nlohmann::json::parse(exec.agent_ids_json,
-                                                                            nullptr, false)},
+                                        {"agent_ids", confined_workflow_agent_ids_json(
+                                                          exec.agent_ids_json, gate.scope)},
                                         {"current_step", exec.current_step},
                                         {"started_at", exec.started_at},
                                         {"completed_at", exec.completed_at},
@@ -1933,6 +1967,11 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                             "application/json");
             return;
         }
+        // #4030 Gate 8 fix (architect, Gate 3): was floor-only -- no upper
+        // clamp reached Postgres, asymmetric with this route's own MCP twin
+        // (clamped to 500) and the sibling GET /api/v1/executions (also
+        // capped 500).
+        q.limit = std::min(q.limit, 500);
         auto workflows_result = workflow_engine->list_workflows(q);
         if (!workflows_result) {
             res.status = 503;
@@ -1946,6 +1985,10 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         nlohmann::json arr = nlohmann::json::array();
         for (const auto& w : *workflows_result)
             arr.push_back(workflow_row_json(w));
+        // #4030 Gate 8 fix (sre, Gate 6): the sibling Executions v1 routes
+        // set X-Correlation-Id unconditionally (success and error); this
+        // route only got it on error paths (via a4_error) before this fix.
+        detail::ensure_correlation_id(res);
         res.set_content(
             nlohmann::json(
                 {{"data", arr},
@@ -1984,6 +2027,9 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                     "application/json");
                     return;
                 }
+                // #4030 Gate 8 fix (sre, Gate 6): X-Correlation-Id parity
+                // with the success path (see GET /api/v1/workflows above).
+                detail::ensure_correlation_id(res);
                 res.set_content(nlohmann::json({{"data", workflow_detail_json(**workflow_result)},
                                                 {"meta", {{"api_version", "v1"}}}})
                                     .dump(),
@@ -2033,6 +2079,31 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                     return;
                 }
                 const auto& exec = **exec_result;
+                // #4030 Gate 8 fix: record-level confinement gate --
+                // workflow_execution_detail_json only ever field-filters
+                // `agent_ids`; it has no way to withhold `status`/
+                // `current_step`/`steps[]` for a caller with zero
+                // visibility into this execution (security-guardian Gate 2
+                // finding: the original cut called the builder
+                // unconditionally for any id the caller supplied). Denial
+                // 404-collapses identically to the not-found body above
+                // (same `detail::a4_error` call, same message -- byte-
+                // identical body, anti-enumeration) and is audited
+                // DISTINCTLY from a successful fetch -- never folded into
+                // the "success" call below, which would audit a denied
+                // read as a success immediately before refusing it (Gate 4
+                // unhappy-path finding UP-1 / chaos_test 2).
+                if (!workflow_execution_visible(exec, gate.scope)) {
+                    if (audit_fn)
+                        audit_fn(req, "workflow_execution.detail.fetch", "denied",
+                                "WorkflowExecution", exec.id,
+                                "not found or outside caller's fleet-read scope "
+                                "(management-group confinement)");
+                    res.status = 404;
+                    res.set_content(detail::a4_error(res, "execution not found"),
+                                    "application/json");
+                    return;
+                }
                 // #4030 audit decision: workflow-execution results carry
                 // operator-supplied step parameters/output, worth the same
                 // audit posture as instruction executions -- audited, verb
@@ -2048,6 +2119,9 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 if (audit_fn)
                     audit_fn(req, "workflow_execution.detail.fetch", "success",
                             "WorkflowExecution", exec.id, "");
+                // #4030 Gate 8 fix (sre, Gate 6): X-Correlation-Id parity
+                // with the success path (see GET /api/v1/workflows above).
+                detail::ensure_correlation_id(res);
                 res.set_content(
                     nlohmann::json({{"data", workflow_execution_detail_json(exec, gate.scope)},
                                     {"meta", {{"api_version", "v1"}}}})
@@ -2077,6 +2151,9 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 nlohmann::json arr = nlohmann::json::array();
                 for (const auto& s : scheds)
                     arr.push_back(schedule_row_json(s));
+                // #4030 Gate 8 fix (sre, Gate 6): X-Correlation-Id parity
+                // with the success path (see GET /api/v1/workflows above).
+                detail::ensure_correlation_id(res);
                 res.set_content(
                     nlohmann::json(
                         {{"data", arr},

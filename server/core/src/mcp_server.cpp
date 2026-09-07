@@ -7237,6 +7237,26 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // #4030 Gate 8 fix: record-level confinement gate (see v1
+                // REST twin's identical comment) -- denial collapses to
+                // the SAME not-found error as the branch above (identical
+                // kInvalidParams code + message template, no extra field
+                // such as audit_persisted attached -- byte-identical body,
+                // anti-enumeration, chaos_test 2) and is audited
+                // DISTINCTLY from a successful fetch, never folded into
+                // the "success" call below.
+                if (!workflow_execution_visible(**exec_result, gate.scope)) {
+                    (void)yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "workflow_execution.detail.fetch", "denied",
+                        "WorkflowExecution", exec_id,
+                        "not found or outside caller's fleet-read scope "
+                        "(management-group confinement)");
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "Workflow execution not found: " + exec_id),
+                        "application/json");
+                    return;
+                }
                 // #4030 audit decision: workflow-execution results carry
                 // operator-supplied step parameters/output — audited (see
                 // REST twin's identical reasoning), verb

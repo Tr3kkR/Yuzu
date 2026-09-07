@@ -40,11 +40,29 @@ nlohmann::json workflow_detail_json(const Workflow& w) {
     return j;
 }
 
-nlohmann::json workflow_execution_detail_json(const WorkflowExecution& we,
-                                              const authz::VisibleSet& scope) {
+bool workflow_execution_visible(const WorkflowExecution& we, const authz::VisibleSet& scope) {
+    if (!scope)
+        return true;
+    auto parsed = nlohmann::json::parse(we.agent_ids_json, nullptr, false);
+    if (parsed.is_discarded() || !parsed.is_array())
+        return false; // malformed/absent agent_ids -- fail closed, never open.
+    // Full scan, no early exit -- see header doc comment (mirrors
+    // execution_scope_rules.hpp's execution_visible() anti-timing-oracle
+    // rationale).
+    bool visible = false;
+    for (const auto& a : parsed) {
+        if (!a.is_string())
+            continue;
+        visible = authz::in_scope(scope, a.get_ref<const std::string&>()) || visible;
+    }
+    return visible;
+}
+
+nlohmann::json confined_workflow_agent_ids_json(const std::string& agent_ids_json,
+                                                const authz::VisibleSet& scope) {
     // agent_ids_json is a stored JSON-text column; parse permissively
     // (malformed/legacy rows must not fail the whole response).
-    auto parsed_agent_ids = nlohmann::json::parse(we.agent_ids_json, nullptr, false);
+    auto parsed_agent_ids = nlohmann::json::parse(agent_ids_json, nullptr, false);
     nlohmann::json agent_ids = nlohmann::json::array();
     if (!parsed_agent_ids.is_discarded() && parsed_agent_ids.is_array()) {
         for (const auto& a : parsed_agent_ids) {
@@ -56,15 +74,53 @@ nlohmann::json workflow_execution_detail_json(const WorkflowExecution& we,
             agent_ids.push_back(id);
         }
     }
+    return agent_ids;
+}
+
+namespace {
+
+// The raw fleet-wide dispatch count for a step's FULL target-agent list
+// (`workflow_routes.cpp`'s `dispatch_fn`: `{"agents_reached", sent}`) --
+// never the confined caller's visible subset. Strip it for a confined
+// caller rather than attempt an honest per-viewer recompute: nothing else
+// in `result_json` carries a per-agent breakdown to recompute FROM (see
+// `workflow_engine.cpp`'s step-dispatch loop), so omission is the only
+// non-disclosing option, matching `last_error_detail.clear()`'s approach
+// for the sibling `Execution` confined projection.
+void strip_agents_reached(nlohmann::json& j) {
+    if (j.is_object())
+        j.erase("agents_reached");
+}
+
+} // namespace
+
+nlohmann::json confined_workflow_step_result_json(const std::string& result_json, bool confined) {
+    auto result = nlohmann::json::parse(result_json, nullptr, false);
+    if (result.is_discarded())
+        return nullptr;
+    if (confined) {
+        if (result.is_array()) {
+            for (auto& elem : result)
+                strip_agents_reached(elem);
+        } else {
+            strip_agents_reached(result);
+        }
+    }
+    return result;
+}
+
+nlohmann::json workflow_execution_detail_json(const WorkflowExecution& we,
+                                              const authz::VisibleSet& scope) {
+    nlohmann::json agent_ids = confined_workflow_agent_ids_json(we.agent_ids_json, scope);
 
     nlohmann::json steps = nlohmann::json::array();
     for (const auto& sr : we.step_results) {
-        auto result = nlohmann::json::parse(sr.result_json, nullptr, false);
         steps.push_back(nlohmann::json{
             {"step_index", sr.step_index},
             {"instruction_id", sr.instruction_id},
             {"status", sr.status},
-            {"result", result.is_discarded() ? nlohmann::json(nullptr) : result},
+            {"result", confined_workflow_step_result_json(sr.result_json,
+                                                           static_cast<bool>(scope))},
             {"started_at", sr.started_at},
             {"completed_at", sr.completed_at},
             {"attempt", sr.attempt},

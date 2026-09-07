@@ -45,8 +45,62 @@ nlohmann::json workflow_detail_json(const Workflow& w);
 /// confinement decision, #4030 — a caller confined by `fleet_read_fn` sees
 /// only in-scope agent ids). `std::nullopt` is unrestricted, matching every
 /// other `VisibleSet` consumer in the tree.
+///
+/// CALLERS MUST GATE THE RECORD FIRST via `workflow_execution_visible()`
+/// below -- this builder only ever field-filters `agent_ids`; it has no way
+/// to withhold `status`/`current_step`/`steps[]` for a caller with zero
+/// visibility into the execution (#4030 Gate 8 fix, security-guardian Gate
+/// 2 finding: the original cut called this builder unconditionally for any
+/// id the caller supplied).
 nlohmann::json workflow_execution_detail_json(const WorkflowExecution& we,
                                               const authz::VisibleSet& scope);
+
+/// Is `we` visible at all to a caller confined to `scope`? `WorkflowExecution`
+/// carries no `dispatched_by` field (unlike `Execution`) — there is
+/// deliberately NO ownership fallback here: visibility is
+/// `has_visible_agent`-only. A caller who dispatched a workflow but has
+/// since been re-scoped out of every one of its target agents loses
+/// visibility to it — a consequence of the data model the fix accepts
+/// rather than papers over (#4030 Gate 8 fix). `std::nullopt` scope is
+/// always visible (unconfined/fleet-wide caller). A malformed/absent
+/// `agent_ids_json` fails CLOSED (not visible) for a confined caller rather
+/// than silently admitting.
+///
+/// Full scan, no early exit — mirrors `execution_scope_rules.hpp`'s
+/// `execution_visible()` anti-timing-oracle rationale: an early `return
+/// true` on the first in-scope id makes wall-clock time a function of WHERE
+/// in `agent_ids` the first visible entry falls, a scan-length existence
+/// oracle on the admit path.
+[[nodiscard]] bool workflow_execution_visible(const WorkflowExecution& we,
+                                              const authz::VisibleSet& scope);
+
+/// Confined `agent_ids` array for a workflow execution — parses
+/// `agent_ids_json` permissively and narrows to `authz::in_scope(scope,
+/// id)` members. Factored out so `workflow_execution_detail_json` and the
+/// legacy `GET /api/workflow-executions/:id` route (which keeps its own,
+/// differently-shaped response envelope and is therefore not migrated onto
+/// the builder above) compute the SAME confined array rather than risking
+/// two hand-copied loops drifting apart (#4030 Gate 8 fix).
+nlohmann::json confined_workflow_agent_ids_json(const std::string& agent_ids_json,
+                                                const authz::VisibleSet& scope);
+
+/// Confined per-step `result` value — parses `result_json` permissively (a
+/// parse failure embeds as JSON `null`, never the literal nlohmann
+/// `<discarded>` sentinel text that an un-guarded embed produces, #4030
+/// Gate 8 fix / Gate 4 unhappy-path finding UP-2) and, when `confined` is
+/// true, strips the `agents_reached` key from the result (handles both the
+/// single-object and the foreach-expanded array shape
+/// `WorkflowEngine::execute` can produce, `workflow_engine.cpp`). That key
+/// is the raw fleet-wide dispatch count for the step's FULL target-agent
+/// list (`workflow_routes.cpp`'s `dispatch_fn`, `{"agents_reached", sent}`)
+/// — not the confined caller's visible subset — so emitting it verbatim to
+/// a confined caller discloses the true out-of-scope agent count by simple
+/// arithmetic, the same disclosure class this file's sibling KPI strip
+/// guards against for `Execution` (`workflow_routes.cpp`, the "#1712"
+/// comment on `render_results`'s `total_agent_count`). Shared by
+/// `workflow_execution_detail_json` and the legacy route for the same
+/// no-drift reason as `confined_workflow_agent_ids_json` above.
+nlohmann::json confined_workflow_step_result_json(const std::string& result_json, bool confined);
 
 /// `GET /fragments/schedules` / `GET /api/v1/schedules` / MCP
 /// `list_schedules` row — adds `execution_count` (a real, already-populated
