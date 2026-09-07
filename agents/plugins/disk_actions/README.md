@@ -120,7 +120,7 @@ Surfaced as `plugin_result_status` on the command response.
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Windows 11 Pro 10.0.26200 · bare-metal · 2026-09-06 · Administrator (elevated SSH session) · leg-hash f062fb9a3dfd
+**Windows** — captured: windows Windows 11 Pro 10.0.26200 · bare-metal · 2026-09-07 · Alex (elevated) · leg-hash f062fb9a3dfd
 
 ```
 == action=smart
@@ -137,25 +137,24 @@ volume|//?/Volume{b188886e-39bb-4915-a893-d61a3ca3c707}/|-|PhysicalDrive0|FAT32|
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos 26.5.1 · bare-metal · 2026-09-06 · euid 501 · leg-hash f062fb9a3dfd
+**macOS** — captured: macos 26.6.2 · bare-metal · 2026-09-07 · euid 501 · leg-hash f062fb9a3dfd
 
 ```
 == action=smart
 smart|disk0|APPLE SSD AP0512Z|nvme|ssd|unknown|-|-|device advertises SMART; health attributes are not read on macOS (they require Apple's private IONVMeSMARTUserClient interface)
-smart|disk4|Disk Image|virtual|unknown|unknown|-|-|device does not advertise SMART capability
 [result_status] CONSTRAINED / PARTIAL / macos:iokit:health_unread
 
 == action=volumes
 volume|disk0s1|-|disk0|-|524288000|-
-volume|disk0s2|-|disk0|-|494384795648|-
 volume|disk0s3|-|disk0|-|5368664064|-
+volume|disk0s2|-|disk0|-|494384795648|-
 volume|disk1|-|disk0|-|524288000|-
-volume|disk3|-|disk0|-|494384795648|-
 volume|disk2|-|disk0|-|5368664064|-
+volume|disk3|-|disk0|-|494384795648|-
 volume|disk1s1|/System/Volumes/iSCPreboot|disk0|apfs|524288000|-
-volume|disk1s3|/System/Volumes/Hardware|disk0|apfs|524288000|-
 volume|disk1s4|-|disk0|-|524288000|-
 volume|disk1s2|/System/Volumes/xarts|disk0|apfs|524288000|-
+volume|disk1s3|/System/Volumes/Hardware|disk0|apfs|524288000|-
 volume|disk2s1|-|disk0|-|5368664064|-
 volume|disk2s2|-|disk0|-|5368664064|-
 … 12 of 19 rows shown

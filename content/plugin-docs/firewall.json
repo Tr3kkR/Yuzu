@@ -335,11 +335,11 @@
         }
       ],
       "stamp": {
-        "date": "2026-09-06",
+        "date": "2026-09-07",
         "host_class": "bare-metal",
         "leg_hash": "8ef7b004fc8a",
         "os": "macos",
-        "os_version": "26.5.1",
+        "os_version": "26.6.2",
         "privilege": "euid 501"
       }
     },
@@ -385,12 +385,12 @@
         }
       ],
       "stamp": {
-        "date": "2026-09-06",
+        "date": "2026-09-07",
         "host_class": "bare-metal",
         "leg_hash": "8ef7b004fc8a",
         "os": "windows",
         "os_version": "Windows 11 Pro 10.0.26200",
-        "privilege": "Administrator (elevated SSH session)"
+        "privilege": "Alex (elevated)"
       }
     }
   },

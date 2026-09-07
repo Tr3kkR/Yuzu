@@ -99,7 +99,7 @@ The plugin does not call `set_result_status`; every run reports `UNDECLARED`, fr
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Windows 11 Pro 10.0.26200 · bare-metal · 2026-09-06 · Administrator (elevated SSH session) · leg-hash 8ef7b004fc8a
+**Windows** — captured: windows Windows 11 Pro 10.0.26200 · bare-metal · 2026-09-07 · Alex (elevated) · leg-hash 8ef7b004fc8a
 
 ```
 == action=state
@@ -125,7 +125,7 @@ rule|Microsoft Edge (mDNS-In)|enabled|in|allow|2147483647
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos 26.5.1 · bare-metal · 2026-09-06 · euid 501 · leg-hash 8ef7b004fc8a
+**macOS** — captured: macos 26.6.2 · bare-metal · 2026-09-07 · euid 501 · leg-hash 8ef7b004fc8a
 
 ```
 == action=state

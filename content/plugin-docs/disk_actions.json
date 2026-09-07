@@ -396,10 +396,9 @@
             "provenance": "macos:iokit:health_unread",
             "status": "CONSTRAINED"
           },
-          "row_count": 2,
+          "row_count": 1,
           "rows": [
-            "smart|disk0|APPLE SSD AP0512Z|nvme|ssd|unknown|-|-|device advertises SMART; health attributes are not read on macOS (they require Apple's private IONVMeSMARTUserClient interface)",
-            "smart|disk4|Disk Image|virtual|unknown|unknown|-|-|device does not advertise SMART capability"
+            "smart|disk0|APPLE SSD AP0512Z|nvme|ssd|unknown|-|-|device advertises SMART; health attributes are not read on macOS (they require Apple's private IONVMeSMARTUserClient interface)"
           ],
           "truncated": false
         },
@@ -416,20 +415,20 @@
           "row_count": 19,
           "rows": [
             "volume|disk0s1|-|disk0|-|524288000|-",
-            "volume|disk0s2|-|disk0|-|494384795648|-",
             "volume|disk0s3|-|disk0|-|5368664064|-",
+            "volume|disk0s2|-|disk0|-|494384795648|-",
             "volume|disk1|-|disk0|-|524288000|-",
-            "volume|disk3|-|disk0|-|494384795648|-"
+            "volume|disk2|-|disk0|-|5368664064|-"
           ],
           "truncated": false
         }
       ],
       "stamp": {
-        "date": "2026-09-06",
+        "date": "2026-09-07",
         "host_class": "bare-metal",
         "leg_hash": "f062fb9a3dfd",
         "os": "macos",
-        "os_version": "26.5.1",
+        "os_version": "26.6.2",
         "privilege": "euid 501"
       }
     },
@@ -474,12 +473,12 @@
         }
       ],
       "stamp": {
-        "date": "2026-09-06",
+        "date": "2026-09-07",
         "host_class": "bare-metal",
         "leg_hash": "f062fb9a3dfd",
         "os": "windows",
         "os_version": "Windows 11 Pro 10.0.26200",
-        "privilege": "Administrator (elevated SSH session)"
+        "privilege": "Alex (elevated)"
       }
     }
   },
