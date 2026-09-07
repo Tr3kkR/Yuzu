@@ -70,6 +70,11 @@ const std::vector<pg::PgMigration>& migrations() {
         // single-writer retention prune (shared shape, see run_retention_prune).
         {2, "CREATE TABLE IF NOT EXISTS retention_meta ("
             "  key TEXT PRIMARY KEY, value TEXT NOT NULL);"},
+        // WS-10 (#2508): leading `created_at_ms` index so the retention guard's
+        // EXISTS probe is index-eligible (deployments_owner_idx leads on created_by,
+        // not the timestamp). Small table (retention-pruned) → a plain in-txn CREATE
+        // INDEX is fine (no CONCURRENTLY needed).
+        {3, "CREATE INDEX IF NOT EXISTS deployments_created_at_idx ON deployments (created_at_ms);"},
     };
     return kMigrations;
 }

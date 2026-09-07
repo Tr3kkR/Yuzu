@@ -107,6 +107,15 @@ struct ClockGuardedPruneSpec {
     std::int64_t min_plausible_reading;///< part 3: an anchor below this is unusable (column unit)
     std::int64_t cap_per_pass;         ///< part 5 unconditional LIMIT
     MissingAnchorPolicy missing_anchor;///< part 6 (recorded at the call site)
+    /// Optional CUTOFF alignment (column unit), default 0 = none. When > 0 the
+    /// cutoff is floored to a multiple of this (`cutoff = (cutoff/align)*align`) so
+    /// a bucketed column deletes on a bucket boundary. It aligns ONLY the cutoff —
+    /// `now_expr` MUST stay a RAW reading so the persisted anchor + the part-7
+    /// big_step comparison see real elapsed time; flooring the reading itself makes
+    /// two adjacent buckets look one full bucket apart and false-fires Step every
+    /// boundary crossing. `app_perf`'s day-floored-seconds `day` sets 86400; the
+    /// ms stores leave it 0.
+    std::int64_t cutoff_align = 0;
 };
 
 struct ClockGuardedPruneOutcome {

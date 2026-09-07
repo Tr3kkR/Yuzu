@@ -87,7 +87,13 @@ ClockGuardedPruneOutcome run_clock_guarded_prune(PgPool& pool, const ClockGuarde
         // unflagged: it only pushes `cutoff` further into the past, so this pass
         // deletes FEWER rows, never more — self-protecting, not a wipe risk. A
         // backward jump LARGER than the floor is caught by big_step (part 7).
-        const std::int64_t cutoff = now_unit - spec.retention_window;
+        // NOTE: now_unit stays RAW here — the anchor + big_step below compare it as
+        // real elapsed time. Only the CUTOFF is optionally bucket-aligned; aligning
+        // the reading itself would make two adjacent buckets read one bucket apart
+        // and false-fire Step on every boundary crossing (WS-10 C1).
+        std::int64_t cutoff = now_unit - spec.retention_window;
+        if (spec.cutoff_align > 0)
+            cutoff = (cutoff / spec.cutoff_align) * spec.cutoff_align; // floor to a bucket boundary
         const std::int64_t future_ceiling = now_unit + spec.implausibility_bound;
 
         // Part 2 — persisted reading.
@@ -140,24 +146,31 @@ ClockGuardedPruneOutcome run_clock_guarded_prune(PgPool& pool, const ClockGuarde
         }
         const bool bootstrap_settled = PQntuples(settled_res.get()) > 0;
 
-        // Part 1 — probe by OUTCOME. total_datable excludes implausibly-future
-        // rows (one forward-skewed row otherwise disarms would_wipe forever).
-        pg::PgResult counts = pg::exec_params(
+        // Part 1 — probe by OUTCOME with EXISTS, NOT COUNT(*) FILTER. The guard
+        // only ever asks "any?", and the counting form has no statement-level WHERE
+        // so it full-scans the target every pass — the exact anti-pattern
+        // `docs/postgres-store-playbook.md` and `audit_store.cpp` reject. EXISTS
+        // carries the predicate into the ts index and stops at the first match.
+        //   has_expired  = any row older than the cutoff.
+        //   has_survivor = any DATABLE (not implausibly-future) row at/after the
+        //                  cutoff — bounded by future_ceiling so one forward-skewed
+        //                  row cannot veto would_wipe for the store's life.
+        // would_wipe = has_expired AND no survivor (every datable row is expired).
+        pg::PgResult probe = pg::exec_params(
             conn,
-            ("SELECT COUNT(*) FILTER (WHERE " + q(spec.ts_column) + " <= $1::bigint), "
-             "COUNT(*) FILTER (WHERE " + q(spec.ts_column) + " < $2::bigint) FROM " +
-             q(spec.target_table))
+            ("SELECT EXISTS(SELECT 1 FROM " + q(spec.target_table) + " WHERE " + q(spec.ts_column) +
+             " < $1::bigint), EXISTS(SELECT 1 FROM " + q(spec.target_table) + " WHERE " +
+             q(spec.ts_column) + " >= $1::bigint AND " + q(spec.ts_column) + " <= $2::bigint)")
                 .c_str(),
-            std::vector<std::string>{std::to_string(future_ceiling), std::to_string(cutoff)});
-        if (counts.status() != PGRES_TUPLES_OK || PQntuples(counts.get()) != 1) {
-            spdlog::error("clock_guarded_prune[{}]: counts probe failed: {}", spec.store_label,
+            std::vector<std::string>{std::to_string(cutoff), std::to_string(future_ceiling)});
+        if (probe.status() != PGRES_TUPLES_OK || PQntuples(probe.get()) != 1) {
+            spdlog::error("clock_guarded_prune[{}]: existence probe failed: {}", spec.store_label,
                           PQerrorMessage(conn));
             return false;
         }
-        const std::int64_t total_datable = to_i64(PQgetvalue(counts.get(), 0, 0));
-        const std::int64_t expired = to_i64(PQgetvalue(counts.get(), 0, 1));
-        const bool has_expired = expired > 0;
-        const bool would_wipe = has_expired && expired >= total_datable;
+        const bool has_expired = std::strcmp(PQgetvalue(probe.get(), 0, 0), "t") == 0;
+        const bool has_survivor = std::strcmp(PQgetvalue(probe.get(), 0, 1), "t") == 0;
+        const bool would_wipe = has_expired && !has_survivor;
 
         const audit_retention::Facts facts{
             .has_expired = has_expired,

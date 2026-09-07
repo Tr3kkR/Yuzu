@@ -91,7 +91,8 @@ void set_meta(PgPool& pool, const std::string& key, const std::string& value) {
     }));
 }
 
-ClockGuardedPruneSpec spec(std::int64_t window_ms, std::int64_t cap, MissingAnchorPolicy policy) {
+ClockGuardedPruneSpec spec(std::int64_t window_ms, std::int64_t cap, MissingAnchorPolicy policy,
+                           std::int64_t cutoff_align = 0) {
     return ClockGuardedPruneSpec{
         .store_label = "rg_test",
         .target_table = "rg_test.t",
@@ -108,6 +109,7 @@ ClockGuardedPruneSpec spec(std::int64_t window_ms, std::int64_t cap, MissingAnch
         .min_plausible_reading = 946'684'800'000, // year 2000 in ms
         .cap_per_pass = cap,
         .missing_anchor = policy,
+        .cutoff_align = cutoff_align,
     };
 }
 
@@ -285,6 +287,45 @@ TEST_CASE("retention guard: a pass persists the anchor (survives restart)",
     });
     CHECK_FALSE(anchor.empty());
     CHECK(std::stoll(anchor) > 946'684'800'000); // a plausible present-day ms epoch
+}
+
+TEST_CASE("retention guard: cutoff_align floors the cutoff but leaves the anchor RAW (WS-10 C1)",
+          "[pg][store][retention-guard]") {
+    // cutoff_align must day-align the CUTOFF only — the persisted anchor stays the
+    // RAW reading, or two adjacent-bucket passes read one full bucket apart and
+    // false-fire Step every boundary crossing. (a) a row exactly at the floored
+    // cutoff survives (cutoff floored); (b) the stored anchor is near raw now, NOT
+    // floored to the day bucket.
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    setup_schema(pool);
+    const std::int64_t day = 86'400'000; // ms/day (the align unit)
+    seed(pool, 1, 3 * day); // ~3 days old → well before the 2-day floored cutoff → deleted
+    seed(pool, 1, 0);       // recent survivor (avoids would_wipe)
+    const std::int64_t before = now_ms();
+
+    // Proceed policy → no bootstrap decline; a fresh raw anchor is stamped this pass.
+    auto s = spec(/*window*/ 2 * day, /*cap*/ 100, MissingAnchorPolicy::Proceed, /*cutoff_align*/ day);
+    auto r = run_clock_guarded_prune(pool, s, 2000ms);
+    CHECK_FALSE(r.declined);
+    CHECK(r.deleted == 1);        // the ~3-day-old row (cutoff floored to ~2 days)
+    CHECK(count_rows(pool) == 1); // the recent survivor
+
+    // The persisted anchor is the RAW reading (≈ now), NOT floored to the day
+    // bucket (a floored anchor would be up to ~24h < now → fails this bound, except
+    // within 60s of UTC midnight where the distinction — and the bug — vanish).
+    std::string anchor;
+    pool.with_txn_for(2000ms, [&](PGconn* c) {
+        PgResult a = yuzu::server::pg::exec_params(
+            c, "SELECT value FROM rg_test.retention_meta WHERE key='t_last_pass_now'",
+            std::vector<std::string>{});
+        if (a.status() != PGRES_TUPLES_OK || PQntuples(a.get()) != 1)
+            return false;
+        anchor = PQgetvalue(a.get(), 0, 0);
+        return true;
+    });
+    REQUIRE_FALSE(anchor.empty());
+    CHECK(std::stoll(anchor) >= before - 60'000); // raw, not day-floored
 }
 
 TEST_CASE("retention guard: a failed txn reports error and deletes nothing",

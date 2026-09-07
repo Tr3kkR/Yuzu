@@ -71,7 +71,8 @@ const std::vector<pg::PgMigration>& migrations() {
 constexpr std::int64_t kPruneBigStepFloorSecs = 86'400;      // 24h absolute (> any legit inter-pass gap at 1h cadence)
 constexpr std::int64_t kPruneImplausibilitySecs = 86'400;    // day buckets are never future; >1d ahead is skew
 constexpr std::int64_t kPruneMinPlausibleSecs = 946'684'800; // year 2000 in seconds
-constexpr std::int64_t kPruneCapPerPass = 5'000;             // bounded drain per pass (day×app rows)
+// kPruneCapPerPass is a PUBLIC static member (app_perf_fleet_store.hpp) so the
+// roll-up thread can detect a cap-hit and re-arm; referenced below via the member.
 
 std::int64_t now_secs() {
     return std::chrono::duration_cast<std::chrono::seconds>(
@@ -291,6 +292,13 @@ int AppPerfFleetStore::run_retention_prune(std::int64_t retention_window_secs) {
     // SECONDS (the `day` column is a day-floored unix-seconds bucket). Part-6
     // missing-anchor = Decline: fleet perf history is non-regenerable aggregated
     // analytics, so a from-boot skewed clock must not silently wipe it.
+    // now_expr is RAW epoch seconds (NOT day-floored): the anchor + big_step need
+    // the true reading, or an hourly tick across UTC midnight false-fires a 24h
+    // Step and pauses retention (WS-10 C1). The DAY alignment lives in
+    // `cutoff_align = 86400` below, which floors ONLY the cutoff to the `day`
+    // bucket — matching the pre-WS-10 caller (`(now/86400)*86400 - window`) and the
+    // sibling app_perf_daily_store, so the 180-day boundary bucket is not deleted
+    // ~24h early.
     const pg::ClockGuardedPruneSpec spec{
         .store_label = kStoreName,
         .target_table = "app_perf_fleet_store.app_perf_fleet",
@@ -307,6 +315,7 @@ int AppPerfFleetStore::run_retention_prune(std::int64_t retention_window_secs) {
         .min_plausible_reading = kPruneMinPlausibleSecs,
         .cap_per_pass = kPruneCapPerPass,
         .missing_anchor = pg::MissingAnchorPolicy::Decline,
+        .cutoff_align = 86'400, // day-align the cutoff to the `day` bucket (raw now stays for big_step)
     };
     const auto r = pg::run_clock_guarded_prune(pool_, spec, kPruneAcquireTimeout);
     return r.error ? -1 : r.deleted;

@@ -130,6 +130,11 @@ public:
     /// deleting day-buckets older than now - this many days (seconds arithmetic).
     static constexpr int kRetentionDays = 180;
 
+    /// Per-pass bounded-drain cap for `run_retention_prune` (day×app rows). Public
+    /// so the roll-up thread can detect a cap-hit (deleted == this) and re-arm on a
+    /// short floor instead of waiting a full hour with a backlog (WS-10 S3).
+    static constexpr std::int64_t kPruneCapPerPass = 5'000;
+
 private:
     pg::PgPool& pool_;
     bool open_{false};

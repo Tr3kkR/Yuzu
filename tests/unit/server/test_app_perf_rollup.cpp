@@ -192,4 +192,27 @@ TEST_CASE("AppPerfRollup B1->B2 roll-up", "[pg][app_perf]") {
         CHECK(b2.run_retention_prune(window) >= 1);
         REQUIRE(b2.get_app_fleet_perf("p.exe", "")->size() == 1); // only recent survives
     }
+
+    SECTION("prune DAY-FLOORS the cutoff — the boundary bucket is not deleted ~24h early (WS-10 S1)") {
+        // now_expr is day-floored, so cutoff = floor(now/day)*day - window is
+        // day-aligned and a bucket EXACTLY at floor(now)-window survives (== cutoff,
+        // not < cutoff). Without flooring (the regression this guards) cutoff would be
+        // raw_now - window, up to ~24h later, and delete that boundary bucket. At any
+        // non-midnight-UTC second — the normal case — the two cutoffs differ.
+        const std::int64_t window = 10LL * 86400;
+        const std::int64_t old_day = today_utc() - 11 * 86400;      // < cutoff → deleted
+        const std::int64_t boundary_day = today_utc() - 10 * 86400; // == floored cutoff → survives
+        const std::int64_t recent_day = today_utc();                // survivor (avoids would_wipe)
+        seed(b1, "a1", "bnd.exe", "1.0.0.0", old_day, 5.0, 1000);
+        seed(b1, "a1", "bnd.exe", "1.0.0.0", boundary_day, 5.0, 1000);
+        seed(b1, "a1", "bnd.exe", "1.0.0.0", recent_day, 5.0, 1000);
+        REQUIRE(rollup.roll_day(old_day));
+        REQUIRE(rollup.roll_day(boundary_day));
+        REQUIRE(rollup.roll_day(recent_day));
+        CHECK(b2.run_retention_prune(window) == 0); // bootstrap decline
+        CHECK(b2.run_retention_prune(window) >= 1);
+        // Boundary + recent survive; only the strictly-older bucket is gone. A
+        // non-day-floored cutoff would delete the boundary bucket too (size == 1).
+        REQUIRE(b2.get_app_fleet_perf("bnd.exe", "")->size() == 2);
+    }
 }

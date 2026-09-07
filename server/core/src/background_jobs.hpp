@@ -35,15 +35,35 @@
 /// lookup that makes removing/renaming its table entry a BUILD FAILURE (the
 /// `command_capability.hpp` ExecuteGate precedent): all FencedLeaderOnly and
 /// DisabledUntilFixed passes (schedule/policy/quarantine dispatch, ca.publish_crl,
-/// nvd_sync), plus the load-bearing ReplicaSafe ones (the event-outbox poll, the
-/// concurrency reconciler, the three retention prunes, the app_perf rollup
-/// upsert). This proves
-/// named⇒classified for those sites. It does NOT yet prove pass⇒named for every
-/// read-only ReplicaSafe gauge/reap site (a consteval sweep visiting ALL dispatch
-/// sites is a tracked follow-up), so completeness across those rests on THIS array
-/// plus the routed-concern review (cpp-safety+sre+compliance-officer on any new
-/// background pass). A new side-effecting pass is a diff against THIS array, never
-/// a silent addition.
+/// nvd_sync, the concurrency reconciler), plus the load-bearing ReplicaSafe ones —
+/// the event-outbox poll, the three retention prunes, the app_perf rollup upsert,
+/// and the MUST-run-per-replica / shared-PG-writing passes found by the sweep
+/// (cert reloader, catalogue rollup, provisional-MFA cleanup, OTA watchdog, MCP
+/// projector, MCP bridge sweep + session gc, store-worker delivery pools). This
+/// proves named⇒classified for those sites. It does NOT yet prove pass⇒named for
+/// every dispatch site — a consteval sweep visiting ALL of them is a tracked
+/// follow-up (#4094) — so completeness rests on THIS array plus the recorded
+/// sweep methodology below and the routed-concern review
+/// (cpp-safety+sre+compliance-officer on any new background pass). A new
+/// side-effecting pass is a diff against THIS array, never a silent addition.
+///
+/// SWEEP METHODOLOGY (how this array was made exhaustive — repeat it on any audit).
+/// Over `server/core/` + `common/include/yuzu/`, grep for: `std::thread` /
+/// `std::jthread` / `*_thread_` members / `.detach()` (thread-start sites);
+/// `while (`/`for (;;)` bodies containing `sleep_for` / `wait_for` / a
+/// condition-variable wait (periodic loops); and the verbs `run_loop` / `sweep` /
+/// `tick` / `reap` / `cleanup` / `refresh` / `drain` / `recompute` / `poll` /
+/// `reconcile` / `sync` / `watchdog`. For each hit decide: per-request handler
+/// (OUT — rides the caller's thread, e.g. the detached gateway-forward, the lazy
+/// FleetTopologyStore refill, per-request SSE waits) or a standing background pass
+/// (IN — gets a row here). The 2026-09-07 sweep added 8 passes an earlier revision
+/// missed (cert reloader, catalogue rollup, provisional-MFA cleanup, OTA watchdog,
+/// MCP projector, MCP bridge sweep, MCP session gc, store-worker delivery pools);
+/// deliberately-excluded non-passes (documented so the next audit does not re-flag
+/// them): the detached per-dispatch gateway-forward thread, FleetTopologyStore's
+/// request-path refill, ExecutionEventBus inline gc, `shutdown_watcher.hpp`'s
+/// signal self-pipe watcher, per-request SSE `wait_for` loops, and boot-time
+/// one-shot poll loops (`default_certs.cpp`, `nvd_client.cpp`).
 
 #include <array>
 #include <cstddef>
@@ -64,7 +84,9 @@ struct BackgroundJobDecl {
     std::string_view mechanism;     ///< why the class holds (the recorded rationale)
 };
 
-/// The exhaustive inventory. Verified against the source sweep 2026-09-06.
+/// The exhaustive inventory (40 passes). Verified against the source sweep
+/// 2026-09-07 per the SWEEP METHODOLOGY above; keep the count tripwire in
+/// `test_background_jobs.cpp` in step with any add/remove here.
 inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
     // ---- result_set_maint_thread_ (2s tick) ----
     {"session_clock_monitor.observe", "result_set_maint_thread_", BackgroundJobClass::ReplicaSafe,
@@ -82,12 +104,15 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
     {"execution_tracker.reap_command_execution_mappings", "result_set_maint_thread_",
      BackgroundJobClass::ReplicaSafe, "clock-guarded + pg_advisory_xact_lock"},
     {"execution_tracker.reconcile_stale_concurrency_claims", "result_set_maint_thread_",
-     BackgroundJobClass::ReplicaSafe,
+     BackgroundJobClass::DisabledUntilFixed,
      "advisory-lock SINGLE-WRITER (pg_try_advisory_xact_lock, WS-10 10.2, this change) — prevents "
-     "concurrent double-reconcile. CAVEAT: its clock authority is still replica-local system_clock "
-     "(both the claim expires_at write and the reconcile read), NOT shared PG-now; a concurrency_claims "
-     "DB-clock-authority migration (WS-1 class, #3715 shape) is a prerequisite before a 2nd replica, or "
-     "a skewed winner could release a live claim early"},
+     "concurrent double-reconcile — but NOT yet safe for a 2nd replica: its clock authority is still "
+     "replica-local system_clock (both the claim expires_at write via now_epoch() and the reconcile "
+     "read/compare), NOT shared PG-now, so a skewed winner could release a live claim early. Named fix: "
+     "concurrency_claims DB-clock-authority migration (WS-1 class, #3715 shape, tracked #4093). Same "
+     "posture as nvd_sync.do_sync (a pending prerequisite migration → DisabledUntilFixed), NOT "
+     "ReplicaSafe — the advisory lock is real progress but does not make two replicas' clocks one "
+     "authority. Runs on the single replica today; the class gates a 2nd replica on the fix"},
     {"execution_tracker.reap_event_outbox", "result_set_maint_thread_", BackgroundJobClass::ReplicaSafe,
      "clock-guarded + pg_try_advisory_xact_lock"},
     {"execution_tracker.poll_event_outbox_once", "result_set_maint_thread_", BackgroundJobClass::ReplicaSafe,
@@ -137,6 +162,10 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
      "DB-WRITE: CRL row + crlNumber bump must be single-writer or numbering diverges (WS-6)"},
     {"registry.teardown_revoked_streams", "health_recompute_thread_", BackgroundJobClass::ReplicaSafe,
      "per-replica: tears down only the Subscribe streams connected to THIS replica"},
+    {"mcp_stream_bridge.sweep", "health_recompute_thread_", BackgroundJobClass::ReplicaSafe,
+     "per-replica in-memory: pin-ack/session-death/age-reaper teardown over THIS replica's ≤256 bridge records; no shared state"},
+    {"mcp_session_registry.gc", "health_recompute_thread_", BackgroundJobClass::ReplicaSafe,
+     "per-replica in-memory: destroys expired MCP session streams held by THIS replica; no shared state"},
 
     // ---- engine_rotation_sweep_thread_ (60s tick) ----
     {"api_token_store.sweep_expired_rotations", "engine_rotation_sweep_thread_",
@@ -160,6 +189,21 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
      BackgroundJobClass::ReplicaSafe, "per-replica local buffer drain to the operator-supplied sink"},
     {"nvd_sync.do_sync", "NvdSyncManager::sync_thread_", BackgroundJobClass::DisabledUntilFixed,
      "engine-tier migration pending (ADR-1005 Phase 7 / ADR-0023); only a process-local single-flight (sync_active_ CAS), not cross-replica — must move to the engine tier or be leader-gated before a 2nd replica"},
+
+    // ---- other dedicated component threads (added by the 2026-09-07 exhaustive sweep) ----
+    {"cert_reloader.run_loop", "CertReloader::thread_", BackgroundJobClass::ReplicaSafe,
+     "per-replica: polls THIS replica's on-disk cert/key mtimes and hot-swaps its own in-process SSL_CTX; the audit append is idempotent"},
+    {"software_catalog_rollup.refresh_catalog_rollup", "SoftwareCatalogRollup::thread_",
+     BackgroundJobClass::ReplicaSafe,
+     "SHARED-PG, SINGLE-WRITER: refresh_catalog_rollup ALREADY takes a transaction-scoped pg_try_advisory_xact_lock (skip-if-held) before its one-txn DELETE+INSERT atomic replace of the catalogue rollup tables, and is keep-last-good on failure — so concurrent replicas serialize on the lock (a loser skips), never racing the unique-key replace"},
+    {"auth_db.cleanup_provisional_mfa", "AuthDB::cleanup_thread_", BackgroundJobClass::ReplicaSafe,
+     "SHARED-PG, idempotent: a single predicate-scoped UPDATE expiring stale provisional-MFA rows on a PG now() cutoff (shared clock) — an already-cleared row ceases to match, so concurrent replicas converge with no advisory lock. NOT row-count-bounded (no LIMIT; kWriteTimeout bounds the connection acquire, not the rows) and not a would-wipe reaper"},
+    {"ota_transfer_watchdog.sweep_once", "OtaTransferWatchdog::sweeper_", BackgroundJobClass::ReplicaSafe,
+     "per-replica: cancels only the OTA transfers registered on THIS replica's gRPC server (borrowed ServerContext*); the sole per-replica OTA deadline enforcer — MUST run per-replica, never leader-gate; no shared state"},
+    {"mcp_stream_bridge.run_projector", "McpStreamBridge::projector_", BackgroundJobClass::ReplicaSafe,
+     "per-replica in-process: projects ExecutionEventBus progress/terminal frames to the MCP SSE listeners connected to THIS replica; MUST run per-replica; no shared state (terminals are durably re-fetchable)"},
+    {"store_worker_pool.worker_loop", "StoreWorkerPool::workers_", BackgroundJobClass::ReplicaSafe,
+     "per-replica in-process delivery-queue drain (WebhookStore + OffloadTargetStore delivery_pool_): POSTs the events THIS replica enqueued via submit(); MUST run per-replica. CAVEAT/tracked: the pass itself is replica-local, but whether a given logical event is enqueued once-per-fleet or once-per-replica is an EMIT-SITE concern (verify webhook/offload emit sites are per-replica-origin before a 2nd replica, or a fleet-triggered emit double-delivers)"},
 });
 
 /// Index of `pass` in kBackgroundJobs, or -1 if absent. consteval so a site

@@ -2,7 +2,9 @@
 // table (server/core/src/background_jobs.hpp) is the checked-in, CI-auditable
 // guarantee that every background pass is classified for replica-safety. This
 // test binds the table's internal consistency and completeness; the per-site
-// YUZU_ASSERT_BACKGROUND_JOB consteval gate binds that no live pass escapes it.
+// YUZU_ASSERT_BACKGROUND_JOB consteval gate binds that no GATED pass's table entry
+// is removed or renamed (it fires only where the macro is written — proving
+// pass⇒named for every dispatch site is the tracked CI-sweep follow-up #4094).
 
 #include "background_jobs.hpp"
 
@@ -46,7 +48,7 @@ TEST_CASE("background-job table classifies every audited pass correctly",
     // Count tripwire — forces a conscious table update when a pass is added or
     // removed (a silent count change is exactly what WS-10 exists to prevent).
     // Update this number ONLY alongside a real classification change.
-    CHECK(kBackgroundJobs.size() == 32);
+    CHECK(kBackgroundJobs.size() == 40);
 
     // The load-bearing per-pass calls — a regression here is the WS-10 hazard.
     SECTION("MUST-run-per-replica passes are ReplicaSafe, never leader-gated") {
@@ -55,11 +57,25 @@ TEST_CASE("background-job table classifies every audited pass correctly",
         REQUIRE(poll != nullptr);
         CHECK(poll->cls == BackgroundJobClass::ReplicaSafe);
     }
-    SECTION("the four #2508 clock-guard targets are ReplicaSafe (single-writer via guard)") {
+    SECTION("the three #2508 clock-guard prune targets are ReplicaSafe (single-writer via guard)") {
         for (std::string_view p : {"app_perf_fleet_store.run_retention_prune",
                                    "preflight_run_store.run_retention_prune",
-                                   "deployment_run_store.run_retention_prune",
-                                   "execution_tracker.reconcile_stale_concurrency_claims"}) {
+                                   "deployment_run_store.run_retention_prune"}) {
+            auto* j = find(p);
+            INFO("missing/misclassified: " << p);
+            REQUIRE(j != nullptr);
+            CHECK(j->cls == BackgroundJobClass::ReplicaSafe);
+        }
+    }
+    SECTION("the sweep-added MUST-run-per-replica / idempotent passes are ReplicaSafe") {
+        for (std::string_view p : {"cert_reloader.run_loop",
+                                   "software_catalog_rollup.refresh_catalog_rollup",
+                                   "auth_db.cleanup_provisional_mfa",
+                                   "ota_transfer_watchdog.sweep_once",
+                                   "mcp_stream_bridge.run_projector",
+                                   "mcp_stream_bridge.sweep",
+                                   "mcp_session_registry.gc",
+                                   "store_worker_pool.worker_loop"}) {
             auto* j = find(p);
             INFO("missing/misclassified: " << p);
             REQUIRE(j != nullptr);
@@ -75,10 +91,18 @@ TEST_CASE("background-job table classifies every audited pass correctly",
             CHECK(j->cls == BackgroundJobClass::FencedLeaderOnly);
         }
     }
-    SECTION("nvd_sync is DisabledUntilFixed (engine-tier migration pending)") {
-        auto* j = find("nvd_sync.do_sync");
-        REQUIRE(j != nullptr);
-        CHECK(j->cls == BackgroundJobClass::DisabledUntilFixed);
+    SECTION("passes with a pending pre-2nd-replica migration are DisabledUntilFixed") {
+        // nvd_sync: engine-tier migration pending. The concurrency reconciler: its
+        // clock authority is still replica-local (#4093) — the advisory lock made it
+        // single-writer but not clock-consistent, so it is NOT ReplicaSafe until the
+        // DB-clock migration lands (same posture as nvd_sync, not the prunes).
+        for (std::string_view p : {"nvd_sync.do_sync",
+                                   "execution_tracker.reconcile_stale_concurrency_claims"}) {
+            auto* j = find(p);
+            INFO("missing/misclassified: " << p);
+            REQUIRE(j != nullptr);
+            CHECK(j->cls == BackgroundJobClass::DisabledUntilFixed);
+        }
     }
 }
 
