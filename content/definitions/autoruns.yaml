@@ -33,15 +33,17 @@ metadata:
   displayName: Autoruns
   version: 1.0.0
   description: >
-    Enumerates persistence sources across the endpoint's operating system —
-    everything registered to start automatically, from Run keys and
-    Scheduled Tasks on Windows to cron/systemd timers on Linux to launchd
-    jobs on macOS. Every source in the catalog reports a status row even
-    when it produced no entries or is not supported on this OS, so a
-    consumer never reads silence and infers "nothing checked" — an
-    unsupported or foreign-OS source says so explicitly rather than being
-    omitted. `sources=` filters to a comma-separated list of source ids
-    (e.g. `win_run_hklm,win_scheduled_tasks`).
+    Enumerates the plugin's versioned catalog of persistence sources across
+    the endpoint's operating system, from Run keys and Scheduled Tasks on
+    Windows to cron/systemd timers on Linux to launchd jobs on macOS. Every
+    source in the catalog reports a status row even when it produced no
+    entries, could not be read, is constrained by a documented gap (e.g.
+    macOS Login Items has no public read API; some `win_*_hku` sources
+    depend on a per-profile hive being reachable), or is not supported on
+    this OS, so a consumer never reads silence and infers "nothing
+    checked" — every one of those outcomes says so explicitly rather than
+    being omitted. `sources=` filters to a comma-separated list of source
+    ids (e.g. `win_run_hklm,win_scheduled_tasks`).
   tags: [security, persistence, autoruns, startup]
 
 spec:
