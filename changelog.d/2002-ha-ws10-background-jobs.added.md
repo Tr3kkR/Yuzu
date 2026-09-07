@@ -2,9 +2,10 @@
   slices 10.1/10.2).** Every server background pass is now classified for replica-safety in a
   checked-in, CI-auditable table (`server/core/src/background_jobs.hpp`) — ReplicaSafe /
   FencedLeaderOnly / DisabledUntilFixed, one entry per *pass* (a single thread runs many), each with
-  its single-writer rationale; a `consteval` site-gate makes an unclassified pass a build failure, and
-  a table test pins consistency + completeness. Enabling a second replica needs this so a background
-  job cannot silently double-run. Separately, the three remaining bare wall-clock retention deletes
+  its single-writer rationale; a `consteval` site-gate makes removing or renaming a *classified*
+  pass's table entry a build failure, and a table test pins the inventory's consistency + count
+  (proving every dispatch site is classified — full pass⇒named coverage — is a tracked follow-up).
+  Enabling a second replica needs this so a background job cannot silently double-run. Separately, the three remaining bare wall-clock retention deletes
   (`app_perf_fleet_store`, `preflight_run_store`, `deployment_run_store`, #2508) and the
   `concurrency_claims` stale-claim reconciler are now clock-guarded and **SINGLE-WRITER-safe** — the
   three prunes via one shared `pg::run_clock_guarded_prune` helper (the full seven-part guard + a
