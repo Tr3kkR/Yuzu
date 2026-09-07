@@ -8076,7 +8076,7 @@ The **agentic-first (A1) structured surface** for the same destructive purge —
 
 **Request:** no parameters.
 
-**Response:** `{"data":{"devices":[{"agent_id","hostname","os","arch","agent_version","online"}]},"meta":{"api_version":"v1"}}`. Includes **offline** devices (each row carries `online`) unlike the HTML picker, which hides them as a presentation-only choice — an API/MCP caller isn't choosing a live-dispatch target the way the picker is.
+**Response:** `{"data":{"devices":[{"agent_id","hostname","os","arch","agent_version","online"}]},"meta":{"api_version":"v1"}}`. Every row carries `online`, which is **always `true` today** — the sole wired provider sources this list from the live-session registry, so a disconnected enrolled device is not included (#4027 fix round, CDX-P1-02/K1 — an earlier revision of this doc claimed offline-inclusive; that was aspirational, not the shipped behavior). Unlike the HTML picker, this list does not additionally hide any row by online status — a future offline-inclusive provider (tracked follow-up) would make that distinction meaningful.
 
 **Audit:** none on success — a device identity/online list, not per-device behavioral content (matches the fragment's own today-unaudited posture).
 

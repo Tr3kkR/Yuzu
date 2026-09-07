@@ -702,8 +702,19 @@ TEST_CASE("TAR device picker REST twins: Infrastructure:Read denial -> 403, no d
     CHECK(cap->body.find("dev-A") == std::string::npos);
 }
 
-TEST_CASE("TAR device picker REST twins: happy path returns the A4-enveloped device "
-          "list, including offline devices",
+// #4027 fix round (CDX-P1-02/K1): renamed from "...including offline devices" —
+// that title claimed a production behavior this test does not exercise. This
+// harness's `devices` stub returns whatever `devices_list` is set to directly,
+// bypassing the real production provider entirely (`server.cpp`'s `devices_fn`,
+// which sources exclusively from the live-session registry and stamps
+// `online=true` unconditionally — every row is online in production today).
+// What this test legitimately proves: the ROUTE/BUILDER passthrough does not
+// discriminate against an `online=false` row if one is ever supplied — i.e. the
+// route is READY for a future offline-inclusive provider, not that one is wired
+// today. See tar_tree_routes.hpp's builder doc comment for the full correction.
+TEST_CASE("TAR device picker REST twins: happy path returns the A4-enveloped "
+          "device list; the route/builder does not discriminate against an "
+          "online=false row if the provider ever supplies one",
           "[tar][tree][routes][rest]") {
     TarHarness h;
     h.devices_list = {
@@ -725,7 +736,7 @@ TEST_CASE("TAR device picker REST twins: happy path returns the A4-enveloped dev
     CHECK(tree_devices[0]["agent_id"] == "dev-A");
     CHECK(tree_devices[0]["online"] == true);
     CHECK(tree_devices[1]["agent_id"] == "dev-B");
-    CHECK(tree_devices[1]["online"] == false); // offline devices are NOT hidden (unlike the HTML picker)
+    CHECK(tree_devices[1]["online"] == false); // NOT hidden by the route/builder — see comment above
 
     // Same shared builder underlies the sibling endpoint — same shape, same data.
     auto cap = h.sink.Get("/api/v1/tar/capture-sources");

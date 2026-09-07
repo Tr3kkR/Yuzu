@@ -378,18 +378,21 @@ static const ToolDef kTools[] = {
     // twinned by #4027 (see tar_tree_routes.hpp's file comment) — no REST/MCP-only
     // path exists to mint their required pcmd/tcmd/token inputs today.
     {"list_tar_process_tree_devices",
-     "List the operator-scoped device picker for the TAR process-tree viewer "
-     "(online and offline devices; each row carries `online`). Requires "
-     "Infrastructure:Read. Read-only twin of GET /fragments/tar/process-tree's "
-     "device picker / GET /api/v1/tar/process-tree.",
+     "List the operator-scoped device picker for the TAR process-tree viewer. "
+     "Each row carries `online`, which is always true today — the sole wired "
+     "provider sources this list from the live-session registry, so a "
+     "disconnected enrolled device is not included (#4027 fix round, "
+     "CDX-P1-02/K1). Requires Infrastructure:Read. Read-only twin of GET "
+     "/fragments/tar/process-tree's device picker / GET /api/v1/tar/process-tree.",
      R"({"type":"object","properties":{}})",
      R"j({"type":"object","properties":{"devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"},"online":{"type":"boolean"}},"required":["agent_id","hostname","os","arch","agent_version","online"]}}},"required":["devices"]})j"},
 
     {"list_tar_capture_sources_devices",
      "List the operator-scoped device picker for the TAR capture-sources (ADR-0015 "
-     "enable/disable) frame. Same row shape as list_tar_process_tree_devices. "
-     "Requires Infrastructure:Read. Read-only twin of GET /fragments/tar/"
-     "capture-sources's device picker / GET /api/v1/tar/capture-sources.",
+     "enable/disable) frame. Same row shape as list_tar_process_tree_devices — "
+     "`online` is always true today, same reason. Requires Infrastructure:Read. "
+     "Read-only twin of GET /fragments/tar/capture-sources's device picker / "
+     "GET /api/v1/tar/capture-sources.",
      R"({"type":"object","properties":{}})",
      R"j({"type":"object","properties":{"devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"},"online":{"type":"boolean"}},"required":["agent_id","hostname","os","arch","agent_version","online"]}}},"required":["devices"]})j"},
 

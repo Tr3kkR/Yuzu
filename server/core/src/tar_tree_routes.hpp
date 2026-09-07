@@ -75,10 +75,17 @@ class HttpRouteSink;
 /// presentation-only "hide offline" filter (a picker dropdown for live dispatch,
 /// unlike this JSON list) rather than being refactored onto this builder's output —
 /// low risk to add, non-trivial to merge without changing the picker's UX, so left
-/// alone per Rule 1's "where that refactor is low-risk" carve-out. Includes BOTH
-/// online and offline devices (each row carries `online`) — an API/MCP caller isn't
-/// choosing a live-dispatch target the way the picker is, so hiding offline rows
-/// would silently under-report the operator's visible fleet.
+/// alone per Rule 1's "where that refactor is low-risk" carve-out. The builder itself
+/// does NOT discriminate on `online` — it emits every row it is handed, deliberately,
+/// so an API/MCP caller isn't silently under-reported the way hiding offline rows
+/// would. #4027 fix round (CDX-P1-02/K1) correction: the wired PRODUCER
+/// (`server.cpp`'s `devices_fn`) sources exclusively from the live-session registry
+/// and stamps `online=true` unconditionally, so in production every row this
+/// builder actually sees is online — `online` is honest per-row but the list is
+/// NOT offline-inclusive today despite the builder's own online-agnostic contract.
+/// Wiring a genuinely offline-inclusive producer (the pattern at
+/// `server.cpp:20057-20091`, `OfflineEndpointStore::query_stale_within`) is a
+/// tracked follow-up, not done in this fix round.
 std::string tar_process_tree_frame_json(const std::vector<DeviceRow>& devices);
 
 /// Same shape and same "why a distinct name" rationale as
