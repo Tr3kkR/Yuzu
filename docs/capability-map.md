@@ -39,7 +39,10 @@ Each capability is rated on two axes:
 > their per-row behavioural claims (exact signal counts, retention windows, etc.) are inherited
 > from the unmerged 2026-07 capability-industry review rather than independently re-derived
 > this session — honest scoping over implied uniform depth. Domains 1-31's regraded rows each
-> carry their own inline evidence citation and verification date.
+> carry their own inline evidence citation and verification date. Four hand-maintained views
+> must be updated together whenever a row's icon or tier changes: the headline/tier bars below,
+> the per-domain summary table, Appendix A's plugin count, and Appendix B's Foundation tally —
+> nothing in `tests/` or CI checks them against the awk yet (tracked as a governance follow-up).
 
 ```
 Foundation   [===============================-]  58/59 done  (98%)
@@ -92,7 +95,7 @@ Overall      [=========================-------]  207/265 done (78%) (19 partial)
 | 39. Headless Platform — Engine Principals & On-Behalf-Of (ADR-1005) | 3 | 3 | 0 | 0 |
 | **TOTAL** | **265** | **207** | **19** | **39** |
 
-> **Scaffolded vs production-quality.** The percentages above measure feature presence, not enterprise hardening. "Done" means "implemented and functional" — not "hardened, observable, and proven at large-fleet scale" on every domain. Known gaps at the §-level (e.g. configurable heartbeat in §1.2, unified diagnostics bundle in §1.3, runtime plugin install in §1.5) remain even where a domain is marked Done. The `docs/capability-agentic-audit-2026-05.md` audit is the source for the production-quality dimension; subsequent reviews should keep it current.
+> **Scaffolded vs production-quality.** The percentages above measure feature presence, not enterprise hardening. "Done" means "implemented and functional" — not "hardened, observable, and proven at large-fleet scale" on every domain. Known gaps at the §-level (e.g. configurable heartbeat in §1.2, unified diagnostics bundle in §1.3, runtime plugin install in §1.5) remain even where a domain is marked Done. The `docs/capability-agentic-audit-2026-05.md` audit (figures as of 2026-05 — its counts predate this v4.0 tally) is the source for the production-quality dimension; subsequent reviews should keep it current.
 
 ---
 
@@ -420,7 +423,7 @@ ported in the store's Postgres migration; see #3669 for the removed tested-but-u
 implementation. A target's status only advances past `pending` via a direct
 `update_target_status()` call, which nothing in this codebase makes today. *(Re-verified
 2026-09-07 for the v4.0 baseline: `execute_deployment()` remains absent from
-`server/core/src/patch_store.cpp`; grade unchanged.)*
+`server/core/src/patch_manager.{hpp,cpp}`; grade unchanged.)*
 
 ### 8.4 Patch Status Tracking :large_orange_diamond: `T2`
 
@@ -945,7 +948,7 @@ Operator-registered external HTTP endpoints (*offload targets*) that receive a c
 
 ### 20.8 Executions-History Ladder and Agentic Event Stream :white_check_mark: `T2` *(new row, v4.0)*
 
-The `command_id → execution_id` map + `ExecutionEventBus` SSE stream unifying dashboard and REST/MCP execution visibility behind one taxonomy (`/api/v1/events`) — never per-route event formats. `execute_instruction` (REST + MCP) is a tracked-execution producer. A4 error-envelope shape lives in `rest_a4_envelope.hpp`. *(Evidence: `server/core/src/execution_event_bus.{hpp,cpp}`, `execution_tracker.{hpp,cpp}`, `rest_a4_envelope.{hpp,cpp}`; design: `docs/executions-history-ladder.md`; verified 2026-09-07.)*
+The `command_id → execution_id` map + `ExecutionEventBus` SSE stream unifying dashboard and REST/MCP execution visibility behind one taxonomy (`/api/v1/events`) — never per-route event formats. `execute_instruction` (REST + MCP) is a tracked-execution producer. A4 error-envelope shape lives in `rest_a4_envelope.hpp`. *(Evidence: `server/core/src/execution_event_bus.{hpp,cpp}`, `execution_tracker.{hpp,cpp}`, `rest_a4_envelope.hpp` + `rest_a4_envelope_http.hpp`; design: `docs/executions-history-ladder.md`; verified 2026-09-07.)*
 
 ---
 
@@ -975,7 +978,7 @@ Not implemented. Configure which events generate notifications.
 
 ### 21.6 Behavioral-PII Access-Audit Chokepoint :white_check_mark: `T2` *(new row, v4.0)*
 
-Every behavioural-PII read (device-live-info, process/network drill, DEX perf, etc.) funnels through the single `emit_behavioral_audit` chokepoint (#1647) — REST fail-closed 503 + `Sec-Audit-Failed` header on an audit-write failure, dashboard/MCP set-and-proceed. Standing invariant: no new PII route may reintroduce an inline bool-capture bypassing the chokepoint. *(Evidence: `server/core/src/rest_audit.hpp` `emit_behavioral_audit`; verified 2026-09-07.)*
+Every behavioural-PII read (device-live-info, process/network drill, DEX perf, etc.) funnels through the single `emit_behavioral_audit` chokepoint (#1647) — with one tracked exception: the REST `device.live.*` incarnation still uses an inline bool-capture (#1703, open) — REST fail-closed 503 + `Sec-Audit-Failed` header on an audit-write failure, dashboard/MCP set-and-proceed. Standing invariant: no new PII route may reintroduce an inline bool-capture bypassing the chokepoint. *(Evidence: `server/core/src/rest_audit.hpp` `emit_behavioral_audit`; verified 2026-09-07.)*
 
 ---
 
@@ -993,7 +996,7 @@ Kubernetes-style health probes: `/livez` (always 200) and `/readyz` (checks stor
 
 ### 22.3 License Management :large_orange_diamond: `T2`
 
-`LicenseStore` with seat-based licensing, expiry, edition, feature flags. Soft enforcement with alerts at 90% seats / 30 days to expiry. REST: `GET/POST/DELETE /api/v1/license`, `GET /api/v1/license/alerts`. **Dormant** (ADR-0048) — the store is migrated and tested but not constructed by the server, so these routes do not register today. **Regraded ✅ Done → 🔶 Partial (ADR-0048; regraded 2026-09-07)** — the store's own file header states it is "DELIBERATELY DORMANT on `dev`": nothing in `server.cpp` constructs a `LicenseStore`, so a fully-implemented, fully-tested capability that is not wired up in the running server is not a delivered capability. *(Evidence: `server/core/src/license_store.hpp` header comment; verified 2026-09-07. Not to be confused with §27 Software Licensing & Entitlements — this store is Yuzu's own product licensing, unrelated to customer software-license discovery.)*
+`LicenseStore` with seat-based licensing, expiry, edition, feature flags. Soft enforcement with alerts when the seat count is exceeded or expiry is within 30 days (`license_store.cpp:446,456` — no 90% early-warning threshold exists). REST: `GET/POST/DELETE /api/v1/license`, `GET /api/v1/license/alerts`. **Dormant** (ADR-0048) — the store is migrated and tested but not constructed by the server, so these routes do not register today. **Regraded ✅ Done → 🔶 Partial (ADR-0048; regraded 2026-09-07)** — the store's own file header states it is "DELIBERATELY DORMANT on `dev`": nothing in `server.cpp` constructs a `LicenseStore`, so a fully-implemented, fully-tested capability that is not wired up in the running server is not a delivered capability. *(Evidence: `server/core/src/license_store.hpp` header comment; verified 2026-09-07. Not to be confused with §27 Software Licensing & Entitlements — this store is Yuzu's own product licensing, unrelated to customer software-license discovery.)*
 
 ### 22.4 Platform Configuration (TTLs, Limits) :white_check_mark: `T2`
 
@@ -1019,9 +1022,9 @@ Not implemented. Distribute versioned binary resources via server.
 
 Not implemented. Time-partitioned response storage (monthly SQLite files) with automatic rotation, TTL cleanup, and transparent cross-partition query routing.
 
-### 22.10 High Availability (Active-Passive) :large_orange_diamond: `T3`
+### 22.10 High Availability (ADR-2002) :large_orange_diamond: `T3`
 
-Design + one unwired component, not live HA. ADR-2002 (accepted) specifies a fenced, Postgres-backed leader election model (WS-3): a dedicated connection holding a session-scoped advisory lock, an epoch fence that gates every mutating operation, two dispatch planes. `LeaderElector` (`server/core/src/leader_elector.{hpp,cpp}`) implements this and compiles into `server/core/meson.build`, but has **zero call sites outside its own translation unit** — no `server.cpp` construction, nothing wires it into the boot sequence — so no automatic failover, inter-server heartbeat, or gateway re-registration exists at runtime today. Several other server modules (ExecutionTracker's `ExecutionEventBus`, ScheduleEngine's `SELECT ... FOR UPDATE`) carry forward-pointers to ADR-2002 for their own eventual multi-replica story. *(Evidence: `docs/adr/0061-update-registry-postgres-migration.md`, `docs/adr/0065-instruction-cluster-postgres-migration.md` ADR-2002 references; `grep -rl LeaderElector server/core/src/*.cpp` returns only `leader_elector.cpp` itself; verified 2026-09-07 — previously mis-graded Not Started.)*
+Design + one unwired component, not live HA — and not active-passive: ADR-2002 explicitly disavows that model (the earlier title here was wrong). Delivered so far per `docs/ha-delivery-matrix.md`: WS-0 durable idempotency, WS-1 Postgres-backed session state, WS-7 Patroni compose, WS-2a-1 transactional outbox; WS-10 job-safety classification merged after this baseline (#4092). The undelivered core is leader election: ADR-2002 (accepted) specifies a fenced, Postgres-backed leader election model (WS-3): a dedicated connection holding a session-scoped advisory lock, an epoch fence that gates every mutating operation, two dispatch planes. `LeaderElector` (`server/core/src/leader_elector.{hpp,cpp}`) implements this and compiles into `server/core/meson.build`, but has **zero call sites outside its own translation unit** — no `server.cpp` construction, nothing wires it into the boot sequence — so no automatic failover, inter-server heartbeat, or gateway re-registration exists at runtime today. Several other server modules (ExecutionTracker's `ExecutionEventBus`, ScheduleEngine's `SELECT ... FOR UPDATE`) carry forward-pointers to ADR-2002 for their own eventual multi-replica story. *(Evidence: `docs/adr/0061-update-registry-postgres-migration.md`, `docs/adr/0065-instruction-cluster-postgres-migration.md` ADR-2002 references; `grep -rl LeaderElector server/core/src/*.cpp` returns only `leader_elector.cpp` itself; verified 2026-09-07 — previously mis-graded Not Started.)*
 
 ---
 
@@ -1242,7 +1245,7 @@ Not implemented. `yuzu-sdk` Python package wrapping REST API v1 with async suppo
 
 ### 30.1 Result Set Persistence and Lineage :white_check_mark: `T2`
 
-Shipped 2026-05-31 (Phase 15.B; `68427bba`). **Update 2026-09-07: `result_set_store.{cpp,hpp}` is now PostgreSQL** — the Postgres-migration ladder item this row originally flagged is done (verified via `PGconn`/`pg::` usage in `result_set_store.cpp`; part of the broader server-store migration, see §38). The REST surface lives in `rest_api_v1.cpp`. A named, TTL-bounded set of device IDs produced by a query, action result, or operator-curated list — the unit of composable scope. Stable identity (`rs_<ulid>`), optional human-readable per-operator alias, immutable lineage edges that record the chain of `(parent_result_set, narrowing_query)` back to a ground set, source-payload JSON sufficient to live-re-evaluate the producing query without operator re-input. Persisted in `result_sets.db` with `ON DELETE CASCADE` member rows; pinning extends TTL beyond the default 1 hour for incident-response sessions; per-operator quotas (10K result sets, 50 pins) and a 5-minute background GC sweep prevent runaway scripts from filling the table. REST: `/api/v1/result-sets/...` covering create-from-inventory/tar/instruction, members, lineage, pin/unpin/re-eval, delete. Audit row per state transition for forensic reconstruction. Design: `docs/scope-walking-design.md` §3, §6, §9.
+Shipped 2026-05-31 (Phase 15.B; `68427bba`). **Update 2026-09-07: `result_set_store.{cpp,hpp}` is now PostgreSQL** — the Postgres-migration ladder item this row originally flagged is done (verified via `PGconn`/`pg::` usage in `result_set_store.cpp`; part of the broader server-store migration, see §38). The REST surface lives in `rest_api_v1.cpp`. A named, TTL-bounded set of device IDs produced by a query, action result, or operator-curated list — the unit of composable scope. Stable identity (`rs_<ulid>`), optional human-readable per-operator alias, immutable lineage edges that record the chain of `(parent_result_set, narrowing_query)` back to a ground set, source-payload JSON sufficient to live-re-evaluate the producing query without operator re-input. Persisted in the `result_set_store` PostgreSQL schema (ADR-0006; formerly `result_sets.db`) with `ON DELETE CASCADE` member rows; pinning extends TTL beyond the default 1 hour for incident-response sessions; per-operator quotas (10K result sets, 50 pins) and a 5-minute background GC sweep prevent runaway scripts from filling the table. REST: `/api/v1/result-sets/...` covering create-from-inventory/tar/instruction, members, lineage, pin/unpin/re-eval, delete. Audit row per state transition for forensic reconstruction. Design: `docs/scope-walking-design.md` §3, §6, §9.
 
 ### 30.2 Composable Scope from Previous Query :white_check_mark: `T2`
 
@@ -1264,7 +1267,7 @@ Largely shipped (Phase 15.G). Shipped: live re-eval (sibling result set), backgr
 
 ### 31.1 Guardian Engine and Wire Protocol :white_check_mark: `T2`
 
-Shipped — well beyond the PRs 1-2 status this row originally recorded. Agent-side `GuardianEngine` (`agents/core/src/guardian_engine.{hpp,cpp}`) with two-phase startup — `start_local()` pre-network so enforcement is active before the Register RPC, then `sync_with_server()` post-Register. KV namespace `__guardian__` for cached policy. Reserved plugin name `__guard__` intercepted in `agent.cpp` before the plugin match loop (load-time rejection in `plugin_loader.cpp` for defence in depth). Wire contract: `proto/yuzu/guardian/v1/guaranteed_state.proto` with `GuaranteedStateRule`, `GuaranteedStatePush`, `GuaranteedStateEvent`, `GuaranteedStateStatus`, `GuaranteedStateRuleStatus`. Server store `guaranteed-state.db` with immutable event log, plus the `BaselineStore` deployment model (`server/core/src/baseline_store.{hpp,cpp}`) — a **Baseline** is the only deployable unit; push fan-out + heartbeat reconcile gate on `deployed_member_rule_ids()` sourced from each deploy's `deployed_snapshot`, not the live member set (`docs/guardian-baseline-model.md`). **Also verified 2026-09-07: ADR-0021 Spark is wired as Guardian's first consumer** — `agents/core/src/agent.cpp:1255` calls `wire_spark_engine()`, and `GuardianEngine::reconcile_rule_locked()` is the sole per-rule arm/disarm chokepoint enforcing mutual exclusion between legacy `IGuard` and `spark_runtime_`. `prefer_spark_` defaults **false** (confirmed in `guardian_engine.cpp` comments), so Spark is wired but inert — legacy `IGuard` remains the sole *live* enforcement path; this does not change any guard row's grade below, since none of them currently attribute live enforcement to Spark. Actions: `push_rules`, `get_status`.
+Shipped — well beyond the PRs 1-2 status this row originally recorded. Agent-side `GuardianEngine` (`agents/core/src/guardian_engine.{hpp,cpp}`) with two-phase startup — `start_local()` pre-network so enforcement is active before the Register RPC, then `sync_with_server()` post-Register. KV namespace `__guardian__` for cached policy. Reserved plugin name `__guard__` intercepted in `agent.cpp` before the plugin match loop (load-time rejection in `plugin_loader.cpp` for defence in depth). Wire contract: `proto/yuzu/guardian/v1/guaranteed_state.proto` with `GuaranteedStateRule`, `GuaranteedStatePush`, `GuaranteedStateEvent`, `GuaranteedStateStatus`, `GuaranteedStateRuleStatus`. Server store: PostgreSQL schema `guaranteed_state_store` (ADR-0038; formerly `guaranteed-state.db`) with immutable event log, plus the `BaselineStore` deployment model (`server/core/src/baseline_store.{hpp,cpp}`) — a **Baseline** is the only deployable unit; push fan-out + heartbeat reconcile gate on `deployed_member_rule_ids()` sourced from each deploy's `deployed_snapshot`, not the live member set (`docs/guardian-baseline-model.md`). **Also verified 2026-09-07: ADR-0021 Spark is wired as Guardian's first consumer** — `agents/core/src/agent.cpp:1255` calls `wire_spark_engine()`, and `GuardianEngine::reconcile_rule_locked()` is the sole per-rule arm/disarm chokepoint enforcing mutual exclusion between legacy `IGuard` and `spark_runtime_`. `prefer_spark_` defaults **false** (confirmed in `guardian_engine.cpp` comments), so Spark is wired but inert — legacy `IGuard` remains the sole *live* enforcement path; this does not change any guard row's grade below, since none of them currently attribute live enforcement to Spark. Actions: `push_rules`, `get_status`.
 
 ### 31.2 Event Guards — Kernel-Event-Driven Enforcement (Windows) :large_orange_diamond: `T2`
 
@@ -1279,7 +1282,7 @@ Each guard implements `self_test()` on start to prove kernel wiring (sentinel wr
 
 ### 31.3 Condition Guards — Periodic Evaluation (All Platforms) :large_orange_diamond: `T2`
 
-Partial. `spark_interval.cpp` ships a periodic-evaluation mechanism and the cross-platform service run-state guard (`guard_systemd.hpp`'s `make_service_guard()` factory, §31.4) is a shipped instance of it, plus `spark_disk.cpp` (a disk-condition guard not in the original design). The originally-scoped process/WMI/software/compliance condition guards remain open: Hybrid Process Guard (`Microsoft-Windows-Kernel-Process` ETW + `CreateToolhelp32Snapshot` poll safety net), WMI Guard (arbitrary WMI queries against an evaluator), Software Guard (Registry Uninstall keys + WMI freshness), Compliance Guard (Event Log queries) — none of these four found in `agents/core/src`.
+Partial. `spark_interval.cpp` ships a periodic-evaluation mechanism and the Linux service run-state guard (`make_service_guard()` in `agents/core/src/guard_systemd.cpp`, header `agents/core/include/yuzu/agent/guard_systemd.hpp`; Linux-only, §31.4) is a shipped instance of it, plus `spark_disk.cpp` (a disk-condition guard not in the original design). The originally-scoped process/WMI/software/compliance condition guards remain open: Hybrid Process Guard (`Microsoft-Windows-Kernel-Process` ETW + `CreateToolhelp32Snapshot` poll safety net), WMI Guard (arbitrary WMI queries against an evaluator), Software Guard (Registry Uninstall keys + WMI freshness), Compliance Guard (Event Log queries) — none of these four found in `agents/core/src`.
 
 ### 31.4 Event Guards — Linux :large_orange_diamond: `T3`
 
@@ -1302,11 +1305,11 @@ Partial. Registry/service (and now file) drift detection + remediation are live 
 
 ### 31.7 Audit Journal and Server Store :white_check_mark: `T2`
 
-Shipped on both sides — beyond the "server store only" status this row originally recorded. Server store: `server/core/src/guaranteed_state_store.{hpp,cpp}`, `guaranteed-state.db`, immutable event log, no FK cascade on rule delete so historical events persist for forensic review. Agent-side journal shipped under different names than the original plan's `guard_audit.{hpp,cpp}`: `guardian_lifecycle_journal.cpp` + `guardian_journal_format.cpp` (local journal + wire format) and `guardian_outbox_drain_worker.cpp` (the drain-to-server worker), all confirmed compiled in `agents/core/meson.build`. Every detection and remediation journaled locally first, synced to server when online. *(Evidence: file census 2026-09-07 — previously mis-graded Partial because the audit brief's originally-planned filenames don't exist; the capability shipped under renamed files instead.)*
+Shipped on both sides — beyond the "server store only" status this row originally recorded. Server store: `server/core/src/guaranteed_state_store.{hpp,cpp}`, PostgreSQL schema `guaranteed_state_store` (ADR-0038), immutable event log, no FK cascade on rule delete so historical events persist for forensic review. Agent-side journal shipped under different names than the original plan's `guard_audit.{hpp,cpp}`: `guardian_lifecycle_journal.cpp` + `guardian_journal_format.cpp` (local journal + wire format) and `guardian_outbox_drain_worker.cpp` (the drain-to-server worker), all confirmed compiled in `agents/core/meson.build`. Every detection and remediation journaled locally first, synced to server when online. *(Evidence: file census 2026-09-07 — previously mis-graded Partial because the audit brief's originally-planned filenames don't exist; the capability shipped under renamed files instead.)*
 
 ### 31.8 Pre-Login Activation and Offline Capability :white_check_mark: `T2`
 
-Pre-login activation works by construction today: the agent runs as a Windows service with `SERVICE_AUTO_START` + `FailureActions` configured at install time (`agents/core/src/main.cpp:234-338`, and `agents/core/src/service_win.{hpp,cpp}` for the SCM `ServiceMain`/control-handler dispatcher that actually makes `sc start` succeed — #1822); systemd unit on Linux with `Type=notify` + `Restart=always`; launchd `KeepAlive=true` + `RunAtLoad=true` on macOS. `GuardianEngine::start_local()` runs before the Register RPC, so once guard implementations land in PR 3+, enforcement begins as soon as the service starts — before any user can log in. Offline capability comes from caching policy in `kv_store.db` under `__guardian__` namespace; enforcement continues with last-known-good rules when the server is unreachable, and queued events flush when the server returns. Marked `:white_check_mark:` because the service-install side is operational (genuinely so as of #1822 — before it, `sc start YuzuAgent` failed with error 1053 on every real Windows install, so this claim was aspirational, not true, until this fix landed); the *enforcement* half is gated on PR 3+ landing real guards.
+Pre-login activation works by construction today: the agent runs as a Windows service with `SERVICE_AUTO_START` + `FailureActions` configured at install time (`agents/core/src/main.cpp:536`, `:602-609`, and `agents/core/src/service_win.{hpp,cpp}` for the SCM `ServiceMain`/control-handler dispatcher that actually makes `sc start` succeed — #1822); systemd unit on Linux with `Type=notify` + `Restart=always`; launchd `KeepAlive=true` + `RunAtLoad=true` on macOS. `GuardianEngine::start_local()` runs before the Register RPC, so with the registry/SCM/file guards shipped (§31.2) enforcement begins as soon as the service starts — before any user can log in. Offline capability comes from caching policy in `kv_store.db` under `__guardian__` namespace; enforcement continues with last-known-good rules when the server is unreachable, and queued events flush when the server returns. Marked `:white_check_mark:` because the service-install side is operational (genuinely so as of #1822 — before it, `sc start YuzuAgent` failed with error 1053 on every real Windows install, so this claim was aspirational, not true, until this fix landed); the *enforcement* half now rests on the shipped guards in §31.2/§31.6 (re-verified 2026-09-07 — this sentence previously still said "gated on PR 3+").
 
 ### 31.9 Dashboard and Approval Workflow :large_orange_diamond: `T2`
 
@@ -1324,7 +1327,7 @@ Not implemented (PRs 12, 15). HMAC rule signing (HKDF per design §11.2) with pe
 
 ### 32.1 Signal Observation Catalogue :white_check_mark: `T2`
 
-Ruleless observation catalogue (`agents/core/src/dex_signal_catalog.{hpp,cpp}`, engine `dex_observer.{hpp,cpp}`, both confirmed compiled in `agents/core/meson.build`): crashes, hangs, boot/login degradation, device health. Windows poll-and-latch (`dex_win_poll.cpp`) + Linux/macOS collectors (`dex_linux_*.cpp`, `dex_macos_*.cpp`); sustained perf-breach hysteresis (`dex_perf_breach.{hpp,cpp}`).
+Ruleless observation catalogue (`agents/core/src/dex_signal_catalog.cpp`, engine `dex_observer.cpp`; headers under `agents/core/include/yuzu/agent/`; both confirmed compiled in `agents/core/meson.build`): crashes, hangs, boot/login degradation, device health. Windows poll-and-latch (`dex_win_poll.cpp`) + Linux/macOS collectors (`dex_linux_*.cpp`, `dex_macos_*.cpp`); sustained perf-breach hysteresis (`dex_perf_breach.{hpp,cpp}`).
 
 ### 32.2 Continuous Device Performance Telemetry :white_check_mark: `T2`
 
@@ -1340,7 +1343,7 @@ Server-side N-distinct-device incident detector (`server/core/src/dex_blast_radi
 
 ### 32.5 Upgrade Evidence — Cohort-Paired Before/After Comparison :white_check_mark: `T2`
 
-`/auto` Verify (§36.3): pure compare engine (`server/core/src/app_perf_compare.{hpp,cpp}`), cohort reader (`app_perf_cohort_reader.hpp`, `app_perf_group_reader.{hpp,cpp}`), REST `/dex/perf/compare` surface confirmed present. Evidential — no verdict/threshold, per `verify_routes.cpp` (§36.3).
+`/auto` Verify (§36.3): pure compare engine (`server/core/src/app_perf_compare.{hpp,cpp}`), cohort reader (`app_perf_cohort_reader.hpp`, `app_perf_group_reader.{hpp,cpp}`), REST `/dex/perf/compare` surface confirmed present. Evidential — no verdict/threshold, per `verify_routes.cpp` (§36.3). Deliberately **no `kDexCohortFloor` here**, unlike the fleet/group reads in §32.6: the audited `dex.app_perf.compare` read replaces suppression (CLAUDE.md routed-concerns invariant).
 
 ### 32.6 Behavioral-PII Privacy Engineering :white_check_mark: `T2`
 
@@ -1388,7 +1391,7 @@ Dispatch-and-poll card grid (process tree, services, users, netconfig, ARP/DNS o
 
 ### 34.3 Agentic REST Parity for Device Surfaces :white_check_mark: `T2`
 
-REST parity for the live-snapshot kinds, funneling every behavioural-PII read through the `emit_behavioral_audit` chokepoint (§21.6) — fail-closed 503 + `Sec-Audit-Failed` when the audit row cannot persist. *(Evidence: `server/core/src/rest_audit.hpp`.)*
+REST parity for the live-snapshot kinds, funneling behavioural-PII reads through the `emit_behavioral_audit` chokepoint (§21.6) — except the REST `device.live.*` route itself, still an inline bool-capture (#1703, open) — fail-closed 503 + `Sec-Audit-Failed` when the audit row cannot persist. *(Evidence: `server/core/src/rest_audit.hpp`.)*
 
 ---
 
@@ -1434,7 +1437,7 @@ Stage+execute on the go-cohort via `content_dist`; born-on-Postgres `DeploymentR
 
 ### 36.3 Verify (EVIDENCE) :white_check_mark: `T2`
 
-Cohort-paired app-perf before/after comparison (§32.5) closing the ASSESS→ACT→VERIFY loop. *(Evidence: `server/core/src/verify_routes.{hpp,cpp}`.)*
+Cohort-paired app-perf before/after comparison (§32.5) closing the ASSESS→ACT→VERIFY loop. Evidential only — no verdict, threshold or gate, and deliberately no cohort floor (the audited compare read replaces suppression; see §32.5). *(Evidence: `server/core/src/verify_routes.{hpp,cpp}`.)*
 
 ---
 
@@ -1444,7 +1447,7 @@ Cohort-paired app-perf before/after comparison (§32.5) closing the ASSESS→ACT
 
 ### 37.1 Internal CA and Default Certificates :white_check_mark: `T2`
 
-`CaStore` (`server/core/src/ca_store.{hpp,cpp}`, `ca.db` schema; key material behind the `KeyProvider` seam, never in the DB); per-install default certs generated on first boot.
+`CaStore` (`server/core/src/ca_store.{hpp,cpp}`, PostgreSQL schema `ca_store` — ADR-0053, formerly `ca.db`; key material behind the `KeyProvider` seam, never in the DB); per-install default certs generated on first boot.
 
 ### 37.2 Per-Agent mTLS Identity :white_check_mark: `T2`
 
@@ -1460,7 +1463,7 @@ Built-in root subordinated to an enterprise root: CSR export, chain import + val
 
 ### 37.5 Secure-by-Default Distribution :white_check_mark: `T2`
 
-TLS-by-default images shipped (#1314, 2026-06-21, per project memory `project_pki_secure_by_default_shipped.md`). Residual: management-listener mTLS CA-restriction (#1422, per the same memory).
+TLS-by-default images shipped (#1314, merged 2026-06-21). Residual, still open: management-listener mTLS CA-restriction (#1422) — the icon reflects the distribution mechanism; the #1422 gap is an open access-control item.
 
 ---
 
@@ -1478,11 +1481,11 @@ The server refuses to start without a reachable Postgres (no SQLite fallback, AD
 
 ### 38.3 Secrets at Rest :white_check_mark: `T2`
 
-Verify-only hashes or `SecretCodec`-envelope-encrypted blobs (ADR-0010) — never plaintext columns. Verified this session: `license_store.hpp` documents `license_key_hash` as a SHA-256 verify-only hash (§22.3); `offload_routes.cpp`'s `auth_credential` is `SecretCodec`-encrypted per its own row text (§20.7); `webhook_store.cpp`'s constructor takes a `pg::SecretCodec&` (its HMAC signing secret is envelope-encrypted, though the pre-existing §21.4 row text doesn't say so explicitly).
+Verify-only hashes or `SecretCodec`-envelope-encrypted blobs (ADR-0010) — never plaintext columns. Spot-checked this session for 3 of the 14 stores with secret-shaped columns; the remaining 11 rest on each store's ADR-0010 migration-time `security-guardian` review, not on a re-audit here. Verified this session: `license_store.hpp` documents `license_key_hash` as a SHA-256 verify-only hash (§22.3); `offload_routes.cpp`'s `auth_credential` is `SecretCodec`-encrypted per its own row text (§20.7); `webhook_store.cpp`'s constructor takes a `pg::SecretCodec&` (its HMAC signing secret is envelope-encrypted, though the pre-existing §21.4 row text doesn't say so explicitly).
 
 ### 38.4 Store Migration Ladder :white_check_mark: `T2`
 
-**Update 2026-09-07 — census re-run this session, corrects the 2026-07 review's "~27 legacy SQLite stores remain" figure:** `ls server/core/src/*_store.cpp` = 43 files; `grep -lE "PGconn|pg::" server/core/src/*_store.cpp` = 42 of them. The one non-match, `fleet_topology_store.cpp`, holds no direct DB handle of its own (composed from `AuditStore` + `NvdDatabase` reads) — it is not a SQLite store either. **Zero SQLite-only server stores remain.** The sole deliberate SQLite holdout is `server/core/src/nvd_db.cpp` (not `*_store.cpp`-named, confirmed via `sqlite3_open_v2` call), grandfathered under ADR-1005 Phase 7 pending the vulnerability-management use-case engine (§9.4). Graded Done rather than Partial: the migration ladder itself is complete for every intended store; the one remaining SQLite user is a deliberate, documented, out-of-scope exception, not an unfinished migration.
+**Update 2026-09-07 — census re-run this session, corrects the 2026-07 review's "~27 legacy SQLite stores remain" figure:** `ls server/core/src/*_store.cpp` = 43 files; `grep -lE "PGconn|pg::" server/core/src/*_store.cpp` = 42 of them. The one non-match, `fleet_topology_store.cpp`, holds no direct DB handle of its own (composed from `AuditStore` + `NvdDatabase` reads) — it is not a SQLite store either. **Zero SQLite-only server stores remain.** The sole SQLite-*backed* store is `server/core/src/nvd_db.cpp` (not `*_store.cpp`-named, confirmed via `sqlite3_open_v2` call; the read-only legacy-file probes in `runtime_config_store.cpp` and `server.cpp:373` also open SQLite but persist nothing), grandfathered under ADR-1005 Phase 7 pending the vulnerability-management use-case engine (§9.4). Graded Done rather than Partial: the migration ladder itself is complete for every intended store; the one remaining SQLite user is a deliberate, documented, out-of-scope exception, not an unfinished migration.
 
 ---
 
@@ -1514,8 +1517,8 @@ The server rejects — not silently ignores — any on-behalf-of assertion on ev
 | hardware | Y | Y | Y | System Info |
 | device_identity | Y | Y | Y | System Info |
 | status | Y | Y | Y | System Info |
-| power_health | Y | - | Y | System Info |
-| disk_actions | Y | Y | Y | Disk |
+| power_health | Y | Y | Y | System Info |
+| disk_actions | Y | - | Y | Disk |
 | disk_space | Y | Y | Y | Disk |
 | processes | Y | Y | Y | Process/Service |
 | procfetch | Y | Y | Y | Process/Service |
@@ -1528,10 +1531,10 @@ The server rejects — not silently ignores — any on-behalf-of assertion on ev
 | wifi | Y | Y | Y | Network |
 | wol | Y | Y | Y | Network |
 | discovery | Y | Y | Y | Network |
-| netprobe | Y | - | - | Network |
+| netprobe | Y | Y | Y | Network |
 | installed_apps | Y | Y | Y | Software |
 | msi_packages | Y | - | Y | Software |
-| windows_updates | Y | - | - | Patch |
+| windows_updates | Y | Y | Y | Patch |
 | software_actions | Y | Y | Y | Software |
 | sccm | Y | - | - | Software |
 | license_scan | Y | Y | Y | Software |
@@ -1565,15 +1568,13 @@ The server rejects — not silently ignores — any on-behalf-of assertion on ev
 | software_usage | Y | Y | Y | Software | *Planned (Phase 12)* |
 | app_control | Y | Y | - | Security | *Planned (Phase 12)* |
 
-**49 plugins** (+ 2 planned) — covering hardware, network, security, filesystem, registry, WMI, WiFi, WoL, IOC, quarantine, certificates, content distribution, user interaction, and more. Includes cross-platform, Windows-only, and test/debug plugins. Recount verified 2026-09-07 (`ls -d agents/plugins/*/` = 51 directories, minus `example` + `chargen` = 49; the previous "44" undercounted 8 shipped plugins — `disk_actions`, `disk_space`, `filesystem_posture`, `license_scan`, `netprobe`, `power_health`, `rdp_control`, `tags` — none of which were in the table). `software_usage` / `app_control` remain aspirational — confirmed no such directories exist under `agents/plugins/` as of this baseline.
+**49 plugins** (+ 2 planned) — covering hardware, network, security, filesystem, registry, WMI, WiFi, WoL, IOC, quarantine, certificates, content distribution, user interaction, and more. Includes cross-platform and Windows-only plugins; the two test/debug plugins (`chargen`, `example`) appear in the table but are excluded from the headline count. Per-OS cells follow `docs/os-capability-matrix.md` (2026-09-07; a partial 🟡 leg is shown as Y — the matrix carries the per-action detail). Recount verified 2026-09-07 (`ls -d agents/plugins/*/` = 51 directories, minus `example` + `chargen` = 49; the previous "44" undercounted 8 shipped plugins — `disk_actions`, `disk_space`, `filesystem_posture`, `license_scan`, `netprobe`, `power_health`, `rdp_control`, `tags` — none of which were in the table). `software_usage` / `app_control` remain aspirational — confirmed no such directories exist under `agents/plugins/` as of this baseline.
 
 ---
 
 ## Appendix B: Foundation Tier Status
 
-**Foundation tier: 33/33 done (100%)**
-
-All Foundation-tier gaps have been closed as of 2026-03-18:
+**Foundation tier: 58/59 done (98%)** — the tier has grown to 59 entries since this appendix was written; the one open `T1` item is §9.4 (Partial). The list below records the gaps closed as of 2026-03-18 (re-baselined 2026-09-07):
 
 - **1.4** Agent OTA updates -- `agents/core/src/updater.cpp`
 - **1.8** Connection diagnostics -- `connection_info` action in diagnostics plugin
