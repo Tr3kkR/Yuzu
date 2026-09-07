@@ -1,0 +1,14 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+== action=device_name
+device_name|braga.local
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=domain
+domain|local
+joined|false
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=ou
+ou|N/A
+[result_status] UNDECLARED / UNKNOWN / 
+

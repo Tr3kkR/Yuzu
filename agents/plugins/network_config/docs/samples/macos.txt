@@ -1,0 +1,78 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+== action=adapters
+adapter|lo0|-|0|up
+adapter|gif0|-|0|down
+adapter|stf0|-|0|down
+adapter|anpi0|ca:36:a7:b0:f6:23|0|up
+adapter|anpi1|ca:36:a7:b0:f6:24|0|up
+adapter|anpi3|ca:36:a7:b0:f6:26|0|up
+adapter|en0|d0:11:e5:c0:a0:99|1000|up
+adapter|en5|ca:36:a7:b0:f6:03|0|up
+adapter|en6|ca:36:a7:b0:f6:04|0|up
+adapter|en7|ca:36:a7:b0:f6:06|0|up
+adapter|en2|36:d8:fb:d2:52:c0|0|up
+adapter|en3|36:d8:fb:d2:52:c4|0|up
+adapter|en4|36:d8:fb:d2:52:cc|0|up
+adapter|bridge0|36:d8:fb:d2:52:c0|0|up
+adapter|ap1|3a:e1:c4:86:68:d4|0|up
+adapter|en1|f2:1d:69:00:6f:ee|0|up
+adapter|awdl0|5a:a0:84:32:a9:a3|0|down
+adapter|llw0|5a:a0:84:32:a9:a3|0|up
+adapter|utun0|-|0|up
+adapter|utun1|-|0|up
+adapter|utun2|-|0|up
+adapter|utun3|-|0|up
+adapter|utun4|-|0|up
+adapter|utun5|-|0|up
+adapter|utun6|-|0|up
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=ip_addresses
+ip|en0|fe80::9e:c46b:750c:b2eb|64|192.168.0.1
+ip|en0|192.168.0.66|24|192.168.0.1
+ip|llw0|fe80::58a0:84ff:fe32:a9a3|64|192.168.0.1
+ip|utun0|fe80::93eb:5451:9abf:3695|64|192.168.0.1
+ip|utun1|fe80::313e:505c:4e40:16c8|64|192.168.0.1
+ip|utun2|fe80::fa0e:b15e:9046:683d|64|192.168.0.1
+ip|utun3|fe80::ce81:b1c:bd2c:69e|64|192.168.0.1
+ip|utun4|fe80::d211:e5ff:fec0:a099|64|192.168.0.1
+ip|utun4|100.109.177.77|32|192.168.0.1
+ip|utun4|fd7a:115c:a1e0::e032:b14f|48|192.168.0.1
+ip|utun5|fe80::b145:6483:7c96:77fa|64|192.168.0.1
+ip|utun6|fe80::68ce:f640:7c7a:bb05|64|192.168.0.1
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=dns_servers
+dns|system|100.100.100.100|IPv4
+dns|system|fd7a:115c:a1e0::53|IPv6
+dns|system|194.168.4.100|IPv4
+dns|system|194.168.8.100|IPv4
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=proxy
+bypass|*.local,169.254/16
+proxy_type|none
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=dns_cache
+dns_cache|unsupported|macOS does not expose DNS resolver cache contents
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=arp
+arp|-|192.168.0.1|b0:5b:99:ee:d0:32|-
+arp|-|192.168.0.61|1c:53:f9:73:22:6c|-
+arp|-|192.168.0.71|00:17:88:a6:b2:13|-
+arp|-|192.168.0.131|fc:34:97:65:1e:0a|-
+arp|-|192.168.0.138|c2:4e:eb:d7:1f:62|-
+arp|-|192.168.0.140|ce:e1:48:d3:04:97|-
+arp|-|192.168.0.179|b6:08:a0:6a:2d:de|-
+arp|-|192.168.0.197|8e:6e:21:3a:d8:1f|-
+arp|-|192.168.0.210|5c:3e:1b:ef:97:02|-
+arp|-|192.168.0.222|de:75:77:1a:d2:d9|-
+arp|-|192.168.0.238|34:cd:b0:ad:8a:b4|-
+arp|-|192.168.0.246|d8:8c:79:47:1d:43|-
+arp|-|192.168.0.255|ff:ff:ff:ff:ff:ff|-
+arp|-|224.0.0.251|01:00:5e:00:00:fb|-
+arp|-|239.255.255.250|01:00:5e:7f:ff:fa|-
+[result_status] UNDECLARED / UNKNOWN / 
+

@@ -1,0 +1,10 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+== action=get_log
+status|empty|agent log file not configured on this host
+line_count|0
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=get_key_files
+file|/private/tmp/claude-501/-Users-alex-yuzu-dev/8d89cd79-001b-4ea8-8930-0c9affb3265e/scratchpad/d2/plugin_capture|142208|1788774907
+[result_status] UNDECLARED / UNKNOWN / 
+

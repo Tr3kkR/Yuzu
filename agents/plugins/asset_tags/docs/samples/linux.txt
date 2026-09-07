@@ -1,0 +1,24 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash pending
+== action=sync
+[not captured] Mutating/Reversible: not executed on a live host
+
+== action=status
+tag|role|
+tag|environment|
+tag|location|
+tag|service|
+last_sync|0
+stale|true
+check_interval|300
+change_count|0
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=get key=yuzu_capture_tmp
+error|unknown category: yuzu_capture_tmp
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+
+== action=changes
+changes|none
+[result_status] UNDECLARED / UNKNOWN / 
+

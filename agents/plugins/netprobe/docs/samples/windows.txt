@@ -1,0 +1,13 @@
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+== action=icmp targets=127.0.0.1
+rtt|127.0.0.1|icmp|5|5|0.0|0.0|0.0|0.0|0.0|ok
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=tcp targets=127.0.0.1:22
+rtt|127.0.0.122|tcp:443|0|0|0.0|0.0|0.0|0.0|100.0|invalid-target
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=dns targets=localhost
+dns|localhost|2.9|ok|2
+[result_status] UNDECLARED / UNKNOWN / 
+

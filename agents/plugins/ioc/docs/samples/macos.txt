@@ -1,0 +1,6 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+== action=check
+error|none|false|No IOC parameters provided
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+
