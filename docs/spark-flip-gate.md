@@ -435,37 +435,40 @@ diagnostic, ruling-13 on #3850)
 - Detection signal: not specified in source; `yuzu_server_guardian_pushes_dispatched_total`
   rate and agent `full_sync=true` log frequency are the closest existing signals, neither
   purpose-built for this.
-- Operator action: not specified in source; not established by this diagnostic either (see
-  below - no system-side effect was found for a mitigation to target).
+- Operator action: not specified in source; not established by this diagnostic either - no
+  system-side effect was found for a mitigation to target.
 - Compensating control: this diagnostic (`docs/spark-rebuild-baselines/
-  3990-fullsync-blackout-run.md`), run 2026-09-06/07 on DGRHP. **Result: INCONCLUSIVE** for the
-  intended legacy-vs-spark `B` (`full_sync` apply-window) comparison - neither backend reached
-  the pre-registered K=5 valid-repeat floor (legacy 2/5 deploy-triggered, spark 1/5;
-  legacy 2/3 / spark 0/3 on the literal rule-create trigger). **Correction to this entry's own
-  first draft**: the low yield was initially attributed to a "queueing/pile-up effect" real on
-  both backends - that claim did not survive verification against the diagnostic's own
-  complete agent-log evidence and was retracted in the run doc. The actual cause is an
-  unresolved bug in the diagnostic's own driver script's trigger-detection logic; every
-  `full_sync` that could be independently confirmed to have actually run, on either backend, at
-  either the clean 62-rule cohort or the uncontrolled ~5652-rule leftover catalogue, completed
-  in 8.3 seconds or less (most under 100ms at the clean cohort). No slow, stalled, or lost
-  `full_sync` was found anywhere in the complete log. The samples that did register as valid
-  landed in the same 55-82ms band on both backends, too few (1-4 per backend) to support any
-  comparative claim. Full detail, the retraction, and the raw per-repeat data
-  (`fullsync-blackout-results.jsonl`) are in the run doc.
+  3990-fullsync-blackout-run.md`), run 2026-09-06/07 on DGRHP, re-run 2026-09-07 after a
+  driver-tooling fix. **2026-09-06/07: INCONCLUSIVE** - neither backend reached the
+  pre-registered K=5 floor, initially misattributed to a "queueing/pile-up effect" that was
+  checked against the complete agent-log evidence and retracted (every `full_sync` actually
+  confirmed to run completed in 8.3s or less, most under 100ms at the clean cohort - the real
+  cause was an agent `--log-file` flush-lag interacting with the driver's polling timeout, not
+  a system delay). **2026-09-07 re-run, after widening the driver's polling timeout to outlast
+  the flush lag: both backends reached the pre-registered floor** (Phase B: legacy 5/5 valid,
+  median 53.0ms; spark 5/5 valid, median 77.0ms. Phase B2: legacy 3/3, median 66.0ms; spark
+  3/3, median 74.0ms). Applying the pre-registered numeric rule (spark median <= legacy median
+  + max(1000ms, legacy median)) to Phase B: 77.0 <= 1053.0 - **within the predeclared margin**;
+  Phase B2 likewise within margin. **One precondition of the pre-registered rule -
+  functional-validity, `guard.compliant` observed for all 60 cohort rules - was not met by ANY
+  repeat, on either backend**: 3-5 of 20 service-watch cohort rules watch Windows services
+  (Spooler, Themes, BITS, wuauserv, W32Time) that are genuinely `Stopped` on this rig,
+  confirmed directly - a cohort-composition gap inherited from an existing test helper's
+  service list, unrelated to Guardian/spark behavior and identical on both backends. The run
+  doc reports "within margin" as its own judgment call given that gap, explicitly flagged as
+  such rather than asserted as fact - full reasoning, the retraction, and the raw per-repeat
+  data (`fullsync-blackout-results.jsonl`) are there, not restated here.
 - Owner: not assigned in source material.
 - Milestone: not specified. Nothing found by this diagnostic changes this row's own
   #2278/#2469/#2279 package - the two are not shown to be related.
-- Revisit trigger: a fixed driver actually reaching K=5 valid repeats per backend (the rig,
-  cohort, and measurand are otherwise proven workable - only the trigger-detection logic needs
-  debugging); before the PR-5 flip head re-run (CH-5-UAT's own driver, once its threshold work
-  lands); before this diagnostic's "accepted-neutral" citation is relied upon for a flip
-  decision, given the inconclusive result.
-- Whether this evidence is sufficient to cite #3990 as "accepted-neutral" per ruling-13's own
-  wording is Dave's ruling, not asserted by this entry. What this entry CAN say: nothing found
-  here suggests spark and legacy differ on `full_sync` apply-window cost, but the sample sizes
-  are too small to call that a finding, and the pre-registered K=5 floor - the bar this
-  diagnostic itself set for a real comparison - was not reached on either backend.
+- Revisit trigger: before the PR-5 flip head re-run (CH-5-UAT's own driver, once its threshold
+  work lands); before this diagnostic's "accepted-neutral" citation is relied upon for a flip
+  decision; if a stricter reading of the functional-validity precondition is preferred, re-run
+  with a service-rule selection confirmed all-running on the target rig (the measurand, cohort
+  size, and driver are otherwise proven to work reliably as of the 2026-09-07 re-run).
+- Whether "within margin" (this document's own judgment call, given the functional-validity
+  gap above) is sufficient for #3990 to be cited in §5 as "accepted-neutral" per ruling-13's
+  own wording is Dave's ruling, not asserted by this entry.
 
 **#2815 + #2818 + #2833 + #2839** (teardown UAF-class; #2797's legacy half and #2012/#2011
 tracked separately below)

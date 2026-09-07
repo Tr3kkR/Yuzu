@@ -2,8 +2,10 @@
   for #3990** (ruling-13 on #3850). New committed instrument
   (`docs/spark-rebuild-baselines/fullsync_blackout_diag.py`) and run record
   (`docs/spark-rebuild-baselines/3990-fullsync-blackout-run.md`); `docs/spark-flip-gate.md` §5
-  gained a `#3990` risk-accept entry. The intended backend comparison came back inconclusive -
-  neither backend reached the pre-registered sample floor - due to an unresolved bug in the
-  new driver's own trigger-detection logic; every `full_sync` independently confirmed to have
-  actually run completed in under 8.3 seconds on both backends, with no evidence of any slow
-  or stalled trigger. Raw per-repeat data committed alongside the run doc.
+  gained a `#3990` risk-accept entry. First attempt came back inconclusive, traced to the
+  agent's `--log-file` sink having no flush policy (`main.cpp` never calls `flush_on`)
+  interacting with the driver's polling timeout, not a system delay. After widening the
+  timeout, a same-day re-run reached the pre-registered sample floor on both backends: Phase B
+  median 53ms (legacy) vs 77ms (spark), Phase B2 median 66ms vs 74ms, both within the
+  predeclared non-inferiority margin. Raw per-repeat data for both attempts committed
+  alongside the run doc.

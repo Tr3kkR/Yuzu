@@ -19,20 +19,19 @@ override for a non-default rig). YUZU_DGRHP_SSH (ssh destination for the
 agent-log reads, e.g. "-S /tmp/sock -i ~/.ssh/key user@host" as a single
 pre-built arg string), YUZU_AGENT_LOG (default C:\\rigA\\logs\\agent.log).
 
-KNOWN ISSUE, not fixed as of the 2026-09-06/07 run (see
-docs/spark-rebuild-baselines/3990-fullsync-blackout-run.md, "The driver's
-T1-detection gap"): `run`'s T0/T1 log-window detection has an unresolved
-bug causing most clean-cohort (small-N) attempts to falsely void as
-t0_not_found/t1_not_found even when the underlying full_sync completed
-normally and fast (confirmed by correlating the complete agent log against
-every void: no case of a real trigger taking longer than ~8s was ever
-found, at any N tested). Symptoms already fixed in this file: a UTC/local
-timezone mislabeling of agent-log timestamps, and a cross-host clock-drift
-window-start bug (both described in the run doc's "Methodology corrections"
-section) - fixing those did NOT eliminate the residual false-void rate, so
-at least one more bug remains in this same area, not yet isolated. Anyone
-reusing this script to actually reach K=5 should expect to need to debug
-`run`'s window/poll logic further before trusting its void classification.
+FIXED 2026-09-07 (see docs/spark-rebuild-baselines/3990-fullsync-blackout-run.md, "T1
+detection: the real root cause"): the residual t0_not_found/t1_not_found false-void rate
+from the 2026-09-06/07 run was NEVER a bug in this script's window/timestamp matching logic.
+`agents/core/src/main.cpp` never calls `logger->flush_on(...)` on the --log-file sink, and
+spdlog's own default `flush_level_` is `level::off` - confirmed against the vendored header,
+not assumed - so a log line's embedded timestamp is accurate at write time, but the
+underlying bytes can sit unflushed for an unpredictable period (measured live: from ~2s up to
+~108s under this rig's ambient log volume) before becoming visible to ANY external reader,
+this script included. See ROOT_CAUSED_T0_TIMEOUT/ROOT_CAUSED_T1_TIMEOUT below - the fix is a
+timeout wide enough to outlast flush lag, not different search logic. This is a real property
+of the agent's --log-file output worth flagging as its own product finding (live-tailing
+--log-file for near-real-time diagnostics is unreliable without a flush policy) - not filed
+as an issue by this diagnostic; left for whoever picks that up next.
 """
 
 import argparse
@@ -186,6 +185,23 @@ def dgrhp_now():
 
 TAIL_LINES = 20000  # generous: observed peak ~115 lines/sec from the leftover riga-* outbox
                      # storm, so this covers several minutes even in the noisy pre-purge phase
+
+# ROOT CAUSE (2026-09-07, found by deliberate live reproduction - see the run doc's "T1
+# detection: the real root cause" section): the residual t0_not_found/t1_not_found false
+# voids were NEVER a bug in this script's window/timestamp logic. `agents/core/src/main.cpp`
+# never calls `logger->flush_on(...)` on the --log-file sink, and spdlog's own default
+# `flush_level_` is `level::off` (spdlog/logger.h:311, confirmed against the vendored header,
+# not assumed) - so a log LINE's embedded timestamp is recorded at message-construction time,
+# but the underlying bytes can sit unflushed in the sink's buffered ofstream for an
+# unpredictable period before becoming visible to ANY external reader, this driver included.
+# Measured live: one repeat's T1 was visible within ~2s of being written; a later one took
+# ~108s for a burst of ~93 lines (arm events + apply_rules ok) to appear on disk at once, all
+# stamped within the same real-world second they were actually logged. The FIX is patience,
+# not different search logic - these timeouts must comfortably exceed the worst observed
+# flush lag, not the true (near-instant) completion time. A generous but still-bounded margin;
+# if the real agent process ever hangs for genuinely longer than this, that IS a real void.
+ROOT_CAUSED_T0_TIMEOUT = 240
+ROOT_CAUSED_T1_TIMEOUT = 240
 
 
 def agent_log_size():
@@ -613,7 +629,7 @@ def run_repeat(op, phase, backend, trigger_kind, cohort_ids, repeat_idx, trigger
         except Exception as e:  # noqa: BLE001
             return {"phase": phase, "backend": backend, "repeat": repeat_idx,
                      "void_reason": f"trigger_failed:{e}"}
-        t0_timeout, t1_timeout = 30, 60
+        t0_timeout, t1_timeout = ROOT_CAUSED_T0_TIMEOUT, ROOT_CAUSED_T1_TIMEOUT
     else:
         n = trigger_id_cache["hbr_counter"]
         trigger_id_cache["hbr_counter"] += 1
@@ -624,7 +640,7 @@ def run_repeat(op, phase, backend, trigger_kind, cohort_ids, repeat_idx, trigger
         except Exception as e:  # noqa: BLE001
             return {"phase": phase, "backend": backend, "repeat": repeat_idx,
                      "void_reason": f"trigger_failed:{e}"}
-        t0_timeout, t1_timeout = 90, 60
+        t0_timeout, t1_timeout = ROOT_CAUSED_T0_TIMEOUT, ROOT_CAUSED_T1_TIMEOUT
 
     obs = observe_window(window_start_ts, t0_timeout, t1_timeout)
     if obs.get("void_reason"):

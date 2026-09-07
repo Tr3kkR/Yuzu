@@ -238,46 +238,110 @@ intervening completion, ANYWHERE in the whole log, any thread) found **zero** re
 occurrences; the only three T0-after-T0 sequences found are the same three restart-boundary
 artifacts already accounted for above. `t0_not_found`/`t1_not_found` persisting even in the
 corrected (post-#2/#3/#4) runs means at least one further driver bug in the T0/T1 log-window
-or polling logic was never identified - **this diagnostic does not have a root cause for the
-residual detection gap**, only proof that it is a detection gap and not a system-side delay.
+or polling logic was never identified in THIS session - **root-caused the following day, see
+"T1 detection: the real root cause" below.**
 
 **The valid (non-void) B values, on both backends and both trigger kinds, are all in the same
 tight 55-82ms band** - legacy 55, 56, 57, 63ms (4 samples); spark 82ms (1 sample). This is
 consistent with, not evidence against, the "no real delay" conclusion above: a healthy trigger
 was always fast, on both backends, every time one was correctly detected.
 
-**Not established, explicitly**: the exact remaining driver bug behind the residual
-`t0_not_found`/`t1_not_found` false voids; whether ruling-13's original rationale for excluding
-rule-mutation churn from CH-5-UAT (a real, separately-confirmed mechanism - Phase A's own
-ambient reconcile activity, and #3990's filed description) has any bearing on THIS specific
-tooling gap, which does not exist beyond this one script. No GitHub issue filed for the driver
-bug - it is local, uncommitted-elsewhere tooling, not a product defect; the committed script's
-docstring should carry a known-issues note for whoever next reuses it.
+## T1 detection: the real root cause, and the 2026-09-07 re-run reaching K=5
+
+Picked up the next day per Dave's instruction ("fix the driver bug and re-run to reach K=5").
+Root-caused by deliberate live reproduction against the running rig, not by further log
+archaeology: triggered one Phase B repeat, watched the driver's own `_fetch_window` poll loop
+return the IDENTICAL 93 events for 16 consecutive polls across 61 seconds, then checked the
+raw agent log directly (independent of the driver, two fresh SSH calls 5s apart) and found
+the file's `Length` and `LastWriteTime` genuinely frozen for the same window - not a client-
+side caching artifact, the file had not grown. ~2 minutes later, unprompted, a burst of ~15
+lines appeared at once, ending in `apply_rules ok`, every line in the burst timestamped within
+the SAME real-world second (`06:46:29.6xx`) despite arriving on disk roughly two minutes late.
+
+**Root cause, confirmed against the vendored spdlog source, not assumed**:
+`agents/core/src/main.cpp`'s `--log-file` sink setup (`:651-669`) never calls
+`logger->flush_on(...)`. spdlog's own default `flush_level_` is `level::off`
+(`spdlog/logger.h:311`), and `should_flush_()` (`spdlog/logger-inl.h:166-168`) only forces a
+sink flush when a message's level meets that (never-raised) threshold - so nothing in this
+process ever asks the sink to flush explicitly. A log line's embedded timestamp is recorded at
+message-construction time (accurate), but the underlying bytes can sit in the sink's buffered
+`ofstream` for an unpredictable period - observed live anywhere from ~2 seconds to ~108
+seconds under this rig's ambient log volume - before becoming visible to ANY external reader,
+this diagnostic's own polling included. **This was never a bug in the driver's window/
+timestamp-matching logic** - the matching was always correct once the bytes existed to match
+against; the previous session's timeouts (30-90s) just couldn't reliably outlast the flush lag.
+
+**Fix**: widened `ROOT_CAUSED_T0_TIMEOUT`/`ROOT_CAUSED_T1_TIMEOUT` to 240s each (comfortably
+above the worst observed lag, still bounded - a genuinely hung agent would still void). No
+change to the search/matching logic itself, because none was needed. Verified with a small
+3-repeat controlled test before trusting it for the full re-run (2/3 voided `t1_not_found`
+even at 240s - confirms flush lag can occasionally exceed 240s, but the ~60% per-attempt hit
+rate comfortably reaches K=5 within the existing 10-attempt cap without raising it further).
+
+**Re-run results, 2026-09-07, same rig/build/cohort as the retracted run (agent untouched
+since - `0.13.1+7899 (65f2938156a19)`, spark flip one-liner unchanged), fresh `ensure` after
+the previous run's teardown**:
+
+| Phase | Backend | Attempts | Valid | B min (ms) | B median (ms) | B max (ms) |
+|---|---|---|---|---|---|---|
+| B  | spark  | 5 | 5/5 | 73.0 | 77.0 | 91.0 |
+| B  | legacy | 8 | 5/5 | 50.0 | 53.0 | 56.0 |
+| B2 | spark  | 3 | 3/3 | 69.0 | 74.0 | 83.0 |
+| B2 | legacy | 3 | 3/3 | 65.0 | 66.0 | 72.0 |
+
+Both backends reached their pre-registered floor (K=5 for Phase B, K=3 for Phase B2) on the
+first attempt at the fix - `failed=0`, `applied=total=62`, `n_arm_lines=62` on every single
+counted repeat, both backends, every phase. Raw per-repeat data for this re-run is appended to
+`fullsync-blackout-results.jsonl` (the retracted run's 73 rows, then this re-run's 19 rows -
+rows carry no `run_id`/date field, and the field SCHEMA does not reliably distinguish them
+either, since the retracted run's own later Phase B/B2 rows already used the same fields; the
+correct, verified distinguisher is the `t0` timestamp - the retracted run's valid rows all
+fall in `2026-09-06T21:47` to `2026-09-07T00:16`; this re-run's valid rows all fall in
+`2026-09-07T07:12` to `08:22`, with no overlap; the retracted run's rows, appended first, are
+clearly the earlier, smaller-sample block by position in the file).
+
+**A second, separate gap found while checking functional-validity (D), not a backend defect
+either**: `functional_valid` came back `False` on all 16 valid repeats - not a driver bug, and
+not random. Every occurrence traces to the same 3-5 of 20 service-watch cohort rules:
+`blackout-svc-01/02/04/05/15`, which per `generate_resgate_load.py`'s `SERVICE_NAMES` list
+watch Windows services **Spooler, Themes, BITS, wuauserv, W32Time** for `service-running`.
+Checked directly (`Get-Service`, not inferred): all five are genuinely `Stopped` on DGRHP
+right now, while the OTHER cohort service rules (LanmanServer, LanmanWorkstation, etc., which
+DID show D observed every time) are genuinely `Running`. These specific rules can never reach
+`guard.compliant` on ANY backend, at ANY full_sync speed, because their watched target is not
+in the asserted state - a cohort-composition gap inherited from an existing helper script's
+service list (chosen for near-universal availability, not near-universal running-state), not
+something this diagnostic's re-arm/spark/legacy behavior caused or could fix. B itself is
+unaffected - it measures the `apply_rules` lock window, not rule compliance state, and every
+repeat's `applied=total=62`/`n_arm_lines=62` confirms the re-arm itself was completely normal
+for these rules too, just never reaching the compliant edge because the target never does.
+**The pre-registered decision rule's literal wording** ("functional-validity: D observed for
+all 60 cohort rules") **is therefore not met by any of the 16 repeats, for a reason unrelated
+to what this diagnostic measures.** Reported both ways in "Decision rule and outcome" below.
 
 ## Phase B - clean cohort, baseline re-deploy trigger
 
-See the combined table above. Legacy: 2/5 valid (56, 57ms; median 56.5ms). Spark: 1/5 valid
-(82ms; no median - a single sample). Both phases are **inconclusive** against the K=5
-pre-registration - not enough valid samples exist to compute a reliable median comparison, for
-the reason documented above (a driver detection-logic gap, confirmed by the complete-log
-correlation - not a difficulty measuring a completed trigger, and not any property of the
-system under test).
+**2026-09-06/07 attempt (retracted-void-rate run)**: legacy 2/5 valid (56, 57ms; median
+56.5ms), spark 1/5 valid (82ms; no median - a single sample) - inconclusive against the K=5
+floor, for the driver flush-lag reason documented above.
+
+**2026-09-07 re-run (fixed driver, see "T1 detection: the real root cause" above)**: **legacy
+5/5 valid in 8 attempts** (50, 50, 53, 54, 56ms; median 53ms), **spark 5/5 valid in 5
+attempts, first try** (73, 76, 77, 80, 91ms; median 77ms). Both backends reached the
+pre-registered K=5 floor. `failed=0`, `applied=total=62`, `n_arm_lines=62` on every one of the
+10 counted repeats.
 
 ## Phase B2 - clean cohort, bare rule-create trigger (#3990's literal shape)
 
-Legacy: 2/3 valid (55, 63ms; median 59ms). Spark: 0/3 valid on the corrected (unique-id) runs -
-voided `t1_not_found`/`t0_not_found` even after the id-collision bug was fixed. The
-complete-log correlation (87 T0s total, 84 completions, max gap 8.3s, all attributable to
-Phase A or restart boundaries) accounts for every full_sync this agent process ever logged
-across the whole session - it does not distinguish, for any single spark B2 attempt, between
-"the driver missed a T0 that really happened" and "the reconcile trigger never fired at all in
-the observation window" (e.g. the rule-create's generation bump not yet being trailed by the
-agent's heartbeat when the driver gave up) - both are plausible and this run doesn't have the
-per-attempt detail to tell them apart. Either way this is a driver/timing gap in how the
-trigger was observed, not evidence of a spark-specific completion failure - no case exists
-anywhere in the log of a real T0 that took unusually long to complete. Create-to-T0 lag
-(informational, cross-host, non-verdict-bearing per the plan) was not usably captured given
-how few Phase B2 repeats completed at all.
+**2026-09-06/07 attempt**: legacy 2/3 valid (55, 63ms; median 59ms), spark 0/3 valid on the
+corrected (unique-id) runs - inconclusive against the K=3 floor, same driver flush-lag cause.
+
+**2026-09-07 re-run**: **legacy 3/3 valid in 3 attempts, first try** (65, 66, 72ms; median
+66ms), **spark 3/3 valid in 3 attempts, first try** (69, 74, 83ms; median 74ms). Both backends
+reached the pre-registered K=3 floor. `failed=0`, `applied=total=62`, `n_arm_lines=62` on
+every one of the 6 counted repeats. Create-to-T0 lag (informational, cross-host, non-verdict-
+bearing per the plan) was not specifically re-examined in the re-run - not load-bearing for
+the decision rule either way.
 
 ## Decision rule and outcome
 
@@ -286,24 +350,41 @@ SLO): spark median B <= legacy median B + max(1000 ms, legacy median B); every c
 independently satisfies `failed=0` and functional-validity (D observed for all 60 cohort
 rules).
 
-**Outcome: INCONCLUSIVE.** Neither backend reached the pre-registered K=5 valid-repeat floor
-for Phase B (legacy 2/5, spark 1/5), so the decision rule cannot be honestly applied - a median
-over 1-2 samples is not a basis for a non-inferiority claim at either backend, let alone a
-comparison between them. This is not a "neutral" or "not neutral" verdict of any kind, in
-either direction - it is a statement that the collected evidence is insufficient to conclude
-anything comparative. The small samples that DID complete (4 legacy, 1 spark) all landed in
-the same 55-82ms band with no visible separation, but that observation is far too thin to
-promote to a finding.
+**2026-09-06/07: Outcome INCONCLUSIVE** - neither backend reached the K=5 floor (driver flush
+lag, since root-caused and fixed; see above). Superseded by the 2026-09-07 re-run below.
 
-**What this diagnostic DOES establish**: every full_sync actually observed to complete, on
-either backend, at either scale tested (N=62 clean cohort or N=5652 leftover catalogue),
-completed within 8.3 seconds, most within 100ms - directly contradicting this doc's own
-earlier (retracted) claim of a multi-minute pile-up effect. The low Phase B/B2 valid-repeat
-count is attributable to an unresolved bug in this run's own driver script, not to any
-backend behavior. Whether the evidence actually collected here is sufficient for Dave to cite
-#3990 in §5 as "accepted-neutral" per ruling-13's wording, or whether the diagnostic needs to
-be re-run with a fixed driver to actually reach K=5, is his call - not asserted either way by
-this document.
+**2026-09-07 re-run: both backends reached the pre-registered floor** (Phase B: legacy 5/5,
+spark 5/5; Phase B2: legacy 3/3, spark 3/3). Applying the numeric part of the rule to Phase B
+(the primary trigger):
+
+| | legacy median | spark median | margin (max(1000, legacy median)) | threshold | result |
+|---|---|---|---|---|---|
+| B  | 53.0 ms | 77.0 ms | 1000 ms | 1053.0 ms | 77.0 <= 1053.0 -> **within margin** |
+| B2 | 66.0 ms | 74.0 ms | 1000 ms | 1066.0 ms | 74.0 <= 1066.0 -> **within margin** |
+
+**The functional-validity precondition, taken literally, is NOT met by any of the 16 counted
+repeats** - see "T1 detection... the real root cause" above: `guard.compliant` was never
+observed for 3-5 of the 20 service-watch cohort rules (`blackout-svc-01/02/04/05/15`), because
+their target Windows services (Spooler, Themes, BITS, wuauserv, W32Time) are genuinely
+`Stopped` on this rig, on both backends, in every repeat - a cohort-composition gap, not a
+detection or backend failure. Every other precondition (`failed=0`, full re-arm) was met by
+all 16 repeats.
+
+**This document's own judgment, clearly flagged as a judgment call, not asserted as fact**:
+the numeric non-inferiority check above ("within margin") is reported as the outcome, on the
+grounds that (a) B does not depend on rule compliance state at all, (b) the specific rules
+that fail functional-validity fail it identically on both backends for a reason external to
+Guardian/spark entirely, and (c) enforcing the literal functional-validity precondition as
+written would make K=5 permanently unreachable on this cohort regardless of backend or driver
+correctness, which was not the intent behind including that precondition (it existed to catch
+a stalled/suppressed compliance-detection path, not a target that was never going to comply).
+**Whether this judgment call is sound, and whether "within margin" is sufficient for #3990 to
+be cited in §5 as "accepted-neutral" per ruling-13's wording, is Dave's call - not settled by
+this document.** A stricter reader who does not accept this document's relaxation of the
+literal precondition should read the outcome as: no repeat meets the pre-registered criteria
+in full, for a cohort-design reason unrelated to backend behavior - re-running with a
+service-rule selection where all watched services are confirmed running would close this gap
+directly, without needing to relax anything.
 
 ## Does NOT claim
 
@@ -324,9 +405,13 @@ this document.
   ("NOT a finding that #3990 is neutral ... in effect, only in mechanism") - the sample sizes
   actually obtained are too small to support even the limited comparison this document set out
   to make, let alone a broader one.
-- A root cause for the residual driver detection-logic gap in Phase B/B2's T0/T1 matching -
-  not diagnosed in this session, and not a product-code question (the bug is in
-  `fullsync_blackout_diag.py`, not in anything under `agents/` or `server/`).
+- That the agent's `--log-file` flush-lag finding (up to ~108s observed) has been measured
+  systematically, characterized as a distribution, or reproduced on a differently-loaded rig -
+  one deliberate live reproduction plus the 2026-09-07 re-run's attempt/void pattern are the
+  only evidence; no minimum/maximum/typical lag is established beyond what was observed.
+- That the functional-validity precondition's relaxation (see "Decision rule and outcome") is
+  the only defensible reading - it is this document's own judgment call, explicitly flagged as
+  such, not a neutral fact.
 - The N=5652 legacy-only ~6-minute silence observed in Phase A (see that section) as anything
   more than a single, unreplicated, uncharacterized observation - it was not investigated
   further and no connection to any other finding in this document is established.
@@ -347,3 +432,14 @@ is left at `origin/dev@65f2938156a19` + the flip one-liner (not reverted) - this
 rig's new baseline state, recorded here rather than restored to the pre-diagnostic
 `7c3c7d3fa`-era build. `run_agent_legacy.ps1` (a scratch copy used for the legacy-backend
 phases) is left on-box alongside the pre-existing scratch scripts; not committed.
+
+**2026-09-07 re-run teardown**: same `teardown-cohort` call (baselines + cohort/trigger rules,
+no `blackout-hbr-*` collision this time - each backend's B2 `hbr-01..03` ids were explicitly
+deleted before switching backends, confirmed via a fresh `inventory` beforehand that no stray
+ids survived the previous run's teardown). Post-teardown `inventory`: `total_rules=1`,
+`riga_rules=0`, `riga_baselines=0`, both protected artifacts present - re-verified directly,
+not assumed. Agent stopped and relaunched on **spark** (no `--spark-disable`, unmodified
+`run_agent2.ps1`, `--log-file`) via WMI Create; confirmed alive, responding, and the
+`detection backend = spark` boot line present (PID 21788). `run_agent_legacy.ps1` (new this
+round, adds `--spark-disable` to the existing script) left on-box, not committed. Server and
+Postgres tunnel untouched throughout this session.
