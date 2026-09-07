@@ -561,8 +561,10 @@ TEST_CASE("POST /login/mfa recovery-code path still audits mfa.recovery_code.use
     CHECK(step2->status == 401);
     CHECK(step2->get_header_value("Set-Cookie").empty());
     // The recovery code was genuinely consumed - its TRUE audit row must
-    // survive the denied mint, unlike before this fix round.
-    CHECK(h.count_audits("mfa.recovery_code.used", "admin") >= 1);
+    // survive the denied mint, unlike before this fix round. Exact count
+    // (security-guardian Gate 8 NICE) - nothing else in this fixture emits
+    // this action, so == 1 also catches a future duplicate-emission bug.
+    CHECK(h.count_audits("mfa.recovery_code.used", "admin") == 1);
     AuditQuery rq;
     rq.action = "auth.login";
     rq.principal = "admin";
@@ -972,9 +974,17 @@ TEST_CASE("POST /login/mfa/enroll still audits mfa.enroll.verified + "
     CHECK(step2->get_header_value("Set-Cookie").empty());
     // The one-time recovery-codes VALUE reveal stays withheld on deny -
     // only the fact that enrollment/codes were generated is unconditional.
-    CHECK(step2->body.find("recovery_codes") == std::string::npos);
-    CHECK(h.count_audits("mfa.enroll.verified", "alice") >= 1);
-    CHECK(h.count_audits("mfa.recovery_codes.generated", "alice") >= 1);
+    // Exact-body match (security-guardian Gate 8 NICE), not just substring
+    // absence: this is the handler's own kFailureBody literal, so an exact
+    // match is strictly stronger and no more brittle than the substring
+    // check it replaces.
+    CHECK(step2->body ==
+          R"({"error":{"code":401,"message":"Invalid verification code"},"meta":{"api_version":"v1"}})");
+    // Exact counts (security-guardian Gate 8 NICE) - nothing else in this
+    // fixture emits these actions, so == 1 also catches a future
+    // duplicate-emission bug.
+    CHECK(h.count_audits("mfa.enroll.verified", "alice") == 1);
+    CHECK(h.count_audits("mfa.recovery_codes.generated", "alice") == 1);
     AuditQuery eq;
     eq.action = "auth.login";
     eq.principal = "alice";

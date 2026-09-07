@@ -1046,10 +1046,11 @@ TEST_CASE("post_mint_role_recheck denies a login when a demote lands strictly "
 }
 
 TEST_CASE("create_local_session's own post-mint recheck denies a stale-role "
-          "mint too (#4107 fix - the MFA step-up route reads a role from an "
-          "earlier verify_password() call, potentially across an entire "
-          "TOTP-verification round trip, then hands it to create_local_"
-          "session as a plain parameter with no idea how stale it is)",
+          "mint too (#4107 fix - /login/mfa's TOTP/recovery verify reads a "
+          "role from an earlier verify_password() call, potentially across "
+          "an entire TOTP-verification round trip, then hands it to "
+          "create_local_session as a plain parameter with no idea how "
+          "stale it is)",
           "[pg][auth][session][cold_cache]") {
     yuzu::test::AuthDbPg auth_db;
 
@@ -1058,9 +1059,11 @@ TEST_CASE("create_local_session's own post-mint recheck denies a stale-role "
     // "frank" is genuinely a user - never admin. Simulates a role that
     // changed (or was simply wrong) somewhere in the gap between an earlier
     // verify_password() call and this create_local_session() call actually
-    // minting - exactly the wider check-then-mint window the MFA step-up
-    // route has (auth_routes.cpp's create_local_session call sites), which
-    // has no row lock of its own to narrow it in the first place.
+    // minting - exactly the wider check-then-mint window /login/mfa's TOTP/
+    // recovery verify has (auth_routes.cpp's create_local_session call
+    // sites; NOT /login/mfa/stepup, which never calls create_local_session
+    // at all), which has no row lock of its own to narrow it in the first
+    // place.
     REQUIRE(mgr.upsert_user("frank", "password1234", Role::user));
 
     // Mint with a STALE "admin" role, as if an earlier check had returned it
