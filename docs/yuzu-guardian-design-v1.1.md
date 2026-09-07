@@ -2539,6 +2539,28 @@ Guardian ladder must check these.
   the agent cannot enforce (or silently drops one it can), and nothing else in
   the build catches the divergence.
 
+- **`full_sync`'s KV teardown clears `rule:` keys ONLY, never `baseline:`
+  records (#4021).** A `file-hash-equals` rule authored with no `expected_hash`
+  captures a baseline on arm; that capture is persisted per `rule_id` under
+  `__guardian__`/`baseline:` (fingerprint = assertion type + authored path,
+  schema-versioned separately from the fingerprint content so a future schema
+  bump cannot silently mass-invalidate every existing record as "a genuine
+  retarget"), and re-seeded at both arm sites (legacy
+  `start_guard_for_rule_locked`, Spark's `reconcile_rule_locked`). A future
+  blanket `kv_->clear(kKvNamespace)` — or a new key type added under this
+  namespace without updating the scoped delete — silently reinstates the
+  #4021 laundering (a genuinely drifted rule's baseline reset to whatever the
+  target currently holds, with no remediation and no visible action). Absence
+  from one push is not deletion — the server omits disabled/out-of-scope rules
+  from every push, so a rule_id's baseline record is never swept merely for
+  being absent from a full_sync. `guardian_persist_baseline` additionally
+  refuses to overwrite a well-formed, same-fingerprint record (a write reaching
+  that state can only mean a failed seed lookup — adversarial-review K1/C2-1).
+  Spark's own first-ever baseline capture is NOT yet wired to this store
+  (tracked as #4045) — under `prefer_spark_=true` (not the shipping default), a
+  rule never armed via legacy still relaunders on full_sync/restart exactly as
+  before this fix.
+
 ## 25. Lifecycle-audit journal (ADR-0021 Stage 2, item 7)
 
 Guardian's spark-backed rule engine keeps a durable audit trail of `guard.armed` /

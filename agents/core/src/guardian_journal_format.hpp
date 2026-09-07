@@ -32,7 +32,9 @@ namespace yuzu::agent {
 
 // ── Namespace, format version, caps (design §3, §6; rev-4.1) ──────────────────
 
-/// Distinct kv_store "plugin" namespace - survives full_sync's clear("__guardian__").
+/// Distinct kv_store "plugin" namespace - survives full_sync's rule-record
+/// sweep (a scoped delete of "rule:"-prefixed keys under "__guardian__" as of
+/// #4021; this namespace was never touched by it either before or after).
 inline constexpr std::string_view kJournalNamespace = "__guardian_journal__";
 
 /// Value envelope version. An unknown version on read → quarantine (never trust).
