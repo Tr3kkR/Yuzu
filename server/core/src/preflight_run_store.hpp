@@ -122,9 +122,11 @@ public:
     /// Runner: flip a run to complete (compute → persist_grid → THEN this).
     bool complete_run(const std::string& run_id, std::int64_t completed_at_ms);
 
-    /// Runner: delete runs created before `cutoff_ms` (run_device cascades).
-    /// Returns rows deleted, or -1 on error.
-    int prune_older_than(std::int64_t cutoff_ms);
+    /// Runner: clock-guarded, single-writer, capped retention prune (WS-10 #2508;
+    /// run_device cascades). Deletes runs older than now - `retention_window_ms`,
+    /// where now is read from Postgres itself (shared clock). Returns rows deleted
+    /// this pass, or -1 on error.
+    int run_retention_prune(std::int64_t retention_window_ms);
 
     /// Delete one run, OWNER-SCOPED at the seam (`created_by` must match;
     /// run_device cascades). Returns true if a row was deleted.
