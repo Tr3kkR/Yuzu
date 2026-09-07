@@ -318,6 +318,24 @@ TEST_CASE("GET /api/v1/executions/:id/responses: mirrors query_responses' execut
     CHECK(audited);
 }
 
+// #4030 Gate 8 fix (happy-path, Gate 4, HIGH/I3): `offset` over this
+// route's non-unique, actively-growing `timestamp DESC` order silently
+// skips/duplicates rows while an execution is non-terminal -- the same
+// hazard its declared MCP twin query_responses deliberately avoids by
+// never accepting the parameter. Reject rather than silently ignore.
+TEST_CASE("GET /api/v1/executions/:id/responses: offset is rejected with 400, "
+          "not silently ignored (#4030 Gate 8 fix)",
+          "[pg][rest][executions][v1][responses]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecV1Harness h(pool);
+    auto exec_id = h.make_exec_with_agents("def-resp-offset");
+
+    auto res = h.sink.Get("/api/v1/executions/" + exec_id + "/responses?offset=1");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+}
+
 TEST_CASE("GET /api/v1/executions/:id/responses: fleet_read_fn gates on Response:Read, "
           "independent of Execution:Read",
           "[pg][rest][executions][v1][responses][security]") {
