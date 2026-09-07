@@ -948,6 +948,15 @@ struct McpTestServer {
     /// field (read LIVE at request time via the wiring lambda below).
     DexFleet dex_fleet_for_test;
 
+    /// #4035 hardening (governance) — the visible-agent-set resolver for
+    /// get_dex_app/get_dex_overview (ADR-0017 World A confinement,
+    /// independent of the service-scoped-token deny belt). nullopt (default)
+    /// = unfiltered, matching every EXISTING test in this file. Ignores
+    /// `username` — this stub doesn't model per-username resolution, only
+    /// whether the caller's set is engaged (read LIVE at request time via the
+    /// wiring lambda below).
+    std::optional<std::set<std::string>> dex_visible_for_test;
+
     /// ADR-0024 (SLE discovery): optionally wire a typed SoftwareLicensingStore so
     /// query_software_licenses (the MCP twin of the GET /sle/agents/{id} drill) is
     /// exercised end-to-end — success shape, the deliberate user_scope/user_ref PII
@@ -1184,6 +1193,13 @@ private:
         // time (see that field's doc comment) — unconditional, no-op-shaped
         // default for every pre-existing test.
         mcp.set_dex_fleet_fn([this]() { return dex_fleet_for_test; });
+
+        // #4035 hardening (governance): same setter idiom, reads
+        // dex_visible_for_test LIVE at request time (see that field's doc
+        // comment) — unconditional, no-op-shaped default for every
+        // pre-existing test.
+        mcp.set_dex_visible_fn(
+            [this](const std::string&) { return dex_visible_for_test; });
 
         // #3685: the Destructive-targeting classifier ALSO rides a setter,
         // same pattern as the two above — wire before the handlers are
@@ -4296,6 +4312,46 @@ TEST_CASE("MCP DEX: get_dex_app returns the blast-radius shape, audits dex.app.v
     CHECK(denied->body.find("chrome.exe") == std::string::npos);
 }
 
+// #4035 hardening (governance): closure evidence for the ADR-0017 World A
+// confinement gap — get_dex_app's devices[] previously ALWAYS passed
+// visible=nullptr to the shared builder, the same defect as its REST twin
+// (see test_rest_guaranteed_state.cpp's matching regression test).
+TEST_CASE("MCP DEX: get_dex_app devices[] confined to the caller's visible set "
+          "(ADR-0017 World A — regression coverage for the governance fix)",
+          "[pg][mcp][integration][dex][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_obs(store, "sa1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    mcp_seed_obs(store, "sa2", "WS-2", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T11:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+
+    auto unconfined = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":9721,"params":{"name":"get_dex_app","arguments":{"name":"chrome.exe","window":"all"}}})");
+    REQUIRE(unconfined);
+    auto ubody = nlohmann::json::parse(unconfined->body);
+    auto upayload =
+        nlohmann::json::parse(ubody["result"]["content"][0]["text"].get<std::string>());
+    CHECK(upayload["devices"].size() == 2);
+
+    ts.dex_visible_for_test = std::set<std::string>{"WS-1"};
+    auto confined = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":9722,"params":{"name":"get_dex_app","arguments":{"name":"chrome.exe","window":"all"}}})");
+    REQUIRE(confined);
+    auto cbody = nlohmann::json::parse(confined->body);
+    auto cpayload =
+        nlohmann::json::parse(cbody["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(cpayload["devices"].is_array());
+    CHECK(cpayload["devices"].size() == 1);
+    CHECK(cpayload["devices"][0]["agent_id"] == "WS-1");
+    for (const auto& d : cpayload["devices"])
+        CHECK(d["agent_id"].get<std::string>() != "WS-2");
+}
+
 TEST_CASE("MCP DEX: list_dex_apps returns the stability list, no audit (aggregate)",
           "[pg][mcp][integration][dex]") {
     YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
@@ -4437,6 +4493,46 @@ TEST_CASE("MCP DEX: get_dex_overview returns the fleet summary, audits dex.overv
         R"({"jsonrpc":"2.0","method":"tools/call","id":981,"params":{"name":"get_dex_overview","arguments":{}}})");
     REQUIRE(denied);
     CHECK(denied->body.find("chrome.exe") == std::string::npos);
+}
+
+// #4035 hardening (governance): closure evidence for the ADR-0017 World A
+// confinement gap on get_dex_overview's top_devices[] — same defect class
+// and same fix as get_dex_app above.
+TEST_CASE("MCP DEX: get_dex_overview top_devices[] confined to the caller's visible set "
+          "(ADR-0017 World A — regression coverage for the governance fix)",
+          "[pg][mcp][integration][dex][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_obs(store, "st1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    mcp_seed_obs(store, "st2", "WS-2", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T11:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+
+    auto unconfined = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":9801,"params":{"name":"get_dex_overview","arguments":{"window":"all"}}})");
+    REQUIRE(unconfined);
+    auto ubody = nlohmann::json::parse(unconfined->body);
+    auto upayload =
+        nlohmann::json::parse(ubody["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(upayload["top_devices"].is_array());
+    CHECK(upayload["top_devices"].size() == 2);
+
+    ts.dex_visible_for_test = std::set<std::string>{"WS-1"};
+    auto confined = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":9802,"params":{"name":"get_dex_overview","arguments":{"window":"all"}}})");
+    REQUIRE(confined);
+    auto cbody = nlohmann::json::parse(confined->body);
+    auto cpayload =
+        nlohmann::json::parse(cbody["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(cpayload["top_devices"].is_array());
+    CHECK(cpayload["top_devices"].size() == 1);
+    CHECK(cpayload["top_devices"][0]["agent_id"] == "WS-1");
+    for (const auto& d : cpayload["top_devices"])
+        CHECK(d["agent_id"].get<std::string>() != "WS-2");
 }
 
 TEST_CASE("MCP DEX: get_dex_device_history returns per-device history, audits dex.device.view "

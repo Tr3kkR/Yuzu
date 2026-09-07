@@ -1108,7 +1108,7 @@ const std::string& openapi_spec() {
         // compile time. #4035's 8 new DEX twins start a fresh literal segment.
         R"json(,
     "/dex/app": {
-      "get": {"summary": "App blast-radius drill", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Crash/hang summary, faulting modules, exception codes, and the affected-device list for one application (process image name) — the REST twin of the /fragments/dex/app dashboard drill. The devices array names affected agent_ids fleet-wide (individual-identifying behavioral data), so every call emits a dex.app.view audit event and a service-scoped API token is denied outright (403) — there is no single agent_id to confine the token's own service-tag scope against. FAILS CLOSED (503 + Sec-Audit-Failed: true header) when that audit row cannot persist.", "parameters": [{"name": "name", "in": "query", "required": true, "schema": {"type": "string"}, "description": "Process image name, e.g. notepad.exe."}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "App drill object (process_name, window, crashes, hangs, signals, distinct_devices, first_seen, last_seen, modules[], exceptions[], devices[])"}, "400": {"description": "missing name, or invalid window"}, "403": {"description": "Service-scoped API token — this fleet-wide read cannot be confined to the token's service."}, "503": {"description": "Service unavailable OR the dex.app.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
+      "get": {"summary": "App blast-radius drill", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Crash/hang summary, faulting modules, exception codes, and the affected-device list for one application (process image name) — the REST twin of the /fragments/dex/app dashboard drill. The devices array names affected agent_ids (individual-identifying behavioral data) and is confined to the caller's management-group scope exactly like the dashboard fragment (ADR-0017); the crash/hang/module/exception counts remain fleet-wide aggregates. Every call emits a dex.app.view audit event and a service-scoped API token is denied outright (403) — there is no single agent_id to confine the token's own service-tag scope against. FAILS CLOSED (503 + Sec-Audit-Failed: true header) when that audit row cannot persist.", "parameters": [{"name": "name", "in": "query", "required": true, "schema": {"type": "string"}, "description": "Process image name, e.g. notepad.exe."}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "App drill object (process_name, window, crashes, hangs, signals, distinct_devices, first_seen, last_seen, modules[], exceptions[], devices[])"}, "400": {"description": "missing name, or invalid window"}, "403": {"description": "Service-scoped API token — this fleet-wide read cannot be confined to the token's service."}, "503": {"description": "Service unavailable OR the dex.app.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
     },
     "/dex/apps": {
       "get": {"summary": "App-centric stability list", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Every application with a crash/hang signal in the window, ranked by activity — the REST twin of the /fragments/dex/apps dashboard tab. No per-agent identity (a distinct-device COUNT per app, never an agent_id) — fleet aggregate, NOT audited.", "parameters": [{"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Apps list (data.window, data.apps[].{subject, crashes, hangs, distinct_devices, last_seen})"}, "400": {"description": "invalid window"}, "503": {"description": "service unavailable"}}}
@@ -1123,7 +1123,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "Cross-OS comparison + per-family day-by-day trend", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Cross-OS scope cards plus per-family event counts for every day in the window (the small-multiples/heatmap source data) — the REST twin of the /fragments/dex/trends dashboard tab. No per-agent identity — fleet aggregate, NOT audited.", "parameters": [{"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Trends object (window, total_catalogued_types, windows_reporting, crash_free_pct|null, os_cards[].{platform, live, distinct_types, total_events}, days[], families[].{name, total, counts[]})"}, "400": {"description": "invalid window"}, "503": {"description": "service unavailable"}}}
     },
     "/dex/overview": {
-      "get": {"summary": "Fleet DEX overview (the /dex landing page's summary)", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Per-device experience score distribution + the Device/App/Network composite, the measured crash-free rate, top apps, and the most-affected-devices list — the REST twin of the /fragments/dex/overview dashboard hub. The top_devices array names affected agent_ids fleet-wide (individual-identifying behavioral data), so every call emits a dex.overview.view audit event and a service-scoped API token is denied outright (403). FAILS CLOSED (503 + Sec-Audit-Failed: true header) when that audit row cannot persist.", "parameters": [{"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Overview object (window, overall_experience, device_score, app_score, network_score, great, fair, poor, coverage_monitored, coverage_total, crash_free_pct|null, windows_reporting, crashes_per_1k_device_days|null, total_crashes, devices_impacted, total_online, active_signal_types, health_score|null, os_reporting_count, segments[], crashes_by_day[], top_apps[], top_devices[], os_table[])"}, "400": {"description": "invalid window"}, "403": {"description": "Service-scoped API token — this fleet-wide read cannot be confined to the token's service."}, "503": {"description": "Service unavailable OR the dex.overview.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
+      "get": {"summary": "Fleet DEX overview (the /dex landing page's summary)", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Per-device experience score distribution + the Device/App/Network composite, the measured crash-free rate, top apps, and the most-affected-devices list — the REST twin of the /fragments/dex/overview dashboard hub. The top_devices array names affected agent_ids (individual-identifying behavioral data) and is confined to the caller's management-group scope exactly like the dashboard fragment (ADR-0017); every other field remains a fleet-wide aggregate. Every call emits a dex.overview.view audit event and a service-scoped API token is denied outright (403). FAILS CLOSED (503 + Sec-Audit-Failed: true header) when that audit row cannot persist.", "parameters": [{"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Overview object (window, overall_experience, device_score, app_score, network_score, great, fair, poor, coverage_monitored, coverage_total, crash_free_pct|null, windows_reporting, crashes_per_1k_device_days|null, total_crashes, devices_impacted, total_online, active_signal_types, health_score|null, os_reporting_count, segments[], crashes_by_day[], top_apps[], top_devices[], os_table[])"}, "400": {"description": "invalid window"}, "403": {"description": "Service-scoped API token — this fleet-wide read cannot be confined to the token's service."}, "503": {"description": "Service unavailable OR the dex.overview.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
     },
     "/dex/devices/{id}/history": {
       "get": {"summary": "Per-device raw signal history", "tags": ["DEX"], "description": "Requires GuaranteedState:Read, scoped to the device's management group. The distinct signal-HISTORY capability from GET /dex/devices/{id} above (same device, different data: every observation row, not just the rollup score) — the REST twin of the /fragments/dex/device dashboard drill. Individual-identifying behavioral data, so every call emits a dex.device.view audit event (the SAME verb GET /dex/devices/{id} uses; the dashboard fragment audits this exact capability under this exact verb too). FAILS CLOSED (503 + Sec-Audit-Failed: true header) when that row cannot persist.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "History object (agent_id, window, crashes, hangs, signals, distinct_apps, last_seen, history[].{event_id, observed_at, obs_type, subject, reason, symbolic, component, metric})"}, "400": {"description": "invalid window"}, "403": {"description": "outside the caller's management scope"}, "503": {"description": "Service unavailable OR the dex.device.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
@@ -1578,7 +1578,7 @@ void RestApiV1::register_routes(
     EnginePrincipalStore* engine_principal_store, AccessReviewStore* access_review_store,
     AuthDB* auth_db, DirectorySync* directory_sync, detail::StreamBudget* stream_budget,
     ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn, FleetReadFn fleet_read_fn,
-    DexFleetFn dex_fleet_fn) {
+    DexFleetFn dex_fleet_fn, DexVisibleFn dex_visible_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -1593,7 +1593,8 @@ void RestApiV1::register_routes(
                     std::move(response_scope_fn),
                     std::move(app_perf_providers), engine_principal_store, access_review_store,
                     auth_db, directory_sync, stream_budget, std::move(exec_visible_fn),
-                    std::move(list_read_fn), std::move(fleet_read_fn), std::move(dex_fleet_fn));
+                    std::move(list_read_fn), std::move(fleet_read_fn), std::move(dex_fleet_fn),
+                    std::move(dex_visible_fn));
 }
 
 void RestApiV1::register_routes(
@@ -1615,7 +1616,7 @@ void RestApiV1::register_routes(
     EnginePrincipalStore* engine_principal_store, AccessReviewStore* access_review_store,
     AuthDB* auth_db, DirectorySync* directory_sync, detail::StreamBudget* stream_budget,
     ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn, FleetReadFn fleet_read_fn,
-    DexFleetFn dex_fleet_fn) {
+    DexFleetFn dex_fleet_fn, DexVisibleFn dex_visible_fn) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -1725,6 +1726,28 @@ void RestApiV1::register_routes(
             detail::error_json_a4(403, message, cid, detail::A4ErrorOpts{.permission = permission}),
             "application/json");
         return true;
+    };
+
+    // #4035 hardening (governance): resolves the caller's management-group
+    // -visible agent set for confining a fleet-wide DEX device list (ADR-0017
+    // World A) — mirrors DexRoutes::resolve_visible (dex_routes.cpp) exactly,
+    // so GET /api/v1/dex/app and GET /api/v1/dex/overview confine their
+    // devices[]/top_devices[] lists the SAME way the equivalent dashboard
+    // fragments already do. This is a SECOND, independent belt alongside
+    // deny_fleet_wide_service_scoped above — that closes the service-scoped
+    // -API-token axis, this closes the management-group-confined-OPERATOR
+    // axis; neither substitutes for the other (see the SCOPING NOTE on
+    // server.cpp's dex_fleet_fn provider). nullopt = unfiltered (global read
+    // / RBAC off, unresolved session, or dex_visible_fn unwired).
+    auto resolve_dex_visible =
+        [auth_fn, dex_visible_fn](const httplib::Request& req) -> std::optional<std::set<std::string>> {
+        if (!dex_visible_fn)
+            return std::nullopt;
+        httplib::Response throwaway;
+        auto sess = auth_fn(req, throwaway);
+        if (!sess)
+            return std::nullopt;
+        return dex_visible_fn(sess->username);
     };
 
     // PR1.9c: the caller-carrying sibling of the above. Same resolution, same
@@ -11608,8 +11631,9 @@ void RestApiV1::register_routes(
     // identity-linked device list -> deny_fleet_wide_service_scoped +
     // fail-closed success audit (dex.app.view), per the posture note above.
     sink.Get("/api/v1/dex/app", [perm_fn, audit_fn, guaranteed_state_store,
-                                 deny_fleet_wide_service_scoped](const httplib::Request& req,
-                                                                 httplib::Response& res) {
+                                 deny_fleet_wide_service_scoped,
+                                 resolve_dex_visible](const httplib::Request& req,
+                                                       httplib::Response& res) {
         const auto cid = detail::make_correlation_id();
         res.set_header("X-Correlation-Id", cid);
         if (deny_fleet_wide_service_scoped(
@@ -11655,8 +11679,15 @@ void RestApiV1::register_routes(
             return;
         }
         const std::string since = dex_iso_since(dex_window_to_days(window));
-        const auto model =
-            build_dex_app_model(guaranteed_state_store, name, window, since, /*visible=*/nullptr);
+        // #4035 hardening (governance): confine the affected-devices list to
+        // the caller's management-group scope (ADR-0017 World A) — the
+        // service-scoped-token axis is already closed above by
+        // deny_fleet_wide_service_scoped; this closes the independent
+        // confined-OPERATOR axis the equivalent /fragments/dex/app fragment
+        // already applies via resolve_visible (dex_routes.cpp).
+        const auto vis = resolve_dex_visible(req);
+        const auto model = build_dex_app_model(guaranteed_state_store, name, window, since,
+                                               vis ? &*vis : nullptr);
         res.set_content(ok_json(dex_app_json(model)), "application/json");
     });
 
@@ -11805,8 +11836,9 @@ void RestApiV1::register_routes(
     // + fail-closed success audit (dex.overview.view), per the posture note above.
     sink.Get("/api/v1/dex/overview",
              [perm_fn, audit_fn, guaranteed_state_store, dex_fleet_fn,
-              deny_fleet_wide_service_scoped](const httplib::Request& req,
-                                              httplib::Response& res) {
+              deny_fleet_wide_service_scoped,
+              resolve_dex_visible](const httplib::Request& req,
+                                    httplib::Response& res) {
                  const auto cid = detail::make_correlation_id();
                  res.set_header("X-Correlation-Id", cid);
                  if (deny_fleet_wide_service_scoped(
@@ -11850,9 +11882,13 @@ void RestApiV1::register_routes(
                  }
                  const std::string since = dex_iso_since(window_days);
                  const DexFleet fleet = dex_fleet_fn ? dex_fleet_fn() : DexFleet{};
+                 // #4035 hardening (governance): confine the top-devices list
+                 // to the caller's management-group scope (ADR-0017 World A) —
+                 // same independent second belt as GET /api/v1/dex/app above.
+                 const auto vis = resolve_dex_visible(req);
                  const auto model = build_dex_overview_model(guaranteed_state_store, fleet, window,
                                                               window_days, since,
-                                                              /*visible=*/nullptr);
+                                                              vis ? &*vis : nullptr);
                  res.set_content(ok_json(dex_overview_json(model)), "application/json");
              });
 
@@ -11931,6 +11967,18 @@ void RestApiV1::register_routes(
             }
             if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
                 return;
+            // #4035 hardening (governance): every sibling DEX route in this
+            // file explicit-503s on a null store BEFORE the read; this one
+            // didn't, so a genuinely-unavailable store rendered the SAME 404
+            // as "no such observation" — storage-layer failure masked as
+            // not-found (build_dex_observation_model folds !store into
+            // nullopt, same as the not-found/foreign-device cases).
+            if (!guaranteed_state_store) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                "application/json");
+                return;
+            }
             // Same oracle-closed contract as the fragment
             // (dex_routes.cpp:2916): a guessed/foreign event_id and a
             // genuinely-absent one both resolve to the SAME 404, so neither

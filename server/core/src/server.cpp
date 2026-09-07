@@ -21795,7 +21795,13 @@ private:
             // above already received — see its doc comment (defined once,
             // just above the DexRoutes registration) for why this must be
             // the identical lambda, not a second copy.
-            dex_fleet_fn);
+            dex_fleet_fn,
+            // #4035 hardening (governance): the SAME visible_set_fn
+            // DexRoutes::register_routes above already received (defined
+            // once, just above the DexRoutes registration) — GET
+            // /api/v1/dex/app and GET /api/v1/dex/overview confine their
+            // device lists the identical way the dashboard fragments do.
+            visible_set_fn);
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -21957,6 +21963,11 @@ private:
             // the DexRoutes registration) for why this must be the identical
             // lambda, not a second copy.
             mcp_server_->set_dex_fleet_fn(dex_fleet_fn);
+            // #4035 hardening (governance): the SAME visible_set_fn wired into
+            // the REST registration's trailing dex_visible_fn param above, so
+            // get_dex_app/get_dex_overview confine their device lists the
+            // identical way their REST twins and the dashboard fragments do.
+            mcp_server_->set_dex_visible_fn(visible_set_fn);
             // PR1.5c/1.6c (p14) — ADR-0031 operator surface MCP twins,
             // wired UNCONDITIONALLY exactly like kek_ops above (never
             // gated behind an unrelated conditional — see the KEK comment

@@ -270,6 +270,15 @@ struct RestGsHarness {
     // at request time, letting a test mutate it after construction.
     yuzu::server::DexFleet dex_fleet_override_;
 
+    // #4035 hardening (governance): the visible-agent-set resolver for GET
+    // /api/v1/dex/app and GET /api/v1/dex/overview (ADR-0017 World A
+    // confinement — ind. of the service-scoped-token deny belt above).
+    // nullopt (default) = unfiltered, matching every EXISTING test in this
+    // file (and matching an unwired dex_visible_fn / RBAC-off / global-read
+    // production posture). A test proving confinement sets this to a
+    // specific agent set before issuing the request.
+    std::optional<std::set<std::string>> dex_visible_override_;
+
     // What the wired VERIFY cohort provider returns (default = present-but-empty
     // CohortRead → the compare reads "insufficient"). A test sets member_count +
     // rows to drive the paired-compare path, or sets it to nullopt to prove the
@@ -538,7 +547,14 @@ struct RestGsHarness {
                             /*fleet_read_fn=*/{},
                             // #4035: reads dex_fleet_override_ LIVE at request
                             // time (see that field's doc comment).
-                            RestApiV1::DexFleetFn{[this]() { return dex_fleet_override_; }});
+                            RestApiV1::DexFleetFn{[this]() { return dex_fleet_override_; }},
+                            // #4035 hardening (governance): reads
+                            // dex_visible_override_ LIVE at request time
+                            // (ignores `username` — this stub doesn't model
+                            // per-username resolution, only whether the
+                            // caller's set is engaged).
+                            RestApiV1::DexVisibleFn{
+                                [this](const std::string&) { return dex_visible_override_; }});
     }
 
     // The fleet /status route's real AuthRoutes::require_list_read gate needs
@@ -2043,6 +2059,55 @@ TEST_CASE("REST dex/app: blast-radius drill, audited, service-scoped token denie
     CHECK(denied->status == 403);
 }
 
+// #4035 hardening (governance): closure evidence for the ADR-0017 World A
+// confinement gap — GET /api/v1/dex/app's devices[] list previously ALWAYS
+// passed visible=nullptr to the shared builder regardless of the caller's
+// management-group scope, unlike its own /fragments/dex/app dashboard
+// fragment (which confines via resolve_visible). A management-group-confined
+// operator could read affected agent_ids fleet-wide through this route even
+// though the equivalent dashboard fragment would have hidden them.
+TEST_CASE("REST dex/app: devices[] confined to the caller's visible set "
+          "(ADR-0017 World A — regression coverage for the governance fix)",
+          "[pg][rest][dex][app][scope]") {
+    RestGsHarness h;
+    h.seed_obs("s1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.seed_obs("s2", "WS-2", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
+
+    // Unconfined (default, matches production RBAC-off / global-read): both
+    // devices are visible.
+    auto unconfined = h.sink.Get("/api/v1/dex/app?name=chrome.exe&window=all");
+    REQUIRE(unconfined);
+    CHECK(unconfined->status == 200);
+    auto uj = nlohmann::json::parse(unconfined->body);
+    CHECK(uj["data"]["devices"].size() == 2);
+
+    // Confined to WS-1 only (simulating a management-group-scoped operator):
+    // WS-2 must NEVER appear, even though the aggregate crash COUNT still
+    // reflects the whole fleet (the SCOPING NOTE's tracked, separate,
+    // aggregate-numerator follow-up — not this fix's scope).
+    h.dex_visible_override_ = std::set<std::string>{"WS-1"};
+    auto confined = h.sink.Get("/api/v1/dex/app?name=chrome.exe&window=all");
+    REQUIRE(confined);
+    CHECK(confined->status == 200);
+    auto cj = nlohmann::json::parse(confined->body);
+    REQUIRE(cj["data"]["devices"].is_array());
+    CHECK(cj["data"]["devices"].size() == 1);
+    CHECK(cj["data"]["devices"][0]["agent_id"].get<std::string>() == "WS-1");
+    for (const auto& d : cj["data"]["devices"])
+        CHECK(d["agent_id"].get<std::string>() != "WS-2");
+
+    // Confined to a DISJOINT set (simulating an operator with no visibility
+    // into either device): devices[] is empty, never a 403/404 — matching
+    // the fragment's own admit-then-filter posture (ADR-0017 INV-2: engaged-
+    // empty is a legitimate, distinct outcome from "unfiltered").
+    h.dex_visible_override_ = std::set<std::string>{};
+    auto empty_scope = h.sink.Get("/api/v1/dex/app?name=chrome.exe&window=all");
+    REQUIRE(empty_scope);
+    CHECK(empty_scope->status == 200);
+    auto ej = nlohmann::json::parse(empty_scope->body);
+    CHECK(ej["data"]["devices"].empty());
+}
+
 TEST_CASE("REST dex/apps: app-centric stability list, no audit (aggregate)",
           "[pg][rest][dex][apps]") {
     RestGsHarness h;
@@ -2146,6 +2211,35 @@ TEST_CASE("REST dex/overview: fleet summary, audited, service-scoped token denie
     auto denied = h2.sink.Get("/api/v1/dex/overview");
     REQUIRE(denied);
     CHECK(denied->status == 403);
+}
+
+// #4035 hardening (governance): closure evidence for the ADR-0017 World A
+// confinement gap on GET /api/v1/dex/overview's top_devices[] — same defect
+// class and same fix as GET /api/v1/dex/app above.
+TEST_CASE("REST dex/overview: top_devices[] confined to the caller's visible set "
+          "(ADR-0017 World A — regression coverage for the governance fix)",
+          "[pg][rest][dex][overview][scope]") {
+    RestGsHarness h;
+    h.seed_obs("t1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.seed_obs("t2", "WS-2", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
+
+    auto unconfined = h.sink.Get("/api/v1/dex/overview?window=all");
+    REQUIRE(unconfined);
+    CHECK(unconfined->status == 200);
+    auto uj = nlohmann::json::parse(unconfined->body);
+    REQUIRE(uj["data"]["top_devices"].is_array());
+    CHECK(uj["data"]["top_devices"].size() == 2);
+
+    h.dex_visible_override_ = std::set<std::string>{"WS-1"};
+    auto confined = h.sink.Get("/api/v1/dex/overview?window=all");
+    REQUIRE(confined);
+    CHECK(confined->status == 200);
+    auto cj = nlohmann::json::parse(confined->body);
+    REQUIRE(cj["data"]["top_devices"].is_array());
+    CHECK(cj["data"]["top_devices"].size() == 1);
+    CHECK(cj["data"]["top_devices"][0]["agent_id"].get<std::string>() == "WS-1");
+    for (const auto& d : cj["data"]["top_devices"])
+        CHECK(d["agent_id"].get<std::string>() != "WS-2");
 }
 
 TEST_CASE("REST dex/devices/{id}/history: per-device signal history, audited dex.device.view "

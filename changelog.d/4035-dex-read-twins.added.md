@@ -9,11 +9,14 @@
   worker previously had no machine-readable access to. Every pair shares one
   pure builder function (`dex_read_model.hpp`) so the REST and MCP response
   shapes cannot drift (per `docs/api-twin-recipe.md`'s Rule 1). `app`/`overview`
-  fail-closed audit (`dex.app.view`/`dex.overview.view`) on their fleet-wide
-  affected-device lists; `device/history` and `observation` reuse the existing
-  per-device scoped gate + `dex.device.view`/`dex.observation.view` audit
-  verbs; `apps`/`catalogue/group`/`health`/`trends` are fleet aggregates with
-  no per-agent identity and are not audited.
+  fail-closed audit (`dex.app.view`/`dex.overview.view`) on their affected-
+  device lists, which are confined to the caller's management-group scope
+  (ADR-0017 World A) exactly like the equivalent dashboard fragments — the
+  crash/health aggregates themselves remain fleet-wide; `device/history` and
+  `observation` reuse the existing per-device scoped gate +
+  `dex.device.view`/`dex.observation.view` audit verbs; `apps`/`catalogue/group`/
+  `health`/`trends` are fleet aggregates with no per-agent identity and are not
+  audited.
 
   Known gap (tracked, not closed by this change): the corresponding
   `/fragments/dex/*` dashboard renderers still take a store handle and

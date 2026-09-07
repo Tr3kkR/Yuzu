@@ -607,8 +607,8 @@ static const ToolDef kTools[] = {
     {"get_dex_app",
      "App blast-radius drill: crash/hang summary + faulting modules + exception codes + the "
      "affected-device list for one application. The devices list names affected agent IDs "
-     "(behavioral data) — every call is audit-logged (dex.app.view). Mirrors GET "
-     "/api/v1/dex/app. Requires GuaranteedState:Read.",
+     "(behavioral data), confined to the caller's management-group scope — every call is "
+     "audit-logged (dex.app.view). Mirrors GET /api/v1/dex/app. Requires GuaranteedState:Read.",
      R"j({"type":"object","properties":{)j"
      R"j("name":{"type":"string","minLength":1,"maxLength":512,"description":"Process image name, e.g. notepad.exe"},)j"
      R"j("window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"})j"
@@ -707,9 +707,9 @@ static const ToolDef kTools[] = {
     {"get_dex_overview",
      "The /dex landing page's fleet summary: per-device experience score distribution + "
      "Device/App/Network composite, measured crash-free rate, top apps, and the most-affected- "
-     "devices list. The devices list names affected agent IDs (behavioral data) — every call is "
-     "audit-logged (dex.overview.view). Mirrors GET /api/v1/dex/overview. Requires "
-     "GuaranteedState:Read.",
+     "devices list. The devices list names affected agent IDs (behavioral data), confined to "
+     "the caller's management-group scope — every call is audit-logged (dex.overview.view). "
+     "Mirrors GET /api/v1/dex/overview. Requires GuaranteedState:Read.",
      R"j({"type":"object","properties":{"window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"}}})j",
      R"j({"type":"object","properties":{)j"
      R"j("window":{"type":"string"},"overall_experience":{"type":"integer"},"device_score":{"type":"integer"},"app_score":{"type":"integer"},"network_score":{"type":"integer"},)j"
@@ -7757,8 +7757,16 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const std::string since = dex_iso_since(dex_window_to_days(window));
+                // #4035 hardening (governance): confine the affected-devices
+                // list to the caller's management-group scope (ADR-0017 World
+                // A) -- deny_fleet_wide_service_scoped above closes the
+                // service-scoped-token axis only; this is the independent
+                // confined-OPERATOR axis the REST twin now also applies (see
+                // rest_api_v1.cpp's GET /dex/app handler).
+                const std::optional<std::set<std::string>> vis =
+                    dex_visible_fn_ ? dex_visible_fn_(session->username) : std::nullopt;
                 const auto model = build_dex_app_model(guaranteed_state_store, name, window, since,
-                                                       /*visible=*/nullptr);
+                                                       vis ? &*vis : nullptr);
                 // Fail-closed success audit (matches REST twin's posture --
                 // see rest_api_v1.cpp's route comment above GET /dex/app).
                 const bool audit_ok = yuzu::server::detail::try_persist_audit(
@@ -7928,6 +7936,19 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
                     return; // the gate wrote its own 401/403
+                // #4035 hardening (governance): every sibling DEX tool in this
+                // file explicit-errors on a null store BEFORE the read; this
+                // one didn't, so a genuinely-unavailable store returned the
+                // SAME "observation not found" as a real 404 -- storage-layer
+                // failure masked as not-found (build_dex_observation_model
+                // folds !store into nullopt, same as the not-found/foreign-
+                // device cases). Matches the REST twin's fix (rest_api_v1.cpp).
+                if (!guaranteed_state_store) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Guaranteed State store unavailable"),
+                        "application/json");
+                    return;
+                }
                 // Same oracle-closed contract as the fragment/REST twin: a
                 // guessed/foreign event_id and a genuinely-absent one both
                 // resolve to the SAME error, revealing nothing beyond what
@@ -8054,9 +8075,14 @@ McpServer::HandlerFn McpServer::build_handler(
                 const int window_days = dex_window_to_days(window);
                 const std::string since = dex_iso_since(window_days);
                 const DexFleet fleet = dex_fleet_fn_ ? dex_fleet_fn_() : DexFleet{};
+                // #4035 hardening (governance): confine the top-devices list
+                // to the caller's management-group scope (ADR-0017 World A) --
+                // same independent second belt as get_dex_app above.
+                const std::optional<std::set<std::string>> vis =
+                    dex_visible_fn_ ? dex_visible_fn_(session->username) : std::nullopt;
                 const auto model = build_dex_overview_model(guaranteed_state_store, fleet, window,
                                                             window_days, since,
-                                                            /*visible=*/nullptr);
+                                                            vis ? &*vis : nullptr);
                 // Fail-closed success audit (matches REST twin's posture --
                 // see rest_api_v1.cpp's route comment above GET /dex/overview).
                 const bool audit_ok = yuzu::server::detail::try_persist_audit(
