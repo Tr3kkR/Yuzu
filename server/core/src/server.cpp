@@ -20660,11 +20660,16 @@ private:
 
         // EnrollmentDirectoryRoutes — #4031 REST v1 read twins:
         // /api/v1/directory/{users,status}, /api/v1/enrollment/{auto-approve-rules,
-        // pending-agents}, /api/v1/settings/oidc.
+        // pending-agents}, /api/v1/settings/oidc. `fleet_read_fn` (constructed
+        // above, already wired into RestApiV1/dashboard_routes_) is the
+        // ADR-0017 admit-then-filter gate for pending-agents alone — see this
+        // class's own header comment for why the other four routes stay on
+        // `perm_fn`.
         enrollment_directory_routes_ = std::make_unique<EnrollmentDirectoryRoutes>();
         enrollment_directory_routes_->register_routes(*web_server_, auth_fn, perm_fn, audit_fn,
                                                        directory_sync_.get(), &auto_approve_,
-                                                       &auth_mgr_, &cfg_, oidc_mu_);
+                                                       &auth_mgr_, &cfg_, oidc_mu_,
+                                                       fleet_read_fn);
 
         // -- PKI PR4: internal-CA REST surface (/api/v1/ca/*) ---------------------
         // The publish-CRL callback captures `this`; like the agent-cert signer it

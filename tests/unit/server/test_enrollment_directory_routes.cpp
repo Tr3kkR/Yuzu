@@ -24,6 +24,7 @@
  *     Directory
  */
 
+#include "authz_gates.hpp" // authz::FleetReadGate — the pending-agents ADR-0017 fake gate
 #include "enrollment_directory_routes.hpp"
 #include "test_directory_sync_pg_helper.hpp"
 #include "test_route_sink.hpp"
@@ -37,6 +38,7 @@
 
 #include <shared_mutex>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 using namespace yuzu::server;
@@ -70,6 +72,16 @@ struct EnrollmentDirectoryRouteHarness {
     std::vector<AuditRecord> audit_log;
     bool audit_persists{true};
 
+    // #4031 hardening: pending-agents alone gates on fleet_read_fn (ADR-0017)
+    // instead of perm_fn — a separate fake so denial/admit/scope are testable
+    // independently of the (now-unrelated, for this one route) perm_calls
+    // tracking above. `fleet_scope` default (nullopt) = unfiltered TOP,
+    // matching an Administrator's real AdmitAll result; a test that wants to
+    // exercise the AdmitScoped/empty-intersection path sets it explicitly.
+    bool fleet_admit{true};
+    authz::VisibleSet fleet_scope;
+    std::vector<PermCall> fleet_read_calls;
+
     yuzu::server::test::TestRouteSink sink;
     EnrollmentDirectoryRoutes routes;
 
@@ -96,9 +108,19 @@ struct EnrollmentDirectoryRouteHarness {
             audit_log.push_back({a, r, tt, ti, d});
             return audit_persists;
         };
+        auto fleet_read_fn = [this](const httplib::Request&, httplib::Response& res,
+                                    const std::string& securable,
+                                    const std::string& op) -> authz::FleetReadGate {
+            fleet_read_calls.push_back({securable, op});
+            if (!fleet_admit) {
+                res.status = 403;
+                return authz::FleetReadGate{}; // admitted=false, scope=deny_all() default
+            }
+            return authz::FleetReadGate{true, fleet_scope};
+        };
 
         routes.register_routes(sink, auth_fn, perm_fn, audit_fn, directory_sync, &auto_approve,
-                               &auth_mgr, &cfg, oidc_mu);
+                               &auth_mgr, &cfg, oidc_mu, fleet_read_fn);
     }
 };
 
@@ -158,18 +180,27 @@ TEST_CASE("REST enrollment/directory: perm_fn denial 403s auto-approve-rules on 
     CHECK(h.audit_log.empty());
 }
 
-TEST_CASE("REST enrollment/directory: perm_fn denial 403s pending-agents on Enrollment:Read",
+TEST_CASE("REST enrollment/directory: fleet_read_fn denial 403s pending-agents on "
+          "Enrollment:Read (#4031 hardening -- migrated off perm_fn onto the ADR-0017 "
+          "admit-then-filter chokepoint; NEVER stacked with perm_fn, see authz_gates.hpp's "
+          "own falsifier)",
           "[rest][enrollment_directory]") {
     EnrollmentDirectoryRouteHarness h;
-    h.perm_grant = false;
+    h.fleet_admit = false;
     auto res = h.sink.Get("/api/v1/enrollment/pending-agents");
     REQUIRE(res);
     CHECK(res->status == 403);
-    REQUIRE_FALSE(h.perm_calls.empty());
-    CHECK(h.perm_calls.size() == 1);
-    CHECK(h.perm_calls.back().securable == "Enrollment");
-    CHECK(h.perm_calls.back().operation == "Read");
+    REQUIRE_FALSE(h.fleet_read_calls.empty());
+    CHECK(h.fleet_read_calls.size() == 1);
+    CHECK(h.fleet_read_calls.back().securable == "Enrollment");
+    CHECK(h.fleet_read_calls.back().operation == "Read");
     CHECK(h.audit_log.empty());
+    // Never-stacked regression pin: perm_fn must not be consulted at all for
+    // this route any more -- a re-added perm_fn call ahead of/behind
+    // fleet_read_fn is the exact BLOCKING defect authz_gates.hpp's own doc
+    // comment warns about (it makes the AdmitScoped branch permanently
+    // unreachable for a management-group-scoped-only caller).
+    CHECK(h.perm_calls.empty());
 }
 
 TEST_CASE("REST enrollment/directory: perm_fn denial 403s settings/oidc on OidcConfig:Read — "
@@ -275,8 +306,42 @@ TEST_CASE("REST enrollment/directory: pending-agents 503s when auth_mgr is null 
                        const std::string&, const std::string&, const std::string&) {
         return true;
     };
+    // Wire a permissive fleet_read_fn -- pending-agents' sole gate is now
+    // this, not perm_fn (above), so leaving it unwired (default `{}`) would
+    // 503 for "fleet-read authorization gate unavailable" instead of the
+    // auth_mgr-null reason this test claims to exercise.
+    auto fleet_read_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                            const std::string&) -> authz::FleetReadGate {
+        return authz::FleetReadGate{true, std::nullopt};
+    };
     routes2.register_routes(sink2, auth_fn, perm_fn, audit_fn, nullptr, nullptr, nullptr, &h.cfg,
-                            h.oidc_mu);
+                            h.oidc_mu, fleet_read_fn);
+    auto res = sink2.Get("/api/v1/enrollment/pending-agents");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+}
+
+TEST_CASE("REST enrollment/directory: pending-agents 503s when fleet_read_fn is unwired "
+          "(#4031 hardening -- misconfiguration fails closed, mirrors the "
+          "GET /api/v1/inventory/software precedent)",
+          "[rest][enrollment_directory]") {
+    yuzu::server::test::TestRouteSink sink2;
+    EnrollmentDirectoryRoutes routes2;
+    auto auth_fn = [](const httplib::Request&, httplib::Response&)
+        -> std::optional<auth::Session> { return auth::Session{}; };
+    auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                      const std::string&) { return true; };
+    auto audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
+                       const std::string&, const std::string&, const std::string&) {
+        return true;
+    };
+    auth::AutoApproveEngine auto_approve;
+    auth::AuthManager auth_mgr;
+    Config cfg;
+    std::shared_mutex oidc_mu;
+    // fleet_read_fn left at its default `{}` -- deliberately unwired.
+    routes2.register_routes(sink2, auth_fn, perm_fn, audit_fn, nullptr, &auto_approve, &auth_mgr,
+                            &cfg, oidc_mu);
     auto res = sink2.Get("/api/v1/enrollment/pending-agents");
     REQUIRE(res);
     CHECK(res->status == 503);
@@ -358,6 +423,50 @@ TEST_CASE("REST enrollment/directory: pending-agents includes denied agents (onl
     REQUIRE(j["data"].size() == 1);
     CHECK(j["data"][0]["agent_id"] == "agent-3");
     CHECK(j["data"][0]["status"] == "denied");
+}
+
+// ── pending-agents: ADR-0017 scope filtering (#4031 hardening) ────────────
+
+TEST_CASE("REST enrollment/directory: pending-agents narrows to an engaged scope -- an "
+          "out-of-scope pending agent is dropped, an in-scope one is kept",
+          "[rest][enrollment_directory]") {
+    EnrollmentDirectoryRouteHarness h;
+    h.auth_mgr.add_pending_agent("agent-1", "host1.example.com", "linux", "x86_64", "1.2.3");
+    h.auth_mgr.add_pending_agent("agent-3", "host3.example.com", "macos", "arm64", "1.2.3");
+    // Engaged (non-nullopt) scope containing only agent-1 -- simulates a
+    // management-group-scoped `fleet_read_fn` admit, distinct from the
+    // harness default's unfiltered TOP.
+    h.fleet_scope = std::unordered_set<std::string>{"agent-1"};
+
+    auto res = h.sink.Get("/api/v1/enrollment/pending-agents");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j["data"].is_array());
+    REQUIRE(j["data"].size() == 1);
+    CHECK(j["data"][0]["agent_id"] == "agent-1");
+    CHECK(j["pagination"]["total"] == 1);
+}
+
+TEST_CASE("REST enrollment/directory: pending-agents admitted-empty scope -- 200 with an EMPTY "
+          "list, never a 403 (the exact 'correct confined answer' claim the #4031 hardening "
+          "fix rests on: a pending agent holds no management-group membership yet, so a "
+          "scoped-only grant's real intersection is always empty, not a denial)",
+          "[rest][enrollment_directory]") {
+    EnrollmentDirectoryRouteHarness h;
+    h.auth_mgr.add_pending_agent("agent-1", "host1.example.com", "linux", "x86_64", "1.2.3");
+    // Engaged-empty scope (authz::deny_all() shape) -- admitted, but the
+    // real visible-agent intersection is empty.
+    h.fleet_scope = std::unordered_set<std::string>{};
+
+    auto res = h.sink.Get("/api/v1/enrollment/pending-agents");
+    REQUIRE(res);
+    CHECK(res->status == 200); // admitted, not denied -- this is the whole point of the fix
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j["data"].is_array());
+    CHECK(j["data"].empty());
+    CHECK(j["pagination"]["total"] == 0);
 }
 
 // ── settings/oidc: success shape + secret masking (in-memory, no PG) ──────

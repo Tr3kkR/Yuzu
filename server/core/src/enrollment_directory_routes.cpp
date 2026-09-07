@@ -43,10 +43,12 @@ void EnrollmentDirectoryRoutes::register_routes(httplib::Server& svr, AuthFn aut
                                                 DirectorySync* directory_sync,
                                                 auth::AutoApproveEngine* auto_approve,
                                                 auth::AuthManager* auth_mgr, Config* cfg,
-                                                std::shared_mutex& oidc_mu) {
+                                                std::shared_mutex& oidc_mu,
+                                                FleetReadFn fleet_read_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
-                    directory_sync, auto_approve, auth_mgr, cfg, oidc_mu);
+                    directory_sync, auto_approve, auth_mgr, cfg, oidc_mu,
+                    std::move(fleet_read_fn));
 }
 
 void EnrollmentDirectoryRoutes::register_routes(HttpRouteSink& sink, AuthFn /*auth_fn*/,
@@ -54,7 +56,8 @@ void EnrollmentDirectoryRoutes::register_routes(HttpRouteSink& sink, AuthFn /*au
                                                 DirectorySync* directory_sync,
                                                 auth::AutoApproveEngine* auto_approve,
                                                 auth::AuthManager* auth_mgr, Config* cfg,
-                                                std::shared_mutex& oidc_mu) {
+                                                std::shared_mutex& oidc_mu,
+                                                FleetReadFn fleet_read_fn) {
     // ── GET /api/v1/directory/users — Directory:Read ────────────────────
     // Genuinely PII (email/UPN/group membership) — REST fails CLOSED on an
     // audit-persist failure (docs/api-twin-recipe.md §4), matching the
@@ -135,15 +138,51 @@ void EnrollmentDirectoryRoutes::register_routes(HttpRouteSink& sink, AuthFn /*au
                 res.set_content(ok_json(data), "application/json");
             });
 
-    // ── GET /api/v1/enrollment/pending-agents — Enrollment:Read ─────────
+    // ── GET /api/v1/enrollment/pending-agents — Enrollment:Read, ADR-0017 ──
     // #520 decision: REST-only, no MCP twin — see file header. Audited
     // (non-blocking): device-identity fingerprint data, "a lighter version
     // of the device_ci GDPR-personal-data-adjacent class" per the #4031
     // issue text — enough to warrant a log entry, not per-person PII in the
     // directory.users.view sense, so not fail-closed.
+    //
+    // CONFINEMENT (#4031 hardening round, post-merge adversarial review):
+    // this is the ONE route among the five in this file whose rows carry
+    // genuine per-agent identity (`auth::PendingAgent::agent_id` +
+    // hostname/os/arch/agent_version) — see this file's header comment.
+    // `.claude/routed-concerns.md` row 1 (ADR-0017 "World A"): "Every new
+    // list/fan-out read of per-agent data MUST use the admit-then-filter
+    // authorize_list_read chokepoint — never a bare global
+    // require_permission". Gates on `fleet_read_fn` (the transport-layer
+    // seam for `AuthRoutes::require_fleet_read`) as its SOLE gate — never
+    // stacked with `perm_fn` (pairing them makes the AdmitScoped branch
+    // permanently unreachable, since `check_permission` never consults
+    // `ManagementGroupStore`; see `authz_gates.hpp`'s falsifier).
+    //
+    // UNDER-ADMISSION, not disclosure: the defect the bare `perm_fn` gate
+    // had was NOT a fleet-wide leak to a scoped caller — `check_permission`
+    // resolves only global/direct-role grants (`RbacStore::collect_roles`),
+    // so a caller holding ONLY a management-group-scoped `Enrollment:Read`
+    // grant was 403'd outright, never shown anyone's data. The bug was that
+    // the scoped-grant feature the product's own docs (docs/user-manual/
+    // rbac.md) instruct operators to use was silently inert for this route.
+    // Since a pending (not-yet-approved) agent holds no management-group
+    // membership by construction, the correct confined answer is an
+    // ADMITTED, EMPTY 200 — exactly what `authz::in_scope` below produces
+    // once `fleet_read_fn` is wired as the real gate, rather than a 403 that
+    // masks a working RBAC grant as a permission error.
     sink.Get("/api/v1/enrollment/pending-agents",
-            [perm_fn, audit_fn, auth_mgr](const httplib::Request& req, httplib::Response& res) {
-                if (!perm_fn(req, res, "Enrollment", "Read"))
+            [fleet_read_fn, audit_fn, auth_mgr](const httplib::Request& req,
+                                                httplib::Response& res) {
+                if (!fleet_read_fn) {
+                    respond_service_unavailable(res, "fleet-read authorization gate");
+                    return;
+                }
+                // require_fleet_read renders 401/403/503 itself and returns
+                // !admitted on denial — see the comment above this route and
+                // authz_gates.hpp's own doc comment for why this must stay
+                // the sole gate.
+                auto gate = fleet_read_fn(req, res, "Enrollment", "Read");
+                if (!gate.admitted)
                     return;
                 if (!auth_mgr) {
                     respond_service_unavailable(res, "auth manager");
@@ -167,10 +206,21 @@ void EnrollmentDirectoryRoutes::register_routes(HttpRouteSink& sink, AuthFn /*au
                 // duplicate this filter predicate rather than sharing one -- a
                 // follow-up could route both through a single filtered accessor
                 // on AuthManager instead.
+                //
+                // Scope filter — `gate.scope` is the resolved meet(management-
+                // group, service-scope) VisibleSet (nullopt = unfiltered TOP;
+                // engaged, including empty, = filter to exactly these agents).
+                // A pending agent holds no management-group membership yet
+                // (enrollment/approval happens BEFORE group assignment), so a
+                // scoped caller's admitted result is always the empty set —
+                // the correct confined answer, not a widening.
                 nlohmann::json arr = nlohmann::json::array();
                 for (const auto& a : agents) {
-                    if (a.status != auth::PendingStatus::approved)
-                        arr.push_back(pending_agent_row_json(a));
+                    if (a.status == auth::PendingStatus::approved)
+                        continue;
+                    if (!authz::in_scope(gate.scope, a.agent_id))
+                        continue;
+                    arr.push_back(pending_agent_row_json(a));
                 }
                 res.set_content(list_json(arr, static_cast<int64_t>(arr.size())),
                                 "application/json");

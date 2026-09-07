@@ -37,10 +37,25 @@
 /// directory-sync section for the full explanation. Its REST v1 path lives
 /// under `/api/v1/settings/...` (not `/api/v1/directory/...`) specifically to
 /// avoid the collision.
+///
+/// CONFINEMENT (ADR-0017, #4031 hardening — adversarial review, post-merge):
+/// `GET /api/v1/enrollment/pending-agents` is the one route among these five
+/// whose rows carry genuine per-agent identity (`agent_id`, hostname, os,
+/// arch, agent_version — `auth::PendingAgent`) — the other four return
+/// human-identity rows, aggregate metadata, or rule/config objects, none of
+/// which ADR-0017 applies to. It therefore gates on `FleetReadFn`
+/// (`AuthRoutes::require_fleet_read`, the admit-then-filter chokepoint),
+/// NEVER `PermFn`, per `.claude/routed-concerns.md` row 1's MUST/never — see
+/// the route's own comment in enrollment_directory_routes.cpp for the
+/// under-admission scenario this closes (a management-group-scoped
+/// `Enrollment:Read` grant was previously 403'd outright instead of admitted
+/// with a scoped, here always-empty, result, since pre-enrollment agents
+/// hold no group membership).
 
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auto_approve.hpp>
 
+#include "authz_gates.hpp" // authz::FleetReadGate — ADR-0017 confinement for pending-agents
 #include "directory_sync.hpp"
 
 #include <httplib.h>
@@ -70,6 +85,25 @@ public:
     using AuditFn = std::function<bool(const httplib::Request&, const std::string& action,
                                        const std::string& result, const std::string& target_type,
                                        const std::string& target_id, const std::string& detail)>;
+    /// #4031 hardening: ADR-0017 admit-then-filter chokepoint
+    /// (`AuthRoutes::require_fleet_read`), the injected-callback seam
+    /// `RestApiV1`/`McpServer` already use (`rest_api_v1.hpp`'s own
+    /// `FleetReadFn` — this is a second, identical typedef rather than a
+    /// shared one because that header pulls in far more than this class
+    /// needs; the underlying gate is the SAME shared `AuthRoutes` method,
+    /// never reimplemented). MUST be `pending-agents`'s SOLE gate — never
+    /// stacked with `PermFn` (see `authz_gates.hpp`'s own doc comment for
+    /// why pairing them makes the `AdmitScoped` branch permanently
+    /// unreachable). Default `{}` exists ONLY for source-stability of the
+    /// OTHER four routes in this class, which stay on `PermFn` (none of them
+    /// read per-agent data — see this file's CONFINEMENT header comment); a
+    /// route that requires this gate treats an unwired fn as
+    /// misconfiguration and fails closed (503), mirroring `FleetReadFn`'s
+    /// contract everywhere else it's used.
+    using FleetReadFn =
+        std::function<authz::FleetReadGate(const httplib::Request&, httplib::Response&,
+                                           const std::string& securable_type,
+                                           const std::string& operation)>;
 
     /// Production entry point — wraps `svr` in HttplibRouteSink and delegates
     /// to the testable overload below (mirrors DiscoveryRoutes/DexRoutes).
@@ -86,14 +120,16 @@ public:
     /// SettingsRoutes/AuthRoutes for this exact purpose).
     void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
                          DirectorySync* directory_sync, auth::AutoApproveEngine* auto_approve,
-                         auth::AuthManager* auth_mgr, Config* cfg, std::shared_mutex& oidc_mu);
+                         auth::AuthManager* auth_mgr, Config* cfg, std::shared_mutex& oidc_mu,
+                         FleetReadFn fleet_read_fn = {});
 
     /// HttpRouteSink overload — used by tests to register routes against an
     /// in-process TestRouteSink and dispatch synthesised requests directly
     /// (no httplib::Server acceptor thread, the #438 TSan trap).
     void register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
                          DirectorySync* directory_sync, auth::AutoApproveEngine* auto_approve,
-                         auth::AuthManager* auth_mgr, Config* cfg, std::shared_mutex& oidc_mu);
+                         auth::AuthManager* auth_mgr, Config* cfg, std::shared_mutex& oidc_mu,
+                         FleetReadFn fleet_read_fn = {});
 };
 
 } // namespace yuzu::server
