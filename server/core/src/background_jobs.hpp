@@ -23,7 +23,13 @@
 ///   - FencedLeaderOnly     — side-effecting singleton work that double-fires
 ///                            across replicas (agent dispatch, CRL numbering).
 ///                            Runs only on the WS-3 fenced leader; ENFORCEMENT is
-///                            slice 10.3 (rides WS-3 3.2), not this file.
+///                            slice 10.3 (rides WS-3 3.2), not this file. ADDING a
+///                            FencedLeaderOnly pass REQUIRES wrapping its dispatch
+///                            site with `leader_gate_permits<background_job_class(
+///                            "<pass>")>(leader_elector_.get())` (leader_gate.hpp) —
+///                            the consteval class lookup pins the CLASS but not gate
+///                            PRESENCE, so a new row without a gate site compiles and
+///                            double-fires (adversarial review K5; CI sweep #4121).
 ///   - DisabledUntilFixed   — not yet replica-safe and not yet leader-gated; must
 ///                            not run per-replica until its named fix lands.
 ///
@@ -213,6 +219,21 @@ consteval int background_job_index(std::string_view pass) {
         if (kBackgroundJobs[i].pass == pass)
             return static_cast<int>(i);
     return -1;
+}
+
+/// The class of a background pass, resolved at COMPILE TIME (slice 3.2's runtime
+/// gate, `leader_gate.hpp`, dispatches on this). Pairs with
+/// `YUZU_ASSERT_BACKGROUND_JOB` at the same site: an unclassified `pass` throws
+/// in constant evaluation, which is a hard BUILD FAILURE — the gate can never be
+/// applied to an unclassified pass, and never silently defaults to a class. This
+/// is what makes the runtime leader-gate unable to drift from this table: change
+/// a pass's class here and its gate follows, because the gate reads it FROM here.
+consteval BackgroundJobClass background_job_class(std::string_view pass) {
+    const int i = background_job_index(pass);
+    if (i < 0)
+        throw "background pass is not classified in kBackgroundJobs "
+              "(server/core/src/background_jobs.hpp)";
+    return kBackgroundJobs[static_cast<std::size_t>(i)].cls;
 }
 
 /// Assert (at compile time) that a background pass is classified in

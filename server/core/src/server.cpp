@@ -170,6 +170,9 @@
 #include "preflight_runner.hpp"
 #include "tar_tree_routes.hpp"
 #include "background_jobs.hpp" // WS-10: pass-classification table + YUZU_ASSERT_BACKGROUND_JOB gate
+#include "coord_dsn.hpp"       // WS-3: build the elector's dedicated coordination DSN (testable)
+#include "leader_elector.hpp"  // WS-3: fenced leader-election primitive (ADR-2002 §3/§6/§10)
+#include "leader_gate.hpp"     // WS-3 3.2: runtime FencedLeaderOnly loop gate over kBackgroundJobs
 #include "policy_evaluator.hpp"
 #include "schedule_arming_check.hpp"
 #include "schedule_routes.hpp"
@@ -252,6 +255,7 @@ template <typename Req> auto yuzu_req_get_file(const Req& req, const std::string
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <atomic>
 #include <semaphore>
 #include <cctype>
@@ -270,6 +274,7 @@ template <typename Req> auto yuzu_req_get_file(const Req& req, const std::string
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <shared_mutex>
 #include <ranges>
 #include <set>
@@ -335,6 +340,38 @@ std::string trim_ascii_whitespace(std::string_view s) {
 }
 
 namespace {
+
+// ---- WS-3 slice 3.2: leader-election wiring helpers (ADR-2002 §3/§6/§10) ----
+
+// Election-loop cadences (steady_clock, immune to NTP jumps). A healthy follower
+// polls to acquire on kLeaderPoll; a leader heartbeats on the same cadence; a
+// connection failure backs off exponentially between kLeaderBackoffMin and
+// kLeaderBackoffMax so a repeated reconnect during a failover window does not
+// hammer Postgres (#4013). Jitter up to kLeaderJitterMax is added to every wait
+// so replicas do not stampede the lock in lockstep after a primary failover.
+constexpr std::chrono::seconds kLeaderPoll{5};
+constexpr std::chrono::seconds kLeaderBackoffMin{2};
+constexpr std::chrono::seconds kLeaderBackoffMax{30};
+constexpr std::chrono::seconds kLeaderJitterMax{3};
+
+// A boot-time random identity for the LeaderElector's leader_state.holder_id
+// (ADR-2002 §10 attributability; the elector fails closed on an empty one). Not
+// a security token — just enough entropy that two replicas' rows are
+// distinguishable in the leadership registry.
+std::string random_holder_id() {
+    std::random_device rd;
+    std::uniform_int_distribution<int> hex(0, 15);
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string id = "srv-";
+    for (int i = 0; i < 16; ++i)
+        id += kHex[hex(rd)];
+    return id;
+}
+
+// build_coord_dsn (the LeaderElector's dedicated coordination DSN, ADR-2002 §10)
+// moved to the header `coord_dsn.hpp` so it is unit-testable (test_coord_dsn.cpp) —
+// adversarial review K3/CDX-P2-03.
+
 // Best-effort row count for a legacy-file detect-and-warn check (currently
 // PolicyStore's boot path; postgres-store-playbook.md's Backfill bullet
 // mandates a count, not just file-existence, so a schema-only legacy file
@@ -3997,6 +4034,17 @@ public:
             }
         }
 
+        // WS-3 (ADR-2002 §3/§6/§10): the fenced leader elector + its election loop
+        // are constructed and STARTED in run(), NOT here — see the #1867-shaped
+        // block just before start_web_server(). Spawning the thread in the
+        // constructor is unsafe: ~3000 lines of construction follow, and a throw in
+        // any of them skips ~ServerImpl (so stop()'s join never runs), which would
+        // leave a joinable std::thread → std::terminate (cpp-safety BLOCKING, this
+        // review round). The elector OBJECT could live here safely (a constructed
+        // member is destroyed on a constructor throw), but keeping construction and
+        // loop-start together in run() is clearer and matches the NVD/web/health
+        // thread pattern.
+
         // First born-on-Postgres store (#1320 PR 3): last-known endpoint state,
         // so offline hosts render stale-flagged on /viz/fleet. Only built when
         // the substrate probe above succeeded (an unreachable database already
@@ -7113,6 +7161,18 @@ public:
                 // the CA key for an anonymous caller (the public handler is
                 // serve-or-503, it does NOT build). Best-effort: a failure just means
                 // /ca/crl returns 503 until the next revoke republishes.
+                //
+                // WS-3 note (adversarial review CDX-P1-01/K7): this boot-time one-shot
+                // is an AUTOMATIC CRL publish that is deliberately NOT leader-gated —
+                // it runs before the elector is constructed (below), and gating it
+                // would skip the boot CRL on the single-replica deployment (leadership
+                // is acquired asynchronously). It is a SEPARATE call site from WS-10's
+                // classified `ca.publish_crl` background pass (the freshness re-publish
+                // in the health loop, which IS gated). Cross-replica crlNumber-
+                // allocation atomicity for BOTH sites is WS-6's job (durable CRL
+                // numbering); until then a concurrent multi-replica *boot* could race
+                // the number — E6-capped today (single-replica is the only supported
+                // topology). Tracked: #4126 (WS-6).
                 if (!publish_crl())
                     spdlog::warn("PKI: initial CRL publish failed; GET /api/v1/ca/crl will 503 until "
                                  "the next revocation republishes");
@@ -7266,6 +7326,89 @@ public:
         // thread wedged in an uncancellable fetch.
         if (nvd_sync_) {
             nvd_sync_->start();
+        }
+
+        // WS-3 (ADR-2002 §3/§6/§10): construct the fenced leader elector and start
+        // its election loop HERE in run() — past every fail-closed check (same
+        // #1867 rationale as the NVD thread above: a construction/early-run failure
+        // returns before this point, so ~ServerImpl never has to join a thread that
+        // was never started), and BEFORE start_web_server() + the health thread
+        // below spawn the FencedLeaderOnly worker loops. Leadership is acquired
+        // ASYNCHRONOUSLY inside the election thread, typically within one round-trip
+        // of thread start, so a worker's very first tick may legitimately observe
+        // not-leader and skip once (harmless — ticks are periodic and single-replica
+        // acquisition is milliseconds); it is not a synchronous ordering guarantee
+        // (adversarial review K6/CDX-P2-05). The elector takes a DEDICATED coordination
+        // connection (§10), derived from the same reachable DSN the pool proved,
+        // augmented with connect_timeout + keepalives so a half-open backend fails
+        // fast rather than stalling the loop (#4013).
+        if (pg_pool_ && !startup_failed_) {
+            leader_elector_ = std::make_unique<LeaderElector>(LeaderElector::Config{
+                .dsn = build_coord_dsn(cfg_.postgres_dsn), .holder_id = random_holder_id()});
+            if (!leader_elector_->is_open()) {
+                // Do NOT fail boot. On the single-replica deployment the loop below
+                // re-acquires within one cycle and the gated loops resume; the pause
+                // touches ONLY the FencedLeaderOnly loops, which is the fail-closed
+                // posture (never double-dispatch), not a data-loss one. A persistent
+                // failure is a coordination-substrate problem (§10) — loud, never
+                // silent. WS-11 (#4014) adds the metric/alert/readyz surface.
+                spdlog::error("[HA] leader_elector could not open its coordination connection; "
+                              "FencedLeaderOnly background loops are PAUSED until leadership is "
+                              "acquired (single-replica: self-heals within one election cycle; "
+                              "persistent: a coordination-substrate fault, ADR-2002 §10)");
+            }
+            leader_thread_ = std::thread([this]() {
+                using namespace std::chrono;
+                spdlog::info("leader_elector: election loop started (poll={}s)", kLeaderPoll.count());
+                std::mt19937 rng{std::random_device{}()};
+                seconds backoff{0};
+                while (!stop_requested_.load(std::memory_order_acquire)) {
+                    // Per-iteration try/catch, mirroring the three sibling background
+                    // tick loops (policy/quarantine/schedule): an exception escaping a
+                    // std::thread entry is std::terminate — the whole process, over a
+                    // best-effort coordination iteration. The body allocates (rng, the
+                    // spdlog formats), so bad_alloc alone makes it reachable
+                    // (adversarial review K2/CDX-P2-02). Catch, log, keep leading/
+                    // polling.
+                    seconds wait = kLeaderPoll;
+                    try {
+                        // Sole writer of leadership state: heartbeat while leading, else
+                        // attempt to acquire. is_leader()/epoch() readers are lock-free.
+                        const bool leading = leader_elector_->is_leader()
+                                                 ? leader_elector_->heartbeat()
+                                                 : leader_elector_->try_acquire();
+                        if (leading || leader_elector_->is_open()) {
+                            // Leader (heartbeating), or a HEALTHY follower whose acquire
+                            // was simply refused because another replica holds the lock:
+                            // steady cadence, no backoff (fast failover).
+                            backoff = seconds{0};
+                            wait = kLeaderPoll;
+                        } else {
+                            // Connection trouble (is_open() went false): exponential
+                            // backoff so a reconnect storm during a failover window does
+                            // not hammer Postgres (#4013).
+                            backoff = backoff == seconds{0}
+                                          ? kLeaderBackoffMin
+                                          : std::min(backoff * 2, kLeaderBackoffMax);
+                            wait = backoff;
+                        }
+                        std::uniform_int_distribution<int> jitter(
+                            0, static_cast<int>(kLeaderJitterMax.count()));
+                        wait += seconds{jitter(rng)};
+                    } catch (const std::exception& e) {
+                        spdlog::error("leader_elector: election iteration threw ({}) — continuing",
+                                      e.what());
+                        wait = kLeaderBackoffMin; // brief backoff so a persistent throw can't spin
+                    } catch (...) {
+                        spdlog::error("leader_elector: election iteration threw unknown — continuing");
+                        wait = kLeaderBackoffMin;
+                    }
+                    for (seconds::rep i = 0;
+                         i < wait.count() && !stop_requested_.load(std::memory_order_acquire); ++i)
+                        std::this_thread::sleep_for(seconds{1});
+                }
+                spdlog::info("leader_elector: election loop stopped");
+            });
         }
 
         // Create AuthRoutes — must precede start_web_server which uses it
@@ -7702,11 +7845,22 @@ public:
                             !latest || (latest->next_update - now_epoch) < 24 * 3600;
                         if (stale) {
                             YUZU_ASSERT_BACKGROUND_JOB("ca.publish_crl"); // WS-10 FencedLeaderOnly (crlNumber)
-                            if (publish_crl())
-                                spdlog::info(
-                                    "PKI: CRL re-published for freshness (nextUpdate window)");
-                            else
-                                crl_freshness_retry_after_ = now_steady + std::chrono::minutes(5);
+                            // WS-3 3.2: the background freshness re-publish bumps
+                            // crlNumber (a DB single-writer), so gate it to the fenced
+                            // leader — two replicas must not diverge the number. The
+                            // OPERATOR revoke path (ca_routes.cpp) publishes on its own
+                            // plane and is deliberately NOT gated here (two-dispatch-
+                            // planes rule; it carries no background-job assert).
+                            // Numbering correctness itself is WS-6.
+                            if (leader_gate_permits<background_job_class("ca.publish_crl")>(
+                                    leader_elector_.get())) {
+                                if (publish_crl())
+                                    spdlog::info(
+                                        "PKI: CRL re-published for freshness (nextUpdate window)");
+                                else
+                                    crl_freshness_retry_after_ =
+                                        now_steady + std::chrono::minutes(5);
+                            }
                         }
                     }
                 }
@@ -8775,6 +8929,20 @@ public:
             schedule_tick_thread_.join();
         }
         schedule_runner_.reset();
+
+        // WS-3 (ADR-2002 §3): stop the election loop and resign leadership. Joined
+        // here, AFTER every FencedLeaderOnly worker thread that reads is_leader()
+        // is joined, so no tick observes leadership after we resign; the elector
+        // (dedicated connection, no pg_pool_ dependency) outlives the join and is
+        // destroyed at ~ServerImpl. stop_requested_ was set at the top of stop(),
+        // so the loop has already stopped re-acquiring. resign() hands the lock
+        // back promptly for a clean handover rather than waiting for the session
+        // connection to drop.
+        if (leader_elector_)
+            leader_elector_->resign();
+        if (leader_thread_.joinable()) {
+            leader_thread_.join();
+        }
 
         // Join the result-set maintenance thread (borrows result_set_store_,
         // execution_tracker_, response_store_ — must stop before teardown)
@@ -15886,7 +16054,15 @@ private:
                     // kill compliance evaluation). Catch, log, and keep ticking.
                     try {
                         YUZU_ASSERT_BACKGROUND_JOB("policy_evaluator.tick"); // WS-10 FencedLeaderOnly
-                        policy_evaluator_->tick();
+                        // WS-3 3.2: run the remediation-dispatch tick only on the
+                        // fenced leader. Due-ness is already fleet-safe via ADR-0056
+                        // claim_due_policies, so this is defense-in-depth that also
+                        // stops non-leaders churning; the OPERATOR remediate()/
+                        // evaluate_now() REST paths run on any replica and are NOT
+                        // gated (two-dispatch-planes rule).
+                        if (leader_gate_permits<background_job_class("policy_evaluator.tick")>(
+                                leader_elector_.get()))
+                            policy_evaluator_->tick();
                     } catch (const std::exception& e) {
                         spdlog::error("policy_eval: tick threw ({}) — thread continuing", e.what());
                     } catch (...) {
@@ -16066,7 +16242,19 @@ private:
                     // already carry this shape).
                     try {
                         YUZU_ASSERT_BACKGROUND_JOB("quarantine_reconciler.tick"); // WS-10 FencedLeaderOnly
-                        quarantine_reconciler_->tick();
+                        // WS-3 3.2: gated leader-only via the uniform kBackgroundJobs
+                        // classification (no special-casing — the runtime gate must
+                        // not fork from the checked-in table). NOTE (BLOCKING for a
+                        // 2nd replica, tracked #4119): once WS-4 gateway-fronting
+                        // routes agents to specific core nodes, containment re-apply
+                        // must follow STREAM LOCALITY (the node holding an agent's
+                        // Subscribe stream reconciles it); a leader-only gate would
+                        // then strand agents homed on non-leader nodes. WS-4/5 MUST
+                        // reclassify this pass to a ReplicaSafe stream-partitioned
+                        // form. Correct + inert today (single replica == leader).
+                        if (leader_gate_permits<background_job_class("quarantine_reconciler.tick")>(
+                                leader_elector_.get()))
+                            quarantine_reconciler_->tick();
                     } catch (const std::exception& e) {
                         spdlog::error("quarantine_reconciler: tick threw ({}) — thread continuing",
                                       e.what());
@@ -16201,7 +16389,14 @@ private:
                     // the process. Catch, log, keep ticking.
                     try {
                         YUZU_ASSERT_BACKGROUND_JOB("schedule_runner.tick"); // WS-10 FencedLeaderOnly
-                        schedule_runner_->tick();
+                        // WS-3 3.2: the genuinely unprotected loop — evaluate_due() is
+                        // a bare SELECT and fire-then-advance has no cross-replica
+                        // claim, so two replicas would double-fire schedules. Gate it
+                        // leader-only now; the claim-before-dispatch + command outbox
+                        // that makes a re-drive effectively-once is slice 3.3.
+                        if (leader_gate_permits<background_job_class("schedule_runner.tick")>(
+                                leader_elector_.get()))
+                            schedule_runner_->tick();
                     } catch (const std::exception& e) {
                         metrics_.counter("yuzu_schedule_tick_errors_total").increment();
                         spdlog::error("schedule_runner: tick threw ({}) — thread continuing",
@@ -20131,6 +20326,15 @@ private:
     std::thread preflight_runner_thread_; // joined before stores in stop()
     std::thread schedule_tick_thread_;    // drives ScheduleRunner (#1191); joined before stores
     std::thread result_set_maint_thread_;
+
+    // WS-3 (ADR-2002 §3/§6/§10): the fenced leader elector + its election loop.
+    // The elector owns a dedicated coordination connection (NOT pg_pool_), so it
+    // has no store-teardown ordering dependency; leader_thread_ is ALWAYS joined
+    // in stop() before ~ServerImpl (a joinable std::thread destructor terminates).
+    // FencedLeaderOnly background loops (schedule/policy/quarantine/CRL) gate on
+    // leader_elector_->is_leader() via leader_gate.hpp — slice 3.2.
+    std::unique_ptr<LeaderElector> leader_elector_;
+    std::thread leader_thread_;
 
     // Periodic reminder when running with --insecure-skip-client-verify (issue #79)
     std::thread insecure_tls_reminder_thread_;

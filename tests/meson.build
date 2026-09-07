@@ -933,6 +933,8 @@ if build_server
       'unit/server/test_execution_tracker.cpp',
       'unit/server/test_execution_routes.cpp', # #2542 PR-7: the 7-route legacy pre-v1 Executions API, extracted onto the HttpRouteSink seam
       'unit/server/test_leader_elector.cpp',
+      'unit/server/test_leader_gate.cpp',
+      'unit/server/test_coord_dsn.cpp',
       'unit/server/test_execution_event_bus.cpp',
       'unit/server/test_approval_manager.cpp',
       'unit/server/test_schedule_engine.cpp',

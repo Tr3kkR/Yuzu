@@ -91,6 +91,20 @@ LeaderElector::LeaderElector(Config cfg)
     }
     std::lock_guard<std::mutex> lk(mu_);
     connect_locked();
+    if (open_) {
+        // #4013: log the RESOLVED coordination endpoint (never the DSN, which may
+        // carry a password) so an operator can confirm the elector is on a
+        // dedicated, direct-to-primary connection — not the app pool, not a
+        // transaction-mode pooler (§10). PQhost/PQport/PQdb read the connection's
+        // own resolved parameters.
+        const char* host = PQhost(conn_.get());
+        const char* port = PQport(conn_.get());
+        const char* dbn = PQdb(conn_.get());
+        spdlog::info("leader_elector: coordination connection established "
+                     "(host={} port={} dbname={}; dedicated, never-recycled)",
+                     host && *host ? host : "?", port && *port ? port : "?",
+                     dbn && *dbn ? dbn : "?");
+    }
 }
 
 LeaderElector::~LeaderElector() {
@@ -127,6 +141,10 @@ bool LeaderElector::connect_locked() {
 void LeaderElector::drop_leadership_locked() {
     lock_guard_.reset(); // runs pg_advisory_unlock on conn_ if it was held
     epoch_.reset();
+    // Publish "not leader" (slice 3.2, #4013). Release-ordered so a reader that
+    // observes 0 has seen every write the drop performed; ordered BEFORE any
+    // subsequent reconnect so a live follower never reads a stale leader epoch.
+    live_epoch_.store(0, std::memory_order_release);
 }
 
 bool LeaderElector::is_open() const {
@@ -198,18 +216,25 @@ bool LeaderElector::try_acquire() {
         return false;
     }
     epoch_ = *parsed;
+    // Publish the minted epoch (slice 3.2, #4013). Minted epochs are >= 1, so a
+    // non-zero value unambiguously means "leader at this epoch" to a lock-free
+    // reader. Release-ordered to pair with the acquire loads in is_leader/epoch.
+    live_epoch_.store(*epoch_, std::memory_order_release);
     spdlog::info("leader_elector: acquired leadership '{}' at epoch {}", cfg_.lock_name, *epoch_);
     return true;
 }
 
 bool LeaderElector::is_leader() const {
-    std::lock_guard<std::mutex> lk(mu_);
-    return epoch_.has_value();
+    // Lock-free (slice 3.2, #4013): see the header note. A libpq probe stalled
+    // under mu_ in the election loop must never block this reader.
+    return live_epoch_.load(std::memory_order_acquire) > 0;
 }
 
 std::optional<std::int64_t> LeaderElector::epoch() const {
-    std::lock_guard<std::mutex> lk(mu_);
-    return epoch_;
+    const std::int64_t v = live_epoch_.load(std::memory_order_acquire);
+    if (v <= 0)
+        return std::nullopt;
+    return v;
 }
 
 bool LeaderElector::heartbeat() {
