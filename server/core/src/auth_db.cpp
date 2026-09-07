@@ -920,11 +920,22 @@ AuthDB::recheck_role_locked(const std::string& username,
     // concurrent update_role()/reactivate_user() write - same technique as
     // mfa_verify_login_code's replay guard above. kWriteTimeout (not
     // kReadTimeout) because FOR UPDATE takes a write-class lock, matching
-    // that precedent. with_txn_for does a SINGLE bounded try_acquire_for
-    // (no #2396 retry loop), so this stays safe under the /login stripe
-    // mutex this call runs inside (auth_routes.cpp's login_lock_for) - the
-    // same acquire-shape discipline the stripe already requires of every
-    // call in this critical section.
+    // that precedent. with_txn_for does a SINGLE bounded try_acquire_for (no
+    // #2396 retry loop), matching the acquire-shape discipline this file's
+    // stripe-held call sites already use.
+    //
+    // Safety argument (security-guardian Gate 8 re-review correction: an
+    // earlier draft of this comment leaned on the /login stripe mutex -
+    // auth_routes.cpp's login_lock_for - as if it universally guarded this
+    // call; it doesn't, since the stripe is only taken when
+    // `auth_lockout_threshold > 0`, an operator-configurable setting that
+    // can be 0). The actual safety argument doesn't need the stripe: this
+    // critical section (one SELECT, one fast/uncontended mu_ map write, one
+    // COMMIT) is microseconds, not anywhere near kWriteTimeout's ceiling, so
+    // N concurrent same-username rechecks drain in roughly N x low-single-
+    // digit-ms regardless of whether the stripe happens to be serializing
+    // them too - the row lock's own bounded hold time is what keeps this
+    // safe on the shared connection pool, with or without the stripe.
     std::optional<AuthDBError> err;
     const bool committed = impl_->pool.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
         pg::PgResult sel = pg::exec_params(

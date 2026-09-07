@@ -94,25 +94,40 @@ struct UserEntry {
     /// `AuthManager::next_role_version_()`'s single PROCESS-WIDE monotonic
     /// counter, taken every time ANY entry (any username) is created or has
     /// `.role` mutated in place - NOT a per-username counter starting at 0.
-    /// Comparing this stamp instead of `.role` itself in the recheck
-    /// compare-guard closes an ABA hole a role-VALUE compare cannot: a
-    /// promote-then-demote back to the same role value inside one PBKDF2
+    ///
+    /// #4107 (row-locking rewrite) REMOVED the only code that ever COMPARED
+    /// this stamp - `recheck_role_after_credential_check` now serializes via
+    /// a real Postgres row lock instead (see that function's header doc),
+    /// and no longer reads `pre_check_version` at all. This field is
+    /// retained purely as a write-ordering stamp: every writer still bumps
+    /// it in lockstep with `.role` (an invariant several reviewers have
+    /// checked for and relied on), which is useful for future consumers and
+    /// for reasoning about write ordering, but nothing compares it for
+    /// correctness today. The history below (why it's process-wide, not
+    /// per-username) explains the counter's DESIGN and remains accurate;
+    /// just read every "the compare-guard" reference below as "the retired
+    /// compare-guard, historical context for why this field is shaped the
+    /// way it is."
+    ///
+    /// Comparing this stamp instead of `.role` itself in the (retired)
+    /// recheck compare-guard closed an ABA hole a role-VALUE compare cannot:
+    /// a promote-then-demote back to the same role value inside one PBKDF2
     /// window would satisfy a value-equality guard and let a stale read win
     /// over the demote that already landed. A cpp-safety re-review of the
-    /// first version of this fix (which used a per-username counter
+    /// first version of that fix (which used a per-username counter
     /// carried forward across `upsert_user`/reactivate) found that a
     /// PER-USERNAME scheme reopens the identical class through a different
     /// door: `remove_user()` erases the cache entry outright, and
     /// `reactivate_user()`/a fresh cold hydrate then reinstalls a NEW entry
     /// whose counter restarts at a low value (typically 0) - a stale
-    /// in-flight call's `pre_check_version`, captured before the
-    /// removal, can coincidentally match that reset value. A single
-    /// process-wide source stamped at EVERY write (including first
-    /// creation, not just later mutation) makes any two equal stamps
-    /// observed by this process mean the exact same write event, full stop
-    /// - erase/reinsert included. Only a u64 wraparound (~2^64 writes across
-    /// every username combined, over one process's lifetime) could
-    /// theoretically repeat a stamp, which is not a realistic concern.
+    /// in-flight call's captured pre-check version could coincidentally
+    /// match that reset value. A single process-wide source stamped at
+    /// EVERY write (including first creation, not just later mutation) made
+    /// any two equal stamps observed by this process mean the exact same
+    /// write event, full stop - erase/reinsert included. Only a u64
+    /// wraparound (~2^64 writes across every username combined, over one
+    /// process's lifetime) could theoretically repeat a stamp, which was
+    /// never a realistic concern.
     ///
     /// One creation path is a carve-out, not covered by "every entry is
     /// stamped": `load_config()`'s cfg-file bulk load builds entries directly
@@ -571,18 +586,6 @@ public:
     [[nodiscard]] std::optional<std::uint64_t>
     cached_role_version_for_test(const std::string& username) const;
 
-    /// TEST-ONLY: thin public forwarder to the private
-    /// `recheck_role_after_credential_check`, letting a test drive that
-    /// method directly with an explicitly-constructed `pre_check_role`/
-    /// `pre_check_version` pair instead of needing to land a real interleaving
-    /// inside `authenticate()`'s live PBKDF2 window (which only the ONE
-    /// existing race-hook injection point, after this method's own DB read,
-    /// can reach - not the earlier "something changed while PBKDF2 was
-    /// running" half of the CH-1 interleaving). Production code MUST NOT call
-    /// this - no caller in `server/core/src/**` references it.
-    [[nodiscard]] std::optional<Role> recheck_role_after_credential_check_for_test(
-        const std::string& username, Role pre_check_role, std::uint64_t pre_check_version);
-
     /// Derive a cache `Session`'s adjudication deadlines from the DB-authored
     /// timestamps and the AUTHORITY clock `now_ms` (Postgres `now()` for a durable
     /// session; this host's wall clock for the legacy no-store path). Sets the
@@ -1032,14 +1035,21 @@ private:
     /// function including this one; only serializing all the way through
     /// session creation would close it, which is a materially bigger change
     /// (would need `persist_new_session`, and its own DB write in HA mode, to
-    /// run inside the same transaction/lock). Also not closed: the
-    /// cross-replica case (a demotion committed on a DIFFERENT server,
-    /// invisible to a single process's row lock the same way it was invisible
-    /// to the old version counter). Both are the CURRENT scope of issue
-    /// #4107 (re-scoped from its original case-2/case-3 framing, which this
-    /// commit closes) - `validate_session` still performs no per-request
-    /// AuthDB re-verification, so a session minted via either remaining gap
-    /// still carries a stale role for its full lifetime, not one request.
+    /// run inside the same transaction/lock). This is NOT a same-process-only
+    /// gap: Postgres row locks serialize at the DATABASE-ENGINE level, not
+    /// per-process or per-connection, so a racing writer from a DIFFERENT
+    /// replica sharing the same Postgres primary is serialized against this
+    /// function's own row-locked read exactly like a same-process writer
+    /// (security-guardian Gate 8 re-review verified this empirically against
+    /// a live instance, in both directions - a corrected earlier draft of
+    /// this doc wrongly described a separate "cross-replica" residual here;
+    /// there isn't one - the check-then-mint window is the one remaining gap,
+    /// same mechanism regardless of which process the racing writer runs in).
+    /// This is the CURRENT scope of issue #4107 (re-scoped from its original
+    /// case-2/case-3 framing, which this commit closes) - `validate_session`
+    /// still performs no per-request AuthDB re-verification, so a session
+    /// minted via this gap still carries a stale role for its full lifetime,
+    /// not one request.
     ///
     /// Returns the current role on success (cfg-file mode, no `auth_db_`,
     /// trivially returns `pre_check_role` unchanged - there's no DB to
@@ -1086,7 +1096,6 @@ private:
     /// production-reachability as `role_recheck_race_hook_for_test_` above -
     /// see that field's Resource Ledger entry, which covers this one too.
     std::function<void()> role_recheck_inside_lock_hook_for_test_;
-    /// see that field's Resource Ledger entry, which covers this one too.
 
     /// Backing counter for `next_role_version_()` - see `UserEntry::role_version`'s
     /// doc for why this is process-wide, not per-username. `std::atomic` since
@@ -1100,8 +1109,11 @@ private:
     /// (cfg-file bulk load, boot-only, always before `set_auth_db()` - see that
     /// call's doc) seeds entries at the struct default `role_version{0}`
     /// without drawing a stamp at all, and 0 must stay a value this counter can
-    /// never (re)issue, or such an entry's version could coincidentally match a
-    /// stale in-flight caller's `pre_check_version`.
+    /// never (re)issue - historically (pre-#4107) so such an entry's version
+    /// could never coincidentally match a stale in-flight caller's
+    /// `pre_check_version` in the now-retired recheck compare-guard; kept
+    /// unconditionally true today even though nothing compares this value
+    /// anymore (see `UserEntry::role_version`'s doc).
     std::atomic<std::uint64_t> role_version_epoch_{1};
 
     // ── Durable session store integration (HA WS-1/1a) ─────────────────────────

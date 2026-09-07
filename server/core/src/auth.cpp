@@ -757,6 +757,17 @@ AuthManager::recheck_role_after_credential_check(const std::string& username, Ro
     std::optional<Role> result;
     auto outcome = auth_db_->recheck_role_locked(username, [&](Role db_role) {
         // Invoked while AuthDB holds this row's lock - see the header doc.
+        // Lock ORDERING invariant (cpp-expert Gate 8 catch): this is the
+        // first place in this file mu_ is acquired from INSIDE an open
+        // AuthDB transaction. Safe only because every AuthDB write this file
+        // makes (update_role/reactivate_user/remove_user) completes its own
+        // DB call BEFORE ever touching mu_ (the file-wide "never hold mu_
+        // across a DB call" discipline, stated where each of those calls
+        // takes mu_) - so no code path can be holding mu_ while ALSO
+        // attempting to open a transaction that needs this same row lock,
+        // which would deadlock against this one. A future change that holds
+        // mu_ and then calls an AuthDB write method would break this.
+        //
         // TEST-ONLY seam (see set_role_recheck_inside_lock_hook_for_test's
         // doc): a no-op (nullptr) in production.
         if (role_recheck_inside_lock_hook_for_test_)
@@ -767,6 +778,17 @@ AuthManager::recheck_role_after_credential_check(const std::string& username, Ro
             it->second.role = db_role;
             it->second.role_version = next_role_version_();
         }
+        // else: the entry vanished from the cache mid-recheck. Provably
+        // unreachable today (cpp-expert Gate 8 verified this by tracing):
+        // the only eraser of a specific username is remove_user(), whose own
+        // DB write takes this SAME row lock, so its cache-erase (which runs
+        // strictly after its own DB commit) cannot land before a callback
+        // that already observed the row as active. Not a silent bypass if
+        // this invariant is ever broken by a future change - `result` still
+        // gets set to the DB-confirmed role either way, which is the
+        // conservative choice (the row lock already proved the account is
+        // active; a merely-absent cache entry is this process's own
+        // bookkeeping lagging, not a signal to deny).
         result = db_role;
     });
     if (!outcome) {
@@ -841,7 +863,8 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
     // Re-verify against AuthDB: catches a soft-deleted/removed user AND makes
     // this the authoritative role for the session about to be minted (#4020 +
     // Gate 2/3 governance follow-ups — see recheck_role_after_credential_check's
-    // doc for the full rationale, including the race the compare-guard closes).
+    // doc for the full rationale, including the row-lock serialization #4107
+    // added to close the same-process divergence race).
     auto current_role = recheck_role_after_credential_check(username, entry->role,
                                                              entry->role_version, "Auth failed");
     if (!current_role)
@@ -1237,12 +1260,6 @@ AuthManager::cached_role_version_for_test(const std::string& username) const {
     if (it == users_.end())
         return std::nullopt;
     return it->second.role_version;
-}
-
-std::optional<Role> AuthManager::recheck_role_after_credential_check_for_test(
-    const std::string& username, Role pre_check_role, std::uint64_t pre_check_version) {
-    return recheck_role_after_credential_check(username, pre_check_role, pre_check_version,
-                                                "test");
 }
 
 std::uint64_t AuthManager::next_role_version_() {
@@ -1795,8 +1812,10 @@ bool AuthManager::reactivate_user(const std::string& username) {
     // independently): AuthDB::get_user() has no knowledge of role_version, so
     // `*entry` defaults it to 0 - a wholesale entry-replace exactly like
     // upsert_user()'s, and needs the same process-wide stamp for the same
-    // reason (a stale in-flight recheck's pre_check_version could otherwise
-    // coincidentally re-match a reset-to-0 value).
+    // reason: every writer pairs `.role`/`.role_version` together (an
+    // invariant #4107's row-locking rewrite still relies on for cache
+    // write-ordering, even though nothing compares this value for
+    // correctness anymore - see UserEntry::role_version's doc).
     entry->role_version = next_role_version_();
 
     std::unique_lock lock(mu_);
@@ -1915,7 +1934,7 @@ bool AuthManager::update_role(const std::string& username, Role new_role) {
         auto it = users_.find(username);
         if (it != users_.end()) {
             it->second.role = new_role;
-            it->second.role_version = next_role_version_(); // Gate 5 CH-1: invalidate a racing recheck's stale read
+            it->second.role_version = next_role_version_(); // keeps .role/.role_version paired - see UserEntry::role_version's doc
         }
 
         // Invalidate sessions so the user picks up the new role on next login
@@ -1937,7 +1956,7 @@ bool AuthManager::update_role(const std::string& username, Role new_role) {
         return false;
     }
     it->second.role = new_role;
-    it->second.role_version = next_role_version_(); // Gate 5 CH-1: same ABA guard as the AuthDB-backed branch above
+    it->second.role_version = next_role_version_(); // keeps .role/.role_version paired, same as the AuthDB-backed branch above
 
     // Invalidate sessions so the user picks up the new role on next login
     // Prevents stale session role from granting old privileges

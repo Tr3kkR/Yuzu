@@ -874,6 +874,7 @@ TEST_CASE("the row lock genuinely blocks a concurrent update_role() until "
     std::atomic<bool> writer_finished{false};
     std::atomic<bool> writer_update_ok{false};
     bool writer_was_still_blocked = false; // set on the main thread below
+    std::chrono::steady_clock::duration writer_call_duration{};
     std::thread writer;
 
     cold_mgr.set_role_recheck_inside_lock_hook_for_test([&] {
@@ -883,31 +884,63 @@ TEST_CASE("the row lock genuinely blocks a concurrent update_role() until "
         // give it a moment to genuinely attempt (and block on) its UPDATE
         // before this hook returns and releases the lock. Catch2 assertion
         // macros are NOT safe to call from a non-main thread - the spawned
-        // thread only sets plain atomics; every REQUIRE/CHECK below runs on
-        // the main test thread, either in this hook (which Catch2 itself
-        // invoked synchronously, so this IS the main thread) or after
-        // writer.join().
+        // thread only sets plain atomics. NO throwing assertion (REQUIRE)
+        // runs anywhere between spawning `writer` and joining it below
+        // (cpp-safety Gate 8 catch, matching test_baseline_store.cpp's own
+        // documented fix for the identical hazard: a REQUIRE in this window
+        // would unwind past a still-joinable std::thread on failure and call
+        // std::terminate, aborting the whole shard instead of failing one
+        // test) - this hook only ever writes plain bools/atomics.
         writer = std::thread([&] {
+            const auto call_start = std::chrono::steady_clock::now();
             writer_started = true;
             writer_update_ok = cold_mgr.update_role("cora", Role::user);
+            writer_call_duration = std::chrono::steady_clock::now() - call_start;
             writer_finished = true;
         });
         // Poll for the writer to have started; a bounded wait, not a fixed
         // sleep, so this isn't flaky under CI scheduling jitter. If the row
         // lock did NOT block it, writer_finished would already be true well
-        // within this window.
-        for (int i = 0; i < 200 && !writer_started; ++i)
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        REQUIRE(writer_started.load());
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        // The writer must NOT have finished yet - its UPDATE is blocked on
-        // the row lock THIS transaction still holds.
-        writer_was_still_blocked = !writer_finished.load();
+        // within this window. Not load-bearing for correctness (the row
+        // lock forces the ordering regardless of timing) - only gives the
+        // writer thread a realistic chance to actually reach and block on
+        // the lock before we resolve whether it did.
+        bool started_in_time = false;
+        for (int i = 0; i < 200 && !started_in_time; ++i) {
+            started_in_time = writer_started.load();
+            if (!started_in_time)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        // 200ms, matching test_baseline_store.cpp's own row-lock-blocking
+        // test (same technique, same margin) - cpp-expert Gate 8 flagged an
+        // earlier, thinner 20ms margin here as a latent false-green risk
+        // under CI Postgres load (an UNBLOCKED update_role() doing two DB
+        // round trips could plausibly still be mid-flight at 20ms on a
+        // loaded runner, passing this check even if the row lock were
+        // broken). 200ms holds the lock long enough that only genuine
+        // blocking - not ordinary pool/network latency - explains the
+        // writer still being incomplete at this mark, AND is corroborated
+        // below by `writer_call_duration` (self-verifying, per the same
+        // baseline_store precedent): a call that WASN'T blocked would
+        // complete in low milliseconds, not the ~200ms this margin forces.
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        // Only "genuinely still blocked" if it actually started AND hasn't
+        // finished - trivially true-but-meaningless if it never started at
+        // all (cpp-safety Gate 8 catch).
+        writer_was_still_blocked = started_in_time && !writer_finished.load();
     });
 
     auto token = cold_mgr.authenticate("cora", "password1234");
+    writer.join(); // BEFORE any assertion that could throw - see the hook's own comment above.
     REQUIRE(token.has_value());
-    writer.join();
+    // Self-verifying against a future regression that weakens the row lock
+    // (e.g. swapping FOR UPDATE for a plain SELECT): if update_role()'s
+    // UPDATE did NOT block on the held lock, it would return in low
+    // milliseconds (a single local Postgres round trip), well under the
+    // 150ms this test controls for - proving the writer thread actually
+    // exercised the blocking path, not a coincidentally-slow fast call
+    // (test_baseline_store.cpp's own precedent for this exact technique).
+    CHECK(writer_call_duration >= std::chrono::milliseconds(150));
     CHECK(writer_was_still_blocked);
     CHECK(writer_finished.load());
     CHECK(writer_update_ok.load());
