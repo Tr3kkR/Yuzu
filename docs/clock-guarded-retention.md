@@ -100,11 +100,14 @@ Siblings become compliant store-by-store as they migrate to Postgres.
 | `guaranteed_state_store` | ADR-0038, compliant #2663 |
 | `api_token_store` T12 rotation sweep | #2964 |
 | `response_store` | ADR-0039, compliant #2691 — full Facts/classify + `kMaxPlausibleNow` clamp + PG-clock read via the shared `gc_meta` anchor |
-| `ExecutionTracker::concurrency_claims` stale-claim reconciler | ADR-1007 — compliant on all seven parts, including a persisted anchor + dedup fact-set in `retention_meta` surviving restarts, and the whole probe-decide-act sequence wrapped in one transaction. `would_wipe` is a DELIBERATE non-adoption of part 1 for this small ephemeral table, same reasoning as `api_token_store`'s own DELIBERATE NON-ADOPTION comment — sharing the SINGLE-WRITER gap above with every other store in this list, not a worse one |
+| `ExecutionTracker::concurrency_claims` stale-claim reconciler | ADR-1007 — compliant on all seven parts, including a persisted anchor + dedup fact-set in `retention_meta` surviving restarts, and the whole probe-decide-act sequence wrapped in one transaction. `would_wipe` is a DELIBERATE non-adoption of part 1 for this small ephemeral table, same reasoning as `api_token_store`'s own DELIBERATE NON-ADOPTION comment. **SINGLE-WRITER as of WS-10** — a `pg_try_advisory_xact_lock('execution_tracker:concurrency_reconcile')` is now the first in-txn statement (try-and-skip; a lost race skips without advancing the liveness gauge), closing the shared gap the note below describes |
+| `app_perf_fleet_store`, `preflight_run_store`, `deployment_run_store` retention prunes | **WS-10 (#2508)** — the three formerly-bare wall-clock deletes now run through the shared `pg::run_clock_guarded_prune` helper (`server/core/src/pg/pg_retention_guard.{hpp,cpp}`): all seven parts + a `pg_try_advisory_xact_lock` (SINGLE-WRITER), reading Postgres `now()` in-SQL (shared clock, #3715). Constants are per-store parameters (`ClockGuardedPruneSpec`), part-6 = **Decline** at each call site (non-regenerable operator/analytics history). ONE reviewed impl parameterised per store, not three hand-copies — the "copy the SHAPE, never the numbers" rule made mechanical |
 
 ### Still issuing bare wall-clock deletes
 
-`app_perf_*`, `PreflightRunStore`, `DeploymentRunStore` — tracked as **#2508**.
+None. The last three (`app_perf_*`, `PreflightRunStore`, `DeploymentRunStore`,
+**#2508**) adopted the guarded shape via `pg::run_clock_guarded_prune` in WS-10 —
+see the register entry above.
 
 ### `api_token_store` — first store to DECLINE part 1's would-wipe half
 
