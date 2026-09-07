@@ -18,6 +18,7 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <chrono>
 #include <string>
 #include <vector>
@@ -1252,15 +1253,26 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
             FragmentQuery q;
             if (req.has_param("name"))
                 q.name_filter = req.get_param_value("name");
+            // #4034 follow-up: clamp in 64-bit BEFORE narrowing — mirrors
+            // GET /api/v1/inventory/software's identical idiom
+            // (rest_api_v1.cpp) and MCP's list_policy_fragments sibling
+            // (mcp_server.cpp), which already clamped its own `limit` arg to
+            // [1,1000]. A negative or huge value can no longer reach the
+            // store's SQL LIMIT unbounded, and the clamped value (not
+            // FragmentQuery's raw default) drives pagination.page_size below
+            // — previously hard-coded to list_json's own 50 default
+            // regardless of what limit was actually applied.
+            std::int64_t want_limit = q.limit; // FragmentQuery's own default (100)
             try {
                 if (req.has_param("limit"))
-                    q.limit = std::stoi(req.get_param_value("limit"));
+                    want_limit = std::stoll(req.get_param_value("limit"));
             } catch (const std::exception&) {
                 res.status = 400;
                 res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
                                 "application/json");
                 return;
             }
+            q.limit = static_cast<int>(std::clamp<std::int64_t>(want_limit, 1, 1000));
             auto frags = policy_store_->query_fragments(q);
             if (!frags) {
                 res.status = 503;
@@ -1271,8 +1283,9 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
             nlohmann::json arr = nlohmann::json::array();
             for (const auto& f : *frags)
                 arr.push_back(policy_fragment_list_row_json(f));
-            res.set_content(list_json(arr, static_cast<int64_t>(frags->size())),
-                            "application/json");
+            res.set_content(
+                list_json(arr, static_cast<int64_t>(frags->size()), /*start=*/0, q.limit),
+                "application/json");
         });
 
     // GET /api/v1/policies -- list all policies (MCP twin: list_policies —
@@ -1294,17 +1307,41 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
                 q.name_filter = req.get_param_value("name");
             if (req.has_param("fragment_id"))
                 q.fragment_filter = req.get_param_value("fragment_id");
-            if (req.has_param("enabled_only"))
-                q.enabled_only = true;
+            // #4034 follow-up: `enabled_only` is a documented boolean query
+            // parameter (docs/user-manual/rest-api.md) — presence alone must
+            // not decide it, or `enabled_only=false` silently behaves like
+            // `enabled_only=true` (the caller asked to see disabled policies
+            // and got the opposite). An unrecognized value 400s, matching
+            // this handler's own existing posture for a malformed `limit`.
+            if (req.has_param("enabled_only")) {
+                auto v = req.get_param_value("enabled_only");
+                if (v == "true" || v == "1") {
+                    q.enabled_only = true;
+                } else if (v == "false" || v == "0") {
+                    q.enabled_only = false;
+                } else {
+                    res.status = 400;
+                    res.set_content(
+                        detail::a4_error(res, "invalid boolean query parameter: enabled_only"),
+                        "application/json");
+                    return;
+                }
+            }
+            // Clamp in 64-bit BEFORE narrowing — mirrors GET
+            // /api/v1/inventory/software's identical idiom and MCP's
+            // list_policy_fragments sibling; see the identical comment on
+            // GET /api/v1/policy-fragments above for the full rationale.
+            std::int64_t want_limit = q.limit; // PolicyQuery's own default (100)
             try {
                 if (req.has_param("limit"))
-                    q.limit = std::stoi(req.get_param_value("limit"));
+                    want_limit = std::stoll(req.get_param_value("limit"));
             } catch (const std::exception&) {
                 res.status = 400;
                 res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
                                 "application/json");
                 return;
             }
+            q.limit = static_cast<int>(std::clamp<std::int64_t>(want_limit, 1, 1000));
             auto policies = policy_store_->query_policies(q);
             if (!policies) {
                 res.status = 503;
@@ -1315,8 +1352,9 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
             nlohmann::json arr = nlohmann::json::array();
             for (const auto& p : *policies)
                 arr.push_back(policy_list_row_json(p));
-            res.set_content(list_json(arr, static_cast<int64_t>(policies->size())),
-                            "application/json");
+            res.set_content(
+                list_json(arr, static_cast<int64_t>(policies->size()), /*start=*/0, q.limit),
+                "application/json");
         });
 
     // GET /api/v1/policies/:id -- single-policy detail (MCP twin: get_policy)

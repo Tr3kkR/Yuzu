@@ -13,12 +13,17 @@
 
 #include "authz_gates.hpp"
 #include "compliance_routes.hpp"
+#include "pg/pg_pool.hpp"
+#include "policy_store.hpp"
 #include "test_route_sink.hpp"
+
+#include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -57,7 +62,13 @@ struct ComplianceHarness {
     bool fleet_admitted{true};
     std::optional<std::unordered_set<std::string>> fleet_scope; // nullopt = TOP/unfiltered
 
-    ComplianceHarness() {
+    /// #4034 follow-up — `policy_store` defaults to nullptr (every
+    /// pre-existing test above and the null-store 503 tests below rely on
+    /// that), but a test can pass a REAL, live-Postgres-backed PolicyStore
+    /// (see `policy_store_tpl` below) to exercise query parsing, pagination,
+    /// and the audit fail-closed path end to end — the one thing the
+    /// null-store harness can never reach.
+    explicit ComplianceHarness(PolicyStore* policy_store = nullptr) {
         auto auth_fn = [this](const httplib::Request&,
                               httplib::Response&) -> std::optional<auth::Session> {
             auth::Session s;
@@ -89,12 +100,67 @@ struct ComplianceHarness {
             return {true, fleet_scope};
         };
 
-        routes.register_routes(sink, auth_fn, perm_fn, audit_fn, emit_fn,
-                               /*policy_store=*/nullptr, agents_json_fn,
-                               /*policy_evaluator=*/nullptr, /*metrics=*/nullptr,
+        routes.register_routes(sink, auth_fn, perm_fn, audit_fn, emit_fn, policy_store,
+                               agents_json_fn, /*policy_evaluator=*/nullptr, /*metrics=*/nullptr,
                                std::move(fleet_read_fn));
     }
 };
+
+// ---- PG fixtures for the live-store tests below ---------------------------
+// Same template KEY and byte-identical setup callback as
+// test_policy_store.cpp's `policy_store_tpl` — PgTestTemplate explicitly
+// supports (and replay-verifies) sharing a name across files that need the
+// exact same store set, so this reuses that file's already-built template
+// instead of paying a second migration pass.
+yuzu::test::PgTestTemplate policy_store_tpl{
+    "policystore", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        PolicyStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("policy_store template: failed to migrate");
+    }};
+
+const std::string kFragmentYaml = R"(
+apiVersion: yuzu.io/v1alpha1
+kind: PolicyFragment
+displayName: Check Service Running
+description: Verify a Windows service is running
+spec:
+  check:
+    instruction: get_service_status
+    compliance: "result.status == 'running'"
+)";
+
+// Fragment `name` (displayName) is uniqueness-checked pre-insert
+// (policy_store.cpp #396) — a test that creates more than one fragment in
+// the same (per-test, freshly-cloned) database must give each a distinct
+// name, unlike policies, which carry no such constraint.
+std::string make_fragment_yaml(const std::string& name) {
+    return R"(
+apiVersion: yuzu.io/v1alpha1
+kind: PolicyFragment
+displayName: )" +
+           name + R"(
+description: Verify a Windows service is running
+spec:
+  check:
+    instruction: get_service_status
+    compliance: "result.status == 'running'"
+)";
+}
+
+std::string make_policy_yaml(const std::string& fragment_id, const std::string& name) {
+    return R"(
+apiVersion: yuzu.io/v1alpha1
+kind: Policy
+displayName: )" +
+           name + R"(
+description: A test policy
+fragment: )" +
+           fragment_id + R"(
+scope: "tags.env == 'production'"
+)";
+}
 
 } // namespace
 
@@ -259,4 +325,141 @@ TEST_CASE("GET /api/v1/compliance/{id}: fleet_read_fn admits, null store -> 503,
     // store case above.
     for (const auto& c : h.audit_calls)
         CHECK(c.action != "compliance.agent_statuses.view");
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// #4034 follow-up — live-store coverage for the REST v1 list routes' query
+// parsing. The tests above pin the auth/gate/envelope/degraded-service
+// wiring against a permanently-null store; these exercise the actual
+// `enabled_only`/`limit`/`pagination.page_size` handling end to end against
+// a real PolicyStore, closing the "no test reaches a successful response"
+// gap the null-store harness could never reach. PG-gated: skips when
+// YUZU_TEST_POSTGRES_DSN is unset.
+// ═════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("GET /api/v1/policies: enabled_only=false does NOT filter (regression — "
+          "presence alone used to silently mean true)",
+          "[compliance][rest][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+
+    auto frag = store.create_fragment(kFragmentYaml);
+    REQUIRE(frag.has_value());
+    auto p1 = store.create_policy(make_policy_yaml(frag.value(), "Enabled Policy"));
+    auto p2 = store.create_policy(make_policy_yaml(frag.value(), "Disabled Policy"));
+    REQUIRE(p1.has_value());
+    REQUIRE(p2.has_value());
+    REQUIRE(store.disable_policy(p2.value()).has_value());
+
+    ComplianceHarness h{&store};
+    auto res = h.sink.Get("/api/v1/policies?enabled_only=false");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    // Both policies present — the filter must NOT have engaged.
+    CHECK(j["data"].size() == 2);
+}
+
+TEST_CASE("GET /api/v1/policies: enabled_only=true filters to enabled only",
+          "[compliance][rest][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+
+    auto frag = store.create_fragment(kFragmentYaml);
+    REQUIRE(frag.has_value());
+    auto p1 = store.create_policy(make_policy_yaml(frag.value(), "Enabled Policy"));
+    auto p2 = store.create_policy(make_policy_yaml(frag.value(), "Disabled Policy"));
+    REQUIRE(p1.has_value());
+    REQUIRE(p2.has_value());
+    REQUIRE(store.disable_policy(p2.value()).has_value());
+
+    ComplianceHarness h{&store};
+    auto res = h.sink.Get("/api/v1/policies?enabled_only=true");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j["data"].size() == 1);
+    CHECK(j["data"][0]["name"].get<std::string>() == "Enabled Policy");
+}
+
+TEST_CASE("GET /api/v1/policies: enabled_only with an unrecognized value -> 400",
+          "[compliance][rest][pg]") {
+    // Needs a real (non-null) store: the null-store 503 short-circuit runs
+    // BEFORE query-parameter parsing, so a null-store harness can never
+    // reach this branch (see the null-store 503 test above).
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+
+    ComplianceHarness h{&store};
+    auto res = h.sink.Get("/api/v1/policies?enabled_only=maybe");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["message"].get<std::string>().find("enabled_only") != std::string::npos);
+}
+
+TEST_CASE("GET /api/v1/policies: limit clamps and pagination.page_size reflects the "
+          "resolved limit, not a hard-coded 50",
+          "[compliance][rest][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+
+    auto frag = store.create_fragment(kFragmentYaml);
+    REQUIRE(frag.has_value());
+    REQUIRE(store.create_policy(make_policy_yaml(frag.value(), "Policy A")).has_value());
+    REQUIRE(store.create_policy(make_policy_yaml(frag.value(), "Policy B")).has_value());
+    REQUIRE(store.create_policy(make_policy_yaml(frag.value(), "Policy C")).has_value());
+
+    ComplianceHarness h{&store};
+    auto res = h.sink.Get("/api/v1/policies?limit=2");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"].size() == 2);
+    CHECK(j["pagination"]["page_size"].get<int64_t>() == 2); // NOT the list_json default of 50
+}
+
+TEST_CASE("GET /api/v1/policies: a negative limit clamps to 1 rather than binding "
+          "unbounded SQL LIMIT (no cap defeat)",
+          "[compliance][rest][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+
+    auto frag = store.create_fragment(kFragmentYaml);
+    REQUIRE(frag.has_value());
+    REQUIRE(store.create_policy(make_policy_yaml(frag.value(), "Policy A")).has_value());
+    REQUIRE(store.create_policy(make_policy_yaml(frag.value(), "Policy B")).has_value());
+
+    ComplianceHarness h{&store};
+    auto res = h.sink.Get("/api/v1/policies?limit=-5");
+    REQUIRE(res);
+    REQUIRE(res->status == 200); // clamps, does not 400 and does not defeat the cap
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"].size() == 1);
+    CHECK(j["pagination"]["page_size"].get<int64_t>() == 1);
+}
+
+TEST_CASE("GET /api/v1/policy-fragments: limit clamps and page_size reflects the "
+          "resolved limit",
+          "[compliance][rest][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+
+    REQUIRE(store.create_fragment(make_fragment_yaml("Fragment A")).has_value());
+    REQUIRE(store.create_fragment(make_fragment_yaml("Fragment B")).has_value());
+    REQUIRE(store.create_fragment(make_fragment_yaml("Fragment C")).has_value());
+
+    ComplianceHarness h{&store};
+    auto res = h.sink.Get("/api/v1/policy-fragments?limit=1");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"].size() == 1);
+    CHECK(j["pagination"]["page_size"].get<int64_t>() == 1);
 }
