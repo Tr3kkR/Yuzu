@@ -10,7 +10,7 @@ supersedes-direction: the grill-session recommendation that CAVM must score on *
 
 # 4002 — CAVM MVP scores on observed reachability; potential reachability deferred
 
-> **Implementation status (2026-09-07 ADR reconciliation):** Accepted — deferred, not started. Zero crown-jewel/trust-zone/AMAPC/chain-centrality implementation in `server/core/src` (the only "crown jewel" hits are unrelated CA-root-key comments in `ca_store.hpp`/`key_provider.hpp`/`server.cpp`). Deferred, not withdrawn: re-homes into a use-case engine under ADR-1005 Phase 7 (not started, #4099); NOT grandfathered — faces ADR-1005 Decision 2 at implementation.
+> **Implementation status (2026-09-07 ADR reconciliation):** Accepted — deferred, not started. No observed-reachability graph substrate exists to build the MVP on: zero hits for `reachability_graph`/`ReachabilityGraph`/`service_node`/`host_node` in `server/` and `agents/` (see ADR-0001/0002), and no CAVM scoring code in `server/core/src`. Deferred, not withdrawn: re-homes into a use-case engine under ADR-1005 Phase 7 (not started, #4099); NOT grandfathered — faces ADR-1005 Decision 2 at implementation.
 
 > Records a deliberate, eyes-open MVP trade-off taken 2026-07-01 (@lesault + @Tr3kkR): the first
 > CAVM increment scores attack paths over the **observed** reachability graph Yuzu already produces,
