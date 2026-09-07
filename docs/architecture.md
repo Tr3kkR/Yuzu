@@ -293,10 +293,10 @@ Operator                     Server                                  Agent
 
 Most HTTP surfaces the server exposes — REST, dashboard fragments, MCP — are registered by a
 **route owner**: a class with a `register_routes(...)` method that the server calls once at
-startup. `server.cpp` wires those owners, *and* registers a further **58 routes inline** on
+startup. `server.cpp` wires those owners, *and* registers a further **54 routes inline** on
 `web_server_->{Get,Post,Put,Delete}` — the health and readiness probes and much of the `/api/*`
 dashboard JSON. It constructs no persistent `HttplibRouteSink` of its own for these remaining
-inline routes, so none of them is reachable from the in-process test harness. (Six surfaces this
+inline routes, so none of them is reachable from the in-process test harness. (Seven surfaces this
 prose previously credited to this inline count have since moved to their own `HttpRouteSink`
 modules and are no longer part of it: `POST /api/command` is `command_routes.cpp` (#2557); the
 page-shell/static-asset surface — `/static/*`, `/`, `/chargen`, `/procfetch`, `/api/help*`,
@@ -306,11 +306,13 @@ page-shell/static-asset surface — `/static/*`, `/`, `/chargen`, `/procfetch`, 
 /api/export/json-to-csv`, `POST /api/scope/validate`, `/api/analytics/{status,recent}`; 7 routes)
 and `nvd_routes.{hpp,cpp}` (`/api/nvd/{status,sync,match}`; 3 routes); the 5-route Custom
 Properties API (7.6) — `/api/agents/:id/properties[/:key]`, `/api/property-schemas` — is
-`custom_properties_routes.{hpp,cpp}` (#2542 PR-4); and the Result Sets fragment API —
+`custom_properties_routes.{hpp,cpp}` (#2542 PR-4); the Result Sets fragment API —
 `/fragments/result-sets/{sidebar,create}` plus the three `:id`-scoped
 `/fragments/result-sets/:id/{detail,pin,unpin,delete}`; 6 routes — is
-`result_set_routes.{hpp,cpp}` (#2542 PR-5). All five owner files register against the same
-stack-local `inline_sink`, constructed in `start_web_server()`.)
+`result_set_routes.{hpp,cpp}` (#2542 PR-5); and the 4-route Schedules API —
+`/api/schedules`, `POST /api/schedules`, `/api/schedules/:id` (DELETE), `/api/schedules/:id/enable`
+(POST) — is `schedule_routes.{hpp,cpp}` (#2542 PR-8). All six owner files register against the
+same stack-local `inline_sink`, constructed in `start_web_server()`.)
 
 Counting the surface therefore needs a receiver-agnostic pattern, not a search for one variable
 name:
@@ -350,18 +352,20 @@ Registrations outside the sink are pre-existing debt, not a precedent to copy: a
 extraction (`page_routes.{hpp,cpp}`, PR-2, 25 routes registered against `inline_sink`), a #2542
 follow-up (`dashboard_api_routes.{hpp,cpp}` + `nvd_routes.{hpp,cpp}`, 10 more scattered routes
 registered against the same `inline_sink`), the Custom Properties API extraction
-(`custom_properties_routes.{hpp,cpp}`, 5 routes, #2542 PR-4), and the Result Sets fragment
-extraction (`result_set_routes.{hpp,cpp}`, PR-5, 6 routes, also against `inline_sink`) —
-`mcp_server.cpp` is the only remaining route owner registering directly on a raw
-`svr.{Get,Post,Delete}` (3 registrations) — plus `server.cpp`'s own 58 inline routes, which are not
-a route-owner class and are untouched by this migration; 61 registrations remain outside the sink
+(`custom_properties_routes.{hpp,cpp}`, 5 routes, #2542 PR-4), the Result Sets fragment
+extraction (`result_set_routes.{hpp,cpp}`, PR-5, 6 routes, also against `inline_sink`), and the
+Schedules API extraction (`schedule_routes.{hpp,cpp}`, PR-8, 4 routes, also against
+`inline_sink`) — `mcp_server.cpp` is the only remaining route owner registering directly on a raw
+`svr.{Get,Post,Delete}` (3 registrations) — plus `server.cpp`'s own 54 inline routes, which are not
+a route-owner class and are untouched by this migration; 57 registrations remain outside the sink
 in total. Count these with the anchored pattern `grep -cE '^\s*web_server_->(Get|Post|Put|Delete|Patch|Options)\('
 server/core/src/server.cpp`, not a bare `grep -c` of the receiver-agnostic pattern above — the
 unanchored form over-counts by picking up at least one comment-line false match, which is how a
 105/106 figure was previously published here; the anchored count was 104 immediately before the
 page-shell extraction (independently re-verified during that extraction), 79 after it, 64 after the
 `dashboard_api_routes`/`nvd_routes` follow-up (-10) and the Custom Properties API extraction (-5)
-landed together, and is 58 now that the Result Sets fragment extraction (-6) has also landed.
+landed together, 58 after the Result Sets fragment extraction (-6), and is 54 now that the
+Schedules API extraction (-4) has also landed.
 
 ## Storage Architecture
 

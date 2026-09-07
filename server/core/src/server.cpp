@@ -13294,6 +13294,36 @@ private:
                              .metrics = &metrics_,
                          });
 
+        // #2542 PR-8: schedule_routes.hpp's NEW `resolve_session_fn` closure —
+        // wraps `AuthRoutes::resolve_session` directly (no `res` param, no
+        // 401-gating side effect), the post-gate "who is calling" lookup the
+        // Schedules API's DELETE/enable/create handlers use after perm_fn has
+        // already proven a session exists. See schedule_routes.hpp's "NEW
+        // DEPS FIELD" doc comment for why no existing hoisted closure covers
+        // this narrower shape.
+        auto resolve_session_fn =
+            [this](const httplib::Request& req) -> std::optional<auth::Session> {
+            return auth_routes_->resolve_session(req);
+        };
+
+        // #2542 PR-8: the 4-route Schedules API (/api/schedules[/:id[/enable]]),
+        // extracted onto the same inline_sink seam. Placed here rather than
+        // alongside page_routes's call above (like PR-4's custom_properties
+        // sibling) because this module needs the just-defined
+        // resolve_session_fn + audit_fn, neither of which is in scope yet at
+        // that earlier point. Folds in the interim PR #1806 (H-01)
+        // create-schedule extraction, which used to call a standalone
+        // `handle_create_schedule(AuthRoutes&, ...)` free function from this
+        // same site — see schedule_routes.hpp's file header for the full
+        // history.
+        yuzu::server::schedule::register_schedule_routes(
+            inline_sink, yuzu::server::schedule::Deps{
+                             .perm_fn = perm_fn,
+                             .resolve_session_fn = resolve_session_fn,
+                             .audit_fn = audit_fn,
+                             .schedule_engine = schedule_engine_.get(),
+                         });
+
         // Shared command-dispatch closure — sends a CommandRequest to agents via
         // gRPC. Hoisted here (was inline in the WorkflowRoutes block) so every
         // background consumer drives the EXACT same dispatch path.
@@ -16707,151 +16737,6 @@ private:
                 }
             }
             res.set_content(nlohmann::json({{"children", arr}}).dump(), "application/json");
-        });
-
-        // -- Schedule API -----------------------------------------------------
-
-        web_server_->Get("/api/schedules", [this](const httplib::Request& req,
-                                                  httplib::Response& res) {
-            if (!require_permission(req, res, "Schedule", "Read"))
-                return;
-            // guardian-confinement-2298 hardening sweep originally added an
-            // explicit deny_service_scoped_schedule() call here (ITServiceOwner
-            // grants full CRUD on Schedule, and query_schedules has no owner/
-            // service filter at all — a bare Schedule:Read gate would let a
-            // service-scoped token enumerate every schedule from every other
-            // service). guardian-confinement-2298 PR 3 ("the flip") made it
-            // provably dead: require_permission above already denies any
-            // service-scoped token outright for (Schedule, Read)
-            // (kServiceScopeGlobalSafe is compile-time-empty), so a
-            // service-scoped session can never reach this point at all.
-            // Retired #3290 Phase 2 bucket 1a — see
-            // docs/security-reviews/service-scope-phase2-migrations-2026-08.md.
-            if (!schedule_engine_) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            ScheduleQuery q;
-            if (req.has_param("definition_id"))
-                q.definition_id = req.get_param_value("definition_id");
-            if (req.has_param("enabled_only"))
-                q.enabled_only = true;
-
-            auto scheds = schedule_engine_->query_schedules(q);
-            nlohmann::json arr = nlohmann::json::array();
-            for (const auto& s : scheds) {
-                arr.push_back({{"id", s.id},
-                               {"name", s.name},
-                               {"definition_id", s.definition_id},
-                               {"enabled", s.enabled},
-                               {"frequency_type", s.frequency_type},
-                               {"next_execution_at", s.next_execution_at},
-                               {"last_executed_at", s.last_executed_at},
-                               {"execution_count", s.execution_count}});
-            }
-            res.set_content(nlohmann::json({{"schedules", arr}}).dump(), "application/json");
-        });
-
-        web_server_->Post("/api/schedules", [this](const httplib::Request& req,
-                                                   httplib::Response& res) {
-            // Extracted to schedule_routes.cpp (H-01, #1806): the
-            // Schedule:Write + Execution:Execute gate ordering needs direct
-            // unit coverage that a bare inline lambda cannot get.
-            handle_create_schedule(*auth_routes_, schedule_engine_.get(), req, res);
-        });
-
-        web_server_->Delete(R"(/api/schedules/([^/]+))", [this](const httplib::Request& req,
-                                                                httplib::Response& res) {
-            if (!require_permission(req, res, "Schedule", "Delete"))
-                return;
-            if (!schedule_engine_) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            auto id = req.matches[1].str();
-            // An interim deny_service_scoped_schedule() call used to sit here
-            // (delete_schedule is username-owner-scoped below, and a
-            // service-scoped token shares its creating principal's username —
-            // without a deny it could delete a fleet-wide schedule its own
-            // principal created interactively). guardian-confinement-2298 PR 3
-            // ("the flip") made it provably dead: require_permission above
-            // already denies any service-scoped token outright for
-            // (Schedule, Delete). Retired #3290 Phase 2 bucket 1a.
-            // M-01 (#1806): owner-scoped delete — a Schedule:Delete grant
-            // deletes only schedules the caller created, not the whole
-            // fleet's. auth_routes_->resolve_session, not require_permission's
-            // session (already consumed) — this call cannot fail auth since
-            // require_permission above already proved a valid session exists.
-            auto session = auth_routes_->resolve_session(req);
-            auto user = session ? session->username : std::string();
-            bool deleted = schedule_engine_->delete_schedule(id, user);
-            if (deleted) {
-                (void)audit_log(req, "schedule.delete", "success", "schedule", id);
-                res.set_header("HX-Trigger",
-                               R"({"showToast":{"message":"Schedule deleted","level":"success"}})");
-            }
-            res.set_content(nlohmann::json({{"deleted", deleted}}).dump(), "application/json");
-        });
-
-        web_server_->Post(R"(/api/schedules/([^/]+)/enable)", [this](const httplib::Request& req,
-                                                                     httplib::Response& res) {
-            if (!require_permission(req, res, "Schedule", "Write"))
-                return;
-            if (!schedule_engine_) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            auto id = req.matches[1].str();
-            // guardian-confinement-2298: parse_schedule_enabled (schedule_routes.hpp)
-            // — extract_json_string only matches a JSON *string*, so a real
-            // JSON boolean {"enabled":false} used to silently fall through
-            // to the "absent" default (true), inverting the request and
-            // defeating the disable-always-reachable kill switch (H-01).
-            bool enabled = parse_schedule_enabled(req.body);
-            // H-01 (#1806): re-enabling arms the schedule to fire unattended
-            // through ScheduleRunner — the same fleet-wide-dispatch concern
-            // as create, so it needs the same Execution:Execute gate.
-            // Disabling only ever stops a schedule, so it stays gated on
-            // Schedule:Write alone — an operator must be able to kill a
-            // runaway schedule even without Execution:Execute.
-            if (enabled && !require_permission(req, res, "Execution", "Execute"))
-                return;
-            // An interim deny_service_scoped_schedule() call used to sit here,
-            // enable(true) only — deliberately built to leave disable
-            // reachable for a service-scoped token as its kill switch (H-01).
-            // guardian-confinement-2298 PR 3 ("the flip") made the deny itself
-            // provably dead (require_permission above already denies any
-            // service-scoped token outright for (Schedule, Write), enabled or
-            // not) — retired here, #3290 Phase 2 bucket 1a. NOTE: the flip's
-            // unconditional Schedule:Write gate ALSO means the documented
-            // kill-switch guarantee (disable stays reachable) does not
-            // currently hold for a service-scoped token, since it never gets
-            // past `require_permission` above regardless of `enabled`'s
-            // value — a real, pre-existing, NOT-yet-fixed gap this retirement
-            // discovered but does not resolve; see #3378.
-
-            // M-01 (#1806): owner-scoped enable/disable, same as delete above.
-            auto session = auth_routes_->resolve_session(req);
-            auto user = session ? session->username : std::string();
-            bool changed = schedule_engine_->set_enabled(id, enabled, user);
-            if (changed) {
-                // L-04 (#1806): enable/disable had no audit trail at all.
-                (void)audit_log(req, enabled ? "schedule.enable" : "schedule.disable", "success",
-                                "schedule", id);
-            }
-            res.set_content(nlohmann::json({{"enabled", enabled}}).dump(), "application/json");
         });
 
         // -- Approval API -----------------------------------------------------
