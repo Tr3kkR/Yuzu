@@ -460,10 +460,19 @@ TEST_CASE("REST enrollment/directory: pending-agents admitted-engaged-EMPTY scop
     // does NOT prove that a scoped grant against real enrollment data is
     // always empty (it is not -- see the CONFINEMENT comment above the
     // pending-agents route in enrollment_directory_routes.cpp for why the
-    // data model doesn't guarantee that). The real gate composition,
-    // including the AdmitScoped-with-empty-membership shape, is covered
-    // with real Postgres-backed RbacStore/ManagementGroupStore state in
-    // test_authz_gates.cpp's GatesRig-based cases.
+    // data model doesn't guarantee that). The real gate composition is
+    // covered elsewhere, in two separate pieces -- neither of which alone
+    // is the exact "require_fleet_read against a real, memberless
+    // management group" case, and this test doesn't claim to be either:
+    // test_authz_gates.cpp's GatesRig cases cover require_fleet_read with
+    // real Postgres-backed RbacStore/ManagementGroupStore state, but every
+    // GatesRig group has a real member -- its only admitted-empty case is
+    // an empty *service-tag* intersection under a global grant, a
+    // different axis. The AdmitScoped-on-a-memberless-group shape itself
+    // (INV-2) is covered in test_list_read_confinement.cpp's "allow on an
+    // empty group ⇒ AdmitScoped empty" case, but that drives
+    // RbacStore::authorize_list_read directly, one layer below
+    // require_fleet_read.
     EnrollmentDirectoryRouteHarness h;
     h.auth_mgr.add_pending_agent("agent-1", "host1.example.com", "linux", "x86_64", "1.2.3");
     // Engaged-empty scope (authz::deny_all() shape) -- admitted, but the

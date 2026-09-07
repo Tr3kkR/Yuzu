@@ -50,8 +50,10 @@
 /// the route's own comment in enrollment_directory_routes.cpp for the
 /// under-admission scenario this closes (a management-group-scoped
 /// `Enrollment:Read` grant was previously 403'd outright instead of admitted
-/// with a scoped, here always-empty, result, since pre-enrollment agents
-/// hold no group membership).
+/// with its real, confined result — typically empty, since pre-enrollment
+/// agents normally hold no group membership yet, but NOT a data-model
+/// guarantee: a pre-assigned membership row yields a non-empty, still
+/// correctly-confined, result).
 
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auto_approve.hpp>
