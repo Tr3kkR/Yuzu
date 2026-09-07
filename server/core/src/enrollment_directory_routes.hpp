@@ -13,11 +13,12 @@
 ///     see the naming-trap note below)
 ///
 /// Every row's JSON shape comes from `enrollment_directory_model.hpp`'s
-/// shared builder functions — REST here, the two new MCP tools
-/// (`list_directory_users`/`get_directory_status` in mcp_server.cpp), and the
-/// existing dashboard fragments (settings_routes.cpp) for the three
-/// admin_fn_-gated capabilities all call the SAME functions (docs/
-/// api-twin-recipe.md §1).
+/// shared builder functions, per docs/api-twin-recipe.md §1 — but the
+/// dashboard fragments (settings_routes.cpp) do NOT call them today; only
+/// `directory_user_row_json`/`directory_status_json` are genuinely
+/// multi-consumer (REST v1 + the two new MCP tools + the legacy
+/// `/api/directory/*` route). See `enrollment_directory_model.hpp`'s file
+/// header for the accurate 2-of-5 scope and why that matters.
 ///
 /// #520 DECISION (prerequisite 2 of the #4031 issue, same policy question as
 /// the sibling settings issue #4028): the three previously admin_fn_-gated

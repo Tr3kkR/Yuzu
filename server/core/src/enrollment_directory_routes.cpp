@@ -151,9 +151,25 @@ void EnrollmentDirectoryRoutes::register_routes(HttpRouteSink& sink, AuthFn /*au
                                                 "success", "Enrollment", "",
                                                 "REST v1 pending-agents read");
                 auto agents = auth_mgr->list_pending_agents();
+                // Filter out already-approved agents — they don't need admin
+                // attention, matching SettingsRoutes::render_pending_fragment()'s
+                // identical filter (settings_routes.cpp) so this route genuinely
+                // twins that fragment's population, not just its row shape.
+                // Gate 4 finding (#4031 hardening round): the unfiltered version
+                // silently returned every agent that had EVER enrolled, since
+                // nothing ages an approved entry out of pending_agents_ -- on any
+                // real fleet that made this route's actual output diverge from
+                // its name, OpenAPI summary, docs, and the API-parity ledger's
+                // "twinned" status, all of which describe it as the pending/
+                // denied queue. TODO: the fragment and this route independently
+                // duplicate this filter predicate rather than sharing one -- a
+                // follow-up could route both through a single filtered accessor
+                // on AuthManager instead.
                 nlohmann::json arr = nlohmann::json::array();
-                for (const auto& a : agents)
-                    arr.push_back(pending_agent_row_json(a));
+                for (const auto& a : agents) {
+                    if (a.status != auth::PendingStatus::approved)
+                        arr.push_back(pending_agent_row_json(a));
+                }
                 res.set_content(list_json(arr, static_cast<int64_t>(arr.size())),
                                 "application/json");
             });

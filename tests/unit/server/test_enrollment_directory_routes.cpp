@@ -104,6 +104,16 @@ struct EnrollmentDirectoryRouteHarness {
 
 // ── perm_fn denial (403) — every route, exact securable/operation ─────────
 
+// NOTE (Gate 4 hardening): every denial test below also asserts
+// `h.audit_log.empty()` and (where the route can only ever call perm_fn
+// once) `h.perm_calls.size() == 1`. Neither assertion existed originally —
+// quality-engineer's Gate 3 SHOULD noted that a future edit dropping the
+// early `return` after a denied `perm_fn` would fall through, write an
+// audit row, and overwrite `res.status` via `set_content` (which never
+// touches `status`), yet every pre-existing assertion here would still
+// pass — a 403 status carrying a 200-shaped PII/config body. These two
+// extra checks close that gap.
+
 TEST_CASE("REST enrollment/directory[pg]: perm_fn denial 403s directory/users on Directory:Read",
           "[rest][enrollment_directory][pg]") {
     EnrollmentDirectoryRouteHarness h;
@@ -112,8 +122,10 @@ TEST_CASE("REST enrollment/directory[pg]: perm_fn denial 403s directory/users on
     REQUIRE(res);
     CHECK(res->status == 403);
     REQUIRE_FALSE(h.perm_calls.empty());
+    CHECK(h.perm_calls.size() == 1);
     CHECK(h.perm_calls.back().securable == "Directory");
     CHECK(h.perm_calls.back().operation == "Read");
+    CHECK(h.audit_log.empty());
 }
 
 TEST_CASE("REST enrollment/directory: perm_fn denial 403s directory/status on Directory:Read",
@@ -124,8 +136,10 @@ TEST_CASE("REST enrollment/directory: perm_fn denial 403s directory/status on Di
     REQUIRE(res);
     CHECK(res->status == 403);
     REQUIRE_FALSE(h.perm_calls.empty());
+    CHECK(h.perm_calls.size() == 1);
     CHECK(h.perm_calls.back().securable == "Directory");
     CHECK(h.perm_calls.back().operation == "Read");
+    CHECK(h.audit_log.empty());
 }
 
 TEST_CASE("REST enrollment/directory: perm_fn denial 403s auto-approve-rules on Enrollment:Read",
@@ -136,8 +150,10 @@ TEST_CASE("REST enrollment/directory: perm_fn denial 403s auto-approve-rules on 
     REQUIRE(res);
     CHECK(res->status == 403);
     REQUIRE_FALSE(h.perm_calls.empty());
+    CHECK(h.perm_calls.size() == 1);
     CHECK(h.perm_calls.back().securable == "Enrollment");
     CHECK(h.perm_calls.back().operation == "Read");
+    CHECK(h.audit_log.empty());
 }
 
 TEST_CASE("REST enrollment/directory: perm_fn denial 403s pending-agents on Enrollment:Read",
@@ -148,8 +164,10 @@ TEST_CASE("REST enrollment/directory: perm_fn denial 403s pending-agents on Enro
     REQUIRE(res);
     CHECK(res->status == 403);
     REQUIRE_FALSE(h.perm_calls.empty());
+    CHECK(h.perm_calls.size() == 1);
     CHECK(h.perm_calls.back().securable == "Enrollment");
     CHECK(h.perm_calls.back().operation == "Read");
+    CHECK(h.audit_log.empty());
 }
 
 TEST_CASE("REST enrollment/directory: perm_fn denial 403s settings/oidc on OidcConfig:Read — "
@@ -161,8 +179,14 @@ TEST_CASE("REST enrollment/directory: perm_fn denial 403s settings/oidc on OidcC
     REQUIRE(res);
     CHECK(res->status == 403);
     REQUIRE_FALSE(h.perm_calls.empty());
+    // Pins call COUNT, not just the last call's securable — catches a
+    // regression that inserted an extra, earlier permission probe (e.g.
+    // gating on Directory first, then OidcConfig) ahead of the real check,
+    // not just a straight securable swap.
+    CHECK(h.perm_calls.size() == 1);
     CHECK(h.perm_calls.back().securable == "OidcConfig");
     CHECK(h.perm_calls.back().operation == "Read");
+    CHECK(h.audit_log.empty());
 }
 
 // ── 503 on a null dependency ────────────────────────────────────────────
@@ -234,13 +258,92 @@ TEST_CASE("REST enrollment/directory: auto-approve-rules 503s when the engine is
     CHECK(res->status == 503);
 }
 
+TEST_CASE("REST enrollment/directory: pending-agents 503s when auth_mgr is null "
+          "(Gate 4: closes a coverage gap the file header claimed was already covered)",
+          "[rest][enrollment_directory]") {
+    EnrollmentDirectoryRouteHarness h;
+    yuzu::server::test::TestRouteSink sink2;
+    EnrollmentDirectoryRoutes routes2;
+    auto auth_fn = [](const httplib::Request&, httplib::Response&)
+        -> std::optional<auth::Session> { return auth::Session{}; };
+    auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                      const std::string&) { return true; };
+    auto audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
+                       const std::string&, const std::string&, const std::string&) {
+        return true;
+    };
+    routes2.register_routes(sink2, auth_fn, perm_fn, audit_fn, nullptr, nullptr, nullptr, &h.cfg);
+    auto res = sink2.Get("/api/v1/enrollment/pending-agents");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+}
+
+TEST_CASE("REST enrollment/directory: settings/oidc 503s when cfg is null "
+          "(Gate 4: closes a coverage gap the file header claimed was already covered)",
+          "[rest][enrollment_directory]") {
+    EnrollmentDirectoryRouteHarness h;
+    yuzu::server::test::TestRouteSink sink2;
+    EnrollmentDirectoryRoutes routes2;
+    auto auth_fn = [](const httplib::Request&, httplib::Response&)
+        -> std::optional<auth::Session> { return auth::Session{}; };
+    auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                      const std::string&) { return true; };
+    auto audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
+                       const std::string&, const std::string&, const std::string&) {
+        return true;
+    };
+    routes2.register_routes(sink2, auth_fn, perm_fn, audit_fn, nullptr, &h.auto_approve,
+                            &h.auth_mgr, nullptr);
+    auto res = sink2.Get("/api/v1/settings/oidc");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+}
+
 // ── pending-agents: success shape + audit (in-memory, no PG) ──────────────
 
-TEST_CASE("REST enrollment/directory: pending-agents returns the queue, excludes nothing "
-          "(unlike the fragment, no approved-filter)",
+TEST_CASE("REST enrollment/directory: pending-agents returns pending+denied only, EXCLUDES "
+          "already-approved agents (Gate 4 fix -- matches render_pending_fragment()'s "
+          "identical filter; the route previously returned every agent that had ever "
+          "enrolled, silently diverging from its own name/docs/API-parity ledger)",
           "[rest][enrollment_directory]") {
     EnrollmentDirectoryRouteHarness h;
     h.auth_mgr.add_pending_agent("agent-1", "host1.example.com", "linux", "x86_64", "1.2.3");
+    h.auth_mgr.add_pending_agent("agent-2", "host2.example.com", "windows", "x86_64", "1.2.3");
+    REQUIRE(h.auth_mgr.approve_pending_agent("agent-2"));
+
+    auto res = h.sink.Get("/api/v1/enrollment/pending-agents");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j["data"].is_array());
+    // Only agent-1 (still pending) should appear -- agent-2 (approved) must
+    // be excluded. Before the fix this returned BOTH (size 2), including
+    // agent-2 with status:"approved" -- this assertion fails on the
+    // unfiltered code, closing the false-green floor for this finding.
+    REQUIRE(j["data"].size() == 1);
+    CHECK(j["data"][0]["agent_id"] == "agent-1");
+    CHECK(j["data"][0]["hostname"] == "host1.example.com");
+    CHECK(j["data"][0]["os"] == "linux");
+    CHECK(j["data"][0]["arch"] == "x86_64");
+    CHECK(j["data"][0]["agent_version"] == "1.2.3");
+    CHECK(j["data"][0]["status"] == "pending");
+    // pagination.total must reflect the FILTERED count, not the raw
+    // pending_agents_ map size -- list_json computes it from the array
+    // actually pushed, so this also guards against a fix that filters the
+    // rows but forgets to recompute the count from the same filtered set.
+    CHECK(j["pagination"]["total"] == 1);
+
+    REQUIRE_FALSE(h.audit_log.empty());
+    CHECK(h.audit_log.back().action == "enrollment.pending_agents.view");
+}
+
+TEST_CASE("REST enrollment/directory: pending-agents includes denied agents (only "
+          "'approved' is excluded, matching PendingStatus's exact 3-value enum)",
+          "[rest][enrollment_directory]") {
+    EnrollmentDirectoryRouteHarness h;
+    h.auth_mgr.add_pending_agent("agent-3", "host3.example.com", "macos", "arm64", "1.2.3");
+    REQUIRE(h.auth_mgr.deny_pending_agent("agent-3"));
 
     auto res = h.sink.Get("/api/v1/enrollment/pending-agents");
     REQUIRE(res);
@@ -249,16 +352,8 @@ TEST_CASE("REST enrollment/directory: pending-agents returns the queue, excludes
     auto j = nlohmann::json::parse(res->body);
     REQUIRE(j["data"].is_array());
     REQUIRE(j["data"].size() == 1);
-    CHECK(j["data"][0]["agent_id"] == "agent-1");
-    CHECK(j["data"][0]["hostname"] == "host1.example.com");
-    CHECK(j["data"][0]["os"] == "linux");
-    CHECK(j["data"][0]["arch"] == "x86_64");
-    CHECK(j["data"][0]["agent_version"] == "1.2.3");
-    CHECK(j["data"][0]["status"] == "pending");
-    CHECK(j["pagination"]["total"] == 1);
-
-    REQUIRE_FALSE(h.audit_log.empty());
-    CHECK(h.audit_log.back().action == "enrollment.pending_agents.view");
+    CHECK(j["data"][0]["agent_id"] == "agent-3");
+    CHECK(j["data"][0]["status"] == "denied");
 }
 
 // ── settings/oidc: success shape + secret masking (in-memory, no PG) ──────

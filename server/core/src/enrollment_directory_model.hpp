@@ -4,11 +4,27 @@
 ///
 /// #4031 (API-parity Batch A): shared pure builder functions for the
 /// directory-sync (AD/Entra), enrollment (auto-approve rules + pending
-/// agents), and OIDC SSO config read surfaces — REST v1, MCP, and (where one
-/// already exists) the HTML dashboard fragment all call the SAME functions
-/// here to build a row's data, per docs/api-twin-recipe.md §1. No
-/// `httplib.h`, no MCP-specific includes — pure functions of a store/struct
-/// value, returning `nlohmann::json`.
+/// agents), and OIDC SSO config read surfaces, per docs/api-twin-recipe.md
+/// §1. No `httplib.h`, no MCP-specific includes — pure functions of a
+/// store/struct value, returning `nlohmann::json`.
+///
+/// Genuinely multi-consumer today: `directory_user_row_json` and
+/// `directory_status_json` — REST v1, MCP, AND the legacy `/api/directory/*`
+/// route all call the same function (verified: `discovery_routes.cpp`,
+/// `mcp_server.cpp`, `enrollment_directory_routes.cpp`). The other three
+/// (`auto_approve_rule_row_json`, `pending_agent_row_json`, `oidc_config_json`)
+/// have NO dashboard-fragment consumer today — `settings_routes.cpp`'s
+/// `render_auto_approve_fragment`/`render_pending_fragment`/
+/// `render_directory_fragment` independently re-derive equivalent facts by
+/// hand rather than calling these functions. That independent duplication is
+/// exactly the anti-pattern §1 warns against, and is what let
+/// `pending_agent_row_json`'s REST v1 caller silently diverge from the
+/// fragment's population (the fragment filters out `approved` agents, the
+/// route originally didn't — fixed as a Gate 4 finding in #4031's hardening
+/// round; see the route's own comment in `enrollment_directory_routes.cpp`).
+/// Routing the three fragment renderers through these builders would make
+/// the lockstep real rather than asserted — tracked as a follow-up, not done
+/// here.
 ///
 /// NAMING TRAP (see the #4031 issue text and discovery_routes.cpp's own
 /// header comment): `GET /fragments/settings/directory` renders OIDC SSO

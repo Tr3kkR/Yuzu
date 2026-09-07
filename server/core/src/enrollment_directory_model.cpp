@@ -9,9 +9,16 @@ namespace yuzu::server {
 
 namespace {
 
-// Matches the string names render_auto_approve_fragment() (settings_routes.cpp)
-// already uses for the same enum — kept in lockstep by hand since the enum has
-// no built-in stringifier; a future new rule type must update both.
+// Machine (snake_case) values, matching settings_routes.cpp's auto-approve
+// POST-body parser (~line 5210) and byte-identical to auto_approve.cpp's own
+// internal-linkage rule_type_to_string() (used for on-disk persistence) —
+// NOT render_auto_approve_fragment()'s dashboard labels, which are Title
+// Case display strings ("Trusted CA", "Hostname Glob") for a different
+// audience. Three independent hand-synced copies of this mapping now exist
+// (auto_approve.cpp's persistence pair, settings_routes.cpp's UI labels,
+// this one); auto_approve.cpp's pair could be exported from auto_approve.hpp
+// and reused here instead of a third switch — not done in this pass. A
+// future new rule type must update all three.
 const char* auto_approve_rule_type_str(auth::AutoApproveRuleType t) {
     switch (t) {
     case auth::AutoApproveRuleType::trusted_ca:
