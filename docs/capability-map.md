@@ -1,6 +1,6 @@
 # Yuzu Capability Map
 
-**Version:** 3.0 | **Date:** 2026-03-30 | **Status:** Draft
+**Version:** 4.0 | **Date:** 2026-09-07 | **Status:** Baselined against dev @ d295db964
 
 ---
 
@@ -26,51 +26,73 @@ Each capability is rated on two axes:
 
 ## Progress at a Glance
 
+> **Method (reproduce this before trusting the number).** Every figure below is a direct
+> tally of the per-entry status icons in the 39 domains that follow — no entry is counted
+> outside its own domain, and each entry counts once against its `T1`/`T2`/`T3` tier label.
+> Reproduce with:
+> `awk '/^### [0-9]+\.[0-9]+/ { if ($0 ~ /:white_check_mark:/) d++; else if ($0 ~ /:large_orange_diamond:/) p++; else if ($0 ~ /:x:/) n++ } END { print d, p, n, d+p+n }' docs/capability-map.md`
+> → `207 19 39 265`. Tier tallies (`Foundation`=T1, `Advanced`=T2, `Future`=T3) add the same
+> awk pattern filtered on `` `T1` ``/`` `T2` ``/`` `T3` ``. The former "New (Ph 8-16)" interim
+> row is retired — those phases are now ordinary domains 25-31, and 2026 additions land as
+> domains 32-39 rather than an undifferentiated bucket. **Domains 32-39 were verified for
+> file presence and meson-build compilation only** (grep/`ls`/`meson.build` census, 2026-09-07);
+> their per-row behavioural claims (exact signal counts, retention windows, etc.) are inherited
+> from the unmerged 2026-07 capability-industry review rather than independently re-derived
+> this session — honest scoping over implied uniform depth. Domains 1-31's regraded rows each
+> carry their own inline evidence citation and verification date.
+
 ```
-Foundation   [================================]  33/33 done  (100%)
-Advanced     [==============================--]  96/101 done (95%)
-Future       [=====================-----------]  33/50 done  (66%)
-New (Ph 8-16)[=---------------------------]     2/44 done   (5%) (5 partial — Guardian PRs 1-2 + Guardian pre-login activation done; 15.A + 28.4 + 28.6 + 28.7 fleet-viz in flight)
+Foundation   [===============================-]  58/59 done  (98%)
+Advanced     [==========================------]  138/172 done (80%) (15 partial)
+Future       [==========----------------------]  11/34 done  (32%) (3 partial)
 ─────────────────────────────────────────────────────────────────
-Overall      [=======================--------]   167/228 done (73%)
+Overall      [=========================-------]  207/265 done (78%) (19 partial)
 ```
 
 | Domain | Total | Done | Partial | Not Started |
 |--------|:-----:|:----:|:-------:|:-----------:|
-| 1. Agent Lifecycle | 9 | 9 | 0 | 0 |
-| 2. Command Execution | 13 | 13 | 0 | 0 |
-| 3. Device & Endpoint Info | 10 | 8 | 1 | 1 |
-| 4. Network Info & Discovery | 11 | 9 | 0 | 2 |
-| 5. Process & Service Mgmt | 5 | 4 | 0 | 1 |
-| 6. User & Session Mgmt | 5 | 5 | 0 | 0 |
-| 7. Software & App Mgmt | 6 | 6 | 0 | 0 |
-| 8. Patch & Update Mgmt | 9 | 3 | 4 | 2 |
-| 9. Security & Compliance | 10 | 9 | 0 | 1 |
+| 1. Agent Lifecycle Management | 9 | 9 | 0 | 0 |
+| 2. Command Execution and Orchestration | 13 | 13 | 0 | 0 |
+| 3. Device and Endpoint Information | 10 | 8 | 1 | 1 |
+| 4. Network Information and Discovery | 11 | 9 | 0 | 2 |
+| 5. Process and Service Management | 5 | 4 | 0 | 1 |
+| 6. User and Session Management | 5 | 5 | 0 | 0 |
+| 7. Software and Application Management | 6 | 6 | 0 | 0 |
+| 8. Patch and Update Management | 9 | 3 | 4 | 2 |
+| 9. Security and Compliance | 10 | 8 | 1 | 1 |
 | 10. File System Operations | 15 | 14 | 0 | 1 |
-| 11. Script & Command Exec | 4 | 4 | 0 | 0 |
-| 12. Registry & System Config | 7 | 7 | 0 | 0 |
-| 13. Content Distribution | 5 | 5 | 0 | 0 |
-| 14. User Interaction | 6 | 3 | 0 | 3 |
-| 15. Inventory & Data Collection | 5 | 4 | 0 | 1 |
-| 16. Policy & Compliance Engine | 8 | 8 | 0 | 0 |
-| 17. Triggers & Automation | 7 | 7 | 0 | 0 |
-| 18. Auth & Authorization | 10 | 9 | 0 | 1 |
-| 19. Device & Group Mgmt | 7 | 7 | 0 | 0 |
-| 20. Response Collection | 7 | 7 | 0 | 0 |
-| 21. Notifications & Audit | 5 | 4 | 0 | 1 |
-| 22. System & Infrastructure | 10 | 7 | 0 | 3 |
-| 23. Agent Key-Value Storage | 3 | 3 | 0 | 0 |
-| 24. Integration & Extensibility | 10 | 8 | 0 | 2 |
+| 11. Script and Command Execution | 4 | 4 | 0 | 0 |
+| 12. Registry and System Configuration | 7 | 7 | 0 | 0 |
+| 13. Content Distribution | 5 | 4 | 0 | 1 |
+| 14. User Interaction | 6 | 5 | 0 | 1 |
+| 15. Inventory and Data Collection | 5 | 4 | 0 | 1 |
+| 16. Policy and Compliance Engine | 8 | 8 | 0 | 0 |
+| 17. Triggers and Event-Driven Automation | 7 | 7 | 0 | 0 |
+| 18. Server: Authentication and Authorization | 10 | 10 | 0 | 0 |
+| 19. Server: Device and Group Management | 7 | 7 | 0 | 0 |
+| 20. Server: Response Collection and Reporting | 8 | 8 | 0 | 0 |
+| 21. Server: Notifications and Audit | 6 | 5 | 0 | 1 |
+| 22. Server: System and Infrastructure | 10 | 6 | 2 | 2 |
+| 23. Agent-Side Key-Value Storage | 3 | 3 | 0 | 0 |
+| 24. Integration and Extensibility | 11 | 9 | 0 | 2 |
 | 25. Connector Framework | 5 | 0 | 0 | 5 |
-| 26. Inventory Repositories | 4 | 0 | 0 | 4 |
-| 27. Software Licensing & Entitlements (SLE) | 5 | 0 | 0 | 5 |
-| 28. Response Visualization | 9 | 0 | 3 | 6 |
+| 26. Inventory Repositories | 4 | 0 | 1 | 3 |
+| 27. Software Licensing & Entitlements (SLE) | 5 | 0 | 1 | 4 |
+| 28. Response Visualization | 9 | 5 | 2 | 2 |
 | 29. Consumer Applications | 4 | 0 | 0 | 4 |
 | 30. Scope Walking & Result Sets | 4 | 3 | 1 | 0 |
-| 31. System Guardian | 10 | 1 | 2 | 7 |
-| **TOTAL** | **228** | **167** | **11** | **50** |
+| 31. System Guardian | 10 | 3 | 5 | 2 |
+| 32. DEX — Digital Employee Experience | 7 | 6 | 0 | 1 |
+| 33. Network Quality | 4 | 3 | 0 | 1 |
+| 34. Device Pages and Live Snapshot | 3 | 3 | 0 | 0 |
+| 35. Agent Daily-Sync Inventory (ADR-0016) | 5 | 3 | 1 | 1 |
+| 36. `/auto` — Operator Automation | 3 | 3 | 0 | 0 |
+| 37. Internal PKI / Certificate Authority | 5 | 5 | 0 | 0 |
+| 38. Server Storage Substrate — PostgreSQL | 4 | 4 | 0 | 0 |
+| 39. Headless Platform — Engine Principals & On-Behalf-Of (ADR-1005) | 3 | 3 | 0 | 0 |
+| **TOTAL** | **265** | **207** | **19** | **39** |
 
-> **Scaffolded vs production-quality.** The percentages above measure feature presence, not enterprise hardening. Foundation and Advanced tiers reach 100% on the "implemented and functional" bar — they do not yet reach "hardened, observable, and proven at large-fleet scale" on every domain. Known gaps at the §-level (e.g. configurable heartbeat in §1.2, unified diagnostics bundle in §1.3, runtime plugin install in §1.5) remain even where a domain is marked Done. The `docs/capability-agentic-audit-2026-05.md` audit is the source for the production-quality dimension; subsequent reviews should keep it current.
+> **Scaffolded vs production-quality.** The percentages above measure feature presence, not enterprise hardening. "Done" means "implemented and functional" — not "hardened, observable, and proven at large-fleet scale" on every domain. Known gaps at the §-level (e.g. configurable heartbeat in §1.2, unified diagnostics bundle in §1.3, runtime plugin install in §1.5) remain even where a domain is marked Done. The `docs/capability-agentic-audit-2026-05.md` audit is the source for the production-quality dimension; subsequent reviews should keep it current.
 
 ---
 
@@ -396,7 +418,9 @@ implementation** — it existed as `PatchManager::execute_deployment()` but had 
 callers (nothing ever wired a dispatch/OS-lookup callback to it) and was deleted rather than
 ported in the store's Postgres migration; see #3669 for the removed tested-but-unwired
 implementation. A target's status only advances past `pending` via a direct
-`update_target_status()` call, which nothing in this codebase makes today.
+`update_target_status()` call, which nothing in this codebase makes today. *(Re-verified
+2026-09-07 for the v4.0 baseline: `execute_deployment()` remains absent from
+`server/core/src/patch_store.cpp`; grade unchanged.)*
 
 ### 8.4 Patch Status Tracking :large_orange_diamond: `T2`
 
@@ -424,7 +448,8 @@ Linux/macOS `shutdown -r +N`) existed but had zero production callers and was re
 store's Postgres migration (ADR-0062); see #3669 for the removed tested-but-unwired
 implementation. `reboot_delay_seconds`/`reboot_at` are still accepted by
 `POST /api/patches/deploy`, clamped, and stored on `PatchDeployment`, but nothing currently acts
-on them.
+on them. *(Re-verified 2026-09-07 for the v4.0 baseline: no reboot-orchestration call site
+found; grade unchanged.)*
 
 ### 8.7 Update Summary and Compliance Reporting :large_orange_diamond: `T2`
 
@@ -491,8 +516,14 @@ collisions possible; vendor precision pending ADR-0018). See
 > `vuln_scan` collection action is *mechanism* and stays core, but the
 > plugin's embedded static CVE rule list (`cve_rules.hpp`) and its use as an
 > authoritative `cve_scan` finding source are **frozen (no further rule
-> updates) and deprecated** — the long-term replacement is engine-published
-> content delivered through the existing content-distribution plane.
+> updates) and deprecated** — verified 2026-09-07: `VulnFindingStore::reconcile_agent`
+> (`server/core/src/vuln_finding_store.{hpp,cpp}`) has zero production callers — its own
+> header literally says "no engine calls `reconcile_agent` yet (PR 4 lands the matching
+> engine)" — so the modern matcher/finding-reconciliation path is **design-only — deferred
+> to ADR-1005 Phase 7** along with the rest of the vulnerability-management use-case engine;
+> do not read the basic plugin+NVD-sync capability above as covering it. The long-term
+> replacement is engine-published content delivered through the existing
+> content-distribution plane.
 
 ### 9.5 Event Log Collection :white_check_mark: `T1`
 
@@ -686,13 +717,13 @@ Not implemented. P2P caching to reduce WAN bandwidth. Requires agent mesh networ
 
 `interaction` plugin with `input` action. Text input dialog with configurable prompt and default value. Returns entered text or cancellation. MessageBoxW (Windows), zenity (Linux), osascript (macOS).
 
-### 14.4 Survey Dialog :x: `T3`
+### 14.4 Survey Dialog :white_check_mark: `T3`
 
-Not implemented. Multi-question form with response aggregation.
+Shipped. `interaction` plugin `survey` action — multi-question form via `zenity` (Linux, supported), `powershell_winforms` (Windows, supported), `osascript` (macOS, constrained — no reachable GUI session under the headless/root LaunchDaemon). *(Evidence: `agents/plugins/interaction/src/interaction_plugin.cpp`, `"survey"` action registered ~line 1284, dispatched via `do_survey()`; verified 2026-09-07 — previously mis-graded Not Started.)*
 
-### 14.5 Do-Not-Disturb Mode :x: `T3`
+### 14.5 Do-Not-Disturb Mode :white_check_mark: `T3`
 
-Not implemented. Suppress notifications during user-defined windows.
+Shipped. `interaction` plugin `set_dnd` action — enables/disables DND with an optional expiry, suppresses `notify` calls while active (`is_dnd_active()` gate in `do_notify()`), and persists state across restarts via the agent's local KV store (`local_kv_store`) on all three platforms. *(Evidence: `agents/plugins/interaction/src/interaction_plugin.cpp`, `"set_dnd"` action ~line 1290, state restore in `init()`; verified 2026-09-07 — previously mis-graded Not Started.)*
 
 ### 14.6 Active Response Tracking :x: `T3`
 
@@ -840,9 +871,9 @@ Session-cookie auth with PBKDF2-hashed passwords.
 
 `httplib::SSLServer` with OpenSSL. CLI flags: `--https`, `--https-port`, `--https-cert`, `--https-key`, `--no-https-redirect`. HTTP-to-HTTPS 301 redirect. Secure cookie flag. Settings UI TLS configuration section.
 
-### 18.10 Two-Factor Authentication for Approvals :x: `T2`
+### 18.10 Two-Factor Authentication :white_check_mark: `T2`
 
-Not implemented. TOTP (RFC 6238) second factor for instruction approval workflows. Per-user TOTP enrollment with QR code, email-based OTP fallback.
+Shipped (SOC 2 CC6.6 privileged-access MFA ladder). RFC 6238 TOTP + RFC 4648 base32 + `otpauth://` URI builder (`totp.cpp`), per-user enrollment with QR code (`mfa_qr.cpp`), and a step-up gate (`mfa_step_up.cpp`) that blocks high-risk REST/Settings handlers unless `Session::mfa_verified_at` is fresh within `mfa_step_up_window_secs` — API-token/MCP-token principals skip step-up by design (the bearer credential is the step-up moment). Retitled from "...for Approvals" — the shipped scope is login-time TOTP + step-up on privileged handlers generally, not specifically the instruction-approval workflow. Email-based OTP fallback not found; scope narrower than the original row's aspiration in that respect. *(Evidence: `server/core/src/totp.{hpp,cpp}`, `mfa_qr.{hpp,cpp}`, `mfa_step_up.{hpp,cpp}`; verified 2026-09-07 — previously mis-graded Not Started.)*
 
 ---
 
@@ -912,6 +943,10 @@ Named response-view configurations (column subset, sort order, filter presets) a
 
 Operator-registered external HTTP endpoints (*offload targets*) that receive a copy of `agent.registered` and `execution.completed` events as they fire. Sibling `OffloadTargetStore` (Postgres schema `offload_target_store`, ADR-0059) wired into `AgentServiceImpl` next to the existing webhook fan-out — every event that fires a webhook also fans out to every enabled offload target whose `event_types` filter matches. Typed auth: none / bearer / basic / hmac (Authorization headers are CRLF-guarded against header injection). Server-side batching: `batch_size > 1` accumulates events into a per-target buffer and flushes on threshold; flush body is JSON of shape `{"events":[…]}`. REST CRUD at `/api/v1/offload-targets` gated on `Infrastructure:Read`/`Write`. `auth_credential` is `SecretCodec`-encrypted at rest (ADR-0010) and never returned by any read endpoint (a `has_credential` flag reports whether one is configured; paranoia-double-check assertion in REST tests). YAML authoring via `spec.offload.targets` is documented; dispatcher-side correlation (per-instruction filter honouring) deferred to a follow-up. Phase 8.3, issue #255.
 
+### 20.8 Executions-History Ladder and Agentic Event Stream :white_check_mark: `T2` *(new row, v4.0)*
+
+The `command_id → execution_id` map + `ExecutionEventBus` SSE stream unifying dashboard and REST/MCP execution visibility behind one taxonomy (`/api/v1/events`) — never per-route event formats. `execute_instruction` (REST + MCP) is a tracked-execution producer. A4 error-envelope shape lives in `rest_a4_envelope.hpp`. *(Evidence: `server/core/src/execution_event_bus.{hpp,cpp}`, `execution_tracker.{hpp,cpp}`, `rest_a4_envelope.{hpp,cpp}`; design: `docs/executions-history-ladder.md`; verified 2026-09-07.)*
+
 ---
 
 ## 21. Server: Notifications and Audit
@@ -924,11 +959,11 @@ Operator-registered external HTTP endpoints (*offload targets*) that receive a c
 
 ### 21.2 Audit Trail of User Actions :white_check_mark: `T2`
 
-`AuditStore` with SQLite WAL backend. Structured events: timestamp, principal, principal_role, action, target_type, target_id, detail, source_ip, result. Query with filtering and pagination via `/api/audit`. Default 365-day retention.
+`AuditStore` (migrated to PostgreSQL, ADR-0040/Wave 1.3, PR #2697 — fail-hard writes, degrade→deny reads, SOC-2 evidence chain; verified 2026-09-07 via `pg::PgPool`/`pg::PgMigration` usage in `audit_store.cpp`, previous row text stale-claimed SQLite). Structured events: timestamp, principal, principal_role, action, target_type, target_id, detail, source_ip, result. Query with filtering and pagination via `/api/audit`. Default 365-day retention.
 
 ### 21.3 System Notifications :white_check_mark: `T2`
 
-`NotificationStore` (SQLite backend). Create notifications with level (info/warn/error/success), title, and message. List unread/all, mark as read, dismiss (soft-delete), count unread. Server generates notifications for system events (agent registration, policy violations, deployment completions). REST API and dashboard bell icon integration.
+`NotificationStore` (migrated to PostgreSQL; verified 2026-09-07 via `pg::PgPool` constructor in `notification_store.cpp`, previous row text stale-claimed SQLite). Create notifications with level (info/warn/error/success), title, and message. List unread/all, mark as read, dismiss (soft-delete), count unread. Server generates notifications for system events (agent registration, policy violations, deployment completions). REST API and dashboard bell icon integration.
 
 ### 21.4 Event Subscriptions (Webhook / Email) :white_check_mark: `T3`
 
@@ -937,6 +972,10 @@ Operator-registered external HTTP endpoints (*offload targets*) that receive a c
 ### 21.5 Event Source Management :x: `T3`
 
 Not implemented. Configure which events generate notifications.
+
+### 21.6 Behavioral-PII Access-Audit Chokepoint :white_check_mark: `T2` *(new row, v4.0)*
+
+Every behavioural-PII read (device-live-info, process/network drill, DEX perf, etc.) funnels through the single `emit_behavioral_audit` chokepoint (#1647) — REST fail-closed 503 + `Sec-Audit-Failed` header on an audit-write failure, dashboard/MCP set-and-proceed. Standing invariant: no new PII route may reintroduce an inline bool-capture bypassing the chokepoint. *(Evidence: `server/core/src/rest_audit.hpp` `emit_behavioral_audit`; verified 2026-09-07.)*
 
 ---
 
@@ -952,9 +991,9 @@ Kubernetes-style health probes: `/livez` (always 200) and `/readyz` (checks stor
 
 `topology_ui.cpp` dashboard page at `/topology`. HTMX fragment `/frag/topology-data` (30s poll). Shows server node, gateway badges, management group tree, OS breakdown. REST: `GET /api/v1/topology`.
 
-### 22.3 License Management :white_check_mark: `T2`
+### 22.3 License Management :large_orange_diamond: `T2`
 
-`LicenseStore` with seat-based licensing, expiry, edition, feature flags. Soft enforcement with alerts at 90% seats / 30 days to expiry. REST: `GET/POST/DELETE /api/v1/license`, `GET /api/v1/license/alerts`. **Dormant** (ADR-0048) — the store is migrated and tested but not constructed by the server, so these routes do not register today.
+`LicenseStore` with seat-based licensing, expiry, edition, feature flags. Soft enforcement with alerts at 90% seats / 30 days to expiry. REST: `GET/POST/DELETE /api/v1/license`, `GET /api/v1/license/alerts`. **Dormant** (ADR-0048) — the store is migrated and tested but not constructed by the server, so these routes do not register today. **Regraded ✅ Done → 🔶 Partial (ADR-0048; regraded 2026-09-07)** — the store's own file header states it is "DELIBERATELY DORMANT on `dev`": nothing in `server.cpp` constructs a `LicenseStore`, so a fully-implemented, fully-tested capability that is not wired up in the running server is not a delivered capability. *(Evidence: `server/core/src/license_store.hpp` header comment; verified 2026-09-07. Not to be confused with §27 Software Licensing & Entitlements — this store is Yuzu's own product licensing, unrelated to customer software-license discovery.)*
 
 ### 22.4 Platform Configuration (TTLs, Limits) :white_check_mark: `T2`
 
@@ -980,9 +1019,9 @@ Not implemented. Distribute versioned binary resources via server.
 
 Not implemented. Time-partitioned response storage (monthly SQLite files) with automatic rotation, TTL cleanup, and transparent cross-partition query routing.
 
-### 22.10 High Availability (Active-Passive) :x: `T3`
+### 22.10 High Availability (Active-Passive) :large_orange_diamond: `T3`
 
-Not implemented. Active-passive failover with shared storage, inter-server heartbeat, automatic failover on primary health check failure, and gateway re-registration.
+Design + one unwired component, not live HA. ADR-2002 (accepted) specifies a fenced, Postgres-backed leader election model (WS-3): a dedicated connection holding a session-scoped advisory lock, an epoch fence that gates every mutating operation, two dispatch planes. `LeaderElector` (`server/core/src/leader_elector.{hpp,cpp}`) implements this and compiles into `server/core/meson.build`, but has **zero call sites outside its own translation unit** — no `server.cpp` construction, nothing wires it into the boot sequence — so no automatic failover, inter-server heartbeat, or gateway re-registration exists at runtime today. Several other server modules (ExecutionTracker's `ExecutionEventBus`, ScheduleEngine's `SELECT ... FOR UPDATE`) carry forward-pointers to ADR-2002 for their own eventual multi-replica story. *(Evidence: `docs/adr/0061-update-registry-postgres-migration.md`, `docs/adr/0065-instruction-cluster-postgres-migration.md` ADR-2002 references; `grep -rl LeaderElector server/core/src/*.cpp` returns only `leader_elector.cpp` itself; verified 2026-09-07 — previously mis-graded Not Started.)*
 
 ---
 
@@ -1038,7 +1077,7 @@ Not implemented. Client libraries wrapping the management API for third-party in
 
 ### 24.8 MCP Server (Model Context Protocol) :white_check_mark: `T2`
 
-Embedded MCP server at `POST /mcp/v1/` using JSON-RPC 2.0 transport. Enables AI models (e.g., Claude Desktop) to query fleet status, check compliance, and investigate agents. Phase 1: 22 read-only tools (`list_agents`, `get_agent_details`, `query_audit_log`, `list_definitions`, `get_definition`, `query_responses`, `aggregate_responses`, `query_inventory`, `list_inventory_tables`, `get_agent_inventory`, `get_tags`, `search_agents_by_tag`, `list_policies`, `get_compliance_summary`, `get_fleet_compliance`, `list_management_groups`, `get_execution_status`, `list_executions`, `list_schedules`, `validate_scope`, `preview_scope_targets`, `list_pending_approvals`), 3 resources (`yuzu://server/health`, `yuzu://compliance/fleet`, `yuzu://audit/recent`), 4 prompts (`fleet_overview`, `investigate_agent`, `compliance_report`, `audit_investigation`).
+Embedded MCP server at `POST /mcp/v1/` using JSON-RPC 2.0 transport. Enables AI models (e.g., Claude Desktop) to query fleet status, check compliance, and investigate agents. Phase 1 (historical): 22 read-only tools, 3 resources, 4 prompts. **Update 2026-09-07: 91 tools registered** — directly counted this session via `awk` over the `kTools[]` array in `server/core/src/mcp_server.cpp` (`awk '/^static const ToolDef kTools\[\] = \{/{f=1;next} f && /^\};/{exit} f' server/core/src/mcp_server.cpp | grep -cE '^    \{"'` → 91), spanning DEX perf twins, TAR, inventory, executions, preflight/deployment/verify, PKI, and license/SLE discovery among others. The write surface is broader than the historical single-dispatch note implied, but every tool honours the tier-before-RBAC ordering (§24.9) and the standard A5 annotation contract (destructiveHint, bounded input schema, typed output schema).
 
 ### 24.9 MCP Authorization Tiers :white_check_mark: `T2`
 
@@ -1047,6 +1086,10 @@ Three-tier authorization model enforced before RBAC: `readonly` (read-only tools
 ### 24.10 MCP Settings UI :white_check_mark: `T2`
 
 Settings page section for MCP configuration: enable/disable toggle, read-only mode toggle. API token creation supports MCP tier dropdown for creating MCP-scoped tokens.
+
+### 24.11 MCP Streamed HTTP Transport :white_check_mark: `T2` *(new row, v4.0)*
+
+Streamable HTTP transport per ADR-1005 exec-plan Decision 15 / track 2f — sessions, GET SSE, and a progress bridge alongside the original single-request JSON-RPC transport, giving long-running MCP tool calls (e.g. `execute_instruction`) a streamed progress channel joining the executions-history ladder (§20.8) as a third bus consumer. *(Evidence: `server/core/src/mcp_transport.{hpp,cpp}`, `mcp_session.{hpp,cpp}`, `mcp_stream_bridge.{hpp,cpp}`; design: `docs/mcp-server.md`; verified 2026-09-07.)*
 
 ---
 
@@ -1088,9 +1131,9 @@ Not implemented. Named repositories per type (inventory, compliance, entitlement
 
 Not implemented. Multi-source deduplication by device identity (hostname + MAC + serial). Consolidation reports showing matched vs. unmatched records.
 
-### 26.3 Software Normalization :x: `T2`
+### 26.3 Software Normalization :large_orange_diamond: `T2`
 
-Not implemented. Vendor/title/version canonicalization pipeline. Normalize raw inventory entries to canonical software identities.
+Partial. `SoftwareCatalogRollup` (`server/core/src/software_catalog_rollup.{hpp,cpp}`) canonicalizes vendor/title/version from the ADR-0016 `installed_software` daily-sync source for the `/inventory` dashboard's catalogue view. This is the `/inventory`-scoped normalization pipeline (§35.4), not a general-purpose, repository-model-backed consolidation pipeline (§26.1/26.2 remain Not Started — no `Repository` model, no multi-source dedup-by-device-identity). *(Evidence: `server/core/src/software_catalog_rollup.cpp`; verified 2026-09-07 — previously mis-graded Not Started.)*
 
 ### 26.4 WSUS / CSV / File Upload Connectors :x: `T2`
 
@@ -1102,9 +1145,9 @@ Not implemented. WSUS database connector for patch compliance. CSV/TSV file uplo
 
 *Normalized software identification, agent-discovered software licences, entitlements, and compliance management. Renamed from "Software Catalog & Licensing" by ADR-0024 ("software catalog" keeps its existing `/inventory` meaning; design of record: `docs/adr/0024-software-licensing-entitlements.md`). Sub-capability descriptions below predate ADR-0024 and are stale where they conflict with it.*
 
-### 27.1 Product Registry :x: `T2`
+### 27.1 Product Registry :large_orange_diamond: `T2`
 
-Not implemented. Canonical software-identity registry (vendor, title, version, edition, platform) with deterministic automatic matching from raw inventory; manual curation layers on aliases later (ADR-0024 Decision 6).
+Partial. `ProductRegistryStore` (`server/core/src/product_registry_store.{hpp,cpp}`) ships the canonical-identity plane: a `products` row per canonical identity keyed by the deterministic `product_normalize` norm key, plus `product_aliases` match links recording how each raw `(source, raw_name, raw_publisher)` triple resolved onto a canonical row — `method` + `confidence` persisted so manual curation can layer on later without redesign (ADR-0024 Decision 6), exactly as designed. **Missing:** no curation UI to review/edit aliases, and no dedicated dashboard surface (the discovery flows through `/api/v1/sle/*` and its MCP twin, §27.5). *(Evidence: `server/core/src/product_registry_store.hpp`, `product_normalize.hpp`; wired in `server.cpp` ~line 6615; verified 2026-09-07 — previously mis-graded Not Started. Correction to the source audit brief: this row's evidence is `product_registry_store.cpp`, NOT `license_store.cpp` — the latter is §22.3's unrelated, dormant, Yuzu-self-licensing store.)*
 
 ### 27.2 Software Usage Tracking :x: `T2`
 
@@ -1136,9 +1179,9 @@ Implemented. Server-side data transformation with built-in processors (`single_s
 
 Implemented. Named response view configurations stored per `InstructionDefinition` in a `response_templates_spec` JSON column. Synthesised `__default__` view from `spec.result.columns` or plugin schema. REST CRUD + dashboard View dropdown. See §20.6 for the full contract. Phase 8.2, issue #254.
 
-### 28.3 Response Offloading :x: `T2`
+### 28.3 Response Offloading :white_check_mark: `T2`
 
-Not implemented. Configure external HTTP endpoints to receive response data in real time. OffloadTarget model with auth, event filtering, and batch delivery.
+Shipped — this row duplicates §20.7 (same capability, filed under two domains during the original outline). See §20.7 for the full description: operator-registered offload targets, typed auth, CRLF-guarded headers, batching, `SecretCodec`-encrypted credentials at rest, REST CRUD at `/api/v1/offload-targets`. *(Evidence: `server/core/src/offload_routes.{hpp,cpp}`; verified 2026-09-07 — previously mis-graded Not Started; the row is kept rather than deleted per the map's "mark, don't remove" convention.)*
 
 ### 28.4 TAR Dashboard Page :large_orange_diamond: `T2`
 
@@ -1154,7 +1197,7 @@ Shipped (Phase 15.A). Operator-facing aggregate view of every device × source p
 
 ### 28.7 Fleet Topology 3D Visualization :large_orange_diamond: `T2`
 
-In progress (`feat/viz-engine` branch, 11-PR ladder; PRs 1–7 shipped). `/viz/fleet` page renders the fleet as translucent cubes (one per agent) with interior process dots coloured by category (`system`, `browser`, `database`, `web`, `runtime`, `other`). Backed by an aggregating `FleetTopologyStore` (60s LRU-of-2 cache, single-flight refill) producing a `fleet_topology.v1` JSON envelope. REST: `GET /api/v1/viz/fleet/topology` + HTMX fragment `/fragments/viz/fleet/topology`. WASD/orbit/zoom camera, hostname `Sprite` labels, hover tooltip with raycaster, kill switch (`--viz-disable` / `YUZU_VIZ_DISABLE`), `machines_max` DoS cap (default 5000 / ceiling 100000), tier-before-permission ordering, audit actions `viz.fleet_topology` + `viz.fleet_topology.invalidate`. Remaining rungs: PR 8 intra-cube localhost edges, PR 9 cross-machine + external edges, PR 10 vulnerability overlay, PR 11 polish (LOD, edge bundling, a11y, InstancedMesh). Design: `docs/plans/feat-viz-engine-plan-2026-05-09.md`. Standing invariants: `docs/fleet-viz-invariants.md`.
+Further along than the original 11-PR estimate (`feat/viz-engine` branch, merged to dev 2026-05-15). `/viz/fleet` page renders the fleet as translucent cubes (one per agent) with interior process dots coloured by category (`system`, `browser`, `database`, `web`, `runtime`, `other`). Backed by an aggregating `FleetTopologyStore` (60s LRU-of-2 cache, single-flight refill) producing a `fleet_topology.v1` JSON envelope. REST: `GET /api/v1/viz/fleet/topology` + HTMX fragment `/fragments/viz/fleet/topology`. WASD/orbit/zoom camera, hostname `Sprite` labels, hover tooltip with raycaster, kill switch (`--viz-disable` / `YUZU_VIZ_DISABLE`), `machines_max` DoS cap (default 5000 / ceiling 100000), tier-before-permission ordering, audit actions `viz.fleet_topology` + `viz.fleet_topology.invalidate`. **Verified 2026-09-07: PRs 8 and 9 shipped** (intra-cube localhost edges + cross-machine/external edges — `docs/fleet-viz-invariants.md` "Edge invariants — PR 8", cross-machine edge code in `yuzu-viz.js`). **PR 10 shipped too, but scope changed**: it landed as `fleet_snapshot_json` push-ingestion (`FleetTopologyStore::push_snapshot()`, additive proto field on `HeartbeatRequest`) rather than the originally-planned vulnerability overlay — that overlay does not exist (zero hits for `mode=threat`/`ThreatGraph` in `yuzu-viz.js`; tracks with §28.8 staying Not Started). **PR 11 (LOD/InstancedMesh/scheduler polish) remains open** — only forward-looking comments in `yuzu-viz.js` reference it, no InstancedMesh migration landed. Design: `docs/plans/feat-viz-engine-plan-2026-05-09.md`. Standing invariants: `docs/fleet-viz-invariants.md`.
 
 ### 28.8 Threat Graph Mode :x: `T2`
 
@@ -1199,7 +1242,7 @@ Not implemented. `yuzu-sdk` Python package wrapping REST API v1 with async suppo
 
 ### 30.1 Result Set Persistence and Lineage :white_check_mark: `T2`
 
-Shipped 2026-05-31 (Phase 15.B; `68427bba`). As-shipped the store is SQLite (`result_set_store.{cpp,hpp}`, on the Postgres-migration ladder) and the REST surface lives in `rest_api_v1.cpp`. A named, TTL-bounded set of device IDs produced by a query, action result, or operator-curated list — the unit of composable scope. Stable identity (`rs_<ulid>`), optional human-readable per-operator alias, immutable lineage edges that record the chain of `(parent_result_set, narrowing_query)` back to a ground set, source-payload JSON sufficient to live-re-evaluate the producing query without operator re-input. Persisted in `result_sets.db` with `ON DELETE CASCADE` member rows; pinning extends TTL beyond the default 1 hour for incident-response sessions; per-operator quotas (10K result sets, 50 pins) and a 5-minute background GC sweep prevent runaway scripts from filling the table. REST: `/api/v1/result-sets/...` covering create-from-inventory/tar/instruction, members, lineage, pin/unpin/re-eval, delete. Audit row per state transition for forensic reconstruction. Design: `docs/scope-walking-design.md` §3, §6, §9.
+Shipped 2026-05-31 (Phase 15.B; `68427bba`). **Update 2026-09-07: `result_set_store.{cpp,hpp}` is now PostgreSQL** — the Postgres-migration ladder item this row originally flagged is done (verified via `PGconn`/`pg::` usage in `result_set_store.cpp`; part of the broader server-store migration, see §38). The REST surface lives in `rest_api_v1.cpp`. A named, TTL-bounded set of device IDs produced by a query, action result, or operator-curated list — the unit of composable scope. Stable identity (`rs_<ulid>`), optional human-readable per-operator alias, immutable lineage edges that record the chain of `(parent_result_set, narrowing_query)` back to a ground set, source-payload JSON sufficient to live-re-evaluate the producing query without operator re-input. Persisted in `result_sets.db` with `ON DELETE CASCADE` member rows; pinning extends TTL beyond the default 1 hour for incident-response sessions; per-operator quotas (10K result sets, 50 pins) and a 5-minute background GC sweep prevent runaway scripts from filling the table. REST: `/api/v1/result-sets/...` covering create-from-inventory/tar/instruction, members, lineage, pin/unpin/re-eval, delete. Audit row per state transition for forensic reconstruction. Design: `docs/scope-walking-design.md` §3, §6, §9.
 
 ### 30.2 Composable Scope from Previous Query :white_check_mark: `T2`
 
@@ -1219,23 +1262,24 @@ Largely shipped (Phase 15.G). Shipped: live re-eval (sibling result set), backgr
 
 *The agent-side primitive that makes guaranteed state **operationally true** rather than approximately true. PolicyStore (§16) evaluates desired-state rules on a poll-based schedule — typical 5-minute cadence. For security-sensitive settings ("this firewall port must never be open," "this registry value must never change," "this EDR process must always run") a 5-minute window is unacceptable. System Guardian uses **kernel-backed user-mode notification APIs** to detect drift within microseconds of it occurring, remediate it, and journal the event — even when the server is unreachable, even before any user has logged in. This is the headline parity feature against the leading commercial endpoint-management platforms' real-time enforcement engines. Agent runs in user space as SYSTEM (Windows) / root (Linux) / privileged daemon (macOS); no kernel drivers required. Design: `docs/yuzu-guardian-design-v1.1.md`. Windows-first delivery: `docs/yuzu-guardian-windows-implementation-plan.md`.*
 
-### 31.1 Guardian Engine and Wire Protocol :large_orange_diamond: `T2`
+### 31.1 Guardian Engine and Wire Protocol :white_check_mark: `T2`
 
-In progress (PRs 1-2 shipped). Agent-side `GuardianEngine` (`agents/core/src/guardian_engine.{hpp,cpp}`) with two-phase startup — `start_local()` pre-network so enforcement is active before the Register RPC, then `sync_with_server()` post-Register. KV namespace `__guardian__` for cached policy. Reserved plugin name `__guard__` intercepted in `agent.cpp` before the plugin match loop (load-time rejection in `plugin_loader.cpp` for defence in depth). Wire contract: `proto/yuzu/guardian/v1/guaranteed_state.proto` with `GuaranteedStateRule`, `GuaranteedStatePush`, `GuaranteedStateEvent`, `GuaranteedStateStatus`, `GuaranteedStateRuleStatus`. Server store `guaranteed-state.db` with immutable event log. Actions: `push_rules`, `get_status`. Every rule reports `errored` until guard implementations land in PR 3+.
+Shipped — well beyond the PRs 1-2 status this row originally recorded. Agent-side `GuardianEngine` (`agents/core/src/guardian_engine.{hpp,cpp}`) with two-phase startup — `start_local()` pre-network so enforcement is active before the Register RPC, then `sync_with_server()` post-Register. KV namespace `__guardian__` for cached policy. Reserved plugin name `__guard__` intercepted in `agent.cpp` before the plugin match loop (load-time rejection in `plugin_loader.cpp` for defence in depth). Wire contract: `proto/yuzu/guardian/v1/guaranteed_state.proto` with `GuaranteedStateRule`, `GuaranteedStatePush`, `GuaranteedStateEvent`, `GuaranteedStateStatus`, `GuaranteedStateRuleStatus`. Server store `guaranteed-state.db` with immutable event log, plus the `BaselineStore` deployment model (`server/core/src/baseline_store.{hpp,cpp}`) — a **Baseline** is the only deployable unit; push fan-out + heartbeat reconcile gate on `deployed_member_rule_ids()` sourced from each deploy's `deployed_snapshot`, not the live member set (`docs/guardian-baseline-model.md`). **Also verified 2026-09-07: ADR-0021 Spark is wired as Guardian's first consumer** — `agents/core/src/agent.cpp:1255` calls `wire_spark_engine()`, and `GuardianEngine::reconcile_rule_locked()` is the sole per-rule arm/disarm chokepoint enforcing mutual exclusion between legacy `IGuard` and `spark_runtime_`. `prefer_spark_` defaults **false** (confirmed in `guardian_engine.cpp` comments), so Spark is wired but inert — legacy `IGuard` remains the sole *live* enforcement path; this does not change any guard row's grade below, since none of them currently attribute live enforcement to Spark. Actions: `push_rules`, `get_status`.
 
-### 31.2 Event Guards — Kernel-Event-Driven Enforcement (Windows) :x: `T2`
+### 31.2 Event Guards — Kernel-Event-Driven Enforcement (Windows) :large_orange_diamond: `T2`
 
-Not implemented (PRs 3, 5, 6, 7, 10). Real-time enforcement via four Windows kernel-backed user-mode APIs:
-- **Registry Guard** — `RegNotifyChangeKeyValue` + `WaitForMultipleObjects` (~0 ms latency); the canonical "registry value must equal X" enforcer.
-- **SCM Guard** — `NotifyServiceStatusChange` (~0 ms latency); enforces "service must remain running/stopped/disabled."
-- **WFP Guard** — `FwpmFilterSubscribeChanges0` (~0 ms latency); defence-in-depth filter monitor for firewall posture.
-- **ETW Guard** — `OpenTrace` / `ProcessTrace` (~1-5 ms latency); the multiplexed event provider with shared-session pooling per `docs/yuzu-guardian-design-v1.1.md` §8.3 (mandatory because Windows caps system-wide ETW sessions at 64, shared with Defender / EDR).
+Partial. Three of the four designed Windows kernel-backed user-mode guards are live, gated by the single `dangerous_enforce_in_spec` chokepoint (`server/core/src/guardian_rule_spec.cpp:303`) for enforce-promotion:
+- **Registry Guard** — shipped (`agents/core/src/guard_registry.cpp` legacy path, `spark_registry.cpp` Spark-mechanism path). `RegNotifyChangeKeyValue` + `WaitForMultipleObjects` (~0 ms latency); the canonical "registry value must equal X" enforcer.
+- **SCM Guard** — shipped (`agents/core/src/guard_service.cpp`, `spark_service.cpp`). `NotifyServiceStatusChange` (~0 ms latency); enforces "service must remain running/stopped/disabled."
+- **File Guard** — shipped (`agents/core/src/guard_file.cpp`, `spark_file.cpp`), not in the original 4-guard design but delivered alongside it.
+- **WFP Guard** — Not implemented. `FwpmFilterSubscribeChanges0` (~0 ms latency); defence-in-depth filter monitor for firewall posture. *(Verified 2026-09-07: no `FwpmFilterSubscribeChanges` call sites in `agents/core/src`.)*
+- **ETW Guard** — Not implemented. `OpenTrace` / `ProcessTrace` (~1-5 ms latency); the multiplexed event provider with shared-session pooling per `docs/yuzu-guardian-design-v1.1.md` §8.3 (mandatory because Windows caps system-wide ETW sessions at 64, shared with Defender / EDR). *(Verified 2026-09-07: no `ProcessTrace`/`OpenTrace`/ETW-guard call sites anywhere in `agents/core/src`.)*
 
-Each guard implements `self_test()` on start to prove kernel wiring (sentinel write → expected callback within 500 ms → pass / `errored` mark). Resilience strategies (`Fixed`, `Backoff`, `Escalation`) and `RaceDetector` (sliding-window drifts/second) surface at PR 4.
+Each guard implements `self_test()` on start to prove kernel wiring (sentinel write → expected callback within 500 ms → pass / `errored` mark). Resilience strategies (`Fixed`, `Backoff`, `Escalation`) live in `resilience_strategy.cpp`.
 
-### 31.3 Condition Guards — Periodic Evaluation (All Platforms) :x: `T2`
+### 31.3 Condition Guards — Periodic Evaluation (All Platforms) :large_orange_diamond: `T2`
 
-Not implemented (PRs 8, 9). Time-based compliance — "process X must be running," "AV scan must have run within last 7 days," "software must have been updated within 30 days." Configurable interval per type. Hybrid Process Guard combines `Microsoft-Windows-Kernel-Process` ETW (events 1/2 for start/stop, near-real-time) with periodic `CreateToolhelp32Snapshot` poll (safety net). WMI Guard runs arbitrary WMI queries against an evaluator. Software Guard reads Registry Uninstall keys + WMI for installed-software freshness. Compliance Guard runs Event Log queries.
+Partial. `spark_interval.cpp` ships a periodic-evaluation mechanism and the cross-platform service run-state guard (`guard_systemd.hpp`'s `make_service_guard()` factory, §31.4) is a shipped instance of it, plus `spark_disk.cpp` (a disk-condition guard not in the original design). The originally-scoped process/WMI/software/compliance condition guards remain open: Hybrid Process Guard (`Microsoft-Windows-Kernel-Process` ETW + `CreateToolhelp32Snapshot` poll safety net), WMI Guard (arbitrary WMI queries against an evaluator), Software Guard (Registry Uninstall keys + WMI freshness), Compliance Guard (Event Log queries) — none of these four found in `agents/core/src`.
 
 ### 31.4 Event Guards — Linux :large_orange_diamond: `T3`
 
@@ -1252,29 +1296,217 @@ The systemd service guard landed ahead of the rest of the Linux track (the motiv
 
 Not implemented (PR 17). macOS equivalents using Apple's Endpoint Security (ES) framework — *requires the ES entitlement*, which is a notarised-build / DDM-distributed entitlement that Apple grants per-bundle-ID. Without ES, the macOS guard surface is reduced to `fseventsd`, `launchd` plist polling, and `kqueue` file-watch. Phase 16 macOS delivery is gated on (a) Windows + Linux soak and (b) ES entitlement availability.
 
-### 31.6 State Evaluator and Remediation Engine :x: `T2`
+### 31.6 State Evaluator and Remediation Engine :large_orange_diamond: `T2`
 
-Not implemented (PRs 3, 5+). Assertion registry (`registry-value-equals`, `registry-value-absent`, `service-running`, `service-stopped`, `firewall-port-blocked`, `process-running`, `file-hash-equals`, `kernel-param-equals`, `plist-key-equals`, etc.) returns `compliant | drift | exempt` for a `StateSnapshot`. Remediation methods are **system calls only — no shell-out** (per design §14): `RegSetValueExW` / `RegDeleteValueW` (Win), `INetFwPolicy2` COM (Win firewall), service control via SCM (Win) / systemd D-Bus (Linux) / launchctl (macOS), `/proc/sys` writes (Linux), `defaults write` equivalent via plist serialisation (macOS). Re-entrancy guard per rule with 5 ms suppression window prevents the remediation from triggering its own watch callback.
+Partial. Registry/service (and now file) drift detection + remediation are live behind the `dangerous_enforce_in_spec` denylist chokepoint (`server/core/src/guardian_rule_spec.cpp:303` — confirmed handles `registry-value-equals` and `service-stopped` denials for H1 registry-persistence keys and critical-service stops such as `rpcss`/`dcomlaunch`/the agent's own service). The decide/emit evaluation core (`agents/core/src/guardian_rule_eval.{hpp,cpp}`) computes `compliant | drift | exempt`-style verdicts per guard type with debounce/recovery-edge handling, but it is wired to the shipped guard types (registry/service/file), **not** the fully general assertion registry the original design specified (`firewall-port-blocked`, `process-running`, `file-hash-equals`, `kernel-param-equals`, `plist-key-equals` are not found in `agents/core/src`). Remediation methods are **system calls only — no shell-out** for the shipped guards (per design §14). *(Evidence: `guardian_rule_spec.cpp`, `guardian_rule_eval.cpp`; verified 2026-09-07 — previously mis-graded Not Started.)*
 
-### 31.7 Audit Journal and Server Store :large_orange_diamond: `T2`
+### 31.7 Audit Journal and Server Store :white_check_mark: `T2`
 
-Server store shipped (PR 1 — `server/core/src/guaranteed_state_store.{hpp,cpp}`, `guaranteed-state.db`, immutable event log, no FK cascade on rule delete so historical events persist for forensic review). Agent-side journal (`agents/core/src/guard_audit.{hpp,cpp}`) lands with PR 3: MPSC queue + dedicated writer thread, SQLite journal table inside `kv_store.db` keyed by monotonic `event_seq`, drained by `GuardianEngine::sync_with_server` into `CommandResponse { plugin: "__guard__", action: "event" }`. Every detection and remediation journaled locally first, synced to server when online.
+Shipped on both sides — beyond the "server store only" status this row originally recorded. Server store: `server/core/src/guaranteed_state_store.{hpp,cpp}`, `guaranteed-state.db`, immutable event log, no FK cascade on rule delete so historical events persist for forensic review. Agent-side journal shipped under different names than the original plan's `guard_audit.{hpp,cpp}`: `guardian_lifecycle_journal.cpp` + `guardian_journal_format.cpp` (local journal + wire format) and `guardian_outbox_drain_worker.cpp` (the drain-to-server worker), all confirmed compiled in `agents/core/meson.build`. Every detection and remediation journaled locally first, synced to server when online. *(Evidence: file census 2026-09-07 — previously mis-graded Partial because the audit brief's originally-planned filenames don't exist; the capability shipped under renamed files instead.)*
 
 ### 31.8 Pre-Login Activation and Offline Capability :white_check_mark: `T2`
 
 Pre-login activation works by construction today: the agent runs as a Windows service with `SERVICE_AUTO_START` + `FailureActions` configured at install time (`agents/core/src/main.cpp:234-338`, and `agents/core/src/service_win.{hpp,cpp}` for the SCM `ServiceMain`/control-handler dispatcher that actually makes `sc start` succeed — #1822); systemd unit on Linux with `Type=notify` + `Restart=always`; launchd `KeepAlive=true` + `RunAtLoad=true` on macOS. `GuardianEngine::start_local()` runs before the Register RPC, so once guard implementations land in PR 3+, enforcement begins as soon as the service starts — before any user can log in. Offline capability comes from caching policy in `kv_store.db` under `__guardian__` namespace; enforcement continues with last-known-good rules when the server is unreachable, and queued events flush when the server returns. Marked `:white_check_mark:` because the service-install side is operational (genuinely so as of #1822 — before it, `sc start YuzuAgent` failed with error 1053 on every real Windows install, so this claim was aspirational, not true, until this fix landed); the *enforcement* half is gated on PR 3+ landing real guards.
 
-### 31.9 Dashboard and Approval Workflow :x: `T2`
+### 31.9 Dashboard and Approval Workflow :large_orange_diamond: `T2`
 
-Not implemented (PRs 4, 11, 14). Dashboard page at `/guaranteed-state` listing rules (with kernel-wiring health indicator — `guard_healthy` + `last_notification` timestamp surface "deaf because subscription silently went nowhere" vs. "compliant because nothing's happening"), event timeline, summary cards, fragments per `docs/yuzu-guardian-design-v1.1.md` §10. Approval workflow reuses the existing `ApprovalManager` with `definition_id = "guaranteed_state_rule_*"` — no manager code changes (already generic). HTMX rule editor (CRUD + YAML validation + conflict detection) at PR 14.
+Partial. The Guardian dashboard shipped at `/guardian` (`server/core/src/guardian_page_ui.cpp`, `guardian_ui.cpp` — not the originally-planned `/guaranteed-state` path) with the Baseline draft/deployed lifecycle (deploys are `Push`-gated; editing a deployed Baseline's members reaches agents only via a re-deploy snapshot rewrite — `docs/guardian-baseline-model.md`). **Missing:** the kernel-wiring health indicator (`guard_healthy` + `last_notification` "deaf vs. compliant" distinction) and the full HTMX rule editor (CRUD + YAML validation + conflict detection) called for in the original design §10. Approval-workflow reuse of the existing `ApprovalManager` not independently re-verified this session. *(Evidence: `server/core/src/guardian_page_ui.cpp`, `guardian_ui.cpp`; verified 2026-09-07 — previously mis-graded Not Started.)*
 
 ### 31.10 Rule Signing and Quarantine Integration :x: `T2`
 
-Not implemented (PRs 12, 15). HMAC rule signing (HKDF per design §11.2) with per-tenant key stored in `CredWrite`/`CredRead` (Windows), Linux Secret Service / kernel keyring (Linux), Keychain (macOS); agent-side signature validation before activating a rule prevents unauthenticated rule injection. Quarantine integration: WFP block-all filter at weight 65535 (Windows) or `iptables` / `nftables` rule (Linux) drops all traffic except Yuzu's own; instruction handlers `quarantine.add_exception | remove_exception | lift`; server-side DNS resolution; resilience reset on lift so a remediation storm doesn't carry over.
+Not implemented (PRs 12, 15). HMAC rule signing (HKDF per design §11.2) with per-tenant key stored in `CredWrite`/`CredRead` (Windows), Linux Secret Service / kernel keyring (Linux), Keychain (macOS); agent-side signature validation before activating a rule prevents unauthenticated rule injection. Quarantine integration: WFP block-all filter at weight 65535 (Windows) or `iptables` / `nftables` rule (Linux) drops all traffic except Yuzu's own; instruction handlers `quarantine.add_exception | remove_exception | lift`; server-side DNS resolution; resilience reset on lift so a remediation storm doesn't carry over. *(Re-verified 2026-09-07: still absent — `guardian_rule_spec.cpp:394`'s own comment says "full RFC-8785 canonicalisation lands with rule signing", i.e. not yet; no `sign`/`HMAC`-keyed rule-activation code found in `guardian_rule_spec.*`, `baseline_store.*`, or `guardian_engine.*`. Grade unchanged.)*
+
+---
+
+## 32. DEX — Digital Employee Experience
+
+*Endpoint-experience observation, performance analytics, and upgrade evidence. Shipped 2026-Q2 on the Guardian ingest path (§31.7); previously unmapped in this file. Docs: `docs/dex-signal-catalog.md`, `docs/user-manual/dex.md`, `docs/user-manual/preflight.md`. Presence + compilation of every file cited below was verified 2026-09-07; per-row behavioural detail (signal counts, retention windows) is inherited from the 2026-07 capability-industry review and was not independently re-derived this session.*
+
+### 32.1 Signal Observation Catalogue :white_check_mark: `T2`
+
+Ruleless observation catalogue (`agents/core/src/dex_signal_catalog.{hpp,cpp}`, engine `dex_observer.{hpp,cpp}`, both confirmed compiled in `agents/core/meson.build`): crashes, hangs, boot/login degradation, device health. Windows poll-and-latch (`dex_win_poll.cpp`) + Linux/macOS collectors (`dex_linux_*.cpp`, `dex_macos_*.cpp`); sustained perf-breach hysteresis (`dex_perf_breach.{hpp,cpp}`).
+
+### 32.2 Continuous Device Performance Telemetry :white_check_mark: `T2`
+
+TAR `perf` capture source feeding device-level performance rollups; per-app top-N process telemetry; fleet rollup gauges + `/dex` device sparklines. *(Evidence: `server/core/src/dex_perf_ui.cpp`, `dex_perf_rules.hpp`, `dex_perf_model.{hpp,cpp}`.)*
+
+### 32.3 App Performance Over Time :white_check_mark: `T2`
+
+Per-device daily rollups (`server/core/src/app_perf_daily_store.{hpp,cpp}`) feeding fleet aggregates (`app_perf_fleet_store.{hpp,cpp}`) via a shared read model surfaced through REST `/api/v1/dex/perf/*`, MCP twins, and `/fragments/dex/perf/*` (`dex_app_perf_ui.{hpp,cpp}`, `dex_app_perf_model.{hpp,cpp}`, `dex_routes.{hpp,cpp}`).
+
+### 32.4 Fleet Blast-Radius Alerting and Signal Routing :white_check_mark: `T2`
+
+Server-side N-distinct-device incident detector (`server/core/src/dex_blast_radius.{hpp,cpp}`) firing an alert webhook; per-signal operator routing (`dex_alert_router.{hpp,cpp}`).
+
+### 32.5 Upgrade Evidence — Cohort-Paired Before/After Comparison :white_check_mark: `T2`
+
+`/auto` Verify (§36.3): pure compare engine (`server/core/src/app_perf_compare.{hpp,cpp}`), cohort reader (`app_perf_cohort_reader.hpp`, `app_perf_group_reader.{hpp,cpp}`), REST `/dex/perf/compare` surface confirmed present. Evidential — no verdict/threshold, per `verify_routes.cpp` (§36.3).
+
+### 32.6 Behavioral-PII Privacy Engineering :white_check_mark: `T2`
+
+Cohort-floor suppression on fleet/group app-perf reads (no singling-out below the floor) and audit-on-open per-device lenses (§21.6). *(Referenced from `docs/yuzu-guardian-design-v1.1.md` §24 invariants cited in `CLAUDE.md`; not independently re-derived this session.)*
+
+### 32.7 Experience Scoring and Sentiment :x: `T3`
+
+Not implemented — deliberately. Composite 0-100 experience scores (with sentiment surveys as an input) are a DEX-market pattern; Yuzu currently positions evidence-not-scores. Would additionally require the §14.4 survey primitive as an input (now shipped, but no scoring/sentiment engine consumes it).
+
+---
+
+## 33. Network Quality
+
+*Measurement-first device/local-link health lens. Shipped 2026-06; previously unmapped in this file. Doc: `docs/user-manual/network.md`.*
+
+### 33.1 Device Network Heartbeat Facts :white_check_mark: `T2`
+
+Interval retransmit rate, RTT, and throughput as thin `yuzu.net_*` heartbeat tags, sampled agent-side. *(Evidence: `agents/core/src/net_quality_sampler.{hpp,cpp}`, confirmed compiled in `agents/core/meson.build`. Windows retransmit is whole-stack + unvalidated per `CLAUDE.md`'s routed-concerns table — withheld from the fleet gauge, Linux-only today.)*
+
+### 33.2 Fleet Network Gauges :white_check_mark: `T2`
+
+`yuzu_fleet_net_*` gauges with a per-OS label (never blended cross-OS, per the routed-concerns invariant). *(Evidence: `server/core/src/network_perf_model.{hpp,cpp}`, `network_perf_rules.hpp`.)*
+
+### 33.3 `/network` Dashboard :white_check_mark: `T2`
+
+Fleet and per-device network-health page. *(Evidence: `server/core/src/network_routes.{hpp,cpp}`, `network_ui.cpp`.)*
+
+### 33.4 Degraded Classification and Per-Destination Localization :x: `T3`
+
+Deferred — `yuzu.net_degraded` is retired per the routed-concerns table (gauge absent-not-zero); a hard degraded threshold needs a real-fleet baseline first.
+
+---
+
+## 34. Device Pages and Live Snapshot
+
+*The shared per-device surface (`/devices` + `/device?id=`). Shipped 2026-06; previously unmapped in this file. Doc: `docs/user-manual/device-management.md`.*
+
+### 34.1 Fleet List and Device Entity Page :white_check_mark: `T2`
+
+`/devices` + `/device?id=` with Device info / DEX / Guardian lens tabs. *(Evidence: `server/core/src/device_routes.{hpp,cpp}`, `device_ui.cpp`.)*
+
+### 34.2 Live Snapshot ("Get live info") :white_check_mark: `T2`
+
+Dispatch-and-poll card grid (process tree, services, users, netconfig, ARP/DNS on Windows, listening/connections, capture sources) with a per-kind `device.live.<kind>` audit verb, gated on `Execution:Execute`.
+
+### 34.3 Agentic REST Parity for Device Surfaces :white_check_mark: `T2`
+
+REST parity for the live-snapshot kinds, funneling every behavioural-PII read through the `emit_behavioral_audit` chokepoint (§21.6) — fail-closed 503 + `Sec-Audit-Failed` when the audit row cannot persist. *(Evidence: `server/core/src/rest_audit.hpp`.)*
+
+---
+
+## 35. Agent Daily-Sync Inventory (ADR-0016)
+
+*Per-source endpoint state pushed daily over `ReportInventory`, hash-skip on no change. Shipped 2026-06; previously unmapped in this file. Docs: `docs/adr/0016-agent-daily-sync-framework.md`, `docs/user-manual/inventory.md`.*
+
+### 35.1 Sync Framework :white_check_mark: `T2`
+
+`SyncScheduler` (`agents/core/src/sync_scheduler.{hpp,cpp}`) + `LocalDispatcher` (`local_dispatcher.cpp`) — stable per-agent phase spread, hash-skip when unchanged, server `need_full` resend. Shared ingestion seam wired identically on the direct and gateway paths. All confirmed compiled in `agents/core/meson.build`.
+
+### 35.2 Installed-Software Inventory :white_check_mark: `T2`
+
+Source #1 (`agents/core/src/sync_source_installed_software.{hpp,cpp}`) → born-on-Postgres `SoftwareInventoryStore` (`server/core/src/software_inventory_store.{hpp,cpp}`), normalized rows, server-receipt freshness per the #1685 clock-skew rule. `Inventory` RBAC securable.
+
+### 35.3 Device CI (Hardware/OS Identity) :large_orange_diamond: `T2`
+
+Source #3 (`agents/core/src/sync_source_device_ci.{hpp,cpp}`) → born-on-Postgres `DeviceInventoryStore` (`server/core/src/device_inventory_store.{hpp,cpp}`) — serial/UUID/MAC, GDPR-personal-data / works-council-relevant per CLAUDE.md's routed-concerns table. Full read-surface + CMDB correlation not independently re-verified this session (inherits Partial from the 2026-07 review).
+
+### 35.4 Software Catalogue and `/inventory` Dashboard :white_check_mark: `T2`
+
+Background catalogue rollup (`server/core/src/software_catalog_rollup.{hpp,cpp}`, cross-referenced from §26.3/§27.1) feeding the `/inventory` dashboard page (`inventory_ui.cpp`).
+
+### 35.5 Multi-Source Consolidation :x: `T2`
+
+Not implemented — connector-fed sources and identity-merge consolidation remain the §25/§26 gap; confirmed no `Repository`/consolidation model exists (§26.1/26.2 stay Not Started).
+
+Sources #2 (app_perf) and licensing also confirmed present but out of this domain's scope: `agents/core/src/sync_source_app_perf.{hpp,cpp}` feeds §32 DEX; `sync_source_software_licensing.{hpp,cpp}` feeds §27 SLE.
+
+---
+
+## 36. `/auto` — Operator Automation (Assess → Act → Verify)
+
+*Pre-flight readiness, gated deployment, and paired-cohort verification. Shipped 2026-06; previously unmapped in this file. Doc: `docs/user-manual/preflight.md`.*
+
+### 36.1 Pre-Flight Readiness (ASSESS) :white_check_mark: `T2`
+
+Born-on-Postgres `PreflightRunStore` (`server/core/src/preflight_run_store.{hpp,cpp}`) + background `PreflightRunner` (`preflight_runner.{hpp,cpp}`) re-dispatching read-only checks to a frozen cohort; `Infrastructure:Read` + `Execution:Execute` gated. *(Evidence: `preflight_eval.cpp`, `preflight_routes.cpp`, `preflight_ui.cpp`.)*
+
+### 36.2 Deploy (ACT) :white_check_mark: `T2`
+
+Stage+execute on the go-cohort via `content_dist`; born-on-Postgres `DeploymentRunStore` (`server/core/src/deployment_run_store.{hpp,cpp}`) with guarded one-way transitions and an execute-once CAS (per the ladder row in `docs/postgres-migration-ladder.md`). *(Evidence: `deployment_engine.cpp`, `deployment_routes.cpp`, `deployment_ui.cpp`.)*
+
+### 36.3 Verify (EVIDENCE) :white_check_mark: `T2`
+
+Cohort-paired app-perf before/after comparison (§32.5) closing the ASSESS→ACT→VERIFY loop. *(Evidence: `server/core/src/verify_routes.{hpp,cpp}`.)*
+
+---
+
+## 37. Internal PKI / Certificate Authority
+
+*Internal CA subsystem. Shipped 2026-05/06; previously represented only as a §1.1 gap note. Doc: `docs/pki-architecture.md`.*
+
+### 37.1 Internal CA and Default Certificates :white_check_mark: `T2`
+
+`CaStore` (`server/core/src/ca_store.{hpp,cpp}`, `ca.db` schema; key material behind the `KeyProvider` seam, never in the DB); per-install default certs generated on first boot.
+
+### 37.2 Per-Agent mTLS Identity :white_check_mark: `T2`
+
+Agent CSR at enrollment (`agent_csr.{hpp,cpp}`) → `sign_agent_csr` (`server/core/src/x509_ca.{hpp,cpp}`, server-chosen subject/SAN/EKU) → app-layer enforcement. Per CLAUDE.md's routed-concerns table, `sign_agent_csr` is the single shared signer for direct `Register` AND gateway `ProxyRegister`; revoke is serial-scoped.
+
+### 37.3 CA Operations Surface :white_check_mark: `T2`
+
+REST `/api/v1/ca/*` (public root/CRL by design — confirmed NOT in the TLS chain per the CLAUDE.md-cited PR #2479 finding). *(Evidence: `server/core/src/ca_routes.{hpp,cpp}`.)*
+
+### 37.4 Subordinate-CA Mode :white_check_mark: `T2`
+
+Built-in root subordinated to an enterprise root: CSR export, chain import + validation. *(Inherits from the 2026-07 review; `CaMode::Subordinate` not independently re-verified this session.)*
+
+### 37.5 Secure-by-Default Distribution :white_check_mark: `T2`
+
+TLS-by-default images shipped (#1314, 2026-06-21, per project memory `project_pki_secure_by_default_shipped.md`). Residual: management-listener mTLS CA-restriction (#1422, per the same memory).
+
+---
+
+## 38. Server Storage Substrate — PostgreSQL
+
+*ADR-0006/0007/0008/0010/0012 program: the server's storage substrate is PostgreSQL; the agent stays SQLite. Previously unmapped in this file (supersedes the §22.9 sharding strategy).*
+
+### 38.1 Substrate and Pool :white_check_mark: `T2`
+
+`server/core/src/pg/`: RAII connection/result/transaction wrappers, a bounded `PgPool` with lease-RAII, `PgMigrationRunner`, `yuzu_pg_*` metrics, `/readyz` conjunction.
+
+### 38.2 Fail-Closed Flip :white_check_mark: `T2`
+
+The server refuses to start without a reachable Postgres (no SQLite fallback, ADR-0007) — per `CLAUDE.md`'s routed-concerns table, this is a standing invariant enforced at boot.
+
+### 38.3 Secrets at Rest :white_check_mark: `T2`
+
+Verify-only hashes or `SecretCodec`-envelope-encrypted blobs (ADR-0010) — never plaintext columns. Verified this session: `license_store.hpp` documents `license_key_hash` as a SHA-256 verify-only hash (§22.3); `offload_routes.cpp`'s `auth_credential` is `SecretCodec`-encrypted per its own row text (§20.7); `webhook_store.cpp`'s constructor takes a `pg::SecretCodec&` (its HMAC signing secret is envelope-encrypted, though the pre-existing §21.4 row text doesn't say so explicitly).
+
+### 38.4 Store Migration Ladder :white_check_mark: `T2`
+
+**Update 2026-09-07 — census re-run this session, corrects the 2026-07 review's "~27 legacy SQLite stores remain" figure:** `ls server/core/src/*_store.cpp` = 43 files; `grep -lE "PGconn|pg::" server/core/src/*_store.cpp` = 42 of them. The one non-match, `fleet_topology_store.cpp`, holds no direct DB handle of its own (composed from `AuditStore` + `NvdDatabase` reads) — it is not a SQLite store either. **Zero SQLite-only server stores remain.** The sole deliberate SQLite holdout is `server/core/src/nvd_db.cpp` (not `*_store.cpp`-named, confirmed via `sqlite3_open_v2` call), grandfathered under ADR-1005 Phase 7 pending the vulnerability-management use-case engine (§9.4). Graded Done rather than Partial: the migration ladder itself is complete for every intended store; the one remaining SQLite user is a deliberate, documented, out-of-scope exception, not an unfinished migration.
+
+---
+
+## 39. Headless Platform — Engine Principals and On-Behalf-Of Authorization (ADR-1005) *(new domain, v4.0)*
+
+*A distinct principal class for autonomous use-case engine (UCE) modules, and the interim rule that no ingress surface accepts a client-asserted on-behalf-of assertion until server-verifiable delegation ships. Not present in any prior version of this map. Doc: `docs/adr/1005-headless-platform-use-case-engines.md`.*
+
+### 39.1 Engine Principal Store :white_check_mark: `T2`
+
+Born-on-Postgres `EnginePrincipalStore` (`server/core/src/engine_principal_store.{hpp,cpp}`, schema `engine_principal_store`) — a dedicated durable identity (owner, justification, classification, lifecycle) for an autonomous UCE module, separate from `ApiTokenStore` (no secret material lives here; credentials stay hash-only in `ApiTokenStore`). Fail-closed at construction and at the `get_for_auth` runtime chokepoint, which returns a three-state result (Active / not the binary alive-or-not a naive store would return). *(Evidence: `server/core/src/engine_principal_store.hpp` header; design: `docs/auth-engine-principals-design.md` §3.1.)*
+
+### 39.2 Principal Class Metric Label :white_check_mark: `T2`
+
+Closed-set `principal_class` label (`human` / `agent` / `none` / `engine`) for HTTP request metrics, resolved from the session's authenticated `principal_kind`/`auth_source` (not header presentation) — an engine-token request that fails resolution stays `agent`, never `engine`, so the label can't be spoofed by presenting a bearer token shaped like one. *(Evidence: `server/core/src/principal_class.hpp`; design: `docs/observability-conventions.md`.)*
+
+### 39.3 On-Behalf-Of Assertion Guard :white_check_mark: `T2`
+
+The server rejects — not silently ignores — any on-behalf-of assertion on every ingress surface (REST, MCP, agent gRPC) until Phase 5 server-verifiable delegation ships; a rejected assertion is a hard error, so a header-stamping proxy fails loudly rather than silently impersonating. Per CLAUDE.md's routed-concerns table, the four health-probe paths are the sole exception (so a header-stamping proxy doesn't crash-loop the server). *(Evidence: `server/core/src/on_behalf_guard.hpp`.)*
 
 ---
 
 ## Appendix A: Plugin Coverage Matrix
+
+*Category labels assigned 2026-09-07 (judgment call, matched to the pre-existing taxonomy below — no canonical category list exists in this file).*
 
 | Plugin | Win | Linux | macOS | Category |
 |--------|:---:|:-----:|:-----:|----------|
@@ -1282,6 +1514,9 @@ Not implemented (PRs 12, 15). HMAC rule signing (HKDF per design §11.2) with pe
 | hardware | Y | Y | Y | System Info |
 | device_identity | Y | Y | Y | System Info |
 | status | Y | Y | Y | System Info |
+| power_health | Y | - | Y | System Info |
+| disk_actions | Y | Y | Y | Disk |
+| disk_space | Y | Y | Y | Disk |
 | processes | Y | Y | Y | Process/Service |
 | procfetch | Y | Y | Y | Process/Service |
 | services | Y | Y | Y | Process/Service |
@@ -1293,11 +1528,13 @@ Not implemented (PRs 12, 15). HMAC rule signing (HKDF per design §11.2) with pe
 | wifi | Y | Y | Y | Network |
 | wol | Y | Y | Y | Network |
 | discovery | Y | Y | Y | Network |
+| netprobe | Y | - | - | Network |
 | installed_apps | Y | Y | Y | Software |
 | msi_packages | Y | - | Y | Software |
 | windows_updates | Y | - | - | Patch |
 | software_actions | Y | Y | Y | Software |
 | sccm | Y | - | - | Software |
+| license_scan | Y | Y | Y | Software |
 | antivirus | Y | Y | Y | Security |
 | firewall | Y | Y | Y | Security |
 | bitlocker | Y | Y | Y | Security |
@@ -1306,7 +1543,9 @@ Not implemented (PRs 12, 15). HMAC rule signing (HKDF per design §11.2) with pe
 | ioc | Y | Y | Y | Security |
 | quarantine | Y | Y | Y | Security |
 | certificates | Y | Y | Y | Security |
+| rdp_control | Y | - | - | Security |
 | filesystem | Y | Y | Y | File System |
+| filesystem_posture | Y | Y | Y | File System |
 | registry | Y | - | - | System Config |
 | wmi | Y | - | - | System Config |
 | script_exec | Y | Y | Y | Execution |
@@ -1315,6 +1554,7 @@ Not implemented (PRs 12, 15). HMAC rule signing (HKDF per design §11.2) with pe
 | interaction | Y | Y | Y | User Interaction |
 | storage | Y | Y | Y | Agent KV |
 | asset_tags | Y | Y | Y | Device Mgmt |
+| tags | Y | Y | Y | Device Mgmt |
 | agent_logging | Y | Y | Y | Agent Mgmt |
 | agent_actions | Y | Y | Y | Agent Mgmt |
 | diagnostics | Y | Y | Y | Agent Mgmt |
@@ -1325,7 +1565,7 @@ Not implemented (PRs 12, 15). HMAC rule signing (HKDF per design §11.2) with pe
 | software_usage | Y | Y | Y | Software | *Planned (Phase 12)* |
 | app_control | Y | Y | - | Security | *Planned (Phase 12)* |
 
-**44 plugins** (+ 2 planned) — covering hardware, network, security, filesystem, registry, WMI, WiFi, WoL, IOC, quarantine, certificates, content distribution, user interaction, and more. Includes cross-platform, Windows-only, and test/debug plugins.
+**49 plugins** (+ 2 planned) — covering hardware, network, security, filesystem, registry, WMI, WiFi, WoL, IOC, quarantine, certificates, content distribution, user interaction, and more. Includes cross-platform, Windows-only, and test/debug plugins. Recount verified 2026-09-07 (`ls -d agents/plugins/*/` = 51 directories, minus `example` + `chargen` = 49; the previous "44" undercounted 8 shipped plugins — `disk_actions`, `disk_space`, `filesystem_posture`, `license_scan`, `netprobe`, `power_health`, `rdp_control`, `tags` — none of which were in the table). `software_usage` / `app_control` remain aspirational — confirmed no such directories exist under `agents/plugins/` as of this baseline.
 
 ---
 
