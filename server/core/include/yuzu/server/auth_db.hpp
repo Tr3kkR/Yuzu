@@ -330,15 +330,30 @@ public:
     /// Row-locked role re-check (#4107): `SELECT role FROM auth.users WHERE
     /// username = $1 AND is_active FOR UPDATE`, same technique
     /// `mfa_verify_login_code` already uses to close ITS OWN replay race.
-    /// Serializes against ANY concurrent `update_role()`/`reactivate_user()`
-    /// write to this row: if one is already committed, this call's SELECT
-    /// sees it directly; if one is mid-flight (issued, not yet committed),
-    /// this call's SELECT FOR UPDATE blocks until it commits, then reads the
-    /// fresh row (standard Postgres row-lock semantics — a plain `UPDATE`
-    /// already takes an equivalent row lock for its own transaction's
-    /// duration, so the writer side needs no changes). Either way, the value
-    /// handed to `under_row_lock` is never a value some OTHER writer's
-    /// already-in-flight commit could invalidate a moment later.
+    /// Serializes against ANY concurrent `update_role()` write to this row:
+    /// if one is already committed, this call's SELECT sees it directly; if
+    /// one is mid-flight (issued, not yet committed), this call's SELECT FOR
+    /// UPDATE blocks until it commits, then reads the fresh row (standard
+    /// Postgres row-lock semantics — a plain `UPDATE` already takes an
+    /// equivalent row lock for its own transaction's duration, so the writer
+    /// side needs no changes). Either way, the value handed to
+    /// `under_row_lock` is never a value some OTHER writer's already-
+    /// in-flight commit could invalidate a moment later.
+    ///
+    /// `reactivate_user()` is asymmetric (authdb Gate 8 finding), because its
+    /// `UPDATE` deliberately carries no `is_active` filter (it's the only
+    /// writer allowed to flip a row from inactive back to active) while THIS
+    /// SELECT is filtered to `is_active = TRUE`. So: if the row is active
+    /// when this call runs, it genuinely serializes against a concurrent
+    /// `reactivate_user()` exactly like `update_role()` (either blocks
+    /// behind that UPDATE's in-flight lock, or that UPDATE blocks behind
+    /// this one). But if the row is ALREADY inactive at read time (no writer
+    /// in flight), this SELECT's own filter simply excludes it — zero rows,
+    /// `UserNotFound`, immediately, with nothing to wait on. That's not a
+    /// missed serialization, it's the correct fail-closed answer (a recheck
+    /// on an inactive account should deny), but it means this call never
+    /// blocks a *fresh* `reactivate_user()` call that starts against an
+    /// already-inactive row — there is no lock to contend for at that point.
     ///
     /// `under_row_lock` runs WHILE the row lock is held, immediately before
     /// this call commits (releasing the lock) — use it to update

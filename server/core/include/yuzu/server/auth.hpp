@@ -1009,8 +1009,15 @@ private:
     /// #4107: re-verifies via `AuthDB::recheck_role_locked`, which takes a
     /// `SELECT ... FOR UPDATE` row lock and holds it across the callback
     /// below (where the in-process cache write happens) before committing.
-    /// This SERIALIZES against any concurrent `update_role()`/
-    /// `reactivate_user()` write to this user's row - by construction, not by
+    /// This SERIALIZES against any concurrent `update_role()` write to this
+    /// user's row, and against `reactivate_user()` too WHEN the row is
+    /// active at read time (authdb Gate 8: `reactivate_user`'s UPDATE has no
+    /// `is_active` filter, so it contends for the same lock; but if the row
+    /// is already inactive when this SELECT runs, its own `is_active = TRUE`
+    /// filter excludes it immediately - correct fail-closed denial, not a
+    /// missed serialization, since there is no writer in flight to wait on
+    /// at that instant - see `recheck_role_locked`'s own doc in
+    /// `auth_db.hpp` for the full asymmetry). This is by construction, not by
     /// detecting a race after the fact - closing the whole class of
     /// same-process divergence residuals every EARLIER version of this
     /// function's version-counter guard could only narrow, never eliminate

@@ -936,8 +936,27 @@ AuthDB::recheck_role_locked(const std::string& username,
     // digit-ms regardless of whether the stripe happens to be serializing
     // them too - the row lock's own bounded hold time is what keeps this
     // safe on the shared connection pool, with or without the stripe.
+    //
+    // authdb Gate 8 finding: kWriteTimeout only bounds the connection
+    // ACQUIRE (with_txn_for's try_acquire_for). Once inside the txn, the
+    // FOR UPDATE's own row-lock WAIT is bounded by PgPool::connect_one's
+    // per-connection `lock_timeout` (10000ms default, pg_pool.hpp) unless
+    // overridden - a contended lock could otherwise block ~5x longer than
+    // this call's own acquire bound. SET LOCAL below closes that: it scopes
+    // to this transaction only (no leak back to the pooled connection) and
+    // matches the wait bound to kWriteTimeout itself, so a genuinely stuck
+    // writer fails this call closed (QueryFailed, via the SQLSTATE 55P03
+    // lock_timeout error surfacing as a non-PGRES_COMMAND_OK/TUPLES_OK
+    // status) well inside the caller's own expectations.
     std::optional<AuthDBError> err;
     const bool committed = impl_->pool.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        const std::string lock_timeout_sql =
+            "SET LOCAL lock_timeout = '" + std::to_string(kWriteTimeout.count()) + "ms'";
+        pg::PgResult set_lt = pg::exec_params(conn, lock_timeout_sql.c_str(), std::vector<std::string>{});
+        if (set_lt.status() != PGRES_COMMAND_OK) {
+            err = AuthDBError::QueryFailed;
+            return false;
+        }
         pg::PgResult sel = pg::exec_params(
             conn, "SELECT role FROM auth.users WHERE username = $1 AND is_active = TRUE FOR UPDATE",
             std::vector<std::string>{username});
