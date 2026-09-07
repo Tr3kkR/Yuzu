@@ -425,6 +425,67 @@ TEST_CASE("POST /login/mfa with valid TOTP mints session and emits dual audit (m
     CHECK(h.count_audits("auth.login", "admin") >= 1);
 }
 
+// #4107 Gate 8 (security-guardian + authdb): the AuthManager-level tests for
+// post_mint_role_recheck (test_auth.cpp) only exercise authenticate() and a
+// direct create_local_session() call with a hand-supplied stale role - not
+// the actual fixed code, the 3 token.empty() deny blocks in auth_routes.cpp.
+// This drives the real gap through the real wire path with NO test hook:
+// the pending entry's role is captured by verify_password() at step 1 and
+// held unread until create_local_session() at step 2, a genuine two-request
+// window (unlike plain /login's single-request authenticate()/verify_
+// password() call, which has no such gap to reproduce without a hook) - a
+// real demote landing in that window is exactly the #4107 scenario.
+TEST_CASE("POST /login/mfa denies the mint (401, no cookie, honest audit) when the account "
+          "is demoted between the pending /login and the TOTP verify - the real wire-path "
+          "reproduction of the #4107 route-layer gap (Gate 8 coverage, no test hook needed)",
+          "[pg][mfa][routes][auth_routes]") {
+    AuthRoutesHarness h;
+    auto secret_b32 = h.enroll_mfa("admin");
+    auto step1 = h.sink.Post("/login",
+                             form({{"username", "admin"}, {"password", "adminpassword1"}}),
+                             "application/x-www-form-urlencoded");
+    REQUIRE(step1->status == 202);
+    auto body = step1->body;
+    auto pending_start = body.find(R"("mfa_pending_token":")") + 21;
+    auto pending_end = body.find('"', pending_start);
+    auto pending = body.substr(pending_start, pending_end - pending_start);
+    REQUIRE(pending.size() == 64);
+    auto code = h.totp_at(secret_b32);
+
+    // The pending entry captured role=admin at step 1. Demote strictly
+    // between the two requests - update_role() writes AuthDB durably
+    // before this call returns (auth.cpp), so create_local_session()'s
+    // post_mint_role_recheck is guaranteed to observe "user", not "admin".
+    REQUIRE(h.auth_mgr.update_role("admin", auth::Role::user));
+
+    auto step2 = h.sink.Post("/login/mfa", form({{"mfa_pending_token", pending}, {"code", code}}),
+                             "application/x-www-form-urlencoded");
+    REQUIRE(step2);
+    CHECK(step2->status == 401);
+    CHECK(step2->get_header_value("Set-Cookie").empty());
+    // The TOTP code itself was genuinely correct and consumed - proves the
+    // fix (auth_routes.cpp's token.empty() check) denies the MINT, not the
+    // code verification; the false "auth.login ok" this used to produce is
+    // gone, replaced by an honest failure row that doesn't overclaim which
+    // of create_local_session's two internal causes fired.
+    CHECK(h.count_audits("mfa.login.verified", "admin") >= 1);
+    CHECK(h.count_audits("auth.login", "admin") >= 1); // the new failure row, never a false "ok"
+    AuditQuery q;
+    q.action = "auth.login";
+    q.principal = "admin";
+    auto res = h.audit_store->query(q);
+    REQUIRE(res.has_value());
+    bool found_failure_row = false;
+    for (const auto& row : *res) {
+        if (row.result == "failure") {
+            found_failure_row = true;
+            CHECK(row.detail.find("session_mint_failed") != std::string::npos);
+            CHECK(row.detail.find("post_mint_recheck=true") == std::string::npos);
+        }
+    }
+    CHECK(found_failure_row);
+}
+
 TEST_CASE("POST /login/mfa with valid recovery code emits mfa.recovery_code.used + auth.login",
           "[pg][mfa][routes][auth_routes]") {
     AuthRoutesHarness h;

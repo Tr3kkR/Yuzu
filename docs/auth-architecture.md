@@ -3717,13 +3717,16 @@ the HTTP response, a larger change than a role recheck (the same residual
 OIDC/SAML's own post-mint recheck discloses, `docs/adr/2001-scim-oidc-identity-linkage.md`
 "Known residuals").
 
-A denied post-mint recheck is audited via `auth.login` `result=failure`,
-`detail=reason=session_mint_failed;post_mint_recheck=true[;method=...]`
+A denied mint is audited via `auth.login` `result=failure`,
+`detail=reason=session_mint_failed;cause=undifferentiated[;method=...]`
 (`auth_routes.cpp`) and counted in `yuzu_auth_login_session_mint_denied_total`
-— undifferentiated between a genuine divergence and a store error, unlike
-the OIDC/SAML counters' genuine-vs-store-unavailable split, since
-`create_local_session`'s caller-facing contract (an empty string) does not
-itself distinguish the two causes.
+— undifferentiated not just between a genuine role divergence and a
+post-mint store error, but also against a plain `SessionStore` persist
+failure (an ordinary availability event, unrelated to the role recheck at
+all), since `create_local_session`'s caller-facing contract (an empty
+string) collapses all three into one sentinel. Unlike the OIDC/SAML
+counters' genuine-vs-store-unavailable split, this counter is not a
+role-recheck-specific signal and must not be alerted on as one.
 
 ## RbacStore — the authorization substrate (Postgres, ADR-0041 — SQLite `rbac.db` retired)
 

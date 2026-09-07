@@ -3021,21 +3021,29 @@ public:
                           "PostgreSQL health, do not treat as a CC6.8 deprovision-deny",
                           "counter");
         // #4107 — the local-auth analogue of the OIDC/SAML post-mint
-        // recheck above: AuthManager::post_mint_role_recheck denies a
-        // just-minted local session (password login, MFA step-up, or MFA
-        // enrollment-confirm) whose role diverged from AuthDB during the
-        // check-then-mint window, or whose post-mint AuthDB read hit a
-        // store error - undifferentiated (see auth_routes.cpp's
-        // `reason=session_mint_failed` audit detail), unlike the OIDC/SAML
-        // counters' genuine-vs-store-unavailable split, since
-        // create_local_session's caller-facing contract (an empty string)
-        // does not itself distinguish the two causes.
+        // recheck above, with one more undifferentiated cause than those:
+        // AuthManager::create_local_session (password login, MFA step-up,
+        // MFA enrollment-confirm) returns its caller-facing empty-string
+        // sentinel on EITHER a plain SessionStore persist failure (an
+        // ordinary availability event, unrelated to any role check) OR a
+        // post_mint_role_recheck denial (role diverged from AuthDB during
+        // the check-then-mint window, or the post-mint AuthDB read itself
+        // hit a store error) - the route layer cannot distinguish any of
+        // the three from the sentinel alone (see auth_routes.cpp's
+        // `reason=session_mint_failed;cause=undifferentiated` audit
+        // detail), so unlike the OIDC/SAML counters' genuine-vs-store-
+        // unavailable split, this one is NOT purely a role-recheck signal
+        // and must not be alerted on as one (cpp-expert/security-guardian/
+        // authdb Gate 8: an earlier draft of this text asserted only the
+        // post_mint_role_recheck causes).
         metrics_.describe("yuzu_auth_login_session_mint_denied_total",
                           "TOTAL local-auth logins (password, MFA step-up, MFA enrollment-"
-                          "confirm) denied by AuthManager::post_mint_role_recheck because the "
-                          "role diverged from AuthDB during the check-then-mint window (#4107) "
-                          "OR because the post-mint AuthDB read hit a store error (fail-closed) "
-                          "- undifferentiated, unlike the OIDC/SAML analogues below",
+                          "confirm) whose session mint was denied - EITHER an ordinary "
+                          "SessionStore persist failure OR a post_mint_role_recheck denial "
+                          "(#4107 role-recheck: role diverged from AuthDB during the "
+                          "check-then-mint window, or the post-mint AuthDB read hit a store "
+                          "error) - undifferentiated, unlike the OIDC/SAML analogues above; "
+                          "do not alert on this as a role-recheck-specific signal",
                           "counter");
         // describe() only registers HELP/TYPE metadata; the series is absent
         // from /metrics until first .increment(). Instantiate each bare
@@ -3053,8 +3061,8 @@ public:
         metrics_.counter("yuzu_auth_oidc_deprovisioned_denied_store_unavailable_total");
         metrics_.counter("yuzu_auth_saml_deprovisioned_denied_total");
         metrics_.counter("yuzu_auth_saml_deprovisioned_denied_genuine_total");
-        metrics_.counter("yuzu_auth_login_session_mint_denied_total");
         metrics_.counter("yuzu_auth_saml_deprovisioned_denied_store_unavailable_total");
+        metrics_.counter("yuzu_auth_login_session_mint_denied_total");
         metrics_.counter("yuzu_scim_saml_link_unmatched_total");
         metrics_.counter("yuzu_scim_saml_link_ambiguous_total");
         metrics_.counter("yuzu_scim_saml_link_lookup_failures_total");

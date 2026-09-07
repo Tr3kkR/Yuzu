@@ -2125,15 +2125,20 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 // audited a fictional successful admin-role login. Neither
                 // failure mode is distinguishable from the caller side
                 // without a structural return-type change (tracked as a
-                // follow-up) - "session_mint_failed" is deliberately
-                // honest about that rather than guessing.
+                // follow-up) - the audit reason below deliberately does NOT
+                // assert which of the two fired (cpp-expert Gate 8: an
+                // earlier draft asserted post_mint_recheck=true
+                // unconditionally, which is false audit evidence on an
+                // ordinary persist failure). Same 401 body as this route's
+                // other failure branches (no oracle on which credential/
+                // state step failed).
                 res.status = 401;
                 res.set_content(
-                    R"({"error":{"code":401,"message":"authentication failed"},"meta":{"api_version":"v1"}})",
+                    R"({"error":{"code":401,"message":"Invalid username or password"},"meta":{"api_version":"v1"}})",
                     "application/json");
                 audit_log_for_principal(req, "auth.login", "failure", username,
                                         auth::role_to_string(*role_opt), "User", username,
-                                        "reason=session_mint_failed;post_mint_recheck=true");
+                                        "reason=session_mint_failed;cause=undifferentiated");
                 emit_event("auth.login", req,
                            {{"source_ip", req.remote_addr},
                             {"username", username},
@@ -2395,16 +2400,38 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         }
 
         // Terminal success — entry was already erased atomically at
-        // lookup time. Mint the real session marked as MFA-verified.
+        // lookup time. The TOTP/recovery code has already been verified
+        // (and, for recovery, irreversibly consumed in AuthDB) above —
+        // that DB-committed state change is real regardless of what the
+        // session mint below does, so its audit row is emitted here,
+        // unconditionally, rather than after the mint (#4107 Gate 8,
+        // security-guardian: a denied mint used to silently drop this
+        // TRUE row along with the false auth.login "ok" it was
+        // previously bundled with).
+        if (used_recovery) {
+            audit_log_for_principal(req, "mfa.recovery_code.used", "ok", entry.username,
+                                    auth::role_to_string(entry.role), "User", entry.username,
+                                    "method=recovery");
+        } else {
+            audit_log_for_principal(req, "mfa.login.verified", "ok", entry.username,
+                                    auth::role_to_string(entry.role), "User", entry.username);
+        }
+        emit_event(used_recovery ? "mfa.recovery_code.used" : "mfa.login.verified", req,
+                   {{"source_ip", req.remote_addr},
+                    {"username", entry.username},
+                    {"auth_method", used_recovery ? "password+recovery" : "password+totp"}});
+        // Mint the real session marked as MFA-verified.
         auto token = auth_mgr_.create_local_session(entry.username, entry.role, true);
         if (token.empty()) {
             // #4107 Gate 8 finding (security-guardian) - see the plain-
-            // password-login call site's identical comment above.
+            // password-login call site's identical comment above (also
+            // covers why the audit reason below doesn't assert
+            // post_mint_recheck=true - cpp-expert Gate 8).
             res.status = 401;
             res.set_content(kFailureBody, "application/json");
             audit_log_for_principal(req, "auth.login", "failure", entry.username,
                                     auth::role_to_string(entry.role), "User", entry.username,
-                                    "reason=session_mint_failed;post_mint_recheck=true;method=" +
+                                    "reason=session_mint_failed;cause=undifferentiated;method=" +
                                         std::string(used_recovery ? "password+recovery"
                                                                    : "password+totp"));
             emit_event("auth.login", req,
@@ -2419,27 +2446,13 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         }
         res.set_header("Set-Cookie", "yuzu_session=" + token + session_cookie_attrs());
         res.set_content(R"({"status":"ok"})", "application/json");
-        // Audit chain — emit BOTH the method-specific verb AND the
-        // canonical auth.login row so SIEM queries that key on
-        // `auth.login` for session-creation parity across password,
-        // OIDC, and MFA paths stay correct (Gate 4 architect S2 +
-        // happy-path S1 + S2).
-        if (used_recovery) {
-            audit_log_for_principal(req, "mfa.recovery_code.used", "ok", entry.username,
-                                    auth::role_to_string(entry.role), "User", entry.username,
-                                    "method=recovery");
-        } else {
-            audit_log_for_principal(req, "mfa.login.verified", "ok", entry.username,
-                                    auth::role_to_string(entry.role), "User", entry.username);
-        }
+        // Canonical auth.login row so SIEM queries that key on it for
+        // session-creation parity across password, OIDC, and MFA paths
+        // stay correct (Gate 4 architect S2 + happy-path S1 + S2).
         audit_log_for_principal(req, "auth.login", "ok", entry.username,
                                 auth::role_to_string(entry.role), "User", entry.username,
                                 used_recovery ? "method=password+recovery"
                                               : "method=password+totp");
-        emit_event(used_recovery ? "mfa.recovery_code.used" : "mfa.login.verified", req,
-                   {{"source_ip", req.remote_addr},
-                    {"username", entry.username},
-                    {"auth_method", used_recovery ? "password+recovery" : "password+totp"}});
         if (auto* m = auth_mgr_.metrics_registry()) {
             m->counter("yuzu_auth_mfa_logins_total",
                        {{"method", used_recovery ? "recovery" : "totp"},
@@ -2653,11 +2666,24 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             return;
         }
 
-        // Enrollment confirmed — mint the MFA-verified session and return
-        // the recovery codes for the one-time reveal. Emit the enrollment
-        // verb, the canonical recovery-codes-generated verb, and the
-        // canonical auth.login row (session-creation parity with the
-        // password / OIDC / login-challenge paths).
+        // Enrollment confirmed - TOTP secret is already durably promoted
+        // to enrolled and the recovery codes already generated server-
+        // side, regardless of what the session mint below does, so their
+        // audit rows fire here, unconditionally (#4107 Gate 8, security-
+        // guardian: a denied mint used to silently drop these TRUE rows
+        // along with the false auth.login "ok" they were previously
+        // bundled with). The recovery codes' one-time VALUE reveal to the
+        // client stays gated on a successful mint below - only the fact
+        // that they were generated is unconditional.
+        audit_log_for_principal(req, "mfa.enroll.verified", "ok", entry.username,
+                                auth::role_to_string(entry.role), "User", entry.username,
+                                "enforcement bootstrap");
+        audit_log_for_principal(req, "mfa.recovery_codes.generated", "ok", entry.username,
+                                auth::role_to_string(entry.role), "User", entry.username);
+        emit_event("mfa.enroll.verified", req,
+                   {{"source_ip", req.remote_addr}, {"username", entry.username}});
+        // Mint the MFA-verified session and return the recovery codes for
+        // the one-time reveal.
         auto token = auth_mgr_.create_local_session(entry.username, entry.role, true);
         if (token.empty()) {
             // #4107 Gate 8 finding (security-guardian) - see the plain-
@@ -2672,7 +2698,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             res.set_content(kFailureBody, "application/json");
             audit_log_for_principal(req, "auth.login", "failure", entry.username,
                                     auth::role_to_string(entry.role), "User", entry.username,
-                                    "reason=session_mint_failed;post_mint_recheck=true;"
+                                    "reason=session_mint_failed;cause=undifferentiated;"
                                     "method=password+totp-enroll");
             emit_event("auth.login", req,
                        {{"source_ip", req.remote_addr}, {"username", entry.username}}, {},
@@ -2685,16 +2711,11 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         res.set_header("Set-Cookie", "yuzu_session=" + token + session_cookie_attrs());
         nlohmann::json body = {{"status", "ok"}, {"recovery_codes", recovery_codes}};
         res.set_content(body.dump(), "application/json");
-        audit_log_for_principal(req, "mfa.enroll.verified", "ok", entry.username,
-                                auth::role_to_string(entry.role), "User", entry.username,
-                                "enforcement bootstrap");
-        audit_log_for_principal(req, "mfa.recovery_codes.generated", "ok", entry.username,
-                                auth::role_to_string(entry.role), "User", entry.username);
+        // Canonical auth.login row (session-creation parity with the
+        // password / OIDC / login-challenge paths).
         audit_log_for_principal(req, "auth.login", "ok", entry.username,
                                 auth::role_to_string(entry.role), "User", entry.username,
                                 "method=password+totp-enroll");
-        emit_event("mfa.enroll.verified", req,
-                   {{"source_ip", req.remote_addr}, {"username", entry.username}});
         if (auto* m = auth_mgr_.metrics_registry()) {
             m->counter("yuzu_auth_mfa_logins_total", {{"method", "enroll"}, {"result", "success"}})
                 .increment();
