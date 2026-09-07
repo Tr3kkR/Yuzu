@@ -303,12 +303,19 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        security-guardian-reviewed amendment... not a side effect of a
        routine REST-twin PR." This stands as a standing exception until
        that amendment happens, not a numbered issue with a revisit date.
-     - **The exception relaxes no control.** Each route requires its
-       dedicated RBAC securable (`Read`), is floored in
+     - **The exception relaxes no control.** Every route requires its
+       dedicated RBAC securable (`Read`) and is floored in
        `authz_topology_floor.hpp` so an RBAC-off deployment stays
-       admin-gated rather than silently widening to any authenticated user,
-       and is audited fail-closed (`settings.*.read` / `plugin_signing.*`).
-       The MCP deny-list changes nothing about REST-side access control.
+       admin-gated rather than silently widening to any authenticated user.
+       Four of the eight (TLS, HTTPS, plugin-signing, analytics — the
+       higher-sensitivity sub-areas) are additionally audited fail-closed
+       (`settings.*.read` / `plugin_signing.*`, `settings_routes.hpp`'s
+       dedicated `AuditFn`); the other four (gateway, server-config,
+       data-retention, MCP) are deliberately unaudited, matching their
+       pre-existing dashboard-fragment posture and #4028's own Evidence
+       classification of that data as non-sensitive (each REST handler's
+       comment states this explicitly). The MCP deny-list changes nothing
+       about REST-side access control either way.
      - Design record: `server/core/src/mcp_policy.hpp`'s `#4028/#520`
        comment; `docs/auth-architecture.md`'s "Settings read-twins" section;
        wire reference: `docs/user-manual/rest-api.md`'s Settings routes,
