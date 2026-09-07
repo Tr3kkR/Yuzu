@@ -648,6 +648,12 @@ if host_machine.system() == 'linux' and get_option('b_sanitize') == 'none'
   test(
     'spark allocation budget',
     spark_alloc_budget_exe,
+    # BR4-005 sibling (this executable is Linux-only, so the macOS branch
+    # review never reached it): a plugin-scoped `--test-args '[tag]'` against
+    # the agent suite appends that filter here too, where it never matches —
+    # see the cert_store_fallback_test_exe comment above for the full
+    # rationale.
+    args: ['--allow-running-no-tests'],
     suite: 'agent',
     timeout: 60,
   )
@@ -689,7 +695,18 @@ if host_machine.system() == 'darwin'
     # actually calls into it.
     dependencies: [yuzu_sdk_dep, spdlog_dep, catch2_dep],
   )
-  test('cert_store macOS honest-unsupported', cert_store_fallback_test_exe, suite: 'agent', timeout: 30)
+  # BR4-005 (branch-review round 4): `meson test --suite agent --test-args
+  # '[some-tag]'` appends that tag filter to EVERY test in the agent suite,
+  # including this standalone executable — which has no tag matching a
+  # plugin-specific filter like `[autoruns]`/`[app_usage]`. Catch2 exits 2 on
+  # a zero-match tag filter by default, so a plugin-scoped `--test-args`
+  # invocation (documented practice for a fast, targeted local check)
+  # deterministically fails this ENTIRELY UNRELATED test. --allow-running-no-tests
+  # makes a zero-match filter here report success (0 run) instead, matching
+  # what the caller actually meant: "run autoruns's tests", not "fail
+  # anything that isn't autoruns's tests".
+  test('cert_store macOS honest-unsupported', cert_store_fallback_test_exe,
+       args: ['--allow-running-no-tests'], suite: 'agent', timeout: 30)
 endif
 
 # ── TAR plugin unit tests ────────────────────────────────────────────────────
