@@ -125,6 +125,7 @@
 #include "dashboard_api_routes.hpp" // #2542 follow-up: /api/me, /api/agents, /api/audit, /api/export/json-to-csv, /api/scope/validate, /api/analytics/{status,recent}
 #include "nvd_routes.hpp" // #2542 follow-up: /api/nvd/{status,sync,match}, extracted onto the HttpRouteSink seam
 #include "custom_properties_routes.hpp" // #2542 PR-4: the 5-route Custom Properties API (7.6), extracted onto the HttpRouteSink seam
+#include "result_set_routes.hpp" // #2542 PR-5: the 6-route Result Sets fragment API, extracted onto the HttpRouteSink seam
 #include "command_capability.hpp" // PR1.9c: CommandCapabilityRegistry — the dispatch classification vocabulary
 #include "command_capability_parsers.hpp" // PR1.9c: encode_dispatch_tag / compute_plan_hash
 // PR1.9c: the seven capability spans build_classified_command's registry composes over —
@@ -13264,6 +13265,35 @@ private:
                              .store = custom_properties_store_.get(),
                          });
 
+        // #2542 PR-5: wraps AuthRoutes::deny_service_scoped_session — the
+        // first extracted route module whose handlers call it (see
+        // result_set_routes.hpp's "NEW DEPS FIELD" doc comment for why no
+        // earlier extraction needed this closure).
+        auto deny_service_scoped_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                             const std::string& action,
+                                             const std::string& message,
+                                             const std::string& target_type,
+                                             const std::string& target_id) -> bool {
+            return auth_routes_->deny_service_scoped_session(req, res, action, message,
+                                                              target_type, target_id);
+        };
+
+        // #2542 PR-5: the 6-route Result Sets fragment API
+        // (/fragments/result-sets/{sidebar,create,:id/{detail,pin,unpin,delete}}),
+        // extracted onto the same inline_sink seam. Placed here rather than
+        // alongside page_routes's call above (like PR-4's custom_properties
+        // sibling) because this module needs auth_fn + the just-defined
+        // deny_service_scoped_fn + audit_fn, none of which is in scope yet
+        // at that earlier point.
+        yuzu::server::result_set::register_result_set_routes(
+            inline_sink, yuzu::server::result_set::Deps{
+                             .auth_fn = auth_fn,
+                             .deny_service_scoped_fn = deny_service_scoped_fn,
+                             .audit_fn = audit_fn,
+                             .store = result_set_store_.get(),
+                             .metrics = &metrics_,
+                         });
+
         // Shared command-dispatch closure — sends a CommandRequest to agents via
         // gRPC. Hoisted here (was inline in the WorkflowRoutes block) so every
         // background consumer drives the EXACT same dispatch path.
@@ -15239,268 +15269,6 @@ private:
                             "application/json");
         });
 
-        // Owner-scoped sidebar list.
-        //
-        // guardian-confinement-2298 PR3 §3e: every result-set fragment below
-        // is require_auth-only, keyed on `session->username` — but that
-        // username is the MINTING principal's, not the individual token's
-        // own service scope. A service-scoped token therefore reaches every
-        // result set the minter (or any OTHER service token that same
-        // minter holds) has created/pinned — cross-service reach beyond
-        // this token's own intended cohort. Denied all six (one read here,
-        // detail below, plus pin/unpin/delete/create).
-        web_server_->Get(
-            "/fragments/result-sets/sidebar",
-            [this](const httplib::Request& req, httplib::Response& res) {
-                if (auth_routes_->deny_service_scoped_session(
-                        req, res, "result_set.sidebar.access_denied",
-                        "service-scoped tokens may not read the result-set sidebar",
-                        "ResultSet"))
-                    return;
-                auto session = require_auth(req, res);
-                if (!session)
-                    return;
-                if (!result_set_store_) {
-                    res.set_content("", "text/html; charset=utf-8");
-                    return;
-                }
-                std::string next;
-                std::string selected =
-                    req.has_param("selected") ? req.get_param_value("selected") : "";
-                auto sets = result_set_store_->list_by_owner(session->username, "", 200, next);
-                res.set_content(render_result_sets_sidebar(sets, selected),
-                                "text/html; charset=utf-8");
-            });
-
-        // Owner-checked read shared by every fragment mutation below: a DB
-        // error is treated IDENTICALLY to "not found or not owned" — a
-        // mutation (pin/unpin/delete) must never proceed on a degraded
-        // ownership read (ADR-0036 fail-closed authoritative-read contract).
-        // Collapses ResultSetStore::get's std::expected<optional<...>,...>
-        // into a plain optional so every call site below is unchanged from
-        // its pre-widening shape.
-        auto rs_get_owned = [this](const std::string& id,
-                                   const std::string& owner) -> std::optional<ResultSet> {
-            if (!result_set_store_)
-                return std::nullopt;
-            auto row = result_set_store_->get(id);
-            if (!row || !row->has_value() || (*row)->owner_principal != owner)
-                return std::nullopt;
-            return **row;
-        };
-
-        // Detail pane for one set (owner-checked).
-        web_server_->Get(
-            R"(/fragments/result-sets/(rs_[0-9a-f]+)/detail)",
-            [this, rs_get_owned](const httplib::Request& req, httplib::Response& res) {
-                if (auth_routes_->deny_service_scoped_session(
-                        req, res, "result_set.detail.access_denied",
-                        "service-scoped tokens may not read result-set detail", "ResultSet",
-                        req.matches[1].str()))
-                    return;
-                auto session = require_auth(req, res);
-                if (!session)
-                    return;
-                auto id = req.matches[1].str();
-                auto row = rs_get_owned(id, session->username);
-                if (!row) {
-                    res.set_content(render_result_set_detail_empty(),
-                                    "text/html; charset=utf-8");
-                    return;
-                }
-                auto chain = result_set_store_->lineage(id, session->username);
-                res.set_content(render_result_set_detail(*row, chain),
-                                "text/html; charset=utf-8");
-            });
-
-        // Pin / unpin — return the refreshed detail and trigger a sidebar reload.
-        auto rs_detail_after = [this, rs_get_owned](const std::string& id,
-                                                    const std::string& owner,
-                                                    httplib::Response& res) {
-            auto row = rs_get_owned(id, owner);
-            if (!row) {
-                res.set_content(render_result_set_detail_empty(), "text/html; charset=utf-8");
-                return;
-            }
-            auto chain = result_set_store_->lineage(id, owner);
-            res.set_header("HX-Trigger", "resultSetsChanged");
-            res.set_content(render_result_set_detail(*row, chain), "text/html; charset=utf-8");
-        };
-
-        web_server_->Post(
-            R"(/fragments/result-sets/(rs_[0-9a-f]+)/pin)",
-            [this, rs_detail_after, rs_get_owned](const httplib::Request& req,
-                                                  httplib::Response& res) {
-                if (auth_routes_->deny_service_scoped_session(
-                        req, res, "result_set.pin.access_denied",
-                        "service-scoped tokens may not pin result sets", "ResultSet",
-                        req.matches[1].str()))
-                    return;
-                auto session = require_auth(req, res);
-                if (!session || !result_set_store_)
-                    return;
-                auto id = req.matches[1].str();
-                auto row = rs_get_owned(id, session->username);
-                if (!row) {
-                    res.set_content(render_result_set_detail_empty(), "text/html; charset=utf-8");
-                    return;
-                }
-                auto pinned = result_set_store_->pin(id);
-                if (!pinned) {
-                    // Don't audit a success that didn't happen, and tell the
-                    // operator why (review merged_bug_009). PinLimit is the
-                    // 50-pin cap; otherwise a transient store error.
-                    audit_log(req, "result_set.pin",
-                              pinned.error() == ResultSetError::PinLimit ? "denied" : "failure",
-                              "ResultSet", id, to_string(pinned.error()));
-                    res.set_header(
-                        "HX-Trigger",
-                        nlohmann::json{{"showToast",
-                                        {{"level", "error"}, {"message", to_string(pinned.error())}}}}
-                            .dump());
-                    auto chain = result_set_store_->lineage(id, session->username);
-                    res.set_content(render_result_set_detail(*row, chain),
-                                    "text/html; charset=utf-8");
-                    return;
-                }
-                audit_log(req, "result_set.pin", "success", "ResultSet", id, "");
-                rs_detail_after(id, session->username, res);
-            });
-
-        web_server_->Post(
-            R"(/fragments/result-sets/(rs_[0-9a-f]+)/unpin)",
-            [this, rs_detail_after, rs_get_owned](const httplib::Request& req,
-                                                  httplib::Response& res) {
-                if (auth_routes_->deny_service_scoped_session(
-                        req, res, "result_set.unpin.access_denied",
-                        "service-scoped tokens may not unpin result sets", "ResultSet",
-                        req.matches[1].str()))
-                    return;
-                auto session = require_auth(req, res);
-                if (!session || !result_set_store_)
-                    return;
-                auto id = req.matches[1].str();
-                auto row = rs_get_owned(id, session->username);
-                if (!row) {
-                    res.set_content(render_result_set_detail_empty(), "text/html; charset=utf-8");
-                    return;
-                }
-                auto unpinned = result_set_store_->unpin(id);
-                if (!unpinned) {
-                    audit_log(req, "result_set.unpin", "failure", "ResultSet", id,
-                              to_string(unpinned.error()));
-                    res.set_header("HX-Trigger",
-                                   nlohmann::json{{"showToast",
-                                                   {{"level", "error"},
-                                                    {"message", to_string(unpinned.error())}}}}
-                                       .dump());
-                    auto chain = result_set_store_->lineage(id, session->username);
-                    res.set_content(render_result_set_detail(*row, chain),
-                                    "text/html; charset=utf-8");
-                    return;
-                }
-                audit_log(req, "result_set.unpin", "success", "ResultSet", id, "");
-                rs_detail_after(id, session->username, res);
-            });
-
-        web_server_->Post(
-            R"(/fragments/result-sets/(rs_[0-9a-f]+)/delete)",
-            [this, rs_get_owned](const httplib::Request& req, httplib::Response& res) {
-                if (auth_routes_->deny_service_scoped_session(
-                        req, res, "result_set.delete.access_denied",
-                        "service-scoped tokens may not delete result sets", "ResultSet",
-                        req.matches[1].str()))
-                    return;
-                auto session = require_auth(req, res);
-                if (!session || !result_set_store_)
-                    return;
-                auto id = req.matches[1].str();
-                auto row = rs_get_owned(id, session->username);
-                if (!row) {
-                    res.set_content(render_result_set_detail_empty(), "text/html; charset=utf-8");
-                    return;
-                }
-                auto del = result_set_store_->delete_set(id);
-                if (!del) {
-                    // Pinned sets must be unpinned first — re-render the detail
-                    // so the operator sees why nothing was deleted.
-                    auto chain = result_set_store_->lineage(id, session->username);
-                    res.set_content(render_result_set_detail(*row, chain),
-                                    "text/html; charset=utf-8");
-                    return;
-                }
-                audit_log(req, "result_set.delete", "success", "ResultSet", id, "");
-                res.set_header("HX-Trigger", "resultSetsChanged");
-                res.set_content(render_result_set_detail_empty(), "text/html; charset=utf-8");
-            });
-
-        // Create from pasted device IDs (CSV import) — returns refreshed sidebar.
-        web_server_->Post(
-            "/fragments/result-sets/create",
-            [this](const httplib::Request& req, httplib::Response& res) {
-                if (auth_routes_->deny_service_scoped_session(
-                        req, res, "result_set.create.access_denied",
-                        "service-scoped tokens may not create result sets", "ResultSet"))
-                    return;
-                auto session = require_auth(req, res);
-                if (!session || !result_set_store_)
-                    return;
-                CreateRequest cr;
-                cr.owner_principal = session->username;
-                cr.name = req.has_param("name") ? req.get_param_value("name") : "";
-                cr.source_kind = std::string(source_kind::kManualCurate);
-                cr.source_payload = R"({"note":"dashboard CSV import"})";
-
-                std::vector<std::string> members;
-                if (req.has_param("device_ids")) {
-                    std::string raw = req.get_param_value("device_ids");
-                    std::string cur;
-                    auto flush = [&]() {
-                        // trim whitespace
-                        std::size_t a = cur.find_first_not_of(" \t\r\n");
-                        std::size_t b = cur.find_last_not_of(" \t\r\n");
-                        if (a != std::string::npos)
-                            members.push_back(cur.substr(a, b - a + 1));
-                        cur.clear();
-                    };
-                    for (char c : raw) {
-                        if (c == '\n' || c == ',')
-                            flush();
-                        else
-                            cur += c;
-                    }
-                    flush();
-                }
-                auto created = result_set_store_->create_materialized(cr, members);
-                if (!created) {
-                    // Surface quota / too-many-members / store errors instead of
-                    // silently re-rendering as if the create succeeded (review
-                    // merged_bug_009). The store enforces kMaxMembersPerSet, so an
-                    // oversized pasted CSV lands here as TooManyMembers (B4).
-                    if (created.error() == ResultSetError::QuotaExceeded ||
-                        created.error() == ResultSetError::TooManyMembers)
-                        metrics_.counter("yuzu_result_set_quota_rejected").increment();
-                    audit_log(req, "result_set.create", "denied", "ResultSet", "",
-                              to_string(created.error()));
-                    res.set_header("HX-Trigger",
-                                   nlohmann::json{{"showToast",
-                                                   {{"level", "error"},
-                                                    {"message", to_string(created.error())}}}}
-                                       .dump());
-                    std::string next;
-                    auto sets = result_set_store_->list_by_owner(session->username, "", 200, next);
-                    res.set_content(render_result_sets_sidebar(sets, ""),
-                                    "text/html; charset=utf-8");
-                    return;
-                }
-                audit_log(req, "result_set.create", "success", "ResultSet", created->id,
-                          cr.source_kind);
-                std::string next;
-                auto sets = result_set_store_->list_by_owner(session->username, "", 200, next);
-                res.set_header("HX-Trigger", "resultSetsChanged");
-                res.set_content(render_result_sets_sidebar(sets, created->id),
-                                "text/html; charset=utf-8");
-            });
 
         // -- Instruction Definitions API --------------------------------------
 
