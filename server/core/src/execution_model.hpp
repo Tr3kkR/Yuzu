@@ -86,8 +86,13 @@ struct ExecutionKpi {
 nlohmann::json execution_kpi_json(const ExecutionKpi& k);
 
 /// Execution-scoped response row for `GET /api/v1/executions/{id}/responses`
-/// (mirrors MCP `query_responses`'s `execution_id`-filtered field set, so the
-/// new REST route is a genuine twin of that existing MCP tool).
+/// (mirrors MCP `query_responses`'s `execution_id`-filtered field set --
+/// FIELD-SET PARITY only, not a shared builder: `query_responses` builds its
+/// row inline in `mcp_server.cpp` rather than calling this function, so a
+/// future field change to one will not propagate to the other without a
+/// human remembering both, unlike this file's other builders (#4030 Gate 3,
+/// consistency-auditor -- retrofitting `query_responses` onto this function
+/// is deliberately out of scope for the Gate 8 fix round; tracked open).
 nlohmann::json execution_response_row_json(const StoredResponse& r);
 
 } // namespace yuzu::server
