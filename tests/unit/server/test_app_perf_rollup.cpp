@@ -194,11 +194,13 @@ TEST_CASE("AppPerfRollup B1->B2 roll-up", "[pg][app_perf]") {
     }
 
     SECTION("prune DAY-FLOORS the cutoff — the boundary bucket is not deleted ~24h early (WS-10 S1)") {
-        // now_expr is day-floored, so cutoff = floor(now/day)*day - window is
-        // day-aligned and a bucket EXACTLY at floor(now)-window survives (== cutoff,
-        // not < cutoff). Without flooring (the regression this guards) cutoff would be
-        // raw_now - window, up to ~24h later, and delete that boundary bucket. At any
-        // non-midnight-UTC second — the normal case — the two cutoffs differ.
+        // The spec's cutoff_align=86400 floors ONLY the cutoff (now_expr stays RAW —
+        // flooring the reading itself would false-fire a 24h Step at every midnight,
+        // WS-10 C1). So cutoff = floor((raw_now - window)/day)*day is day-aligned and a
+        // bucket EXACTLY at floor(now)-window survives (== cutoff, not < cutoff).
+        // Without cutoff alignment the cutoff would be raw_now - window, up to ~24h
+        // later, and delete that boundary bucket. At any non-midnight-UTC second — the
+        // normal case — the two cutoffs differ.
         const std::int64_t window = 10LL * 86400;
         const std::int64_t old_day = today_utc() - 11 * 86400;      // < cutoff → deleted
         const std::int64_t boundary_day = today_utc() - 10 * 86400; // == floored cutoff → survives
