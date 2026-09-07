@@ -20,6 +20,39 @@ inline bool tier_allows(std::string_view mcp_tier,
                         std::string_view operation) {
     if (mcp_tier.empty()) return true;  // Not an MCP token
 
+    // ── #520/#4031: MCP tokens must never administer the server itself ───
+    //
+    // `AuthRoutes::require_admin()` (auth_routes.cpp) unconditionally denies
+    // ANY non-empty mcp_tier before it even looks at role — "MCP tokens are
+    // for fleet management (queries, instruction execution) and must not be
+    // used to administer the server itself (settings, users, TLS, OIDC)".
+    // That function's own comment claims tier enforcement applies "on all
+    // transports... so a token cannot bypass the tier by switching
+    // endpoints" — true for the admin_fn_-gated dashboard routes it guards,
+    // but NOT true here: this function (the chokepoint every REST/MCP
+    // permission check funnels through, per the ROUND-3 FINDING below) had
+    // no securable-type awareness at any tier, so a "readonly"-tier token —
+    // or "supervised", which allows everything unconditionally further down
+    // — could reach the #4031 REST v1 Enrollment/OidcConfig routes
+    // (auto-approve rules, pending-agent visibility, OIDC SSO config) purely
+    // because `tier_allows()` only ever checked the OPERATION ("Read"), never
+    // the SECURABLE. Deny both explicitly, at every tier, before any
+    // tier-specific branch runs — mirroring require_admin's unconditional
+    // posture for this same class of surface. Directory is deliberately
+    // NOT included here: AD/Entra directory-synced user listing has real MCP
+    // twins (list_directory_users/get_directory_status) by design and must
+    // stay reachable at readonly tier.
+    //
+    // Per the ROUND-3 FINDING below (a distinct prior incident, same
+    // lesson): a route-local or tool-local exception is structurally
+    // unreachable here, because this function is the single chokepoint both
+    // `AuthRoutes::require_permission`/`require_scoped_permission` (every
+    // REST transport) and mcp_server.cpp's generic C8 gate (the MCP
+    // transport) consult for EVERY call — so the fix belongs HERE, not at
+    // EnrollmentDirectoryRoutes' call sites.
+    if (securable_type == "Enrollment" || securable_type == "OidcConfig")
+        return false;
+
     // ── readonly: only Read operations ──────────────────────────────────
     if (mcp_tier == "readonly") {
         return operation == "Read";

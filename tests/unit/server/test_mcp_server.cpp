@@ -301,7 +301,9 @@ TEST_CASE("MCP Policy: operator tier DOES allow the distinct ApiToken:Rotate "
     CHECK(tier_allows("operator", "ApiToken", "Rotate"));
 }
 
-TEST_CASE("MCP Policy: supervised tier allows everything", "[mcp][policy]") {
+TEST_CASE("MCP Policy: supervised tier allows everything except server "
+          "self-administration (Enrollment/OidcConfig)",
+          "[mcp][policy]") {
     CHECK(tier_allows("supervised", "Infrastructure", "Read"));
     CHECK(tier_allows("supervised", "Execution", "Execute"));
     CHECK(tier_allows("supervised", "Policy", "Write"));
@@ -316,6 +318,36 @@ TEST_CASE("MCP Policy: supervised tier allows everything", "[mcp][policy]") {
 TEST_CASE("MCP Policy: unknown tier denies everything", "[mcp][policy]") {
     CHECK(!tier_allows("bogus", "Infrastructure", "Read"));
     CHECK(!tier_allows("bogus", "Tag", "Write"));
+}
+
+TEST_CASE("MCP Policy: #4031/#520 Enrollment and OidcConfig are denied at "
+          "EVERY tier, including supervised — MCP tokens must never "
+          "administer the server itself (settings, users, TLS, OIDC)",
+          "[mcp][policy][security]") {
+    // The bug this pins: tier_allows() checked only the OPERATION
+    // ("Read"), never the SECURABLE, so a readonly-tier MCP token could
+    // reach the #4031 REST v1 enrollment/auto-approve-rules,
+    // enrollment/pending-agents, and settings/oidc routes purely because
+    // those routes' perm_fn asks "is this Read?" — the same question a
+    // readonly token answers yes to for every OTHER securable too.
+    CHECK_FALSE(tier_allows("readonly", "Enrollment", "Read"));
+    CHECK_FALSE(tier_allows("readonly", "OidcConfig", "Read"));
+    CHECK_FALSE(tier_allows("operator", "Enrollment", "Read"));
+    CHECK_FALSE(tier_allows("operator", "OidcConfig", "Read"));
+    // supervised tier allows everything else (see the test above) — this is
+    // the one carve-out, matching require_admin()'s unconditional posture
+    // for the equivalent admin_fn_-gated dashboard surface.
+    CHECK_FALSE(tier_allows("supervised", "Enrollment", "Read"));
+    CHECK_FALSE(tier_allows("supervised", "OidcConfig", "Read"));
+    CHECK_FALSE(tier_allows("supervised", "Enrollment", "Write"));
+    CHECK_FALSE(tier_allows("supervised", "OidcConfig", "Write"));
+
+    // Directory is deliberately NOT in this deny set — it has real MCP twins
+    // (list_directory_users/get_directory_status) by design, so it must stay
+    // reachable at readonly tier, unlike Enrollment/OidcConfig which have
+    // none.
+    CHECK(tier_allows("readonly", "Directory", "Read"));
+    CHECK(tier_allows("supervised", "Directory", "Read"));
 }
 
 TEST_CASE("MCP Policy: readonly never requires approval", "[mcp][policy]") {
