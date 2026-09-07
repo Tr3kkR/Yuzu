@@ -2,12 +2,14 @@
 
 **Version:** 3.0 | **Date:** 2026-09-07 | dev @ `d295db964`
 
-This roadmap transforms Yuzu from a functional agent/server framework into a full-featured enterprise endpoint management platform. Work is organized into 19 phases: 0–16 are scheduled and tracked as GitHub issues (126 issues total), each building on the previous; 17–19 are proposed extensions (agentic-surface hardening, compliance/lifecycle, threat graph) not yet all filed as issues.
+This roadmap transforms Yuzu from a functional agent/server framework into a full-featured enterprise endpoint management platform. Work is organized into 20 phases: 0–16 (17 phases) are scheduled and tracked as GitHub issues (126 issues total), each building on the previous; 17–19 are proposed extensions (agentic-surface hardening, compliance/lifecycle, threat graph) not yet all filed as issues.
 
 <!-- Reproducibility recipe for the next re-roll: batch-resolve every issue number cited below in one
      call — `gh api graphql -f query="query { repository(owner: \"Tr3kkR\", name: \"Yuzu\") {
      i<N>: issue(number: <N>) { number state closedAt title } ... } }"` (one alias per issue number,
-     extracted via `grep -oE 'issues/[0-9]+' docs/roadmap.md`) — then diff against the tables below.
+     extracted via `grep -oE 'issues/[0-9]+' docs/roadmap.md | sort -u` — 129 unique numbers: the 126 Index
+     rows plus #251/#252 (decision log) and #1562 (15.H follow-up); #555–#557 are cited twice) — then diff
+     against the tables below.
      Cross-check "Recommended Execution Order" / "Delivered outside the roadmap" claims with
      `gh pr list --state open --search <term>` and `grep`/`ls` against the cited files — never restate
      status from memory of a prior version of this doc. -->
@@ -87,7 +89,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 7.17 | [#217](https://github.com/Tr3kkR/Yuzu/issues/217) | Inventory Table Enumeration and Item Lookup | Done |
 | | 7.18 | [#218](https://github.com/Tr3kkR/Yuzu/issues/218) | Device Discovery (Unmanaged Endpoints) | Done |
 | | 7.19 | [#235](https://github.com/Tr3kkR/Yuzu/issues/235) | Timeline Activity Record (TAR) | Done |
-| | 7.20 | [#236](https://github.com/Tr3kkR/Yuzu/issues/236) | MCP Server (Model Context Protocol) Phase 1 | Done — **doc-integrity note:** #236 no longer resolves as an issue (GitHub reused the number for a later merged PR, "Release v0.1.0"); status confirmed by code inspection (`server/core/src/mcp_server.cpp`) instead |
+| | 7.20 | [#236](https://github.com/Tr3kkR/Yuzu/issues/236) | MCP Server (Model Context Protocol) Phase 1 | Done — **doc-integrity note:** #236 is not an issue and never was — issues and PRs share one number sequence and #236 is PR "Release v0.1.0" (2026-03-21); the v2.0 link was wrong from birth. Status confirmed by code inspection (`server/core/src/mcp_server.cpp`) instead |
 | **8** | 8.1 | [#253](https://github.com/Tr3kkR/Yuzu/issues/253) | Response Visualization Engine | **Done** |
 | | 8.2 | [#254](https://github.com/Tr3kkR/Yuzu/issues/254) | Response Templates | **Done** |
 | :white_check_mark: | 8.3 | [#255](https://github.com/Tr3kkR/Yuzu/issues/255) | Response Offloading (Data Export Streams) | Done |
@@ -137,7 +139,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 15.D | [#550](https://github.com/Tr3kkR/Yuzu/issues/550) | TAR SQL frame: relocate, scope-walking-aware, "save as result set" | **Shipped** (closed 2026-07-04) |
 | | 15.E | [#551](https://github.com/Tr3kkR/Yuzu/issues/551) | YAML DSL `fromResultSet:` + `definition_store` validation + spec amendment | **Shipped** (closed 2026-07-04) |
 | | 15.F | [#552](https://github.com/Tr3kkR/Yuzu/issues/552) | Reference walkthrough integration test (Chrome IR end-to-end) | **Shipped** (closed 2026-07-14) |
-| | 15.G | [#553](https://github.com/Tr3kkR/Yuzu/issues/553) | Operational hardening — live re-eval, GC sweep, Prometheus + audit polish | **Shipped** (closed 2026-07-04) |
+| | 15.G | [#553](https://github.com/Tr3kkR/Yuzu/issues/553) | Operational hardening — live re-eval, GC sweep, Prometheus + audit polish | **Largely shipped** (closed 2026-07-04) — `yuzu_result_set_resolve_seconds` histogram + audit-polish pass still outstanding, see body |
 | | 15.H | [#554](https://github.com/Tr3kkR/Yuzu/issues/554) | TAR process tree viewer | **Shipped** 2026-06-18 (as-built: local-TAR-data-only reconstruction, no seed; `docs/tar-dashboard.md` §5). REST/MCP parity deferred. |
 | **16** | 16.A | [#555](https://github.com/Tr3kkR/Yuzu/issues/555) | System Guardian — Windows-first delivery (PRs 1-15 per implementation plan) | **In progress** — Spark engine rungs 1-7+, `GuardianEngine`, `BaselineStore`, `/guaranteed-state` UI live; 59 merged guardian PRs (issue itself still open — no sub-checklist tracks the PR ladder) |
 | | 16.B | [#556](https://github.com/Tr3kkR/Yuzu/issues/556) | System Guardian — Linux delivery (inotify, netlink, D-Bus, audit, sysctl) | Open — **started early** (`guard_systemd.cpp` exists) ahead of the stated 16.A-soak gate, see body note |
@@ -156,7 +158,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | 6: Windows Depth | 6 | 0 | 6 | 100% |
 | 7: Scale & Integration | 20 | 0 | 20 | 100% |
 | 8: Visualization & Response Experience | 3 | 0 | 3 | 100% |
-| 9: Connector Framework & Multi-Source Inventory | 1 | 7 | 8 | 13% — **Deferred** (re-planned as use-case-engine work under ADR-1005 once the UCE model exists, see Phase 9 body note); demoted out of the #1 execution-order slot |
+| 9: Connector Framework & Multi-Source Inventory | 1 | 7 | 8 | 13% — **Deferred** (re-planned as use-case-engine work under ADR-1005 once the UCE model exists, see Phase 9 body note); demoted out of the #2 execution-order slot it held since 2026-03 |
 | 10: Software Catalog & License Compliance | 4 | 0 | 4 | 100% — shipped as ADR-0024 "Software Licensing & Entitlements" (SLE), not the sketch below |
 | 11: Consumer Model & Platform Extensibility | 1 | 3 | 4 | 25% |
 | 12: Remaining Agent Capabilities | 2 | 11 | 13 | 15% |
@@ -166,13 +168,15 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | 16: System Guardian — Real-Time GS | 0 | 3 | 3 | 0% — issue-closure only; substantial implementation progress not reflected here, see 16.A/16.B body notes |
 | **Total** | **94** | **32** | **126** | **75%** |
 
+Done/Open count **GitHub issue state**, not verified delivery — delivery status lives in each body section (Phase 16 is the clearest case: 0 closed issues, substantial shipped code).
+
 **Scaffolded** means DDL/structs/stubs exist but business logic is not wired. See `docs/Instruction-Engine.md` for Phase 2 scaffold details.
 
 ---
 
 ## Delivered outside the roadmap (2026-04 → 2026-09)
 
-Capability that shipped without ever being scheduled as a roadmap phase/issue — verified against dev @ `d295db964` by file/ADR lookup, not memory:
+Capability that shipped without being scheduled on this roadmap — each item is authorised and traceable through the ADR, PR, or issue it cites (or, where only files are cited, through the merged PRs that added them); verified against dev @ `d295db964` by file/ADR lookup, not memory:
 
 - **Postgres substrate program** (ADR-0006–0065) — server storage substrate migrated store-by-store from SQLite to PostgreSQL; only `server/core/src/nvd_db.cpp` remains SQLite (scheduled for deletion under ADR-1005 Phase 7).
 - **SCIM / SAML / OIDC identity linkage** (ADR-2001, `docs/adr/2001-scim-oidc-identity-linkage.md`).
@@ -183,7 +187,7 @@ Capability that shipped without ever being scheduled as a roadmap phase/issue �
 - **Fleet visualization (3D)** — `server/core/src/viz_routes.cpp`.
 - **Plugin-config plane** (ADR-3005, `docs/adr/3005-plugin-config-store.md`).
 - **PKI/CA + KEK routes** — `server/core/src/ca_routes.cpp`, `server/core/src/kek_routes.hpp`.
-- **Management-plane SPKI pinning** (#1422) — `server/core/src/server.cpp` (SPKI SHA-256 pin of the presented leaf).
+- **Management-plane SPKI pinning** (#1422) — enforced gateway-side in `gateway/apps/yuzu_gw/src/yuzu_gw_authz.erl` (`mgmt_peer_pins`: SPKI SHA-256 of the server leaf + serverAuth EKU); `server/core/src/server.cpp` documents the contract and surfaces the rejection.
 - **Agent daily-sync framework** (ADR-0016, `docs/adr/0016-agent-daily-sync-framework.md`) — `agents/core/src/sync_scheduler.cpp`.
 - **New agent plugins**: `power_health`, `disk_actions`, `filesystem_posture`, `device_identity`, `netprobe`, `procfetch`, `rdp_control`, `vuln_scan` (all present under `agents/plugins/`).
 
@@ -388,7 +392,7 @@ Implement the 4-category error code taxonomy from `docs/Instruction-Engine.md` S
 **Files:** `server/core/src/execution_tracker.hpp`, `server/core/src/execution_tracker.cpp`, `agents/core/src/agent.cpp`, `proto/yuzu/common/v1/common.proto`
 
 ### Issue 2.9: Concurrency Enforcement (real-usage scope, ADR-1007)
-**Scope:** Server
+**Scope:** Server | **Status:** Done (ADR-1007, landed 2026-09-02)
 
 Only `per-device` is enforced, server-side, via a dedicated `concurrency_claims` table in
 `execution_tracker`'s Postgres schema (a partial unique index gives race-free claim/release — see
@@ -1678,7 +1682,7 @@ Linux equivalents of Windows event guards: Inotify Guard (`inotify_add_watch`), 
 
 **As found (2026-09-07):** `agents/core/src/guard_systemd.cpp` already exists — Linux delivery began before the stated 16.A soak gate was satisfied. Recorded honestly rather than silently reconciled.
 
-**Sequencing decision pending (PO):** 16.B began before the 16.A soak gate — accept and drop the gate, or pause 16.B.
+**Sequencing decision pending (PO):** 16.B began before the 16.A soak gate — accept and drop the gate, or pause 16.B. Until decided, 16.B proceeds ungated: nothing enforces the gate, so it is advisory.
 
 **Files:** new `agents/core/src/guard_inotify.{cpp,hpp}`, `guard_netlink.{cpp,hpp}`, `guard_dbus.{cpp,hpp}`, `guard_audit_linux.{cpp,hpp}`, `guard_sysctl.{cpp,hpp}` (all Linux-only); `agents/core/src/guard_systemd.cpp` (already started); `agents/core/meson.build` Linux block adding `libdbus-1`, `libaudit` deps.
 
@@ -1982,10 +1986,14 @@ Route-sink refactor (#2542) — cross-cutting, ongoing
 ## Recommended Execution Order
 
 Phases 0–8, 10, and 15 are complete. Phase 9 is demoted (deferred pending ADR-1005's UCE model — no
-longer the #1 slot). The order below leads with the fronts the commit log and open-PR list show as
-currently active, then works through the remaining backlog phases:
+longer the #2 slot it held since 2026-03). The order below leads with the fronts the commit log and
+open-PR list show as currently active, then works through the remaining backlog phases. PR and
+workstream states below are **as of dev @ `d295db964` (2026-09-07)** and drift within hours — re-check
+before acting on any "open" / "in progress" claim:
 
-1. **ADR-1005 Phase 7 — NVD/vuln UCE strangler migration.** Next up, not started. Re-homes the
+1. **ADR-1005 Phase 7 — NVD/vuln UCE strangler migration.** Next up, not started — PRs A–D are
+   unblocked; PR E (the server-side deletion) is gated on Phase 6 **and** the M3 parity/confinement
+   gates per `docs/adr-1005-execution-plan.md`, so "next" means A–D, not the whole phase. Re-homes the
    server-side NVD sync + CVE matching capability (and the grandfathered ADR-0023/ADR-4001 additions)
    into the vulnerability-management use-case engine module; deletes `server/core/src/nvd_db.cpp`,
    the **last server-side SQLite store** — closing out the Postgres substrate migration. Unblocks
