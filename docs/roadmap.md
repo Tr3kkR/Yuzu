@@ -6,10 +6,18 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 
 <!-- Reproducibility recipe for the next re-roll: batch-resolve every issue number cited below in one
      call — `gh api graphql -f query="query { repository(owner: \"Tr3kkR\", name: \"Yuzu\") {
-     i<N>: issue(number: <N>) { number state closedAt title } ... } }"` (one alias per issue number,
-     extracted via `grep -oE 'issues/[0-9]+' docs/roadmap.md | sort -u` — 129 unique numbers: the 126 Index
-     rows plus #251/#252 (decision log) and #1562 (15.H follow-up); #555–#557 are cited twice) — then diff
-     against the tables below.
+     i<N>: issue(number: <N>) { number state stateReason closedAt title } ... } }"` (one alias per issue
+     number, extracted via `grep -oE 'issues/[0-9]+' docs/roadmap.md | sort -u` — 129 unique numbers: the
+     126 Index rows plus #251/#252 (decision log) and #1562 (15.H follow-up); #555–#557 are cited twice) —
+     then diff against the tables below. **`stateReason` is load-bearing, not optional**: a `state`-only
+     pull cannot distinguish a genuinely-delivered `COMPLETED` closure from a `NOT_PLANNED` backlog-reset
+     closure (2026-07-14 closed 11 issues NOT_PLANNED — #252, #263–#268, #283, #286, #292, #552 — none of
+     which are "delivered" by the closure alone). Status vocabulary: **Done** = closed COMPLETED, or
+     closed NOT_PLANNED *with* a cited delivery-evidence path/ADR (the thing shipped differently from how
+     the issue described it); **Closed — not planned** = closed NOT_PLANNED with no delivery evidence (a
+     real decision not to build it); **Open** = still open; **Deferred** = open but explicitly re-scoped
+     pending a decision (see Phase 9). Verify each NOT_PLANNED row's delivery claim by `grep`/`ls` against
+     the cited files — do not infer delivery from the closure alone.
      Cross-check "Recommended Execution Order" / "Delivered outside the roadmap" claims with
      `gh pr list --state open --search <term>` and `grep`/`ls` against the cited files — never restate
      status from memory of a prior version of this doc. -->
@@ -100,12 +108,12 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 9.5 | [#260](https://github.com/Tr3kkR/Yuzu/issues/260) | ServiceNow Connector | **Deferred** — see Phase 9 body note |
 | | 9.6 | [#261](https://github.com/Tr3kkR/Yuzu/issues/261) | WSUS Connector | **Deferred** — see Phase 9 body note |
 | | 9.7 | [#262](https://github.com/Tr3kkR/Yuzu/issues/262) | CSV / File Upload Connector | **Deferred** — see Phase 9 body note |
-| | 9.8 | [#263](https://github.com/Tr3kkR/Yuzu/issues/263) | Inventory Consolidation & Normalization | **Done** (closed 2026-07-14) |
-| **10** | 10.1 | [#264](https://github.com/Tr3kkR/Yuzu/issues/264) | Software Catalog Store | **Done** (closed 2026-07-14 — shipped as the ADR-0024 `ProductRegistryStore`, see Phase 10 note) |
-| | 10.2 | [#265](https://github.com/Tr3kkR/Yuzu/issues/265) | Software Usage Tracking | **Done** (closed 2026-07-14) |
-| | 10.3 | [#266](https://github.com/Tr3kkR/Yuzu/issues/266) | License Entitlements & Compliance | **Done** (closed 2026-07-14) |
-| | 10.4 | [#267](https://github.com/Tr3kkR/Yuzu/issues/267) | Software Tags | **Done** (closed 2026-07-14) |
-| **11** | 11.1 | [#268](https://github.com/Tr3kkR/Yuzu/issues/268) | Consumer Application Registration | **Done** (closed 2026-07-14) — partially superseded by ADR-1005; push/consumer-deploy fanout remains open, see body note |
+| | 9.8 | [#263](https://github.com/Tr3kkR/Yuzu/issues/263) | Inventory Consolidation & Normalization | **Closed — not planned** (NOT_PLANNED, 2026-07-14) — no dedup/normalization code found, see body note |
+| **10** | 10.1 | [#264](https://github.com/Tr3kkR/Yuzu/issues/264) | Software Catalog Store | **Done** (NOT_PLANNED, 2026-07-14, delivered differently: ADR-0024 keeps the product registry permanently server-resident core, shipped as `ProductRegistryStore`) |
+| | 10.2 | [#265](https://github.com/Tr3kkR/Yuzu/issues/265) | Software Usage Tracking | **Closed — not planned** (NOT_PLANNED, 2026-07-14) — ADR-0024 places usage metering/reclamation in the UCE module (Decision D15); no agent usage-sync source exists in-server |
+| | 10.3 | [#266](https://github.com/Tr3kkR/Yuzu/issues/266) | License Entitlements & Compliance | **Closed — not planned** (NOT_PLANNED, 2026-07-14) — ADR-0024 places the entitlement plane in the UCE module (Decision D12); not built in-server |
+| | 10.4 | [#267](https://github.com/Tr3kkR/Yuzu/issues/267) | Software Tags | **Closed — not planned** (NOT_PLANNED, 2026-07-14) — no server-side software-tags code found |
+| **11** | 11.1 | [#268](https://github.com/Tr3kkR/Yuzu/issues/268) | Consumer Application Registration | **Closed — not planned** (NOT_PLANNED, 2026-07-14) — the auth/token substance was absorbed into ADR-1005 engine principals (`EnginePrincipalStore`, delivered); the push/consumer-deploy fanout this issue described was never built, see body note |
 | | 11.2 | [#269](https://github.com/Tr3kkR/Yuzu/issues/269) | Event Source Management | Open |
 | | 11.3 | [#270](https://github.com/Tr3kkR/Yuzu/issues/270) | PowerShell Module | Open |
 | | 11.4 | [#271](https://github.com/Tr3kkR/Yuzu/issues/271) | Python SDK | Open |
@@ -120,16 +128,16 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 12.9 | [#280](https://github.com/Tr3kkR/Yuzu/issues/280) | Active Response Tracking | Open |
 | | 12.10 | [#281](https://github.com/Tr3kkR/Yuzu/issues/281) | Patch Inventory Event Generation | Open |
 | | 12.11 | [#282](https://github.com/Tr3kkR/Yuzu/issues/282) | Application Whitelisting | Open |
-| | 12.12 | [#283](https://github.com/Tr3kkR/Yuzu/issues/283) | Inventory Replication (Delta Sync) | Open |
+| | 12.12 | [#283](https://github.com/Tr3kkR/Yuzu/issues/283) | Inventory Replication (Delta Sync) | **Done** (NOT_PLANNED, 2026-07-14, delivered differently: ADR-0016's hash-skip conditional sync, `sync_scheduler.hpp`) |
 | | 12.13 | [#284](https://github.com/Tr3kkR/Yuzu/issues/284) | Binary Resource Distribution | Open |
 | **13** | 13.1 | [#285](https://github.com/Tr3kkR/Yuzu/issues/285) | 2FA for Instruction Approval (TOTP) | Open (stale — TOTP/MFA step-up shipped generally, not wired to approval, see body note) |
-| | 13.2 | [#286](https://github.com/Tr3kkR/Yuzu/issues/286) | Composable Instruction Chains | **Done** (closed 2026-07-14) |
+| | 13.2 | [#286](https://github.com/Tr3kkR/Yuzu/issues/286) | Composable Instruction Chains | **Done** (NOT_PLANNED, 2026-07-14, delivered: `workflow_engine.cpp` `foreach_source` step field + step interpolation) |
 | | 13.3 | [#287](https://github.com/Tr3kkR/Yuzu/issues/287) | Process / Sync Logging UI | Open |
 | | 13.4 | [#288](https://github.com/Tr3kkR/Yuzu/issues/288) | Dashboard Branding | Open |
 | | 13.5 | [#289](https://github.com/Tr3kkR/Yuzu/issues/289) | MCP Phase 2 (Write Tools) | Done |
 | **14** | 14.1 | [#290](https://github.com/Tr3kkR/Yuzu/issues/290) | P2P Content Distribution | Open |
 | | 14.2 | [#291](https://github.com/Tr3kkR/Yuzu/issues/291) | Multi-Gateway Topology | Open |
-| | 14.3 | [#292](https://github.com/Tr3kkR/Yuzu/issues/292) | Database Sharding (Response Partitioning) | **Done** (closed 2026-07-14 — obsoleted by the Postgres substrate migration, see body note) |
+| | 14.3 | [#292](https://github.com/Tr3kkR/Yuzu/issues/292) | Database Sharding (Response Partitioning) | **Done** (NOT_PLANNED, 2026-07-14, delivered differently: the Postgres substrate migration, ADR-0039, obsoleted the need — not implemented as designed, see body note) |
 | | 14.4 | [#293](https://github.com/Tr3kkR/Yuzu/issues/293) | vCenter Connector | Open |
 | | 14.5 | [#294](https://github.com/Tr3kkR/Yuzu/issues/294) | Additional Connectors (BigFix, O365, Oracle) | Open |
 | | 14.6 | [#295](https://github.com/Tr3kkR/Yuzu/issues/295) | High Availability | Open (stale — superseded by ADR-2002, see body note) |
@@ -138,10 +146,10 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 15.C | [#549](https://github.com/Tr3kkR/Yuzu/issues/549) | Scope-engine `from_result_set:` + dashboard chip + sidebar + breadcrumb | **Shipped** (closed 2026-07-04) |
 | | 15.D | [#550](https://github.com/Tr3kkR/Yuzu/issues/550) | TAR SQL frame: relocate, scope-walking-aware, "save as result set" | **Shipped** (closed 2026-07-04) |
 | | 15.E | [#551](https://github.com/Tr3kkR/Yuzu/issues/551) | YAML DSL `fromResultSet:` + `definition_store` validation + spec amendment | **Shipped** (closed 2026-07-04) |
-| | 15.F | [#552](https://github.com/Tr3kkR/Yuzu/issues/552) | Reference walkthrough integration test (Chrome IR end-to-end) | **Shipped** (closed 2026-07-14) |
+| | 15.F | [#552](https://github.com/Tr3kkR/Yuzu/issues/552) | Reference walkthrough integration test (Chrome IR end-to-end) | **Done** (NOT_PLANNED, 2026-07-14, delivered differently: an in-process Catch2 test, `tests/unit/server/test_chrome_ir_chain.cpp`, not the originally-scoped scripted UAT variant, see body) |
 | | 15.G | [#553](https://github.com/Tr3kkR/Yuzu/issues/553) | Operational hardening — live re-eval, GC sweep, Prometheus + audit polish | **Largely shipped** (closed 2026-07-04) — `yuzu_result_set_resolve_seconds` histogram + audit-polish pass still outstanding, see body |
 | | 15.H | [#554](https://github.com/Tr3kkR/Yuzu/issues/554) | TAR process tree viewer | **Shipped** 2026-06-18 (as-built: local-TAR-data-only reconstruction, no seed; `docs/tar-dashboard.md` §5). REST/MCP parity deferred. |
-| **16** | 16.A | [#555](https://github.com/Tr3kkR/Yuzu/issues/555) | System Guardian — Windows-first delivery (PRs 1-15 per implementation plan) | **In progress** — Spark engine rungs 1-7+, `GuardianEngine`, `BaselineStore`, `/guaranteed-state` UI live; 59 merged guardian PRs (issue itself still open — no sub-checklist tracks the PR ladder) |
+| **16** | 16.A | [#555](https://github.com/Tr3kkR/Yuzu/issues/555) | System Guardian — Windows-first delivery (PRs 1-15 per implementation plan) | **In progress** — Spark engine rungs 1-7+, `GuardianEngine`, `BaselineStore`, `/guaranteed-state` UI shipped; Spark is wired (`agent.cpp:1255`) but inert by default — `prefer_spark_=false`, legacy `IGuard` remains the sole live enforcement path; 59 merged guardian PRs (issue itself still open — no sub-checklist tracks the PR ladder) |
 | | 16.B | [#556](https://github.com/Tr3kkR/Yuzu/issues/556) | System Guardian — Linux delivery (inotify, netlink, D-Bus, audit, sysctl) | Open — **started early** (`guard_systemd.cpp` exists) ahead of the stated 16.A-soak gate, see body note |
 | | 16.C | [#557](https://github.com/Tr3kkR/Yuzu/issues/557) | System Guardian — macOS delivery (Endpoint Security, fseventsd, launchd) | Open (gated on 16.A + 16.B soak + ES entitlement) |
 
@@ -158,17 +166,17 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | 6: Windows Depth | 6 | 0 | 6 | 100% |
 | 7: Scale & Integration | 20 | 0 | 20 | 100% |
 | 8: Visualization & Response Experience | 3 | 0 | 3 | 100% |
-| 9: Connector Framework & Multi-Source Inventory | 1 | 7 | 8 | 13% — **Deferred** (re-planned as use-case-engine work under ADR-1005 once the UCE model exists, see Phase 9 body note); demoted out of the #2 execution-order slot it held since 2026-03 |
-| 10: Software Catalog & License Compliance | 4 | 0 | 4 | 100% — shipped as ADR-0024 "Software Licensing & Entitlements" (SLE), not the sketch below |
-| 11: Consumer Model & Platform Extensibility | 1 | 3 | 4 | 25% |
-| 12: Remaining Agent Capabilities | 2 | 11 | 13 | 15% |
+| 9: Connector Framework & Multi-Source Inventory | 0 | 8 | 8 | 0% — **Deferred** (owner decision 2026-09-07: placement — core vs. use-case-engine — is an open question to be settled before any re-plan, see Phase 9 body note); demoted out of the #2 execution-order slot it held since 2026-03 |
+| 10: Software Catalog & License Compliance | 1 | 3 | 4 | 25% — only 10.1 (product registry) shipped in-server; 10.2–10.4 closed NOT_PLANNED with no delivery, see Phase 10 note |
+| 11: Consumer Model & Platform Extensibility | 0 | 4 | 4 | 0% |
+| 12: Remaining Agent Capabilities | 3 | 10 | 13 | 23% |
 | 13: Security Hardening & Operational Polish | 2 | 3 | 5 | 40% |
 | 14: Scale & Enterprise Readiness | 1 | 5 | 6 | 17% |
 | 15: TAR Dashboard & Scope Walking | 8 | 0 | 8 | 100% |
 | 16: System Guardian — Real-Time GS | 0 | 3 | 3 | 0% — issue-closure only; substantial implementation progress not reflected here, see 16.A/16.B body notes |
-| **Total** | **94** | **32** | **126** | **75%** |
+| **Total** | **90** | **36** | **126** | **71%** |
 
-Done/Open count **GitHub issue state**, not verified delivery — delivery status lives in each body section (Phase 16 is the clearest case: 0 closed issues, substantial shipped code).
+**Done** requires verified delivery: closed COMPLETED, or closed NOT_PLANNED *with* a cited delivery-evidence path/ADR (e.g. 12.12/#283 shipped differently as ADR-0016's hash-skip sync). **Open** is everything else, including issues closed **NOT_PLANNED with no delivery** (a real decision not to build the thing, distinct from a still-open backlog item — see the Issue Index's "Closed — not planned" rows for the per-issue distinction and `stateReason`). The number moved from 94/126 (75%) to 90/126 (71%) because the first pull used `state` without `stateReason` and miscounted 5 NOT_PLANNED-with-no-delivery closures (9.8, 10.2, 10.3, 10.4, 11.1) as Done while missing 1 NOT_PLANNED-with-delivery closure (12.12) that should have counted — net **−4**.
 
 **Scaffolded** means DDL/structs/stubs exist but business logic is not wired. See `docs/Instruction-Engine.md` for Phase 2 scaffold details.
 
@@ -180,7 +188,7 @@ Capability that shipped without being scheduled on this roadmap — each item is
 
 - **Postgres substrate program** (ADR-0006–0065) — server storage substrate migrated store-by-store from SQLite to PostgreSQL; only `server/core/src/nvd_db.cpp` remains SQLite (scheduled for deletion under ADR-1005 Phase 7).
 - **SCIM / SAML / OIDC identity linkage** (ADR-2001, `docs/adr/2001-scim-oidc-identity-linkage.md`).
-- **HA workstreams landed so far** (ADR-2002) — WS-0 (agent command idempotency+replay), WS-1 (server-plane state → Postgres, milestones 1a/1b/1c), WS-7 (HA-Postgres Patroni+etcd+HAProxy compose profile), and WS-2a-1 (durable event outbox) are done; see `docs/ha-delivery-matrix.md`.
+- **HA workstreams landed so far** (ADR-2002, as of dev @ `d295db964`) — WS-0 (agent command idempotency+replay), WS-1 (server-plane state → Postgres, milestones 1a/1b/1c), WS-7 (HA-Postgres Patroni+etcd+HAProxy compose profile), WS-2a (durable event outbox + #3924 cross-replica SSE delivery), and WS-10 10.1/10.2 (#4092, background-job replica-safety classification) are done; WS-3 slice 3.1 (#4011, fenced `LeaderElector` primitive) is done but inert (no loop wired). See `docs/ha-delivery-matrix.md`.
 - **ADR-1005 engine principals + on-behalf guard** — `server/core/src/on_behalf_guard.hpp` (rejects on-behalf-of assertions on every ingress except the four health-probe paths).
 - **`/auto` pre-flight + deployment** — `server/core/src/preflight_routes.cpp`, `server/core/src/deployment_routes.cpp`.
 - **DEX / network quality / device pages** — `server/core/src/dex_routes.cpp`, `server/core/src/network_routes.cpp`, `server/core/src/device_routes.cpp`.
@@ -1035,14 +1043,17 @@ REST: `GET/POST/DELETE /api/v1/offload-targets`, `GET /api/v1/offload-targets/{i
 
 *Federate inventory data from external management systems. Core enterprise integration capability.*
 
-> **Status: Deferred** — to be re-planned as use-case-engine work under ADR-1005 once the UCE model
-> exists (Phase 7). Rationale: this phase was declared the next priority since 2026-03 with zero
-> commits against it; connectors are use-case interpretation, which ADR-1005 places outside the
-> server (`docs/adr/1005-headless-platform-use-case-engines.md`). The sketches below (9.1–9.7) are
-> retained for traceability but are not the design that will ship — a future connector UCE re-plans
-> from ADR-1005's engine-principal / REST+MCP-twin model, not the SQLite-backed in-server
-> `ConnectorStore`/`ConnectorEngine` sketched here. 9.8 (Inventory Consolidation & Normalization,
-> #263) shipped independently and is unaffected by this deferral.
+> **Owner decision (2026-09-07):** deferred — declared next priority since 2026-03 with zero commits;
+> whether connectors are core estate-fact collection (ADR-1005 Decision 2) or use-case interpretation
+> belonging in an engine is an **open placement question to be settled before any re-plan**. ADR-1005
+> itself does not classify connectors either way, and Decision 2 places estate-fact *collection* in
+> core — so "connectors belong in a UCE" is not a settled ADR-1005 consequence, it is the open question
+> this deferral is waiting on. The sketches below (9.1–9.7) are retained for traceability but are not
+> necessarily the design that ships once the placement question resolves — a core re-plan keeps the
+> SQLite-backed in-server `ConnectorStore`/`ConnectorEngine` shape (evolved); a use-case-engine re-plan
+> would instead build on ADR-1005's engine-principal / REST+MCP-twin model. 9.8 (Inventory
+> Consolidation & Normalization, #263) closed NOT_PLANNED with no delivery (see its own
+> **Closed — not planned** status) and is unaffected by this deferral either way.
 
 ### Issue 9.1: Connector Framework (Core)
 **Capability:** new | **Scope:** Server | **Status:** Deferred (see banner above)
@@ -1141,17 +1152,17 @@ Import inventory data from structured files:
 **Files:** New `server/core/src/connectors/file_upload_connector.cpp`
 
 ### Issue 9.8: Inventory Consolidation & Normalization
-**Capability:** new | **Scope:** Server | **Status:** **Done** (closed 2026-07-14) — shipped independently of the deferred 9.1–9.7 connector framework, and via different files than sketched below (as part of the ADR-0024 Software Licensing & Entitlements program, see Phase 10 note)
-**Depends on:** 9.2 (as originally scoped — moot now that 9.8 shipped without 9.1–9.7)
+**Capability:** new | **Scope:** Server | **Status:** **Closed — not planned** (#263 closed NOT_PLANNED, 2026-07-14) — **not delivered**: `server/core/src/software_catalog_rollup.{hpp,cpp}` exists but contains no deduplication, title/vendor normalization, or consolidation-reporting logic (verified 2026-09-07); it is a rollup view, not the cleanup pipeline sketched below
+**Depends on:** 9.2 (moot — 9.1–9.7 are deferred, see Phase 9 banner, and 9.8 was closed not-planned rather than shipped)
 
-Multi-source inventory cleanup pipeline (original sketch — see files note for as-shipped form):
+Multi-source inventory cleanup pipeline (never built):
 - Deduplication by device identity (hostname + MAC + serial)
 - Software normalization: vendor/title/version canonicalization
 - Hardware normalization: processor model mapping, VM detection
 - Consolidation reports: matched vs. unmatched, normalization coverage percentage
 - Runs after each connector sync or on-demand via REST
 
-**Files (as shipped):** `server/core/src/software_catalog_rollup.{hpp,cpp}` — not the `inventory_consolidation.cpp`/`repository_store.cpp` sketched at design time.
+**Files:** New `server/core/src/inventory_consolidation.cpp`, `server/core/src/repository_store.cpp` — neither exists; `software_catalog_rollup.{hpp,cpp}` is a separate, narrower rollup that does not substitute for this issue's scope.
 
 ---
 
@@ -1159,20 +1170,22 @@ Multi-source inventory cleanup pipeline (original sketch — see files note for 
 
 *Normalized software identification for license management and compliance reporting.*
 
-> **Superseded by ADR-0024 (2026-07-06).** This phase's design is superseded by
+> **Superseded by ADR-0024 (2026-07-06, status: proposed).** This phase's design is superseded by
 > `docs/adr/0024-software-licensing-entitlements.md` ("Software Licensing &
-> Entitlements", capability §27 — renamed by the same ADR). The sketches below are
-> stale where they conflict: the SQLite `CatalogStore` becomes the born-on-Postgres
-> `ProductRegistryStore`; entitlements are a five-source plane (manual, CSV, M365
-> connector, agent-observed FlexLM/KMS), not a manual-only register; licence discovery
-> is a new agent `license_scan` plugin on the ADR-0016 daily-sync framework; REST is
-> unified under `/api/v1/sle/*`; usage metering (10.2 / #265) becomes **opt-in**
-> (`--usage-sync-enable`, default off) and machine-scope, not on-by-default launch
-> tracking. The issue breakdown is retained for traceability (10.1–10.4 ↔ #264–#267).
+> Entitlements", capability §27 — renamed by the same ADR), which also re-scopes most of it: only
+> **licence discovery** (a new agent `license_scan` plugin on the ADR-0016 daily-sync framework) and
+> the **product registry** (the SQLite `CatalogStore` sketch becomes the born-on-Postgres
+> `ProductRegistryStore`) are built in-server. The **entitlement plane** (5 sources: manual, CSV, M365
+> connector, agent-observed FlexLM/KMS — Decisions D12/D14), **usage metering & reclamation**
+> (Decision D15), and **software tags** are re-scoped to the vulnerability/SAM use-case-engine (UCE)
+> module per ADR-1005 and are **not built in-server** — the 10.2–10.4 sketches below did not ship as
+> designed and their GitHub issues closed NOT_PLANNED, not delivered. REST is unified under
+> `/api/v1/sle/*` for what did ship. The issue breakdown is retained for traceability (10.1–10.4 ↔
+> #264–#267).
 
 ### Issue 10.1: Software Catalog Store
-**Capability:** new | **Scope:** Server | **Status:** **Done** (closed 2026-07-14 — shipped as ADR-0024's `ProductRegistryStore`, see banner above)
-**Depends on:** 9.8
+**Capability:** new | **Scope:** Server | **Status:** **Done** (#264 closed NOT_PLANNED, 2026-07-14 — delivered differently: ADR-0024 keeps the product registry permanently server-resident core, shipped as `ProductRegistryStore`, see banner above)
+**Depends on:** 9.8 (moot — see 9.8's own Closed-not-planned status)
 
 Canonical software registry:
 - `CatalogStore` (SQLite): normalized software entries (vendor, title, version, edition, platform)
@@ -1181,13 +1194,13 @@ Canonical software registry:
 - Automatic matching: raw inventory entries linked to catalog entries by fuzzy title/vendor
 - REST: `GET/POST/PUT /api/v1/catalog/software`, `POST /api/v1/catalog/software/match`
 
-**Files:** New `server/core/src/catalog_store.cpp`, `server/core/src/rest_api_v1.cpp`
+**Files (as shipped):** `server/core/src/product_registry_store.{hpp,cpp}` — not the sketched `catalog_store.cpp`/`entitlement_store.cpp`, which don't exist.
 
 ### Issue 10.2: Software Usage Tracking
-**Capability:** new | **Scope:** Agent + Server | **Status:** **Done** (closed 2026-07-14 — shipped opt-in/machine-scope, not on-by-default launch tracking, see banner above)
+**Capability:** new | **Scope:** Agent + Server | **Status:** **Closed — not planned** (#265 closed NOT_PLANNED, 2026-07-14) — **not delivered**: ADR-0024 places usage metering/reclamation in the UCE module (Decision D15, "usage joined with entitlement data for a reclamation purpose"); no `software_usage` agent plugin and no agent usage-sync source exist in-server (verified 2026-09-07)
 **Depends on:** 10.1
 
-Agent-side application usage metering:
+Agent-side application usage metering (never built in-server):
 - New `software_usage` agent plugin
 - Track application launches, cumulative run time, last-used timestamp
 - Categorize: Used (30d), Rarely Used (90d), Unused (>90d), Unreported
@@ -1195,32 +1208,32 @@ Agent-side application usage metering:
 - Server-side aggregation: per-title usage across fleet
 - Dashboard: usage summary with reclamation candidates
 
-**Files:** New `agents/plugins/software_usage/`, `server/core/src/catalog_store.cpp`
+**Files:** New `agents/plugins/software_usage/`, `server/core/src/catalog_store.cpp` — neither exists.
 
 ### Issue 10.3: License Entitlements & Compliance
-**Capability:** new | **Scope:** Server | **Status:** **Done** (closed 2026-07-14 — shipped as the five-source entitlement plane, see banner above)
+**Capability:** new | **Scope:** Server | **Status:** **Closed — not planned** (#266 closed NOT_PLANNED, 2026-07-14) — **not delivered**: ADR-0024 places the entitlement plane (`SoftwareEntitlementStore`, Decision D12) in the UCE module; no `entitlement_store.cpp` or entitlement REST surface exists in-server (verified 2026-09-07)
 **Depends on:** 10.1
 
-License compliance calculation:
+License compliance calculation (never built in-server):
 - Entitlement records: product, purchased_seats, license_type (per-device/per-user/site/enterprise)
 - Compliance calculation: installed_count vs. entitled_count
 - Over/under-licensed reporting per product
 - REST: `GET/POST/PUT/DELETE /api/v1/entitlements`
 - Dashboard: license compliance summary with drill-down
 
-**Files:** New `server/core/src/entitlement_store.cpp`, `server/core/src/rest_api_v1.cpp`
+**Files:** New `server/core/src/entitlement_store.cpp`, `server/core/src/rest_api_v1.cpp` — the store doesn't exist.
 
 ### Issue 10.4: Software Tags
-**Capability:** new | **Scope:** Server | **Status:** **Done** (closed 2026-07-14)
+**Capability:** new | **Scope:** Server | **Status:** **Closed — not planned** (#267 closed NOT_PLANNED, 2026-07-14) — **not delivered**: no server-side software-tags code found (verified 2026-09-07)
 **Depends on:** 10.1
 
-Server-side tags on software catalog entries:
+Server-side tags on software catalog entries (never built):
 - Tag software titles for categorization (e.g., "approved", "prohibited", "eval")
 - Used for Management Group rules ("devices with software tagged X")
 - REST: `GET/POST/DELETE /api/v1/catalog/software/{id}/tags`
 - Dashboard: tag management in catalog view
 
-**Files:** `server/core/src/catalog_store.cpp`, `server/core/src/management_group_store.cpp`
+**Files:** `server/core/src/catalog_store.cpp`, `server/core/src/management_group_store.cpp` — the catalog-tags surface doesn't exist; `management_group_store.cpp` exists but has no software-tag linkage.
 
 ---
 
@@ -1229,16 +1242,17 @@ Server-side tags on software catalog entries:
 *Formalize third-party integration and provide client libraries for automation.*
 
 ### Issue 11.1: Consumer Application Registration
-**Capability:** 24.4 | **Scope:** Server | **Status:** **Done** (#268 closed 2026-07-14) — **partially superseded by ADR-1005**; the push/consumer-deploy fanout mechanics ADR-1005 doesn't cover remain unimplemented despite the issue being closed
+**Capability:** 24.4 | **Scope:** Server | **Status:** **Closed — not planned** (#268 closed NOT_PLANNED, 2026-07-14) — **not delivered as scoped**: no `ConsumerStore`/`server/core/src/consumer_store.cpp` exists (verified 2026-09-07); the auth/token *substance* described below was separately absorbed into ADR-1005 engine principals (`EnginePrincipalStore`, delivered) but that is a different architecture, not this issue's design shipping
 
 > **ADR-1005 note:** the consumer auth/token model described below (scoped API
 > tokens, rate limits, consumer identity) is absorbed into ADR-1005's **engine
 > principals** (see `docs/adr/1005-headless-platform-use-case-engines.md`
-> Decision 5 and the execution plan's Phase 4). The push/consumer-deploy fanout
-> mechanics (pushing instruction definitions and policies *to* consumers) are
-> **not** addressed by ADR-1005 and remain open under this issue.
+> Decision 5 and the execution plan's Phase 4) — delivered under that name, not
+> as `ConsumerStore`. The push/consumer-deploy fanout mechanics (pushing
+> instruction definitions and policies *to* consumers) are **not** addressed by
+> ADR-1005 and were never built.
 
-Formal model for external systems consuming Yuzu data:
+Formal model for external systems consuming Yuzu data (never built as designed):
 - `ConsumerStore` (SQLite): name, URL, max_concurrent_instructions, offload_target, enabled
 - Consumers get scoped API tokens with rate limits
 - Custom data field for consumer-specific metadata
@@ -1246,7 +1260,7 @@ Formal model for external systems consuming Yuzu data:
 - REST: `GET/POST/PUT/DELETE /api/v1/consumers`
 - Dashboard: Consumers page in Settings
 
-**Files:** New `server/core/src/consumer_store.cpp`, `server/core/src/settings_routes.cpp`
+**Files:** New `server/core/src/consumer_store.cpp`, `server/core/src/settings_routes.cpp` — the store doesn't exist.
 
 ### Issue 11.2: Event Source Management
 **Capability:** 21.5 | **Scope:** Server | **Status:** Open
@@ -1554,7 +1568,7 @@ Extend the connector framework with additional integrations:
 ### Issue 14.6: High Availability
 **Capability:** new | **Scope:** Server | **Status:** Open (stale — **superseded by ADR-2002**, see body note)
 
-> **Superseded by ADR-2002 (High Availability Architecture).** The active-passive-over-shared-SQLite/NFS design sketched below is explicitly disavowed by the ADR itself as "pre-Postgres and now wrong." The current HA design targets **active-active** on the Postgres substrate (both self-managed on-prem and future SaaS), decomposed into workstreams WS-0…WS-14 tracked in `docs/ha-delivery-matrix.md`. WS-0/WS-1/WS-7/WS-2a-1 are done; WS-10 (background-job replica-safety classification) is in progress (PR #4092 open); the remaining workstreams (WS-3…WS-6, WS-8-readyz, WS-9, WS-11…WS-14, WS-2a-2/2b) are not started. See "Delivered outside the roadmap" above and the Dependency Graph below.
+> **Superseded by ADR-2002 (High Availability Architecture).** The active-passive-over-shared-SQLite/NFS design sketched below is explicitly disavowed by the ADR itself as "pre-Postgres and now wrong." The current HA design targets **active-active** on the Postgres substrate (both self-managed on-prem and future SaaS), decomposed into workstreams WS-0…WS-14 tracked in `docs/ha-delivery-matrix.md`. **As of dev @ `d295db964` (2026-09-07):** WS-0, WS-1, WS-7, and **WS-2a (both 2a-1 and 2a-2, #3924 — cross-replica SSE delivery)** are done; **WS-3 slice 3.1** (fenced `LeaderElector` primitive, #4011) is done but inert — no loop wired yet, no runtime behaviour change; **WS-10** (background-job replica-safety classification, #4092) is done for 10.1/10.2, with 10.3 (fenced-leader-only *enforcement*) pending WS-3 3.2. The remaining workstreams (WS-2b, WS-3 3.2/3.3/3.4, WS-4, WS-5, WS-6, WS-8-readyz, WS-9, WS-11…WS-14) are not started. See "Delivered outside the roadmap" above and the Dependency Graph below.
 
 <details><summary>Original active-passive design (superseded — kept for history)</summary>
 
@@ -1658,7 +1672,7 @@ Live re-eval (`POST /api/v1/result-sets/{id}/re-eval`); background GC sweep ever
 *The headline parity feature against the leading commercial endpoint-management platforms' real-time enforcement engines. PolicyStore (Phase 5) covers server-side compliance evaluation on a 5-minute poll; this phase covers the **kernel-event-driven, microsecond-latency, pre-login-active, fully-offline-capable** agent-side enforcement that makes guaranteed state operationally true rather than approximately true. Without Phase 16, "policy engine equivalent" overclaims — a 5-minute window is unacceptable for security-sensitive settings (firewall ports, registry-backed posture, EDR running). Design: `docs/yuzu-guardian-design-v1.1.md` (architecture), `docs/yuzu-guardian-windows-implementation-plan.md` (Windows-first 17-PR delivery ladder).*
 
 ### Issue 16.A: System Guardian — Windows-first delivery
-**Capability:** 31.1, 31.2, 31.3, 31.6, 31.7, 31.8, 31.9, 31.10 | **Scope:** Agent (Windows) + Server | **Status:** In progress — far beyond "PRs 1-2 shipped": 59 merged guardian PRs land the Spark detection engine (rungs 1–7+, ADR-0021), `GuardianEngine`, `BaselineStore`, and the `/guaranteed-state` operator UI (rule list, event timeline, approval workflow). Issue #555 itself remains open — the PR ladder has no GitHub sub-checklist tracking it item-by-item.
+**Capability:** 31.1, 31.2, 31.3, 31.6, 31.7, 31.8, 31.9, 31.10 | **Scope:** Agent (Windows) + Server | **Status:** In progress — far beyond "PRs 1-2 shipped": 59 merged guardian PRs land the Spark detection engine (rungs 1–7+, ADR-0021), `GuardianEngine`, `BaselineStore`, and the `/guaranteed-state` operator UI (rule list, event timeline, approval workflow). **Spark is wired (`agent.cpp:1255`) but inert by default** — `prefer_spark_=false`, legacy `IGuard` remains the sole live enforcement path; Spark makes no enforcement decisions today. Issue #555 itself remains open — the PR ladder has no GitHub sub-checklist tracking it item-by-item.
 **GitHub:** [#555](https://github.com/Tr3kkR/Yuzu/issues/555)
 
 End-to-end Windows enforcement using kernel-backed user-mode APIs:
@@ -1870,7 +1884,7 @@ Land after the foundational IPC plugins (19.1) ship and the rendering model prov
 | # | Issue | Topic | Status |
 |---|-------|-------|--------|
 | D1 | [#251](https://github.com/Tr3kkR/Yuzu/issues/251) | License key generation and signing strategy | **Open** — Options: signed keys (offline), license server (online), or hybrid. Blocks production use of capability 22.3. |
-| D2 | [#252](https://github.com/Tr3kkR/Yuzu/issues/252) | CEL is a custom subset, not full Common Expression Language | **Resolved** (#252 closed 2026-07-14) |
+| D2 | [#252](https://github.com/Tr3kkR/Yuzu/issues/252) | CEL is a custom subset, not full Common Expression Language | **Closed — not planned** (NOT_PLANNED, 2026-07-14) — decided to keep the custom CEL subset; full `cel-cpp` adoption will not be pursued |
 
 ## Future Phase (T3 Items — Not Scheduled)
 
@@ -1957,7 +1971,9 @@ Phase 15 (TAR Dashboard & Scope Walking) — DONE, all 8 issues (15.A–15.H) sh
 
 Phase 16 (System Guardian — Guaranteed State)
   16.A Windows-first ──── IN PROGRESS (Spark engine rungs 1-7+, GuardianEngine, BaselineStore,
-                           /guaranteed-state UI; 59 merged guardian PRs; issue #555 itself still open)
+                           /guaranteed-state UI shipped; Spark wired (agent.cpp:1255) but INERT by
+                           default — prefer_spark_=false, legacy IGuard is the sole live enforcement
+                           path; 59 merged guardian PRs; issue #555 itself still open)
     └── 16.B Linux ─────── STARTED EARLY (`guard_systemd.cpp` exists) ahead of the stated 16.A-soak
                             gate — sequencing decision pending, see 16.B body note
           └── 16.C macOS ── NOT STARTED; gated on 16.A + 16.B soak + Endpoint Security entitlement
@@ -1965,15 +1981,24 @@ Phase 16 (System Guardian — Guaranteed State)
 ADR-1005 (Headless Platform & Use-Case Engines, `docs/adr-1005-execution-plan.md`)
   ├── Phase 6 (module cutover to engine-principal auth) ── gated on M3(d) confinement mechanism
   └── Phase 7 (NVD/vuln UCE strangler migration) ────────── NEXT, not started
-        ├── deletes `nvd_db.cpp` (the last server-side SQLite store, Postgres block above)
-        └── Phase 9 (Connector Framework) ────────────────── DEMOTED, hangs here: re-planned as
-              use-case-engine work once the UCE model exists; Phase 9 issues #256–#262 stay
-              deferred/unscheduled pending the UCE model (see Phase 9 body banner)
+        └── deletes `nvd_db.cpp` (the last server-side SQLite store, Postgres block above)
+
+Phase 9 (Connector Framework) ── DEMOTED, NOT a dependent of ADR-1005 Phase 7 (no such edge exists —
+  owner decision withdrawn 2026-09-07: ADR-1005 does not classify connectors, and Decision 2 places
+  estate-fact collection in core). Standalone, PLACEMENT REVIEW PENDING: whether connectors are core
+  estate-fact collection or use-case interpretation belonging in an engine is an open question to be
+  settled before any re-plan; Phase 9 issues #256–#262 stay deferred/unscheduled until it is
+  (see Phase 9 body banner)
 
 High Availability (ADR-2002, `docs/ha-delivery-matrix.md`) — supersedes Phase 14.6 above
-  ├── Phase A (WS-0, WS-1, WS-2a, WS-7, WS-10) ── WS-0/WS-1/WS-7 done; WS-2a-1 done, WS-2a-2
-  │                                                 outstanding; WS-10 IN PROGRESS (PR #4092 open)
-  ├── Phase B (WS-3..WS-6, WS-8-readyz, WS-13) ── ALL required before a 2nd server replica; not started
+  [as of dev @ `d295db964`, 2026-09-07 — re-check `docs/ha-delivery-matrix.md` before acting on any
+   "not started" claim below; PR/workstream state moves within hours]
+  ├── Phase A (WS-0, WS-1, WS-2a, WS-7, WS-10) ── WS-0/WS-1/WS-7 DONE; WS-2a DONE (2a-1 + 2a-2,
+  │                                                 #3924 cross-replica SSE delivery); WS-10 DONE for
+  │                                                 10.1/10.2 (#4092), 10.3 enforcement pending WS-3 3.2
+  ├── Phase B (WS-3..WS-6, WS-8-readyz, WS-13) ── ALL required before a 2nd server replica; mostly not
+  │                                                 started, EXCEPT WS-3 slice 3.1 (fenced `LeaderElector`
+  │                                                 primitive, #4011) — done but INERT, no loop wired yet
   └── Phase C (enable/validate/operate: WS-9, WS-11, WS-12, WS-14) ── not started
 
 Route-sink refactor (#2542) — cross-cutting, ongoing
@@ -1985,8 +2010,9 @@ Route-sink refactor (#2542) — cross-cutting, ongoing
 
 ## Recommended Execution Order
 
-Phases 0–8, 10, and 15 are complete. Phase 9 is demoted (deferred pending ADR-1005's UCE model — no
-longer the #2 slot it held since 2026-03). The order below leads with the fronts the commit log and
+Phases 0–8 and 15 are complete; Phase 10 is 25% delivered in-server (10.1 only — see Phase 10 note).
+Phase 9 is demoted (deferred pending an owner placement decision, not an ADR-1005 consequence — see
+Phase 9 body banner — no longer the #2 slot it held since 2026-03). The order below leads with the fronts the commit log and
 open-PR list show as currently active, then works through the remaining backlog phases. PR and
 workstream states below are **as of dev @ `d295db964` (2026-09-07)** and drift within hours — re-check
 before acting on any "open" / "in progress" claim:
@@ -1997,12 +2023,15 @@ before acting on any "open" / "in progress" claim:
    it on the ladder), so "next" means A–D, not the whole phase. Re-homes the
    server-side NVD sync + CVE matching capability (and the grandfathered ADR-0023/ADR-4001 additions)
    into the vulnerability-management use-case engine module; deletes `server/core/src/nvd_db.cpp`,
-   the **last server-side SQLite store** — closing out the Postgres substrate migration. Unblocks
-   Phase 9's eventual re-plan as UCE work. See `docs/adr-1005-execution-plan.md` Phase 7.
-2. **High Availability (ADR-2002).** Phase A near-complete (WS-0/WS-1/WS-7/WS-2a-1 done); **WS-10**
-   (background-job replica-safety classification) in progress with **PR #4092 open**; WS-2a-2/WS-2b
-   outstanding before Phase B's all-of-WS-3..6/8-readyz/13 gate for a 2nd server replica. See
-   `docs/ha-delivery-matrix.md`.
+   the **last server-side SQLite store** — closing out the Postgres substrate migration. See
+   `docs/adr-1005-execution-plan.md` Phase 7. (No dependency on Phase 9 — see Phase 9's own entry.)
+2. **High Availability (ADR-2002).** As of dev @ `d295db964`: Phase A done (WS-0/WS-1/WS-7/WS-2a
+   — both 2a-1 and 2a-2, #3924 merged; WS-10 10.1/10.2 done, #4092 merged); WS-2b outstanding. Phase B
+   has one early slice landed — WS-3 3.1 (fenced `LeaderElector` primitive, #4011 merged) is done but
+   **inert** (no loop wired, no runtime change) — the rest of Phase B (WS-3 3.2/3.3/3.4, WS-4, WS-5,
+   WS-6, WS-8-readyz, WS-13) plus WS-10's 10.3 enforcement (needs WS-3 3.2) remain the gate for a 2nd
+   server replica. See `docs/ha-delivery-matrix.md`; re-verify PR states before acting — they moved
+   twice in the 24 hours around this pin (#3924, #4011, #4092 all merged 2026-09-03 → 2026-09-07).
 3. **Guardian hardening (Phase 16).** 16.A Windows-first soak continues (Spark engine, BaselineStore,
    `/guaranteed-state` UI — 59 merged guardian PRs); 16.B Linux delivery has already started
    (`guard_systemd.cpp`) ahead of the stated 16.A-soak gate — **sequencing decision pending (PO)**:
@@ -2013,18 +2042,20 @@ before acting on any "open" / "in progress" claim:
    PR #4083 (custom-properties) open, PR #4057 (dashboard/nvd) merged into d295db964.
 5. **Phase 12** — Remaining agent capabilities (closes capability map further; no blockers;
    parallelizable). 12.1 and 12.8 already shipped.
-6. **Phase 11** — Consumer model & SDKs (platform extensibility, parallelizable with 12). 11.1 shipped
-   (partially superseded by ADR-1005); 11.2–11.4 not started.
+6. **Phase 11** — Consumer model & SDKs (platform extensibility, parallelizable with 12). 11.1 closed
+   NOT_PLANNED with no delivery (its auth/token substance was absorbed into ADR-1005 engine principals,
+   but the issue's own scope was never built); 11.2–11.4 not started.
 7. **Phase 13** — Remaining security hardening & polish: 13.1 (2FA on approval — stale, general MFA
    step-up exists but isn't wired to approval), 13.3 (monitoring UI), 13.4 (branding). 13.2 and 13.5
    already shipped.
 8. **Phase 14** — Remaining scale items: 14.1 (P2P content), 14.2 (multi-gateway), 14.4–14.5
    (additional connectors — nominally depend on the now-deferred Phase 9). 14.3 shipped (obsoleted by
    Postgres); 14.6 superseded by the ADR-2002 HA program above.
-9. **Phase 9 (demoted)** — Connector framework. **Deferred** — to be re-planned as use-case-engine
-   work under ADR-1005 once the UCE model exists (Phase 7). Declared next priority since 2026-03 with
-   zero commits against it; connectors are use-case interpretation, which ADR-1005 places outside the
-   server. 9.8 already shipped independently and is unaffected.
+9. **Phase 9 (demoted)** — Connector framework. **Deferred.** **Owner decision (2026-09-07):**
+   declared next priority since 2026-03 with zero commits; whether connectors are core estate-fact
+   collection (ADR-1005 Decision 2) or use-case interpretation belonging in an engine is an **open
+   placement question to be settled before any re-plan** — not a settled ADR-1005 consequence.
+   9.8 closed NOT_PLANNED with no delivery and is unaffected either way.
 
 ---
 
