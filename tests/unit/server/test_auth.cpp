@@ -1000,10 +1000,13 @@ TEST_CASE("recheck_role_locked's own SET LOCAL lock_timeout fails the "
 
     // Hold a real row lock on greta's row from a SEPARATE, un-pooled
     // connection - never committed until after the timed call below
-    // returns. This connection's own session-level lock_timeout stays at
-    // the pool's 10000ms default (AuthDbPg's pool never overrides it) -
-    // only recheck_role_locked's SET LOCAL inside its own transaction is
-    // under test here.
+    // returns. Opened directly via PQconnectdb, so it never receives
+    // AuthDbPg's pool's `-c lock_timeout=10000` startup option
+    // (pg_pool.cpp) at all - it's irrelevant here either way, since this
+    // connection never itself waits on a lock. What's under test is
+    // cold_mgr's OWN pooled connection: its `lock_timeout` stays at that
+    // pool's 10000ms default except inside recheck_role_locked's own
+    // transaction, where its SET LOCAL narrows it to kWriteTimeout.
     yuzu::server::pg::PgConn holder{PQconnectdb(auth_db.dsn().c_str())};
     REQUIRE(PQstatus(holder.get()) == CONNECTION_OK);
     {
@@ -1034,8 +1037,13 @@ TEST_CASE("recheck_role_locked's own SET LOCAL lock_timeout fails the "
     // actually took effect, not just compiled), comfortably above near-zero
     // (proves the call genuinely waited on the lock and hit the timeout,
     // rather than failing instantly for some unrelated faster reason).
+    // authdb Gate 8 confirmation round: measured 2011-2012ms across 6 direct
+    // runs (a server-side timer interrupt, largely insensitive to client
+    // scheduling jitter, not a client-side poll loop) - 8000ms leaves headroom
+    // for a more jitter-prone runner (e.g. Wee Tam/Windows) without moving
+    // the fix-absent discriminator, which is ~10011ms per the red run above.
     CHECK(call_duration >= std::chrono::milliseconds(1500));
-    CHECK(call_duration < std::chrono::milliseconds(6000));
+    CHECK(call_duration < std::chrono::milliseconds(8000));
 }
 
 TEST_CASE("a concurrent remove_user() that completes before the recheck "
