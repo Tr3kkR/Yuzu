@@ -569,6 +569,23 @@ public:
     /// (nullptr) by default.
     void set_role_recheck_inside_lock_hook_for_test(std::function<void()> hook);
 
+    /// TEST-ONLY: installs a callback fired in `authenticate()`/
+    /// `create_local_session()`, AFTER the row lock has already been
+    /// released (`recheck_role_after_credential_check`/its caller's earlier
+    /// `verify_password()` has returned) but BEFORE `persist_new_session`
+    /// mints the session - i.e. squarely inside the #4107 check-then-mint
+    /// window `post_mint_role_recheck` exists to close. Unlike the two hooks
+    /// above, there is no lock held at this firing point, so a hook MAY
+    /// safely call `update_role()` (or spawn+join a thread that does)
+    /// synchronously and wait for it to fully complete before returning -
+    /// this lets a test force a demote to land, fully committed, strictly
+    /// inside the gap, with no race/timing dependence at all (deterministic
+    /// red/green, unlike the row-lock-blocking test's genuinely-racy
+    /// coverage of this same window). Production code MUST NOT call this -
+    /// no caller in `server/core/src/**` references it. A no-op (nullptr) by
+    /// default.
+    void set_post_mint_race_hook_for_test(std::function<void()> hook);
+
     /// TEST-ONLY: raw `users_` cache peek, bypassing AuthDB entirely (unlike
     /// `get_user_role()`, which is DB-authoritative and so cannot observe
     /// cache staleness at all). Lets a test confirm the version-guard in
@@ -1092,6 +1109,33 @@ private:
                                         std::uint64_t pre_check_version,
                                         std::string_view context);
 
+    /// Closes the #4107 check-then-mint gap: `recheck_role_after_credential_
+    /// check`'s row-locked read (or, for `create_local_session`'s callers, an
+    /// even earlier `verify_password()` call) can be stale by the time a
+    /// session actually finishes minting - `persist_new_session` is a
+    /// separate, later step, not itself inside any row lock. Call this
+    /// immediately after a successful `persist_new_session`, passing the
+    /// role the just-minted session was stamped with; on divergence (or a
+    /// store error) it revokes that session via `invalidate_user_sessions`
+    /// and returns `false` - the caller must then treat the mint as denied
+    /// (return `nullopt`/`{}` per its own contract), never hand out a token
+    /// past this point.
+    ///
+    /// This is the SAME pattern (mint, then post-mint re-check, then revoke-
+    /// and-deny on divergence) `docs/auth-architecture.md` already documents
+    /// for the structurally identical OIDC/SAML deprovision-race - chosen
+    /// over serializing the mint inside AuthDB's row lock, which that doc's
+    /// §3 explicitly rejects for this race class ("never hold one store's
+    /// pool lease while calling another" - `SessionStore`'s shared write-
+    /// generation row is exactly the cross-store lock that discipline
+    /// exists to avoid). See this method's own `.cpp` doc for the ordering
+    /// proof that this closes the race rather than merely narrowing it.
+    ///
+    /// Returns `true` unconditionally in cfg-file mode (`!auth_db_`) - no
+    /// separate authority exists to diverge from. Caller must NOT hold `mu_`.
+    [[nodiscard]] bool post_mint_role_recheck(const std::string& username, Role minted_role,
+                                              std::string_view context);
+
     /// Backing field for `set_role_recheck_race_hook_for_test` - see that
     /// method's doc. Invoked (if set) from inside
     /// `recheck_role_after_credential_check`.
@@ -1104,6 +1148,14 @@ private:
     /// production-reachability as `role_recheck_race_hook_for_test_` above -
     /// see that field's Resource Ledger entry, which covers this one too.
     std::function<void()> role_recheck_inside_lock_hook_for_test_;
+
+    /// Backing field for `set_post_mint_race_hook_for_test` - see that
+    /// method's doc. Invoked (if set) from inside `authenticate()`/
+    /// `create_local_session()`, after the row lock releases but before
+    /// `persist_new_session`. Same shape/lifetime/production-reachability
+    /// as `role_recheck_race_hook_for_test_` above - see that field's
+    /// Resource Ledger entry, which covers this one too.
+    std::function<void()> post_mint_race_hook_for_test_;
 
     /// Backing counter for `next_role_version_()` - see `UserEntry::role_version`'s
     /// doc for why this is process-wide, not per-username. `std::atomic` since

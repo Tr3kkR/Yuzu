@@ -820,6 +820,78 @@ AuthManager::recheck_role_after_credential_check(const std::string& username, Ro
     return result;
 }
 
+bool AuthManager::post_mint_role_recheck(const std::string& username, Role minted_role,
+                                         std::string_view context) {
+    // #4107 check-then-mint gap (external adversarial review, fjarvis, PR
+    // #4076): recheck_role_after_credential_check's row-locked read closes
+    // the SAME-process/cross-replica divergence race for the read itself,
+    // but a demotion committing strictly AFTER that read and before this
+    // session's mint completes still lands a session stamped with the
+    // pre-demote role - and that demote's own sweep (update_role's
+    // std::erase_if) already ran before this session existed, so it can't
+    // catch it either.
+    //
+    // Closed here via the SAME pattern this codebase already uses for the
+    // structurally identical OIDC/SAML deprovision-race (docs/
+    // auth-architecture.md, "post-mint re-check"): mint normally, then
+    // immediately re-verify against the authority and revoke-and-deny if it
+    // diverged, rather than serializing the mint inside the row lock.
+    // Serializing was considered and explicitly rejected for that race
+    // class - it would require holding AuthDB's row lock across a
+    // SessionStore call, violating this codebase's "never hold one store's
+    // pool lease while calling another" discipline (docs/
+    // auth-architecture.md §3) - SessionStore's shared write-generation row
+    // is exactly the kind of cross-store lock that could deadlock against
+    // AuthDB's row lock under the wrong interleaving.
+    //
+    // Ordering proof (why this closes the race rather than merely
+    // narrowing it, for the SAME-PROCESS case): a racing update_role()
+    // commits its AuthDB UPDATE BEFORE taking mu_ to sweep sessions_ (see
+    // update_role's own body). persist_new_session's mint-write and
+    // update_role's sweep both take mu_, so one strictly happens-before
+    // the other. If the mint happens-before the sweep, the sweep (running
+    // after) finds and erases this just-minted session - self-healed. If
+    // the sweep happens-before the mint, the sweep's own UPDATE already
+    // committed before the sweep ran, which is before the mint, which is
+    // before this call - so this call's fresh AuthDB read is guaranteed to
+    // observe it. Cross-replica: the same argument holds with Postgres's
+    // own commit ordering standing in for mu_, since both auth.users and
+    // the durable session row live in the one shared database (server.cpp
+    // wires AuthDB and SessionStore to the same PgPool) and
+    // wipe_user_sessions_durable/invalidate_user_sessions delete the
+    // durable row directly rather than working off a stale local list.
+    //
+    // Returns true (nothing to do) in cfg-file mode - `users_` IS the
+    // truth there, nothing to diverge from.
+    if (!auth_db_)
+        return true;
+    auto post = auth_db_->get_user(username);
+    if (!post) {
+        const bool removed = yuzu::server::AuthDBError::UserNotFound == post.error();
+        spdlog::warn("{}: post-mint re-check for '{}' {} - revoking the session just minted",
+                    context, username, removed ? "found the account no longer active"
+                                                : "hit a store error (failing closed)");
+        auto revoke = invalidate_user_sessions(username);
+        if (metrics_) {
+            metrics_->counter("yuzu_auth_role_recheck_post_mint_denied_total").increment();
+        }
+        (void)revoke; // best-effort revoke; the mint is already denied to the caller either way
+        return false;
+    }
+    if (post->role != minted_role) {
+        spdlog::warn("{}: post-mint re-check for '{}' found the role changed {} -> {} during "
+                    "the mint (concurrent role-change race) - revoking the session just minted",
+                    context, username, role_to_string(minted_role), role_to_string(post->role));
+        auto revoke = invalidate_user_sessions(username);
+        if (metrics_) {
+            metrics_->counter("yuzu_auth_role_recheck_post_mint_denied_total").increment();
+        }
+        (void)revoke;
+        return false;
+    }
+    return true;
+}
+
 std::optional<std::string> AuthManager::authenticate(const std::string& username,
                                                      const std::string& password) {
     // Time the PBKDF2 verify path. Histogram is observed even on failure
@@ -883,10 +955,19 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
     params.session_lifetime_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(kSessionDuration).count();
     // password login carries no MFA proof yet — a step-up stamps it later.
+    // TEST-ONLY seam (see set_post_mint_race_hook_for_test's doc): fires
+    // here, squarely inside the #4107 check-then-mint window - the row lock
+    // has already released (recheck above returned) but the session has not
+    // yet been minted. A no-op (nullptr) in production.
+    if (post_mint_race_hook_for_test_)
+        post_mint_race_hook_for_test_();
     // mu_ is not held here: persist_new_session does durable PG I/O and
     // re-takes mu_ to cache (non-recursive) — never hold mu_ across it.
     if (!persist_new_session(token, params))
         return std::nullopt; // durable-write failure → login not honored (ADR-0007)
+    // #4107 check-then-mint gap: see post_mint_role_recheck's own doc.
+    if (!post_mint_role_recheck(username, entry->role, "Auth failed"))
+        return std::nullopt;
 
     spdlog::info("User '{}' authenticated (role={})", username, params.role);
     if (metrics_) {
@@ -972,6 +1053,16 @@ std::string AuthManager::create_local_session(const std::string& username, Role 
         spdlog::error("create_local_session: durable persist failed for '{}'", username);
         return {};
     }
+    // #4107 check-then-mint gap: see post_mint_role_recheck's own doc. This
+    // function's `role` parameter can be arbitrarily stale by the time this
+    // point is reached (its callers include the MFA step-up route, which
+    // reads a role from an earlier verify_password() call across an entire
+    // TOTP-verification round trip) - the fresh re-read here closes the gap
+    // regardless of how wide that earlier window was. Same empty-token
+    // fail-safe contract as the durable-write-failure branch above: no
+    // session, degrades to "not authenticated" at the caller's cookie set.
+    if (!post_mint_role_recheck(username, role, "create_local_session"))
+        return {};
     // Stamp last_login_at on every successful login, not just the
     // MFA-verified TOTP path. The MFA-verified TOTP path already does
     // this as part of its counter UPDATE so calling here is harmless
@@ -1246,6 +1337,10 @@ void AuthManager::set_role_recheck_race_hook_for_test(std::function<void()> hook
 
 void AuthManager::set_role_recheck_inside_lock_hook_for_test(std::function<void()> hook) {
     role_recheck_inside_lock_hook_for_test_ = std::move(hook);
+}
+
+void AuthManager::set_post_mint_race_hook_for_test(std::function<void()> hook) {
+    post_mint_race_hook_for_test_ = std::move(hook);
 }
 
 std::optional<Role> AuthManager::cached_role_for_test(const std::string& username) const {

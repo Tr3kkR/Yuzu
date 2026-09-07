@@ -849,9 +849,11 @@ TEST_CASE("recheck never trusts a stale in-process cache value, only its own "
 }
 
 TEST_CASE("the row lock genuinely blocks a concurrent update_role() until "
-          "the recheck commits, and the writer's change is then visible on "
-          "its own next read (#4107 fix - row-locking closes the same-"
-          "process divergence residual by construction)",
+          "the recheck commits, and the check-then-mint gap is closed "
+          "either by the post-mint recheck or by the demote's own sweep "
+          "(#4107 fix - row-locking closes the same-process divergence "
+          "residual by construction; post_mint_role_recheck closes the "
+          "check-then-mint gap fjarvis's PR #4076 review raised)",
           "[pg][auth][session][cold_cache]") {
     // The one test in this file that proves SERIALIZATION, not just a
     // sequenced outcome: spawns a genuine writer thread INSIDE the row lock
@@ -957,29 +959,115 @@ TEST_CASE("the row lock genuinely blocks a concurrent update_role() until "
     // NORMAL (hook-fired) path - see the hook's own comment above.
     if (writer.joinable())
         writer.join();
-    REQUIRE(token.has_value());
     // Primary evidence: pg_stat_activity directly observed the writer's
     // UPDATE waiting on the row lock - not a wall-clock proxy for it.
     CHECK(writer_observed_blocked);
     CHECK(writer_finished.load());
     CHECK(writer_update_ok.load());
 
-    // Deliberately NOT asserting on validate_session(*token) here. This
-    // call's own row-locked read happened-before the writer's commit, so it
-    // correctly minted a session at "admin" - the true state as of a
-    // definite point in a serialized order. But EXACTLY which of two
-    // independent, unordered critical sections runs first in real wall-clock
-    // time - this thread's persist_new_session (after recheck returns) vs.
-    // the writer thread's own session sweep (once its update_role() unblocks
-    // and completes) - is a genuine race: nothing orders "session inserted"
-    // against "sweep for this username runs" once the row lock itself is
-    // released, so validate_session(*token) can legitimately come back
-    // either way depending on scheduling. That IS the separate, already-
-    // disclosed check-then-mint gap this function's header doc names as not
-    // closed by row-locking - this test exists to prove the row lock's
-    // BLOCKING mechanism (asserted above), not to also pin an outcome that's
-    // inherently non-deterministic for a different, disclosed reason.
-    CHECK(cold_mgr.get_user_role("cora") == Role::user); // DB-authoritative, unaffected by the sweep race
+    // #4107 check-then-mint gap (external adversarial review, fjarvis, PR
+    // #4076): EXACTLY which of two independent, unordered operations
+    // happens first once the row lock releases - this thread's
+    // persist_new_session (mint) vs. the writer thread's own session sweep
+    // (inside its update_role(), once it unblocks and its DB UPDATE
+    // commits) - is a genuine, uncontrolled race. But by this point
+    // (writer already joined - its ENTIRE update_role(), sweep included, is
+    // done) exactly one of two outcomes is possible, and BOTH are correct:
+    //
+    // (a) The mint's own post_mint_role_recheck ran AFTER the writer's DB
+    //     UPDATE had already committed (whether or not the mint happened-
+    //     before or after the writer's sweep specifically) - it observes
+    //     the demoted role directly and denies the mint outright:
+    //     token has no value.
+    // (b) The mint's post_mint_role_recheck ran BEFORE the writer's DB
+    //     UPDATE committed - the mint succeeds (token has a value), but
+    //     because the writer's sweep runs strictly after its own commit,
+    //     and we've already joined it, ANY session sweep-vs-mint ordering
+    //     that could have raced is now resolved: either the sweep ran
+    //     after the mint (removed it - validate_session comes back empty)
+    //     or the mint ran after a sweep that found nothing (impossible
+    //     here, since a sweep before the mint would find no entry to
+    //     remove, and post_mint_role_recheck already covers that ordering
+    //     in case (a) via its own fresh read).
+    //
+    // Either way, "cora" must never come out of this race still validly
+    // holding an admin session - that's the property this block proves,
+    // not a specific outcome of the (a)/(b) split.
+    if (token.has_value()) {
+        auto session = cold_mgr.validate_session(*token);
+        CHECK((!session.has_value() || session->role != Role::admin));
+    } else {
+        SUCCEED("post_mint_role_recheck denied the mint outright - the stronger of the "
+                "two possible correct outcomes");
+    }
+    CHECK(cold_mgr.get_user_role("cora") == Role::user); // DB-authoritative, unaffected either way
+}
+
+TEST_CASE("post_mint_role_recheck denies a login when a demote lands strictly "
+          "inside the check-then-mint window, deterministically - not a race "
+          "(#4107 fix for the external adversarial review, fjarvis, PR #4076: "
+          "\"an inherent check-then-mint gap no non-serialized recheck can "
+          "close\" - closed via the same post-mint-recheck-and-revoke pattern "
+          "docs/auth-architecture.md already uses for OIDC/SAML)",
+          "[pg][auth][session][cold_cache]") {
+    yuzu::test::AuthDbPg auth_db;
+
+    AuthManager warm_mgr;
+    warm_mgr.set_auth_db(auth_db.get());
+    REQUIRE(warm_mgr.upsert_user("dana", "password1234", Role::admin));
+
+    AuthManager cold_mgr;
+    cold_mgr.set_auth_db(auth_db.get());
+    REQUIRE(cold_mgr.authenticate("dana", "password1234").has_value()); // hydrates cache=admin
+
+    bool demote_ok = false;
+    // Fires AFTER the row-locked recheck has already returned "admin" (the
+    // row lock is released by this point - see the hook's own doc) but
+    // BEFORE persist_new_session mints the session. No lock is held here,
+    // so this can safely demote SYNCHRONOUSLY and wait for it to fully
+    // complete (unlike the row-lock-blocking test's hook, which must spawn
+    // a separate thread to avoid a self-deadlock) - this is what makes the
+    // race deterministic instead of timing-dependent: by the time this hook
+    // returns, the demote (DB UPDATE + its own session sweep) has
+    // unconditionally already committed.
+    cold_mgr.set_post_mint_race_hook_for_test([&] { demote_ok = cold_mgr.update_role("dana", Role::user); });
+
+    auto token = cold_mgr.authenticate("dana", "password1234");
+    REQUIRE(demote_ok);
+    // The demote committed strictly inside the check-then-mint window - the
+    // recheck read "admin" before it, the mint's post_mint_role_recheck
+    // fresh-reads AuthDB after it, sees the divergence, and denies the mint
+    // outright. Deterministic: this is NOT the same non-deterministic race
+    // the earlier row-lock-blocking test covers (there, the demote races the
+    // mint after the lock releases; here, the hook forces the demote to be
+    // 100% complete before the mint's own post-check ever runs).
+    CHECK_FALSE(token.has_value());
+    CHECK(cold_mgr.get_user_role("dana") == Role::user); // DB-authoritative
+}
+
+TEST_CASE("create_local_session's own post-mint recheck denies a stale-role "
+          "mint too (#4107 fix - the MFA step-up route reads a role from an "
+          "earlier verify_password() call, potentially across an entire "
+          "TOTP-verification round trip, then hands it to create_local_"
+          "session as a plain parameter with no idea how stale it is)",
+          "[pg][auth][session][cold_cache]") {
+    yuzu::test::AuthDbPg auth_db;
+
+    AuthManager mgr;
+    mgr.set_auth_db(auth_db.get());
+    // "frank" is genuinely a user - never admin. Simulates a role that
+    // changed (or was simply wrong) somewhere in the gap between an earlier
+    // verify_password() call and this create_local_session() call actually
+    // minting - exactly the wider check-then-mint window the MFA step-up
+    // route has (auth_routes.cpp's create_local_session call sites), which
+    // has no row lock of its own to narrow it in the first place.
+    REQUIRE(mgr.upsert_user("frank", "password1234", Role::user));
+
+    // Mint with a STALE "admin" role, as if an earlier check had returned it
+    // before a demote (or simply a bug upstream) landed.
+    auto token = mgr.create_local_session("frank", Role::admin, true);
+    CHECK(token.empty()); // fail-safe empty-token contract (ADR-0007), same as a durable-write failure
+    CHECK(mgr.get_user_role("frank") == Role::user); // DB-authoritative, unaffected
 }
 
 TEST_CASE("recheck_role_locked's own set_config() lock_timeout fails the "
