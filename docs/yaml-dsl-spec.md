@@ -147,7 +147,7 @@ Each parameter descriptor supports:
 | `displayName` | string | No | -- | Human-readable label for the dashboard form. |
 | `description` | string | No | `""` | Parameter description. |
 | `default` | varies | No | -- | Default value if not provided. Must match the declared type. |
-| `validation` | object | No | -- | Validation constraints. See below. Also rendered, verbatim, into the plugin README's Inputs table (Constraints column) and the `content/plugin-docs` manifest (`inputs[].constraints`). |
+| `validation` | object | No | -- | Validation constraints. See below. Also summarised into the plugin README's Inputs table (Constraints column, e.g. `enum: a, b · minLength 1`) and carried verbatim in the `content/plugin-docs` manifest (`inputs[].constraints`). |
 
 #### `spec.parameters.properties.<name>.validation`
 

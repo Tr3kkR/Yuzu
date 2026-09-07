@@ -553,13 +553,70 @@ class ShapeChecks(unittest.TestCase):
         # inputs/samples/source fences, and no `windows:x:denied` in Result status.
         self.assertIn("has no macOS row", joined)
         self.assertIn("has no Linux row", joined)
-        self.assertIn("does not list it", joined)
+        self.assertIn("does not name it", joined)
         self.assertNotIn("Caveats and known gaps' has", joined)
         self.assertNotIn("Where the data goes' needs", joined)
 
     def test_index_total_caption(self):
         idx = g.render_index([Rendering()._doc()], 51)
         self.assertTrue(idx.startswith("1 of 51 plugins document themselves this way"))
+
+
+class ValidationShapes(unittest.TestCase):
+    def _doc(self, validation):
+        return [{"kind": "InstructionDefinition", "metadata": {"id": "x.a"},
+                 "spec": {"execution": {"plugin": "alpha", "action": "probe"},
+                          "parameters": {"type": "object", "properties": {"mode": {"type": "string", "validation": validation}}}}}]
+
+    def test_validation_block_shape(self):
+        with self.assertRaisesRegex(ValueError, "'mode': validation must be an object"):
+            g.parse_definition_docs(self._doc("x"), "p.yaml")
+        with self.assertRaisesRegex(ValueError, "validation.enum must be a list"):
+            g.parse_definition_docs(self._doc({"enum": "x"}), "p.yaml")
+        self.assertEqual(len(g.parse_definition_docs(self._doc({"enum": ["a"], "minLength": 1}), "p.yaml")), 1)
+
+
+class DuplicateIds(unittest.TestCase):
+    def test_duplicate_definition_id_across_files_is_an_error(self):
+        import tempfile, shutil
+        tmp = Path(tempfile.mkdtemp(prefix="yuzu_test_dupids_"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        (tmp / "content" / "definitions").mkdir(parents=True)
+        body = "---\nkind: InstructionDefinition\nmetadata: {id: x.dup}\nspec:\n  execution: {plugin: alpha, action: probe}\n"
+        (tmp / "content" / "definitions" / "a.yaml").write_text(body, encoding="utf-8")
+        (tmp / "content" / "definitions" / "b.yaml").write_text(body, encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "b.yaml: definition id 'x.dup' is already defined in content/definitions/a.yaml"):
+            g.load_definitions(tmp)
+
+
+class StructuralLintsPositive(unittest.TestCase):
+    def test_caveat_count_lead_and_bullets(self):
+        many = README.replace("1. **One.** first\n2. **Two.** second",
+                              "\n".join(f"{i}. **C{i}.** x" for i in range(1, 7)))
+        self.assertTrue(any("has 6 items; the contract is 1–5" in p
+                            for p in g.readme_shape_problems(many, "alpha", "r.md")))
+        plain = README.replace("1. **One.** first", "1. One. first")
+        self.assertTrue(any("does not open with a bold lead" in p
+                            for p in g.readme_shape_problems(plain, "alpha", "r.md")))
+        one_bullet = README.replace("- **Siblings:** none\n", "")
+        self.assertTrue(any("needs at least the instruction-result bullet" in p
+                            for p in g.readme_shape_problems(one_bullet, "alpha", "r.md")))
+        self.assertTrue(any("no '**Sensitivity.**' bullet" in p
+                            for p in g.readme_shape_problems(README, "alpha", "r.md")))
+
+
+class MarkerBinding(unittest.TestCase):
+    def test_marker_class_must_match_the_capability_row(self):
+        doc = Rendering()._doc()  # alpha: probe is ReadOnly/None; sample marks `danger` Destructive/Irreversible
+        problems = g.sample_coverage_problems(doc)
+        self.assertTrue(any("`[not captured] Destructive/Irreversible:` on action 'danger' — the capability row says no row"
+                            in p for p in problems), problems)
+        s = g.parse_sample(SAMPLE.replace("== action=danger key=value path=\"/Applications/Some App\"", "== action=probe2"), "macos")
+        doc.samples = {"macos": s}
+        doc.cap_rows = list(doc.cap_rows) + [g.CapRow(plugin="alpha", action="probe2", dispatch_class="Destructive",
+                                                       mutability="Irreversible", securable="S", operation="Write",
+                                                       risk_tier="High", execute_gate="AlwaysApproval", fragment="f")]
+        self.assertFalse([p for p in g.sample_coverage_problems(doc) if "probe2" in p and "[not captured]" in p])
 
 
 if __name__ == "__main__":

@@ -88,6 +88,16 @@
 #include <yuzu/plugin.h>
 
 #include "local_dispatcher.hpp"
+#if defined(_WIN32)
+#include "guard_win_handle.hpp"
+#endif
+
+namespace yuzu::agent {
+// agents/core/src/plugin_loader.cpp — the one place that knows an ABI<4
+// descriptor ends before action_descriptors (no public header; forward-
+// declared here the way tests/unit/test_capability_descriptor.cpp does).
+YUZU_EXPORT std::size_t gated_action_descriptor_count(const YuzuPluginDescriptor* desc);
+} // namespace yuzu::agent
 
 namespace {
 
@@ -129,16 +139,6 @@ std::string today() {
     return buf;
 }
 
-#if defined(_WIN32)
-std::string utf8_from_wide(const wchar_t* ws) {
-    const int n = WideCharToMultiByte(CP_UTF8, 0, ws, -1, nullptr, 0, nullptr, nullptr);
-    if (n <= 1) return {};
-    std::string out(static_cast<std::size_t>(n - 1), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, ws, -1, out.data(), n, nullptr, nullptr);
-    return out;
-}
-#endif
-
 // The measured privilege the stamp records when --privilege is not given:
 // the effective uid on POSIX; on Windows the token's elevation state plus the
 // ROLE it runs under — a well-known service account by name, any other
@@ -151,18 +151,18 @@ std::string default_privilege() {
     std::string elevation = "elevation unknown";
     HANDLE raw = nullptr;
     if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw)) {
+        const yuzu::agent::detail::ScopedWinHandle<&yuzu::agent::detail::close_handle_> token(raw);
         TOKEN_ELEVATION te{};
         DWORD got = 0;
-        if (GetTokenInformation(raw, TokenElevation, &te, sizeof te, &got))
+        if (GetTokenInformation(token.get(), TokenElevation, &te, sizeof te, &got))
             elevation = te.TokenIsElevated ? "elevated" : "not elevated";
         alignas(TOKEN_USER) unsigned char buf[sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE]{};
-        if (GetTokenInformation(raw, TokenUser, buf, sizeof buf, &got)) {
+        if (GetTokenInformation(token.get(), TokenUser, buf, sizeof buf, &got)) {
             PSID sid = reinterpret_cast<TOKEN_USER*>(buf)->User.Sid;
             if (IsWellKnownSid(sid, WinLocalSystemSid)) role = "LocalSystem";
             else if (IsWellKnownSid(sid, WinLocalServiceSid)) role = "NT AUTHORITY\\LOCAL SERVICE";
             else if (IsWellKnownSid(sid, WinNetworkServiceSid)) role = "NT AUTHORITY\\NETWORK SERVICE";
         }
-        CloseHandle(raw);
     }
     return role + " (" + elevation + ")";
 #else
@@ -171,8 +171,9 @@ std::string default_privilege() {
 }
 
 // The OS version the stamp records when --os-version is not given: the
-// product name and version plus the architecture, so a reader can tell a
-// container's kernel from its userland and an arm64 host from x86-64.
+// product name and version (os-release's PRETTY_NAME on Linux, so a
+// container stamps its userland, not the host kernel) plus the machine
+// architecture, so an arm64 host reads differently from x86-64.
 std::string default_os_version() {
 #if defined(_WIN32)
     using RtlGetVersionFn = LONG(WINAPI*)(PRTL_OSVERSIONINFOW);
@@ -311,12 +312,14 @@ int main(int argc, char** argv) {
         return 1;
     }
     // Every requested action must be one the descriptor declares; a typo would
-    // otherwise be captured as the plugin's "unknown action" row and pass.
+    // otherwise be captured as the plugin's "unknown action" row and pass. The
+    // count is ABI-gated: an ABI<4 descriptor ends before these fields.
+    const std::size_t declared_count = yuzu::agent::gated_action_descriptor_count(desc);
     for (const auto& spec : actions) {
         bool declared = false;
-        for (std::size_t k = 0; k < desc->action_descriptor_count && !declared; ++k)
+        for (std::size_t k = 0; k < declared_count && !declared; ++k)
             declared = desc->action_descriptors[k].action && spec.name == desc->action_descriptors[k].action;
-        if (!declared && desc->action_descriptor_count > 0) {
+        if (!declared && declared_count > 0) {
             std::cerr << "plugin-capture: " << lib << " declares no action named '" << spec.name << "'\n";
             return 2;
         }
@@ -392,8 +395,13 @@ int main(int argc, char** argv) {
         f.flush();
         if (!f) {
             f.close();
-            std::remove(out_path.c_str()); // never leave a partial sample behind
-            std::cerr << "plugin-capture: writing " << out_path << " failed — the partial file was removed\n";
+            // Never leave a partial sample behind: the parser would read the
+            // prefix as a whole capture. Opened with trunc, so nothing of value
+            // predates this run.
+            const bool removed = std::remove(out_path.c_str()) == 0;
+            std::cerr << "plugin-capture: writing " << out_path << " failed — "
+                      << (removed ? "the partial file was removed" : "the partial file could not be removed; delete it")
+                      << "\n";
             return 1;
         }
     }

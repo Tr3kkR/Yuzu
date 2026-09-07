@@ -78,7 +78,7 @@ Pipe-delimited key rows; the first field is the row kind. `state` emits `profile
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
 | `profile_or_backend` | string | `profile` `backend` `state` `mode` `pf` `error` | all | `profile` | Row key. Windows: "profile" rows carry the profile name in the next field (Domain, Private, Public). Linux and macOS: "backend", "state", "mode" and "pf" rows, one key each. |
-| `state` | string | - | all | `enabled` | The remainder of the row after the key (the server clamps this plugin to two fields). Windows "profile" rows: "<Domain\|Private\|Public>\|<enabled\| disabled\|unknown\|error:<hresult>>" — the profile name first, then its state. Linux "state" rows: running (firewalld), active, inactive or unknown. macOS "state" rows: enabled, disabled or unknown; "pf" rows the same; "mode" row is block_all. "backend" rows name the backend (appfirewall, firewalld, nftables, ufw, iptables, none). |
+| `state` | string | - | all | `enabled` | The remainder of the row after the key (the server clamps this plugin to two fields). Windows "profile" rows: the profile name (Domain, Private, Public), then its state (enabled, disabled, unknown or error:<hresult>). Linux "state" rows: running (firewalld), active, inactive or unknown. macOS "state" rows: enabled, disabled or unknown; "pf" rows the same; "mode" row is block_all. "backend" rows name the backend (appfirewall, firewalld, nftables, ufw, iptables, none). |
 <!-- END GENERATED -->
 
 ### Result status

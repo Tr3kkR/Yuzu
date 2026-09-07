@@ -179,8 +179,9 @@ def main() -> int:
             f"{key} must be a string" for key in ("description", "readme")
             if not isinstance(manifest.get(key), str)
         ]
-        if not isinstance(manifest.get("platforms"), dict):
-            shape_errors.append("platforms must be an object")
+        for key in ("platforms", "kind"):
+            if not isinstance(manifest.get(key), dict):
+                shape_errors.append(f"{key} must be an object")
         if shape_errors:
             bad_manifests.append((str(mf), "; ".join(shape_errors)))
             continue
@@ -197,8 +198,8 @@ def main() -> int:
         print(
             f"ERROR: embed_content.py: {len(bad_manifests)} plugin-docs manifest(s) "
             "failed validation (content/plugin-docs/<name>.json must be a JSON object "
-            "whose name matches the file stem, with string description/readme and an "
-            "object platforms — regenerate with tools/plugin-doc-gen):",
+            "whose name matches the file stem, with string description/readme and object "
+            "platforms/kind — regenerate with tools/plugin-doc-gen):",
             file=sys.stderr,
         )
         for path, reason in bad_manifests:

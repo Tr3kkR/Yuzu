@@ -516,7 +516,7 @@ DiscoveryDoc build_plugins_catalog(const yuzu::server::detail::AgentRegistry& ag
          "reports is absent from this list. To dispatch an action, call "
          "execute_instruction / POST /api/v1/instructions/execute with its "
          "plugin+action; supply the params from parameter_schema where present. "
-         "Each plugin's docs field is a documentation summary {summary, platforms, "
+         "Each plugin's docs field is a documentation summary {summary, kind, platforms, "
          "readme, resource} when the plugin has adopted the README standard, else "
          "null; the full manifest is GET /discover/plugin-docs / yuzu://plugin-docs."},
         {"limitation",

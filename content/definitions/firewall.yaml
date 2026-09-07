@@ -57,9 +57,9 @@ spec:
         type: string
         description: >-
           The remainder of the row after the key (the server clamps this plugin
-          to two fields). Windows "profile" rows: "<Domain|Private|Public>|<enabled|
-          disabled|unknown|error:<hresult>>" — the profile name first, then its
-          state. Linux "state" rows: running (firewalld), active, inactive or
+          to two fields). Windows "profile" rows: the profile name (Domain,
+          Private, Public), then its state (enabled, disabled, unknown or
+          error:<hresult>). Linux "state" rows: running (firewalld), active, inactive or
           unknown. macOS "state" rows: enabled, disabled or unknown; "pf" rows
           the same; "mode" row is block_all. "backend" rows name the backend
           (appfirewall, firewalld, nftables, ufw, iptables, none).

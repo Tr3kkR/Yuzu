@@ -277,6 +277,18 @@ def _check_definition_shapes(spec: dict, perms: dict, result: dict, definition_i
     props = (spec.get("parameters") or {}).get("properties")
     if props is not None and not isinstance(props, dict):
         raise ValueError(f"{where}: spec.parameters.properties must be an object")
+    for pname, pspec in (props or {}).items():
+        if not isinstance(pspec, dict):
+            raise ValueError(f"{where}: parameter {pname!r} must be an object")
+        v = pspec.get("validation")
+        if v is not None:
+            if not isinstance(v, dict):
+                raise ValueError(f"{where}: parameter {pname!r}: validation must be an object")
+            if "enum" in v and not isinstance(v["enum"], list):
+                raise ValueError(f"{where}: parameter {pname!r}: validation.enum must be a list")
+            for key in ("pattern", "minLength", "maxLength", "minimum", "maximum"):
+                if key in v and not isinstance(v[key], _SCALAR):
+                    raise ValueError(f"{where}: parameter {pname!r}: validation.{key} must be a scalar")
     for col in result.get("columns") or []:
         if not isinstance(col, dict):
             raise ValueError(f"{where}: every spec.result.columns entry must be an object")
@@ -522,7 +534,19 @@ def hand_sections_to_manifest(readme: str) -> dict:
 
 DATA_CONTRACT_ORDER = ("### Inputs", "### Outputs", "### Result status", "### Where the data goes")
 HAND_TABLE_WIDTHS = (("## Privileges and prerequisites", 5), ("### Result status", 4))
-_PROVENANCE_LITERAL_RE = re.compile(r'"((?:windows|macos|linux):[a-z0-9_:]+)"')
+# Provenance tokens reach the host through the CC-07 status seam. The gate
+# takes them from (a) every literal passed to a status call in the plugin's own
+# sources — `"<os>:<token>"`, `"<plugin>:<token>"`, or the literal prefix of a
+# formatted token — and (b) the tokens a shared status-emitting header defines
+# (runner_status.hpp's `subprocess_runner:*`) when the plugin includes it.
+_STATUS_CALL_RE = re.compile(
+    r"\b(?:set_result_status|mark_result_[a-z_]+|emit_unsupported|forward_runner_failure)\s*\(([^;]*?)\)\s*;",
+    re.DOTALL)
+_PROVENANCE_TOKEN_RE = re.compile(r'"([a-z][a-z0-9_]*:[a-z0-9_]+(?::[a-z0-9_]+)*)')
+_OS_LITERAL_RE = re.compile(r'"((?:windows|macos|linux):[a-z0-9_:]+)"')
+_INCLUDE_RE = re.compile(r'^\s*#include\s*[<"]([^>"]+)[>"]', re.MULTILINE)
+_SHARED_HEADER_ROOTS = ("agents/core/include/yuzu/agent", "agents/shared", "agents/core/include")
+_COMMENT_RE = re.compile(r"//[^\n]*|/\*.*?\*/", re.DOTALL)
 _CAVEAT_ITEM_RE = re.compile(r"^\*\*[^*]+\*\*")  # parse_bullets has stripped the `1. `
 
 
@@ -583,19 +607,41 @@ def readme_shape_problems(text: str, name: str, rel: str, provenance_literals: I
     if len(parse_bullets(sections.get("### Where the data goes", ""))) < 2:
         problems.append(f"{rel}: '### Where the data goes' needs at least the instruction-result bullet and the "
                         "'Not consumed by' bullet")
+    where_bullets = parse_bullets(sections.get("### Where the data goes", ""))
+    if not any(b.startswith("**Sensitivity") for b in where_bullets):
+        problems.append(f"{rel}: '### Where the data goes' has no '**Sensitivity.**' bullet (what in the rows could "
+                        "identify a device, a person or installed software)")
     status_text = sections.get("### Result status", "")
     for lit in sorted(set(provenance_literals)):
-        if f"`{lit}`" not in status_text:
+        if lit not in status_text:
             problems.append(f"{rel}: the source emits result provenance `{lit}` but '### Result status' does not "
-                            "list it (every provenance literal is named, grouped by status)")
+                            "name it (every provenance token is listed, grouped by status)")
     return problems
+
+
+def _strip_comments(text: str) -> str:
+    return _COMMENT_RE.sub("", text)
 
 
 def provenance_literals(repo: Path, name: str) -> set[str]:
     out: set[str] = set()
-    for src in (repo / "agents" / "plugins" / name / "src").glob("*"):
-        if src.is_file() and src.suffix in (".cpp", ".hpp", ".h", ".mm"):
-            out.update(_PROVENANCE_LITERAL_RE.findall(_read(src)))
+    includes: set[str] = set()
+    for src in sorted((repo / "agents" / "plugins" / name / "src").glob("*"), key=lambda q: q.as_posix()):
+        if not (src.is_file() and src.suffix in (".cpp", ".hpp", ".h", ".mm")):
+            continue
+        text = _strip_comments(_read(src))
+        for call in _STATUS_CALL_RE.findall(text):
+            out.update(_PROVENANCE_TOKEN_RE.findall(call))
+        out.update(_OS_LITERAL_RE.findall(text))
+        includes.update(_INCLUDE_RE.findall(text))
+    for inc in sorted(includes):
+        for root in _SHARED_HEADER_ROOTS:
+            header = repo / root / inc
+            if header.is_file():
+                text = _strip_comments(_read(header))
+                if "set_result_status" in text:
+                    out.update(m.group(1) for m in _PROVENANCE_TOKEN_RE.finditer(text) if m.group(1).count(":") >= 1)
+                break
     return out
 
 
@@ -614,6 +660,17 @@ def sample_coverage_problems(doc: "PluginDoc") -> list[str]:
                                 f"docs/samples/{os_name}.txt is missing or unparseable (rule 5)")
             continue
         present = {a["action"] for a in sample.actions}
+        cap_by_action = {r.action: r for r in doc.cap_rows}
+        for a in sample.actions:
+            marker = a.get("not_captured")
+            if marker and "/" in marker.split(":", 1)[0]:
+                cls = marker.split(":", 1)[0]
+                row = cap_by_action.get(a["action"])
+                expected = f"{row.dispatch_class}/{row.mutability}" if row else None
+                if row is None or row.dispatch_class not in ("Mutating", "Destructive") or cls != expected:
+                    problems.append(f"{doc.name}/{os_name}: `[not captured] {cls}:` on action '{a['action']}' — the "
+                                    f"capability row says {expected or 'no row'}; only a Mutating or Destructive "
+                                    "action may skip a live run under that class (rule 5)")
         for action in wanted:
             if action not in present:
                 problems.append(f"{doc.name}/{os_name}: action '{action}' is {doc.legs[action][os_name].support} "
@@ -827,8 +884,7 @@ def _scalar_cell(v) -> str:
     return str(v)
 
 
-_CONSTRAINT_ORDER = ("enum", "pattern", "minLength", "maxLength", "minimum", "maximum",
-                     "minItems", "maxItems", "format")
+_CONSTRAINT_ORDER = ("enum", "pattern", "minLength", "maxLength", "minimum", "maximum")  # docs/yaml-dsl-spec.md §3.1
 
 
 def constraints_text(spec: dict) -> str:

@@ -227,6 +227,7 @@ Rows are `kind|value`.
 
 - **Instruction result.** store
 - **Not consumed by** anything else.
+- **Sensitivity.** nothing beyond the device id.
 
 ## Sample output
 

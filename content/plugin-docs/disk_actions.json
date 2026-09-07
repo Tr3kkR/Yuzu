@@ -291,7 +291,7 @@
   },
   "privileges": [
     {
-      "grant": "None measured for `smart`: the device handle is opened with zero access rights, not `GENERIC_READ`, and both IOCTLs are `FILE_ANY_ACCESS`, so it keeps working after #1442 moves the agent off LocalSystem. `volumes` opens each volume handle the same way, but that path has not been measured under an unprivileged account (`disk_actions_win.cpp`, U1); a refusal there is reported as denied, never as \"the device did not answer\".",
+      "grant": "None measured for `smart`: the device handle is opened with zero access rights, not `GENERIC_READ`, and both IOCTLs are `FILE_ANY_ACCESS`, so it keeps working after #1442 moves the agent off LocalSystem. `volumes` opens each volume handle the same way, but that path has not been measured under an unprivileged account (the `U1` comment in `disk_actions_win.cpp` records it); a refusal there is reported as denied, never as \"the device did not answer\".",
       "if_refused": "result status `PERMISSION_DENIED` / partial, provenance `windows:physicaldrive:denied` (a device handle) or `windows:volume_enum:denied` (a volume handle or the volume enumeration)",
       "measured": "`smart`: 2026-09-03 on the-rig as `NT AUTHORITY\\LOCAL SERVICE`. `volumes`: elevated only (2026-09-06 on the-rig)",
       "os": "Windows",
@@ -299,7 +299,7 @@
     },
     {
       "grant": "None. IOKit property reads only; no user client is opened, so the leg needs nothing root has.",
-      "if_refused": "never `PERMISSION_DENIED`: the macOS legs report a refused or failed IOKit read as `CONSTRAINED` (partial, `macos:iokit` / `macos:iomedia` and their sub-tokens) or, when the service match itself fails, `UNAVAILABLE`",
+      "if_refused": "never `PERMISSION_DENIED`: the macOS legs report a refused or failed IOKit read — including a failed service match — as `CONSTRAINED` (partial, `macos:iokit` / `macos:iomedia` and their sub-tokens), and `UNAVAILABLE` only when the enumeration returned nothing at all",
       "measured": "2026-09-03 and 2026-09-06 at euid 501 (an unprivileged user, a stricter test than the daemon's)",
       "os": "macOS",
       "runs_as": "LaunchDaemon (root today; `docs/agent-privilege-model.md`)"
