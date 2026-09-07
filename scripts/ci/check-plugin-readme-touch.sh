@@ -111,9 +111,16 @@ check() {
 }
 
 # ── selftest ─────────────────────────────────────────────────────────────────
-# A fake `git` on PATH answers the two calls the rule makes from environment
-# fixtures: FAKE_CHANGED (newline-separated changed paths) and FAKE_EXISTS
-# (newline-separated objects that exist: commits, or "<rev>:<path>").
+# A fake `git` on PATH answers the two calls the rule makes from FILE-based
+# fixtures: FAKE_CHANGED_FILE (newline-separated changed paths) and
+# FAKE_EXISTS_FILE (newline-separated objects that exist: commits, or
+# "<rev>:<path>"). Files, not environment variables: a fixture the size of a
+# real large-PR change list, passed as an exported env var to a re-exec'd
+# subprocess, can exceed the kernel's execve() argv+envp limit (ARG_MAX) —
+# observed on a CI container where the effective limit is far below what a
+# developer workstation allows, even though the *script's own* internal
+# here-string handling (the fix this exact fixture exists to verify) has no
+# such limit. A file has none either way.
 
 selftest() {
   local tmp
@@ -124,8 +131,8 @@ selftest() {
   cat > "$tmp/bin/git" <<'FAKE'
 #!/usr/bin/env bash
 case "$1" in
-  cat-file) obj="${3%^\{commit\}}"; grep -qxF -- "$obj" <<<"${FAKE_EXISTS:-}" ;;
-  diff)     printf '%s\n' "${FAKE_CHANGED:-}" ;;
+  cat-file) obj="${3%^\{commit\}}"; grep -qxF -- "$obj" <"${FAKE_EXISTS_FILE:?}" ;;
+  diff)     cat "${FAKE_CHANGED_FILE:?}" ;;
   *)        exit 1 ;;
 esac
 FAKE
@@ -137,11 +144,15 @@ FAKE
   run() {
     local name="$1" want="$2" body="" rc=0
     n=$((n + 1))
+    local changed_file="$tmp/changed.$n" exists_file="$tmp/exists.$n"
+    printf '%s' "$3" > "$changed_file"
+    printf '%s' "$4" > "$exists_file"
     if [ $# -ge 5 ]; then
       body="$tmp/body.$n"
       printf '%s' "$5" > "$body"
     fi
-    FAKE_CHANGED="$3" FAKE_EXISTS="$4" "$0" base1 head1 "$body" > "$tmp/out.$n" 2>&1 || rc=$?
+    FAKE_CHANGED_FILE="$changed_file" FAKE_EXISTS_FILE="$exists_file" \
+      "$0" base1 head1 "$body" > "$tmp/out.$n" 2>&1 || rc=$?
     if [ "$rc" != "$want" ]; then
       echo "selftest FAIL: $name — expected rc $want, got $rc:" >&2
       sed 's/^/    /' "$tmp/out.$n" >&2
