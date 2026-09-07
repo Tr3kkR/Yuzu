@@ -5453,8 +5453,24 @@ void RestApiV1::register_routes(
             q.type_filter = req.get_param_value("type");
         if (req.has_param("set_id"))
             q.set_id_filter = req.get_param_value("set_id");
-        if (req.has_param("enabled_only"))
-            q.enabled_only = true;
+        // #4029 Gate 4/8 fix: presence alone used to mean "filter to
+        // enabled-only" regardless of value, so `?enabled_only=false` still
+        // filtered -- silently returning a narrower result set than asked
+        // for, with nothing in the response to signal the mismatch (I3).
+        // This route's own OpenAPI schema (below) advertises a real
+        // `type: boolean`, and the MCP twin (mcp_server.cpp list_definitions)
+        // already reads the value, not just presence -- so this now matches
+        // both its own documented contract and its sibling surface. Follows
+        // the same value/"true"|"1" convention already used by
+        // inventory_routes.cpp:230 and notification_routes.cpp:34, rather
+        // than introducing a new "invalid boolean" error branch. The
+        // legacy, unversioned (non-OpenAPI) `/api/instructions` route
+        // (server.cpp:16298) keeps its original presence-only behavior --
+        // deliberately out of scope; changing an already-shipped route's
+        // semantics would itself be the breaking change.
+        q.enabled_only = req.has_param("enabled_only") &&
+                          (req.get_param_value("enabled_only") == "true" ||
+                           req.get_param_value("enabled_only") == "1");
         if (req.has_param("limit")) {
             try {
                 q.limit = std::stoi(req.get_param_value("limit"));

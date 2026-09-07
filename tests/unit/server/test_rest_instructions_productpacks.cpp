@@ -223,6 +223,46 @@ TEST_CASE("GET /api/v1/instructions: name/set_id/enabled_only/limit filters",
         CHECK(row["instruction_set_id"] == "set-ip4029");
 }
 
+TEST_CASE("GET /api/v1/instructions: enabled_only=false does NOT filter (Gate 4/8 #4029 fix)",
+          "[rest][v1][instructions][4029][pg]") {
+    // Regression test for the presence-vs-value bug: `?enabled_only=false`
+    // used to still filter to enabled-only (req.has_param() alone gated the
+    // filter, ignoring the actual value) -- silently narrowing the result
+    // set with no signal to the caller. A disabled definition must be
+    // visible with `enabled_only=false` (and absent with `enabled_only=true`).
+    IpHarness h;
+    InstructionDefinition d;
+    d.name = "Disabled Def";
+    d.version = "1.0";
+    d.plugin = "system_info_4029ip_disabled";
+    d.action = "query";
+    d.type = "question";
+    d.description = "test";
+    d.enabled = false;
+    d.approval_mode = "auto";
+    d.yaml_source = "apiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\n";
+    auto created = h.instruction_store->create_definition(d);
+    REQUIRE(created.has_value());
+
+    {
+        auto res = h.sink.Get(
+            "/api/v1/instructions?plugin=system_info_4029ip_disabled&enabled_only=false");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE_FALSE(body["data"].empty());
+        CHECK(body["data"][0]["enabled"] == false);
+    }
+    {
+        auto res = h.sink.Get(
+            "/api/v1/instructions?plugin=system_info_4029ip_disabled&enabled_only=true");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        CHECK(body["data"].empty());
+    }
+}
+
 TEST_CASE("GET /api/v1/instructions: bad limit is 400, null store is 503, denied perm is 403",
           "[rest][v1][instructions][4029][pg]") {
     {
