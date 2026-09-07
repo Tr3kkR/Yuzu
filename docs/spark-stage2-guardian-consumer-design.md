@@ -8,7 +8,7 @@ tracks: #1939 (Stage-2 readiness checklist), #2011, #2014, #1938, #1929, #1933, 
 governance:
   - original design - 9-agent /governance pipeline, 2026-07-11 (report local, not committed to git); hardening round folded all findings into the sections below.
   - rung 9a addition (the §Rung-2 decision record + inner ladder) - 4-agent pipeline (security-guardian, docs-writer, architect, consistency-auditor), 2026-07-17; every embedded code-claim verified against origin/dev; security MEDIUMs on the F3 blast radius and intra-class lane exhaustion folded in.
-  - rung 9c addition (§Async-arm acknowledgment / R5) - the design itself went through six external review rounds (Astra/Codex ×4, Fable ×multiple, Kimi K3 ×2), 2026-09-07, against the plan document, not this doc directly; a seventh round (round 7, 2026-09-07) then adversarially reviewed this PR-0 write-up itself (Kimi + Codex, two HIGH findings against the transcription, folded in - see A3's Epistemic cell and the H-section citation fix); this PR-0 write-up has NOT itself been through `/governance` yet - that runs when this PR is opened, per the standard gate.
+  - rung 9c addition (§Async-arm acknowledgment / R5) - the design itself went through six external review rounds (Astra/Codex ×4, Fable ×multiple, Kimi K3 ×2), 2026-09-07, against the plan document, not this doc directly; a seventh round (round 7, 2026-09-07) then adversarially reviewed this PR-0 write-up itself (Kimi + Codex, two HIGH findings against the transcription, folded in - see A3's Epistemic cell and the H-section citation fix); a full `/governance` pass then ran on this PR-0 commit (2026-09-07: Gate 2 security-guardian+docs-writer, Gate 3 architect+cpp-safety, Gate 4 happy-path+unhappy-path+consistency-auditor, Gate 6 compliance-officer+sre+enterprise-readiness - 10 agents total; Gate 5 chaos-injector skipped, no executable-chaos-shaped findings). No BLOCKING findings anywhere; ~25 non-blocking findings folded in directly (citation fixes, an "episode"/"expired" terminology clarification, telemetry-tag gauge-semantics guidance, a restart-remediation caveat cross-referencing this doc's own F3 crash-loop finding, an acknowledged-≠-compliant callout, a changelog fragment). One finding is a genuine, still-open design ambiguity rather than a wording fix: whether a queued-waiter's congestion-only "expired" outcome should count toward decision 7's K-bound the same as a genuine wedge - the plan's own decision-7 headline and its D3 mechanism disagree, unnoticed across all six prior review rounds; recorded as an explicit open question (R5.2) for PR-1/PR-2's own design pass, not resolved here.
 history:
   - 2026-07-11 - initial design; 2 governance rounds; landed as PR #2051.
   - 2026-07-17 - rung 9a - §Rung-2 decision record (R1-R4) + the inner-ladder
@@ -262,10 +262,14 @@ persisted before the exit, then read, reported and cleared on the next boot.
 
 Sequenced after PR-2c (#3848) and before the `prefer_spark` flip (PR-5) — lands dormant
 behind `prefer_spark_=false`, same posture as every other pre-flip PR in this document.
-Settled 2026-09-07 after seven external review rounds (Astra/Codex ×4, Fable
-×multiple, Kimi K3 ×2, plus a round-7 adversarial review of this doc's own committed
-PR-0 text) against the plan document, transcribed into this doc as §R5, into the
-registry as row A3, and into the flip-gate as §3a.
+Settled 2026-09-07 after six external review rounds (Astra/Codex ×4, Fable ×multiple,
+Kimi K3 ×2) against the plan document, transcribed into this doc as §R5, into the
+registry as row A3, and into the flip-gate as §3a - plus a seventh round, an
+adversarial review of this doc's own committed PR-0 transcription (not the plan),
+which found and fixed real transcription defects (**corrected round, 2026-09-07**:
+an earlier version of this sentence collapsed the split, reading as if all seven
+rounds reviewed the plan document - contradicted its own round-7 parenthetical in the
+same sentence; see the front-matter `governance:` entry above for the precise split).
 
 ### R5 - Accepted is not acknowledged: `apply_rules` never waits for an OS watch
 
@@ -278,9 +282,19 @@ and the policy generation reported to the server on `yuzu.guardian_generation` o
 
 **Motivation.** The #3990 diagnostic measured Guardian's synchronous rearm window
 (window B: from "full_sync cleared N prior rule(s)" to "apply_rules ok") on a 62-rule
-cohort: legacy median 70-86 ms, spark 127-140 ms. The gap splits roughly evenly between
-teardown (spark 39 ms vs legacy 11-13 ms) and the rearm span itself (spark 85-92 ms vs
-legacy 59-71 ms). Root cause: `attach_rule()` already dispatches each rule's
+cohort: legacy median 70-86 ms, spark 127-140 ms — both figures are the diagnostic's
+own committed measurand (`b_ms` in `fullsync-blackout-results.jsonl`). A teardown-vs-
+rearm-span sub-split (**corrected governance round, 2026-09-07**: an earlier version
+of this sentence gave specific millisecond figures for that split — spark 39 ms
+teardown / legacy 11-13 ms, spark 85-92 ms rearm / legacy 59-71 ms — attributed to the
+#3990 diagnostic itself; verified directly against the diagnostic's own committed run
+doc and raw results file, neither of which records any teardown/rearm sub-split at
+all, only the single `B` window quoted above. The split figures traced to an
+uncommitted local review brief's own log-timestamp analysis during the #3990 run, not
+to the diagnostic's committed measurand — removed here rather than misattributed)
+is not restated as a measured fact; the root cause below explains where within B the
+gap plausibly sits, without claiming a specific measured split. Root cause:
+`attach_rule()` already dispatches each rule's
 `backend->arm()` onto a detached `GuardianIoExecutor` worker, but the caller blocks on
 `cv.wait_until` for the result while `apply_rules()` holds `mtx_`, and `detach_all()`
 blocks the same way per disarm. Legacy's guards return as soon as their own thread is
@@ -343,16 +357,60 @@ couldn't be armed. A disarm claim is retained until it actually executes or is
 terminally superseded — never silently dropped for capacity reasons — which is what
 makes "a key's disarm completes before its own rearm dispatches" true by construction
 rather than by a separately-maintained ordering rule. An arm attempt that never
-returns (a genuinely wedged OS call) is bounded by a deadline; past it, the key is
-marked quarantined and every waiter on it fails without a further backend attempt,
-until the original wedged worker's call eventually completes (if ever) and clears the
-marker. What stays deferred: same-type mechanism serialization (`mech_ops_mu_by_type_`,
+returns (a genuinely **wedged** OS call — the backend call itself is stuck) is bounded
+by a deadline; past it, the key is marked **quarantined** and every waiter on it fails
+without a further backend attempt, until the original wedged worker's call eventually
+completes (if ever) and clears the marker. A queued waiter can separately fail its own
+wait without ever being dispatched at all — R5.3 below also calls this **expired**,
+the same word used loosely elsewhere in this design for "past its deadline"; whether a
+waiter's own expiry is meant to be K-qualifying on the same terms as a genuinely
+wedged (quarantined) key, or is meant to hold the acknowledgment indefinitely as an
+admission-congestion signal distinct from an actual dead target, is exactly the open
+question below — this document does not disambiguate the two senses of "expired." This
+per-key quarantine marker is distinct from — and not wired to — the existing
+per-mechanism `mech_quarantined_total` counter (a fleet-alerting signal expected to
+stay at 0); this design's quarantine is the ordinary, K-bounded, non-alerting outcome
+of a single wedged key, not a mechanism-wide fault.
+
+**Open questions for PR-1/PR-2's own design pass (flagged here, round 7's adversarial
+review, not resolved by this document):** (a) **whether a queued waiter's own expiry
+(never dispatched at all, distinct from a dispatched-and-wedged backend call) is
+K-qualifying on the same terms as a genuine wedge, or holds the acknowledgment
+indefinitely as an admission-congestion signal instead** — R5.3's "wedged or expired
+key is K-bounded" phrasing and its underlying source material use "expired" both ways
+in different places, and the choice has a real consequence: if congestion-only
+expiries count toward K, a sustained #2012/#3840-style same-type stall can K-waive
+otherwise-healthy keys purely from admission pressure, never having attempted their
+backend call; if they don't, they instead hold the acknowledgment (and drive repeated
+25s full re-applies) indefinitely under the same congestion, which is also worth
+naming as a load consequence rather than a silent side effect. Similarly, whether
+`CapacityExhausted` at admission time (a push never even reaching the per-key queue)
+is classified the same way is the identical question one layer earlier and should be
+decided together, not separately; (b) whether a late-arriving result for an
+already-K-waived, already-acknowledged rule adjusts the `yuzu.guardian_arm_failed`
+health tag (does a late success clear it?), and whether that rule is left enforcing or
+is disarmed, outside the specific case R5.5 (shutdown) already covers.
+
+**What stays deferred:** same-type mechanism serialization (`mech_ops_mu_by_type_`,
 #2012/#3840) is unchanged by this design — a single stalled `watch()` can still delay
 sibling arms of the same type, and that remains a distinct, already-tracked liveness
-question, not one this design resolves.
+question, not one this design resolves. **Consequence this design adds, stated
+explicitly rather than left implicit**: once R5.3's K-bound exists, a same-type stall
+can cause otherwise-healthy sibling keys to accumulate quarantine-qualifying timeouts
+from admission congestion alone, not from an actually-dead backend target — and the
+resulting `yuzu.guardian_arm_failed` signal does not distinguish the two causes. An
+operator paged on this tag cannot tell, from the tag alone, whether a key is genuinely
+dead or merely queued behind a slow sibling of the same mechanism type.
 
-**R5.3 - Ack model: accepted vs. acknowledged.** "Accepted" means
-`reconcile_rule_locked()` returned `Accepted` specifically — the async-arm outcome, as
+**R5.3 - Ack model: accepted vs. acknowledged.** **Acknowledged ≠ compliant/enforced,
+stated explicitly (Gate 6 compliance-officer) — mirroring this codebase's own
+"flag ≠ revoke" precedent for a similarly-named-but-distinct signal** (Periodic Access
+Reviews, `docs/security-reviews/access-reviews-2026-07-21.md`): a K-waived
+acknowledgment (below) means the server stops re-pushing this generation, NOT that
+every rule in it is actually enforced — a quarantined rule inside an acknowledged
+generation is not armed, and `yuzu.guardian_arm_failed>0` (not the acknowledged
+generation number itself) is the only durable signal that distinction is visible on.
+"Accepted" means `reconcile_rule_locked()` returned `Accepted` specifically — the async-arm outcome, as
 opposed to `Armed` (an inline type or already-committed shared watcher, resolved
 synchronously with no ack tracking needed), `Failed`, or `Inert` (a legacy-guard rule,
 unrelated to spark). An `Inert` outcome never enters the pending-arm set at all, exactly
@@ -361,22 +419,55 @@ rules are entirely `Inert` (all legacy) satisfies the predicate immediately, wit
 nothing to wait on. `apply_rules()` tracks, per accepted
 rule, whether its arm has resolved. The policy generation advances (and is persisted)
 only once every rule accepted under it has either armed or been quarantined per the
-K-bound below — never on acceptance alone. A same-generation re-push (the server's 25 s
-`full_sync=true` heartbeat retry) is a no-op while every episode for that generation is
-still genuinely pending and within its deadline, and only triggers a full re-apply once
-something has actually failed, expired, or the push's content has changed underneath
-it. **A wedged or expired key is K-bounded, not held forever**: after three identical
+K-bound below — never on acceptance alone. An **episode**, here, is one accepted
+rule's not-yet-resolved arm attempt under a given generation — a rule that has already
+armed has no episode left to be pending, so it does not count against the condition
+below. A same-generation re-push (the server's 25 s `full_sync=true` heartbeat retry)
+is a no-op while every *outstanding* episode for that generation is still genuinely
+pending and within its deadline — including the ordinary case where SOME rules in the
+push have already armed and the rest are still resolving, the common shape of a
+retry landing mid-drain (R5.3's own bounded drain, below, routinely spans several
+ticks) — and only triggers a full re-apply once something has actually failed,
+expired, or the push's content has changed underneath it.
+**A wedged or expired key is K-bounded, not held forever**: after three identical
 same-generation re-applies whose only unresolved rules are already-quarantined or
 already-expired, the generation acknowledges anyway, leaving
 `yuzu.guardian_arm_failed>0` as the durable fleet signal — a wedged key stays
-quarantined until its own worker returns or the agent restarts; a later policy change
-re-evaluates the rule but cannot by itself re-attempt the arm. A genuine refusal
+quarantined until its own worker returns or the agent restarts (**restart is a
+remediation only for a *transient* wedge — for a *permanently* wedged target, restart
+re-arms the same rule against the same dead target and re-wedges, matching this
+document's own F3 × `Restart=always` crash-loop finding above, "a security finding,
+not only an ops one"; an operator paged on this tag should not treat restart as a
+default first action without first checking whether the target is transient or
+permanently dead**); a later policy change re-evaluates the rule but cannot by itself
+re-attempt the arm. A genuine refusal
 (backend refused, worker threw, arm queue full) is a different case and holds the
 acknowledgment indefinitely — K only bounds the wedged/expired case, never a live
 refusal. The drain that resolves pending arms against incoming results is bounded
 per tick, matching the existing lifecycle-journal's 4-batch/1024-record shape, so a
 large outstanding batch drains over several heartbeat ticks rather than risking a
 heartbeat-thread stall.
+
+**Telemetry-tag semantics, flagged not specified (SHOULD, Gate 6 sre):**
+`yuzu.guardian_arm_pending`/`yuzu.guardian_arm_failed` (introduced here, wired in
+PR-3) need their gauge-vs-counter semantics stated before PR-3 implements them, not
+left to be inferred by analogy. R5.2's open question (b) above already implies
+`arm_failed` must be a **re-statable gauge** (able to return to 0 on a late success),
+but this row's own table placement sits next to the C1/D1-style rows in
+`docs/spark-legacy-delta-registry.md`, whose tags are the OPPOSITE
+pattern — monotonic per-sweep counters summed into a fleet gauge, `docs/
+observability-conventions.md`'s own stated "monitor-only: neither `>0` nor
+`increase()` is sound" shape. Copying that adjacent pattern by analogy would silently
+break the K-bound safety argument this whole mechanism rests on (a cleared quarantine
+would never be reflected). PR-3 must specify these as gauges matching the age-tag
+pattern (`observability-conventions.md`'s `emit_guardian_journal_age_tags`), not the
+counter-rollup pattern, and should carry the same five fields this doc's own
+risk-accept register uses elsewhere (`docs/spark-flip-gate.md`'s detection-signal /
+operator-action / owner / milestone / revisit-condition shape) rather than a bare tag
+name. The physical-orphan ceiling (R5.1) similarly has no named observability today —
+a repeated ceiling hit (implying wedging across multiple mechanism types at once,
+structurally worse than ordinary per-class quota pressure) should be independently
+alert-worthy, not folded silently into the same signal as ordinary contention.
 
 **R5.4 - Audit and durability.** The "armed" audit record is still staged only on a
 real, confirmed backend commit — never on acceptance alone, matching today's contract
