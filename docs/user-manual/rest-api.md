@@ -3748,7 +3748,7 @@ See [Audit log](audit-log.md) for the `detail` contract, which differs for secre
 
 ### Custom Properties
 
-Custom properties are operator-defined key-value pairs on agents, separate from tags. Properties can have schemas that enforce type, allowed values, and validation rules. Properties are available for use in scope expressions via the `props.<key>` prefix.
+Custom properties are operator-defined key-value pairs on agents, separate from tags. Properties can have schemas that enforce a value type (`string`/`int`/`bool`/`datetime`) and an optional regex-pattern validation rule. Properties are available for use in scope expressions via the `props.<key>` prefix.
 
 #### `GET /api/agents/:id/properties`
 
@@ -3770,21 +3770,26 @@ properties."
 {"error":{"code":503,"message":"custom properties store degraded"},"meta":{"api_version":"v1"}}
 ```
 
-**Response:**
+**Response:** a flat, unwrapped body — this legacy route family predates the `data`/`meta` v1
+envelope and has not been migrated onto it.
 
 ```json
 {
-  "data": [
+  "agent_id": "agent-042",
+  "properties": [
     {
       "key": "department",
-      "value": "Engineering"
+      "value": "Engineering",
+      "type": "string",
+      "updated_at": "2026-08-01T12:00:00Z"
     },
     {
       "key": "cost_center",
-      "value": "CC-4200"
+      "value": "CC-4200",
+      "type": "string",
+      "updated_at": "2026-07-15T09:30:00Z"
     }
-  ],
-  "meta": { "api_version": "v1" }
+  ]
 }
 ```
 
@@ -3801,30 +3806,35 @@ is unchanged). A degraded
 confinement check (management-group store unavailable) denies with `403`, distinct from the `503`
 below for a degraded properties-store write.
 
-**Request body:**
+**Request body:** `type` is optional (default `"string"`) and IS persisted, but a schema on this
+key (below) takes precedence — if one exists, its own `type` overrides whatever the request sent
+before the write, so the stored (and later `GET`-returned) `type` reflects the caller's value only
+when no schema is registered for the key.
 
 ```json
 {
-  "value": "Engineering"
+  "value": "Engineering",
+  "type": "string"
 }
 ```
 
-**Response:**
+**Response:** flat, unwrapped (same family caveat as `GET` above).
 
 ```json
 {
-  "data": { "set": true },
-  "meta": { "api_version": "v1" }
+  "agent_id": "agent-042",
+  "key": "department",
+  "value": "Engineering",
+  "type": "string"
 }
 ```
 
-**Error (400) -- schema validation failure:**
+**Error (400) -- schema validation failure:** the message depends on which schema constraint
+failed -- a type mismatch (`int`/`bool`) or a `validation_regex` mismatch (`GET
+/api/property-schemas` below):
 
 ```json
-{
-  "error": "value 'bogus' not allowed for property 'department'; allowed: Engineering, Sales, Operations, Support",
-  "meta": { "api_version": "v1" }
-}
+{"error": "value does not match validation pattern for 'department'"}
 ```
 
 **Error (503) -- store outage:**
@@ -3858,12 +3868,12 @@ confinement check (management-group store unavailable) denies with `403` -- dist
 degrade conflation noted below, which is a property-store issue on the delete path itself, not the
 authorization check.
 
-**Response:**
+**Response:** flat, unwrapped (same family caveat as `GET`/`PUT` above).
 
 ```json
 {
-  "data": { "deleted": true },
-  "meta": { "api_version": "v1" }
+  "deleted": true,
+  "key": "department"
 }
 ```
 
@@ -3883,37 +3893,39 @@ List all property schemas. Schemas define the allowed keys, types, and validatio
 **Permission:** `Infrastructure:Read`
 
 **Note on database degrade:** a transient database failure during this list currently surfaces as
-a `200` with an empty `data` array — indistinguishable from "no schemas configured." Not yet
+a `200` with an empty `schemas` array — indistinguishable from "no schemas configured." Not yet
 type-widened, predates the Postgres migration. Unlike `PUT`/`POST` above (fixed to a
 distinguishable `503`), this route's underlying `list_schemas` was deliberately left unwidened —
 it's an admin-surface read, not scope/dispatch-feeding, matching `custom_properties_store.hpp`'s
 documented posture — so this stays a tracked gap rather than a fixed one.
 
-**Response:**
+**Response:** flat, unwrapped (same family caveat as the agent-properties routes above).
 
 ```json
 {
-  "data": [
+  "schemas": [
     {
       "key": "department",
       "display_name": "Department",
       "type": "string",
-      "allowed_values": ["Engineering", "Sales", "Operations", "Support"],
-      "required": false
+      "description": "The employee's department",
+      "validation_regex": ""
     },
     {
       "key": "cost_center",
       "display_name": "Cost Center",
       "type": "string",
-      "allowed_values": [],
-      "required": true
+      "description": "",
+      "validation_regex": "^CC-[0-9]{4}$"
     }
-  ],
-  "meta": { "api_version": "v1" }
+  ]
 }
 ```
 
-Schemas with an empty `allowed_values` array accept free-form values.
+`type` is one of `string`, `int`, `bool`, `datetime` -- `int`/`bool` values are type-checked on
+write; `string`/`datetime` accept any text. A non-empty `validation_regex` (RE2 syntax, max 256
+characters) is additionally applied via `RE2::FullMatch` regardless of `type`. An empty
+`validation_regex` accepts any value of the declared type.
 
 ---
 
@@ -3927,11 +3939,11 @@ Create or update a property schema. If a schema with the given key already exist
 
 ```json
 {
-  "key": "department",
-  "display_name": "Department",
+  "key": "cost_center",
+  "display_name": "Cost Center",
   "type": "string",
-  "allowed_values": ["Engineering", "Sales", "Operations", "Support"],
-  "required": false
+  "description": "The agent's billing cost center",
+  "validation_regex": "^CC-[0-9]{4}$"
 }
 ```
 
@@ -3939,16 +3951,21 @@ Create or update a property schema. If a schema with the given key already exist
 |---|---|---|---|
 | `key` | string | Yes | Property key (unique identifier) |
 | `display_name` | string | No | Human-readable label |
-| `type` | string | No | Value type: `string` (default), `integer`, `boolean` |
-| `allowed_values` | array | No | Restrict values to this set (empty = free-form) |
-| `required` | boolean | No | Whether every agent must have this property |
+| `type` | string | No | Value type: `string` (default), `int`, `bool`, `datetime` |
+| `description` | string | No | Free-text description |
+| `validation_regex` | string | No | RE2 pattern (max 256 chars) values must fully match; empty = no pattern constraint |
 
-**Response (201):**
+**Response (201):** flat, unwrapped (same family caveat as the routes above) -- echoes the
+stored schema back, including any server-applied default (`type` defaults to `"string"` if
+omitted).
 
 ```json
 {
-  "data": { "created": true, "key": "department" },
-  "meta": { "api_version": "v1" }
+  "key": "cost_center",
+  "display_name": "Cost Center",
+  "type": "string",
+  "description": "The agent's billing cost center",
+  "validation_regex": "^CC-[0-9]{4}$"
 }
 ```
 
@@ -7708,7 +7725,8 @@ once the underlying condition clears.
 
 #### `POST /api/nvd/sync`
 
-Trigger a manual NVD database sync. Admin only. Runs asynchronously and returns immediately.
+Trigger a manual NVD database sync. Requires `Infrastructure:Execute` (held by Administrator
+and ITServiceOwner, not Administrator alone). Runs asynchronously and returns immediately.
 
 #### `POST /api/nvd/match`
 

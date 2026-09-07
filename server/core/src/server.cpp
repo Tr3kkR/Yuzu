@@ -123,6 +123,9 @@
 #include "json_extract.hpp" // #2557: shared JSON body-extraction helpers (was 7 ServerImpl statics)
 #include "command_routes.hpp" // #2557: POST /api/command, extracted onto the HttpRouteSink seam
 #include "page_routes.hpp" // #2542: page-shell/static-asset routes, extracted onto the HttpRouteSink seam
+#include "dashboard_api_routes.hpp" // #2542 follow-up: /api/me, /api/agents, /api/audit, /api/export/json-to-csv, /api/scope/validate, /api/analytics/{status,recent}
+#include "nvd_routes.hpp" // #2542 follow-up: /api/nvd/{status,sync,match}, extracted onto the HttpRouteSink seam
+#include "custom_properties_routes.hpp" // #2542 PR-4: the 5-route Custom Properties API (7.6), extracted onto the HttpRouteSink seam
 #include "command_capability.hpp" // PR1.9c: CommandCapabilityRegistry — the dispatch classification vocabulary
 #include "command_capability_parsers.hpp" // PR1.9c: encode_dispatch_tag / compute_plan_hash
 // PR1.9c: the seven capability spans build_classified_command's registry composes over —
@@ -165,6 +168,7 @@
 #include "session_store.hpp"       // HA WS-1/1a — durable operator sessions (ADR-2002 §4)
 #include "preflight_runner.hpp"
 #include "tar_tree_routes.hpp"
+#include "background_jobs.hpp" // WS-10: pass-classification table + YUZU_ASSERT_BACKGROUND_JOB gate
 #include "policy_evaluator.hpp"
 #include "schedule_arming_check.hpp"
 #include "schedule_routes.hpp"
@@ -329,19 +333,6 @@ std::string trim_ascii_whitespace(std::string_view s) {
 }
 
 namespace {
-// CustomPropertiesStore error classifier — same shape as discovery_routes.cpp's
-// is_deployment_db_error (internal linkage there via an anonymous namespace,
-// matched here rather than left as a bare external-linkage free function),
-// keyed off the SHARED constant (custom_properties_store.hpp) rather than a
-// local copy of the literal, so a future rename of the prefix can't silently
-// regress a classified 503 back to 400 (gov Gate 8 finding, fjarvis
-// re-review of PR #3065; the anonymous-namespace correction is a second Gate
-// 8 finding on THIS fix — cpp-expert/architect/consistency-auditor
-// independently, same round).
-bool is_custom_properties_db_error(const std::string& err) {
-    return err.starts_with(kCustomPropertiesDbErrorPrefix);
-}
-
 // Best-effort row count for a legacy-file detect-and-warn check (currently
 // PolicyStore's boot path; postgres-store-playbook.md's Backfill bullet
 // mandates a count, not just file-existence, so a schema-only legacy file
@@ -7666,6 +7657,7 @@ public:
                         const bool stale =
                             !latest || (latest->next_update - now_epoch) < 24 * 3600;
                         if (stale) {
+                            YUZU_ASSERT_BACKGROUND_JOB("ca.publish_crl"); // WS-10 FencedLeaderOnly (crlNumber)
                             if (publish_crl())
                                 spdlog::info(
                                     "PKI: CRL re-published for freshness (nextUpdate window)");
@@ -7908,6 +7900,7 @@ public:
                 // boundary). Do not collapse these into a single flat catch.
                 if (mcp_stream_bridge_) {
                     try {
+                        YUZU_ASSERT_BACKGROUND_JOB("mcp_stream_bridge.sweep"); // WS-10 ReplicaSafe
                         mcp_stream_bridge_->sweep();
                     } catch (...) {
                         try {
@@ -7921,6 +7914,7 @@ public:
                     }
                     if (mcp_sessions_) {
                         try {
+                            YUZU_ASSERT_BACKGROUND_JOB("mcp_session_registry.gc"); // WS-10 ReplicaSafe
                             mcp_sessions_->gc();
                         } catch (...) {
                             try {
@@ -13121,6 +13115,13 @@ private:
                               const std::string& type, const std::string& op) -> bool {
             return require_permission(req, res, type, op);
         };
+        // dashboard_api_routes' /api/agents seam onto get_visible_agents_json.
+        // The method itself (server.cpp:11293) has a second live caller (DEX
+        // device-list, ~line 19349) and stays exactly where it is — this
+        // closure is the only thing that moved.
+        auto visible_agents_json_fn = [this](const std::string& username) {
+            return get_visible_agents_json(username);
+        };
 
         // #2542: page-shell/static-asset routes (25), extracted onto inline_sink
         // (this call's own HttpRouteSink seam) rather than any per-owner sink —
@@ -13132,6 +13133,29 @@ private:
             .viz_disabled = &viz_disabled_,
             .registry = &registry_,
         });
+
+        // #2542 follow-up: 7 dashboard/API routes with no single owning store
+        // (/api/me, /api/agents, /api/audit, /api/export/json-to-csv,
+        // /api/scope/validate, /api/analytics/{status,recent}), extracted
+        // onto the same inline_sink seam.
+        yuzu::server::dashboard_api::register_dashboard_api_routes(
+            inline_sink, yuzu::server::dashboard_api::Deps{
+                             .auth_fn = auth_fn,
+                             .perm_fn = perm_fn,
+                             .visible_agents_json_fn = visible_agents_json_fn,
+                             .rbac_store = rbac_store_.get(),
+                             .audit_store = audit_store_.get(),
+                             .analytics_store = analytics_store_.get(),
+                         });
+
+        // #2542 follow-up: the 3 NVD CVE-feed routes (/api/nvd/status,
+        // /api/nvd/sync, /api/nvd/match), extracted onto the same inline_sink
+        // seam.
+        yuzu::server::nvd::register_nvd_routes(inline_sink, yuzu::server::nvd::Deps{
+                                                                 .perm_fn = perm_fn,
+                                                                 .nvd_db = nvd_db_.get(),
+                                                                 .nvd_sync = nvd_sync_.get(),
+                                                             });
 
         // Per-device tier + management-group scope gate (wraps
         // require_scoped_permission). Used by DeviceRoutes' per-device routes so an
@@ -13223,6 +13247,21 @@ private:
                                const std::string& target_id, const std::string& detail) -> bool {
             return audit_log(req, action, result, target_type, target_id, detail);
         };
+
+        // #2542 PR-4: the 5-route Custom Properties API (7.6)
+        // (/api/agents/:id/properties[/:key], /api/property-schemas),
+        // extracted onto the same inline_sink seam. Placed here rather than
+        // alongside page_routes's call above (like dashboard_api/nvd's
+        // eventual siblings) because this module needs scoped_perm_fn +
+        // audit_fn, neither of which is in scope yet at that earlier point —
+        // both are defined by this line.
+        yuzu::server::custom_properties::register_custom_properties_routes(
+            inline_sink, yuzu::server::custom_properties::Deps{
+                             .perm_fn = perm_fn,
+                             .scoped_perm_fn = scoped_perm_fn,
+                             .audit_fn = audit_fn,
+                             .store = custom_properties_store_.get(),
+                         });
 
         // Shared command-dispatch closure — sends a CommandRequest to agents via
         // gRPC. Hoisted here (was inline in the WorkflowRoutes block) so every
@@ -14224,298 +14263,6 @@ private:
                 "application/json");
         });
 
-        // -- Custom Properties API (7.6) ----------------------------------------
-
-        // GET /api/agents/:id/properties
-        web_server_->Get(R"(/api/agents/([^/]+)/properties)", [this](const httplib::Request& req,
-                                                                     httplib::Response& res) {
-            auto agent_id = req.matches[1].str();
-            // #3700: per-TARGET authorization -- NOT a global Infrastructure:Read
-            // gate. The old require_permission("Infrastructure","Read") admitted
-            // a global-permission holder with no target check, disclosing
-            // custom-properties data for agents outside a management-group-
-            // confined caller's scope (World A gap, ADR-0017). Same pattern as
-            // the Tag routes' require_scoped_permission (see /api/tags/set).
-            if (!require_scoped_permission(req, res, "Infrastructure", "Read", agent_id))
-                return;
-            if (!custom_properties_store_ || !custom_properties_store_->is_open()) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"custom properties store unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            auto props = custom_properties_store_->get_properties(agent_id);
-            if (!props) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"custom properties store degraded"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            nlohmann::json arr = nlohmann::json::array();
-            for (const auto& p : *props) {
-                arr.push_back({{"key", p.key},
-                               {"value", p.value},
-                               {"type", p.type},
-                               {"updated_at", p.updated_at}});
-            }
-            res.set_content(nlohmann::json({{"agent_id", agent_id}, {"properties", arr}}).dump(),
-                            "application/json");
-        });
-
-        // PUT /api/agents/:id/properties/:key
-        web_server_->Put(R"(/api/agents/([^/]+)/properties/([a-zA-Z0-9_.:-]+))", [this](
-                                                                                     const httplib::
-                                                                                         Request&
-                                                                                             req,
-                                                                                     httplib::
-                                                                                         Response&
-                                                                                             res) {
-            auto agent_id = req.matches[1].str();
-            // #3700: per-TARGET authorization -- NOT a global Infrastructure:Write
-            // gate. The old require_permission("Infrastructure","Write") admitted
-            // any global-permission holder with no target check, letting a
-            // caller mutate custom-properties data for any agent regardless of
-            // their otherwise-confined visibility elsewhere (World A gap,
-            // ADR-0017). Same pattern as the Tag routes' require_scoped_permission
-            // (see /api/tags/set).
-            if (!require_scoped_permission(req, res, "Infrastructure", "Write", agent_id))
-                return;
-            if (!custom_properties_store_ || !custom_properties_store_->is_open()) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"custom properties store unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            auto key = req.matches[2].str();
-
-            std::string value;
-            std::string type = "string";
-            try {
-                auto j = nlohmann::json::parse(req.body);
-                if (j.contains("value"))
-                    value =
-                        j["value"].is_string() ? j["value"].get<std::string>() : j["value"].dump();
-                else {
-                    res.status = 400;
-                    res.set_content(
-                        R"({"error":{"code":400,"message":"missing 'value' in request body"},"meta":{"api_version":"v1"}})",
-                        "application/json");
-                    return;
-                }
-                if (j.contains("type") && j["type"].is_string())
-                    type = j["type"].get<std::string>();
-            } catch (...) {
-                res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"invalid JSON body"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            auto result = custom_properties_store_->set_property(agent_id, key, value, type);
-            if (!result) {
-                (void)audit_log(req, "custom_property.set", "failure", "Agent", agent_id,
-                                key + ": " + result.error());
-                if (is_custom_properties_db_error(result.error())) {
-                    spdlog::error("PUT /api/agents/{}/properties/{}: {}", agent_id, key,
-                                  result.error());
-                    res.status = 503;
-                    res.set_content(
-                        R"({"error":{"code":503,"message":"custom properties store unavailable"},"meta":{"api_version":"v1"}})",
-                        "application/json");
-                    return;
-                }
-                res.status = 400;
-                res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
-                                "application/json");
-                return;
-            }
-
-            (void)audit_log(req, "custom_property.set", "success", "Agent", agent_id,
-                            key + "=" + value);
-
-            res.set_content(
-                nlohmann::json(
-                    {{"agent_id", agent_id}, {"key", key}, {"value", value}, {"type", type}})
-                    .dump(),
-                "application/json");
-        });
-
-        // DELETE /api/agents/:id/properties/:key
-        web_server_->Delete(R"(/api/agents/([^/]+)/properties/([a-zA-Z0-9_.:-]+))", [this](
-                                                                                        const httplib::
-                                                                                            Request&
-                                                                                                req,
-                                                                                        httplib::
-                                                                                            Response&
-                                                                                                res) {
-            auto agent_id = req.matches[1].str();
-            // #3700: per-TARGET authorization -- NOT a global Infrastructure:Write
-            // gate. The old require_permission("Infrastructure","Write") admitted
-            // any global-permission holder with no target check, letting a
-            // caller delete custom-properties data for any agent regardless of
-            // their otherwise-confined visibility elsewhere (World A gap,
-            // ADR-0017). Same pattern as the Tag routes' require_scoped_permission
-            // (see /api/tags/delete).
-            if (!require_scoped_permission(req, res, "Infrastructure", "Write", agent_id))
-                return;
-            if (!custom_properties_store_ || !custom_properties_store_->is_open()) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"custom properties store unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            auto key = req.matches[2].str();
-
-            bool deleted = custom_properties_store_->delete_property(agent_id, key);
-            if (!deleted) {
-                (void)audit_log(req, "custom_property.delete", "not_found", "Agent", agent_id,
-                                "key=" + key);
-                res.status = 404;
-                res.set_content(
-                    R"({"error":{"code":404,"message":"property not found"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            (void)audit_log(req, "custom_property.delete", "success", "Agent", agent_id,
-                            "key=" + key);
-
-            res.set_content(nlohmann::json({{"deleted", true}, {"key", key}}).dump(),
-                            "application/json");
-        });
-
-        // GET /api/property-schemas
-        web_server_->Get("/api/property-schemas", [this](const httplib::Request& req,
-                                                         httplib::Response& res) {
-            if (!require_permission(req, res, "Infrastructure", "Read"))
-                return;
-            if (!custom_properties_store_ || !custom_properties_store_->is_open()) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"custom properties store unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            auto schemas = custom_properties_store_->list_schemas();
-            nlohmann::json arr = nlohmann::json::array();
-            for (const auto& s : schemas) {
-                arr.push_back({{"key", s.key},
-                               {"display_name", s.display_name},
-                               {"type", s.type},
-                               {"description", s.description},
-                               {"validation_regex", s.validation_regex}});
-            }
-            res.set_content(nlohmann::json({{"schemas", arr}}).dump(), "application/json");
-        });
-
-        // POST /api/property-schemas
-        web_server_->Post("/api/property-schemas", [this](const httplib::Request& req,
-                                                          httplib::Response& res) {
-            if (!require_permission(req, res, "Infrastructure", "Write"))
-                return;
-            if (!custom_properties_store_ || !custom_properties_store_->is_open()) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"custom properties store unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            CustomPropertySchema schema;
-            try {
-                auto j = nlohmann::json::parse(req.body);
-                schema.key = j.value("key", "");
-                schema.display_name = j.value("display_name", "");
-                schema.type = j.value("type", "string");
-                schema.description = j.value("description", "");
-                schema.validation_regex = j.value("validation_regex", "");
-            } catch (...) {
-                res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"invalid JSON body"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            if (schema.key.empty()) {
-                res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"'key' is required"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            auto result = custom_properties_store_->upsert_schema(schema);
-            if (!result) {
-                if (is_custom_properties_db_error(result.error())) {
-                    spdlog::error("POST /api/property-schemas: {}", result.error());
-                    res.status = 503;
-                    res.set_content(
-                        R"({"error":{"code":503,"message":"custom properties store unavailable"},"meta":{"api_version":"v1"}})",
-                        "application/json");
-                    return;
-                }
-                res.status = 400;
-                res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
-                                "application/json");
-                return;
-            }
-
-            (void)audit_log(req, "property_schema.create", "success", "PropertySchema", schema.key);
-
-            res.status = 201;
-            res.set_content(nlohmann::json({{"key", schema.key},
-                                            {"display_name", schema.display_name},
-                                            {"type", schema.type},
-                                            {"description", schema.description},
-                                            {"validation_regex", schema.validation_regex}})
-                                .dump(),
-                            "application/json");
-        });
-
-        // -- Current user info (/api/me) --------------------------------------
-        web_server_->Get("/api/me", [this](const httplib::Request& req, httplib::Response& res) {
-            auto session = require_auth(req, res);
-            if (!session)
-                return;
-            // #1837: `username` is the STABLE authorization principal (an
-            // opaque `oidc:<iss>#<sub>` id for SSO sessions) — never render
-            // it alone as the nav-bar identity. `display_name` is the
-            // human-readable label consumed by every page's nav/context
-            // bar JS below; falls back to `username` for a legacy session
-            // created before this field existed.
-            auto j = nlohmann::json(
-                {{"username", session->username},
-                {"display_name",
-                 session->display_name.empty() ? session->username : session->display_name},
-                {"role", auth::role_to_string(session->role)}});
-            // Add RBAC role if enabled
-            if (rbac_store_ && rbac_store_->is_rbac_enabled()) {
-                j["rbac_enabled"] = true;
-                auto roles = rbac_store_->get_principal_roles("user", session->username);
-                if (!roles.empty()) {
-                    j["rbac_role"] = roles[0].role_name;
-                } else {
-                    // Fallback: map legacy role to RBAC role name
-                    j["rbac_role"] =
-                        session->role == auth::Role::admin ? "Administrator" : "Viewer";
-                }
-            } else {
-                j["rbac_enabled"] = false;
-                j["rbac_role"] = session->role == auth::Role::admin ? "Administrator" : "Viewer";
-            }
-            res.set_content(j.dump(), "application/json");
-        });
-
         // Issue #253 fragment route lives in dashboard_routes.cpp now (#589).
 
         // PR2 — MFA step-up gate. Single shared closure (governance Gate 2
@@ -14694,113 +14441,7 @@ private:
                     }));
         });
 
-        // -- Agent listing API ------------------------------------------------
-
-        web_server_->Get("/api/agents", [this](const httplib::Request& req,
-                                               httplib::Response& res) {
-            if (!require_permission(req, res, "Infrastructure", "Read"))
-                return;
-            auto session = require_auth(req, res);
-            if (!session)
-                return;
-            res.set_content(get_visible_agents_json(session->username).dump(), "application/json");
-        });
-
         // /fragments/scope-list — moved to DashboardRoutes (with groups support)
-
-        // -- NVD CVE feed endpoints -------------------------------------------
-
-        web_server_->Get("/api/nvd/status",
-                         [this](const httplib::Request& req, httplib::Response& res) {
-                             if (!require_permission(req, res, "Infrastructure", "Read"))
-                                 return;
-                             if (!nvd_db_ || !nvd_db_->is_open()) {
-                                 res.set_content(R"({"enabled":false})", "application/json");
-                                 return;
-                             }
-                             nlohmann::json j;
-                             // "enabled" reflects whether the sync manager exists, not
-                             // merely whether the DB file is open: under --no-nvd-sync the
-                             // catalog DB is still open (for matching) but sync is off, so
-                             // reporting enabled=true then 503-ing POST /api/nvd/sync was
-                             // contradictory (#1889 review r2).
-                             j["enabled"] = (nvd_sync_ != nullptr);
-                             j["total_cves"] = nvd_db_->total_cve_count();
-                             if (nvd_sync_) {
-                                 auto st = nvd_sync_->status();
-                                 j["syncing"] = st.syncing;
-                                 j["last_sync_time"] = st.last_sync_time;
-                                 j["last_error"] = st.last_error;
-                                 j["backfill_complete"] = st.backfill_complete;
-                                 j["backfill_oldest_published"] = st.backfill_oldest_published;
-                             }
-                             res.set_content(j.dump(), "application/json");
-                         });
-
-        web_server_->Post("/api/nvd/sync", [this](const httplib::Request& req,
-                                                  httplib::Response& res) {
-            if (!require_permission(req, res, "Infrastructure", "Execute"))
-                return;
-            if (!nvd_sync_) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"NVD sync not enabled"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            // Ask the background loop to sync at its next wake and return at once.
-            // (A detached thread here could outlive the manager and use-after-free
-            // db_/fetcher_ during the hours-long backfill — governance BLOCKING.)
-            nvd_sync_->request_sync();
-            res.set_content(R"({"status":"sync_started"})", "application/json");
-        });
-
-        web_server_->Post("/api/nvd/match", [this](const httplib::Request& req,
-                                                   httplib::Response& res) {
-            if (!require_permission(req, res, "Infrastructure", "Read"))
-                return;
-            if (!nvd_db_ || !nvd_db_->is_open()) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"NVD database not available"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            // Parse inventory: JSON body with an "inventory" array of {name, version}.
-            std::vector<SoftwareItem> inventory;
-            try {
-                auto body = nlohmann::json::parse(req.body);
-                if (body.contains("inventory") && body["inventory"].is_array()) {
-                    for (const auto& item : body["inventory"]) {
-                        SoftwareItem si;
-                        si.name = item.value("name", "");
-                        si.version = item.value("version", "");
-                        if (!si.name.empty())
-                            inventory.push_back(std::move(si));
-                    }
-                }
-            } catch (...) {
-                res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"invalid JSON body"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            auto matches = nvd_db_->match_inventory(inventory);
-            nlohmann::json arr = nlohmann::json::array();
-            for (const auto& m : matches) {
-                arr.push_back({{"cve_id", m.cve_id},
-                               {"severity", m.severity},
-                               {"description", m.description},
-                               {"product", m.product},
-                               {"installed_version", m.installed_version},
-                               {"fixed_in", m.fixed_in},
-                               {"source", m.source}});
-            }
-            res.set_content(nlohmann::json({{"findings", arr}, {"count", arr.size()}}).dump(),
-                            "application/json");
-        });
 
         // -- Generic command dispatch API -------------------------------------
 
@@ -15319,101 +14960,6 @@ private:
                                {"error_detail", r.error_detail}});
             }
             res.set_content(nlohmann::json({{"responses", arr}, {"count", arr.size()}}).dump(),
-                            "application/json");
-        });
-
-        // -- Audit API -----------------------------------------------------------
-        web_server_->Get("/api/audit", [this](const httplib::Request& req, httplib::Response& res) {
-            if (!require_permission(req, res, "AuditLog", "Read"))
-                return;
-
-            if (!audit_store_ || !audit_store_->is_open()) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"audit store not available"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            AuditQuery q;
-            if (req.has_param("principal"))
-                q.principal = req.get_param_value("principal");
-            if (req.has_param("action"))
-                q.action = req.get_param_value("action");
-            if (req.has_param("target_type"))
-                q.target_type = req.get_param_value("target_type");
-            if (req.has_param("target_id"))
-                q.target_id = req.get_param_value("target_id");
-            try {
-                if (req.has_param("since"))
-                    q.since = std::stoll(req.get_param_value("since"));
-                if (req.has_param("until"))
-                    q.until = std::stoll(req.get_param_value("until"));
-                if (req.has_param("limit"))
-                    q.limit = std::stoi(req.get_param_value("limit"));
-                if (req.has_param("offset"))
-                    q.offset = std::stoi(req.get_param_value("offset"));
-            } catch (const std::exception&) {
-                res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            // Range, not just parseability: a negative limit would otherwise
-            // reach PG as `LIMIT -1`, error, and be reported as an audit-store
-            // DEGRADE — 503 plus the read-degrade counter the availability
-            // alert pages on — rather than the client error it is (Gate 2
-            // security). A negative offset is already inert at the store, but
-            // it is a client error here too, so say so.
-            if (q.limit < 1 || q.offset < 0) {
-                res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"limit must be >= 1 and offset >= 0"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            // ADR-0040: reads are degrade-distinguishable. A store/pool failure
-            // returns nullopt — surface 503, NEVER a false-empty 200 (an audit
-            // blip must not read as "no activity" — evidence integrity).
-            auto results = audit_store_->query(q);
-            if (!results) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"audit store degraded"},"data":null})",
-                    "application/json");
-                return;
-            }
-
-            nlohmann::json arr = nlohmann::json::array();
-            for (const auto& e : *results) {
-                arr.push_back({{"id", e.id},
-                               {"timestamp", e.timestamp},
-                               {"principal", e.principal},
-                               {"principal_role", e.principal_role},
-                               {"action", e.action},
-                               {"target_type", e.target_type},
-                               {"target_id", e.target_id},
-                               {"detail", e.detail},
-                               {"source_ip", e.source_ip},
-                               {"result", e.result}});
-            }
-            // Total is a best-effort adornment now that the page rows are in
-            // hand: it takes a SECOND, independent lease, so it can degrade while
-            // the page rows are perfectly good. Do not answer a second 503 —
-            // but do NOT substitute the page size either. That reads as
-            // `count == total`, i.e. "this page is the whole trail", which is
-            // plausible and wrong on the one store whose entire posture in this
-            // change is that a blip must never read as an absence (Gate 3
-            // cpp-expert + Gate 2 security; the old `0` was at least obviously
-            // wrong). `null` is the honest answer and JSON has it.
-            auto total = audit_store_->total_count();
-            res.set_content(nlohmann::json({{"events", arr},
-                                            {"count", arr.size()},
-                                            {"total", total ? nlohmann::json(*total)
-                                                            : nlohmann::json(nullptr)}})
-                                .dump(),
                             "application/json");
         });
 
@@ -15954,24 +15500,6 @@ private:
                 res.set_content(render_result_sets_sidebar(sets, created->id),
                                 "text/html; charset=utf-8");
             });
-
-        // -- Generic JSON-to-CSV export -----------------------------------------
-        web_server_->Post("/api/export/json-to-csv", [this](const httplib::Request& req,
-                                                            httplib::Response& res) {
-            if (!require_permission(req, res, "Response", "Read"))
-                return;
-
-            auto csv = data_export::json_array_to_csv(req.body);
-            if (csv.empty()) {
-                res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"invalid JSON array"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            res.set_header("Content-Disposition", "attachment; filename=\"export.csv\"");
-            res.set_content(csv, "text/csv; charset=utf-8");
-        });
 
         // -- Instruction Definitions API --------------------------------------
 
@@ -17703,85 +17231,6 @@ private:
             res.set_content(R"({"status":"rejected"})", "application/json");
         });
 
-        // -- Analytics API ---------------------------------------------------------
-
-        web_server_->Get("/api/analytics/status",
-                         [this](const httplib::Request& req, httplib::Response& res) {
-                             if (!require_permission(req, res, "Infrastructure", "Read"))
-                                 return;
-
-                             nlohmann::json j;
-                             if (analytics_store_) {
-                                 // Degrade-distinguishable seam (ADR-0049): a
-                                 // transient PG blip 503s rather than
-                                 // rendering pending_count=0, which would be
-                                 // indistinguishable from a genuinely empty
-                                 // buffer.
-                                 auto pending = analytics_store_->pending_count();
-                                 if (!pending) {
-                                     res.status = 503;
-                                     res.set_content(
-                                         R"({"error":{"code":503,"message":)"
-                                         R"("analytics store degraded"},)"
-                                         R"("meta":{"api_version":"v1"}})",
-                                         "application/json");
-                                     return;
-                                 }
-                                 j["enabled"] = true;
-                                 j["pending_count"] = *pending;
-                                 j["total_emitted"] = analytics_store_->total_emitted();
-                             } else {
-                                 j["enabled"] = false;
-                                 j["pending_count"] = 0;
-                                 j["total_emitted"] = 0;
-                             }
-                             res.set_content(j.dump(), "application/json");
-                         });
-
-        web_server_->Get(
-            "/api/analytics/recent", [this](const httplib::Request& req, httplib::Response& res) {
-                if (!require_permission(req, res, "Infrastructure", "Read"))
-                    return;
-
-                int limit = 50;
-                if (req.has_param("limit")) {
-                    try {
-                        limit = std::stoi(req.get_param_value("limit"));
-                    } catch (...) {}
-                }
-                // A non-positive limit isn't a client-error worth a 400 (this
-                // route has always silently ignored a malformed value), but
-                // unlike SQLite's LIMIT -1 = "unlimited" idiom the old store
-                // relied on, Postgres's LIMIT REJECTS a negative bind
-                // outright — which query_recent() below can only report as
-                // nullopt (degraded), and this route would then 503
-                // "analytics store degraded" for a client-supplied bad
-                // parameter, not an actual store problem (governance Gate 4
-                // unhappy-path finding, 2026-08-16, following up on the
-                // happy-path reviewer's flagged lead). Clamp instead.
-                if (limit <= 0)
-                    limit = 50;
-                if (!analytics_store_) {
-                    res.set_content(R"({"events":[],"count":0})", "application/json");
-                    return;
-                }
-                auto events = analytics_store_->query_recent(limit);
-                if (!events) {
-                    res.status = 503;
-                    res.set_content(R"({"error":{"code":503,"message":)"
-                                    R"("analytics store degraded"},)"
-                                    R"("meta":{"api_version":"v1"}})",
-                                    "application/json");
-                    return;
-                }
-                nlohmann::json arr = nlohmann::json::array();
-                for (const auto& e : *events) {
-                    arr.push_back(e);
-                }
-                res.set_content(nlohmann::json({{"events", arr}, {"count", arr.size()}}).dump(),
-                                "application/json");
-            });
-
         // -- HTMX Fragment Routes for Instructions UI -------------------------
 
         web_server_->Get(
@@ -18278,32 +17727,6 @@ private:
                 res.set_content(html, "text/html; charset=utf-8");
             });
 
-        // -- Scope API --------------------------------------------------------
-        web_server_->Post("/api/scope/validate", [this](const httplib::Request& req,
-                                                        httplib::Response& res) {
-            auto session = require_auth(req, res);
-            if (!session)
-                return;
-
-            auto expression = extract_json_string(req.body, "expression");
-            if (expression.empty()) {
-                res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"expression required"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            auto result = yuzu::scope::validate(expression);
-            if (result) {
-                res.set_content(R"({"valid":true})", "application/json");
-            } else {
-                res.set_content(
-                    nlohmann::json({{"valid", false}, {"error", result.error()}}).dump(),
-                    "application/json");
-            }
-        });
-
         // -- Inventory REST endpoints (Issue 7.17) --------------------------------
 
         // GET /api/inventory/tables — list available inventory data types
@@ -18473,6 +17896,7 @@ private:
                     // so a single bad policy must not take the process (or silently
                     // kill compliance evaluation). Catch, log, and keep ticking.
                     try {
+                        YUZU_ASSERT_BACKGROUND_JOB("policy_evaluator.tick"); // WS-10 FencedLeaderOnly
                         policy_evaluator_->tick();
                     } catch (const std::exception& e) {
                         spdlog::error("policy_eval: tick threw ({}) — thread continuing", e.what());
@@ -18514,11 +17938,23 @@ private:
                             std::chrono::duration_cast<std::chrono::seconds>(
                                 std::chrono::system_clock::now().time_since_epoch())
                                 .count();
+                        YUZU_ASSERT_BACKGROUND_JOB("app_perf_rollup.roll_window"); // WS-10 ReplicaSafe
                         app_perf_rollup_->roll_window(now);
-                        const std::int64_t today = (now / 86400) * 86400;
-                        app_perf_fleet_store_->prune(
-                            today -
-                            static_cast<std::int64_t>(AppPerfFleetStore::kRetentionDays) * 86400);
+                        // WS-10: the store clock-guards + reads Postgres now() itself; pass the window (secs).
+                        // Bounded backlog drain (WS-10 S3): each pass deletes at most
+                        // kPruneCapPerPass; if it hit the cap there may be more, so re-arm
+                        // immediately (bounded) instead of waiting a full hour with a backlog.
+                        // Any non-cap result — under-cap, a decline (0), or an error (-1) —
+                        // stops the drain and the thread resumes its hourly cadence.
+                        YUZU_ASSERT_BACKGROUND_JOB("app_perf_fleet_store.run_retention_prune");
+                        const std::int64_t retention_win =
+                            static_cast<std::int64_t>(AppPerfFleetStore::kRetentionDays) * 86400;
+                        for (int drain = 0;
+                             drain < 12 && !stop_requested_.load(std::memory_order_acquire); ++drain) {
+                            const int pruned = app_perf_fleet_store_->run_retention_prune(retention_win);
+                            if (pruned != static_cast<int>(AppPerfFleetStore::kPruneCapPerPass))
+                                break;
+                        }
                     } catch (const std::exception& e) {
                         spdlog::error("app_perf_rollup: tick threw ({}) — thread continuing",
                                       e.what());
@@ -18574,12 +18010,10 @@ private:
                 // unbounded (#governance H2/CAP-1).
                 if (deployment_run_store_ && deployment_run_store_->is_open()) {
                     try {
-                        const auto cutoff =
-                            std::chrono::duration_cast<std::chrono::milliseconds>(
-                                std::chrono::system_clock::now().time_since_epoch())
-                                .count() -
-                            14LL * 24 * 60 * 60 * 1000;
-                        deployment_run_store_->prune_older_than(cutoff);
+                        // WS-10: clock-guarded, single-writer; the store reads Postgres now()
+                        // itself (shared clock) — pass the 14-day retention WINDOW in ms.
+                        YUZU_ASSERT_BACKGROUND_JOB("deployment_run_store.run_retention_prune");
+                        deployment_run_store_->run_retention_prune(14LL * 24 * 60 * 60 * 1000);
                     } catch (const std::exception& e) {
                         spdlog::error("deployment prune threw ({}) — thread continuing", e.what());
                     } catch (...) {
@@ -18642,6 +18076,7 @@ private:
                     // keep ticking (five other background loops in this file
                     // already carry this shape).
                     try {
+                        YUZU_ASSERT_BACKGROUND_JOB("quarantine_reconciler.tick"); // WS-10 FencedLeaderOnly
                         quarantine_reconciler_->tick();
                     } catch (const std::exception& e) {
                         spdlog::error("quarantine_reconciler: tick threw ({}) — thread continuing",
@@ -18776,6 +18211,7 @@ private:
                     // calls std::terminate, so one bad schedule must not take
                     // the process. Catch, log, keep ticking.
                     try {
+                        YUZU_ASSERT_BACKGROUND_JOB("schedule_runner.tick"); // WS-10 FencedLeaderOnly
                         schedule_runner_->tick();
                     } catch (const std::exception& e) {
                         metrics_.counter("yuzu_schedule_tick_errors_total").increment();
@@ -19066,6 +18502,8 @@ private:
                         // cadence, not the safety.
                         if (execution_tracker_ && execution_tracker_->is_open() &&
                             tick % kConcurrencyClaimReconcileEveryNTicks == 0) {
+                            YUZU_ASSERT_BACKGROUND_JOB( // WS-10 DisabledUntilFixed (advisory-locked single-writer, but replica-local clock — #4093)
+                                "execution_tracker.reconcile_stale_concurrency_claims");
                             execution_tracker_->reconcile_stale_concurrency_claims(now);
                         }
 
@@ -19103,6 +18541,8 @@ private:
                         // degrade does NOT advance the in-memory horizon, so the
                         // window is re-read next tick (a duplicate, never a gap).
                         if (execution_tracker_ && execution_tracker_->is_open()) {
+                            // WS-10 ReplicaSafe — MUST run per-replica (ADR-2002 §5); never leader-gate.
+                            YUZU_ASSERT_BACKGROUND_JOB("execution_tracker.poll_event_outbox_once");
                             if (auto published = execution_tracker_->poll_event_outbox_once()) {
                                 if (*published > 0)
                                     metrics_.counter("yuzu_exec_outbox_poll_published_total")

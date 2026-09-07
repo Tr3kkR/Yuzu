@@ -4,28 +4,33 @@
  * `require_scoped_permission("Infrastructure", "Read"/"Write", agent_id)`,
  * not a bare global `require_permission`.
  *
- * The three route handlers are inline `web_server_->Get/Put/Delete` lambdas
- * in `ServerImpl` with no route-injection seam (matching every sibling
- * server.cpp handler — see test_auth_routes.cpp's
- * `deny_service_scoped_service_tag_mutation` tests for the same convention),
- * so this drives the gate directly through `AuthRoutes::require_scoped_permission`
- * rather than through an httplib route harness. This is also net-new
- * coverage for that gate's ordinary-RBAC branch composed with a REAL
- * `ManagementGroupStore` through `AuthRoutes` — the primitive
- * (`RbacStore::check_scoped_permission`) is covered directly in
+ * These TEST_CASEs drive the gate directly through
+ * `AuthRoutes::require_scoped_permission` rather than through an httplib
+ * route harness — net-new coverage for that gate's ordinary-RBAC branch
+ * composed with a REAL `ManagementGroupStore` through `AuthRoutes` (the
+ * primitive, `RbacStore::check_scoped_permission`, is covered directly in
  * test_rbac_store.cpp, but no prior test drove it through this gate with
- * group-scoped confinement.
+ * group-scoped confinement).
  *
- * The primitive-level cases above cannot detect a wiring regression in the
- * route handlers themselves (a future edit reverting one handler back to
- * `require_permission`, or swapping the regex capture index) — that's a
- * real, disclosed limitation of the no-route-injection-seam shape, flagged
- * independently by both the adversarial review (Kimi/Codex) and a PR #3742
- * review (Doomgoose). The last TEST_CASE in this file is a source-text
- * tripwire (the `test_body_cap_route_inventory.cpp` pattern, scoped down to
- * these three routes) that closes exactly that gap: it reads `server.cpp`
- * at test-run time and fails if any of the three handlers no longer calls
- * `require_scoped_permission("Infrastructure", ...)`.
+ * HISTORY — the wiring-regression tripwire moved. Until #2542 PR-4, the
+ * three route handlers were inline `web_server_->Get/Put/Delete` lambdas in
+ * `ServerImpl` with no route-injection seam, so the primitive-level cases
+ * above could not detect a wiring regression in the handlers themselves (a
+ * future edit reverting one back to `require_permission`, or swapping the
+ * regex capture index) — a real, disclosed limitation flagged independently
+ * by both the adversarial review (Kimi/Codex) and a PR #3742 review
+ * (Doomgoose). This file used to close that gap with a source-text tripwire
+ * (the `test_body_cap_route_inventory.cpp` pattern, scoped down to these
+ * three routes) that read `server.cpp` at test-run time. #2542 PR-4
+ * extracted the three handlers onto the `HttpRouteSink` seam
+ * (`custom_properties_routes.{hpp,cpp}`), which gives them a REAL
+ * in-process dispatch path — `test_custom_properties_routes.cpp`'s gate-
+ * pinning TEST_CASEs now prove the wiring behaviourally (dispatch a denied
+ * request, assert 403/the right securable+operation+agent_id) instead of by
+ * scanning source text, so the text-scan tripwire here was deleted rather
+ * than repointed at the new file: a real dispatch is strictly stronger
+ * evidence than a regex over source, and the old approach would in any case
+ * have needed to scan a different file post-move.
  */
 
 #include "audit_store.hpp"
@@ -47,8 +52,6 @@
 #include <httplib.h>
 
 #include <chrono>
-#include <filesystem>
-#include <fstream>
 #include <memory>
 #include <shared_mutex>
 #include <string>
@@ -278,98 +281,9 @@ TEST_CASE("require_scoped_permission(Infrastructure,Write): RBAC disabled — le
     CHECK(res.status == 403);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Regression tripwire: the primitive-level cases above prove
-// require_scoped_permission's own branch semantics, but say nothing about
-// whether the three server.cpp route handlers still CALL it. A revert of
-// any one handler back to the bare `require_permission` gate -- the exact
-// #3700 vulnerability -- would leave every case above green.
-// ═══════════════════════════════════════════════════════════════════════════
-
-namespace {
-
-// YUZU_SERVER_SRC_DIR is injected for the whole yuzu_server_tests target
-// (tests/meson.build, originally for test_body_cap_route_inventory.cpp) --
-// available here with no build-file change.
-#ifndef YUZU_SERVER_SRC_DIR
-#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
-#endif
-
-std::string read_server_cpp() {
-    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
-    REQUIRE(in.is_open());
-    return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
-}
-
-// Bounds a route registration's handler body as the source text from its
-// regex-pattern marker up to the NEXT `web_server_->` registration (or
-// EOF) -- a source-text tripwire, not a real parse, matching
-// test_body_cap_route_inventory.cpp's documented rationale for why a
-// hand-copied line-range would go stale exactly like the thing it tests.
-std::string route_block_at(const std::string& src, std::size_t marker_pos) {
-    REQUIRE(marker_pos != std::string::npos);
-    auto next = src.find("web_server_->", marker_pos + 1);
-    return src.substr(marker_pos, (next == std::string::npos ? src.size() : next) - marker_pos);
-}
-
-// Collapses any run of whitespace (including a clang-format line-wrap
-// inserted between a call's arguments) to a single space, so the needle
-// searches below survive a reformat that doesn't touch the call itself --
-// only a REAL change to the call (gate swapped, operation changed) should
-// ever flip these assertions, never incidental column-limit wrapping.
-std::string collapse_ws(const std::string& s) {
-    std::string out;
-    out.reserve(s.size());
-    bool in_ws = false;
-    for (char c : s) {
-        if (std::isspace(static_cast<unsigned char>(c))) {
-            if (!in_ws)
-                out.push_back(' ');
-            in_ws = true;
-        } else {
-            out.push_back(c);
-            in_ws = false;
-        }
-    }
-    return out;
-}
-
-} // namespace
-
-TEST_CASE("route wiring: GET/PUT/DELETE /api/agents/:id/properties[/:key] still call "
-          "require_scoped_permission, not require_permission (#3700 regression tripwire)",
-          "[properties_authz]") {
-    const std::string src = read_server_cpp();
-
-    // GET's regex has no trailing key segment, so its literal text is not a
-    // substring of PUT/DELETE's (which share the identical regex). PUT and
-    // DELETE share one marker text: find the first occurrence (PUT,
-    // registered first in this file) then continue past it for the second
-    // (DELETE).
-    const std::string get_marker = "/api/agents/([^/]+)/properties)";
-    const std::string key_marker = "/api/agents/([^/]+)/properties/([a-zA-Z0-9_.:-]+))";
-
-    auto get_pos = src.find(get_marker);
-    REQUIRE(get_pos != std::string::npos);
-    auto put_pos = src.find(key_marker);
-    REQUIRE(put_pos != std::string::npos);
-    auto delete_pos = src.find(key_marker, put_pos + key_marker.size());
-    REQUIRE(delete_pos != std::string::npos);
-
-    // Pins the operation too, not just that SOME require_scoped_permission
-    // call exists in the block -- a Read/Write drift on one route is a
-    // different, real regression class this would otherwise miss.
-    struct Route {
-        std::size_t marker_pos;
-        const char* op;
-    };
-    for (const auto& route :
-         {Route{get_pos, "Read"}, Route{put_pos, "Write"}, Route{delete_pos, "Write"}}) {
-        auto block = collapse_ws(route_block_at(src, route.marker_pos));
-        const std::string scoped_needle = "require_scoped_permission(req, res, \"Infrastructure\", \"" +
-                                          std::string(route.op) + "\",";
-        const std::string bare_needle = "require_permission(req, res, \"Infrastructure\",";
-        CHECK(block.find(scoped_needle) != std::string::npos);
-        CHECK(block.find(bare_needle) == std::string::npos);
-    }
-}
+// The former source-text wiring-regression tripwire (a scan of server.cpp
+// pinning that these three handlers call require_scoped_permission, not
+// require_permission) lived here through #2542 PR-4. It is now
+// test_custom_properties_routes.cpp's real TestRouteSink dispatch coverage
+// — see this file's header comment (HISTORY) for why a behavioural test
+// replaced it outright rather than being repointed at the new file.
