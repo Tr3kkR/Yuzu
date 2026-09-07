@@ -1008,9 +1008,48 @@ private:
     /// (get_user_role() itself is no longer such a consumer - a later fix
     /// made it AuthDB-authoritative on every call, independent of this
     /// eviction entirely; this comment's original wording named it as the
-    /// example before that fix landed.) `context` is the log-message prefix
-    /// ("Auth failed" / "verify_password failed") so both callers keep their
-    /// existing distinct wording. Caller
+    /// example before that fix landed.)
+    ///
+    /// External adversarial review (fjarvis, PR #4076 review round, "C1"):
+    /// the RETURN VALUE follows the same freshness rule as the cache write,
+    /// not this call's own single DB read, in two cases the version guard
+    /// above detects but an earlier version of this function ignored for its
+    /// return value specifically:
+    ///  - Version diverged (a concurrent update_role()/reactivate_user()
+    ///    landed in this call's own read-to-lock window): re-verifies against
+    ///    AuthDB directly rather than trusting either this call's own
+    ///    now-superseded read OR the cache's current value. A first version
+    ///    of this fix trusted the cache here on the theory that "every writer
+    ///    updates `.role` and `.role_version` together, so a moved version
+    ///    means a DB-confirmed write already landed" - a Gate 3 re-review
+    ///    (security-guardian + authdb, converged independently) showed that
+    ///    theory false: the write that moved the cache can be ANOTHER
+    ///    concurrent call's OWN case-2 branch above, persisting its own
+    ///    stale read, so the cache is not provably DB-confirmed either.
+    ///    Closes that stale-cache-propagation instance: the old unconditional
+    ///    `return db_user->role` let a session get minted at a role a
+    ///    same-process demote had already committed, surviving that demote's
+    ///    own session-invalidation sweep; the intermediate (cache-trusting)
+    ///    fix could relay a DIFFERENT call's stale read instead. Still open,
+    ///    same class, narrower: the case-2 branch above (no version
+    ///    divergence observed) - a racing writer's DB commit can land in this
+    ///    call's own read-to-lock window without yet reaching ITS OWN lock,
+    ///    so the version counter shows no change and this call still trusts
+    ///    its own now-stale `db_user->role`. Not closed - re-verifying on
+    ///    every call would add an unconditional second DB round-trip to the
+    ///    common (non-divergent) path, defeating the version-guard's purpose.
+    ///    Disclosed and tracked (issue TBD - see PR #4076), same footing as
+    ///    the cross-replica case below.
+    ///    The cross-replica case (a demotion committed on a DIFFERENT server,
+    ///    invisible to this process's local version counter) is a separate,
+    ///    harder residual, not closed here either.
+    ///  - Entry vanished (a concurrent `remove_user()`'s own erase landed in
+    ///    the same window): returns `std::nullopt` (fail closed) rather than
+    ///    the stale pre-removal role - the account cannot be confirmed active
+    ///    right now, so the caller denies rather than mints a session for it.
+    ///
+    /// `context` is the log-message prefix ("Auth failed" / "verify_password
+    /// failed") so both callers keep their existing distinct wording. Caller
     /// must NOT hold `mu_`.
     [[nodiscard]] std::optional<Role>
     recheck_role_after_credential_check(const std::string& username, Role pre_check_role,

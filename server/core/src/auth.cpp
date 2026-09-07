@@ -772,20 +772,100 @@ AuthManager::recheck_role_after_credential_check(const std::string& username, Ro
     // for the ABA interleaving a role-VALUE compare would miss). A divergence
     // means some other write already landed and must win over this call's
     // now-stale observation.
-    if (auto it = users_.find(username);
-        it != users_.end() && it->second.role_version == pre_check_version) {
+    auto it = users_.find(username);
+    if (it == users_.end()) {
+        // External adversarial review (fjarvis, C1): a concurrent remove_user()
+        // erased this entry between this call's own DB read (above) and this
+        // lock acquire - db_user->role is now stale precisely because the
+        // removal that erased the entry is what invalidates it. The old code
+        // returned db_user->role anyway, minting a session for an account that
+        // was just removed, at its last-known role, after remove_user()'s own
+        // session sweep had already run - the new session then outlives the
+        // sweep. Fail closed instead: this account cannot be confirmed active
+        // right now, so deny rather than trust the stale read.
+        spdlog::warn("{}: user '{}' vanished from the cache during recheck (concurrent "
+                     "remove_user) - failing closed",
+                     context, username);
+        return std::nullopt;
+    }
+    if (it->second.role_version == pre_check_version) {
         it->second.role = db_user->role;
         it->second.role_version = next_role_version_();
+        // Gate 3 authdb follow-up: this refreshes ONLY `.role` from `db_user`,
+        // never `.salt_hex`/`.hash_hex` - currently safe (verified: no
+        // AuthDB/AuthManager method changes an existing user's password;
+        // `upsert_user` is create-only, INSERT...ON CONFLICT DO NOTHING), so a
+        // cached hash can never diverge from the DB today. A FUTURE
+        // password-change/reset feature MUST extend this same refresh to the
+        // credential fields too, or it reintroduces the exact stale-credential
+        // class this function exists to close - just for password material
+        // instead of role.
+        //
+        // Gate 3 re-review (security-guardian, #4020 second round): a write
+        // landing here can ITSELF be stale - db_user->role is this call's own
+        // read, taken before mu_, and nothing proves no OTHER writer's DB
+        // commit landed in the read-to-lock window without yet reaching ITS
+        // OWN lock acquisition (so role_version here still shows no change).
+        // That narrower, same-process timing gap is NOT closed by this
+        // function - see the header doc's "still open" note. Closing it here
+        // would mean re-reading AuthDB unconditionally on every login
+        // (this is the COMMON path - version divergence is the rare one),
+        // which defeats the whole point of the version-guard fast path.
+        // Disclosed, not fixed - tracked in the follow-up issue this
+        // function's header doc cites.
+        return db_user->role;
     }
-    // Gate 3 authdb follow-up: this refreshes ONLY `.role` from `db_user`, never
-    // `.salt_hex`/`.hash_hex` - currently safe (verified: no AuthDB/AuthManager
-    // method changes an existing user's password; `upsert_user` is
-    // create-only, INSERT...ON CONFLICT DO NOTHING), so a cached hash can never
-    // diverge from the DB today. A FUTURE password-change/reset feature MUST
-    // extend this same refresh to the credential fields too, or it reintroduces
-    // the exact stale-credential class this function exists to close - just for
-    // password material instead of role.
-    return db_user->role;
+    // External adversarial review (fjarvis, C1) + Gate 3 re-review
+    // (security-guardian + authdb, #4020 second round, converged
+    // independently): version diverged - a concurrent update_role()/
+    // reactivate_user() landed between this call's own DB read and this lock
+    // acquire. The FIRST version of this fix trusted `it->second.role` here on
+    // the theory that "the cache moved, so it must reflect a DB-confirmed
+    // write." That theory is false: the write that moved it can be ANOTHER
+    // concurrent recheck's OWN case-2 branch above, persisting ITS OWN
+    // now-stale read - the cache can end up holding a value nobody ever
+    // confirmed against a current DB state. Trusting it here would silently
+    // relay that staleness across calls instead of closing it.
+    //
+    // Fix: re-verify against AuthDB directly rather than trusting either this
+    // call's own now-superseded `db_user->role` OR the cache's unverified
+    // current value. Never hold mu_ across a DB call (same rule every other
+    // writer in this file follows) - release it, re-read, then re-acquire and
+    // write only if nothing has changed again in the meantime (guarded by the
+    // SAME version-compare shape as the case above, on the version observed
+    // at THIS point, not the original pre_check_version).
+    const auto version_before_reread = it->second.role_version;
+    lock.unlock();
+    auto reread = auth_db_->get_user(username);
+    if (!reread) {
+        if (yuzu::server::AuthDBError::UserNotFound == reread.error()) {
+            spdlog::warn("{}: user '{}' not active in AuthDB (re-verify after detecting a "
+                         "concurrent write)",
+                         context, username);
+            std::unique_lock lock2(mu_);
+            users_.erase(username);
+        } else {
+            spdlog::error("{}: AuthDB re-verify for '{}' failed after detecting a concurrent "
+                         "write - failing closed without touching the cache",
+                         context, username);
+        }
+        return std::nullopt;
+    }
+    std::unique_lock lock2(mu_);
+    it = users_.find(username);
+    if (it == users_.end())
+        return std::nullopt; // removed while the re-verify read was in flight
+    if (it->second.role_version == version_before_reread) {
+        it->second.role = reread->role;
+        it->second.role_version = next_role_version_();
+    }
+    // Else: yet another write landed while we were re-verifying. Don't
+    // clobber it - return the DB-confirmed value we just read either way,
+    // since it's still strictly fresher than either of this call's two now-
+    // superseded observations, but leave the cache to whatever the newer
+    // write left it (this call has no way to prove ITS OWN reread is fresher
+    // than that write without looping indefinitely under contention).
+    return reread->role;
 }
 
 std::optional<std::string> AuthManager::authenticate(const std::string& username,

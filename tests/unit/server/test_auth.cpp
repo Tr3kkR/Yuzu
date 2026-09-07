@@ -773,8 +773,9 @@ TEST_CASE("a hydrated entry is superseded by a later in-process role change (#40
     REQUIRE(*role == Role::admin);
 }
 
-TEST_CASE("a demote landing between the recheck's own DB read and its cache "
-          "write is never reverted (Gate 5 chaos-injector CH-1)",
+TEST_CASE("a demote whose cache write already landed before the recheck takes "
+          "mu_ is never reverted - including in the minted session (Gate 5 "
+          "chaos-injector CH-1 / external adversarial review fjarvis C1)",
           "[pg][auth][session][cold_cache]") {
     // Deterministic reproduction of the ABA race chaos-injector traced: this
     // call's own AuthDB re-read observes the role AS IT WAS AT READ TIME
@@ -785,7 +786,9 @@ TEST_CASE("a demote landing between the recheck's own DB read and its cache "
     // back to the pre_check_role, so it isn't even the coincidental case that
     // guard missed) - what actually matters is proving the version guard
     // trusts the fresher cache write rather than blindly reapplying its own
-    // now-stale read.
+    // now-stale read - and, per fjarvis's review, that the RETURN VALUE (what
+    // the session gets minted with) follows the same rule as the cache write,
+    // not the call's own stale read regardless of the guard's outcome.
     yuzu::test::AuthDbPg auth_db;
 
     AuthManager warm_mgr;
@@ -809,17 +812,19 @@ TEST_CASE("a demote landing between the recheck's own DB read and its cache "
     CHECK(cold_mgr.cached_role_for_test("cora") == Role::user);
     CHECK(cold_mgr.get_user_role("cora") == Role::user); // DB-authoritative, same answer
 
-    // Accepted, disclosed residual (NOT what this test is proving fixed):
-    // this specific call's own read happened before the demote landed, so
-    // the session IT mints still carries the stale "admin" role - an
-    // inherent check-then-mint gap no non-serialized recheck can close
-    // (the window is the time between one DB round-trip and a mutex
-    // acquire - sub-millisecond in practice, not the ~100-200ms PBKDF2
-    // window promote/demote flapping needs to land in to reach this call's
-    // OWN read at all).
+    // Previously an ACCEPTED, disclosed residual: this specific call's own
+    // read happened before the demote landed, so the session IT minted still
+    // carried the stale "admin" role, surviving the demote's own session
+    // sweep (which already ran before this new session existed) -
+    // effectively un-revoking a same-process demotion. External adversarial
+    // review (fjarvis, C1) correctly argued this was closeable, not inherent:
+    // on version divergence, return the cache's now-fresher role (which the
+    // racing writer already committed under the same lock) instead of this
+    // call's own superseded read. Now closed - the minted session must also
+    // reflect "user", not "admin".
     auto session = cold_mgr.validate_session(*token);
     REQUIRE(session.has_value());
-    CHECK(session->role == Role::admin);
+    CHECK(session->role == Role::user);
 }
 
 TEST_CASE("a promote-then-demote round trip back to the ORIGINAL role is never "
@@ -861,7 +866,10 @@ TEST_CASE("a promote-then-demote round trip back to the ORIGINAL role is never "
     auto current_role = cold_mgr.recheck_role_after_credential_check_for_test(
         "cora", *pre_check_role, *pre_check_version);
     REQUIRE(current_role.has_value());
-    CHECK(*current_role == Role::admin); // this call's own (stale) read - accepted residual
+    // Previously returned Role::admin (this call's own stale read) - now
+    // returns the cache's current, fresher value on version divergence
+    // (external adversarial review, fjarvis C1).
+    CHECK(*current_role == Role::user);
 
     // The guard must NOT revert the cache to "admin" just because the role
     // value happens to round-trip back to pre_check_role. A role-VALUE guard
@@ -872,6 +880,114 @@ TEST_CASE("a promote-then-demote round trip back to the ORIGINAL role is never "
     // both bumped role_version past what this call captured.
     CHECK(cold_mgr.cached_role_for_test("cora") == Role::user);
     CHECK(cold_mgr.get_user_role("cora") == Role::user);
+}
+
+TEST_CASE("on version divergence, the recheck re-verifies against AuthDB "
+          "rather than trusting a cache write that may itself be another "
+          "call's stale read (#4020 Gate 3 re-review, security-guardian + "
+          "authdb)",
+          "[pg][auth][session][cold_cache]") {
+    // The intermediate fix (see the two tests above) trusted `it->second.role`
+    // on version divergence, reasoning "the cache moved, so it must be a
+    // DB-confirmed write." That's false when the write that moved it was
+    // ANOTHER concurrent call's own now-stale read, persisted through the
+    // no-divergence (case 2) branch — the cache ends up holding a value
+    // nobody ever confirmed against current DB state. Reproduce that exact
+    // shape directly: bump the cache to a role that does NOT match the DB,
+    // then prove the recheck returns the DB-confirmed value, not the cache's.
+    yuzu::test::AuthDbPg auth_db;
+
+    AuthManager warm_mgr;
+    warm_mgr.set_auth_db(auth_db.get());
+    REQUIRE(warm_mgr.upsert_user("cora", "password1234", Role::admin));
+
+    AuthManager cold_mgr;
+    cold_mgr.set_auth_db(auth_db.get());
+    REQUIRE(cold_mgr.authenticate("cora", "password1234").has_value()); // hydrates cache=admin
+
+    cold_mgr.set_role_recheck_race_hook_for_test([&] {
+        // Diverge cache from DB. First bump the CACHE (through cold_mgr, so
+        // role_version moves) - this is the "other call's own case-2 write"
+        // half. Then change the DB directly UNDERNEATH it, without touching
+        // the cache/version again - this is the "further write nobody
+        // confirmed against the cache" half. update_role() writes its DB row
+        // before touching the cache, so the direct write MUST come second or
+        // it would just be overwritten back to "admin" by the first call.
+        REQUIRE(cold_mgr.update_role("cora", Role::admin));
+        REQUIRE(auth_db.get()->update_role("cora", Role::user).has_value());
+        // Cache now says "admin" (freshest role_version), DB says "user".
+        // The old (intermediate) fix would trust the cache here and return
+        // "admin" - stale relative to the actual, current DB row.
+    });
+
+    auto token = cold_mgr.authenticate("cora", "password1234");
+    REQUIRE(token.has_value());
+
+    // Re-verified against AuthDB, not relayed from the cache - the cache
+    // itself is also corrected, not just the return value.
+    CHECK(cold_mgr.cached_role_for_test("cora") == Role::user);
+    CHECK(cold_mgr.get_user_role("cora") == Role::user);
+    auto session = cold_mgr.validate_session(*token);
+    REQUIRE(session.has_value());
+    CHECK(session->role == Role::user);
+}
+
+TEST_CASE("KNOWN RESIDUAL: a demote whose DB commit lands after the "
+          "recheck's own read but before either side reaches mu_ is not "
+          "detected - the version counter shows no change (#4020 Gate 3 "
+          "re-review, security-guardian)",
+          "[pg][auth][session][cold_cache]") {
+    // Disclosed, not fixed - see recheck_role_after_credential_check's header
+    // doc. Closing this would mean re-reading AuthDB unconditionally on every
+    // login (case 2 is the COMMON path, unlike the rare divergent path the
+    // test above exercises), which defeats the version-guard's purpose. This
+    // test exists to make the residual `verified` rather than merely
+    // `likely`, and to catch any accidental narrowing or widening of it.
+    yuzu::test::AuthDbPg auth_db;
+
+    AuthManager warm_mgr;
+    warm_mgr.set_auth_db(auth_db.get());
+    REQUIRE(warm_mgr.upsert_user("cora", "password1234", Role::admin));
+
+    AuthManager cold_mgr;
+    cold_mgr.set_auth_db(auth_db.get());
+    cold_mgr.set_role_recheck_race_hook_for_test([&] {
+        // Write the DB directly - simulates a racing writer whose DB commit
+        // lands in this window but who has NOT yet reached its own mu_
+        // acquisition to bump the cache's role_version.
+        REQUIRE(auth_db.get()->update_role("cora", Role::user).has_value());
+    });
+
+    auto token = cold_mgr.authenticate("cora", "password1234");
+    REQUIRE(token.has_value());
+
+    // No divergence was observed (role_version never moved), so this call
+    // trusts its own now-stale read. This is the known-open gap, not the
+    // desired outcome - if this ever starts returning Role::user instead,
+    // the residual has been closed and this test (and the header doc) should
+    // be updated to say so.
+    auto session = cold_mgr.validate_session(*token);
+    REQUIRE(session.has_value());
+    CHECK(session->role == Role::admin);
+}
+
+TEST_CASE("a concurrent remove_user() landing during the recheck denies "
+          "rather than trusting the stale pre-removal role (#4020 Gate 3 "
+          "re-review, authdb Finding 3 coverage gap)",
+          "[pg][auth][session][cold_cache]") {
+    yuzu::test::AuthDbPg auth_db;
+
+    AuthManager warm_mgr;
+    warm_mgr.set_auth_db(auth_db.get());
+    REQUIRE(warm_mgr.upsert_user("cora", "password1234", Role::user));
+
+    AuthManager cold_mgr;
+    cold_mgr.set_auth_db(auth_db.get());
+    cold_mgr.set_role_recheck_race_hook_for_test(
+        [&] { REQUIRE(cold_mgr.remove_user("cora")); });
+
+    auto token = cold_mgr.authenticate("cora", "password1234");
+    CHECK_FALSE(token.has_value());
 }
 
 TEST_CASE("reactivate_user() draws a fresh process-wide version stamp, never a "
