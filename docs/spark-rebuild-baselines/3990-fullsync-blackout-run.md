@@ -304,9 +304,13 @@ neither rate is "comfortably" anything, and 240s does not reliably outlast the p
 compensating for - it only outlasted it often enough, within a generous 10-attempt cap, to
 reach the sample counts this run needed. Deliberately NOT changing the agent daemon's own
 flush policy for this diagnostic - that would alter the executable being measured and risk
-perturbing a sub-100ms measurand; the underlying observability gap (no flush policy makes
-`--log-file` unreliable for any near-real-time external tailing, not just this driver) is a
-separate, real product finding, left for whoever picks it up, not fixed here.
+perturbing a sub-100ms measurand; unlike the functional-validity precondition below (a gap in
+THIS diagnostic's own driver, fair game to fix and re-run), the flush policy lives in the
+agent binary under test, and touching it here would invalidate the very B numbers this run
+exists to produce. The underlying observability gap (no flush policy makes `--log-file`
+unreliable for any near-real-time external tailing, not just this driver) is real and worth
+its own product fix, but is explicitly OUT OF SCOPE for this diagnostic to carry - flagged in
+"Open, needs Dave" below rather than left as an implied someone-else's-problem.
 
 **Re-run results, 2026-09-07, same rig/build/cohort as the retracted run (agent untouched
 since - `0.13.1+7899 (65f2938156a19)`, spark flip one-liner unchanged), fresh `ensure` after
@@ -456,6 +460,16 @@ externally-pinned service, or may need one more iteration to confirm). The measu
 size, purge/ensure mechanics, and driver timeout are otherwise proven to work as of this
 re-run - only the functional-validity wiring (a `cmd_run()` fix, not attempted here) and the
 service selection need to change for a clean pass.
+
+**Open, needs Dave**: two separate decisions this document deliberately does not make for
+itself. (1) Whether to accept the pre-registered rule's failure as final, or fix `cmd_run()`'s
+functional-validity wiring and re-run with better-behaved service targets for a genuine pass
+(previous paragraph). (2) Whether the agent `--log-file` flush-policy gap (no `flush_on` call,
+`spdlog` default `flush_level_=off`, `main.cpp`) should be filed as its own product issue -
+it's real, reproducible, and affects any external near-real-time log tailing, not just this
+diagnostic's driver, but fixing it here was deliberately out of scope (it would alter the
+executable under measurement). Not filed yet; this document is not the place to decide that on
+its own.
 
 ## Does NOT claim
 
