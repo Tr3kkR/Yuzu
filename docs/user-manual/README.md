@@ -66,6 +66,8 @@ The following features are documented within the files listed above:
 | [Disaster Recovery](../operations/disaster-recovery.md) | Backup strategy, restore procedures, and failover architecture |
 | [Certificate Renewal](../operations/certificate-renewal.md) | TLS certificate lifecycle, rotation, and automated renewal |
 | [Capacity Planning](../operations/capacity-planning.md) | Server sizing, storage growth, network bandwidth, and scaling patterns |
+| [TAR Power Source](tar-power.md) | TAR power capture source: AC-line and sleep/wake history — on by default |
+| [TAR Removable Source](tar-removable.md) | TAR removable-media capture source: attach/detach and executed-from-removable evidence — on by default |
 
 ---
 
