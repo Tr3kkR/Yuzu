@@ -366,6 +366,13 @@ header):
     `test_tar_diff.cpp` (appeared/removed + cap), `test_tar_warehouse.cpp` (DDL +
     `$`-name translation + authorizer), and add a `test_tar_<source>.cpp`.
 
+**`usage` is not an example of this pattern.** It is a DERIVED source (a fold over
+`process_live`, `tar_usage.cpp`/`tar_usage.hpp`) — no `enumerate_<source>()`, no
+`compute_<source>_events()` diff, no collector `.cpp` of its own. It still gets a
+`CaptureSourceDef` row in `build_sources()` (step 5) so the schema/`$Name_Tier`
+translation/queryable-table allowlist machinery applies uniformly, but a new
+capture source should follow the numbered steps above, not `tar_usage.*`.
+
 ### 8.1 Streaming sources and the `ProcStreamCollector` contract
 
 Most sources are snapshot-and-diff pollers (above). A **streaming source**

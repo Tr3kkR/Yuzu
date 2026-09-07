@@ -35,6 +35,7 @@ All `curl` examples assume a running Yuzu server at `https://localhost:8080` (HT
 | [REST API Reference](rest-api.md) | Complete REST API v1 endpoint reference with request/response examples |
 | [Gateway](gateway.md) | Erlang/OTP gateway node for multi-site deployments and scale-out |
 | [TAR (Timeline Activity Record)](tar.md) | Continuous system state change tracking -- processes, network, services, users |
+| [App Usage](app-usage.md) | Read-only, machine-scope application run-time inventory derived from TAR's `usage` fold — per-executable run counts/durations, gated behind the `Forensics` securable |
 | [Upgrading](upgrading.md) | Version upgrades, rollback, and migration |
 | [Release Verification](release-verification.md) | SHA256SUMS, cosign signatures, SLSA provenance, and CycloneDX / SPDX SBOMs |
 | [MCP (AI Integration)](mcp.md) | Model Context Protocol server -- AI-driven fleet querying, tools, tokens, and approval workflows |
