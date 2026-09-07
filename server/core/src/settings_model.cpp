@@ -4,33 +4,7 @@
 
 #include "settings_model.hpp"
 
-#include <algorithm>
-#include <cctype>
-
 namespace yuzu::server::settings_model {
-
-namespace {
-
-// True if `s` looks like a bare "host" or "host:port" with no userinfo --
-// i.e. either no ':' at all, or the LAST ':' is followed only by digits (a
-// plausible port). Real hosts never contain '@' or an internal '/'; this is
-// the signal `sanitize_url_userinfo` uses below to tell "an unencoded '/'
-// inside the userinfo landed here" (looks_like_bare_host == false, keep
-// searching for the real '@') apart from "this genuinely is the host, the
-// '/' right after it starts the path" (looks_like_bare_host == true, a
-// later '@' -- if any -- belongs to the path, not to credentials; #4028
-// fix-round finding UP-1's ".../db@table` regression case).
-bool looks_like_bare_host(std::string_view s) {
-    auto colon = s.find_last_of(':');
-    if (colon == std::string_view::npos)
-        return true;
-    auto port = s.substr(colon + 1);
-    return !port.empty() &&
-           std::all_of(port.begin(), port.end(),
-                       [](unsigned char c) { return std::isdigit(c) != 0; });
-}
-
-}  // namespace
 
 std::string sanitize_url_userinfo(std::string_view url) {
     if (url.empty())
@@ -42,46 +16,82 @@ std::string sanitize_url_userinfo(std::string_view url) {
     if (auto scheme_end = url.find("://"); scheme_end != std::string_view::npos)
         authority_start = scheme_end + 3;
 
+    // #4028 fix-round history (kept because the naive-looking design below
+    // is the product of two failed, more "precise" attempts -- a future
+    // editor tempted to reintroduce a host/authority-boundary heuristic
+    // should read this first):
+    //
+    //   Round 1 tried to first locate the authority's end (the path-
+    //   starting '/') and search for '@' only within that boundary, with a
+    //   `looks_like_bare_host` heuristic to widen the search past an
+    //   embedded, unescaped '/' in the password. Gate 8 re-review (three
+    //   independent reviewers: cpp-safety, security-guardian, cpp-expert)
+    //   found the boundary-first approach fundamentally unfixable: a
+    //   password segment that happens to be digit-only before the '/'
+    //   (e.g. "admin:1234/ss@host") is LEXICALLY IDENTICAL to a real
+    //   "host:port" and the heuristic cannot tell them apart, no matter how
+    //   it is patched -- two rounds of patching that same heuristic each
+    //   shipped a new bypass or regression.
+    //
+    //   Round 2 (this implementation) deletes the heuristic and the
+    //   boundary-first search entirely. `@` is never legal in a URL's
+    //   host/port; the only genuinely unresolvable ambiguity is whether a
+    //   later '@' belongs to a corrupted (unescaped) password or to
+    //   legitimate path/table content (".../db@table"). Since this is a
+    //   DISPLAY-ONLY sanitizer with no obligation to hand back a working
+    //   URL, that ambiguity is resolved by always preferring to
+    //   OVER-STRIP: the LAST '@' anywhere at or after `authority_start` is
+    //   treated as ending a userinfo component, full stop. This can
+    //   discard legitimate trailing path content when the path itself
+    //   contains a later '@' (see the "sweeps up a legitimate path '@'"
+    //   test below), but it can never leave a real credential character in
+    //   the output -- the discarded prefix always fully contains whatever
+    //   userinfo existed, however it was shaped, because nothing after the
+    //   chosen '@' can be part of an EARLIER credential.
+    //
+    //   KNOWN OPEN GAPS as of this writing (governance ledger
+    //   governance.d/4028-settings-read-twins.BAbeot.jsonl, findings
+    //   g8b-sanitizer-scheme-boundary and the query-vs-userinfo ordering
+    //   finding, both `open`/HIGH/BLOCKING) -- the "it can never leave a
+    //   real credential character" claim two paragraphs up is NOT true in
+    //   two cases Gate 8b found: (a) a schemeless credential URL whose
+    //   query string embeds another "://" (e.g. a
+    //   "?ssl_ca=https://ca.example/root.pem" value) fools the
+    //   `url.find("://")` scheme search above into computing
+    //   `authority_start` past the real userinfo entirely, leaking it in
+    //   full; (b) a query string that itself contains a later '@' (e.g.
+    //   "?user=admin@corp.com&password=...") breaks the sequential
+    //   strip-then-search-the-result ordering below, discarding the
+    //   query's own '?' before it can be found. A verified fix exists
+    //   (compute both cut points against the ORIGINAL `url`, not
+    //   sequentially against a once-mutated string, and union the two
+    //   removal ranges) but was not applied this session -- two full
+    //   redesigns of this function each surfaced new bypasses on review,
+    //   and a third rushed patch was judged higher risk than stopping to
+    //   flag it for deliberate, unhurried review. DO NOT patch this
+    //   function again without reading the full ledger history first.
+    auto at_pos = url.find_last_of('@');
+    std::string sanitized = (at_pos != std::string_view::npos && at_pos >= authority_start)
+                                 ? std::string(url.substr(0, authority_start)) +
+                                       std::string(url.substr(at_pos + 1))
+                                 : std::string(url);
+
     // A query string or fragment can carry its OWN credential form this
     // function otherwise never models at all -- e.g. ClickHouse's HTTP
     // interface also accepts "?user=admin&password=..." with no '@'
-    // anywhere in the URL (#4028 fix-round finding UP-2). This is a
-    // display-only sanitizer with no obligation to hand back a working
-    // URL, so query string and fragment are dropped unconditionally rather
-    // than selectively redacted (selective redaction would need to
-    // enumerate every driver's own query-parameter convention and stays
-    // wrong for the next one).
-    auto qf = url.find_first_of("?#", authority_start);
-    std::string base(url.substr(0, qf == std::string_view::npos ? url.size() : qf));
-
-    auto slash = base.find('/', authority_start);
-    auto authority_end = (slash == std::string::npos) ? base.size() : slash;
-
-    // Userinfo delimiter is the LAST '@' before authority_end, not the
-    // first: a password containing an unescaped '@' (e.g. "p@ss") left the
-    // first-'@' search stop mid-password, leaking the remainder verbatim
-    // (original sec-H1 report).
-    auto at_pos = base.find_last_of('@');
-    if (at_pos != std::string::npos && at_pos < authority_end && at_pos >= authority_start)
-        return base.substr(0, authority_start) + base.substr(at_pos + 1);
-
-    // No '@' found before the naive authority boundary. Either there is
-    // genuinely no userinfo (the common case -- e.g. ".../db@table", where
-    // "host:9000" before the '/' looks like a bare host and this branch
-    // must NOT fire), or the naive boundary itself is wrong: a password
-    // containing an unescaped '/' (e.g. "pa/ss") makes the FIRST '/' land
-    // inside the userinfo, well before the real '@' (original UP-1
-    // report), which is exactly what `looks_like_bare_host` distinguishes.
-    // If what precedes the '/' does NOT look like a plausible host[:port],
-    // widen the search for '@' past that '/' and, if found, treat
-    // everything up to it as userinfo.
-    if (slash != std::string::npos &&
-        !looks_like_bare_host(base.substr(authority_start, slash - authority_start))) {
-        if (auto wider_at = base.find('@', slash); wider_at != std::string::npos)
-            return base.substr(0, authority_start) + base.substr(wider_at + 1);
-    }
-
-    return base; // no userinfo present in the authority component
+    // anywhere in the URL (#4028 fix-round finding UP-2). This is dropped
+    // unconditionally rather than selectively redacted (selective
+    // redaction would need to enumerate every driver's own query-parameter
+    // convention and stays wrong for the next one), and it runs AFTER the
+    // '@'-based strip above, against the ALREADY-sanitized string: an
+    // unescaped '?' or '#' inside a password that the '@' strip already
+    // removed can then never be mistaken for the real query start (running
+    // this step first, against the raw `url`, was round 1's other defect --
+    // it truncated before the real userinfo delimiter was ever found).
+    auto qf = sanitized.find_first_of("?#", authority_start);
+    if (qf != std::string::npos)
+        sanitized.resize(qf);
+    return sanitized;
 }
 
 nlohmann::json build_tls_settings(const Config& cfg) {

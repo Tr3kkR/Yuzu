@@ -2635,13 +2635,29 @@ the separate `clickhouse_password` field — a URL with embedded userinfo creden
 (`clickhouse://user:pass@host:9000/db`) leaked the credential regardless. The shared builder now
 strips URL userinfo unconditionally (`settings_model::sanitize_url_userinfo`) before either surface
 ever sees it, and never reads the raw password into a response at all — only a
-`clickhouse_password_set` bool. Fix-round hardening (governance Gate 2-5) found the initial strip
-itself incomplete: an unescaped `@` or `/` inside the userinfo let part or all of a credential
-through (`user:p@ss@host`, `user:pa/ss@host`), and a query-string credential form (`?password=...`,
-no `@` at all) was not modeled. `sanitize_url_userinfo` now finds the userinfo delimiter as the
-LAST `@` before the authority boundary (not the first), widens that boundary search past an
-unencoded `/` when what precedes it does not look like a plausible `host[:port]`, and drops any
-query string or fragment unconditionally rather than selectively redacting it.
+`clickhouse_password_set` bool. Fix-round hardening (governance Gate 2-8, two rounds) found the
+initial strip itself incomplete: an unescaped `@`, `/`, or `?` inside the userinfo let part or all
+of a credential through, and a query-string credential form (`?password=...`, no `@` at all) was
+not modeled. A first attempt tried to locate the authority boundary (the path-starting `/`) and
+search for `@` only within it, widening past an embedded `/` via a "does this look like a
+`host[:port]`" heuristic — governance re-review found that unfixable (a digit-only password
+segment before the `/` is lexically identical to a real port, so the heuristic cannot tell them
+apart) and it shipped a regression on top of the bypass it was meant to close. `sanitize_url_userinfo`
+now finds the userinfo delimiter as simply the LAST `@` anywhere in the URL, with no boundary
+computation at all, and drops any query string or fragment afterward. This deliberately
+over-strips when the path itself contains a later, harmless `@` (`.../db@table` becomes
+`.../table`) — an accepted trade-off, since the alternative is a heuristic that can be fooled into
+leaving a real credential in place.
+**Not fully closed as of this writing**: two independent Gate 8b reviewers each found a
+DIFFERENT remaining bypass in this second design — a schemeless URL whose query string contains
+a nested `://` can fool scheme-boundary detection into skipping the strip entirely, and a query
+string that itself contains an `@` can make the query-strip (which runs against the
+already-userinfo-stripped string) miss its own delimiter and leave a password fragment exposed.
+Both are recorded `open`, HIGH/BLOCKING, in the governance ledger
+(`governance.d/4028-settings-read-twins.BAbeot.jsonl`) rather than fixed — the session reached its
+fix-round cap after two full redesigns of this function each surfaced new bypasses on review, and
+judged a third rushed patch higher-risk than stopping to flag it for deliberate, unhurried review.
+Treat this sanitizer as materially improved over the pre-#4028 state, not as fully hardened.
 
 ## On-behalf-of assertions rejected (ADR-1005 Interim rules)
 

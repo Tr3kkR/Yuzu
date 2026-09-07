@@ -3006,15 +3006,20 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
     // a genuine runtime_config_store read failure to "", identically to a
     // healthy "not required" — and this badge/toggle IS the deliverable an
     // operator reads to know the require-signature state (I3: the caller
-    // cannot tell degraded from healthy). Real pack-install enforcement is
-    // independent of this flag (sole gate is
-    // ProductPackStore::require_signed_packs_, set from the CLI flag at
-    // boot — see runtime_config_store.hpp's file header) so this is a
-    // display-honesty fix, not an enforcement-bypass fix. `get()` lets a
-    // degraded read say so instead of silently reporting "false". The REST
-    // handler below applies the identical `get()` switch — keep both in
-    // sync (sre finding: a REST/dashboard divergence here would be worse
-    // than the original bug).
+    // cannot tell degraded from healthy). This flag is a status RECORD
+    // only — no server-side check consumes it today (see the corrected
+    // runtime_config_store.hpp file header; an earlier round of this fix
+    // wrongly cited ProductPackStore::require_signed_packs_ here, which
+    // governs YAML product-pack content, a different artifact from
+    // compiled plugin binaries — consistency-auditor's Gate 8 catch).
+    // Plugin-binary signature verification, where configured, is local to
+    // each agent via its own --plugin-require-signature/--plugin-trust-
+    // bundle flags. So this is a display-honesty fix, not an
+    // enforcement-bypass fix. `get()` lets a degraded read say so instead
+    // of silently reporting "false". The REST handler below applies the
+    // identical `get()` switch — keep both in sync (sre finding: a
+    // REST/dashboard divergence here would be worse than the original
+    // bug).
     bool required = false;
     bool required_status_unknown = false;
     if (runtime_config_store_) {
@@ -3049,11 +3054,13 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
             badge_text + "</span></div>";
     if (required_status_unknown) {
         html += "<div class=\"feedback feedback-error\">Runtime config store is unavailable, "
-                "so the Require-signature toggle's saved value could not be read. This does "
-                "<strong>not</strong> disable real enforcement -- that is gated independently, "
-                "at agent pack-install time, by a boot-time server flag this store has no "
-                "influence over. It means this page cannot currently show whether Require is "
-                "on or off. Retry shortly.</div>";
+                "so the Require-signature toggle's saved value could not be read. This flag "
+                "is a status record only -- no server-side check consumes it today. Plugin "
+                "signature verification, where an agent is configured for it, is local to "
+                "that agent (its own <code>--plugin-require-signature</code> / "
+                "<code>--plugin-trust-bundle</code> flags) and is unaffected by this outage. "
+                "It means this page cannot currently show whether Require is on or off. "
+                "Retry shortly.</div>";
     }
 
     // Current state
@@ -3117,8 +3124,18 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
             "Upload &amp; verify</button></div>";
     html += "</form>";
 
-    // Toggle: require signature (only meaningful when bundle is loaded)
-    if (enabled) {
+    // Toggle: require signature (only meaningful when bundle is loaded).
+    // #4028 fix-round finding (consistency-auditor/unhappy-path, Gate 8):
+    // also gated on !required_status_unknown -- otherwise this form
+    // renders with the checkbox defaulted UNCHECKED (since `required`
+    // stays false when its true value could not be read) while the
+    // banner above says the value is unknown, and submitting Save writes
+    // "false" unconditionally, silently discarding whatever the real
+    // prior value was the moment the store recovers. Suppress the whole
+    // form (and the Clear button below it) until a real read succeeds --
+    // forcing a retry is strictly safer than presenting a write control
+    // whose displayed state the page itself just declared untrustworthy.
+    if (enabled && !required_status_unknown) {
         html += "<form hx-post=\"/api/settings/plugin-signing/require\" "
                 "hx-target=\"#plugin-signing-section\" hx-swap=\"innerHTML\" "
                 "style=\"margin-top:0.75rem\">";
@@ -4025,14 +4042,20 @@ void SettingsRoutes::register_routes(
         // polls to learn the require-signature state -- `get_value()`
         // collapsed a genuine runtime_config_store read failure to "",
         // identical to a healthy "not required" (I3: the caller cannot
-        // tell degraded from healthy). Real pack-install enforcement is
-        // independent of this flag (sole gate is
-        // ProductPackStore::require_signed_packs_, set from the CLI flag at
-        // boot -- see runtime_config_store.hpp's file header), so this is a
-        // display-honesty fix, not an enforcement-bypass fix: a degraded
-        // read now fails the REQUEST closed (503) rather than answer with a
-        // value it cannot stand behind. The dashboard fragment renderer
-        // above applies the identical `get()` switch -- keep both in sync.
+        // tell degraded from healthy). This flag is a status RECORD only
+        // -- no server-side check consumes it today (an earlier round of
+        // this fix wrongly cited ProductPackStore::require_signed_packs_
+        // here, which governs YAML product-pack content, a different
+        // artifact from compiled plugin binaries -- consistency-auditor's
+        // Gate 8 catch; see the corrected runtime_config_store.hpp file
+        // header). Plugin-binary signature verification, where
+        // configured, is local to each agent via its own
+        // --plugin-require-signature/--plugin-trust-bundle flags. So this
+        // is a display-honesty fix, not an enforcement-bypass fix: a
+        // degraded read now fails the REQUEST closed (503) rather than
+        // answer with a value it cannot stand behind. The dashboard
+        // fragment renderer above applies the identical `get()` switch --
+        // keep both in sync.
         bool required = false;
         if (runtime_config_store_) {
             auto rc = runtime_config_store_->get(plugin_signing::kPluginSigningRequiredKey);
@@ -4047,9 +4070,11 @@ void SettingsRoutes::register_routes(
                             .retry_after_ms = 5000,
                             .remediation =
                                 "Retry shortly; if this persists, check Postgres connectivity "
-                                "for the runtime_config_store schema. Real plugin-signature "
-                                "enforcement (ProductPackStore, boot-time CLI flag) is "
-                                "unaffected by this outage."}),
+                                "for the runtime_config_store schema. This flag is a status "
+                                "record only -- no server-side check consumes it, and "
+                                "plugin-binary verification (where an agent is configured for "
+                                "it, via that agent's own local flags) is unaffected by this "
+                                "outage."}),
                     "application/json");
                 return;
             }

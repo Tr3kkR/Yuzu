@@ -48,16 +48,50 @@ namespace yuzu::server::settings_model {
 /// only caller; exposed here so the sanitizer itself is unit-testable
 /// without going through the full builder.
 ///
-/// Handles three input shapes a naive first-'@'/first-'/' scan does not:
-/// a password containing an unescaped '@' (the last '@' before the
-/// authority boundary is the real delimiter, not the first), a password
-/// containing an unescaped '/' (which would otherwise truncate the
-/// authority boundary INSIDE the userinfo and make the real '@' read as
-/// past it, leaving the URL returned completely unsanitized), and
-/// query-string credentials (`?user=...&password=...`, which never
-/// involve an '@' at all) — the query string and fragment are dropped
-/// unconditionally rather than selectively redacted. A URL with no
-/// userinfo, query, or fragment is returned unchanged.
+/// The userinfo delimiter is the LAST '@' anywhere in the URL, full stop —
+/// no authority-boundary computation, no "does this look like a host"
+/// heuristic. That is a deliberate design choice, not an oversight: an
+/// earlier version tried to first locate the authority's end (the
+/// path-starting '/') and search for '@' only within it, with a heuristic
+/// to widen past an unescaped '/' embedded in the password. Governance
+/// review found that approach unfixable — a password segment that happens
+/// to be digit-only before the '/' (e.g. "admin:1234/pass@host") is
+/// lexically identical to a real "host:port", so no heuristic patch can
+/// tell them apart, and two rounds of patching that heuristic each shipped
+/// a new bypass. Since this is a display-only sanitizer with no obligation
+/// to hand back a working URL, the unresolvable ambiguity between "a
+/// corrupted password" and "legitimate path content containing '@'" (e.g.
+/// `.../db@table`) is resolved by always preferring to OVER-strip: the
+/// discarded prefix necessarily contains any real credential regardless of
+/// its shape, at the cost of also discarding a later, harmless path '@'
+/// when one happens to be present. The query string and fragment are
+/// dropped unconditionally (rather than selectively redacted — that would
+/// need to enumerate every driver's own query-parameter convention and
+/// stays wrong for the next one), evaluated AFTER the '@'-based strip so
+/// that a '?' or '#' inside an already-removed password is USUALLY not
+/// mistaken for a real query start. A URL with no userinfo, query, or
+/// fragment is returned unchanged.
+///
+/// KNOWN OPEN GAPS (governance ledger `governance.d/
+/// 4028-settings-read-twins.BAbeot.jsonl`, findings
+/// `g8b-sanitizer-scheme-boundary` and the query-vs-userinfo ordering
+/// finding, both `open`/HIGH/BLOCKING as of this writing) — do not treat
+/// this function as fully closed:
+///  1. Scheme-boundary detection (`url.find("://")`) finds the FIRST
+///     "://" anywhere in the string. A schemeless credential URL whose
+///     query string happens to contain another URL as a value (e.g.
+///     `myuser:pass@host:9000/db?ssl_ca=https://ca.example/root.pem`)
+///     computes `authority_start` past the real userinfo, and the
+///     credential is returned completely unsanitized.
+///  2. The sequential "strip '@', then search the RESULT for '?'/'#'"
+///     ordering breaks when the query string itself contains a later
+///     '@' (e.g. `?user=admin@corp.com&password=...`): the discarded
+///     `[authority_start, at_pos]` span swallows the query's own '?'
+///     before the second step ever runs, and a password fragment
+///     survives in the output. A verified fix exists (compute both cut
+///     points against the ORIGINAL string and union the two removal
+///     ranges, rather than mutating sequentially) but was not applied —
+///     see the ledger row for why.
 [[nodiscard]] std::string sanitize_url_userinfo(std::string_view url);
 
 /// `GET /fragments/settings/tls` + `GET /api/v1/settings/tls`. TlsConfig:Read.

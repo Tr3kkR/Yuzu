@@ -3857,9 +3857,12 @@ unreadable returns 500 (A4 error envelope) instead.
 503 above — the `required` flag's backing `runtime_config_store` read failed (the response would
 otherwise be unable to distinguish a genuine outage from a healthy "not required"), or the trust
 bundle was concurrently uploaded/cleared between this request's existence check and its PEM
-re-read. Both are retryable; neither indicates real plugin-signature enforcement is affected — that
-is gated independently, at agent pack-install time, by a boot-time server flag this route and its
-backing store have no influence over.
+re-read. Both are retryable, and neither affects real plugin-signature enforcement — see
+[When a change takes effect](#when-a-change-takes-effect) above: `plugin_signing_required` "records
+intent only," is read in exactly two places (this route and its dashboard fragment twin), and no
+server or agent code consumes it to require signatures. Agent-side enforcement, where configured,
+is that agent's own `--plugin-require-signature`/`--plugin-trust-bundle` flags, independent of this
+route and its backing store.
 
 #### `GET /api/v1/settings/gateway`
 
@@ -6949,6 +6952,14 @@ These endpoints drive the **Settings → Plugin Code Signing** card. The four `/
   ```
 
 - **Response (503, audit subsystem unavailable):** same A4 error shape with `code: 503`.
+
+- **Response (503, two further cases, #4028 fix round):** the `required` flag's backing
+  `runtime_config_store` read failed (distinguishes a genuine outage from a healthy "not required" —
+  see [When a change takes effect](#when-a-change-takes-effect) above: `plugin_signing_required`
+  "records intent only," no server or agent code consumes it to require signatures, so a degraded
+  read here does not affect real enforcement), or the trust bundle was concurrently
+  uploaded/cleared between this request's existence check and its PEM re-read. Both are retryable
+  (A4 envelope, `retry_after_ms` set).
 
 - **Operator usage:** curl this into a local file on each agent host, then point the agent at that file with `--plugin-trust-bundle`:
 

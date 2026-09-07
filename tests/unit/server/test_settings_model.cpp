@@ -50,28 +50,47 @@ TEST_CASE("sanitize_url_userinfo handles a schemeless authority",
     CHECK(sm::sanitize_url_userinfo("admin:s3cr3t@host:9000/yuzu") == "host:9000/yuzu");
 }
 
-TEST_CASE("sanitize_url_userinfo does not touch an '@' inside the path",
+TEST_CASE("sanitize_url_userinfo sweeps up a legitimate path '@' along with it "
+          "(deliberate over-strip, round 2)",
           "[settings][settings_model]") {
-    // An '@' appearing only after the first '/' is not authority userinfo —
-    // must not be mistaken for one and stripped.
-    CHECK(sm::sanitize_url_userinfo("clickhouse://host:9000/db@table") ==
-          "clickhouse://host:9000/db@table");
+    // #4028 fix-round history: this test used to assert the path's '@' was
+    // left untouched, distinguishing "no userinfo, path has an '@'" from a
+    // real credential. That distinction turned out to be UNDECIDABLE from
+    // the string alone -- "admin:1234/ss@host" (a real, '/'-corrupted
+    // password) and "host:9000/db@table" (no userinfo at all) are
+    // impossible to tell apart by any lexical heuristic (three independent
+    // governance reviewers converged on this: cpp-safety, security-guardian,
+    // cpp-expert, each finding a different input that broke a different
+    // attempted heuristic). Since this is a display-only sanitizer with no
+    // obligation to hand back a working URL, the design now deliberately
+    // resolves the ambiguity by over-stripping: the LAST '@' anywhere in the
+    // URL is always treated as ending userinfo, even when -- as here --
+    // there was no userinfo and the '@' was harmless path content. This
+    // trades path fidelity for a guarantee that no credential can ever
+    // survive, regardless of shape.
+    CHECK(sm::sanitize_url_userinfo("clickhouse://host:9000/db@table") == "clickhouse://table");
 }
 
 TEST_CASE("sanitize_url_userinfo handles an empty string", "[settings][settings_model]") {
     CHECK(sm::sanitize_url_userinfo("") == "");
 }
 
-// #4028 fix-round hardening (governance Gate 2-5: security-guardian,
+// #4028 fix-round hardening (governance Gate 2-5/8: security-guardian,
 // quality-engineer F1, unhappy-path UP-1/UP-2, chaos-injector CH-1) —
-// adversarial regression coverage for three bypasses the original
-// first-'@'/first-'/' scan missed.
+// adversarial regression coverage. History, since this function has been
+// through two designs: round 1 tried to locate the authority boundary first
+// and search for '@' within it (with a `looks_like_bare_host` heuristic to
+// widen past an embedded '/'). Gate 8 re-review found that approach
+// unfixable -- a digit-only password segment before the '/' is lexically
+// identical to a real host:port, so no heuristic patch could close every
+// shape. Round 2 (current) deletes the heuristic: the LAST '@' anywhere in
+// the URL is always the delimiter, full stop -- see the sweeps-up-a-path-'@'
+// test above for the accepted trade-off this makes.
 
 TEST_CASE("sanitize_url_userinfo strips a password containing an unescaped '@'",
           "[settings][settings_model][security]") {
     // A naive FIRST-'@' scan stops mid-password here, leaking "ss@host..."
-    // verbatim. The real delimiter is the LAST '@' before the authority
-    // boundary.
+    // verbatim. The real delimiter is the LAST '@' in the URL.
     CHECK(sm::sanitize_url_userinfo("clickhouse://admin:p@ss@host:9000/yuzu") ==
           "clickhouse://host:9000/yuzu");
 }
@@ -79,12 +98,52 @@ TEST_CASE("sanitize_url_userinfo strips a password containing an unescaped '@'",
 TEST_CASE("sanitize_url_userinfo strips a password containing an unescaped '/'",
           "[settings][settings_model][security]") {
     // A naive FIRST-'/' authority boundary lands INSIDE the userinfo here
-    // ("admin:pa" / "ss@host..."), which makes the real '@' read as past the
-    // boundary and the whole URL fall through completely unsanitized. The
-    // fix widens the search past the early '/' whenever what precedes it
-    // does not look like a plausible host[:port].
+    // ("admin:pa" / "ss@host..."). Since round 2 never computes an authority
+    // boundary before searching for '@', this shape was never a special
+    // case to begin with.
     CHECK(sm::sanitize_url_userinfo("clickhouse://admin:pa/ss@host:9000/yuzu") ==
           "clickhouse://host:9000/yuzu");
+}
+
+TEST_CASE("sanitize_url_userinfo strips a password containing an unescaped '/' even when "
+          "the password's prefix is digit-only",
+          "[settings][settings_model][security]") {
+    // Round 1 regression (security-guardian + cpp-expert, Gate 8): a
+    // password segment that happens to be all-digits before the embedded
+    // '/' (here "1234") is lexically indistinguishable from a real
+    // "host:port" to any last-colon-followed-by-digits heuristic, so round
+    // 1's `looks_like_bare_host` widen check never fired and this shape
+    // bypassed the sanitizer completely. Round 2 has no such heuristic.
+    CHECK(sm::sanitize_url_userinfo("clickhouse://admin:1234/ss@host:9000/yuzu") ==
+          "clickhouse://host:9000/yuzu");
+}
+
+TEST_CASE("sanitize_url_userinfo strips a password containing an unescaped '?'",
+          "[settings][settings_model][security]") {
+    // Round 1 regression (security-guardian, Gate 8): round 1 dropped the
+    // query string/fragment from the RAW url before ever searching for
+    // '@', so an unescaped '?' inside the password truncated the string
+    // before the real delimiter was found, leaking the username and a
+    // password prefix ("clickhouse://admin:p"). Round 2 runs the query/
+    // fragment drop AFTER the '@'-based strip, against the already-
+    // sanitized string, so a '?' inside a since-removed password can never
+    // be mistaken for a real query start.
+    CHECK(sm::sanitize_url_userinfo("clickhouse://admin:p?ss@host:9000/yuzu") ==
+          "clickhouse://host:9000/yuzu");
+}
+
+TEST_CASE("sanitize_url_userinfo strips real userinfo even when the path also contains an '@'",
+          "[settings][settings_model][security]") {
+    // Round 1 regression (cpp-safety, cpp-expert, compliance-officer, Gate
+    // 8): round 1's `find_last_of('@')` was unbounded, so a URL combining
+    // REAL credentials with a later path '@' (".../db@table") picked the
+    // path's '@' instead of the credential's, failed the boundary check,
+    // and fell through to `return base` -- the credential leaked in full.
+    // Round 2's over-strip design (see the test above) sweeps up BOTH the
+    // credential and the path '@' in the same pass -- lossier than round
+    // 1's original intent, but the credential can never survive.
+    CHECK(sm::sanitize_url_userinfo("clickhouse://admin:s3cr3t@host:9000/db@table") ==
+          "clickhouse://table");
 }
 
 TEST_CASE("sanitize_url_userinfo strips a query-string credential form entirely",

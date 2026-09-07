@@ -22,6 +22,9 @@
 
 #include "settings_routes.hpp"
 
+#include "key_provider.hpp"
+#include "pg/pg_pool.hpp"
+#include "pg/secret_codec.hpp"
 #include "test_route_sink.hpp"
 
 #include <yuzu/server/auth.hpp>
@@ -38,6 +41,8 @@
 #include <shared_mutex>
 #include <string>
 #include <vector>
+
+#include "../test_helpers.hpp"
 
 using namespace yuzu::server;
 
@@ -69,7 +74,15 @@ struct SettingsReadTwinsHarness {
     std::vector<AuditReadCall> audit_read_calls;
     std::size_t gateway_sessions{7};
 
-    SettingsReadTwinsHarness() {
+    /// `runtime_config_store` defaults to nullptr (the pre-existing
+    /// behaviour every other test in this file relies on: `required` reads
+    /// as false, no 503, no "status unknown" state). Passing a real
+    /// (possibly deliberately-failed-to-open) store lets a test exercise
+    /// `RuntimeConfigStore::get()`'s error branch — #4028 fix-round finding
+    /// (sre, consistency-auditor, Gate 8): the prior nullptr-only harness
+    /// meant that branch shipped with zero test coverage despite being the
+    /// BLOCKING fix's own new code path.
+    explicit SettingsReadTwinsHarness(RuntimeConfigStore* runtime_config_store = nullptr) {
         auto auth_fn = [](const httplib::Request&,
                           httplib::Response&) -> std::optional<auth::Session> {
             auth::Session s;
@@ -105,8 +118,7 @@ struct SettingsReadTwinsHarness {
                                /*api_token_store=*/nullptr,
                                /*mgmt_group_store=*/nullptr,
                                /*tag_store=*/nullptr,
-                               /*update_registry=*/nullptr,
-                               /*runtime_config_store=*/nullptr,
+                               /*update_registry=*/nullptr, runtime_config_store,
                                /*audit_store=*/nullptr,
                                /*gateway_enabled=*/true, gateway_count_fn, agents_json_fn, oidc_mu,
                                oidc_provider,
@@ -353,4 +365,70 @@ TEST_CASE("The analytics HTML fragment sanitizes the ClickHouse URL identically 
     CHECK(res->status == 200);
     CHECK(res->body.find("s3cr3t") == std::string::npos);
     CHECK(res->body.find("host:9000/yuzu") != std::string::npos);
+}
+
+// ── Degraded runtime_config_store (UP-3/CH-2 fix, Gate 8 coverage gap) ────
+//
+// A `PgPool` built on an invalid conninfo fails PgPool's own parse step and
+// never attempts a network connection (documented in
+// test_runtime_config_store.cpp: "valid() is false and every acquire
+// returns an empty lease"), so `RuntimeConfigStore::is_open()` is
+// immediately false and every read returns `unexpected` -- fast,
+// deterministic, no real Postgres required. This is the exact scenario the
+// #4028 fix round's `get()` migration exists to handle; the harness above
+// only ever passes `runtime_config_store=nullptr`, which takes a DIFFERENT
+// code path (`if (runtime_config_store_)` is false, `required` reads as a
+// plain default false, no 503) and never touched the `!rc.has_value()`
+// branch this fix introduced.
+
+namespace {
+struct DegradedRuntimeConfigFixture {
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
+    yuzu::server::FileKeyProvider key_provider{keys.path};
+    yuzu::server::pg::SecretCodec codec{key_provider};
+    yuzu::server::pg::PgPool pool{{.conninfo = "this is not a valid conninfo :::", .size = 1}};
+    yuzu::server::RuntimeConfigStore store{pool, codec};
+
+    DegradedRuntimeConfigFixture() {
+        REQUIRE_FALSE(pool.valid());
+        REQUIRE_FALSE(store.is_open());
+    }
+};
+} // namespace
+
+TEST_CASE("GET /api/v1/agent/plugin-policy fails closed (503) when runtime_config_store is down",
+          "[settings][rest][settings-read-twins][security]") {
+    DegradedRuntimeConfigFixture fixture;
+    SettingsReadTwinsHarness h{&fixture.store};
+
+    auto res = h.sink.Get("/api/v1/agent/plugin-policy");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    nlohmann::json body = nlohmann::json::parse(res->body);
+    CHECK(body.at("error").at("code").get<int>() == 503);
+    CHECK(body.at("error").at("retry_after_ms").get<std::int64_t>() == 5000);
+    CHECK(body.at("error").at("message").get<std::string>().find("could not be determined") !=
+          std::string::npos);
+}
+
+TEST_CASE("The plugin-signing fragment shows a distinct status-unknown state when "
+          "runtime_config_store is down",
+          "[settings][rest][settings-read-twins][security]") {
+    DegradedRuntimeConfigFixture fixture;
+    SettingsReadTwinsHarness h{&fixture.store};
+
+    auto res = h.sink.Get("/fragments/settings/plugin-signing");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("status unknown") != std::string::npos);
+    // NOTE: this fixture has no trust bundle on disk (`enabled=false`), so
+    // it cannot exercise the write-path fix (consistency-auditor/
+    // unhappy-path, Gate 8: the toggle-and-Save form is now ALSO gated on
+    // `!required_status_unknown`, not just `enabled`) -- that additionally
+    // needs a bundle present, and `trust_bundle_path()` resolves to a real,
+    // non-test-overridable filesystem location (`auth::default_cert_dir()`)
+    // that a unit test must not write into. Verified instead by direct code
+    // read (settings_routes.cpp's toggle-form `if` condition) rather than
+    // by execution; flagged here so a future reader knows why this gap is
+    // deliberate, not missed.
 }
