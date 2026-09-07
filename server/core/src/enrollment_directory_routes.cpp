@@ -145,7 +145,8 @@ void EnrollmentDirectoryRoutes::register_routes(HttpRouteSink& sink, AuthFn /*au
     // issue text — enough to warrant a log entry, not per-person PII in the
     // directory.users.view sense, so not fail-closed.
     //
-    // CONFINEMENT (#4031 hardening round, post-merge adversarial review):
+    // CONFINEMENT (#4031 hardening round, adversarial review of the branch
+    // before push):
     // this is the ONE route among the five in this file whose rows carry
     // genuine per-agent identity (`auth::PendingAgent::agent_id` +
     // hostname/os/arch/agent_version) — see this file's header comment.
@@ -165,11 +166,19 @@ void EnrollmentDirectoryRoutes::register_routes(HttpRouteSink& sink, AuthFn /*au
     // grant was 403'd outright, never shown anyone's data. The bug was that
     // the scoped-grant feature the product's own docs (docs/user-manual/
     // rbac.md) instruct operators to use was silently inert for this route.
-    // Since a pending (not-yet-approved) agent holds no management-group
-    // membership by construction, the correct confined answer is an
-    // ADMITTED, EMPTY 200 — exactly what `authz::in_scope` below produces
-    // once `fleet_read_fn` is wired as the real gate, rather than a 403 that
-    // masks a working RBAC grant as a permission error.
+    // Under the intended enrollment workflow a pending (not-yet-approved)
+    // agent holds no management-group membership yet — group assignment
+    // follows approval, not the reverse — so the correct confined answer
+    // for a scoped-only grant is typically an ADMITTED, EMPTY 200, not a
+    // 403 that masks a working RBAC grant as a permission error. That is
+    // NOT enforced by the data model: `management_group_members.agent_id`
+    // carries no enrollment/agent-registry foreign key, and
+    // `POST /api/v1/management-groups/{id}/members` accepts any non-empty
+    // caller-supplied id with no existence check (management_group_store.cpp,
+    // rest_api_v1.cpp), so an admin who pre-assigns a not-yet-approved
+    // agent's id to a group produces a non-empty, correctly-confined result
+    // via the same `authz::in_scope` filter below — never a widening either
+    // way.
     sink.Get("/api/v1/enrollment/pending-agents",
             [fleet_read_fn, audit_fn, auth_mgr](const httplib::Request& req,
                                                 httplib::Response& res) {
@@ -210,10 +219,14 @@ void EnrollmentDirectoryRoutes::register_routes(HttpRouteSink& sink, AuthFn /*au
                 // Scope filter — `gate.scope` is the resolved meet(management-
                 // group, service-scope) VisibleSet (nullopt = unfiltered TOP;
                 // engaged, including empty, = filter to exactly these agents).
-                // A pending agent holds no management-group membership yet
-                // (enrollment/approval happens BEFORE group assignment), so a
-                // scoped caller's admitted result is always the empty set —
-                // the correct confined answer, not a widening.
+                // Under the intended workflow a pending agent holds no
+                // management-group membership yet (enrollment/approval
+                // happens before group assignment), so a scoped caller's
+                // admitted result is typically the empty set — but this is a
+                // workflow expectation, not a data-model guarantee (see the
+                // route-header comment above): a pre-assigned membership row
+                // yields a non-empty, correctly-confined result here, never
+                // a widening.
                 nlohmann::json arr = nlohmann::json::array();
                 for (const auto& a : agents) {
                     if (a.status == auth::PendingStatus::approved)

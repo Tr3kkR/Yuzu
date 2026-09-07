@@ -449,11 +449,21 @@ TEST_CASE("REST enrollment/directory: pending-agents narrows to an engaged scope
     CHECK(j["pagination"]["total"] == 1);
 }
 
-TEST_CASE("REST enrollment/directory: pending-agents admitted-empty scope -- 200 with an EMPTY "
-          "list, never a 403 (the exact 'correct confined answer' claim the #4031 hardening "
-          "fix rests on: a pending agent holds no management-group membership yet, so a "
-          "scoped-only grant's real intersection is always empty, not a denial)",
+TEST_CASE("REST enrollment/directory: pending-agents admitted-engaged-EMPTY scope -- 200 with "
+          "an empty list, never a 403 (route half of the under-admission fix: an admitted gate "
+          "result is always answered with its real intersection, even when that intersection "
+          "is empty, rather than being treated as a denial)",
           "[rest][enrollment_directory]") {
+    // NOTE: `h.fleet_scope` below is a hand-injected fake -- it exercises
+    // only this route's own post-gate `authz::in_scope` filtering, not a
+    // real RbacStore+ManagementGroupStore composition. It intentionally
+    // does NOT prove that a scoped grant against real enrollment data is
+    // always empty (it is not -- see the CONFINEMENT comment above the
+    // pending-agents route in enrollment_directory_routes.cpp for why the
+    // data model doesn't guarantee that). The real gate composition,
+    // including the AdmitScoped-with-empty-membership shape, is covered
+    // with real Postgres-backed RbacStore/ManagementGroupStore state in
+    // test_authz_gates.cpp's GatesRig-based cases.
     EnrollmentDirectoryRouteHarness h;
     h.auth_mgr.add_pending_agent("agent-1", "host1.example.com", "linux", "x86_64", "1.2.3");
     // Engaged-empty scope (authz::deny_all() shape) -- admitted, but the

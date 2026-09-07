@@ -38,7 +38,8 @@
 /// under `/api/v1/settings/...` (not `/api/v1/directory/...`) specifically to
 /// avoid the collision.
 ///
-/// CONFINEMENT (ADR-0017, #4031 hardening — adversarial review, post-merge):
+/// CONFINEMENT (ADR-0017, #4031 hardening — adversarial review of the branch
+/// before push):
 /// `GET /api/v1/enrollment/pending-agents` is the one route among these five
 /// whose rows carry genuine per-agent identity (`agent_id`, hostname, os,
 /// arch, agent_version — `auth::PendingAgent`) — the other four return
