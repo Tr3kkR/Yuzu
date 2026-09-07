@@ -32,13 +32,24 @@ this one-time measurement, NOT a proven-reliable fix: even at 240s, 3 of 8 legac
 attempts and 2 of 3 controlled-pilot attempts still voided `t1_not_found` in the 2026-09-07
 re-run. Treat this as the established dominant cause, not an exhaustively-confirmed one.
 
-KNOWN BUG, NOT FIXED: `run_repeat()` computes `functional_valid` and returns it in every
-result row, but `cmd_run()`'s counting loop only checks `void_reason` when deciding whether a
-repeat counts toward `valid`/`repeats` - `functional_valid` is written to output and never
-read by anything that gates the count. So a repeat that fails functional-validity (as ALL 16
-of the 2026-09-07 re-run's counted repeats did) is still counted as valid. Anyone reusing this
-script for a real pre-registered pass must wire this in before trusting its "N/N valid" output
-against a rule that includes functional-validity as a precondition.
+FIXED 2026-09-07 (Dave: "Fix cmd_run's functional_valid wiring and re-run"): `run_repeat()`
+now folds `functional_valid` into `void_reason` itself (as `"functional_invalid"`) for the
+clean-verdict phases (B/B2), so `cmd_run()`'s existing `if not r.get("void_reason")` counting
+loop naturally excludes a functionally-invalid repeat - no change needed in `cmd_run()` itself,
+the bug was that `run_repeat()` computed the precondition but never folded it into the one
+field the counting loop actually reads. Previously: ALL 16 of the 2026-09-07 re-run's counted
+repeats had `functional_valid=False` and were still counted as valid - see the run doc's
+"Decision rule and outcome" section for that history.
+
+Also fixed the same day, same commit: the cohort's service-watch targets included 5 services
+(Spooler, Themes, BITS, wuauserv, W32Time - `SERVICE_NAMES` indices 1/2/4/5/15) confirmed
+Stopped on DGRHP (3 consistently across all 16 prior repeats, 2 intermittently) - `guard.compliant`
+can never fire for a service that never transitions to Running, which made `functional_valid`
+unsatisfiable BY COHORT DESIGN regardless of the wiring fix above. Replaced with 5 services
+confirmed live (`Get-Service`, 2026-09-07) as Running + Automatic-start and not already used
+elsewhere in the 20-name cohort: LSM, DcomLaunch, RpcEptMapper, nsi, SamSs - see
+`BLACKOUT_SVC_OVERRIDE` below. This overrides `G.SERVICE_NAMES` locally for this script's own
+cohort only; `generate_resgate_load.py`'s own list is untouched (out of scope, used elsewhere).
 
 KNOWN BUG, NOT FIXED: `cmd_report`'s grouping key is (label, backend, phase) only - it cannot
 distinguish rows from two different `run` invocations that both used the same label (e.g. two
@@ -81,6 +92,11 @@ COHORT_BASELINE = "blackout-cohort"
 TRIGGER_RULE_ID = "blackout-trigger-rule"
 TRIGGER_BASELINE = "blackout-trigger"
 SCRATCH_DIR_WIN = r"C:\rigA\blackout-scratch"
+
+# 1-indexed override of G.SERVICE_NAMES for THIS script's cohort only - see the "FIXED
+# 2026-09-07" docstring note above for why (Spooler/Themes/BITS/wuauserv/W32Time confirmed
+# Stopped on DGRHP, live-checked before picking these replacements).
+BLACKOUT_SVC_OVERRIDE = {1: "LSM", 2: "DcomLaunch", 4: "RpcEptMapper", 5: "nsi", 15: "SamSs"}
 
 RIGA_ALLOWLIST_RE = re.compile(r"^riga-")
 PROTECTED_RULE_IDS = {"dgrhp-drift-test-file"}
@@ -301,7 +317,7 @@ def cohort_rule(kind, i):
             "remediation": {"type": "alert-only", "params": {}},
         }
     if kind == "svc":
-        name = G.SERVICE_NAMES[i - 1]
+        name = BLACKOUT_SVC_OVERRIDE.get(i, G.SERVICE_NAMES[i - 1])
         return {
             "rule_id": rid, "name": rid, "enabled": True, "enforcement_mode": "audit",
             "severity": "low", "os_target": "windows", "scope": "",
@@ -706,6 +722,8 @@ def run_repeat(op, phase, backend, trigger_kind, cohort_ids, repeat_idx, trigger
     d_by_rule = cohort_events_d(op, cohort_ids, t0["ts"], deadline_ms)
     functional_valid = all(v != "not_observed" for v in d_by_rule.values())
     d_ms = max((v for v in d_by_rule.values() if isinstance(v, (int, float))), default=None)
+    if phase_is_clean_verdict and void_reason is None and not functional_valid:
+        void_reason = "functional_invalid"
 
     # t0["ts"] is log-native (local-labeled-as-UTC); trig_ts is a true
     # time.time() epoch from this (BigColin) host - convert t0 back to true
