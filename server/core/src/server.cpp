@@ -166,6 +166,7 @@
 #include "session_store.hpp"       // HA WS-1/1a — durable operator sessions (ADR-2002 §4)
 #include "preflight_runner.hpp"
 #include "tar_tree_routes.hpp"
+#include "background_jobs.hpp" // WS-10: pass-classification table + YUZU_ASSERT_BACKGROUND_JOB gate
 #include "policy_evaluator.hpp"
 #include "schedule_arming_check.hpp"
 #include "schedule_routes.hpp"
@@ -7669,6 +7670,7 @@ public:
                         const bool stale =
                             !latest || (latest->next_update - now_epoch) < 24 * 3600;
                         if (stale) {
+                            YUZU_ASSERT_BACKGROUND_JOB("ca.publish_crl"); // WS-10 FencedLeaderOnly (crlNumber)
                             if (publish_crl())
                                 spdlog::info(
                                     "PKI: CRL re-published for freshness (nextUpdate window)");
@@ -7911,6 +7913,7 @@ public:
                 // boundary). Do not collapse these into a single flat catch.
                 if (mcp_stream_bridge_) {
                     try {
+                        YUZU_ASSERT_BACKGROUND_JOB("mcp_stream_bridge.sweep"); // WS-10 ReplicaSafe
                         mcp_stream_bridge_->sweep();
                     } catch (...) {
                         try {
@@ -7924,6 +7927,7 @@ public:
                     }
                     if (mcp_sessions_) {
                         try {
+                            YUZU_ASSERT_BACKGROUND_JOB("mcp_session_registry.gc"); // WS-10 ReplicaSafe
                             mcp_sessions_->gc();
                         } catch (...) {
                             try {
@@ -18148,6 +18152,7 @@ private:
                     // so a single bad policy must not take the process (or silently
                     // kill compliance evaluation). Catch, log, and keep ticking.
                     try {
+                        YUZU_ASSERT_BACKGROUND_JOB("policy_evaluator.tick"); // WS-10 FencedLeaderOnly
                         policy_evaluator_->tick();
                     } catch (const std::exception& e) {
                         spdlog::error("policy_eval: tick threw ({}) — thread continuing", e.what());
@@ -18189,11 +18194,23 @@ private:
                             std::chrono::duration_cast<std::chrono::seconds>(
                                 std::chrono::system_clock::now().time_since_epoch())
                                 .count();
+                        YUZU_ASSERT_BACKGROUND_JOB("app_perf_rollup.roll_window"); // WS-10 ReplicaSafe
                         app_perf_rollup_->roll_window(now);
-                        const std::int64_t today = (now / 86400) * 86400;
-                        app_perf_fleet_store_->prune(
-                            today -
-                            static_cast<std::int64_t>(AppPerfFleetStore::kRetentionDays) * 86400);
+                        // WS-10: the store clock-guards + reads Postgres now() itself; pass the window (secs).
+                        // Bounded backlog drain (WS-10 S3): each pass deletes at most
+                        // kPruneCapPerPass; if it hit the cap there may be more, so re-arm
+                        // immediately (bounded) instead of waiting a full hour with a backlog.
+                        // Any non-cap result — under-cap, a decline (0), or an error (-1) —
+                        // stops the drain and the thread resumes its hourly cadence.
+                        YUZU_ASSERT_BACKGROUND_JOB("app_perf_fleet_store.run_retention_prune");
+                        const std::int64_t retention_win =
+                            static_cast<std::int64_t>(AppPerfFleetStore::kRetentionDays) * 86400;
+                        for (int drain = 0;
+                             drain < 12 && !stop_requested_.load(std::memory_order_acquire); ++drain) {
+                            const int pruned = app_perf_fleet_store_->run_retention_prune(retention_win);
+                            if (pruned != static_cast<int>(AppPerfFleetStore::kPruneCapPerPass))
+                                break;
+                        }
                     } catch (const std::exception& e) {
                         spdlog::error("app_perf_rollup: tick threw ({}) — thread continuing",
                                       e.what());
@@ -18249,12 +18266,10 @@ private:
                 // unbounded (#governance H2/CAP-1).
                 if (deployment_run_store_ && deployment_run_store_->is_open()) {
                     try {
-                        const auto cutoff =
-                            std::chrono::duration_cast<std::chrono::milliseconds>(
-                                std::chrono::system_clock::now().time_since_epoch())
-                                .count() -
-                            14LL * 24 * 60 * 60 * 1000;
-                        deployment_run_store_->prune_older_than(cutoff);
+                        // WS-10: clock-guarded, single-writer; the store reads Postgres now()
+                        // itself (shared clock) — pass the 14-day retention WINDOW in ms.
+                        YUZU_ASSERT_BACKGROUND_JOB("deployment_run_store.run_retention_prune");
+                        deployment_run_store_->run_retention_prune(14LL * 24 * 60 * 60 * 1000);
                     } catch (const std::exception& e) {
                         spdlog::error("deployment prune threw ({}) — thread continuing", e.what());
                     } catch (...) {
@@ -18317,6 +18332,7 @@ private:
                     // keep ticking (five other background loops in this file
                     // already carry this shape).
                     try {
+                        YUZU_ASSERT_BACKGROUND_JOB("quarantine_reconciler.tick"); // WS-10 FencedLeaderOnly
                         quarantine_reconciler_->tick();
                     } catch (const std::exception& e) {
                         spdlog::error("quarantine_reconciler: tick threw ({}) — thread continuing",
@@ -18451,6 +18467,7 @@ private:
                     // calls std::terminate, so one bad schedule must not take
                     // the process. Catch, log, keep ticking.
                     try {
+                        YUZU_ASSERT_BACKGROUND_JOB("schedule_runner.tick"); // WS-10 FencedLeaderOnly
                         schedule_runner_->tick();
                     } catch (const std::exception& e) {
                         metrics_.counter("yuzu_schedule_tick_errors_total").increment();
@@ -18741,6 +18758,8 @@ private:
                         // cadence, not the safety.
                         if (execution_tracker_ && execution_tracker_->is_open() &&
                             tick % kConcurrencyClaimReconcileEveryNTicks == 0) {
+                            YUZU_ASSERT_BACKGROUND_JOB( // WS-10 DisabledUntilFixed (advisory-locked single-writer, but replica-local clock — #4093)
+                                "execution_tracker.reconcile_stale_concurrency_claims");
                             execution_tracker_->reconcile_stale_concurrency_claims(now);
                         }
 
@@ -18778,6 +18797,8 @@ private:
                         // degrade does NOT advance the in-memory horizon, so the
                         // window is re-read next tick (a duplicate, never a gap).
                         if (execution_tracker_ && execution_tracker_->is_open()) {
+                            // WS-10 ReplicaSafe — MUST run per-replica (ADR-2002 §5); never leader-gate.
+                            YUZU_ASSERT_BACKGROUND_JOB("execution_tracker.poll_event_outbox_once");
                             if (auto published = execution_tracker_->poll_event_outbox_once()) {
                                 if (*published > 0)
                                     metrics_.counter("yuzu_exec_outbox_poll_published_total")
