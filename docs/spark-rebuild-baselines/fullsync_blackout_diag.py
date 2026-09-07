@@ -19,19 +19,36 @@ override for a non-default rig). YUZU_DGRHP_SSH (ssh destination for the
 agent-log reads, e.g. "-S /tmp/sock -i ~/.ssh/key user@host" as a single
 pre-built arg string), YUZU_AGENT_LOG (default C:\\rigA\\logs\\agent.log).
 
-FIXED 2026-09-07 (see docs/spark-rebuild-baselines/3990-fullsync-blackout-run.md, "T1
-detection: the real root cause"): the residual t0_not_found/t1_not_found false-void rate
-from the 2026-09-06/07 run was NEVER a bug in this script's window/timestamp matching logic.
-`agents/core/src/main.cpp` never calls `logger->flush_on(...)` on the --log-file sink, and
-spdlog's own default `flush_level_` is `level::off` - confirmed against the vendored header,
-not assumed - so a log line's embedded timestamp is accurate at write time, but the
-underlying bytes can sit unflushed for an unpredictable period (measured live: from ~2s up to
-~108s under this rig's ambient log volume) before becoming visible to ANY external reader,
-this script included. See ROOT_CAUSED_T0_TIMEOUT/ROOT_CAUSED_T1_TIMEOUT below - the fix is a
-timeout wide enough to outlast flush lag, not different search logic. This is a real property
-of the agent's --log-file output worth flagging as its own product finding (live-tailing
---log-file for near-real-time diagnostics is unreliable without a flush policy) - not filed
-as an issue by this diagnostic; left for whoever picks that up next.
+PARTIALLY FIXED 2026-09-07 (see docs/spark-rebuild-baselines/3990-fullsync-blackout-run.md,
+"T1 detection: the real root cause"): much of the t0_not_found/t1_not_found false-void rate
+from the 2026-09-06/07 run is explained by a flush-lag gap, not this script's window/timestamp
+matching logic. `agents/core/src/main.cpp` never calls `logger->flush_on(...)` on the
+--log-file sink, and spdlog's own default `flush_level_` is `level::off` - confirmed against
+the vendored header, not assumed - so a log line's embedded timestamp is accurate at write
+time, but the underlying bytes can sit unflushed for an unpredictable period (measured live:
+from ~2s up to ~108s) before becoming visible to ANY external reader, this script included.
+Widened ROOT_CAUSED_T0_TIMEOUT/ROOT_CAUSED_T1_TIMEOUT to compensate - a bounded workaround for
+this one-time measurement, NOT a proven-reliable fix: even at 240s, 3 of 8 legacy Phase B
+attempts and 2 of 3 controlled-pilot attempts still voided `t1_not_found` in the 2026-09-07
+re-run. Treat this as the established dominant cause, not an exhaustively-confirmed one.
+
+KNOWN BUG, NOT FIXED: `run_repeat()` computes `functional_valid` and returns it in every
+result row, but `cmd_run()`'s counting loop only checks `void_reason` when deciding whether a
+repeat counts toward `valid`/`repeats` - `functional_valid` is written to output and never
+read by anything that gates the count. So a repeat that fails functional-validity (as ALL 16
+of the 2026-09-07 re-run's counted repeats did) is still counted as valid. Anyone reusing this
+script for a real pre-registered pass must wire this in before trusting its "N/N valid" output
+against a rule that includes functional-validity as a precondition.
+
+KNOWN BUG, NOT FIXED: `cmd_report`'s grouping key is (label, backend, phase) only - it cannot
+distinguish rows from two different `run` invocations that both used the same label (e.g. two
+separate attempts both run with label="clean"). Re-running `report` against a results file
+containing more than one such attempt silently pools their rows together. Add a run
+identifier before trusting `report`'s output across multiple attempts.
+
+This is a real property of the agent's --log-file output worth flagging as its own product
+finding (live-tailing --log-file for near-real-time diagnostics is unreliable without a flush
+policy) - not filed as an issue by this diagnostic; left for whoever picks that up next.
 """
 
 import argparse

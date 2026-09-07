@@ -438,37 +438,40 @@ diagnostic, ruling-13 on #3850)
 - Operator action: not specified in source; not established by this diagnostic either - no
   system-side effect was found for a mitigation to target.
 - Compensating control: this diagnostic (`docs/spark-rebuild-baselines/
-  3990-fullsync-blackout-run.md`), run 2026-09-06/07 on DGRHP, re-run 2026-09-07 after a
-  driver-tooling fix. **2026-09-06/07: INCONCLUSIVE** - neither backend reached the
-  pre-registered K=5 floor, initially misattributed to a "queueing/pile-up effect" that was
-  checked against the complete agent-log evidence and retracted (every `full_sync` actually
-  confirmed to run completed in 8.3s or less, most under 100ms at the clean cohort - the real
-  cause was an agent `--log-file` flush-lag interacting with the driver's polling timeout, not
-  a system delay). **2026-09-07 re-run, after widening the driver's polling timeout to outlast
-  the flush lag: both backends reached the pre-registered floor** (Phase B: legacy 5/5 valid,
-  median 53.0ms; spark 5/5 valid, median 77.0ms. Phase B2: legacy 3/3, median 66.0ms; spark
-  3/3, median 74.0ms). Applying the pre-registered numeric rule (spark median <= legacy median
-  + max(1000ms, legacy median)) to Phase B: 77.0 <= 1053.0 - **within the predeclared margin**;
-  Phase B2 likewise within margin. **One precondition of the pre-registered rule -
-  functional-validity, `guard.compliant` observed for all 60 cohort rules - was not met by ANY
-  repeat, on either backend**: 3-5 of 20 service-watch cohort rules watch Windows services
-  (Spooler, Themes, BITS, wuauserv, W32Time) that are genuinely `Stopped` on this rig,
-  confirmed directly - a cohort-composition gap inherited from an existing test helper's
-  service list, unrelated to Guardian/spark behavior and identical on both backends. The run
-  doc reports "within margin" as its own judgment call given that gap, explicitly flagged as
-  such rather than asserted as fact - full reasoning, the retraction, and the raw per-repeat
-  data (`fullsync-blackout-results.jsonl`) are there, not restated here.
+  3990-fullsync-blackout-run.md`), run 2026-09-06/07 on DGRHP, re-run 2026-09-07. **Corrected
+  TWICE on review before landing here** - first a fabricated "pile-up effect" claim (retracted:
+  every `full_sync` actually confirmed to run completed in 8.3s or less, most under 100ms at
+  the clean cohort; the real cause of the low first-attempt sample count was an agent
+  `--log-file` flush-lag interacting with the driver's polling timeout), then an overclaimed
+  "reached the pre-registered floor / within margin" framing on the 2026-09-07 re-run (a
+  second review, `gpt-5.6-sol` opine, found the driver computes `functional_valid` but never
+  actually gates its sample count on it - confirmed by reading the code). **Current, accurate
+  state**: the re-run collected the intended B samples (Phase B: legacy median 53.0ms, spark
+  77.0ms; Phase B2: legacy 66.0ms, spark 74.0ms) which, as a NUMERIC OBSERVATION ONLY, fall
+  within the predeclared margin (threshold 1053.0ms / 1066.0ms). But the **FORMAL pre-registered
+  decision is INCONCLUSIVE / INVALID BY COHORT DESIGN - zero of the 16 counted repeats satisfy
+  the full rule** (`failed=0` AND functional-validity), because `guard.compliant` was never
+  observed for `blackout-svc-01/02/15` in any repeat (their target Windows services are
+  genuinely stopped, confirmed directly - a cohort-composition gap, not a backend defect) and
+  intermittently missing for two more (`svc-04/05`, 14/16 and 11/16 - their target services'
+  running state is evidently not stable across the run, not yet characterized). This is not a
+  relaxable technicality: pre-registration exists to prevent exactly this kind of after-the-fact
+  "the failure looks unrelated, so let's count it anyway" reasoning. Full detail, both
+  corrections, and the raw per-repeat data (`fullsync-blackout-results.jsonl`) are in the run
+  doc, not restated here.
 - Owner: not assigned in source material.
 - Milestone: not specified. Nothing found by this diagnostic changes this row's own
   #2278/#2469/#2279 package - the two are not shown to be related.
-- Revisit trigger: before the PR-5 flip head re-run (CH-5-UAT's own driver, once its threshold
-  work lands); before this diagnostic's "accepted-neutral" citation is relied upon for a flip
-  decision; if a stricter reading of the functional-validity precondition is preferred, re-run
-  with a service-rule selection confirmed all-running on the target rig (the measurand, cohort
-  size, and driver are otherwise proven to work reliably as of the 2026-09-07 re-run).
-- Whether "within margin" (this document's own judgment call, given the functional-validity
-  gap above) is sufficient for #3990 to be cited in §5 as "accepted-neutral" per ruling-13's
-  own wording is Dave's ruling, not asserted by this entry.
+- Revisit trigger: a driver fix that actually wires `functional_valid` into `cmd_run`'s
+  counting, run against a cohort whose service-watch rules target services confirmed running
+  AND held stable for the run's duration - that is what would produce an actual pre-registered
+  pass, not a further relaxation; before the PR-5 flip head re-run (CH-5-UAT's own driver, once
+  its threshold work lands); before this diagnostic's "accepted-neutral" citation is relied
+  upon for a flip decision.
+- The numeric observation above is not, by itself, sufficient for #3990 to be cited in §5 as
+  "accepted-neutral" per ruling-13's own wording - that would require Dave to explicitly waive
+  the unmet functional-validity precondition as a recorded protocol deviation, which is his
+  call to make, not a conclusion reached by this entry.
 
 **#2815 + #2818 + #2833 + #2839** (teardown UAF-class; #2797's legacy half and #2012/#2011
 tracked separately below)

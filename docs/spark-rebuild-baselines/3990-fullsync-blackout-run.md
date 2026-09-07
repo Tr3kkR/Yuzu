@@ -9,21 +9,26 @@ specifies nothing beyond that sentence - no measurand, sample size, or neutralit
 Everything below that isn't a direct quote of the ruling is this run's own definition, stated
 as such rather than attributed to source.
 
-**Headline result, read this first, CORRECTED after this doc's own first draft overclaimed
-it** (see "Retraction" below the fold in "The driver's T1-detection gap" section - kept
-in-doc rather than silently edited away, since the wrong version was briefly the working
-conclusion): the intended legacy-vs-spark comparison could not be completed at the
-pre-registered sample size (K=5). The reason is a **bug in this run's own driver script's T1
-(completion-marker) detection**, confirmed by correlating EVERY `full_sync` trigger in the
-complete agent log (not a sample) against its own completion line: across the whole
-~5.5-hour session, all 84 real triggers that ran to completion did so in **8.3 seconds or
-less** - most in under 100ms at the clean 62-rule cohort, and a consistent ~7.5-7.9s at the
-5652-rule leftover-catalogue scale (Phase A). There is no gap anywhere in the log approaching
-even one minute, on either backend. The driver's own poll logic nonetheless recorded most
-clean-cohort attempts as `t1_not_found` (timed out waiting) or `t0_not_found` (never saw the
-trigger at all) - a tooling gap in THIS run's instrument, not a property of the system under
-test. See "The driver's T1-detection gap" below for the full evidence and what remains
-unexplained about the bug itself.
+**Headline result, read this first, CORRECTED TWICE since this doc's own first draft** (see
+"Retraction" below the fold in "The driver's T1-detection gap" for the first correction, and
+"Decision rule and outcome" for the second - both kept in-doc rather than silently edited
+away, since each wrong version was briefly the working conclusion): the 2026-09-06/07 attempt
+could not complete the intended legacy-vs-spark comparison at the pre-registered sample size.
+The reason was a **flush-lag gap in the agent's own `--log-file` output** (confirmed against
+the vendored spdlog source - see "T1 detection: the real root cause" below), not a stall in
+the system under test: correlating EVERY `full_sync` trigger in that session's complete agent
+log against its own completion line showed all 84 real triggers that ran to completion did so
+in **8.3 seconds or less**, most under 100ms at the clean 62-rule cohort - but the log's own
+bytes could sit unflushed on disk for up to ~108s before any external reader, including the
+diagnostic's own polling, could see them, causing most clean-cohort attempts to time out
+waiting for a completion that had, in truth, already happened. A 2026-09-07 re-run with a
+widened polling timeout collected enough samples to compute the intended B comparison (both
+backends land within the predeclared margin) - **but a SEPARATE, unrelated gap (a
+never-wired-up functional-validity check in the driver, plus 2 of 5 targeted Windows services
+having an unstable running state on this rig) means the samples do not satisfy the diagnostic's
+own pre-registered decision rule.** The FORMAL outcome is therefore still **inconclusive /
+invalid by cohort design**, not a pass - see "Decision rule and outcome" for the full,
+three-part breakdown of what is and isn't established.
 
 ## What was measured, and how
 
@@ -251,15 +256,22 @@ was always fast, on both backends, every time one was correctly detected.
 Picked up the next day per Dave's instruction ("fix the driver bug and re-run to reach K=5").
 Root-caused by deliberate live reproduction against the running rig, not by further log
 archaeology: triggered one Phase B repeat, watched the driver's own `_fetch_window` poll loop
-return the IDENTICAL 93 events for 16 consecutive polls across 61 seconds, then checked the
-raw agent log directly (independent of the driver, two fresh SSH calls 5s apart) and found
-the file's `Length` and `LastWriteTime` genuinely frozen for the same window - not a client-
-side caching artifact, the file had not grown. ~2 minutes later, unprompted, a burst of ~15
-lines appeared at once, ending in `apply_rules ok`, every line in the burst timestamped within
+return the IDENTICAL 93 matched events (the cumulative window contents, not new lines) for 16
+consecutive polls across 61 seconds, then checked the raw agent log directly (independent of
+the driver, two fresh SSH calls 5s apart) and found the file's `Length` and `LastWriteTime`
+genuinely frozen for the same window - not a client-side caching artifact, the file had not
+grown. **Correction**: an earlier version of this paragraph also called the eventual burst "~15
+lines," conflating it with the 93-event window total above without saying what either number
+actually counted - the 93 is the poll loop's cumulative matched-event count across the whole
+search window; the smaller figure was this one attempt's own new arm/apply lines within that
+burst, not independently re-verified against the raw log before this correction, and is left
+out rather than restated as a precise number it wasn't checked to be. What IS directly
+confirmed: ~2 minutes after the freeze, a burst of new lines appeared at once, ending in
+`apply_rules ok`, every line in the burst timestamped within
 the SAME real-world second (`06:46:29.6xx`) despite arriving on disk roughly two minutes late.
 
-**Root cause, confirmed against the vendored spdlog source, not assumed**:
-`agents/core/src/main.cpp`'s `--log-file` sink setup (`:651-669`) never calls
+**Root cause for the flush lag ITSELF, confirmed against the vendored spdlog source, not
+assumed**: `agents/core/src/main.cpp`'s `--log-file` sink setup (`:651-669`) never calls
 `logger->flush_on(...)`. spdlog's own default `flush_level_` is `level::off`
 (`spdlog/logger.h:311`), and `should_flush_()` (`spdlog/logger-inl.h:166-168`) only forces a
 sink flush when a message's level meets that (never-raised) threshold - so nothing in this
@@ -267,16 +279,34 @@ process ever asks the sink to flush explicitly. A log line's embedded timestamp 
 message-construction time (accurate), but the underlying bytes can sit in the sink's buffered
 `ofstream` for an unpredictable period - observed live anywhere from ~2 seconds to ~108
 seconds under this rig's ambient log volume - before becoming visible to ANY external reader,
-this diagnostic's own polling included. **This was never a bug in the driver's window/
-timestamp-matching logic** - the matching was always correct once the bytes existed to match
-against; the previous session's timeouts (30-90s) just couldn't reliably outlast the flush lag.
+this diagnostic's own polling included.
 
-**Fix**: widened `ROOT_CAUSED_T0_TIMEOUT`/`ROOT_CAUSED_T1_TIMEOUT` to 240s each (comfortably
-above the worst observed lag, still bounded - a genuinely hung agent would still void). No
-change to the search/matching logic itself, because none was needed. Verified with a small
-3-repeat controlled test before trusting it for the full re-run (2/3 voided `t1_not_found`
-even at 240s - confirms flush lag can occasionally exceed 240s, but the ~60% per-attempt hit
-rate comfortably reaches K=5 within the existing 10-attempt cap without raising it further).
+**Correction (Sol/`gpt-5.6-sol` opine, 2026-09-07)**: "this was never a bug in the driver's
+window/timestamp-matching logic" and "only its timeout was too short" overstate what was
+actually established. The flush-lag mechanism is real and is a strong explanation for MANY of
+the residual `t1_not_found` voids - but the committed evidence does not prove it explains
+EVERY historical one: the original run's `t0_not_found` batch on Phase B2/spark had its own,
+separately-confirmed cause (the rule-id collision, correction #4, which meant there was
+genuinely no trigger to find, nothing to do with flushing); and even after widening the
+timeout to 240s, 3 of 8 legacy Phase B attempts in the re-run still voided `t1_not_found` -
+consistent with flush lag occasionally exceeding 240s, but not independently confirmed to be
+that specific cause each time (the underlying complete-log correlation that grounded the
+retraction above was itself a one-time analysis of the FIRST attempt's log, not repeated for
+every void in the re-run). Read "flush lag" as the established, dominant, and most likely
+explanation for the residual gap - not as a proven, exhaustively-attributed one.
+
+**Fix - more precisely, a bounded workaround for THIS one-time measurement, not a general
+fix**: widened `ROOT_CAUSED_T0_TIMEOUT`/`ROOT_CAUSED_T1_TIMEOUT` to 240s each. No change to
+the search/matching logic itself. Verified with a small 3-repeat controlled test before
+trusting it for the full re-run - **2 of those 3 STILL voided `t1_not_found` even at 240s**,
+a roughly 33% hit rate on that pilot, versus 5/8 (63%) on the actual legacy Phase B re-run;
+neither rate is "comfortably" anything, and 240s does not reliably outlast the phenomenon it's
+compensating for - it only outlasted it often enough, within a generous 10-attempt cap, to
+reach the sample counts this run needed. Deliberately NOT changing the agent daemon's own
+flush policy for this diagnostic - that would alter the executable being measured and risk
+perturbing a sub-100ms measurand; the underlying observability gap (no flush policy makes
+`--log-file` unreliable for any near-real-time external tailing, not just this driver) is a
+separate, real product finding, left for whoever picks it up, not fixed here.
 
 **Re-run results, 2026-09-07, same rig/build/cohort as the retracted run (agent untouched
 since - `0.13.1+7899 (65f2938156a19)`, spark flip one-liner unchanged), fresh `ensure` after
@@ -289,35 +319,61 @@ the previous run's teardown**:
 | B2 | spark  | 3 | 3/3 | 69.0 | 74.0 | 83.0 |
 | B2 | legacy | 3 | 3/3 | 65.0 | 66.0 | 72.0 |
 
-Both backends reached their pre-registered floor (K=5 for Phase B, K=3 for Phase B2) on the
-first attempt at the fix - `failed=0`, `applied=total=62`, `n_arm_lines=62` on every single
-counted repeat, both backends, every phase. Raw per-repeat data for this re-run is appended to
-`fullsync-blackout-results.jsonl` (the retracted run's 73 rows, then this re-run's 19 rows -
-rows carry no `run_id`/date field, and the field SCHEMA does not reliably distinguish them
-either, since the retracted run's own later Phase B/B2 rows already used the same fields; the
-correct, verified distinguisher is the `t0` timestamp - the retracted run's valid rows all
-fall in `2026-09-06T21:47` to `2026-09-07T00:16`; this re-run's valid rows all fall in
-`2026-09-07T07:12` to `08:22`, with no overlap; the retracted run's rows, appended first, are
-clearly the earlier, smaller-sample block by position in the file).
+Both backends reached the driver's own SAMPLE-COUNT floor (K=5 for Phase B, K=3 for Phase B2)
+on the first attempt at the fix - `failed=0`, `applied=total=62`, `n_arm_lines=62` on every
+single counted repeat, both backends, every phase. **Correction, found on a second review of
+this doc (Sol/`gpt-5.6-sol` opine, 2026-09-07) and confirmed by reading the driver's own
+code**: "reached the pre-registered floor" overclaims what the code actually enforces.
+`fullsync_blackout_diag.py`'s `run_repeat()` computes `functional_valid` and returns it in
+every result row, but `cmd_run()`'s counting loop only checks `void_reason` - `functional_valid`
+is written to the output and never read by anything that decides whether a repeat counts. So
+the "5/5"/"3/3" tallies below only enforce `failed=0`/`applied=total`/arm-count/push-counter
+matching - NOT the functional-validity precondition the pre-registered rule (below) also
+requires. See "Decision rule and outcome" for what this means for the actual outcome; treat
+every "N/N valid" claim in this section as "N/N by the driver's partial check," not by the
+full pre-registered rule.
+
+Raw per-repeat data for this re-run is appended to `fullsync-blackout-results.jsonl` (the
+retracted run's 73 rows, then this re-run's 19 rows - rows carry no `run_id`/date field, and
+the field SCHEMA does not reliably distinguish them either, since the retracted run's own later
+Phase B/B2 rows already used the same fields; the correct, verified distinguisher is the `t0`
+timestamp - the retracted run's valid rows all fall in `2026-09-06T21:47` to `2026-09-07T00:16`;
+this re-run's valid rows all fall in `2026-09-07T07:12` to `08:22`, with no overlap; the
+retracted run's rows, appended first, are clearly the earlier, smaller-sample block by position
+in the file). **Also confirmed by the same review**: `cmd_report`'s grouping key is
+`(label, backend, phase)` only - both runs used `label="clean"` for Phase B/B2, so re-running
+`report` against the combined committed file would silently pool the retracted run's few rows
+together with this re-run's, and would NOT reproduce the medians in this doc. Do not run
+`report` against the combined file and trust its output; use the by-hand `t0`-range split above,
+or filter the file first.
 
 **A second, separate gap found while checking functional-validity (D), not a backend defect
-either**: `functional_valid` came back `False` on all 16 valid repeats - not a driver bug, and
-not random. Every occurrence traces to the same 3-5 of 20 service-watch cohort rules:
-`blackout-svc-01/02/04/05/15`, which per `generate_resgate_load.py`'s `SERVICE_NAMES` list
-watch Windows services **Spooler, Themes, BITS, wuauserv, W32Time** for `service-running`.
-Checked directly (`Get-Service`, not inferred): all five are genuinely `Stopped` on DGRHP
-right now, while the OTHER cohort service rules (LanmanServer, LanmanWorkstation, etc., which
-DID show D observed every time) are genuinely `Running`. These specific rules can never reach
-`guard.compliant` on ANY backend, at ANY full_sync speed, because their watched target is not
-in the asserted state - a cohort-composition gap inherited from an existing helper script's
-service list (chosen for near-universal availability, not near-universal running-state), not
-something this diagnostic's re-arm/spark/legacy behavior caused or could fix. B itself is
-unaffected - it measures the `apply_rules` lock window, not rule compliance state, and every
-repeat's `applied=total=62`/`n_arm_lines=62` confirms the re-arm itself was completely normal
-for these rules too, just never reaching the compliant edge because the target never does.
-**The pre-registered decision rule's literal wording** ("functional-validity: D observed for
-all 60 cohort rules") **is therefore not met by any of the 16 repeats, for a reason unrelated
-to what this diagnostic measures.** Reported both ways in "Decision rule and outcome" below.
+either, but the claim below was itself corrected on review**: `functional_valid` came back
+`False` on all 16 valid (by the partial check above) repeats. The ORIGINAL version of this
+paragraph claimed all five of `blackout-svc-01/02/04/05/15` were "genuinely Stopped ... in
+every repeat." **That is only true for THREE of the five** - checked directly against the raw
+per-repeat `compliant_restored_ms_by_rule` data, not re-asserted: `svc-01` and `svc-02` and
+`svc-15` show `not_observed` in all 16/16 repeats (consistent with a target that is simply
+never in the asserted state); `svc-04` shows `not_observed` in 14/16 (observed compliant in
+repeats `B/spark#3`, `B/spark#5`); `svc-05` shows `not_observed` in 11/16 (observed compliant
+in 5 of 16, spread across both backends). These two rules' target services (per
+`generate_resgate_load.py`'s `SERVICE_NAMES` list, watching Windows services **BITS** and
+**wuauserv** for `service-running`) were evidently started and stopped by something else
+during the run - Windows' own background servicing/update activity is the obvious candidate,
+not confirmed - not held in one fixed state throughout. The blanket claim that these rules
+"can never reach `guard.compliant` on ANY backend, at ANY full_sync speed" is true for
+`svc-01/02/15` and NOT established for `svc-04/05`, which sometimes did. This does not change
+which backend was affected (both, comparably, per repeat-count) but it does mean the
+functional-validity gap is smaller and less structurally fixed than first claimed - a cohort
+using a service list confirmed running AND held stable for the run's duration would likely
+still leave `svc-01/02/15` failing, but might not leave `svc-04/05` failing every time. B
+itself is unaffected either way - it measures the `apply_rules` lock window, not rule
+compliance state, and every repeat's `applied=total=62`/`n_arm_lines=62` confirms the re-arm
+itself was normal for all 20 service rules regardless of their eventual compliance state.
+**The pre-registered decision rule's functional-validity precondition is not met by any of the
+16 repeats** - for `svc-01/02/15`, for a reason unrelated to what B measures; for `svc-04/05`,
+for a reason that is not yet fully characterized. Reported in "Decision rule and outcome" below
+as what it actually is: an unmet precondition, not a relaxable technicality.
 
 ## Phase B - clean cohort, baseline re-deploy trigger
 
@@ -325,11 +381,12 @@ to what this diagnostic measures.** Reported both ways in "Decision rule and out
 56.5ms), spark 1/5 valid (82ms; no median - a single sample) - inconclusive against the K=5
 floor, for the driver flush-lag reason documented above.
 
-**2026-09-07 re-run (fixed driver, see "T1 detection: the real root cause" above)**: **legacy
-5/5 valid in 8 attempts** (50, 50, 53, 54, 56ms; median 53ms), **spark 5/5 valid in 5
-attempts, first try** (73, 76, 77, 80, 91ms; median 77ms). Both backends reached the
-pre-registered K=5 floor. `failed=0`, `applied=total=62`, `n_arm_lines=62` on every one of the
-10 counted repeats.
+**2026-09-07 re-run (fixed flush-timeout, see "T1 detection: the real root cause" above)**:
+**legacy 5/5 valid in 8 attempts** (50, 50, 53, 54, 56ms; median 53ms), **spark 5/5 valid in 5
+attempts, first try** (73, 76, 77, 80, 91ms; median 77ms) - by the driver's partial check
+(`failed=0`/`applied=total`/arm-count/push-counter). `n_arm_lines=62` on every one of the 10
+counted repeats too. **None of these 10 also satisfy functional-validity** - see "Decision
+rule and outcome": the pre-registered K=5 floor, taken in full, was NOT reached.
 
 ## Phase B2 - clean cohort, bare rule-create trigger (#3990's literal shape)
 
@@ -337,11 +394,11 @@ pre-registered K=5 floor. `failed=0`, `applied=total=62`, `n_arm_lines=62` on ev
 corrected (unique-id) runs - inconclusive against the K=3 floor, same driver flush-lag cause.
 
 **2026-09-07 re-run**: **legacy 3/3 valid in 3 attempts, first try** (65, 66, 72ms; median
-66ms), **spark 3/3 valid in 3 attempts, first try** (69, 74, 83ms; median 74ms). Both backends
-reached the pre-registered K=3 floor. `failed=0`, `applied=total=62`, `n_arm_lines=62` on
-every one of the 6 counted repeats. Create-to-T0 lag (informational, cross-host, non-verdict-
-bearing per the plan) was not specifically re-examined in the re-run - not load-bearing for
-the decision rule either way.
+66ms), **spark 3/3 valid in 3 attempts, first try** (69, 74, 83ms; median 74ms) - by the
+driver's partial check, same caveat as Phase B above; `n_arm_lines=62` on every one of the 6
+counted repeats too, and none of the 6 also satisfy functional-validity. Create-to-T0 lag
+(informational, cross-host, non-verdict-bearing per the plan) was not specifically re-examined
+in the re-run - not load-bearing for the decision rule either way.
 
 ## Decision rule and outcome
 
@@ -353,38 +410,52 @@ rules).
 **2026-09-06/07: Outcome INCONCLUSIVE** - neither backend reached the K=5 floor (driver flush
 lag, since root-caused and fixed; see above). Superseded by the 2026-09-07 re-run below.
 
-**2026-09-07 re-run: both backends reached the pre-registered floor** (Phase B: legacy 5/5,
-spark 5/5; Phase B2: legacy 3/3, spark 3/3). Applying the numeric part of the rule to Phase B
-(the primary trigger):
+**2026-09-07 re-run: both backends reached the driver's own sample-count floor** (Phase B:
+legacy 5/5, spark 5/5; Phase B2: legacy 3/3, spark 3/3, all by the partial check described
+above - `failed=0`/`applied=total`/arm-count/push-counter only, NOT functional-validity, which
+the code never actually gates on). The numeric B comparison, computed from those samples:
 
-| | legacy median | spark median | margin (max(1000, legacy median)) | threshold | result |
+| | legacy median | spark median | margin (max(1000, legacy median)) | threshold | numeric result |
 |---|---|---|---|---|---|
-| B  | 53.0 ms | 77.0 ms | 1000 ms | 1053.0 ms | 77.0 <= 1053.0 -> **within margin** |
-| B2 | 66.0 ms | 74.0 ms | 1000 ms | 1066.0 ms | 74.0 <= 1066.0 -> **within margin** |
+| B  | 53.0 ms | 77.0 ms | 1000 ms | 1053.0 ms | 77.0 <= 1053.0 -> within margin |
+| B2 | 66.0 ms | 74.0 ms | 1000 ms | 1066.0 ms | 74.0 <= 1066.0 -> within margin |
 
-**The functional-validity precondition, taken literally, is NOT met by any of the 16 counted
-repeats** - see "T1 detection... the real root cause" above: `guard.compliant` was never
-observed for 3-5 of the 20 service-watch cohort rules (`blackout-svc-01/02/04/05/15`), because
-their target Windows services (Spooler, Themes, BITS, wuauserv, W32Time) are genuinely
-`Stopped` on this rig, on both backends, in every repeat - a cohort-composition gap, not a
-detection or backend failure. Every other precondition (`failed=0`, full re-arm) was met by
-all 16 repeats.
+**Second correction to this section (Sol/`gpt-5.6-sol` opine, 2026-09-07, confirmed against
+the code and data before accepting it)**: an earlier version of this section treated "within
+margin" as the outcome, framing the unmet functional-validity precondition as a relaxable
+judgment call. That is procedurally unsound, for two reasons found on review, not just one:
 
-**This document's own judgment, clearly flagged as a judgment call, not asserted as fact**:
-the numeric non-inferiority check above ("within margin") is reported as the outcome, on the
-grounds that (a) B does not depend on rule compliance state at all, (b) the specific rules
-that fail functional-validity fail it identically on both backends for a reason external to
-Guardian/spark entirely, and (c) enforcing the literal functional-validity precondition as
-written would make K=5 permanently unreachable on this cohort regardless of backend or driver
-correctness, which was not the intent behind including that precondition (it existed to catch
-a stalled/suppressed compliance-detection path, not a target that was never going to comply).
-**Whether this judgment call is sound, and whether "within margin" is sufficient for #3990 to
-be cited in §5 as "accepted-neutral" per ruling-13's wording, is Dave's call - not settled by
-this document.** A stricter reader who does not accept this document's relaxation of the
-literal precondition should read the outcome as: no repeat meets the pre-registered criteria
-in full, for a cohort-design reason unrelated to backend behavior - re-running with a
-service-rule selection where all watched services are confirmed running would close this gap
-directly, without needing to relax anything.
+1. **Pre-registration exists specifically to prevent exactly this** - deciding, after seeing
+   data that looks fine, that a precondition set in advance doesn't really need to apply this
+   time. A well-argued relaxation is still a relaxation decided post hoc; writing it down
+   transparently doesn't restore its status as a pre-registered pass.
+2. **The "5/5"/"3/3" counts themselves never enforced functional-validity in the first place**
+   - not because it was judged unmeetable and consciously waived at decision time, but because
+   `cmd_run()`'s own counting loop only checks `void_reason`, and `void_reason` is never set
+   from `functional_valid`. So even setting aside point 1, the correct count of repeats
+   satisfying the FULL pre-registered rule (as written: `failed=0` AND functional-validity) is
+   **0 of 16**, not 5/5 or 3/3 under any reading.
+
+**Correct statement of the outcome, in three separately-labeled parts, per that review**:
+- **Numeric observation** (informational, not a decision): the B values that were collected
+  land within the predeclared margin on both phases, table above.
+- **Formal pre-registered decision**: **INCONCLUSIVE / INVALID BY COHORT DESIGN.** Zero repeats
+  satisfy the rule as written. This is not the same failure mode as the 2026-09-06/07 attempt
+  (which failed to collect enough samples at all) - samples exist and are usable as
+  observations, but none of them satisfy the full pre-registered criteria for a decision.
+- **Accepted-neutral status for §5**: **not established by this document.** Citing #3990 as
+  accepted-neutral on the strength of the numeric observation alone would require Dave to
+  explicitly waive the functional-validity precondition as a recorded protocol deviation -
+  that is his call to make, not a conclusion this document reaches on its own.
+
+**Path to an actual pre-registered pass, not just a relaxation**: re-run Phase B/B2 with a
+cohort whose service-watch rules target services confirmed running and held stable for the
+whole run (closes the gap for `svc-01/02/15` definitively; `svc-04/05`'s intermittent-service
+behavior, per the correction above, may resolve on its own with a better-chosen or
+externally-pinned service, or may need one more iteration to confirm). The measurand, cohort
+size, purge/ensure mechanics, and driver timeout are otherwise proven to work as of this
+re-run - only the functional-validity wiring (a `cmd_run()` fix, not attempted here) and the
+service selection need to change for a clean pass.
 
 ## Does NOT claim
 
@@ -402,16 +473,27 @@ directly, without needing to relax anything.
   of this document and is explicitly retracted above, with the evidence that disproved it.**
   Do not cite this document as evidence of such an effect.
 - A neutrality finding in the sense the original CH-5-UAT ruling text explicitly disclaimed
-  ("NOT a finding that #3990 is neutral ... in effect, only in mechanism") - the sample sizes
-  actually obtained are too small to support even the limited comparison this document set out
-  to make, let alone a broader one.
+  ("NOT a finding that #3990 is neutral ... in effect, only in mechanism") - even after the
+  2026-09-07 re-run collected the intended sample counts, the pre-registered decision rule's
+  own functional-validity precondition is not met by any repeat (see "Decision rule and
+  outcome"), so the FORMAL outcome remains inconclusive/invalid by cohort design, not a pass.
 - That the agent's `--log-file` flush-lag finding (up to ~108s observed) has been measured
-  systematically, characterized as a distribution, or reproduced on a differently-loaded rig -
-  one deliberate live reproduction plus the 2026-09-07 re-run's attempt/void pattern are the
-  only evidence; no minimum/maximum/typical lag is established beyond what was observed.
-- That the functional-validity precondition's relaxation (see "Decision rule and outcome") is
-  the only defensible reading - it is this document's own judgment call, explicitly flagged as
-  such, not a neutral fact.
+  systematically, characterized as a distribution, fully attributed as the SOLE cause of every
+  historical void, or reproduced on a differently-loaded rig - one deliberate live reproduction
+  plus the 2026-09-07 re-run's attempt/void pattern are the only evidence; no minimum/maximum/
+  typical lag is established beyond what was observed, and 3 of 8 legacy Phase B attempts still
+  voided even after the timeout was widened to 240s.
+- That the "5/5"/"3/3" sample counts in this document represent a pass against the
+  pre-registered decision rule - they do not; they represent the driver's own PARTIAL check
+  (`failed=0`/`applied=total`/arm-count/push-counter only), because `cmd_run()` never wires
+  `functional_valid` into its counting logic (confirmed by reading the code, not assumed).
+- That `blackout-svc-01/02/04/05/15` are all equally and consistently non-compliant - only
+  `svc-01/02/15` are (16/16 repeats); `svc-04/05` are intermittent (14/16 and 11/16), meaning
+  something external to this diagnostic started and stopped their target services during the
+  run - not characterized further here.
+- That `cmd_report`'s output can be trusted if re-run against the combined
+  `fullsync-blackout-results.jsonl` as committed - its grouping key does not distinguish the
+  retracted run's rows from this re-run's, and would silently pool both under `label="clean"`.
 - The N=5652 legacy-only ~6-minute silence observed in Phase A (see that section) as anything
   more than a single, unreplicated, uncharacterized observation - it was not investigated
   further and no connection to any other finding in this document is established.
