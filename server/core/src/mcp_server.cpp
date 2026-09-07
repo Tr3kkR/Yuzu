@@ -7106,14 +7106,28 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // #4030 review finding (blocking): was the unchecked
+                // query_schedules(), which silently returned an empty list
+                // on pool exhaustion / a failed query, indistinguishable
+                // from a genuinely empty table -- mirrors the same-PR
+                // list_workflows MCP tool's checked/error_response shape
+                // immediately below.
                 ScheduleQuery sq;
-                auto schedules = schedule_engine->query_schedules(sq);
+                auto schedules_result = schedule_engine->query_schedules_checked(sq);
+                if (!schedules_result) {
+                    res.set_content(
+                        error_response(id, kInternalError,
+                                       yuzu::server::genericize_db_error(
+                                           "list_schedules", schedules_result.error())),
+                        "application/json");
+                    return;
+                }
                 // #4030: shared builder (schedule_row_json, workflow_model.hpp) —
                 // widens this tool's output with execution_count, the one field
                 // the dashboard fragment showed that this tool didn't. Same
                 // builder as GET /api/v1/schedules, so the two cannot drift.
                 JArr arr;
-                for (const auto& s : schedules)
+                for (const auto& s : schedules_result->schedules)
                     arr.add_raw(schedule_row_json(s).dump());
                 mcp_audit("success");
                 res.set_content(

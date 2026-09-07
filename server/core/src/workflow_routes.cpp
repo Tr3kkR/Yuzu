@@ -2147,9 +2147,23 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                     "application/json");
                     return;
                 }
-                auto scheds = schedule_engine->query_schedules();
+                // #4030 review finding (blocking): was the unchecked
+                // query_schedules(), which collapsed a pool-exhaustion or
+                // query failure into the same empty vector a genuinely
+                // empty table returns -- matches GET /api/v1/workflows
+                // above, which already has this checked/503 shape.
+                auto scheds_result = schedule_engine->query_schedules_checked();
+                if (!scheds_result) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res,
+                                                     yuzu::server::genericize_db_error(
+                                                         "list_schedules", scheds_result.error()),
+                                                     {.retry_after_ms = 5000}),
+                                    "application/json");
+                    return;
+                }
                 nlohmann::json arr = nlohmann::json::array();
-                for (const auto& s : scheds)
+                for (const auto& s : scheds_result->schedules)
                     arr.push_back(schedule_row_json(s));
                 // #4030 Gate 8 fix (sre, Gate 6): X-Correlation-Id parity
                 // with the success path (see GET /api/v1/workflows above).

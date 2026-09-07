@@ -6,6 +6,7 @@
 #include "pg/pg_raii.hpp"
 #include "schedule_params_parsers.hpp"
 #include "sensitive_instruction_params.hpp" // schedule_params_contain_sensitive_key (#3136 blocker)
+#include "store_errors.hpp" // kDbErrorPrefix (query_schedules_checked, #4030 review finding)
 
 #include <libpq-fe.h>
 #include <spdlog/spdlog.h>
@@ -222,6 +223,48 @@ std::vector<InstructionSchedule> ScheduleEngine::query_schedules(const ScheduleQ
     for (int i = 0; i < rows; ++i)
         results.push_back(row_to_schedule(res.get(), i));
     return results;
+}
+
+// Checked twin of query_schedules() above (#4030 review finding, blocking):
+// the same three degraded conditions that method silently folds into an
+// empty vector -- engine not open, pool-lease timeout, and a failed SQL
+// query -- are reported as std::unexpected here instead, mirroring
+// WorkflowEngine::list_workflows's identical shape (workflow_engine.cpp) so
+// GET /api/v1/schedules and MCP list_schedules can emit the same honest
+// 503/retry_after_ms their sibling GET /api/v1/workflows already does rather
+// than serializing a false empty-success response.
+std::expected<ScheduleListResult, std::string>
+ScheduleEngine::query_schedules_checked(const ScheduleQuery& q) const {
+    if (!open_)
+        return std::unexpected(std::string(kDbErrorPrefix) + "schedule engine not open");
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kDbErrorPrefix) + "pool exhausted");
+
+    std::string sql =
+        std::string("SELECT ") + kSelectAllCols + " FROM schedule_engine.schedules WHERE 1=1";
+    std::vector<std::string> params;
+    int idx = 1;
+
+    if (!q.definition_id.empty()) {
+        sql += " AND definition_id = $" + std::to_string(idx++);
+        params.push_back(q.definition_id);
+    }
+    if (q.enabled_only) {
+        sql += " AND enabled = TRUE";
+    }
+    sql += " ORDER BY name ASC LIMIT 100";
+
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string(kDbErrorPrefix) + PQresultErrorMessage(res.get()));
+
+    ScheduleListResult out;
+    const int rows = PQntuples(res.get());
+    out.schedules.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i)
+        out.schedules.push_back(row_to_schedule(res.get(), i));
+    return out;
 }
 
 // ---------------------------------------------------------------------------
