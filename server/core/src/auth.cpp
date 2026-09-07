@@ -751,9 +751,12 @@ AuthManager::recheck_role_after_credential_check(const std::string& username, Ro
     // by construction (serializes against any concurrent update_role()/
     // reactivate_user()) rather than detecting it after the fact via a
     // version counter - see recheck_role_locked's header doc for the full
-    // mechanism. `pre_check_version` is now unused here (kept in the
-    // signature for the cfg-file-mode branch above and to avoid touching
-    // both call sites in this same round - cleanup tracked as a follow-up).
+    // mechanism. `pre_check_version` is now unused THROUGHOUT this function
+    // (fjarvis Gate 8 catch: an earlier version of this comment wrongly
+    // claimed the cfg-file-mode branch above used it - it doesn't, that
+    // branch only reads `pre_check_role`). Kept in the signature only to
+    // avoid touching both call sites in this same round - cleanup tracked
+    // as a follow-up.
     std::optional<Role> result;
     auto outcome = auth_db_->recheck_role_locked(username, [&](Role db_role) {
         // Invoked while AuthDB holds this row's lock - see the header doc.
