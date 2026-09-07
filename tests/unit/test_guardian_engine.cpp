@@ -177,8 +177,15 @@ struct GuardianFixture {
 TEST_CASE("a file-hash-equals rule with no persisted baseline arms with no seed",
           "[guardian][engine][baseline]") {
     GuardianFixture f;
-    f.engine->apply_rules(GuardianFixture::make_push({GuardianFixture::make_file_hash_rule("r1", "/tmp/x")},
-                                           /*full_sync=*/true));
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    *p.add_rules() = GuardianFixture::make_file_hash_rule("r1", "/tmp/x");
+    // Serialize-then-dispatch so the params Map is parsed INSIDE the agent DLL
+    // (#501 cross-image hash-seed) - a direct apply_rules(p) call here builds
+    // the rule's params Map in the TEST EXE, which a DLL-side .find() (in
+    // spark_spec_from_rule/start_guard_for_rule_locked) can spuriously miss.
+    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+    REQUIRE(dr.exit_code == 0);
     CHECK(f.engine->last_file_expected_hash_for_test().empty()); // first-ever arm: nothing to seed
 }
 
@@ -192,8 +199,12 @@ TEST_CASE("a persisted baseline matching this rule's fingerprint seeds the arm",
     j["hash"] = hash;
     REQUIRE(f.kv->set(GuardianEngine::kv_namespace(), "baseline:r1", j.dump()));
 
-    f.engine->apply_rules(GuardianFixture::make_push({GuardianFixture::make_file_hash_rule("r1", "/tmp/x")},
-                                           /*full_sync=*/true));
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    *p.add_rules() = GuardianFixture::make_file_hash_rule("r1", "/tmp/x");
+    // #501: serialize-then-dispatch, see the comment on the test above.
+    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+    REQUIRE(dr.exit_code == 0);
     CHECK(f.engine->last_file_expected_hash_for_test() == hash);
 }
 
@@ -206,8 +217,12 @@ TEST_CASE("a persisted baseline for a DIFFERENT target does not seed (fingerprin
     j["hash"] = std::string(64, 'b');
     REQUIRE(f.kv->set(GuardianEngine::kv_namespace(), "baseline:r1", j.dump()));
 
-    f.engine->apply_rules(GuardianFixture::make_push({GuardianFixture::make_file_hash_rule("r1", "/tmp/x")},
-                                           /*full_sync=*/true));
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    *p.add_rules() = GuardianFixture::make_file_hash_rule("r1", "/tmp/x");
+    // #501: serialize-then-dispatch, see the comment on the first test above.
+    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+    REQUIRE(dr.exit_code == 0);
     CHECK(f.engine->last_file_expected_hash_for_test().empty()); // genuinely different target
 }
 
@@ -221,8 +236,12 @@ TEST_CASE("an authored expected_hash always wins over any persisted baseline",
     REQUIRE(f.kv->set(GuardianEngine::kv_namespace(), "baseline:r1", j.dump()));
 
     const std::string authored(64, 'd');
-    f.engine->apply_rules(GuardianFixture::make_push(
-        {GuardianFixture::make_file_hash_rule("r1", "/tmp/x", authored)}, /*full_sync=*/true));
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    *p.add_rules() = GuardianFixture::make_file_hash_rule("r1", "/tmp/x", authored);
+    // #501: serialize-then-dispatch, see the comment on the first test above.
+    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+    REQUIRE(dr.exit_code == 0);
     CHECK(f.engine->last_file_expected_hash_for_test() == authored);
 }
 
@@ -239,6 +258,13 @@ TEST_CASE("full_sync clears the prior rule set but PRESERVES a persisted baselin
     // otherwise the closing CHECK_FALSE below is vacuously true regardless of
     // whether the scoped-delete fix works, since rule:r1 was never written in
     // the first place).
+    //
+    // Direct apply_rules() call is safe here (unlike the [baseline] tests
+    // above/below, which route through guardian_dispatch_push_bytes_for_test
+    // for #501) ONLY because make_rule() populates no assertion params() Map
+    // at all - swap either make_rule() call in this test for
+    // make_file_hash_rule() and it needs the same serialize-then-dispatch
+    // migration, or the #501 cross-image hash-seed flake reopens.
     f.engine->apply_rules(
         GuardianFixture::make_push({GuardianFixture::make_rule("r1", "r1")}, /*full_sync=*/true));
     REQUIRE(f.kv->exists(GuardianEngine::kv_namespace(), "rule:r1"));
@@ -278,8 +304,13 @@ TEST_CASE("a full_sync that DOES re-arm the baselined rule seeds it from the per
     // time ago (possibly now genuinely drifted on disk — this test doesn't need a
     // real file since FileGuard doesn't run off Windows); an UNRELATED fleet edit
     // now triggers a full_sync that also re-includes r1 unchanged.
-    f.engine->apply_rules(GuardianFixture::make_push({GuardianFixture::make_file_hash_rule("r1", "/tmp/x")},
-                                           /*full_sync=*/true));
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    *p.add_rules() = GuardianFixture::make_file_hash_rule("r1", "/tmp/x");
+    // #501: serialize-then-dispatch - see the comment on the first [baseline]
+    // test above for the full cross-image hash-seed rationale.
+    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+    REQUIRE(dr.exit_code == 0);
     CHECK(f.engine->last_file_expected_hash_for_test() == original_hash);
 
     // The persisted record itself is unchanged — this arm attempt (whether or not
@@ -420,8 +451,13 @@ TEST_CASE("arming a file-hash-equals rule wires the on_baseline capture callback
     // seeded rule never re-enters the branch that would exercise it.
     GuardianFixture f;
     CHECK_FALSE(f.engine->last_file_on_baseline_wired_for_test()); // nothing armed yet
-    f.engine->apply_rules(GuardianFixture::make_push({GuardianFixture::make_file_hash_rule("r1", "/tmp/x")},
-                                                     /*full_sync=*/true));
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    *p.add_rules() = GuardianFixture::make_file_hash_rule("r1", "/tmp/x");
+    // #501: serialize-then-dispatch - see the comment on the first [baseline]
+    // test above for the full cross-image hash-seed rationale.
+    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+    REQUIRE(dr.exit_code == 0);
     CHECK(f.engine->last_file_on_baseline_wired_for_test());
 }
 
