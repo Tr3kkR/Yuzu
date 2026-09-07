@@ -31,7 +31,9 @@
 ///      because ITS column is a FUTURE expiry; that relationship is inapplicable
 ///      here — do not import it.);
 ///   2. a PERSISTED clock reading in `retention_meta` (survives restarts);
-///   3. SANITISE it (below `min_plausible_reading` → prev_unusable/BadState);
+///   3. SANITISE it — below `min_plausible_reading` (negative/garbage) OR
+///      ahead-of-now (a backward shared-clock step) → prev_unusable/BadState,
+///      never a quiet re-stamp (mirrors `AuditStore`'s `*prev < 0 || *prev > now`);
 ///   4. SUPPRESS only a repeat of the SAME full fact set;
 ///   5. cap every accepted pass UNCONDITIONALLY (`cap_per_pass` LIMIT);
 ///   6. a DELIBERATE missing-anchor decision (`MissingAnchorPolicy`), recorded
@@ -44,10 +46,15 @@
 /// from Postgres `now()` in-SQL (the shared clock, #3715), never a replica's
 /// `system_clock`, so cross-host skew cannot split the guard.
 ///
-/// UNIT-AGNOSTIC. Everything is expressed in the timestamp COLUMN's native unit
-/// (ms for `created_at_ms`, unix-days for `day`), so `now_expr` yields the current
-/// time in that unit and `retention_window`, `big_step_floor`,
-/// `implausibility_bound` and `min_plausible_reading` are all in that same unit.
+/// UNIT-AGNOSTIC. Everything is expressed in the timestamp COLUMN's native unit,
+/// so `now_expr` yields the current time in that unit and `retention_window`,
+/// `big_step_floor`, `implausibility_bound` and `min_plausible_reading` are all in
+/// that same unit. The two units in use today are BOTH epoch-derived integers:
+/// milliseconds for `created_at_ms` (preflight/deployment) and day-floored
+/// unix-SECONDS for `app_perf`'s `day` column (a bucket like
+/// `(epoch_secs/86400)*86400`, so its `now_expr` is raw epoch seconds, NOT a
+/// day-NUMBER). A future store with a true day-number column would need its own
+/// `/86400` now_expr and matching constants — do not copy an existing example blind.
 ///
 /// TRUSTED-CONSTANTS CONTRACT (catastrophic — this is a retention chokepoint).
 /// The SQL-identifier / SQL-expression spec fields (`target_table`, `ts_column`,
@@ -82,8 +89,10 @@ struct ClockGuardedPruneSpec {
     std::string_view target_table;     ///< schema-qualified, e.g. "preflight_run_store.runs"
     std::string_view ts_column;        ///< the retention timestamp column, e.g. "created_at_ms"
     /// SQL yielding "now" in the column's unit, e.g.
-    ///   "(EXTRACT(EPOCH FROM now())*1000)::bigint"  (ms) or
-    ///   "(EXTRACT(EPOCH FROM now())/86400)::bigint"  (unix-days).
+    ///   "(EXTRACT(EPOCH FROM now())*1000)::bigint"  (ms — created_at_ms) or
+    ///   "(EXTRACT(EPOCH FROM now()))::bigint"       (epoch seconds — app_perf's
+    ///                                                day-floored-seconds `day`).
+    /// (A true day-NUMBER column would use "…/86400)::bigint"; no store does today.)
     std::string_view now_expr;
     std::string_view meta_table;       ///< schema-qualified retention_meta(key TEXT PK, value TEXT)
     std::string_view anchor_key;       ///< retention_meta key for the persisted reading

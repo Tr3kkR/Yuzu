@@ -153,8 +153,6 @@ public:
     /// caller's read). Returns true iff a row was flipped.
     bool complete_deployment(const std::string& deployment_id, std::int64_t completed_at_ms);
 
-    /// Delete deployments created before `cutoff_ms` (device rows cascade).
-    /// Returns rows deleted, or -1 on error.
     /// WS-10 (#2508): clock-guarded, single-writer, capped retention prune
     /// (deployment_device cascades). Deletes deployments older than
     /// now - `retention_window_ms`, now read from Postgres itself. Returns rows

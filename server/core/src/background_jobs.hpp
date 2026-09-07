@@ -83,7 +83,11 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
      BackgroundJobClass::ReplicaSafe, "clock-guarded + pg_advisory_xact_lock"},
     {"execution_tracker.reconcile_stale_concurrency_claims", "result_set_maint_thread_",
      BackgroundJobClass::ReplicaSafe,
-     "clock-guarded + pg_try_advisory_xact_lock (WS-10 10.2, this change)"},
+     "advisory-lock SINGLE-WRITER (pg_try_advisory_xact_lock, WS-10 10.2, this change) — prevents "
+     "concurrent double-reconcile. CAVEAT: its clock authority is still replica-local system_clock "
+     "(both the claim expires_at write and the reconcile read), NOT shared PG-now; a concurrency_claims "
+     "DB-clock-authority migration (WS-1 class, #3715 shape) is a prerequisite before a 2nd replica, or "
+     "a skewed winner could release a live claim early"},
     {"execution_tracker.reap_event_outbox", "result_set_maint_thread_", BackgroundJobClass::ReplicaSafe,
      "clock-guarded + pg_try_advisory_xact_lock"},
     {"execution_tracker.poll_event_outbox_once", "result_set_maint_thread_", BackgroundJobClass::ReplicaSafe,

@@ -101,8 +101,17 @@ ClockGuardedPruneOutcome run_clock_guarded_prune(PgPool& pool, const ClockGuarde
         }
         const bool have_anchor = PQntuples(anchor_res.get()) > 0;
         const std::int64_t last_pass_now = have_anchor ? to_i64(PQgetvalue(anchor_res.get(), 0, 0)) : 0;
-        // Part 3 — sanitise: below the plausible floor is unusable, not absent.
-        const bool prev_unusable = have_anchor && last_pass_now < spec.min_plausible_reading;
+        // Part 3 — SANITISE the reading. Below the plausible floor (negative /
+        // garbage-parsed-to-0) OR ahead-of-now is an anomaly, never a quiet reset
+        // (`docs/clock-guarded-retention.md` part 3: "Ahead-of-now, negative, or
+        // unparseable is an anomaly, never a quiet reset"). Ahead-of-now means the
+        // shared PG clock stepped BACKWARD since the last pass (NTP correction /
+        // failover to a lagging standby); it must DECLINE (recorded BadState), not
+        // silently re-stamp the anchor to the earlier `now_unit`. This mirrors the
+        // reference `AuditStore::cleanup_once` (`*prev < 0 || *prev > pg_now`).
+        // Comparison is value-only (no arithmetic), so it is overflow-safe.
+        const bool prev_unusable =
+            have_anchor && (last_pass_now < spec.min_plausible_reading || last_pass_now > now_unit);
 
         // Re-anchor BEFORE the probes (rolled back with the whole txn on any
         // later failure) so a decline still advances the comparison point and a

@@ -118,7 +118,6 @@ public:
     /// data yet. Capped (`truncated` set when the cap clipped the list).
     [[nodiscard]] std::optional<std::vector<AppPerfAppSummary>> list_apps(bool& truncated);
 
-    /// Delete rows with `day` strictly older than `before_day` (epoch seconds).
     /// Best-effort (called by the roll-up background thread). Uses the `(day)` index.
     /// WS-10 (#2508): clock-guarded, single-writer, capped retention prune.
     /// Deletes day-buckets older than now - `retention_window_secs` (SECONDS; the
@@ -127,7 +126,8 @@ public:
     int run_retention_prune(std::int64_t retention_window_secs);
 
     /// Long-retention horizon for the fleet aggregate (vs B1's 31 days) — the trend
-    /// window. The roll-up thread prunes `day < now_utc_day - kRetentionDays`.
+    /// window. The roll-up thread calls `run_retention_prune(kRetentionDays*86400)`,
+    /// deleting day-buckets older than now - this many days (seconds arithmetic).
     static constexpr int kRetentionDays = 180;
 
 private:

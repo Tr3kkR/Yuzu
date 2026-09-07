@@ -187,6 +187,28 @@ TEST_CASE("retention guard: an unusable persisted anchor DECLINES (BadState)",
     CHECK(count_rows(pool) == 2); // declined — nothing deleted
 }
 
+TEST_CASE("retention guard: an ahead-of-now anchor DECLINES (BadState, part 3)",
+          "[pg][store][retention-guard]") {
+    // Part 3 (docs/clock-guarded-retention.md): "Ahead-of-now, negative, or
+    // unparseable is an anomaly, never a quiet reset." A persisted anchor in the
+    // FUTURE by LESS than the big_step floor must still decline — big_step (part 7)
+    // cannot catch it, so only the ahead-of-now sanitiser can. Mirrors the
+    // reference AuditStore's `*prev > pg_now` carrier.
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    setup_schema(pool);
+    seed(pool, 2, 3'600'000); // expired
+    seed(pool, 1, 0);         // recent → NOT would_wipe (isolates the ahead-of-now clause)
+    set_meta(pool, "t_bootstrap_settled", "1");
+    // 1h in the FUTURE: ahead-of-now, but well under the 24h big_step floor.
+    set_meta(pool, "t_last_pass_now", std::to_string(now_ms() + 3'600'000));
+
+    auto r = run_clock_guarded_prune(pool, spec(60'000, 100, MissingAnchorPolicy::Decline), 2000ms);
+    CHECK(r.anomaly == yuzu::server::audit_retention::Anomaly::BadState);
+    CHECK(r.declined);
+    CHECK(count_rows(pool) == 3); // declined — nothing deleted (no silent proceed)
+}
+
 TEST_CASE("retention guard: a large clock step DECLINES (Step)", "[pg][store][retention-guard]") {
     YUZU_REQUIRE_PG_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
