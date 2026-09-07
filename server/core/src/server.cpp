@@ -13297,7 +13297,8 @@ private:
         };
 
         // #2542 PR-7: wraps ServerImpl::emit_event's 4-argument shape (no
-        // caller in either new module passes a non-default Severity).
+        // caller in any of the three modules below passes a non-default
+        // Severity).
         auto emit_event_fn = [this](const std::string& event_type, const httplib::Request& req,
                                     const nlohmann::json& attrs,
                                     const nlohmann::json& payload_data) {
