@@ -427,7 +427,39 @@ that is stated explicitly rather than inferred or invented.
   captures the CURRENT target content as its baseline on every arm, and `#3990`'s `full_sync`
   re-arms every rule unconditionally on any unrelated mutation, a genuinely-still-drifted such
   rule can be silently reclassified as compliant with no remediation having happened - filed
-  as **#4021**, also not risk-accepted here.
+  as **#4021**, also not risk-accepted here. See the new **#3990** entry immediately below for
+  the ruling-13 diagnostic this package's own milestone re-weighing should be read alongside.
+
+**#3990** (fleet-wide `full_sync` storm on any rule mutation - legacy-vs-spark blackout
+diagnostic, ruling-13 on #3850)
+- Detection signal: not specified in source; `yuzu_server_guardian_pushes_dispatched_total`
+  rate and agent `full_sync=true` log frequency are the closest existing signals, neither
+  purpose-built for this.
+- Operator action: not specified in source; the practical mitigation this diagnostic's own
+  evidence points at is batching rule/baseline mutations rather than issuing them in quick
+  succession, not a documented runbook step.
+- Compensating control: this diagnostic (`docs/spark-rebuild-baselines/
+  3990-fullsync-blackout-run.md`), run 2026-09-06/07 on DGRHP. **Result: INCONCLUSIVE** for the
+  intended legacy-vs-spark `B` (`full_sync` apply-window) comparison - neither backend reached
+  the pre-registered K=5 valid-repeat floor (legacy 2/5 deploy-triggered, spark 1/5;
+  legacy 2/3 / spark 0/3 on the literal rule-create trigger) because repeated triggers 45-110s
+  apart caused ~80-90% of individual triggers on BOTH backends to take far longer than a 60-90s
+  budget to resolve - a real, reproducible, shared queueing/pile-up effect neither backend was
+  immune to, found BY this diagnostic rather than assumed going in. The samples that did
+  complete landed in the same 55-82ms band on both backends, too few to support any comparative
+  claim. Full detail, all corrections, and the raw per-repeat data are in the run doc.
+- Owner: not assigned in source material.
+- Milestone: not specified; the pile-up effect found here is a strong candidate to fold into
+  this row's own #2278/#2469/#2279 hardening package rather than stand alone, given the shared
+  mechanism (repeated/queued Guardian pushes) - re-weigh together, not assumed here.
+- Revisit trigger: any change to `apply_rules`' locking/queueing shape; before the PR-5 flip
+  head re-run (CH-5-UAT's own driver, once its threshold work lands); before this diagnostic's
+  "accepted-neutral" citation is relied upon for a flip decision, given the inconclusive result.
+- Whether this evidence is sufficient to cite #3990 as "accepted-neutral" per ruling-13's own
+  wording is Dave's ruling, not asserted by this entry - the honest summary is "neutral in the
+  narrow comparison the samples support, but the diagnostic surfaced a bigger, shared
+  reliability question (the pile-up effect) that neither #3990's own scope nor this row
+  originally anticipated."
 
 **#2815 + #2818 + #2833 + #2839** (teardown UAF-class; #2797's legacy half and #2012/#2011
 tracked separately below)
