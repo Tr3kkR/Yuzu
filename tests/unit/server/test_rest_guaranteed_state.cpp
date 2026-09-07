@@ -3773,6 +3773,75 @@ TEST_CASE("REST gs.rule-status: a service-scoped token is denied outright (same 
     CHECK(res->status == 403);
 }
 
+TEST_CASE("REST gs.rule-status: a management-group-confined grant sees only visible agents "
+          "(AdmitScoped) — same require_list_read composition proof as the fleet /status "
+          "route's own [adr0017] test above, pinned here because this route's C++ post-filter "
+          "(agent_rule_statuses(rule_id) has no scope parameter of its own) is a genuinely "
+          "different code path from /status's SQL-pushed errored_rule_count(agent_scope)",
+          "[pg][rest][guaranteed_state][rule_status][adr0017]") {
+    RestGsHarness h;
+    h.rbac_.set_rbac_enabled(true);
+    REQUIRE(h.rbac_.create_role({"GsReader", "", false, 0}).has_value());
+    REQUIRE(h.rbac_.set_permission({"GsReader", "GuaranteedState", "Read", "allow"}).has_value());
+
+    ManagementGroup g;
+    g.name = "RegionA";
+    g.membership_type = "static";
+    auto gid = h.mgmt_.create_group(g);
+    REQUIRE(gid.has_value());
+    REQUIRE(h.mgmt_.add_member(*gid, "WS-1").has_value()); // WS-1 visible; WS-2 is not
+    // Group-SCOPED grant, deliberately NOT a global RbacStore::assign_role — carol
+    // can see only what RegionA can see, exactly the AdmitScoped fixture shape used
+    // by the fleet /status route's own [adr0017] tests above.
+    REQUIRE(h.mgmt_.assign_role({*gid, "user", "carol", "GsReader"}).has_value());
+    h.session_user = "carol";
+
+    h.seed_rule("r1", "rule-one");
+    h.seed_status("e1", "WS-1", "r1", "guard.unhealthy", "2026-06-20T10:00:00Z"); // visible
+    h.seed_status("e2", "WS-2", "r1", "guard.compliant", "2026-06-20T10:00:00Z"); // NOT visible
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/rules/r1/status", h.status_route_headers());
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j["data"].is_array());
+    // Only WS-1's row is returned — WS-2 is out of carol's management-group scope.
+    CHECK(j["data"].size() == 1);
+    CHECK(j["data"][0]["agent_id"].get<std::string>() == "WS-1");
+    CHECK(j["pagination"]["total"].get<int>() == 1);
+}
+
+TEST_CASE("REST gs.rule-status: AdmitScoped with zero visible agents returns an empty list, "
+          "not a 403 (INV-2) — the caller has a real grant, it simply resolves to no visible "
+          "agents",
+          "[pg][rest][guaranteed_state][rule_status][adr0017]") {
+    RestGsHarness h;
+    h.rbac_.set_rbac_enabled(true);
+    REQUIRE(h.rbac_.create_role({"GsReader", "", false, 0}).has_value());
+    REQUIRE(h.rbac_.set_permission({"GsReader", "GuaranteedState", "Read", "allow"}).has_value());
+
+    ManagementGroup g;
+    g.name = "EmptyRegion";
+    g.membership_type = "static";
+    auto gid = h.mgmt_.create_group(g);
+    REQUIRE(gid.has_value());
+    // No members added — dana's group is real and her grant is real, but it
+    // contains no agents.
+    REQUIRE(h.mgmt_.assign_role({*gid, "user", "dana", "GsReader"}).has_value());
+    h.session_user = "dana";
+
+    h.seed_rule("r1", "rule-one");
+    h.seed_status("e1", "WS-1", "r1", "guard.unhealthy", "2026-06-20T10:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/rules/r1/status", h.status_route_headers());
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j["data"].is_array());
+    CHECK(j["data"].empty());
+    CHECK(j["pagination"]["total"].get<int>() == 0);
+}
+
 // ═════════════════════════════════════════════════════════════════════════
 // #4037 — per-device all-guards view
 // (GET /api/v1/guaranteed-state/agents/{agent_id}/rules)

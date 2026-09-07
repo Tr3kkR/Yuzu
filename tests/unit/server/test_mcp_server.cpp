@@ -3581,6 +3581,73 @@ TEST_CASE("MCP Guardian: get_guardian_rule_status on an unknown rule_id errors, 
     CHECK(ts.audit_log.back() == "guaranteed_state.rule.view|not_found");
 }
 
+TEST_CASE("MCP Guardian: get_guardian_rule_status filters to gate.scope's visible agents "
+          "(ADR-0017) — this route's C++ post-filter (agent_rule_statuses(rule_id) has no "
+          "scope parameter of its own) is a distinct code path from get_guardian_status's "
+          "SQL-pushed errored_rule_count(agent_scope), so a confined witness on one does not "
+          "prove the other",
+          "[pg][mcp][integration][guardian][adr0017]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_rule(store, "r1", "rule-one");
+    mcp_seed_status(store, "e1", "WS-1", "r1", "guard.unhealthy", "2026-06-20T10:00:00Z");
+    mcp_seed_status(store, "e2", "WS-2", "r1", "guard.compliant", "2026-06-20T10:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    // AdmitScoped witness: only WS-1 is visible to this caller's management
+    // group — mirrors REST gs.rule-status's own [adr0017] AdmitScoped test.
+    ts.list_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                  const std::string&,
+                                  const std::string&) -> yuzu::server::ListReadGate {
+        return {true, std::vector<std::string>{"WS-1"}, std::nullopt};
+    };
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":58,"params":{"name":"get_guardian_rule_status","arguments":{"rule_id":"r1"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto data = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(data["agents"].is_array());
+    // WS-2's row is filtered out — it is outside the caller's visible set.
+    CHECK(data["agents"].size() == 1);
+    CHECK(data["agents"][0]["agent_id"] == "WS-1");
+    CHECK(data["total"].get<int>() == 1);
+}
+
+TEST_CASE("MCP Guardian: get_guardian_status scopes errored_rules to gate.scope's visible "
+          "agents (ADR-0017), same require_list_read composition as REST",
+          "[pg][mcp][integration][guardian][adr0017]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_rule(store, "r1", "rule-one");
+    mcp_seed_rule(store, "r2", "rule-two");
+    mcp_seed_status(store, "e1", "WS-1", "r1", "guard.unhealthy", "2026-06-20T10:00:00Z"); // visible
+    mcp_seed_status(store, "e2", "WS-2", "r2", "guard.unhealthy", "2026-06-20T10:00:00Z"); // NOT visible
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.list_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                  const std::string&,
+                                  const std::string&) -> yuzu::server::ListReadGate {
+        return {true, std::vector<std::string>{"WS-1"}, std::nullopt};
+    };
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":59,"params":{"name":"get_guardian_status"}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto data = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    // Only WS-1's errored rule (r1) counts — WS-2's r2 is out of scope.
+    CHECK(data["errored_rules"].get<int>() == 1);
+    // total_rules is never confined — it is the global rule-catalogue size.
+    CHECK(data["total_rules"].get<int>() == 2);
+}
+
 TEST_CASE("MCP Guardian: get_guardian_device_guards returns every guard's state for one "
           "device, unscoped to any Baseline",
           "[pg][mcp][integration][guardian]") {
