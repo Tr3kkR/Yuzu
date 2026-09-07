@@ -950,10 +950,19 @@ AuthDB::recheck_role_locked(const std::string& username,
     // status) well inside the caller's own expectations.
     std::optional<AuthDBError> err;
     const bool committed = impl_->pool.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
-        const std::string lock_timeout_sql =
-            "SET LOCAL lock_timeout = '" + std::to_string(kWriteTimeout.count()) + "ms'";
-        pg::PgResult set_lt = pg::exec_params(conn, lock_timeout_sql.c_str(), std::vector<std::string>{});
-        if (set_lt.status() != PGRES_COMMAND_OK) {
+        // Bound parameter, not string interpolation (authdb review contract,
+        // .claude/agents/authdb.md: "zero string interpolation", SQL string
+        // interpolation grades HIGH/block-merge - fjarvis PR #4076 re-review
+        // caught the prior version building this via std::to_string +
+        // concatenation, even though the value was a trusted compile-time
+        // constant). set_config('lock_timeout', $1, true) is the
+        // parameterized equivalent of `SET LOCAL lock_timeout = $1` - the
+        // third argument (is_local=true) scopes it to this transaction only,
+        // identically to SET LOCAL.
+        pg::PgResult set_lt = pg::exec_params(
+            conn, "SELECT set_config('lock_timeout', $1, true)",
+            std::vector<std::string>{std::to_string(kWriteTimeout.count()) + "ms"});
+        if (set_lt.status() != PGRES_TUPLES_OK) {
             err = AuthDBError::QueryFailed;
             return false;
         }
