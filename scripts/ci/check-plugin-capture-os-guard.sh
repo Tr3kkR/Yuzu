@@ -45,6 +45,18 @@ else
   HOST_OS="linux"
 fi
 
+# plugin-capture links yuzu_agent_core dynamically (a shared_library --
+# agents/core/meson.build), so on Windows the loader needs
+# yuzu_agent_core.dll resolvable via PATH before the .exe can even start;
+# without it Windows refuses to launch the process at all, and MSYS2/Cygwin
+# bash reports that loader failure as rc=127 -- indistinguishable from
+# "command not found" even though $capture is right there and directly
+# invocable by path. Confirmed against the real Windows CI leg. Linux/macOS
+# resolve their .so/.dylib via rpath at link time, so this is a no-op there.
+if [ "$HOST_OS" = "windows" ]; then
+  export PATH="$BUILDDIR/agents/core:$PATH"
+fi
+
 case "$HOST_OS" in
   windows) WRONG_OS="linux" ;;
   *)       WRONG_OS="windows" ;;

@@ -799,23 +799,20 @@ jobs:
             ${{ matrix.build_type == 'release' && matrix.compiler == 'gcc-15' && '-Db_lto=true' || '' }}
 
       - name: Build
-        run: meson compile -C build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -j "$YUZU_BUILD_JOBS"
-
-      # Cross-OS capture certification guard (PR #4112 review, blocker):
-      # tools/plugin-capture must reject a --os that does not match the
-      # platform it was compiled for, or a wrong-platform capture becomes
-      # gate-certified, embedded, and served as truth.
-      #
-      # CodeQL (CWE-349, actions/cache-poisoning): this self-hosted job's
-      # persistent VCPKG_DEFAULT_BINARY_CACHE/ccache disk state is already
-      # isolated to a run-id-scoped temp path under trusted-fork-ci dispatch
-      # (see the VCPKG_DEFAULT_BINARY_CACHE ternary above) -- skipping this
-      # step under the same condition keeps it consistent with that existing
-      # isolation boundary rather than adding a step CodeQL's reachability
-      # analysis has to newly reason about on the low-trust dispatch path.
-      - name: Plugin-capture OS guard
-        if: needs.preflight.outputs.trusted_execution != 'true'
+        # Cross-OS capture certification guard (PR #4112 review, blocker),
+        # folded into this step rather than a standalone one: tools/plugin-capture
+        # must reject a --os that does not match the platform it was compiled
+        # for, or a wrong-platform capture becomes gate-certified, embedded,
+        # and served as truth. Deliberately part of Build, not its own step --
+        # CodeQL (CWE-349, actions/cache-poisoning/poisonable-step) flagged a
+        # standalone new step here as a fresh node its reachability analysis
+        # has to reason about on the workflow_dispatch/trusted-fork-ci path,
+        # even gated on trusted_execution; Build itself (already executing
+        # this same untrusted checkout's meson.build content, unconditionally)
+        # is not flagged, so this check rides the already-accepted boundary
+        # instead of adding a new one.
         run: |
+          meson compile -C build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -j "$YUZU_BUILD_JOBS"
           bash scripts/ci/check-plugin-capture-os-guard.sh \
             "build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}"
 
@@ -1561,14 +1558,13 @@ jobs:
       - name: Build
         # Affinity controls placement, not Ninja's processor-count discovery;
         # pass the runner's 16-thread CCD width unconditionally.
-        run: meson compile -C build-windows-${{ matrix.build_type }} -j "$YUZU_BUILD_JOBS"
-
-      # Cross-OS capture certification guard (PR #4112 review, blocker): see
-      # the linux job's identical step for the full rationale, including the
-      # CodeQL (CWE-349) trusted_execution gate.
-      - name: Plugin-capture OS guard
-        if: needs.preflight.outputs.trusted_execution != 'true'
+        #
+        # Cross-OS capture certification guard (PR #4112 review, blocker),
+        # folded into Build rather than a standalone step: see the linux
+        # job's identical Build step for the full rationale, including why
+        # a standalone step tripped CodeQL (CWE-349) here.
         run: |
+          meson compile -C build-windows-${{ matrix.build_type }} -j "$YUZU_BUILD_JOBS"
           bash scripts/ci/check-plugin-capture-os-guard.sh "build-windows-${{ matrix.build_type }}"
 
       # Link-provenance assertion (#1331 review HIGH-2): on Windows libpq is
@@ -2006,14 +2002,13 @@ jobs:
         # oversubscribe memory when both build at once. Guarded default keeps it
         # bounded even if the var is unset (unlike the bare Linux/Windows form,
         # because macOS is the only pool where uncontrolled -j risks OOM here).
-        run: meson compile -C build-macos -j "${YUZU_BUILD_JOBS:-6}"
-
-      # Cross-OS capture certification guard (PR #4112 review, blocker): see
-      # the linux job's identical step for the full rationale, including the
-      # CodeQL (CWE-349) trusted_execution gate.
-      - name: Plugin-capture OS guard
-        if: needs.preflight.outputs.trusted_execution != 'true'
-        run: bash scripts/ci/check-plugin-capture-os-guard.sh build-macos
+        # Cross-OS capture certification guard (PR #4112 review, blocker),
+        # folded into Build rather than a standalone step: see the linux
+        # job's identical Build step for the full rationale, including why
+        # a standalone step tripped CodeQL (CWE-349) here.
+        run: |
+          meson compile -C build-macos -j "${YUZU_BUILD_JOBS:-6}"
+          bash scripts/ci/check-plugin-capture-os-guard.sh build-macos
 
       # Link-provenance assertion (#1331 review HIGH-2): hosted macOS images can
       # carry a system PostgreSQL, so prove the canary linked vcpkg's static
