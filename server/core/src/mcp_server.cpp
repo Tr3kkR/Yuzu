@@ -485,7 +485,9 @@ static const ToolDef kTools[] = {
     // #4033 (#2146 Batch A) — MCP twin of /fragments/create-group-form's
     // live scoped agent-count preview (GET /api/v1/management-groups/
     // agent-count-preview is the REST twin; group_agent_count_preview.hpp
-    // is the shared builder all three surfaces call). Gated
+    // is the shared builder this tool and that REST route both call — the
+    // dashboard fragment itself keeps its own separate, behaviourally-
+    // equivalent inline implementation, unchanged by this PR). Gated
     // ManagementGroup:Write matching the fragment EXACTLY (only an operator
     // who could create the group may preview it) — NOT ManagementGroup:Read,
     // even though the tool performs no mutation. Consequence: approval-gated
@@ -498,7 +500,9 @@ static const ToolDef kTools[] = {
      "Preview the number of currently-visible agents that would match a would-be "
      "management group's filter criteria, BEFORE creating it. Mirrors "
      "/fragments/create-group-form's live count and GET /api/v1/management-groups/"
-     "agent-count-preview exactly (same shared builder, same scope). filters is a "
+     "agent-count-preview (this tool and that REST route share one builder, so those "
+     "two cannot drift from each other; the dashboard fragment keeps its own separate "
+     "inline implementation). filters is a "
      "map of mangled column key -> exact-match value for `plugin`'s response columns "
      "(lowercase, spaces/dashes -> underscore, e.g. \"Local Addr\" -> \"local_addr\"); "
      "an empty filters map returns a genuine 0 (no scoped count to report), never a "
@@ -6769,9 +6773,12 @@ McpServer::HandlerFn McpServer::build_handler(
 
             // ── preview_management_group_agent_count (#4033, #2146 Batch A) ─
             // MCP twin of GET /api/v1/management-groups/agent-count-preview
-            // and /fragments/create-group-form's own live count — all three
-            // call the SAME shared builder (group_agent_count_preview.hpp).
-            // Gated ManagementGroup:Write matching the fragment exactly (see
+            // and /fragments/create-group-form's own live count — this tool
+            // and that REST route call the SAME shared builder
+            // (group_agent_count_preview.hpp), so those two cannot drift
+            // from each other; the fragment keeps its own separate,
+            // behaviourally-equivalent inline implementation, unchanged by
+            // this PR. Gated ManagementGroup:Write matching the fragment exactly (see
             // kTools[]'s comment on this tool) — NOT migrated onto
             // fleet_read_fn_ (that chokepoint is for per-agent LIST reads;
             // this route's scope is the D3 Response:Read-visible set, a

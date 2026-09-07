@@ -10,8 +10,12 @@
   `get_agent_details` tools serve the same row/detail shape. The create-group
   agent-count preview (`/fragments/create-group-form`) also gains a REST twin,
   `GET /api/v1/management-groups/agent-count-preview`, and an MCP twin,
-  `preview_management_group_agent_count`, sharing one builder
-  (`group_agent_count_preview.hpp`) across all three surfaces. Migrating MCP
+  `preview_management_group_agent_count`; REST and MCP share one builder
+  (`group_agent_count_preview.hpp`) so those two transports cannot drift from
+  each other — the pre-existing `/fragments/create-group-form` fragment keeps
+  its own separate, behaviourally-equivalent inline implementation
+  (`DashboardRoutes::parse_filters`), unchanged and un-refactored by this PR.
+  Migrating MCP
   `list_agents` onto the same fleet-read chokepoint is tracked separately as #4041
   (its current unconfined-fan-out gap is a distinct, already-filed P1 bug, not
   silently carried by this change).

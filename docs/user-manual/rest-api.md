@@ -807,9 +807,12 @@ Remove a role assignment from this management group.
 
 Preview the number of currently-visible agents that would match a would-be management group's
 filter criteria, before creating it (#4033, #2146 API-parity Batch A). REST/MCP/dashboard-fragment
-twin of `/fragments/create-group-form`'s own live count — all three call the same shared builder
-(`group_agent_count_preview.hpp`), so the number shown in the dashboard's create-group form and
-this route's `agent_count` can never drift apart. MCP twin: `preview_management_group_agent_count`.
+twin of `/fragments/create-group-form`'s own live count. This route and its MCP twin call the same
+shared builder (`group_agent_count_preview.hpp`), so those two cannot drift from each other; the
+dashboard fragment keeps its own separate, behaviourally-equivalent inline implementation
+(`DashboardRoutes::parse_filters`), unchanged by this PR — the number it shows and this route's
+`agent_count` are expected to agree today, but are not structurally guaranteed to. MCP twin:
+`preview_management_group_agent_count`.
 
 **Permission:** `ManagementGroup:Write` — matching the fragment's own gate exactly (only an
 operator who could create the group may preview it), **not** `ManagementGroup:Read`, even though
@@ -821,7 +824,7 @@ this route performs no mutation.
 |---|---|
 | `command_id` | The response set's instruction/command id to count against. |
 | `plugin` | Plugin name whose response columns the filter keys are matched against. |
-| `<filter keys>` | Any other query param is treated as a filter, keyed by the SAME mangled column-name convention the dashboard fragment's `f_<column>` params use — lowercase, spaces/dashes replaced with underscores (e.g. `Local Addr` → `local_addr`). An unrecognised key is silently ignored. |
+| `<filter keys>` | Any other query param is treated as a filter, keyed by the SAME mangling the dashboard fragment's `f_<column>` params apply to a column name — lowercase, spaces/dashes replaced with underscores (e.g. `Local Addr` → `local_addr`). Unlike the fragment, this route's keys carry **no** `f_` prefix — supply `local_addr`, not `f_local_addr`. An unrecognised key is silently ignored. |
 
 An empty filter set (no recognised filter keys supplied) returns a genuine `0` — no scoped count
 to report, and no store read is made.

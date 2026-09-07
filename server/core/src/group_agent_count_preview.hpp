@@ -1,15 +1,17 @@
 #pragma once
 
 /// @file group_agent_count_preview.hpp
-/// Shared REST+MCP+dashboard-fragment model for the create-group agent-count
-/// preview (#4033, #2146 Batch A). `/fragments/create-group-form`
-/// (dashboard_routes.cpp) queries `ResponseStore::facet_agent_count` inline;
-/// this pair of PURE functions (no httplib.h, no mcp_jsonrpc.hpp) is the
-/// SAME logic factored out so `GET /api/v1/management-groups/agent-count-
+/// Shared REST+MCP model for the create-group agent-count preview (#4033,
+/// #2146 Batch A) — see the NOTE below for why "shared" stops at REST+MCP
+/// and does not extend to the dashboard fragment. `/fragments/create-group-
+/// form` (dashboard_routes.cpp) queries `ResponseStore::facet_agent_count`
+/// inline; this pair of PURE functions (no httplib.h, no mcp_jsonrpc.hpp) is
+/// the SAME logic factored out so `GET /api/v1/management-groups/agent-count-
 /// preview` and its MCP twin `preview_management_group_agent_count` call it
-/// too — recipe Rule 1 (docs/api-twin-recipe.md §1): REST, MCP, and the
-/// fragment cannot drift on "what counts as a filter" or "empty filters
-/// means a genuine zero" by construction.
+/// too — recipe Rule 1 (docs/api-twin-recipe.md §1): REST and MCP cannot
+/// drift from EACH OTHER on "what counts as a filter" or "empty filters
+/// means a genuine zero" by construction. The fragment is NOT a third party
+/// to that construction — see NOTE.
 ///
 /// NOTE: the dashboard fragment (`DashboardRoutes::parse_filters`,
 /// dashboard_routes.cpp) is NOT refactored onto `resolve_group_preview_filters`

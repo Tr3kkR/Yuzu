@@ -9,8 +9,12 @@
 // this file borrows) as their SOLE gate; this harness fakes that gate the
 // same way. No Postgres substrate is needed for the paths under test here:
 // `agents_fn` is a plain in-memory lambda (mirrors registry_.to_json_obj()'s
-// shape), `tag_store`/`response_store` stay unwired (nullptr) except where a
-// test specifically exercises their absence.
+// shape). `TagStore` itself is Postgres-only (`explicit TagStore(pg::PgPool&)`,
+// tag_store.hpp) and cannot be constructed in a plain unit test, so the HTTP
+// harness below always wires `tag_store=nullptr` — the "tag_store present"
+// case is instead covered directly against the PURE builder function
+// `device_agent_detail_json` (no TagStore/HTTP/store needed at all — see the
+// "PURE builder coverage" section below), not through this harness.
 //
 // What's covered:
 //   - GET /api/v1/devices: gate deny (401/403/503-unwired) -> no rows; gate
@@ -18,8 +22,12 @@
 //     count; row shape matches list_agents' 5-field contract.
 //   - GET /api/v1/devices/{id}: found in-scope -> 200 w/ fields; out-of-scope
 //     match collapses to the SAME 404 as a genuinely nonexistent agent_id
-//     (#1700-style existence-oracle closure); tag_store unwired -> no `tags`
-//     key; tag_store present -> `tags` array.
+//     (#1700-style existence-oracle closure); tag_store unwired (this file's
+//     HTTP harness only) -> no `tags` key.
+//   - device_agent_row_json / device_agent_detail_json (PURE, no HTTP/store):
+//     5-field row shape; tags omitted when the tags pointer is null; tags
+//     array populated (key/value/source per entry) when it is not — this is
+//     the "tag_store present" coverage the HTTP harness above cannot provide.
 //   - GET /api/v1/management-groups/agent-count-preview: perm_fn/auth_fn gate;
 //     empty filters -> agent_count 0 with NO store call (works even with
 //     response_store == nullptr); non-empty filters + response_store ==
@@ -250,6 +258,78 @@ TEST_CASE("GET /api/v1/devices/{id} — out-of-scope match collapses to the SAME
     auto res2 = h2.sink.Get("/api/v1/devices/does-not-exist-either");
     REQUIRE(res2 != nullptr);
     CHECK(res2->status == 404);
+}
+
+// ── PURE builder coverage: device_agent_row_json / device_agent_detail_json ──
+// No HTTP, no store, no TagStore (which is Postgres-only and cannot be
+// constructed here) — direct calls against the pure functions declared in
+// device_routes.hpp. This is the ONLY coverage of the tags-populated branch;
+// the HTTP harness above always wires tag_store=nullptr (see file header).
+
+TEST_CASE("device_agent_row_json: exactly the 5 list_agents fields, defensively extracted",
+          "[devices][pure]") {
+    nlohmann::json agent = {{"agent_id", "a1"}, {"hostname", "host1"},
+                            {"os", "linux"},    {"arch", "x86_64"},
+                            {"agent_version", "1.0.0"}};
+    auto row = device_agent_row_json(agent);
+    CHECK(row["agent_id"] == "a1");
+    CHECK(row["hostname"] == "host1");
+    CHECK(row["os"] == "linux");
+    CHECK(row["arch"] == "x86_64");
+    CHECK(row["agent_version"] == "1.0.0");
+    CHECK(row.size() == 5);
+}
+
+TEST_CASE("device_agent_row_json: a short/malformed source object degrades to empty fields, "
+          "never throws",
+          "[devices][pure]") {
+    nlohmann::json agent = {{"agent_id", "a1"}}; // hostname/os/arch/agent_version all missing
+    auto row = device_agent_row_json(agent);
+    CHECK(row["agent_id"] == "a1");
+    CHECK(row["hostname"] == "");
+    CHECK(row["os"] == "");
+}
+
+TEST_CASE("device_agent_detail_json: null tags pointer omits the tags key entirely (never an "
+          "empty array)",
+          "[devices][pure]") {
+    nlohmann::json agent = {{"agent_id", "a1"}, {"hostname", "host1"}};
+    auto detail = device_agent_detail_json(agent, /*tags=*/nullptr);
+    CHECK_FALSE(detail.contains("tags"));
+}
+
+TEST_CASE("device_agent_detail_json: an engaged-but-empty tags vector produces an empty array, "
+          "distinguishable from a null pointer",
+          "[devices][pure]") {
+    nlohmann::json agent = {{"agent_id", "a1"}};
+    std::vector<DeviceTag> tags; // present, TagStore succeeded, agent just has no tags
+    auto detail = device_agent_detail_json(agent, &tags);
+    REQUIRE(detail.contains("tags"));
+    CHECK(detail["tags"].is_array());
+    CHECK(detail["tags"].empty());
+}
+
+TEST_CASE("device_agent_detail_json: a populated tags vector serialises key/value/source per "
+          "entry — the 'tag_store present' case the HTTP harness above cannot cover",
+          "[devices][pure]") {
+    nlohmann::json agent = {{"agent_id", "a1"}, {"hostname", "host1"}, {"os", "linux"},
+                            {"arch", "x86_64"}, {"agent_version", "1.0.0"}};
+    std::vector<DeviceTag> tags{
+        DeviceTag{.agent_id = "a1", .key = "environment", .value = "production", .source = "server"},
+        DeviceTag{.agent_id = "a1", .key = "owner", .value = "sre-team", .source = "agent"},
+    };
+    auto detail = device_agent_detail_json(agent, &tags);
+    REQUIRE(detail.contains("tags"));
+    REQUIRE(detail["tags"].size() == 2);
+    CHECK(detail["tags"][0]["key"] == "environment");
+    CHECK(detail["tags"][0]["value"] == "production");
+    CHECK(detail["tags"][0]["source"] == "server");
+    CHECK(detail["tags"][1]["key"] == "owner");
+    CHECK(detail["tags"][1]["value"] == "sre-team");
+    CHECK(detail["tags"][1]["source"] == "agent");
+    // Detail still carries the base 5 row fields alongside tags.
+    CHECK(detail["agent_id"] == "a1");
+    CHECK(detail["hostname"] == "host1");
 }
 
 TEST_CASE("GET /api/v1/management-groups/agent-count-preview — perm_fn denial blocks the route",
