@@ -569,12 +569,16 @@ public:
     /// (nullptr) by default.
     void set_role_recheck_inside_lock_hook_for_test(std::function<void()> hook);
 
-    /// TEST-ONLY: installs a callback fired in `authenticate()`/
-    /// `create_local_session()`, AFTER the row lock has already been
-    /// released (`recheck_role_after_credential_check`/its caller's earlier
-    /// `verify_password()` has returned) but BEFORE `persist_new_session`
-    /// mints the session - i.e. squarely inside the #4107 check-then-mint
-    /// window `post_mint_role_recheck` exists to close. Unlike the two hooks
+    /// TEST-ONLY: installs a callback fired in `authenticate()` (cpp-safety
+    /// Gate 8 catch: NOT in `create_local_session()` - that function has no
+    /// pre-mint recheck of its own to race against, since its `role`
+    /// parameter comes from an EARLIER caller-side check; see the doc on
+    /// `test_auth.cpp`'s parameter-based stale-role test for that path's
+    /// coverage instead), AFTER the row lock has already been released
+    /// (`recheck_role_after_credential_check` has returned) but BEFORE
+    /// `persist_new_session` mints the session - i.e. squarely inside the
+    /// #4107 check-then-mint window `post_mint_role_recheck` exists to
+    /// close. Unlike the two hooks
     /// above, there is no lock held at this firing point, so a hook MAY
     /// safely call `update_role()` (or spawn+join a thread that does)
     /// synchronously and wait for it to fully complete before returning -
@@ -1150,9 +1154,10 @@ private:
     std::function<void()> role_recheck_inside_lock_hook_for_test_;
 
     /// Backing field for `set_post_mint_race_hook_for_test` - see that
-    /// method's doc. Invoked (if set) from inside `authenticate()`/
-    /// `create_local_session()`, after the row lock releases but before
-    /// `persist_new_session`. Same shape/lifetime/production-reachability
+    /// method's doc. Invoked (if set) from inside `authenticate()` only
+    /// (NOT `create_local_session()` - see the setter's doc), after the row
+    /// lock releases but before `persist_new_session`. Same shape/lifetime/
+    /// production-reachability
     /// as `role_recheck_race_hook_for_test_` above - see that field's
     /// Resource Ledger entry, which covers this one too.
     std::function<void()> post_mint_race_hook_for_test_;

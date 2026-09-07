@@ -854,12 +854,33 @@ bool AuthManager::post_mint_role_recheck(const std::string& username, Role minte
     // the sweep happens-before the mint, the sweep's own UPDATE already
     // committed before the sweep ran, which is before the mint, which is
     // before this call - so this call's fresh AuthDB read is guaranteed to
-    // observe it. Cross-replica: the same argument holds with Postgres's
-    // own commit ordering standing in for mu_, since both auth.users and
-    // the durable session row live in the one shared database (server.cpp
-    // wires AuthDB and SessionStore to the same PgPool) and
+    // observe it. Cross-replica: this needs no mu_ analogue at all (authdb
+    // Gate 8 correction to an earlier draft of this comment, which wrongly
+    // reached for one) - mu_ is per-process and has no cross-replica
+    // meaning. The actual argument is simpler and stronger: this call's
+    // own SELECT (get_user(), a bare autocommit read, no held transaction)
+    // runs strictly AFTER persist_new_session returns, and ordinary READ
+    // COMMITTED visibility on a single-primary Postgres instance guarantees
+    // it observes any commit that landed before it, regardless of which
+    // connection or replica issued either statement - no replica-local
+    // state or clock needs to agree with any other's. This reasoning
+    // assumes single-primary Postgres; it would need re-deriving under
+    // read-replica routing, the same caveat ADR-2001's own analogous
+    // cross-replica guarantee (docs/adr/2001-scim-oidc-identity-linkage.md,
+    // "Known residuals") flags for its own case.
+    //
+    // Residual this does NOT close (same one ADR-2001/OIDC's own post-mint
+    // recheck discloses for its structurally identical race): a demote
+    // landing strictly between this call's own read and the response/
+    // Set-Cookie actually reaching the client is not observable to this
+    // function at all - closing that would mean holding this transaction
+    // open all the way to the HTTP response, which is a different, larger
+    // change than a role recheck.
+    //
     // wipe_user_sessions_durable/invalidate_user_sessions delete the
-    // durable row directly rather than working off a stale local list.
+    // durable row directly rather than working off a stale local list,
+    // which is what makes the revoke-on-divergence half of this function
+    // (not just the read half above) cross-replica-correct too.
     //
     // Returns true (nothing to do) in cfg-file mode - `users_` IS the
     // truth there, nothing to diverge from.

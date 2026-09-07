@@ -2116,6 +2116,35 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
 
         if (!mfa_enrolled) {
             auto token = auth_mgr_.create_local_session(username, *role_opt, false);
+            if (token.empty()) {
+                // #4107 Gate 8 finding (security-guardian): create_local_
+                // session's empty-token sentinel (durable-persist failure,
+                // OR - since this branch's #4107 fix - a post-mint role-
+                // recheck denial) was previously UNCHECKED here: the route
+                // still set a garbage Set-Cookie, reported 200 "ok", and
+                // audited a fictional successful admin-role login. Neither
+                // failure mode is distinguishable from the caller side
+                // without a structural return-type change (tracked as a
+                // follow-up) - "session_mint_failed" is deliberately
+                // honest about that rather than guessing.
+                res.status = 401;
+                res.set_content(
+                    R"({"error":{"code":401,"message":"authentication failed"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                audit_log_for_principal(req, "auth.login", "failure", username,
+                                        auth::role_to_string(*role_opt), "User", username,
+                                        "reason=session_mint_failed;post_mint_recheck=true");
+                emit_event("auth.login", req,
+                           {{"source_ip", req.remote_addr},
+                            {"username", username},
+                            {"auth_method", "password"},
+                            {"user_agent", req.get_header_value("User-Agent")}},
+                           {}, Severity::kWarn);
+                if (auto* m = auth_mgr_.metrics_registry()) {
+                    m->counter("yuzu_auth_login_session_mint_denied_total").increment();
+                }
+                return;
+            }
             res.set_header("Set-Cookie", "yuzu_session=" + token + session_cookie_attrs());
             res.set_content(R"({"status":"ok"})", "application/json");
             // Mint-time audit row uses the explicit-principal helper —
@@ -2368,6 +2397,26 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // Terminal success — entry was already erased atomically at
         // lookup time. Mint the real session marked as MFA-verified.
         auto token = auth_mgr_.create_local_session(entry.username, entry.role, true);
+        if (token.empty()) {
+            // #4107 Gate 8 finding (security-guardian) - see the plain-
+            // password-login call site's identical comment above.
+            res.status = 401;
+            res.set_content(kFailureBody, "application/json");
+            audit_log_for_principal(req, "auth.login", "failure", entry.username,
+                                    auth::role_to_string(entry.role), "User", entry.username,
+                                    "reason=session_mint_failed;post_mint_recheck=true;method=" +
+                                        std::string(used_recovery ? "password+recovery"
+                                                                   : "password+totp"));
+            emit_event("auth.login", req,
+                       {{"source_ip", req.remote_addr},
+                        {"username", entry.username},
+                        {"auth_method", used_recovery ? "password+recovery" : "password+totp"}},
+                       {}, Severity::kWarn);
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_login_session_mint_denied_total").increment();
+            }
+            return;
+        }
         res.set_header("Set-Cookie", "yuzu_session=" + token + session_cookie_attrs());
         res.set_content(R"({"status":"ok"})", "application/json");
         // Audit chain — emit BOTH the method-specific verb AND the
@@ -2610,6 +2659,29 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // canonical auth.login row (session-creation parity with the
         // password / OIDC / login-challenge paths).
         auto token = auth_mgr_.create_local_session(entry.username, entry.role, true);
+        if (token.empty()) {
+            // #4107 Gate 8 finding (security-guardian) - see the plain-
+            // password-login call site's identical comment. Enrollment
+            // itself already committed (TOTP confirmed, recovery codes
+            // generated) - only the SESSION mint is denied here, which is
+            // correct and safe: the account's role changed (or the store
+            // degraded) during this flow, so no session should be handed
+            // out regardless of enrollment status. The recovery-codes
+            // one-time reveal is correctly withheld on this path too.
+            res.status = 401;
+            res.set_content(kFailureBody, "application/json");
+            audit_log_for_principal(req, "auth.login", "failure", entry.username,
+                                    auth::role_to_string(entry.role), "User", entry.username,
+                                    "reason=session_mint_failed;post_mint_recheck=true;"
+                                    "method=password+totp-enroll");
+            emit_event("auth.login", req,
+                       {{"source_ip", req.remote_addr}, {"username", entry.username}}, {},
+                       Severity::kWarn);
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_login_session_mint_denied_total").increment();
+            }
+            return;
+        }
         res.set_header("Set-Cookie", "yuzu_session=" + token + session_cookie_attrs());
         nlohmann::json body = {{"status", "ok"}, {"recovery_codes", recovery_codes}};
         res.set_content(body.dump(), "application/json");

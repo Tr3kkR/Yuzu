@@ -1070,6 +1070,45 @@ TEST_CASE("create_local_session's own post-mint recheck denies a stale-role "
     CHECK(mgr.get_user_role("frank") == Role::user); // DB-authoritative, unaffected
 }
 
+TEST_CASE("post_mint_role_recheck fails closed on a genuine AuthDB store "
+          "error too, not only on an actual role divergence (#4107 Gate 8 "
+          "coverage gap, cpp-safety)",
+          "[pg][auth][session][cold_cache]") {
+    yuzu::test::AuthDbPg auth_db;
+
+    AuthManager warm_mgr;
+    warm_mgr.set_auth_db(auth_db.get());
+    REQUIRE(warm_mgr.upsert_user("greg", "password1234", Role::admin));
+
+    AuthManager cold_mgr;
+    cold_mgr.set_auth_db(auth_db.get());
+    REQUIRE(cold_mgr.authenticate("greg", "password1234").has_value()); // hydrates cache
+
+    // Saturate the fixture's size-4 pool from inside the check-then-mint
+    // window (same #2396 pattern the pool-saturation cold_cache test above
+    // uses) so post_mint_role_recheck's own auth_db_->get_user() call
+    // cannot acquire a connection and fails QueryFailed, not UserNotFound -
+    // proving the store-error branch denies too, not just the role-
+    // divergence branch (post_mint_role_recheck's `!post` check folds both
+    // into one deny path, but only the role-divergence half had a test).
+    std::vector<yuzu::server::pg::PgPool::Lease> held;
+    cold_mgr.set_post_mint_race_hook_for_test([&] {
+        for (int i = 0; i < 4; ++i) {
+            auto lease = auth_db.pool().try_acquire_for(std::chrono::seconds(2));
+            REQUIRE(lease);
+            held.push_back(std::move(lease));
+        }
+    });
+
+    auto token = cold_mgr.authenticate("greg", "password1234");
+    held.clear(); // release before any further assertion - restores normal service
+    CHECK_FALSE(token.has_value());
+    // A store error must fail closed WITHOUT wrongly evicting/demoting a
+    // perfectly valid entry over a transient blip - same principle
+    // recheck_role_after_credential_check's own store-error branch follows.
+    CHECK(cold_mgr.get_user_role("greg") == Role::admin);
+}
+
 TEST_CASE("recheck_role_locked's own set_config() lock_timeout fails the "
           "recheck closed well under the pooled connection's 10s default "
           "when the row lock is already held elsewhere (#4107 Gate 8 "

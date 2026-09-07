@@ -3658,6 +3658,73 @@ local bypass that would itself weaken the fail-closed guarantee.
 `--postgres-pool-size` is the operator lever for reducing acquire contention
 on the live server (the login path runs on the shared server pool).
 
+### Role recheck at login — row-lock plus post-mint recheck (#4107)
+
+Local-auth credential checks (`authenticate()`/`verify_password()`) re-verify
+role against AuthDB *after* the password check, rather than trusting the
+in-process cache: `AuthManager::recheck_role_after_credential_check` calls
+`AuthDB::recheck_role_locked`, which takes a `SELECT ... FOR UPDATE` row lock
+on the user's row and holds it across the in-process cache write — the same
+technique `mfa_verify_login_code` already uses to close its own replay race.
+This closes the same-process AND cross-replica divergence residual an
+earlier, now-retired in-memory version counter could only narrow (a version
+counter can tell you something changed since you looked; it cannot make your
+look happen atomically with the change) — Postgres row locks serialize at the
+database-engine level, not per-process, so a racing `update_role()`/
+`reactivate_user()` from a different replica sharing the same Postgres
+primary is serialized against this read exactly like a same-process writer.
+
+**What the row lock alone does NOT close: the check-then-mint gap.** A role
+this call observes under the row lock is provably fresh at the moment of the
+read — but `persist_new_session` (the actual session mint) is a separate,
+later step, outside the row lock (external adversarial review, fjarvis, PR
+#4076 — "an inherent check-then-mint gap no non-serialized recheck can
+close"). A demotion committing in the window between this function returning
+and the mint completing would otherwise mint a session at the pre-demote
+role, surviving that demotion's own session sweep (`update_role`'s
+`std::erase_if(sessions_, ...)`, which already ran before the new session
+existed).
+
+Closing that gap by holding AuthDB's row lock across the mint was considered
+and rejected — `persist_new_session` calls `SessionStore::create` in durable
+mode, and holding one store's pool lease while calling another is exactly
+the cross-store-lock deadlock hazard §3 above names for the structurally
+identical OIDC/SAML deprovision race (`SessionStore`'s shared write-
+generation row is the concrete instance: this row lock could end up waiting
+on that row while some other path holds the gen row and needs this row
+lock). Closed instead via the SAME pattern already used for OIDC/SAML: mint
+normally, then a **post-mint re-check** (`AuthManager::post_mint_role_recheck`)
+immediately re-verifies the just-minted role against a fresh AuthDB read and,
+on divergence or a store error, revokes the session (`invalidate_user_sessions`)
+and denies. Wired into both `authenticate()` and `create_local_session()` —
+the latter also closes the same gap for the MFA step-up and enrollment-
+confirm routes, whose caller-supplied role can be stale across an entire
+TOTP round trip, a wider window than `authenticate()`'s own.
+
+**The honest guarantee.** For the SAME-PROCESS/single-primary-Postgres case
+this is airtight, not merely narrowed: a racing `update_role()` commits its
+AuthDB `UPDATE` before taking `mu_` to sweep `sessions_`, and the mint's own
+`mu_` write is mutually ordered against that sweep, so either the sweep
+(running after the mint) removes the just-minted session, or the post-mint
+recheck (running after the demote's already-committed write) catches the
+divergence directly — one of the two always fires. Ordinary READ COMMITTED
+visibility extends the same guarantee across replicas sharing one primary,
+with no per-replica coordination needed. **Not closed:** a demote landing
+strictly between the post-mint recheck's own read and the response/
+`Set-Cookie` actually reaching the client is invisible to this mechanism —
+closing that would mean holding the mint's transaction open all the way to
+the HTTP response, a larger change than a role recheck (the same residual
+OIDC/SAML's own post-mint recheck discloses, `docs/adr/2001-scim-oidc-identity-linkage.md`
+"Known residuals").
+
+A denied post-mint recheck is audited via `auth.login` `result=failure`,
+`detail=reason=session_mint_failed;post_mint_recheck=true[;method=...]`
+(`auth_routes.cpp`) and counted in `yuzu_auth_login_session_mint_denied_total`
+— undifferentiated between a genuine divergence and a store error, unlike
+the OIDC/SAML counters' genuine-vs-store-unavailable split, since
+`create_local_session`'s caller-facing contract (an empty string) does not
+itself distinguish the two causes.
+
 ## RbacStore — the authorization substrate (Postgres, ADR-0041 — SQLite `rbac.db` retired)
 
 `RbacStore` (`server/core/src/rbac_store.{hpp,cpp}`) is the **authorization
