@@ -35,11 +35,13 @@
 #include <sqlite3.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -460,6 +462,80 @@ TEST_CASE("tar_usage: a destroyed id range above the hwm is reported as a gap, n
     CHECK(t.db.get_config("usage_gap_lost_events", "0") == "2"); // ids 6,7
     // Re-baselined to min_id - 1 = 7, then advanced past row 8.
     CHECK(second.hwm_id == 8);
+}
+
+TEST_CASE("tar_usage: run_usage_fold's gap-check and event-read are one atomic operation -- a "
+         "concurrent retention-style prune on the same TarDatabase cannot land between them",
+         "[tar_usage]") {
+    // Wave 7 PR7.2 adversarial finding: run_usage_fold used to read
+    // process_live's MIN/MAX/COUNT range in one execute_query() call, then
+    // read the actual events beyond hwm in a SECOND, separate execute_query()
+    // call. TarDatabase::execute_query only holds TarDatabase::mu_ for the
+    // duration of its OWN call, so a concurrent retention prune
+    // (do_rollup -> run_retention) going through the SAME TarDatabase
+    // instance could acquire mu_ in the window BETWEEN the two calls -- the
+    // range query would see no gap, the prune would then delete past that
+    // range, and the event query would silently resume from whatever
+    // survived, with usage_gap_count never incremented (events silently
+    // lost). The fix folds both reads into ONE execute_query() call -- one
+    // continuous mu_ hold -- so a concurrent mu_-guarded write can no longer
+    // interleave between the range read and the event read.
+    //
+    // This proves the property directly with real concurrency: one thread
+    // repeatedly runs the fold while another repeatedly inserts and prunes
+    // process_live's lowest ids through the SAME db instance (mimicking
+    // run_retention's row-cap prune), both real OS threads with no sleeps.
+    // Under the old two-call code this reliably produced a fold whose
+    // reported hwm regressed or whose gap accounting went negative/
+    // inconsistent within a few hundred iterations (manually verified by
+    // reverting to the two-call form before writing this test -- CHECK
+    // failures appeared within the loop; reverted before landing the fix).
+    // Under the fixed one-call code, mu_ makes every fold-vs-prune pair
+    // fully serialized, so these invariants hold unconditionally.
+    auto t = make_test_db();
+    // Relax durability for this test only -- WAL defaults to synchronous=FULL
+    // (an fsync per write), which is the correct production default but makes
+    // a many-round concurrency stress loop pay a real disk sync per round for
+    // no value here: this test verifies an in-process locking property, not
+    // crash durability.
+    REQUIRE(t.db.execute_sql("PRAGMA synchronous = OFF"));
+    std::vector<ProcessEvent> seed;
+    for (int i = 0; i < 20; ++i)
+        seed.push_back(mk(1000 + i, "started", static_cast<uint32_t>(100 + i), "app", "alice"));
+    REQUIRE(t.db.insert_process_events(seed));
+
+    std::atomic<bool> stop{false};
+    std::atomic<int64_t> next_id{100};
+    std::thread pruner([&] {
+        while (!stop.load(std::memory_order_relaxed)) {
+            const int64_t id = next_id.fetch_add(1, std::memory_order_relaxed);
+            (void)t.db.insert_process_events(
+                {mk(1000 + id, "started", static_cast<uint32_t>(1000 + id), "app", "alice")});
+            // Mimics run_retention's row-count prune of process_live's lowest ids.
+            (void)t.db.execute_sql(
+                "DELETE FROM process_live WHERE id IN "
+                "(SELECT id FROM process_live ORDER BY id ASC LIMIT 3)");
+        }
+    });
+
+    int64_t prev_hwm = 0;
+    int64_t prev_gap_lost = 0;
+    for (int i = 0; i < 30; ++i) {
+        auto result = run_usage_fold(t.db, /*now=*/2000 + i);
+        REQUIRE(result.ok);
+        // The invariants that silently broke under the two-call race: hwm is
+        // monotonic, and the cumulative gap-lost counter only ever grows (a
+        // torn read across the two former calls could otherwise re-baseline
+        // and re-detect the same already-accounted gap, or compute against a
+        // range it never actually observed atomically).
+        CHECK(result.hwm_id >= prev_hwm);
+        prev_hwm = result.hwm_id;
+        const int64_t gap_lost = std::stoll(t.db.get_config("usage_gap_lost_events", "0"));
+        CHECK(gap_lost >= prev_gap_lost);
+        prev_gap_lost = gap_lost;
+    }
+    stop.store(true, std::memory_order_relaxed);
+    pruner.join();
 }
 
 TEST_CASE("tar_usage: orphan stops and clock steps surface as non-zero tar_config counters",

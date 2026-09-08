@@ -142,17 +142,41 @@ UsageFoldResult run_usage_fold(TarDatabase& db, int64_t now, int64_t max_events_
     int64_t hwm = parse_i64(db.get_config("usage_hwm_id", "0"));
     result.hwm_id = hwm;
 
-    // ── Gap check FIRST, before any event is read ───────────────────────────
-    auto range_res = db.execute_query(
-        "SELECT COALESCE(MIN(id), 0), COALESCE(MAX(id), 0), COUNT(*) FROM process_live", 1);
-    if (!range_res.has_value() || range_res->rows.empty()) {
-        result.error = range_res.has_value() ? "process_live range query returned no row"
-                                             : range_res.error();
+    // ── Gap check + event read, in ONE statement ────────────────────────────
+    // These used to be two separate execute_query() calls. TarDatabase::mu_ is
+    // released between statement-scoped calls, so a concurrent retention pass
+    // (do_rollup -> run_retention, tar_aggregator.cpp) pruning process_live's
+    // lowest ids by row-count could land in the window between them: the range
+    // query sees no gap (MIN(id) still <= hwm+1), the prune then deletes ids up
+    // to and past that range, and the event query -- now running against the
+    // post-prune table -- silently skips straight to whatever ids survived,
+    // advancing usage_hwm_id past the lost range with usage_gap_count never
+    // incremented. Folding both reads into one SQL statement (one execute_query
+    // call, one continuous hold of mu_) means no prune can execute between the
+    // range read and the event read -- they observe the SAME snapshot. The
+    // aggregate range (over the WHOLE table) is computed in a one-row derived
+    // table `r`, LEFT JOINed against the hwm-filtered event rows `e` so `r`'s
+    // columns are still present even when zero events match (an empty `e`
+    // would otherwise make the outer query return zero rows and lose the range
+    // entirely).
+    auto combined_res = db.execute_query(
+        std::format(
+            "SELECT r.min_id, r.max_id, r.row_count, e.id, e.ts, e.action, e.pid, e.name, e.user "
+            "FROM (SELECT COALESCE(MIN(id), 0) AS min_id, COALESCE(MAX(id), 0) AS max_id, "
+            "COUNT(*) AS row_count FROM process_live) r "
+            "LEFT JOIN (SELECT id, ts, action, pid, name, user FROM process_live "
+            "WHERE id > {} ORDER BY id LIMIT {}) e ON 1=1 "
+            "ORDER BY e.id",
+            hwm, max_events_per_tick),
+        static_cast<int>(max_events_per_tick) + 2);
+    if (!combined_res.has_value() || combined_res->rows.empty()) {
+        result.error = combined_res.has_value() ? "process_live range/event query returned no row"
+                                                 : combined_res.error();
         return result; // ok=false, hwm unchanged -- nothing written, retried next tick
     }
-    const int64_t min_id = parse_i64(range_res->rows[0][0]);
-    const int64_t max_id = parse_i64(range_res->rows[0][1]);
-    const int64_t row_count = parse_i64(range_res->rows[0][2]);
+    const int64_t min_id = parse_i64(combined_res->rows[0][0]);
+    const int64_t max_id = parse_i64(combined_res->rows[0][1]);
+    const int64_t row_count = parse_i64(combined_res->rows[0][2]);
 
     int64_t effective_hwm = hwm;
     int64_t gap_lost = 0;
@@ -180,31 +204,25 @@ UsageFoldResult run_usage_fold(TarDatabase& db, int64_t now, int64_t max_events_
         state.open[{run.pid, run.exe_key}] = run;
     }
 
-    // ── Read new events beyond the (possibly re-baselined) hwm ──────────────
+    // ── Fold in the events already read above ───────────────────────────────
+    // A row's `e.id` column (index 3) is empty when the LEFT JOIN found no
+    // matching event (the placeholder row carrying only the range columns) --
+    // never mistake it for a real process_live row with id 0 (ids are an
+    // AUTOINCREMENT primary key, never 0).
     std::vector<ProcessEvent> events;
     int64_t new_hwm = effective_hwm;
-    if (row_count > 0) {
-        auto ev_res = db.execute_query(
-            std::format("SELECT id, ts, action, pid, name, user FROM process_live "
-                        "WHERE id > {} ORDER BY id LIMIT {}",
-                        effective_hwm, max_events_per_tick),
-            static_cast<int>(max_events_per_tick) + 1);
-        if (!ev_res.has_value()) {
-            result.error = ev_res.error();
-            return result; // ok=false, hwm unchanged
-        }
-        events.reserve(ev_res->rows.size());
-        for (const auto& row : ev_res->rows) {
-            const int64_t id = parse_i64(row[0]);
-            ProcessEvent pe;
-            pe.ts = parse_i64(row[1]);
-            pe.action = row[2];
-            pe.pid = static_cast<uint32_t>(parse_i64(row[3]));
-            pe.name = row[4];
-            pe.user = row[5];
-            events.push_back(std::move(pe));
-            new_hwm = std::max(new_hwm, id);
-        }
+    for (const auto& row : combined_res->rows) {
+        if (row[3].empty())
+            continue;
+        const int64_t id = parse_i64(row[3]);
+        ProcessEvent pe;
+        pe.ts = parse_i64(row[4]);
+        pe.action = row[5];
+        pe.pid = static_cast<uint32_t>(parse_i64(row[6]));
+        pe.name = row[7];
+        pe.user = row[8];
+        events.push_back(std::move(pe));
+        new_hwm = std::max(new_hwm, id);
     }
     result.events_seen = static_cast<int64_t>(events.size());
     result.lag_events = max_id - new_hwm;
