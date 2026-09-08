@@ -81,7 +81,7 @@ engine-path marker has breached it.
 
 ## 2. The interlock ledger (a)–(n)
 
-Command shape for a marker: `git grep -nE '<regex>' origin/dev -- . :(exclude)docs/ :(exclude).claude/
+Command shape for a marker (pinned to the certified SHA, not mutable `origin/dev`): `git grep -nE '<regex>' d2e89ffaa -- . :(exclude)docs/ :(exclude).claude/
 :(exclude)changelog.d/ :(exclude)governance.d/ :(exclude)tests/split_interlock_ledger.json
 :(exclude)tests/test_split_interlock_tripwire*.py` — the whole tree minus the prose/evidence trees
 (`docs/`, `.claude/`, `changelog.d/`, `governance.d/` — which legitimately name markers in prose) and
@@ -92,17 +92,17 @@ binary directory (`server/engine/`, `gateway/`, …) cannot be silently uncovere
 |---|---|---|---|
 | **(a)** | Phase-4 engine principals | **GREEN** (ADR-0032 cell STALE) | RBAC-only enforcement ships: `auth_routes.cpp` `require_permission` engine branch (`principal_kind == "engine"`, ~L667–705) — no legacy/service fallback, 503 on store-unavailable, 403 on RBAC-off/no-grant; twin in `require_scoped_permission`. `git grep -c 'engine_principal_store' origin/dev -- server/` → 182 hits / 22 files. |
 | **(b)** | admit-then-filter gate **+ deny-precedence + evaluate-as-operator seam** | **RED — two open halves** | Chokepoint SHIPPED + pinned: `authorize_list_read` `git grep -c … -- server/` → **66** (128 server+tests, 263 whole-tree), decl `rbac_store.hpp:340`; transport twin `require_list_read` `auth_routes.hpp:198`; pinned `tests/unit/server/test_list_read_confinement.cpp` `[1715]`. **#1715 landed ADDITIVE** → deny-precedence is **#2665 (OPEN)**. `evaluate_as_operator` = **0-in-code** → seam is **#2675 (OPEN)**. |
-| **(c)** | D12 audit schema, indexed `use_case_run_id` | **RED** | `use_case_run_id` = **0-in-code** (20 whole-tree, docs/skills only). `AuditEvent` has a single `principal` field. |
-| **(d)** | P7 release-log schema | **RED** | `release_log`/`ReleaseLog` = **0-in-code** (one forward-reference *comment* at `authz_model.hpp:206`, §4 below). Born-on-PG store, ADR-0012. |
+| **(c)** | D12 audit schema, indexed `use_case_run_id` | **RED** | `git grep -c 'use_case_run_id' d2e89ffaa -- server/ agents/ common/ proto/ sdk/` → **0** (20 whole-tree, docs/skills only). `AuditEvent` has a single `principal` field. |
+| **(d)** | P7 release-log schema | **RED** | `git grep -c 'release_log\|ReleaseLog' d2e89ffaa -- server/ agents/ common/ proto/ sdk/` → **0** (one forward-reference *comment* at `authz_model.hpp:206`, §4 below). Born-on-PG store, ADR-0012. |
 | **(e)** | G1 cross-process event transport | RED (gates Decision 9 only) | Buses process-local (`execution_event_bus.hpp`). Rides HA WS-2a `event_outbox`. |
 | **(f)** | per-action mutability in the plugin ABI | RED (gates fact-dispatch only) | `sdk/include/yuzu/plugin.h:28` is ALREADY `YUZU_PLUGIN_ABI_VERSION 4` with `YuzuActionDescriptor` (action + per-OS legs, `:124-136`) — the v3→v4 bump SHIPPED. RED because no per-action **mutability** field exists yet; the real change is an append-only **v4→v5** bump, not v3→v4. |
 | **(g)** | derived-state confinement | RED | Nothing exists (ADR-0032 (g): "Not a line of engine code has been written"). |
-| **(h)** | runtime capability-declaration registry **+ credential columns** | **RED** | Securables are a compile-time `std::array<std::string_view, 27>` at `rbac_store.cpp:559`; the only INSERT is `seed_defaults()` (`:588`). No `create_securable`/`add_securable`/`register_securable` route. Admitting/requesting-credential columns absent. **Marker pins the registry create-path only**; the credential columns (ADR-0032:956) live on `use_case_runs`/the Execution Plan (engine-path, un-mechanizable pre-gate), so flipping (h) green **requires a human attestation** they landed too — same pattern as (b)'s #2665. |
+| **(h)** | runtime capability-declaration registry **+ credential columns** | **RED** | `git grep -c 'register_securable\|create_securable\|ratified_mapping' d2e89ffaa -- server/ agents/ common/ proto/ sdk/` → **0**. Securables are a compile-time `std::array<std::string_view, 27>` at `rbac_store.cpp:559`; the only INSERT is `seed_defaults()` (`:588`). Admitting/requesting-credential columns absent. **Marker pins the registry create-path only**; the credential columns (ADR-0032:956) live on `use_case_runs`/the Execution Plan (engine-path, un-mechanizable pre-gate), so flipping (h) green **requires a human attestation** they landed too — same pattern as (b)'s #2665. |
 | **(i)** | execution semantics: outcome correlation + coverage envelope | RED | Coverage fields 0-in-code; `workflow_engine.cpp` marks a step successful on dispatch, uncorrelated. |
 | **(j)** | capability projection (generated OpenAPI + `tools/list`) | RED | `tools/list` iterates a compile-time array; OpenAPI a hand-typed literal. INV-31-4 test cannot exist until this lands. |
 | **(k)** | operational readiness (new stores in readyz + reaper liveness) | RED | Six new stores, none in `/readyz`; reaper has no liveness metric. |
 | **(l)** | intra-module cross-run isolation | RED | Nothing exists (ADR-0032 (l)); the first module (vuln-mgmt) serves many operators from one deployment. |
-| **(m)** | per-principal quota caps | **RED — PARTIAL** (not in gate set) | The **#1973 base cap** ships: `PrincipalQuota` (`principal_quota.{hpp,cpp}`, `max_concurrency=16`, `rate_per_second=20`), wired into `agent_service_impl.cpp` / `mcp_server.cpp` / `mcp_stream.cpp`. But ADR-0032 (m) **also** requires the 2b §5 invocation-grant outstanding-count + issuance-rate caps + dual-side debit (engine-path, **0-in-code**). So ADR-0032's "none enforced" **overstates** the gap (the base cap ships) but is **not wholesale stale**. |
+| **(m)** | per-principal quota caps | **RED — PARTIAL** (not in gate set) | The **#1973 base cap** ships: `git grep -c 'class PrincipalQuota' d2e89ffaa -- server/` → **present** (`principal_quota.{hpp,cpp}`, `max_concurrency=16`, `rate_per_second=20`), wired into `agent_service_impl.cpp` / `mcp_server.cpp` / `mcp_stream.cpp`. But ADR-0032 (m) **also** requires the 2b §5 invocation-grant outstanding-count + issuance-rate caps + dual-side debit (engine-path, **0-in-code**). So ADR-0032's "none enforced" **overstates** the gap (the base cap ships) but is **not wholesale stale**. |
 | **(n)** | credential predecessor/successor relation + terminal-reason classification | RED | Unbuilt (ADR-0032 (n)); 2b must be amended. |
 
 **Unconditional merge-gate set (a)–(d)+(h): a=green, b/c/d/h=RED → gate CLOSED.** No engine-path code
@@ -142,6 +142,9 @@ as verified input, each with the nuance the correction must preserve so #4124 do
   fully-shipped.
 - cell **(h)** cites the securables array as `rbac_store.cpp:217-244, 21 entries`; the **locator is stale**
   (actual `:559`, 27 entries). Status (red) is unaffected — only the line/count reference drifted.
+- cell **(f)** (ADR-0032 line 954) still says `plugin.h` "carries action names only; ABI v3→v4" — **stale**:
+  the v3→v4 bump shipped (`plugin.h:28` is already v4, `YuzuActionDescriptor`). RED is still correct (no
+  mutability field); the real change is an append-only **v4→v5**. Add to the #4124 correction alongside (a)/(m)/(h).
 
 **#4124 should carry a remediation deadline.** A stale authoritative ADR sitting open indefinitely is a
 contradictory-record risk (an auditor sampling ADR-0032 directly reads a false "not shipped" for a live
@@ -181,6 +184,11 @@ in-flight engine-path ballot threatens the merge-gate as of this ref.
 - [x] §1c ratification confirmed landed (#4125), cited at four sites (two matrices, two skills) (§3).
 - [x] #2665 named the single engine-gate open question; #2675 named the seam; both OPEN (§4).
 - [x] In-flight engine-path ballot sweep clean (§5).
-- [ ] (a)/(m)/(h) ADR-0032 staleness (scoped per §4) + `authz_model.hpp:206` forward-reference appended
-  to #4124, with a remediation deadline (external action — pending operator go-ahead to comment).
 - [x] Matrix WS-0 row flipped planned→done + Verified line re-stamped in this PR.
+
+**WS-0's own deliverables are complete (every box above checked).** One TRACKED FOLLOW-UP remains — it is
+**not** a WS-0 deliverable and does not gate WS-0's "done" status: the ADR-0032 (a)/(m)/(f)/(h) staleness
+(scoped per §4) + the `authz_model.hpp:206` forward-reference should be appended to **#4124** with a
+remediation deadline (external issue action, pending operator go-ahead). The authoritative ledger + this
+cert already carry the correct state, so nothing downstream reads the stale ADR as truth; #4124 is the
+documentation cleanup of the ADR's own table.

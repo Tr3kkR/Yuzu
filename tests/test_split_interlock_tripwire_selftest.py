@@ -147,9 +147,14 @@ def main() -> int:
         if rc != TRIPWIRE_PASS:
             _fail(f"tripwire did not PASS on an unmodified ledger (got {rc}, want {TRIPWIRE_PASS})", failures)
 
-        # False-certification: flip red gate cell (d) green with its substrate absent.
+        # False-certification: a green cell whose substrate is absent must fail. Force the
+        # cell green AND neuter its substrate regex in the COPY, so this stays valid after
+        # WS-A6 legitimately lands (d)'s substrate — otherwise, once (d) is really green with
+        # its marker present, flipping it green is a no-op and this leg would wrongly demand a
+        # VIOLATION a correct tripwire won't produce (mirrors the RULE-1 probe's self-containment).
         fc = json.loads(json.dumps(ledger))
         fc["cells"]["d"]["status"] = "green"
+        fc["substrate_markers"]["release_log_store"]["regex"] = "__never_matches_substrate_zzz__"
         rc = _run_tripwire(_write(fc, "false_cert.json", td))
         if rc != TRIPWIRE_VIOLATION:
             _fail(f"tripwire did not DETECT a false certification (got {rc}, want {TRIPWIRE_VIOLATION})", failures)
