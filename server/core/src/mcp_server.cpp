@@ -6551,6 +6551,27 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // Per-access behavioural audit — same posture as the REST twin
+                // (app_usage_routes.cpp): this data is behavioural PII (what ran,
+                // when, how often), so a dropped audit row FAILS CLOSED rather than
+                // set-and-proceed (docs/wave7/integration-app-usage-read.md "Error
+                // posture"). Mirrors the #3937 credential-reveal precedent above
+                // (engine_principal.credential.reveal) — audit BEFORE the payload
+                // is built, and on failure the data is WITHHELD entirely, never
+                // served with an audit_persisted:false flag.
+                const bool audit_ok = mcp_audit("success", agent_id);
+                if (!audit_ok) {
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "the app-usage read succeeded but its access-audit record could "
+                                 "not be persisted; refusing to serve behavioural data without "
+                                 "durable evidence",
+                                 "retry the request",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs,
+                                 /*cid_override=*/{}, /*audit_ok=*/false),
+                        "application/json");
+                    return;
+                }
                 JArr arr;
                 for (const auto& r : *rows) {
                     arr.add(JObj()
@@ -6566,9 +6587,6 @@ McpServer::HandlerFn McpServer::build_handler(
                 const std::int64_t collected_at = rows->empty() ? 0 : rows->front().collected_at;
                 JObj payload;
                 payload.add("agent_id", agent_id).raw("apps", arr.str()).add("collected_at", collected_at);
-                const bool audit_ok = mcp_audit("success", agent_id);
-                if (!audit_ok)
-                    payload.add("audit_persisted", false);
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");
                 return;

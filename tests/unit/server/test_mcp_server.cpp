@@ -12396,10 +12396,14 @@ TEST_CASE("MCP get_agent_app_usage: a degraded store errors, never success+[]", 
     CHECK(res->body.find("read failed") != std::string::npos);
 }
 
-TEST_CASE("MCP get_agent_app_usage: dropped audit row surfaces audit_persisted:false",
+TEST_CASE("MCP get_agent_app_usage: dropped audit row fails closed, no data served",
           "[mcp][pg][audit]") {
-    // Mirrors query_software_licenses's dropped-audit-row case above: set-and-
-    // proceed, never a refusal, on the success path.
+    // Unlike query_software_licenses's dropped-audit-row case above (set-and-
+    // proceed), app-usage is behavioural PII with a documented fail-closed
+    // posture (docs/wave7/integration-app-usage-read.md "Error posture") —
+    // parity with the REST twin's 503 (app_usage_routes.cpp) and the
+    // engine_principal.credential.reveal #3937 fail-closed precedent: a
+    // dropped per-access audit row must never let the data out.
     YUZU_REQUIRE_PG_DB_TPL(db, mcp_app_usage_rbac_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
@@ -12422,15 +12426,18 @@ TEST_CASE("MCP get_agent_app_usage: dropped audit row surfaces audit_persisted:f
     auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":99,)"
                        R"("params":{"name":"get_agent_app_usage","arguments":{"agent_id":"agent-in"}}})");
     REQUIRE(res);
-    CHECK(res->status == 200); // set-and-proceed, NOT a refusal
+    CHECK(res->status == 200); // JSON-RPC errors still ride a 200 HTTP envelope
 
     auto envelope = nlohmann::json::parse(res->body);
-    const auto& payload = envelope.at("result").at("structuredContent");
-    REQUIRE(payload.contains("audit_persisted"));
-    CHECK(payload.at("audit_persisted") == false);
-    // Data is STILL SERVED alongside the flag — that is the set-and-proceed half.
-    CHECK(payload.at("agent_id") == "agent-in");
-    REQUIRE(payload.at("apps").size() == 1);
+    CHECK_FALSE(envelope.contains("result"));
+    REQUIRE(envelope.contains("error"));
+    const auto& error = envelope.at("error");
+    CHECK(error.at("code") == -32603); // kInternalError
+    REQUIRE(error.contains("data"));
+    CHECK(error.at("data").at("audit_persisted") == false);
+    // No app-usage rows anywhere in the response — the read is refused whole.
+    CHECK(res->body.find("exe_key") == std::string::npos);
+    CHECK(res->body.find("run_count_30d") == std::string::npos);
 }
 
 // ── aggregate_responses — #1634 management-group scope (filter-BEFORE-aggregate) ──
