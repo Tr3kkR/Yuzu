@@ -37,9 +37,10 @@
  *    wedged-slot bug. The caller never releases a key in either form.
  *  - TWO COUNTS, not one (R5.1): a QUOTA-HELD count (per class + total, what
  *    admission checks against the class quotas) and a PHYSICAL ALIVE count (every
- *    worker whose OS thread has not exited, what active_worker_count() / Stats::
- *    active_* report and what GuardianEngine::active_io_workers() sums for the F3
- *    orphan grace - #4147). They diverge only for submit(): its worker frees quota
+ *    worker whose payload has not yet been destroyed in the trampoline - the latest
+ *    self-observable point before its OS thread exits - what active_worker_count() /
+ *    Stats::active_* report and what GuardianEngine::active_io_workers() sums for
+ *    the F3 orphan grace - #4147). They diverge only for submit(): its worker frees quota
  *    at fn() return but stays alive through on_complete.
  *  - Per-type bulkheads: per-class quota-held quotas (File/Registry/Service) PLUS a
  *    total bound derived as their sum (rung 9a R3, exact bulkheads), so a dead
@@ -372,7 +373,8 @@ public:
 
     /// A by-value snapshot (never a reference into State after the lock releases).
     struct Stats {
-        /// PHYSICAL alive workers (OS thread not yet exited) - the F3 count.
+        /// PHYSICAL alive workers (payload not yet destroyed; the latest
+        /// self-observable point before OS-thread exit) - the F3 count.
         std::size_t active_total{0};
         std::array<std::size_t, kIoClassCount> active_by_class{};
         std::array<std::size_t, kIoClassCount> active_at_shutdown{};
@@ -629,8 +631,9 @@ public:
     /// NOT block: on success `on_complete(IoResult<T>&&)` fires exactly once on the
     /// worker thread after fn() returns (WorkerThrew is delivered through it too).
     /// The quota slot AND the single-flight key are released at fn() return, BEFORE
-    /// on_complete runs; the physical alive count is released only at OS-thread
-    /// exit. No deadline: see the INVARIANTS block for the contract in full (fires
+    /// on_complete runs; the physical alive count is released only when the worker
+    /// payload is destroyed in the trampoline (the latest self-observable point before
+    /// OS-thread exit). No deadline: see the INVARIANTS block for the contract in full (fires
     /// after stop(), may fire before this returns, nested dispatch from the callback
     /// is legal, a throwing callback is contained and counted). `T` must not be
     /// void (same limitation as run(); `emplace(fn())` cannot express it).
@@ -744,8 +747,9 @@ public:
     /// nonblocking; does NOT cancel the detached OS calls (they run to completion
     /// or their own per-call timeout), and does NOT suppress a submit() worker's
     /// on_complete (counted as completed_after_stop instead). Snapshots the
-    /// per-class PHYSICAL alive count at the first stop for telemetry (F3: OS
-    /// threads alive at stop; quota-held is meaningless once admission is closed).
+    /// per-class PHYSICAL alive count at the first stop for telemetry (F3: worker
+    /// payloads still alive at stop; quota-held is meaningless once admission is
+    /// closed).
     void stop() {
         {
             std::lock_guard<std::mutex> lk{state_->mu};
@@ -761,8 +765,9 @@ public:
         state_->cv.notify_all();
     }
 
-    /// PHYSICAL alive workers (OS thread not yet exited), the F3 orphan-grace count
-    /// (#4147). Includes a submit() worker still inside on_complete after its quota
+    /// PHYSICAL alive workers (payload not yet destroyed in the trampoline, the
+    /// latest self-observable point before OS-thread exit), the F3 orphan-grace
+    /// count (#4147). Includes a submit() worker still inside on_complete after its quota
     /// was released. Never the quota-held count.
     [[nodiscard]] std::size_t active_worker_count() const {
         std::lock_guard<std::mutex> lk{state_->mu};

@@ -613,7 +613,6 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                     // rollback had.
                     const std::uint64_t sub = **r;
                     std::shared_ptr<PerKey> pk;
-                    std::string adopted_by; // rule_id whose commit adopted `sub`
                     for (const auto& c : live) {
                         if (!pk) {
                             // First surviving claim (the head may itself be withdrawn):
@@ -645,7 +644,6 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                                     throw;
                                 }
                                 pk = fresh;
-                                adopted_by = c->rule_id;
                             } catch (...) {
                                 release_claim_index_locked(*c);
                                 stage(c, std::nullopt, std::current_exception(),

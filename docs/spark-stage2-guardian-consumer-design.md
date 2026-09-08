@@ -400,7 +400,12 @@ genuine failure every sibling fails with it, since the underlying key genuinely
 couldn't be armed. A disarm claim is retained until it actually executes or is
 terminally superseded — never silently dropped for capacity reasons — which is what
 makes "a key's disarm completes before its own rearm dispatches" true by construction
-rather than by a separately-maintained ordering rule.
+rather than by a separately-maintained ordering rule. Each claim also records a
+facts-only `ClaimEnd` (how it ended: committed, backend refused, worker threw, admission
+rejected, withdrawn, waiter timed out while queued or while dispatched, stopped, commit
+threw, disarm done) as the plug point PR-5's quarantine / K-bound / `arm_failed`
+classification reads; PR-1 carries no classification logic on it - the only reads are
+bookkeeping guards (a committed claim is a `rules_` entry, never a pending one).
 
 **Three distinct non-success outcomes, named once (PR-1 doc pass, 2026-09-08; an
 earlier version of this section used "expired" for two of them).** (1) **Admission

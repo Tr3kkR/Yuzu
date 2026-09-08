@@ -816,7 +816,9 @@ private:
     ///
     /// `end` is a PR-5 plug point: a FACT about how the claim ended, recorded so the
     /// fault-wiring rung (quarantine / K-bound / arm_failed reason) has something to
-    /// classify; nothing in PR-1 reads it.
+    /// classify. PR-1 carries NO classification logic on it; the only reads are the
+    /// bookkeeping guards (a `Committed` claim is a rules_ entry, never "pending":
+    /// detach_rule_locked's Case-0 skip, and the drain's publish fill-in).
     enum class ClaimKind { Arm, Disarm };
     enum class ClaimDispatch { Queued, Dispatching, Dispatched };
     enum class ClaimEnd {
