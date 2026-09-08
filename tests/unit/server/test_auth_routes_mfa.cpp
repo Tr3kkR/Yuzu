@@ -425,6 +425,71 @@ TEST_CASE("POST /login/mfa with valid TOTP mints session and emits dual audit (m
     CHECK(h.count_audits("auth.login", "admin") >= 1);
 }
 
+// #4107 Gate 8 (security-guardian + authdb): the AuthManager-level tests for
+// post_mint_role_recheck (test_auth.cpp) only exercise authenticate() and a
+// direct create_local_session() call with a hand-supplied stale role - not
+// the actual fixed code, the 3 token.empty() deny blocks in auth_routes.cpp.
+// This drives the real gap through the real wire path with NO test hook:
+// the pending entry's role is captured by verify_password() at step 1 and
+// held unread until create_local_session() at step 2, a genuine two-request
+// window (unlike plain /login's single-request authenticate()/verify_
+// password() call, which has no such gap to reproduce without a hook) - a
+// real demote landing in that window is exactly the #4107 scenario.
+TEST_CASE("POST /login/mfa denies the mint (401, no cookie, honest audit) when the account "
+          "is demoted between the pending /login and the TOTP verify - the real wire-path "
+          "reproduction of the #4107 route-layer gap (Gate 8 coverage, no test hook needed)",
+          "[pg][mfa][routes][auth_routes]") {
+    AuthRoutesHarness h;
+    auto secret_b32 = h.enroll_mfa("admin");
+    auto step1 = h.sink.Post("/login",
+                             form({{"username", "admin"}, {"password", "adminpassword1"}}),
+                             "application/x-www-form-urlencoded");
+    REQUIRE(step1->status == 202);
+    auto body = step1->body;
+    auto pending_start = body.find(R"("mfa_pending_token":")") + 21;
+    auto pending_end = body.find('"', pending_start);
+    auto pending = body.substr(pending_start, pending_end - pending_start);
+    REQUIRE(pending.size() == 64);
+    auto code = h.totp_at(secret_b32);
+
+    // The pending entry captured role=admin at step 1. Demote strictly
+    // between the two requests - update_role() writes AuthDB durably
+    // before this call returns (auth.cpp), so create_local_session()'s
+    // post_mint_role_recheck is guaranteed to observe "user", not "admin".
+    REQUIRE(h.auth_mgr.update_role("admin", auth::Role::user));
+
+    auto step2 = h.sink.Post("/login/mfa", form({{"mfa_pending_token", pending}, {"code", code}}),
+                             "application/x-www-form-urlencoded");
+    REQUIRE(step2);
+    CHECK(step2->status == 401);
+    CHECK(step2->get_header_value("Set-Cookie").empty());
+    // The TOTP code itself was genuinely correct and consumed - proves the
+    // fix (auth_routes.cpp's token.empty() check) denies the MINT, not the
+    // code verification; the false "auth.login ok" this used to produce is
+    // gone, replaced by an honest failure row that doesn't overclaim which
+    // of create_local_session's two internal causes fired.
+    CHECK(h.count_audits("mfa.login.verified", "admin") >= 1);
+    CHECK(h.count_audits("auth.login", "admin") >= 1); // the new failure row, never a false "ok"
+    AuditQuery q;
+    q.action = "auth.login";
+    q.principal = "admin";
+    auto res = h.audit_store->query(q);
+    REQUIRE(res.has_value());
+    bool found_failure_row = false;
+    for (const auto& row : *res) {
+        // cpp-expert Gate 8 NICE: the count_audits check above only proves a
+        // row exists, not that it isn't a false "ok" sitting alongside a
+        // failure row - assert directly on every row's result here instead.
+        CHECK(row.result != "ok");
+        if (row.result == "failure") {
+            found_failure_row = true;
+            CHECK(row.detail.find("session_mint_failed") != std::string::npos);
+            CHECK(row.detail.find("post_mint_recheck=true") == std::string::npos);
+        }
+    }
+    CHECK(found_failure_row);
+}
+
 TEST_CASE("POST /login/mfa with valid recovery code emits mfa.recovery_code.used + auth.login",
           "[pg][mfa][routes][auth_routes]") {
     AuthRoutesHarness h;
@@ -458,6 +523,60 @@ TEST_CASE("POST /login/mfa with valid recovery code emits mfa.recovery_code.used
     // that verb belongs to the TOTP branch (otherwise the count of
     // "TOTP logins" is double-attributed).
     CHECK(h.count_audits("mfa.login.verified", "admin") == 0);
+}
+
+// security-guardian Gate 8 SHOULD (1b4d041ff review): the audit-row-
+// suppression regression this fix round closed (Finding 3 - a burned
+// recovery code's TRUE audit row was silently dropped alongside the old
+// false "auth.login ok") lived specifically in this recovery-code branch,
+// but the route-level test added for that fix round only exercised the
+// TOTP arm. This covers the recovery-code arm directly: the code is a
+// genuine one-time credential, irreversibly consumed in AuthDB regardless
+// of the later mint outcome, so its audit row must survive a denied mint.
+TEST_CASE("POST /login/mfa recovery-code path still audits mfa.recovery_code.used "
+          "(a burned one-time credential) even when the mint is denied by a "
+          "demote landing before the verify completes",
+          "[pg][mfa][routes][auth_routes]") {
+    AuthRoutesHarness h;
+    h.enroll_mfa("admin");
+    auto codes = h.auth_db->mfa_regenerate_recovery_codes("admin");
+    REQUIRE(codes.has_value());
+    REQUIRE_FALSE(codes->empty());
+    auto recovery = codes->front();
+
+    auto step1 = h.sink.Post("/login",
+                             form({{"username", "admin"}, {"password", "adminpassword1"}}),
+                             "application/x-www-form-urlencoded");
+    REQUIRE(step1->status == 202);
+    auto body = step1->body;
+    auto p_start = body.find(R"("mfa_pending_token":")") + 21;
+    auto pending = body.substr(p_start, body.find('"', p_start) - p_start);
+
+    REQUIRE(h.auth_mgr.update_role("admin", auth::Role::user));
+
+    auto step2 =
+        h.sink.Post("/login/mfa", form({{"mfa_pending_token", pending}, {"code", recovery}}),
+                    "application/x-www-form-urlencoded");
+    REQUIRE(step2);
+    CHECK(step2->status == 401);
+    CHECK(step2->get_header_value("Set-Cookie").empty());
+    // The recovery code was genuinely consumed - its TRUE audit row must
+    // survive the denied mint, unlike before this fix round. Exact count
+    // (security-guardian Gate 8 NICE) - nothing else in this fixture emits
+    // this action, so == 1 also catches a future duplicate-emission bug.
+    CHECK(h.count_audits("mfa.recovery_code.used", "admin") == 1);
+    AuditQuery rq;
+    rq.action = "auth.login";
+    rq.principal = "admin";
+    auto rres = h.audit_store->query(rq);
+    REQUIRE(rres.has_value());
+    bool found_failure_row = false;
+    for (const auto& row : *rres) {
+        CHECK(row.result != "ok");
+        if (row.result == "failure")
+            found_failure_row = true;
+    }
+    CHECK(found_failure_row);
 }
 
 TEST_CASE("POST /login/mfa with invalid pending token returns 401 + audit",
@@ -816,6 +935,69 @@ TEST_CASE("POST /login/mfa/enroll completes enforced enrollment: 200 + cookie + 
     CHECK(h.count_audits("mfa.recovery_codes.generated", "alice") >= 1);
     CHECK(h.count_audits("auth.login", "alice") >= 1);
     // The user is now genuinely enrolled.
+    auto status = h.auth_db->mfa_status("alice");
+    REQUIRE(status.has_value());
+    CHECK(status->enrolled);
+}
+
+// security-guardian Gate 8 SHOULD (1b4d041ff review): same coverage gap as
+// the recovery-code test above, for the enrollment-verify branch, where
+// Finding 3's regression also lived (mfa.enroll.verified /
+// mfa.recovery_codes.generated rows describe a TOTP-secret confirmation and
+// a recovery-code generation already durably committed in AuthDB - both
+// must survive a denied mint, and the codes' one-time VALUE must still be
+// withheld).
+TEST_CASE("POST /login/mfa/enroll still audits mfa.enroll.verified + "
+          "mfa.recovery_codes.generated (already-committed enrollment) even when the mint "
+          "is denied by a demote landing before the verify completes, and withholds the "
+          "recovery codes themselves",
+          "[pg][mfa][enroll][routes][auth_routes]") {
+    AuthRoutesHarness h;
+    h.cfg.mfa_enforcement = "required";
+    REQUIRE(h.auth_mgr.update_role("alice", auth::Role::admin));
+    auto step1 =
+        h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                    "application/x-www-form-urlencoded");
+    REQUIRE(step1->status == 202);
+    auto body = nlohmann::json::parse(step1->body);
+    std::string pending = body.at("mfa_pending_token");
+    std::string secret = body.at("secret_base32");
+
+    REQUIRE(h.auth_mgr.update_role("alice", auth::Role::user));
+
+    auto code = h.totp_at(secret, 0);
+    auto step2 = h.sink.Post("/login/mfa/enroll",
+                             form({{"mfa_pending_token", pending}, {"code", code}}),
+                             "application/x-www-form-urlencoded");
+    REQUIRE(step2);
+    CHECK(step2->status == 401);
+    CHECK(step2->get_header_value("Set-Cookie").empty());
+    // The one-time recovery-codes VALUE reveal stays withheld on deny -
+    // only the fact that enrollment/codes were generated is unconditional.
+    // Exact-body match (security-guardian Gate 8 NICE), not just substring
+    // absence: this is the handler's own kFailureBody literal, so an exact
+    // match is strictly stronger and no more brittle than the substring
+    // check it replaces.
+    CHECK(step2->body ==
+          R"({"error":{"code":401,"message":"Invalid verification code"},"meta":{"api_version":"v1"}})");
+    // Exact counts (security-guardian Gate 8 NICE) - nothing else in this
+    // fixture emits these actions, so == 1 also catches a future
+    // duplicate-emission bug.
+    CHECK(h.count_audits("mfa.enroll.verified", "alice") == 1);
+    CHECK(h.count_audits("mfa.recovery_codes.generated", "alice") == 1);
+    AuditQuery eq;
+    eq.action = "auth.login";
+    eq.principal = "alice";
+    auto eres = h.audit_store->query(eq);
+    REQUIRE(eres.has_value());
+    bool found_failure_row = false;
+    for (const auto& row : *eres) {
+        CHECK(row.result != "ok");
+        if (row.result == "failure")
+            found_failure_row = true;
+    }
+    CHECK(found_failure_row);
+    // The account really is enrolled now, regardless of the denied login.
     auto status = h.auth_db->mfa_status("alice");
     REQUIRE(status.has_value());
     CHECK(status->enrolled);

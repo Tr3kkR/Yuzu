@@ -76,15 +76,13 @@ Miss any one and the failure is **not cosmetic**:
 (no SPOF / RPO=0), not the second server replica. The "Gates 2nd replica?"
 column in the matrix encodes this per row.
 
-### 1c. Split ↔ HA — PROVISIONALLY decoupled, pending ADR-1005-owner ratification
+### 1c. Split ↔ HA — RATIFIED: decoupled (the split is NOT a prerequisite)
 
 **Is the presentation/core split (ADR-0031) a prerequisite for active-active?
-Working position: No (decoupled) — but NOT yet ratified by the ADR-1005 owner
-(Dave Rae).** Monolith active-active is the target; the split is a parallel
-programme, not a gate for a 2nd replica. The one in-process blocker (direct agent
-`Subscribe` stream) is solved by **gateway-fronting (WS-4)**, not the split. The
-closure is *provisional* until the owner rules — tracked as WS-0 in the split
-matrix; if they rule the split IS a prerequisite, Phase B reshuffles onto it.
+No — decoupled. Ratified by the ADR-1005 owner (Dave Rae), 2026-09-07.** Monolith
+active-active is the target; the split is a parallel programme, not a gate for a
+2nd replica. The one in-process blocker (direct agent `Subscribe` stream) is solved
+by **gateway-fronting (WS-4)**, not the split.
 - **Kimi's dissent (recorded, rebutted):** Kimi called the split a hard safety
   prerequisite. Every safety property it could mean — singleton double-dispatch
   (WS-3), in-memory sessions (WS-1a, **done**), stream routing (WS-4) — is closed in
@@ -198,7 +196,7 @@ constraint. Delivery phases (dependency-ordered):
 2. **Phase B — Multi-instance safety (ALL required before a 2nd replica):**
    `WS-3` (fenced leader), `WS-4` (gateway routing), `WS-5` (presence),
    `WS-6` (PKI), `WS-8`-readyz, `WS-13` (agent gateway-front rollout).
-   **The split question (§1c) is PROVISIONALLY decoupled (pending ADR-1005-owner ratification); Phase-B proceeds on the monolith track unless the owner rules otherwise.**
+   **The split question (§1c) is RESOLVED — decoupled, ratified by the ADR-1005 owner (Dave Rae, 2026-09-07); the split does not gate a 2nd replica.**
 3. **Phase C — Enable, validate, operate:** flip on the second replica;
    `WS-9` runs continuously throughout B/C; `WS-11` ships *with* the second
    replica; then `WS-12` (cutover/DR), `WS-14` (security/capacity). `WS-2b`
@@ -241,8 +239,8 @@ For every WS in the matrix:
    idempotency/outbox mechanism if applicable; and the **WS-9 scenario** it
    must add (a WS is not done without one).
 
-3. **Confirm the split question (§1c) before any Phase-B slice** — with the
-   ADR-1005 owner (Dave Rae); §1c is *provisionally* decoupled, not yet ratified. This can reshuffle the phase.
+3. **The split question (§1c) is RESOLVED** — decoupled, ratified by the ADR-1005
+   owner (Dave Rae, 2026-09-07). Phase-B proceeds on the monolith track; no per-slice re-confirmation needed.
 
 4. **Implement** as a focused PR per slice, in an isolated worktree off `dev`.
    Drive schema through `MigrationRunner` / `docs/postgres-store-playbook.md`,

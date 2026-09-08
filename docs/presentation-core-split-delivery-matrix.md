@@ -118,7 +118,7 @@ Columns: **WS · Delivers · Axis · Owner · Depends · Gates cutover? · Revie
 
 | WS | Delivers | Axis | Owner | Depends | Gates? | Reviewers | Status |
 |----|----------|:---:|-------|---------|:---:|-----------|--------|
-| **WS-0** | Reconciliation & **interlock certification** — re-verify every deferred item **against the tree**; certify interlock (a)/(b#2665)/(c)/(d)/(h); certify no in-flight engine-path ballot ships before the merge-gate closes; ratify HA §1c with the **ADR-1005 owner (Dave Rae)** — currently *provisionally* decoupled, not yet owner-ratified (dissent recorded-with-rebuttal); bottom out #2665 as the engine-gate's real open question | — | THIS | — | **predecessor of all** | architect + security-guardian | planned |
+| **WS-0** | Reconciliation & **interlock certification** — re-verify every deferred item **against the tree**; certify interlock (a)/(b#2665)/(c)/(d)/(h); certify no in-flight engine-path ballot ships before the merge-gate closes; ratify HA §1c with the **ADR-1005 owner (Dave Rae)** — **DONE: ratified decoupled 2026-09-07** (dissent recorded-with-rebuttal); bottom out #2665 as the engine-gate's real open question | — | THIS | — | **predecessor of all** | architect + security-guardian | planned |
 | **WS-A1** | Baseline execution-semantics repair (step 1); also interlock (i) | A | THIS | WS-0 | — | architect + cpp-safety | planned |
 | **WS-A2r** | In-process public-API contracts, **read/command paths** (step 2, read half) | A | THIS | WS-A1 | — | architect | planned |
 | **WS-A2a** | In-process **admission / grant / finalisation-receipt** contracts (step 2, admission half) — **under the standing merge-gate** | A | THIS | WS-A1, WS-A6(c/d/h) | — | architect + security-guardian | blocked on interlock |
@@ -174,10 +174,9 @@ programme now that WS-A3 is THIS-owned per-family.
 
 ## Relationship to HA (the split *consumes* HA, does not gate it)
 
-The presentation/core split is (on the current working position) **not** a prerequisite for
-active-active — HA §1c is *provisionally* decoupled, **pending ADR-1005-owner (Dave Rae) ratification**
-(tracked as WS-0). The one in-process blocker HA cared about — the agent `Subscribe` stream — is solved
-by gateway-fronting (HA WS-4), not the split. But the split has **one-way dependencies** on HA deliverables and inherits them
+The presentation/core split is **not** a prerequisite for active-active — HA §1c is decoupled,
+**ratified by the ADR-1005 owner (Dave Rae), 2026-09-07**. The one in-process blocker HA cared about —
+the agent `Subscribe` stream — is solved by gateway-fronting (HA WS-4), not the split. But the split has **one-way dependencies** on HA deliverables and inherits them
 rather than rebuilding:
 
 - **Sessions** (WS-B3a) inherit HA WS-1 (**done** — durable `SessionStore`, DB-clock authority).
