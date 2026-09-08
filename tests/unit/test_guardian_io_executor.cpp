@@ -8,6 +8,8 @@
 
 #include "guardian_io_executor.hpp"
 
+#include "guardian_detached_worker_role.hpp"
+#include "guardian_joined_thread_role.hpp"
 #include "test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -672,4 +674,30 @@ TEST_CASE("the same key string under different IoClass values is independent",
     gate->release();
     caller.join();
     CHECK(spin_until([&] { return ex.active_worker_count() == 0; }));
+}
+
+TEST_CASE("the detached-worker role marker is set on the marked thread and nowhere else",
+          "[spark][ioexecutor]") {
+    // rung 9c R5.1: the PREDICATE GuardianEngine::WorkerHostileMutex consults for its
+    // second role. The abort itself is proven by the forked-child death test in
+    // test_guardian_engine_spark_reconcile.cpp; this isolates the flag. Mutation: drop
+    // set_guardian_detached_worker_thread(true) from the RAII ctor -> marked_true false.
+    CHECK_FALSE(on_guardian_detached_worker_thread()); // the test thread is not a worker
+
+    std::atomic<bool> marked_true{false};
+    std::atomic<bool> joined_seen{true}; // default true so a missed read fails loudly
+    std::atomic<bool> cleared_after{true};
+    std::thread marked_thread([&] {
+        {
+            GuardianDetachedWorkerRole role_marker;
+            marked_true.store(on_guardian_detached_worker_thread());
+            joined_seen.store(on_guardian_joined_thread()); // the two roles are independent
+        }
+        cleared_after.store(on_guardian_detached_worker_thread()); // RAII clears on exit
+    });
+    marked_thread.join();
+    CHECK(marked_true.load());
+    CHECK_FALSE(joined_seen.load());
+    CHECK_FALSE(cleared_after.load());
+    CHECK_FALSE(on_guardian_detached_worker_thread()); // still false here after the join
 }
