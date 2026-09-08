@@ -923,6 +923,7 @@ if build_server
       'unit/server/test_dashboard_api_routes.cpp',
       'unit/server/test_nvd_routes.cpp',
       'unit/server/test_result_set_routes.cpp',
+      'unit/server/test_approval_routes.cpp', # #2542 PR-9: the 4-route Approval API, extracted onto the HttpRouteSink seam
       'unit/server/test_agent_service_impl.cpp',
       'unit/server/test_analytics_event.cpp',
       'unit/server/test_agent_health_store.cpp',

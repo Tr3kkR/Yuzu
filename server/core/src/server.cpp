@@ -126,6 +126,8 @@
 #include "result_set_routes.hpp" // #2542 PR-5: the 6-route Result Sets fragment API, extracted onto the HttpRouteSink seam
 #include "instruction_routes.hpp" // #2542 PR-7: the 13-route Instruction Definitions + Instruction Sets API, extracted onto the HttpRouteSink seam
 #include "execution_routes.hpp" // #2542 PR-7: the 7-route legacy pre-v1 Executions API, extracted onto the HttpRouteSink seam
+#include "schedule_routes.hpp" // #2542 PR-8: the 4-route Schedules API, extracted onto the HttpRouteSink seam
+#include "approval_routes.hpp" // #2542 PR-9: the 4-route Approval API, extracted onto the HttpRouteSink seam
 #include "health_routes.hpp" // #2542 PR-10: the 6-route Health/Infra cluster, extracted onto the HttpRouteSink seam
 #include "command_capability.hpp" // PR1.9c: CommandCapabilityRegistry — the dispatch classification vocabulary
 #include "command_capability_parsers.hpp" // PR1.9c: encode_dispatch_tag / compute_plan_hash
@@ -172,7 +174,6 @@
 #include "background_jobs.hpp" // WS-10: pass-classification table + YUZU_ASSERT_BACKGROUND_JOB gate
 #include "policy_evaluator.hpp"
 #include "schedule_arming_check.hpp"
-#include "schedule_routes.hpp"
 #include "schedule_runner.hpp"
 #include "dashboard_routes.hpp"
 #include "discovery_routes.hpp"
@@ -2662,6 +2663,20 @@ public:
             metrics_.counter("yuzu_auth_read_degrade_total",
                              {{"route", "login"}, {"reason", reason}});
         }
+        // Gate 5 chaos-injector CH-3/UP-6 follow-up (#4020): the ONE
+        // caller-visible signal that get_user_role() is about to floor a
+        // legacy-API-token-authenticated request's role to Role::user
+        // (auth_routes.cpp's `.value_or(Role::user)`) on a genuine AuthDB
+        // store error - not a plain not-found. Single call site, single
+        // failure shape reaches it (AuthDBError::QueryFailed; UserNotFound/
+        // InvalidUsername are excluded before the increment), so no label
+        // set - pre-seeded to 0 so an increase() alert is meaningful.
+        metrics_.describe("yuzu_auth_get_user_role_store_error_total",
+                          "get_user_role() AuthDB lookups that failed on a genuine store error "
+                          "(not a plain not-found/invalid-username miss) - each one floors the "
+                          "caller's legacy-API-token-authenticated request to Role::user",
+                          "counter");
+        metrics_.counter("yuzu_auth_get_user_role_store_error_total");
         // HA WS-1/1a: durable SessionStore degradation on the auth hot path
         // (validate/create/touch/generation-refresh/reap). Mirrors the
         // yuzu_auth_read_degrade_total / yuzu_server_rbac_read_degrade_total
@@ -2999,6 +3014,33 @@ public:
                           "AVAILABILITY signal, not a termination event; correlate with "
                           "PostgreSQL health, do not treat as a CC6.8 deprovision-deny",
                           "counter");
+        // #4107 — the local-auth analogue of the OIDC/SAML post-mint
+        // recheck above, with one more undifferentiated cause than those:
+        // AuthManager::create_local_session (password login, MFA login-
+        // challenge TOTP/recovery verify at /login/mfa, MFA enrollment-
+        // confirm) returns its caller-facing empty-string
+        // sentinel on EITHER a plain SessionStore persist failure (an
+        // ordinary availability event, unrelated to any role check) OR a
+        // post_mint_role_recheck denial (role diverged from AuthDB during
+        // the check-then-mint window, or the post-mint AuthDB read itself
+        // hit a store error) - the route layer cannot distinguish any of
+        // the three from the sentinel alone (see auth_routes.cpp's
+        // `reason=session_mint_failed;cause=undifferentiated` audit
+        // detail), so unlike the OIDC/SAML counters' genuine-vs-store-
+        // unavailable split, this one is NOT purely a role-recheck signal
+        // and must not be alerted on as one (cpp-expert/security-guardian/
+        // authdb Gate 8: an earlier draft of this text asserted only the
+        // post_mint_role_recheck causes).
+        metrics_.describe("yuzu_auth_login_session_mint_denied_total",
+                          "TOTAL local-auth logins (password, MFA login-challenge TOTP/"
+                          "recovery verify, MFA enrollment-confirm) whose session mint was "
+                          "denied - EITHER an ordinary "
+                          "SessionStore persist failure OR a post_mint_role_recheck denial "
+                          "(#4107 role-recheck: role diverged from AuthDB during the "
+                          "check-then-mint window, or the post-mint AuthDB read hit a store "
+                          "error) - undifferentiated, unlike the OIDC/SAML analogues above; "
+                          "do not alert on this as a role-recheck-specific signal",
+                          "counter");
         // describe() only registers HELP/TYPE metadata; the series is absent
         // from /metrics until first .increment(). Instantiate each bare
         // counter at 0 now so absent()-style alert rules on the CC6.8
@@ -3016,6 +3058,7 @@ public:
         metrics_.counter("yuzu_auth_saml_deprovisioned_denied_total");
         metrics_.counter("yuzu_auth_saml_deprovisioned_denied_genuine_total");
         metrics_.counter("yuzu_auth_saml_deprovisioned_denied_store_unavailable_total");
+        metrics_.counter("yuzu_auth_login_session_mint_denied_total");
         metrics_.counter("yuzu_scim_saml_link_unmatched_total");
         metrics_.counter("yuzu_scim_saml_link_ambiguous_total");
         metrics_.counter("yuzu_scim_saml_link_lookup_failures_total");
@@ -10327,10 +10370,11 @@ private:
     // -- HTML helpers ---------------------------------------------------------
 
     // log_safe moved to web_utils.hpp (#2542 PR-7) — instruction_routes.cpp
-    // needs it alongside the /api/approvals/:id/{approve,reject} call sites
-    // immediately below, which stay inline here. Promoted, not duplicated
-    // (#2557 json_extract.hpp precedent); unqualified call sites in this
-    // class resolve to yuzu::server::log_safe via ordinary lookup.
+    // and approval_routes.cpp (#2542 PR-9, reconciled at merge time onto
+    // this same promotion rather than PR-9's own now-deleted log_safe.hpp)
+    // both need it. Promoted, not duplicated (#2557 json_extract.hpp
+    // precedent); unqualified call sites in this class resolve to
+    // yuzu::server::log_safe via ordinary lookup.
 
     static std::string html_escape(const std::string& s) {
         std::string out;
@@ -13279,19 +13323,27 @@ private:
                              .metrics = &metrics_,
                          });
 
-        // #2542 PR-7: NON-BLOCKING session resolve (never writes to `res` on
-        // failure) — distinct from `auth_fn` above, which wraps
-        // `require_auth` and DOES write a 401. `instruction_routes.cpp`'s
-        // POST /api/instructions (best-effort `created_by`) and every
-        // `execution_routes.cpp` route under an engaged fleet-read scope
-        // need this exact non-blocking shape; see either module's header
-        // comment for the full rationale.
+        // NON-BLOCKING session resolve (never writes to `res` on failure) —
+        // distinct from `auth_fn` above, which wraps `require_auth` and DOES
+        // write a 401. Shared by four #2542 modules' post-gate "who is
+        // calling" lookups: PR-7's `instruction_routes.cpp` (POST
+        // /api/instructions's best-effort `created_by`) and every
+        // `execution_routes.cpp` route under an engaged fleet-read scope,
+        // PR-9's `approval_routes.cpp` (approve/reject need the CALLER's
+        // identity as `reviewer` even when perm_fn's gate already passed),
+        // and PR-8's `schedule_routes.cpp` (DELETE/enable/create's
+        // owner-scoping lookup after `perm_fn` has already proven a session
+        // exists). See any of the four modules' header comments for the
+        // full rationale.
         auto resolve_session_fn =
             [this](const httplib::Request& req) -> std::optional<auth::Session> {
             return auth_routes_->resolve_session(req);
         };
+
         // #2542 PR-7: wraps ServerImpl::emit_event's 4-argument shape (no
-        // caller in either new module passes a non-default Severity).
+        // caller in the three modules below that take it — instruction,
+        // execution, approval; schedule_routes does not — passes a
+        // non-default Severity).
         auto emit_event_fn = [this](const std::string& event_type, const httplib::Request& req,
                                     const nlohmann::json& attrs,
                                     const nlohmann::json& payload_data) {
@@ -13394,6 +13446,41 @@ private:
                              .audit_fn = audit_fn,
                              .emit_event_fn = emit_event_fn,
                              .execution_tracker = execution_tracker_.get(),
+                         });
+
+        // #2542 PR-9: the 4-route Approval API (/api/approvals,
+        // /api/approvals/pending/count, /api/approvals/:id/{approve,reject}),
+        // extracted onto the same inline_sink seam. Placed here rather than
+        // alongside page_routes's call above (like PR-4/PR-5's siblings)
+        // because this module needs resolve_session_fn (defined just above;
+        // instruction_routes.cpp, PR-7, was its first extracted caller) +
+        // audit_fn + emit_event_fn, none of which is in scope yet at that
+        // earlier point.
+        yuzu::server::approval::register_approval_routes(
+            inline_sink, yuzu::server::approval::Deps{
+                             .perm_fn = perm_fn,
+                             .resolve_session_fn = resolve_session_fn,
+                             .audit_fn = audit_fn,
+                             .emit_event_fn = emit_event_fn,
+                             .approval_manager = approval_manager_.get(),
+                         });
+
+        // #2542 PR-8: the 4-route Schedules API (/api/schedules[/:id[/enable]]),
+        // extracted onto the same inline_sink seam. Placed here rather than
+        // alongside page_routes's call above (like PR-4's custom_properties
+        // sibling) because this module needs the just-defined
+        // resolve_session_fn + audit_fn, neither of which is in scope yet at
+        // that earlier point. Folds in the interim PR #1806 (H-01)
+        // create-schedule extraction, which used to call a standalone
+        // `handle_create_schedule(AuthRoutes&, ...)` free function from this
+        // same site — see schedule_routes.hpp's file header for the full
+        // history.
+        yuzu::server::schedule::register_schedule_routes(
+            inline_sink, yuzu::server::schedule::Deps{
+                             .perm_fn = perm_fn,
+                             .resolve_session_fn = resolve_session_fn,
+                             .audit_fn = audit_fn,
+                             .schedule_engine = schedule_engine_.get(),
                          });
 
         // Shared command-dispatch closure — sends a CommandRequest to agents via
@@ -14617,297 +14704,6 @@ private:
                 arr.push_back(a);
             res.set_content(nlohmann::json({{"agents", arr}, {"count", arr.size()}}).dump(),
                             "application/json");
-        });
-
-        // -- Schedule API -----------------------------------------------------
-
-        web_server_->Get("/api/schedules", [this](const httplib::Request& req,
-                                                  httplib::Response& res) {
-            if (!require_permission(req, res, "Schedule", "Read"))
-                return;
-            // guardian-confinement-2298 hardening sweep originally added an
-            // explicit deny_service_scoped_schedule() call here (ITServiceOwner
-            // grants full CRUD on Schedule, and query_schedules has no owner/
-            // service filter at all — a bare Schedule:Read gate would let a
-            // service-scoped token enumerate every schedule from every other
-            // service). guardian-confinement-2298 PR 3 ("the flip") made it
-            // provably dead: require_permission above already denies any
-            // service-scoped token outright for (Schedule, Read)
-            // (kServiceScopeGlobalSafe is compile-time-empty), so a
-            // service-scoped session can never reach this point at all.
-            // Retired #3290 Phase 2 bucket 1a — see
-            // docs/security-reviews/service-scope-phase2-migrations-2026-08.md.
-            if (!schedule_engine_) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            ScheduleQuery q;
-            if (req.has_param("definition_id"))
-                q.definition_id = req.get_param_value("definition_id");
-            if (req.has_param("enabled_only"))
-                q.enabled_only = true;
-
-            auto scheds = schedule_engine_->query_schedules(q);
-            nlohmann::json arr = nlohmann::json::array();
-            for (const auto& s : scheds) {
-                arr.push_back({{"id", s.id},
-                               {"name", s.name},
-                               {"definition_id", s.definition_id},
-                               {"enabled", s.enabled},
-                               {"frequency_type", s.frequency_type},
-                               {"next_execution_at", s.next_execution_at},
-                               {"last_executed_at", s.last_executed_at},
-                               {"execution_count", s.execution_count}});
-            }
-            res.set_content(nlohmann::json({{"schedules", arr}}).dump(), "application/json");
-        });
-
-        web_server_->Post("/api/schedules", [this](const httplib::Request& req,
-                                                   httplib::Response& res) {
-            // Extracted to schedule_routes.cpp (H-01, #1806): the
-            // Schedule:Write + Execution:Execute gate ordering needs direct
-            // unit coverage that a bare inline lambda cannot get.
-            handle_create_schedule(*auth_routes_, schedule_engine_.get(), req, res);
-        });
-
-        web_server_->Delete(R"(/api/schedules/([^/]+))", [this](const httplib::Request& req,
-                                                                httplib::Response& res) {
-            if (!require_permission(req, res, "Schedule", "Delete"))
-                return;
-            if (!schedule_engine_) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            auto id = req.matches[1].str();
-            // An interim deny_service_scoped_schedule() call used to sit here
-            // (delete_schedule is username-owner-scoped below, and a
-            // service-scoped token shares its creating principal's username —
-            // without a deny it could delete a fleet-wide schedule its own
-            // principal created interactively). guardian-confinement-2298 PR 3
-            // ("the flip") made it provably dead: require_permission above
-            // already denies any service-scoped token outright for
-            // (Schedule, Delete). Retired #3290 Phase 2 bucket 1a.
-            // M-01 (#1806): owner-scoped delete — a Schedule:Delete grant
-            // deletes only schedules the caller created, not the whole
-            // fleet's. auth_routes_->resolve_session, not require_permission's
-            // session (already consumed) — this call cannot fail auth since
-            // require_permission above already proved a valid session exists.
-            auto session = auth_routes_->resolve_session(req);
-            auto user = session ? session->username : std::string();
-            bool deleted = schedule_engine_->delete_schedule(id, user);
-            if (deleted) {
-                (void)audit_log(req, "schedule.delete", "success", "schedule", id);
-                res.set_header("HX-Trigger",
-                               R"({"showToast":{"message":"Schedule deleted","level":"success"}})");
-            }
-            res.set_content(nlohmann::json({{"deleted", deleted}}).dump(), "application/json");
-        });
-
-        web_server_->Post(R"(/api/schedules/([^/]+)/enable)", [this](const httplib::Request& req,
-                                                                     httplib::Response& res) {
-            if (!require_permission(req, res, "Schedule", "Write"))
-                return;
-            if (!schedule_engine_) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            auto id = req.matches[1].str();
-            // guardian-confinement-2298: parse_schedule_enabled (schedule_routes.hpp)
-            // — extract_json_string only matches a JSON *string*, so a real
-            // JSON boolean {"enabled":false} used to silently fall through
-            // to the "absent" default (true), inverting the request and
-            // defeating the disable-always-reachable kill switch (H-01).
-            bool enabled = parse_schedule_enabled(req.body);
-            // H-01 (#1806): re-enabling arms the schedule to fire unattended
-            // through ScheduleRunner — the same fleet-wide-dispatch concern
-            // as create, so it needs the same Execution:Execute gate.
-            // Disabling only ever stops a schedule, so it stays gated on
-            // Schedule:Write alone — an operator must be able to kill a
-            // runaway schedule even without Execution:Execute.
-            if (enabled && !require_permission(req, res, "Execution", "Execute"))
-                return;
-            // An interim deny_service_scoped_schedule() call used to sit here,
-            // enable(true) only — deliberately built to leave disable
-            // reachable for a service-scoped token as its kill switch (H-01).
-            // guardian-confinement-2298 PR 3 ("the flip") made the deny itself
-            // provably dead (require_permission above already denies any
-            // service-scoped token outright for (Schedule, Write), enabled or
-            // not) — retired here, #3290 Phase 2 bucket 1a. NOTE: the flip's
-            // unconditional Schedule:Write gate ALSO means the documented
-            // kill-switch guarantee (disable stays reachable) does not
-            // currently hold for a service-scoped token, since it never gets
-            // past `require_permission` above regardless of `enabled`'s
-            // value — a real, pre-existing, NOT-yet-fixed gap this retirement
-            // discovered but does not resolve; see #3378.
-
-            // M-01 (#1806): owner-scoped enable/disable, same as delete above.
-            auto session = auth_routes_->resolve_session(req);
-            auto user = session ? session->username : std::string();
-            bool changed = schedule_engine_->set_enabled(id, enabled, user);
-            if (changed) {
-                // L-04 (#1806): enable/disable had no audit trail at all.
-                (void)audit_log(req, enabled ? "schedule.enable" : "schedule.disable", "success",
-                                "schedule", id);
-            }
-            res.set_content(nlohmann::json({{"enabled", enabled}}).dump(), "application/json");
-        });
-
-        // -- Approval API -----------------------------------------------------
-
-        web_server_->Get("/api/approvals", [this](const httplib::Request& req,
-                                                  httplib::Response& res) {
-            if (!require_permission(req, res, "Approval", "Read"))
-                return;
-            if (!approval_manager_) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            ApprovalQuery q;
-            if (req.has_param("status"))
-                q.status = req.get_param_value("status");
-            if (req.has_param("submitted_by"))
-                q.submitted_by = req.get_param_value("submitted_by");
-
-            auto approvals = approval_manager_->query(q);
-            nlohmann::json arr = nlohmann::json::array();
-            for (const auto& a : approvals) {
-                arr.push_back({{"id", a.id},
-                               {"definition_id", a.definition_id},
-                               {"status", a.status},
-                               {"submitted_by", a.submitted_by},
-                               {"submitted_at", a.submitted_at},
-                               {"reviewed_by", a.reviewed_by},
-                               {"reviewed_at", a.reviewed_at},
-                               {"review_comment", a.review_comment},
-                               {"scope_expression", a.scope_expression}});
-            }
-            res.set_content(nlohmann::json({{"approvals", arr}}).dump(), "application/json");
-        });
-
-        web_server_->Get("/api/approvals/pending/count", [this](const httplib::Request& req,
-                                                                httplib::Response& res) {
-            if (!require_permission(req, res, "Approval", "Read"))
-                return;
-            if (!approval_manager_) {
-                res.set_content(R"({"count":0})", "application/json");
-                return;
-            }
-            auto count = approval_manager_->pending_count();
-            res.set_content(nlohmann::json({{"count", count}}).dump(), "application/json");
-        });
-
-        web_server_->Post(R"(/api/approvals/([^/]+)/approve)", [this](const httplib::Request& req,
-                                                                      httplib::Response& res) {
-            if (!require_permission(req, res, "Approval", "Approve"))
-                return;
-            if (!approval_manager_) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            auto id = req.matches[1].str();
-            auto comment = extract_json_string(req.body, "comment");
-            auto session = auth_routes_->resolve_session(req);
-            auto reviewer = session ? session->username : "unknown";
-
-            auto result = approval_manager_->approve(id, reviewer, comment);
-            if (!result) {
-                res.status = 400;
-                // A denied review is an access-control decision (e.g. the
-                // self-approval segregation-of-duties block) — leave an audit
-                // trace like the other denial paths in this file (governance
-                // compliance CC6.1/CC6.3), and a greppable server-side line.
-                (void)audit_log(req, "approval.approve", "denied", "approval", id,
-                                result.error());
-                spdlog::warn("approval approve denied: id={} reviewer={} reason={}",
-                             log_safe(id), reviewer, log_safe(result.error(), 256));
-                // htmx doesn't swap a non-2xx response, so without a trigger
-                // the denial (e.g. the self-approval block) is a silent no-op
-                // in the dashboard (#1821). HX-Trigger headers ARE processed
-                // on error responses — surface the reason as a toast. dump()
-                // uses `replace`: the error can echo the raw URL id, and the
-                // default handler throws on invalid UTF-8 (governance UP-5).
-                nlohmann::json trigger = {
-                    {"showToast", {{"message", result.error()}, {"level", "error"}}}};
-                res.set_header("HX-Trigger",
-                               trigger.dump(-1, ' ', false,
-                                            nlohmann::json::error_handler_t::replace));
-                res.set_content(nlohmann::json({{"error", result.error()}})
-                                    .dump(-1, ' ', false,
-                                          nlohmann::json::error_handler_t::replace),
-                                "application/json");
-                return;
-            }
-            (void)audit_log(req, "approval.approve", "success", "approval", id);
-            emit_event("approval.approved", req, {{"reviewer", reviewer}}, {{"approval_id", id}});
-            res.set_header("HX-Trigger",
-                           R"({"showToast":{"message":"Approved","level":"success"}})");
-            res.set_content(R"({"status":"approved"})", "application/json");
-        });
-
-        web_server_->Post(R"(/api/approvals/([^/]+)/reject)", [this](const httplib::Request& req,
-                                                                     httplib::Response& res) {
-            if (!require_permission(req, res, "Approval", "Approve"))
-                return;
-            if (!approval_manager_) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            auto id = req.matches[1].str();
-            auto comment = extract_json_string(req.body, "comment");
-            auto session = auth_routes_->resolve_session(req);
-            auto reviewer = session ? session->username : "unknown";
-
-            auto result = approval_manager_->reject(id, reviewer, comment);
-            if (!result) {
-                res.status = 400;
-                // Same as the approve branch: audit the denial, log it, and
-                // surface it as a toast (#1821) — htmx swallows non-2xx
-                // bodies but processes HX-Trigger on them.
-                (void)audit_log(req, "approval.reject", "denied", "approval", id,
-                                result.error());
-                spdlog::warn("approval reject denied: id={} reviewer={} reason={}",
-                             log_safe(id), reviewer, log_safe(result.error(), 256));
-                nlohmann::json trigger = {
-                    {"showToast", {{"message", result.error()}, {"level", "error"}}}};
-                res.set_header("HX-Trigger",
-                               trigger.dump(-1, ' ', false,
-                                            nlohmann::json::error_handler_t::replace));
-                res.set_content(nlohmann::json({{"error", result.error()}})
-                                    .dump(-1, ' ', false,
-                                          nlohmann::json::error_handler_t::replace),
-                                "application/json");
-                return;
-            }
-            (void)audit_log(req, "approval.reject", "success", "approval", id);
-            emit_event("approval.rejected", req, {{"reviewer", reviewer}, {"comment", comment}},
-                       {{"approval_id", id}});
-            res.set_header("HX-Trigger",
-                           R"({"showToast":{"message":"Rejected","level":"warning"}})");
-            res.set_content(R"({"status":"rejected"})", "application/json");
         });
 
         // -- HTMX Fragment Routes for Instructions UI -------------------------
