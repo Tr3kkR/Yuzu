@@ -2663,6 +2663,20 @@ public:
             metrics_.counter("yuzu_auth_read_degrade_total",
                              {{"route", "login"}, {"reason", reason}});
         }
+        // Gate 5 chaos-injector CH-3/UP-6 follow-up (#4020): the ONE
+        // caller-visible signal that get_user_role() is about to floor a
+        // legacy-API-token-authenticated request's role to Role::user
+        // (auth_routes.cpp's `.value_or(Role::user)`) on a genuine AuthDB
+        // store error - not a plain not-found. Single call site, single
+        // failure shape reaches it (AuthDBError::QueryFailed; UserNotFound/
+        // InvalidUsername are excluded before the increment), so no label
+        // set - pre-seeded to 0 so an increase() alert is meaningful.
+        metrics_.describe("yuzu_auth_get_user_role_store_error_total",
+                          "get_user_role() AuthDB lookups that failed on a genuine store error "
+                          "(not a plain not-found/invalid-username miss) - each one floors the "
+                          "caller's legacy-API-token-authenticated request to Role::user",
+                          "counter");
+        metrics_.counter("yuzu_auth_get_user_role_store_error_total");
         // HA WS-1/1a: durable SessionStore degradation on the auth hot path
         // (validate/create/touch/generation-refresh/reap). Mirrors the
         // yuzu_auth_read_degrade_total / yuzu_server_rbac_read_degrade_total
@@ -3000,6 +3014,33 @@ public:
                           "AVAILABILITY signal, not a termination event; correlate with "
                           "PostgreSQL health, do not treat as a CC6.8 deprovision-deny",
                           "counter");
+        // #4107 — the local-auth analogue of the OIDC/SAML post-mint
+        // recheck above, with one more undifferentiated cause than those:
+        // AuthManager::create_local_session (password login, MFA login-
+        // challenge TOTP/recovery verify at /login/mfa, MFA enrollment-
+        // confirm) returns its caller-facing empty-string
+        // sentinel on EITHER a plain SessionStore persist failure (an
+        // ordinary availability event, unrelated to any role check) OR a
+        // post_mint_role_recheck denial (role diverged from AuthDB during
+        // the check-then-mint window, or the post-mint AuthDB read itself
+        // hit a store error) - the route layer cannot distinguish any of
+        // the three from the sentinel alone (see auth_routes.cpp's
+        // `reason=session_mint_failed;cause=undifferentiated` audit
+        // detail), so unlike the OIDC/SAML counters' genuine-vs-store-
+        // unavailable split, this one is NOT purely a role-recheck signal
+        // and must not be alerted on as one (cpp-expert/security-guardian/
+        // authdb Gate 8: an earlier draft of this text asserted only the
+        // post_mint_role_recheck causes).
+        metrics_.describe("yuzu_auth_login_session_mint_denied_total",
+                          "TOTAL local-auth logins (password, MFA login-challenge TOTP/"
+                          "recovery verify, MFA enrollment-confirm) whose session mint was "
+                          "denied - EITHER an ordinary "
+                          "SessionStore persist failure OR a post_mint_role_recheck denial "
+                          "(#4107 role-recheck: role diverged from AuthDB during the "
+                          "check-then-mint window, or the post-mint AuthDB read hit a store "
+                          "error) - undifferentiated, unlike the OIDC/SAML analogues above; "
+                          "do not alert on this as a role-recheck-specific signal",
+                          "counter");
         // describe() only registers HELP/TYPE metadata; the series is absent
         // from /metrics until first .increment(). Instantiate each bare
         // counter at 0 now so absent()-style alert rules on the CC6.8
@@ -3017,6 +3058,7 @@ public:
         metrics_.counter("yuzu_auth_saml_deprovisioned_denied_total");
         metrics_.counter("yuzu_auth_saml_deprovisioned_denied_genuine_total");
         metrics_.counter("yuzu_auth_saml_deprovisioned_denied_store_unavailable_total");
+        metrics_.counter("yuzu_auth_login_session_mint_denied_total");
         metrics_.counter("yuzu_scim_saml_link_unmatched_total");
         metrics_.counter("yuzu_scim_saml_link_ambiguous_total");
         metrics_.counter("yuzu_scim_saml_link_lookup_failures_total");
