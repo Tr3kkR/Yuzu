@@ -243,7 +243,23 @@ explicit transaction.
 `mfa_regenerate_recovery_codes` deletes every row for the user (consumed
 or otherwise) and issues 10 fresh ones. The UI surfaces this when
 recovery_codes_remaining drops below 5 or when the operator presses
-"Regenerate recovery codes".
+"Regenerate recovery codes". Unlike the consume path, DELETE-all + INSERT-10
+is **not** self-serializing, so it takes a `SELECT … FOR UPDATE` on the
+`auth.users` row first (#3779): without it two concurrent regenerates each
+delete the committed rows and insert 10 (20 persist under READ COMMITTED), and
+each caller is handed a set that no longer matches storage. The row lock — the
+same one `mfa_verify_enrollment`, `mfa_verify_login_code`, `mfa_disable` and
+`remove_user` already take for the user — orders them into clean sequential
+last-writer-wins (returned == persisted for each caller in turn). The
+`is_active = TRUE` predicate additionally **refuses** a regenerate once
+`remove_user` has deactivated the account: the loser re-reads `is_active =
+FALSE`, matches zero rows, and returns `UserNotFound` — so a regenerate racing an
+account **deactivation** can never leave live recovery codes on a disabled
+account. (An `mfa_disable` leaves `is_active = TRUE`, so a regenerate racing it is
+serialized by the row lock but still issues codes; those are inert — a recovery
+code is only consumable through an MFA challenge, which a disabled account cannot
+present — and the next enroll/disable clears them. The `is_active` refusal is
+specific to `remove_user`, not `mfa_disable`.)
 
 `mfa_disable` deletes the user's recovery codes alongside clearing the
 secret — leaving them around would let a disabled user authenticate via
