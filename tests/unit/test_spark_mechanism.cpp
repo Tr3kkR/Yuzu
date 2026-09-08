@@ -4521,10 +4521,44 @@ TEST_CASE("Watch establishment (Service): S2 sequence under SCM load (S3)",
         SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset - skipping establishment latency harness");
         return;
     }
+    // Same mask S2 uses (spark_service.cpp:888-892's copy).
+    constexpr DWORD kEstablishNotifyMask =
+        SERVICE_NOTIFY_RUNNING | SERVICE_NOTIFY_STOPPED | SERVICE_NOTIFY_START_PENDING |
+        SERVICE_NOTIFY_STOP_PENDING | SERVICE_NOTIFY_CONTINUE_PENDING |
+        SERVICE_NOTIFY_PAUSE_PENDING | SERVICE_NOTIFY_PAUSED;
+
+    // SCM setup + enumeration FIRST, entirely before the churn threads exist
+    // (adversarial-review finding, PR-A round 2): a REQUIRE failing here
+    // used to unwind past two already-constructed, unguarded joinable
+    // std::threads, which std::terminate()s the whole test binary instead
+    // of reporting the failed precondition cleanly. Moving thread creation
+    // to after every REQUIRE below removes the hazard without adding new
+    // RAII scaffolding - nothing between thread creation and the
+    // deterministic join() at the end can fail a fatal assertion.
+    SC_HANDLE scm = ::OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT | SC_MANAGER_ENUMERATE_SERVICE);
+    REQUIRE(scm != nullptr);
+    // resume reset to 0 before the real call, same reasoning as S2's
+    // identical comment - the probe call is expected to fail (ERROR_MORE_
+    // DATA) and must not leave a stale resume handle for the real
+    // enumeration to (incorrectly) start from (adversarial-review finding,
+    // PR-A round 2 - this reset was present in S2 but missing here).
+    DWORD needed = 0, count = 0, resume = 0;
+    ::EnumServicesStatusExW(scm, SC_ENUM_PROCESS_INFO, SERVICE_WIN32, SERVICE_STATE_ALL, nullptr,
+                            0, &needed, &count, &resume, nullptr);
+    resume = 0;
+    std::vector<BYTE> buf(needed);
+    REQUIRE(::EnumServicesStatusExW(scm, SC_ENUM_PROCESS_INFO, SERVICE_WIN32, SERVICE_STATE_ALL,
+                                    buf.data(), static_cast<DWORD>(buf.size()), &needed, &count,
+                                    &resume, nullptr));
+    REQUIRE(count > 0);
+    const auto* entries = reinterpret_cast<const ENUM_SERVICE_STATUS_PROCESSW*>(buf.data());
+
     // SCM load: two background threads hammering OpenSCManagerW+Close in a
     // tight loop for the duration of the measurement - a proxy for
     // contention on the SCM RPC connection itself (no toggling of any real
-    // service; read-only, safe on any host).
+    // service; read-only, safe on any host). No REQUIRE/fatal assertion
+    // runs anywhere below this point - only the timing loop and the
+    // deterministic join()s.
     std::atomic<bool> stop{false};
     auto scm_churn = [&stop] {
         while (!stop.load(std::memory_order_relaxed)) {
@@ -4534,27 +4568,37 @@ TEST_CASE("Watch establishment (Service): S2 sequence under SCM load (S3)",
     };
     std::thread t1(scm_churn), t2(scm_churn);
 
-    SC_HANDLE scm = ::OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT | SC_MANAGER_ENUMERATE_SERVICE);
-    REQUIRE(scm != nullptr);
-    DWORD needed = 0, count = 0, resume = 0;
-    ::EnumServicesStatusExW(scm, SC_ENUM_PROCESS_INFO, SERVICE_WIN32, SERVICE_STATE_ALL, nullptr,
-                            0, &needed, &count, &resume, nullptr);
-    std::vector<BYTE> buf(needed);
-    REQUIRE(::EnumServicesStatusExW(scm, SC_ENUM_PROCESS_INFO, SERVICE_WIN32, SERVICE_STATE_ALL,
-                                    buf.data(), static_cast<DWORD>(buf.size()), &needed, &count,
-                                    &resume, nullptr));
-    REQUIRE(count > 0);
-    const auto* entries = reinterpret_cast<const ENUM_SERVICE_STATUS_PROCESSW*>(buf.data());
-
-    std::vector<std::int64_t> t_open;
+    // Complete S2 sequence (open + notify), not just open (adversarial-
+    // review finding, PR-A round 2: this loop previously timed only
+    // OpenServiceW, so S3 was not actually "S2 under SCM load" despite its
+    // own name - notification-registration latency under contention went
+    // uncharacterized).
+    std::vector<std::int64_t> t_open, t_notify;
+    std::vector<std::int64_t> t_open_failed;
     int sampled = 0;
     for (int cycle = 0; sampled < kEstablishSamples; ++cycle) {
         const auto& svc = entries[static_cast<DWORD>(cycle) % count];
         SC_HANDLE h = nullptr;
-        time_call(t_open, [&] { h = ::OpenServiceW(scm, svc.lpServiceName, SERVICE_QUERY_STATUS); });
+        DWORD last_err = 0;
+        time_call(t_open, [&] {
+            h = ::OpenServiceW(scm, svc.lpServiceName, SERVICE_QUERY_STATUS);
+            if (!h)
+                last_err = ::GetLastError();
+        });
         ++sampled;
-        if (h)
-            ::CloseServiceHandle(h);
+        if (!h) {
+            t_open_failed.push_back(static_cast<std::int64_t>(last_err));
+            continue;
+        }
+
+        SERVICE_NOTIFYW notify{};
+        notify.dwVersion = SERVICE_NOTIFY_STATUS_CHANGE;
+        notify.pfnNotifyCallback = &establish_s2_notify_cb;
+        DWORD rc = 0;
+        time_call(t_notify,
+                  [&] { rc = ::NotifyServiceStatusChangeW(h, kEstablishNotifyMask, &notify); });
+        (void)rc; // report-only, same posture as S2
+        ::CloseServiceHandle(h);
     }
     ::CloseServiceHandle(scm);
 
@@ -4563,6 +4607,11 @@ TEST_CASE("Watch establishment (Service): S2 sequence under SCM load (S3)",
     t2.join();
 
     warn_establish("S3 OpenServiceW UNDER SCM LOAD", "OpenServiceW", t_open);
+    warn_establish("S3 NotifyServiceStatusChangeW UNDER SCM LOAD", "NotifyServiceStatusChangeW",
+                   t_notify);
+    WARN("S3 UNDER SCM LOAD: " << t_open_failed.size() << " of " << sampled
+         << " OpenServiceW attempts failed (GetLastError values reported, not timed as a"
+            " separate latency series)");
 }
 
 TEST_CASE("Watch establishment (File): is_directory + CreateFileW sanity (F1)",
