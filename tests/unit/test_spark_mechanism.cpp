@@ -13,6 +13,8 @@
 #include "spark_engine.hpp"
 #include "spark_heartbeat.hpp" // emit_spark_heartbeat_tags — the #2833 egress pin
 #include "spark_mechanism.hpp"
+#include "test_helpers.hpp" // process_random_salt — the PR-A watch-establishment harness'
+                            // scratch registry keys (#2012/#3840 D-value measurement)
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -3440,7 +3442,7 @@ TEST_CASE("Registry spark (real mechanism): survives key delete + recreate",
 namespace {
 struct LatencyStats {
     std::size_t n{0};
-    std::int64_t min_us{0}, median_us{0}, p90_us{0}, max_us{0};
+    std::int64_t min_us{0}, median_us{0}, p90_us{0}, p99_us{0}, max_us{0};
 };
 LatencyStats summarize_us(std::vector<std::int64_t> v) {
     LatencyStats s;
@@ -3452,6 +3454,12 @@ LatencyStats summarize_us(std::vector<std::int64_t> v) {
     s.max_us = v.back();
     s.median_us = v[v.size() / 2];
     s.p90_us = v[(v.size() * 9) / 10];
+    // Clamped (unlike the p90 line above, left as-is): the PR-A establishment
+    // harness below can in principle hand this a shorter vector than the
+    // dispatch-latency callers above always produce (n >= 5 REQUIRE'd there),
+    // and (v.size()*99)/100 is an off-by-one risk at small n that p90's 9/10
+    // divisor does not hit in practice at the sizes callers use.
+    s.p99_us = v[std::min(v.size() - 1, (v.size() * 99) / 100)];
     return s;
 }
 } // namespace
@@ -3813,6 +3821,795 @@ TEST_CASE("Service spark (real mechanism): live service transition + inline disp
              << "  (OS-notify latency NOT included — that is APC-delivery-scale, separate)");
         CHECK(s.median_us < 10000);
     }
+}
+
+// ── Watch-establishment LATENCY CHARACTERIZATION harness (PR-A; #2012/#3840) ─
+//
+// Measures the RAW Win32 call sequences DIRECTLY — CreateEventW /
+// CreateThreadpoolWait / RegOpenKeyExW / RegNotifyChangeKeyValue /
+// SetThreadpoolWait for Registry; OpenSCManagerW / OpenServiceW /
+// NotifyServiceStatusChangeW for Service; is_directory / CreateFileW for
+// File — NOT through the mechanism classes (spark_file.cpp /
+// spark_registry.cpp / spark_service.cpp), which do not yet have the
+// off-lock restructuring this measurement feeds (that is PR-B). Deliberate:
+// D must be chosen from TODAY's raw call cost, before a mechanism hides it
+// behind a bounded worker — measuring through the mechanism is only possible
+// once PR-B lands, by which point D would already be baked in.
+//
+// REPORT ONLY — never assert on these numbers on the shared Wee Tam CI pool.
+// Treat a 200-sample p99 here as DEADLINE-CALIBRATION input, not evidence
+// about cold boot / a dead network share / true worst-case latency (Astra,
+// plan round 3, "#2012 + #3840" plan doc). Any downstream doc/PR body citing
+// these numbers must say so explicitly.
+//
+// Env-gated (YUZU_SPARK_ESTABLISH_BENCH=1), same shape as the
+// YUZU_SPARK_LIVE_SERVICE case above — every other [windows] case in this
+// file runs by default on the shared Wee Tam CI box, and this is a
+// measurement run, not a gate; it must never fire there un-asked.
+//
+// NOT RUN IN THIS SESSION. No Windows toolchain/host was available when this
+// harness was authored (PR-A, docs/spark-rebuild-baselines/stage2-watch-
+// establish-latency.md records the pending-DGRHP-run status) — every Win32
+// call shape below is modeled directly on the existing, already-shipped
+// usage in spark_registry.cpp / spark_service.cpp / spark_file.cpp (cited
+// per case), not invented, but this file has NOT been compiled or executed
+// on a real Windows host as part of this change.
+
+namespace {
+
+bool spark_establish_bench_enabled() {
+    const char* env = std::getenv("YUZU_SPARK_ESTABLISH_BENCH");
+    return env && *env && std::string_view(env) != "0";
+}
+
+constexpr int kEstablishSamples = 200;
+
+/// Times `body()` and appends the elapsed microseconds to `out`.
+template <class Fn> void time_call(std::vector<std::int64_t>& out, Fn&& body) {
+    const auto t0 = std::chrono::steady_clock::now();
+    body();
+    const auto t1 = std::chrono::steady_clock::now();
+    out.push_back(std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
+}
+
+void warn_establish(const char* case_label, const char* call_label, std::vector<std::int64_t> v) {
+    const LatencyStats s = summarize_us(std::move(v));
+    WARN("ESTABLISH " << case_label << " " << call_label << " n=" << s.n << " min=" << s.min_us
+         << " p50=" << s.median_us << " p90=" << s.p90_us << " p99=" << s.p99_us
+         << " max=" << s.max_us << " us");
+}
+
+/// ASCII-only widen — every path/name this harness constructs is a
+/// PID/salt-suffixed ASCII literal, so a naive char->wchar_t widen is exact
+/// (no MultiByteToWideChar needed).
+std::wstring establish_widen(const std::string& s) { return std::wstring(s.begin(), s.end()); }
+
+void CALLBACK establish_null_wait_cb(PTP_CALLBACK_INSTANCE, PVOID, PTP_WAIT, TP_WAIT_RESULT) {}
+
+/// R5 in-flight-drain callback: sleeps 50ms to simulate a callback parked
+/// inside a slow inline consumer, so WaitForThreadpoolWaitCallbacks(TRUE) has
+/// something real to drain. A named CALLBACK function, not a captureless
+/// lambda passed where a raw PTP_WAIT_CALLBACK is expected — matches the
+/// named-function convention spark_registry.cpp's own OnWait uses, rather
+/// than relying on a lambda-to-function-pointer conversion across the
+/// CALLBACK/__stdcall decoration.
+void CALLBACK establish_r5_inflight_cb(PTP_CALLBACK_INSTANCE, PVOID, PTP_WAIT, TP_WAIT_RESULT) {
+    std::this_thread::sleep_for(50ms);
+}
+
+/// R6 fired-flag callback: `ctx` is the `std::atomic<bool>*` the control
+/// polls. Named for the same reason as establish_r5_inflight_cb above.
+void CALLBACK establish_r6_fired_cb(PTP_CALLBACK_INSTANCE, PVOID ctx, PTP_WAIT, TP_WAIT_RESULT) {
+    static_cast<std::atomic<bool>*>(ctx)->store(true, std::memory_order_relaxed);
+}
+
+/// S2's SERVICE_NOTIFYW::pfnNotifyCallback — PFN_SC_NOTIFY_CALLBACK takes a
+/// single PVOID (spark_service.cpp's own notify_cb, spark_service.cpp:968,
+/// matches this exact signature), NOT a SERVICE_NOTIFYW* — establishment
+/// only, this harness never reads the delivered status.
+void CALLBACK establish_s2_notify_cb(PVOID) {}
+
+/// One CreateEventW + CreateThreadpoolWait + RegOpenKeyExW +
+/// RegNotifyChangeKeyValue + SetThreadpoolWait sample, timed per call and
+/// appended to the five out-vectors (same order as the plan's R1/R2 call
+/// list). `open` performs the RegOpenKeyExW step itself (R1: a single open of
+/// the target; R2: an ancestor walk — see establish_open_ancestor_walk below)
+/// so both cases can share this shell. `env` is null for the default process
+/// pool (R1/R2) or a private pool's environment (R3/R4, under hive load).
+template <class OpenFn>
+void establish_registry_sample(PTP_CALLBACK_ENVIRON* env, DWORD notify_filter, OpenFn&& open,
+                               std::vector<std::int64_t>& t_event,
+                               std::vector<std::int64_t>& t_wait_create,
+                               std::vector<std::int64_t>& t_open,
+                               std::vector<std::int64_t>& t_notify,
+                               std::vector<std::int64_t>& t_wait_set) {
+    HANDLE ev = nullptr;
+    time_call(t_event, [&] { ev = ::CreateEventW(nullptr, FALSE, FALSE, nullptr); });
+    REQUIRE(ev != nullptr);
+
+    PTP_WAIT wait = nullptr;
+    time_call(t_wait_create,
+              [&] { wait = ::CreateThreadpoolWait(&establish_null_wait_cb, nullptr, env); });
+    REQUIRE(wait != nullptr);
+
+    HKEY h = open(t_open);
+    REQUIRE(h != nullptr);
+
+    LONG rc = 0;
+    time_call(t_notify,
+              [&] { rc = ::RegNotifyChangeKeyValue(h, FALSE, notify_filter, ev, TRUE); });
+    CHECK(rc == ERROR_SUCCESS);
+
+    time_call(t_wait_set, [&] { ::SetThreadpoolWait(wait, ev, nullptr); });
+
+    // Teardown — not itself measured; mirrors spark_registry.cpp's own
+    // teardown() shape (cancel-new, drain in-flight, then close).
+    ::SetThreadpoolWait(wait, nullptr, nullptr);
+    ::WaitForThreadpoolWaitCallbacks(wait, TRUE);
+    ::CloseThreadpoolWait(wait);
+    ::RegCloseKey(h);
+    ::CloseHandle(ev);
+}
+
+/// A private TP wait-group (min=2/max=4) matching spark_registry.cpp's own
+/// pool sizing (spark_registry.cpp:173-176) — used ONLY by the "under hive
+/// load" cases (R3/R4) so the measured contention is realistic private-pool
+/// saturation, not the effectively-unbounded default process pool.
+struct EstablishPrivatePool {
+    PTP_POOL pool{nullptr};
+    TP_CALLBACK_ENVIRON env{};
+
+    EstablishPrivatePool() {
+        pool = ::CreateThreadpool(nullptr);
+        REQUIRE(pool != nullptr);
+        ::SetThreadpoolThreadMinimum(pool, 2);
+        ::SetThreadpoolThreadMaximum(pool, 4);
+        ::InitializeThreadpoolEnvironment(&env);
+        ::SetThreadpoolCallbackPool(&env, pool);
+    }
+    ~EstablishPrivatePool() {
+        ::DestroyThreadpoolEnvironment(&env);
+        if (pool)
+            ::CloseThreadpool(pool);
+    }
+    EstablishPrivatePool(const EstablishPrivatePool&) = delete;
+    EstablishPrivatePool& operator=(const EstablishPrivatePool&) = delete;
+};
+
+/// One self-re-arming registry watch used purely as CHURN LOAD for R3/R4 —
+/// arm-before-process (mirrors spark_registry.cpp's reconcile() ordering) so
+/// it keeps firing/re-arming for the whole measurement window without
+/// growing unbounded. All churn watches point at the SAME shared key; a
+/// background writer thread keeps them firing.
+struct EstablishChurnWatch {
+    HKEY hkey{nullptr};
+    HANDLE event{nullptr};
+    PTP_WAIT wait{nullptr};
+    const std::atomic<bool>* stop{nullptr};
+
+    static void CALLBACK on_fire(PTP_CALLBACK_INSTANCE, void* ctx, PTP_WAIT, TP_WAIT_RESULT) {
+        auto* self = static_cast<EstablishChurnWatch*>(ctx);
+        if (self->stop->load(std::memory_order_relaxed))
+            return;
+        ::RegNotifyChangeKeyValue(self->hkey, FALSE,
+                                  REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_THREAD_AGNOSTIC,
+                                  self->event, TRUE);
+        ::SetThreadpoolWait(self->wait, self->event, nullptr);
+    }
+};
+
+} // namespace
+
+TEST_CASE("Watch establishment (Registry): target-present raw call sequence (R1)",
+          "[spark][mechanism][windows][latency][establish]") {
+    if (!spark_establish_bench_enabled()) {
+        SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset — skipping establishment latency harness");
+        return;
+    }
+    const std::string base =
+        "SOFTWARE\\YuzuTest\\SparkEst_" + std::to_string(yuzu::test::process_random_salt());
+    HKEY base_h = nullptr;
+    REQUIRE(::RegCreateKeyExA(HKEY_CURRENT_USER, base.c_str(), 0, nullptr, 0, KEY_ALL_ACCESS,
+                              nullptr, &base_h, nullptr) == ERROR_SUCCESS);
+    ::RegCloseKey(base_h);
+    const std::wstring base_w = establish_widen(base);
+
+    std::vector<std::int64_t> t_event, t_wait_create, t_open, t_notify, t_wait_set;
+    for (int i = 0; i < kEstablishSamples; ++i) {
+        establish_registry_sample(
+            /*env=*/nullptr,
+            REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_THREAD_AGNOSTIC,
+            [&](std::vector<std::int64_t>& t_open_inner) {
+                HKEY h = nullptr;
+                time_call(t_open_inner, [&] {
+                    ::RegOpenKeyExW(HKEY_CURRENT_USER, base_w.c_str(), 0, KEY_NOTIFY | KEY_READ, &h);
+                });
+                return h;
+            },
+            t_event, t_wait_create, t_open, t_notify, t_wait_set);
+    }
+    warn_establish("R1 registry target-present", "CreateEventW", t_event);
+    warn_establish("R1 registry target-present", "CreateThreadpoolWait", t_wait_create);
+    warn_establish("R1 registry target-present", "RegOpenKeyExW", t_open);
+    warn_establish("R1 registry target-present", "RegNotifyChangeKeyValue", t_notify);
+    warn_establish("R1 registry target-present", "SetThreadpoolWait", t_wait_set);
+
+    ::RegDeleteKeyA(HKEY_CURRENT_USER, base.c_str());
+}
+
+TEST_CASE("Watch establishment (Registry): target-absent, ancestor walk depth 6 (R2)",
+          "[spark][mechanism][windows][latency][establish]") {
+    if (!spark_establish_bench_enabled()) {
+        SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset — skipping establishment latency harness");
+        return;
+    }
+    const std::string base =
+        "SOFTWARE\\YuzuTest\\SparkEst_" + std::to_string(yuzu::test::process_random_salt()) +
+        "_anc";
+    HKEY base_h = nullptr;
+    REQUIRE(::RegCreateKeyExA(HKEY_CURRENT_USER, base.c_str(), 0, nullptr, 0, KEY_ALL_ACCESS,
+                              nullptr, &base_h, nullptr) == ERROR_SUCCESS);
+    ::RegCloseKey(base_h);
+    // 6 absent levels under `base`, which exists — matches the plan's
+    // "ancestor walk depth 6". None of a\b\c\d\e\f is ever created.
+    const std::string target = base + "\\a\\b\\c\\d\\e\\f";
+
+    std::vector<std::int64_t> t_event, t_wait_create, t_open_per_level, t_notify, t_wait_set;
+    std::vector<std::int64_t> t_walk_total;
+    for (int i = 0; i < kEstablishSamples; ++i) {
+        const auto walk_t0 = std::chrono::steady_clock::now();
+        establish_registry_sample(
+            /*env=*/nullptr, REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_THREAD_AGNOSTIC,
+            [&](std::vector<std::int64_t>& t_open_inner) -> HKEY {
+                // Walk up from `target`, stripping one path component at a
+                // time, until RegOpenKeyExW succeeds — the same shape as
+                // spark_registry.cpp's private open_nearest_ancestor(), not
+                // reused directly (it is a private member of
+                // WindowsRegistryMechanism, not exported) but replicated
+                // faithfully: this harness measures the RAW call cost the
+                // real function pays, not the function itself.
+                std::string path = target;
+                for (;;) {
+                    const std::wstring path_w = establish_widen(path);
+                    HKEY h = nullptr;
+                    LONG rc = 0;
+                    time_call(t_open_inner, [&] {
+                        rc = ::RegOpenKeyExW(HKEY_CURRENT_USER, path_w.c_str(), 0,
+                                             KEY_NOTIFY | KEY_READ, &h);
+                    });
+                    if (rc == ERROR_SUCCESS)
+                        return h;
+                    const auto pos = path.find_last_of('\\');
+                    if (pos == std::string::npos)
+                        return nullptr; // exhausted — should not happen, base_h exists
+                    path = path.substr(0, pos);
+                }
+            },
+            t_event, t_wait_create, t_open_per_level, t_notify, t_wait_set);
+        const auto walk_t1 = std::chrono::steady_clock::now();
+        t_walk_total.push_back(
+            std::chrono::duration_cast<std::chrono::microseconds>(walk_t1 - walk_t0).count());
+    }
+    warn_establish("R2 registry target-absent depth6", "CreateEventW", t_event);
+    warn_establish("R2 registry target-absent depth6", "CreateThreadpoolWait", t_wait_create);
+    warn_establish("R2 registry target-absent depth6", "RegOpenKeyExW (per level)",
+                   t_open_per_level);
+    warn_establish("R2 registry target-absent depth6", "RegNotifyChangeKeyValue", t_notify);
+    warn_establish("R2 registry target-absent depth6", "SetThreadpoolWait", t_wait_set);
+    warn_establish("R2 registry target-absent depth6", "TOTAL (event+waitcreate+walk+notify+set)",
+                   t_walk_total);
+
+    ::RegDeleteKeyA(HKEY_CURRENT_USER, base.c_str());
+}
+
+namespace {
+/// Shared setup for R3/R4: a private wait-group + N self-re-arming churn
+/// watches on one shared key, kept firing by a background writer thread for
+/// the caller's measurement window. RAII: stops the writer, disarms every
+/// churn watch, and tears down the pool on destruction.
+struct EstablishHiveLoad {
+    EstablishPrivatePool pool;
+    HKEY churn_key{nullptr};
+    std::atomic<bool> stop{false};
+    std::vector<EstablishChurnWatch> watches;
+    std::thread writer;
+
+    explicit EstablishHiveLoad(const std::string& base) {
+        const std::string churn_key_path = base + "\\churn";
+        REQUIRE(::RegCreateKeyExA(HKEY_CURRENT_USER, churn_key_path.c_str(), 0, nullptr, 0,
+                                  KEY_ALL_ACCESS, nullptr, &churn_key, nullptr) == ERROR_SUCCESS);
+        constexpr int kChurnWatches = 200; // plan: "200 pre-armed watches on the private pool"
+        watches.resize(kChurnWatches);
+        for (auto& w : watches) {
+            w.hkey = churn_key;
+            w.stop = &stop;
+            w.event = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            REQUIRE(w.event != nullptr);
+            w.wait = ::CreateThreadpoolWait(&EstablishChurnWatch::on_fire, &w, &pool.env);
+            REQUIRE(w.wait != nullptr);
+            REQUIRE(::RegNotifyChangeKeyValue(
+                        churn_key, FALSE, REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_THREAD_AGNOSTIC,
+                        w.event, TRUE) == ERROR_SUCCESS);
+            ::SetThreadpoolWait(w.wait, w.event, nullptr);
+        }
+        writer = std::thread([this] {
+            DWORD v = 0;
+            while (!stop.load(std::memory_order_relaxed)) {
+                ::RegSetValueExA(churn_key, "v", 0, REG_DWORD,
+                                 reinterpret_cast<const BYTE*>(&v), sizeof(v));
+                ++v;
+                std::this_thread::sleep_for(2ms);
+            }
+        });
+    }
+    ~EstablishHiveLoad() {
+        stop.store(true, std::memory_order_relaxed);
+        if (writer.joinable())
+            writer.join();
+        for (auto& w : watches) {
+            if (w.wait) {
+                ::SetThreadpoolWait(w.wait, nullptr, nullptr);
+                ::WaitForThreadpoolWaitCallbacks(w.wait, TRUE);
+                ::CloseThreadpoolWait(w.wait);
+            }
+            if (w.event)
+                ::CloseHandle(w.event);
+        }
+        if (churn_key)
+            ::RegCloseKey(churn_key);
+    }
+    EstablishHiveLoad(const EstablishHiveLoad&) = delete;
+    EstablishHiveLoad& operator=(const EstablishHiveLoad&) = delete;
+};
+} // namespace
+
+TEST_CASE("Watch establishment (Registry): target-present under hive load (R3)",
+          "[spark][mechanism][windows][latency][establish]") {
+    if (!spark_establish_bench_enabled()) {
+        SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset — skipping establishment latency harness");
+        return;
+    }
+    const std::string base =
+        "SOFTWARE\\YuzuTest\\SparkEst_" + std::to_string(yuzu::test::process_random_salt()) +
+        "_r3";
+    HKEY base_h = nullptr;
+    REQUIRE(::RegCreateKeyExA(HKEY_CURRENT_USER, base.c_str(), 0, nullptr, 0, KEY_ALL_ACCESS,
+                              nullptr, &base_h, nullptr) == ERROR_SUCCESS);
+    ::RegCloseKey(base_h);
+    const std::wstring base_w = establish_widen(base);
+
+    EstablishHiveLoad load(base); // 200 churn watches + writer thread, private pool
+
+    std::vector<std::int64_t> t_event, t_wait_create, t_open, t_notify, t_wait_set;
+    for (int i = 0; i < kEstablishSamples; ++i) {
+        establish_registry_sample(
+            &load.pool.env,
+            REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_THREAD_AGNOSTIC,
+            [&](std::vector<std::int64_t>& t_open_inner) {
+                HKEY h = nullptr;
+                time_call(t_open_inner, [&] {
+                    ::RegOpenKeyExW(HKEY_CURRENT_USER, base_w.c_str(), 0, KEY_NOTIFY | KEY_READ, &h);
+                });
+                return h;
+            },
+            t_event, t_wait_create, t_open, t_notify, t_wait_set);
+    }
+    warn_establish("R3 registry target-present UNDER HIVE LOAD", "CreateEventW", t_event);
+    warn_establish("R3 registry target-present UNDER HIVE LOAD", "CreateThreadpoolWait",
+                   t_wait_create);
+    warn_establish("R3 registry target-present UNDER HIVE LOAD", "RegOpenKeyExW", t_open);
+    warn_establish("R3 registry target-present UNDER HIVE LOAD", "RegNotifyChangeKeyValue",
+                   t_notify);
+    warn_establish("R3 registry target-present UNDER HIVE LOAD", "SetThreadpoolWait", t_wait_set);
+
+    ::RegDeleteKeyA(HKEY_CURRENT_USER, base.c_str());
+}
+
+TEST_CASE("Watch establishment (Registry): target-absent depth6 under hive load (R4)",
+          "[spark][mechanism][windows][latency][establish]") {
+    if (!spark_establish_bench_enabled()) {
+        SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset — skipping establishment latency harness");
+        return;
+    }
+    const std::string base =
+        "SOFTWARE\\YuzuTest\\SparkEst_" + std::to_string(yuzu::test::process_random_salt()) +
+        "_r4";
+    HKEY base_h = nullptr;
+    REQUIRE(::RegCreateKeyExA(HKEY_CURRENT_USER, base.c_str(), 0, nullptr, 0, KEY_ALL_ACCESS,
+                              nullptr, &base_h, nullptr) == ERROR_SUCCESS);
+    ::RegCloseKey(base_h);
+    const std::string target = base + "\\a\\b\\c\\d\\e\\f";
+
+    EstablishHiveLoad load(base);
+
+    std::vector<std::int64_t> t_event, t_wait_create, t_open_per_level, t_notify, t_wait_set;
+    for (int i = 0; i < kEstablishSamples; ++i) {
+        establish_registry_sample(
+            &load.pool.env, REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_THREAD_AGNOSTIC,
+            [&](std::vector<std::int64_t>& t_open_inner) -> HKEY {
+                std::string path = target;
+                for (;;) {
+                    const std::wstring path_w = establish_widen(path);
+                    HKEY h = nullptr;
+                    LONG rc = 0;
+                    time_call(t_open_inner, [&] {
+                        rc = ::RegOpenKeyExW(HKEY_CURRENT_USER, path_w.c_str(), 0,
+                                             KEY_NOTIFY | KEY_READ, &h);
+                    });
+                    if (rc == ERROR_SUCCESS)
+                        return h;
+                    const auto pos = path.find_last_of('\\');
+                    if (pos == std::string::npos)
+                        return nullptr;
+                    path = path.substr(0, pos);
+                }
+            },
+            t_event, t_wait_create, t_open_per_level, t_notify, t_wait_set);
+    }
+    warn_establish("R4 registry target-absent depth6 UNDER HIVE LOAD", "CreateEventW", t_event);
+    warn_establish("R4 registry target-absent depth6 UNDER HIVE LOAD", "CreateThreadpoolWait",
+                   t_wait_create);
+    warn_establish("R4 registry target-absent depth6 UNDER HIVE LOAD", "RegOpenKeyExW (per level)",
+                   t_open_per_level);
+    warn_establish("R4 registry target-absent depth6 UNDER HIVE LOAD", "RegNotifyChangeKeyValue",
+                   t_notify);
+    warn_establish("R4 registry target-absent depth6 UNDER HIVE LOAD", "SetThreadpoolWait",
+                   t_wait_set);
+
+    ::RegDeleteKeyA(HKEY_CURRENT_USER, base.c_str());
+}
+
+TEST_CASE("Watch establishment (Registry): WaitForThreadpoolWaitCallbacks drain, idle vs in-flight (R5)",
+          "[spark][mechanism][windows][latency][establish]") {
+    if (!spark_establish_bench_enabled()) {
+        SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset — skipping establishment latency harness");
+        return;
+    }
+    // Idle drain: a wait that was never signaled, disarmed then drained —
+    // this is unwatch()'s common case (spark_registry.cpp:304's
+    // WaitForThreadpoolWaitCallbacks(TRUE)).
+    std::vector<std::int64_t> t_idle;
+    for (int i = 0; i < kEstablishSamples; ++i) {
+        HANDLE ev = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        REQUIRE(ev != nullptr);
+        PTP_WAIT wait = ::CreateThreadpoolWait(&establish_null_wait_cb, nullptr, nullptr);
+        REQUIRE(wait != nullptr);
+        ::SetThreadpoolWait(wait, ev, nullptr);
+        ::SetThreadpoolWait(wait, nullptr, nullptr); // cancel before it ever fires
+        time_call(t_idle, [&] { ::WaitForThreadpoolWaitCallbacks(wait, TRUE); });
+        ::CloseThreadpoolWait(wait);
+        ::CloseHandle(ev);
+    }
+    warn_establish("R5 drain idle", "WaitForThreadpoolWaitCallbacks", t_idle);
+
+    // In-flight drain: the callback is already running (sleeping 50ms) when
+    // unwatch() calls the drain — this is the case that stalls a lane if the
+    // callback is parked inside an inline consumer (the whole reason this
+    // restructuring exists). Smaller n: each sample costs >= 50ms.
+    std::vector<std::int64_t> t_inflight;
+    constexpr int kInflightSamples = 20;
+    for (int i = 0; i < kInflightSamples; ++i) {
+        HANDLE ev = ::CreateEventW(nullptr, TRUE /*manual-reset*/, FALSE, nullptr);
+        REQUIRE(ev != nullptr);
+        PTP_WAIT wait = ::CreateThreadpoolWait(&establish_r5_inflight_cb, nullptr, nullptr);
+        REQUIRE(wait != nullptr);
+        ::SetThreadpoolWait(wait, ev, nullptr);
+        ::SetEvent(ev); // fire it — the callback is now (about to be) running
+        std::this_thread::sleep_for(5ms); // give the pool a moment to pick it up
+        time_call(t_inflight, [&] { ::WaitForThreadpoolWaitCallbacks(wait, TRUE); });
+        ::CloseThreadpoolWait(wait);
+        ::CloseHandle(ev);
+    }
+    warn_establish("R5 drain in-flight (50ms callback)", "WaitForThreadpoolWaitCallbacks",
+                   t_inflight);
+}
+
+TEST_CASE("Watch establishment (Registry): THREAD_AGNOSTIC correctness control (R6)",
+          "[spark][mechanism][windows][latency][establish]") {
+    if (!spark_establish_bench_enabled()) {
+        SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset — skipping establishment latency harness");
+        return;
+    }
+    // Real risk this control exists for (Astra, plan round 3): without
+    // REG_NOTIFY_THREAD_AGNOSTIC, a notification registered on a thread that
+    // then exits is indistinguishable — by symptom alone — from a real
+    // registry change, because the registering thread's OWN EXIT can signal
+    // the event. This case proves the flag is what makes the notification
+    // survive; the negative control demonstrates (does not hard-assert,
+    // since the failure-mode timing is exactly what's being characterized)
+    // what happens without it.
+    const std::string sub = "SOFTWARE\\YuzuTest\\SparkEst_" +
+                            std::to_string(yuzu::test::process_random_salt()) + "_r6";
+    HKEY setup_h = nullptr;
+    REQUIRE(::RegCreateKeyExA(HKEY_CURRENT_USER, sub.c_str(), 0, nullptr, 0, KEY_ALL_ACCESS,
+                              nullptr, &setup_h, nullptr) == ERROR_SUCCESS);
+    ::RegCloseKey(setup_h);
+    const std::wstring sub_w = establish_widen(sub);
+
+    auto run_one = [&](bool thread_agnostic) -> bool {
+        auto fired = std::make_shared<std::atomic<bool>>(false);
+        auto ev_holder = std::make_shared<HANDLE>(nullptr);
+        auto wait_holder = std::make_shared<PTP_WAIT>(nullptr);
+        auto key_holder = std::make_shared<HKEY>(nullptr);
+
+        std::thread registrant([&, fired, ev_holder, wait_holder, key_holder] {
+            *ev_holder = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            ::RegOpenKeyExW(HKEY_CURRENT_USER, sub_w.c_str(), 0, KEY_NOTIFY | KEY_READ,
+                            key_holder.get());
+            *wait_holder = ::CreateThreadpoolWait(&establish_r6_fired_cb, fired.get(), nullptr);
+            const DWORD filter = REG_NOTIFY_CHANGE_LAST_SET |
+                                 (thread_agnostic ? REG_NOTIFY_THREAD_AGNOSTIC : 0);
+            ::RegNotifyChangeKeyValue(*key_holder, FALSE, filter, *ev_holder, TRUE);
+            ::SetThreadpoolWait(*wait_holder, *ev_holder, nullptr);
+            // Thread exits HERE, immediately after arming — the whole point
+            // of the control.
+        });
+        registrant.join();
+
+        std::this_thread::sleep_for(100ms); // let any registering-thread-exit
+                                            // artifact settle before writing
+        DWORD v = 1;
+        HKEY writer_h = nullptr;
+        ::RegOpenKeyExA(HKEY_CURRENT_USER, sub.c_str(), 0, KEY_SET_VALUE, &writer_h);
+        ::RegSetValueExA(writer_h, "V", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&v),
+                         sizeof(v));
+        ::RegCloseKey(writer_h);
+
+        const bool ok = eventually([&] { return fired->load(std::memory_order_relaxed); }, 3000ms);
+
+        if (*wait_holder) {
+            ::SetThreadpoolWait(*wait_holder, nullptr, nullptr);
+            ::WaitForThreadpoolWaitCallbacks(*wait_holder, TRUE);
+            ::CloseThreadpoolWait(*wait_holder);
+        }
+        if (*key_holder)
+            ::RegCloseKey(*key_holder);
+        if (*ev_holder)
+            ::CloseHandle(*ev_holder);
+        return ok;
+    };
+
+    const bool with_flag = run_one(/*thread_agnostic=*/true);
+    CHECK(with_flag); // REG_NOTIFY_THREAD_AGNOSTIC: must survive the registering thread's exit
+    const bool without_flag = run_one(/*thread_agnostic=*/false);
+    WARN("R6 THREAD_AGNOSTIC control: with-flag fired=" << with_flag
+         << " without-flag fired=" << without_flag
+         << " (without-flag NOT hard-asserted — this control characterizes, "
+            "rather than assumes, the failure mode; a false 'fired' there "
+            "would itself be the documented risk: the registering thread's "
+            "own exit signaling the event, indistinguishable from a real "
+            "change)");
+
+    ::RegDeleteKeyA(HKEY_CURRENT_USER, sub.c_str());
+}
+
+TEST_CASE("Watch establishment (Service): OpenSCManagerW connect+close (S1)",
+          "[spark][mechanism][windows][latency][establish]") {
+    if (!spark_establish_bench_enabled()) {
+        SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset — skipping establishment latency harness");
+        return;
+    }
+    std::vector<std::int64_t> t_open, t_close;
+    for (int i = 0; i < kEstablishSamples; ++i) {
+        SC_HANDLE scm = nullptr;
+        time_call(t_open,
+                  [&] { scm = ::OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT); });
+        REQUIRE(scm != nullptr);
+        time_call(t_close, [&] { ::CloseServiceHandle(scm); });
+    }
+    warn_establish("S1 OpenSCManagerW connect", "OpenSCManagerW", t_open);
+    warn_establish("S1 OpenSCManagerW connect", "CloseServiceHandle", t_close);
+}
+
+TEST_CASE("Watch establishment (Service): OpenServiceW+NotifyServiceStatusChangeW across the real "
+          "service list (S2)",
+          "[spark][mechanism][windows][latency][establish]") {
+    if (!spark_establish_bench_enabled()) {
+        SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset — skipping establishment latency harness");
+        return;
+    }
+    // Same mask spark_service.cpp uses (spark_service.cpp:888-892) — copied
+    // here rather than shared since it is a private constexpr in that TU.
+    constexpr DWORD kEstablishNotifyMask =
+        SERVICE_NOTIFY_RUNNING | SERVICE_NOTIFY_STOPPED | SERVICE_NOTIFY_START_PENDING |
+        SERVICE_NOTIFY_STOP_PENDING | SERVICE_NOTIFY_CONTINUE_PENDING |
+        SERVICE_NOTIFY_PAUSE_PENDING | SERVICE_NOTIFY_PAUSED;
+
+    SC_HANDLE scm = ::OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT | SC_MANAGER_ENUMERATE_SERVICE);
+    REQUIRE(scm != nullptr);
+
+    // EnumServicesStatusExW two-call pattern (MSDN): size probe, then fetch.
+    // resume reset to 0 before the real call — the probe call is expected to
+    // fail (ERROR_MORE_DATA) and must not leave a stale resume handle for
+    // the real enumeration to (incorrectly) start from.
+    DWORD needed = 0, count = 0, resume = 0;
+    ::EnumServicesStatusExW(scm, SC_ENUM_PROCESS_INFO, SERVICE_WIN32, SERVICE_STATE_ALL, nullptr,
+                            0, &needed, &count, &resume, nullptr);
+    resume = 0;
+    std::vector<BYTE> buf(needed);
+    REQUIRE(::EnumServicesStatusExW(scm, SC_ENUM_PROCESS_INFO, SERVICE_WIN32, SERVICE_STATE_ALL,
+                                    buf.data(), static_cast<DWORD>(buf.size()), &needed, &count,
+                                    &resume, nullptr));
+    REQUIRE(count > 0);
+    const auto* entries = reinterpret_cast<const ENUM_SERVICE_STATUS_PROCESSW*>(buf.data());
+
+    std::vector<std::int64_t> t_open, t_notify;
+    std::vector<std::int64_t> t_open_failed; // GetLastError-bearing failures, timed separately
+    int sampled = 0;
+    for (int cycle = 0; sampled < kEstablishSamples; ++cycle) {
+        // Cycle the real service list (EnumServicesStatusExW "cycled to
+        // n >= 200" per the plan) — re-use the enumeration round-robin until
+        // kEstablishSamples opens have been attempted.
+        const auto& svc = entries[static_cast<DWORD>(cycle) % count];
+
+        SC_HANDLE h = nullptr;
+        DWORD last_err = 0;
+        time_call(t_open, [&] {
+            h = ::OpenServiceW(scm, svc.lpServiceName, SERVICE_QUERY_STATUS);
+            if (!h)
+                last_err = ::GetLastError(); // SAME thread, IMMEDIATELY after the
+                                             // failed call (Astra correctness note)
+        });
+        ++sampled;
+        if (!h) {
+            t_open_failed.push_back(static_cast<std::int64_t>(last_err));
+            continue;
+        }
+
+        SERVICE_NOTIFYW notify{};
+        notify.dwVersion = SERVICE_NOTIFY_STATUS_CHANGE;
+        notify.pfnNotifyCallback = &establish_s2_notify_cb;
+        DWORD rc = 0;
+        time_call(t_notify,
+                  [&] { rc = ::NotifyServiceStatusChangeW(h, kEstablishNotifyMask, &notify); });
+        (void)rc; // report-only; a real service under active management may
+                 // legitimately refuse a second concurrent notify — not a
+                 // harness failure either way.
+        ::CloseServiceHandle(h);
+    }
+    ::CloseServiceHandle(scm);
+
+    warn_establish("S2 service list open+notify", "OpenServiceW", t_open);
+    warn_establish("S2 service list open+notify", "NotifyServiceStatusChangeW", t_notify);
+    WARN("S2 service list open+notify: " << t_open_failed.size() << " of " << sampled
+         << " OpenServiceW attempts failed (GetLastError values reported, not timed as a"
+            " separate latency series)");
+}
+
+TEST_CASE("Watch establishment (Service): S2 sequence under SCM load (S3)",
+          "[spark][mechanism][windows][latency][establish]") {
+    if (!spark_establish_bench_enabled()) {
+        SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset — skipping establishment latency harness");
+        return;
+    }
+    // SCM load: two background threads hammering OpenSCManagerW+Close in a
+    // tight loop for the duration of the measurement — a proxy for
+    // contention on the SCM RPC connection itself (no toggling of any real
+    // service; read-only, safe on any host).
+    std::atomic<bool> stop{false};
+    auto scm_churn = [&stop] {
+        while (!stop.load(std::memory_order_relaxed)) {
+            if (SC_HANDLE h = ::OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT))
+                ::CloseServiceHandle(h);
+        }
+    };
+    std::thread t1(scm_churn), t2(scm_churn);
+
+    SC_HANDLE scm = ::OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT | SC_MANAGER_ENUMERATE_SERVICE);
+    REQUIRE(scm != nullptr);
+    DWORD needed = 0, count = 0, resume = 0;
+    ::EnumServicesStatusExW(scm, SC_ENUM_PROCESS_INFO, SERVICE_WIN32, SERVICE_STATE_ALL, nullptr,
+                            0, &needed, &count, &resume, nullptr);
+    std::vector<BYTE> buf(needed);
+    REQUIRE(::EnumServicesStatusExW(scm, SC_ENUM_PROCESS_INFO, SERVICE_WIN32, SERVICE_STATE_ALL,
+                                    buf.data(), static_cast<DWORD>(buf.size()), &needed, &count,
+                                    &resume, nullptr));
+    REQUIRE(count > 0);
+    const auto* entries = reinterpret_cast<const ENUM_SERVICE_STATUS_PROCESSW*>(buf.data());
+
+    std::vector<std::int64_t> t_open;
+    int sampled = 0;
+    for (int cycle = 0; sampled < kEstablishSamples; ++cycle) {
+        const auto& svc = entries[static_cast<DWORD>(cycle) % count];
+        SC_HANDLE h = nullptr;
+        time_call(t_open, [&] { h = ::OpenServiceW(scm, svc.lpServiceName, SERVICE_QUERY_STATUS); });
+        ++sampled;
+        if (h)
+            ::CloseServiceHandle(h);
+    }
+    ::CloseServiceHandle(scm);
+
+    stop.store(true, std::memory_order_relaxed);
+    t1.join();
+    t2.join();
+
+    warn_establish("S3 OpenServiceW UNDER SCM LOAD", "OpenServiceW", t_open);
+}
+
+TEST_CASE("Watch establishment (File): is_directory + CreateFileW sanity (F1)",
+          "[spark][mechanism][windows][latency][establish]") {
+    if (!spark_establish_bench_enabled()) {
+        SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset — skipping establishment latency harness");
+        return;
+    }
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path();
+
+    std::vector<std::int64_t> t_is_dir, t_create;
+    for (int i = 0; i < kEstablishSamples; ++i) {
+        std::error_code ec;
+        bool isdir = false;
+        time_call(t_is_dir, [&] { isdir = fs::is_directory(dir, ec); });
+        REQUIRE(isdir);
+
+        HANDLE h = nullptr;
+        time_call(t_create, [&] {
+            h = ::CreateFileW(dir.c_str(), FILE_LIST_DIRECTORY,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                              OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
+                              nullptr);
+        });
+        REQUIRE(h != INVALID_HANDLE_VALUE);
+        ::CloseHandle(h);
+    }
+    warn_establish("F1 file dir sanity", "is_directory", t_is_dir);
+    warn_establish("F1 file dir sanity", "CreateFileW(BACKUP|OVERLAPPED)", t_create);
+}
+
+TEST_CASE("Watch establishment: post-fix fast-path cost, bulk engine.arm() (N=200/mechanism)",
+          "[spark][mechanism][windows][latency][establish]") {
+    // NOT env-gated on YUZU_SPARK_ESTABLISH_BENCH alone in spirit — this
+    // case exercises the REAL mechanisms (through SparkEngine::arm(), not
+    // raw Win32 calls), so it is meaningful TODAY (the "before" figure) and
+    // must be re-run VERBATIM once PR-B lands (the "after" figure) — see
+    // the plan's "Post-fix fast-path cost" note: the restructuring adds one
+    // _beginthreadex spawn per arm/re-arm, and this measurement is what
+    // states that cost honestly against CH-5-UAT's spark_p99 <= 15s gate.
+    // Gated the same way as every other case here regardless, since it is
+    // still a measurement, not a gate.
+    if (!spark_establish_bench_enabled()) {
+        SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset — skipping establishment latency harness");
+        return;
+    }
+    constexpr int kBulkKeys = 200;
+    const std::string base =
+        "SOFTWARE\\YuzuTest\\SparkEst_" + std::to_string(yuzu::test::process_random_salt()) +
+        "_bulk";
+    HKEY base_h = nullptr;
+    REQUIRE(::RegCreateKeyExA(HKEY_CURRENT_USER, base.c_str(), 0, nullptr, 0, KEY_ALL_ACCESS,
+                              nullptr, &base_h, nullptr) == ERROR_SUCCESS);
+    ::RegCloseKey(base_h);
+
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::Registry, make_registry_mechanism()).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    std::vector<std::int64_t> t_arm;
+    const auto bulk_t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < kBulkKeys; ++i) {
+        const std::string sub = base + "\\k" + std::to_string(i);
+        HKEY h = nullptr;
+        REQUIRE(::RegCreateKeyExA(HKEY_CURRENT_USER, sub.c_str(), 0, nullptr, 0, KEY_ALL_ACCESS,
+                                  nullptr, &h, nullptr) == ERROR_SUCCESS);
+        ::RegCloseKey(h);
+        time_call(t_arm, [&] {
+            auto r = engine.arm(*c, registry_spec("HKCU", sub));
+            REQUIRE(r.has_value());
+        });
+    }
+    const auto bulk_t1 = std::chrono::steady_clock::now();
+    warn_establish("post-fix-cost bulk arm (TODAY's baseline — re-run on PR-B build)",
+                   "SparkEngine::arm (Registry)", t_arm);
+    WARN("post-fix-cost bulk arm: " << kBulkKeys << " arms, wall clock total = "
+         << std::chrono::duration_cast<std::chrono::milliseconds>(bulk_t1 - bulk_t0).count()
+         << "ms (compare against CH-5-UAT's spark_p99 <= 15s gate once this same case is "
+            "re-run on the PR-B build)");
+
+    engine.stop();
+    ::RegDeleteKeyA(HKEY_CURRENT_USER, base.c_str());
 }
 
 #endif // _WIN32
