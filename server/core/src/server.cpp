@@ -127,6 +127,7 @@
 #include "result_set_routes.hpp" // #2542 PR-5: the 6-route Result Sets fragment API, extracted onto the HttpRouteSink seam
 #include "instruction_routes.hpp" // #2542 PR-7: the 13-route Instruction Definitions + Instruction Sets API, extracted onto the HttpRouteSink seam
 #include "execution_routes.hpp" // #2542 PR-7: the 7-route legacy pre-v1 Executions API, extracted onto the HttpRouteSink seam
+#include "approval_routes.hpp" // #2542 PR-9: the 4-route Approval API, extracted onto the HttpRouteSink seam
 #include "command_capability.hpp" // PR1.9c: CommandCapabilityRegistry — the dispatch classification vocabulary
 #include "command_capability_parsers.hpp" // PR1.9c: encode_dispatch_tag / compute_plan_hash
 // PR1.9c: the seven capability spans build_classified_command's registry composes over —
@@ -10369,10 +10370,11 @@ private:
     // -- HTML helpers ---------------------------------------------------------
 
     // log_safe moved to web_utils.hpp (#2542 PR-7) — instruction_routes.cpp
-    // needs it alongside the /api/approvals/:id/{approve,reject} call sites
-    // immediately below, which stay inline here. Promoted, not duplicated
-    // (#2557 json_extract.hpp precedent); unqualified call sites in this
-    // class resolve to yuzu::server::log_safe via ordinary lookup.
+    // and approval_routes.cpp (#2542 PR-9, reconciled at merge time onto
+    // this same promotion rather than PR-9's own now-deleted log_safe.hpp)
+    // both need it. Promoted, not duplicated (#2557 json_extract.hpp
+    // precedent); unqualified call sites in this class resolve to
+    // yuzu::server::log_safe via ordinary lookup.
 
     static std::string html_escape(const std::string& s) {
         std::string out;
@@ -13323,13 +13325,15 @@ private:
 
         // NON-BLOCKING session resolve (never writes to `res` on failure) —
         // distinct from `auth_fn` above, which wraps `require_auth` and DOES
-        // write a 401. Shared by three #2542 modules' post-gate "who is
+        // write a 401. Shared by four #2542 modules' post-gate "who is
         // calling" lookups: PR-7's `instruction_routes.cpp` (POST
         // /api/instructions's best-effort `created_by`) and every
         // `execution_routes.cpp` route under an engaged fleet-read scope,
+        // PR-9's `approval_routes.cpp` (approve/reject need the CALLER's
+        // identity as `reviewer` even when perm_fn's gate already passed),
         // and PR-8's `schedule_routes.cpp` (DELETE/enable/create's
         // owner-scoping lookup after `perm_fn` has already proven a session
-        // exists). See any of the three modules' header comments for the
+        // exists). See any of the four modules' header comments for the
         // full rationale.
         auto resolve_session_fn =
             [this](const httplib::Request& req) -> std::optional<auth::Session> {
@@ -13337,7 +13341,9 @@ private:
         };
 
         // #2542 PR-7: wraps ServerImpl::emit_event's 4-argument shape (no
-        // caller in either new module passes a non-default Severity).
+        // caller in the three modules below that take it — instruction,
+        // execution, approval; schedule_routes does not — passes a
+        // non-default Severity).
         auto emit_event_fn = [this](const std::string& event_type, const httplib::Request& req,
                                     const nlohmann::json& attrs,
                                     const nlohmann::json& payload_data) {
@@ -13369,6 +13375,23 @@ private:
                              .audit_fn = audit_fn,
                              .emit_event_fn = emit_event_fn,
                              .execution_tracker = execution_tracker_.get(),
+                         });
+
+        // #2542 PR-9: the 4-route Approval API (/api/approvals,
+        // /api/approvals/pending/count, /api/approvals/:id/{approve,reject}),
+        // extracted onto the same inline_sink seam. Placed here rather than
+        // alongside page_routes's call above (like PR-4/PR-5's siblings)
+        // because this module needs resolve_session_fn (defined just above;
+        // instruction_routes.cpp, PR-7, was its first extracted caller) +
+        // audit_fn + emit_event_fn, none of which is in scope yet at that
+        // earlier point.
+        yuzu::server::approval::register_approval_routes(
+            inline_sink, yuzu::server::approval::Deps{
+                             .perm_fn = perm_fn,
+                             .resolve_session_fn = resolve_session_fn,
+                             .audit_fn = audit_fn,
+                             .emit_event_fn = emit_event_fn,
+                             .approval_manager = approval_manager_.get(),
                          });
 
         // #2542 PR-8: the 4-route Schedules API (/api/schedules[/:id[/enable]]),
@@ -15362,152 +15385,6 @@ private:
                 arr.push_back(a);
             res.set_content(nlohmann::json({{"agents", arr}, {"count", arr.size()}}).dump(),
                             "application/json");
-        });
-
-        // -- Approval API -----------------------------------------------------
-
-        web_server_->Get("/api/approvals", [this](const httplib::Request& req,
-                                                  httplib::Response& res) {
-            if (!require_permission(req, res, "Approval", "Read"))
-                return;
-            if (!approval_manager_) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            ApprovalQuery q;
-            if (req.has_param("status"))
-                q.status = req.get_param_value("status");
-            if (req.has_param("submitted_by"))
-                q.submitted_by = req.get_param_value("submitted_by");
-
-            auto approvals = approval_manager_->query(q);
-            nlohmann::json arr = nlohmann::json::array();
-            for (const auto& a : approvals) {
-                arr.push_back({{"id", a.id},
-                               {"definition_id", a.definition_id},
-                               {"status", a.status},
-                               {"submitted_by", a.submitted_by},
-                               {"submitted_at", a.submitted_at},
-                               {"reviewed_by", a.reviewed_by},
-                               {"reviewed_at", a.reviewed_at},
-                               {"review_comment", a.review_comment},
-                               {"scope_expression", a.scope_expression}});
-            }
-            res.set_content(nlohmann::json({{"approvals", arr}}).dump(), "application/json");
-        });
-
-        web_server_->Get("/api/approvals/pending/count", [this](const httplib::Request& req,
-                                                                httplib::Response& res) {
-            if (!require_permission(req, res, "Approval", "Read"))
-                return;
-            if (!approval_manager_) {
-                res.set_content(R"({"count":0})", "application/json");
-                return;
-            }
-            auto count = approval_manager_->pending_count();
-            res.set_content(nlohmann::json({{"count", count}}).dump(), "application/json");
-        });
-
-        web_server_->Post(R"(/api/approvals/([^/]+)/approve)", [this](const httplib::Request& req,
-                                                                      httplib::Response& res) {
-            if (!require_permission(req, res, "Approval", "Approve"))
-                return;
-            if (!approval_manager_) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            auto id = req.matches[1].str();
-            auto comment = extract_json_string(req.body, "comment");
-            auto session = auth_routes_->resolve_session(req);
-            auto reviewer = session ? session->username : "unknown";
-
-            auto result = approval_manager_->approve(id, reviewer, comment);
-            if (!result) {
-                res.status = 400;
-                // A denied review is an access-control decision (e.g. the
-                // self-approval segregation-of-duties block) — leave an audit
-                // trace like the other denial paths in this file (governance
-                // compliance CC6.1/CC6.3), and a greppable server-side line.
-                (void)audit_log(req, "approval.approve", "denied", "approval", id,
-                                result.error());
-                spdlog::warn("approval approve denied: id={} reviewer={} reason={}",
-                             log_safe(id), reviewer, log_safe(result.error(), 256));
-                // htmx doesn't swap a non-2xx response, so without a trigger
-                // the denial (e.g. the self-approval block) is a silent no-op
-                // in the dashboard (#1821). HX-Trigger headers ARE processed
-                // on error responses — surface the reason as a toast. dump()
-                // uses `replace`: the error can echo the raw URL id, and the
-                // default handler throws on invalid UTF-8 (governance UP-5).
-                nlohmann::json trigger = {
-                    {"showToast", {{"message", result.error()}, {"level", "error"}}}};
-                res.set_header("HX-Trigger",
-                               trigger.dump(-1, ' ', false,
-                                            nlohmann::json::error_handler_t::replace));
-                res.set_content(nlohmann::json({{"error", result.error()}})
-                                    .dump(-1, ' ', false,
-                                          nlohmann::json::error_handler_t::replace),
-                                "application/json");
-                return;
-            }
-            (void)audit_log(req, "approval.approve", "success", "approval", id);
-            emit_event("approval.approved", req, {{"reviewer", reviewer}}, {{"approval_id", id}});
-            res.set_header("HX-Trigger",
-                           R"({"showToast":{"message":"Approved","level":"success"}})");
-            res.set_content(R"({"status":"approved"})", "application/json");
-        });
-
-        web_server_->Post(R"(/api/approvals/([^/]+)/reject)", [this](const httplib::Request& req,
-                                                                     httplib::Response& res) {
-            if (!require_permission(req, res, "Approval", "Approve"))
-                return;
-            if (!approval_manager_) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            auto id = req.matches[1].str();
-            auto comment = extract_json_string(req.body, "comment");
-            auto session = auth_routes_->resolve_session(req);
-            auto reviewer = session ? session->username : "unknown";
-
-            auto result = approval_manager_->reject(id, reviewer, comment);
-            if (!result) {
-                res.status = 400;
-                // Same as the approve branch: audit the denial, log it, and
-                // surface it as a toast (#1821) — htmx swallows non-2xx
-                // bodies but processes HX-Trigger on them.
-                (void)audit_log(req, "approval.reject", "denied", "approval", id,
-                                result.error());
-                spdlog::warn("approval reject denied: id={} reviewer={} reason={}",
-                             log_safe(id), reviewer, log_safe(result.error(), 256));
-                nlohmann::json trigger = {
-                    {"showToast", {{"message", result.error()}, {"level", "error"}}}};
-                res.set_header("HX-Trigger",
-                               trigger.dump(-1, ' ', false,
-                                            nlohmann::json::error_handler_t::replace));
-                res.set_content(nlohmann::json({{"error", result.error()}})
-                                    .dump(-1, ' ', false,
-                                          nlohmann::json::error_handler_t::replace),
-                                "application/json");
-                return;
-            }
-            (void)audit_log(req, "approval.reject", "success", "approval", id);
-            emit_event("approval.rejected", req, {{"reviewer", reviewer}, {"comment", comment}},
-                       {{"approval_id", id}});
-            res.set_header("HX-Trigger",
-                           R"({"showToast":{"message":"Rejected","level":"warning"}})");
-            res.set_content(R"({"status":"rejected"})", "application/json");
         });
 
         // -- HTMX Fragment Routes for Instructions UI -------------------------
