@@ -87,26 +87,20 @@ spec:
         platforms: [windows, linux, darwin]
       - name: value
         type: string
-        description: >
-          The IOC value that was checked, copied from the input parameter
-          with any literal `|` escaped to `\|`.
-        values: free text
+        description: >-
+          The IOC value that was checked, copied from the input parameter with any literal `|` escaped to `\|`. Values: free text.
         example: "127.0.0.1"
         platforms: [windows, linux, darwin]
       - name: matched
         type: bool
-        description: >
-          Whether the IOC was found on this endpoint. Always `false` for
-          the single `error` row.
-        values: "true, false"
+        description: >-
+          Whether the IOC was found on this endpoint. Always `false` for the single `error` row. Values: true, false.
         example: "true"
         platforms: [windows, linux, darwin]
       - name: detail
         type: string
-        description: >
-          Human-readable explanation of the match or non-match (e.g. which
-          PID owns a connection, or why a check could not run).
-        values: free text
+        description: >-
+          Human-readable explanation of the match or non-match (e.g. which PID owns a connection, or why a check could not run). Values: free text.
         example: Found in /etc/hosts
         platforms: [windows, linux, darwin]
     aggregation:

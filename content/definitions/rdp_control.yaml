@@ -71,26 +71,22 @@ spec:
     columns:
       - name: reg_status
         type: string
-        description: Outcome of writing HKLM fDenyTSConnections; ok or a Win32 error code.
-        values: "ok, error:<win32 code> (e.g. error:5 = ERROR_ACCESS_DENIED)"
+        description: 'Outcome of writing HKLM fDenyTSConnections; ok or a Win32 error code. Values: ok, error:<win32 code> (e.g. error:5 = ERROR_ACCESS_DENIED).'
         example: "not observed in any capture" # only the rejection path was run
         platforms: [windows]
       - name: firewall_status
         type: string
-        description: Outcome of toggling the Remote Desktop firewall rule group via INetFwPolicy2.
-        values: "ok, error:com_init, error:group_not_found, error:0x<hresult>"
+        description: 'Outcome of toggling the Remote Desktop firewall rule group via INetFwPolicy2. Values: ok, error:com_init, error:group_not_found, error:0x<hresult>.'
         example: "not observed in any capture"
         platforms: [windows]
       - name: service_status
         type: string
-        description: TermService outcome — running once start is confirmed by polling (enable), untouched (disable), or a Win32 error.
-        values: "running, untouched, error:<win32 code>"
+        description: 'TermService outcome — running once start is confirmed by polling (enable), untouched (disable), or a Win32 error. Values: running, untouched, error:<win32 code>.'
         example: "not observed in any capture"
         platforms: [windows]
       - name: overall
         type: string
-        description: Terminal verdict for the whole set_state call; ok only when every step above succeeded.
-        values: "ok, error"
+        description: 'Terminal verdict for the whole set_state call; ok only when every step above succeeded. Values: ok, error.'
         example: "not observed in any capture"
         platforms: [windows]
   readablePayload: "Set Remote Desktop state to ${state}"
@@ -136,26 +132,22 @@ spec:
     columns:
       - name: deny_ts_connections
         type: string
-        description: Raw fDenyTSConnections registry value (0 = RDP allowed, 1 = RDP denied), or a Win32 error if the read failed.
-        values: "0, 1, error:<win32 code>"
+        description: 'Raw fDenyTSConnections registry value (0 = RDP allowed, 1 = RDP denied), or a Win32 error if the read failed. Values: 0, 1, error:<win32 code>.'
         example: "0"
         platforms: [windows]
       - name: firewall_group
         type: string
-        description: Whether the Remote Desktop firewall rule group is enabled, or why it could not be read.
-        values: "enabled, disabled, group_not_found, error:com_init, error:0x<hresult>"
+        description: 'Whether the Remote Desktop firewall rule group is enabled, or why it could not be read. Values: enabled, disabled, group_not_found, error:com_init, error:0x<hresult>.'
         example: "enabled"
         platforms: [windows]
       - name: term_service
         type: string
-        description: Current SCM state name for TermService, or a Win32 error if the query failed.
-        values: "running, start_pending, stopped, stop_pending, paused, pause_pending, continue_pending, unknown, error:<win32 code>"
+        description: 'Current SCM state name for TermService, or a Win32 error if the query failed. Values: running, start_pending, stopped, stop_pending, paused, pause_pending, continue_pending, unknown, error:<win32 code>.'
         example: "not observed in any capture"
         platforms: [windows]
       - name: rdp
         type: string
-        description: Derived RDP posture — on only when all three gates are readable and open, unknown when any gate could not be read, off otherwise.
-        values: "on, off, unknown"
+        description: 'Derived RDP posture — on only when all three gates are readable and open, unknown when any gate could not be read, off otherwise. Values: on, off, unknown.'
         example: "on"
         platforms: [windows]
   approval:

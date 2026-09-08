@@ -44,47 +44,32 @@ spec:
     columns:
       - name: ssid
         type: string
-        description: >
-          The network's SSID, or a sentinel discriminator (info/error/
-          scan_output) when the row is a status line rather than an
-          access point.
-        values: "SSID text, <hidden> (empty SSID), <hex:...> (Linux D-Bus non-UTF-8 SSID), or info/error/scan_output"
+        description: >-
+          The network's SSID, or a sentinel discriminator (info/error/ scan_output) when the row is a status line rather than an access point. Values: SSID text, <hidden> (empty SSID), <hex:...> (Linux D-Bus non-UTF-8 SSID), or info/error/scan_output.
         example: "info"
         platforms: [windows, linux, darwin]
       - name: signal
         type: string
-        description: >
-          Signal strength: 0-100 quality/percent on Windows and Linux,
-          RSSI in dBm on macOS; on a sentinel row this field carries
-          the free-text message instead.
-        values: "integer 0-100 (Windows/Linux), a dBm integer (macOS), or free text on a sentinel row"
+        description: >-
+          Signal strength: 0-100 quality/percent on Windows and Linux, RSSI in dBm on macOS; on a sentinel row this field carries the free-text message instead. Values: integer 0-100 (Windows/Linux), a dBm integer (macOS), or free text on a sentinel row.
         example: "wi-fi scan unavailable; airport removed in macOS 14+ and system_profiler requires Location Services"
         platforms: [windows, linux, darwin]
       - name: security
         type: string
-        description: >
-          The access point's security type in the emitting leg's own
-          vocabulary (e.g. Open, WPA2-Personal, WPA3, 802.1X); "0" on
-          a sentinel row.
-        values: "free text, or 0 on a sentinel row"
+        description: >-
+          The access point's security type in the emitting leg's own vocabulary (e.g. Open, WPA2-Personal, WPA3, 802.1X); "0" on a sentinel row. Values: free text, or 0 on a sentinel row.
         example: "0"
         platforms: [windows, linux, darwin]
       - name: channel_or_type
         type: string
-        description: >
-          802.11 channel number on Linux/macOS; BSS type
-          (Infrastructure/Ad-hoc/Unknown) on Windows -- the two OS
-          families populate genuinely different data in this column.
-        values: "channel number as a string, 0 when unknown, or Infrastructure/Ad-hoc/Unknown"
+        description: >-
+          802.11 channel number on Linux/macOS; BSS type (Infrastructure/Ad-hoc/Unknown) on Windows -- the two OS families populate genuinely different data in this column. Values: channel number as a string, 0 when unknown, or Infrastructure/Ad-hoc/Unknown.
         example: "0"
         platforms: [windows, linux, darwin]
       - name: bssid_or_connected
         type: string
-        description: >
-          Access point MAC address on Linux/macOS; the literal
-          true/false for whether this network is the one currently
-          connected on Windows -- again a different meaning per OS.
-        values: "MAC address, - when unknown, or true/false"
+        description: >-
+          Access point MAC address on Linux/macOS; the literal true/false for whether this network is the one currently connected on Windows -- again a different meaning per OS. Values: MAC address, - when unknown, or true/false.
         example: "none"
         platforms: [windows, linux, darwin]
 
@@ -144,49 +129,32 @@ spec:
     columns:
       - name: ssid
         type: string
-        description: >
-          The connected network's SSID; sentinel none/unknown when
-          disconnected or undetermined; <ssid-withheld> on macOS when
-          Location Services blocks the read on an otherwise-live
-          association; <hex:...> on the Linux D-Bus leg for a
-          non-UTF-8 SSID.
-        values: "SSID text, none, unknown, <ssid-withheld>, or <hex:...>"
+        description: >-
+          The connected network's SSID; sentinel none/unknown when disconnected or undetermined; <ssid-withheld> on macOS when Location Services blocks the read on an otherwise-live association; <hex:...> on the Linux D-Bus leg for a non-UTF-8 SSID. Values: SSID text, none, unknown, <ssid-withheld>, or <hex:...>.
         example: "none"
         platforms: [windows, linux, darwin]
       - name: signal
         type: string
-        description: >
-          Signal strength using the same per-OS units as
-          list_networks' signal field; on a disconnected/undetermined
-          sentinel row this carries the free-text message instead
-          (e.g. "Not connected").
-        values: "integer, or a free-text sentinel message"
+        description: >-
+          Signal strength using the same per-OS units as list_networks' signal field; on a disconnected/undetermined sentinel row this carries the free-text message instead (e.g. "Not connected"). Values: integer, or a free-text sentinel message.
         example: "Not connected"
         platforms: [windows, linux, darwin]
       - name: security
         type: string
-        description: >
-          Security type of the connected access point; "unknown" on
-          the Linux iwconfig blob fallback; "0" on the
-          disconnected/undetermined sentinel.
-        values: "free text, unknown, or 0"
+        description: >-
+          Security type of the connected access point; "unknown" on the Linux iwconfig blob fallback; "0" on the disconnected/undetermined sentinel. Values: free text, unknown, or 0.
         example: "0"
         platforms: [windows, linux, darwin]
       - name: bssid
         type: string
-        description: >
-          Connected access point's MAC address; - or none when not
-          associated or unknown.
-        values: "MAC address, -, or none"
+        description: >-
+          Connected access point's MAC address; - or none when not associated or unknown. Values: MAC address, -, or none.
         example: "none"
         platforms: [windows, linux, darwin]
       - name: interface_or_channel
         type: string
-        description: >
-          Wireless interface name on Linux/Windows (e.g. wlan0, an
-          adapter description); 802.11 channel number on macOS; none
-          when undetermined.
-        values: "interface name string, channel number, or none"
+        description: >-
+          Wireless interface name on Linux/Windows (e.g. wlan0, an adapter description); 802.11 channel number on macOS; none when undetermined. Values: interface name string, channel number, or none.
         example: "none"
         platforms: [windows, linux, darwin]
 

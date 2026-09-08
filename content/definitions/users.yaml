@@ -34,26 +34,22 @@ spec:
     columns:
       - name: username
         type: string
-        description: The account name of a currently logged-on user.
-        values: free text
+        description: 'The account name of a currently logged-on user. Values: free text.'
         example: alex
         platforms: [windows, linux, darwin]
       - name: domain
         type: string
-        description: The host or domain the session belongs to, or the literal "local" when it has none.
-        values: hostname/domain or the literal "local"
+        description: 'The host or domain the session belongs to, or the literal "local" when it has none. Values: hostname/domain or the literal "local".'
         example: local
         platforms: [windows, linux, darwin]
       - name: logon_type
         type: string
-        description: How the session was established.
-        values: "console, remote, RDP (Windows only)"
+        description: 'How the session was established. Values: console, remote, RDP (Windows only).'
         example: console
         platforms: [windows, linux, darwin]
       - name: session_id
         type: string
-        description: The session's terminal identifier — a utmp line name (Linux), a tty (macOS), or a numeric WTS session ID (Windows).
-        values: free text
+        description: "The session's terminal identifier — a utmp line name (Linux), a tty (macOS), or a numeric WTS session ID (Windows). Values: free text."
         example: console
         platforms: [windows, linux, darwin]
 
@@ -108,32 +104,27 @@ spec:
     columns:
       - name: session_id
         type: string
-        description: The session's controlling tty (Linux/macOS) or numeric WTS session ID (Windows).
-        values: free text
+        description: "The session's controlling tty (Linux/macOS) or numeric WTS session ID (Windows). Values: free text."
         example: console
         platforms: [windows, linux, darwin]
       - name: username
         type: string
-        description: The account that owns this session.
-        values: free text
+        description: 'The account that owns this session. Values: free text.'
         example: alex
         platforms: [windows, linux, darwin]
       - name: state
         type: string
-        description: The session's connection state.
-        values: "Active (Linux/macOS, always); Windows: Active, Connected, Disconnected, Idle, Listen, Other"
+        description: "The session's connection state. Values: Active (Linux/macOS, always); Windows: Active, Connected, Disconnected, Idle, Listen, Other."
         example: Active
         platforms: [windows, linux, darwin]
       - name: client
         type: string
-        description: The remote host the session connects from ('w' FROM column) or the RDP client name on Windows; "-" when none.
-        values: free text or "-"
+        description: "The remote host the session connects from ('w' FROM column) or the RDP client name on Windows; \"-\" when none. Values: free text or \"-\"."
         example: "-"
         platforms: [windows, linux, darwin]
       - name: idle
         type: string
-        description: Idle time as reported by 'w' on Linux/macOS; always the literal "0" on Windows, where idle-time decoding is unimplemented.
-        values: free text (Linux/macOS) or the literal "0" (Windows)
+        description: "Idle time as reported by 'w' on Linux/macOS; always the literal \"0\" on Windows, where idle-time decoding is unimplemented. Values: free text (Linux/macOS) or the literal \"0\" (Windows)."
         example: "13:35"
         platforms: [windows, linux, darwin]
 
@@ -192,32 +183,27 @@ spec:
     columns:
       - name: username
         type: string
-        description: The local account's username.
-        values: free text
+        description: "The local account's username. Values: free text."
         example: Alex
         platforms: [windows, linux, darwin]
       - name: enabled
         type: bool
-        description: Whether the account is enabled.
-        values: "true, false"
+        description: 'Whether the account is enabled. Values: true, false.'
         example: "true"
         platforms: [windows, linux, darwin]
       - name: last_logon
         type: string
-        description: The account's most recent login timestamp, or a sentinel when unknown or never logged in.
-        values: "\"YYYY-MM-DD HH:MM:SS\", \"Never\", \"unknown\""
+        description: "The account's most recent login timestamp, or a sentinel when unknown or never logged in. Values: \"YYYY-MM-DD HH:MM:SS\", \"Never\", \"unknown\"."
         example: "2026-09-07 11:08:37"
         platforms: [windows, linux, darwin]
       - name: description
         type: string
-        description: The account's comment/description text (Windows comment, macOS RealName, Linux GECOS field), or "-" when empty.
-        values: free text or "-"
+        description: "The account's comment/description text (Windows comment, macOS RealName, Linux GECOS field), or \"-\" when empty. Values: free text or \"-\"."
         example: Built-in account for administering the computer/domain
         platforms: [windows, linux, darwin]
       - name: console_state
         type: string
-        description: Tri-state flag for whether this account is the current GUI/console-login user; the field is entirely absent (not empty) on Linux and Windows.
-        values: "true, false, unknown"
+        description: 'Tri-state flag for whether this account is the current GUI/console-login user; the field is entirely absent (not empty) on Linux and Windows. Values: true, false, unknown.'
         example: "true"
         platforms: [darwin]
 
@@ -272,20 +258,17 @@ spec:
     columns:
       - name: member_name
         type: string
-        description: The name of an account or group belonging to the local admin membership.
-        values: free text
+        description: 'The name of an account or group belonging to the local admin membership. Values: free text.'
         example: Alex
         platforms: [windows, linux, darwin]
       - name: member_type
         type: string
-        description: The kind of member.
-        values: "user (always on Linux/macOS); Windows: user, group, well_known_group, alias, unknown"
+        description: 'The kind of member. Values: user (always on Linux/macOS); Windows: user, group, well_known_group, alias, unknown.'
         example: user
         platforms: [windows, linux, darwin]
       - name: domain_or_group
         type: string
-        description: The domain owning the member (Windows), or the source group/account name (Linux "sudo"/"wheel"/"root", macOS literal "admin").
-        values: free text
+        description: 'The domain owning the member (Windows), or the source group/account name (Linux "sudo"/"wheel"/"root", macOS literal "admin"). Values: free text.'
         example: DESKTOP-04DNSIG
         platforms: [windows, linux, darwin]
 
@@ -350,20 +333,17 @@ spec:
     columns:
       - name: member_name
         type: string
-        description: The account (or nested group, on Windows) belonging to the queried group.
-        values: free text
+        description: 'The account (or nested group, on Windows) belonging to the queried group. Values: free text.'
         example: Alex
         platforms: [windows, linux, darwin]
       - name: group_name
         type: string
-        description: The group name from the "group" parameter, echoed back on every row.
-        values: free text
+        description: 'The group name from the "group" parameter, echoed back on every row. Values: free text.'
         example: Administrators
         platforms: [windows, linux, darwin]
       - name: member_type
         type: string
-        description: The kind of membership.
-        values: "user, primary_group (Linux only); Windows: user, group, well_known_group, alias"
+        description: 'The kind of membership. Values: user, primary_group (Linux only); Windows: user, group, well_known_group, alias.'
         example: user
         platforms: [windows, linux, darwin]
 
@@ -423,20 +403,17 @@ spec:
     columns:
       - name: username
         type: string
-        description: The account with the most login events in the examined history, or "unknown" when none could be determined.
-        values: free text or "unknown"
+        description: 'The account with the most login events in the examined history, or "unknown" when none could be determined. Values: free text or "unknown".'
         example: Alex
         platforms: [windows, linux, darwin]
       - name: login_count
         type: int32
-        description: The number of login events counted for this user; "0" for the Windows ProfileList fallback, which carries no count.
-        values: integer
+        description: 'The number of login events counted for this user; "0" for the Windows ProfileList fallback, which carries no count. Values: integer.'
         example: "118"
         platforms: [windows, linux, darwin]
       - name: source
         type: string
-        description: How the answer was derived.
-        values: "last (Linux/macOS); event_log_4624, profile_list (Windows); free text on a query failure"
+        description: 'How the answer was derived. Values: last (Linux/macOS); event_log_4624, profile_list (Windows); free text on a query failure.'
         example: event_log_4624
         platforms: [windows, linux, darwin]
 
@@ -508,38 +485,32 @@ spec:
     columns:
       - name: username
         type: string
-        description: The account named in the record.
-        values: free text
+        description: 'The account named in the record. Values: free text.'
         example: Alex
         platforms: [windows, linux, darwin]
       - name: event_type
         type: string
-        description: "Windows: \"logon\" or \"logoff\". Linux/macOS: actually the session's tty, not an event-type label — see the plugin README's Caveats."
-        values: "logon, logoff (Windows); a tty name (Linux/macOS)"
+        description: "Windows: \"logon\" or \"logoff\". Linux/macOS: actually the session's tty, not an event-type label — see the plugin README's Caveats. Values: logon, logoff (Windows); a tty name (Linux/macOS)."
         example: logoff
         platforms: [windows, linux, darwin]
       - name: logon_type
         type: string
-        description: "Windows: the mapped LogonType name or raw numeric code, empty when absent. Linux/macOS: actually last's host/source token, usually empty for a local session."
-        values: "interactive, network, batch, service, unlock, network_cleartext, new_credentials, remote_interactive, cached_interactive, or a raw numeric code (Windows); free text, often empty (Linux/macOS)"
+        description: "Windows: the mapped LogonType name or raw numeric code, empty when absent. Linux/macOS: actually last's host/source token, usually empty for a local session. Values: interactive, network, batch, service, unlock, network_cleartext, new_credentials, remote_interactive, cached_interactive, or a raw numeric code (Windows); free text, often empty (Linux/macOS)."
         example: network
         platforms: [windows, linux, darwin]
       - name: source
         type: string
-        description: "Windows: the event's IpAddress, or \"-\". Linux/macOS: actually the derived console/remote/system classification, not a network source."
-        values: "an IP address or \"-\" (Windows); console, remote, system (Linux/macOS)"
+        description: "Windows: the event's IpAddress, or \"-\". Linux/macOS: actually the derived console/remote/system classification, not a network source. Values: an IP address or \"-\" (Windows); console, remote, system (Linux/macOS)."
         example: "-"
         platforms: [windows, linux, darwin]
       - name: timestamp
         type: string
-        description: "Windows: the event's TimeCreated, full-precision UTC. Linux/macOS: actually the completed/active/crash status word, not a timestamp — the real date/time is embedded in \"detail\"."
-        values: "ISO-8601 UTC (Windows); completed, active, crash (Linux/macOS)"
+        description: "Windows: the event's TimeCreated, full-precision UTC. Linux/macOS: actually the completed/active/crash status word, not a timestamp — the real date/time is embedded in \"detail\". Values: ISO-8601 UTC (Windows); completed, active, crash (Linux/macOS)."
         example: "2026-09-07T10:08:37.8345208Z"
         platforms: [windows, linux, darwin]
       - name: detail
         type: string
-        description: "Windows: the raw EventID text. Linux/macOS: the remainder of the 'last' line verbatim (weekday, date, time, and logout/duration or \"still logged in\")."
-        values: free text
+        description: "Windows: the raw EventID text. Linux/macOS: the remainder of the 'last' line verbatim (weekday, date, time, and logout/duration or \"still logged in\"). Values: free text."
         example: "4634"
         platforms: [windows, linux, darwin]
 

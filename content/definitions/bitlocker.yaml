@@ -42,10 +42,8 @@ spec:
     columns:
       - name: volume
         type: string
-        description: >
-          Per-OS volume identifier: drive letter on Windows, block-device
-          basename on Linux, or the APFS volume's display label on macOS.
-        values: free text
+        description: >-
+          Per-OS volume identifier: drive letter on Windows, block-device basename on Linux, or the APFS volume's display label on macOS. Values: free text.
         example: "C:"
         platforms: [windows, linux, darwin]
       - name: conversion_status
@@ -60,10 +58,8 @@ spec:
         platforms: [windows]
       - name: percentage_encrypted
         type: string
-        description: >
-          Percentage of the volume currently encrypted, from BitLocker's
-          EncryptionPercentage out-parameter. Populated only on Windows.
-        values: "`<integer>%` or `unknown`"
+        description: >-
+          Percentage of the volume currently encrypted, from BitLocker's EncryptionPercentage out-parameter. Populated only on Windows. Values: `<integer>%` or `unknown`.
         example: "0%"
         platforms: [windows]
       - name: encryption_method

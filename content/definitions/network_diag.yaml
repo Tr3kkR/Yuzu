@@ -45,31 +45,23 @@ spec:
           The socket's transport protocol. Always the literal "tcp" today —
           the plugin never distinguishes an IPv6 socket with "tcp6", even
           though Linux and macOS both source rows from IPv6-capable tables.
-        values: "tcp"
         example: "tcp"
         platforms: [windows, linux, darwin]
       - name: local_addr
         type: string
-        description: >
-          The bound local address. Dotted IPv4 on all platforms; "*" for an
-          unbound wildcard on macOS; on Linux an IPv6 address is emitted as
-          raw undecoded hex, not text (hex_to_ip's IPv6 branch is a passthrough).
-        values: free text
+        description: >-
+          The bound local address. Dotted IPv4 on all platforms; "*" for an unbound wildcard on macOS; on Linux an IPv6 address is emitted as raw undecoded hex, not text (hex_to_ip's IPv6 branch is a passthrough). Values: free text.
         example: "127.0.0.1"
         platforms: [windows, linux, darwin]
       - name: local_port
         type: int32
-        description: The bound local TCP port number.
-        values: integer
+        description: 'The bound local TCP port number. Values: integer.'
         example: 5432
         platforms: [windows, linux, darwin]
       - name: pid
         type: int32
-        description: >
-          The owning process id on Windows and macOS. On Linux this is NOT
-          a PID — the Linux leg never resolves /proc/[pid]/fd, so the value
-          is the socket's raw /proc/net/tcp[6] inode number.
-        values: integer
+        description: >-
+          The owning process id on Windows and macOS. On Linux this is NOT a PID — the Linux leg never resolves /proc/[pid]/fd, so the value is the socket's raw /proc/net/tcp[6] inode number. Values: integer.
         example: 1533
         platforms: [windows, linux, darwin]
     aggregation:
@@ -136,44 +128,34 @@ spec:
           The socket's transport protocol. Always the literal "tcp" today —
           the plugin never distinguishes an IPv6 socket with "tcp6", even
           though Linux and macOS both source rows from IPv6-capable tables.
-        values: "tcp"
         example: "tcp"
         platforms: [windows, linux, darwin]
       - name: local_addr
         type: string
-        description: >
-          The local endpoint address. Dotted IPv4 on all platforms; on
-          Linux an IPv6 address is emitted as raw undecoded hex, not text.
-        values: free text
+        description: >-
+          The local endpoint address. Dotted IPv4 on all platforms; on Linux an IPv6 address is emitted as raw undecoded hex, not text. Values: free text.
         example: "192.168.0.66"
         platforms: [windows, linux, darwin]
       - name: local_port
         type: int32
-        description: The local TCP port number.
-        values: integer
+        description: 'The local TCP port number. Values: integer.'
         example: 52882
         platforms: [windows, linux, darwin]
       - name: remote_addr
         type: string
-        description: >
-          The remote endpoint address. Dotted IPv4 on all platforms; on
-          Linux an IPv6 address is emitted as raw undecoded hex, not text.
-        values: free text
+        description: >-
+          The remote endpoint address. Dotted IPv4 on all platforms; on Linux an IPv6 address is emitted as raw undecoded hex, not text. Values: free text.
         example: "160.79.104.10"
         platforms: [windows, linux, darwin]
       - name: remote_port
         type: int32
-        description: The remote TCP port number.
-        values: integer
+        description: 'The remote TCP port number. Values: integer.'
         example: 443
         platforms: [windows, linux, darwin]
       - name: pid
         type: int32
-        description: >
-          The owning process id on Windows and macOS. On Linux this is NOT
-          a PID — the Linux leg never resolves /proc/[pid]/fd, so the value
-          is the socket's raw /proc/net/tcp[6] inode number.
-        values: integer
+        description: >-
+          The owning process id on Windows and macOS. On Linux this is NOT a PID — the Linux leg never resolves /proc/[pid]/fd, so the value is the socket's raw /proc/net/tcp[6] inode number. Values: integer.
         example: 9039
         platforms: [windows, linux, darwin]
     aggregation:

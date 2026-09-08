@@ -45,21 +45,14 @@ spec:
     columns:
       - name: status
         type: string
-        description: >
-          Whether the flush succeeded ("ok") or failed ("error");
-          reflects the real exit code(s) of the underlying command(s),
-          never a blind success.
-        values: "ok, error"
+        description: >-
+          Whether the flush succeeded ("ok") or failed ("error"); reflects the real exit code(s) of the underlying command(s), never a blind success. Values: ok, error.
         example: "ok"
         platforms: [windows, linux, darwin]
       - name: output
         type: string
-        description: >
-          Captured stdout+stderr of the underlying flush command(s),
-          merged. On macOS this is a fixed
-          "dscacheutil rc={} mDNSResponder rc={}" summary; on Windows
-          and Linux it is the raw captured command output.
-        values: free text
+        description: >-
+          Captured stdout+stderr of the underlying flush command(s), merged. On macOS this is a fixed "dscacheutil rc={} mDNSResponder rc={}" summary; on Windows and Linux it is the raw captured command output. Values: free text.
         example: "dscacheutil rc={} mDNSResponder rc={}"
         platforms: [windows, linux, darwin]
 
@@ -136,12 +129,8 @@ spec:
     columns:
       - name: output
         type: string
-        description: >
-          One raw line of the system ping tool's stdout, emitted per
-          line of output. Not present when host/count validation fails
-          — that path emits a single "error|<message>" line instead,
-          outside this schema.
-        values: free text (raw ping-tool output)
+        description: >-
+          One raw line of the system ping tool's stdout, emitted per line of output. Not present when host/count validation fails — that path emits a single "error|<message>" line instead, outside this schema. Values: free text (raw ping-tool output).
         example: "PING 127.0.0.1 (127.0.0.1): 56 data bytes"
         platforms: [windows, linux, darwin]
 

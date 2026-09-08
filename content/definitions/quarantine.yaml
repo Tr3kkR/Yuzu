@@ -65,11 +65,8 @@ spec:
         platforms: [windows, linux, darwin]
       - name: rules_applied
         type: int32
-        description: >
-          Count of firewall rules the action attempted-and-applied this
-          call (Windows/Linux: the mutation tally's succeeded count;
-          macOS: the pf ruleset line count), reported alongside status.
-        values: "integer >= 0"
+        description: >-
+          Count of firewall rules the action attempted-and-applied this call (Windows/Linux: the mutation tally's succeeded count; macOS: the pf ruleset line count), reported alongside status. Values: integer >= 0.
         example: "4"
         platforms: [windows, linux, darwin]
 
@@ -207,12 +204,8 @@ spec:
         platforms: [windows, linux, darwin]
       - name: whitelist
         type: string
-        description: >
-          Comma-separated whitelist of currently-allowed IPs, read fresh
-          from the firewall. Reported only when state is not inactive,
-          and empty when the device is contained with no additional
-          whitelist entries.
-        values: "free text - comma-separated IP list, or empty"
+        description: >-
+          Comma-separated whitelist of currently-allowed IPs, read fresh from the firewall. Reported only when state is not inactive, and empty when the device is contained with no additional whitelist entries. Values: free text - comma-separated IP list, or empty.
         example: ""
         platforms: [windows, linux, darwin]
 
@@ -293,11 +286,8 @@ spec:
         platforms: [windows, linux, darwin]
       - name: whitelist
         type: string
-        description: >
-          Comma-separated whitelist after the add/remove, read fresh from
-          the firewall (on macOS this is the full pf ruleset whitelist,
-          since add/remove rebuilds the entire main ruleset there).
-        values: "free text - comma-separated IP list, or empty"
+        description: >-
+          Comma-separated whitelist after the add/remove, read fresh from the firewall (on macOS this is the full pf ruleset whitelist, since add/remove rebuilds the entire main ruleset there). Values: free text - comma-separated IP list, or empty.
         example: ""
         platforms: [windows, linux, darwin]
 

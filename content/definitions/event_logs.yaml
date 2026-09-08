@@ -69,29 +69,23 @@ spec:
     columns:
       - name: timestamp
         type: string
-        description: Event timestamp. Full-precision UTC ISO-8601 on Windows; local short-iso time on Linux; the `log show --style compact` column timestamp on macOS.
-        values: free text
+        description: 'Event timestamp. Full-precision UTC ISO-8601 on Windows; local short-iso time on Linux; the `log show --style compact` column timestamp on macOS. Values: free text.'
         example: "2026-09-06T14:55:55.0521384Z"
         platforms: [windows, linux, darwin]
       - name: event_id
         type: string
-        description: Windows numeric Event ID. Not populated on Linux or macOS.
-        values: integer
+        description: 'Windows numeric Event ID. Not populated on Linux or macOS. Values: integer.'
         example: "6008"
         platforms: [windows]
       - name: source
         type: string
         description: >-
-          Windows event provider name. Not populated on Linux or macOS —
-          those legs report a journal unit or process name in this row
-          position instead, which is a different field outside this schema.
-        values: free text
+          Windows event provider name. Not populated on Linux or macOS — those legs report a journal unit or process name in this row position instead, which is a different field outside this schema. Values: free text.
         example: "EventLog"
         platforms: [windows]
       - name: message
         type: string
-        description: Event message text, truncated to 200 bytes at a UTF-8 character boundary.
-        values: free text
+        description: 'Event message text, truncated to 200 bytes at a UTF-8 character boundary. Values: free text.'
         example: "16:11:31 ‎05/‎09/‎2026 105614"
         platforms: [windows, linux, darwin]
     aggregation:
@@ -190,40 +184,30 @@ spec:
     columns:
       - name: timestamp
         type: string
-        description: Event timestamp. Full-precision UTC ISO-8601 on Windows; local short-iso time on Linux; the `log show --style compact` column timestamp on macOS.
-        values: free text
+        description: 'Event timestamp. Full-precision UTC ISO-8601 on Windows; local short-iso time on Linux; the `log show --style compact` column timestamp on macOS. Values: free text.'
         example: "2026-09-06 10:55:53.560"
         platforms: [windows, linux, darwin]
       - name: level
         type: string
         description: >-
-          Windows event level display name derived from the numeric
-          `<Level>`. Not populated on Linux or macOS.
-        values: "Critical, Error, Warning, Information, Verbose, or Level<n> for an unmapped numeric level"
+          Windows event level display name derived from the numeric `<Level>`. Not populated on Linux or macOS. Values: Critical, Error, Warning, Information, Verbose, or Level<n> for an unmapped numeric level.
         example: "not observed in any capture (the Windows query run matched no rows)"
         platforms: [windows]
       - name: event_id
         type: string
-        description: Windows numeric Event ID. Not populated on Linux or macOS.
-        values: integer
+        description: 'Windows numeric Event ID. Not populated on Linux or macOS. Values: integer.'
         example: "6008 (from the errors sample; the query run matched no rows)"
         platforms: [windows]
       - name: source
         type: string
         description: >-
-          Windows event provider name. Not populated on Linux or macOS —
-          those legs report a journal unit or process name in this row
-          position instead, which is a different field outside this schema.
-        values: free text
+          Windows event provider name. Not populated on Linux or macOS — those legs report a journal unit or process name in this row position instead, which is a different field outside this schema. Values: free text.
         example: "Kernel-General"
         platforms: [windows]
       - name: message
         type: string
         description: >-
-          Matched event message text, truncated to 200 bytes at a UTF-8
-          character boundary. The `filter` keyword is matched against this
-          field (and the provider name, on Windows).
-        values: free text
+          Matched event message text, truncated to 200 bytes at a UTF-8 character boundary. The `filter` keyword is matched against this field (and the provider name, on Windows). Values: free text.
         example: "2026-09-06 10:55:53.560 Df WeatherWidget[977:d9fa44] [com.apple.weather:WidgetRefresh] About to compute error refresh policy. (5 min to next refresh)."
         platforms: [windows, linux, darwin]
     aggregation:

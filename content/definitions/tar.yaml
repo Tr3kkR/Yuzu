@@ -54,32 +54,27 @@ spec:
     columns:
       - name: record_count
         type: int64
-        description: Total number of TAR event rows currently stored across all warehouse tables.
-        values: non-negative integer
+        description: 'Total number of TAR event rows currently stored across all warehouse tables. Values: non-negative integer.'
         example: "-"
         platforms: [windows, linux, darwin]
       - name: oldest_timestamp
         type: int64
-        description: Unix epoch seconds of the oldest event row still retained, or 0 when the warehouse is empty.
-        values: epoch seconds, or 0
+        description: 'Unix epoch seconds of the oldest event row still retained, or 0 when the warehouse is empty. Values: epoch seconds, or 0.'
         example: "-"
         platforms: [windows, linux, darwin]
       - name: newest_timestamp
         type: int64
-        description: Unix epoch seconds of the newest event row, or 0 when the warehouse is empty.
-        values: epoch seconds, or 0
+        description: 'Unix epoch seconds of the newest event row, or 0 when the warehouse is empty. Values: epoch seconds, or 0.'
         example: "-"
         platforms: [windows, linux, darwin]
       - name: db_size_bytes
         type: int64
-        description: Size in bytes of tar.db on disk.
-        values: non-negative integer
+        description: 'Size in bytes of tar.db on disk. Values: non-negative integer.'
         example: "-"
         platforms: [windows, linux, darwin]
       - name: retention_days
         type: int32
-        description: Currently configured retention window in days (see configure.retention_days).
-        values: 1-365
+        description: 'Currently configured retention window in days (see configure.retention_days). Values: 1-365.'
         example: "-"
         platforms: [windows, linux, darwin]
 
@@ -173,34 +168,27 @@ spec:
       - name: timestamp
         type: int64
         description: Unix epoch seconds the event was recorded.
-        values: epoch seconds
         example: "-"
         platforms: [windows, linux, darwin]
       - name: event_type
         type: string
-        description: Which capture source the row came from.
-        values: "process, network, service, user, software, arp, dns, mapdrive"
+        description: 'Which capture source the row came from. Values: process, network, service, user, software, arp, dns, mapdrive.'
         example: "-"
         platforms: [windows, linux, darwin]
       - name: event_action
         type: string
-        description: The lifecycle verb for this event (e.g. started/stopped, appeared/removed, opened/closed); the vocabulary is source-specific.
-        values: free text, source-dependent verb
+        description: 'The lifecycle verb for this event (e.g. started/stopped, appeared/removed, opened/closed); the vocabulary is source-specific. Values: free text, source-dependent verb.'
         example: "-"
         platforms: [windows, linux, darwin]
       - name: snapshot_id
         type: int64
-        description: Internal id of the collection cycle that produced this row, used to correlate rows from the same tick.
-        values: integer
+        description: 'Internal id of the collection cycle that produced this row, used to correlate rows from the same tick. Values: integer.'
         example: "-"
         platforms: [windows, linux, darwin]
       - name: detail_json
         type: clob
-        description: >
-          JSON object with type-specific fields (see metadata.description for the
-          per-type shape); empty string on the default (no type filter) union
-          branches, which project only ts/event_type/action/snapshot_id.
-        values: JSON object, or empty string
+        description: >-
+          JSON object with type-specific fields (see metadata.description for the per-type shape); empty string on the default (no type filter) union branches, which project only ts/event_type/action/snapshot_id. Values: JSON object, or empty string.
         example: "-"
         platforms: [windows, linux, darwin]
 
@@ -254,23 +242,14 @@ spec:
     columns:
       - name: status
         type: string
-        description: >
-          Outcome token for the forced snapshot. The actual response line is
-          `tar|snapshot|complete` when every enabled source collected cleanly,
-          or `tar|snapshot|partial|<comma-joined source names>` when one or
-          more sources threw an incomplete-capture error and retained their
-          previous baseline instead of collecting.
-        values: "complete, partial"
+        description: >-
+          Outcome token for the forced snapshot. The actual response line is `tar|snapshot|complete` when every enabled source collected cleanly, or `tar|snapshot|partial|<comma-joined source names>` when one or more sources threw an incomplete-capture error and retained their previous baseline instead of collecting. Values: complete, partial.
         example: "-"
         platforms: [windows, linux, darwin]
       - name: events_recorded
         type: int32
-        description: >
-          Declared as a count of events the forced snapshot recorded; the
-          current wire format (tar|snapshot|complete or |partial|<sources>)
-          does not carry a numeric count, so this column is not populated —
-          see Caveats and known gaps.
-        values: not emitted by the current wire format
+        description: >-
+          Declared as a count of events the forced snapshot recorded; the current wire format (tar|snapshot|complete or |partial|<sources>) does not carry a numeric count, so this column is not populated — see Caveats and known gaps. Values: not emitted by the current wire format.
         example: "-"
         platforms: []
 
@@ -344,7 +323,6 @@ spec:
           A JSON array of event objects; each carries id, timestamp,
           event_type, event_action, snapshot_id and a nested detail object
           with type-specific fields.
-        values: JSON array
         example: "-"
         platforms: [windows, linux, darwin]
 
@@ -763,19 +741,14 @@ spec:
     columns:
       - name: key
         type: string
-        description: >
-          Name of one configuration setting that was changed by this call
-          (e.g. retention_days, arp_enabled); one row is emitted per
-          persisted key — unchanged keys emit nothing.
-        values: one of the parameter names listed under Inputs
+        description: >-
+          Name of one configuration setting that was changed by this call (e.g. retention_days, arp_enabled); one row is emitted per persisted key — unchanged keys emit nothing. Values: one of the parameter names listed under Inputs.
         example: "-"
         platforms: [windows, linux, darwin]
       - name: value
         type: string
-        description: >
-          The new value that was persisted for that key, as a string
-          (post-clamp / post-validation where the parameter defines one).
-        values: free text, mirrors the parameter's own type/values
+        description: >-
+          The new value that was persisted for that key, as a string (post-clamp / post-validation where the parameter defines one). Values: free text, mirrors the parameter's own type/values.
         example: "-"
         platforms: [windows, linux, darwin]
 
@@ -829,13 +802,8 @@ spec:
     columns:
       - name: events_recorded
         type: int32
-        description: >
-          Count of change events this tick appended to the warehouse. Carried
-          as the third field of the actual response line
-          `tar|collect_fast|<events_recorded>|<token>`, where <token> is one
-          of source_disabled / unsupported_platform / baseline /
-          sample_recorded / cursor_advanced / cursor_lost / capture_incomplete.
-        values: non-negative integer
+        description: >-
+          Count of change events this tick appended to the warehouse. Carried as the third field of the actual response line `tar|collect_fast|<events_recorded>|<token>`, where <token> is one of source_disabled / unsupported_platform / baseline / sample_recorded / cursor_advanced / cursor_lost / capture_incomplete. Values: non-negative integer.
         example: "-"
         platforms: [windows, linux, darwin]
 
@@ -890,12 +858,8 @@ spec:
     columns:
       - name: events_recorded
         type: int32
-        description: >
-          Count of change events this tick appended to the warehouse. Carried
-          as the third field of the actual response line
-          `tar|collect_slow|<events_recorded>|<token>` (same token vocabulary
-          as collect_fast).
-        values: non-negative integer
+        description: >-
+          Count of change events this tick appended to the warehouse. Carried as the third field of the actual response line `tar|collect_slow|<events_recorded>|<token>` (same token vocabulary as collect_fast). Values: non-negative integer.
         example: "-"
         platforms: [windows, linux, darwin]
 
@@ -959,12 +923,8 @@ spec:
     columns:
       - name: output
         type: clob
-        description: >
-          One `header|source|os|status|capture_method|notes` line, then one
-          `row|<source>|<os>|<status>|<capture_method>|<notes>` line per
-          registered capture source x OS combination (every OS, not only the
-          host's own).
-        values: "header|... or row|... lines; status is supported, constrained, planned, or unsupported"
+        description: >-
+          One `header|source|os|status|capture_method|notes` line, then one `row|<source>|<os>|<status>|<capture_method>|<notes>` line per registered capture source x OS combination (every OS, not only the host's own). Values: header|... or row|... lines; status is supported, constrained, planned, or unsupported.
         example: "-"
         platforms: [windows, linux, darwin]
 
@@ -1025,12 +985,8 @@ spec:
     columns:
       - name: json_output
         type: clob
-        description: >
-          A single fleet_snapshot.v1 JSON document: hostname, timestamp,
-          local IPs, up to 4096 processes and 4096 TCP connections (each list
-          truncated with a truncated_processes / truncated_connections flag),
-          and source_paused.* markers when process or tcp capture is paused.
-        values: JSON object (fleet_snapshot.v1)
+        description: >-
+          A single fleet_snapshot.v1 JSON document: hostname, timestamp, local IPs, up to 4096 processes and 4096 TCP connections (each list truncated with a truncated_processes / truncated_connections flag), and source_paused.* markers when process or tcp capture is paused. Values: JSON object (fleet_snapshot.v1).
         example: "-"
         platforms: [windows, linux, darwin]
 

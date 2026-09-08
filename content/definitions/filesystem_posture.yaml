@@ -61,50 +61,42 @@ spec:
     columns:
       - name: mount_point
         type: string
-        description: Filesystem path (Linux, macOS) or drive/volume path (Windows) the volume is mounted at.
-        values: free text
+        description: 'Filesystem path (Linux, macOS) or drive/volume path (Windows) the volume is mounted at. Values: free text.'
         example: "/"
         platforms: [windows, linux, darwin]
       - name: device
         type: string
-        description: OS-reported mount source or volume identifier backing this mount point.
-        values: free text
+        description: 'OS-reported mount source or volume identifier backing this mount point. Values: free text.'
         example: "/dev/vda1"
         platforms: [windows, linux, darwin]
       - name: fstype
         type: string
-        description: OS-supplied filesystem type name.
-        values: free text
+        description: 'OS-supplied filesystem type name. Values: free text.'
         example: ext4
         platforms: [windows, linux, darwin]
       - name: options
         type: string
-        description: Comma-separated mount options as reported by the OS, or "-" when no per-mount option string exists.
-        values: free text or "-"
+        description: 'Comma-separated mount options as reported by the OS, or "-" when no per-mount option string exists. Values: free text or "-".'
         example: "rw,relatime"
         platforms: [linux]
       - name: total_bytes
         type: int64
-        description: Raw filesystem capacity in bytes, or "-" when not read (omitted for network filesystems on Linux to avoid a blocking statvfs call).
-        values: integer or "-"
+        description: 'Raw filesystem capacity in bytes, or "-" when not read (omitted for network filesystems on Linux to avoid a blocking statvfs call). Values: integer or "-".'
         example: "485473984512"
         platforms: [windows, linux, darwin]
       - name: free_bytes
         type: int64
-        description: Free space in bytes, or "-" under the same conditions as total_bytes.
-        values: integer or "-"
+        description: 'Free space in bytes, or "-" under the same conditions as total_bytes. Values: integer or "-".'
         example: "432465076224"
         platforms: [windows, linux, darwin]
       - name: available_bytes
         type: int64
-        description: Space available to an unprivileged caller in bytes, or "-" under the same conditions as total_bytes.
-        values: integer or "-"
+        description: 'Space available to an unprivileged caller in bytes, or "-" under the same conditions as total_bytes. Values: integer or "-".'
         example: "407729119232"
         platforms: [windows, linux, darwin]
       - name: flags
         type: string
-        description: Comma-joined mount flags drawn from a fixed vocabulary; any option outside the vocabulary is dropped rather than passed through.
-        values: "ro, rw, nosuid, nodev, noexec, noatime, relatime, removable, remote, cdrom"
+        description: 'Comma-joined mount flags drawn from a fixed vocabulary; any option outside the vocabulary is dropped rather than passed through. Values: ro, rw, nosuid, nodev, noexec, noatime, relatime, removable, remote, cdrom.'
         example: "rw,relatime"
         platforms: [windows, linux, darwin]
     aggregation:
@@ -172,38 +164,32 @@ spec:
     columns:
       - name: mount_point
         type: string
-        description: Filesystem path or volume path the quota state applies to, or "-" on the aggregate Linux no_block_device row.
-        values: free text or "-"
+        description: 'Filesystem path or volume path the quota state applies to, or "-" on the aggregate Linux no_block_device row. Values: free text or "-".'
         example: "/"
         platforms: [windows, linux, darwin]
       - name: scope
         type: string
-        description: Fixed literal identifying the quota scope; this plugin never reports a narrower scope.
-        values: "volume"
+        description: 'Fixed literal identifying the quota scope; this plugin never reports a narrower scope. Values: volume.'
         example: volume
         platforms: [windows, linux, darwin]
       - name: state
         type: string
-        description: Classified quota-subsystem state for this volume.
-        values: "configured, none, not_enabled, unsupported_fs, no_block_device, permission_denied, unavailable"
+        description: 'Classified quota-subsystem state for this volume. Values: configured, none, not_enabled, unsupported_fs, no_block_device, permission_denied, unavailable.'
         example: not_enabled
         platforms: [windows, linux, darwin]
       - name: limit_bytes
         type: int64
-        description: Default quota limit in bytes; only populated when state is configured.
-        values: integer or "-"
+        description: 'Default quota limit in bytes; only populated when state is configured. Values: integer or "-".'
         example: "-"
         platforms: [windows, darwin]
       - name: reserved_bytes
         type: int64
-        description: Reserved/threshold size in bytes; only populated when state is configured.
-        values: integer or "-"
+        description: 'Reserved/threshold size in bytes; only populated when state is configured. Values: integer or "-".'
         example: "-"
         platforms: [windows, darwin]
       - name: detail
         type: string
-        description: Free-text reason or errno/HRESULT name explaining the state, or "-" when nothing further applies.
-        values: free text or "-"
+        description: 'Free-text reason or errno/HRESULT name explaining the state, or "-" when nothing further applies. Values: free text or "-".'
         example: ESRCH
         platforms: [windows, linux, darwin]
     aggregation:
@@ -271,26 +257,22 @@ spec:
     columns:
       - name: mount_point
         type: string
-        description: Filesystem path or volume path the snapshot (or snapshot-capable volume) belongs to, or "-" on a kind=none sentinel row.
-        values: free text or "-"
+        description: 'Filesystem path or volume path the snapshot (or snapshot-capable volume) belongs to, or "-" on a kind=none sentinel row. Values: free text or "-".'
         example: "C:/"
         platforms: [windows, linux, darwin]
       - name: name
         type: string
-        description: Snapshot identifier — a GUID on Windows, an APFS snapshot name on macOS, a btrfs subvolume path/id or device-mapper source on Linux — or "-" on a none row.
-        values: free text or "-"
+        description: 'Snapshot identifier — a GUID on Windows, an APFS snapshot name on macOS, a btrfs subvolume path/id or device-mapper source on Linux — or "-" on a none row. Values: free text or "-".'
         example: "{9F2F924B-2DD2-46D5-A779-709B2F6FFB9B}"
         platforms: [windows, linux, darwin]
       - name: kind
         type: string
-        description: Fixed-vocabulary classification of what this row represents.
-        values: "apfs, btrfs_subvolume, device_mapper, vss, none"
+        description: 'Fixed-vocabulary classification of what this row represents. Values: apfs, btrfs_subvolume, device_mapper, vss, none.'
         example: vss
         platforms: [windows, linux, darwin]
       - name: detail
         type: string
-        description: Free-text detail — a device path, an operator-actionable reason on a none row, or "-".
-        values: free text or "-"
+        description: 'Free-text detail — a device path, an operator-actionable reason on a none row, or "-". Values: free text or "-".'
         example: "//?/GLOBALROOT/Device/HarddiskVolumeShadowCopy1"
         platforms: [windows, linux, darwin]
     aggregation:

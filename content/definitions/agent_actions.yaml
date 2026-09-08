@@ -102,32 +102,27 @@ spec:
     columns:
       - name: agent_id
         type: string
-        description: The agent's agent.id config value, or the literal "(not set)" when the config context has not populated it.
-        values: "free text, or literal \"(not set)\""
+        description: "The agent's agent.id config value, or the literal \"(not set)\" when the config context has not populated it. Values: free text, or literal \"(not set)\"."
         example: "(not set)"
         platforms: [windows, linux, darwin]
       - name: agent_version
         type: string
-        description: The agent's agent.version config value, or the literal "(not set)" when unpopulated.
-        values: "free text, or literal \"(not set)\""
+        description: "The agent's agent.version config value, or the literal \"(not set)\" when unpopulated. Values: free text, or literal \"(not set)\"."
         example: "(not set)"
         platforms: [windows, linux, darwin]
       - name: server_address
         type: string
-        description: The agent's agent.server_address config value, or the literal "(not set)" when unpopulated.
-        values: "free text, or literal \"(not set)\""
+        description: "The agent's agent.server_address config value, or the literal \"(not set)\" when unpopulated. Values: free text, or literal \"(not set)\"."
         example: "(not set)"
         platforms: [windows, linux, darwin]
       - name: heartbeat_interval
         type: string
-        description: The agent's agent.heartbeat_interval config value, or the literal "(not set)" when unpopulated.
-        values: "free text, or literal \"(not set)\""
+        description: "The agent's agent.heartbeat_interval config value, or the literal \"(not set)\" when unpopulated. Values: free text, or literal \"(not set)\"."
         example: "(not set)"
         platforms: [windows, linux, darwin]
       - name: plugins_count
         type: int32
-        description: The agent's agent.plugins.count config value. Always emitted as text, never a JSON number — the raw config string or the literal "(not set)".
-        values: "free text, or literal \"(not set)\""
+        description: "The agent's agent.plugins.count config value. Always emitted as text, never a JSON number — the raw config string or the literal \"(not set)\". Values: free text, or literal \"(not set)\"."
         example: "(not set)"
         platforms: [windows, linux, darwin]
 

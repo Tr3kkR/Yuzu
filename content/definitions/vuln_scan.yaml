@@ -49,19 +49,14 @@ spec:
         platforms: [windows, linux, darwin]
       - name: title
         type: string
-        description: >
-          For a cve row, "<CVE-ID>: <description>" from the matched rule; for a config row,
-          the name of the compliance check; "No vulnerabilities" on the single placeholder row
-          emitted when a run finds nothing.
-        values: free text
+        description: >-
+          For a cve row, "<CVE-ID>: <description>" from the matched rule; for a config row, the name of the compliance check; "No vulnerabilities" on the single placeholder row emitted when a run finds nothing. Values: free text.
         example: "CVE-2021-34527: PrintNightmare: RCE via Windows Print Spooler"
         platforms: [windows, linux, darwin]
       - name: detail
         type: string
-        description: >
-          For a cve row, "<installed product> <version> (fixed in <fixed_ver>)"; for a config
-          row, the check's human-readable result text.
-        values: free text
+        description: >-
+          For a cve row, "<installed product> <version> (fixed in <fixed_ver>)"; for a config row, the check's human-readable result text. Values: free text.
         example: "Microsoft Windows Desktop Runtime - 6.0.11 (x64) 6.0.11.31823 (fixed in KB5004945)"
         platforms: [windows, linux, darwin]
     aggregation:
@@ -144,16 +139,13 @@ spec:
         platforms: [windows, linux, darwin]
       - name: title
         type: string
-        description: >
-          "<CVE-ID>: <description>" from the matched rule, or "No vulnerabilities" on the
-          placeholder row.
-        values: free text
+        description: >-
+          "<CVE-ID>: <description>" from the matched rule, or "No vulnerabilities" on the placeholder row. Values: free text.
         example: "CVE-2023-24329: urllib.parse URL parsing bypass via leading whitespace"
         platforms: [windows, linux, darwin]
       - name: detail
         type: string
-        description: "<installed product> <version> (fixed in <fixed_ver>)."
-        values: free text
+        description: "<installed product> <version> (fixed in <fixed_ver>). Values: free text."
         example: "Python 3.9.6 (fixed in 3.11.4)"
         platforms: [windows, linux, darwin]
     aggregation:
@@ -223,14 +215,12 @@ spec:
         platforms: [windows, linux, darwin]
       - name: title
         type: string
-        description: The name of the compliance check, e.g. the setting it inspects.
-        values: free text
+        description: 'The name of the compliance check, e.g. the setting it inspects. Values: free text.'
         example: "SMBv1 Protocol"
         platforms: [windows, linux, darwin]
       - name: detail
         type: string
-        description: The check's human-readable result text, including why a failing check failed.
-        values: free text
+        description: "The check's human-readable result text, including why a failing check failed. Values: free text."
         example: "Enabled - vulnerable to EternalBlue/WannaCry (MS17-010)"
         platforms: [windows, linux, darwin]
     aggregation:
@@ -296,11 +286,8 @@ spec:
         platforms: [windows, linux, darwin]
       - name: count
         type: int32
-        description: >
-          The number of findings at this severity. The TOTAL row is an exception: despite the
-          declared int32 type, that row's cell holds the formatted string
-          "<n> findings (<n> issues)", not an integer.
-        values: integer, except a formatted string on the TOTAL row
+        description: >-
+          The number of findings at this severity. The TOTAL row is an exception: despite the declared int32 type, that row's cell holds the formatted string "<n> findings (<n> issues)", not an integer. Values: integer, except a formatted string on the TOTAL row.
         example: "17"
         platforms: [windows, linux, darwin]
 
@@ -354,16 +341,13 @@ spec:
     columns:
       - name: name
         type: string
-        description: Installed application or package name, as reported by the OS's own inventory source.
-        values: free text
+        description: "Installed application or package name, as reported by the OS's own inventory source. Values: free text."
         example: curl
         platforms: [windows, linux, darwin]
       - name: version
         type: string
-        description: >
-          Installed version string, or empty when the source reports none (e.g. a Windows
-          uninstall entry with no DisplayVersion).
-        values: free text, or empty
+        description: >-
+          Installed version string, or empty when the source reports none (e.g. a Windows uninstall entry with no DisplayVersion). Values: free text, or empty.
         example: "8.14.1-2+deb13u4"
         platforms: [windows, linux, darwin]
 

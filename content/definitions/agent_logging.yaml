@@ -46,25 +46,19 @@ spec:
     columns:
       - name: log_file
         type: string
-        description: >
-          Absolute path to the log file that was read; the field is
-          omitted from the output entirely when no log file resolves
-          on this host.
-        values: absolute path, or field absent
+        description: >-
+          Absolute path to the log file that was read; the field is omitted from the output entirely when no log file resolves on this host. Values: absolute path, or field absent.
         example: field omitted in every captured sample — no capture has resolved a log file (see status|empty)
         platforms: [windows, linux, darwin]
       - name: line_count
         type: int32
-        description: Count of line entries returned; 0 when no log file resolves.
-        values: non-negative integer
+        description: 'Count of line entries returned; 0 when no log file resolves. Values: non-negative integer.'
         example: "0"
         platforms: [windows, linux, darwin]
       - name: line
         type: string
-        description: >
-          One raw line from the tailed log file, unescaped and in
-          file order; omitted entirely when no log file resolves.
-        values: free text, or field absent
+        description: >-
+          One raw line from the tailed log file, unescaped and in file order; omitted entirely when no log file resolves. Values: free text, or field absent.
         example: field omitted in every captured sample — no capture has resolved a log file
         platforms: [windows, linux, darwin]
 
@@ -119,23 +113,18 @@ spec:
     columns:
       - name: path
         type: string
-        description: >
-          Absolute path of a discovered agent file (executable, log
-          file, config file, data store, plugin file, or TLS
-          certificate/key).
-        values: absolute path
+        description: >-
+          Absolute path of a discovered agent file (executable, log file, config file, data store, plugin file, or TLS certificate/key). Values: absolute path.
         example: "/private/tmp/claude-501/-Users-alex-yuzu-dev/8d89cd79-001b-4ea8-8930-0c9affb3265e/scratchpad/d2/plugin_capture"
         platforms: [windows, linux, darwin]
       - name: size
         type: int64
-        description: File size in bytes; 0 if the size read failed.
-        values: non-negative integer (bytes)
+        description: 'File size in bytes; 0 if the size read failed. Values: non-negative integer (bytes).'
         example: "142208"
         platforms: [windows, linux, darwin]
       - name: modified
         type: int64
-        description: Last-write time as Unix epoch seconds; 0 if the mtime read failed.
-        values: non-negative integer (unix epoch seconds)
+        description: 'Last-write time as Unix epoch seconds; 0 if the mtime read failed. Values: non-negative integer (unix epoch seconds).'
         example: "1788774907"
         platforms: [windows, linux, darwin]
 

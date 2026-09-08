@@ -44,13 +44,11 @@ spec:
           Write outcome. Present and equal to "ok" only when the write
           succeeded; on failure this row is absent and an "error|<message>"
           line is written instead (not represented as a column).
-        values: "ok"
         example: "ok"
         platforms: [windows, linux, darwin]
       - name: key
         type: string
-        description: The key name that was stored, echoed back unchanged.
-        values: free text
+        description: 'The key name that was stored, echoed back unchanged. Values: free text.'
         example: "yuzu_capture_tmp"
         platforms: [windows, linux, darwin]
 
@@ -108,19 +106,14 @@ spec:
     columns:
       - name: key
         type: string
-        description: >
-          The requested key name, echoed back unchanged. (The literal "key"
-          row-discriminator emitted before this field is not itself a
-          separate column.)
-        values: free text
+        description: >-
+          The requested key name, echoed back unchanged. (The literal "key" row-discriminator emitted before this field is not itself a separate column.). Values: free text.
         example: "yuzu_capture_tmp"
         platforms: [windows, linux, darwin]
       - name: value
         type: string
-        description: >
-          The stored value, or the literal sentinel "not_found" when the
-          key has no stored value.
-        values: "free text, or the sentinel not_found"
+        description: >-
+          The stored value, or the literal sentinel "not_found" when the key has no stored value. Values: free text, or the sentinel not_found.
         example: "not_found"
         platforms: [windows, linux, darwin]
 
@@ -182,13 +175,11 @@ spec:
           Write outcome. Always the literal "ok" when present — written
           unconditionally once the delete call returns, without checking
           whether the delete actually succeeded.
-        values: "ok"
         example: "ok"
         platforms: [windows, linux, darwin]
       - name: key
         type: string
-        description: The key name that was targeted for deletion, echoed back unchanged.
-        values: free text
+        description: 'The key name that was targeted for deletion, echoed back unchanged. Values: free text.'
         example: "yuzu_capture_tmp"
         platforms: [windows, linux, darwin]
 
@@ -246,15 +237,13 @@ spec:
     columns:
       - name: count
         type: int32
-        description: Number of keys returned, written once as the first row of every response.
-        values: integer >= 0
+        description: 'Number of keys returned, written once as the first row of every response. Values: integer >= 0.'
         example: "0"
         platforms: [windows, linux, darwin]
       - name: key
         type: string
-        description: >
-          One row per matching key name; no key rows at all when count is 0.
-        values: free text
+        description: >-
+          One row per matching key name; no key rows at all when count is 0. Values: free text.
         example: "-"
         platforms: [windows, linux, darwin]
 
@@ -310,16 +299,12 @@ spec:
       - name: status
         type: string
         description: Write outcome. Always the literal "ok", written after the clear loop completes.
-        values: "ok"
         example: "ok"
         platforms: [windows, linux, darwin]
       - name: cleared
         type: int32
-        description: >
-          Count of keys deleted in this run — the size of the key list
-          read at the start of the pass, not a per-key confirmed-delete
-          count.
-        values: integer >= 0
+        description: >-
+          Count of keys deleted in this run — the size of the key list read at the start of the pass, not a per-key confirmed-delete count. Values: integer >= 0.
         example: "-"
         platforms: [windows, linux, darwin]
 

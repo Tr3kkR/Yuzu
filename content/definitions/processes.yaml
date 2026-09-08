@@ -34,22 +34,14 @@ spec:
     columns:
       - name: pid
         type: int64
-        description: >
-          The process's numeric identifier, as assigned by the OS
-          kernel at process creation.
-        values: integer
+        description: >-
+          The process's numeric identifier, as assigned by the OS kernel at process creation. Values: integer.
         example: "1936"
         platforms: [windows, linux, darwin]
       - name: name
         type: string
-        description: >
-          The process's short name (Windows: PROCESSENTRY32W.szExeFile,
-          the image filename only, no path; Linux: /proc/<pid>/status
-          Name:, kernel-truncated to 15 bytes; macOS: the resolved
-          on-disk executable path when it starts with '/', else the
-          16-byte-truncated p_comm). '|', CR and LF are replaced with a
-          space before the row is emitted.
-        values: free text
+        description: >-
+          The process's short name (Windows: PROCESSENTRY32W.szExeFile, the image filename only, no path; Linux: /proc/<pid>/status Name:, kernel-truncated to 15 bytes; macOS: the resolved on-disk executable path when it starts with '/', else the 16-byte-truncated p_comm). '|', CR and LF are replaced with a space before the row is emitted. Values: free text.
         example: "svchost.exe"
         platforms: [windows, linux, darwin]
     aggregation:
@@ -120,27 +112,20 @@ spec:
     columns:
       - name: found
         type: bool
-        description: >
-          One leading row: true if at least one process name contains
-          the filter (case-insensitive substring), false otherwise.
-        values: "true, false"
+        description: >-
+          One leading row: true if at least one process name contains the filter (case-insensitive substring), false otherwise. Values: true, false.
         example: "true"
         platforms: [windows, linux, darwin]
       - name: pid
         type: int64
-        description: >
-          The matching process's numeric identifier. Absent (no row)
-          when found=false.
-        values: integer
+        description: >-
+          The matching process's numeric identifier. Absent (no row) when found=false. Values: integer.
         example: "1936"
         platforms: [windows, linux, darwin]
       - name: name
         type: string
-        description: >
-          The matching process's short name, same format and
-          truncation rules as processes.list's name column. Absent
-          (no row) when found=false.
-        values: free text
+        description: >-
+          The matching process's short name, same format and truncation rules as processes.list's name column. Absent (no row) when found=false. Values: free text.
         example: "svchost.exe"
         platforms: [windows, linux, darwin]
     aggregation:

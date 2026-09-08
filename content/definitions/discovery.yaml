@@ -85,29 +85,20 @@ spec:
         platforms: [windows, linux, darwin]
       - name: ip_address
         type: string
-        description: >
-          IPv4 address of a host found in the target subnet, either
-          already present in the OS ARP/neighbour table or reached by
-          an ICMP probe.
-        values: free text (dotted-quad IPv4)
+        description: >-
+          IPv4 address of a host found in the target subnet, either already present in the OS ARP/neighbour table or reached by an ICMP probe. Values: free text (dotted-quad IPv4).
         example: "127.0.0.1"
         platforms: [windows, linux, darwin]
       - name: mac_address
         type: string
-        description: >
-          Colon-separated lowercase MAC48 read from the ARP/neighbour
-          table, or the literal "unknown" when the host has no ARP
-          entry.
-        values: colon-hex MAC48, or "unknown"
+        description: >-
+          Colon-separated lowercase MAC48 read from the ARP/neighbour table, or the literal "unknown" when the host has no ARP entry. Values: colon-hex MAC48, or "unknown".
         example: "unknown"
         platforms: [windows, linux, darwin]
       - name: hostname
         type: string
-        description: >
-          Reverse-DNS (PTR) result for the IP, or the literal
-          "unknown" when the lookup found nothing, timed out, or was
-          throttled.
-        values: free text (PTR hostname), or "unknown"
+        description: >-
+          Reverse-DNS (PTR) result for the IP, or the literal "unknown" when the lookup found nothing, timed out, or was throttled. Values: free text (PTR hostname), or "unknown".
         example: "localhost"
         platforms: [windows, linux, darwin]
       - name: managed

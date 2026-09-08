@@ -45,19 +45,14 @@ spec:
     columns:
       - name: value
         type: string
-        description: >
-          The value's data, decoded to a display string. Never truncated or
-          fabricated; a value over the registry's own limits fails the
-          action rather than returning a partial string.
-        values: free text
+        description: >-
+          The value's data, decoded to a display string. Never truncated or fabricated; a value over the registry's own limits fails the action rather than returning a partial string. Values: free text.
         example: "Windows 10 Pro"
         platforms: [windows]
       - name: type
         type: string
-        description: >
-          The registry value type, named via the shared type table shared
-          with get_user_value and enumerate_values.
-        values: "REG_SZ, REG_EXPAND_SZ, REG_DWORD, REG_QWORD, REG_BINARY, REG_MULTI_SZ, REG_NONE, REG_LINK, REG_DWORD_BIG_ENDIAN, REG_UNKNOWN"
+        description: >-
+          The registry value type, named via the shared type table shared with get_user_value and enumerate_values. Values: REG_SZ, REG_EXPAND_SZ, REG_DWORD, REG_QWORD, REG_BINARY, REG_MULTI_SZ, REG_NONE, REG_LINK, REG_DWORD_BIG_ENDIAN, REG_UNKNOWN.
         example: "REG_SZ"
         platforms: [windows]
   approval:
@@ -138,28 +133,19 @@ spec:
     columns:
       - name: username
         type: string
-        description: >
-          The resolved profile display name the value was read from — falls
-          back to the caller's own username/sid input, then the resolved
-          sid, but is never fabricated and never empty (ADR-0024 D11).
-        values: free text
+        description: >-
+          The resolved profile display name the value was read from — falls back to the caller's own username/sid input, then the resolved sid, but is never fabricated and never empty (ADR-0024 D11). Values: free text.
         example: "alex"
         platforms: [windows]
       - name: value
         type: string
-        description: >
-          The value's data, decoded the same way get_value decodes it, plus
-          REG_MULTI_SZ (records semicolon-joined) and REG_LINK (target
-          string) — the two types get_value leaves hex-encoded — both
-          sanitised against '|'/CR/LF so a value cannot forge a column or
-          row.
-        values: free text
+        description: >-
+          The value's data, decoded the same way get_value decodes it, plus REG_MULTI_SZ (records semicolon-joined) and REG_LINK (target string) — the two types get_value leaves hex-encoded — both sanitised against '|'/CR/LF so a value cannot forge a column or row. Values: free text.
         example: "1"
         platforms: [windows]
       - name: type
         type: string
-        description: The registry value type, named via the shared type table.
-        values: "REG_SZ, REG_EXPAND_SZ, REG_DWORD, REG_QWORD, REG_BINARY, REG_MULTI_SZ, REG_NONE, REG_LINK, REG_DWORD_BIG_ENDIAN, REG_UNKNOWN"
+        description: 'The registry value type, named via the shared type table. Values: REG_SZ, REG_EXPAND_SZ, REG_DWORD, REG_QWORD, REG_BINARY, REG_MULTI_SZ, REG_NONE, REG_LINK, REG_DWORD_BIG_ENDIAN, REG_UNKNOWN.'
         example: "REG_DWORD"
         platforms: [windows]
   readablePayload: "Read registry value '${name}' from user '${username}' key '${key}'"
@@ -203,31 +189,24 @@ spec:
     columns:
       - name: sid
         type: string
-        description: The profile's Windows security identifier.
-        values: free text (a Windows SID string)
+        description: "The profile's Windows security identifier. Values: free text (a Windows SID string)."
         example: "S-1-5-21-571721511-16201247-3531262703-1001"
         platforms: [windows]
       - name: profile_name
         type: string
-        description: >
-          The resolved profile folder name (the last path component of
-          ProfileImagePath); rendered "-" when it cannot be resolved —
-          never falls back to the sid (ADR-0024 D11).
-        values: free text or "-"
+        description: >-
+          The resolved profile folder name (the last path component of ProfileImagePath); rendered "-" when it cannot be resolved — never falls back to the sid (ADR-0024 D11). Values: free text or "-".
         example: "Alex"
         platforms: [windows]
       - name: profile_path
         type: string
-        description: >
-          The profile's ProfileImagePath, environment-expanded; rendered
-          "-" when it is absent or unreadable.
-        values: free text or "-"
+        description: >-
+          The profile's ProfileImagePath, environment-expanded; rendered "-" when it is absent or unreadable. Values: free text or "-".
         example: "C:\\Users\\Alex"
         platforms: [windows]
       - name: hive_state
         type: string
-        description: Whether the profile's registry hive is reachable right now.
-        values: "loaded, loaded_classes_only, not_loaded"
+        description: "Whether the profile's registry hive is reachable right now. Values: loaded, loaded_classes_only, not_loaded."
         example: "loaded"
         platforms: [windows]
   readablePayload: "List local user profiles"
@@ -294,11 +273,8 @@ spec:
     columns:
       - name: status
         type: string
-        description: >
-          Confirms the write succeeded; only ever emitted on success — a
-          failure is reported as an `error|` line and a non-zero exit
-          instead of this column.
-        values: "ok"
+        description: >-
+          Confirms the write succeeded; only ever emitted on success — a failure is reported as an `error|` line and a non-zero exit instead of this column. Values: ok.
         example: "ok"
         platforms: [windows]
   approval:
@@ -349,10 +325,8 @@ spec:
     columns:
       - name: subkey
         type: string
-        description: >
-          One immediate subkey name under the given key; zero rows means
-          the key has no subkeys.
-        values: free text
+        description: >-
+          One immediate subkey name under the given key; zero rows means the key has no subkeys. Values: free text.
         example: "ProfileList"
         platforms: [windows]
   approval:
@@ -409,11 +383,8 @@ spec:
     columns:
       - name: status
         type: string
-        description: >
-          Confirms the delete succeeded; only ever emitted on success — a
-          failure is reported as an `error|` line and a non-zero exit
-          instead of this column.
-        values: "ok"
+        description: >-
+          Confirms the delete succeeded; only ever emitted on success — a failure is reported as an `error|` line and a non-zero exit instead of this column. Values: ok.
         example: "ok"
         platforms: [windows]
   approval:
@@ -465,11 +436,8 @@ spec:
     columns:
       - name: status
         type: string
-        description: >
-          Confirms the delete succeeded; only ever emitted on success — a
-          failure is reported as an `error|` line and a non-zero exit
-          instead of this column.
-        values: "ok"
+        description: >-
+          Confirms the delete succeeded; only ever emitted on success — a failure is reported as an `error|` line and a non-zero exit instead of this column. Values: ok.
         example: "ok"
         platforms: [windows]
   approval:
@@ -521,8 +489,7 @@ spec:
     columns:
       - name: exists
         type: bool
-        description: Whether the key could be opened for read.
-        values: "true, false"
+        description: 'Whether the key could be opened for read. Values: true, false.'
         example: "true"
         platforms: [windows]
   approval:
@@ -575,17 +542,14 @@ spec:
     columns:
       - name: name
         type: string
-        description: >
-          The value's name; zero rows means the key has no values.
-        values: free text
+        description: >-
+          The value's name; zero rows means the key has no values. Values: free text.
         example: "ProductName"
         platforms: [windows]
       - name: type
         type: string
-        description: >
-          The value's registry type, named via the shared type table
-          shared with get_value and get_user_value.
-        values: "REG_SZ, REG_EXPAND_SZ, REG_DWORD, REG_QWORD, REG_BINARY, REG_MULTI_SZ, REG_NONE, REG_LINK, REG_DWORD_BIG_ENDIAN, REG_UNKNOWN"
+        description: >-
+          The value's registry type, named via the shared type table shared with get_value and get_user_value. Values: REG_SZ, REG_EXPAND_SZ, REG_DWORD, REG_QWORD, REG_BINARY, REG_MULTI_SZ, REG_NONE, REG_LINK, REG_DWORD_BIG_ENDIAN, REG_UNKNOWN.
         example: "REG_SZ"
         platforms: [windows]
   approval:

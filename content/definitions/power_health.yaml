@@ -67,46 +67,34 @@ spec:
     columns:
       - name: present
         type: boolean
-        description: Whether a power source was found by the platform mechanism.
-        values: "1 (battery present), 0 (none) — a digit, never true/false"
+        description: 'Whether a power source was found by the platform mechanism. Values: 1 (battery present), 0 (none) — a digit, never true/false.'
         example: "0"
         platforms: [windows, linux, darwin]
       - name: state
         type: string
-        description: Reported battery state.
-        values: "charging, discharging, full, not_charging, ac_no_battery, unknown"
+        description: 'Reported battery state. Values: charging, discharging, full, not_charging, ac_no_battery, unknown.'
         example: ac_no_battery
         platforms: [windows, linux, darwin]
       - name: percent
         type: int64
-        description: Battery charge percentage.
-        values: "0-100, or -1 (unknown)"
+        description: 'Battery charge percentage. Values: 0-100, or -1 (unknown).'
         example: -1
         platforms: [windows, linux, darwin]
       - name: time_to_empty_min
         type: int64
-        description: Estimated minutes until empty.
-        values: "non-negative integer, or -1 (unknown)"
+        description: 'Estimated minutes until empty. Values: non-negative integer, or -1 (unknown).'
         example: -1
         platforms: [windows, linux, darwin]
       - name: cycle_count
         type: int64
-        description: >
-          Battery charge-cycle count. Neither GetSystemPowerStatus/
-          CallNtPowerInformation (Windows) nor IOPSKeys.h (macOS) expose a
-          cycle counter, so this is structurally -1 on those two platforms;
-          only the Linux leg has a real source (POWER_SUPPLY_CYCLE_COUNT).
-        values: "non-negative integer, or -1 (unknown / not exposed by the platform mechanism)"
+        description: >-
+          Battery charge-cycle count. Neither GetSystemPowerStatus/ CallNtPowerInformation (Windows) nor IOPSKeys.h (macOS) expose a cycle counter, so this is structurally -1 on those two platforms; only the Linux leg has a real source (POWER_SUPPLY_CYCLE_COUNT). Values: non-negative integer, or -1 (unknown / not exposed by the platform mechanism).
         example: -1
         platforms: [linux]
       - name: health_percent
         type: int64
-        description: >
-          Battery health as current-full-charge/design-capacity, derived only
-          when the Linux kernel driver exposes both CHARGE_FULL and
-          CHARGE_FULL_DESIGN. Windows and macOS have no equivalent source and
-          are structurally -1.
-        values: "0-100, or -1 (unknown / not exposed by the platform mechanism)"
+        description: >-
+          Battery health as current-full-charge/design-capacity, derived only when the Linux kernel driver exposes both CHARGE_FULL and CHARGE_FULL_DESIGN. Windows and macOS have no equivalent source and are structurally -1. Values: 0-100, or -1 (unknown / not exposed by the platform mechanism).
         example: -1
         platforms: [linux]
     aggregation:
@@ -172,34 +160,20 @@ spec:
     columns:
       - name: status
         type: string
-        description: >
-          Thermal read outcome. constrained is a positive claim of no
-          sensors; unavailable means the read itself failed.
-        values: "ok, constrained, unavailable"
+        description: >-
+          Thermal read outcome. constrained is a positive claim of no sensors; unavailable means the read itself failed. Values: ok, constrained, unavailable.
         example: ok
         platforms: [windows, linux, darwin]
       - name: zone_or_detail
         type: string
-        description: >
-          The zone/sensor name on a Windows or Linux status=ok row, the
-          macOS thermal-pressure level (nominal/fair/serious/critical) on a
-          macOS status=ok row, or a failure/constrained token
-          (no_thermal_zones_exposed, pdh_open_failed, pdh_add_counter_failed,
-          pdh_collect_rejected, pdh_collect_timed_out, pdh_collect_failed,
-          pdh_fetch_failed, pdh_provider_degraded,
-          sys_class_thermal_not_readable) otherwise.
-        values: "free text (zone name), nominal | fair | serious | critical (macOS), or a fixed failure/constrained token"
+        description: >-
+          The zone/sensor name on a Windows or Linux status=ok row, the macOS thermal-pressure level (nominal/fair/serious/critical) on a macOS status=ok row, or a failure/constrained token (no_thermal_zones_exposed, pdh_open_failed, pdh_add_counter_failed, pdh_collect_rejected, pdh_collect_timed_out, pdh_collect_failed, pdh_fetch_failed, pdh_provider_degraded, sys_class_thermal_not_readable) otherwise. Values: free text (zone name), nominal | fair | serious | critical (macOS), or a fixed failure/constrained token.
         example: nominal
         platforms: [windows, linux, darwin]
       - name: celsius
         type: number
-        description: >
-          Sensor temperature in Celsius. Present only on a status=ok row
-          that carries a real per-zone reading (Windows/Linux); the field is
-          omitted entirely (not "-") on every macOS row and on any non-ok
-          row, which is why this column's field count varies by row — see
-          the plugin README's Outputs section.
-        values: "decimal degrees Celsius, or the field is absent"
+        description: >-
+          Sensor temperature in Celsius. Present only on a status=ok row that carries a real per-zone reading (Windows/Linux); the field is omitted entirely (not "-") on every macOS row and on any non-ok row, which is why this column's field count varies by row — see the plugin README's Outputs section. Values: decimal degrees Celsius, or the field is absent.
         example: "-"
         platforms: [windows, linux]
 
@@ -260,17 +234,13 @@ spec:
     columns:
       - name: guid
         type: string
-        description: Power scheme GUID, or "-" when no scheme rows were produced.
-        values: "GUID string, or -"
+        description: 'Power scheme GUID, or "-" when no scheme rows were produced. Values: GUID string, or -.'
         example: 381b4222-f694-41f0-9685-ff5bb260df2e
         platforms: [windows]
       - name: friendly_name
         type: string
-        description: >
-          Operator-visible scheme name (Windows PowerReadFriendlyName;
-          operator-settable via powercfg -changename, so it is untrusted
-          input to the pipe-delimited grammar), or "-".
-        values: "free text, or -"
+        description: >-
+          Operator-visible scheme name (Windows PowerReadFriendlyName; operator-settable via powercfg -changename, so it is untrusted input to the pipe-delimited grammar), or "-". Values: free text, or -.
         example: Balanced
         platforms: [windows]
       - name: active
@@ -282,20 +252,14 @@ spec:
         # misparse the "-" row. Modelled as string like users.yaml's analogous
         # tri-state rather than fabricating a 0.
         type: string
-        description: >
-          Tri-state: "1" active, "0" not active/inapplicable, "-" only when
-          every scheme WAS enumerated but the active-scheme read itself
-          failed (status=active_unknown).
-        values: '"0", "1", "-"'
+        description: >-
+          Tri-state: "1" active, "0" not active/inapplicable, "-" only when every scheme WAS enumerated but the active-scheme read itself failed (status=active_unknown). Values: "0", "1", "-".
         example: "1"
         platforms: [windows, linux, darwin]
       - name: status
         type: string
-        description: >
-          Row outcome: ok (a real enumerated scheme), timeout,
-          enumeration_incomplete, no_schemes_enumerated, active_unknown,
-          unsupported_on_macos, or planned_not_implemented.
-        values: "ok, timeout, enumeration_incomplete, no_schemes_enumerated, active_unknown, unsupported_on_macos, planned_not_implemented"
+        description: >-
+          Row outcome: ok (a real enumerated scheme), timeout, enumeration_incomplete, no_schemes_enumerated, active_unknown, unsupported_on_macos, or planned_not_implemented. Values: ok, timeout, enumeration_incomplete, no_schemes_enumerated, active_unknown, unsupported_on_macos, planned_not_implemented.
         example: ok
         platforms: [windows, linux, darwin]
 
@@ -378,35 +342,25 @@ spec:
     columns:
       - name: status
         type: string
-        description: Mutation outcome.
-        values: "ok, error"
+        description: 'Mutation outcome. Values: ok, error.'
         example: error
         platforms: [windows, linux, darwin]
       - name: reason
         type: string
-        description: >
-          Failure token, or "-" on a success row. missing_param, timeout,
-          enumeration_incomplete, ambiguous, no_match, read_prior_failed,
-          set_failed, readback_failed, and readback_mismatch are Windows
-          failure branches; unsupported_on_macos and planned_not_implemented
-          are the permanent macOS/Linux postures.
-        values: "missing_param, timeout, enumeration_incomplete, ambiguous, no_match, read_prior_failed, set_failed, readback_failed, readback_mismatch, unsupported_on_macos, planned_not_implemented, or -"
+        description: >-
+          Failure token, or "-" on a success row. missing_param, timeout, enumeration_incomplete, ambiguous, no_match, read_prior_failed, set_failed, readback_failed, and readback_mismatch are Windows failure branches; unsupported_on_macos and planned_not_implemented are the permanent macOS/Linux postures. Values: missing_param, timeout, enumeration_incomplete, ambiguous, no_match, read_prior_failed, set_failed, readback_failed, readback_mismatch, unsupported_on_macos, planned_not_implemented, or -.
         example: missing_param
         platforms: [windows, linux, darwin]
       - name: previous_guid
         type: string
-        description: >
-          The scheme GUID active before the mutation attempt (read before
-          any mutation runs), or "-" when not reached or not applicable.
-        values: "GUID string, or -"
+        description: >-
+          The scheme GUID active before the mutation attempt (read before any mutation runs), or "-" when not reached or not applicable. Values: GUID string, or -.
         example: "-"
         platforms: [windows]
       - name: new_guid
         type: string
-        description: >
-          The scheme GUID observed by the post-set read-back, or "-" when
-          not reached.
-        values: "GUID string, or -"
+        description: >-
+          The scheme GUID observed by the post-set read-back, or "-" when not reached. Values: GUID string, or -.
         example: "-"
         platforms: [windows]
 

@@ -31,8 +31,7 @@ spec:
     columns:
       - name: device_name
         type: string
-        description: The device's hostname as reported by the OS.
-        values: free text
+        description: "The device's hostname as reported by the OS. Values: free text."
         example: "DESKTOP-04DNSIG"
         platforms: [windows, linux, darwin]
 
@@ -89,14 +88,12 @@ spec:
     columns:
       - name: domain
         type: string
-        description: The DNS or Active Directory domain name the device reports, or "N/A" if none was found.
-        values: free text (or the literal "N/A")
+        description: 'The DNS or Active Directory domain name the device reports, or "N/A" if none was found. Values: free text (or the literal "N/A").'
         example: "WORKGROUP"
         platforms: [windows, linux, darwin]
       - name: joined
         type: bool
         description: Whether the device is currently joined to a domain or realm.
-        values: [true, false]
         example: false
         platforms: [windows, linux, darwin]
 
@@ -151,8 +148,7 @@ spec:
     columns:
       - name: ou
         type: string
-        description: The Active Directory organizational unit distinguished-name path, or "N/A" if the device is not domain-joined or the OU could not be read.
-        values: free text (AD DN fragment) or the literal "N/A"
+        description: 'The Active Directory organizational unit distinguished-name path, or "N/A" if the device is not domain-joined or the OU could not be read. Values: free text (AD DN fragment) or the literal "N/A".'
         example: "N/A"
         platforms: [windows, linux, darwin]
 

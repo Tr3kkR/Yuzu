@@ -92,14 +92,12 @@ spec:
         platforms: [windows, linux, darwin]
       - name: path
         type: string
-        description: Filesystem path configured for this slot's config key, or the literal "(not configured)" when unset.
-        values: free text (path) or "(not configured)"
+        description: "Filesystem path configured for this slot's config key, or the literal \"(not configured)\" when unset. Values: free text (path) or \"(not configured)\"."
         example: "(not configured)"
         platforms: [windows, linux, darwin]
       - name: exists
         type: bool
         description: Whether std::filesystem::exists() found a file at path; always false when path is unconfigured.
-        values: [true, false]
         example: "false"
         platforms: [windows, linux, darwin]
 
@@ -153,50 +151,42 @@ spec:
     columns:
       - name: server_address
         type: string
-        description: gRPC server endpoint the agent is configured to connect to, or the literal "(not configured)" when unset.
-        values: free text (host:port) or "(not configured)"
+        description: 'gRPC server endpoint the agent is configured to connect to, or the literal "(not configured)" when unset. Values: free text (host:port) or "(not configured)".'
         example: "(not configured)"
         platforms: [windows, linux, darwin]
       - name: tls_enabled
         type: bool
         description: Whether mTLS is enabled for the agent's server connection, read from tls.enabled; false when unset.
-        values: [true, false]
         example: "false"
         platforms: [windows, linux, darwin]
       - name: session_id
         type: string
-        description: Current gRPC session identifier (the live agent session credential), or the literal "(none)" when there is no active session.
-        values: free text or "(none)"
+        description: 'Current gRPC session identifier (the live agent session credential), or the literal "(none)" when there is no active session. Values: free text or "(none)".'
         example: "(none)"
         platforms: [windows, linux, darwin]
       - name: grpc_channel_state
         type: string
-        description: Current gRPC channel connectivity state, read verbatim from agent.grpc_channel_state, or "unknown" when unset.
-        values: free text (e.g. READY, CONNECTING, TRANSIENT_FAILURE) or "unknown"
+        description: 'Current gRPC channel connectivity state, read verbatim from agent.grpc_channel_state, or "unknown" when unset. Values: free text (e.g. READY, CONNECTING, TRANSIENT_FAILURE) or "unknown".'
         example: "unknown"
         platforms: [windows, linux, darwin]
       - name: reconnect_count
         type: int32
-        description: Number of times the agent has reconnected to the server since startup; 0 when unset.
-        values: integer >= 0
+        description: 'Number of times the agent has reconnected to the server since startup; 0 when unset. Values: integer >= 0.'
         example: "0"
         platforms: [windows, linux, darwin]
       - name: latency_ms
         type: int32
-        description: Last measured round-trip latency to the server in milliseconds; 0 when unset.
-        values: integer >= 0
+        description: 'Last measured round-trip latency to the server in milliseconds; 0 when unset. Values: integer >= 0.'
         example: "0"
         platforms: [windows, linux, darwin]
       - name: uptime_seconds
         type: int64
-        description: Seconds since agent.start_time_epoch, computed at read time; 0 when start_time_epoch is unset or unparsable.
-        values: integer >= 0
+        description: 'Seconds since agent.start_time_epoch, computed at read time; 0 when start_time_epoch is unset or unparsable. Values: integer >= 0.'
         example: "0"
         platforms: [windows, linux, darwin]
       - name: connected_since
         type: string
-        description: Unix epoch timestamp (as a string) of when the current connection was established, or "0" when unset.
-        values: free text (epoch seconds) or "0"
+        description: 'Unix epoch timestamp (as a string) of when the current connection was established, or "0" when unset. Values: free text (epoch seconds) or "0".'
         example: "0"
         platforms: [windows, linux, darwin]
 

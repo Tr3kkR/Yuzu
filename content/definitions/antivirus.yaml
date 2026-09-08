@@ -52,8 +52,7 @@ spec:
     columns:
       - name: name
         type: string
-        description: OS-supplied display name of the detected antivirus product or extension.
-        values: free text
+        description: 'OS-supplied display name of the detected antivirus product or extension. Values: free text.'
         example: "Windows Defender"
         platforms: [windows, linux, darwin]
       - name: state
@@ -137,20 +136,17 @@ spec:
         platforms: [windows]
       - name: definition_version
         type: string
-        description: Antivirus signature version string as reported by MSFT_MpComputerStatus.
-        values: free text
+        description: 'Antivirus signature version string as reported by MSFT_MpComputerStatus. Values: free text.'
         example: "1.459.88.0"
         platforms: [windows]
       - name: last_update
         type: string
-        description: Signature last-updated timestamp, WMI CIM datetime format (not ISO-8601).
-        values: free text
+        description: 'Signature last-updated timestamp, WMI CIM datetime format (not ISO-8601). Values: free text.'
         example: "20260906211522.000000+000"
         platforms: [windows]
       - name: last_quick_scan
         type: string
-        description: Last quick-scan completion timestamp, WMI CIM datetime format (not ISO-8601).
-        values: free text
+        description: 'Last quick-scan completion timestamp, WMI CIM datetime format (not ISO-8601). Values: free text.'
         example: "20260906150800.885000+000"
         platforms: [windows]
 
@@ -221,28 +217,24 @@ spec:
     columns:
       - name: definition_version
         type: string
-        description: XProtect definition bundle version token (CFBundleShortVersionString).
-        values: free text
+        description: 'XProtect definition bundle version token (CFBundleShortVersionString). Values: free text.'
         example: "5358"
         platforms: [darwin]
       - name: last_update
         type: string # ISO-8601 (bundle mtime, local time); the Windows defender_status
                       # last_update is a locale-dependent PowerShell render —
                       # do not treat the two as interchangeably formatted
-        description: XProtect bundle Info.plist modification time, ISO-8601 local time. Not the same format as the Windows defender_status last_update.
-        values: free text
+        description: 'XProtect bundle Info.plist modification time, ISO-8601 local time. Not the same format as the Windows defender_status last_update. Values: free text.'
         example: "2026-08-28T08:11:38"
         platforms: [darwin]
       - name: remediator_version
         type: string
-        description: XProtect Remediator (XProtect.app) version token, omitted if unreadable.
-        values: free text
+        description: 'XProtect Remediator (XProtect.app) version token, omitted if unreadable. Values: free text.'
         example: "157"
         platforms: [darwin]
       - name: mrt_version
         type: string
-        description: Malware Removal Tool (MRT.app) version token, omitted if unreadable.
-        values: free text
+        description: 'Malware Removal Tool (MRT.app) version token, omitted if unreadable. Values: free text.'
         example: "1.93"
         platforms: [darwin]
 
@@ -321,7 +313,6 @@ spec:
       - name: value
         type: string
         description: The excluded path, process, or extension, sanitized. Vendor/operator-controlled free text.
-        values: free text
         example: "D:\\yuzu-dev"
         platforms: [windows]
 

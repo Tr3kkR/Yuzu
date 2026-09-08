@@ -46,26 +46,22 @@ spec:
     columns:
       - name: name
         type: string
-        description: The application's display name as read from the OS-native registry or package database.
-        values: free text
+        description: "The application's display name as read from the OS-native registry or package database. Values: free text."
         example: "7-Zip 26.02 (x64)"
         platforms: [windows, linux, darwin]
       - name: version
         type: string
-        description: The installed version string, or "-" when the source reports none.
-        values: free text or "-"
+        description: 'The installed version string, or "-" when the source reports none. Values: free text or "-".'
         example: "26.02"
         platforms: [windows, linux, darwin]
       - name: publisher
         type: string
-        description: The vendor or maintainer name; always "-" on macOS, since system_profiler's mini detail carries no publisher field.
-        values: free text or "-"
+        description: "The vendor or maintainer name; always \"-\" on macOS, since system_profiler's mini detail carries no publisher field. Values: free text or \"-\"."
         example: "Igor Pavlov"
         platforms: [windows, linux]
       - name: install_date
         type: string
-        description: Install date in the OS's native format (Windows registry InstallDate, rpm's formatted install time); "-" when the source reports none, which dpkg-based Linux hosts always do.
-        values: free text or "-"
+        description: "Install date in the OS's native format (Windows registry InstallDate, rpm's formatted install time); \"-\" when the source reports none, which dpkg-based Linux hosts always do. Values: free text or \"-\"."
         example: "20260617"
         platforms: [windows, darwin]
     aggregation:
@@ -136,26 +132,22 @@ spec:
     columns:
       - name: found
         type: bool
-        description: Whether at least one installed application matched the search string.
-        values: "true, false"
+        description: 'Whether at least one installed application matched the search string. Values: true, false.'
         example: "true"
         platforms: [windows, linux, darwin]
       - name: name
         type: string
-        description: The matching application's display name.
-        values: free text
+        description: "The matching application's display name. Values: free text."
         example: "Microsoft Edge"
         platforms: [windows, linux, darwin]
       - name: version
         type: string
-        description: The matching application's installed version string, or "-" when the source reports none.
-        values: free text or "-"
+        description: "The matching application's installed version string, or \"-\" when the source reports none. Values: free text or \"-\"."
         example: "152.0.4191.66"
         platforms: [windows, linux, darwin]
       - name: publisher
         type: string
-        description: The vendor or maintainer name; always "-" on macOS, since system_profiler's mini detail carries no publisher field.
-        values: free text or "-"
+        description: "The vendor or maintainer name; always \"-\" on macOS, since system_profiler's mini detail carries no publisher field. Values: free text or \"-\"."
         example: "Microsoft Corporation"
         platforms: [windows, linux]
     aggregation:
@@ -218,32 +210,27 @@ spec:
     columns:
       - name: username
         type: string
-        description: The resolved local profile name on Windows (never the SID), the literal "system" for the machine-scope Linux/macOS leg, or "brew" for macOS per-user Homebrew formulae.
-        values: profile name, "system", "brew", or "-"
+        description: 'The resolved local profile name on Windows (never the SID), the literal "system" for the machine-scope Linux/macOS leg, or "brew" for macOS per-user Homebrew formulae. Values: profile name, "system", "brew", or "-".'
         example: "Alex"
         platforms: [windows, linux, darwin]
       - name: name
         type: string
-        description: The application's display name.
-        values: free text
+        description: "The application's display name. Values: free text."
         example: "Signal 8.18.0"
         platforms: [windows, linux, darwin]
       - name: version
         type: string
-        description: The installed version string, or "-" when the source reports none.
-        values: free text or "-"
+        description: 'The installed version string, or "-" when the source reports none. Values: free text or "-".'
         example: "8.18.0"
         platforms: [windows, linux, darwin]
       - name: publisher
         type: string
-        description: The vendor or maintainer name; always "-" on macOS and for Homebrew rows.
-        values: free text or "-"
+        description: 'The vendor or maintainer name; always "-" on macOS and for Homebrew rows. Values: free text or "-".'
         example: "Signal Messenger, LLC"
         platforms: [windows, linux]
       - name: install_date
         type: string
-        description: Install date in the OS's native format; "-" when the source reports none, which dpkg-based Linux hosts and Homebrew rows always do.
-        values: free text or "-"
+        description: "Install date in the OS's native format; \"-\" when the source reports none, which dpkg-based Linux hosts and Homebrew rows always do. Values: free text or \"-\"."
         example: "20260714"
         platforms: [windows, darwin]
     aggregation:

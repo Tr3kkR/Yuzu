@@ -69,70 +69,48 @@ spec:
     columns:
       - name: subject
         type: string
-        description: >
-          The certificate's Subject distinguished name, rendered by the OS's
-          own name printer (CryptoAPI simple display name on Windows,
-          OpenSSL/libcrypto's default name rendering on Linux and macOS
-          System/root reads, the `security find-certificate` subprocess's
-          `subject=` line on the macOS login keychain).
-        values: free text (distinguished name)
+        description: >-
+          The certificate's Subject distinguished name, rendered by the OS's own name printer (CryptoAPI simple display name on Windows, OpenSSL/libcrypto's default name rendering on Linux and macOS System/root reads, the `security find-certificate` subprocess's `subject=` line on the macOS login keychain). Values: free text (distinguished name).
         example: "Logitech Inc"
         platforms: [windows, linux, darwin]
       - name: issuer
         type: string
-        description: >
-          The certificate's Issuer distinguished name, rendered the same way
-          as subject.
-        values: free text (distinguished name)
+        description: >-
+          The certificate's Issuer distinguished name, rendered the same way as subject. Values: free text (distinguished name).
         example: "DigiCert Trusted G4 Code Signing RSA4096 SHA384 2021 CA1"
         platforms: [windows, linux, darwin]
       - name: thumbprint
         type: string
-        description: >
-          SHA-1 fingerprint of the certificate's DER encoding, uppercase hex
-          with no separators -- the identifier `details`/`delete` match
-          against (the request parameter is case-insensitive, this column is
-          always uppercase). "(unknown)" when the row's identity could not be
-          established (a failed/timed-out per-block parse) and "(skipped)" for
-          a Linux file that could not be read at all.
-        values: 40 uppercase hex characters, or "(unknown)"/"(skipped)"
+        description: >-
+          SHA-1 fingerprint of the certificate's DER encoding, uppercase hex with no separators -- the identifier `details`/`delete` match against (the request parameter is case-insensitive, this column is always uppercase). "(unknown)" when the row's identity could not be established (a failed/timed-out per-block parse) and "(skipped)" for a Linux file that could not be read at all. Values: 40 uppercase hex characters, or "(unknown)"/"(skipped)".
         example: "FBD3B2C0991549EC5FB12FA1A994D2E0C32D8057"
         platforms: [windows, linux, darwin]
       - name: not_before
         type: string
-        description: Validity-period start date, YYYY-MM-DD (no time-of-day).
-        values: "date (YYYY-MM-DD), or \"(unknown)\" when the source date could not be parsed"
+        description: 'Validity-period start date, YYYY-MM-DD (no time-of-day). Values: date (YYYY-MM-DD), or "(unknown)" when the source date could not be parsed.'
         example: "2025-01-09"
         platforms: [windows, linux, darwin]
       - name: not_after
         type: string
-        description: >
-          Validity-period end date, YYYY-MM-DD. Also the field
-          `expiring_within_days` filters on.
-        values: "date (YYYY-MM-DD), or \"(unknown)\" when the source date could not be parsed"
+        description: >-
+          Validity-period end date, YYYY-MM-DD. Also the field `expiring_within_days` filters on. Values: date (YYYY-MM-DD), or "(unknown)" when the source date could not be parsed.
         example: "2026-01-09"
         platforms: [windows, linux, darwin]
       - name: serial
         type: string
-        description: >
-          Certificate serial number as hex text, via the OS's own serial
-          renderer (Windows: little-endian byte reversal; Linux/macOS:
-          `i2a_ASN1_INTEGER` or the openssl `-serial` line).
-        values: free text (hex)
+        description: >-
+          Certificate serial number as hex text, via the OS's own serial renderer (Windows: little-endian byte reversal; Linux/macOS: `i2a_ASN1_INTEGER` or the openssl `-serial` line). Values: free text (hex).
         example: "09CFB6DE3AB5124757FFEFDF3759BBF2"
         platforms: [windows, linux, darwin]
       - name: store
         type: string
-        description: Which store/keychain/directory the row was read from.
-        values: "Windows: MY, ROOT, CA, Trust. macOS: System.keychain, SystemRootCertificates.keychain, login.keychain-db. Linux: the literal path \"/etc/ssl/certs\" for every row."
+        description: 'Which store/keychain/directory the row was read from. Values: Windows: MY, ROOT, CA, Trust. macOS: System.keychain, SystemRootCertificates.keychain, login.keychain-db. Linux: the literal path "/etc/ssl/certs" for every row..'
         example: "ROOT"
         platforms: [windows, linux, darwin]
       - name: key_usage
         type: string
-        description: >
-          Comma-separated X.509 Key Usage extension names, or "(none)" when
-          the extension is absent, empty, or could not be read.
-        values: "comma-separated usage names, or \"(none)\""
+        description: >-
+          Comma-separated X.509 Key Usage extension names, or "(none)" when the extension is absent, empty, or could not be read. Values: comma-separated usage names, or "(none)".
         example: "Digital Signature"
         platforms: [windows, linux, darwin]
     aggregation:
@@ -222,65 +200,47 @@ spec:
     columns:
       - name: subject
         type: string
-        description: >
-          The certificate's Subject distinguished name, rendered by the OS's
-          own name printer (CryptoAPI simple display name on Windows,
-          OpenSSL/libcrypto's default name rendering on Linux and macOS
-          System/root reads, the `security find-certificate` subprocess's
-          `subject=` line on the macOS login keychain).
-        values: free text (distinguished name)
+        description: >-
+          The certificate's Subject distinguished name, rendered by the OS's own name printer (CryptoAPI simple display name on Windows, OpenSSL/libcrypto's default name rendering on Linux and macOS System/root reads, the `security find-certificate` subprocess's `subject=` line on the macOS login keychain). Values: free text (distinguished name).
         example: "CN=com.apple.systemdefault, O=System Identity"
         platforms: [windows, linux, darwin]
       - name: issuer
         type: string
-        description: >
-          The certificate's Issuer distinguished name, rendered the same way
-          as subject.
-        values: free text (distinguished name)
+        description: >-
+          The certificate's Issuer distinguished name, rendered the same way as subject. Values: free text (distinguished name).
         example: "CN=com.apple.systemdefault, O=System Identity"
         platforms: [windows, linux, darwin]
       - name: thumbprint
         type: string
-        description: >
-          SHA-1 fingerprint of the certificate's DER encoding, uppercase hex
-          with no separators -- always equal to the request's `thumbprint`
-          parameter (canonicalized to uppercase) on a matching row.
-        values: 40 uppercase hex characters
+        description: >-
+          SHA-1 fingerprint of the certificate's DER encoding, uppercase hex with no separators -- always equal to the request's `thumbprint` parameter (canonicalized to uppercase) on a matching row. Values: 40 uppercase hex characters.
         example: "0C24DA5DE02640D8924F5C7BCB7D5F734815228D"
         platforms: [windows, linux, darwin]
       - name: not_before
         type: string
-        description: Validity-period start date, YYYY-MM-DD (no time-of-day).
-        values: "date (YYYY-MM-DD), or \"(unknown)\" when the source date could not be parsed"
+        description: 'Validity-period start date, YYYY-MM-DD (no time-of-day). Values: date (YYYY-MM-DD), or "(unknown)" when the source date could not be parsed.'
         example: "2026-07-18"
         platforms: [windows, linux, darwin]
       - name: not_after
         type: string
-        description: Validity-period end date, YYYY-MM-DD.
-        values: "date (YYYY-MM-DD), or \"(unknown)\" when the source date could not be parsed"
+        description: 'Validity-period end date, YYYY-MM-DD. Values: date (YYYY-MM-DD), or "(unknown)" when the source date could not be parsed.'
         example: "2046-07-13"
         platforms: [windows, linux, darwin]
       - name: serial
         type: string
-        description: >
-          Certificate serial number as hex text, via the OS's own serial
-          renderer (Windows: little-endian byte reversal; Linux/macOS:
-          `i2a_ASN1_INTEGER` or the openssl `-serial` line).
-        values: free text (hex)
+        description: >-
+          Certificate serial number as hex text, via the OS's own serial renderer (Windows: little-endian byte reversal; Linux/macOS: `i2a_ASN1_INTEGER` or the openssl `-serial` line). Values: free text (hex).
         example: "076C11D1"
         platforms: [windows, linux, darwin]
       - name: store
         type: string
-        description: Which store/keychain/directory the matching row was found in.
-        values: "Windows: MY, ROOT, CA, Trust. macOS: System.keychain, SystemRootCertificates.keychain, login.keychain-db. Linux: the literal path \"/etc/ssl/certs\"."
+        description: 'Which store/keychain/directory the matching row was found in. Values: Windows: MY, ROOT, CA, Trust. macOS: System.keychain, SystemRootCertificates.keychain, login.keychain-db. Linux: the literal path "/etc/ssl/certs"..'
         example: "System.keychain"
         platforms: [windows, linux, darwin]
       - name: key_usage
         type: string
-        description: >
-          Comma-separated X.509 Key Usage extension names, or "(none)" when
-          the extension is absent, empty, or could not be read.
-        values: "comma-separated usage names, or \"(none)\""
+        description: >-
+          Comma-separated X.509 Key Usage extension names, or "(none)" when the extension is absent, empty, or could not be read. Values: comma-separated usage names, or "(none)".
         example: "Digital Signature, Key Encipherment, Data Encipherment"
         platforms: [windows, linux, darwin]
 
@@ -363,18 +323,8 @@ spec:
     columns:
       - name: status
         type: string
-        description: >
-          A successful macOS delete emits status|deleted; a delete targeting
-          a certificate already provably absent from the keychain emits
-          status|not_found (rc 0), matching the Windows/Linux contract for an
-          absent cert. store=root is rejected with error|MESSAGE
-          (SystemRootCertificates.keychain is sealed by System Integrity
-          Protection). Every other macOS rejection or failure -- an
-          unsupported store, a failed delete command, or a post-delete
-          verification that still finds the certificate or could not re-read
-          the keychain -- also emits error|MESSAGE. Windows and Linux always
-          emit status|deleted, status|delete_failed, or status|not_found.
-        values: "status|deleted, status|not_found, status|delete_failed (Windows/Linux only), error|<message> (any OS: bad thumbprint, unsupported/rejected store, or a macOS delete that could not be verified), not_available|<reason> (macOS only, pre-validation)"
+        description: >-
+          A successful macOS delete emits status|deleted; a delete targeting a certificate already provably absent from the keychain emits status|not_found (rc 0), matching the Windows/Linux contract for an absent cert. store=root is rejected with error|MESSAGE (SystemRootCertificates.keychain is sealed by System Integrity Protection). Every other macOS rejection or failure -- an unsupported store, a failed delete command, or a post-delete verification that still finds the certificate or could not re-read the keychain -- also emits error|MESSAGE. Windows and Linux always emit status|deleted, status|delete_failed, or status|not_found. Values: status|deleted, status|not_found, status|delete_failed (Windows/Linux only), error|<message> (any OS: bad thumbprint, unsupported/rejected store, or a macOS delete that could not be verified), not_available|<reason> (macOS only, pre-validation).
         example: "error|thumbprint parameter required"
         platforms: [windows, linux, darwin]
 

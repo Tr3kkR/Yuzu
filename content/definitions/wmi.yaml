@@ -36,14 +36,12 @@ spec:
     columns:
       - name: property
         type: string
-        description: The non-system WMI property name for one output row; null/empty/array-typed properties are omitted rather than reported as empty.
-        values: free text (WMI property name)
+        description: 'The non-system WMI property name for one output row; null/empty/array-typed properties are omitted rather than reported as empty. Values: free text (WMI property name).'
         example: Caption
         platforms: [windows]
       - name: value
         type: string
-        description: The stringified WMI property value — BSTR text passed through, numeric VARIANTs formatted as decimal text, booleans as `true`/`false`.
-        values: free text
+        description: 'The stringified WMI property value — BSTR text passed through, numeric VARIANTs formatted as decimal text, booleans as `true`/`false`. Values: free text.'
         example: Microsoft Windows 11 Pro
         platforms: [windows]
   approval:
@@ -93,14 +91,12 @@ spec:
     columns:
       - name: property
         type: string
-        description: The non-system WMI property name for one property of the first matching instance; null/empty/array-typed properties are omitted rather than reported as empty.
-        values: free text (WMI property name)
+        description: 'The non-system WMI property name for one property of the first matching instance; null/empty/array-typed properties are omitted rather than reported as empty. Values: free text (WMI property name).'
         example: BootDevice
         platforms: [windows]
       - name: value
         type: string
-        description: The stringified WMI property value — BSTR text passed through, numeric VARIANTs formatted as decimal text, booleans as `true`/`false`.
-        values: free text
+        description: 'The stringified WMI property value — BSTR text passed through, numeric VARIANTs formatted as decimal text, booleans as `true`/`false`. Values: free text.'
         example: \Device\HarddiskVolume1
         platforms: [windows]
   approval:

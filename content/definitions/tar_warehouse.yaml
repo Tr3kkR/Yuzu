@@ -44,14 +44,8 @@ spec:
     columns:
       - name: output
         type: clob
-        description: >
-          One line per row of the underlying query result (pipe-delimited
-          field values, as produced by `sql`'s row loop). The base `sql`
-          action additionally emits a leading `__schema__|<col>|<col>...`
-          line and a trailing `__total__|<n>` line; this canned query
-          executes through that same action and inherits the identical wire
-          shape.
-        values: pipe-delimited row text, or the __schema__/__total__ marker lines
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
         example: "-"
         platforms: [windows, linux, darwin]
 
@@ -110,14 +104,8 @@ spec:
     columns:
       - name: output
         type: clob
-        description: >
-          One line per row of the underlying query result (pipe-delimited
-          field values, as produced by `sql`'s row loop). The base `sql`
-          action additionally emits a leading `__schema__|<col>|<col>...`
-          line and a trailing `__total__|<n>` line; this canned query
-          executes through that same action and inherits the identical wire
-          shape.
-        values: pipe-delimited row text, or the __schema__/__total__ marker lines
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
         example: "-"
         platforms: [windows, linux, darwin]
 
@@ -176,14 +164,8 @@ spec:
     columns:
       - name: output
         type: clob
-        description: >
-          One line per row of the underlying query result (pipe-delimited
-          field values, as produced by `sql`'s row loop). The base `sql`
-          action additionally emits a leading `__schema__|<col>|<col>...`
-          line and a trailing `__total__|<n>` line; this canned query
-          executes through that same action and inherits the identical wire
-          shape.
-        values: pipe-delimited row text, or the __schema__/__total__ marker lines
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
         example: "-"
         platforms: [windows, linux, darwin]
 
@@ -242,14 +224,8 @@ spec:
     columns:
       - name: output
         type: clob
-        description: >
-          One line per row of the underlying query result (pipe-delimited
-          field values, as produced by `sql`'s row loop). The base `sql`
-          action additionally emits a leading `__schema__|<col>|<col>...`
-          line and a trailing `__total__|<n>` line; this canned query
-          executes through that same action and inherits the identical wire
-          shape.
-        values: pipe-delimited row text, or the __schema__/__total__ marker lines
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
         example: "-"
         platforms: [windows, linux, darwin]
 
@@ -308,14 +284,8 @@ spec:
     columns:
       - name: output
         type: clob
-        description: >
-          One line per row of the underlying query result (pipe-delimited
-          field values, as produced by `sql`'s row loop). The base `sql`
-          action additionally emits a leading `__schema__|<col>|<col>...`
-          line and a trailing `__total__|<n>` line; this canned query
-          executes through that same action and inherits the identical wire
-          shape.
-        values: pipe-delimited row text, or the __schema__/__total__ marker lines
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
         example: "-"
         platforms: [windows, linux, darwin]
 
@@ -374,14 +344,8 @@ spec:
     columns:
       - name: output
         type: clob
-        description: >
-          One line per row of the underlying query result (pipe-delimited
-          field values, as produced by `sql`'s row loop). The base `sql`
-          action additionally emits a leading `__schema__|<col>|<col>...`
-          line and a trailing `__total__|<n>` line; this canned query
-          executes through that same action and inherits the identical wire
-          shape.
-        values: pipe-delimited row text, or the __schema__/__total__ marker lines
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
         example: "-"
         platforms: [windows, linux, darwin]
 
@@ -437,14 +401,8 @@ spec:
     columns:
       - name: output
         type: clob
-        description: >
-          One line per row of the underlying query result (pipe-delimited
-          field values, as produced by `sql`'s row loop). The base `sql`
-          action additionally emits a leading `__schema__|<col>|<col>...`
-          line and a trailing `__total__|<n>` line; this canned query
-          executes through that same action and inherits the identical wire
-          shape.
-        values: pipe-delimited row text, or the __schema__/__total__ marker lines
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
         example: "-"
         platforms: [windows, linux, darwin]
 
@@ -503,14 +461,8 @@ spec:
     columns:
       - name: output
         type: clob
-        description: >
-          One line per row of the underlying query result (pipe-delimited
-          field values, as produced by `sql`'s row loop). The base `sql`
-          action additionally emits a leading `__schema__|<col>|<col>...`
-          line and a trailing `__total__|<n>` line; this canned query
-          executes through that same action and inherits the identical wire
-          shape.
-        values: pipe-delimited row text, or the __schema__/__total__ marker lines
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
         example: "-"
         platforms: [windows, linux, darwin]
 
@@ -569,14 +521,8 @@ spec:
     columns:
       - name: output
         type: clob
-        description: >
-          One line per row of the underlying query result (pipe-delimited
-          field values, as produced by `sql`'s row loop). The base `sql`
-          action additionally emits a leading `__schema__|<col>|<col>...`
-          line and a trailing `__total__|<n>` line; this canned query
-          executes through that same action and inherits the identical wire
-          shape.
-        values: pipe-delimited row text, or the __schema__/__total__ marker lines
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
         example: "-"
         platforms: [windows, linux, darwin]
 
@@ -636,14 +582,8 @@ spec:
     columns:
       - name: output
         type: clob
-        description: >
-          One line per row of the underlying query result (pipe-delimited
-          field values, as produced by `sql`'s row loop). The base `sql`
-          action additionally emits a leading `__schema__|<col>|<col>...`
-          line and a trailing `__total__|<n>` line; this canned query
-          executes through that same action and inherits the identical wire
-          shape.
-        values: pipe-delimited row text, or the __schema__/__total__ marker lines
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
         example: "-"
         platforms: [windows, linux, darwin]
 
@@ -711,14 +651,8 @@ spec:
     columns:
       - name: output
         type: clob
-        description: >
-          One line per row of the underlying query result (pipe-delimited
-          field values, as produced by `sql`'s row loop). The base `sql`
-          action additionally emits a leading `__schema__|<col>|<col>...`
-          line and a trailing `__total__|<n>` line; this canned query
-          executes through that same action and inherits the identical wire
-          shape.
-        values: pipe-delimited row text, or the __schema__/__total__ marker lines
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
         example: "-"
         platforms: [windows, linux, darwin]
 
@@ -786,14 +720,8 @@ spec:
     columns:
       - name: output
         type: clob
-        description: >
-          One line per row of the underlying query result (pipe-delimited
-          field values, as produced by `sql`'s row loop). The base `sql`
-          action additionally emits a leading `__schema__|<col>|<col>...`
-          line and a trailing `__total__|<n>` line; this canned query
-          executes through that same action and inherits the identical wire
-          shape.
-        values: pipe-delimited row text, or the __schema__/__total__ marker lines
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
         example: "-"
         platforms: [windows, linux, darwin]
 
@@ -846,24 +774,14 @@ spec:
     columns:
       - name: status
         type: string
-        description: >
-          Declared as a literal status token; the plugin's actual
-          response line is `tar|rollup|<n>|rows_aggregated`
-          (a single positional line, not a status/rows_aggregated
-          pair), so this column is not populated by the current
-          wire format — see Caveats and known gaps.
-        values: not emitted by the current wire format
+        description: >-
+          Declared as a literal status token; the plugin's actual response line is `tar|rollup|<n>|rows_aggregated` (a single positional line, not a status/rows_aggregated pair), so this column is not populated by the current wire format — see Caveats and known gaps. Values: not emitted by the current wire format.
         example: "-"
         platforms: []
       - name: rows_aggregated
         type: int32
-        description: >
-          Number of rows the aggregation pass moved into the
-          hourly/daily/monthly tiers this cycle (run_aggregation's
-          return value); carried as the third field of the
-          `tar|rollup|<n>|rows_aggregated` line rather than a
-          named column.
-        values: non-negative integer
+        description: >-
+          Number of rows the aggregation pass moved into the hourly/daily/monthly tiers this cycle (run_aggregation's return value); carried as the third field of the `tar|rollup|<n>|rows_aggregated` line rather than a named column. Values: non-negative integer.
         example: "-"
         platforms: [windows, linux, darwin]
 
@@ -926,14 +844,8 @@ spec:
     columns:
       - name: output
         type: clob
-        description: >
-          One line per row of the underlying query result (pipe-delimited
-          field values, as produced by `sql`'s row loop). The base `sql`
-          action additionally emits a leading `__schema__|<col>|<col>...`
-          line and a trailing `__total__|<n>` line; this canned query
-          executes through that same action and inherits the identical wire
-          shape.
-        values: pipe-delimited row text, or the __schema__/__total__ marker lines
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
         example: "-"
         platforms: [windows]
 
@@ -995,14 +907,8 @@ spec:
     columns:
       - name: output
         type: clob
-        description: >
-          One line per row of the underlying query result (pipe-delimited
-          field values, as produced by `sql`'s row loop). The base `sql`
-          action additionally emits a leading `__schema__|<col>|<col>...`
-          line and a trailing `__total__|<n>` line; this canned query
-          executes through that same action and inherits the identical wire
-          shape.
-        values: pipe-delimited row text, or the __schema__/__total__ marker lines
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
         example: "-"
         platforms: [windows]
 
@@ -1067,14 +973,8 @@ spec:
     columns:
       - name: output
         type: clob
-        description: >
-          One line per row of the underlying query result (pipe-delimited
-          field values, as produced by `sql`'s row loop). The base `sql`
-          action additionally emits a leading `__schema__|<col>|<col>...`
-          line and a trailing `__total__|<n>` line; this canned query
-          executes through that same action and inherits the identical wire
-          shape.
-        values: pipe-delimited row text, or the __schema__/__total__ marker lines
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
         example: "-"
         platforms: [windows, linux]
 
