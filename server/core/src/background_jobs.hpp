@@ -150,9 +150,11 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
     {"policy_evaluator.dispatch_due", "policy_eval_thread_", BackgroundJobClass::FencedLeaderOnly,
      "side-effecting due-policy scheduling dispatch; ADR-0056 claim_due_policies is fleet-safe but the leader-only gate cuts non-leader churn (WS-3 3.2/3.4)"},
 
-    // ---- schedule_tick_thread_ (30s tick) ----
+    // ---- schedule_tick_thread_ (30s schedule eval; 5s outbox delivery sub-tick) ----
     {"schedule_runner.tick", "schedule_tick_thread_", BackgroundJobClass::FencedLeaderOnly,
-     "side-effecting scheduled dispatch — double-fire across replicas without a fenced leader (WS-3 3.2)"},
+     "side-effecting scheduled dispatch — enqueues a durable outbox occurrence; double-enqueue across replicas without a fenced leader (WS-3 3.2/3.3)"},
+    {"command_outbox.deliver", "schedule_tick_thread_", BackgroundJobClass::FencedLeaderOnly,
+     "side-effecting wire dispatch of pending command-outbox occurrences (WS-3 3.3); effectively-once holds via the stable command_id + agent dedup, but the leader gate keeps a second replica from redundantly re-driving"},
 
     // ---- quarantine_reconcile_thread_ (20s tick) ----
     {"quarantine_reconciler.tick", "quarantine_reconcile_thread_", BackgroundJobClass::FencedLeaderOnly,

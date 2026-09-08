@@ -71,10 +71,9 @@ class CommandOutboxDelivery {
 public:
     /// The PLAIN confined dispatch (R1: NO concurrency gate) WITH a
     /// caller-supplied `command_id` — the occurrence's stable id, threaded so a
-    /// re-drive reuses it and the agent dedups. A deliberate sibling of
-    /// `ScheduleRunner::CommandDispatchFn` (which mints its own id and takes no
-    /// concurrency mode); server.cpp binds this to the shared dispatch lambda's
-    /// supplied-command_id path.
+    /// re-drive reuses it and the agent dedups. server.cpp binds this to the
+    /// shared `dispatch_confined` seam's `supplied_command_id` path with empty
+    /// `definition_id`/`concurrency_mode` (so no ADR-1007 per-device claim runs).
     using DispatchFn = std::function<yuzu::server::ConfinedDispatchOutcome(
         const std::string& plugin, const std::string& action,
         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
@@ -83,8 +82,9 @@ public:
         const std::string& command_id)>;
 
     /// Resolve the CURRENT `DispatchCaller` for a stored principal at send time
-    /// (re-resolving live permissions — never a stale snapshot). Same shape and
-    /// wiring as `ScheduleRunner::ResolveCallerFn`.
+    /// (re-resolving live permissions — never a stale snapshot). server.cpp binds
+    /// this to `derive_dispatch_caller_for_username`, the same resolver the
+    /// operator dispatch surfaces use.
     using ResolveCallerFn = std::function<yuzu::server::DispatchCaller(const std::string& principal)>;
 
     /// Re-verify the principal's CURRENT authority to fire one plugin.action at

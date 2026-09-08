@@ -45,7 +45,7 @@ bool ticket_is_current(const Approval& a, const InstructionSchedule& s) {
 ScheduleRunner::ScheduleRunner(Deps deps) : d_(std::move(deps)) {}
 
 void ScheduleRunner::tick() {
-    if (!d_.schedule_engine || !d_.instruction_store || !d_.dispatch_fn)
+    if (!d_.schedule_engine || !d_.instruction_store || !d_.enqueue_fn)
         return;
 
     for (const auto& s : d_.schedule_engine->evaluate_due()) {
@@ -159,8 +159,13 @@ void ScheduleRunner::fire(const InstructionSchedule& s) {
         return; // pending → stays due, re-checked next tick
     }
 
-    dispatch_tracked(s, def.plugin, def.action, /*approval_id=*/"");
-    d_.schedule_engine->advance_schedule(s.id);
+    // WS-3 3.3: enqueue a durable occurrence instead of dispatching inline. Only
+    // advance on a durable enqueue — a degraded/fenced-out enqueue leaves the
+    // schedule due so it retries next tick, and the stable occurrence key makes
+    // the retry idempotent (matching the store-unavailable no-advance posture of
+    // the get_definition path above).
+    if (enqueue_occurrence(s, def.plugin, def.action, /*approval_id=*/""))
+        d_.schedule_engine->advance_schedule(s.id);
 }
 
 bool ScheduleRunner::fire_with_approval(const InstructionSchedule& s, const std::string& plugin,
@@ -228,8 +233,11 @@ bool ScheduleRunner::fire_with_approval(const InstructionSchedule& s, const std:
             }
             continue;
         }
-        dispatch_tracked(s, plugin, action, a.id);
-        return true;
+        // WS-3 3.3: enqueue instead of inline dispatch. Propagate the enqueue
+        // outcome as the settle signal — a degraded enqueue returns false so the
+        // caller does NOT advance; the approved ticket stays valid and the next
+        // tick re-enqueues the same (idempotent) occurrence.
+        return enqueue_occurrence(s, plugin, action, a.id);
     }
 
     // 2) A PENDING ticket for THIS schedule → the occurrence waits (no
@@ -291,178 +299,118 @@ bool ScheduleRunner::fire_with_approval(const InstructionSchedule& s, const std:
     return false;
 }
 
-int ScheduleRunner::dispatch_tracked(const InstructionSchedule& s, const std::string& plugin,
-                                     const std::string& action, const std::string& approval_id) {
-    // Create-before-dispatch (executions ladder UP2-4): the execution row must
-    // exist and the command_id→execution_id mapping must be registered by the
-    // dispatch fn BEFORE any RPC, or a fast loopback agent can reply ahead of
-    // the mapping. dispatched_by = the schedule's creator: scheduled runs are
-    // attributed to the operator who authored the schedule, and the dispatch
-    // fn recovers this principal for owner-scoped scope kinds.
+bool ScheduleRunner::enqueue_occurrence(const InstructionSchedule& s, const std::string& plugin,
+                                        const std::string& action, const std::string& approval_id) {
+    if (!d_.enqueue_fn) {
+        // Fail closed: without a wired enqueue seam a fire cannot be durably
+        // recorded. Do NOT advance — the schedule stays due and retries once the
+        // seam is wired (never a silently-dropped occurrence).
+        count("yuzu_schedule_fire_failures_total");
+        spdlog::error("schedule_runner: schedule '{}' (id={}) has no enqueue_fn wired — occurrence "
+                      "not queued",
+                      s.name, s.id);
+        return false;
+    }
+
+    // Create-before-dispatch (executions ladder UP2-4): the execution row is
+    // created HERE, at enqueue time, so scheduled runs appear in the Executions
+    // history immediately; the delivery loop registers the command_id→exec_id
+    // mapping and dispatches later. dispatched_by = the schedule's creator.
     std::string exec_id;
     if (d_.execution_tracker) {
         Execution exec;
         exec.definition_id = s.definition_id;
         exec.status = "running";
         exec.scope_expression = s.scope_expression;
-        // PR1.5a: the schedule's own canonical parameters, not a hardcoded
-        // "{}" — create_schedule() guarantees s.parameter_values is always a
-        // validated canonical blob (never truly empty), but a schedule row
-        // constructed off the persistence path (a test, a future direct
-        // caller) is defended against here too.
+        // PR1.5a: the schedule's own canonical parameters, not a hardcoded "{}".
         exec.parameter_values =
             s.parameter_values.empty() ? std::string(kEmptyScheduleParams) : s.parameter_values;
         exec.dispatched_by = s.created_by;
         if (auto created = d_.execution_tracker->create_execution(exec); created.has_value())
             exec_id = *created;
         else
-            spdlog::warn("schedule_runner: create_execution failed for schedule '{}' — firing "
+            spdlog::warn("schedule_runner: create_execution failed for schedule '{}' — queuing "
                          "untracked",
                          s.name);
     }
 
-    std::string command_id;
-    int sent = 0;
-    // #2500: a schedule has no agent_ids, so an empty `scope_expression` is how
-    // this path has always meant "the whole fleet" — but it meant it by falling
-    // into the dispatch sink's empty-means-everybody default, which that issue
-    // inverted. Say it explicitly so the behaviour survives the inversion and is
-    // greppable at the call site rather than implied three files away.
-    //
-    // This PRESERVES today's semantics; it does not fix them. A schedule stored
-    // with an empty scope still fires fleet-wide on every tick, unattended, and
-    // `schedule_routes.cpp`'s `j.value("scope_expression","")` still collapses
-    // omitted, supplied-but-empty and type-confused into the same empty string
-    // at CREATE time, so an operator cannot express the difference. That is a
-    // create-route validation gap with its own product decision (should a
-    // schedule have to name `__all__`?) and is tracked separately — see #2500's
-    // sibling issue. When it is fixed, this mapping is what stops being needed.
-    const std::string dispatch_scope = s.scope_expression.empty()
-                                           ? std::string(yuzu::server::kBroadcastScope)
-                                           : s.scope_expression;
-    auto parameters = schedule_params_to_map(s.parameter_values);
-    try {
-        // Review finding (#3133): re-resolve the creator's CURRENT
-        // permissions at fire time rather than dispatching as `system` —
-        // an operator who could create this schedule but does not (or no
-        // longer) holds the classified permission for `plugin.action`
-        // must be refused by the SAME chokepoint every operator-initiated
-        // dispatch goes through, not silently bypass it. `parameters` is
-        // this package's typed-schedule-params payload — the two are
-        // independent: WHAT is dispatched vs WHO it is dispatched as.
-        auto caller = d_.resolve_caller(s.created_by);
-        // #1398: `approval_id` is empty on a direct auto-mode fire and a
-        // real ApprovalManager ticket id on the approved-ticket branch
-        // (fire_with_approval, above) — the same signal dispatch_tracked's
-        // own audit detail already keys on (see `detail += " approval_id="`
-        // below), reused here rather than re-derived.
-        caller.approval_provenance =
-            approval_id.empty() ? ApprovalProvenance::None : ApprovalProvenance::Ticket;
-        // ADR-1007: per-device concurrency gate, when wired. A second
-        // get_definition() read (fire() already did one) rather than
-        // threading concurrency_mode through fire_with_approval's
-        // signature too — schedule fires are not a hot path, and this
-        // keeps dispatch_tracked's own signature/callers unchanged.
-        std::string concurrency_mode;
-        if (d_.dispatch_fn_concurrency && d_.instruction_store) {
-            auto def_result = d_.instruction_store->get_definition(s.definition_id);
-            if (def_result && *def_result) {
-                concurrency_mode = (*def_result)->concurrency_mode;
-            } else {
-                // ADR-1007 correctness fix (Gate 4 unhappy-path UP-5): a
-                // failed or empty second read must not silently leave
-                // concurrency_mode empty — that disarms the per-device gate
-                // for this one fire with zero observability, the exact
-                // false-assurance pattern (advertised as enforced, silently
-                // isn't) this whole PR exists to close. fire() already
-                // succeeded on the FIRST read moments earlier, so a failure
-                // here is a genuine anomaly worth a loud, countable signal —
-                // not a routine "instruction was deleted" case, which would
-                // already have been caught by fire()'s own check.
-                count("yuzu_schedule_concurrency_mode_lookup_failed_total");
-                spdlog::error(
-                    "schedule_runner: schedule '{}' (id={}) second get_definition() read for "
-                    "'{}' failed or returned empty on dispatch — per-device concurrency "
-                    "enforcement is NOT applied to this fire",
-                    s.name, s.id, s.definition_id);
-            }
-        }
-        const auto dispatch_outcome =
-            d_.dispatch_fn_concurrency
-                ? d_.dispatch_fn_concurrency(plugin, action, /*agent_ids=*/{}, dispatch_scope,
-                                            parameters, exec_id, caller, s.definition_id,
-                                            concurrency_mode)
-                : d_.dispatch_fn(plugin, action, /*agent_ids=*/{}, dispatch_scope, parameters,
-                                 exec_id, caller);
-        command_id = dispatch_outcome.command_id;
-        sent = dispatch_outcome.sent;
-    } catch (const std::exception& e) {
-        count("yuzu_schedule_fire_failures_total");
-        spdlog::error("schedule_runner: dispatch failed for schedule '{}' (id={}): {}", s.name,
-                      s.id, e.what());
+    OutboxEnqueueRequest req;
+    // STABLE occurrence key: schedule id + the occurrence's due time. A re-fire
+    // after a crash-before-advance recomputes the identical key, so the store
+    // returns AlreadyEnqueued (one occurrence, never two). The delivery loop
+    // dispatches by scope, so schedules carry no agent_ids.
+    req.occurrence_id = s.id + ":" + std::to_string(s.next_execution_at);
+    req.source = "schedule_runner";
+    req.plugin = plugin;
+    req.action = action;
+    // #2500: an empty scope has always meant "the whole fleet" on this path — say
+    // it explicitly (Broadcast) so the meaning survives the empty-means-everybody
+    // inversion, exactly as the inline path did. (The create-route gap that lets
+    // an operator store an empty scope at all is tracked separately under #2500.)
+    req.scope_expr = s.scope_expression.empty() ? std::string(yuzu::server::kBroadcastScope)
+                                                : s.scope_expression;
+    req.agent_ids = ""; // schedules target by scope, never an id list
+    req.parameters =
+        s.parameter_values.empty() ? std::string(kEmptyScheduleParams) : s.parameter_values;
+    req.execution_id = exec_id;
+    // The schedule's creator: re-resolved to a live caller and re-authorized at
+    // SEND time by the delivery loop (never a stale creation-time snapshot).
+    req.principal = s.created_by;
+    // #1398: carried so the delivery loop can stamp Ticket provenance for an
+    // approved fire (empty on a direct auto-mode fire → None).
+    req.approval_id = approval_id;
+
+    const auto outcome = d_.enqueue_fn(req);
+    switch (outcome) {
+    case OutboxEnqueueOutcome::AlreadyEnqueued:
+        // Idempotent re-fire (a crash between a prior enqueue and its advance):
+        // the occurrence already exists with its OWN execution row, so the row
+        // we just created is a duplicate the outbox discarded (ON CONFLICT). Cancel
+        // it so it cannot idle at 'running' to the materialise timeout, then
+        // advance exactly as the first fire would have.
         if (d_.execution_tracker && !exec_id.empty() &&
-            !d_.execution_tracker->mark_cancelled(exec_id, s.created_by)) {
-            spdlog::error("schedule_runner: mark_cancelled failed for execution_id={}", exec_id);
-        }
-        audit(s, "instruction.schedule_fired", "failure",
-              "dispatch_failed schedule_id=" + s.id + " execution_id=" + exec_id);
-        return 0;
+            !d_.execution_tracker->mark_cancelled(exec_id, s.created_by))
+            spdlog::error("schedule_runner: mark_cancelled failed for duplicate execution_id={}",
+                          exec_id);
+        [[fallthrough]];
+    case OutboxEnqueueOutcome::Enqueued: {
+        count("yuzu_schedule_fires_total");
+        spdlog::info("schedule_runner: schedule '{}' (id={}) queued — occurrence_id={} "
+                     "execution_id={}{}",
+                     s.name, s.id, req.occurrence_id, exec_id,
+                     outcome == OutboxEnqueueOutcome::AlreadyEnqueued ? " (idempotent re-fire)"
+                                                                      : "");
+        std::string detail = "schedule_id=" + s.id + " occurrence_id=" + req.occurrence_id +
+                             " execution_id=" + exec_id;
+        if (!approval_id.empty())
+            detail += " approval_id=" + approval_id;
+        audit(s, "instruction.schedule_fired", "queued", detail);
+        return true;
     }
-
-    if (sent == 0) {
-        // No agents in scope right now. Record the attempt and move on —
-        // recurring schedules catch the fleet next period, and a phantom
-        // 'running' row must not idle to the materialise timeout.
-        count("yuzu_schedule_fire_failures_total");
-        spdlog::warn("schedule_runner: schedule '{}' (id={}) reached no agents (scope='{}')",
-                     s.name, s.id, s.scope_expression);
+    case OutboxEnqueueOutcome::FencedOut:
+        // Leadership lost mid-tick — leave the occurrence for the true leader and
+        // do NOT advance. Cancel the exec row we speculatively created.
+        spdlog::warn("schedule_runner: schedule '{}' (id={}) enqueue fenced out (leadership "
+                     "moved) — deferring",
+                     s.name, s.id);
         if (d_.execution_tracker && !exec_id.empty() &&
-            !d_.execution_tracker->mark_cancelled(exec_id, s.created_by)) {
+            !d_.execution_tracker->mark_cancelled(exec_id, s.created_by))
             spdlog::error("schedule_runner: mark_cancelled failed for execution_id={}", exec_id);
-        }
+        return false;
+    case OutboxEnqueueOutcome::Degraded:
+    default:
+        // Transient store failure — retry next tick (do NOT advance). Cancel the
+        // exec row so it cannot idle to the materialise timeout.
+        count("yuzu_schedule_fire_failures_total");
+        spdlog::warn("schedule_runner: schedule '{}' (id={}) enqueue degraded — retrying next tick",
+                     s.name, s.id);
+        if (d_.execution_tracker && !exec_id.empty() &&
+            !d_.execution_tracker->mark_cancelled(exec_id, s.created_by))
+            spdlog::error("schedule_runner: mark_cancelled failed for execution_id={}", exec_id);
         audit(s, "instruction.schedule_fired", "failure",
-              "no_agents schedule_id=" + s.id + " execution_id=" + exec_id);
-        return 0;
+              "enqueue_degraded schedule_id=" + s.id + " execution_id=" + exec_id);
+        return false;
     }
-
-    if (d_.execution_tracker && !exec_id.empty()) {
-        // L-03 (#1806): dispatch has already succeeded at this point — a
-        // failed set_agents_targeted (store error) must not leave the
-        // execution row stuck at "running" forever, since tick()'s
-        // outer catch only advances the SCHEDULE, not the execution it
-        // already created. Mark the row failed here so it can't idle to the
-        // materialise timeout while still counting the fire as a success.
-        //
-        // governance PR review (2026-08-31): this used to be a try/catch
-        // around a void call that never actually threw on a store failure
-        // (it swallowed the failure silently instead) — dead recovery code.
-        // set_agents_targeted/mark_cancelled now report success via their
-        // return value instead, which is what actually makes this reachable.
-        if (!d_.execution_tracker->set_agents_targeted(exec_id, sent)) {
-            spdlog::error("schedule_runner: set_agents_targeted failed for schedule '{}' (id={}, "
-                          "execution_id={})",
-                          s.name, s.id, exec_id);
-            if (!d_.execution_tracker->mark_cancelled(exec_id, s.created_by)) {
-                spdlog::error("schedule_runner: mark_cancelled also failed for execution_id={}",
-                              exec_id);
-            }
-            audit(s, "instruction.schedule_fired", "failure",
-                  "set_agents_targeted_failed schedule_id=" + s.id + " execution_id=" + exec_id);
-            count("yuzu_schedule_fire_failures_total");
-            return sent;
-        }
-    }
-
-    count("yuzu_schedule_fires_total");
-    spdlog::info("schedule_runner: schedule '{}' (id={}) fired — command_id={} execution_id={} "
-                 "agents={}",
-                 s.name, s.id, command_id, exec_id, sent);
-    std::string detail = "schedule_id=" + s.id + " command_id=" + command_id +
-                         " execution_id=" + exec_id + " agents=" + std::to_string(sent);
-    if (!approval_id.empty())
-        detail += " approval_id=" + approval_id;
-    audit(s, "instruction.schedule_fired", "success", detail);
-    return sent;
 }
 
 void ScheduleRunner::audit(const InstructionSchedule& s, const std::string& action,
