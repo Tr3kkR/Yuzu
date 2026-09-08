@@ -703,7 +703,8 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
         // dead without pulling a healthy node out of LB/orchestrator rotation.
         std::vector<StoreCheck> notices = {
             {"analytics_event_store",
-             !deps.cfg->analytics_enabled || (deps.analytics_store && deps.analytics_store->is_open())},
+             !deps.cfg->analytics_enabled ||
+                 (deps.analytics_store && deps.analytics_store->is_open())},
         };
 
         std::string failed_list;
