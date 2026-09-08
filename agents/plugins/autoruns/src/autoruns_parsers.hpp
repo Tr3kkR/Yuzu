@@ -31,6 +31,7 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <span>
 #include <string>
@@ -631,47 +632,71 @@ inline TaskInfo parse_task_xml(std::string_view xml) {
         }
     }
 
-    std::size_t t = xml.find("<Triggers");
-    if (t != std::string_view::npos) {
-        std::size_t gt = xml.find('>', t);
-        if (gt != std::string_view::npos) {
-            bool self_closed = gt > 0 && xml[gt - 1] == '/';
-            if (!self_closed) {
-                std::size_t close = xml.find("</Triggers>", gt + 1);
-                if (close != std::string_view::npos && close > gt + 1) {
-                    std::string_view inner = xml.substr(gt + 1, close - (gt + 1));
-                    const bool has_real_content =
-                        inner.find_first_not_of(" \t\r\n") != std::string_view::npos;
-                    // Bare presence of a trigger element isn't enough: each
-                    // trigger can carry its own <Enabled>false</Enabled>
-                    // (default true when the tag is absent, per Task
-                    // Scheduler's schema) -- a Triggers block whose every
-                    // trigger is individually disabled will never fire, same
-                    // as an empty one.
-                    std::size_t total_enabled_tags = 0;
-                    std::size_t true_enabled_tags = 0;
-                    std::size_t p = 0;
-                    while (true) {
-                        std::size_t tag = inner.find("<Enabled>", p);
-                        if (tag == std::string_view::npos) break;
-                        ++total_enabled_tags;
-                        std::size_t vend = inner.find("</Enabled>", tag);
-                        if (vend != std::string_view::npos &&
-                            inner.substr(tag + 9, vend - (tag + 9)) == "true")
-                            ++true_enabled_tags;
-                        p = tag + 9;
-                    }
-                    const bool any_effectively_enabled =
-                        total_enabled_tags == 0 || true_enabled_tags > 0;
-                    out.has_triggers = has_real_content && any_effectively_enabled;
+    if (auto triggers_block = detail::extract_tagged_block(xml, "Triggers")) {
+        // Every trigger element type ITriggerCollection can hold (Task
+        // Scheduler's fixed schema) -- checked individually via the SAME
+        // exact-tag, no-attributes helper find_all_tagged_blocks uses for
+        // <Exec>, since these elements never carry attributes either. Each
+        // trigger's OWN direct <Enabled> child decides that trigger alone
+        // (absent -> schema-default enabled, "false" -> disabled) -- never
+        // aggregated document-wide, or one disabled sibling would cancel
+        // out an unrelated enabled (or untagged) trigger with no
+        // relationship to it.
+        for (const char* trigger_tag :
+            {"BootTrigger", "IdleTrigger", "LogonTrigger", "TimeTrigger", "EventTrigger",
+             "SessionStateChangeTrigger", "CalendarTrigger", "RegistrationTrigger",
+             "WnfStateChangeTrigger"}) {
+            for (auto trigger : detail::find_all_tagged_blocks(*triggers_block, trigger_tag)) {
+                auto enabled_val = detail::extract_tag(trigger, "Enabled");
+                if (!enabled_val || *enabled_val != "false") {
+                    out.has_triggers = true;
+                    break;
                 }
             }
+            if (out.has_triggers) break;
         }
     }
     return out;
 }
 
 // ── 8. parse_wmi_subscription_triple ─────────────────────────────────────
+
+// The highest-value payload this plugin can produce
+// (ActiveScriptEventConsumer::ScriptText) is routinely multi-line real
+// script text; parse_wmi_subscription_triple splits on blank lines and
+// requires exactly one "Key : Value" per line, so an unescaped embedded
+// '\n' would either truncate the value to its first line or split one
+// record into two. escape_wmi_value/format_wmi_block are the producer half
+// of that round trip, kept in this portable seam (not autoruns_win.cpp,
+// their only real caller) specifically so a test here can assert
+// parse(format(original)) == original rather than only exercising the
+// decoder against a hand-escaped literal.
+inline std::string escape_wmi_value(std::string_view v) {
+    std::string out;
+    out.reserve(v.size());
+    for (char c : v) {
+        if (c == '\\') out += "\\\\";
+        else if (c == '\n') out += "\\n";
+        else if (c == '\r') out += "\\r";
+        else out += c;
+    }
+    return out;
+}
+
+inline std::string format_wmi_block(std::string_view cim_class,
+                                    const std::map<std::string, std::string>& row) {
+    std::string out = "CimClass : ";
+    out += cim_class;
+    out += '\n';
+    for (const auto& [k, v] : row) {
+        out += k;
+        out += " : ";
+        out += escape_wmi_value(v);
+        out += '\n';
+    }
+    out += '\n';
+    return out;
+}
 
 struct WmiTriple {
     bool filter_found = false;

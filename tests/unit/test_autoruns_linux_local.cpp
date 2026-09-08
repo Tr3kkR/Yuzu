@@ -441,6 +441,30 @@ TEST_CASE("autoruns Linux leg: timer_scan_status combines truncation and per-fil
     }
 }
 
+TEST_CASE("autoruns Linux leg: apply_narrow_search_path_coverage always "
+          "downgrades to Constrained and names the permanent gap "
+          "(RECONSTRUCTION: pins round 4's should-fix -- extracted from the "
+          "call site into a named function specifically so this integration "
+          "point, previously unexercised by any test, is now directly "
+          "testable)",
+          "[autoruns][actions][linux]") {
+    using yuzu::autoruns::apply_narrow_search_path_coverage;
+
+    SECTION("Supported -> Constrained, standalone reason") {
+        const auto [support, reason] =
+            apply_narrow_search_path_coverage(YUZU_SUPPORT_SUPPORTED, "-");
+        CHECK(support == YUZU_SUPPORT_CONSTRAINED);
+        CHECK(reason == "narrow_search_path_coverage");
+    }
+
+    SECTION("already Constrained -> stays Constrained, reason appended") {
+        const auto [support, reason] =
+            apply_narrow_search_path_coverage(YUZU_SUPPORT_CONSTRAINED, "partial_permission_denied");
+        CHECK(support == YUZU_SUPPORT_CONSTRAINED);
+        CHECK(reason == "partial_permission_denied,narrow_search_path_coverage");
+    }
+}
+
 TEST_CASE("autoruns Linux leg: timer_enabled correlates a global-directory "
           "unit against every enumerated user's own wants directory "
           "(RECONSTRUCTION: pins round 3's blocker -- an ordinary "
@@ -487,6 +511,47 @@ TEST_CASE("autoruns Linux leg: timer_enabled correlates a global-directory "
         std::filesystem::create_directories(other_user_dir.path / "timers.target.wants");
         CHECK(timer_enabled(vendor_dir.path.string(), "backup.timer", "", Scope::user,
                             {other_user_dir.path.string()}) == Enabled::disabled);
+    }
+
+    SECTION("a same-named timer enabled in one user's own directory does not "
+            "falsely enable an unrelated user's separate, never-enabled timer "
+            "of the same name (RECONSTRUCTION: pins round 4's should-fix -- "
+            "user_wants_bases must reach only the two GLOBAL-directory scans, "
+            "never the per-home scans, whose own unit_dir is already the "
+            "correct wants base; the round-3 fix passed it to every "
+            "user-scope call, so Bob enabling his own same.timer used to "
+            "falsely mark Alice's separate same.timer enabled too)") {
+        using yuzu::autoruns::Row;
+        using yuzu::autoruns::scan_systemd_timer_dir_unique;
+        using yuzu::autoruns::TimerScan;
+
+        yuzu::test::TempDir bob_dir("yuzu_test_autoruns_bob_");
+        yuzu::test::TempDir alice_dir("yuzu_test_autoruns_alice_");
+        std::filesystem::create_directories(bob_dir.path / "timers.target.wants");
+        std::filesystem::create_directories(alice_dir.path);
+
+        const auto bob_unit = bob_dir.path / "same.timer";
+        { std::ofstream f(bob_unit); f << "[Timer]\nOnCalendar=daily\n"; }
+        std::filesystem::create_symlink(bob_unit, bob_dir.path / "timers.target.wants" / "same.timer");
+
+        const auto alice_unit = alice_dir.path / "same.timer";
+        { std::ofstream f(alice_unit); f << "[Timer]\nOnCalendar=daily\n"; }
+        // Alice never enables her copy -- no wants symlink in her directory.
+
+        TimerScan scan;
+        std::vector<std::pair<dev_t, ino_t>> seen_dirs;
+        // Matches the real call site exactly: per-home scans get no
+        // user_wants_bases argument at all.
+        scan_systemd_timer_dir_unique(bob_dir.path.string(), Scope::user, "bob", scan, seen_dirs);
+        scan_systemd_timer_dir_unique(alice_dir.path.string(), Scope::user, "alice", scan, seen_dirs);
+
+        Enabled bob_enabled = Enabled::unknown, alice_enabled = Enabled::unknown;
+        for (const auto& row : scan.rows) {
+            if (row.user == "bob") bob_enabled = row.enabled;
+            if (row.user == "alice") alice_enabled = row.enabled;
+        }
+        CHECK(bob_enabled == Enabled::enabled);
+        CHECK(alice_enabled == Enabled::disabled);
     }
 }
 

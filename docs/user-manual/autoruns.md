@@ -91,7 +91,7 @@ stubs never special-case per-OS.
 | `win_appinit_dlls` | AppInit_DLLs | S | U | U | Reg\*W |
 | `win_ifeo_debugger` | Image File Execution Options Debugger | S | U | U | Reg\*W |
 | `win_startup_folder_common` | Startup folder (All Users) | S | U | U | file listing |
-| `win_startup_folder_user` | Startup folder (current user) | S | U | U | file listing, per profile |
+| `win_startup_folder_user` | Startup folder (current user) | S | U | U | file listing, per profile -- uses the literal `AppData\Roaming\...\Startup` suffix, not a resolved Known Folder; a profile with a redirected Startup folder (policy/`USER_SHELL_FOLDERS`) is not followed (disclosed follow-up, not a silent drop) |
 | `win_scheduled_tasks` | Scheduled Tasks | S | U | U | ITaskService COM |
 | `win_wmi_subscriptions` | WMI permanent event subscriptions | S | U | U | bounded `root\subscription` query |
 | `lnx_etc_crontab` | `/etc/crontab` | U | S | U | file read; absent is CONSTRAINED (required) |
@@ -101,7 +101,7 @@ stubs never special-case per-OS.
 | `lnx_anacrontab` | `/etc/anacrontab` | U | S | U | file read; absent is CONSTRAINED (required) |
 | `lnx_at_spool` | `/var/spool/at` (`at(1)` jobs) | U | S | U | dir listing |
 | `lnx_systemd_timers_system` | systemd system timer units | U | S | U | tri-state; see below |
-| `lnx_systemd_timers_user` | systemd user timer units | U | S | U | tri-state; see below |
+| `lnx_systemd_timers_user` | systemd user timer units | U | **C** | U | tri-state; see below -- always Constrained when reportable (`narrow_search_path_coverage`): the scanned search-path set omits several standard `systemd --user` unit roots |
 | `lnx_xdg_autostart_system` | XDG autostart (`/etc/xdg/autostart`) | U | S | U | dir listing |
 | `lnx_xdg_autostart_user` | XDG autostart (`~/.config/autostart`) | U | S | U | dir listing, per user |
 | `lnx_rc_local` | `/etc/rc.local` | U | S | U | file read |

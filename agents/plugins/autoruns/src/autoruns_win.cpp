@@ -1029,41 +1029,11 @@ void collect_scheduled_tasks(std::string_view filter, SourceOutcome& outcome) {
 
 // ── 8. WMI permanent event subscriptions ─────────────────────────────────
 
-// The highest-value payload this plugin can produce
-// (ActiveScriptEventConsumer::ScriptText) is routinely multi-line real
-// script text; format_wmi_block's own reader (parse_wmi_subscription_triple)
-// splits on blank lines and requires exactly one "Key : Value" per line, so
-// an unescaped embedded '\n' would either truncate the value to its first
-// line or split one record into two. Escaping here and unescaping in
-// unescape_wmi_value (autoruns_parsers.hpp) keeps the round trip lossless --
-// this is the ONLY producer feeding parse_wmi_subscription_triple, so the
-// escaping is self-contained to this file pair, not a format any external
-// capture needs to match.
-std::string escape_wmi_value(std::string_view v) {
-    std::string out;
-    out.reserve(v.size());
-    for (char c : v) {
-        if (c == '\\') out += "\\\\";
-        else if (c == '\n') out += "\\n";
-        else if (c == '\r') out += "\\r";
-        else out += c;
-    }
-    return out;
-}
-
-std::string format_wmi_block(std::string_view cim_class, const yuzu::shared::wmi::WmiRow& row) {
-    std::string out = "CimClass : ";
-    out += cim_class;
-    out += '\n';
-    for (const auto& [k, v] : row) {
-        out += k;
-        out += " : ";
-        out += escape_wmi_value(v);
-        out += '\n';
-    }
-    out += '\n';
-    return out;
-}
+// escape_wmi_value/format_wmi_block moved to autoruns_parsers.hpp (the
+// portable seam) so their round trip with parse_wmi_subscription_triple is
+// directly testable off-Windows -- see that header's banner for why the
+// escaping exists at all. yuzu::shared::wmi::WmiRow is a plain
+// std::map<std::string, std::string>, so it passes through unchanged.
 
 // Formats one joined binding's three CIM blocks (only THIS binding's filter,
 // consumer, and the binding itself -- never the whole enumeration) and

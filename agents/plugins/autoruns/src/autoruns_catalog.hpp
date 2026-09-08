@@ -128,7 +128,7 @@ struct SourceDecl {
 };
 
 /// The full 34-source catalog. Declared support is SUPPORTED on a source's
-/// own OS except the two documented exceptions:
+/// own OS except the three documented exceptions:
 ///   - mac_login_items: the login-items list lives in a private BTM database
 ///     with no public read API; the only route is `osascript` driving System
 ///     Events, which is a rung-3 governed-shell acquisition under Decision 5
@@ -137,6 +137,11 @@ struct SourceDecl {
 ///     plugin lists (script names + metadata) but does not interpret --
 ///     whether a listed script is actually wired into the current runlevel
 ///     needs update-rc.d/systemctl state this leg does not read -- CONSTRAINED.
+///   - lnx_systemd_timers_user: the scanned search-path set omits several
+///     standard `systemd --user` unit-search roots (`~/.local/share/systemd/
+///     user`, `/run/systemd/user`, `/usr/local/{lib,share}/systemd/user`,
+///     `/usr/share/systemd/user`) -- a permanent, documented coverage gap,
+///     not a transient failure -- CONSTRAINED.
 inline constexpr std::array<SourceDecl, 34> kSourceCatalog{{
     // Windows
     {SourceId::win_run_hklm, "HKLM Run", YUZU_SUPPORT_UNSUPPORTED, YUZU_SUPPORT_UNSUPPORTED,
@@ -182,7 +187,7 @@ inline constexpr std::array<SourceDecl, 34> kSourceCatalog{{
      YUZU_SUPPORT_UNSUPPORTED, YUZU_SUPPORT_UNSUPPORTED},
     {SourceId::lnx_systemd_timers_system, "systemd system timer units", YUZU_SUPPORT_SUPPORTED,
      YUZU_SUPPORT_UNSUPPORTED, YUZU_SUPPORT_UNSUPPORTED},
-    {SourceId::lnx_systemd_timers_user, "systemd user timer units", YUZU_SUPPORT_SUPPORTED,
+    {SourceId::lnx_systemd_timers_user, "systemd user timer units", YUZU_SUPPORT_CONSTRAINED,
      YUZU_SUPPORT_UNSUPPORTED, YUZU_SUPPORT_UNSUPPORTED},
     {SourceId::lnx_xdg_autostart_system, "XDG autostart (/etc/xdg/autostart)",
      YUZU_SUPPORT_SUPPORTED, YUZU_SUPPORT_UNSUPPORTED, YUZU_SUPPORT_UNSUPPORTED},

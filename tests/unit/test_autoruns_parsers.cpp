@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -428,6 +429,21 @@ TEST_CASE("autoruns: parse_task_xml's has_triggers consults each trigger's own "
         CHECK_FALSE(parse_task_xml(xml).has_triggers);
     }
 
+    SECTION("one explicitly-disabled trigger plus one untagged (schema-default "
+            "enabled) sibling -> true (RECONSTRUCTION: pins round 4's blocker -- "
+            "the round-3 fix aggregated <Enabled> tag counts across the WHOLE "
+            "Triggers block instead of per trigger element, so this exact shape "
+            "-- the ordinary result of disabling one of several triggers via the "
+            "Task Scheduler UI -- was misclassified as no live trigger, even "
+            "though the untagged sibling will fire the task)") {
+        const std::string xml =
+            "<Task><Triggers>"
+            "<CalendarTrigger><Enabled>false</Enabled></CalendarTrigger>"
+            "<TimeTrigger><StartBoundary>2026-01-01T00:00:00</StartBoundary></TimeTrigger>"
+            "</Triggers></Task>";
+        CHECK(parse_task_xml(xml).has_triggers);
+    }
+
     SECTION("whitespace-only Triggers block -> false") {
         const std::string xml = "<Task><Triggers>\n   \t\n</Triggers></Task>";
         CHECK_FALSE(parse_task_xml(xml).has_triggers);
@@ -471,28 +487,33 @@ TEST_CASE("autoruns: parse_wmi_subscription_triple resolves target from CommandL
 }
 
 TEST_CASE("autoruns: parse_wmi_subscription_triple recovers a multi-line ScriptText "
-          "value through format_wmi_block's escape round trip, not just its first line "
-          "(RECONSTRUCTION: pins round 3's should-fix -- an unescaped embedded newline "
-          "either truncated the value to one line or, on a blank line, split one "
-          "record into two)",
+          "value through format_wmi_block's real escape round trip, exercising both "
+          "the encoder and the decoder "
+          "(RECONSTRUCTION: pins round 3's should-fix, strengthened per round 4's "
+          "should-fix -- the original version of this test hand-supplied an "
+          "already-escaped literal and never called format_wmi_block/escape_wmi_value "
+          "at all, so a regression in the producer half would have left this test, "
+          "and all other autoruns tests, green while live multi-line ScriptText "
+          "payloads corrupted again)",
           "[autoruns][parsers]") {
-    // Mirrors exactly what autoruns_win.cpp's escape_wmi_value produces for a
-    // real multi-line ActiveScriptEventConsumer::ScriptText -- \n and \r
-    // escaped to literal two-character sequences so the one-line-per-value
-    // format and blank-line block separator both stay intact.
-    const std::string text =
-        "CimClass               : ROOT/subscription:__EventFilter\n"
-        "Name                   : EvilFilter\n"
-        "Query                  : select * from Win32_ProcessStartTrace\n"
-        "\n\n"
-        "CimClass               : ROOT/subscription:ActiveScriptEventConsumer\n"
-        "Name                   : EvilConsumer\n"
-        "ScriptText             : line1\\nline2\\n\\nline4\n"
-        "\n\n"
-        "CimClass               : ROOT/subscription:__FilterToConsumerBinding\n";
-    const auto triple = parse_wmi_subscription_triple(text);
+    const std::string original_script = "line1\nline2\n\nline4";
+    std::map<std::string, std::string> consumer_row{
+        {"Name", "EvilConsumer"},
+        {"ScriptText", original_script},
+    };
+    std::map<std::string, std::string> filter_row{
+        {"Name", "EvilFilter"},
+        {"Query", "select * from Win32_ProcessStartTrace"},
+    };
+    std::map<std::string, std::string> binding_row{};
+
+    const std::string combined = format_wmi_block("__EventFilter", filter_row) +
+                                 format_wmi_block("ROOT/subscription:ActiveScriptEventConsumer",
+                                                  consumer_row) +
+                                 format_wmi_block("__FilterToConsumerBinding", binding_row);
+    const auto triple = parse_wmi_subscription_triple(combined);
     CHECK(triple.consumer_found);
-    CHECK(triple.target == "line1\nline2\n\nline4");
+    CHECK(triple.target == original_script);
 }
 
 // ── 9. parse_crontab ──────────────────────────────────────────────────────
@@ -767,10 +788,15 @@ TEST_CASE("autoruns: parse_emond_rule_plist_fields builds a Row from a rule dict
 
 // ── source catalog sanity (not per-parser, but pure and cheap here) ──────
 
-TEST_CASE("autoruns: every SourceDecl declares all three OSes and the two documented "
-          "constrained exceptions hold",
+TEST_CASE("autoruns: every SourceDecl declares all three OSes and the three documented "
+          "constrained exceptions hold, no more and no fewer "
+          "(RECONSTRUCTION: pins round 4's should-fix -- lnx_systemd_timers_user's "
+          "runtime status was downgraded to permanently Constrained in round 3 "
+          "without updating its own catalog declaration, so autoruns.catalog and "
+          "autoruns.list contradicted each other about the same source)",
           "[autoruns][catalog]") {
     REQUIRE(kSourceCatalog.size() == 34);
+    std::size_t constrained_count = 0;
     for (const auto& decl : kSourceCatalog) {
         // Exactly one OS is not UNSUPPORTED for a native source -- the
         // catalog carries no cross-platform source in this wave.
@@ -779,7 +805,11 @@ TEST_CASE("autoruns: every SourceDecl declares all three OSes and the two docume
         if (decl.macos != YUZU_SUPPORT_UNSUPPORTED) ++native;
         if (decl.windows != YUZU_SUPPORT_UNSUPPORTED) ++native;
         CHECK(native == 1);
+        if (decl.linux == YUZU_SUPPORT_CONSTRAINED || decl.macos == YUZU_SUPPORT_CONSTRAINED ||
+            decl.windows == YUZU_SUPPORT_CONSTRAINED)
+            ++constrained_count;
     }
+    CHECK(constrained_count == 3);
     const auto find = [](SourceId id) -> const SourceDecl& {
         for (const auto& d : kSourceCatalog)
             if (d.id == id) return d;
@@ -789,4 +819,5 @@ TEST_CASE("autoruns: every SourceDecl declares all three OSes and the two docume
     };
     CHECK(find(SourceId::mac_login_items).macos == YUZU_SUPPORT_CONSTRAINED);
     CHECK(find(SourceId::lnx_init_d).linux == YUZU_SUPPORT_CONSTRAINED);
+    CHECK(find(SourceId::lnx_systemd_timers_user).linux == YUZU_SUPPORT_CONSTRAINED);
 }

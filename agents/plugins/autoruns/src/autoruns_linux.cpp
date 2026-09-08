@@ -487,6 +487,19 @@ std::pair<YuzuSupportLevel, std::string> timer_scan_status(const TimerScan& scan
     return {YUZU_SUPPORT_CONSTRAINED, reason};
 }
 
+/// lnx_systemd_timers_user's own catalog-declared level is CONSTRAINED (the
+/// scanned search-path set omits several standard `systemd --user` unit
+/// roots -- a permanent, documented gap, autoruns_catalog.hpp's third
+/// exception), so a would-be-Supported timer_scan_status result must be
+/// downgraded, and any other Constrained result must still name this
+/// permanent gap alongside its own reason. Never emits Supported.
+std::pair<YuzuSupportLevel, std::string> apply_narrow_search_path_coverage(
+    YuzuSupportLevel support, std::string reason) {
+    if (support == YUZU_SUPPORT_SUPPORTED) return {YUZU_SUPPORT_CONSTRAINED, "narrow_search_path_coverage"};
+    reason += ",narrow_search_path_coverage";
+    return {support, reason};
+}
+
 /// Rung-2 fallback (autoruns/collect_linux#1, docs/wave7/integration-
 /// autoruns-linux.md) -- used ONLY when zero of the three system unit dirs
 /// were readable. Heuristic, not a fixture-tested pure parser: real
@@ -892,8 +905,11 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
         ctx.write_output(format_source_status(SourceId::lnx_systemd_timers_system,
                                               YUZU_SUPPORT_SUPPORTED, std::nullopt, "filtered"));
     if (!want_user_timers)
+        // CONSTRAINED even filtered-out -- matches this source's own
+        // catalog-declared level (narrow_search_path_coverage, a permanent
+        // gap), same principle as lnx_init_d's filtered branch above.
         ctx.write_output(format_source_status(SourceId::lnx_systemd_timers_user,
-                                              YUZU_SUPPORT_SUPPORTED, std::nullopt, "filtered"));
+                                              YUZU_SUPPORT_CONSTRAINED, std::nullopt, "filtered"));
     if (want_sys_timers || want_user_timers) {
         const SystemdPresence presence = check_systemd_presence();
         if (presence == SystemdPresence::absent) {
@@ -984,12 +1000,23 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                 std::vector<std::string> user_wants_bases = home_dirs;
                 user_wants_bases.emplace_back("/root/.config/systemd/user");
 
+                // Per-home and root scans do NOT get user_wants_bases: each
+                // one's own unit_dir already IS that user's wants base (see
+                // timer_enabled's banner), so passing the full cross-user
+                // list here would let a same-named timer enabled in ONE
+                // user's directory falsely mark an unrelated, never-enabled
+                // same-named timer in ANOTHER user's directory as enabled
+                // too (matching is by symlink basename only, with no
+                // per-user scoping once the list is passed through). Only
+                // the two GLOBAL-directory scans below need the correlation
+                // -- a unit discovered there has no home directory of its
+                // own to serve as an implicit wants base.
                 for (const auto& dir : home_dirs)
                     scan_systemd_timer_dir_unique(dir, Scope::user, owner_uid_string(dir), scan,
-                                                  seen_dirs, user_wants_bases);
+                                                  seen_dirs);
                 scan_systemd_timer_dir_unique("/root/.config/systemd/user", Scope::user,
                                               owner_uid_string("/root/.config/systemd/user"), scan,
-                                              seen_dirs, user_wants_bases);
+                                              seen_dirs);
                 // Global user-unit search paths, consulted for EVERY user's systemd --user
                 // instance regardless of home directory (standard entries in
                 // `systemd-analyze unit-paths --user` on every systemd distro) -- omitting
@@ -1000,21 +1027,9 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                                               seen_dirs, user_wants_bases);
                 for (const auto& row : scan.rows) ctx.write_output(format_row(row));
                 if (scan.any_dir_readable || home_listing.opened) {
-                    auto [support, reason] = timer_scan_status(scan);
-                    // The scanned search-path set still omits several standard
-                    // systemd user-unit roots (~/.local/share/systemd/user,
-                    // /run/systemd/user, /usr/local/{lib,share}/systemd/user,
-                    // /usr/share/systemd/user) -- a known, permanent coverage
-                    // gap, not a transient failure, so this source stays
-                    // Constrained the same way lnx_init_d does for its own
-                    // documented gap rather than claiming full Supported
-                    // coverage.
-                    if (support == YUZU_SUPPORT_SUPPORTED) {
-                        support = YUZU_SUPPORT_CONSTRAINED;
-                        reason = "narrow_search_path_coverage";
-                    } else {
-                        reason += ",narrow_search_path_coverage";
-                    }
+                    const auto [scan_support, scan_reason] = timer_scan_status(scan);
+                    const auto [support, reason] =
+                        apply_narrow_search_path_coverage(scan_support, scan_reason);
                     ctx.write_output(format_source_status(SourceId::lnx_systemd_timers_user, support,
                                                           scan.rows.size(), reason));
                 } else if (home_listing.permission_denied) {
@@ -1092,12 +1107,23 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
         std::size_t n = 0;
         bool any_truncated = home_listing.truncated;
         bool any_file_constrained = false;
+        bool any_permission_denied = false;
         std::string file_constrained_reason;
         if (home_listing.opened) {
             for (const auto& user : home_listing.names) {
                 std::string dir = "/home/" + user + "/.config/autostart";
                 auto listing = list_dir(dir);
-                if (!listing.opened) continue; // most users have none -- not an error
+                if (!listing.opened) {
+                    // Absent (ENOENT, "most users have none") is benign; a
+                    // real denial (EACCES on a 0700 .config under a 0750
+                    // home, the documented unprivileged agent's default
+                    // posture) is a genuine constraint -- must accumulate
+                    // it the same way the sibling per-user loops in this
+                    // file (systemd-timer, at-spool, crontab) already do,
+                    // never silently fold it into "not found".
+                    if (listing.permission_denied) any_permission_denied = true;
+                    continue;
+                }
                 if (listing.truncated) any_truncated = true;
                 const std::string uid = owner_uid_string(dir);
                 for (const auto& name : listing.names) {
@@ -1130,7 +1156,9 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                 }
             }
             std::string reason;
-            if (any_file_constrained) reason = file_constrained_reason;
+            if (any_permission_denied) reason = "partial_permission_denied";
+            if (any_file_constrained)
+                reason += (reason.empty() ? "" : ",") + file_constrained_reason;
             if (any_truncated) reason += (reason.empty() ? "" : ",") + std::string{"row_cap"};
             ctx.write_output(format_source_status(
                 id, reason.empty() ? YUZU_SUPPORT_SUPPORTED : YUZU_SUPPORT_CONSTRAINED, n,
