@@ -3887,6 +3887,22 @@ void warn_establish(const char* case_label, const char* call_label, std::vector<
 /// (no MultiByteToWideChar needed).
 std::wstring establish_widen(const std::string& s) { return std::wstring(s.begin(), s.end()); }
 
+/// Checked, recursive teardown for a harness scratch subtree that may still
+/// have children (adversarial-review finding, PR-A round 2): RegDeleteKeyA
+/// silently fails - return value was previously discarded at every call
+/// site - on a key with subkeys, so R3/R4's `base\churn` and the post-fix
+/// bulk case's `base\k0..k199` were never actually deleted, leaking inert
+/// keys under HKCU on a by-hand measurement host across repeated runs.
+/// Callers whose `base` has already-scoped child owners (e.g. R3/R4's
+/// EstablishHiveLoad) must let those go out of scope FIRST, so nothing
+/// still holds an open handle into the subtree being deleted.
+void establish_cleanup_tree(const std::string& base) {
+    const LSTATUS rc = ::RegDeleteTreeA(HKEY_CURRENT_USER, base.c_str());
+    if (rc != ERROR_SUCCESS)
+        WARN("establish_cleanup_tree: RegDeleteTreeA(" << base << ") failed, rc=" << rc
+             << " - a scratch key under HKCU\\" << base << " may be leaked");
+}
+
 void CALLBACK establish_null_wait_cb(PTP_CALLBACK_INSTANCE, PVOID, PTP_WAIT, TP_WAIT_RESULT) {}
 
 /// R5 in-flight-drain callback: sleeps 50ms to simulate a callback parked
@@ -4189,31 +4205,38 @@ TEST_CASE("Watch establishment (Registry): target-present under hive load (R3)",
     ::RegCloseKey(base_h);
     const std::wstring base_w = establish_widen(base);
 
-    EstablishHiveLoad load(base); // 200 churn watches + writer thread, private pool
+    {
+        // Scoped so EstablishHiveLoad (and the open handle it holds into
+        // base\churn) is torn down BEFORE the recursive cleanup below runs
+        // (adversarial-review finding, PR-A round 2).
+        EstablishHiveLoad load(base); // 200 churn watches + writer thread, private pool
 
-    std::vector<std::int64_t> t_event, t_wait_create, t_open, t_notify, t_wait_set;
-    for (int i = 0; i < kEstablishSamples; ++i) {
-        establish_registry_sample(
-            &load.pool.env,
-            REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_THREAD_AGNOSTIC,
-            [&](std::vector<std::int64_t>& t_open_inner) {
-                HKEY h = nullptr;
-                time_call(t_open_inner, [&] {
-                    ::RegOpenKeyExW(HKEY_CURRENT_USER, base_w.c_str(), 0, KEY_NOTIFY | KEY_READ, &h);
-                });
-                return h;
-            },
-            t_event, t_wait_create, t_open, t_notify, t_wait_set);
-    }
-    warn_establish("R3 registry target-present UNDER HIVE LOAD", "CreateEventW", t_event);
-    warn_establish("R3 registry target-present UNDER HIVE LOAD", "CreateThreadpoolWait",
-                   t_wait_create);
-    warn_establish("R3 registry target-present UNDER HIVE LOAD", "RegOpenKeyExW", t_open);
-    warn_establish("R3 registry target-present UNDER HIVE LOAD", "RegNotifyChangeKeyValue",
-                   t_notify);
-    warn_establish("R3 registry target-present UNDER HIVE LOAD", "SetThreadpoolWait", t_wait_set);
+        std::vector<std::int64_t> t_event, t_wait_create, t_open, t_notify, t_wait_set;
+        for (int i = 0; i < kEstablishSamples; ++i) {
+            establish_registry_sample(
+                &load.pool.env,
+                REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_THREAD_AGNOSTIC,
+                [&](std::vector<std::int64_t>& t_open_inner) {
+                    HKEY h = nullptr;
+                    time_call(t_open_inner, [&] {
+                        ::RegOpenKeyExW(HKEY_CURRENT_USER, base_w.c_str(), 0, KEY_NOTIFY | KEY_READ,
+                                       &h);
+                    });
+                    return h;
+                },
+                t_event, t_wait_create, t_open, t_notify, t_wait_set);
+        }
+        warn_establish("R3 registry target-present UNDER HIVE LOAD", "CreateEventW", t_event);
+        warn_establish("R3 registry target-present UNDER HIVE LOAD", "CreateThreadpoolWait",
+                       t_wait_create);
+        warn_establish("R3 registry target-present UNDER HIVE LOAD", "RegOpenKeyExW", t_open);
+        warn_establish("R3 registry target-present UNDER HIVE LOAD", "RegNotifyChangeKeyValue",
+                       t_notify);
+        warn_establish("R3 registry target-present UNDER HIVE LOAD", "SetThreadpoolWait",
+                       t_wait_set);
+    } // load destroyed here - base\churn's handle is closed before cleanup
 
-    ::RegDeleteKeyA(HKEY_CURRENT_USER, base.c_str());
+    establish_cleanup_tree(base);
 }
 
 TEST_CASE("Watch establishment (Registry): target-absent depth6 under hive load (R4)",
@@ -4231,43 +4254,48 @@ TEST_CASE("Watch establishment (Registry): target-absent depth6 under hive load 
     ::RegCloseKey(base_h);
     const std::string target = base + "\\a\\b\\c\\d\\e\\f";
 
-    EstablishHiveLoad load(base);
+    {
+        // Scoped so EstablishHiveLoad is torn down before the recursive
+        // cleanup below runs (same reasoning as R3's identical scoping).
+        EstablishHiveLoad load(base);
 
-    std::vector<std::int64_t> t_event, t_wait_create, t_open_per_level, t_notify, t_wait_set;
-    for (int i = 0; i < kEstablishSamples; ++i) {
-        establish_registry_sample(
-            &load.pool.env, REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_THREAD_AGNOSTIC,
-            [&](std::vector<std::int64_t>& t_open_inner) -> HKEY {
-                std::string path = target;
-                for (;;) {
-                    const std::wstring path_w = establish_widen(path);
-                    HKEY h = nullptr;
-                    LONG rc = 0;
-                    time_call(t_open_inner, [&] {
-                        rc = ::RegOpenKeyExW(HKEY_CURRENT_USER, path_w.c_str(), 0,
-                                             KEY_NOTIFY | KEY_READ, &h);
-                    });
-                    if (rc == ERROR_SUCCESS)
-                        return h;
-                    const auto pos = path.find_last_of('\\');
-                    if (pos == std::string::npos)
-                        return nullptr;
-                    path = path.substr(0, pos);
-                }
-            },
-            t_event, t_wait_create, t_open_per_level, t_notify, t_wait_set);
-    }
-    warn_establish("R4 registry target-absent depth6 UNDER HIVE LOAD", "CreateEventW", t_event);
-    warn_establish("R4 registry target-absent depth6 UNDER HIVE LOAD", "CreateThreadpoolWait",
-                   t_wait_create);
-    warn_establish("R4 registry target-absent depth6 UNDER HIVE LOAD", "RegOpenKeyExW (per level)",
-                   t_open_per_level);
-    warn_establish("R4 registry target-absent depth6 UNDER HIVE LOAD", "RegNotifyChangeKeyValue",
-                   t_notify);
-    warn_establish("R4 registry target-absent depth6 UNDER HIVE LOAD", "SetThreadpoolWait",
-                   t_wait_set);
+        std::vector<std::int64_t> t_event, t_wait_create, t_open_per_level, t_notify, t_wait_set;
+        for (int i = 0; i < kEstablishSamples; ++i) {
+            establish_registry_sample(
+                &load.pool.env, REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_THREAD_AGNOSTIC,
+                [&](std::vector<std::int64_t>& t_open_inner) -> HKEY {
+                    std::string path = target;
+                    for (;;) {
+                        const std::wstring path_w = establish_widen(path);
+                        HKEY h = nullptr;
+                        LONG rc = 0;
+                        time_call(t_open_inner, [&] {
+                            rc = ::RegOpenKeyExW(HKEY_CURRENT_USER, path_w.c_str(), 0,
+                                                 KEY_NOTIFY | KEY_READ, &h);
+                        });
+                        if (rc == ERROR_SUCCESS)
+                            return h;
+                        const auto pos = path.find_last_of('\\');
+                        if (pos == std::string::npos)
+                            return nullptr;
+                        path = path.substr(0, pos);
+                    }
+                },
+                t_event, t_wait_create, t_open_per_level, t_notify, t_wait_set);
+        }
+        warn_establish("R4 registry target-absent depth6 UNDER HIVE LOAD", "CreateEventW",
+                       t_event);
+        warn_establish("R4 registry target-absent depth6 UNDER HIVE LOAD", "CreateThreadpoolWait",
+                       t_wait_create);
+        warn_establish("R4 registry target-absent depth6 UNDER HIVE LOAD",
+                       "RegOpenKeyExW (per level)", t_open_per_level);
+        warn_establish("R4 registry target-absent depth6 UNDER HIVE LOAD",
+                       "RegNotifyChangeKeyValue", t_notify);
+        warn_establish("R4 registry target-absent depth6 UNDER HIVE LOAD", "SetThreadpoolWait",
+                       t_wait_set);
+    } // load destroyed here
 
-    ::RegDeleteKeyA(HKEY_CURRENT_USER, base.c_str());
+    establish_cleanup_tree(base);
 }
 
 TEST_CASE("Watch establishment (Registry): WaitForThreadpoolWaitCallbacks drain, idle vs in-flight (R5)",
@@ -4620,7 +4648,8 @@ TEST_CASE("Watch establishment: post-fix fast-path cost, bulk engine.arm() (N=20
             "re-run on the PR-B build)");
 
     engine.stop();
-    ::RegDeleteKeyA(HKEY_CURRENT_USER, base.c_str());
+    establish_cleanup_tree(base); // base\k0..k199 - RegDeleteKeyA would silently
+                                  // fail here (200 children still present)
 }
 
 #endif // _WIN32
