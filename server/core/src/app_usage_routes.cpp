@@ -123,24 +123,11 @@ void AppUsageRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_pe
                  if (!scoped_perm_fn_(req, res, "Forensics", "Read", agent_id))
                      return; // the gate wrote its own 401/403
 
-                 // Per-open behavioural audit — set BEFORE the store read (matches the
-                 // app-perf device drill's ordering). Behavioural PII (what ran, when,
-                 // how often), so this FAILS CLOSED (503 + Sec-Audit-Failed) exactly
-                 // like the SLE drill and the app-perf REST twin's documented posture
-                 // when the access-audit row is KNOWN to have failed to persist.
-                 if (!detail::emit_behavioral_audit(
-                         audit_fn_, req, res, "app_usage.agent.view", "success", "Agent", agent_id,
-                         "per-agent app-usage projection drill cid=" + cid)) {
-                     send_json(res, 503,
-                               a4_error(503,
-                                        "audit subsystem unavailable; refusing to serve "
-                                        "behavioural app-usage data without durable evidence",
-                                        cid, 5000, "retry the request"));
-                     spdlog::warn("app_usage.agent.view audit fail-closed (503) cid={} agent_id={}",
-                                  cid, agent_id);
-                     return;
-                 }
-
+                 // Read BEFORE audit — matches the MCP twin (get_agent_app_usage in
+                 // mcp_server.cpp) and the sle.agent.decommission pattern: auditing
+                 // "success" before the store read is confirmed leaves a durable
+                 // false-positive audit row when the read then degrades (a second
+                 // "failure" row never retracts the first "success" one).
                  std::optional<std::vector<AgentLastUsedRow>> rows;
                  if (agent_last_used_fn_)
                      rows = agent_last_used_fn_(agent_id);
@@ -153,6 +140,26 @@ void AppUsageRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_pe
                      send_json(res, 503,
                                a4_error(503, "app-usage store unavailable — read failed", cid, 5000,
                                         "retry the request"));
+                     return;
+                 }
+
+                 // Per-access behavioural audit — set only AFTER the read is confirmed
+                 // to have succeeded. Behavioural PII (what ran, when, how often), so
+                 // this still FAILS CLOSED (503 + Sec-Audit-Failed) exactly like the
+                 // SLE drill and the app-perf REST twin's documented posture when the
+                 // access-audit row is KNOWN to have failed to persist — the data is
+                 // withheld entirely rather than served with a set-and-proceed flag.
+                 if (!detail::emit_behavioral_audit(
+                         audit_fn_, req, res, "app_usage.agent.view", "success", "Agent", agent_id,
+                         "per-agent app-usage projection drill cid=" + cid)) {
+                     send_json(res, 503,
+                               a4_error(503,
+                                        "the app-usage read succeeded but its access-audit record "
+                                        "could not be persisted; refusing to serve behavioural data "
+                                        "without durable evidence",
+                                        cid, 5000, "retry the request"));
+                     spdlog::warn("app_usage.agent.view audit fail-closed (503) cid={} agent_id={}",
+                                  cid, agent_id);
                      return;
                  }
 

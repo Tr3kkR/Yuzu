@@ -221,7 +221,8 @@ TEST_CASE("app-usage: scoped gate runs BEFORE the audit + read (out-of-scope →
     CHECK(h.audits.empty());
 }
 
-TEST_CASE("app-usage: store degrade → 503 + audited failure, never an empty 200",
+TEST_CASE("app-usage: store degrade → 503 + audited failure, never an empty 200, "
+          "and never a phantom success row",
           "[app_usage_routes]") {
     AppUsageHarness h;
     h.allow_scoped_all = true;
@@ -230,6 +231,11 @@ TEST_CASE("app-usage: store degrade → 503 + audited failure, never an empty 20
     REQUIRE(res);
     CHECK(res->status == 503);
     CHECK(contains(res->body, "unavailable"));
-    CHECK(h.audited("app_usage.agent.view|success")); // the per-open audit fired on open
+    // The read is confirmed BEFORE the audit fires (matches the MCP twin's
+    // ordering and the sle.agent.decommission pattern): a degraded read never
+    // reaches the audit call at all, so there is no "success" row left behind
+    // for a later "failure" row to sit alongside — the phantom-audit-row bug
+    // this ordering fixes.
+    CHECK_FALSE(h.audited("app_usage.agent.view|success"));
     CHECK(h.audited("app_usage.agent.view|failure"));
 }
