@@ -770,9 +770,19 @@ void PolicyEvaluator::collect_ready() {
     }
 }
 
-void PolicyEvaluator::tick() {
+void PolicyEvaluator::tick(bool dispatch_due_allowed) {
+    // collect_ready() ALWAYS runs on its owning replica (WS-3 3.2, PR #4134 review):
+    // it is the ONLY production path that matures an in-flight Check/FixWait record —
+    // created by the operator-synchronous evaluate_now()/remediate() REST handlers,
+    // which run on whichever replica received the call — to a terminal verdict. It is
+    // replica-local + in-memory and takes no durable claim needing fencing, so gating
+    // it would strand an accepted operator remediation as `fixing` forever on any
+    // non-leader (the two-dispatch-planes rule: never fence an operator-synchronous
+    // path). Only dispatch_due() — the leader-owned durable due-policy scheduling
+    // (ADR-0056 claim_due_policies) — is fenced, via `dispatch_due_allowed`.
     collect_ready();
-    dispatch_due();
+    if (dispatch_due_allowed)
+        dispatch_due();
 }
 
 } // namespace yuzu::server
