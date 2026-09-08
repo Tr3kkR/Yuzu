@@ -1,6 +1,45 @@
-Tree: tests/unit/fixtures/wave9/peripherals/linux/sysfs_tree/
-Package: P91-5 (peripherals Linux leg)
-date: 2026-09-08
+Tree: tests/unit/fixtures/wave9/peripherals/linux/sysfs_tree/ (MATERIALIZED AT RUNTIME --
+see re-key note immediately below; this file used to live inside that directory when the
+tree was tracked on disk verbatim).
+Package: P91-5 (peripherals Linux leg) capture; re-keyed by P91-7 (Architect respec,
+2026-09-08) -- see "Storage re-key" below. Byte content and provenance are unchanged;
+only where the data lives on disk changed.
+
+== Storage re-key (P91-7, 2026-09-08) ==
+
+35 of the 58 attribute-file paths below use a literal ':' in a path segment
+(sysfs's own device-address grammar: "0000:00:01.0", "1-0:1.0", "0-0:1.1"). NTFS
+rejects ':' in a filename outright (ERROR_INVALID_NAME), so a plain `git checkout`
+of a branch tracking these paths verbatim fails on Windows -- this broke both the-rig
+and the required "Windows MSVC" self-hosted CI checkout job. Filed and fixed under an
+Architect respec of P91-7 (see tests/unit/fixtures/wave9/probes/the-rig-pr91a-verification.md,
+"Part A / Storage re-key" section, for the full incident record).
+
+Fix: the tree is no longer tracked on disk path-for-path. Every attribute file's
+relative path (colons included) and exact content is instead one line of
+`sysfs_tree.manifest` (this directory), a single portable-named text file with no
+illegal Windows path characters anywhere in ITS OWN name -- only inside the text
+values on each line, which is just data, not a path. `test_peripherals_linux_parsers.cpp`
+materializes the manifest onto disk under a fresh TempDir at the start of each of the
+three walk-case tests (usb_rows_at / pci_rows_at / thunderbolt_rows_at), recreating
+the real colon-bearing names the walk code under test keys on (is_usb_interface_entry,
+the thunderbolt retimer ':' grammar) -- so those assertions exercise genuine colon
+names exactly as before, just never persisted as tracked git blobs. On Windows,
+where NTFS cannot hold those names, materialization is not attempted at all: the three
+walk cases report Catch2 SKIP() naming the NTFS constraint instead of failing. The four
+pure-parser cases (parse_hex_attr, parse_pci_class, is_usb_interface_entry,
+is_tb_domain_entry) and the two negative/error cases (absent bus directory, unreadable
+root) never touched the tracked tree's path structure and are unaffected.
+
+Manifest line format: `<relative-path-from-sysfs_tree-root>\t<exact-attribute-content>`,
+one sysfs attribute file per line, content excluding the trailing newline (the
+materializer appends exactly one '\n' per file, matching every attribute file's
+original single-trailing-newline shape, verified byte-for-byte against the pre-re-key
+tree before it was deleted).
+
+No value below was regenerated, resampled, or edited as part of this re-key -- every
+byte in sysfs_tree.manifest is a straight copy of the tree this section's history
+describes. What follows, unchanged from the original P91-5 capture record:
 
 == sys/bus/pci/devices/ -- REAL CAPTURE ==
 host: this Mac, Docker Desktop's Linux VM (linuxkit)

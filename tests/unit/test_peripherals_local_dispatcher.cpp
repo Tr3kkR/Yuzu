@@ -98,6 +98,14 @@ std::vector<std::string> captured_rows(const std::string& captured) {
 
 /// Under `meson test` (MESON_BUILD_ROOT is always set) a missing plugin means
 /// the build is genuinely broken and must NOT report "All tests passed".
+///
+/// getenv (not _dupenv_s) matches every sibling *_local_dispatcher.cpp's
+/// identical helper -- MSVC's C4996 is silenced locally rather than
+/// diverging from that shared idiom (the-rig MSVC verification, P91-7).
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#endif
 void require_plugin_or_skip() {
     if (std::getenv("MESON_BUILD_ROOT") != nullptr) {
         FAIL("peripherals plugin library not found under meson test -- the plugin did not build, "
@@ -105,6 +113,9 @@ void require_plugin_or_skip() {
     }
     WARN("peripherals plugin library not found -- skipping the LocalDispatcher round-trip");
 }
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
 #if defined(_WIN32)
 constexpr const char* kPluginExt = ".dll";
@@ -117,7 +128,15 @@ constexpr const char* kPluginExt = ".so";
 fs::path find_peripherals_plugin() {
     const std::string lib_name = std::string{"peripherals"} + kPluginExt;
     std::vector<fs::path> candidates;
-    if (auto* build_root = std::getenv("MESON_BUILD_ROOT"))
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#endif
+    auto* build_root = std::getenv("MESON_BUILD_ROOT");
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+    if (build_root)
         candidates.emplace_back(fs::path{build_root} / "agents" / "plugins" / "peripherals" /
                                 lib_name);
     candidates.emplace_back(fs::path{"agents"} / "plugins" / "peripherals" / lib_name);
