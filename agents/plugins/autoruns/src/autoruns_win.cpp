@@ -125,6 +125,26 @@ std::string_view hive_status_token(yuzu::win::HiveAccessStatus st) {
     return "not_found";
 }
 
+/// True when `status` (an LSTATUS from RegOpenKeyExW) reflects a
+/// genuinely-absent key -- several of this leg's keys are legitimately
+/// absent on a given host (RunOnceEx unused, no per-app IFEO override
+/// configured, etc.), and "absent" is not this leg's error to report. Any
+/// OTHER open failure -- ERROR_ACCESS_DENIED foremost -- is a real
+/// constraint the caller must surface via note_constraint, never silently
+/// folded into "zero rows" (AC4: failure != empty).
+bool is_benign_absent_reg(LSTATUS status) noexcept {
+    return status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND;
+}
+
+/// `LSTATUS` (from a failed RegOpenKeyExW) -> a stable reason token for a
+/// `constrained` source status.
+std::string_view reg_open_constraint_token(LSTATUS status) noexcept {
+    switch (status) {
+    case ERROR_ACCESS_DENIED: return "permission_denied";
+    default:                  return "reg_open_failed";
+    }
+}
+
 /// Reverses user_profile_model.hpp's hex_encode (2 hex chars/byte, no
 /// delimiter) -- needed because read_reg_value hex-encodes REG_BINARY into
 /// `out_value` and the StartupApproved blob parser wants raw bytes.
@@ -287,9 +307,54 @@ void open_and_collect(HKEY hive, const std::wstring& subkey, REGSAM extra_view, 
                      const std::wstring& location, Scope scope, std::string_view user,
                      SourceOutcome& outcome) {
     RegKey key;
-    if (RegOpenKeyExW(hive, subkey.c_str(), 0, KEY_READ | extra_view, key.put()) != ERROR_SUCCESS)
-        return; // absent key on this host is not an error
+    const LSTATUS status = RegOpenKeyExW(hive, subkey.c_str(), 0, KEY_READ | extra_view, key.put());
+    if (status != ERROR_SUCCESS) {
+        if (!is_benign_absent_reg(status)) note_constraint(outcome, reg_open_constraint_token(status));
+        return;
+    }
     collect_reg_values(key.get(), location, id, scope, user, outcome);
+}
+
+constexpr DWORD kMaxRunOnceExSubkeys = 4096;
+
+/// RunOnceEx's real registration shape is a NUMBERED subkey per queued
+/// command (e.g. "0001"), each holding one or more values whose data is the
+/// command line to run -- Microsoft's own documented RunOnceEx mechanism.
+/// `open_and_collect`'s direct-value read (still run, defensively, since
+/// nothing forbids a value directly under RunOnceEx too) misses this shape
+/// entirely: a real RunOnceEx-registered persistence mechanism was
+/// previously never enumerated at all. One row per value per numbered
+/// subkey, via the same collect_reg_values every other flat-value source
+/// here uses.
+void collect_runonceex_subkeys(HKEY hive, const std::wstring& subkey, REGSAM extra_view,
+                               SourceId id, const std::wstring& location_prefix, Scope scope,
+                               SourceOutcome& outcome) {
+    RegKey key;
+    const LSTATUS status = RegOpenKeyExW(hive, subkey.c_str(), 0, KEY_READ | extra_view, key.put());
+    if (status != ERROR_SUCCESS) {
+        if (!is_benign_absent_reg(status)) note_constraint(outcome, reg_open_constraint_token(status));
+        return;
+    }
+    constexpr DWORD kNameBufLen = 256;
+    wchar_t name_buf[kNameBufLen]{};
+    DWORD idx = 0;
+    DWORD name_len = kNameBufLen;
+    while (idx < kMaxRunOnceExSubkeys &&
+          RegEnumKeyExW(key.get(), idx, name_buf, &name_len, nullptr, nullptr, nullptr,
+                       nullptr) == ERROR_SUCCESS) {
+        const std::wstring numbered_w(name_buf, name_len);
+        ++idx;
+        name_len = kNameBufLen;
+
+        RegKey sub;
+        const LSTATUS sub_status = RegOpenKeyExW(key.get(), numbered_w.c_str(), 0, KEY_READ, sub.put());
+        if (sub_status != ERROR_SUCCESS) {
+            if (!is_benign_absent_reg(sub_status))
+                note_constraint(outcome, reg_open_constraint_token(sub_status));
+            continue;
+        }
+        collect_reg_values(sub.get(), location_prefix + L"\\" + numbered_w, id, scope, "-", outcome);
+    }
 }
 
 void collect_hklm_run_family(std::string_view filter, SourceOutcome& run, SourceOutcome& runonce,
@@ -303,9 +368,6 @@ void collect_hklm_run_family(std::string_view filter, SourceOutcome& run, Source
         {SourceId::win_run_hklm, &run, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"},
         {SourceId::win_runonce_hklm, &runonce,
          L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce"},
-        // RunOnceEx's numbered-subkey nesting shape is not walked here --
-        // only direct values under the key itself. Documented gap, same
-        // spirit as the Startup-folder .lnk targets not being resolved.
         {SourceId::win_runonceex_hklm, &runonceex,
          L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnceEx"},
     };
@@ -317,6 +379,12 @@ void collect_hklm_run_family(std::string_view filter, SourceOutcome& run, Source
         const std::wstring wow_loc = native_loc + L" [WOW6432Node]";
         open_and_collect(HKEY_LOCAL_MACHINE, e.subkey, KEY_WOW64_32KEY, e.id, wow_loc,
                          Scope::system, "-", *e.outcome);
+        if (e.id == SourceId::win_runonceex_hklm) {
+            collect_runonceex_subkeys(HKEY_LOCAL_MACHINE, e.subkey, KEY_WOW64_64KEY, e.id,
+                                      native_loc, Scope::system, *e.outcome);
+            collect_runonceex_subkeys(HKEY_LOCAL_MACHINE, e.subkey, KEY_WOW64_32KEY, e.id,
+                                      wow_loc, Scope::system, *e.outcome);
+        }
     }
 }
 
@@ -326,7 +394,11 @@ void collect_startup_approved_subkey(HKEY root, const wchar_t* subkey, const std
                                      Scope scope, std::string_view user,
                                      std::map<std::string, bool>& seen, SourceOutcome& outcome) {
     RegKey key;
-    if (RegOpenKeyExW(root, subkey, 0, KEY_READ, key.put()) != ERROR_SUCCESS) return;
+    const LSTATUS status = RegOpenKeyExW(root, subkey, 0, KEY_READ, key.put());
+    if (status != ERROR_SUCCESS) {
+        if (!is_benign_absent_reg(status)) note_constraint(outcome, reg_open_constraint_token(status));
+        return;
+    }
     auto names = yuzu::win::enumerate_value_names(key.get());
     if (!names.complete) note_constraint(outcome, "enumeration_incomplete");
     const std::int64_t mtime = reg_key_mtime(key.get());
@@ -388,14 +460,19 @@ void collect_winlogon(std::string_view filter, SourceOutcome& shell_out,
         {SourceId::win_winlogon_userinit, &userinit_out, L"Userinit", &parse_winlogon_userinit},
     };
     RegKey key;
-    const bool opened =
+    const LSTATUS open_status =
         RegOpenKeyExW(HKEY_LOCAL_MACHINE,
                      L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon", 0, KEY_READ,
-                     key.put()) == ERROR_SUCCESS;
+                     key.put());
+    const bool opened = open_status == ERROR_SUCCESS;
+    const bool open_constrained = !opened && !is_benign_absent_reg(open_status);
     const std::int64_t mtime = opened ? reg_key_mtime(key.get()) : 0;
     for (const auto& e : entries) {
         if (!want(filter, e.id)) continue;
-        if (!opened) continue; // absent Winlogon key -> zero rows, not an error
+        if (!opened) {
+            if (open_constrained) note_constraint(*e.outcome, reg_open_constraint_token(open_status));
+            continue;
+        }
         std::string value, type_name;
         const auto st = yuzu::win::read_reg_value(key.get(), yuzu::win::from_wide(e.value_name),
                                                   value, type_name);
@@ -435,10 +512,13 @@ void collect_winlogon(std::string_view filter, SourceOutcome& shell_out,
 void collect_appinit_dlls(std::string_view filter, SourceOutcome& outcome) {
     if (!want(filter, SourceId::win_appinit_dlls)) return;
     RegKey key;
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
-                      L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Windows", 0, KEY_READ,
-                      key.put()) != ERROR_SUCCESS)
+    const LSTATUS status = RegOpenKeyExW(
+        HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Windows", 0,
+        KEY_READ, key.put());
+    if (status != ERROR_SUCCESS) {
+        if (!is_benign_absent_reg(status)) note_constraint(outcome, reg_open_constraint_token(status));
         return;
+    }
     const std::int64_t mtime = reg_key_mtime(key.get());
 
     std::string load_value, load_type;
@@ -491,11 +571,14 @@ constexpr DWORD kMaxIfeoSubkeys = 4096;
 void collect_ifeo(std::string_view filter, SourceOutcome& outcome) {
     if (!want(filter, SourceId::win_ifeo_debugger)) return;
     RegKey key;
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
-                      L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution "
-                      L"Options",
-                      0, KEY_READ, key.put()) != ERROR_SUCCESS)
+    const LSTATUS status = RegOpenKeyExW(
+        HKEY_LOCAL_MACHINE,
+        L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options", 0,
+        KEY_READ, key.put());
+    if (status != ERROR_SUCCESS) {
+        if (!is_benign_absent_reg(status)) note_constraint(outcome, reg_open_constraint_token(status));
         return;
+    }
 
     constexpr DWORD kNameBufLen = 512;
     wchar_t name_buf[kNameBufLen]{};
@@ -510,8 +593,12 @@ void collect_ifeo(std::string_view filter, SourceOutcome& outcome) {
         name_len = kNameBufLen;
 
         RegKey sub;
-        if (RegOpenKeyExW(key.get(), exe_name_w.c_str(), 0, KEY_READ, sub.put()) != ERROR_SUCCESS)
+        const LSTATUS sub_status = RegOpenKeyExW(key.get(), exe_name_w.c_str(), 0, KEY_READ, sub.put());
+        if (sub_status != ERROR_SUCCESS) {
+            if (!is_benign_absent_reg(sub_status))
+                note_constraint(outcome, reg_open_constraint_token(sub_status));
             continue;
+        }
         std::string debugger_value, type_name;
         const auto st = yuzu::win::read_reg_value(sub.get(), "Debugger", debugger_value, type_name);
         if (st == ReadValueStatus::not_found) continue;
@@ -550,7 +637,15 @@ void collect_startup_folder(const std::wstring& dir, SourceId id, Scope scope,
     WIN32_FIND_DATAW find_data{};
     const std::wstring pattern = dir + L"\\*";
     HANDLE h = FindFirstFileW(pattern.c_str(), &find_data);
-    if (h == INVALID_HANDLE_VALUE) return; // folder absent/unreadable -- zero rows, not an error
+    if (h == INVALID_HANDLE_VALUE) {
+        const DWORD err = GetLastError();
+        // A genuinely-absent folder is not an error; anything else (access
+        // denied foremost) is a real constraint (AC4: failure != empty).
+        if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND) {
+            note_constraint(outcome, err == ERROR_ACCESS_DENIED ? "permission_denied" : "dir_open_failed");
+        }
+        return;
+    }
     std::size_t count = 0;
     do {
         const std::wstring name = find_data.cFileName;
