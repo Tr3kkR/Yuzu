@@ -934,6 +934,7 @@ if build_server
       'unit/server/test_instruction_routes.cpp', # #2542 PR-7: the 13-route Instruction Definitions + Instruction Sets API, extracted onto the HttpRouteSink seam
       'unit/server/test_execution_tracker.cpp',
       'unit/server/test_execution_routes.cpp', # #2542 PR-7: the 7-route legacy pre-v1 Executions API, extracted onto the HttpRouteSink seam
+      'unit/server/test_health_routes.cpp', # #2542 PR-10: the 6-route Health/Infra cluster, extracted onto the HttpRouteSink seam
       'unit/server/test_leader_elector.cpp',
       'unit/server/test_leader_gate.cpp',
       'unit/server/test_coord_dsn.cpp',
@@ -1136,6 +1137,8 @@ if build_server
       'unit/server/test_settings_routes_ota_audit.cpp',
       'unit/server/test_settings_routes_management_groups.cpp', # stored-XSS regression (mgmt-group name/id escaping)
       'unit/server/test_settings_routes_oidc.cpp',
+      'unit/server/test_settings_model.cpp',        # #4028 — pure Settings read-twin builder unit tests
+      'unit/server/test_settings_read_twins.cpp',   # #4028 — REST v1 read-twin route coverage
       'unit/server/test_plugin_signing_helpers.cpp',
       'unit/server/test_store_errors.cpp',
       'unit/server/test_static_js_bundle.cpp',
@@ -1144,6 +1147,7 @@ if build_server
       'unit/server/test_rest_visualization.cpp',
       'unit/server/test_response_templates_engine.cpp',
       'unit/server/test_rest_response_templates.cpp',
+      'unit/server/test_rest_instructions_productpacks.cpp', # #4029: GET /api/v1/instructions*, /api/v1/product-packs*
       'unit/server/test_offload_target_store.cpp',
       'unit/server/test_rest_offload_targets.cpp',
       'unit/server/test_directory_sync.cpp', # ADR-0063: directory_sync Postgres migration
