@@ -11,9 +11,14 @@
 // it decides not to publish), no-UAF on early handle destruction, and the
 // Guardian-backend_op_deadline compile-time tripwire pattern.
 //
-// This file is also this primitive's TSan/ASan checkpoint (shared mutable
-// state across threads) - see the session's final report for the exact
-// sanitizer build/run commands used to verify it.
+// This file is also this primitive's TSan checkpoint (shared mutable state
+// across threads) - full [spark] tag, zero races. An ASan+UBSan run was
+// also attempted (governance finding, PR-A round 2 - correcting an earlier
+// overclaim here) but is blocked on this box by a pre-existing, unrelated
+// protobuf/abseil static-initialization false-positive that reproduces for
+// ANY test in this binary (confirmed via an unrelated tag) - not a claim
+// this file's own code is unverified under ASan, just that ASan could not
+// be run here at all.
 
 #include "spark_detached_call.hpp"
 

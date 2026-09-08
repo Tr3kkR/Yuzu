@@ -34,7 +34,7 @@
  * See launch()'s own comments for how this is achieved even across every
  * allocation-failure path (not just the common OS-refused-thread path).
  *
- * F3 / §24 (`docs/yuzu-guardian-design-v1.1.md:2478-2484`): the process must
+ * F3 / §24 (`docs/yuzu-guardian-design-v1.1.md:2478-2487`): the process must
  * not run normal C++ teardown while any detached worker is alive - "a source
  * left out of the sum would silently reinstate the use-after-free the
  * joined-thread rule used to prevent by a different mechanism." Every
@@ -51,8 +51,8 @@
  * active_workers() count is a separate, lane-scoped mirror of the same
  * lifetime, incremented/decremented in lockstep with the shared F3 counter.
  *
- * TICKETING (mirrors GuardianIoExecutor's AliveTicket rule in SPIRIT,
- * guardian_io_executor.hpp:586-597 - read-only reference, this file does
+ * TICKETING (mirrors GuardianIoExecutor's TicketCore admission-slot rule in
+ * SPIRIT, guardian_io_executor.hpp:586-597 - read-only reference, this file does
  * not include or modify that class, and does NOT copy its shared_ptr-based
  * ownership shape; see launch()'s own "Payload is a std::unique_ptr, NOT a
  * shared_ptr" comment for why that specific difference is load-bearing,
@@ -206,9 +206,11 @@ struct LaneState {
     // (it would need a global operator-new hook), so this is the only
     // reachable way to exercise take_locked()'s null-result branch at all.
     // NOTE: this seam's discard happens OUTSIDE operator()()'s try/catch, so
-    // it always leaves worker_threw_total==0 - it cannot exercise the FIRST
-    // box's own allocation failing INSIDE the try/catch (see
-    // fail_first_box_alloc_for_test below for that path specifically).
+    // it never itself SETS worker_threw_total (whether the counter ends up
+    // 0 depends only on whether fn() threw, same as without this seam
+    // active) - it cannot exercise the FIRST box's own allocation failing
+    // INSIDE the try/catch (see fail_first_box_alloc_for_test below for
+    // that path specifically).
     std::atomic<bool> fail_result_alloc_for_test{false};
     // Test seam only: makes the FIRST box allocation (wrapping fn()'s real
     // return value) throw std::bad_alloc from inside operator()()'s inner
@@ -256,8 +258,13 @@ struct CountGuard {
 } // namespace detached_detail
 
 /// Owner-side handle to one launched call. Move-only. Destroying a handle
-/// while its call is still in flight ("parked") is safe (no UAF, tested
-/// under ASan/TSan) and behaves like an implicit abandon() - a not-yet-
+/// while its call is still in flight ("parked") is safe (no UAF, TSan-
+/// confirmed - zero races across the full [spark] tag; ASan attempted but
+/// blocked on this box by a pre-existing, unrelated protobuf/abseil static-
+/// init false-positive that reproduces for ANY test in this binary,
+/// confirmed via an unrelated tag - governance finding, PR-A round 2, not a
+/// claim this file's own code was ASan-clean, just that ASan could not be
+/// run here) and behaves like an implicit abandon() - a not-yet-
 /// published result is disposed by the WORKER when it eventually completes;
 /// an already-published-but-untaken result is disposed right here, on
 /// whichever thread destroys the handle (fast: T is a result value or an
@@ -269,7 +276,25 @@ public:
     DetachedCall(const DetachedCall&) = delete;
     DetachedCall& operator=(const DetachedCall&) = delete;
     DetachedCall(DetachedCall&&) noexcept = default;
-    DetachedCall& operator=(DetachedCall&&) noexcept = default;
+    // User-defined, NOT = default (governance finding, PR-A round 2): a
+    // defaulted move-assignment would overwrite cell_ without ever calling
+    // dispose_or_abandon() on the handle's PRIOR cell - silently discarding
+    // whatever that older call's result was (or leaving it perpetually
+    // un-abandoned if not yet published), a fourth, undocumented delivery
+    // path outside this class's own "exactly-once" enumeration above. No
+    // UAF/leak either way (the worker's own Payload::cell reference keeps
+    // the old Cell<T> alive independently, and it self-tears-down via
+    // ~Cell on the worker thread once that worker eventually finishes) -
+    // but a caller reassigning a live handle (`pending_[key] = lane.launch(
+    // ...).call`, the exact shape PR-B's per-key sweepers use) deserves the
+    // same disposal/abandonment semantics destruction already gives it.
+    DetachedCall& operator=(DetachedCall&& other) noexcept {
+        if (this != &other) {
+            dispose_or_abandon();
+            cell_ = std::move(other.cell_);
+        }
+        return *this;
+    }
 
     ~DetachedCall() { dispose_or_abandon(); }
 
@@ -359,7 +384,17 @@ private:
         if (!cell_->result)
             return DetachedResult<T>{std::unexpect, DetachedCallError::ResultAllocFailed};
         auto out = std::move(*cell_->result);
-        cell_->result.reset();
+        // Deliberately NOT cell_->result.reset() here (governance finding,
+        // PR-A round 2): a std::expected move leaves the source ENGAGED (T's
+        // move ctor runs, the moved-from T remains a live object), so an
+        // explicit reset() here would run ~T() on that moved-from remnant
+        // while cell_->mu is STILL HELD - exactly the "disposal under the
+        // lock" mistake dispose_or_abandon()'s own comment (above) already
+        // names and avoids. `taken` alone gates re-entry (checked at the top
+        // of this function), so a stale, moved-from unique_ptr in
+        // cell_->result is harmless and inert; it is destroyed later, outside
+        // any lock, whenever Cell<T> itself is (the shared_ptr's last
+        // reference dropping - by then nothing can be holding cell_->mu).
         return out;
     }
 
