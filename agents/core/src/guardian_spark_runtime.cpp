@@ -101,53 +101,552 @@ GuardianSparkRuntime::make_handler(std::shared_ptr<GuardianSparkRuntime> rt) {
     return [rt = std::move(rt)](const SparkEvent& ev) { rt->on_event(ev); };
 }
 
-void GuardianSparkRuntime::submit_disarm_off_lock(const DisarmWork& work) {
-    // fn's own return value is discarded below - disarm() is void and was never
-    // awaited for success even in the old inline call this replaces (see the
-    // header doc).
+void GuardianSparkRuntime::release_claim_index_locked(KeyClaim& claim) {
+    if (!claim.index_held)
+        return;
+    claim.index_held = false;
+    index_->remove_rule(claim.rule_id); // idempotent; guarded by index_held so a stale
+                                        // claim never removes a replacement's mapping
+}
+
+std::shared_ptr<GuardianSparkRuntime::KeyClaim>
+GuardianSparkRuntime::try_dispatch_head_locked(const std::string& key) {
+    const auto eit = claims_.find(key);
+    if (eit == claims_.end() || eit->second.fifo.empty())
+        return nullptr;
+    auto& head = eit->second.fifo.front();
+    if (head->dispatch != ClaimDispatch::Queued)
+        return nullptr;
+    head->dispatch = ClaimDispatch::Dispatching;
+    return head;
+}
+
+void GuardianSparkRuntime::fail_all_claims_locked(const std::string& key, const std::string& reason,
+                                                  ClaimEnd end) {
+    const auto eit = claims_.find(key);
+    if (eit == claims_.end())
+        return;
+    for (auto& c : eit->second.fifo) {
+        release_claim_index_locked(*c);
+        if (!c->outcome)
+            c->outcome = std::unexpected(reason);
+        if (c->end == ClaimEnd::None)
+            c->end = end;
+    }
+    claims_.erase(eit);
+}
+
+std::string GuardianSparkRuntime::abandon_claim_locked(const std::string& key,
+                                                       const std::shared_ptr<KeyClaim>& claim,
+                                                       bool stopping) {
+    // The caller-side half of the exactly-once decision, taken under the SAME
+    // registry_mu_ acquisition the completion callback will take (#3816's shape, now on
+    // the runtime side): either we get here first and the callback sees
+    // waiter_abandoned, or the callback published first and the waiter never reaches
+    // this. A timeout while the claim is still Dispatching (mid-submit()) is waiter
+    // abandonment too - never erase a claim the dispatcher still expects to find.
+    release_claim_index_locked(*claim);
+    const std::string reason = stopping ? "stopping" : "arm timed out";
+    if (claim->dispatch == ClaimDispatch::Queued) {
+        // Never dispatched: queue-wait expiry. Erase it outright; nothing is in flight.
+        if (const auto eit = claims_.find(key); eit != claims_.end()) {
+            auto& fifo = eit->second.fifo;
+            for (auto it = fifo.begin(); it != fifo.end(); ++it) {
+                if (*it == claim) {
+                    fifo.erase(it);
+                    break;
+                }
+            }
+            if (fifo.empty())
+                claims_.erase(eit);
+        }
+        claim->end = stopping ? ClaimEnd::Stopped : ClaimEnd::WaiterTimedOutQueued;
+    } else {
+        claim->waiter_abandoned = true; // the completion callback finishes this episode
+        claim->end = stopping ? ClaimEnd::Stopped : ClaimEnd::WaiterTimedOutDispatched;
+    }
+    if (!claim->outcome)
+        claim->outcome = std::unexpected(reason);
+    if (!stopping)
+        backend_op_timeouts_.fetch_add(1, std::memory_order_relaxed);
+    return reason;
+}
+
+std::expected<std::uint64_t, std::string>
+GuardianSparkRuntime::wait_for_claim(const std::string& key, const std::shared_ptr<KeyClaim>& claim,
+                                     std::chrono::steady_clock::time_point deadline) {
+    std::unique_lock<std::mutex> lk{registry_mu_};
+    claim_cv_.wait_until(lk, deadline, [&] {
+        return claim->outcome.has_value() || claim->commit_exception || stopping_;
+    });
+    if (claim->commit_exception) {
+        // The drain already undid this claim's own commit and erased it; the waiter
+        // just re-raises on its own thread (existing "attach_rule throws" contract).
+        const std::exception_ptr e = claim->commit_exception;
+        lk.unlock();
+        std::rethrow_exception(e);
+    }
+    if (claim->outcome)
+        return *claim->outcome; // a real outcome wins over a concurrent stop
+    // No outcome: the deadline elapsed, or begin_stop() flipped stopping_ while this
+    // claim is dispatched (begin_stop drops QUEUED claims with an outcome itself).
+    // Never dereference the empty optional - abandon under this same acquisition.
+    return std::unexpected(abandon_claim_locked(key, claim, stopping_));
+}
+
+void GuardianSparkRuntime::submit_disarm_off_lock(const std::shared_ptr<KeyClaim>& claim) {
+    const std::string key = claim->key;
+    {
+        std::lock_guard<std::mutex> lk{registry_mu_};
+        const auto eit = claims_.find(key);
+        if (eit == claims_.end() || eit->second.fifo.empty() || eit->second.fifo.front() != claim)
+            return; // completed, dropped, or not yet the head
+        if (claim->dispatch != ClaimDispatch::Queued)
+            return; // another caller is already driving it
+        claim->dispatch = ClaimDispatch::Dispatching;
+    }
+    // The bounded backend disarm, exactly as before rung 9c: run() holds the class
+    // quota and the single-flight key for the call's duration and bounds THIS
+    // caller's wait by cfg_.backend_op_deadline; fn's own return value is discarded
+    // (disarm() is void and was never awaited for success even in the old inline
+    // call this replaces - see the header doc). Kept on the blocking form
+    // deliberately in PR-1: the caller waits anyway, and run() supplies the bound,
+    // the quota slot and the timeout accounting for free; the claim entry supplies
+    // the same-key ordering (an arm that arrives meanwhile queues behind this claim).
     //
-    // #3816: io_executor_.run() no longer has an internal throwing wait-path (its
-    // one remaining pre-launch mutex-lock failure returns IoFailure::LaunchFailed
-    // rather than throwing - see guardian_io_executor.hpp's INVARIANTS block). This
-    // try/catch is NOT dead code even so: `work.key` copies into run()'s by-value
-    // `std::string key` parameter as part of evaluating this call expression, in
-    // THIS function's own frame, before run() is ever entered - a bad_alloc there
-    // is the live trigger now, the same class of "argument evaluation, not the
-    // callee's own body" hazard as attach_rule's arming_rollback guard. Every
-    // caller of THIS function treats a disarm as best-effort and never awaited for
-    // success anyway (see the comment above); letting that same best-effort
-    // posture extend to "the attempt itself threw" - rather than letting the
-    // exception propagate out of a caller that has already committed unrelated
-    // state (e.g. attach_rule's own new generation, already live in
-    // rules_/keys_/index_ by the time it calls this on the normal-exit path) - is
-    // strictly more consistent than leaving exactly one of this function's several
-    // call sites exposed. Swallow-and-log, not swallow-and-silence: an operator
-    // debugging a stuck key still has a log line, unlike a silently dropped
-    // exception would give them.
-    std::expected<int, IoFailure> result;
+    // #3816: run() no longer has an internal throwing wait-path (a wait-lock failure
+    // returns IoFailure::LaunchFailed). The try/catch is NOT dead code even so: the
+    // argument evaluation (`key`'s copy into run()'s by-value parameter, the lambda's
+    // captures) runs in THIS frame before run() is entered - a bad_alloc there is the
+    // live trigger. Every caller treats a disarm as best-effort; a throw here leaves
+    // the claim RETAINED (below) rather than dropped, so the watcher is not forgotten.
+    std::expected<int, IoFailure> result{std::unexpect, IoFailure::LaunchFailed};
     try {
-        result = io_executor_.run(work.io_class, work.key, cfg_.backend_op_deadline,
-                                  [backend = backend_, sub = work.subscription]() -> int {
+        result = io_executor_.run(claim->io_class, key, cfg_.backend_op_deadline,
+                                  [backend = backend_, sub = claim->subscription]() -> int {
                                       backend->disarm(sub);
                                       return 0;
                                   });
     } catch (const std::exception& e) {
         spdlog::error("Guardian spark: submit_disarm_off_lock's own io_executor_.run() threw "
                      "({}) for key '{}' - the disarm attempt itself failed, not just the "
-                     "backend call; the watcher's fate is unknown", e.what(), work.key);
+                     "backend call; the claim is retained for the next same-key event",
+                     e.what(), key);
+    }
+    std::shared_ptr<KeyClaim> refill;
+    {
+        std::lock_guard<std::mutex> lk{registry_mu_};
+        const auto eit = claims_.find(key);
+        if (eit == claims_.end() || eit->second.fifo.empty() || eit->second.fifo.front() != claim)
+            return; // begin_stop() dropped it meanwhile
+        auto& fifo = eit->second.fifo;
+        if (!result && result.error() != IoFailure::Timeout && result.error() != IoFailure::Stopped) {
+            // ADMISSION refusal (capacity, key, ceiling, launch, or the throw above):
+            // the backend call never ran. Retain the claim at the head - never drop a
+            // disarm for capacity reasons (rung 9c R5.2, closing the #3415 silent-drop
+            // gap) - and count it. The next same-key event (an attach, which then
+            // queues its own arm behind this claim) re-drives it; there is no redrive
+            // timer in PR-1. The caller returns now: "retained" is not an outcome.
+            claim->dispatch = ClaimDispatch::Queued;
+            ++claim->admission_rejections;
+            disarm_retained_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        if (!result && result.error() == IoFailure::Timeout) {
+            // backend_op_timeouts_ counts deadline hits specifically - only
+            // IoFailure::Timeout, matching attach_rule's own increment site (adversarial
+            // review C3/k1). The disarm is still running on its worker and completes
+            // on its own schedule; the claim is done from this caller's view.
+            backend_op_timeouts_.fetch_add(1, std::memory_order_relaxed);
+            claim->end = ClaimEnd::WaiterTimedOutDispatched;
+            claim->outcome = std::unexpected(std::string{"disarm timed out"});
+        } else if (!result) {
+            // Stopped: the executor refused admission at shutdown. Dropped with a count
+            // (R5.5 makes this the counted total); everything queued behind it goes
+            // with it, since nothing can dispatch any more.
+            claims_dropped_at_stop_.fetch_add(1, std::memory_order_relaxed);
+            fail_all_claims_locked(key, "stopping", ClaimEnd::Stopped);
+            claim_cv_.notify_all();
+            return;
+        } else {
+            claim->end = ClaimEnd::DisarmDone;
+            claim->outcome = 0;
+        }
+        fifo.pop_front();
+        if (fifo.empty())
+            claims_.erase(eit);
+        else
+            refill = try_dispatch_head_locked(key); // an arm queued behind this disarm
+    }
+    claim_cv_.notify_all();
+    if (refill)
+        dispatch_arm_off_lock(key, refill);
+}
+
+void GuardianSparkRuntime::dispatch_arm_off_lock(const std::string& key,
+                                                 const std::shared_ptr<KeyClaim>& claim) {
+    // The claim is the Dispatching head; nothing else can dispatch it. Build the
+    // submit() call: `fn` is the bare backend call (it needs nothing from this
+    // runtime - #3816); the completion callback captures self_keepalive, NOT `this`,
+    // because it runs on a detached io_executor_ worker that may outlive
+    // ~GuardianSparkRuntime() (the class's established off-thread capture pattern).
+    // shared_from_this()'s documented bad_weak_ptr, a bad_alloc copying `spec`, or a
+    // synchronous admission refusal all land in the same place: the claim never
+    // launched, no callback will ever fire, so fail the head and every arm queued
+    // behind it here (they were all waiting on this one backend call).
+    if (claim->kind != ClaimKind::Arm) {
+        // Defensive: only an Arm claim is ever handed here (the FIFO invariant puts a
+        // Disarm only at the head of an otherwise-empty entry, and every refill site
+        // pops the disarm first). Hand a mis-routed disarm back to the retained state
+        // rather than arm a spec it does not carry.
+        assert(false && "dispatch_arm_off_lock: not an Arm claim");
+        std::lock_guard<std::mutex> lk{registry_mu_};
+        if (claim->dispatch == ClaimDispatch::Dispatching)
+            claim->dispatch = ClaimDispatch::Queued;
         return;
     }
-    // backend_op_timeouts_ is documented (guardian_spark_runtime.hpp) as counting
-    // deadline hits specifically - only IoFailure::Timeout, matching attach_rule's
-    // own increment site (adversarial review C3/k1: this previously counted EVERY
-    // executor failure here, including a clean Stopped during shutdown or
-    // CapacityExhausted, both unrelated to a hung backend call and misleading for
-    // an operator diagnosing a wedge from this counter alone). A non-timeout
-    // disarm failure still means the OS watcher's fate is genuinely unknown to us
-    // (unlike the old synchronous call, which never risked this) but that is a
-    // DIFFERENT condition from a deadline hit and does not belong in this counter.
-    if (!result && result.error() == IoFailure::Timeout)
-        backend_op_timeouts_.fetch_add(1, std::memory_order_relaxed);
+    IoResult<void> adm{std::unexpect, IoFailure::LaunchFailed};
+    try {
+        auto self = shared_from_this();
+        adm = io_executor_.submit(
+            claim->io_class, key,
+            [backend = backend_, spec = claim->spec]() -> std::expected<std::uint64_t, std::string> {
+                return backend->arm(spec);
+            },
+            [self, key, claim](IoResult<std::expected<std::uint64_t, std::string>>&& r) {
+                self->on_arm_complete(key, claim, std::move(r));
+            });
+    } catch (const std::exception& e) {
+        try {
+            spdlog::error("Guardian spark: building the arm submission for key '{}' threw ({}) - "
+                          "the arm was never dispatched",
+                          key, e.what());
+        } catch (...) {
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk{registry_mu_};
+        const auto eit = claims_.find(key);
+        if (eit == claims_.end() || eit->second.fifo.empty() || eit->second.fifo.front() != claim)
+            return; // the callback already ran (before submit() even returned) and
+                    // erased or replaced it - never touch whatever occupies the key now
+        if (adm) {
+            if (claim->dispatch == ClaimDispatch::Dispatching)
+                claim->dispatch = ClaimDispatch::Dispatched;
+            return;
+        }
+        std::string reason;
+        switch (adm.error()) {
+        case IoFailure::Timeout:            reason = "arm timed out"; break; // unreachable: submit() has no deadline
+        case IoFailure::Stopped:            reason = "stopping"; break;
+        case IoFailure::CapacityExhausted:  reason = "arm capacity exhausted"; break;
+        case IoFailure::AlreadyRunning:     reason = "arm already in progress for this key"; break;
+        case IoFailure::LaunchFailed:       reason = "arm worker launch failed"; break;
+        case IoFailure::WorkerThrew:        reason = "arm worker threw"; break; // unreachable at admission
+        case IoFailure::CeilingExhausted:   reason = "arm rejected at alive-worker ceiling"; break;
+        }
+        fail_all_claims_locked(key, reason,
+                               adm.error() == IoFailure::Stopped ? ClaimEnd::Stopped
+                                                                 : ClaimEnd::AdmissionRejected);
+    }
+    claim_cv_.notify_all();
+}
+
+void GuardianSparkRuntime::on_arm_complete(const std::string& key,
+                                           const std::shared_ptr<KeyClaim>& claim,
+                                           IoResult<std::expected<std::uint64_t, std::string>>&& r) noexcept {
+    // Runs on the detached io_executor_ worker (GuardianDetachedWorkerRole marked -
+    // nothing here may take GuardianEngine::mtx_; registry_mu_/outbox_mu_ are fine).
+    // The executor already released its quota slot and single-flight key before
+    // invoking this, so the bounded compensating run() below admits normally.
+    //
+    // Shape (rung 9c R5.2, commit-in-callback): (1) under registry_mu_, decide the
+    // outcome of the head and every sibling and perform the commits - the head stays
+    // in the fifo as the key's marker throughout; (2) OFF the lock, run the
+    // compensating disarm if a live subscription ended up unwanted; (3) under the
+    // lock again, PUBLISH every outcome, pop the finished claims, and dispatch the
+    // next head if new claims queued behind meanwhile; (4) wake waiters, fire wakers.
+    // Publishing only after (2) is deliberate: no waiter can observe its outcome
+    // while a subscription nobody wants is still live, which is what keeps "attach_rule
+    // threw => the rollback disarm already happened" true for the caller (:2187's
+    // contract) without any notify-order reasoning.
+    std::optional<std::uint64_t> compensating; // a live subscription nobody adopted
+    std::vector<std::shared_ptr<KeyClaim>> finished;
+    std::function<void()> waker;
+    std::function<void()> outbox_waker;
+    bool firewalled = false;
+    try {
+        {
+            std::unique_lock<std::mutex> lk{registry_mu_};
+            const auto eit = claims_.find(key);
+            const bool is_head = eit != claims_.end() && !eit->second.fifo.empty() &&
+                                 eit->second.fifo.front() == claim;
+            const bool armed_live = r && r->has_value();
+            if (!is_head) {
+                // Cannot happen by construction (only this callback pops the head) -
+                // defensive: never leak the subscription, never touch a foreign entry.
+                if (armed_live)
+                    compensating = **r;
+                if (!claim->outcome)
+                    claim->outcome = std::unexpected(std::string{"arm claim orphaned"});
+                claim->end = ClaimEnd::AdmissionRejected;
+                lk.unlock();
+                claim_drain_failures_.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                auto& fifo = eit->second.fifo;
+                // Everything currently queued is an Arm claim behind this head (a disarm
+                // is only ever created on a key with no live claim - see KeyClaim).
+                for (const auto& c : fifo)
+                    finished.push_back(c);
+                std::vector<std::shared_ptr<KeyClaim>> live;
+                for (const auto& c : finished)
+                    if (!c->withdrawn && !c->waiter_abandoned)
+                        live.push_back(c);
+
+                if (stopping_ || live.empty()) {
+                    // Nobody is left to adopt the result: withdrawn, abandoned, or the
+                    // runtime is stopping (R5.5: a late success is disarmed, never left
+                    // live). No "armed" audit - nothing committed.
+                    for (const auto& c : finished) {
+                        release_claim_index_locked(*c);
+                        if (!c->outcome)
+                            c->outcome = std::unexpected(
+                                std::string{stopping_ ? "stopping" : "withdrawn"});
+                        if (c->end == ClaimEnd::None)
+                            c->end = stopping_ ? ClaimEnd::Stopped : ClaimEnd::Withdrawn;
+                    }
+                    if (armed_live) {
+                        compensating = **r;
+                        if (claim->waiter_abandoned)
+                            backend_op_late_arms_.fetch_add(1, std::memory_order_relaxed);
+                    }
+                } else if (!r) {
+                    // The executor's own outer failure. Only WorkerThrew is reachable
+                    // here (submit() has no deadline and admission refusals never reach
+                    // a callback); the full map is kept for PR-5.
+                    std::string reason;
+                    switch (r.error()) {
+                    case IoFailure::Timeout:            reason = "arm timed out"; break;
+                    case IoFailure::Stopped:            reason = "stopping"; break;
+                    case IoFailure::CapacityExhausted:  reason = "arm capacity exhausted"; break;
+                    case IoFailure::AlreadyRunning:     reason = "arm already in progress for this key"; break;
+                    case IoFailure::LaunchFailed:       reason = "arm worker launch failed"; break;
+                    case IoFailure::WorkerThrew:        reason = "arm worker threw"; break;
+                    case IoFailure::CeilingExhausted:   reason = "arm rejected at alive-worker ceiling"; break;
+                    }
+                    if (r.error() == IoFailure::Timeout)
+                        backend_op_timeouts_.fetch_add(1, std::memory_order_relaxed);
+                    for (const auto& c : finished) {
+                        release_claim_index_locked(*c);
+                        if (!c->outcome)
+                            c->outcome = std::unexpected(reason);
+                        if (c->end == ClaimEnd::None)
+                            c->end = r.error() == IoFailure::WorkerThrew ? ClaimEnd::WorkerThrew
+                                                                        : ClaimEnd::AdmissionRejected;
+                    }
+                } else if (!armed_live) {
+                    // backend_->arm() itself refused (synchronously, on the worker) - the
+                    // key genuinely could not be armed, so every sibling fails with it.
+                    for (const auto& c : finished) {
+                        release_claim_index_locked(*c);
+                        if (!c->outcome)
+                            c->outcome = std::unexpected(r->error());
+                        if (c->end == ClaimEnd::None)
+                            c->end = ClaimEnd::BackendRefused;
+                    }
+                } else {
+                    // Success: commit every live claim, in FIFO order, against the ONE
+                    // new subscription. `compensating` holds the subscription from this
+                    // point until the first surviving claim's commit adopts it, so a
+                    // throw anywhere before that (make_shared, keys_.emplace, a waker
+                    // copy, the lifecycle enqueue) leaves it owned by the disarm step
+                    // below, never leaked - the guard exists BEFORE the fallible work,
+                    // exactly as the pre-R5.2 post-wait commit's rollback did.
+                    const std::uint64_t sub = **r;
+                    compensating = sub;
+                    std::shared_ptr<PerKey> pk;
+                    std::string adopted_by; // rule_id whose commit adopted `sub`
+                    for (const auto& c : live) {
+                        if (!pk) {
+                            // First surviving claim (the head may itself be withdrawn):
+                            // its commit is what makes keys_[key] live. Undo on throw:
+                            // erase what this claim wrote and leave `compensating` set.
+                            try {
+                                auto fresh = std::make_shared<PerKey>();
+                                fresh->spec = claim->spec; // the spec actually armed
+                                fresh->subscription = sub;
+                                keys_.emplace(key, fresh);
+                                try {
+                                    commit_new_generation_locked(c->rule_id, c->generation,
+                                                                 c->guard_type, c->rule_name,
+                                                                 fresh, std::move(c->rg),
+                                                                 c->attach_now, waker, outbox_waker);
+                                } catch (...) {
+                                    rules_.erase(c->rule_id);
+                                    fresh->pending_initial.erase(c->rule_id);
+                                    keys_.erase(key);
+                                    throw;
+                                }
+                                pk = fresh;
+                                adopted_by = c->rule_id;
+                            } catch (...) {
+                                release_claim_index_locked(*c);
+                                c->commit_exception = std::current_exception();
+                                c->end = ClaimEnd::CommitThrew;
+                                // `compensating` still holds `sub`: the remaining live
+                                // claims cannot adopt a subscription whose PerKey does
+                                // not exist, so they fail with a plain reason.
+                                for (const auto& other : live) {
+                                    if (other == c || other->outcome || other->commit_exception)
+                                        continue;
+                                    release_claim_index_locked(*other);
+                                    other->outcome = std::unexpected(std::string{"arm commit failed"});
+                                    other->end = ClaimEnd::CommitThrew;
+                                }
+                                break;
+                            }
+                            compensating.reset(); // adopted
+                            c->index_held = false; // ownership passed to rules_/keys_
+                            c->outcome = c->generation;
+                            c->end = ClaimEnd::Committed;
+                        } else {
+                            // A later sibling joins the existing shared watcher - the
+                            // pre-existing reuse path, one commit per claim. A throw here
+                            // undoes only THIS claim's own bookkeeping; the drain continues.
+                            try {
+                                commit_new_generation_locked(c->rule_id, c->generation,
+                                                             c->guard_type, c->rule_name, pk,
+                                                             std::move(c->rg), c->attach_now,
+                                                             waker, outbox_waker);
+                                c->index_held = false;
+                                c->outcome = c->generation;
+                                c->end = ClaimEnd::Committed;
+                            } catch (...) {
+                                rules_.erase(c->rule_id);
+                                pk->pending_initial.erase(c->rule_id);
+                                release_claim_index_locked(*c);
+                                c->commit_exception = std::current_exception();
+                                c->end = ClaimEnd::CommitThrew;
+                            }
+                        }
+                    }
+                    // Claims that were withdrawn/abandoned while their siblings adopted.
+                    for (const auto& c : finished) {
+                        if (c->outcome || c->commit_exception)
+                            continue;
+                        release_claim_index_locked(*c);
+                        c->outcome = std::unexpected(
+                            std::string{c->withdrawn ? "withdrawn" : "arm timed out"});
+                        if (c->end == ClaimEnd::None)
+                            c->end = c->withdrawn ? ClaimEnd::Withdrawn
+                                                  : ClaimEnd::WaiterTimedOutDispatched;
+                    }
+                }
+            }
+        }
+
+        // (2) OFF the lock: the compensating disarm, BEFORE anything is published. A
+        // bounded run() on this worker holds the class quota for the call (a wedged
+        // disarm therefore never escapes the bulkhead into the physical ceiling) and
+        // the head claim is still the key's marker, so a rearm that arrives meanwhile
+        // queues behind it. Direct only when the executor is stopping (R5.5: a late
+        // success is disarmed rather than left live; nothing else can run it then).
+        if (compensating) {
+            std::expected<int, IoFailure> d{std::unexpect, IoFailure::LaunchFailed};
+            try {
+                d = io_executor_.run(claim->io_class, key, cfg_.backend_op_deadline,
+                                     [backend = backend_, sub = *compensating]() -> int {
+                                         backend->disarm(sub);
+                                         return 0;
+                                     });
+            } catch (...) {
+            }
+            if (!d) {
+                if (d.error() == IoFailure::Timeout) {
+                    backend_op_timeouts_.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    // Stopped, or refused/threw at admission: the watcher must not be
+                    // left live. Direct call on this (detached, role-marked) worker.
+                    try {
+                        backend_->disarm(*compensating);
+                    } catch (...) {
+                    }
+                }
+            }
+            compensating.reset();
+        }
+    } catch (...) {
+        firewalled = true;
+    }
+
+    // (3) PUBLISH and pop. Reached on every path, including the firewall: a claim
+    // left in the fifo with no outcome would be a Dispatched head nobody pops - #3831's
+    // orphaned marker in the new shape, wedging the key until restart.
+    std::shared_ptr<KeyClaim> refill;
+    try {
+        std::lock_guard<std::mutex> lk{registry_mu_};
+        if (firewalled) {
+            claim_drain_failures_.fetch_add(1, std::memory_order_relaxed);
+            if (compensating) {
+                try {
+                    backend_->disarm(*compensating); // last resort; never leak it
+                } catch (...) {
+                }
+                compensating.reset();
+            }
+        }
+        const auto eit = claims_.find(key);
+        if (eit != claims_.end()) {
+            auto& fifo = eit->second.fifo;
+            // Pop every claim this drain finished (they are a prefix of the fifo; new
+            // claims that queued behind the head during (2) follow them).
+            for (const auto& c : finished) {
+                if (!c->outcome && !c->commit_exception) {
+                    release_claim_index_locked(*c);
+                    c->outcome = std::unexpected(std::string{"arm drain failed"});
+                    c->end = ClaimEnd::CommitThrew;
+                }
+                if (!fifo.empty() && fifo.front() == c)
+                    fifo.pop_front();
+            }
+            if (firewalled && !fifo.empty() && fifo.front() == claim) {
+                // finished was never filled: the head is still here. Drop the entry.
+                for (auto& c : fifo) {
+                    release_claim_index_locked(*c);
+                    if (!c->outcome)
+                        c->outcome = std::unexpected(std::string{"arm drain failed"});
+                    if (c->end == ClaimEnd::None)
+                        c->end = ClaimEnd::CommitThrew;
+                }
+                fifo.clear();
+            }
+            if (fifo.empty())
+                claims_.erase(eit);
+            else
+                refill = try_dispatch_head_locked(key);
+        }
+    } catch (...) {
+        // A lock failure here leaves the entry as-is; the waiters' own deadlines still
+        // bound them, and the count records that this path fired.
+        claim_drain_failures_.fetch_add(1, std::memory_order_relaxed);
+    }
+    // (4) Wake + notify. Waiters were unreachable until now.
+    claim_cv_.notify_all();
+    try {
+        if (waker)
+            waker();
+        if (outbox_waker)
+            outbox_waker();
+    } catch (...) {
+    }
+    if (refill)
+        dispatch_arm_off_lock(key, refill);
+}
+
+std::size_t GuardianSparkRuntime::claim_queue_depth_for_test(const std::string& key) const {
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    const auto eit = claims_.find(key);
+    return eit == claims_.end() ? 0 : eit->second.fifo.size();
 }
 
 void GuardianSparkRuntime::commit_new_generation_locked(
@@ -169,22 +668,23 @@ std::expected<std::uint64_t, std::string>
 GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAssertion assertion,
                                   bool emit_compliant_edge) {
     const std::string key = spark_key(spec);
-    // #2233 item 3: File/Registry/Service arm off registry_mu_, bounded; every other
-    // type stays inline (see io_class_for_spark_type's doc).
+    // #2233 item 3: File/Registry/Service arm off registry_mu_; every other type
+    // stays inline (see io_class_for_spark_type's doc).
     const std::optional<IoClass> io_class = io_class_for_spark_type(spec.type);
     std::function<void()> waker;
     std::function<void()> outbox_waker;
     std::uint64_t new_gen = 0;
-    std::optional<DisarmWork> prior_disarm;
+    std::shared_ptr<KeyClaim> prior_disarm;
     // Snapshot BEFORE taking registry_mu_ (same outside-lock pattern evaluate_key uses
     // for its own now-snapshot): this is PendingState::first_seen, the M1 item (b)
     // elapsed-time demotion clock. A fresh attach always starts un-demoted regardless
     // of how long a PRIOR generation on this rule_id sat pending (detach_rule_locked
-    // below drops that generation's PendingState entirely).
+    // below drops that generation's PendingState entirely). It comes from the
+    // INJECTED clock_() and is never used as the real wait deadline below.
     const auto attach_now = clock_();
 
     // Built once, reused by both the fast (reuse-existing-watcher / inline-type) path
-    // and the slow (bounded off-lock arm) path's post-wait commit.
+    // and the claim (bounded off-lock arm) path's commit.
     const std::string rule_name = assertion.rule_name;
     const char* guard_type = guard_type_for(assertion.kind);
     auto rg = std::make_shared<RuleGeneration>();
@@ -194,60 +694,50 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
     rg->assertion.rule_id = rule_id; // keep the assertion's own rule_id authoritative
 
     std::uint64_t gen = 0;
-    bool need_bounded_arm = false;
+    std::shared_ptr<KeyClaim> arm_claim;    // this call's own claim, once queued
+    std::shared_ptr<KeyClaim> to_dispatch;  // set iff this call must dispatch it
+    std::shared_ptr<KeyClaim> head_to_drive; // a retained disarm at the head to redrive first
 
-    // #3831: this guard protects arming_keys_.emplace() (inside the locked block just
-    // below), but the bounded-arm work it must ALSO wrap (io_executor_.run(), much
-    // further down) runs OFF both locks in a separate region after that block has
-    // already closed. Promoted to function scope - one object spanning both regions -
-    // rather than declared at the io_executor_.run() call site (where it used to live):
-    // that placement meant its .fn ASSIGNMENT (a multi-capture closure exceeding
-    // libstdc++'s std::function SBO) ran AFTER arming_keys_.emplace() had already
-    // succeeded, so a bad_alloc during the assignment itself left the guard's fn empty
-    // (a no-op on destruction) with arming_keys_[key] permanently orphaned - every future
-    // attach_rule on that key failed-fast "busy" forever, no self-heal short of a
-    // restart. This reopens governance waiver g8b-saf-1 (which accepted that shape as
-    // "idiom-wide, not worth a special-case fix"); see #3831.
+    // #3831 (rung 9c R5.2 shape): this guard protects the claim enqueue inside the
+    // locked block just below, but the work it must ALSO wrap - the off-lock dispatch
+    // and the bounded wait, much further down - runs OFF both locks in a separate
+    // region after that block has already closed. Function-scoped, one object spanning
+    // both regions, .fn assigned HERE before registry_mu_ is even locked, so a throw
+    // during the assignment (a multi-capture closure exceeding libstdc++'s
+    // std::function SBO heap-allocates) has nothing to roll back yet - the original
+    // defect was a guard whose .fn was assigned AFTER the mutation it protected, which
+    // left the key's marker orphaned forever on a bad_alloc. arm_claim starts null and
+    // is set (a noexcept pointer write) immediately after the enqueue succeeds, so fn
+    // no-ops until then. Matched on POINTER identity: a same-rule_id retry that has
+    // since queued a FRESH claim is a different object, so this guard can never touch
+    // it (stronger than the (rule_id, generation) match the InFlightArm shape needed).
     //
-    // .fn is assigned HERE, before registry_mu_ is even locked, so a throw during the
-    // assignment has nothing to roll back yet - matching prior_disarm_rollback /
-    // index_add_rollback's own armed-before-the-mutation-it-protects shape (PR #3821
-    // round 2/3). arming_emplaced starts false and flips true (a noexcept bool write,
-    // cannot itself introduce a new gap) immediately after arming_keys_.emplace()
-    // succeeds below - the guard is a no-op until then. gen is captured BY REFERENCE
-    // (not by value): it is not assigned its real value until just below, well after
-    // this closure is built.
-    //
-    // Lock order: this guard's fn takes registry_mu_, yet it is declared here while
-    // the caller has NOT locked it, and it can also FIRE while the locked block below
-    // still holds it. That is safe only because the block's own std::unique_lock is a
-    // NARROWER scope than this function-scope guard - C++ unwind always destructs the
-    // narrower scope's locals (releasing registry_mu_) before continuing to unwind this
-    // one, so fn's lock_guard never double-locks. Moving this declaration back inside
-    // that block would deadlock on exactly that unwind path.
-    bool arming_emplaced = false;
-    GuardianRollback arming_rollback;
-    arming_rollback.fn = [this, key, rule_id, &gen, &arming_emplaced] {
-        if (!arming_emplaced)
-            return; // arming_keys_.emplace() below never ran (or hasn't yet) - nothing to undo
+    // Lock order: fn takes registry_mu_, yet it is declared while the caller has NOT
+    // locked it, and it can fire while the locked block below still holds it. Safe only
+    // because that block's own std::unique_lock is a NARROWER scope than this
+    // function-scope guard - C++ unwind destructs the narrower scope's locals
+    // (releasing registry_mu_) before continuing to unwind this one. Moving this
+    // declaration back inside that block would deadlock on exactly that unwind path.
+    GuardianRollback claim_rollback;
+    claim_rollback.fn = [this, key, &arm_claim] {
+        if (!arm_claim)
+            return; // never enqueued (or not yet) - nothing to undo
         std::lock_guard<std::mutex> lk{registry_mu_};
-        if (const auto it = arming_keys_.find(key);
-            it != arming_keys_.end() && it->second.rule_id == rule_id && it->second.generation == gen)
-            arming_keys_.erase(it);
-        // NOT redundant with index_add_rollback in this guard's PRIMARY firing window.
-        // index_add_rollback is armed before index_->add() and committed at this locked
-        // block's own normal end (well before arming_emplaced can be true for any
-        // exception-reachable duration - nothing throwing runs between the two), so it
-        // has already gone out of scope by the time io_executor_.run() (much further
-        // down, off both locks) can throw and fire THIS guard - at that point this is
-        // the ONLY undo of index_->add() left. It is a harmless no-op (index_->remove_rule
-        // is documented idempotent) ONLY in the narrow window index_add_rollback still
-        // covers (a throw inside the locked block, before it commits) - do not delete
-        // this call as "redundant" without re-checking that later window. Also not a
-        // second copy of the class of duplication PR #3821 round 3 removed (that
-        // removed three IDENTICAL per-branch copies of the same undo within one window;
-        // this is a different guard's undo for a later, non-overlapping window).
-        index_->remove_rule(rule_id); // no-op if already withdrawn
+        // Only if the claim is still live in its entry: a completed/erased claim is
+        // already terminal and needs no undo.
+        const auto eit = claims_.find(key);
+        if (eit == claims_.end())
+            return;
+        bool present = false;
+        for (const auto& c : eit->second.fifo)
+            if (c == arm_claim) {
+                present = true;
+                break;
+            }
+        if (!present || arm_claim->outcome || arm_claim->commit_exception)
+            return;
+        abandon_claim_locked(key, arm_claim, stopping_);
+        claim_cv_.notify_all();
     };
 
     {
@@ -263,20 +753,18 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
         // value would itself have a bad_alloc-sized gap where the mutation was
         // real but the guard protecting it did not exist yet. Safe to install
         // this early: fn checks `if (prior_disarm)` at fire-time and correctly
-        // no-ops on every exit before the assignment below actually runs (that
-        // includes the stopping_ return just above - fn simply never fires there,
-        // since the guard itself isn't even constructed yet at that point).
+        // no-ops on every exit before the assignment below actually runs.
         // Protects every return/throw between here and this locked block's normal
-        // end (the off-lock submission that follows this block on the fall-
-        // through path) uniformly: lk.unlock() before the off-lock submission,
-        // matching this function's own established discipline (the success-
-        // commit rollback below does the same). Committed only once that normal
-        // end is reached.
+        // end uniformly: lk.unlock() before the off-lock submission, matching this
+        // function's own established discipline. Committed only once that normal
+        // end is reached. (rung 9c R5.2: the disarm claim is already queued at the
+        // head of the key entry by detach_rule_locked, so a same-key rearm that
+        // arrives during this unlock queues BEHIND it by construction.)
         GuardianRollback prior_disarm_rollback;
         prior_disarm_rollback.fn = [this, &prior_disarm, &lk] {
             if (prior_disarm) {
                 lk.unlock();
-                submit_disarm_off_lock(*prior_disarm);
+                submit_disarm_off_lock(prior_disarm);
             }
         };
 
@@ -285,29 +773,17 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
         // included - there is no diff-skip that preserves it (matches the legacy
         // path's own tear-down-and-rebuild-every-push behavior). If a prior
         // generation existed, this already enqueued its "disarmed" lifecycle entry
-        // (and, #2233 item 3, may return backend work submitted off-lock either
+        // (and, #2233 item 3, may return a disarm claim driven off-lock either
         // way: prior_disarm_rollback above fires it on an early return/throw,
         // committed=true suppresses it and the explicit call after this locked
         // block fires it instead on the normal path - exit-path-exclusive, never
         // both) - the "armed" entry below covers the new one, so ONE outbox-waker
-        // firing at the end of this call covers both.
+        // firing at the end of this call covers both. A prior generation whose own
+        // arm is still claimed is withdrawn in place (Case 0, generalised).
         prior_disarm = detach_rule_locked(rule_id);
 
         gen = ++gen_counter_;
         rg->generation = gen;
-
-        // #2233 item 3 fail-fast: a DIFFERENT rule_id's arm is already resolving for
-        // this key off-lock (unreachable via GuardianEngine's mtx_-serialised
-        // production callers - start_local/apply_rules hold mtx_ for their entire
-        // body, so no second attach_rule call can even start while this one's is
-        // in flight; matters only for a caller that invokes this class directly
-        // across threads, e.g. a test). Never wait, never double-arm: registry_mu_
-        // alone used to make this impossible by construction (arm() ran inside it);
-        // now that the backend call is off-lock, this closes the gap explicitly.
-        if (const auto in_flight = arming_keys_.find(key); in_flight != arming_keys_.end()) {
-            backend_op_busy_.fetch_add(1, std::memory_order_relaxed);
-            return std::unexpected(std::string{"arm already in progress for this key"});
-        }
 
         // Gate 4 unhappy-path re-review (PR #3821 scoped governance): armed BEFORE
         // index_->add() runs, same reasoning and same fix shape as
@@ -317,28 +793,63 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
         // after index_->add() returns (a bool assignment, cannot throw), so fn
         // correctly no-ops if the assignment below never runs. Covers index_->add's
         // effect uniformly for every branch below - each branch's OWN rollback
-        // (still correctly armed-before-mutation within its own branch, unlike
-        // this one previously was) now protects only ITS OWN additional state,
-        // not this shared one, so nothing double-removes it.
+        // (still correctly armed-before-mutation within its own branch) now
+        // protects only ITS OWN additional state, not this shared one, so nothing
+        // double-removes it. On the claim branches the claim's own index_held flag
+        // takes over once the claim is queued (committed below), so the two never
+        // both remove the mapping.
         bool index_added = false;
         GuardianRollback index_add_rollback;
         index_add_rollback.fn = [this, rule_id, &index_added] {
             if (index_added)
                 index_->remove_rule(rule_id);
         };
+
+        // rung 9c R5.2: a key that already has a claim entry (an arm in flight with
+        // or without siblings, a disarm in flight, or a disarm RETAINED after an
+        // admission refusal) is checked FIRST - before the 0->1 edge decides
+        // anything - so this call queues behind it instead of double-arming or
+        // failing fast. The old fail-fast "busy" rejection lived here (#2233 item 3);
+        // it was unreachable via GuardianEngine's mtx_-serialised production callers
+        // and is replaced, not removed: a second same-key call is now a QUEUED claim
+        // that commits against the same subscription when the head's arm lands.
+        const auto cit = claims_.find(key);
+        const bool key_claimed = io_class && cit != claims_.end() && !cit->second.fifo.empty();
+
         const bool arm_edge = index_->add(key, rule_id); // may throw; index_added still false then
         index_added = true;
-        if (arm_edge && io_class) {
-            // Slow path: mark in-flight and return to the caller below WITHOUT
-            // touching keys_/rules_/pending_initial/lifecycle - all deferred to the
-            // post-wait commit phase, so a same-key racer's arming_keys_ check above
-            // never sees a half-built PerKey. index_add_rollback above already
-            // covers arming_keys_.emplace's own throw (undoing index_->add is the
-            // full undo needed here, matching this branch's pre-#3821-round-3 own
-            // rollback exactly - no separate guard needed for this branch).
-            arming_keys_.emplace(key, InFlightArm{rule_id, gen, false}); // may throw -> index_add_rollback
-            arming_emplaced = true; // noexcept; arms arming_rollback's fn (#3831)
-            need_bounded_arm = true;
+        if (key_claimed || (arm_edge && io_class)) {
+            // Claim path: mark and return to the caller below WITHOUT touching
+            // keys_/rules_/pending_initial/lifecycle - all deferred to the completion
+            // callback's commit, so a same-key racer never sees a half-built PerKey.
+            auto c = std::make_shared<KeyClaim>(); // may throw -> index_add_rollback
+            c->kind = ClaimKind::Arm;
+            c->key = key;
+            c->io_class = *io_class;
+            c->rule_id = rule_id;
+            c->generation = gen;
+            c->spec = spec;
+            c->rg = std::move(rg);
+            c->rule_name = rule_name;
+            c->guard_type = guard_type;
+            c->attach_now = attach_now;
+            auto& entry = claims_[key];               // may throw -> index_add_rollback
+            entry.fifo.push_back(c);                  // may throw -> index_add_rollback
+            c->index_held = true;                     // noexcept; ownership handed over
+            arm_claim = c;                            // noexcept; arms claim_rollback (#3831)
+            if (key_claimed) {
+                backend_op_queued_.fetch_add(1, std::memory_order_relaxed);
+                // A retained (Queued, refused-before) disarm at the head is re-driven
+                // by THIS call after it unlocks; a Dispatching/Dispatched head needs
+                // nothing from us.
+                if (entry.fifo.front() != c && entry.fifo.front()->kind == ClaimKind::Disarm &&
+                    entry.fifo.front()->dispatch == ClaimDispatch::Queued)
+                    head_to_drive = entry.fifo.front();
+                assert(entry.fifo.front()->kind == ClaimKind::Disarm ||
+                       entry.fifo.front()->kind == ClaimKind::Arm);
+            } else {
+                to_dispatch = try_dispatch_head_locked(key); // it is the head
+            }
         } else if (arm_edge) {
             // Inline type (Interval/Startup/Disk): unchanged synchronous arm, still
             // under registry_mu_ - these are never a blocking OS watch.
@@ -369,10 +880,10 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
                                          attach_now, waker, outbox_waker);
             rollback.committed = true;
         } else {
-            // An existing shared watcher for this key (armed or, #2233 item 3, itself
-            // mid-arm - the arming_keys_ check above already rejected that case, so
-            // reaching here with arm_edge==false means keys_ genuinely has it). No
-            // backend call, but a throw below (map insert, or a throwing
+            // An existing, COMMITTED shared watcher for this key: reaching here with
+            // arm_edge==false and no claim entry means keys_ genuinely has it (a key
+            // with a claim entry took the branch above, so keys_.at cannot throw here).
+            // No backend call, but a throw below (map insert, or a throwing
             // waker/outbox_waker COPY) must still undo the index_->add - mirrors the
             // original unified rollback's armed_here=false shape (never disarms;
             // there is no new watcher to tear down, only this rule's own bookkeeping;
@@ -392,15 +903,20 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
         prior_disarm_rollback.committed = true;
     }
 
-    // Off-lock: any watcher a superseded prior generation owed a disarm to. Fire
-    // this before the new arm below so a redeploy that keeps the SAME key (rare -
-    // most redeploys change the spec) does not race its own teardown against its
-    // own re-arm; SparkEngine's per-type mechanism lock orders the two regardless,
-    // but there is no reason to invite it.
+    // Off-lock: any watcher a superseded prior generation owed a disarm to. Its claim
+    // is already at the head of its key entry, so if this redeploy kept the SAME key
+    // our own arm claim is queued behind it by construction (the "disarm completes
+    // before its own rearm dispatches" property R5.2 asks for) and driving it here
+    // refills straight into our arm; a different key just runs the disarm first, as
+    // before, so the two never race their own teardown against their own re-arm.
     if (prior_disarm)
-        submit_disarm_off_lock(*prior_disarm);
+        submit_disarm_off_lock(prior_disarm);
+    else if (head_to_drive)
+        submit_disarm_off_lock(head_to_drive); // a retained disarm from an earlier detach
+    if (to_dispatch)
+        dispatch_arm_off_lock(key, to_dispatch);
 
-    if (!need_bounded_arm) {
+    if (!arm_claim) {
         if (waker)
             waker();
         if (outbox_waker)
@@ -408,192 +924,33 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
         return new_gen;
     }
 
-    // The actual backend arm, OFF both runtime locks, bounded by cfg_.backend_op_deadline.
-    // A caller (GuardianEngine::apply_rules/start_local, still holding mtx_ for its
-    // whole body) waits at most this long for THIS rule's arm - PLUS, if this
-    // rule_id had a prior generation on a bounded (F/R/S) key, up to another
-    // cfg_.backend_op_deadline for that generation's disarm above (the off-lock
-    // submission immediately following this locked block), since the two are
-    // sequential, not concurrent (deliberately: see that call site's own comment
-    // on why disarm-before-arm is ordered this way). A same-key redeploy is
-    // therefore up to 2x this deadline, not 1x. Every OTHER rule's attach/detach and
-    // every evaluate_key proceed freely throughout, since registry_mu_ is not held
-    // here at all.
-    // T = std::expected<uint64_t, string> (backend_->arm's own return type) - two
-    // layers to unwrap below: the OUTER expected is io_executor_'s own bounded-wait
-    // outcome (timeout/capacity/etc, IoFailure), the INNER is backend_->arm()'s own
-    // synchronous refusal, exactly as returned before this call moved off-lock.
-    //
-    // #3816: GuardianIoExecutor itself now owns the "caller gave up before the
-    // backend call finished" decision (exactly-once result delivery, see that
-    // class's INVARIANTS block) - a late-succeeding arm is routed to the
-    // on_abandoned callback below instead of ever reaching a still_wanted-style
-    // self-check on this side. That means `fn` itself needs nothing from this
-    // runtime any more (no self_keepalive, no registry_mu_, no arming_keys_) - it
-    // is the bare backend call. on_abandoned disarms a late SUCCESS (there is
-    // nothing to clean up for a late FAILURE - the inner expected already holds no
-    // live subscription) and counts it separately from an ordinary timeout
-    // (backend_op_late_arms_, #3813's own distinction, kept at the source here
-    // rather than folded into backend_op_timeouts_).
-    //
-    // self_keepalive, NOT `this`, in on_abandoned: it can still run on a detached
-    // io_executor_ worker after ~GuardianSparkRuntime() (the whole reason
-    // io_executor_'s workers are detached, not joined - a wedged OS call cannot be
-    // cancelled). A raw `this` capture would use-after-free backend_op_late_arms_
-    // the moment the worker finally returns past that destruction. Matches the
-    // class's own established pattern for every other off-thread-executing capture
-    // (make_handler's shared_ptr<GuardianSparkRuntime>, this file's header doc).
-    //
-    // arming_rollback (declared at function scope above, #3831) is committed just
-    // below once io_executor_.run() has returned without throwing. run() itself no
-    // longer has a throwing wait-path to propagate (a wait-lock failure now folds
-    // into a plain IoFailure::LaunchFailed return - see guardian_io_executor.hpp),
-    // but this call expression's own ARGUMENT evaluation - `spec`'s copy into fn's
-    // capture, `shared_from_this()`'s documented bad_weak_ptr thrown while building
-    // on_abandoned's own capture list - still runs in THIS function's frame, before
-    // run() is even entered, and is still a live trigger for arming_rollback's
-    // guard, same reasoning as submit_disarm_off_lock's own try/catch a few
-    // functions above.
-    auto io_result = io_executor_.run(
-        *io_class, key, cfg_.backend_op_deadline,
-        [backend = backend_, spec]() -> std::expected<std::uint64_t, std::string> {
-            return backend->arm(spec);
-        },
-        [backend = backend_, self_keepalive = shared_from_this()](auto&& r) {
-            if (r) {
-                backend->disarm(*r); // off-lock: this worker thread never held registry_mu_ for it
-                self_keepalive->backend_op_late_arms_.fetch_add(1, std::memory_order_relaxed);
-            }
-        });
-    arming_rollback.committed = true;
-
-    std::optional<DisarmWork> stale_disarm; // set below iff we must undo a LATE success
-    std::expected<std::uint64_t, std::string> outcome = new_gen;
-    {
-        // unique_lock, not lock_guard: the success-commit branch below needs to
-        // .unlock() explicitly before its exceptional-rollback path submits a
-        // bounded off-lock disarm (C2/c2, adversarial review) - see that branch's
-        // comment.
-        std::unique_lock<std::mutex> lk{registry_mu_};
-        const auto it = arming_keys_.find(key);
-        const bool withdrawn = it != arming_keys_.end() && it->second.withdrawn;
-        arming_keys_.erase(key); // this in-flight episode is over either way
-        const bool armed_live = io_result && io_result->has_value(); // both layers succeeded
-
-        if (stopping_ || withdrawn) {
-            index_->remove_rule(rule_id); // no-op if detach already removed it (withdrawn path)
-            if (armed_live) {
-                // A live subscription nobody wants any more - disarm it, off-lock,
-                // after this block unlocks. No "armed" audit: this generation never
-                // committed - it was never armed from the runtime's point of view.
-                // This EXTENDS the pre-existing "pending arm withdrawn -> no
-                // lifecycle entry" contract to a new, ORDINARY case (compliance
-                // review, corrected per Gate 8 consistency re-review - the widener
-                // is stopping_, NOT a timeout: a timed-out io_executor_.run() call
-                // returns IoFailure::Timeout, which fails `armed_live` above and
-                // never reaches this branch at all): pre-#2233 the withdrawn arm
-                // could only be reached via the EXCEPTIONAL withdrawn-during-
-                // in-flight-arm path, because arm() itself ran synchronously under
-                // registry_mu_, so stopping_ could not flip mid-arm. Now that arm
-                // runs off-lock and bounded, stopping_ CAN flip while this rule's
-                // arm is still resolving, and a genuinely-succeeding-but-late arm
-                // can race it - a real, not merely inherited, expansion of the
-                // no-audit-entry window from "exceptional" to "ordinary". (The
-                // SEPARATE timeout-then-late-success case never reaches this
-                // function's post-wait commit at all - #3816: a timed-out
-                // io_executor_.run() call always returns IoFailure::Timeout as ITS
-                // own outer result, so `armed_live` above is false regardless of
-                // what the executor's on_abandoned callback later does with the
-                // worker's actual result.) No MISLEADING entry is ever written
-                // either way (silence reads as "not armed", which stays accurate),
-                // but the window is wider than before this PR.
-                stale_disarm = DisarmWork{*io_class, key, **io_result};
-            }
-            outcome = std::unexpected(std::string{stopping_ ? "stopping" : "withdrawn"});
-        } else if (!io_result) {
-            index_->remove_rule(rule_id);
-            std::string reason;
-            switch (io_result.error()) {
-            case IoFailure::Timeout:            reason = "arm timed out"; break;
-            case IoFailure::Stopped:            reason = "stopping"; break;
-            case IoFailure::CapacityExhausted:  reason = "arm capacity exhausted"; break;
-            case IoFailure::AlreadyRunning:     reason = "arm already in progress for this key"; break;
-            case IoFailure::LaunchFailed:       reason = "arm worker launch failed"; break;
-            case IoFailure::WorkerThrew:        reason = "arm worker threw"; break;
-            case IoFailure::CeilingExhausted:   reason = "arm rejected at alive-worker ceiling"; break;
-            }
-            if (io_result.error() == IoFailure::Timeout)
-                backend_op_timeouts_.fetch_add(1, std::memory_order_relaxed);
-            outcome = std::unexpected(reason);
-        } else if (!armed_live) {
-            // The bounded wait completed and backend_->arm() itself returned an
-            // error (io_result->error()) - the SAME synchronous-refusal outcome the
-            // old inline call could always produce, just observed after the
-            // off-lock wait instead of under registry_mu_.
-            index_->remove_rule(rule_id);
-            outcome = std::unexpected(io_result->error());
-        } else {
-            // index_->add already ran in phase 1, and we now hold a live subscription
-            // - a throw from here down (keys_/rules_/pending_initial insert, or a
-            // throwing waker/outbox_waker COPY, exactly as the fast path's own
-            // "throw AFTER arm()" test exercises) must not leave keys_/rules_/index_
-            // desynced or leak the watcher. UNLIKE the fast (inline-type) path's
-            // rollback, this one must NOT call backend_->disarm() while holding
-            // registry_mu_ (adversarial review C2/c2, both reviewers independently
-            // confirmed HIGH): that would let the exact class of hung backend call
-            // this PR exists to unblock wedge every other registry_mu_ operation
-            // again, just via a rarer trigger (an allocation failure or a throwing
-            // waker copy, not the common path - rarity does not bound duration once
-            // entered). A GuardianRollback (not a hand-rolled try/catch - adversarial
-            // review + cpp-safety adjudication: manual cleanup in new C++ is a
-            // policy floor, and the hand-rolled version was strictly WEAKER anyway -
-            // a throw from submit_disarm_off_lock was swallowed with zero
-            // observability, whereas GuardianRollback's destructor counts +logs it)
-            // captures `lk` by reference so its `fn` can unlock BEFORE the bounded
-            // off-lock disarm, exactly like every other rollback in this function -
-            // the guard's own destructor already contains a throw from `fn` (it is
-            // built for firing mid-unwind), so no inner try/catch is needed here.
-            const std::uint64_t sub = **io_result;
-            const IoClass sub_ioc = *io_class;
-            // Rollback armed BEFORE touching pk (Gate 8 re-review, happy-path): the
-            // original hand-rolled try wrapped make_shared<PerKey>() and the pk->
-            // assignments too, so a bad_alloc there still disarmed the live
-            // subscription. Constructing this guard AFTER those lines (an earlier
-            // draft of this RAII conversion did) would narrow that protection back
-            // to a leak on the exact rare-allocation-failure path this whole
-            // rollback exists for - keep the guard's scope at least as wide as the
-            // resource it protects.
-            GuardianRollback rollback;
-            rollback.fn = [this, rule_id, key, sub, sub_ioc, &lk] {
-                index_->remove_rule(rule_id); // undo phase 1's index_->add
-                keys_.erase(key); // no-op if make_shared<PerKey>/keys_.emplace never ran
-                rules_.erase(rule_id);
-                lk.unlock(); // BEFORE the bounded off-lock disarm - see the comment above
-                submit_disarm_off_lock(DisarmWork{sub_ioc, key, sub});
-            };
-            auto pk = std::make_shared<PerKey>();
-            pk->spec = spec;
-            pk->subscription = sub;
-            keys_.emplace(key, pk);
-            commit_new_generation_locked(rule_id, gen, guard_type, rule_name, pk, std::move(rg),
-                                         attach_now, waker, outbox_waker);
-            rollback.committed = true;
-        }
-    }
-    if (stale_disarm)
-        submit_disarm_off_lock(*stale_disarm);
-    if (outcome) {
-        if (waker)
-            waker();
-        if (outbox_waker)
-            outbox_waker();
-    }
+    // The bounded wait for THIS call's own claim (PR-1's synchronous contract: a
+    // caller - GuardianEngine::apply_rules/start_local, still holding mtx_ for its
+    // whole body - waits at most cfg_.backend_op_deadline for this rule's arm to
+    // resolve, PLUS, if this rule_id had a prior generation on a bounded key, up to
+    // another deadline for that generation's disarm above, since the two are
+    // sequential, not concurrent - a same-key redeploy is therefore up to 2x this
+    // deadline, not 1x; PR-2 removes the wait). The deadline is real steady_clock
+    // time captured HERE, after the prior-disarm wait, never the injected clock_()
+    // snapshot above (tests inject fake clocks) and never counted from entry. Every
+    // OTHER rule's attach/detach and every evaluate_key proceed freely throughout,
+    // since registry_mu_ is not held here at all. The commit itself - keys_/rules_/
+    // pending_initial/"armed" audit - runs in on_arm_complete on the executor
+    // worker; the wait only collects its recorded outcome (or rethrows its commit
+    // exception on this thread). On a deadline or stop the waiter abandons the claim
+    // under registry_mu_ (a queued claim is erased, a dispatched one is left for the
+    // callback to finish and disarm - #3816's late-success handling, now decided on
+    // the runtime's side with the same one-mutex shape). The wakers for a claim
+    // commit are fired by the callback, not here.
+    const auto deadline = std::chrono::steady_clock::now() + cfg_.backend_op_deadline;
+    auto outcome = wait_for_claim(key, arm_claim, deadline);
+    claim_rollback.committed = true;
     return outcome;
 }
 
 void GuardianSparkRuntime::detach_rule(const std::string& rule_id) {
     std::function<void()> outbox_waker;
-    std::optional<DisarmWork> work;
+    std::shared_ptr<KeyClaim> work;
     {
         std::lock_guard<std::mutex> lk{registry_mu_};
         work = detach_rule_locked(rule_id);
@@ -602,23 +959,34 @@ void GuardianSparkRuntime::detach_rule(const std::string& rule_id) {
     // #2233 item 3: off both locks - the confirmed-state mutation + "disarmed" audit
     // above are already committed regardless of what follows here.
     if (work)
-        submit_disarm_off_lock(*work);
+        submit_disarm_off_lock(work);
     if (outbox_waker)
         outbox_waker();
 }
 
 void GuardianSparkRuntime::detach_all() {
     std::function<void()> outbox_waker;
-    std::vector<DisarmWork> works;
+    std::vector<std::shared_ptr<KeyClaim>> works;
     {
         std::lock_guard<std::mutex> lk{registry_mu_};
+        // rung 9c R5.2: a full sync replaces the active set, so a rule that is still
+        // only CLAIMED (its arm in flight or queued, no rules_ entry yet) must be
+        // withdrawn too - detach_rule_locked's Case 0 handles each, generalised.
+        std::vector<std::string> claimed;
+        for (const auto& [k, entry] : claims_)
+            for (const auto& c : entry.fifo)
+                if (c->kind == ClaimKind::Arm && !c->withdrawn && !c->waiter_abandoned &&
+                    !c->outcome)
+                    claimed.push_back(c->rule_id);
+        for (const auto& rid : claimed)
+            (void)detach_rule_locked(rid);
         std::vector<std::string> rule_ids;
         rule_ids.reserve(rules_.size());
         for (const auto& [rid, rg] : rules_)
             rule_ids.push_back(rid);
         for (const auto& rid : rule_ids)
             if (auto work = detach_rule_locked(rid))
-                works.push_back(std::move(*work));
+                works.push_back(std::move(work));
         outbox_waker = outbox_enqueue_waker_;
     }
     // #2233 item 3: submitted sequentially, off-lock, each bounded by
@@ -632,22 +1000,44 @@ void GuardianSparkRuntime::detach_all() {
         outbox_waker();
 }
 
-std::optional<GuardianSparkRuntime::DisarmWork>
+std::shared_ptr<GuardianSparkRuntime::KeyClaim>
 GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id, std::string_view lifecycle_kind) {
-    // #2233 item 3: rule_id belongs to a key whose FIRST arm is still resolving
-    // off-lock (attach_rule released registry_mu_ before the backend call) - it has
-    // no rules_/keys_ entry to withdraw yet. Mark the in-flight episode withdrawn so
-    // its own completion abandons + disarms rather than committing a rule nobody
-    // wants any more, and drop it from the index NOW (matches the immediate-index-
-    // cleanup semantics the confirmed path below already has). No "disarmed" audit -
-    // the rule was never actually armed (same "pending arm withdrawn -> no lifecycle
-    // entry" contract the confirmed path's `known` gate already encodes).
+    // rung 9c R5.2 (Case 0, generalised from #2233 item 3): rule_id belongs to a key
+    // whose arm is still CLAIMED - in flight as the head, or queued behind it - so it
+    // has no rules_/keys_ entry to withdraw yet. Mark the claim withdrawn and release
+    // its index mapping NOW (matches the immediate-index-cleanup semantics the
+    // confirmed path below already has). A queued (never dispatched) claim is erased
+    // outright and its waiter woken; a dispatched one stays as the key's marker and
+    // its completion skips it (a live sibling adopts the subscription, or it is
+    // disarmed). No "disarmed" audit - the rule was never actually armed (same
+    // "pending arm withdrawn -> no lifecycle entry" contract the confirmed path's
+    // `known` gate already encodes). The search excludes withdrawn AND abandoned
+    // claims so a retained stale claim can never match ahead of its live replacement.
     if (const auto key_opt = index_->key_for_rule(rule_id); key_opt) {
-        if (auto it = arming_keys_.find(*key_opt);
-            it != arming_keys_.end() && it->second.rule_id == rule_id) {
-            it->second.withdrawn = true;
-            index_->remove_rule(rule_id);
-            return std::nullopt; // nothing to disarm yet; the in-flight attach's completion does
+        if (const auto eit = claims_.find(*key_opt); eit != claims_.end()) {
+            auto& fifo = eit->second.fifo;
+            for (auto it = fifo.begin(); it != fifo.end(); ++it) {
+                auto& c = *it;
+                if (c->kind != ClaimKind::Arm || c->rule_id != rule_id || c->withdrawn ||
+                    c->waiter_abandoned || c->outcome)
+                    continue;
+                c->withdrawn = true;
+                release_claim_index_locked(*c);
+                // The waiter returns "withdrawn" NOW in either state - the rule is no
+                // longer wanted, so there is nothing for its caller to wait for. A
+                // dispatched claim keeps its place as the key's marker and the drain
+                // skips it by the `withdrawn` flag (a live sibling adopts the result, or
+                // it is disarmed); a queued one is erased outright.
+                c->outcome = std::unexpected(std::string{"withdrawn"});
+                c->end = ClaimEnd::Withdrawn;
+                if (c->dispatch == ClaimDispatch::Queued) {
+                    fifo.erase(it);
+                    if (fifo.empty())
+                        claims_.erase(eit);
+                }
+                claim_cv_.notify_all(); // under the lock: a _locked helper cannot defer it
+                return nullptr; // nothing to disarm yet; the claim's completion handles it
+            }
         }
     }
 
@@ -667,20 +1057,34 @@ GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id, std::string
         std::lock_guard<std::mutex> ob{outbox_mu_};
         outbox_.drop_rule(rule_id); // compliance/health only - Lifecycle lives in lifecycle_log_
     }
-    // #2233 item 3: the confirmed-state mutation above (index_/rules_/keys_) and the
-    // "disarmed" audit below are the durable commit; the actual backend_->disarm()
-    // call is now the CALLER's job, off-lock (submit_disarm_off_lock). This changes
-    // WHERE that call runs, not whether its success is confirmed - disarm() is void
-    // and was never awaited for success even in the old inline call (see the header
-    // doc's DisarmWork comment), so this is not a new unconfirmed-teardown gap.
-    std::optional<DisarmWork> work;
+    // #2233 item 3 / rung 9c R5.2: the confirmed-state mutation above (index_/rules_/
+    // keys_) and the "disarmed" audit below are the durable commit; the actual
+    // backend_->disarm() call is the CALLER's job, off-lock, by driving the DISARM
+    // CLAIM queued here (submit_disarm_off_lock). Queued in THIS critical section, the
+    // same one that erases keys_[key]: a same-key attach that lands in the off-lock
+    // gap sees the claim and queues its arm behind it, rather than seeing "no keys_
+    // entry, no claim" and dispatching an arm ahead of the teardown. Changes WHERE
+    // the call runs, not whether its success is confirmed - disarm() is void and was
+    // never awaited for success even in the old inline call.
+    std::shared_ptr<KeyClaim> work;
     if (disarm_key) {
         const auto kit = keys_.find(*disarm_key);
         if (kit != keys_.end()) {
-            if (const auto ioc = io_class_for_spark_type(kit->second->spec.type))
-                work = DisarmWork{*ioc, *disarm_key, kit->second->subscription};
-            else
+            if (const auto ioc = io_class_for_spark_type(kit->second->spec.type)) {
+                auto c = std::make_shared<KeyClaim>();
+                c->kind = ClaimKind::Disarm;
+                c->key = *disarm_key;
+                c->io_class = *ioc;
+                c->subscription = kit->second->subscription;
+                auto& entry = claims_[*disarm_key];
+                // A disarm is only ever created on a key with no live claim (an arm
+                // never writes keys_ until it commits, and commit erases the entry).
+                assert(entry.fifo.empty());
+                entry.fifo.push_back(c);
+                work = c;
+            } else {
                 backend_->disarm(kit->second->subscription); // inline type: unchanged, synchronous
+            }
             keys_.erase(kit); // the in-flight pass (if any) holds its own shared_ptr; safe
         }
     } else if (key_opt) {
@@ -1598,8 +2002,36 @@ void GuardianSparkRuntime::begin_stop() {
         stopping_ = true;
         for (auto& [rid, rg] : rules_)
             rg->active = false;
+        // rung 9c R5.2: every QUEUED (never dispatched) claim is dropped here with a
+        // counted "stopping" outcome so its waiter wakes now rather than riding out
+        // its deadline; a Dispatching/Dispatched head is left in place - its
+        // completion callback finishes it (a late success is disarmed, R5.5). A
+        // retained disarm dropped here leaks its watcher exactly as the old
+        // silent Stopped drop did, now counted.
+        for (auto eit = claims_.begin(); eit != claims_.end();) {
+            auto& fifo = eit->second.fifo;
+            for (auto it = fifo.begin(); it != fifo.end();) {
+                auto& c = *it;
+                if (c->dispatch == ClaimDispatch::Queued) {
+                    release_claim_index_locked(*c);
+                    if (!c->outcome)
+                        c->outcome = std::unexpected(std::string{"stopping"});
+                    if (c->end == ClaimEnd::None)
+                        c->end = ClaimEnd::Stopped;
+                    claims_dropped_at_stop_.fetch_add(1, std::memory_order_relaxed);
+                    it = fifo.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            if (fifo.empty())
+                eit = claims_.erase(eit);
+            else
+                ++eit;
+        }
         reader = reader_; // copy under the lock; call request_stop() outside it
     }
+    claim_cv_.notify_all(); // after the lock: wake every claim waiter
     // request_stop() is an extensible virtual - never invoke it under registry_mu_
     // (the runtime already avoids calling copied wakers under its central lock). It
     // is contractually noexcept + nonblocking, so it is safe here even though
