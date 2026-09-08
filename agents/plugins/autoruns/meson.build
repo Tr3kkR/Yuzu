@@ -14,13 +14,14 @@ autoruns_sources = files('src/autoruns_plugin.cpp')
 if host_machine.system() == 'windows'
   # advapi32: Reg*W registry probes. ole32/oleaut32/wbemuuid: WMI
   # (root\subscription) COM plumbing. taskschd: ITaskService Task Scheduler
-  # COM interface.
+  # COM interface. shell32: SHGetKnownFolderPath (common Startup folder).
   autoruns_deps += [
     cxx.find_library('advapi32'),
     cxx.find_library('ole32'),
     cxx.find_library('oleaut32'),
     cxx.find_library('wbemuuid'),
     cxx.find_library('taskschd'),
+    cxx.find_library('shell32'),
   ]
   autoruns_sources += files('src/autoruns_win.cpp')
 elif host_machine.system() == 'linux'

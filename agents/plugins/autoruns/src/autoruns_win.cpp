@@ -60,6 +60,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <shlobj.h>
 #include <taskschd.h>
 
 #include <win_com.hpp>
@@ -278,6 +279,21 @@ void finish_source(yuzu::CommandContext& ctx, SourceId id, const SourceOutcome& 
     ctx.write_output(format_source_status(
         id, outcome.constrained ? YUZU_SUPPORT_CONSTRAINED : YUZU_SUPPORT_SUPPORTED,
         outcome.rows.size(), outcome.constrained ? std::string_view{outcome.reason} : "ok"));
+}
+
+/// A `sources=` filter excluding `id` must still report a status row for
+/// it -- content/definitions/autoruns.yaml and docs/user-manual/autoruns.md
+/// both guarantee every catalog source reports a status on every `list`
+/// capture, "never omitted" -- so this is the sole dispatch point for every
+/// Windows source's final status, matching the macOS leg's `filtered`
+/// convention rather than silently emitting nothing.
+void finish_source_or_filtered(yuzu::CommandContext& ctx, std::string_view filter, SourceId id,
+                               const SourceOutcome& outcome) {
+    if (want(filter, id)) {
+        finish_source(ctx, id, outcome);
+    } else {
+        ctx.write_output(format_source_status(id, YUZU_SUPPORT_SUPPORTED, std::nullopt, "filtered"));
+    }
 }
 
 // ── 1. HKLM Run / RunOnce / RunOnceEx (native + WOW6432Node views) ───────
@@ -545,12 +561,18 @@ void collect_winlogon(std::string_view filter, SourceOutcome& shell_out,
 
 // ── 4. AppInit_DLLs ───────────────────────────────────────────────────────
 
-void collect_appinit_dlls(std::string_view filter, SourceOutcome& outcome) {
-    if (!want(filter, SourceId::win_appinit_dlls)) return;
+/// One WOW64 view of AppInit_DLLs. `wow_view` combined with `KEY_READ` selects
+/// the 64-bit or 32-bit registry redirection (this key IS subject to WOW64
+/// redirection under HKLM\SOFTWARE -- unlike StartupApproved\Run32, which is
+/// Explorer's own non-redirected key name); `location` is the row/constraint
+/// label for that view, matching collect_hklm_run_family's `[WOW6432Node]`
+/// suffix convention.
+void collect_appinit_dlls_view(REGSAM wow_view, const std::string& location,
+                               SourceOutcome& outcome) {
     RegKey key;
     const LSTATUS status = RegOpenKeyExW(
         HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Windows", 0,
-        KEY_READ, key.put());
+        KEY_READ | wow_view, key.put());
     if (status != ERROR_SUCCESS) {
         if (!is_benign_absent_reg(status)) note_constraint(outcome, reg_open_constraint_token(status));
         return;
@@ -574,7 +596,7 @@ void collect_appinit_dlls(std::string_view filter, SourceOutcome& outcome) {
         Row row;
         row.source_id = SourceId::win_appinit_dlls;
         row.catalog_version = kAutorunSourceCatalogVersion;
-        row.location = "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Windows";
+        row.location = location;
         row.entry = "AppInit_DLLs";
         row.enabled = Enabled::unmodelled;
         row.scope = Scope::system;
@@ -588,7 +610,7 @@ void collect_appinit_dlls(std::string_view filter, SourceOutcome& outcome) {
         Row row;
         row.source_id = SourceId::win_appinit_dlls;
         row.catalog_version = kAutorunSourceCatalogVersion;
-        row.location = "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Windows";
+        row.location = location;
         row.entry = "AppInit_DLLs";
         row.target = dll;
         row.enabled = toggle;
@@ -598,6 +620,16 @@ void collect_appinit_dlls(std::string_view filter, SourceOutcome& outcome) {
         row.mtime = mtime;
         outcome.rows.push_back(std::move(row));
     }
+}
+
+void collect_appinit_dlls(std::string_view filter, SourceOutcome& outcome) {
+    if (!want(filter, SourceId::win_appinit_dlls)) return;
+    collect_appinit_dlls_view(KEY_WOW64_64KEY,
+                              "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Windows",
+                              outcome);
+    collect_appinit_dlls_view(
+        KEY_WOW64_32KEY,
+        "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Windows [WOW6432Node]", outcome);
 }
 
 // ── 5. Image File Execution Options\*\Debugger ───────────────────────────
@@ -781,7 +813,15 @@ constexpr std::size_t kMaxScheduledTaskFolderDepth = 256;
 
 void walk_task_folder(ITaskFolder* folder, SourceOutcome& outcome, std::size_t cap,
                       std::size_t depth = 0) {
-    if (outcome.rows.size() >= cap) return;
+    if (outcome.rows.size() >= cap) {
+        // Entered (directly or recursively for a sibling/subfolder) after an
+        // earlier folder's own loop already reached the cap exactly at its
+        // last item -- that loop's own iteration never re-checks the cap, so
+        // this entry-guard is the only place that would otherwise silently
+        // drop the rest of the tree with no row_cap recorded.
+        note_constraint(outcome, "row_cap");
+        return;
+    }
     if (depth >= kMaxScheduledTaskFolderDepth) {
         note_constraint(outcome, "row_cap");
         return;
@@ -832,30 +872,59 @@ void walk_task_folder(ITaskFolder* folder, SourceOutcome& outcome, std::size_t c
 
             const std::string xml_utf8 = wstring_to_utf8(xml_w);
             const auto info = parse_task_xml(xml_utf8);
+            if (info.has_unmodelled_action)
+                note_constraint(outcome, "unmodelled_action_type");
 
-            Row row;
-            row.source_id = SourceId::win_scheduled_tasks;
-            row.catalog_version = kAutorunSourceCatalogVersion;
-            row.location = wstring_to_utf8(path_w);
-            row.entry = wstring_to_utf8(last_path_component(path_w));
-            row.target = info.command;
-            row.args = info.arguments;
-            row.enabled = (enabled_b == VARIANT_TRUE) ? Enabled::enabled : Enabled::disabled;
-            row.scope = Scope::system;
-            row.user = info.user_id.empty() ? "-" : info.user_id;
-            row.signed_state = Signed::not_checked;
-
+            std::int64_t task_mtime = 0;
             std::size_t date_start = xml_utf8.find("<Date>");
-            row.mtime = 0;
             if (date_start != std::string::npos) {
                 date_start += 6;
                 const std::size_t date_end = xml_utf8.find("</Date>", date_start);
                 if (date_end != std::string::npos)
-                    row.mtime =
-                        parse_iso8601_to_epoch(std::string_view{xml_utf8}.substr(
-                            date_start, date_end - date_start));
+                    task_mtime = parse_iso8601_to_epoch(
+                        std::string_view{xml_utf8}.substr(date_start, date_end - date_start));
             }
-            outcome.rows.push_back(std::move(row));
+
+            const std::string entry_base = wstring_to_utf8(last_path_component(path_w));
+            const std::string location = wstring_to_utf8(path_w);
+            const std::string user = info.user_id.empty() ? "-" : info.user_id;
+            const Enabled enabled_state =
+                (enabled_b == VARIANT_TRUE) ? Enabled::enabled : Enabled::disabled;
+
+            // Task Scheduler executes every <Exec> action in sequence -- one
+            // row per action (index-suffixed once there's more than one) so
+            // a later action is never silently hidden behind the first.
+            const bool multi = info.actions.size() > 1;
+            if (info.actions.empty()) {
+                Row row;
+                row.source_id = SourceId::win_scheduled_tasks;
+                row.catalog_version = kAutorunSourceCatalogVersion;
+                row.location = location;
+                row.entry = entry_base;
+                row.enabled = enabled_state;
+                row.scope = Scope::system;
+                row.user = user;
+                row.signed_state = Signed::not_checked;
+                row.mtime = task_mtime;
+                outcome.rows.push_back(std::move(row));
+            } else {
+                for (std::size_t i = 0; i < info.actions.size(); ++i) {
+                    Row row;
+                    row.source_id = SourceId::win_scheduled_tasks;
+                    row.catalog_version = kAutorunSourceCatalogVersion;
+                    row.location = location;
+                    row.entry = multi ? entry_base + " [action " + std::to_string(i + 1) + "]"
+                                      : entry_base;
+                    row.target = info.actions[i].command;
+                    row.args = info.actions[i].arguments;
+                    row.enabled = enabled_state;
+                    row.scope = Scope::system;
+                    row.user = user;
+                    row.signed_state = Signed::not_checked;
+                    row.mtime = task_mtime;
+                    outcome.rows.push_back(std::move(row));
+                }
+            }
         }
     }
 
@@ -869,7 +938,15 @@ void walk_task_folder(ITaskFolder* folder, SourceOutcome& outcome, std::size_t c
     LONG count = 0;
     const HRESULT count_hr = subfolders->get_Count(&count);
     if (FAILED(count_hr)) note_constraint(outcome, hr_token(count_hr));
-    for (LONG i = 1; i <= count && outcome.rows.size() < cap; ++i) {
+    for (LONG i = 1; i <= count; ++i) {
+        // Explicit check (not a loop-condition early exit) so a cap reached
+        // exactly here -- leaving one or more subfolders unwalked -- is
+        // recorded, matching the registry walks' probe-past-cap pattern
+        // rather than silently truncating at the boundary.
+        if (outcome.rows.size() >= cap) {
+            note_constraint(outcome, "row_cap");
+            break;
+        }
         VARIANT idx;
         VariantInit(&idx);
         idx.vt = VT_I4;
@@ -1044,14 +1121,21 @@ int collect_windows(yuzu::CommandContext& ctx, std::string_view filter) {
 
     SourceOutcome startup_folder_common, startup_folder_user;
     if (want(filter, SourceId::win_startup_folder_common)) {
-        wchar_t program_data[MAX_PATH]{};
-        const DWORD n = GetEnvironmentVariableW(L"ProgramData", program_data, MAX_PATH);
-        if (n > 0 && n < MAX_PATH) {
-            const std::wstring dir =
-                std::wstring(program_data) + L"\\Microsoft\\Windows\\Start Menu\\Programs\\StartUp";
-            collect_startup_folder(dir, SourceId::win_startup_folder_common, Scope::system, "-",
-                                   startup_folder_common);
+        // SHGetKnownFolderPath, not an env-var lookup: %ProgramData% is a
+        // process-environment string with no failure signal distinct from
+        // "just not set" -- a missing/oversized var or a redirected known
+        // folder previously read as a silent supported|0 rather than a
+        // flagged constraint.
+        PWSTR known_path = nullptr;
+        const HRESULT hr =
+            SHGetKnownFolderPath(FOLDERID_CommonStartup, 0, nullptr, &known_path);
+        if (SUCCEEDED(hr) && known_path) {
+            collect_startup_folder(std::wstring(known_path), SourceId::win_startup_folder_common,
+                                   Scope::system, "-", startup_folder_common);
+        } else {
+            note_constraint(startup_folder_common, hr_token(hr));
         }
+        if (known_path) CoTaskMemFree(known_path);
     }
 
     SourceOutcome scheduled_tasks;
@@ -1140,32 +1224,21 @@ int collect_windows(yuzu::CommandContext& ctx, std::string_view filter) {
         }
     }
 
-    if (want(filter, SourceId::win_run_hklm)) finish_source(ctx, SourceId::win_run_hklm, run_hklm);
-    if (want(filter, SourceId::win_runonce_hklm))
-        finish_source(ctx, SourceId::win_runonce_hklm, runonce_hklm);
-    if (want(filter, SourceId::win_runonceex_hklm))
-        finish_source(ctx, SourceId::win_runonceex_hklm, runonceex_hklm);
-    if (want(filter, SourceId::win_run_hku)) finish_source(ctx, SourceId::win_run_hku, run_hku);
-    if (want(filter, SourceId::win_runonce_hku))
-        finish_source(ctx, SourceId::win_runonce_hku, runonce_hku);
-    if (want(filter, SourceId::win_startup_approved))
-        finish_source(ctx, SourceId::win_startup_approved, startup_approved);
-    if (want(filter, SourceId::win_winlogon_shell))
-        finish_source(ctx, SourceId::win_winlogon_shell, winlogon_shell);
-    if (want(filter, SourceId::win_winlogon_userinit))
-        finish_source(ctx, SourceId::win_winlogon_userinit, winlogon_userinit);
-    if (want(filter, SourceId::win_appinit_dlls))
-        finish_source(ctx, SourceId::win_appinit_dlls, appinit);
-    if (want(filter, SourceId::win_ifeo_debugger))
-        finish_source(ctx, SourceId::win_ifeo_debugger, ifeo);
-    if (want(filter, SourceId::win_startup_folder_common))
-        finish_source(ctx, SourceId::win_startup_folder_common, startup_folder_common);
-    if (want(filter, SourceId::win_startup_folder_user))
-        finish_source(ctx, SourceId::win_startup_folder_user, startup_folder_user);
-    if (want(filter, SourceId::win_scheduled_tasks))
-        finish_source(ctx, SourceId::win_scheduled_tasks, scheduled_tasks);
-    if (want(filter, SourceId::win_wmi_subscriptions))
-        finish_source(ctx, SourceId::win_wmi_subscriptions, wmi_subscriptions);
+    finish_source_or_filtered(ctx, filter, SourceId::win_run_hklm, run_hklm);
+    finish_source_or_filtered(ctx, filter, SourceId::win_runonce_hklm, runonce_hklm);
+    finish_source_or_filtered(ctx, filter, SourceId::win_runonceex_hklm, runonceex_hklm);
+    finish_source_or_filtered(ctx, filter, SourceId::win_run_hku, run_hku);
+    finish_source_or_filtered(ctx, filter, SourceId::win_runonce_hku, runonce_hku);
+    finish_source_or_filtered(ctx, filter, SourceId::win_startup_approved, startup_approved);
+    finish_source_or_filtered(ctx, filter, SourceId::win_winlogon_shell, winlogon_shell);
+    finish_source_or_filtered(ctx, filter, SourceId::win_winlogon_userinit, winlogon_userinit);
+    finish_source_or_filtered(ctx, filter, SourceId::win_appinit_dlls, appinit);
+    finish_source_or_filtered(ctx, filter, SourceId::win_ifeo_debugger, ifeo);
+    finish_source_or_filtered(ctx, filter, SourceId::win_startup_folder_common,
+                              startup_folder_common);
+    finish_source_or_filtered(ctx, filter, SourceId::win_startup_folder_user, startup_folder_user);
+    finish_source_or_filtered(ctx, filter, SourceId::win_scheduled_tasks, scheduled_tasks);
+    finish_source_or_filtered(ctx, filter, SourceId::win_wmi_subscriptions, wmi_subscriptions);
 
     return 0;
 }

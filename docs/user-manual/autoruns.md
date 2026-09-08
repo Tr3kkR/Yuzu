@@ -56,7 +56,7 @@ versus one that could not be read at all:
 - **`constrained|0|btm_private_database_no_public_api`** (`mac_login_items`)
   -- the mechanism exists but this leg deliberately does not exercise it: no
   public read API for the private BTM database.
-- **`constrained|<n>|<sid>_<reason>`** (`win_*_hku` sources, per profile) --
+- **`constrained|<n>|<sid>:<reason>`** (`win_*_hku` sources, per profile) --
   the hive couldn't be reached for that SID, with the specific constraint
   named rather than folded into one bucket: `not_found` (no such profile
   hive), `privilege_missing` (`SeBackupPrivilege`/`SeRestorePrivilege`

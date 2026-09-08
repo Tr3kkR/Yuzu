@@ -514,9 +514,22 @@ inline IfeoEntry parse_ifeo_debugger(std::string_view exe_name, std::string_view
 
 // ── 7. parse_task_xml (minimal tag scanner, no XML library) ──────────────
 
-struct TaskInfo {
+/// One `<Exec>` action within a task's `<Actions>` block. Task Scheduler
+/// supports up to 32 sequential actions per task, ALL of which it executes
+/// in order -- surfacing only the first silently hides the rest from an
+/// operator (a benign first action, persistence-payload second action is a
+/// real scenario, not a hypothetical one).
+struct TaskAction {
     std::string command;
     std::string arguments;
+};
+
+struct TaskInfo {
+    std::vector<TaskAction> actions; // one per <Exec>, in document order
+    bool has_unmodelled_action = false; // an <Actions> child this scanner
+                                        // doesn't decode (e.g. <ComHandler>,
+                                        // <SendEmail>, <ShowMessage>) is
+                                        // present alongside/instead of <Exec>
     bool enabled = true; // Task Scheduler's own documented default
     std::string user_id;
     bool has_triggers = false;
@@ -535,20 +548,88 @@ inline std::optional<std::string> extract_tag(std::string_view xml, std::string_
     return std::string{xml.substr(start, end - start)};
 }
 
+/// Like extract_tag, but the opening tag may carry attributes (e.g.
+/// `<Actions Context="Author">`), which extract_tag's exact `<tag>` match
+/// would miss entirely. Returns the CONTENT span between the opening tag's
+/// '>' and the matching closing tag -- nullopt if the opening or closing
+/// tag isn't found (truncated document) or the match is a longer tag
+/// sharing this prefix (e.g. `<ActionsFoo>` must not match tag "Actions").
+inline std::optional<std::string_view> extract_tagged_block(std::string_view xml,
+                                                             std::string_view tag) {
+    const std::string open_prefix = "<" + std::string{tag};
+    std::size_t start = xml.find(open_prefix);
+    while (start != std::string_view::npos) {
+        const std::size_t after = start + open_prefix.size();
+        const char next = after < xml.size() ? xml[after] : '\0';
+        if (next == '>' || next == ' ' || next == '/' || next == '\t' || next == '\n' ||
+            next == '\r')
+            break; // genuinely this tag, not a longer one sharing the prefix
+        start = xml.find(open_prefix, start + 1);
+    }
+    if (start == std::string_view::npos) return std::nullopt;
+    const std::size_t gt = xml.find('>', start);
+    if (gt == std::string_view::npos) return std::nullopt;
+    if (gt > 0 && xml[gt - 1] == '/') return std::string_view{}; // self-closed: empty content
+    const std::string close = "</" + std::string{tag} + ">";
+    const std::size_t end = xml.find(close, gt + 1);
+    if (end == std::string_view::npos) return std::nullopt; // truncated
+    return xml.substr(gt + 1, end - (gt + 1));
+}
+
+/// Every occurrence of `<tag>...</tag>` (no attributes -- Task Scheduler's
+/// schema never puts them on `<Exec>`) within `xml`, in document order. A
+/// tag opened but never closed stops the scan there, keeping whatever
+/// complete blocks were already found rather than discarding all of them.
+inline std::vector<std::string_view> find_all_tagged_blocks(std::string_view xml,
+                                                             std::string_view tag) {
+    std::vector<std::string_view> out;
+    const std::string open = "<" + std::string{tag} + ">";
+    const std::string close = "</" + std::string{tag} + ">";
+    std::size_t pos = 0;
+    while (true) {
+        const std::size_t start = xml.find(open, pos);
+        if (start == std::string_view::npos) break;
+        const std::size_t content_start = start + open.size();
+        const std::size_t end = xml.find(close, content_start);
+        if (end == std::string_view::npos) break; // truncated: stop, keep what's already found
+        out.push_back(xml.substr(content_start, end - content_start));
+        pos = end + close.size();
+    }
+    return out;
+}
+
 } // namespace detail
 
-/// Scans for `<Command>`, `<Arguments>`, `<Enabled>`, `<UserId>` and whether
-/// `<Triggers>` is empty (self-closed `<Triggers/>` / `<Triggers />`, or an
-/// open/close pair with nothing between) versus carries at least one real
-/// trigger element. A truncated document (a tag opened but never closed)
-/// leaves the corresponding field at its default rather than throwing --
-/// this is a best-effort scanner over untrusted XML, not a validating parser.
+/// Scans for every `<Exec>` action inside `<Actions>`, `<Enabled>`,
+/// `<UserId>` and whether `<Triggers>` is empty (self-closed `<Triggers/>` /
+/// `<Triggers />`, or an open/close pair with nothing between) versus
+/// carries at least one real trigger element. A truncated document (a tag
+/// opened but never closed) leaves the corresponding field at its default
+/// rather than throwing -- this is a best-effort scanner over untrusted
+/// XML, not a validating parser.
 inline TaskInfo parse_task_xml(std::string_view xml) {
     TaskInfo out;
-    if (auto v = detail::extract_tag(xml, "Command")) out.command = *v;
-    if (auto v = detail::extract_tag(xml, "Arguments")) out.arguments = *v;
     if (auto v = detail::extract_tag(xml, "Enabled")) out.enabled = (*v == "true");
     if (auto v = detail::extract_tag(xml, "UserId")) out.user_id = *v;
+
+    if (auto actions_block = detail::extract_tagged_block(xml, "Actions")) {
+        for (auto exec : detail::find_all_tagged_blocks(*actions_block, "Exec")) {
+            TaskAction action;
+            if (auto v = detail::extract_tag(exec, "Command")) action.command = *v;
+            if (auto v = detail::extract_tag(exec, "Arguments")) action.arguments = *v;
+            out.actions.push_back(std::move(action));
+        }
+        // A sibling action element this scanner doesn't decode -- ComHandler
+        // (COM object invocation), SendEmail and ShowMessage (both
+        // deprecated by Task Scheduler but still schema-legal) -- means the
+        // task does more than the Exec rows above show.
+        for (std::string_view unmodelled : {"<ComHandler", "<SendEmail", "<ShowMessage"}) {
+            if (actions_block->find(unmodelled) != std::string_view::npos) {
+                out.has_unmodelled_action = true;
+                break;
+            }
+        }
+    }
 
     std::size_t t = xml.find("<Triggers");
     if (t != std::string_view::npos) {

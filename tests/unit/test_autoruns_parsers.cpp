@@ -333,7 +333,9 @@ TEST_CASE("autoruns: parse_task_xml reads command, disabled state, principal and
           "[autoruns][parsers]") {
     const auto xml = read_fixture_reg_text("windows/sample_task.xml");
     const auto info = parse_task_xml(xml);
-    CHECK(info.command == "%windir%\\system32\\appidpolicyconverter.exe");
+    REQUIRE(info.actions.size() == 1);
+    CHECK(info.actions[0].command == "%windir%\\system32\\appidpolicyconverter.exe");
+    CHECK_FALSE(info.has_unmodelled_action);
     CHECK_FALSE(info.enabled);
     CHECK(info.user_id == "S-1-5-18");
     CHECK_FALSE(info.has_triggers); // <Triggers /> is self-closed
@@ -345,8 +347,47 @@ TEST_CASE("autoruns: parse_task_xml on a truncated document keeps safe defaults"
     // but never closed must not throw or read past the buffer.
     const std::string truncated = "<Task><Actions><Exec><Command>C:\\partial";
     const auto info = parse_task_xml(truncated);
-    CHECK(info.command.empty());
+    CHECK(info.actions.empty());
     CHECK(info.enabled); // documented default when <Enabled> is absent
+}
+
+TEST_CASE("autoruns: parse_task_xml reads every <Exec> action, not just the first",
+          "[autoruns][parsers]") {
+    const std::string xml =
+        "<Task><Actions Context=\"Author\">"
+        "<Exec><Command>C:\\benign.exe</Command><Arguments>-a</Arguments></Exec>"
+        "<Exec><Command>C:\\second.exe</Command><Arguments>-b</Arguments></Exec>"
+        "</Actions></Task>";
+    const auto info = parse_task_xml(xml);
+    REQUIRE(info.actions.size() == 2);
+    CHECK(info.actions[0].command == "C:\\benign.exe");
+    CHECK(info.actions[0].arguments == "-a");
+    CHECK(info.actions[1].command == "C:\\second.exe");
+    CHECK(info.actions[1].arguments == "-b");
+    CHECK_FALSE(info.has_unmodelled_action);
+}
+
+TEST_CASE("autoruns: parse_task_xml flags an unmodelled action type alongside a real Exec",
+          "[autoruns][parsers]") {
+    const std::string xml =
+        "<Task><Actions Context=\"Author\">"
+        "<Exec><Command>C:\\benign.exe</Command></Exec>"
+        "<ComHandler><ClassId>{00000000-0000-0000-0000-000000000000}</ClassId></ComHandler>"
+        "</Actions></Task>";
+    const auto info = parse_task_xml(xml);
+    REQUIRE(info.actions.size() == 1);
+    CHECK(info.actions[0].command == "C:\\benign.exe");
+    CHECK(info.has_unmodelled_action);
+}
+
+TEST_CASE("autoruns: parse_task_xml does not confuse <Actions> with a longer tag sharing "
+          "its prefix",
+          "[autoruns][parsers]") {
+    // A hypothetical <ActionsFoo> block must not be mistaken for <Actions>.
+    const std::string xml = "<Task><ActionsFoo><Exec><Command>C:\\decoy.exe</Command></Exec>"
+                            "</ActionsFoo></Task>";
+    const auto info = parse_task_xml(xml);
+    CHECK(info.actions.empty());
 }
 
 // ── 8. parse_wmi_subscription_triple ─────────────────────────────────────

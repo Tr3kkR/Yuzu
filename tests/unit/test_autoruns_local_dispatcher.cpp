@@ -23,6 +23,7 @@
 #include <filesystem>
 #include <optional>
 #include <set>
+#include <span>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -187,6 +188,65 @@ TEST_CASE("autoruns plugin: list emits a source status per catalog source, every
     }
     CHECK(native_supported_with_rows);
     CHECK(autorun_row_count > 0);
+}
+
+TEST_CASE("autoruns plugin: a sources= filter still reports a status for every catalog "
+          "source, never silently omitting the excluded ones",
+          "[autoruns][actions]") {
+    auto plugin = load_autoruns_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+
+    yuzu::agent::LocalDispatcher dispatcher;
+
+    // Two sources NATIVE to the platform this test actually runs its leg on
+    // -- a foreign-OS source's status is its own "foreign_os" reason
+    // regardless of the filter (a pre-existing, cross-platform stub
+    // behavior, not what this test is guarding), so the "excluded source
+    // reports filtered" assertion below only holds for same-platform
+    // siblings of the included id.
+#if defined(_WIN32)
+    const std::string included_id = "win_run_hklm";
+    const std::string excluded_native_id = "win_appinit_dlls";
+#elif defined(__APPLE__)
+    const std::string included_id = "mac_system_launchdaemons";
+    const std::string excluded_native_id = "mac_launchagents";
+#else
+    const std::string included_id = "lnx_etc_crontab";
+    const std::string excluded_native_id = "lnx_cron_d";
+#endif
+
+    // content/definitions/autoruns.yaml and docs/user-manual/autoruns.md
+    // both guarantee every catalog source reports a status row on every
+    // list capture, "never omitted," regardless of sources=.
+    const YuzuParam filter_param{"sources", included_id.c_str()};
+    auto result = dispatcher.run(plugin->descriptor, "list", std::span{&filter_param, 1});
+    CHECK(result.rc == 0);
+
+    const auto rows = captured_rows(result.captured);
+    REQUIRE_FALSE(rows.empty());
+
+    std::set<std::string> known_ids;
+    for (const auto& decl : yuzu::autoruns::kSourceCatalog)
+        known_ids.insert(std::string{yuzu::autoruns::source_id_string(decl.id)});
+
+    std::set<std::string> seen_status_ids;
+    bool excluded_native_filtered = false;
+    for (const auto& r : rows) {
+        const auto f = fields_of(r);
+        if (f[0] != "source") continue;
+        REQUIRE(f.size() == 5);
+        seen_status_ids.insert(f[1]);
+        if (f[1] == excluded_native_id) {
+            CHECK(f[4] == "filtered");
+            excluded_native_filtered = true;
+        }
+    }
+    // Every catalog source still reports a status -- none dropped by the filter.
+    CHECK(seen_status_ids.size() == known_ids.size());
+    CHECK(excluded_native_filtered);
 }
 
 TEST_CASE("autoruns plugin: an unknown action is refused, not silently ignored",

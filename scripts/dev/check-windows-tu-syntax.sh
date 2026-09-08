@@ -92,10 +92,8 @@ for tu in "${tus[@]}"; do
         extra_inc=(-I "$nlohmann_include")
     fi
     if "$CXX" -std=c++23 -fsyntax-only -fno-elide-constructors \
-        -I "$shim" -I "$src_dir" -I agents/shared -I agents/core/include -I sdk/include \
-        "$tu" 2>"$shim/err.log"; then
         -DWIN32_LEAN_AND_MEAN -DNOMINMAX \
-        -I "$shim" -I "$src_dir" -I agents/shared -I sdk/include -I agents/core/include \
+        -I "$shim" -I "$src_dir" -I agents/shared -I agents/core/include -I sdk/include \
         "${extra_inc[@]}" "$tu" 2>"$shim/err.log"; then
         echo "  ok    $tu"
     else
