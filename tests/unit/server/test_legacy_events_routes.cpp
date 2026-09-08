@@ -144,12 +144,18 @@ TEST_CASE("legacy_events_routes: an admitted request sets Cache-Control/X-Accel-
     h.wire();
 
     CHECK(bus.listener_count() == 0);
-    auto res = h.sink.Get("/events"); // kept alive: see Harness's header comment
-    REQUIRE(res);
-    CHECK(res->status == 200); // TestRouteSink pre-sets 200; handler never overrides it here
-    CHECK(res->get_header_value("Cache-Control") == "no-cache");
-    CHECK(res->get_header_value("X-Accel-Buffering") == "no");
-    CHECK(bus.listener_count() == 1);
+    {
+        auto res = h.sink.Get("/events"); // kept alive: see Harness's header comment
+        REQUIRE(res);
+        CHECK(res->status == 200); // TestRouteSink pre-sets 200; handler never overrides it here
+        CHECK(res->get_header_value("Cache-Control") == "no-cache");
+        CHECK(res->get_header_value("X-Accel-Buffering") == "no");
+        CHECK(bus.listener_count() == 1);
+    }
+    // Response destruction fires httplib's content_provider_resource_releaser_,
+    // which is where the subscription's cleanup lives -- confirm it actually
+    // unsubscribes rather than just trusting the releaser exists.
+    CHECK(bus.listener_count() == 0);
 }
 
 TEST_CASE("legacy_events_routes: resolve_session_fn is best-effort -- an unresolvable "

@@ -294,9 +294,9 @@ Operator                     Server                                  Agent
 Most HTTP surfaces the server exposes — REST, dashboard fragments, MCP — are registered by a
 **route owner**: a class with a `register_routes(...)` method that the server calls once at
 startup. `server.cpp` wires those owners, *and* registers a further **16 routes inline** on
-`web_server_->{Get,Post,Put,Delete}` — the health/readiness probes (`/health`, `/api/health`,
-`/livez`, `/readyz`, `/fragments/health/summary`), `/metrics`, and the response/tags/inventory
-`/api/*` JSON surfaces not yet extracted. It constructs no persistent `HttplibRouteSink` of its own
+`web_server_->{Get,Post,Put,Delete}` — the four health/readiness probes (`/health`, `/api/health`,
+`/livez`, `/readyz`), the `/fragments/health/summary` dashboard fragment, `/metrics`, and the
+response/tags/inventory `/api/*` JSON surfaces not yet extracted. It constructs no persistent `HttplibRouteSink` of its own
 for these remaining inline routes, so none of them is reachable from the in-process test harness.
 (Sixteen surfaces this prose previously credited to this inline count have since moved to their
 own `HttpRouteSink` modules and are no longer part of it: `POST /api/command` is
@@ -342,9 +342,11 @@ through `approval_routes.cpp` plus PR-12's `config_routes.cpp`, `diagnostics_rou
 `legacy_events_routes.cpp`, `instruction_fragment_routes.cpp`, and
 `approvals_fragment_routes.cpp` — register against the same stack-local `inline_sink`, constructed
 in `start_web_server()`. `mcp_disabled_routes.cpp` is the one exception: it registers against its
-own local sink inside the `if (cfg_.mcp_disable)` block, the same own-local-sink pattern
-`command_routes.cpp` itself uses, since `inline_sink` is not assumed still in scope that far into
-the function.)
+own local sink inside the `if (cfg_.mcp_disable)` block — `inline_sink` is in fact still in scope
+there, but this module deliberately follows the own-local-sink pattern `command_routes.cpp`
+already established, rather than reaching back out to the shared one. Either would work
+identically at runtime — `HttplibRouteSink` is a stateless forwarding wrapper — so this is a
+stylistic precedent, not a scope constraint.)
 
 Counting the surface therefore needs a receiver-agnostic pattern, not a search for one variable
 name:

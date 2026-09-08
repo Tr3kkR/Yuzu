@@ -33,9 +33,10 @@ void register_config_routes(HttpRouteSink& sink, Deps deps) {
             spdlog::level::to_string_view(spdlog::default_logger()->level()).data();
 
         // Overrides from store. The omission rule lives in
-        // build_overrides_json (runtime_config_view.hpp) so it is unit-testable -- this
-        // route is TestRouteSink-registered (#2542 PR-12), and it is one of the sites the
-        // secret leaked from twice.
+        // build_overrides_json (runtime_config_view.hpp) so it was independently
+        // unit-testable even while this route was still inline (the route itself is
+        // also TestRouteSink-registered since #2542 PR-12), and it is one of the
+        // sites the secret leaked from twice.
         // A degraded store must NOT read as "nothing is configured". This route no
         // longer returns a secret's value, so the PRESENCE of the key and its
         // `is_set` are the only way to answer "is the OIDC secret set here?" -- and

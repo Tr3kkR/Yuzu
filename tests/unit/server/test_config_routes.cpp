@@ -309,6 +309,15 @@ TEST_CASE("config_routes: PUT an integer key round-trips into cfg AND the store,
     CHECK(h.audits[0].target_type == "RuntimeConfig");
     CHECK(h.audits[0].target_id == "response_retention_days");
     CHECK(h.audits[0].detail == "value=120");
+
+    // The read-back half: GET must reflect the write via the store, not just
+    // the in-memory cfg_ side effect checked above.
+    auto get_res = h.sink.Get("/api/config");
+    REQUIRE(get_res);
+    CHECK(get_res->status == 200);
+    auto get_b = body(get_res->body);
+    REQUIRE(get_b["overrides"].contains("response_retention_days"));
+    CHECK(get_b["overrides"]["response_retention_days"]["value"] == "120");
 }
 
 TEST_CASE("config_routes: PUT a non-numeric value for an integer key is a 400, cfg untouched, "

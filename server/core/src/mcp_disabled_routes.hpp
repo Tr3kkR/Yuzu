@@ -13,10 +13,15 @@
 /// lambda with no captures at all, reused across all three verbs, so this
 /// module needs no `Deps` struct (there is nothing to inject: no session,
 /// no store, no permission gate — the whole point of the stub is to answer
-/// honestly that MCP is off, for ANY caller, unauthenticated or not).
+/// honestly that MCP is off). Note this describes the HANDLER only: an
+/// unauthenticated caller does not actually reach it — `/mcp/v1/` is not in
+/// `is_login_exempt_path` (`web_utils.hpp`), so the server's pre-routing
+/// chokepoint still 401s an unauthenticated request before this lambda
+/// runs, exactly as it does for every other `/mcp/`-prefixed path.
 ///
-/// Routes (3), all unconditional (no gate — MCP is uniformly unavailable
-/// regardless of caller):
+/// Routes (3), no gate INSIDE the handler (reachability is governed
+/// upstream by the pre-routing chokepoint, same as every other `/mcp/`
+/// path):
 ///   POST   /mcp/v1/
 ///   GET    /mcp/v1/
 ///   DELETE /mcp/v1/

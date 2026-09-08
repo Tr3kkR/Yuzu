@@ -10,10 +10,9 @@
 /// newer one).
 ///
 /// SSE-EXTRACTION SAFETY (checked, not assumed — see PR-12's own
-/// governance-ledger self-review entry for the full note): the task brief
-/// for this extraction flagged this route as a candidate to defer if
-/// genuinely incompatible with `HttpRouteSink`'s synchronous
-/// request/response model. It is NOT incompatible. `GET /api/v1/events`
+/// governance-ledger self-review entry for the full note): this route was a
+/// candidate to defer if genuinely incompatible with `HttpRouteSink`'s
+/// synchronous request/response model. It is NOT incompatible. `GET /api/v1/events`
 /// (`rest_api_v1.cpp`) is the existing, in-production precedent — it is
 /// ALREADY registered through this exact seam (`sink.Get("/api/v1/events",
 /// ...)`) and already carries its own `TestRouteSink` coverage
@@ -35,7 +34,13 @@
 /// (`auth_routes_->deny_service_scoped_session` -> `deps.deny_service_scoped_fn`,
 /// `auth_routes_->resolve_session` -> `deps.resolve_session_fn`), and the
 /// member access (`stream_budget_.` -> `deps.stream_budget->`, `event_bus_`
-/// -> `*deps.event_bus`).
+/// -> `*deps.event_bus`). One guard's SHAPE changes without changing its
+/// behaviour: the original `if (auth_routes_) { ... }` (a null-pointer
+/// check) becomes `if (deps.resolve_session_fn) { ... }` (a
+/// `std::function`-empty check) — vacuously true either way, since
+/// `auth_routes_` is unconditionally constructed before `start_web_server()`
+/// runs and `resolve_session_fn` is bound unconditionally at registration
+/// time, matching every other #2542 module's convention.
 ///
 /// ADMISSION CONTROL (ADR-0034): this route leases from the SAME
 /// `deps.stream_budget` instance every other held-open response on the
