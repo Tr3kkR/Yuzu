@@ -26,8 +26,15 @@ namespace yuzu::server {
     // detected-licence rows (incl. `user_ref`) into the generic store on the
     // gateway path, readable under Infrastructure:Read, i.e. a leak past the
     // SoftwareLicensing securable.
+    //
+    // app_usage (Wave 7 PR7.2): same omission class, caught by
+    // test_agent_service_impl.cpp's "ProxyInventory (gateway): an app_usage
+    // payload reaches ingest_app_usage_report..." composition test — without
+    // this entry, a gateway-proxied agent's app_usage blob double-stored into
+    // the generic InventoryStore, readable under Infrastructure:Read rather
+    // than the Forensics securable app_usage is gated on.
     return source == "installed_software" || source == "app_perf" || source == "device_ci" ||
-           source == "software_licensing";
+           source == "software_licensing" || source == "app_usage";
 }
 
 } // namespace yuzu::server
