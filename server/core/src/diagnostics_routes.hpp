@@ -41,8 +41,6 @@
 /// original inline code). Both GET status routes are pure reads, never
 /// audited.
 
-#include <yuzu/server/auth.hpp>
-
 #include <httplib.h>
 
 #include <functional>
