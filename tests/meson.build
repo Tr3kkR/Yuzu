@@ -940,6 +940,9 @@ if build_server
       'unit/server/test_leader_elector.cpp',
       'unit/server/test_leader_gate.cpp',
       'unit/server/test_coord_dsn.cpp',
+      'unit/server/test_command_outbox_store.cpp', # WS-3 3.3: transactional command outbox
+      'unit/server/test_command_outbox_delivery.cpp', # WS-3 3.3: leader-gated delivery loop
+
       'unit/server/test_execution_event_bus.cpp',
       'unit/server/test_approval_manager.cpp',
       'unit/server/test_schedule_engine.cpp',
@@ -1148,6 +1151,7 @@ if build_server
       'unit/server/test_result_parsing.cpp',
       'unit/server/test_visualization_engine.cpp',
       'unit/server/test_rest_visualization.cpp',
+      'unit/server/test_rest_executions_v1_twins.cpp',
       'unit/server/test_response_templates_engine.cpp',
       'unit/server/test_rest_response_templates.cpp',
       'unit/server/test_rest_instructions_productpacks.cpp', # #4029: GET /api/v1/instructions*, /api/v1/product-packs*
@@ -2315,6 +2319,24 @@ test('issue lifecycle docs',
   args: [files('test_issue_docs.py')],
   suite: 'docs',
   timeout: 10,
+)
+
+# ADR-0032 split interlock merge-gate: the tripwire (no engine-path symbol may
+# merge while the gate is red) and its self-test (the ledger's load-bearing
+# constants are pinned so the gate cannot be silently neutered). Both also run in
+# .github/workflows/docs-lint.yml on every PR; registered here for local `meson
+# test --suite docs` parity with the sibling python doc-tests.
+test('split interlock tripwire',
+  _python3_test,
+  args: [files('test_split_interlock_tripwire.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+test('split interlock tripwire selftest',
+  _python3_test,
+  args: [files('test_split_interlock_tripwire_selftest.py')],
+  suite: 'docs',
+  timeout: 30,
 )
 
 # Runner-local CI telemetry contract: v2->v3 migration preserves history,

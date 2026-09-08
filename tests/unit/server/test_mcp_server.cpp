@@ -52,6 +52,7 @@
 #include "response_store.hpp"
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
+#include "workflow_engine.hpp" // #4030 Gate 8 fix: mcp_workflow_tpl / get_workflow_execution tests
 // M5 remediation (ADR-0031 operator-surface functional coverage): mcp_server.hpp
 // only forward-declares PluginConfigStore (its .cpp includes the real header) —
 // the store's live-state assertions below need the full definition + its
@@ -111,6 +112,14 @@ yuzu::test::PgTestTemplate mcp_instr_tpl{"mcpinstr", [](const std::string& dsn) 
     yuzu::server::InstructionStore store{pool};
     if (!store.is_open())
         throw std::runtime_error("mcpinstr template: store failed to migrate");
+}};
+// #4030 Gate 8 fix: WorkflowEngine is Postgres-backed (ADR-0064) -- no MCP
+// test wired one before this fix (get_workflow_execution had zero coverage).
+yuzu::test::PgTestTemplate mcp_workflow_tpl{"mcpworkflow", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    yuzu::server::WorkflowEngine store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("mcpworkflow template: store failed to migrate");
 }};
 } // namespace
 
@@ -873,6 +882,14 @@ struct McpTestServer {
     /// MCP test that needs the lifecycle to be a no-op.
     yuzu::server::ExecutionTracker* execution_tracker_for_test{nullptr};
 
+    /// #4030 Gate 8 fix: optionally wire a real WorkflowEngine so
+    /// list_workflows/get_workflow/get_workflow_execution can be exercised
+    /// end-to-end -- until this fix, no MCP test wired one at all (every
+    /// existing test hit the "Workflow engine unavailable" internal-error
+    /// path unconditionally). Default nullptr preserves that prior
+    /// behaviour for tests that don't opt in.
+    yuzu::server::WorkflowEngine* workflow_engine_for_test{nullptr};
+
     /// Slice 1 (agentic fan-out scale-hardening): optionally wire a real
     /// ResponseStore so query_responses can be exercised end-to-end, including
     /// the new execution_id exact-correlation collect path. Default nullptr
@@ -1293,7 +1310,8 @@ private:
             /*stream_budget=*/stream_budget_for_test,
             /*revalidate_fn=*/revalidate_fn_for_test,
             /*principal_audit_fn=*/principal_audit_fn_for_test,
-            /*product_pack_store=*/product_pack_store_for_test);
+            /*product_pack_store=*/product_pack_store_for_test,
+            /*workflow_engine=*/workflow_engine_for_test);
     }
 };
 
@@ -1749,10 +1767,11 @@ TEST_CASE("MCP 2383: RBAC catalogue mirrors have the expected cardinality", "[mc
     CHECK(rbac_ops_for_test().size() == 8);
     // 23 + 3 PR1.9a additions (PluginConfig, PluginSecret, UploadGrant)
     // + 1 Wave 6 (PowerManagement, power_health's set_power_plan) = 27,
-    // + 1 (#4029: ProductPack prerequisite fix) = 28,
+    // + 1 (#4030/#4032: Workflow, previously gated but never seeded) = 28,
+    // + 1 (#4029: ProductPack prerequisite fix) = 29,
     // + 4 #4028 additions (TlsConfig, PluginSigning, ServerConfig,
-    // AnalyticsConfig — Settings read-twins) = 32.
-    CHECK(rbac_securables_for_test().size() == 32);
+    // AnalyticsConfig — Settings read-twins) = 33.
+    CHECK(rbac_securables_for_test().size() == 33);
 }
 
 TEST_CASE("MCP 2383: three-way dispatch classifier — knownness decides first", "[mcp][2g]") {
@@ -6135,6 +6154,139 @@ TEST_CASE("MCP get_execution_status: invisible execution collapses to the same "
     CHECK(missing_json["error"]["message"].get<std::string>().starts_with("Execution not found:"));
 }
 
+// #4030 Gate 8 fix: get_workflow_execution had ZERO prior MCP-level test
+// coverage (quality-engineer + cpp-safety, Gate 3) -- the confinement fix
+// (security-guardian, Gate 2 HIGH: workflow_execution_detail_json had no
+// record-level confinement gate, only `agent_ids` was field-filtered; a
+// caller with zero visibility into an execution's target agents still got
+// the full status/steps/results) is verified here on the MCP surface,
+// mirroring get_execution_status's own #1634 zero-overlap test above.
+// PRE-fix this call returned 200 with the full unfiltered record.
+TEST_CASE("MCP get_workflow_execution: zero-overlap confined caller gets the "
+          "same not-found error as a nonexistent id (#4030 Gate 8 fix)",
+          "[pg][mcp][integration][workflow][scope][notfound]") {
+    YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ResponseExecutionAuthzPgRig authz{authz_db.dsn()};
+    // The shared rig grants bob Response:Read/Execution:Read via his
+    // management group -- "Workflow" is a brand-new securable this PR
+    // introduces (rbac_store.cpp seeding), so it is not part of the rig's
+    // own fixed setup. Grant it the same way (management-group-scoped),
+    // mirroring the rig's own ResponseReader1634/ExecutionReader1634 shape.
+    REQUIRE(authz.rbac.create_role({"WorkflowReader4030", "", false, 0}).has_value());
+    REQUIRE(
+        authz.rbac.set_permission({"WorkflowReader4030", "Workflow", "Read", "allow"}).has_value());
+    REQUIRE(authz.mgmt.assign_role({authz.bob_group, "user", "bob", "WorkflowReader4030"})
+                .has_value());
+
+    YUZU_REQUIRE_PG_DB_TPL(wf_db, mcp_workflow_tpl);
+    yuzu::server::pg::PgPool wf_pool{{.conninfo = wf_db.dsn(), .size = 4}};
+    yuzu::server::WorkflowEngine workflows{wf_pool};
+    REQUIRE(workflows.is_open());
+
+    const std::string yaml = "kind: Workflow\n"
+                             "metadata:\n"
+                             "  displayName: mcp-wf-scope\n"
+                             "spec:\n"
+                             "  steps:\n"
+                             "    - instruction: def-mcp-wf\n";
+    auto wf_id = workflows.create_workflow(yaml);
+    REQUIRE(wf_id.has_value());
+
+    auto dispatch_fn = [](const std::string&, const std::string&,
+                          const std::string&) -> std::expected<std::string, std::string> {
+        return std::string(
+            R"({"status":"dispatched","command_id":"cmd-mcp-wf","agents_reached":1})");
+    };
+    // Target agent-A only -- bob's confined scope below (mint_bob) is
+    // disjoint from it (mirrors get_execution_status's own bob/alice-agent
+    // disjoint setup above).
+    auto exec_id = workflows.execute(*wf_id, {"agent-A"}, dispatch_fn);
+    REQUIRE(exec_id.has_value());
+
+    McpTestServer ts;
+    ts.workflow_engine_for_test = &workflows;
+    ts.fleet_read_fn_for_test = authz.fleet_read_fn();
+    ts.mock_username = "bob";
+    ts.start("operator");
+
+    const auto token = authz.mint_bob();
+    auto call = [&](const std::string& id) {
+        return ts.call_raw(
+            "POST",
+            std::string(
+                R"({"jsonrpc":"2.0","method":"tools/call","id":740,)"
+                R"("params":{"name":"get_workflow_execution","arguments":{"execution_id":")") +
+                id + R"("}}})",
+            {{"Authorization", "Bearer " + token}});
+    };
+    auto invisible = call(*exec_id);
+    auto missing = call("wfexec-does-not-exist-at-all");
+    REQUIRE(invisible);
+    REQUIRE(missing);
+    auto invisible_json = nlohmann::json::parse(invisible->body);
+    auto missing_json = nlohmann::json::parse(missing->body);
+    REQUIRE(invisible_json.contains("error"));
+    REQUIRE(missing_json.contains("error"));
+    CHECK(invisible_json["error"]["code"] == missing_json["error"]["code"]);
+    CHECK(invisible_json["error"]["message"].get<std::string>().starts_with(
+        "Workflow execution not found:"));
+    CHECK(missing_json["error"]["message"].get<std::string>().starts_with(
+        "Workflow execution not found:"));
+    // PRE-fix regression proof: the error response has no "result" key at
+    // all -- the record (status/steps/results) genuinely was not returned,
+    // not merely field-filtered.
+    CHECK_FALSE(invisible_json.contains("result"));
+}
+
+// Regression guard for the fix above: an UNCONFINED caller must still see
+// the full record, including the raw `agents_reached` count in each step's
+// result (the confined-only redaction the fix's count-disclosure guard
+// applies must not fire for a caller with no scope at all).
+TEST_CASE("MCP get_workflow_execution: unconfined caller still sees the full "
+          "record including agents_reached (#4030 Gate 8 fix regression guard)",
+          "[pg][mcp][integration][workflow][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(wf_db, mcp_workflow_tpl);
+    yuzu::server::pg::PgPool wf_pool{{.conninfo = wf_db.dsn(), .size = 4}};
+    yuzu::server::WorkflowEngine workflows{wf_pool};
+    REQUIRE(workflows.is_open());
+
+    const std::string yaml = "kind: Workflow\n"
+                             "metadata:\n"
+                             "  displayName: mcp-wf-unconfined\n"
+                             "spec:\n"
+                             "  steps:\n"
+                             "    - instruction: def-mcp-wf2\n";
+    auto wf_id = workflows.create_workflow(yaml);
+    REQUIRE(wf_id.has_value());
+    auto dispatch_fn = [](const std::string&, const std::string&,
+                          const std::string&) -> std::expected<std::string, std::string> {
+        return std::string(
+            R"({"status":"dispatched","command_id":"cmd-mcp-wf2","agents_reached":2})");
+    };
+    auto exec_id = workflows.execute(*wf_id, {"agent-X", "agent-Y"}, dispatch_fn);
+    REQUIRE(exec_id.has_value());
+
+    McpTestServer ts;
+    ts.workflow_engine_for_test = &workflows;
+    // fleet_read_fn_for_test's own default (checked above) admits
+    // unconfined -- no authz rig wired for this direction.
+    ts.start("operator");
+
+    auto res = ts.call(
+        std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":741,)"
+                    R"("params":{"name":"get_workflow_execution","arguments":{"execution_id":")") +
+        *exec_id + R"("}}})");
+    REQUIRE(res);
+    auto sc = nlohmann::json::parse(res->body)["result"]["structuredContent"];
+    CHECK(sc["status"] == "completed");
+    REQUIRE(sc["agent_ids"].is_array());
+    CHECK(sc["agent_ids"].size() == 2);
+    REQUIRE(sc["steps"].is_array());
+    REQUIRE(sc["steps"].size() == 1);
+    REQUIRE(sc["steps"][0]["result"].contains("agents_reached"));
+    CHECK(sc["steps"][0]["result"]["agents_reached"] == 2);
+}
+
 // #1634: execution rows carry no single agent_id, so a confined caller is
 // restricted to their own dispatches (ExecutionQuery::dispatched_by) rather than
 // a full per-row visible-agent check — never another operator's execution.
@@ -6228,6 +6380,42 @@ TEST_CASE("MCP list_executions: confined caller's counts reflect only in-scope, 
     // never 2 (alice-agent's out-of-scope success must not leak in either).
     CHECK(sc[0]["agents_targeted"] == 1);
     CHECK(sc[0]["agents_responded"] == 0);
+}
+
+// #4030 review finding (blocking, HIGH): list_executions used to call the
+// unchecked query_executions()/get_agent_statuses_for_executions(), which
+// silently collapsed a degraded tracker (not-open / pool-exhausted /
+// query-failed) into an empty executions list -- indistinguishable from a
+// genuinely empty fleet, and the exact defect class already fixed for
+// list_schedules (5686776fe) two commits earlier in this same PR. Mirrors
+// "create_execution failure degrades..." above: an ExecutionTracker bound to
+// an unreachable pool fails its own connect attempt deterministically
+// (ADR-0065, test_engine_principal_store.cpp's #2456 precedent) -- no live
+// database needed, so this carries no [pg] tag.
+TEST_CASE("MCP list_executions: a degraded tracker surfaces a store-fault "
+          "error, never a false empty-success list (#4030 fix regression)",
+          "[mcp][integration][execution]") {
+    pg::PgPool unreachable{{.conninfo = "host=127.0.0.1 port=1 dbname=yuzu connect_timeout=1",
+                            .size = 1,
+                            .connect_timeout_s = 1}};
+    REQUIRE(unreachable.valid()); // conninfo parses; the host is just unreachable
+    ExecutionTracker broken(unreachable);
+    REQUIRE(!broken.is_open());
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &broken;
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":733,"params":{"name":"list_executions"}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInternalError);
+    // Never the pre-fix shape: a "success" result with an empty executions
+    // array, indistinguishable from a genuinely-empty fleet.
+    CHECK_FALSE(body.contains("result"));
 }
 
 TEST_CASE("MCP Agentic demo: ceo_demo prompt is live-only and ignores injected args (ADR-0016)",

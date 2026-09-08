@@ -85,6 +85,7 @@ A separate, narrower shape applies to ordinary mutation routes that audit a chan
   - [Offload Targets](#offload-targets)
   - [Network Discovery](#network-discovery)
   - [Workflows](#workflows)
+  - [Workflows, Executions & Schedules — v1 read twins (#4030)](#workflows-executions--schedules--v1-read-twins-4030)
   - [OpenAPI Spec](#openapi-spec)
   - [Discovery (A2)](#discovery-a2)
   - [Inventory](#inventory)
@@ -2947,7 +2948,7 @@ row fails to persist, the response carries a `Sec-Audit-Failed: true` header
 | `auth.admin_required` | Centralised denial event emitted by `AuthRoutes::require_admin` on every privileged-endpoint 403. `target_type=endpoint`, `target_id={req.path}`. SOC 2 CC7.2 evidence chain — captures rejected attempts that previously surfaced only in the request log. |
 | `auth.lockout.applied` | Account locked after `--auth-lockout-threshold` consecutive failed local-password logins (SOC 2 CC6.3). Emitted **once** at the threshold crossing — not once per blocked attempt (those are tracked only by `yuzu_auth_lockout_blocked_total` to avoid audit flooding). `result=ok` (the lock was applied; the warning severity is carried by the metric + analytics event, not the audit result), `target_type=User`, `detail=threshold=<N> window_secs=<S>`. |
 | `auth.lockout.cleared` | Account-lockout counter reset. `result` ∈ {`ok`, `error`}, `target_type=User`. `detail=admin_unlock` for `POST /api/v1/users/{name}/unlock`, or `reset_on_successful_login` when the user's next successful login clears a non-zero counter. |
-| `execution.detail.fetch` | `GET /api/v1/executions/{id}` (REST v1 single-execution lookup). `result=denied` only (#1634) — emitted on the 404 branch, execution genuinely nonexistent OR out of the caller's management-group scope, non-distinguishing detail text. There is currently no `result=success` row on this route's 200 path — only the denial is audited. |
+| `execution.detail.fetch` | `GET /api/v1/executions/{id}` (REST v1 single-execution lookup). `result=denied` only (#1634) on the BARE route (no `include`) — emitted on the 404 branch, execution genuinely nonexistent OR out of the caller's management-group scope, non-distinguishing detail text; there is no `result=success` row on the bare route's 200 path. **As of #4030, this no longer holds for the whole URL pattern:** `?include=agents` on this same route, and the sibling `GET /api/v1/executions/{id}/responses`, both DO write `result=success` rows under this identical verb name on their 200 path (see `docs/user-manual/audit-log.md`'s `execution.detail.fetch` row for the full, current three-way split). |
 | `execution.live_subscribe` | Server-Sent Events subscribe to `/sse/executions/{id}`. `result` ∈ {`success`, `denied`}. `success` emitted on every successful subscribe (no per-session-per-execution dedup currently — see #700). `denied` emitted (#1634) on the 404 branch — execution genuinely nonexistent OR out of the caller's management-group scope, using non-distinguishing detail text so the two cases stay audit-indistinguishable. The forensic-grade audit on first-load remains on `/fragments/executions/{id}/detail`'s `execution.detail.view`. |
 | `api.v1.events.subscribe` | Agentic-first SSE subscribe to `/api/v1/events?execution_id=<id>` (sprint W5.1). `result` ∈ {`success`, `denied`}. `success` detail format: `correlation_id=req-<hex-ms>-<hex-seq>` so SIEM rules can join the audit row to the response's `X-Correlation-Id` header. Deliberately separated from `execution.live_subscribe` so the SIEM can distinguish browser-tier vs agentic-worker consumers. Same no-dedup policy (#700). `denied` emitted (#1634) on the 404 branch (unknown execution OR out of scope), using non-distinguishing detail text — corrects an earlier version of this row, which predated #1634 and said this 404 branch never audits. |
 | `instruction.create` | Instruction definition created. `result` ∈ {`success`, `denied`, `error`}. Denied detail value: `duplicate_id` (409, explicit `id` already exists). `error` detail `db_error` on a genuine InstructionStore DB/lease failure (503, ADR-0058) — distinct from `denied`, since an infra degrade is not an operator denial. |
@@ -4789,12 +4790,161 @@ results. `404` for an unknown execution id; `503` on a genuine store degrade (AD
 Execution history survives its workflow being deleted — this route stays readable for an
 execution whose workflow was later soft-deleted.
 
+**Permission:** `Workflow:Read`, fleet-read confined as of #4030 — same record-level gate and
+`agent_ids`/`agents_reached` narrowing as the v1 twin below (a caller with no agent visible in
+the execution's `agent_ids` gets the same `404` as a nonexistent id). Unlike the v1 twin and the
+MCP tool, this legacy route writes **no audit row on any path** (pre-existing; out of scope for
+the #4030 confinement fix).
+
 **Usage guide:**
 
 1. Define a workflow with ordered steps (each step maps to an instruction definition).
 2. Execute the workflow against a scope expression to target specific agents.
 3. Monitor execution progress via `GET /api/workflow-executions/{id}`.
 4. Each step runs sequentially; if a step fails on an agent, subsequent steps for that agent are skipped.
+
+---
+
+### Workflows, Executions & Schedules — v1 read twins (#4030)
+
+Versioned REST + MCP twins of the legacy `/api/workflows*` routes above, the `/fragments/executions`
+and `/fragments/executions/{id}/detail` dashboard fragments, and the `/fragments/schedules`
+fragment — closing the last gaps in that domain's `docs/api-parity-ledger.md` row set. Every route
+here shares its JSON row builder with its MCP tool twin (`docs/api-twin-recipe.md` Rule 1), so the
+two surfaces cannot drift on JSON **shape** independently. This does not by itself guarantee the two
+surfaces admit the same **result set** for a given caller: `GET /api/v1/executions`'s confined
+branch (below) is materially broader than the pre-existing MCP `list_executions` confinement
+(own-dispatches-only) — a disclosed, pre-#4030 difference, not a silent one (`docs/user-manual/mcp.md`).
+
+**Prerequisite fix bundled with this PR:** `Workflow` was used as an RBAC securable throughout
+`workflow_routes.cpp` but was never seeded into `RbacStore`'s securable-types catalogue — meaning
+no role, including Administrator, could ever be granted `Workflow:Read` while RBAC was enabled.
+This PR seeds it and grants `Read` to Administrator (via the standard CRUD seed), PlatformEngineer,
+Operator, ITServiceOwner, and Viewer — the same role footprint `Schedule:Read` already has. This
+applies automatically on upgrade (no migration step, no opt-out) — an existing RBAC-enabled
+deployment picks up these four grants on its next restart; review your role assignments first if
+you've already narrowed them.
+
+#### `GET /api/v1/workflows`
+
+**Permission:** `Workflow:Read`. List workflows — the v1 twin of `GET /api/workflows` above (same
+`name`/`limit` query parameters), MCP twin `list_workflows`.
+
+**Response:**
+
+```json
+{
+  "data": [
+    { "id": "abc123", "name": "Patch and Reboot", "description": "...",
+      "steps": [ { "index": 0, "instruction_id": "windows-update-install", "condition": "",
+                   "retry_count": 0, "retry_delay_seconds": 5, "foreach": "", "label": "",
+                   "on_failure": "abort" } ],
+      "step_count": 1, "created_at": 1710849600, "updated_at": 1710849600 }
+  ],
+  "pagination": { "total": 1, "start": 0, "page_size": 50 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+#### `GET /api/v1/workflows/{id}`
+
+**Permission:** `Workflow:Read`. Fetch one workflow's full detail, including `yaml_source`. The v1
+twin of `GET /api/workflows/{id}` above, MCP twin `get_workflow`. `404` for an unknown or
+soft-deleted id.
+
+#### `GET /api/v1/workflow-executions/{id}`
+
+**Permission:** `Workflow:Read`, gated on the fleet-read chokepoint (the legacy route now shares
+this same gate — see below). Record-level confinement: a caller with no agent visible in
+`WorkflowExecution.agent_ids` gets `404`, byte-identical to a genuinely nonexistent id (never a
+narrower-but-still-present record) — not merely a field-level `agent_ids` filter. An admitted
+confined caller's `agent_ids` array is narrowed to their visible agents, and each step's `result`
+has its `agents_reached` count stripped (it's the step's full target-agent count, not the caller's
+visible subset — emitting it verbatim would disclose the true out-of-scope agent count by simple
+arithmetic). The v1 twin of `GET /api/workflow-executions/{id}` above (which now applies the same
+confinement + `agent_ids`/`agents_reached` narrowing, previously unfiltered), MCP twin
+`get_workflow_execution`. Audited as `workflow_execution.detail.fetch`, set-and-proceed (not
+REST's usual fail-closed-on-audit-failure posture — this file's `AuditFn` predates the checked-bool
+`try_persist_audit`/`emit_behavioral_audit` helpers the Executions family below uses).
+
+**Response:**
+
+```json
+{
+  "data": {
+    "id": "exec-wf-1", "workflow_id": "wf-1", "status": "completed",
+    "agent_ids": ["agent-A"], "current_step": 1,
+    "started_at": 1735689600, "completed_at": 1735689620,
+    "steps": [
+      { "step_index": 0, "instruction_id": "windows-update-install", "status": "success",
+        "result": { "status": "dispatched", "command_id": "cmd-1" },
+        "started_at": 1735689600, "completed_at": 1735689610, "attempt": 1 }
+    ]
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+For an unconfined (global-grant) caller, each step's `result` also carries `agents_reached` (the
+step's dispatch-time target-agent count) — stripped above for a confined caller, as described.
+
+#### `GET /api/v1/executions`
+
+**Permission:** `Execution:Read`, gated on the fleet-read chokepoint (ADR-0017) — **not** the plain
+permission check `GET /fragments/executions` uses; a confined caller sees only executions
+involving at least one visible agent (or that they dispatched). The v1 twin of
+`GET /fragments/executions`, MCP twin `list_executions` (widened by this PR to the same field set).
+Accepts `definition_id`, `status`, and `limit` (capped at 500) query parameters.
+
+**Response:**
+
+```json
+{
+  "data": [
+    { "id": "exec-1", "definition_id": "def-1", "definition_name": "Collect OS Info",
+      "status": "completed", "dispatched_by": "alice", "dispatched_at": 1735689600,
+      "agents_targeted": 2, "agents_responded": 2, "agents_success": 1, "agents_failure": 1,
+      "completed_at": 1735689620, "rerun_of": "", "error_preview": "boom" }
+  ],
+  "pagination": { "total": 1, "start": 0, "page_size": 50 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+#### `GET /api/v1/executions/{id}?include=agents`
+
+**Permission:** `Execution:Read` (same gate as the bare route, `docs/executions-history-ladder.md`).
+`?include=agents` is the #4030 per-agent status/duration expansion decided for this row: a query
+parameter on the existing detail route rather than a new one, so the fragment's aggregate +
+per-agent capability stays a single genuine REST+MCP twin (MCP twin: `get_execution_status` with
+`"include":["agents"]`). Adds a confined `agents` array (`agent_id`, `status`, `dispatched_at`,
+`first_response_at`, `completed_at`, `exit_code`, `error_detail`) and a `kpi` object (`total`,
+`succeeded`, `failed`, `p50_ms`, `p95_ms` — `null` percentiles when no agent has a usable duration
+yet). Unlike the bare request, this expansion **is** audited (`execution.detail.fetch`, REST
+fail-closed 503 on an audit-persist failure) because it discloses raw agent identities. Response
+bodies are a **separate** route (below), not part of this expansion.
+
+#### `GET /api/v1/executions/{id}/responses`
+
+**Permission:** `Response:Read`, gated on the fleet-read chokepoint — deliberately a **different**
+securable than the detail route's `Execution:Read`, so folding this into the detail-route expansion
+above would have over-disclosed response bodies to a caller who holds `Execution:Read` but not
+`Response:Read`. The v1 twin of MCP `query_responses`' `execution_id`-scoped filter (no new MCP
+tool — `query_responses` already covers this shape). Accepts `agent_id`, `status`, `since`, `until`,
+`limit` (capped at 1000) query parameters. **Does not accept `offset`** — matching `query_responses`
+exactly: the result set orders by a non-unique, actively-growing timestamp while an execution is
+non-terminal, so offset-based paging would silently skip or duplicate rows; a caller-supplied
+`offset` is rejected with `400`, not silently ignored. Scope pushdown mirrors `query_responses`
+exactly: the caller's visible agent set is resolved and pushed into the store query before `limit`
+(ADR-0017 INV-3) — never filtered after the fact. Audited as `execution.detail.fetch`.
+
+#### `GET /api/v1/schedules`
+
+**Permission:** same two-stage gate as `GET /fragments/schedules`: a service-scoped API token is
+denied the fleet-wide list outright (schedules carry no per-agent axis for `fleet_read_fn` to
+confine against), then `Schedule:Read`. The v1 twin of `GET /fragments/schedules`, MCP twin
+`list_schedules` (widened by this PR to include `execution_count`). **Not** the separate legacy
+unversioned `GET /api/schedules` documented above — a distinct, untouched capability.
 
 ---
 

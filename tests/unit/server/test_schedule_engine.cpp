@@ -187,6 +187,47 @@ TEST_CASE("ScheduleEngine: query empty store returns empty", "[schedule_engine][
     CHECK(results.empty());
 }
 
+// #4030 review finding (blocking): query_schedules_checked() queries one row
+// PAST the fixed 100-row cap specifically so a fleet of EXACTLY the cap is
+// never misreported as truncated by the simpler "returned == limit"
+// heuristic (schedule_engine.cpp's own comment on the +1 LIMIT). No
+// regression test pinned either side of this boundary before this PR
+// (608d3bbee fixed the truncation-signal consumers; the boundary itself was
+// untested).
+TEST_CASE("ScheduleEngine: query_schedules_checked at exactly the list cap is not "
+          "misreported as truncated (#4030 boundary)",
+          "[schedule_engine][pg]") {
+    ScheduleEnginePg fx;
+    for (int i = 0; i < 100; ++i)
+        REQUIRE(fx->create_schedule(make_schedule("def-cap", "interval", "S" + std::to_string(i)))
+                    .has_value());
+
+    auto result = fx->query_schedules_checked();
+    REQUIRE(result.has_value());
+    CHECK(result->schedules.size() == 100);
+    CHECK_FALSE(result->truncated);
+}
+
+// Sibling of the exact-cap test above: one schedule OVER the cap must come
+// back capped at 100 rows WITH result.truncated == true -- the honest
+// pagination signal both REST (GET /api/v1/schedules) and MCP
+// (list_schedules) surface as result_truncated_by_cap. Before 608d3bbee,
+// `total` silently asserted completeness even when the store had actually
+// truncated the response.
+TEST_CASE("ScheduleEngine: query_schedules_checked truncates and flags a fleet one "
+          "over the list cap (#4030 boundary)",
+          "[schedule_engine][pg]") {
+    ScheduleEnginePg fx;
+    for (int i = 0; i < 101; ++i)
+        REQUIRE(fx->create_schedule(make_schedule("def-cap", "interval", "S" + std::to_string(i)))
+                    .has_value());
+
+    auto result = fx->query_schedules_checked();
+    REQUIRE(result.has_value());
+    CHECK(result->schedules.size() == 100);
+    CHECK(result->truncated);
+}
+
 // ── Delete Schedule ────────────────────────────────────────────────────────
 
 TEST_CASE("ScheduleEngine: delete schedule", "[schedule_engine][pg]") {
@@ -526,4 +567,15 @@ TEST_CASE("ScheduleEngine reports !is_open on a migration failure and degrades e
     CHECK_FALSE(engine.delete_schedule("anything", "admin"));
     CHECK_FALSE(engine.set_enabled("anything", true, "admin"));
     engine.advance_schedule("anything"); // must not crash
+
+    // #4030 review finding (blocking): query_schedules_checked() must fail
+    // closed (std::unexpected) on the SAME degrade the unchecked
+    // query_schedules() above silently collapses to an empty vector --
+    // GET /api/v1/schedules and MCP list_schedules both depend on this to
+    // tell "genuinely empty" apart from "store degraded" (5686776fe fixed
+    // the consumers; no regression test existed for this checked path
+    // itself before this PR).
+    auto checked = engine.query_schedules_checked();
+    REQUIRE_FALSE(checked.has_value());
+    CHECK(checked.error().find("schedule engine not open") != std::string::npos);
 }
