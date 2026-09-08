@@ -19,10 +19,12 @@
  * gated behind `if (<store>)` inside `RestApiV1::register_routes()` never
  * fires - this file sees a SUBSET of the full v1 route table (102 of 173
  * at #3991-time, measured; see the route-count floor below), not all of it. It also
- * covers `RestApiV1` alone, not the several other route-owner files that
- * also register `/api/v1` routes (ca_routes.cpp, auth_routes.cpp,
- * viz_routes.cpp, etc. - `scripts/ci/check-api-parity.py --dump-json` shows
- * the full list). The EXHAUSTIVE, whole-tree gate is
+ * covers `RestApiV1` plus `AppUsageRoutes` (also registered into the same
+ * sink below - server.cpp mounts it separately, next to `sle_routes_`), not
+ * the several OTHER route-owner files that also register `/api/v1` routes
+ * (ca_routes.cpp, auth_routes.cpp, viz_routes.cpp, etc. -
+ * `scripts/ci/check-api-parity.py --dump-json` shows the full list). The
+ * EXHAUSTIVE, whole-tree gate is
  * `scripts/ci/check-api-parity.py`, run as a CI preflight step: it lexically
  * extracts routes from every source file under server/core/src, not just the ones
  * a `nullptr`-heavy in-process harness can construct. This file exists so
@@ -38,6 +40,7 @@
  * `nullptr`, i.e. unconditionally).
  */
 
+#include "app_usage_routes.hpp"
 #include "openapi_spec_access.hpp"
 #include "rest_api_v1.hpp"
 #include "test_route_sink.hpp"
@@ -196,6 +199,22 @@ TEST_CASE("RestApiV1::register_routes vs openapi_spec_json(): every registered "
           "[openapi][completeness]") {
     RestApiV1 api;
     yuzu::server::test::TestRouteSink sink;
+
+    // AppUsageRoutes (server.cpp: `app_usage_routes_`, mounted separately from
+    // RestApiV1 next to `sle_routes_`) is registered into the SAME sink so its
+    // /forensics/agents/{agent_id}/app-usage route is covered by this
+    // completeness check too, not just RestApiV1's own table — a route/spec
+    // drift on it would otherwise go uncaught until the Python CI preflight.
+    AppUsageRoutes app_usage_routes;
+    AppUsageRoutes::ScopedPermFn app_usage_scoped_perm_fn =
+        [](const httplib::Request&, httplib::Response&, const std::string&, const std::string&,
+          const std::string&) { return true; };
+    AppUsageRoutes::AgentLastUsedFn app_usage_agent_last_used_fn =
+        [](const std::string&) -> std::optional<std::vector<AgentLastUsedRow>> {
+        return std::vector<AgentLastUsedRow>{};
+    };
+    app_usage_routes.register_routes(sink, app_usage_scoped_perm_fn,
+                                     app_usage_agent_last_used_fn);
 
     RestApiV1::AuthFn auth_fn = [](const httplib::Request&,
                                    httplib::Response&) -> std::optional<auth::Session> {
