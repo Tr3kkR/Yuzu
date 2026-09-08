@@ -30,8 +30,10 @@ inline bool tier_allows(std::string_view mcp_tier,
     // that require_admin's own #520 comment names explicitly: "MCP tokens
     // ... must not be used to administer the server itself (settings,
     // users, TLS, OIDC)". The settings read-twins (#4028) hardened one of
-    // these routes (GET /api/v1/agent/plugin-policy) off require_admin
-    // (which rejected every mcp_tier token outright) onto require_permission
+    // these routes (GET /api/v2/agent/plugin-policy — its deprecated
+    // /v1/ predecessor is frozen back on require_admin, #4144) off
+    // require_admin (which rejected every mcp_tier token outright) onto
+    // require_permission
     // — this deny-list is what keeps that hardening from silently widening
     // MCP-token reach into TLS/plugin-signing/server-process/analytics
     // config. AccessReview/UserManagement/EnginePrincipal are a DIFFERENT,

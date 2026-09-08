@@ -36,7 +36,8 @@
 /// #4028 (api-parity programme #2146) extended the floor's ORIGINAL
 /// "authorization topology" framing above to a second, related case: the
 /// eight Settings read-twins (`GET /api/v1/settings/*` +
-/// `GET /api/v1/agent/plugin-policy`) were previously gated by
+/// `GET /api/v2/agent/plugin-policy` — its deprecated `/v1/` predecessor
+/// stayed on `require_admin`, #4144) were previously gated by
 /// `AuthRoutes::require_admin` — a whole-route role check with no RBAC-off
 /// fallback at all. Migrating them onto RBAC securables
 /// (`TlsConfig`/`PluginSigning`/`ServerConfig`/`AnalyticsConfig`, all

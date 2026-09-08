@@ -2577,8 +2577,10 @@ rather than one blanket `Settings:Read` (the same reasoning `EnginePrincipal` ab
 - **`TlsConfig`** — the `tls` and `https` fragments (mTLS/HTTPS listener posture, cert/key/CA file
   paths).
 - **`PluginSigning`** — the `plugin-signing` fragment and its REST twin, the hardened
-  `GET /api/v1/agent/plugin-policy` (deliberately distinct from the unrelated `PluginConfig`
-  securable, which gates per-plugin runtime kill-switch config — a different domain).
+  `GET /api/v2/agent/plugin-policy` (deliberately distinct from the unrelated `PluginConfig`
+  securable, which gates per-plugin runtime kill-switch config — a different domain). Its
+  deprecated `/api/v1/` predecessor is frozen on `require_admin`, not this securable — see
+  `docs/api-versioning-policy.md` and #4144.
 - **`ServerConfig`** — the `gateway`, `server-config`, `mcp`, and `data-retention` fragments
   (operational/infra config, "nothing secret" per #4028's own evidence).
 - **`AnalyticsConfig`** — the `analytics` fragment (ClickHouse integration; embedded-credential
@@ -2612,9 +2614,10 @@ does not otherwise distinguish an admin-owned MCP token from an ordinary admin s
 carries its **creator's** real legacy role there by design (see "The authorization topology floor"
 above), so an admin-owned MCP token — at any tier, including `readonly` — would satisfy the floor
 exactly like an interactive admin session would, unless something stops it earlier. Hardening
-`GET /api/v1/agent/plugin-policy` off `require_admin` (which rejected every `mcp_tier` token
-outright, regardless of role) onto `require_permission` would have silently reopened this route to
-admin-owned MCP tokens without an explicit second control. #4028's actual enforcement point is
+this route off `require_admin` (which rejected every `mcp_tier` token
+outright, regardless of role) onto `require_permission` — now `GET /api/v2/agent/plugin-policy`,
+split from the still-`require_admin`-gated, deprecated `/api/v1/` shape by #4144 — would have
+silently reopened it to admin-owned MCP tokens without an explicit second control. #4028's actual enforcement point is
 `mcp_policy.hpp`'s `tier_allows()`: `TlsConfig`, `PluginSigning`, `ServerConfig`, and
 `AnalyticsConfig` are denied at **every** tier there (readonly/operator/supervised) for **every**
 operation, so `require_permission`'s tier check 403s an MCP token before it ever reaches the

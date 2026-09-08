@@ -1,8 +1,15 @@
 /**
  * test_settings_read_twins.cpp — HTTP-level coverage for the eight Settings
- * REST v1 read-twins (#4028, api-parity programme #2146):
+ * REST read-twins (#4028, api-parity programme #2146):
  *   GET /api/v1/settings/tls|https|gateway|server-config|mcp|data-retention|analytics
- *   GET /api/v1/agent/plugin-policy (plugin-signing's twin, hardened by #4028)
+ *   GET /api/v2/agent/plugin-policy (plugin-signing's twin, hardened by #4028)
+ *
+ * #4144 review fix: the plugin-policy twin above is /v2/, not /v1/ — #4028
+ * originally hardened it in place at /v1/, which violated
+ * docs/api-versioning-policy.md (a breaking envelope-shape change with no
+ * version bump). GET /api/v1/agent/plugin-policy is now a SEPARATE,
+ * deprecated, frozen-shape route (its own TEST_CASEs below), not this file's
+ * read-twin under test.
  *
  * Pattern matches test_settings_routes_users.cpp / test_discovery_routes.cpp:
  * register SettingsRoutes against an in-process TestRouteSink and dispatch
@@ -70,6 +77,11 @@ struct SettingsReadTwinsHarness {
 
     bool allow_perm{true};
     std::string last_perm_securable, last_perm_operation;
+    // #4144 review fix: GET /api/v1/agent/plugin-policy is frozen back onto
+    // admin_fn_ (never perm_fn_) — see that route's own comment. A separate
+    // toggle from allow_perm so a test can deny v1 without also denying
+    // every perm_fn_-gated route.
+    bool allow_admin{true};
     bool audit_read_ok{true};
     std::vector<AuditReadCall> audit_read_calls;
     std::size_t gateway_sessions{7};
@@ -90,7 +102,14 @@ struct SettingsReadTwinsHarness {
             s.role = auth::Role::admin;
             return s;
         };
-        auto admin_fn = [](const httplib::Request&, httplib::Response&) { return true; };
+        auto admin_fn = [this](const httplib::Request&, httplib::Response& res) {
+            if (allow_admin)
+                return true;
+            res.status = 403;
+            res.set_content(R"({"error":{"code":403,"message":"admin required"}})",
+                            "application/json");
+            return false;
+        };
         auto perm_fn = [this](const httplib::Request&, httplib::Response& res,
                               const std::string& securable, const std::string& op) {
             last_perm_securable = securable;
@@ -251,12 +270,12 @@ TEST_CASE("GET /api/v1/settings/analytics sanitizes the ClickHouse URL and gates
     CHECK(!body.at("data").contains("clickhouse_password"));
 }
 
-TEST_CASE("GET /api/v1/agent/plugin-policy (plugin-signing's REST twin) returns 200 with no "
+TEST_CASE("GET /api/v2/agent/plugin-policy (plugin-signing's REST twin) returns 200 with no "
           "bundle on disk and gates on PluginSigning:Read",
           "[settings][rest][settings-read-twins]") {
     SettingsReadTwinsHarness h;
 
-    auto res = h.sink.Get("/api/v1/agent/plugin-policy");
+    auto res = h.sink.Get("/api/v2/agent/plugin-policy");
     REQUIRE(res);
     CHECK(res->status == 200); // absent bundle is a normal state, not 404/500
     CHECK(h.last_perm_securable == "PluginSigning");
@@ -268,6 +287,37 @@ TEST_CASE("GET /api/v1/agent/plugin-policy (plugin-signing's REST twin) returns 
     CHECK(body.at("data").at("trust_bundle_pem").get<std::string>().empty());
 }
 
+// #4144 review fix (BLOCKING, docs/api-versioning-policy.md): v1 is FROZEN
+// at its pre-#4028 flat-body shape and gates on admin_fn_, not perm_fn_/RBAC
+// — see the route's own comment in settings_routes.cpp. This is the
+// regression test proving the freeze actually holds.
+TEST_CASE("GET /api/v1/agent/plugin-policy (DEPRECATED, frozen shape) returns the old flat "
+          "body and gates on admin_fn_, not RBAC",
+          "[settings][rest][settings-read-twins]") {
+    SettingsReadTwinsHarness h;
+
+    auto res = h.sink.Get("/api/v1/agent/plugin-policy");
+    REQUIRE(res);
+    CHECK(res->status == 200); // absent bundle is a normal state, not 404/500
+    // v1 never calls perm_fn_ at all — the frozen route uses admin_fn_ only.
+    CHECK(h.last_perm_securable.empty());
+    CHECK(h.last_perm_operation.empty());
+
+    auto body = nlohmann::json::parse(res->body);
+    CHECK_FALSE(body.contains("meta")); // no A4 envelope on the frozen shape
+    CHECK_FALSE(body.contains("data"));
+    CHECK(body.at("enabled").get<bool>() == false);
+    CHECK(body.at("trust_bundle_pem").get<std::string>().empty());
+
+    SECTION("admin_fn_ denial still 403s") {
+        SettingsReadTwinsHarness h2;
+        h2.allow_admin = false;
+        auto denied = h2.sink.Get("/api/v1/agent/plugin-policy");
+        REQUIRE(denied);
+        CHECK(denied->status == 403);
+    }
+}
+
 // ── 403 when the RBAC securable/operation is denied ──────────────────────
 
 TEST_CASE("Every Settings REST read-twin denies with 403 when its permission check fails",
@@ -275,11 +325,15 @@ TEST_CASE("Every Settings REST read-twin denies with 403 when its permission che
     SettingsReadTwinsHarness h;
     h.allow_perm = false;
 
+    // #4144 review fix: /api/v1/agent/plugin-policy is deliberately absent
+    // here — it is frozen onto admin_fn_, not perm_fn_ (see the dedicated
+    // admin_fn_-denial SECTION above). Its RBAC-gated successor,
+    // /api/v2/agent/plugin-policy, is covered by this same perm_fn_ loop.
     for (const std::string& path :
         {std::string("/api/v1/settings/tls"), std::string("/api/v1/settings/https"),
          std::string("/api/v1/settings/gateway"), std::string("/api/v1/settings/server-config"),
          std::string("/api/v1/settings/mcp"), std::string("/api/v1/settings/data-retention"),
-         std::string("/api/v1/settings/analytics"), std::string("/api/v1/agent/plugin-policy")}) {
+         std::string("/api/v1/settings/analytics"), std::string("/api/v2/agent/plugin-policy")}) {
         INFO("path=" << path);
         auto res = h.sink.Get(path);
         REQUIRE(res);
@@ -294,9 +348,11 @@ TEST_CASE("The four high-sensitivity read-twins fail closed (503) on an audit-pe
     SettingsReadTwinsHarness h;
     h.audit_read_ok = false;
 
+    // #4144 review fix: v1's frozen shape never calls the audit hook at
+    // all (see the dedicated v1 test above) — v2 is this loop's coverage.
     for (const std::string& path :
         {std::string("/api/v1/settings/tls"), std::string("/api/v1/settings/https"),
-         std::string("/api/v1/settings/analytics"), std::string("/api/v1/agent/plugin-policy")}) {
+         std::string("/api/v1/settings/analytics"), std::string("/api/v2/agent/plugin-policy")}) {
         INFO("path=" << path);
         auto res = h.sink.Get(path);
         REQUIRE(res);
@@ -342,7 +398,9 @@ TEST_CASE("The four audited read-twins each call the audit hook exactly once wit
     REQUIRE(h.audit_read_calls.size() == 3);
     CHECK(h.audit_read_calls.back().action == "settings.analytics.read");
 
-    auto res_policy = h.sink.Get("/api/v1/agent/plugin-policy");
+    // #4144 review fix: the audited plugin-policy twin is now v2 — v1 is
+    // frozen and never calls the audit hook (see the dedicated v1 test).
+    auto res_policy = h.sink.Get("/api/v2/agent/plugin-policy");
     REQUIRE(res_policy);
     REQUIRE(h.audit_read_calls.size() == 4);
     // Same domain verb as GET /api/v1/settings/... — both routes read the
@@ -396,12 +454,12 @@ struct DegradedRuntimeConfigFixture {
 };
 } // namespace
 
-TEST_CASE("GET /api/v1/agent/plugin-policy fails closed (503) when runtime_config_store is down",
+TEST_CASE("GET /api/v2/agent/plugin-policy fails closed (503) when runtime_config_store is down",
           "[settings][rest][settings-read-twins][security]") {
     DegradedRuntimeConfigFixture fixture;
     SettingsReadTwinsHarness h{&fixture.store};
 
-    auto res = h.sink.Get("/api/v1/agent/plugin-policy");
+    auto res = h.sink.Get("/api/v2/agent/plugin-policy");
     REQUIRE(res);
     CHECK(res->status == 503);
     nlohmann::json body = nlohmann::json::parse(res->body);
@@ -409,6 +467,24 @@ TEST_CASE("GET /api/v1/agent/plugin-policy fails closed (503) when runtime_confi
     CHECK(body.at("error").at("retry_after_ms").get<std::int64_t>() == 5000);
     CHECK(body.at("error").at("message").get<std::string>().find("could not be determined") !=
           std::string::npos);
+}
+
+// #4144 review fix: v1's FROZEN shape reverted to the pre-#4028 get_value()
+// API, which silently collapses a degraded read to "" (no 503) — this is
+// exactly the UP-3/CH-2 gap #4028 fixed, now reintroduced deliberately on
+// v1 by the freeze (v2 above keeps the fix). Pinning this so a future
+// refactor can't accidentally "fix" v1 back into a breaking-change round 2.
+TEST_CASE("GET /api/v1/agent/plugin-policy (frozen shape) silently reads required=false "
+          "when runtime_config_store is down, unlike v2",
+          "[settings][rest][settings-read-twins][security]") {
+    DegradedRuntimeConfigFixture fixture;
+    SettingsReadTwinsHarness h{&fixture.store};
+
+    auto res = h.sink.Get("/api/v1/agent/plugin-policy");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    nlohmann::json body = nlohmann::json::parse(res->body);
+    CHECK(body.at("required").get<bool>() == false);
 }
 
 TEST_CASE("The plugin-signing fragment shows a distinct status-unknown state when "

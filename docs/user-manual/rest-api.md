@@ -3762,7 +3762,8 @@ them via REST either — at any tier, including readonly. Issue #520 established
 `require_admin`'s own comment: "MCP tokens are for fleet management (queries, instruction execution)
 and must not be used to administer the server itself (settings, users, TLS, OIDC)". Seven of these
 eight routes are new and were never gated by `require_admin`; the eighth
-(`/api/v1/agent/plugin-policy`) is hardened off it onto `require_permission` (below). Gating via
+(`/api/v2/agent/plugin-policy` — its predecessor `/api/v1/agent/plugin-policy` is deprecated,
+frozen on `require_admin`; see below) is hardened off it onto `require_permission`. Gating via
 `require_permission` alone is not sufficient to preserve #520's blanket MCP exclusion — an
 admin-owned MCP token (any tier) satisfies `require_permission`'s topology-floor legacy-role check
 the same way an interactive admin session does. #4028 closes that gap at the actual chokepoint:
@@ -3818,14 +3819,20 @@ HTTPS listener settings: enabled state, port, cert/key file paths, HTTP-redirect
 }
 ```
 
-#### `GET /api/v1/agent/plugin-policy`
+#### `GET /api/v2/agent/plugin-policy`
 
-Plugin code-signing trust bundle — **this is plugin-signing's REST v1 twin**, not a separate
+Plugin code-signing trust bundle — **this is plugin-signing's REST twin**, not a separate
 `/api/v1/settings/plugin-signing` route (deliberate: the acceptance criteria for #4028 hardens this
 pre-existing, previously off-ledger route onto the A4 envelope + OpenAPI + the shared builder
 rather than adding a parallel one). Superset of the `/fragments/settings/plugin-signing` fragment's
 data — this route alone also returns the raw `trust_bundle_pem` bytes, for out-of-band agent-config
 distribution (`--plugin-trust-bundle`).
+
+**v1 is deprecated.** `GET /api/v1/agent/plugin-policy` predates #4028 and is FROZEN at its original
+flat-body shape (`require_admin` gate, no `data` envelope, no audit, no A4 error shape) rather than
+reshaped in place — #4144 caught that the original #4028 round did exactly that and violated
+`docs/api-versioning-policy.md`. v1 keeps working through the announced deprecation window (see
+`server-admin.md`'s vNEXT note); new integrations should target v2 below.
 
 **Permission:** `PluginSigning:Read` (dedicated securable, deliberately distinct from the unrelated
 `PluginConfig` securable, which gates per-plugin runtime kill-switch config — a different domain). No
@@ -6882,7 +6889,7 @@ outcome's granularity.
 
 ### Settings — Plugin Code Signing
 
-These endpoints drive the **Settings → Plugin Code Signing** card. The four `/api/settings/plugin-signing/*` routes are admin-only HTMX paths that return fragment HTML; the agent-facing distribution endpoint at `/api/v1/agent/plugin-policy` returns JSON. See *user-manual/agent-plugins.md → Plugin Code Signing* for the operator workflow and *user-manual/server-admin.md → vNEXT* for the upgrade notes. See also [Settings](#settings) below — `/api/v1/agent/plugin-policy` is plugin-signing's REST v1 read-twin (#4028); it is documented in both places because it predates the Settings read-twins programme and keeps its original path rather than moving under `/api/v1/settings/...`.
+These endpoints drive the **Settings → Plugin Code Signing** card. The four `/api/settings/plugin-signing/*` routes are admin-only HTMX paths that return fragment HTML; the agent-facing distribution endpoint at `/api/v2/agent/plugin-policy` returns JSON (its predecessor `/api/v1/agent/plugin-policy` is deprecated — see below). See *user-manual/agent-plugins.md → Plugin Code Signing* for the operator workflow and *user-manual/server-admin.md → vNEXT* for the upgrade notes. See also [Settings](#settings) below — `/api/v2/agent/plugin-policy` is plugin-signing's REST read-twin (#4028, #4144); it is documented in both places because it predates the Settings read-twins programme and keeps its original path rather than moving under `/api/v1/settings/...`.
 
 **`GET /fragments/settings/plugin-signing`** — Render the Plugin Code Signing card fragment.
 
@@ -6914,11 +6921,13 @@ These endpoints drive the **Settings → Plugin Code Signing** card. The four `/
 - **Response (200):** Re-rendered fragment, `HX-Trigger: showToast level=success`. Audit `plugin_signing.require.changed` / `success`, `target_type=RuntimeConfig`, `target_id=plugin_signing_required`, `detail=<new_val>`.
 - **Response (500):** DB write failure with the store error.
 
-**`GET /api/v1/agent/plugin-policy`** — Distribution endpoint for operator agent-config flows, and plugin-signing's REST v1 read-twin (#4028). Returns the current trust bundle PEM and require flag as JSON.
+**`GET /api/v2/agent/plugin-policy`** — Distribution endpoint for operator agent-config flows, and plugin-signing's REST read-twin (#4028, #4144). Returns the current trust bundle PEM and require flag as JSON.
+
+**v1 deprecated.** `GET /api/v1/agent/plugin-policy` predates #4028, is now DEPRECATED, and stays on its original flat-body shape (no `data` envelope, `require_admin` gate instead of `PluginSigning:Read`, no audit row, the old bespoke error shape) — see `server-admin.md`'s vNEXT note for the announced removal window. #4028 originally hardened this route's shape in place; #4144 corrected that into the v1/v2 split below, since an in-place envelope reshape is a breaking change per `docs/api-versioning-policy.md`.
 
 - **Permission:** `PluginSigning:Read` (Administrator-only via the `rbac_store.cpp` seed; floored in `authz_topology_floor.hpp` so an RBAC-off deployment stays admin-gated — the same practical posture the prior admin-only gate had for interactive sessions and non-MCP API tokens). **No MCP token, at any tier, can satisfy this permission** — `PluginSigning` is one of four server-administration securables `mcp_policy.hpp`'s `tier_allows()` denies outright, regardless of Read/Write, so an admin-owned MCP token that would otherwise fall through the legacy role check is stopped before it gets there. The bundle holds X.509 certificates only (no private keys), but the SHA-256 fingerprint and the trust-anchor identity are operationally sensitive — non-admin token holders are not authorized to see when the trust anchor rotates. Future automatic agent-side fetch will introduce a dedicated agent identity for this endpoint.
 - **Audit:** fail-closed. `settings.plugin_signing.read` is persisted before the response is built; if the audit subsystem is unavailable the route returns 503 rather than serve settings data without durable evidence.
-- **Stability:** pilot-stable. The path `/api/v1/agent/...` may change before the GA `/v1/` contract is finalized; the field set is unlikely to shrink (forward-compatible additions only). The response envelope changed under #4028 — the payload now nests under `data` per the standard A4 shape (previously top-level fields); update any `jq` pipeline that reads the older shape.
+- **Stability:** pilot-stable. The field set is unlikely to shrink (forward-compatible additions only). `cert_count`/`sha256`/`subjects`/`trust_bundle_pem` are derived from a single filesystem read (#4144) — they cannot describe two different bundle versions on a concurrent-upload race, unlike v1.
 - **Response (200, bundle uploaded):**
 
   ```json
@@ -6965,7 +6974,7 @@ These endpoints drive the **Settings → Plugin Code Signing** card. The four `/
 
   ```bash
   curl -fsSL -H "Authorization: Bearer $YUZU_ADMIN_TOKEN" \
-    https://server.example.com:8443/api/v1/agent/plugin-policy \
+    https://server.example.com:8443/api/v2/agent/plugin-policy \
     | jq -r .data.trust_bundle_pem > /etc/yuzu/plugin-trust-bundle.pem
   ```
 

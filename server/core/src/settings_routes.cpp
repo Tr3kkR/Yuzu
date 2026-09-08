@@ -2996,7 +2996,8 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
     std::string html;
 
     // #4028 — shared builder (also feeds the hardened
-    // GET /api/v1/agent/plugin-policy, plugin-signing's only REST twin);
+    // GET /api/v2/agent/plugin-policy, plugin-signing's only REST twin —
+    // #4144 moved it from /v1/, now deprecated);
     // this renderer reads the view's fields rather than `bundle`/`required`
     // directly, so both surfaces present the identical underlying data.
     auto bundle = read_on_disk_bundle();
@@ -3178,9 +3179,11 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
             "margin:1rem 0\">";
     html += "<p style=\"font-size:0.75rem;color:var(--mds-color-theme-text-tertiary);"
             "margin-bottom:0.4rem\"><strong>Agent distribution.</strong> The bundle "
-            "is served at <code>GET /api/v1/agent/plugin-policy</code> "
+            "is served at <code>GET /api/v2/agent/plugin-policy</code> "
             "(<em>admin-only</em> — operators distribute to agents via the "
-            "standard config-management flow). Agents are pointed at a local "
+            "standard config-management flow; the deprecated "
+            "<code>/v1/</code> shape still works during its announced "
+            "removal window). Agents are pointed at a local "
             "file via <code>--plugin-trust-bundle</code>; automatic agent-side "
             "fetch is a forthcoming change, at which point this endpoint will "
             "gain a dedicated agent identity.</p>";
@@ -3781,9 +3784,9 @@ void SettingsRoutes::register_routes(
 
     // #4028 — no parallel `/api/v1/settings/plugin-signing` route: the
     // acceptance criteria is explicit that plugin-signing's REST twin is the
-    // hardened `GET /api/v1/agent/plugin-policy` below (already existed,
-    // off-ledger), not a second route duplicating its data. See that
-    // handler's own comment.
+    // hardened `GET /api/v2/agent/plugin-policy` below (already existed
+    // off-ledger at /v1/; #4144 moved the hardening there — see that
+    // handler's own comment), not a second route duplicating its data.
 
     // -- Plugin Code Signing: upload PEM trust bundle (admin) -----------------
     sink.Post("/api/settings/plugin-signing/upload", [this](const httplib::Request& req,
@@ -3974,7 +3977,81 @@ void SettingsRoutes::register_routes(
         res.set_content(render_plugin_signing_fragment(), "text/html; charset=utf-8");
     });
 
-    // -- Plugin Code Signing: distribution endpoint --------------------------
+    // -- Plugin Code Signing: distribution endpoint (v1, FROZEN) -------------
+    //
+    // #4144 review fix (external colleague review, BLOCKING, confirmed
+    // against docs/api-versioning-policy.md by direct fetch): this route
+    // predates #4028 (present since the F2 OpenAPI backfill), and #4028's
+    // hardening reshaped its response envelope (flat body -> data/meta) and
+    // added new fields/error codes IN PLACE at this same /api/v1/ path — a
+    // breaking change per the policy's own "changing an error envelope's
+    // shape" clause, shipped with no version bump, no deprecation cycle, and
+    // no ADR-1005 exception-ledger entry. The policy's narrow
+    // security-tightening carve-out doesn't apply here (it requires a
+    // CHANGELOG Security entry citing a tracked vulnerability; this PR's own
+    // changelog carries a SEPARATE .security.md fragment for its actual
+    // security fix — the ClickHouse sanitizer — proving the classification
+    // was deliberate, not an oversight).
+    //
+    // Fix: this handler is now FROZEN at exactly its pre-#4028 shape (see
+    // git show <pre-#4028 SHA>:server/core/src/settings_routes.cpp for the
+    // byte-for-byte source) — flat body, admin_fn_ gate, no audit call, the
+    // old ad hoc error envelope. All of #4028's hardening (RBAC securable,
+    // audit-fail-closed, A4 envelope, new fields, the TOCTOU fix) lives
+    // ONLY at GET /api/v2/agent/plugin-policy below. Per
+    // docs/api-versioning-policy.md's deprecation cycle: this v1 route is
+    // formally deprecated (see changelog.d/4144-plugin-policy-v1-deprecated
+    // .deprecated.md + docs/user-manual/upgrading.md) and stays live for the
+    // full window (>= 90 days AND >= one intervening feature release) before
+    // removal.
+    sink.Get("/api/v1/agent/plugin-policy", [this](const httplib::Request& req,
+                                                   httplib::Response& res) {
+        if (!admin_fn_(req, res))
+            return;
+
+        auto disk = read_on_disk_bundle();
+        const bool required =
+            runtime_config_store_ &&
+            runtime_config_store_->get_value(plugin_signing::kPluginSigningRequiredKey) == "true";
+
+        // Bundle absent → 200 success-shape with enabled=false.
+        // Status code 404 was misleading: "no bundle uploaded" is
+        // a normal operational state, not a fetch failure
+        // (CONS-B1 part 2).
+        if (!disk) {
+            nlohmann::json out;
+            out["enabled"] = false;
+            out["required"] = required;
+            out["trust_bundle_pem"] = "";
+            res.set_content(out.dump(), "application/json");
+            return;
+        }
+        if (!disk->has_value()) {
+            // Structured envelope (A4 / CONS-B1) — same shape as
+            // every other /api/v1/* error site (auth_routes,
+            // rest_api_v1, etc.).
+            res.status = 500;
+            nlohmann::json err = {
+                {"error", {{"code", 500}, {"message", "Trust bundle on disk is unreadable"}}},
+                {"meta", {{"api_version", "v1"}}}};
+            res.set_content(err.dump(), "application/json");
+            return;
+        }
+
+        // Re-read the file so the response carries the actual
+        // bytes, not a regenerated copy.
+        std::ifstream f(trust_bundle_path(), std::ios::binary);
+        std::string pem((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        nlohmann::json out;
+        out["enabled"] = true;
+        out["required"] = required;
+        out["trust_bundle_pem"] = pem;
+        out["cert_count"] = disk->value().cert_count;
+        out["sha256"] = disk->value().sha256_hex;
+        res.set_content(out.dump(), "application/json");
+    });
+
+    // -- Plugin Code Signing: distribution endpoint (v2) ----------------------
     //
     // Returns the current trust bundle and require flag as JSON for
     // out-of-band distribution to agents (operators curl this into
@@ -3986,16 +4063,29 @@ void SettingsRoutes::register_routes(
     // settings_model::build_plugin_signing_settings builder (the SAME
     // builder the /fragments/settings/plugin-signing HTML fragment calls)
     // rather than duplicating a second bespoke JSON shape for this route.
-    // This IS plugin-signing's REST v1 twin — the #4028 acceptance criteria
-    // is explicit: harden this previously off-ledger route rather than add
-    // a parallel `/api/v1/settings/plugin-signing` one. This route stays
-    // the SUPERSET over the fragment's own data: it alone adds
-    // `trust_bundle_pem` (the raw bundle bytes), applied as an explicit
+    // This route stays the SUPERSET over the fragment's own data: it alone
+    // adds `trust_bundle_pem` (the raw bundle bytes), applied as an explicit
     // override below rather than via the builder's own omit-when-empty
     // default (the fragment renderer passes an empty string on purpose so
     // the field is absent there).
     //
-    // Authorization: now PluginSigning:Read (dedicated securable, minted by
+    // #4144 review fix: promoted to /api/v2/ — see the v1 handler above's
+    // comment for why. #4144 ALSO fixed the TOCTOU the earlier #4028 fix
+    // round only partially closed (Important finding, confirmed by direct
+    // source read): the old two-read design (read_on_disk_bundle() for
+    // stats, a SEPARATE ifstream re-read for the raw PEM bytes) guarded
+    // against the bundle being DELETED between the two reads, but not
+    // REPLACED (the upload handler does write-temp-then-atomic-rename(), so
+    // a second read against a concurrently-replaced file simply succeeds —
+    // against the NEW file). That let a response pair the OLD read's
+    // sha256/cert_count/subjects with the NEW read's trust_bundle_pem bytes,
+    // defeating the integrity property (sha256 describes trust_bundle_pem)
+    // this route exists to provide. Fixed: ONE read of the raw bytes,
+    // validate_trust_bundle_pem() derives cert_count/sha256/subjects from
+    // THOSE SAME bytes — sha256 and trust_bundle_pem can no longer disagree,
+    // by construction.
+    //
+    // Authorization: PluginSigning:Read (dedicated securable, minted by
     // #4028 — Administrator-only via the rbac_store.cpp seed, floored in
     // authz_topology_floor.hpp so an RBAC-off deployment stays admin-gated).
     // That flooring alone is NOT the same practical posture the prior
@@ -4015,7 +4105,7 @@ void SettingsRoutes::register_routes(
     // admin principals (governance hardening round 1: sec-LOW-4 / UP-13 /
     // CC6.1) — now also audited fail-closed (§4) under the
     // `settings.plugin_signing.read` verb.
-    sink.Get("/api/v1/agent/plugin-policy", [this](const httplib::Request& req,
+    sink.Get("/api/v2/agent/plugin-policy", [this](const httplib::Request& req,
                                                    httplib::Response& res) {
         if (!perm_fn_(req, res, "PluginSigning", "Read"))
             return;
@@ -4033,8 +4123,6 @@ void SettingsRoutes::register_routes(
                             "application/json");
             return;
         }
-
-        auto disk = read_on_disk_bundle();
 
         // #4028 fix-round finding UP-3/CH-2 (governance Gate 4/5, re-derived
         // by sre/compliance-officer/enterprise-readiness): this route's
@@ -4081,32 +4169,22 @@ void SettingsRoutes::register_routes(
             required = rc->has_value() && rc->value().value == "true";
         }
 
-        // Bundle unreadable (exists on disk, failed to parse) → 500. Bundle
-        // ABSENT (disk == nullopt) is a normal operational state, not a
-        // fetch failure (CONS-B1 part 2) — falls through to the 200 path
-        // below with enabled=false, matching the shared builder's own
-        // nullopt handling.
-        if (disk && !disk->has_value()) {
-            res.status = 500;
-            res.set_content(detail::a4_error(res, "Trust bundle on disk is unreadable"),
-                            "application/json");
-            return;
-        }
-
-        // Re-read the file so the response carries the actual bytes, not a
-        // regenerated copy. Empty when no bundle is on disk.
+        // #4144 review fix: ONE filesystem read for both the raw PEM bytes
+        // and the derived stats — see this route's header comment above for
+        // the TOCTOU this closes. Bundle absent (does not exist on disk) is
+        // a normal operational state (CONS-B1 part 2): falls through with
+        // enabled=false, empty pem.
+        std::error_code ec;
+        auto bundle_path = trust_bundle_path();
+        std::optional<std::expected<plugin_signing::TrustBundleStats, std::string>> stats;
         std::string pem;
-        if (disk && disk->has_value()) {
-            std::ifstream f(trust_bundle_path(), std::ios::binary);
+        if (std::filesystem::exists(bundle_path, ec)) {
+            std::ifstream f(bundle_path, std::ios::binary);
             if (!f) {
-                // #4028 fix-round finding (cpp-safety): the bundle existed
-                // moments ago when read_on_disk_bundle() parsed it above,
-                // but a concurrent upload/clear can remove or replace the
-                // file between that read and this one -- do not silently
-                // fall through to enabled=true with an empty
-                // trust_bundle_pem (indistinguishable from "an empty
-                // bundle" to a caller). Fail closed; the caller retries
-                // against whatever the now-current state is.
+                // Existed a moment ago (exists() above); a concurrent
+                // upload/clear removed it before this open() — same
+                // "changed while serving this request" fail-closed posture
+                // #4028 introduced, just guarding the (now sole) read.
                 res.status = 503;
                 res.set_content(
                     detail::a4_error(
@@ -4118,8 +4196,16 @@ void SettingsRoutes::register_routes(
                 return;
             }
             pem.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+            stats = plugin_signing::validate_trust_bundle_pem(pem);
+            if (!stats->has_value()) {
+                // Bundle unreadable (exists on disk, failed to parse) → 500.
+                res.status = 500;
+                res.set_content(detail::a4_error(res, "Trust bundle on disk is unreadable"),
+                                "application/json");
+                return;
+            }
         }
-        auto data = settings_model::build_plugin_signing_settings(required, disk);
+        auto data = settings_model::build_plugin_signing_settings(required, stats);
         data["trust_bundle_pem"] = pem; // superset field — always present on this route alone
         res.set_content(settings_ok_envelope(std::move(data)).dump(), "application/json");
     });

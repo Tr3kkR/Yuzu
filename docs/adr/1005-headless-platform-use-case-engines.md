@@ -266,7 +266,9 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
 
    - **2026-09-07 — 8 Settings read-twins (`GET /api/v1/settings/{tls,https,
      gateway,server-config,mcp,data-retention,analytics}` +
-     `GET /api/v1/agent/plugin-policy`, #4028).** REST-only, no MCP twin — a
+     `GET /api/v2/agent/plugin-policy` — its predecessor `/api/v1/agent/
+     plugin-policy` deprecated by #4144 per `docs/api-versioning-policy.md`,
+     not covered by this exception, #4028).** REST-only, no MCP twin — a
      "no" on Decision 1's both-surfaces requirement. Recorded rather than
      fixed pre-merge because:
      - **The gap is a deliberate, pre-existing security boundary, not a

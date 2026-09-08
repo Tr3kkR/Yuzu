@@ -151,9 +151,11 @@ namespace yuzu::server::settings_model {
 [[nodiscard]] nlohmann::json build_analytics_settings(const Config& cfg);
 
 /// `GET /fragments/settings/plugin-signing` + the hardened
-/// `GET /api/v1/agent/plugin-policy` (plugin-signing's ONLY REST twin —
+/// `GET /api/v2/agent/plugin-policy` (plugin-signing's ONLY REST twin —
 /// #4028's acceptance criteria is explicit that this sub-area hardens the
-/// existing route rather than adding a parallel `/api/v1/settings/*` one).
+/// existing route rather than adding a parallel `/api/v1/settings/*` one;
+/// #4144 moved the hardened shape to `/v2/` — see that route's own comment
+/// in settings_routes.cpp for why).
 /// PluginSigning:Read. {enabled, required, cert_count, sha256, subjects[],
 /// bundle_unreadable, bundle_error?} plus, only when the caller passes a
 /// non-empty `trust_bundle_pem`, {trust_bundle_pem} — the superset field
