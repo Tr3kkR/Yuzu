@@ -191,6 +191,13 @@ struct LaneState {
     std::atomic<std::uint64_t> launch_failed_total{0};
     std::atomic<std::uint64_t> worker_threw_total{0};
     std::atomic<bool> fail_launch_for_test{false};
+    // Test seam only: forces Payload::operator()() to discard its own
+    // successfully-boxed result immediately after computing it, so a test
+    // can reach the ResultAllocFailed path deterministically. There is no
+    // portable way to make std::make_unique<DetachedResult<T>> itself fail
+    // (it would need a global operator-new hook), so this is the only
+    // reachable way to exercise take_locked()'s null-result branch at all.
+    std::atomic<bool> fail_result_alloc_for_test{false};
 };
 
 /// Decrements the lane's active-worker count and the shared F3 counter when
@@ -303,28 +310,53 @@ public:
         : cell_(std::move(cell)) {}
 
 private:
-    /// Caller must hold cell_->mu.
+    /// Caller must hold cell_->mu. A null cell_->result (the worker could
+    /// not even box a WorkerThrew error - see Payload::operator()'s own
+    /// second catch) is a real, reachable state, not a defect: `done` is
+    /// still true (Cell<T>'s doc comment), so take_locked() must not assume
+    /// `result` is engaged just because `done` is. Mirrors
+    /// GuardianIoExecutor's equivalent null-check (guardian_io_executor.hpp,
+    /// its ResultCell take path) - found by inspection here, not by a live
+    /// failure, but the shape (and the fact that it is untestable without an
+    /// operator-new hook) is the same in both files.
     std::optional<DetachedResult<T>> take_locked() {
         if (!cell_->done || cell_->taken)
             return std::nullopt;
         cell_->taken = true;
+        if (!cell_->result)
+            return DetachedResult<T>{std::unexpect, DetachedCallError::ResultAllocFailed};
         auto out = std::move(*cell_->result);
         cell_->result.reset();
         return out;
     }
 
+    /// Disposes a published-but-untaken result OUTSIDE cell_->mu - matching
+    /// this file's own "EXACTLY-ONCE DELIVERY" contract that disposal never
+    /// runs under the cell's lock (only the worker's self-dispose path and
+    /// the owner's abandon()-then-later-destroy path were exercised under
+    /// that rule before; this is the third, and it held the lock across
+    /// T's destructor in an earlier draft - a mistake for the same reason
+    /// the primitive avoids running arbitrary teardown under any lock at
+    /// all). The unique_ptr is moved out under the lock (a nothrow pointer
+    /// move) and destroyed after the lock scope ends.
     void dispose_or_abandon() noexcept {
         if (!cell_)
             return;
-        std::lock_guard<std::mutex> lk(cell_->mu);
-        if (cell_->taken)
-            return;
-        if (cell_->done) {
-            cell_->taken = true;
-            cell_->result.reset(); // dispose here, on the destructing thread
-        } else {
-            cell_->abandoned = true; // tell the worker to self-dispose later
+        std::unique_ptr<DetachedResult<T>> to_dispose;
+        {
+            std::lock_guard<std::mutex> lk(cell_->mu);
+            if (cell_->taken)
+                return;
+            if (cell_->done) {
+                cell_->taken = true;
+                to_dispose = std::move(cell_->result); // disposed below, outside cell_->mu
+            } else {
+                cell_->abandoned = true; // tell the worker to self-dispose later
+                return;
+            }
         }
+        // to_dispose's destructor (T's, if engaged) runs here, on the
+        // destructing thread, outside cell_->mu.
     }
 
     std::shared_ptr<detached_detail::Cell<T>> cell_;
@@ -368,6 +400,13 @@ struct Payload {
             } catch (...) {
                 boxed.reset(); // ResultAllocFailed - even the error box didn't fit
             }
+        }
+        if (guard.lane->fail_result_alloc_for_test.load(std::memory_order_relaxed)) {
+            // Test seam only (LaneState::fail_result_alloc_for_test's doc
+            // comment) - discard whatever was successfully boxed above so a
+            // test can reach the ResultAllocFailed path deterministically,
+            // without a global operator-new hook.
+            boxed.reset();
         }
         bool was_abandoned = false;
         {
@@ -567,21 +606,41 @@ public:
         // "last". `payload` (still held here, in launch()) is untouched by
         // whatever the worker does with the raw pointer - see below.
         P* raw = payload.get();
-        const bool launched = io_detail::spawn_detached([raw]() noexcept {
-            std::unique_ptr<P> owned{raw}; // sole ownership from HERE, on the worker thread
-            (*owned)();
-            // `owned` destructs at the end of THIS scope, on the WORKER
-            // thread, unconditionally - fn's teardown and CountGuard's
-            // decrement both happen here, never on any other thread.
-        });
+        bool launched = false;
+        try {
+            launched = io_detail::spawn_detached([raw]() noexcept {
+                std::unique_ptr<P> owned{raw}; // sole ownership from HERE, on the worker thread
+                (*owned)();
+                // `owned` destructs at the end of THIS scope, on the WORKER
+                // thread, unconditionally - fn's teardown and CountGuard's
+                // decrement both happen here, never on any other thread.
+            });
+        } catch (...) {
+            // spawn_detached's own doc comment: "May throw std::bad_alloc
+            // from the single payload allocation" - that allocation (`new
+            // P{...}` inside spawn_detached, guardian_io_executor.hpp)
+            // happens STRICTLY BEFORE pthread_create/_beginthreadex, so a
+            // throw here means the OS thread was never created and the
+            // closure above never ran - `raw` was never reclaimed by
+            // anyone, so `payload` (still ours, untouched) remains the sole
+            // owner, exactly like the `!launched` case below. Treating a
+            // thrown bad_alloc identically to an OS-refused-thread
+            // LaunchFailed (rather than letting it escape launch()) is what
+            // the plan's own enum comment already documents: `LaunchFailed
+            // /* OS refused | bad_alloc */`. Not exercised by a live test
+            // (there is no portable, non-global way to force this specific
+            // allocation to fail) - GuardianIoExecutor's own equivalent
+            // call site has the same gap.
+            launched = false;
+        }
         if (!launched) {
-            // spawn_detached returned false ONLY if the OS never created the
-            // thread at all (its own doc comment) - the closure above never
-            // ran, so `raw` was never reclaimed by anyone; `payload` (still
-            // ours, untouched) is the sole owner. Recover fn, then let
-            // `payload` destruct normally below (guard rolls the admission
-            // back via its own destructor, single-threaded, no race
-            // possible here since no worker thread ever existed).
+            // spawn_detached returned false, or threw, ONLY if the OS never
+            // created the thread at all - the closure above never ran, so
+            // `raw` was never reclaimed by anyone; `payload` (still ours,
+            // untouched) is the sole owner. Recover fn, then let `payload`
+            // destruct normally below (guard rolls the admission back via
+            // its own destructor, single-threaded, no race possible here
+            // since no worker thread ever existed).
             state_->launch_failed_total.fetch_add(1, std::memory_order_relaxed);
             Result r;
             r.status = DetachedLaunch::LaunchFailed;
@@ -631,6 +690,11 @@ public:
     /// launch() on this lane that is expected to succeed.
     void set_fail_launch_for_test(bool v) noexcept {
         state_->fail_launch_for_test.store(v, std::memory_order_relaxed);
+    }
+    /// Test seam: see LaneState::fail_result_alloc_for_test's doc comment.
+    /// Sticky until reset, same convention as set_fail_launch_for_test.
+    void set_fail_result_alloc_for_test(bool v) noexcept {
+        state_->fail_result_alloc_for_test.store(v, std::memory_order_relaxed);
     }
 
 private:

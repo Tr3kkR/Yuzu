@@ -233,6 +233,70 @@ TEST_CASE("launch: a throwing fn maps to WorkerThrew and the process stays alive
     CHECK(lane.worker_threw_total() == 1);
 }
 
+TEST_CASE("launch: a result-alloc failure maps to ResultAllocFailed, not a null deref",
+          "[spark][detachedcall]") {
+    // Exercises take_locked()'s null-result branch (Cell<T>::result can be
+    // null even though `done` is true - Payload::operator()()'s own doc
+    // comment: the worker publishes a null box when even the WorkerThrew
+    // error box could not be allocated). There is no portable way to force
+    // the real allocation to fail, so this uses the dedicated test seam
+    // (set_fail_result_alloc_for_test) to reach the same state
+    // deterministically. Before the take_locked()/dispose_or_abandon() null
+    // check, this test dereferenced a null unique_ptr - UB caught by ASan
+    // as a null-pointer read, not a crash-on-sight, which is why the
+    // regression is worth pinning explicitly rather than trusting "it would
+    // have crashed".
+    auto f3 = std::make_shared<std::atomic<std::size_t>>(0);
+    SparkDetachedLane lane(f3, /*cap=*/4);
+    lane.set_fail_result_alloc_for_test(true);
+
+    auto res = lane.launch([]() -> int { return 7; });
+    REQUIRE(res.status == DetachedLaunch::Launched);
+    auto v = res.call->wait_take(std::chrono::steady_clock::now() + 5s);
+    REQUIRE(v.has_value()); // done() is still true - the outer optional is engaged
+    CHECK_FALSE(v->has_value()); // but the boxed DetachedResult<T> itself is the error
+    CHECK(v->error() == DetachedCallError::ResultAllocFailed);
+
+    // Not WorkerThrew - fn() itself succeeded; only the box failed.
+    CHECK(lane.worker_threw_total() == 0);
+
+    CHECK(spin_until([&] { return lane.active_workers() == 0; }));
+    CHECK(f3->load() == 0);
+
+    lane.set_fail_result_alloc_for_test(false);
+}
+
+TEST_CASE("launch: an abandon()'d, published-but-untaken result-alloc failure is a safe "
+          "no-op, not a null deref",
+          "[spark][detachedcall]") {
+    // Same defect class as above, reached through dispose_or_abandon()'s
+    // code path instead of take_locked()'s: abandon() calls take_locked()
+    // internally, so this mostly re-confirms the same fix from a different
+    // call site, plus exercises that a subsequent DetachedCall destructor
+    // (dispose_or_abandon() again, now with cell_->taken already true) is a
+    // clean no-op rather than a double-dispose.
+    auto f3 = std::make_shared<std::atomic<std::size_t>>(0);
+    SparkDetachedLane lane(f3, /*cap=*/4);
+    lane.set_fail_result_alloc_for_test(true);
+
+    auto res = lane.launch([]() -> int { return 9; });
+    REQUIRE(res.status == DetachedLaunch::Launched);
+    CHECK(spin_until([&] { return res.call->done(); }));
+
+    auto abandoned = res.call->abandon();
+    REQUIRE(abandoned.has_value());
+    CHECK_FALSE(abandoned->has_value());
+    CHECK(abandoned->error() == DetachedCallError::ResultAllocFailed);
+
+    // Handle destruction after an already-taken abandon() must be a no-op.
+    res.call.reset();
+
+    CHECK(spin_until([&] { return lane.active_workers() == 0; }));
+    CHECK(f3->load() == 0);
+
+    lane.set_fail_result_alloc_for_test(false);
+}
+
 TEST_CASE("launch: owner handle destroyed while parked - no UAF, disposal happens on the "
           "WORKER thread",
           "[spark][detachedcall]") {
