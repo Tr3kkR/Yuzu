@@ -67,7 +67,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 4.6 | [#189](https://github.com/Tr3kkR/Yuzu/issues/189) | Desktop User Interaction (Windows) | Done |
 | | 4.7 | [#193](https://github.com/Tr3kkR/Yuzu/issues/193) | Agent Logging and Remote Log Retrieval | Done |
 | | 4.8 | [#212](https://github.com/Tr3kkR/Yuzu/issues/212) | service.set_start_mode Cross-Platform Primitive | Done |
-| **5** | 5.1 | [#175](https://github.com/Tr3kkR/Yuzu/issues/175) | Policy Rules and Fragments | Done |
+| **5** | 5.1 | [#175](https://github.com/Tr3kkR/Yuzu/issues/175) | Policy Rules and Fragments | Done — remediation ("Fix") is operator-gated, never automatic; distinct from Guardian (Phase 16), see body note |
 | | 5.2 | [#176](https://github.com/Tr3kkR/Yuzu/issues/176) | Policy Assignment and Deployment | Done |
 | | 5.3 | [#178](https://github.com/Tr3kkR/Yuzu/issues/178) | Compliance Dashboard and Statistics | Done |
 | | 5.4 | [#179](https://github.com/Tr3kkR/Yuzu/issues/179) | Policy Cache Invalidation and Force Re-Evaluation | Done |
@@ -85,7 +85,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 7.5 | [#194](https://github.com/Tr3kkR/Yuzu/issues/194) | Active Directory / Entra Integration | Done |
 | | 7.6 | [#195](https://github.com/Tr3kkR/Yuzu/issues/195) | Custom Properties on Devices | Done |
 | | 7.7 | [#196](https://github.com/Tr3kkR/Yuzu/issues/196) | Agent Deployment Jobs | Done |
-| | 7.8 | [#197](https://github.com/Tr3kkR/Yuzu/issues/197) | Patch Deployment Workflow | Done |
+| | 7.8 | [#197](https://github.com/Tr3kkR/Yuzu/issues/197) | Patch Deployment Workflow | **Partial** — records + audits only; dispatch (#4138) and ingestion (#3676) are unwired, see body note |
 | | 7.9 | [#198](https://github.com/Tr3kkR/Yuzu/issues/198) | Product Packs (Bundled Definitions) | Done |
 | | 7.10 | [#199](https://github.com/Tr3kkR/Yuzu/issues/199) | User Sessions and Group Membership Plugins | Done |
 | | 7.11 | [#200](https://github.com/Tr3kkR/Yuzu/issues/200) | Advanced User Interaction (Surveys, DND) | Done |
@@ -164,7 +164,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | 4: Agent Infrastructure | 8 | 0 | 8 | 100% |
 | 5: Policy Engine | 5 | 0 | 5 | 100% |
 | 6: Windows Depth | 6 | 0 | 6 | 100% |
-| 7: Scale & Integration | 20 | 0 | 20 | 100% |
+| 7: Scale & Integration | 19 | 1 | 20 | 95% — 7.8 is **Partial**, not Done (patch deploy records + audits only; dispatch #4138 and ingestion #3676 are unwired) |
 | 8: Visualization & Response Experience | 3 | 0 | 3 | 100% |
 | 9: Connector Framework & Multi-Source Inventory | 0 | 8 | 8 | 0% — **Deferred** (owner decision 2026-09-07: placement — core vs. use-case-engine — is an open question to be settled before any re-plan, see Phase 9 body note); demoted out of the #2 execution-order slot it held since 2026-03 |
 | 10: Software Catalog & License Compliance | 1 | 3 | 4 | 25% — only 10.1 (product registry) shipped in-server; 10.2–10.4 closed NOT_PLANNED with no delivery, see Phase 10 note |
@@ -174,9 +174,9 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | 14: Scale & Enterprise Readiness | 1 | 5 | 6 | 17% |
 | 15: TAR Dashboard & Scope Walking | 8 | 0 | 8 | 100% |
 | 16: System Guardian — Real-Time GS | 0 | 3 | 3 | 0% — issue-closure only; substantial implementation progress not reflected here, see 16.A/16.B body notes |
-| **Total** | **89** | **37** | **126** | **71%** |
+| **Total** | **88** | **38** | **126** | **70%** |
 
-**Done** requires verified delivery: closed COMPLETED, or closed NOT_PLANNED *with* a cited delivery-evidence path/ADR (e.g. 12.12/#283 shipped differently as ADR-0016's hash-skip sync). **Open** is everything else, including issues closed **NOT_PLANNED with no delivery** (a real decision not to build the thing, distinct from a still-open backlog item — see the Issue Index's "Closed — not planned" rows for the per-issue distinction and `stateReason`) and **Partial** items (per-device-only concurrency, 2.9 — real but narrower delivery than "Done" implies). The number moved from 94/126 (75%) to 90/126 (71%) then to **89/126 (71%)** in two corrective passes: first, the initial pull used `state` without `stateReason` and miscounted 5 NOT_PLANNED-with-no-delivery closures (9.8, 10.2, 10.3, 10.4, 11.1) as Done while missing 1 NOT_PLANNED-with-delivery closure (12.12) that should have counted — net **−4**; second, 2.9 was reverted from Done to **Partial** per ADR-1007's own text ("Issue 2.9 no longer claims 'Done'; it reflects the real, narrower scope this ADR ships," `docs/adr/1007-concurrency-enforcement-scope.md:986`) — net **−1**. 94 − 4 − 1 = **89**.
+**Done** requires verified delivery: closed COMPLETED, or closed NOT_PLANNED *with* a cited delivery-evidence path/ADR (e.g. 12.12/#283 shipped differently as ADR-0016's hash-skip sync). **Open** is everything else, including issues closed **NOT_PLANNED with no delivery** (a real decision not to build the thing, distinct from a still-open backlog item — see the Issue Index's "Closed — not planned" rows for the per-issue distinction and `stateReason`) and **Partial** items (real but narrower delivery than "Done" implies: 2.9 per-device-only concurrency; 7.8 patch deploy records+audits with no working dispatch/ingestion path). The number moved from 94/126 (75%) → 90/126 (71%) → 89/126 (71%) → **88/126 (70%)** across three corrective passes: first, the initial pull used `state` without `stateReason` and miscounted 5 NOT_PLANNED-with-no-delivery closures (9.8, 10.2, 10.3, 10.4, 11.1) as Done while missing 1 NOT_PLANNED-with-delivery closure (12.12) that should have counted — net **−4**; second, 2.9 was reverted from Done to **Partial** per ADR-1007's own text ("Issue 2.9 no longer claims 'Done'; it reflects the real, narrower scope this ADR ships," `docs/adr/1007-concurrency-enforcement-scope.md:986`) — net **−1**; third, 7.8 was reverted from Done to **Partial** — the HTTP deploy path audits "Deployed … to N agents" but dispatches nothing (#4138) and patch inventory ingestion has zero production callers (#3676) — net **−1**. 94 − 4 − 1 − 1 = **88**.
 
 **Scaffolded** means DDL/structs/stubs exist but business logic is not wired. See `docs/Instruction-Engine.md` for Phase 2 scaffold details.
 
@@ -648,14 +648,18 @@ Add `set_start_mode` action to the `services` plugin. Parameters: `serviceName`,
 
 ## Phase 5: Policy Engine and Compliance
 
-*Desired-state policies with trigger-based evaluation and auto-remediation.*
+*Desired-state policies with scheduled evaluation (`PolicyEvaluator`, default 3600s interval,
+`policy_evaluator.hpp:107`) and operator-gated remediation — detection is on a schedule, applying a
+fix is always an explicit action, never automatic (`docs/user-manual/policy-engine.md` § Compliance
+Evaluation Pipeline: "Remediation is never automatic"). Distinct from Guardian's (Phase 16)
+kernel-event-driven, real-time, agent-side enforcement — do not conflate the two.*
 
 ### Issue 5.1: Policy Rules and Fragments :white_check_mark:
-**Capabilities:** 16.1, 16.2 | **Scope:** Server + Agent | **Status:** Done
+**Capabilities:** 16.1, 16.2 | **Scope:** Server + Agent | **Status:** Done — note: "Fix" below means *evaluable-and-remediable*, not auto-remediated; applying the fix is a separate, explicit operator-gated action (`POST /api/policies/{id}/remediate`), never triggered automatically by evaluation
 
 Core policy engine:
 - **Fragments:** Reusable compliance check/fix code blocks. Each fragment defines a check instruction (evaluate state) and optional fix instruction (remediate). Parameters are configured when rules are created.
-- **Rules:** Bind a fragment to one or more triggers. Rule types: Check (evaluate only) or Fix (evaluate + remediate). Status codes: Received, CheckErrored, CheckFailed, CheckPassed, FixErrored, FixPassed, FixFailed.
+- **Rules:** Bind a fragment to one or more triggers. Rule types: Check (evaluate only) or Fix (evaluate, with a fix instruction available for a separate, explicit operator-gated remediation call — evaluation alone never remediates). Status codes: Received, CheckErrored, CheckFailed, CheckPassed, FixErrored, FixPassed, FixFailed.
 - **Agent-side evaluation:** Rules evaluate on trigger fire, agent startup, and initial receipt. De-bounce prevents rapid re-evaluation.
 - **Server-side management:** CRUD for fragments and rules via management API.
 
@@ -885,7 +889,7 @@ Server-initiated agent installation on discovered endpoints:
 **Files:** New `server/core/src/deploy.cpp`, `server/core/src/server.cpp`
 
 ### Issue 7.8: Patch Deployment Workflow
-**Capabilities:** 8.3-8.8 | **Scope:** Plugin + Server
+**Capabilities:** 8.3-8.8 | **Scope:** Plugin + Server | **Status:** **Partial** — records + audits only; dispatch (#4138) and ingestion (#3676) are unwired
 
 New `patch` plugin and server-side patch management:
 - **Plugin (agent-side):** Deploy patch (download + install), get status, test patch server connection, restart with notification
@@ -899,6 +903,13 @@ compliance dashboard** are separately affected too: `PatchManager::record_patche
 method that writes patch inventory, was independently found to have zero production callers as
 well (pre-existing, predates this migration) — see `docs/capability-map.md` §8.5/§8.7 and
 tracking issue #3676. The remaining server-side capabilities listed above are unaffected.
+
+**Further correction (2026-09-08, #4138):** `POST /api/patches/deploy` returns `201` and audits
+"Deployed … to N agents", but dispatches no command to any agent — a stronger claim than #3669's
+"creates records only" phrasing above suggested (that phrasing described the *absence* of the
+removed reboot-control orchestration; #4138 confirms the *presence* of a success response/audit
+trail with no dispatch behind it at all). Combined with #3676 (patch inventory can never
+populate), the honest status is **records + audits only, no working dispatch or ingestion path**.
 
 **Files:** New `agents/plugins/patch/`, `server/core/src/server.cpp`
 
@@ -1676,7 +1687,7 @@ Live re-eval (`POST /api/v1/result-sets/{id}/re-eval`); background GC sweep ever
 
 ## Phase 16: System Guardian — Real-Time Agent-Side Guaranteed State
 
-*The headline parity feature against the leading commercial endpoint-management platforms' real-time enforcement engines. PolicyStore (Phase 5) covers server-side compliance evaluation on a 5-minute poll; this phase covers the **kernel-event-driven, microsecond-latency, pre-login-active, fully-offline-capable** agent-side enforcement that makes guaranteed state operationally true rather than approximately true. Without Phase 16, "policy engine equivalent" overclaims — a 5-minute window is unacceptable for security-sensitive settings (firewall ports, registry-backed posture, EDR running). Design: `docs/yuzu-guardian-design-v1.1.md` (architecture), `docs/yuzu-guardian-windows-implementation-plan.md` (Windows-first 17-PR delivery ladder).*
+*The headline parity feature against the leading commercial endpoint-management platforms' real-time enforcement engines. PolicyStore (Phase 5) covers server-side compliance evaluation on a scheduled poll (`PolicyEvaluator`, default 3600s interval, `policy_evaluator.hpp:107`) with operator-gated remediation — never automatic (see Phase 5 note); this phase covers the **kernel-event-driven, microsecond-latency, pre-login-active, fully-offline-capable** agent-side enforcement that makes guaranteed state operationally true rather than approximately true. Without Phase 16, "policy engine equivalent" overclaims — an hour-scale window (let alone one gated on a further explicit operator action) is unacceptable for security-sensitive settings (firewall ports, registry-backed posture, EDR running). Design: `docs/yuzu-guardian-design-v1.1.md` (architecture), `docs/yuzu-guardian-windows-implementation-plan.md` (Windows-first 17-PR delivery ladder).*
 
 ### Issue 16.A: System Guardian — Windows-first delivery
 **Capability:** 31.1, 31.2, 31.3, 31.6, 31.7, 31.8, 31.9, 31.10 | **Scope:** Agent (Windows) + Server | **Status:** In progress — far beyond "PRs 1-2 shipped": 59 merged guardian PRs land the Spark detection engine (rungs 1–7+, ADR-0021), `GuardianEngine`, `BaselineStore`, and the `/guaranteed-state` operator UI (rule list, event timeline, approval workflow). **Spark is wired (`agent.cpp:1255`) but inert by default** — `prefer_spark_=false`, legacy `IGuard` remains the sole live enforcement path; Spark makes no enforcement decisions today. Issue #555 itself remains open — the PR ladder has no GitHub sub-checklist tracking it item-by-item.
