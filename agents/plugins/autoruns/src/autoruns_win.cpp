@@ -896,7 +896,15 @@ void walk_task_folder(ITaskFolder* folder, SourceOutcome& outcome, std::size_t c
             // <Triggers/> empty (no triggers defined) is Enabled==true yet
             // Task Scheduler will never invoke it on its own -- only a
             // manual Run counts, which is not persistence. Both must hold.
-            const Enabled enabled_state = (enabled_b == VARIANT_TRUE && info.has_triggers)
+            // If either accessor needed for that decision failed, the state
+            // is genuinely unknown, not a fabricated definite answer:
+            // get_Enabled failing leaves enabled_b at its VARIANT_TRUE
+            // initializer (would silently read as "enabled"), and get_Xml
+            // failing leaves info.has_triggers at its default false (would
+            // silently read as "disabled" for a task that may be firing).
+            const Enabled enabled_state = (FAILED(enabled_hr) || FAILED(xml_hr))
+                                              ? Enabled::unknown
+                                          : (enabled_b == VARIANT_TRUE && info.has_triggers)
                                               ? Enabled::enabled
                                               : Enabled::disabled;
 
@@ -918,6 +926,15 @@ void walk_task_folder(ITaskFolder* folder, SourceOutcome& outcome, std::size_t c
                 outcome.rows.push_back(std::move(row));
             } else {
                 for (std::size_t i = 0; i < info.actions.size(); ++i) {
+                    // A task admitted just under the cap can still carry
+                    // several actions (bounded by Task Scheduler's own
+                    // per-task action limit, so not unbounded) -- re-check
+                    // per action, not just once per task, so the total row
+                    // count can't creep past the cap.
+                    if (outcome.rows.size() >= cap) {
+                        note_constraint(outcome, "row_cap");
+                        return;
+                    }
                     Row row;
                     row.source_id = SourceId::win_scheduled_tasks;
                     row.catalog_version = kAutorunSourceCatalogVersion;
@@ -1012,6 +1029,28 @@ void collect_scheduled_tasks(std::string_view filter, SourceOutcome& outcome) {
 
 // ── 8. WMI permanent event subscriptions ─────────────────────────────────
 
+// The highest-value payload this plugin can produce
+// (ActiveScriptEventConsumer::ScriptText) is routinely multi-line real
+// script text; format_wmi_block's own reader (parse_wmi_subscription_triple)
+// splits on blank lines and requires exactly one "Key : Value" per line, so
+// an unescaped embedded '\n' would either truncate the value to its first
+// line or split one record into two. Escaping here and unescaping in
+// unescape_wmi_value (autoruns_parsers.hpp) keeps the round trip lossless --
+// this is the ONLY producer feeding parse_wmi_subscription_triple, so the
+// escaping is self-contained to this file pair, not a format any external
+// capture needs to match.
+std::string escape_wmi_value(std::string_view v) {
+    std::string out;
+    out.reserve(v.size());
+    for (char c : v) {
+        if (c == '\\') out += "\\\\";
+        else if (c == '\n') out += "\\n";
+        else if (c == '\r') out += "\\r";
+        else out += c;
+    }
+    return out;
+}
+
 std::string format_wmi_block(std::string_view cim_class, const yuzu::shared::wmi::WmiRow& row) {
     std::string out = "CimClass : ";
     out += cim_class;
@@ -1019,7 +1058,7 @@ std::string format_wmi_block(std::string_view cim_class, const yuzu::shared::wmi
     for (const auto& [k, v] : row) {
         out += k;
         out += " : ";
-        out += v;
+        out += escape_wmi_value(v);
         out += '\n';
     }
     out += '\n';
@@ -1181,13 +1220,24 @@ int collect_windows(yuzu::CommandContext& ctx, std::string_view filter) {
                     profile.profile_name.empty() ? std::string_view{profile.sid}
                                                  : std::string_view{profile.profile_name};
 
-                if (want(filter, SourceId::win_startup_folder_user) &&
-                    !profile.profile_path.empty()) {
-                    const std::wstring dir = yuzu::win::to_wide(profile.profile_path) +
-                                            L"\\AppData\\Roaming\\Microsoft\\Windows\\Start "
-                                            L"Menu\\Programs\\Startup";
-                    collect_startup_folder(dir, SourceId::win_startup_folder_user, Scope::user,
-                                          user, startup_folder_user);
+                if (want(filter, SourceId::win_startup_folder_user)) {
+                    if (!profile.profile_path.empty()) {
+                        // The literal AppData\Roaming\...\Startup suffix doesn't
+                        // resolve a redirected Known Folder (a profile whose Startup
+                        // folder was moved via policy/USER_SHELL_FOLDERS) -- a real
+                        // but pre-existing gap, not fixed here.
+                        const std::wstring dir = yuzu::win::to_wide(profile.profile_path) +
+                                                L"\\AppData\\Roaming\\Microsoft\\Windows\\Start "
+                                                L"Menu\\Programs\\Startup";
+                        collect_startup_folder(dir, SourceId::win_startup_folder_user, Scope::user,
+                                              user, startup_folder_user);
+                    } else if (profile.profile_path_unreadable) {
+                        // An unreadable/ACL-denied ProfileImagePath must not
+                        // silently drop this profile from a Supported source --
+                        // matches the constraint-not-empty-result discipline
+                        // every other collector in this file follows.
+                        note_constraint(startup_folder_user, "profile_path_unreadable");
+                    }
                 }
 
                 if (!want(filter, SourceId::win_run_hku) &&

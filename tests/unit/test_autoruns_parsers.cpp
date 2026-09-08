@@ -390,6 +390,50 @@ TEST_CASE("autoruns: parse_task_xml does not confuse <Actions> with a longer tag
     CHECK(info.actions.empty());
 }
 
+TEST_CASE("autoruns: parse_task_xml's has_triggers consults each trigger's own "
+          "<Enabled> value, not just bare presence of a trigger element "
+          "(RECONSTRUCTION: pins round 3's should-fix -- a task with only "
+          "individually-disabled triggers, or a whitespace-only <Triggers> "
+          "block, must not report has_triggers=true)",
+          "[autoruns][parsers]") {
+    SECTION("a single disabled trigger -> false") {
+        const std::string xml =
+            "<Task><Triggers><CalendarTrigger><Enabled>false</Enabled>"
+            "</CalendarTrigger></Triggers></Task>";
+        CHECK_FALSE(parse_task_xml(xml).has_triggers);
+    }
+
+    SECTION("a trigger with no <Enabled> tag at all -> true (schema default enabled)") {
+        const std::string xml =
+            "<Task><Triggers><CalendarTrigger><StartBoundary>2026-01-01T00:00:00</StartBoundary>"
+            "</CalendarTrigger></Triggers></Task>";
+        CHECK(parse_task_xml(xml).has_triggers);
+    }
+
+    SECTION("one disabled, one enabled -> true (at least one will fire)") {
+        const std::string xml =
+            "<Task><Triggers>"
+            "<CalendarTrigger><Enabled>false</Enabled></CalendarTrigger>"
+            "<TimeTrigger><Enabled>true</Enabled></TimeTrigger>"
+            "</Triggers></Task>";
+        CHECK(parse_task_xml(xml).has_triggers);
+    }
+
+    SECTION("all disabled -> false") {
+        const std::string xml =
+            "<Task><Triggers>"
+            "<CalendarTrigger><Enabled>false</Enabled></CalendarTrigger>"
+            "<TimeTrigger><Enabled>false</Enabled></TimeTrigger>"
+            "</Triggers></Task>";
+        CHECK_FALSE(parse_task_xml(xml).has_triggers);
+    }
+
+    SECTION("whitespace-only Triggers block -> false") {
+        const std::string xml = "<Task><Triggers>\n   \t\n</Triggers></Task>";
+        CHECK_FALSE(parse_task_xml(xml).has_triggers);
+    }
+}
+
 // ── 8. parse_wmi_subscription_triple ─────────────────────────────────────
 
 TEST_CASE("autoruns: parse_wmi_subscription_triple joins filter/consumer/binding blocks "
@@ -424,6 +468,31 @@ TEST_CASE("autoruns: parse_wmi_subscription_triple resolves target from CommandL
         "CimClass               : ROOT/subscription:__FilterToConsumerBinding\n";
     const auto triple = parse_wmi_subscription_triple(text);
     CHECK(triple.target == "cmd.exe /c calc.exe");
+}
+
+TEST_CASE("autoruns: parse_wmi_subscription_triple recovers a multi-line ScriptText "
+          "value through format_wmi_block's escape round trip, not just its first line "
+          "(RECONSTRUCTION: pins round 3's should-fix -- an unescaped embedded newline "
+          "either truncated the value to one line or, on a blank line, split one "
+          "record into two)",
+          "[autoruns][parsers]") {
+    // Mirrors exactly what autoruns_win.cpp's escape_wmi_value produces for a
+    // real multi-line ActiveScriptEventConsumer::ScriptText -- \n and \r
+    // escaped to literal two-character sequences so the one-line-per-value
+    // format and blank-line block separator both stay intact.
+    const std::string text =
+        "CimClass               : ROOT/subscription:__EventFilter\n"
+        "Name                   : EvilFilter\n"
+        "Query                  : select * from Win32_ProcessStartTrace\n"
+        "\n\n"
+        "CimClass               : ROOT/subscription:ActiveScriptEventConsumer\n"
+        "Name                   : EvilConsumer\n"
+        "ScriptText             : line1\\nline2\\n\\nline4\n"
+        "\n\n"
+        "CimClass               : ROOT/subscription:__FilterToConsumerBinding\n";
+    const auto triple = parse_wmi_subscription_triple(text);
+    CHECK(triple.consumer_found);
+    CHECK(triple.target == "line1\nline2\n\nline4");
 }
 
 // ── 9. parse_crontab ──────────────────────────────────────────────────────

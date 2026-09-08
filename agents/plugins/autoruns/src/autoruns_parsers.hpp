@@ -638,7 +638,33 @@ inline TaskInfo parse_task_xml(std::string_view xml) {
             bool self_closed = gt > 0 && xml[gt - 1] == '/';
             if (!self_closed) {
                 std::size_t close = xml.find("</Triggers>", gt + 1);
-                if (close != std::string_view::npos && close > gt + 1) out.has_triggers = true;
+                if (close != std::string_view::npos && close > gt + 1) {
+                    std::string_view inner = xml.substr(gt + 1, close - (gt + 1));
+                    const bool has_real_content =
+                        inner.find_first_not_of(" \t\r\n") != std::string_view::npos;
+                    // Bare presence of a trigger element isn't enough: each
+                    // trigger can carry its own <Enabled>false</Enabled>
+                    // (default true when the tag is absent, per Task
+                    // Scheduler's schema) -- a Triggers block whose every
+                    // trigger is individually disabled will never fire, same
+                    // as an empty one.
+                    std::size_t total_enabled_tags = 0;
+                    std::size_t true_enabled_tags = 0;
+                    std::size_t p = 0;
+                    while (true) {
+                        std::size_t tag = inner.find("<Enabled>", p);
+                        if (tag == std::string_view::npos) break;
+                        ++total_enabled_tags;
+                        std::size_t vend = inner.find("</Enabled>", tag);
+                        if (vend != std::string_view::npos &&
+                            inner.substr(tag + 9, vend - (tag + 9)) == "true")
+                            ++true_enabled_tags;
+                        p = tag + 9;
+                    }
+                    const bool any_effectively_enabled =
+                        total_enabled_tags == 0 || true_enabled_tags > 0;
+                    out.has_triggers = has_real_content && any_effectively_enabled;
+                }
             }
         }
     }
@@ -674,6 +700,24 @@ inline std::string kv_get(const KvBlock& block, std::string_view key) {
     return {};
 }
 
+/// Inverse of autoruns_win.cpp's escape_wmi_value -- undoes the \\, \n, \r
+/// escaping that keeps a multi-line value (e.g. ActiveScriptEventConsumer::
+/// ScriptText) intact through this format's one-line-per-value shape.
+inline std::string unescape_wmi_value(std::string_view v) {
+    std::string out;
+    out.reserve(v.size());
+    for (std::size_t i = 0; i < v.size(); ++i) {
+        if (v[i] == '\\' && i + 1 < v.size()) {
+            const char next = v[i + 1];
+            if (next == 'n') { out += '\n'; ++i; continue; }
+            if (next == 'r') { out += '\r'; ++i; continue; }
+            if (next == '\\') { out += '\\'; ++i; continue; }
+        }
+        out += v[i];
+    }
+    return out;
+}
+
 } // namespace detail
 
 /// Parses PowerShell `Format-List`-style output (`Key : Value` lines, blocks
@@ -705,7 +749,7 @@ inline WmiTriple parse_wmi_subscription_triple(std::string_view text) {
             std::size_t colon = line.find(':');
             if (colon != std::string_view::npos) {
                 std::string key = detail::trim(line.substr(0, colon));
-                std::string val = detail::trim(line.substr(colon + 1));
+                std::string val = detail::unescape_wmi_value(detail::trim(line.substr(colon + 1)));
                 if (!key.empty()) current.emplace_back(std::move(key), std::move(val));
             }
         }

@@ -318,7 +318,7 @@
       "completeness": "`PARTIAL`",
       "provenance": "`subprocess_runner:spawn_error`",
       "status": "`UNAVAILABLE`",
-      "when": "The rung-2 Linux fallback (`systemctl list-timers`, `collect_linux`'s `lnx_systemd_timers_system` branch) could not spawn the child at all, forwarded via `forward_runner_failure` (`autoruns_linux.cpp:845`)."
+      "when": "The rung-2 Linux fallback (`systemctl list-timers`, `collect_linux`'s `lnx_systemd_timers_system` branch) could not spawn the child at all, forwarded via `forward_runner_failure` (`autoruns_linux.cpp:941`)."
     },
     {
       "completeness": "`PARTIAL`",
@@ -342,7 +342,7 @@
       "completeness": "`PARTIAL`",
       "provenance": "`subprocess_runner:line_limit`",
       "status": "`OK`",
-      "when": "The same rung-2 fallback hit the runner's output line cap — a deliberate bounded stop, not a failure; `trim_possibly_truncated_tail` additionally drops a possibly-partial trailing line before parsing (`autoruns_linux.cpp:448-452`)."
+      "when": "The same rung-2 fallback hit the runner's output line cap — a deliberate bounded stop, not a failure; `trim_possibly_truncated_tail` additionally drops a possibly-partial trailing line before parsing (`autoruns_linux.cpp:511-515`)."
     }
   ],
   "samples": {

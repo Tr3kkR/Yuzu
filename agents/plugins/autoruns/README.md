@@ -111,11 +111,11 @@ Surfaced as `plugin_result_status` on the command response, set via `ctx.set_res
 |---|---|---|---|
 | `UNDECLARED` (agent default) | — | — | No `set_result_status` call fires on this path — the overwhelming majority of `list`/`catalog` runs. Every per-source outcome, including a degraded one, is carried in that source's own `source\|` row instead of this command-level status. |
 | `UNAVAILABLE` | `PARTIAL` | `autoruns:exception` | `execute()`'s top-level `catch` — either `catch (const std::exception&)` or `catch (...)` — caught an exception escaping `do_catalog`/`do_list` before any OS-ABI boundary crossing (`autoruns_plugin.cpp:210-219`). No exception may cross the plugin's `extern "C"` boundary, so this is the last-resort backstop, not an expected per-source outcome. |
-| `UNAVAILABLE` | `PARTIAL` | `subprocess_runner:spawn_error` | The rung-2 Linux fallback (`systemctl list-timers`, `collect_linux`'s `lnx_systemd_timers_system` branch) could not spawn the child at all, forwarded via `forward_runner_failure` (`autoruns_linux.cpp:845`). |
+| `UNAVAILABLE` | `PARTIAL` | `subprocess_runner:spawn_error` | The rung-2 Linux fallback (`systemctl list-timers`, `collect_linux`'s `lnx_systemd_timers_system` branch) could not spawn the child at all, forwarded via `forward_runner_failure` (`autoruns_linux.cpp:941`). |
 | `CONSTRAINED` | `PARTIAL` | `subprocess_runner:deadline` | The same rung-2 fallback's 20s deadline elapsed and the still-running `systemctl` was killed. |
 | `CONSTRAINED` | `PARTIAL` | `subprocess_runner:cancelled` | The same rung-2 fallback's run was cancelled before it finished. |
 | `CONSTRAINED` | `PARTIAL` | `subprocess_runner:signaled` | The same rung-2 fallback's `systemctl` child was killed by a signal rather than exiting cleanly. |
-| `OK` | `PARTIAL` | `subprocess_runner:line_limit` | The same rung-2 fallback hit the runner's output line cap — a deliberate bounded stop, not a failure; `trim_possibly_truncated_tail` additionally drops a possibly-partial trailing line before parsing (`autoruns_linux.cpp:448-452`). |
+| `OK` | `PARTIAL` | `subprocess_runner:line_limit` | The same rung-2 fallback hit the runner's output line cap — a deliberate bounded stop, not a failure; `trim_possibly_truncated_tail` additionally drops a possibly-partial trailing line before parsing (`autoruns_linux.cpp:511-515`). |
 
 `subprocess_runner:*` is the only subprocess this plugin ever runs anywhere on any OS — the Windows and macOS legs never call `forward_runner_failure` because they never spawn a child process at all.
 

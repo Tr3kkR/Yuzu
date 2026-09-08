@@ -315,19 +315,35 @@ WantsListing build_wants_listing(const std::string& wants_dir) {
 /// NEVER `/etc/systemd/system`, which holds only system-scope enablement
 /// state and has no relationship to a user timer regardless of where that
 /// timer's unit file lives. Each scope's own global wants root is the one
-/// location every enable of that scope writes to, so the candidate list is
-/// scope-conditional: probed both next to the unit file itself (covers the
-/// vendor-"static" case, where the unit ships its own `.wants/` symlink
-/// alongside it -- this also covers a per-user timer's own
-/// `~/.config/systemd/user/timers.target.wants`, since that IS the unit's
-/// own directory for a per-user scan) AND, unconditionally, under this
-/// scope's own global wants root.
+/// location every GLOBAL enable of that scope writes to, so the candidate
+/// list is scope-conditional: probed both next to the unit file itself
+/// (covers the vendor-"static" case, where the unit ships its own
+/// `.wants/` symlink alongside it -- this also covers a per-user timer's
+/// own `~/.config/systemd/user/timers.target.wants`, since that IS the
+/// unit's own directory for a per-user scan) AND, unconditionally, under
+/// this scope's own global wants root.
+///
+/// Neither of those covers the single most common user-scope layout: a
+/// vendor unit file living in a GLOBAL directory (e.g.
+/// `/usr/lib/systemd/user`), enabled by one specific user via ordinary
+/// `systemctl --user enable`, which writes the symlink into THAT USER's
+/// OWN `~/.config/systemd/user/timers.target.wants` -- a directory that has
+/// no relationship to the unit file's own location. `user_wants_bases`
+/// (every enumerated user's own `~/.config/systemd/user`, collected once by
+/// the caller) is checked too for user scope, so a global-directory unit
+/// enabled by any one user is found regardless of which directory the
+/// caller happened to discover it in.
 Enabled timer_enabled(const std::string& unit_dir, const std::string& timer_filename,
-                      const std::string& wanted_by, Scope scope) {
+                      const std::string& wanted_by, Scope scope,
+                      const std::vector<std::string>& user_wants_bases = {}) {
     const std::string_view wants_root =
         scope == Scope::system ? "/etc/systemd/system" : "/etc/systemd/user";
     std::vector<std::string> wants_base_dirs = {unit_dir};
     if (unit_dir != wants_root) wants_base_dirs.emplace_back(wants_root);
+    if (scope == Scope::user) {
+        for (const auto& base : user_wants_bases)
+            if (base != unit_dir) wants_base_dirs.push_back(base);
+    }
 
     bool any_opened = false;
     for (const auto& base : wants_base_dirs) {
@@ -386,10 +402,11 @@ std::optional<std::pair<dev_t, ino_t>> dir_identity(const std::string& dir) {
 /// skipped too.
 void scan_systemd_timer_dir_unique(const std::string& dir, Scope scope, const std::string& user,
                                     TimerScan& out,
-                                    std::vector<std::pair<dev_t, ino_t>>& seen);
+                                    std::vector<std::pair<dev_t, ino_t>>& seen,
+                                    const std::vector<std::string>& user_wants_bases = {});
 
 void scan_systemd_timer_dir(const std::string& dir, Scope scope, const std::string& user,
-                            TimerScan& out) {
+                            TimerScan& out, const std::vector<std::string>& user_wants_bases = {}) {
     auto listing = list_dir(dir);
     if (!listing.opened) {
         if (listing.permission_denied) out.any_permission_denied = true;
@@ -436,7 +453,7 @@ void scan_systemd_timer_dir(const std::string& dir, Scope scope, const std::stri
                 row.args += triggers[i];
             }
         }
-        row.enabled = timer_enabled(dir, name, fields.wanted_by, scope);
+        row.enabled = timer_enabled(dir, name, fields.wanted_by, scope, user_wants_bases);
         row.scope = scope;
         row.user = user;
         row.signed_state = Signed::not_checked;
@@ -447,11 +464,12 @@ void scan_systemd_timer_dir(const std::string& dir, Scope scope, const std::stri
 
 void scan_systemd_timer_dir_unique(const std::string& dir, Scope scope, const std::string& user,
                                     TimerScan& out,
-                                    std::vector<std::pair<dev_t, ino_t>>& seen) {
+                                    std::vector<std::pair<dev_t, ino_t>>& seen,
+                                    const std::vector<std::string>& user_wants_bases) {
     auto id = dir_identity(dir);
     if (id && std::find(seen.begin(), seen.end(), *id) != seen.end()) return;
     if (id) seen.push_back(*id);
-    scan_systemd_timer_dir(dir, scope, user, out);
+    scan_systemd_timer_dir(dir, scope, user, out, user_wants_bases);
 }
 
 /// Combines a TimerScan's cap-truncation and per-file constraint flags into
@@ -948,28 +966,55 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
             if (want_user_timers) {
                 TimerScan scan;
                 std::vector<std::pair<dev_t, ino_t>> seen_dirs;
+                // Every enumerated user's own wants base, collected up front so a
+                // vendor unit discovered in a GLOBAL directory (below) can still be
+                // correlated against the specific user who ran `systemctl --user
+                // enable` on it -- that enablement symlink lands in the enabling
+                // user's own dir, which has no relationship to the unit file's
+                // location (see timer_enabled's banner).
+                std::vector<std::string> home_dirs;
                 auto home_listing = list_dir("/home");
                 if (home_listing.truncated) scan.any_truncated = true;
+                if (!home_listing.opened && home_listing.permission_denied)
+                    scan.any_permission_denied = true;
                 if (home_listing.opened) {
-                    for (const auto& user : home_listing.names) {
-                        std::string dir = "/home/" + user + "/.config/systemd/user";
-                        scan_systemd_timer_dir_unique(dir, Scope::user, owner_uid_string(dir), scan,
-                                                       seen_dirs);
-                    }
+                    for (const auto& user : home_listing.names)
+                        home_dirs.push_back("/home/" + user + "/.config/systemd/user");
                 }
+                std::vector<std::string> user_wants_bases = home_dirs;
+                user_wants_bases.emplace_back("/root/.config/systemd/user");
+
+                for (const auto& dir : home_dirs)
+                    scan_systemd_timer_dir_unique(dir, Scope::user, owner_uid_string(dir), scan,
+                                                  seen_dirs, user_wants_bases);
                 scan_systemd_timer_dir_unique("/root/.config/systemd/user", Scope::user,
                                               owner_uid_string("/root/.config/systemd/user"), scan,
-                                              seen_dirs);
+                                              seen_dirs, user_wants_bases);
                 // Global user-unit search paths, consulted for EVERY user's systemd --user
                 // instance regardless of home directory (standard entries in
                 // `systemd-analyze unit-paths --user` on every systemd distro) -- omitting
                 // these makes a `supported` status false-complete.
-                scan_systemd_timer_dir_unique("/etc/systemd/user", Scope::user, "-", scan, seen_dirs);
+                scan_systemd_timer_dir_unique("/etc/systemd/user", Scope::user, "-", scan, seen_dirs,
+                                              user_wants_bases);
                 scan_systemd_timer_dir_unique("/usr/lib/systemd/user", Scope::user, "-", scan,
-                                              seen_dirs);
+                                              seen_dirs, user_wants_bases);
                 for (const auto& row : scan.rows) ctx.write_output(format_row(row));
                 if (scan.any_dir_readable || home_listing.opened) {
-                    const auto [support, reason] = timer_scan_status(scan);
+                    auto [support, reason] = timer_scan_status(scan);
+                    // The scanned search-path set still omits several standard
+                    // systemd user-unit roots (~/.local/share/systemd/user,
+                    // /run/systemd/user, /usr/local/{lib,share}/systemd/user,
+                    // /usr/share/systemd/user) -- a known, permanent coverage
+                    // gap, not a transient failure, so this source stays
+                    // Constrained the same way lnx_init_d does for its own
+                    // documented gap rather than claiming full Supported
+                    // coverage.
+                    if (support == YUZU_SUPPORT_SUPPORTED) {
+                        support = YUZU_SUPPORT_CONSTRAINED;
+                        reason = "narrow_search_path_coverage";
+                    } else {
+                        reason += ",narrow_search_path_coverage";
+                    }
                     ctx.write_output(format_source_status(SourceId::lnx_systemd_timers_user, support,
                                                           scan.rows.size(), reason));
                 } else if (home_listing.permission_denied) {

@@ -419,6 +419,75 @@ TEST_CASE("autoruns Linux leg: timer_scan_status combines truncation and per-fil
         CHECK(support == YUZU_SUPPORT_CONSTRAINED);
         CHECK(reason == "permission_denied,row_cap");
     }
+
+    SECTION("permission-denied only -> constrained, partial_permission_denied "
+            "(round-3 should-fix: a per-home directory-open failure must not "
+            "be silently folded into Supported just because a global "
+            "directory succeeded)") {
+        TimerScan scan;
+        scan.any_permission_denied = true;
+        const auto [support, reason] = timer_scan_status(scan);
+        CHECK(support == YUZU_SUPPORT_CONSTRAINED);
+        CHECK(reason == "partial_permission_denied");
+    }
+
+    SECTION("permission-denied plus truncated -> both reasons, denial first") {
+        TimerScan scan;
+        scan.any_permission_denied = true;
+        scan.any_truncated = true;
+        const auto [support, reason] = timer_scan_status(scan);
+        CHECK(support == YUZU_SUPPORT_CONSTRAINED);
+        CHECK(reason == "partial_permission_denied,row_cap");
+    }
+}
+
+TEST_CASE("autoruns Linux leg: timer_enabled correlates a global-directory "
+          "unit against every enumerated user's own wants directory "
+          "(RECONSTRUCTION: pins round 3's blocker -- an ordinary "
+          "`systemctl --user enable` on a vendor-shipped unit writes its "
+          "enablement symlink into the enabling user's OWN "
+          "~/.config/systemd/user/timers.target.wants, which has no "
+          "relationship to where the unit file itself lives; the fix must "
+          "check that directory too, not just the unit's own dir and the "
+          "global /etc/systemd/user root)",
+          "[autoruns][actions][linux]") {
+    using yuzu::autoruns::Enabled;
+    using yuzu::autoruns::Scope;
+    using yuzu::autoruns::timer_enabled;
+
+    yuzu::test::TempDir vendor_dir("yuzu_test_autoruns_vendor_");
+    yuzu::test::TempDir user_dir("yuzu_test_autoruns_user_");
+    std::filesystem::create_directories(vendor_dir.path);
+    std::filesystem::create_directories(user_dir.path / "timers.target.wants");
+
+    // The unit file lives ONLY in the vendor (global) directory -- this
+    // mirrors /usr/lib/systemd/user on a real host.
+    const auto unit_file = vendor_dir.path / "backup.timer";
+    { std::ofstream f(unit_file); f << "[Timer]\nOnCalendar=daily\n"; }
+
+    // The enablement symlink lives ONLY in the user's own dir -- this
+    // mirrors ~/.config/systemd/user/timers.target.wants after `systemctl
+    // --user enable backup.timer`, and deliberately does NOT also appear
+    // under the global /etc/systemd/user root this fix already handled.
+    std::filesystem::create_symlink(unit_file, user_dir.path / "timers.target.wants" / "backup.timer");
+
+    SECTION("without the user's wants dir threaded through -> disabled "
+            "(reproduces the round-3 blocker)") {
+        CHECK(timer_enabled(vendor_dir.path.string(), "backup.timer", "", Scope::user, {}) ==
+             Enabled::disabled);
+    }
+
+    SECTION("with the user's wants dir threaded through -> enabled") {
+        CHECK(timer_enabled(vendor_dir.path.string(), "backup.timer", "", Scope::user,
+                            {user_dir.path.string()}) == Enabled::enabled);
+    }
+
+    SECTION("a different, unrelated user's wants dir does not falsely enable it") {
+        yuzu::test::TempDir other_user_dir("yuzu_test_autoruns_other_user_");
+        std::filesystem::create_directories(other_user_dir.path / "timers.target.wants");
+        CHECK(timer_enabled(vendor_dir.path.string(), "backup.timer", "", Scope::user,
+                            {other_user_dir.path.string()}) == Enabled::disabled);
+    }
 }
 
 TEST_CASE("autoruns Linux leg: note_file_constraint dedups a repeated token "
