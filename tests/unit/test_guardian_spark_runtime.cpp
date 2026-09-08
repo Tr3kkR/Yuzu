@@ -4830,3 +4830,156 @@ TEST_CASE("rung 9c R5.2: rapid attaches on distinct keys all commit (the callbac
     CHECK(b->disarms.load() == 200);
     CHECK(rt->armed_key_count() == 0);
 }
+
+// ---------------------------------------------------------------------------
+// rung 9c R5.2 - adversarial-review fix round (C1/K1'): the commit-to-publish gap.
+// Both tests install the drain's gap hook and park in it. With the fix an ADOPTED
+// commit publishes and pops inside its own critical section and never reaches the
+// gap (CHECK_FALSE(park->entered)); the RED mutation (skip the in-step-(1) publish,
+// i.e. comment out `if (!compensating) publish_locked(false);`) reopens the window,
+// the drain parks, and the racing attach / detach lands inside it.
+namespace {
+struct DrainPark {
+    std::mutex m;
+    std::condition_variable cv;
+    bool released{false};
+    std::atomic<bool> entered{false};
+    void wait() {
+        entered.store(true);
+        std::unique_lock<std::mutex> l{m};
+        cv.wait(l, [&] { return released; });
+    }
+    void release() {
+        {
+            std::lock_guard<std::mutex> l{m};
+            released = true;
+        }
+        cv.notify_all();
+    }
+};
+} // namespace
+
+TEST_CASE("rung 9c R5.2 (adversarial review C1/K1'): an adopted commit is published inside "
+          "its own critical section - a same-key attach arriving right after it JOINS the "
+          "watcher instead of queuing behind a committed head and re-arming",
+          "[spark][runtime][liveness]") {
+    // Mutation: skip the in-step-(1) publish -> the drain parks in the gap with keys_[K]
+    // written and the head still claimed; r2 queues, the refill re-arms: arm_entries == 2
+    // and a second subscription id that no detach can ever reach.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+    auto park = std::make_shared<DrainPark>();
+    struct Cleanup {
+        FakeBackend* backend;
+        DrainPark* park;
+        ~Cleanup() {
+            backend->release_hang();
+            park->release();
+        }
+    } cleanup{b.get(), park.get()};
+    rt->set_drain_gap_hook_for_test([park] { park->wait(); });
+    const auto key = spark_key(file_spec("/a"));
+
+    std::atomic<bool> a1_done{false}, a2_done{false};
+    std::exception_ptr a2_threw; // RED: r2's redundant re-arm hits the keys_.emplace hard error
+    QueuedAttach a1, a2;
+    a1.t = std::thread{[&] {
+        a1.gen = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+        a1_done.store(true);
+    }};
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    b->release_hang(); // the drain runs: fixed -> publishes in (1b) and a1 returns; RED -> parks
+    REQUIRE(yuzu::test::spin_until([&] { return park->entered.load() || a1_done.load(); },
+                                   std::chrono::seconds(10)));
+
+    a2.t = std::thread{[&] {
+        try {
+            a2.gen = rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true);
+        } catch (...) {
+            a2_threw = std::current_exception();
+        }
+        a2_done.store(true);
+    }};
+    // Fixed: r2 joins the committed watcher at once. RED: r2 queues behind the head.
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return a2_done.load() || rt->claim_queue_depth_for_test(key) >= 2; },
+        std::chrono::seconds(10)));
+    park->release();
+    a1.t.join();
+    a2.t.join();
+    rt->set_drain_gap_hook_for_test({});
+
+    CHECK_FALSE(park->entered.load()); // an adopted commit never reaches the gap
+    CHECK(b->arm_entries.load() == 1);  // RED: 2 - the refill re-armed the committed key
+    CHECK_FALSE(a2_threw);              // RED: keys_.emplace hard error surfaced on r2
+    REQUIRE(a1.gen.has_value());
+    REQUIRE(a2.gen.has_value());
+    REQUIRE(b->armed_ids().size() == 1);
+    CHECK(rt->rule_count() == 2);
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 0);
+    // Both rules share the ONE subscription: the ->0 edge disarms exactly that id, once.
+    rt->detach_rule("r1");
+    CHECK(b->disarm_entries.load() == 0);
+    rt->detach_rule("r2");
+    CHECK(b->disarm_entries.load() == 1);
+    REQUIRE(b->disarmed_ids().size() == 1);
+    CHECK(b->disarmed_ids()[0] == b->armed_ids()[0]);
+    CHECK(rt->armed_key_count() == 0);
+}
+
+TEST_CASE("rung 9c R5.2 (adversarial review C1/K1'): a detach arriving right after the commit "
+          "disarms the LIVE rule - a committed claim can never be matched as a pending arm",
+          "[spark][runtime][liveness]") {
+    // Mutation: skip the in-step-(1) publish -> detach_rule_locked's Case-0 matches the
+    // still-present committed head, publishes "withdrawn" for a rule that is live in
+    // rules_/keys_, and disarms nothing: a1 returns "withdrawn" and disarm_entries == 0.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+    auto park = std::make_shared<DrainPark>();
+    struct Cleanup {
+        FakeBackend* backend;
+        DrainPark* park;
+        ~Cleanup() {
+            backend->release_hang();
+            park->release();
+        }
+    } cleanup{b.get(), park.get()};
+    rt->set_drain_gap_hook_for_test([park] { park->wait(); });
+    const auto key = spark_key(file_spec("/a"));
+
+    std::atomic<bool> a1_done{false}, d_done{false};
+    QueuedAttach a1;
+    a1.t = std::thread{[&] {
+        a1.gen = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+        a1_done.store(true);
+    }};
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    b->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return park->entered.load() || a1_done.load(); },
+                                   std::chrono::seconds(10)));
+
+    std::thread dt{[&] {
+        rt->detach_rule("r1");
+        d_done.store(true);
+    }};
+    REQUIRE(yuzu::test::spin_until([&] { return d_done.load(); }, std::chrono::seconds(10)));
+    park->release();
+    a1.t.join();
+    dt.join();
+    rt->set_drain_gap_hook_for_test({});
+
+    CHECK_FALSE(park->entered.load());
+    REQUIRE(a1.gen.has_value()); // RED: "withdrawn" for a rule that was actually armed
+    REQUIRE(b->armed_ids().size() == 1);
+    CHECK(b->disarm_entries.load() == 1);
+    REQUIRE(b->disarmed_ids().size() == 1);
+    CHECK(b->disarmed_ids()[0] == b->armed_ids()[0]);
+    CHECK(rt->rule_count() == 0);
+    CHECK(rt->armed_key_count() == 0);
+    CHECK(rt->claim_queue_depth_for_test(key) == 0);
+}

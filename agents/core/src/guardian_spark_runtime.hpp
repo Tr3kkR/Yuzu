@@ -588,6 +588,14 @@ public:
     /// exercised deterministically (the runtime's own executor is not injectable).
     /// Sticky until reset, like GuardianIoExecutor::set_fail_launch_for_test.
     void set_io_executor_fail_launch_for_test(bool v) { io_executor_.set_fail_launch_for_test(v); }
+    /// R5.2 drain seam (adversarial-review fix round, C1/K1'): invoked on the
+    /// on_arm_complete worker in the ONE gap where a key's outcome is decided but its
+    /// claims are still unpublished - between step (1)'s unlock and the compensating
+    /// disarm - which exists ONLY when a compensating disarm is owed. An ADOPTED commit
+    /// publishes and pops inside step (1) itself and never reaches the hook; a test
+    /// asserting "the hook did not fire" on a plain successful attach pins that. Set
+    /// before triggering the drain; copied under registry_mu_ at the drain's start.
+    void set_drain_gap_hook_for_test(std::function<void()> hook);
 
     /// Phase 1 of shutdown: set the stopping flag and mark every generation
     /// inactive under the registry lock, so no in-flight or late eval commits.
@@ -1013,6 +1021,7 @@ private:
     std::atomic<std::uint64_t> disarm_retained_{0};       ///< R5.2: disarm claims retained after an admission refusal
     std::atomic<std::uint64_t> claims_dropped_at_stop_{0}; ///< R5.2: queued claims dropped by begin_stop / Stopped
     std::atomic<std::uint64_t> claim_drain_failures_{0};  ///< R5.2: on_arm_complete firewall fired
+    std::function<void()> drain_gap_hook_for_test_; ///< registry_mu_-guarded; see the setter
 
     mutable std::mutex outbox_mu_;
     GuardianOutbox outbox_;
