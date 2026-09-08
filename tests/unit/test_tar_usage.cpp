@@ -386,9 +386,17 @@ TEST_CASE("tar_usage: a forced failure rolls back -- hwm and usage_daily are unt
     // contract: hwm's own statement would still commit. The class that DOES
     // abort the whole pass unconditionally is a failed BEGIN IMMEDIATE
     // itself (out.began stays false) -- forced here by a second connection
-    // holding the write lock (BEGIN EXCLUSIVE) for TarDatabase's whole
-    // busy_timeout window (5s, TarDatabase::open()), so this test costs
-    // ~5s wall-clock by construction.
+    // holding the write lock (BEGIN EXCLUSIVE).
+    //
+    // TarDatabase::open() sets a 5s busy_timeout on its own connection, so
+    // without intervention run_usage_fold's BEGIN IMMEDIATE would retry via
+    // SQLite's busy handler for the full 5s before failing -- a real sleep,
+    // not a CV/future wait, and exactly the "no timing assumptions" pattern
+    // the unit-test conventions forbid. Drive t.db's OWN busy_timeout to 0
+    // first so its busy handler fires immediately (SQLITE_BUSY on the very
+    // first BEGIN IMMEDIATE attempt) instead of actually sleeping out the
+    // window -- this observes the identical rollback/early-return behavior
+    // without waiting on a real timeout.
     //
     // MUTATION-VERIFY: this test's value is that run_usage_fold's
     // `if (!batch.committed) return result;` early-return, not just SQLite's
@@ -399,6 +407,7 @@ TEST_CASE("tar_usage: a forced failure rolls back -- hwm and usage_daily are unt
     // exercise the guard. Reverted before writing the patch.
     auto t = make_test_db();
     REQUIRE(t.db.insert_process_events({mk(1000, "started", 1, "app", "alice")}));
+    REQUIRE(t.db.execute_sql("PRAGMA busy_timeout = 0"));
 
     sqlite3* raw = nullptr;
     REQUIRE(sqlite3_open(t.path.string().c_str(), &raw) == SQLITE_OK);
