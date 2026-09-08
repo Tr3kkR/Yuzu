@@ -82,9 +82,12 @@ group, DNS); credential rotation that did not reach Yuzu; connection limit
 exhausted (`FATAL: sorry, too many clients already`).
 
 Yuzu restarts cleanly once Postgres is reachable — no Yuzu-side repair is
-needed, and **no auth data is lost by the outage itself**. Sessions are
-in-memory (see [Sessions](#sessions-are-in-memory-only)), so every operator
-must sign in again after the restart; that is expected, not damage.
+needed, and **no auth data is lost by the outage itself**. **Correction
+(2026-09-08):** sessions are PostgreSQL-backed since HA WS-1/1a and survive
+this kind of restart (see the corrected section below) — an operator whose
+session was already established does **not** need to sign in again purely
+because the server restarted; a login is only required if the outage
+itself prevented a session validation from completing while it was down.
 
 ### `auth` schema migration failure
 
@@ -221,20 +224,26 @@ Step 3 is the one people skip. It is the only cheap check that distinguishes
 "restored correctly" from "restored, and every MFA user will be locked out the
 moment they try to log in".
 
-## Sessions are in-memory only
+## ⚠️ CORRECTION (2026-09-08) — sessions are PostgreSQL-backed; a restart does NOT revoke them
 
-There is no sessions table. `AuthManager` holds sessions in memory
-(`sessions_`), so:
+> **This section previously said the opposite and was WRONG — read this
+> before acting on an emergency revocation.** It claimed sessions were
+> in-memory only and that a server restart revoked every session
+> fleet-wide. That has been false since **HA WS-1/1a (ADR-2002 §4)**:
+> `SessionStore` is a born-on-PG durable store, wired into `AuthManager` so
+> sessions write-through to PostgreSQL and **survive a restart, a crash, or
+> a replica failover** (`server/core/src/server.cpp:4216-4225`;
+> `tests/unit/server/test_auth_session_store.cpp`'s "a session survives on
+> a fresh replica" case, `[auth][session_store][pg]`, pins exactly this
+> behaviour). **If you restart the server expecting to kill a compromised
+> session, it will still be live when the server comes back up.** Use the
+> REST revocation surface below instead — it is the only thing that
+> actually revokes a session.
 
-- **A server restart revokes every session, fleet-wide.** That is the fastest
-  emergency revocation there is, and it needs no database access.
-- Nothing about a session survives a crash, a restart, or a failover.
-- The old "verify persistence after Revoke sessions" procedure no longer
-  applies — there is nothing to verify and nothing that can resurrect a
-  revoked session.
-
-For targeted revocation while the server is running, use the REST surface
-rather than a restart:
+There **is** a sessions table (`session_store` schema, PostgreSQL). Do not
+restart the server as an emergency-revocation step — it accomplishes
+nothing against sessions and only adds downtime. For targeted revocation
+while the server is running, use the REST surface:
 
 ```bash
 # Revoke every session for one operator (admin).

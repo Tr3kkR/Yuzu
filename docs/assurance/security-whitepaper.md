@@ -23,6 +23,13 @@ that build rather than assume dev-HEAD posture. ADR-1005 (§9) is accepted
 as of 2026-09-07 (#4099) but is itself a `dev`-only fact at this writing —
 it has not yet reached a tagged release either.
 
+**Threat model status.** No platform-level threat model exists in the
+repository; domain threat models exist for authentication/MFA
+(`docs/auth-mfa-design.md` §Threat model), secrets-at-rest (ADR-0010
+§Threat model) and PKI (`docs/pki-architecture.md`). Read this document's
+security claims against those domain models, not against a single unified
+threat model this repository does not yet have.
+
 ---
 
 ## 1. Architecture and trust boundaries

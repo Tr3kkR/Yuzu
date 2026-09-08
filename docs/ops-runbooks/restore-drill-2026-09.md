@@ -398,6 +398,23 @@ immediately after cleanup.
    failover (not restore-from-backup) on that profile; this drill is the
    single-replica, non-HA case those figures explicitly say to read
    alongside, not instead of.
+8. **Not exercised: `scripts/yuzu-backup.sh` / `scripts/yuzu-restore.sh`
+   (the native/systemd install path).** This entire drill ran against the
+   containerized `docker-compose.reference.yml` rig and its own `pg_dump`/
+   `pg_restore`/`tar` procedure — it says nothing about whether
+   `yuzu-backup.sh`'s output actually restores cleanly via
+   `yuzu-restore.sh`. Separately, and more importantly for a real
+   deployment: `docs/operations/disaster-recovery.md` previously showed
+   `yuzu-backup.sh` as the **sole** nightly cron job — that script covers
+   SQLite/config files only and explicitly warns it excludes PostgreSQL and
+   the CA/keys directory (`scripts/yuzu-backup.sh:123-133`); a cron running
+   it alone **cannot restore the server**, since the server's authoritative
+   state (ADR-0006) lives in PostgreSQL. Fixed in that doc (external review,
+   2026-09-08) to add the missing `pg_dump` + keys-directory steps; not
+   fixed by re-running this drill, since this drill never touched
+   `yuzu-backup.sh`/`yuzu-restore.sh` at all. A future drill iteration
+   should exercise the native path specifically, not just the containerized
+   one.
 
 ## Appendix — attempt 1 (2026-09-07, deviated from the header)
 
