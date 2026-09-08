@@ -462,6 +462,17 @@ public:
     /// `auth_source="local"`. If `mfa_verified` is true, stamps
     /// `mfa_verified_at = system_clock::now()` so the step-up window
     /// covers immediate high-risk actions taken right after login.
+    ///
+    /// Requires the account to already have an AuthDB `users` row when
+    /// `auth_db_` is configured: post_mint_role_recheck (see its own doc)
+    /// re-reads AuthDB immediately after minting and fails closed - empty
+    /// string returned, no session - on ANY read failure, including a
+    /// plain UserNotFound (never provisioned, or removed). Every real
+    /// production caller (auth_routes.cpp's 3 call sites) is only reached
+    /// after a local-auth verify_password() call that already guarantees
+    /// the row exists; calling this directly for an account with no row
+    /// (e.g. a test synthesizing a session for an OIDC/SCIM-only
+    /// principal) will always be denied (#4107 CI finding, 38cc33b88).
     std::string create_local_session(const std::string& username, Role role, bool mfa_verified);
 
     /// Stamp `mfa_verified_at = system_clock::now()` on the named session.

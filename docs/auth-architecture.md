@@ -3695,8 +3695,10 @@ on that row while some other path holds the gen row and needs this row
 lock). Closed instead via the SAME pattern already used for OIDC/SAML: mint
 normally, then a **post-mint re-check** (`AuthManager::post_mint_role_recheck`)
 immediately re-verifies the just-minted role against a fresh AuthDB read and,
-on divergence or a store error, revokes the session (`invalidate_user_sessions`)
-and denies. Wired into both `authenticate()` and `create_local_session()` —
+on divergence, a store error, or the account having no active AuthDB row at
+all (never provisioned, or removed - the same `UserNotFound` branch
+`recheck_role_after_credential_check` uses), revokes the session
+(`invalidate_user_sessions`) and denies. Wired into both `authenticate()` and `create_local_session()` —
 the latter also closes the same gap for the MFA login-challenge (TOTP/
 recovery verify at `/login/mfa`) and enrollment-confirm routes, whose
 caller-supplied role can be stale across an entire TOTP round trip, a
