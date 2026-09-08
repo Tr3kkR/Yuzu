@@ -2318,6 +2318,24 @@ test('issue lifecycle docs',
   timeout: 10,
 )
 
+# ADR-0032 split interlock merge-gate: the tripwire (no engine-path symbol may
+# merge while the gate is red) and its self-test (the ledger's load-bearing
+# constants are pinned so the gate cannot be silently neutered). Both also run in
+# .github/workflows/docs-lint.yml on every PR; registered here for local `meson
+# test --suite docs` parity with the sibling python doc-tests.
+test('split interlock tripwire',
+  _python3_test,
+  args: [files('test_split_interlock_tripwire.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+test('split interlock tripwire selftest',
+  _python3_test,
+  args: [files('test_split_interlock_tripwire_selftest.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Runner-local CI telemetry contract: v2->v3 migration preserves history,
 # GitHub reruns remain distinct, and Meson suite durations/timeouts plus known
 # flake recoveries land in the persistent per-runner test-runs.db.
