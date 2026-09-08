@@ -26,6 +26,7 @@
 #include <yuzu/plugin.hpp>
 
 #include "local_dispatcher.hpp"
+#include "test_helpers.hpp"
 
 #include "autoruns_catalog.hpp"
 
@@ -308,18 +309,10 @@ TEST_CASE("autoruns Linux leg: read_file_bounded/classify_read_error distinguish
           "symlink_refused and oversized from a constructed fixture",
           "[autoruns][actions][linux]") {
     namespace fsx = std::filesystem;
+    yuzu::test::TempDir tmp("yuzu_test_autoruns_linux_");
+    fsx::create_directories(tmp.path);
+    const fsx::path& dir = tmp.path;
     std::error_code ec;
-    fsx::path dir = fsx::temp_directory_path(ec) /
-                    ("autoruns_linux_test_" + std::to_string(static_cast<long>(::getpid())));
-    fsx::create_directories(dir, ec);
-    REQUIRE_FALSE(ec);
-    struct Cleanup {
-        fsx::path p;
-        ~Cleanup() {
-            std::error_code ec2;
-            fsx::remove_all(p, ec2);
-        }
-    } cleanup{dir};
 
     SECTION("a symlinked leaf is refused with symlink_refused, never resolved") {
         fsx::path target = dir / "target.txt";
@@ -335,13 +328,16 @@ TEST_CASE("autoruns Linux leg: read_file_bounded/classify_read_error distinguish
     }
 
     SECTION("a file over the byte cap is refused with oversized") {
+        // The cap itself is injected (max_bytes), so the fixture only needs
+        // to exceed a small, test-chosen cap -- not the real 1 MiB default --
+        // keeping this unit test's I/O a few bytes rather than a megabyte-plus
+        // write (test-efficiency discipline: no unjustified disk cost).
         fsx::path big = dir / "big.txt";
         {
             std::ofstream out(big, std::ios::binary);
-            const std::string chunk(1024, 'x');
-            for (int i = 0; i < 1025; ++i) out << chunk; // 1025 KiB > 1 MiB cap
+            out << "0123456789"; // 10 bytes > the 4-byte cap below
         }
-        auto result = yuzu::autoruns::read_file_bounded(big.string(), /*max_bytes=*/1'048'576);
+        auto result = yuzu::autoruns::read_file_bounded(big.string(), /*max_bytes=*/4);
         REQUIRE_FALSE(result.has_value());
         auto cls = yuzu::autoruns::classify_read_error(result.error(), /*required_by_catalog=*/false);
         CHECK(cls.reason == "oversized");
