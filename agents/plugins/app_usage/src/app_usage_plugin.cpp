@@ -65,12 +65,44 @@ std::string platform_default_data_dir() {
 #endif
 }
 
+// Non-copyable RAII owner for the connection handle, mirroring
+// app_usage_parsers.hpp's detail::Stmt — guarantees sqlite3_close() runs on
+// every path out of a do_summary_on()/do_last_used_on() call, including
+// exception unwinding between open and the (formerly bare) close two
+// statements later.
+class DbHandle {
+public:
+    DbHandle() noexcept = default;
+    explicit DbHandle(sqlite3* db) noexcept : db_(db) {}
+    ~DbHandle() {
+        if (db_)
+            sqlite3_close(db_);
+    }
+    DbHandle(const DbHandle&) = delete;
+    DbHandle& operator=(const DbHandle&) = delete;
+    DbHandle(DbHandle&& other) noexcept : db_(other.db_) { other.db_ = nullptr; }
+    DbHandle& operator=(DbHandle&& other) noexcept {
+        if (this != &other) {
+            if (db_)
+                sqlite3_close(db_);
+            db_ = other.db_;
+            other.db_ = nullptr;
+        }
+        return *this;
+    }
+    [[nodiscard]] sqlite3* get() const noexcept { return db_; }
+    [[nodiscard]] explicit operator bool() const noexcept { return db_ != nullptr; }
+
+private:
+    sqlite3* db_{nullptr};
+};
+
 // Opens tar.db read-only (SQLITE_OPEN_READONLY|SQLITE_OPEN_NOMUTEX per this
 // package's spec), sets a 2s busy timeout, and forces query_only — tar.db
 // is always WAL (tar_db.cpp:430); same process/user, so the -shm sidecar is
-// usable read-only. Returns nullptr and fills `out_err` on failure; the
-// caller owns the returned handle (sqlite3_close()) on success.
-sqlite3* open_readonly(const fs::path& path, std::string& out_err) {
+// usable read-only. Returns an empty DbHandle and fills `out_err` on
+// failure; the returned handle owns the connection on success.
+DbHandle open_readonly(const fs::path& path, std::string& out_err) {
     sqlite3* db = nullptr;
     const int rc = sqlite3_open_v2(path.string().c_str(), &db,
                                    SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nullptr);
@@ -78,11 +110,11 @@ sqlite3* open_readonly(const fs::path& path, std::string& out_err) {
         out_err = db ? sqlite3_errmsg(db) : "sqlite3_open_v2 failed";
         if (db)
             sqlite3_close(db);
-        return nullptr;
+        return DbHandle{};
     }
     sqlite3_busy_timeout(db, 2000);
     sqlite3_exec(db, "PRAGMA query_only=1", nullptr, nullptr, nullptr);
-    return db;
+    return DbHandle{db};
 }
 
 // Aligns a unix timestamp down to the start of its UTC day — usage_daily's
@@ -210,7 +242,7 @@ private:
     int do_summary(yuzu::CommandContext& ctx, yuzu::Params& params) {
         const auto path = resolve_db_path();
         std::string err;
-        sqlite3* db = open_readonly(path, err);
+        DbHandle db = open_readonly(path, err);
         if (!db) {
             ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE,
                                   YUZU_RESULT_COMPLETENESS_PARTIAL, err);
@@ -218,9 +250,7 @@ private:
             return 1;
         }
 
-        const int result = do_summary_on(ctx, params, db);
-        sqlite3_close(db);
-        return result;
+        return do_summary_on(ctx, params, db.get());
     }
 
     int do_summary_on(yuzu::CommandContext& ctx, yuzu::Params& params, sqlite3* db) {
@@ -277,7 +307,7 @@ private:
     int do_last_used(yuzu::CommandContext& ctx, yuzu::Params& params) {
         const auto path = resolve_db_path();
         std::string err;
-        sqlite3* db = open_readonly(path, err);
+        DbHandle db = open_readonly(path, err);
         if (!db) {
             ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE,
                                   YUZU_RESULT_COMPLETENESS_PARTIAL, err);
@@ -285,9 +315,7 @@ private:
             return 1;
         }
 
-        const int result = do_last_used_on(ctx, params, db);
-        sqlite3_close(db);
-        return result;
+        return do_last_used_on(ctx, params, db.get());
     }
 
     int do_last_used_on(yuzu::CommandContext& ctx, yuzu::Params& params, sqlite3* db) {
