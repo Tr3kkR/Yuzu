@@ -3137,6 +3137,38 @@ If a migration fails:
 
 ## Upgrade notes by release
 
+### vNEXT — Decommission securable replaces the SLE/Inventory/GuaranteedState conjunction (breaking for custom roles)
+
+`DELETE /api/v1/sle/agents/{id}` (the whole-device erasure cascade — see
+[REST API § Software Licensing (SLE)](rest-api.md#software-licensing-sle)) used to gate on a
+**three-securable conjunction**: `SoftwareLicensing:Delete` **and** `Inventory:Delete` **and**
+`GuaranteedState:Delete`, all required together. Wave 7 PR7.2 added a sixth per-agent store
+(`app_usage`) to the cascade, and rather than grow the conjunction to a fourth securable, ADR-0024
+Decision 9 was amended to promote a single dedicated **`Decommission`** securable — the route now
+gates on **`Decommission:Delete` alone**, replacing the old conjunction outright (not adding to it).
+
+**Seeded roles are auto-preserved** — the same `INSERT OR IGNORE` role-default seeding as the SLE
+securable above runs on every boot, so `Administrator` (full CRUD via the generic per-securable
+loop) and `ITServiceOwner` (a targeted `Decommission:Delete` grant) pick up the new securable
+automatically on upgrade, with no operator action required.
+
+**This is breaking only for a custom role.** Any custom role an operator built by hand-assembling
+the old three-securable conjunction (`SoftwareLicensing:Delete` + `Inventory:Delete` +
+`GuaranteedState:Delete`) specifically to reach this endpoint will start getting `403 Decommission:Delete`
+on its next call — **the three old grants no longer suffice**, because the route no longer checks
+them at all. Audit your custom roles before upgrading:
+
+```sql
+SELECT DISTINCT principal_id FROM role_permissions
+  WHERE securable_type IN ('SoftwareLicensing', 'Inventory', 'GuaranteedState')
+    AND operation = 'Delete';
+```
+
+Grant `Decommission:Delete` to any custom role in that list that must retain the ability to erase a
+decommissioned device's data. `SoftwareLicensing:Delete`, `Inventory:Delete`, and
+`GuaranteedState:Delete` continue to gate their own unrelated surfaces exactly as before — only the
+erasure cascade's gate moved.
+
 ### Retention clock guards (#2360 server audit store, #2361 TAR agent warehouse, #2964 rotation sweep)
 
 Both retention paths used to issue an unbounded `DELETE` driven by the local wall
