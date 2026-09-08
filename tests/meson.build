@@ -678,18 +678,26 @@ test(
 if get_option('b_sanitize') != 'none'
   # #2373's split (below) still applies to the ONE remaining [tsan-heavy] case (#3848, a
   # BLOCKING-backend soak, SQLite-free but genuinely contention-dominated: a real 60ms backend
-  # deadline, 30s watchdogs, a releaser pulsing sleep_for(1ms), #2345 measured one stalling ~8
-  # minutes on Big Tam under shared-filesystem contention, and #4018 saw the same mechanism
-  # recur on Wee Tam/Windows ASan). Its own entry means a stall here times out AT ITS OWN
-  # BUDGET, classifiably, instead of either being absorbed into the fast suite's tight 240s
+  # deadline, 30s watchdogs, a releaser pulsing sleep_for(1ms), ~4-15s under TSan uncontended).
+  # CORRECTION (#4153 round 3, governance-caught): #2345's ~8-minute Big Tam stall and #4018's
+  # Wee Tam/Windows ASan recurrence were NEVER #3848 - #3848 wasn't added until 2026-09-04, six
+  # weeks after #2345 merged, so it cannot have caused an incident that predates it. Both
+  # incidents belonged to the two SQLite-bound [tsan-heavy] cases this entry ALSO held before
+  # #4153 (below). This entry's own budget means a stall here times out AT ITS OWN BUDGET,
+  # classifiably, instead of either being absorbed into the fast suite's tight 240s
   # ceiling (windows-asan's prior state, #4018) or dragging the whole fast suite down with it.
   # #4153 redesigned the OTHER two former [tsan-heavy] cases off real on-disk SQLite entirely
   # (an in-memory FakeJournalStore) and off the unbounded stop-flag race that caused #2345/
   # #4018's stalls - they moved to [tsan] and now run in the fast entry above, in every build.
-  # 600s here is sized off the measured ~480s (8-minute) stall with headroom, not the plain
-  # suite's ~28-60s baseline; nightly's own --timeout-multiplier 2 (Linux legs) / the
-  # windows-asan job's now-added multiplier scale this to 1200s under sanitizer instrumentation
-  # plus contention. Do NOT replace this with a wall-clock cap inside the tests themselves -
+  # 600s here was ORIGINALLY sized off the measured ~480s (8-minute) stall when this entry held
+  # all three cases; #4153 removed the two tests that stall belonged to, so #3848 alone now
+  # runs against this budget with generous headroom (measured ~3s uncontended, well under 600s) -
+  # left unchanged rather than tightened, since a single-test entry has no other case to protect
+  # from a stall's blast radius, and #3848's own 30s watchdogs already bound its own worst case.
+  # Not the plain suite's ~28-60s fast-entry baseline above; nightly's own --timeout-multiplier 2
+  # (Linux legs) / the windows-asan job's now-added multiplier scale 600s to 1200s under
+  # sanitizer instrumentation plus contention. Do NOT replace this with a wall-clock cap inside
+  # the tests themselves -
   # that was tried and backed out (comment above): a busy main thread starves the worker
   # threads whose progress it is waiting on. #4153's fixed-iteration-count redesign of the two
   # moved-out tests is a DIFFERENT shape, not a revival of that approach - see their own

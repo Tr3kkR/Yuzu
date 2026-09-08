@@ -3855,7 +3855,14 @@ TEST_CASE("concurrent pagers + a drainer do not race (TSan checkpoint)",
     // batches out at once: that pass is declined once (the guard's own
     // would-wipe-everything protection - #2360/#2361's "clock-guarded retention"
     // family), and the very next call, seeing the identical fact set, proceeds and
-    // evicts. Waits on `first_pass` FIRST - the same gate main waits on - so the pagers
+    // evicts. TRIPWIRE (governance Gate 4 finding, #4153 round 3): this decline-then-
+    // proceed sequence depends on `already_reported`'s dedup key NOT including now_ms
+    // (guardian_lifecycle_journal.cpp's Facts comparison) - if a future change adds a
+    // clock reading to that key, every pass here reads as a NEW anomaly, eviction never
+    // proceeds, and `prune_evicted` never fires; the `bounded_wait` below will FAIL this
+    // test with an attributed message rather than hang, but a red run on exactly this
+    // assertion after such a change should look here first, not assume a fresh
+    // concurrency regression. Waits on `first_pass` FIRST - the same gate main waits on - so the pagers
     // get at least one crack at the seeded batches (the paging bucket starts pre-filled
     // to its burst size, so even an unadvanced first pass can place several) before
     // ageing can start; without that gate, a pruner that happened to run ahead of every
@@ -3894,16 +3901,32 @@ TEST_CASE("concurrent pagers + a drainer do not race (TSan checkpoint)",
     // exercising the stop-race gate) while the fixed-iteration workers above may still
     // be mid-loop - exactly the shape of the production drain-worker/reconnect race
     // this checkpoint exists to prove race-free.
-    first_pass.wait();
+    //
+    // Both waits below are bounded (governance Gate 4/5/6 finding, folded #4153 round
+    // 3): every worker's own loop is fixed-iteration, so under normal operation these
+    // release in well under a second - the 30s ceiling only ever fires on a genuine
+    // stuck-thread regression, converting what would otherwise be a silent, unattributed
+    // ride to Meson's external 240s entry timeout into a named FAIL() pointing at which
+    // rendezvous never happened. latch/atomic have no timed wait, so this polls
+    // try_wait()/load() against a steady_clock deadline rather than blocking outright -
+    // deliberately NOT a wall-clock cap on the test's PASS/FAIL logic itself (that
+    // failure mode is what tests/meson.build's own history warns against): a fast run
+    // and a run that takes 29s both still pass identically, only a run stuck past 30s
+    // fails, and only with an explicit reason.
+    const auto bounded_wait = [](auto&& ready, const char* what) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
+        while (!ready()) {
+            if (std::chrono::steady_clock::now() >= deadline)
+                FAIL("timed out after 30s waiting for " << what);
+            std::this_thread::sleep_for(std::chrono::milliseconds{5});
+        }
+    };
+    bounded_wait([&] { return first_pass.try_wait(); },
+                 "first_pass (no pager completed its first page_into_window call)");
     for (int i = 0; i < kMain; ++i)
         rig.journal->page_into_window(*rig.rt, kBaseTs + 500'000 + i * 1000);
-    {
-        bool evicted = prune_evicted.load(std::memory_order_acquire);
-        while (!evicted) {
-            prune_evicted.wait(false, std::memory_order_acquire);
-            evicted = prune_evicted.load(std::memory_order_acquire);
-        }
-    }
+    bounded_wait([&] { return prune_evicted.load(std::memory_order_acquire); },
+                 "prune_evicted (the pruner never evicted a batch for age)");
 
     rig.journal->request_stop();
     for (auto& w : workers)
