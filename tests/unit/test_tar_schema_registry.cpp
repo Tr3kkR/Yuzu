@@ -253,11 +253,23 @@ TEST_CASE("TAR schema: opt-in sources declare default_enabled=false",
         INFO("always-on source=" << name);
         CHECK(source_default_enabled(name));
     }
-    // An unknown source falls back to the always-on default.
+    // An unknown source falls back to the always-on default. On its own this is
+    // indistinguishable from a genuinely-registered always-on source (both
+    // return true), so also assert against the registry's actual source list:
+    // "usage" must be a real, registered entry, and "does_not_exist" must not
+    // be one — otherwise this fallback assertion can't tell an absent source
+    // from a real one and a typo'd/never-registered name would pass silently.
+    const auto& sources = capture_sources();
+    auto has_source = [&sources](const char* name) {
+        return std::any_of(sources.begin(), sources.end(),
+                           [name](const CaptureSourceDef& s) { return s.name == name; });
+    };
+    CHECK(has_source("usage"));
+    CHECK_FALSE(has_source("does_not_exist"));
     CHECK(source_default_enabled("does_not_exist"));
 
     // The field and the lookup must agree for every registered source.
-    for (const auto& src : capture_sources()) {
+    for (const auto& src : sources) {
         INFO("source=" << src.name);
         CHECK(source_default_enabled(src.name) == src.default_enabled);
     }
