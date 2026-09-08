@@ -556,7 +556,7 @@ void RbacStore::seed_defaults() {
          "ON CONFLICT (key) DO NOTHING");
 
     // Securable types.
-    const std::array<std::string_view, 32> types = {
+    const std::array<std::string_view, 33> types = {
         "Infrastructure",  "UserManagement",  "InstructionDefinition",
         "InstructionSet",  "Execution",       "Schedule",
         "Approval",        "Tag",             "AuditLog",
@@ -584,6 +584,20 @@ void RbacStore::seed_defaults() {
         // same PluginConfig/UploadGrant precedent, deliberately absent from
         // the explicit Viewer read-list further down this function.
         "PowerManagement",
+        // #4030/#4032: WorkflowEngine's multi-step-orchestration securable.
+        // `workflow_routes.cpp` has gated `GET/POST/DELETE /api/workflows*`
+        // + `POST .../execute` on `perm_fn(req, res, "Workflow", <op>)`
+        // since WorkflowEngine's introduction, but "Workflow" was never
+        // added here (or mirrored into mcp_server.cpp's `kRbacSecurables[]`)
+        // — `securable_types` carries no FK from `role_permissions`, so a
+        // `grant(role, "Workflow", op)` call silently inserted a row naming
+        // a type RBAC's own catalogue didn't recognise: no role, including
+        // Administrator, could ever be granted Workflow:* while RBAC was
+        // enabled. Scoped to Workflow ONLY — the identical bug also exists
+        // on ProductPack/Directory (tracked generally by #4032), fixed
+        // independently by #4029/#4031 in their own worktrees to avoid a
+        // cross-worktree merge conflict on this shared array.
+        "Workflow",
         // #4029 prerequisite fix: `ProductPack` is used as an RBAC securable
         // string by the already-shipped `/api/product-packs*` routes
         // (workflow_routes.cpp, `perm_fn(req, res, "ProductPack", "Read"/
@@ -720,6 +734,10 @@ void RbacStore::seed_defaults() {
             grant("PlatformEngineer", t, o);
     for (std::string_view t : {"Execution", "Schedule", "Approval", "Tag", "AuditLog", "Response",
                                "SoftwareLicensing", "Inventory",
+                               // #4030: Workflow — read-only, matching Schedule's footprint. Not
+                               // added to the InstructionDefinition/InstructionSet CRUD loop above:
+                               // the issue scopes this prerequisite to granting Read only.
+                               "Workflow",
                                // #4029: read visibility on installed product packs, matching the
                                // existing InstructionDefinition:Read population's consistency.
                                "ProductPack"})
@@ -764,6 +782,9 @@ void RbacStore::seed_defaults() {
     // (secret material is never Operator-readable).
     grant("Operator", "PluginConfig", "Read");
     grant("Operator", "UploadGrant", "Read");
+    // #4030: Workflow — read-only (the issue's prerequisite scopes this fix to
+    // granting Read; not added to the CRUD loop above, unlike Schedule/Execution).
+    grant("Operator", "Workflow", "Read");
 
     // ApiTokenManager. "Rotate" merged from origin/dev (P2 #11, SOC 2 CC6.3
     // — self-service human token rotation; same population that already
@@ -781,6 +802,9 @@ void RbacStore::seed_defaults() {
             grant("ITServiceOwner", t, o);
     }
     grant("ITServiceOwner", "GuaranteedState", "Push");
+    // #4030: Workflow — read-only (issue's prerequisite scope is Read only; not
+    // added to the CRUD loop above, unlike Schedule/Execution).
+    grant("ITServiceOwner", "Workflow", "Read");
 
     // Viewer: read on all except Infrastructure.
     // #2376 (task A) — Viewer held Security:Read (the only non-Administrator
@@ -791,6 +815,7 @@ void RbacStore::seed_defaults() {
                                "ManagementGroup", "ApiToken", "Security", "Policy", "DeviceToken",
                                "SoftwareDeployment", "License", "FileRetrieval", "GuaranteedState",
                                "Inventory", "SoftwareLicensing", "EnginePrincipal",
+                               "Workflow", // #4030: read-only, matching Schedule's footprint.
                                // #4029: read visibility on installed product packs.
                                "ProductPack"})
         grant("Viewer", t, "Read");

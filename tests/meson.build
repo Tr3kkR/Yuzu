@@ -1148,6 +1148,7 @@ if build_server
       'unit/server/test_result_parsing.cpp',
       'unit/server/test_visualization_engine.cpp',
       'unit/server/test_rest_visualization.cpp',
+      'unit/server/test_rest_executions_v1_twins.cpp',
       'unit/server/test_response_templates_engine.cpp',
       'unit/server/test_rest_response_templates.cpp',
       'unit/server/test_rest_instructions_productpacks.cpp', # #4029: GET /api/v1/instructions*, /api/v1/product-packs*

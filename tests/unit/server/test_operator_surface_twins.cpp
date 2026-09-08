@@ -426,6 +426,10 @@ constexpr TwinRow kExpectedTwins[] = {
     {"mint_upload_grant", "UploadGrant", "Write", false},
     {"list_upload_grants", "UploadGrant", "Read", true},
     {"revoke_upload_grant", "UploadGrant", "Delete", false},
+    // #4030: executions/workflows/schedules read-twin programme.
+    {"list_workflows", "Workflow", "Read", true},
+    {"get_workflow", "Workflow", "Read", true},
+    {"get_workflow_execution", "Workflow", "Read", true},
     // #4029 (api-parity Batch A content/catalog half): instruction-definition
     // read twins, pinned against instruction_definition_model.hpp / the new
     // GET /api/v1/instructions* routes (rest_api_v1.cpp).

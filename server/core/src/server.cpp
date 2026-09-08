@@ -18033,7 +18033,9 @@ private:
                     return derive_dispatch_caller(s);
                 },
                 // #4029: backs list_product_packs/get_product_pack.
-                product_pack_store_.get());
+                product_pack_store_.get(),
+                // #4030: backs list_workflows/get_workflow/get_workflow_execution.
+                workflow_engine_.get());
         }
 
         // -- Listen -----------------------------------------------------------

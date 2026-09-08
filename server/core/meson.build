@@ -411,6 +411,7 @@ yuzu_server_core_lib = static_library(
     'src/instruction_definition_model.cpp', # #4029: shared REST v1 + MCP builder
     'src/instruction_routes.cpp',
     'src/execution_tracker.cpp',
+    'src/execution_model.cpp',
     'src/execution_routes.cpp',
     'src/health_routes.cpp',
     'src/leader_elector.cpp',
@@ -528,6 +529,7 @@ yuzu_server_core_lib = static_library(
     'src/cel_eval.cpp',
     'src/compliance_eval.cpp',
     'src/workflow_engine.cpp',
+    'src/workflow_model.cpp',
     'src/product_pack_store.cpp',
     'src/product_pack_model.cpp', # #4029: shared REST v1 + MCP builder
     'src/app_perf_daily_store.cpp',
