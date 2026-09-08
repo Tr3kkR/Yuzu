@@ -65,6 +65,11 @@ versus one that could not be read at all:
   `warning|hive_unload_failed|...` line is emitted if the trailing
   `RegUnLoadKeyW` fails on the way out -- this is orthogonal to the
   per-source `source|` line and never folded into it.
+- **`constrained|<n>|malformed`** (launchd plist walk, `mac_emond`) -- the
+  file was read but its plist could not be parsed (corrupt, or a valid
+  plist truncated by `kMaxPlistBytes`); never silently folded into a
+  `supported` status. `mac_emond` combines this with any directory-level
+  constraint via a comma-joined reason.
 
 ## Versioned source catalog
 
@@ -76,8 +81,8 @@ stubs never special-case per-OS.
 | SourceId | Name | W | L | M | Why |
 |---|---|---|---|---|---|
 | `win_run_hklm` | HKLM Run | S | U | U | Reg\*W, native + WOW6432Node views |
-| `win_runonce_hklm` | HKLM RunOnce | S | U | U | Reg\*W |
-| `win_runonceex_hklm` | HKLM RunOnceEx | S | U | U | Reg\*W |
+| `win_runonce_hklm` | HKLM RunOnce | S | U | U | Reg\*W, native + WOW6432Node views |
+| `win_runonceex_hklm` | HKLM RunOnceEx | S | U | U | Reg\*W, native + WOW6432Node views |
 | `win_run_hku` | HKU Run (every loaded/mountable hive) | S | U | U | per-profile `with_user_hive` ladder |
 | `win_runonce_hku` | HKU RunOnce (every loaded/mountable hive) | S | U | U | per-profile `with_user_hive` ladder |
 | `win_startup_approved` | Explorer StartupApproved\Run | S | U | U | Reg\*W, system + per-user |
