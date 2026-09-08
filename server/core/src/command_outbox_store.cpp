@@ -9,6 +9,9 @@
 
 #include <spdlog/spdlog.h>
 
+#include <charconv>
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -234,10 +237,40 @@ CommandOutboxStore::list_pending(int limit) const {
         c.execution_id = PQgetvalue(res.get(), i, 8);
         c.principal = PQgetvalue(res.get(), i, 9);
         c.approval_id = PQgetvalue(res.get(), i, 10);
-        c.attempts = std::atoi(PQgetvalue(res.get(), i, 11));
+        // Parse attempts with from_chars (house idiom — sibling leader_elector.cpp
+        // avoids atoi/<cstdlib>); a malformed value leaves attempts=0, harmless.
+        const char* av = PQgetvalue(res.get(), i, 11);
+        std::from_chars(av, av + std::char_traits<char>::length(av), c.attempts);
         out.push_back(std::move(c));
     }
     return out;
+}
+
+std::optional<std::int64_t> CommandOutboxStore::count_pending() const {
+    if (!open_) {
+        count_degrade("count_pending", "not_open");
+        return std::nullopt;
+    }
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        count_degrade("count_pending", "lease_timeout");
+        return std::nullopt;
+    }
+    // COUNT over the partial `outbox_ready_idx` (WHERE state='pending'). Not
+    // due-gated (`next_attempt_at`) on purpose: the gauge is total pending
+    // backlog, including rows currently backed off, so a stuck-and-growing queue
+    // is visible even when nothing is due this instant.
+    pg::PgResult res = pg::exec_params(
+        lease.get(), "SELECT count(*) FROM command_outbox_store.outbox WHERE state='pending'",
+        std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1) {
+        count_degrade("count_pending", "db_error");
+        return std::nullopt;
+    }
+    std::int64_t n = 0;
+    const char* v = PQgetvalue(res.get(), 0, 0);
+    std::from_chars(v, v + std::char_traits<char>::length(v), n);
+    return n;
 }
 
 std::expected<bool, CommandOutboxError>

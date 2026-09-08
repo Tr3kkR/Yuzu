@@ -116,6 +116,10 @@ struct Harness {
     // fire()/fire_with_approval() advance the schedule (Enqueued/
     // AlreadyEnqueued) or leave it due for retry (FencedOut/Degraded).
     OutboxEnqueueOutcome enqueue_result{OutboxEnqueueOutcome::Enqueued};
+    // qa-1 regression coverage: when set, the fake enqueue_fn throws (models a
+    // create_execution/entropy failure) so the exec-row-cancel-on-throw path is
+    // exercised.
+    bool throw_on_enqueue{false};
     // #3495: settable AFTER construction (mirrors enqueue_result above) so
     // existing call sites are unaffected — Deps::should_stop wraps a lambda
     // that reads this field live rather than the field's value at
@@ -150,6 +154,8 @@ struct Harness {
                   enqueues.push_back({req.occurrence_id, req.plugin, req.action, req.scope_expr,
                                      req.execution_id, req.principal, req.approval_id,
                                      req.parameters});
+                  if (throw_on_enqueue)
+                      throw std::runtime_error("enqueue boom");
                   return enqueue_result;
               },
               .arming_check = std::move(arming),
@@ -361,6 +367,62 @@ TEST_CASE("ScheduleRunner: a Degraded enqueue cancels the speculative execution 
     REQUIRE(exec.has_value());
     CHECK(exec->status == "cancelled");
     CHECK(h.get(id).next_execution_at == 1); // NOT advanced — stays due
+}
+
+TEST_CASE("ScheduleRunner: AlreadyEnqueued (idempotent re-fire) cancels the duplicate exec row "
+          "and advances",
+          "[schedule][runner][pg]") {
+    // qa-2: the idempotent-re-fire branch (a crash-before-advance re-fire whose
+    // occurrence already exists). The speculative exec row this fire created is a
+    // duplicate the outbox discarded, so it must be cancelled, and the schedule
+    // advances exactly as the first fire would have.
+    Harness h;
+    h.enqueue_result = OutboxEnqueueOutcome::AlreadyEnqueued;
+    auto id = h.make_due("test.def", "interval");
+
+    h.runner.tick();
+
+    REQUIRE(h.enqueues.size() == 1);
+    auto exec = h.tracker.get_execution(h.enqueues[0].execution_id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "cancelled");           // duplicate row cancelled
+    CHECK(h.get(id).next_execution_at > 1);       // advanced (idempotent success)
+}
+
+TEST_CASE("ScheduleRunner: FencedOut (leadership lost) cancels the exec row and leaves the "
+          "schedule due",
+          "[schedule][runner][pg]") {
+    // qa-2: the leadership-lost branch. The occurrence is left for the true
+    // leader (no advance), and the speculative exec row is cancelled.
+    Harness h;
+    h.enqueue_result = OutboxEnqueueOutcome::FencedOut;
+    auto id = h.make_due("test.def", "interval");
+
+    h.runner.tick();
+
+    REQUIRE(h.enqueues.size() == 1);
+    auto exec = h.tracker.get_execution(h.enqueues[0].execution_id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "cancelled");
+    CHECK(h.get(id).next_execution_at == 1); // NOT advanced — deferred to the true leader
+}
+
+TEST_CASE("ScheduleRunner: a throw from enqueue cancels the speculative exec row (qa-1 regression)",
+          "[schedule][runner][pg]") {
+    // qa-1: the former inline dispatch_tracked cancelled the exec row on a dispatch
+    // throw; the enqueue rewrite must preserve that. tick()'s own catch advances
+    // the schedule (fire-and-advance); enqueue_occurrence cancels the row first.
+    Harness h;
+    h.throw_on_enqueue = true;
+    auto id = h.make_due("test.def", "interval");
+
+    h.runner.tick(); // must not propagate — tick() contains per-schedule throws
+
+    REQUIRE(h.enqueues.size() == 1);
+    auto exec = h.tracker.get_execution(h.enqueues[0].execution_id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "cancelled");     // row cancelled, not orphaned at 'running'
+    CHECK(h.get(id).next_execution_at > 1); // advanced by tick()'s catch (fire-and-advance)
 }
 
 TEST_CASE("ScheduleRunner: requires_approval submits one ticket and holds the occurrence",

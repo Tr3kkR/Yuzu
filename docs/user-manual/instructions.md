@@ -576,12 +576,21 @@ The ScheduleEngine supports recurring instruction executions with four frequency
 ### Execution semantics
 
 A server-side poller checks for due schedules every 30 seconds, so a fire can
-land up to ~30 seconds after its due time. Scheduled runs travel the same
-dispatch path as manual runs: each fire creates a tracked execution
-(attributed to the schedule's creator) that appears in the Executions history,
-and emits an `instruction.schedule_fired` audit event. An occurrence that
-cannot run — unknown or disabled definition, no agents in scope, dispatch
-failure — is recorded and skipped; it does not retry into a backlog.
+land up to ~30 seconds after its due time — but firing is now two stages, not
+one. At fire time the poller creates a tracked execution (attributed to the
+schedule's creator, appearing immediately in the Executions history) and
+commits a durable occurrence to the command outbox, emitting an
+`instruction.schedule_fired` audit event with result `queued`. A leader-gated
+delivery loop then drains the outbox and performs the actual dispatch, within
+~5 seconds of enqueue — so up to ~35 seconds total from due time to dispatch.
+Delivery emits its own `command.outbox_delivered` audit event recording the
+real send outcome: `success` (dispatched, with the agents-reached count),
+`failure` (no agents currently in scope — recorded and skipped, not retried;
+or a malformed occurrence), or `denied` (authority was revoked between
+enqueue and delivery). The execution row's targeted-agent count fills in at
+delivery, once the real outcome is known. A systemic delivery-gate failure
+(for example, containment status unreadable) is treated as transient: the
+same occurrence is retried with back-off rather than failed outright.
 
 Approval-gated runs (the schedule's `requires_approval` flag, or a definition
 whose `approvalMode` is not `auto` — there is no operator session on the

@@ -11362,6 +11362,13 @@ private:
         // probabilistically unlikely, not DB-enforced. See the new
         // `ux_concurrency_claims_command` unique index
         // (execution_tracker.cpp) for the enforcement half of this fix.
+        // R1 (arch-F3): a supplied command_id is ONLY the outbox-delivery path,
+        // which must NOT take the ADR-1007 per-device concurrency claim — so it
+        // must never be combined with definition_id/concurrency_mode. Enforce the
+        // invariant the "NEVER combine" comment states, so a future caller cannot
+        // silently violate it and re-enter the (command_id, agent_id) claim.
+        assert(supplied_command_id.empty() ||
+               (definition_id.empty() && concurrency_mode.empty()));
         auto command_id =
             supplied_command_id.empty()
                 ? plugin + "-" +
@@ -13709,6 +13716,17 @@ private:
 
         // -- Prometheus metrics endpoint ----------------------------------------
         web_server_->Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
+            // WS-3 3.3 (sre-F2/WS-11): refresh the command-outbox delivery-backlog
+            // gauge on scrape (regardless of leadership — a stuck loop that never
+            // acquires leadership shows flat event counters, so this gauge is the
+            // only signal that scheduled dispatch has silently stopped). A degraded
+            // read returns nullopt → leave the last value rather than publish a
+            // false 0.
+            if (command_outbox_store_ && command_outbox_store_->is_open()) {
+                if (auto pending = command_outbox_store_->count_pending(); pending.has_value())
+                    metrics_.gauge("yuzu_server_command_outbox_pending")
+                        .set(static_cast<double>(*pending));
+            }
             // Refresh management group gauges before serializing
             if (mgmt_group_store_ && mgmt_group_store_->is_open()) {
                 metrics_.gauge("yuzu_server_management_groups_total")
@@ -13915,6 +13933,9 @@ private:
             // InstructionDbPool fed /readyz only; approval_ok above is the ONE
             // sibling that already had full probe coverage pre-migration).
             bool execution_tracker_ok = execution_tracker_ && execution_tracker_->is_open();
+            // WS-3 3.3 (arch-F1/sre-F1): born-on-PG command outbox on the live
+            // scheduled-dispatch path — mirrors its /readyz row.
+            bool command_outbox_ok = command_outbox_store_ && command_outbox_store_->is_open();
 
             // Determine overall status
             bool all_stores_ok =
@@ -13926,7 +13947,7 @@ private:
                 mgmt_group_ok && discovery_ok && deployment_ok && quarantine_ok &&
                 notification_ok && upload_grant_ok && tag_ok && runtime_config_ok &&
                 patch_manager_ok && session_store_ok && directory_sync_ok && workflow_engine_ok &&
-                schedule_engine_ok && execution_tracker_ok;
+                schedule_engine_ok && execution_tracker_ok && command_outbox_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -13976,7 +13997,8 @@ private:
                   {"directory_sync", directory_sync_ok ? "ok" : "error"},
                   {"workflow_engine", workflow_engine_ok ? "ok" : "error"},
                   {"schedule_engine", schedule_engine_ok ? "ok" : "error"},
-                  {"execution_tracker", execution_tracker_ok ? "ok" : "error"}}},
+                  {"execution_tracker", execution_tracker_ok ? "ok" : "error"},
+                  {"command_outbox_store", command_outbox_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.
@@ -14141,6 +14163,13 @@ private:
                 // caller ever checked availability). Net-new row: the SQLite era
                 // had no equivalent probe at all.
                 {"schedule_engine", schedule_engine_ && schedule_engine_->is_open()},
+                // WS-3 3.3 (gov HC-1, arch-F1/sre-F1): the born-on-PG command
+                // outbox is on the live scheduled-dispatch path. Construction is
+                // already fail-closed (startup_failed_), so this row guards the
+                // RUNTIME is_open()-flip case — without it a post-boot PG hiccup
+                // leaves /readyz green while every scheduled fire silently stops
+                // enqueuing/delivering.
+                {"command_outbox_store", command_outbox_store_ && command_outbox_store_->is_open()},
                 // gov R3 HC-1: FleetTopologyStore became load-bearing for
                 // /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology.
                 // Pure in-memory store with no is_open(); pointer-not-null is

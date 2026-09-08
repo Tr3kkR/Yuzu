@@ -83,6 +83,31 @@ replica sees live execution progress driven from any replica. See
 | `yuzu_exec_outbox_reap_clock_anomaly_total` | counter | Retention sweep passes DECLINED because the substrate `now()` reading was implausible (forward- or backward-skewed vs the persisted anchor) — the clock-guard refusing to delete under a mistrusted clock. A non-zero/rising value means investigate host/DB clock integrity, not retention. |
 | `yuzu_exec_outbox_store_degrade_total` | counter | `event_outbox` **reap OR cross-replica poll** passes that failed outright (pool-acquire timeout / query error), distinct from a clock-anomaly decline. The two sources share one series today (a `stage` label to separate reap from poll is a follow-up); correlate with `yuzu_pg_acquire_timeout_total` / Postgres health. |
 
+## Command outbox delivery metrics (HA WS-3 3.3)
+
+Scheduled instruction fires enqueue a durable `pending` occurrence to
+`CommandOutboxStore` (schema `command_outbox_store`) instead of dispatching
+inline; a leader-gated delivery loop drains it and performs the actual wire
+dispatch. See `docs/user-manual/instructions.md` "Execution semantics" and
+`docs/postgres-migration-ladder.md`'s `CommandOutboxStore` row.
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_server_command_outbox_degrade_total` | counter | Store-level operation (enqueue/claim) that failed outright against Postgres (pool-acquire timeout / query error), labeled `op`/`reason`. Distinct from the delivery loop's own degrade counter below. |
+| `yuzu_server_command_outbox_delivered_total` | counter | Occurrences the delivery loop actually dispatched to at least one agent (`outcome.sent > 0`). The delivered SLI — deliberately excludes the "reached no agents" outcome below so a rise in no-agent misses cannot mask a drop here. |
+| `yuzu_server_command_outbox_deliver_no_agents_total` | counter | Delivery attempted but reached zero agents right now (nothing currently in scope). Recorded and skipped — same as any other terminal outcome, **not** retried into a backlog. |
+| `yuzu_server_command_outbox_deliver_denied_total` | counter | Re-authorization at send time (arming check) denied the occurrence — authority was revoked between enqueue and delivery. Permanent; the occurrence is marked failed, not retried. |
+| `yuzu_server_command_outbox_deliver_retry_total` | counter | Delivery deferred with back-off because the dispatch-gate read was systemically unreadable (e.g. containment status), a transient condition — the occurrence stays `pending` and is re-driven. A sustained climb means the gate dependency, not the schedule, is unhealthy. |
+| `yuzu_server_command_outbox_deliver_errors_total` | counter | An unexpected exception during `deliver()` for one occurrence — the tick treats it as transient and reschedules with back-off rather than letting it starve the rest of the batch. |
+| `yuzu_server_command_outbox_deliver_decode_failed_total` | counter | A pending row's opaque payload (`agent_ids`/`parameters`) failed to decode — a malformed row, marked failed (permanent), never dispatched with an empty target/param set. |
+| `yuzu_server_command_outbox_deliver_degrade_total` | counter | The delivery loop's own Postgres reads/writes degraded — a `list_pending` read failure (deferring the whole tick) or a `mark_sent` write failure (the wire send already happened; the row stays `pending` and is re-driven, absorbed by agent-side `command_id` dedup). |
+| `yuzu_server_command_outbox_pending` | gauge | The current `pending`-occurrence backlog (delivery queue depth). **The primary signal that scheduled dispatch has stalled** — a stuck delivery loop (leadership never acquired, a persistently degraded gate) shows flat event counters everywhere else, so this gauge growing without bound is the tell. |
+
+Until a dedicated alert ships (tracked for WS-11), monitor this family
+manually: alert on `yuzu_server_command_outbox_pending` growing without
+bound, or on `yuzu_server_command_outbox_deliver_retry_total` climbing
+steadily.
+
 ## SSO login metrics
 
 Every SAML and OIDC login attempt — success or failure — increments its provider's login counter. Both counters carry a uniform `{result, role}` label set on every series (including error paths), so a dashboard can group by either label without hitting an unlabelled/labelled split.

@@ -360,7 +360,23 @@ bool ScheduleRunner::enqueue_occurrence(const InstructionSchedule& s, const std:
     // approved fire (empty on a direct auto-mode fire → None).
     req.approval_id = approval_id;
 
-    const auto outcome = d_.enqueue_fn(req);
+    // qa-1 regression fix: the former inline dispatch_tracked wrapped its dispatch
+    // in try/catch and cancelled the speculative exec row on a throw. enqueue_fn
+    // can also throw (e.g. an entropy failure minting the command_id). If it does,
+    // cancel the row we just created so it can't idle at 'running' to the
+    // materialise timeout, then rethrow — tick()'s own catch advances the schedule
+    // (fire-and-advance), exactly as the old path did.
+    OutboxEnqueueOutcome outcome;
+    try {
+        outcome = d_.enqueue_fn(req);
+    } catch (...) {
+        if (d_.execution_tracker && !exec_id.empty() &&
+            !d_.execution_tracker->mark_cancelled(exec_id, s.created_by))
+            spdlog::error("schedule_runner: mark_cancelled failed for execution_id={} after "
+                          "enqueue_fn threw",
+                          exec_id);
+        throw;
+    }
     switch (outcome) {
     case OutboxEnqueueOutcome::AlreadyEnqueued:
         // Idempotent re-fire (a crash between a prior enqueue and its advance):

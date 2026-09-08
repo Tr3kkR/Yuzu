@@ -2,14 +2,26 @@
 
 /// @file command_outbox_store.hpp
 /// WS-3 slice 3.3 (ADR-2002 §6): the durable **transactional command outbox**
-/// behind leader-driven background dispatch. A side-effecting background
-/// producer (the first consumer is `ScheduleRunner`) commits a `pending`
-/// outbound-command row in the SAME transaction as its own state transition
-/// (claim-before-side-effect); a leader-gated delivery loop drives
-/// `pending → sent`; a crash between the commit and the wire send re-drives
-/// from `pending`. The receiver (the agent) dedups on `command_id` (WS-0,
-/// durable), so an at-least-once re-drive is **effectively-once**, never
-/// exactly-once — a duplicate wire send is absorbed at the endpoint.
+/// behind leader-driven background dispatch. A side-effecting background producer
+/// commits a `pending` outbound-command row; a leader-gated delivery loop drives
+/// `pending → sent`; a crash between the commit and the wire send re-drives from
+/// `pending`. The receiver (the agent) dedups on `command_id` (WS-0, durable), so
+/// an at-least-once re-drive is **effectively-once**, never exactly-once — a
+/// duplicate wire send is absorbed at the endpoint.
+///
+/// TWO PRODUCER SHAPES — do not conflate them (arch-F2):
+///   * `claim_and_enqueue_on(conn, ...)` commits the `pending` row in the SAME
+///     transaction as the producer's own state transition (true
+///     claim-before-side-effect atomicity) — for a future producer whose state
+///     ALSO lives in Postgres and can share a txn.
+///   * `claim_and_enqueue(...)` autocommits on its own bounded lease. The FIRST
+///     consumer, `ScheduleRunner`, uses THIS: its state transition
+///     (`ScheduleEngine::advance_schedule`) is a SEPARATE write, so cross-txn
+///     atomicity is impossible. Correctness there rests entirely on the
+///     `occurrence_id` PRIMARY KEY being idempotent — a crash-before-advance
+///     re-fire recomputes the identical key and reads `AlreadyEnqueued`, so no
+///     second occurrence is produced (see `schedule_runner.hpp`). Do NOT assume
+///     enqueue and the producer's transition are atomic for that consumer.
 ///
 /// THE TWO STRUCTURAL GUARANTEES (read before touching the SQL — they are the
 /// whole point of this store, and an adversarial review of the plan made both
@@ -76,6 +88,7 @@
 #include <chrono>
 #include <cstdint>
 #include <expected>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -88,14 +101,6 @@ class PgPool;
 }
 
 namespace yuzu::server {
-
-/// The terminal-vs-live state of an outbox row. `pending` rows are NEVER
-/// evicted (an in-flight claim); only `sent`/`failed` rows are reap-eligible.
-enum class OutboxState {
-    Pending,
-    Sent,
-    Failed,
-};
 
 /// Outcome of an epoch-fenced idempotent enqueue.
 enum class OutboxEnqueueOutcome {
@@ -211,6 +216,15 @@ public:
     /// subsequent state-changing claim.
     [[nodiscard]] std::expected<std::vector<OutboxCommand>, CommandOutboxError>
     list_pending(int limit = 100) const;
+
+    /// The number of `pending` occurrences (the delivery backlog), for the
+    /// `yuzu_server_command_outbox_pending` observability gauge (sre-F2/WS-11): a
+    /// stuck delivery loop (leadership never acquired, degraded gate) shows flat
+    /// event counters, so a backlog gauge is the only signal that scheduled
+    /// dispatch has silently stopped. `nullopt` on a degraded read (the caller
+    /// leaves the gauge unchanged rather than publishing a false 0). Cheap — a
+    /// count over the partial `outbox_ready_idx`.
+    [[nodiscard]] std::optional<std::int64_t> count_pending() const;
 
     /// Epoch-fenced `pending → sent`. Records that the occurrence was delivered
     /// so the delivery loop stops re-driving it. A stale ex-leader's mark is

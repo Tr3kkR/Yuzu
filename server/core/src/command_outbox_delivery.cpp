@@ -77,7 +77,7 @@ void CommandOutboxDelivery::tick() {
     if (!pending) {
         // Typed degraded read (authoritative store) — never treated as "nothing
         // owed"; log + count and retry next tick.
-        count("yuzu_server_command_outbox_deliver_degraded_total");
+        count("yuzu_server_command_outbox_deliver_degrade_total");
         spdlog::warn("command_outbox_delivery: list_pending degraded — deferring this tick");
         return;
     }
@@ -159,10 +159,30 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
         return;
     }
 
-    // 6. Finalize the (fire-time-created) execution row so it cannot idle to the
-    //    materialise timeout (executions ladder). sent>0 → targeted count;
-    //    sent==0 (no agents in scope right now) → cancel, matching
-    //    ScheduleRunner's historical no-agents handling.
+    // 6. Terminal (fire-and-advance): mark sent FIRST, because the fenced claim
+    //    decides whether WE own this delivery's bookkeeping. The wire send already
+    //    happened (step 4). A missed occurrence (sent==0) is still recorded and
+    //    skipped, never spun into a backlog.
+    //    - degraded mark → row stays pending, re-drive next tick; don't finalize/
+    //      count/audit here (the re-send is dedup-absorbed).
+    //    - fenced out / already terminal → the TRUE leader owns finalize+count+
+    //      audit; doing it here too would double-count one logical delivery (C-5).
+    auto marked = d_.outbox->mark_sent(c.occurrence_id, lock_name, epoch);
+    if (!marked.has_value()) {
+        count("yuzu_server_command_outbox_deliver_degrade_total");
+        spdlog::warn("command_outbox_delivery: mark_sent degraded for occurrence '{}' — "
+                     "will re-drive",
+                     c.occurrence_id);
+        return;
+    }
+    if (!*marked)
+        return; // fenced out or already terminal — not ours to finalize/count/audit
+
+    // 7. We own this delivery. Finalize the (fire-time-created) execution row so
+    //    it cannot idle to the materialise timeout (executions ladder), then count
+    //    and audit exactly once. sent==0 (no agents reachable right now) is a
+    //    DISTINCT outcome from a real delivery — a separate counter so the
+    //    delivered SLI is not inflated by no-agent misses (C-1).
     if (d_.execution_tracker && !c.execution_id.empty()) {
         if (outcome.sent > 0) {
             if (!d_.execution_tracker->set_agents_targeted(c.execution_id, outcome.sent))
@@ -171,20 +191,22 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
             (void)d_.execution_tracker->mark_cancelled(c.execution_id, c.principal);
         }
     }
-
-    // 7. Terminal (fire-and-advance): mark sent so the occurrence is not
-    //    re-driven. A missed occurrence (sent==0) is recorded and skipped, never
-    //    spun into a backlog. mark_sent==false (fenced out / already terminal) is
-    //    harmless — the row then stays pending for the true leader, whose send
-    //    the agent dedups.
-    (void)d_.outbox->mark_sent(c.occurrence_id, lock_name, epoch);
-    count("yuzu_server_command_outbox_delivered_total");
-    spdlog::info("command_outbox_delivery: delivered occurrence '{}' — command_id={} "
-                 "execution_id={} agents={}",
-                 c.occurrence_id, c.command_id, c.execution_id, outcome.sent);
-    audit(c, outcome.sent > 0 ? "success" : "failure",
-          "sent=" + std::to_string(outcome.sent) + " command_id=" + c.command_id +
-              " execution_id=" + c.execution_id);
+    if (outcome.sent > 0) {
+        count("yuzu_server_command_outbox_delivered_total");
+        spdlog::info("command_outbox_delivery: delivered occurrence '{}' — command_id={} "
+                     "execution_id={} agents={}",
+                     c.occurrence_id, c.command_id, c.execution_id, outcome.sent);
+        audit(c, "success",
+              "sent=" + std::to_string(outcome.sent) + " command_id=" + c.command_id +
+                  " execution_id=" + c.execution_id);
+    } else {
+        count("yuzu_server_command_outbox_deliver_no_agents_total");
+        spdlog::info("command_outbox_delivery: occurrence '{}' reached no agents (command_id={} "
+                     "execution_id={}) — recorded and skipped (fire-and-advance)",
+                     c.occurrence_id, c.command_id, c.execution_id);
+        audit(c, "failure",
+              "no_agents_reached command_id=" + c.command_id + " execution_id=" + c.execution_id);
+    }
 }
 
 void CommandOutboxDelivery::audit(const OutboxCommand& c, const std::string& result,

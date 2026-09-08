@@ -222,6 +222,25 @@ TEST_CASE("CommandOutboxDelivery[pg]: carries approval provenance from the row",
     CHECK(probe.last_provenance == ApprovalProvenance::None);
 }
 
+TEST_CASE("CommandOutboxDelivery[pg]: a malformed payload fails the occurrence, no dispatch",
+          "[command_outbox][pg][delivery]") {
+    DeliveryPg fx;
+    // Enqueue an occurrence whose agent_ids is not valid JSON — decode_payload
+    // must fail CLOSED (mark_failed), never dispatch with a silently-empty target
+    // set. (safety-S1)
+    auto bad = fx.req("occ-bad", "cmd-bad");
+    bad.agent_ids = "{not-json";
+    REQUIRE(fx.store().claim_and_enqueue(bad, fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+
+    DispatchProbe probe;
+    auto loop = fx.make_delivery(probe, /*arming_allow=*/true);
+    loop.tick();
+
+    CHECK(probe.calls == 0); // decode failed before any send
+    CHECK(fx.raw_state("occ-bad") == "failed");
+}
+
 TEST_CASE("CommandOutboxDelivery[pg]: does nothing when this replica is not leader",
           "[command_outbox][pg][delivery]") {
     DeliveryPg fx;
