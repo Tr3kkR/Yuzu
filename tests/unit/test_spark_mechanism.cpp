@@ -2569,6 +2569,8 @@ TEST_CASE("Service spark (real mechanism): live unit transition fires Running th
 #endif
 #include <windows.h>
 
+#include <win_str.hpp> // yuzu::win::from_wide (real service-name widen/narrow, PR-A round 2)
+
 #include <condition_variable>
 #include <filesystem>
 #include <fstream>
@@ -3946,8 +3948,15 @@ void CALLBACK establish_s2_notify_cb(PVOID) {}
 /// the target; R2: an ancestor walk - see establish_open_ancestor_walk below)
 /// so both cases can share this shell. `env` is null for the default process
 /// pool (R1/R2) or a private pool's environment (R3/R4, under hive load).
+/// PTP_CALLBACK_ENVIRON is ITSELF a pointer typedef (Win32 "P" convention -
+/// matches spark_registry.cpp:360's bare `TP_CALLBACK_ENVIRON env_{}` +
+/// `&env_` usage) - a `PTP_CALLBACK_ENVIRON*` parameter here would be
+/// TP_CALLBACK_ENVIRON** (a hard MSVC compile error at the call sites below
+/// that pass `&load.pool.env`; R1/R2's bare `nullptr` argument masked this
+/// during hand-review, since nullptr converts to any pointer type - governance
+/// finding, PR-A round 2).
 template <class OpenFn>
-void establish_registry_sample(PTP_CALLBACK_ENVIRON* env, DWORD notify_filter, OpenFn&& open,
+void establish_registry_sample(PTP_CALLBACK_ENVIRON env, DWORD notify_filter, OpenFn&& open,
                                std::vector<std::int64_t>& t_event,
                                std::vector<std::int64_t>& t_wait_create,
                                std::vector<std::int64_t>& t_open,
@@ -4011,12 +4020,81 @@ struct EstablishPrivatePool {
 /// it keeps firing/re-arming for the whole measurement window without
 /// growing unbounded. All churn watches point at the SAME shared key; a
 /// background writer thread keeps them firing.
+// Owns its own PTP_WAIT/HANDLE (governance finding, PR-A round 2): the
+// original version had no destructor, so a REQUIRE throwing partway through
+// EstablishHiveLoad's 200-iteration setup loop below left every EARLIER
+// iteration's already-created HANDLE+PTP_WAIT genuinely leaked - watches
+// is a fully-constructed member by the time that loop runs, so its OWN
+// destruction (with EstablishChurnWatch itself trivially-destructible) ran
+// on the exception path but did nothing. Never moved/copied in practice
+// (EstablishHiveLoad's ctor fills a pre-`resize()`d vector via reference,
+// no reallocation after that point), so this destructor is the only
+// teardown path this type needs.
 struct EstablishChurnWatch {
     HKEY hkey{nullptr};
     HANDLE event{nullptr};
     PTP_WAIT wait{nullptr};
     const std::atomic<bool>* stop{nullptr};
 
+    EstablishChurnWatch() = default;
+    EstablishChurnWatch(const EstablishChurnWatch&) = delete;
+    EstablishChurnWatch& operator=(const EstablishChurnWatch&) = delete;
+    // Movable, NOT deleted (unlike a first draft of this fix): std::vector<>
+    // ::resize()'s contract requires MoveInsertable regardless of whether a
+    // given call actually reallocates, so a non-movable element type risks
+    // failing to compile at the resize() call site below. Transfers
+    // ownership and nulls the source (same shape as SlowDtor's move ctor
+    // elsewhere in this repo's tests), so the moved-from object's
+    // destructor becomes a safe no-op - no double-close risk. In practice
+    // this is never exercised: EstablishHiveLoad's ctor resize()s ONCE from
+    // empty, before any address is captured by CreateThreadpoolWait, so no
+    // element is ever moved after its address is registered with the OS.
+    EstablishChurnWatch(EstablishChurnWatch&& o) noexcept
+        : hkey(o.hkey), event(o.event), wait(o.wait), stop(o.stop) {
+        o.event = nullptr;
+        o.wait = nullptr;
+    }
+    EstablishChurnWatch& operator=(EstablishChurnWatch&& o) noexcept {
+        if (this != &o) {
+            hkey = o.hkey;
+            event = o.event;
+            wait = o.wait;
+            stop = o.stop;
+            o.event = nullptr;
+            o.wait = nullptr;
+        }
+        return *this;
+    }
+
+    ~EstablishChurnWatch() {
+        if (wait) {
+            ::SetThreadpoolWait(wait, nullptr, nullptr);
+            ::WaitForThreadpoolWaitCallbacks(wait, TRUE);
+            ::CloseThreadpoolWait(wait);
+        }
+        if (event)
+            ::CloseHandle(event);
+    }
+
+    // KNOWN, UNFIXED RACE (governance finding, PR-A round 2, deliberately
+    // left as-is rather than guessed-at): this check-then-rearm is NOT
+    // synchronized against ~EstablishHiveLoad()'s teardown - `stop` is a
+    // bare atomic with no mutex, so a pool thread already past the check
+    // below can still be calling SetThreadpoolWait on `wait` at the exact
+    // moment the destructor's own SetThreadpoolWait(nullptr,nullptr)/
+    // WaitForThreadpoolWaitCallbacks/CloseThreadpoolWait sequence runs on
+    // it. This harness's own comment elsewhere claims it "mirrors
+    // spark_registry.cpp's reconcile() ordering," but production's
+    // equivalent race-freedom argument rests on a real mutex-guarded
+    // active flag (spark_registry.cpp's mu_), not on cancel+drain alone -
+    // and that production pattern's own correctness is ITSELF flagged as
+    // unverified-on-Windows elsewhere in this project (tracked as "T6" in
+    // the delivery plan), so mechanically copying an unverified production
+    // pattern into this harness would not actually establish safety here
+    // either. Fixing this needs real Windows hardware to verify against,
+    // not a guess from a Linux session with no compiler for this file -
+    // recorded here for whoever runs this harness on DGRHP, not silently
+    // hidden.
     static void CALLBACK on_fire(PTP_CALLBACK_INSTANCE, void* ctx, PTP_WAIT, TP_WAIT_RESULT) {
         auto* self = static_cast<EstablishChurnWatch*>(ctx);
         if (self->stop->load(std::memory_order_relaxed))
@@ -4184,15 +4262,12 @@ struct EstablishHiveLoad {
         stop.store(true, std::memory_order_relaxed);
         if (writer.joinable())
             writer.join();
-        for (auto& w : watches) {
-            if (w.wait) {
-                ::SetThreadpoolWait(w.wait, nullptr, nullptr);
-                ::WaitForThreadpoolWaitCallbacks(w.wait, TRUE);
-                ::CloseThreadpoolWait(w.wait);
-            }
-            if (w.event)
-                ::CloseHandle(w.event);
-        }
+        // Per-watch teardown (disarm, drain, close) now lives in
+        // EstablishChurnWatch's OWN destructor (governance finding, PR-A
+        // round 2) - `watches`' own destruction below runs it for every
+        // element; do NOT duplicate that loop here, a second cleanup pass
+        // over the same wait/event handles would double-close them.
+        watches.clear();
         if (churn_key)
             ::RegCloseKey(churn_key);
     }
@@ -4855,7 +4930,11 @@ TEST_CASE("Watch establishment: post-fix fast-path cost, bulk engine.arm() (N=20
     for (int i = 0; i < kBulkKeys; ++i) {
         const std::wstring& name_w = service_names[static_cast<std::size_t>(i) %
                                                     service_names.size()];
-        const std::string name(name_w.begin(), name_w.end()); // ASCII service names only
+        // Real UTF-16 conversion, not a naive char-by-char truncation
+        // (governance finding, PR-A round 2) - unlike this harness's own
+        // synthetic salted names, a real enumerated service's internal
+        // lpServiceName has no ASCII guarantee.
+        const std::string name = yuzu::win::from_wide(name_w.c_str());
         bool ok = false;
         time_call(t_svc_arm, [&] {
             auto r = engine.arm(*c, service_spec(name));
