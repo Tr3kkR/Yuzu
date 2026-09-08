@@ -13,6 +13,7 @@
 #include "pg/secret_codec.hpp"
 #include "scim_routes.hpp"
 #include "security_headers.hpp"
+#include "sso_boot_guard.hpp" // sso_only_boot_guard_ok / *_config_complete (CC6.3)
 
 #include <CLI/CLI.hpp>
 
@@ -1646,20 +1647,19 @@ int main(int argc, char* argv[]) {
     // Runs HERE (just before serving), after every host-CLI one-shot has already
     // early-returned, so --break-glass-arm / --mfa-reset are never blocked by it.
     if (cfg.auth_mode == "sso-only") {
-        // sso-only disables the local-password path, so OIDC must be configured
-        // or every operator is locked out (the break-glass account is for an IdP
-        // OUTAGE, not for never wiring SSO at all). Fail closed rather than
-        // booting an unreachable server. Gate on the SAME predicate the OIDC
-        // provider uses to enable itself — `oidc::Config::is_enabled()` requires
-        // BOTH issuer and client-id (oidc_provider.hpp), and `/auth/oidc/start`
-        // 404s when the provider is disabled — so checking only `oidc_issuer`
-        // would let `--oidc-issuer=… ` with NO `--oidc-client-id` boot with SSO
-        // silently non-functional (review #1735 HIGH-1).
-        if (cfg.oidc_issuer.empty() || cfg.oidc_client_id.empty()) {
-            spdlog::error("--auth-mode=sso-only disables local-password login but OIDC is not "
-                          "fully configured (need both --oidc-issuer and --oidc-client-id). This "
-                          "would lock every operator out (SSO would be non-functional). Configure "
-                          "OIDC SSO completely, or use --auth-mode=standard.");
+        // sso-only disables the local-password path, so at least one SSO provider
+        // must be able to mint a session or every operator is locked out (the
+        // break-glass account is for an IdP OUTAGE, not for never wiring SSO at
+        // all). Fail closed rather than booting an unreachable server. The
+        // OIDC/SAML/HTTPS/platform preconditions live in the testable
+        // `sso_only_boot_guard_ok` (sso_boot_guard.cpp), which gates on the SAME
+        // predicate each provider uses to enable itself — OIDC needs BOTH issuer
+        // and client-id (review #1735 HIGH-1); SAML (non-Windows) needs its five
+        // SP fields AND HTTPS (server.cpp leaves the provider null under
+        // --no-https). Mirrors the SCIM boot guard below.
+        std::string sso_err;
+        if (!yuzu::server::sso_only_boot_guard_ok(cfg, sso_err)) {
+            spdlog::error("{}", sso_err);
             return EXIT_FAILURE;
         }
         // The break-glass account is the ONLY local-login path under sso-only, so
@@ -1681,8 +1681,19 @@ int main(int argc, char* argv[]) {
                 return EXIT_FAILURE;
             }
         }
+        // Name the active SSO path(s) so this CC6.3 evidence line is accurate
+        // under an OIDC-only, SAML-only, or dual deployment (the boot guard above
+        // has already proven at least one is present).
+        std::string sso_providers;
+        if (yuzu::server::oidc_config_complete(cfg))
+            sso_providers = "OIDC";
+#ifndef _WIN32
+        if (yuzu::server::saml_config_complete(cfg) && cfg.https_enabled)
+            sso_providers += sso_providers.empty() ? "SAML" : " + SAML";
+#endif
         spdlog::warn("Hardened auth mode ACTIVE (--auth-mode=sso-only): local-password login is "
-                     "DISABLED fleet-wide; only OIDC SSO can mint a session.{}",
+                     "DISABLED fleet-wide; only SSO ({}) can mint a session.{}",
+                     sso_providers,
                      cfg.break_glass_user.empty()
                          ? std::string(" No break-glass account is configured.")
                          : std::format(" Break-glass account '{}' is exempt only while armed "

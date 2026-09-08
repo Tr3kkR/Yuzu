@@ -442,6 +442,7 @@ yuzu_server_core_lib = static_library(
     'src/scim_store.cpp',
     'src/scim_json.cpp',
     'src/scim_routes.cpp',
+    'src/sso_boot_guard.cpp',
     'src/deprovision_revoke.cpp',
     'src/quarantine_store.cpp',
     'src/quarantine_reapply.cpp',
