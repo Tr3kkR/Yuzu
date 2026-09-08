@@ -2493,9 +2493,20 @@ MCP twins).
    RBAC-enabled enforcement; only the RBAC-off legacy posture changes (see
    below).
 2. **The topology floor itself**: `{AccessReview:Read, UserManagement:Read,
-   EnginePrincipal:Read}` require the `admin` session role regardless of
-   the RBAC on/off toggle, via `authz_topology_floor.hpp`'s
-   `topology_floor_applies()`. It is consulted **only** inside the legacy
+   EnginePrincipal:Read}` — plus, as of #4028, `{TlsConfig:Read,
+   PluginSigning:Read, ServerConfig:Read, AnalyticsConfig:Read}` (see
+   "Settings read-twins" below) — require the `admin` session role
+   regardless of the RBAC on/off toggle, via `authz_topology_floor.hpp`'s
+   `topology_floor_applies()`. The two groups are different categories that
+   happen to share this one mechanism: the original three are
+   authorization-topology reads (the RBAC role graph, the engine-principal
+   grant graph, the access-review export) that intentionally stay reachable
+   by an admin-owned session on ANY transport, MCP tokens included, per the
+   legacy-role-fallback note below; the #4028 four are
+   server-administration reads that #520 additionally excludes from every
+   MCP tier outright (`mcp_policy.hpp`'s `tier_allows()`), so an admin-owned
+   MCP token cannot reach them even though it would otherwise satisfy this
+   same floor check. It is consulted **only** inside the legacy
    (RBAC-off) fallback of `require_permission`/`require_scoped_permission`
    — never ahead of, or instead of, the live-RBAC branch. That ordering is
    load-bearing, not incidental: #2324 cut the dedicated `AccessReview`
@@ -2554,6 +2565,120 @@ only when a change cannot be expressed as an idempotent additive re-seed
 (`rbac_store.cpp`'s legacy SQLite v4 migration *deletes* rows, which is why
 it needed one — distinct from the PG schema's own migration sequence,
 ADR-0041, currently at v3).
+
+## Settings read-twins (#4028, api-parity programme #2146)
+
+Eight `/fragments/settings/*` dashboard sub-areas (TLS, HTTPS, gateway, server-config, MCP,
+data-retention, analytics, plugin-signing) were gated **only** by `AuthRoutes::require_admin` — a
+whole-route role check, not an RBAC securable/operation pair, with no REST v1 twin and no RBAC-off
+fallback at all. #4028 migrated all eight onto four new securables, split along sensitivity lines
+rather than one blanket `Settings:Read` (the same reasoning `EnginePrincipal` above was cut for):
+
+- **`TlsConfig`** — the `tls` and `https` fragments (mTLS/HTTPS listener posture, cert/key/CA file
+  paths).
+- **`PluginSigning`** — the `plugin-signing` fragment and its REST twin, the hardened
+  `GET /api/v2/agent/plugin-policy` (deliberately distinct from the unrelated `PluginConfig`
+  securable, which gates per-plugin runtime kill-switch config — a different domain). Its
+  deprecated `/api/v1/` predecessor is frozen on `require_admin`, not this securable — see
+  `docs/api-versioning-policy.md` and #4144.
+- **`ServerConfig`** — the `gateway`, `server-config`, `mcp`, and `data-retention` fragments
+  (operational/infra config, "nothing secret" per #4028's own evidence).
+- **`AnalyticsConfig`** — the `analytics` fragment (ClickHouse integration; embedded-credential
+  risk, see below).
+
+Each is `Read`-only today, seeded to `Administrator` only (via the existing cross-type CRUD loop in
+`seed_defaults()` — matching every other admin-only securable's precedent, e.g. `PluginConfig`,
+`PluginSecret`, `UploadGrant`, `PowerManagement` above), deliberately absent from `Viewer`'s blanket
+read-list and every other role's explicit grant list — this is a mechanical RBAC-ification of an
+already-admin-only gate, not a broadening. All four `(securable, "Read")` pairs are also added to
+`authz_topology_floor.hpp`'s `kTopologyFloor[]` (see that file's own doc comment for why: migrating
+an admin-only gate onto a Read securable without flooring it would silently widen every one of these
+eight routes from admin-only to any-authenticated-user on an RBAC-off install, the out-of-the-box
+default) — extending that file's floor beyond its original "authorization topology" framing to a
+second, related case: preserving an *existing* admin-only posture across the RBAC-off toggle.
+
+**The MCP question (#520).** `require_admin`'s own comment states the deliberate design this issue
+had to resolve explicitly, not silently override: "MCP tokens are for fleet management (queries,
+instruction execution) and must not be used to administer the server itself (settings, users, TLS,
+OIDC)." #4028 ships all eight sub-areas **REST-only** — no MCP tool touches any of them — treating
+read-only settings visibility as a meaningfully different exposure than the fleet-query surface #520
+was written to keep MCP confined to, but one that still requires its own reviewed amendment to #520
+rather than a side effect of a routine twin PR. See [MCP Server](mcp-server.md) for the policy
+itself.
+
+Shipping no MCP *tool* is not, by itself, sufficient to preserve #520's intent, because these eight
+routes are also reachable over REST, and an MCP *token* can call any REST route its tier and role
+admit — an MCP tool registration and an MCP token's REST reach are two independent things. The
+topology floor above requires `admin` role in the RBAC-off legacy fallback, but `require_permission`
+does not otherwise distinguish an admin-owned MCP token from an ordinary admin session: an MCP token
+carries its **creator's** real legacy role there by design (see "The authorization topology floor"
+above), so an admin-owned MCP token — at any tier, including `readonly` — would satisfy the floor
+exactly like an interactive admin session would, unless something stops it earlier. Hardening
+this route off `require_admin` (which rejected every `mcp_tier` token
+outright, regardless of role) onto `require_permission` — now `GET /api/v2/agent/plugin-policy`,
+split from the still-`require_admin`-gated, deprecated `/api/v1/` shape by #4144 — would have
+silently reopened it to admin-owned MCP tokens without an explicit second control. #4028's actual enforcement point is
+`mcp_policy.hpp`'s `tier_allows()`: `TlsConfig`, `PluginSigning`, `ServerConfig`, and
+`AnalyticsConfig` are denied at **every** tier there (readonly/operator/supervised) for **every**
+operation, so `require_permission`'s tier check 403s an MCP token before it ever reaches the
+topology-floor/legacy-role fallback that would otherwise admit it. This deliberately puts these four
+securables in a different category from the pre-existing three topology-floor pairs
+(`AccessReview`/`UserManagement`/`EnginePrincipal`), which keep the admin-owned-MCP-token
+reachability described above by design (see the topology floor section) — those are
+authorization-topology reads, not server-administration reads, and #520's language is specific to
+the latter. Coverage: `test_mcp_server.cpp` ("no tier admits the #4028 server-administration
+securables") pins `tier_allows()` directly; `test_auth_routes.cpp` ("no MCP tier ... reaches the
+#4028 settings-administration securables") exercises the same guarantee through the real
+`require_permission()` end-to-end path, with an admin-owned readonly-tier token and RBAC disabled —
+the exact combination that would otherwise have passed.
+
+**Analytics also fixed a leak, not just added RBAC.** `render_analytics_fragment` (and the new
+`GET /api/v1/settings/analytics` twin) previously rendered the ClickHouse URL verbatim, masking only
+the separate `clickhouse_password` field — a URL with embedded userinfo credentials
+(`clickhouse://user:pass@host:9000/db`) leaked the credential regardless. The shared builder now
+strips URL userinfo unconditionally (`settings_model::sanitize_url_userinfo`) before either surface
+ever sees it, and never reads the raw password into a response at all — only a
+`clickhouse_password_set` bool. Fix-round hardening (governance Gate 2-8, three rounds, plus two
+external adversarial-review passes, `/home/dgr/advrev-4028`) found the initial strip itself
+incomplete: an unescaped `@`, `/`, or `?` inside the userinfo let part or all of a credential
+through, and a query-string credential form (`?password=...`, no `@` at all) was not modeled. A
+first attempt tried to locate the authority boundary (the path-starting `/`) and search for `@`
+only within it, widening past an embedded `/` via a "does this look like a `host[:port]`"
+heuristic — governance re-review found that unfixable (a digit-only password segment before the
+`/` is lexically identical to a real port, so the heuristic cannot tell them apart) and it shipped
+a regression on top of the bypass it was meant to close. A second design deleted that heuristic
+entirely — the userinfo delimiter became simply the LAST `@` anywhere in the URL, with the query
+string or fragment dropped afterward — which deliberately over-strips when the path itself
+contains a later, harmless `@` (`.../db@table` becomes `.../table`), an accepted trade-off since
+the alternative is a heuristic that can be fooled into leaving a real credential in place. That
+second design itself shipped with two further bypasses an adversarial-review round found: a
+schemeless URL whose query string contains a nested `://` could fool scheme-boundary detection
+into skipping the strip entirely, and a query string that itself contains an `@` could make the
+query-strip (which ran against the already-userinfo-stripped string) miss its own delimiter and
+leave a password fragment exposed.
+
+**Current (third) design closes both, plus one further gap the fix itself introduced.**
+`sanitize_url_userinfo` bounds the scheme scan to a genuine RFC 3986 §3.1 grammar match
+(`ALPHA *(ALPHA/DIGIT/"+"/"-"/".")` immediately followed by `"://"`, evaluated from position 0
+only — never an unbounded search), and computes both the userinfo-ending `@` and the
+query/fragment-start cut points against the ORIGINAL string, unioning the two removal ranges
+rather than mutating sequentially; when the two ranges overlap (an inherently ambiguous shape —
+a real `?`-corrupted password vs. no userinfo at all with the query containing its own `@`), it
+over-strips to the scheme prefix, the same conservative resolution the design already applies
+elsewhere. A subsequent adversarial-review round of this exact fix (finding CDX-01) found the
+scheme scan itself accepted a DIGIT (or `+`/`-`/`.`) as the *first* scheme byte, contrary to RFC
+3986's ALPHA-first requirement — a schemeless credential URL whose "username" happened to be
+scheme-shaped and digit-led (e.g. `9name://pass@host:9000/db`) had that digit-led prefix wrongly
+preserved as if it were a real scheme. Requiring the first scheme byte be a letter closed this.
+All three findings (`g8b-sanitizer-scheme-boundary`, `g8b-sanitizer-query-at-ordering`, and
+CDX-01) are closed and verified — compiled, linked against the real object, and exercised against
+every adversarial shape either external reviewer or this fix round constructed, including a
+2,000,000-case fuzz run under ASan/UBSan. Regression tests for all three shapes live in
+`tests/unit/server/test_settings_model.cpp`. Treat this sanitizer as a hand-rolled, adversarially
+verified deny-list transform, not an RFC-3986-conformant parser — it has been through four design
+iterations and three rounds of independent review specifically because ad hoc string surgery on
+URLs is a narrow, easy-to-misjudge problem; a future editor changing this function should read its
+full round-by-round history in `settings_model.cpp`'s header comment before touching it again.
 
 ## On-behalf-of assertions rejected (ADR-1005 Interim rules)
 

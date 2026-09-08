@@ -13983,7 +13983,17 @@ private:
             })
                              : SettingsRoutes::GatewaySessionCountFn{},
             [this]() -> std::string { return registry_.to_json(); }, oidc_mu_, oidc_provider_,
-            /*metrics_registry=*/&metrics_, step_up_fn);
+            /*metrics_registry=*/&metrics_, step_up_fn,
+            // #4028 — bool-returning audit hook for the fail-closed REST
+            // settings read-twins (SettingsRoutes::AuditReadFn); same
+            // underlying audit_log() the void-returning audit_fn_ lambda
+            // above already wraps, just with the persisted-or-not bool
+            // preserved instead of discarded.
+            [this](const httplib::Request& req, const std::string& action,
+                   const std::string& result, const std::string& target_type,
+                   const std::string& target_id, const std::string& detail) -> bool {
+                return audit_log(req, action, result, target_type, target_id, detail);
+            });
         // F1: live-apply hook for the DEX alerts settings (wired before the
         // listener starts, so no request races the set).
         settings_routes_->set_dex_alert_apply_fn([this]() { apply_dex_alert_config(); });
