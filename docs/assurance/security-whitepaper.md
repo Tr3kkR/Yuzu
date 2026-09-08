@@ -11,6 +11,18 @@ disclosing one to this audience.
 **Last updated:** 2026-09-07. Re-review this document whenever any cited
 source doc materially changes (its own change-log/date is the trigger).
 
+**Version anchor.** This document describes Yuzu at `dev` @ `d295db964`
+(2026-09-07) unless a claim is explicitly marked otherwise. **The latest
+tagged release is v0.13.0** (2026-07-11), which **predates** several
+controls this document describes as shipped: the PostgreSQL-backed audit
+store (ADR-0040 — v0.13.0's audit trail is still the legacy SQLite
+`audit.db`), the `CaStore` PostgreSQL migration (ADR-0053), and the
+`RbacStore` PostgreSQL migration (ADR-0041). A reviewer evaluating a
+specific deployed version should confirm which of these have shipped in
+that build rather than assume dev-HEAD posture. ADR-1005 (§9) is accepted
+as of 2026-09-07 (#4099) but is itself a `dev`-only fact at this writing —
+it has not yet reached a tagged release either.
+
 ---
 
 ## 1. Architecture and trust boundaries
@@ -18,9 +30,23 @@ source doc materially changes (its own change-log/date is the trigger).
 Yuzu is a three-tier control plane: **Server** (REST API v1, HTMX dashboard,
 Instruction Engine, Policy Engine, Scheduler) → **Gateway** (optional
 Erlang/OTP fan-out tier for command relay at scale) → **Agent** (per-endpoint
-daemon executing a stable-C-ABI plugin host). Transport is gRPC/Protobuf over
-mutual TLS between every hop. Full component reference, data flows, and
-design rationale: `docs/architecture.md`.
+daemon executing a stable-C-ABI plugin host). Transport is gRPC/Protobuf,
+**encrypted on every hop, but not uniformly mutually authenticated** — see
+the per-hop table below. Full component reference, data flows, and design
+rationale: `docs/architecture.md`.
+
+**Per-hop transport authentication (`docs/pki-architecture.md` "M1 posture —
+upstream mutual TLS"):**
+
+| Hop | Mode | Notes |
+|---|---|---|
+| Agent → Server (direct-connect) | Mutual TLS | Per-agent client leaf certificate required. |
+| Agent → Gateway (`:50051`) | **One-way TLS** (server-authenticated only) | No client cert required, so an unenrolled agent can still bootstrap through a gateway; agent identity is app-layer (`gateway_observed_peer`), not transport-layer, on this hop. |
+| Gateway → Server upstream (`:50055`, `GatewayUpstream`) | Mutual TLS | Both peers hold CA-issued certs. |
+| Server → Gateway management (`:50063`, command fan-out) | Strict mutual TLS + SPKI peer pin | The privileged command plane; admits only CA-issued client certs pinned to the server's own key. |
+
+"Mutual TLS between every hop" would overclaim the agent→gateway leg —
+correct only for direct-connect agents and the two gateway↔server hops.
 
 **Storage substrate split (ADR-0006):** the server's control-plane state
 lives in PostgreSQL — the server **fails closed at boot** (refuses to start,
@@ -43,20 +69,30 @@ this database-layer figure.
 
 Every Yuzu install auto-generates a per-install internal Certificate
 Authority on first boot (no external PKI required) and serves the dashboard,
-REST API, and every gRPC listener over TLS/mTLS out of the box — no
-`--no-tls`/`--no-https` opt-out exists. Agent enrollment issues per-agent
-leaf certificates signed by that CA; the CA root **private key is never
-stored in the database** (`ca.db` holds only metadata, CRL versions, and an
-opaque `key_ref` behind a `KeyProvider` abstraction). Full design, the
-`sign_agent_csr` chokepoint shared by direct and gateway-proxied enrollment,
-revocation semantics, and the enterprise CA-subordination path (Settings →
-Internal CA → "Subordinate this CA"):
+REST API, and every gRPC listener over TLS/mTLS out of the box by default.
+**Correction:** `--no-tls`/`--no-https` opt-out flags do exist in the server
+binary (`main.cpp`) — the accurate claim is that the **shipped image `CMD`s
+omit them** (#1314, "Distribution flip"), so a default `docker run`/compose
+deployment gets TLS without the operator doing anything, while an operator
+who explicitly passes `--no-tls`/`--no-https` gets a loud startup warning
+banner but is not prevented from disabling it (a deliberate posture for
+local UAT/demo/dev work — see `docs/pki-architecture.md`). Agent enrollment
+issues per-agent leaf certificates signed by that CA; the CA root **private
+key is never stored in the database** — CA metadata, issued-cert inventory,
+and CRL version history live in the `ca_store` PostgreSQL schema (ADR-0053;
+migrated from the legacy `ca.db` SQLite file — see this document's version
+anchor above for which builds still use the SQLite form), with the key
+itself behind a `KeyProvider` abstraction holding only an opaque `key_ref`.
+Full design, the `sign_agent_csr` chokepoint shared by direct and
+gateway-proxied enrollment, revocation semantics, and the enterprise
+CA-subordination path (Settings → Internal CA → "Subordinate this CA"):
 `docs/pki-architecture.md`.
 
-**Known deployment caveat:** composes stay plaintext internally until a
-scoped follow-up (PR5b) lands — do not internet-expose the agent gRPC port
-(`:50051`) directly; see `docs/pki-architecture.md`'s own operational
-warning.
+**Known deployment caveat:** the gateway command-fan-out topology's internal
+composes are not TLS end-to-end on every leg by default (see the per-hop
+table in §1 — the agent→gateway hop is one-way TLS by design, not mutual) —
+do not internet-expose the agent gRPC port (`:50051`) directly; see
+`docs/pki-architecture.md`'s own operational warning.
 
 ### 2.2 Secrets at rest
 
@@ -119,14 +155,20 @@ enforcement layered on top of SAML SSO login. Full reference:
 Role-based access control with a granular permission model
 (`docs/user-manual/rbac.md`) and hierarchical management groups that scope
 an operator's visibility/authority to a confined subset of the fleet
-(`docs/user-manual/management-groups.md`). List-shaped reads (fleet-wide
-queries, not single-resource lookups) are required to go through the
-admit-then-filter `authorize_list_read` chokepoint (ADR-0017) — a bare
-global `require_permission` on a list route is a known-inert pattern for a
-confined operator and fails open on a corrupt `rbac.db`, so this chokepoint
-is the load-bearing control for every new list/fan-out surface. See
-`docs/auth-architecture.md` "Granular RBAC (Phase 3)" and "The authorization
-topology floor (#2376)".
+(`docs/user-manual/management-groups.md`). `RbacStore` is PostgreSQL-backed
+(ADR-0041); a bare global `require_permission` on a list route is a
+known-inert pattern for a confined operator and fails open if the RBAC
+store is unreadable/degraded. List-shaped reads (fleet-wide queries, not
+single-resource lookups) are **required** to go through the admit-then-filter
+`authorize_list_read` chokepoint (ADR-0017) on **migrated** routes — this is
+policy for all new work, not yet complete coverage of every existing route:
+`docs/auth-architecture.md` names a handful of fleet-wide reads not yet on
+this chokepoint (`GET /api/v1/execution-statistics/agents` and the workflow
+executions LIST fragment, tracked #3526; `/fragments/results` additionally
+has no audit trail at all, tracked #3528). See `docs/auth-architecture.md`
+"Granular RBAC (Phase 3)" and "The authorization topology floor (#2376)" for
+the full migrated/unmigrated inventory — do not cite this control as
+covering every list route without checking that inventory first.
 
 ### 3.6 API tokens and service automation
 
@@ -146,14 +188,27 @@ audited event. `docs/auth-architecture.md` "Account lockout".
 
 ## 4. Audit trail and evidence chain
 
-Every operator action is recorded as a structured, tamper-evident audit
-event suitable for compliance reporting and SIEM export
-(`docs/user-manual/audit-log.md`). As of ADR-0040 the audit store is
-PostgreSQL-backed with **no SQLite fallback** (construction fails closed);
-writes fail hard (`503` + `Sec-Audit-Failed` header, never a silent drop)
-and reads deny on degrade (`503`, never a false-empty response). A
-clock-guarded, capped retention sweep bounds how fast the evidence table can
-drain even under a forward clock jump on the PostgreSQL host — the guard
+Every operator action is recorded as a structured audit event suitable for
+compliance reporting and SIEM export (`docs/user-manual/audit-log.md`).
+**Correction — "tamper-evident" overclaims today:** the audit store is
+append-only **by policy** (no update/delete API surface for a row's
+content), not cryptographically tamper-evident — there is no hash chain or
+signature over the row sequence that would let a reviewer *prove* a row was
+not altered or removed out-of-band (e.g. a direct database edit by someone
+holding PostgreSQL access). Treat this as an access-control/operational
+control (who can reach the database), not a cryptographic integrity
+guarantee, until a hash-chain or equivalent mechanism ships. As of ADR-0040
+the audit store is PostgreSQL-backed with **no SQLite fallback**
+(construction fails closed). **The `503`/`Sec-Audit-Failed` fail-hard write
+behaviour is scoped to behavioural-PII REST reads specifically** (the
+`rest_audit.hpp` `emit_behavioral_audit` chokepoint) — **not** a blanket
+guarantee across every ingress: dashboard HTML routes and MCP tool calls are
+"set-and-proceed" on an audit-write failure (the request completes even if
+the audit row did not persist), a different posture from REST's fail-closed
+one. Reads deny on degrade for the REST audit query surface (`503`, never a
+false-empty response). A clock-guarded, capped retention sweep bounds how
+fast the evidence table can drain even under a forward clock jump on the
+PostgreSQL host — the guard
 declines a pass it cannot trust rather than risk over-deleting, and every
 decline/anomaly is itself an alertable signal
 (`docs/ops-runbooks/audit-store-clock-guard.md`). See
