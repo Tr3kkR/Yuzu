@@ -6983,7 +6983,21 @@ McpServer::HandlerFn McpServer::build_handler(
                 // non-empty (default false; most list_executions-style
                 // callers don't consume the field).
                 eq.include_error_detail = true;
-                auto execs = execution_tracker->query_executions(eq);
+                // #4030 review finding (blocking): was the unchecked
+                // query_executions(), which collapsed a tracker-not-open,
+                // pool-exhaustion, or query-failure degrade into the same
+                // empty vector a genuinely empty table returns -- matches
+                // GET /api/v1/executions above (rest_api_v1.cpp), which
+                // already has this checked/error shape, and mirrors the
+                // list_schedules fix immediately below in this same file.
+                auto execs_opt = execution_tracker->query_executions_checked(eq);
+                if (!execs_opt) {
+                    res.set_content(
+                        error_response(id, kInternalError, "execution tracker degraded"),
+                        "application/json");
+                    return;
+                }
+                const auto& execs = *execs_opt;
                 // #1634 (Doomgoose review finding, important): get_execution_status
                 // projects agents_targeted/agents_responded to the caller's visible
                 // agents when confined; this LIST sibling served the raw fleet-wide
@@ -6996,8 +7010,20 @@ McpServer::HandlerFn McpServer::build_handler(
                     exec_ids.reserve(execs.size());
                     for (const auto& e : execs)
                         exec_ids.push_back(e.id);
-                    statuses_by_exec =
-                        execution_tracker->get_agent_statuses_for_executions(exec_ids);
+                    // #4030 review finding (blocking): same class as the
+                    // list-query fix immediately above -- was the unchecked
+                    // get_agent_statuses_for_executions(), which silently
+                    // zeroed every confined row's counts on a degrade
+                    // instead of surfacing it.
+                    auto statuses_opt =
+                        execution_tracker->get_agent_statuses_for_executions_checked(exec_ids);
+                    if (!statuses_opt) {
+                        res.set_content(
+                            error_response(id, kInternalError, "execution tracker degraded"),
+                            "application/json");
+                        return;
+                    }
+                    statuses_by_exec = std::move(*statuses_opt);
                 }
                 // #4030: reconciled field set (docs/api-twin-recipe.md Rule 1) —
                 // shared builder with GET /fragments/executions and the new

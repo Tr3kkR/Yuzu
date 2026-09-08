@@ -5891,6 +5891,42 @@ TEST_CASE("MCP list_executions: confined caller's counts reflect only in-scope, 
     CHECK(sc[0]["agents_responded"] == 0);
 }
 
+// #4030 review finding (blocking, HIGH): list_executions used to call the
+// unchecked query_executions()/get_agent_statuses_for_executions(), which
+// silently collapsed a degraded tracker (not-open / pool-exhausted /
+// query-failed) into an empty executions list -- indistinguishable from a
+// genuinely empty fleet, and the exact defect class already fixed for
+// list_schedules (5686776fe) two commits earlier in this same PR. Mirrors
+// "create_execution failure degrades..." above: an ExecutionTracker bound to
+// an unreachable pool fails its own connect attempt deterministically
+// (ADR-0065, test_engine_principal_store.cpp's #2456 precedent) -- no live
+// database needed, so this carries no [pg] tag.
+TEST_CASE("MCP list_executions: a degraded tracker surfaces a store-fault "
+          "error, never a false empty-success list (#4030 fix regression)",
+          "[mcp][integration][execution]") {
+    pg::PgPool unreachable{{.conninfo = "host=127.0.0.1 port=1 dbname=yuzu connect_timeout=1",
+                            .size = 1,
+                            .connect_timeout_s = 1}};
+    REQUIRE(unreachable.valid()); // conninfo parses; the host is just unreachable
+    ExecutionTracker broken(unreachable);
+    REQUIRE(!broken.is_open());
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &broken;
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":733,"params":{"name":"list_executions"}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInternalError);
+    // Never the pre-fix shape: a "success" result with an empty executions
+    // array, indistinguishable from a genuinely-empty fleet.
+    CHECK_FALSE(body.contains("result"));
+}
+
 TEST_CASE("MCP Agentic demo: ceo_demo prompt is live-only and ignores injected args (ADR-0016)",
           "[mcp][integration][agentic-demo][prompt-injection][review-1653]") {
     McpTestServer ts;
