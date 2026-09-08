@@ -79,6 +79,7 @@ A separate, narrower shape applies to ordinary mutation routes that audit a chan
   - [Policies](#policies)
   - [Compliance](#compliance)
   - [Runtime Configuration](#runtime-configuration)
+  - [Settings](#settings)
   - [Custom Properties](#custom-properties)
   - [Webhooks](#webhooks)
   - [Offload Targets](#offload-targets)
@@ -3903,6 +3904,242 @@ See [Audit log](audit-log.md) for the `detail` contract, which differs for secre
 
 ---
 
+### Settings
+
+**#4028 (api-parity programme #2146).** REST v1 read-twins for the eight `/fragments/settings/*`
+dashboard sub-areas (TLS, HTTPS, gateway, server-config, MCP, data-retention, analytics,
+plugin-signing) — previously gated by a whole-endpoint admin role check (`require_admin`) with no
+RBAC securable and no REST twin at all. All eight routes are **read-only** and **Administrator-only
+today** (see the per-route Permission line); broadening to another role is a separate, explicit
+decision. Every builder is shared verbatim with the corresponding HTML fragment renderer
+(`docs/api-twin-recipe.md` §1) — the REST and dashboard views cannot drift from each other.
+
+**MCP.** None of these eight routes has an MCP twin, deliberately, and no MCP token can reach any of
+them via REST either — at any tier, including readonly. Issue #520 established the rule via
+`require_admin`'s own comment: "MCP tokens are for fleet management (queries, instruction execution)
+and must not be used to administer the server itself (settings, users, TLS, OIDC)". Seven of these
+eight routes are new and were never gated by `require_admin`; the eighth
+(`/api/v2/agent/plugin-policy` — its predecessor `/api/v1/agent/plugin-policy` is deprecated,
+frozen on `require_admin`; see below) is hardened off it onto `require_permission`. Gating via
+`require_permission` alone is not sufficient to preserve #520's blanket MCP exclusion — an
+admin-owned MCP token (any tier) satisfies `require_permission`'s topology-floor legacy-role check
+the same way an interactive admin session does. #4028 closes that gap at the actual chokepoint:
+`TlsConfig`, `PluginSigning`, `ServerConfig`, and `AnalyticsConfig` are excluded from every MCP tier
+in `mcp_policy.hpp`'s `tier_allows()`, so an MCP token is denied before it ever reaches the
+role-based fallback, on every transport that consults `tier_allows()` (REST today; MCP JSON-RPC too,
+if a future tool ever names one of these securables). #4028 ships these eight sub-areas REST-only
+rather than silently widening #520 — a future MCP carve-out for read-only settings visibility would
+need its own security-guardian-reviewed amendment, not a side effect of this twin work. See
+[MCP Server](../mcp-server.md) for the full #520 policy.
+
+#### `GET /api/v1/settings/tls`
+
+TLS/mTLS listener settings: enabled state, server cert/key/CA file paths, `insecure_skip_client_verify`,
+and the management-listener TLS override paths.
+
+**Permission:** `TlsConfig:Read`. **Audit:** `settings.tls.read` (fail-closed — TLS/mTLS posture and
+cert paths are reconnaissance value for an attacker learning the mTLS enforcement posture).
+
+```json
+{
+  "data": {
+    "enabled": true,
+    "server_cert_path": "/etc/yuzu/certs/server.pem",
+    "server_key_path": "/etc/yuzu/certs/server.key",
+    "ca_cert_path": "/etc/yuzu/certs/ca.pem",
+    "insecure_skip_client_verify": false,
+    "mgmt_server_cert_path": "",
+    "mgmt_server_key_path": "",
+    "mgmt_ca_cert_path": ""
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+#### `GET /api/v1/settings/https`
+
+HTTPS listener settings: enabled state, port, cert/key file paths, HTTP-redirect state.
+
+**Permission:** `TlsConfig:Read` (same securable as `/settings/tls`). **Audit:** `settings.https.read`
+(fail-closed).
+
+```json
+{
+  "data": {
+    "enabled": true,
+    "port": 8443,
+    "cert_path": "/etc/yuzu/certs/https.pem",
+    "key_path": "/etc/yuzu/certs/https.key",
+    "redirect": true
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+#### `GET /api/v2/agent/plugin-policy`
+
+Plugin code-signing trust bundle — **this is plugin-signing's REST twin**, not a separate
+`/api/v1/settings/plugin-signing` route (deliberate: the acceptance criteria for #4028 hardens this
+pre-existing, previously off-ledger route onto the A4 envelope + OpenAPI + the shared builder
+rather than adding a parallel one). Superset of the `/fragments/settings/plugin-signing` fragment's
+data — this route alone also returns the raw `trust_bundle_pem` bytes, for out-of-band agent-config
+distribution (`--plugin-trust-bundle`).
+
+**v1 is deprecated.** `GET /api/v1/agent/plugin-policy` predates #4028 and is FROZEN at its original
+flat-body shape (`require_admin` gate, no `data` envelope, no audit, no A4 error shape) rather than
+reshaped in place — #4144 caught that the original #4028 round did exactly that and violated
+`docs/api-versioning-policy.md`. v1 keeps working through the announced deprecation window (see
+`server-admin.md`'s vNEXT note); new integrations should target v2 below.
+
+**Permission:** `PluginSigning:Read` (dedicated securable, deliberately distinct from the unrelated
+`PluginConfig` securable, which gates per-plugin runtime kill-switch config — a different domain). No
+MCP token, at any tier, satisfies this permission (see "MCP" above). **Audit:**
+`settings.plugin_signing.read` (fail-closed) — CC6.1 least-privilege: a non-admin token holder
+learning when the trust anchor rotates (sha256 changes) is useful reconnaissance for a supply-chain
+attacker.
+
+```json
+{
+  "data": {
+    "enabled": true,
+    "required": false,
+    "cert_count": 2,
+    "sha256": "a1b2c3...",
+    "subjects": ["CN=Yuzu Plugin Signer, O=Example Corp"],
+    "bundle_unreadable": false,
+    "trust_bundle_pem": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n"
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+No bundle uploaded (still 200, not 404 — a normal operational state): `enabled: false`,
+`cert_count: 0`, `sha256: ""`, `subjects: []`, `trust_bundle_pem: ""`. A bundle present on disk but
+unreadable returns 500 (A4 error envelope) instead.
+
+**Errors:** 503 (A4 envelope, `retry_after_ms` set) in two cases distinct from the audit fail-closed
+503 above — the `required` flag's backing `runtime_config_store` read failed (the response would
+otherwise be unable to distinguish a genuine outage from a healthy "not required"), or the trust
+bundle was concurrently uploaded/cleared between this request's existence check and its PEM
+re-read. Both are retryable, and neither affects real plugin-signature enforcement — see
+[When a change takes effect](#when-a-change-takes-effect) above: `plugin_signing_required` "records
+intent only," is read in exactly two places (this route and its dashboard fragment twin), and no
+server or agent code consumes it to require signatures. Agent-side enforcement, where configured,
+is that agent's own `--plugin-require-signature`/`--plugin-trust-bundle` flags, independent of this
+route and its backing store.
+
+#### `GET /api/v1/settings/gateway`
+
+Erlang gateway upstream status: enabled state, listen address, gateway mode, live session count.
+
+**Permission:** `ServerConfig:Read`. **Audit:** none — operational status, nothing secret.
+
+```json
+{
+  "data": { "enabled": true, "listen_address": "0.0.0.0:50053", "gateway_mode": false, "active_sessions": 3 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`listen_address`/`gateway_mode`/`active_sessions` are defaulted (`""`/`false`/`0`) when
+`enabled` is `false`.
+
+#### `GET /api/v1/settings/server-config`
+
+Core server configuration: gRPC/web addresses and ports, session timeout, max agents, rate limits,
+OTA/gRPC tuning knobs. Nothing secret.
+
+**Permission:** `ServerConfig:Read`. **Audit:** none.
+
+```json
+{
+  "data": {
+    "agent_grpc_address": "0.0.0.0:50051",
+    "management_grpc_address": "0.0.0.0:50052",
+    "web_address": "127.0.0.1",
+    "web_port": 8080,
+    "session_timeout_seconds": 3600,
+    "max_agents": 10000,
+    "auth_config_path": "/etc/yuzu/yuzu-server.cfg",
+    "rate_limit_per_ip": 100,
+    "login_rate_limit_per_ip": 10,
+    "ota_max_concurrent_per_peer": 2,
+    "ota_rate_refill_per_min": 1.0,
+    "ota_rate_capacity": 20.0,
+    "ota_max_concurrent_total": 64,
+    "ota_max_peers_tracked": 50000,
+    "ota_transfer_deadline_secs": 900,
+    "ota_chunk_write_deadline_secs": 30,
+    "grpc_max_concurrent_streams": 128,
+    "grpc_max_resource_memory_mb": 512
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+#### `GET /api/v1/settings/mcp`
+
+MCP server status and the client-connection info shown on the dashboard (enabled/read-only state,
+the `/mcp/v1/` endpoint URL).
+
+**Permission:** `ServerConfig:Read`. **Audit:** none — low sensitivity; an MCP client with a valid
+token already knows this endpoint exists. This route describes the MCP surface but is itself
+REST-only — see the #520 note above.
+
+```json
+{
+  "data": { "enabled": true, "read_only": false, "endpoint_url": "https://localhost:8443/mcp/v1/" },
+  "meta": { "api_version": "v1" }
+}
+```
+
+#### `GET /api/v1/settings/data-retention`
+
+Response/audit data retention windows, in days.
+
+**Permission:** `ServerConfig:Read`. **Audit:** none — lowest sensitivity of the eight (two
+integers).
+
+```json
+{
+  "data": { "response_retention_days": 90, "audit_retention_days": 365 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+#### `GET /api/v1/settings/analytics`
+
+Analytics drain configuration and ClickHouse integration settings.
+
+**Permission:** `AnalyticsConfig:Read`. **Audit:** `settings.analytics.read` (fail-closed) — mixed,
+leans high (embedded-credential risk).
+
+> **`clickhouse_url` is sanitized of embedded userinfo credentials** (a URL of the form
+> `clickhouse://user:pass@host:9000/db` has the `user:pass@` segment stripped) before being
+> returned — this closes a gap where the sibling HTML fragment previously rendered the URL
+> verbatim, masking only the separate `clickhouse_password` field. The raw password is never
+> returned at all; only `clickhouse_password_set` (a bool) is.
+
+```json
+{
+  "data": {
+    "enabled": true,
+    "drain_interval_seconds": 10,
+    "batch_size": 100,
+    "clickhouse_configured": true,
+    "clickhouse_url": "clickhouse://host:9000/yuzu",
+    "clickhouse_database": "yuzu",
+    "clickhouse_table": "yuzu_events",
+    "clickhouse_username": "default",
+    "clickhouse_password_set": true,
+    "jsonl_export_path": ""
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
 ### Custom Properties
 
 Custom properties are operator-defined key-value pairs on agents, separate from tags. Properties can have schemas that enforce a value type (`string`/`int`/`bool`/`datetime`) and an optional regex-pattern validation rule. Properties are available for use in scope expressions via the `props.<key>` prefix.
@@ -6873,7 +7110,7 @@ outcome's granularity.
 
 ### Settings — Plugin Code Signing
 
-These endpoints drive the **Settings → Plugin Code Signing** card. The four `/api/settings/plugin-signing/*` routes are admin-only HTMX paths that return fragment HTML; the agent-facing distribution endpoint at `/api/v1/agent/plugin-policy` returns JSON. See *user-manual/agent-plugins.md → Plugin Code Signing* for the operator workflow and *user-manual/server-admin.md → vNEXT* for the upgrade notes.
+These endpoints drive the **Settings → Plugin Code Signing** card. The four `/api/settings/plugin-signing/*` routes are admin-only HTMX paths that return fragment HTML; the agent-facing distribution endpoint at `/api/v2/agent/plugin-policy` returns JSON (its predecessor `/api/v1/agent/plugin-policy` is deprecated — see below). See *user-manual/agent-plugins.md → Plugin Code Signing* for the operator workflow and *user-manual/server-admin.md → vNEXT* for the upgrade notes. See also [Settings](#settings) below — `/api/v2/agent/plugin-policy` is plugin-signing's REST read-twin (#4028, #4144); it is documented in both places because it predates the Settings read-twins programme and keeps its original path rather than moving under `/api/v1/settings/...`.
 
 **`GET /fragments/settings/plugin-signing`** — Render the Plugin Code Signing card fragment.
 
@@ -6905,43 +7142,61 @@ These endpoints drive the **Settings → Plugin Code Signing** card. The four `/
 - **Response (200):** Re-rendered fragment, `HX-Trigger: showToast level=success`. Audit `plugin_signing.require.changed` / `success`, `target_type=RuntimeConfig`, `target_id=plugin_signing_required`, `detail=<new_val>`.
 - **Response (500):** DB write failure with the store error.
 
-**`GET /api/v1/agent/plugin-policy`** — Distribution endpoint for operator agent-config flows. Returns the current trust bundle PEM and require flag as JSON.
+**`GET /api/v2/agent/plugin-policy`** — Distribution endpoint for operator agent-config flows, and plugin-signing's REST read-twin (#4028, #4144). Returns the current trust bundle PEM and require flag as JSON.
 
-- **Permission:** Admin only. The bundle holds X.509 certificates only (no private keys), but the SHA-256 fingerprint and the trust-anchor identity are operationally sensitive — non-admin token holders are not authorized to see when the trust anchor rotates. Future automatic agent-side fetch will introduce a dedicated agent identity for this endpoint.
-- **Stability:** pilot-stable. The path `/api/v1/agent/...` and the JSON response shape may change before the GA `/v1/` contract is finalized; the field set is unlikely to shrink (forward-compatible additions only).
+**v1 deprecated.** `GET /api/v1/agent/plugin-policy` predates #4028, is now DEPRECATED, and stays on its original flat-body shape (no `data` envelope, `require_admin` gate instead of `PluginSigning:Read`, no audit row, the old bespoke error shape) — see `server-admin.md`'s vNEXT note for the announced removal window. #4028 originally hardened this route's shape in place; #4144 corrected that into the v1/v2 split below, since an in-place envelope reshape is a breaking change per `docs/api-versioning-policy.md`.
+
+- **Permission:** `PluginSigning:Read` (Administrator-only via the `rbac_store.cpp` seed; floored in `authz_topology_floor.hpp` so an RBAC-off deployment stays admin-gated — the same practical posture the prior admin-only gate had for interactive sessions and non-MCP API tokens). **No MCP token, at any tier, can satisfy this permission** — `PluginSigning` is one of four server-administration securables `mcp_policy.hpp`'s `tier_allows()` denies outright, regardless of Read/Write, so an admin-owned MCP token that would otherwise fall through the legacy role check is stopped before it gets there. The bundle holds X.509 certificates only (no private keys), but the SHA-256 fingerprint and the trust-anchor identity are operationally sensitive — non-admin token holders are not authorized to see when the trust anchor rotates. Future automatic agent-side fetch will introduce a dedicated agent identity for this endpoint.
+- **Audit:** fail-closed. `settings.plugin_signing.read` is persisted before the response is built; if the audit subsystem is unavailable the route returns 503 rather than serve settings data without durable evidence.
+- **Stability:** pilot-stable. The field set is unlikely to shrink (forward-compatible additions only). `cert_count`/`sha256`/`subjects`/`trust_bundle_pem` are derived from a single filesystem read (#4144) — they cannot describe two different bundle versions on a concurrent-upload race, unlike v1.
 - **Response (200, bundle uploaded):**
 
   ```json
   {
-    "enabled": true,
-    "required": false,
-    "trust_bundle_pem": "-----BEGIN CERTIFICATE-----\nMIIB…\n-----END CERTIFICATE-----\n",
-    "cert_count": 2,
-    "sha256": "abc123…"
+    "data": {
+      "enabled": true,
+      "required": false,
+      "cert_count": 2,
+      "sha256": "abc123…",
+      "trust_bundle_pem": "-----BEGIN CERTIFICATE-----\nMIIB…\n-----END CERTIFICATE-----\n"
+    },
+    "meta": {"api_version": "v1"}
   }
   ```
 
 - **Response (200, no bundle uploaded):**
 
   ```json
-  {"enabled": false, "required": false, "trust_bundle_pem": ""}
+  {"data": {"enabled": false, "required": false, "trust_bundle_pem": ""},
+   "meta": {"api_version": "v1"}}
   ```
 
   (Status is 200, not 404 — "no bundle uploaded" is a normal operational state, not a fetch failure.)
 
-- **Response (500, bundle on disk is unreadable):** standard `/api/v1/*` error envelope.
+- **Response (500, bundle on disk is unreadable):** standard A4 error envelope.
 
   ```json
-  {"error": {"code": 500, "message": "Trust bundle on disk is unreadable"},
+  {"error": {"code": 500, "message": "Trust bundle on disk is unreadable",
+             "correlation_id": "…", "retry_after_ms": null},
    "meta": {"api_version": "v1"}}
   ```
+
+- **Response (503, audit subsystem unavailable):** same A4 error shape with `code: 503`.
+
+- **Response (503, two further cases, #4028 fix round):** the `required` flag's backing
+  `runtime_config_store` read failed (distinguishes a genuine outage from a healthy "not required" —
+  see [When a change takes effect](#when-a-change-takes-effect) above: `plugin_signing_required`
+  "records intent only," no server or agent code consumes it to require signatures, so a degraded
+  read here does not affect real enforcement), or the trust bundle was concurrently
+  uploaded/cleared between this request's existence check and its PEM re-read. Both are retryable
+  (A4 envelope, `retry_after_ms` set).
 
 - **Operator usage:** curl this into a local file on each agent host, then point the agent at that file with `--plugin-trust-bundle`:
 
   ```bash
   curl -fsSL -H "Authorization: Bearer $YUZU_ADMIN_TOKEN" \
-    https://server.example.com:8443/api/v1/agent/plugin-policy \
-    | jq -r .trust_bundle_pem > /etc/yuzu/plugin-trust-bundle.pem
+    https://server.example.com:8443/api/v2/agent/plugin-policy \
+    | jq -r .data.trust_bundle_pem > /etc/yuzu/plugin-trust-bundle.pem
   ```
 
 ---

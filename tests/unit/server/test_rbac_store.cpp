@@ -172,8 +172,10 @@ TEST_CASE("RbacStore: seed data — securable types", "[rbac_store][pg]") {
     // (#2376, cut away from Security:Read) +PluginConfig +PluginSecret
     // +UploadGrant (PR1.9a, peer finding PLAN-001) +PowerManagement (Wave 6 W1B) = 27,
     // +ProductPack (#4029 prerequisite fix — was used as an RBAC securable string by
-    // the shipped /api/product-packs* routes but never seeded) = 28.
-    REQUIRE(types.size() == 28);
+    // the shipped /api/product-packs* routes but never seeded) = 28,
+    // +TlsConfig +PluginSigning +ServerConfig +AnalyticsConfig (#4028
+    // Settings read-twins) = 32.
+    REQUIRE(types.size() == 32);
 
     auto has = [&](const std::string& t) {
         return std::find(types.begin(), types.end(), t) != types.end();
@@ -200,6 +202,11 @@ TEST_CASE("RbacStore: seed data — securable types", "[rbac_store][pg]") {
     CHECK(has("EnginePrincipal")); // Engine-principal inventory + grant-graph reads (#2376),
                                    // cut away from the over-broad Security:Read
     CHECK(has("ProductPack")); // #4029 prerequisite fix
+    CHECK(has("PowerManagement")); // Wave 6 W1B: power_health's set_power_plan
+    CHECK(has("TlsConfig"));       // #4028: tls/https Settings fragments
+    CHECK(has("PluginSigning"));   // #4028: plugin-signing fragment + GET /agent/plugin-policy (v2)
+    CHECK(has("ServerConfig"));    // #4028: gateway/server-config/mcp/data-retention fragments
+    CHECK(has("AnalyticsConfig")); // #4028: analytics fragment
 }
 
 TEST_CASE("RbacStore: seed data — operations", "[rbac_store][pg]") {
@@ -234,17 +241,19 @@ TEST_CASE("RbacStore: seeded catalogues match the MCP C8 validator mirrors",
 TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_store][pg]") {
     RBAC_STORE(store);
     auto perms = store.get_role_permissions("Administrator");
-    // 28 types * 5 CRUD ops = 140 permissions, plus a single targeted Push
-    // grant on GuaranteedState (= 141), plus a single AccessReview:Attest grant
-    // (Periodic Access Reviews, CC6.2, = 142), plus a single ApiToken:Rotate
-    // grant (P2 #11, SOC 2 CC6.3) = 143 permissions total. Push, Attest, and
+    // 32 types * 5 CRUD ops = 160 permissions, plus a single targeted Push
+    // grant on GuaranteedState (= 161), plus a single AccessReview:Attest grant
+    // (Periodic Access Reviews, CC6.2, = 162), plus a single ApiToken:Rotate
+    // grant (P2 #11, SOC 2 CC6.3) = 163 permissions total. Push, Attest, and
     // Rotate are deliberately NOT cross-seeded on other securables — see the
-    // rationale in rbac_store.cpp seed_defaults(). (28th: ProductPack, #4029
-    // prerequisite fix; 27th: PowerManagement, Wave 6 power_health
-    // set_power_plan; 26th-24th: UploadGrant/PluginSecret/PluginConfig,
-    // PR1.9a peer finding PLAN-001; 23rd: EnginePrincipal, #2376; 22nd:
-    // AccessReview, SOC 2 CC6.2; 21st: SoftwareLicensing, ADR-0024.)
-    CHECK(perms.size() == 143);
+    // rationale in rbac_store.cpp seed_defaults(). (32nd-29th: TlsConfig/
+    // PluginSigning/ServerConfig/AnalyticsConfig, #4028 Settings read-twins;
+    // 28th: ProductPack, #4029 prerequisite fix; 27th: PowerManagement, Wave 6
+    // power_health set_power_plan; 26th-24th: UploadGrant/PluginSecret/
+    // PluginConfig, PR1.9a peer finding PLAN-001; 23rd: EnginePrincipal,
+    // #2376; 22nd: AccessReview, SOC 2 CC6.2; 21st: SoftwareLicensing,
+    // ADR-0024.)
+    CHECK(perms.size() == 163);
     for (auto& p : perms)
         CHECK(p.effect == "allow");
 
