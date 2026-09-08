@@ -3454,11 +3454,14 @@ LatencyStats summarize_us(std::vector<std::int64_t> v) {
     s.max_us = v.back();
     s.median_us = v[v.size() / 2];
     s.p90_us = v[(v.size() * 9) / 10];
-    // Clamped (unlike the p90 line above, left as-is): the PR-A establishment
-    // harness below can in principle hand this a shorter vector than the
-    // dispatch-latency callers above always produce (n >= 5 REQUIRE'd there),
-    // and (v.size()*99)/100 is an off-by-one risk at small n that p90's 9/10
-    // divisor does not hit in practice at the sizes callers use.
+    // Comment corrected (adversarial-review finding, PR-A round 2): the
+    // clamp below never actually binds - (n*99)/100 <= n-1 for every n >= 1
+    // (same true of p90's (n*9)/10 above, which is why it needs none), so
+    // there is no real off-by-one risk at small n for either percentile.
+    // Kept anyway as an explicit, self-documenting bound against
+    // std::vector::operator[]'s own UB-on-out-of-range contract, in case a
+    // future change to this formula (or to how it's called) ever changes
+    // that arithmetic fact.
     s.p99_us = v[std::min(v.size() - 1, (v.size() * 99) / 100)];
     return s;
 }
@@ -4096,7 +4099,15 @@ TEST_CASE("Watch establishment (Registry): target-absent, ancestor walk depth 6 
                    t_open_per_level);
     warn_establish("R2 registry target-absent depth6", "RegNotifyChangeKeyValue", t_notify);
     warn_establish("R2 registry target-absent depth6", "SetThreadpoolWait", t_wait_set);
-    warn_establish("R2 registry target-absent depth6", "TOTAL (event+waitcreate+walk+notify+set)",
+    // Labeled honestly (adversarial-review finding, PR-A round 2): walk_t0..
+    // walk_t1 brackets the WHOLE establish_registry_sample() call, whose
+    // body's own last step is an unmeasured-separately teardown (cancel +
+    // WaitForThreadpoolWaitCallbacks drain + closes) - this series is NOT
+    // establishment-only, it includes that teardown/drain too. The bias is
+    // conservative (can only inflate a derived deadline, never undersize
+    // one), so this is a labeling fix, not a measurement fix.
+    warn_establish("R2 registry target-absent depth6",
+                   "TOTAL (event+waitcreate+walk+notify+set, INCL. TEARDOWN/DRAIN)",
                    t_walk_total);
 
     ::RegDeleteKeyA(HKEY_CURRENT_USER, base.c_str());
