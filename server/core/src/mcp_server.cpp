@@ -5498,23 +5498,37 @@ McpServer::HandlerFn McpServer::build_handler(
             // `ServiceScopeClass::denied` classification in kToolSecurityRows
             // below, so the generic C8 chokepoint still denies them before this
             // code is ever reached (parity with the REST retention twin's own
-            // explicit deny — see dashboard_routes.cpp). Then the SAME shared
-            // builder their REST twin calls (api-twin-recipe.md Rule 1), with
-            // gate.scope applied as an additional intersection filter — see the
-            // REST twins' own comment in tar_tree_routes.cpp for why this is an
-            // intersection with tar_devices_fn_'s/gather_tar_retention_paused's
-            // existing narrowing, not a replacement. Unaudited-on-success
+            // explicit deny — see dashboard_routes.cpp). Unaudited-on-success
             // posture for the two device pickers would match their REST
             // siblings, but every other MCP tool in this file (including
             // list_agents just above) calls mcp_audit("success") as baseline
             // MCP-transport access logging regardless of the REST-side audit
             // decision — followed here for consistency rather than introducing
             // a fourth posture into an already-three-posture table
-            // (docs/api-twin-recipe.md §4). ──
+            // (docs/api-twin-recipe.md §4).
+            //
+            // #4143 review fix (external colleague review, BLOCKING + SILENTFAIL-1,
+            // both confirmed by direct source inspection): the two device pickers
+            // now read the SAME shared builder their REST twin calls
+            // (api-twin-recipe.md Rule 1) from an UNFILTERED registry snapshot
+            // (all_devices_fn_ — same source list_agents' agents_fn and
+            // GET /api/v1/devices (#4033) use), with gate.scope as the SOLE
+            // filter — not an intersection with tar_devices_fn_'s direct-
+            // membership-only pre-filter (see set_all_devices_fn's doc comment
+            // above for why the old intersection design was an ADR-0017
+            // INV-4/INV-7 violation). And both now fail LOUD (503-equivalent
+            // kInternalError) when their provider is unwired, matching
+            // list_tar_retention_paused's existing posture below — the previous
+            // code silently answered "0 devices in your scope" on a misconfigured
+            // call site for these two tools only, indistinguishable from a
+            // genuinely-empty-scope caller (a false "closed" that reads as data,
+            // not an outage; the same class of bug the loud unwired-fleet_read_fn_
+            // branch just above already guards against). ──
             if (tool_name == "list_tar_process_tree_devices") {
-                if (!fleet_read_fn_) {
-                    spdlog::error("list_tar_process_tree_devices: fleet_read_fn_ unwired — "
-                                  "misconfigured call site; failing closed");
+                if (!fleet_read_fn_ || !all_devices_fn_) {
+                    spdlog::error("list_tar_process_tree_devices: fleet_read_fn_/"
+                                  "all_devices_fn_ unwired — misconfigured call site; "
+                                  "failing closed");
                     res.set_content(error_response(id, kInternalError, "service unavailable"),
                                     "application/json");
                     return;
@@ -5522,8 +5536,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto gate = fleet_read_fn_(req, res, "Infrastructure", "Read");
                 if (!gate.admitted)
                     return; // gate already wrote the A4 error body + status
-                std::vector<DeviceRow> devices =
-                    tar_devices_fn_ ? tar_devices_fn_(session->username) : std::vector<DeviceRow>{};
+                std::vector<DeviceRow> devices = all_devices_fn_();
                 if (gate.scope) {
                     std::vector<DeviceRow> visible;
                     visible.reserve(devices.size());
@@ -5544,9 +5557,10 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             if (tool_name == "list_tar_capture_sources_devices") {
-                if (!fleet_read_fn_) {
-                    spdlog::error("list_tar_capture_sources_devices: fleet_read_fn_ unwired — "
-                                  "misconfigured call site; failing closed");
+                if (!fleet_read_fn_ || !all_devices_fn_) {
+                    spdlog::error("list_tar_capture_sources_devices: fleet_read_fn_/"
+                                  "all_devices_fn_ unwired — misconfigured call site; "
+                                  "failing closed");
                     res.set_content(error_response(id, kInternalError, "service unavailable"),
                                     "application/json");
                     return;
@@ -5554,8 +5568,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto gate = fleet_read_fn_(req, res, "Infrastructure", "Read");
                 if (!gate.admitted)
                     return; // gate already wrote the A4 error body + status
-                std::vector<DeviceRow> devices =
-                    tar_devices_fn_ ? tar_devices_fn_(session->username) : std::vector<DeviceRow>{};
+                std::vector<DeviceRow> devices = all_devices_fn_();
                 if (gate.scope) {
                     std::vector<DeviceRow> visible;
                     visible.reserve(devices.size());
@@ -5594,8 +5607,11 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                const std::string payload = tar_retention_paused_json(
-                    dashboard_routes_->gather_tar_retention_paused(session->username, gate.scope));
+                // #4143 review fix: gate.scope is authoritative here — see
+                // gather_tar_retention_paused's doc comment.
+                const std::string payload =
+                    tar_retention_paused_json(dashboard_routes_->gather_tar_retention_paused(
+                        session->username, gate.scope, /*extra_scope_is_authoritative=*/true));
                 mcp_audit("success");
                 res.set_content(success_response(id, tool_result(payload, kObjectOutputSchema)),
                                 "application/json");

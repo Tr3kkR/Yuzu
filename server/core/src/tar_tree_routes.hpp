@@ -78,9 +78,15 @@ class HttpRouteSink;
 /// `<option>` elements. Called by `GET /api/v1/tar/process-tree` and the
 /// `list_tar_process_tree_devices` MCP tool; the HTML fragment keeps its own
 /// presentation-only "hide offline" filter (a picker dropdown for live dispatch,
-/// unlike this JSON list) rather than being refactored onto this builder's output —
-/// low risk to add, non-trivial to merge without changing the picker's UX, so left
-/// alone per Rule 1's "where that refactor is low-risk" carve-out. The builder itself
+/// unlike this JSON list) rather than being refactored onto this builder's output.
+/// #4143 review fix (STANDARDS-2): the previous version of this comment cited a
+/// "Rule 1 low-risk carve-out" in api-twin-recipe.md that does not exist there —
+/// the doc's actual Rule 1 guidance (§ "Update the existing REST handler to call
+/// it") argues FOR this refactor, not for skipping it. Corrected, honest status:
+/// NOT done this round — tracked as a deliberate follow-up (same "recorded
+/// exception" posture as the two un-migrated `/fragments/tar/...` routes
+/// elsewhere in this file), not yet verified low-risk against `render_frame`'s
+/// own presentation logic. The builder itself
 /// does NOT discriminate on `online` — it emits every row it is handed, deliberately,
 /// so an API/MCP caller isn't silently under-reported the way hiding offline rows
 /// would. #4027 fix round (CDX-P1-02/K1) correction: the wired PRODUCER
@@ -184,6 +190,30 @@ public:
                                            const std::string& operation)>;
     void set_fleet_read_fn(FleetReadFn fn) { fleet_read_fn_ = std::move(fn); }
 
+    /// External colleague review on PR #4143 (Doomgoose, BLOCKING, confirmed
+    /// against ADR-0017 INV-4/INV-7 by direct source inspection): the two REST
+    /// device-picker twins' PREVIOUS design intersected `fleet_read_fn_`'s
+    /// admit-scope with `devices_fn_`'s own direct-membership-only narrowing
+    /// (`get_visible_agents_json`), which predates the ADR-0017 ancestor-ward
+    /// resolution and does not recognize a management-group-scoped-but-not-
+    /// direct-member grant. That made admit and the row filter DISAGREE for
+    /// that caller shape (INV-4), i.e. two resolvers instead of one shared one
+    /// (INV-7) — a real defect regardless of the "conservative, never widens"
+    /// framing the original comment used to justify it: an ADMITTED operator
+    /// seeing an incomplete/empty list is a functional-correctness break, not
+    /// a merely-cautious one. Fix: `all_devices_fn_` supplies the SAME
+    /// unfiltered snapshot `GET /api/v1/devices` (#4033) and MCP's
+    /// `list_agents` read from (`registry_.to_json_obj()`), and `gate.scope`
+    /// (from `fleet_read_fn_`) is now the SOLE filter on both REST twins and
+    /// their two MCP-tool siblings — one resolver, admit and filter agree by
+    /// construction. `devices_fn_` (still per-operator direct-membership-
+    /// scoped) remains wired for the two NOT-yet-migrated HTML fragment
+    /// siblings only (`/fragments/tar/process-tree`, `/fragments/tar/capture-
+    /// sources`), which stay on `perm_fn_` this round (recorded exception,
+    /// unchanged by this fix).
+    using AllDevicesFn = std::function<std::vector<DeviceRow>()>;
+    void set_all_devices_fn(AllDevicesFn fn) { all_devices_fn_ = std::move(fn); }
+
     using ScopedPermFn =
         std::function<bool(const httplib::Request&, httplib::Response&,
                            const std::string& securable_type, const std::string& op,
@@ -280,6 +310,9 @@ private:
     AuthFn auth_fn_;
     PermFn perm_fn_;
     FleetReadFn fleet_read_fn_; ///< #4027 fix round — see set_fleet_read_fn's doc comment.
+    /// #4143 review fix — unfiltered device snapshot; SOLE row source for the two
+    /// REST device-picker twins. See set_all_devices_fn's doc comment.
+    AllDevicesFn all_devices_fn_;
     ScopedPermFn scoped_perm_fn_;
     DevicesFn devices_fn_;
     LookupFn lookup_fn_;

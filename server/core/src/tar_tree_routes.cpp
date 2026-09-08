@@ -471,33 +471,30 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
         res.set_content(render_frame(devices), "text/html; charset=utf-8");
     });
 
-    // -- REST v1 twin: same operator-scoped device list, JSON (#4027). Gate
-    // sequence: deny_fleet_wide_device_enumeration (service-scoped tokens denied
-    // outright, unchanged), THEN fleet_read_fn_ — the ADR-0017 admit-then-filter
-    // chokepoint (#4027 fix round, CDX-P1-01/K4), NOT perm_fn_. perm_fn_/
-    // require_permission is a bare GLOBAL grant check that 403s a caller whose
-    // Infrastructure:Read is management-group-scoped before devices_fn_ ever runs
-    // (auth_routes.hpp's own require_list_read doc comment names this exact
-    // stacking mistake); fleet_read_fn_/require_fleet_read admits that caller with
-    // a real, composed meet(management-group, service-scope) VisibleSet instead.
-    // The unaudited-on-success posture is unchanged — a device identity/online
-    // list, not per-device behavioral content (api-twin-recipe.md's
+    // -- REST v1 twin: fleet device list, JSON (#4027). Gate sequence:
+    // deny_fleet_wide_device_enumeration (service-scoped tokens denied outright,
+    // unchanged), THEN fleet_read_fn_ — the ADR-0017 admit-then-filter chokepoint
+    // (#4027 fix round, CDX-P1-01/K4), NOT perm_fn_. perm_fn_/require_permission is
+    // a bare GLOBAL grant check that 403s a caller whose Infrastructure:Read is
+    // management-group-scoped before any row source ever runs (auth_routes.hpp's
+    // own require_list_read doc comment names this exact stacking mistake);
+    // fleet_read_fn_/require_fleet_read admits that caller with a real, composed
+    // meet(management-group, service-scope) VisibleSet instead. The
+    // unaudited-on-success posture is unchanged — a device identity/online list,
+    // not per-device behavioral content (api-twin-recipe.md's
     // list_software_deployments precedent).
     //
-    // Scope filter is an INTERSECTION, not a replacement: devices_fn_'s own
-    // internal narrowing (get_visible_agents_json — direct-membership join) still
-    // runs first, unchanged (it is SHARED with the un-migrated fragment route
-    // above, which stays on perm_fn_ this round — see that route's registration).
-    // gate.scope is then applied on top. This can only narrow further, never
-    // widen: an operator whose RBAC role is scoped to a management group they are
-    // not a DIRECT member of may still see fewer rows than gate.scope alone would
-    // admit (devices_fn_'s fallback predates the role-effect-aware ADR-0017
-    // resolution and doesn't recognize that shape) — a conservative gap, not an
-    // over-disclosure, and a deliberate, smallest-surgical-fix choice: it repairs
-    // the finding (a group-scoped grant holder no longer flat-403s) without
-    // touching devices_fn_'s shared logic. Follow-up: source both twins from an
-    // unfiltered registry read and make gate.scope the SOLE filter, once the
-    // fragment route migrates too.
+    // #4143 review fix (external colleague review, BLOCKING, confirmed against
+    // ADR-0017 INV-4/INV-7 by direct source inspection): gate.scope is now the
+    // SOLE filter, applied over an UNFILTERED registry snapshot (all_devices_fn_ —
+    // the SAME source GET /api/v1/devices (#4033) and MCP's list_agents read
+    // from), not an intersection with devices_fn_'s older, direct-membership-only
+    // pre-filter. The prior "intersection, never widens" design let admit and the
+    // row filter disagree for a management-group-scoped-but-not-direct-member
+    // grant (INV-4) via two divergent resolvers (INV-7) — a real defect, not a
+    // merely-conservative one: an ADMITTED operator seeing an incomplete/empty
+    // list is a functional-correctness break. devices_fn_ remains wired for the
+    // un-migrated fragment route above only (see its own registration comment).
     sink.Get("/api/v1/tar/process-tree", [this](const httplib::Request& req,
                                                 httplib::Response& res) {
         const auto cid = detail::make_correlation_id();
@@ -505,9 +502,10 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
         std::optional<auth::Session> session;
         if (deny_fleet_wide_device_enumeration(req, res, &session))
             return;
-        if (!fleet_read_fn_) {
-            spdlog::error("tar.process_tree.device_picker: fleet_read_fn_ unwired — "
-                          "misconfigured call site; failing closed; cid={}", cid);
+        if (!fleet_read_fn_ || !all_devices_fn_) {
+            spdlog::error("tar.process_tree.device_picker: fleet_read_fn_/"
+                          "all_devices_fn_ unwired — misconfigured call site; "
+                          "failing closed; cid={}", cid);
             res.status = 503;
             res.set_content(detail::error_json_a4(503, "service unavailable", cid),
                             "application/json");
@@ -516,8 +514,7 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
         auto gate = fleet_read_fn_(req, res, "Infrastructure", "Read");
         if (!gate.admitted)
             return; // gate already wrote the A4 error body + status
-        std::vector<DeviceRow> devices =
-            devices_fn_ ? devices_fn_(session->username) : std::vector<DeviceRow>{};
+        std::vector<DeviceRow> devices = all_devices_fn_();
         if (gate.scope) {
             std::vector<DeviceRow> visible;
             visible.reserve(devices.size());
@@ -861,10 +858,11 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
         res.set_content(render_cap_frame(devices), "text/html; charset=utf-8");
     });
 
-    // -- REST v1 twin: same operator-scoped device list, JSON (#4027). Same gate
-    // sequence (deny_fleet_wide_device_enumeration then fleet_read_fn_, NOT
-    // perm_fn_) + unaudited success-path posture + intersection-filter rationale
-    // as GET /api/v1/tar/process-tree above — see that route's comment. --
+    // -- REST v1 twin: fleet device list, JSON (#4027). Same gate sequence
+    // (deny_fleet_wide_device_enumeration then fleet_read_fn_, NOT perm_fn_) +
+    // unaudited success-path posture + the #4143 review fix (gate.scope as the
+    // SOLE filter over all_devices_fn_'s unfiltered snapshot) as
+    // GET /api/v1/tar/process-tree above — see that route's comment. --
     sink.Get("/api/v1/tar/capture-sources", [this](const httplib::Request& req,
                                                    httplib::Response& res) {
         const auto cid = detail::make_correlation_id();
@@ -872,9 +870,10 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
         std::optional<auth::Session> session;
         if (deny_fleet_wide_device_enumeration(req, res, &session))
             return;
-        if (!fleet_read_fn_) {
-            spdlog::error("tar.capture_sources.device_picker: fleet_read_fn_ unwired — "
-                          "misconfigured call site; failing closed; cid={}", cid);
+        if (!fleet_read_fn_ || !all_devices_fn_) {
+            spdlog::error("tar.capture_sources.device_picker: fleet_read_fn_/"
+                          "all_devices_fn_ unwired — misconfigured call site; "
+                          "failing closed; cid={}", cid);
             res.status = 503;
             res.set_content(detail::error_json_a4(503, "service unavailable", cid),
                             "application/json");
@@ -883,8 +882,7 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
         auto gate = fleet_read_fn_(req, res, "Infrastructure", "Read");
         if (!gate.admitted)
             return; // gate already wrote the A4 error body + status
-        std::vector<DeviceRow> devices =
-            devices_fn_ ? devices_fn_(session->username) : std::vector<DeviceRow>{};
+        std::vector<DeviceRow> devices = all_devices_fn_();
         if (gate.scope) {
             std::vector<DeviceRow> visible;
             visible.reserve(devices.size());

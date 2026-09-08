@@ -20447,6 +20447,18 @@ private:
         // pre-existing `/fragments/tar/...` HTML routes stay on perm_fn_ this
         // round — see the recorded-exception comment at their registration.
         tar_tree_routes_->set_fleet_read_fn(fleet_read_fn);
+        // #4143 review fix — same unfiltered source list_agents' agents_fn and
+        // GET /api/v1/devices (#4033) read from; gate.scope (fleet_read_fn_
+        // above) is the SOLE filter now, not an intersection with devices_fn's
+        // direct-membership pre-filter. See set_all_devices_fn's doc comment.
+        tar_tree_routes_->set_all_devices_fn([this, make_device_row]() -> std::vector<DeviceRow> {
+            std::vector<DeviceRow> out;
+            auto arr = registry_.to_json_obj();
+            out.reserve(arr.size());
+            for (const auto& a : arr)
+                out.push_back(make_device_row(a));
+            return out;
+        });
 
         // VizRoutes — /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology
         // (PR 3 of feat/viz-engine ladder)
@@ -21958,14 +21970,22 @@ private:
             // does (contrast list_agents' agents_fn, a deliberate pre-existing
             // exception this twin does not extend). #4027 fix round
             // (CDX-P1-01/K4): the RBAC/management-group AXIS for these three
-            // tools is now the fleet_read_fn_ already wired above (the SAME
-            // instance query_installed_software uses) — devices_fn's own
-            // internal narrowing is retained underneath as an intersection, not
-            // the sole gate; see tar_tree_routes.cpp's REST-twin comment for the
-            // full rationale. dashboard_routes_ is guaranteed constructed by
-            // this point (registered well above, in the same function, before
-            // MCP setup begins).
+            // tools is the fleet_read_fn_ already wired above (the SAME
+            // instance query_installed_software uses). dashboard_routes_ is
+            // guaranteed constructed by this point (registered well above, in
+            // the same function, before MCP setup begins).
             mcp_server_->set_tar_devices_fn(devices_fn);
+            // #4143 review fix — see mcp_server.hpp's set_all_devices_fn doc
+            // comment; identical lambda wired into tar_tree_routes_ above so
+            // both transports read from the exact same unfiltered snapshot.
+            mcp_server_->set_all_devices_fn([this, make_device_row]() -> std::vector<DeviceRow> {
+                std::vector<DeviceRow> out;
+                auto arr = registry_.to_json_obj();
+                out.reserve(arr.size());
+                for (const auto& a : arr)
+                    out.push_back(make_device_row(a));
+                return out;
+            });
             mcp_server_->set_dashboard_routes(dashboard_routes_.get());
             // PR1.5c/1.6c (p14) — ADR-0031 operator surface MCP twins,
             // wired UNCONDITIONALLY exactly like kek_ops above (never

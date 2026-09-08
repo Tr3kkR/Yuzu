@@ -67,9 +67,18 @@ struct TarHarness {
     // (nullopt = unfiltered/TOP, matching a global grant or RBAC-off).
     std::optional<std::vector<std::string>> fleet_scope;
     bool allow_execute = true;
-    // #4027: operator-scoped device list the /api/v1/tar/process-tree +
-    // /api/v1/tar/capture-sources REST twins (and the fragment frames) render.
+    // #4027: operator-scoped device list the /fragments/tar/... HTML frames
+    // (still on devices_fn_/perm_fn_ this round) render.
     std::vector<DeviceRow> devices_list;
+    // #4143 review fix: the UNFILTERED registry snapshot all_devices_fn_ now
+    // supplies to the REST/MCP twins (production: registry_.to_json_obj(),
+    // ALL agents regardless of membership) — gate.scope is the sole filter on
+    // top. Defaults to devices_list so every pre-existing test (which never
+    // needed to distinguish "unfiltered registry" from "the old flat
+    // membership-only resolver's output") keeps working unchanged; a test
+    // exercising the ADR-0017 ancestor-scope divergence itself sets this to a
+    // strictly LARGER set than devices_list — see the regression test below.
+    std::optional<std::vector<DeviceRow>> all_devices_list_override;
     std::string scope_device; // empty = unrestricted; else scoped Read denied elsewhere
     std::string os = "linux";
     std::string proc_output = kProcOut;
@@ -139,6 +148,14 @@ struct TarHarness {
             return ok;
         };
         auto devices = [this](const std::string&) { return devices_list; };
+        // #4143 review fix — all_devices_fn_ is now the REST twins'/MCP tools'
+        // sole row source (gate.scope is the sole filter). Defaults to
+        // devices_list (see the member's doc comment) so existing fixtures are
+        // unaffected; override via all_devices_list_override to model the
+        // unfiltered-registry-vs-flat-resolver divergence itself.
+        auto all_devices = [this]() {
+            return all_devices_list_override.value_or(devices_list);
+        };
         auto lookup = [this](const std::string& id) -> std::optional<DeviceRow> {
             DeviceRow d;
             d.agent_id = id;
@@ -193,6 +210,7 @@ struct TarHarness {
         routes.register_routes(sink, auth, perm, scoped, devices, lookup, dispatch, responses, audit,
                                caller_fn);
         routes.set_fleet_read_fn(fleet_read); // #4027 fix round — REST twins' sole gate
+        routes.set_all_devices_fn(all_devices); // #4143 review fix — REST twins' sole row source
     }
 
     // Drive /result directly (skips /run; the result route reads pcmd/tcmd from the
@@ -727,6 +745,42 @@ TEST_CASE("TAR device picker REST twins: Infrastructure:Read denial -> 403, no d
     REQUIRE(cap);
     CHECK(cap->status == 403);
     CHECK(cap->body.find("dev-A") == std::string::npos);
+}
+
+// #4143 review fix regression (BLOCKING, ADR-0017 INV-4/INV-7): an operator
+// admitted via an ancestor management-group role — not a DIRECT member — must
+// see the SAME rows gate.scope authorizes, not a subset silently narrowed by
+// the old direct-membership-only resolver. Models the divergence the same way
+// test_device_routes.cpp's "ancestor-authorized device" tests do: gate.scope
+// (the ADR-0017-aware admit) includes "ancestor-child"; the flat resolver
+// (devices_list, still wired to the un-migrated HTML fragment routes) does
+// not. all_devices_fn_ (the REST twins' new row source) is the full registry —
+// a strict superset of devices_list — so this only passes if gate.scope is
+// genuinely the SOLE filter, not ANDed with the old resolver.
+TEST_CASE("TAR device picker REST twins: ancestor-scoped (not direct-member) "
+          "admit sees the gate-authorized row, not the flat resolver's subset",
+          "[tar][tree][routes][security][rest][adr-0017]") {
+    TarHarness h;
+    h.devices_list = {DeviceRow{.agent_id = "mine", .hostname = "mine-host", .online = true}};
+    h.all_devices_list_override = std::vector<DeviceRow>{
+        DeviceRow{.agent_id = "mine", .hostname = "mine-host", .online = true},
+        DeviceRow{.agent_id = "ancestor-child", .hostname = "ancestor-host", .online = true},
+    };
+    // gate.scope admits BOTH — the ancestor-ward expansion a real
+    // fleet_read_fn_/require_fleet_read performs in production.
+    h.fleet_scope = std::vector<std::string>{"mine", "ancestor-child"};
+
+    auto tree = h.sink.Get("/api/v1/tar/process-tree");
+    REQUIRE(tree);
+    CHECK(tree->status == 200);
+    CHECK(tree->body.find("mine-host") != std::string::npos);
+    CHECK(tree->body.find("ancestor-host") != std::string::npos); // was silently dropped pre-fix
+
+    auto cap = h.sink.Get("/api/v1/tar/capture-sources");
+    REQUIRE(cap);
+    CHECK(cap->status == 200);
+    CHECK(cap->body.find("mine-host") != std::string::npos);
+    CHECK(cap->body.find("ancestor-host") != std::string::npos); // was silently dropped pre-fix
 }
 
 // #4027 fix round (CDX-P1-02/K1): renamed from "...including offline devices" —

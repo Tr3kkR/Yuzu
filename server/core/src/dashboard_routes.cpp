@@ -1531,8 +1531,10 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 // Per-operator scoped data — see the fragment route's UP-11 comment.
                 res.set_header("Cache-Control", "no-store, private");
                 res.set_header("Vary", "Cookie");
-                const TarRetentionPausedScan scan =
-                    gather_tar_retention_paused(session->username, gate.scope);
+                // #4143 review fix: gate.scope is authoritative here — see
+                // gather_tar_retention_paused's doc comment.
+                const TarRetentionPausedScan scan = gather_tar_retention_paused(
+                    session->username, gate.scope, /*extra_scope_is_authoritative=*/true);
                 res.set_content(
                     std::string("{\"data\":") + tar_retention_paused_json(scan) +
                         ",\"meta\":{\"api_version\":\"v1\"}}",
@@ -2849,7 +2851,8 @@ std::string DashboardRoutes::render_scope_list(const std::string& selected,
 // only "was this data trustworthy."
 TarRetentionPausedScan
 DashboardRoutes::gather_tar_retention_paused(const std::string& username,
-                                             const authz::VisibleSet& extra_scope) const {
+                                             const authz::VisibleSet& extra_scope,
+                                             bool extra_scope_is_authoritative) const {
     TarRetentionPausedScan scan;
     {
         std::lock_guard<std::mutex> lk(tar_scan_mu_);
@@ -2930,12 +2933,25 @@ DashboardRoutes::gather_tar_retention_paused(const std::string& username,
         // see. If mgmt_group_store_ is unavailable, fail closed (drop all
         // — operator sees an empty list rather than unscoped data).
         // #4027 fix round: `extra_scope` (nullopt/TOP for the HTML fragment
-        // caller, `FleetReadGate::scope` for the REST/MCP twins) is ANDed in
-        // here — a row dropped by either axis counts toward
-        // `agents_filtered_out_of_scope` the same way, so the honesty
-        // counters never silently disagree with what `rows` actually holds.
-        if (!visible_set.contains(resp.agent_id) ||
-            !authz::in_scope(extra_scope, resp.agent_id)) {
+        // caller, `FleetReadGate::scope` for the REST/MCP twins) is ANDed
+        // in here for the fragment caller — a row dropped by either axis
+        // counts toward `agents_filtered_out_of_scope` the same way, so the
+        // honesty counters never silently disagree with what `rows` actually
+        // holds.
+        //
+        // #4143 review fix (BLOCKING): for the REST/MCP twins
+        // (`extra_scope_is_authoritative`), `extra_scope` (= `gate.scope`,
+        // ADR-0017-authorized) is the SOLE filter — `visible_set`'s
+        // direct-membership-only check is skipped, so an ancestor-scoped
+        // (not direct-member) admitted operator no longer has their rows
+        // silently dropped by the older resolver. See set_all_devices_fn's
+        // doc comment (tar_tree_routes.hpp) for the identical rationale on
+        // the two device pickers.
+        const bool out_of_scope = extra_scope_is_authoritative
+                                       ? !authz::in_scope(extra_scope, resp.agent_id)
+                                       : (!visible_set.contains(resp.agent_id) ||
+                                          !authz::in_scope(extra_scope, resp.agent_id));
+        if (out_of_scope) {
             ++scan.agents_filtered_out_of_scope;
             continue;
         }

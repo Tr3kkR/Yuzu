@@ -472,18 +472,33 @@ public:
                                            const std::string& operation)>;
     void set_fleet_read_fn(FleetReadFn fn) { fleet_read_fn_ = std::move(fn); }
 
-    /// #4027: the SAME operator-scoped TAR device-picker provider
-    /// `TarTreeRoutes::DevicesFn` threads into the REST/fragment routes —
-    /// server.cpp wires the IDENTICAL lambda into both, so
-    /// `list_tar_process_tree_devices`/`list_tar_capture_sources_devices`
-    /// cannot silently drift onto a broader, unscoped list (contrast
-    /// `list_agents`' own `agents_fn`, a zero-arg `[this]{ return
-    /// registry_.to_json_obj(); }` with NO per-operator management-group
-    /// narrowing — a pre-existing, separate gap this twin deliberately does
-    /// NOT copy). Unwired (default-empty) answers with an empty device list,
-    /// same "unavailable" contract as every other nullable seam here.
+    /// #4027: the SAME provider `TarTreeRoutes::DevicesFn` threads into the
+    /// two un-migrated HTML fragment device-picker routes (server.cpp wires
+    /// the IDENTICAL lambda into both). NOT used by `list_tar_process_tree_
+    /// devices`/`list_tar_capture_sources_devices` any more — see
+    /// `all_devices_fn_` below (#4143 review fix). Kept here only in case a
+    /// future MCP tool needs the fragment-parity (per-operator direct-
+    /// membership) shape specifically.
     using TarDevicesFn = std::function<std::vector<DeviceRow>(const std::string& username)>;
     void set_tar_devices_fn(TarDevicesFn fn) { tar_devices_fn_ = std::move(fn); }
+
+    /// #4143 review fix (external colleague review, BLOCKING, confirmed against
+    /// ADR-0017 INV-4/INV-7 by direct source inspection): `list_tar_process_
+    /// tree_devices`/`list_tar_capture_sources_devices` previously intersected
+    /// `fleet_read_fn_`'s admit-scope with `tar_devices_fn_`'s direct-
+    /// membership-only pre-filter — two divergent resolvers, so an operator
+    /// admitted via an ancestor-ward management-group role (not a DIRECT
+    /// member) could see an incomplete or empty list despite being admitted
+    /// (INV-4/INV-7 violation, not a merely-conservative narrowing). Fixed:
+    /// both tools now read this UNFILTERED registry snapshot — the SAME
+    /// zero-arg source `list_agents`' own `agents_fn` and REST's
+    /// `GET /api/v1/devices` (#4033) use (`registry_.to_json_obj()`) — with
+    /// `gate.scope` as the SOLE filter. `list_agents`' unscoped `agents_fn` was
+    /// never the gap: `require_fleet_read`'s `gate.scope` is the actual
+    /// authorization boundary in that pattern, applied after the unfiltered
+    /// read, exactly as here.
+    using AllDevicesFn = std::function<std::vector<DeviceRow>()>;
+    void set_all_devices_fn(AllDevicesFn fn) { all_devices_fn_ = std::move(fn); }
 
     /// #4027: `list_tar_retention_paused`'s data source — the SAME
     /// `DashboardRoutes::gather_tar_retention_paused` the REST twin
@@ -724,6 +739,8 @@ private:
     FleetReadFn fleet_read_fn_;
     // #4027 — see set_tar_devices_fn/set_dashboard_routes above.
     TarDevicesFn tar_devices_fn_;
+    // #4143 review fix — see set_all_devices_fn above.
+    AllDevicesFn all_devices_fn_;
     DashboardRoutes* dashboard_routes_{nullptr};
 };
 
