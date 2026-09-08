@@ -233,13 +233,17 @@ bool read_file_bounded(int dir_fd, const char* name, std::vector<uint8_t>& out,
 
 /// Enumerates `*.plist` entries in an already-opened directory (no
 /// recursion), capped at kMaxEntriesPerDir, and hands each one's bytes +
-/// mtime to `on_plist`. An invalid handle (directory absent, or a
-/// component along the way was refused) silently contributes zero rows —
-/// the same "absence is not an error" contract every rung-1 leg in this
-/// codebase follows.
+/// mtime to `on_plist`. Returns true when the cap was hit AND at least one
+/// more entry remained unread (probed via one extra `readdir()` after the
+/// loop) -- a listing that happened to have exactly kMaxEntriesPerDir
+/// entries is NOT truncated. A caller that hits the cap must surface it as
+/// a constraint (`row_cap`), never silently report a partial listing as a
+/// complete one. An invalid handle (directory absent, or a component along
+/// the way was refused) silently contributes zero rows, untruncated -- the
+/// same "absence is not an error" contract every rung-1 leg here follows.
 template <typename OnPlist>
-void walk_plist_dir_handle(const DirHandle& dir, OnPlist&& on_plist) {
-    if (!dir.valid()) return;
+bool walk_plist_dir_handle(const DirHandle& dir, OnPlist&& on_plist) {
+    if (!dir.valid()) return false;
     const int dfd = dirfd(dir.get());
     std::size_t seen = 0;
     struct dirent* entry = nullptr;
@@ -253,6 +257,7 @@ void walk_plist_dir_handle(const DirHandle& dir, OnPlist&& on_plist) {
         if (!read_file_bounded(dfd, entry->d_name, bytes, mtime)) continue;
         on_plist(entry->d_name, bytes, mtime);
     }
+    return seen >= kMaxEntriesPerDir && readdir(dir.get()) != nullptr;
 }
 
 /// Enumerates `*.plist` entries directly under `dir_path` (no recursion) by
@@ -274,7 +279,8 @@ struct DirConstraint {
 template <typename OnPlist>
 DirConstraint walk_plist_dir(const std::string& dir_path, OnPlist&& on_plist) {
     DirOpenOutcome open = open_dir_no_follow_checked(dir_path);
-    walk_plist_dir_handle(open.handle, std::forward<OnPlist>(on_plist));
+    const bool truncated = walk_plist_dir_handle(open.handle, std::forward<OnPlist>(on_plist));
+    if (truncated) return DirConstraint{true, "row_cap"};
     return DirConstraint{open.constrained, open.reason};
 }
 
@@ -300,6 +306,8 @@ DirConstraint walk_dir_names(const std::string& dir_path, OnEntry&& on_entry) {
         if (!S_ISREG(st.st_mode) && !S_ISLNK(st.st_mode)) continue;
         on_entry(entry->d_name, static_cast<std::int64_t>(st.st_mtime));
     }
+    if (seen >= kMaxEntriesPerDir && readdir(open.handle.get()) != nullptr)
+        return DirConstraint{true, "row_cap"};
     return DirConstraint{};
 }
 
@@ -350,27 +358,36 @@ EmondRuleFields emond_fields_from_dict(CFDictionaryRef dict) {
     return fields;
 }
 
+/// Outcome of collect_launchd_dir_handle: rows emitted, plus whether
+/// kMaxEntriesPerDir was hit with real entries left unread (AC4: a capped
+/// listing is not a complete one).
+struct LaunchdDirOutcome {
+    std::size_t rows = 0;
+    bool truncated = false;
+};
+
 /// Emits one `autorun|` row per successfully-parsed `*.plist` under
 /// `dir_path`, all attributed to `source_id`/`scope`; a plist this host's CF
 /// implementation cannot parse contributes nothing (never a fabricated
 /// row — PlistError is silently skipped here because the row-level contract
 /// this plugin's schema offers has no per-row error field, only a per-source
 /// row count; the header's own test exercises the typed-error path
-/// directly). Returns the number of rows emitted.
-std::size_t collect_launchd_dir_handle(yuzu::CommandContext& ctx, SourceId source_id,
-                                       const DirHandle& dir, const std::string& location,
-                                       Scope scope, std::string_view user_override) {
+/// directly).
+LaunchdDirOutcome collect_launchd_dir_handle(yuzu::CommandContext& ctx, SourceId source_id,
+                                             const DirHandle& dir, const std::string& location,
+                                             Scope scope, std::string_view user_override) {
     std::size_t count = 0;
-    walk_plist_dir_handle(dir, [&](const char* name, const std::vector<uint8_t>& bytes,
-                                   std::int64_t mtime) {
-        auto parsed = plist_to_launchd_fields(std::span<const uint8_t>{bytes.data(), bytes.size()});
-        if (!parsed) return;
-        Row row = launchd_row_from_fields(source_id, *parsed, location + "/" + name, scope, mtime);
-        if (!user_override.empty()) row.user = std::string{user_override};
-        ctx.write_output(format_row(row));
-        ++count;
-    });
-    return count;
+    const bool truncated =
+        walk_plist_dir_handle(dir, [&](const char* name, const std::vector<uint8_t>& bytes,
+                                       std::int64_t mtime) {
+            auto parsed = plist_to_launchd_fields(std::span<const uint8_t>{bytes.data(), bytes.size()});
+            if (!parsed) return;
+            Row row = launchd_row_from_fields(source_id, *parsed, location + "/" + name, scope, mtime);
+            if (!user_override.empty()) row.user = std::string{user_override};
+            ctx.write_output(format_row(row));
+            ++count;
+        });
+    return LaunchdDirOutcome{count, truncated};
 }
 
 /// A whole `collect_*` call's outcome: rows emitted, plus whether ANY
@@ -397,8 +414,10 @@ DirCollectOutcome collect_launchd_dir(yuzu::CommandContext& ctx, SourceId source
                                       std::string_view user_override) {
     DirOpenOutcome open = open_dir_no_follow_checked(dir_path);
     DirCollectOutcome outcome;
-    outcome.rows = collect_launchd_dir_handle(ctx, source_id, open.handle, dir_path, scope, user_override);
+    const auto result = collect_launchd_dir_handle(ctx, source_id, open.handle, dir_path, scope, user_override);
+    outcome.rows = result.rows;
     if (open.constrained) note_dir_constraint(outcome, open.reason);
+    if (result.truncated) note_dir_constraint(outcome, "row_cap");
     return outcome;
 }
 
@@ -449,9 +468,14 @@ DirCollectOutcome collect_user_launchagents(yuzu::CommandContext& ctx) {
             open_dir_no_follow_at_checked(dirfd(library_open.handle.get()), "LaunchAgents");
         if (agents_open.constrained) note_dir_constraint(outcome, agents_open.reason);
         if (!agents_open.handle.valid()) continue;
-        outcome.rows += collect_launchd_dir_handle(ctx, SourceId::mac_user_launchagents, agents_open.handle,
-                                                   home + "/Library/LaunchAgents", Scope::user, name);
+        const auto result = collect_launchd_dir_handle(ctx, SourceId::mac_user_launchagents,
+                                                        agents_open.handle,
+                                                        home + "/Library/LaunchAgents", Scope::user, name);
+        outcome.rows += result.rows;
+        if (result.truncated) note_dir_constraint(outcome, "row_cap");
     }
+    if (seen >= kMaxEntriesPerDir && readdir(users_open.handle.get()) != nullptr)
+        note_dir_constraint(outcome, "row_cap");
     return outcome;
 }
 
