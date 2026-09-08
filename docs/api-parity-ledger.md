@@ -101,7 +101,34 @@ plus `$ref` validity) - the #842 companion to this whole-tree script.
 
 | Domain | Rows | Twinned | Untwinned |
 |---|---:|---:|---:|
-PLACEHOLDER_FULL_REGENERATE
+| devices | 10 | 3 | 7 |
+| inventory | 6 | 1 | 5 |
+| dex | 25 | 1 | 24 |
+| guardian | 16 | 0 | 16 |
+| tar | 12 | 4 | 8 |
+| auto-preflight | 4 | 0 | 4 |
+| auto-deploy | 4 | 0 | 4 |
+| auto-verify | 3 | 0 | 3 |
+| network | 2 | 1 | 1 |
+| viz | 2 | 2 | 0 |
+| executions | 6 | 1 | 5 |
+| scope-result-sets | 1 | 0 | 1 |
+| instructions | 24 | 11 | 13 |
+| compliance-policy | 19 | 1 | 18 |
+| settings | 15 | 0 | 15 |
+| rbac | 8 | 0 | 8 |
+| auth-mfa | 7 | 0 | 7 |
+| engine-principals | 1 | 0 | 1 |
+| access-reviews | 2 | 0 | 2 |
+| ca-pki | 3 | 2 | 1 |
+| ota | 15 | 0 | 15 |
+| enrollment | 19 | 5 | 14 |
+| other | 74 | 0 | 74 |
+| **Total** | **278** | **32** | **246** |
+
+Registered `/api/vN/*` routes: 201. OpenAPI `paths` entries: 200. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 102.
+
+Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 246.
 
 <!-- END GENERATED -->
 
