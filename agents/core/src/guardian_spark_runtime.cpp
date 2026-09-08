@@ -9,6 +9,8 @@
 #include <atomic>
 #include <cassert>
 #include <limits>
+#include <new>
+#include <stdexcept>
 #include <optional>
 #include <random>
 #include <set>
@@ -380,7 +382,24 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
     //     contract) without any notify-order reasoning: no waiter can observe its
     //     outcome while a subscription nobody wants is still live.
     // (4) wake waiters, fire wakers, dispatch the next head if claims queued behind.
+    // OWNERSHIP FIRST (adversarial review C2/K5): if the backend armed, the live
+    // subscription is owned by `compensating` before ANY fallible work - every vector
+    // build, stage(), make_shared and commit below can throw, and the firewall's
+    // last-resort disarm in step (3) can only reclaim what this optional holds. A
+    // nothrow assignment; the adopting commit resets it.
     std::optional<std::uint64_t> compensating; // a live subscription nobody adopted
+    if (r && r->has_value())
+        compensating = **r;
+    // Test seam: consumed once; 1 = bad_alloc before the fifo snapshot (the window
+    // C2 found), 2 = a throw right after the first commit adopted the subscription.
+    const auto fault_here = [this](int point) {
+        int expected = point;
+        if (drain_fault_point_for_test_.compare_exchange_strong(expected, 0)) {
+            if (point == 1)
+                throw std::bad_alloc{};
+            throw std::runtime_error("drain fault point 2 (test seam)");
+        }
+    };
     std::vector<std::shared_ptr<KeyClaim>> finished;
     // Verdicts are STAGED here and written into the claims by publish_locked below:
     // a waiter's predicate reads the claim's own outcome/commit_exception, and
@@ -433,9 +452,22 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
         }
         for (const auto& c : finished) {
             if (!c->outcome && !c->commit_exception) {
-                release_claim_index_locked(*c);
-                c->outcome = std::unexpected(std::string{"arm drain failed"});
-                c->end = ClaimEnd::CommitThrew;
+                // No verdict was staged for this claim: the drain threw before it got
+                // there. Say what is TRUE: if its commit already ran (rules_ carries its
+                // generation) the rule is live and the waiter gets its generation -
+                // never "failed" for an armed rule (C2's second window); otherwise
+                // it never committed and fails plainly.
+                const auto rit = rules_.find(c->rule_id);
+                if (c->kind == ClaimKind::Arm && rit != rules_.end() &&
+                    rit->second->generation == c->generation) {
+                    c->index_held = false; // ownership is rules_/keys_'s
+                    c->outcome = c->generation;
+                    c->end = ClaimEnd::Committed;
+                } else {
+                    release_claim_index_locked(*c);
+                    c->outcome = std::unexpected(std::string{"arm drain failed"});
+                    c->end = ClaimEnd::CommitThrew;
+                }
             }
             if (!fifo.empty() && fifo.front() == c)
                 fifo.pop_front();
@@ -478,9 +510,17 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                 auto& fifo = eit->second.fifo;
                 // Everything currently queued is an Arm claim behind this head (a disarm
                 // is only ever created on a key with no live claim - see KeyClaim).
+                // Pre-size every staging container NOW, so that after the adopting
+                // commit has reset `compensating` no push/emplace below can reallocate
+                // and throw (C2's second window: a throw after adoption would have
+                // published "arm drain failed" for a rule that is live in rules_).
+                fault_here(1);
+                finished.reserve(fifo.size());
+                std::vector<std::shared_ptr<KeyClaim>> live;
+                live.reserve(fifo.size());
+                verdicts.reserve(fifo.size());
                 for (const auto& c : fifo)
                     finished.push_back(c);
-                std::vector<std::shared_ptr<KeyClaim>> live;
                 for (const auto& c : finished)
                     if (!c->withdrawn && !c->waiter_abandoned)
                         live.push_back(c);
@@ -495,7 +535,7 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                               nullptr, stopping_ ? ClaimEnd::Stopped : ClaimEnd::Withdrawn);
                     }
                     if (armed_live) {
-                        compensating = **r;
+                        // `compensating` already owns the subscription (entry).
                         if (claim->waiter_abandoned)
                             backend_op_late_arms_.fetch_add(1, std::memory_order_relaxed);
                     }
@@ -530,14 +570,13 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                     }
                 } else {
                     // Success: commit every live claim, in FIFO order, against the ONE
-                    // new subscription. `compensating` holds the subscription from this
-                    // point until the first surviving claim's commit adopts it, so a
-                    // throw anywhere before that (make_shared, keys_.emplace, a waker
-                    // copy, the lifecycle enqueue) leaves it owned by the disarm step
-                    // below, never leaked - the guard exists BEFORE the fallible work,
-                    // exactly as the pre-R5.2 post-wait commit's rollback did.
+                    // new subscription. `compensating` has owned it since entry; the
+                    // first surviving claim's commit adopts it, so a throw anywhere
+                    // before that (make_shared, keys_.emplace, a waker copy, the
+                    // lifecycle enqueue) leaves it owned by the disarm step below,
+                    // never leaked - the same shape the pre-R5.2 post-wait commit's
+                    // rollback had.
                     const std::uint64_t sub = **r;
-                    compensating = sub;
                     std::shared_ptr<PerKey> pk;
                     std::string adopted_by; // rule_id whose commit adopted `sub`
                     for (const auto& c : live) {
@@ -590,7 +629,8 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                             }
                             compensating.reset(); // adopted
                             c->index_held = false; // ownership passed to rules_/keys_
-                            stage(c, c->generation, nullptr, ClaimEnd::Committed);
+                            fault_here(2);
+                            stage(c, c->generation, nullptr, ClaimEnd::Committed); // nothrow: reserved
                         } else {
                             // A later sibling joins the existing shared watcher - the
                             // pre-existing reuse path, one commit per claim. A throw here
@@ -2212,6 +2252,10 @@ std::vector<std::string> GuardianSparkRuntime::keys_with_pending_initial() const
             out.push_back(key);
     }
     return out;
+}
+
+void GuardianSparkRuntime::set_drain_fault_point_for_test(int point) noexcept {
+    drain_fault_point_for_test_.store(point);
 }
 
 void GuardianSparkRuntime::set_drain_gap_hook_for_test(std::function<void()> hook) {

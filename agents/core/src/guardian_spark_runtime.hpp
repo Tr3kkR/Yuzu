@@ -596,6 +596,11 @@ public:
     /// asserting "the hook did not fire" on a plain successful attach pins that. Set
     /// before triggering the drain; copied under registry_mu_ at the drain's start.
     void set_drain_gap_hook_for_test(std::function<void()> hook);
+    /// R5.2 drain fault seam (C2/K5): consumed once by the next on_arm_complete.
+    /// 1 = std::bad_alloc before the fifo snapshot (after `compensating` took ownership
+    /// of a successful arm); 2 = a throw right after the first commit adopted the
+    /// subscription (before its verdict is staged). 0 = off.
+    void set_drain_fault_point_for_test(int point) noexcept;
 
     /// Phase 1 of shutdown: set the stopping flag and mark every generation
     /// inactive under the registry lock, so no in-flight or late eval commits.
@@ -1022,6 +1027,7 @@ private:
     std::atomic<std::uint64_t> claims_dropped_at_stop_{0}; ///< R5.2: queued claims dropped by begin_stop / Stopped
     std::atomic<std::uint64_t> claim_drain_failures_{0};  ///< R5.2: on_arm_complete firewall fired
     std::function<void()> drain_gap_hook_for_test_; ///< registry_mu_-guarded; see the setter
+    std::atomic<int> drain_fault_point_for_test_{0};  ///< see the setter
 
     mutable std::mutex outbox_mu_;
     GuardianOutbox outbox_;

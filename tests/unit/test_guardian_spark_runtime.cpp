@@ -4983,3 +4983,91 @@ TEST_CASE("rung 9c R5.2 (adversarial review C1/K1'): a detach arriving right aft
     CHECK(rt->armed_key_count() == 0);
     CHECK(rt->claim_queue_depth_for_test(key) == 0);
 }
+
+// rung 9c R5.2 - adversarial-review fix round (C2/K5): the drain's subscription
+// ownership guard must exist before any fallible work, and a throw after the commit
+// adopted the subscription must still publish a TRUTHFUL verdict.
+TEST_CASE("rung 9c R5.2 (adversarial review C2/K5): a bad_alloc in the drain before the fifo "
+          "snapshot never leaks the successful arm - the firewall disarms it and the key stays "
+          "usable",
+          "[spark][runtime][liveness]") {
+    // Mutation: take ownership only inside the success branch (the pre-fix order, after
+    // the vectors are built) -> the firewall finds `compensating` empty: disarms == 0 and
+    // the subscription is live with no owner.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); }
+    } cleanup{b.get()};
+    const auto key = spark_key(file_spec("/a"));
+
+    QueuedAttach a1;
+    a1.t = std::thread{[&] { a1.gen = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); }};
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    rt->set_drain_fault_point_for_test(1); // bad_alloc before finished/live are built
+    b->release_hang();
+    a1.t.join();
+
+    REQUIRE_FALSE(a1.gen.has_value());
+    CHECK(a1.gen.error() == "arm drain failed");
+    CHECK(rt->claim_drain_failures() == 1);
+    CHECK(b->arms.load() == 1);
+    REQUIRE(b->armed_ids().size() == 1);
+    CHECK(b->disarms.load() == 1); // the firewall's last-resort disarm reclaimed it
+    REQUIRE(b->disarmed_ids().size() == 1);
+    CHECK(b->disarmed_ids()[0] == b->armed_ids()[0]);
+    CHECK(rt->rule_count() == 0);
+    CHECK(rt->armed_key_count() == 0);
+    CHECK(rt->claim_queue_depth_for_test(key) == 0);
+    CHECK(drain_lifecycle(*rt).empty()); // nothing committed, no phantom "armed"
+
+    // Runtime is still healthy: a fresh attach arms cleanly (index_ was released).
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(b->arms.load() == 2);
+}
+
+TEST_CASE("rung 9c R5.2 (adversarial review C2/K5): a throw after the first commit adopted the "
+          "subscription publishes the TRUE verdict - the rule is live and its waiter gets its "
+          "generation, not a failure",
+          "[spark][runtime][liveness]") {
+    // Mutation: drop the rules_-carries-this-generation check in the drain's publish
+    // (always "arm drain failed") -> the waiter is told the arm failed while the rule
+    // sits committed in rules_/keys_, and the engine's defensive detach would tear it
+    // down: a1.gen is an error.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); }
+    } cleanup{b.get()};
+    const auto key = spark_key(file_spec("/a"));
+
+    QueuedAttach a1;
+    a1.t = std::thread{[&] { a1.gen = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); }};
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    rt->set_drain_fault_point_for_test(2); // throw right after the commit adopted `sub`
+    b->release_hang();
+    a1.t.join();
+
+    REQUIRE(a1.gen.has_value()); // truthful: the rule IS armed
+    CHECK(rt->claim_drain_failures() == 1);
+    CHECK(rt->rule_count() == 1);
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(b->arms.load() == 1);
+    CHECK(b->disarms.load() == 0); // nothing to compensate: the subscription is owned by keys_
+    CHECK(rt->claim_queue_depth_for_test(key) == 0);
+    CHECK(drain_lifecycle(*rt).size() == 1); // the "armed" record the commit staged
+
+    // The live rule is a normal rule: detaching it disarms exactly that subscription.
+    rt->detach_rule("r1");
+    CHECK(b->disarms.load() == 1);
+    REQUIRE(b->disarmed_ids().size() == 1);
+    CHECK(b->disarmed_ids()[0] == b->armed_ids()[0]);
+    CHECK(rt->armed_key_count() == 0);
+}
