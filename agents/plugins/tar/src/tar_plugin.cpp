@@ -2474,6 +2474,30 @@ private:
         for (const auto& line : yuzu::tar::format_retention_guard_lines(retention_guard_))
             ctx.write_output(line);
 
+        // Usage-fold health (run_usage_fold, tar_usage.cpp) — the derived
+        // process-pairing fold behind the app_usage plugin has no channel of
+        // its own out of tar.db: it is not a CursorSource and has no
+        // collector, so unlike every capture source above it was previously
+        // readable ONLY by the single-target Forensics-gated `app_usage`
+        // plugin's own `summary` action (a fold-lag or coverage-window loss
+        // — e.g. disabling/re-enabling the source, or the fold falling
+        // behind under heavy process churn — was otherwise invisible until
+        // an operator happened to run that query on that one device).
+        // Emitted UNCONDITIONALLY, same key-always-present NFR-visibility
+        // contract as process/module/nstat above (no agent /metrics
+        // endpoint; `tar status` is the operator/agentic surface). Keys
+        // mirror tar_usage.cpp's own tar_config names verbatim.
+        ctx.write_output(
+            std::format("config|usage_gap_count|{}", db_->get_config("usage_gap_count", "0")));
+        ctx.write_output(std::format("config|usage_gap_lost_events|{}",
+                                     db_->get_config("usage_gap_lost_events", "0")));
+        ctx.write_output(
+            std::format("config|usage_gap_last_ts|{}", db_->get_config("usage_gap_last_ts", "-")));
+        ctx.write_output(std::format("config|usage_coverage_since|{}",
+                                     db_->get_config("usage_coverage_since", "-")));
+        ctx.write_output(
+            std::format("config|usage_lag_events|{}", db_->get_config("usage_lag_events", "0")));
+
         // Currently-configured network capture method (defaults to "polling").
         auto net_method = db_->get_config("network_capture_method", "polling");
         ctx.write_output(std::format("config|network_capture_method|{}", net_method));
