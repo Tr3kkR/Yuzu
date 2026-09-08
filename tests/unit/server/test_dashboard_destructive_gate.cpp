@@ -88,6 +88,11 @@ const CommandCapabilityRegistry& real_registry() {
 constexpr std::pair<const char*, const char*> kDestructive{"tar", "purge_source"};
 constexpr std::pair<const char*, const char*> kReadOnly{"os_info", "os_version"};
 constexpr std::pair<const char*, const char*> kMutating{"tags", "set"};
+/// Wave 7 PR7.2: a real `Forensics`-securable row. `ReadOnly`, not
+/// `Destructive` — `requires_explicit_targets` still applies via
+/// `kForensicsSecurable`, and the single-target rule is STRICTER than the
+/// Destructive one (exactly one agent_id, not merely a non-empty set).
+constexpr std::pair<const char*, const char*> kForensics{"app_usage", "last_used"};
 
 struct DispatchCall {
     std::string plugin, action, scope_expr;
@@ -197,10 +202,12 @@ struct ExecHarness {
     }
 
     double rejected_metric() {
+        return rejected_metric(yuzu::server::kReasonDestructiveUntargeted);
+    }
+    double rejected_metric(std::string_view reason) {
         return metrics
             .counter("yuzu_server_dispatch_target_rejected_total",
-                     {{"route", "dashboard"},
-                      {"reason", std::string(yuzu::server::kReasonDestructiveUntargeted)}})
+                     {{"route", "dashboard"}, {"reason", std::string(reason)}})
             .value();
     }
     int audits_with(const std::string& needle) const {
@@ -455,4 +462,94 @@ TEST_CASE("dashboard execute: the gate reads the DECODED scope param, not the ra
     CHECK(contains(res->body, std::string(yuzu::server::kDestructiveNoVisibleAgentMessage)));
     CHECK(!contains(res->body, std::string(yuzu::server::kDestructiveUntargetedMessage)));
     CHECK(h.rejected_metric() == 0.0);
+}
+
+// ── Wave 7 PR7.2: Forensics single-target rule, driven through the REAL
+// dashboard producer surface (not the isolated evaluator function) ──────────
+//
+// `test_dispatch_destructive_gate.cpp` proves `evaluate_destructive_
+// targeting`'s Forensics branch in isolation; nothing previously drove an
+// actual `app_usage` catalogue entry through `dashboard_routes.cpp`'s real
+// handler and asserted the dispatch count/response end-to-end. `app_usage.
+// last_used` is `ReadOnly`, not `Destructive` — it reaches the gate only
+// via `kForensicsSecurable`, and its rule is exactly-one, not merely
+// non-empty, so `group:` fan-out (which the Destructive cases above treat
+// as just another refusal) is exercised here specifically as the "2+
+// targets" shape: a group of two members is still refused, never narrowed
+// to "dispatch to both".
+
+TEST_CASE("catalogue anchor: app_usage.last_used is Forensics-securable and ReadOnly",
+          "[server][dashboard][execute][forensics]") {
+    auto f = real_registry().classify(kForensics.first, kForensics.second);
+    REQUIRE(f.has_value());
+    CHECK(f->dispatch_class == DispatchClass::ReadOnly);
+    CHECK(f->securable == yuzu::server::kForensicsSecurable);
+}
+
+TEST_CASE("dashboard execute: a Forensics read with ZERO targets (omitted scope) is refused, "
+          "counted, and audited",
+          "[server][dashboard][execute][forensics][security]") {
+    ExecHarness h;
+    h.resolve_to = {kForensics.first, kForensics.second};
+
+    auto res = h.post("instruction=usage");
+
+    CHECK(h.calls.empty());
+    CHECK(contains(res->body, std::string(yuzu::server::kForensicUntargetedMessage)));
+    CHECK(h.rejected_metric(yuzu::server::kReasonForensicUntargeted) == 1.0);
+    CHECK(h.audits_with(std::string(yuzu::server::kReasonForensicUntargeted)) == 1);
+}
+
+TEST_CASE("dashboard execute: a Forensics read with a group: scope (2+ implicit targets) is "
+          "refused, never narrowed to the group's members",
+          "[server][dashboard][execute][forensics][security]") {
+    ExecHarness h;
+    h.resolve_to = {kForensics.first, kForensics.second};
+
+    auto res = h.post("instruction=usage&scope=group:eng");
+
+    CHECK(h.calls.empty());
+    CHECK(contains(res->body, std::string(yuzu::server::kForensicUntargetedMessage)));
+    CHECK(h.rejected_metric(yuzu::server::kReasonForensicUntargeted) == 1.0);
+}
+
+TEST_CASE("dashboard execute: a Forensics read with __all__ broadcast is refused",
+          "[server][dashboard][execute][forensics][security]") {
+    ExecHarness h;
+    h.resolve_to = {kForensics.first, kForensics.second};
+
+    auto res = h.post("instruction=usage&scope=__all__");
+
+    CHECK(h.calls.empty());
+    CHECK(contains(res->body, std::string(yuzu::server::kForensicUntargetedMessage)));
+    CHECK(h.rejected_metric(yuzu::server::kReasonForensicUntargeted) == 1.0);
+}
+
+TEST_CASE("dashboard execute: a Forensics read with exactly ONE explicit, in-scope agent DOES "
+          "dispatch, and an out-of-scope agent is confined out",
+          "[pg][server][dashboard][execute][forensics][security]") {
+    yuzu::test::ManagementGroupStorePg mg_bundle;
+    ManagementGroupStore& mg = *mg_bundle;
+    REQUIRE(mg.is_open());
+    grant_visibility(mg, {"dev-A", "dev-B"});
+
+    SECTION("in-scope single agent dispatches") {
+        ExecHarness h{&mg};
+        h.resolve_to = {kForensics.first, kForensics.second};
+        auto res = h.post("instruction=usage&scope=dev-A");
+        REQUIRE(h.calls.size() == 1);
+        CHECK(h.calls[0].plugin == kForensics.first);
+        CHECK(h.calls[0].action == kForensics.second);
+        CHECK(h.calls[0].agent_ids == std::vector<std::string>{"dev-A"});
+        CHECK(h.calls[0].scope_expr.empty());
+        CHECK(h.rejected_metric(yuzu::server::kReasonForensicUntargeted) == 0.0);
+        CHECK(!contains(res->body, std::string(yuzu::server::kForensicUntargetedMessage)));
+    }
+    SECTION("out-of-scope single agent is confined out, not dispatched") {
+        ExecHarness h{&mg};
+        h.resolve_to = {kForensics.first, kForensics.second};
+        auto res = h.post("instruction=usage&scope=dev-Z");
+        CHECK(h.calls.empty());
+        CHECK(contains(res->body, std::string(yuzu::server::kDestructiveNoVisibleAgentMessage)));
+    }
 }
