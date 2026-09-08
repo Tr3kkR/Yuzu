@@ -65,7 +65,7 @@ public:
     FakeJournalStore& operator=(FakeJournalStore&&) = delete;
 
     [[nodiscard]] int pragma_synchronous() override {
-        note_call();
+        auto lock = acquire();
         return 2; // always "FULL" - the fake never warns
     }
 

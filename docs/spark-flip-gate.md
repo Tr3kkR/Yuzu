@@ -1405,8 +1405,15 @@ rewritten against that fake, with fixed per-thread iteration counts (`std::jthre
 `std::latch`/`std::atomic::wait` handshakes) replacing the unbounded `while(!stop)` worker
 loops whose termination depended on the main thread winning lock races against contended real
 SQLite access - the mechanism row 9's own text and #2373/#2345/#4018 document as the cause of
-the CI stalls. Both are retagged `[tsan]` and now run in every build, not only sanitizer
-builds. The third case (`"...TSan checkpoint, #3848)"`, #3848's own liveness soak) is
+the CI stalls. One worker per test remains a poll loop rather than a fixed iteration count -
+the drainer loops `while (!<producers-done latch>.try_wait())` calling a bounded drain per
+pass - because draining WHILE paging/pruning/persisting proceed is the concurrency property
+these two tests are named for; a drainer that blocked until the latch released would remove
+that overlap. This is not the retired pathology: every producer's work is finite, none of it
+touches SQLite, and the loop's own progress never depends on winning a lock race (an
+adversarial two-model review, 2026-09-08, converged on this after one reviewer initially
+flagged the loop as a design contradiction). Both are retagged `[tsan]` and now run in every
+build, not only sanitizer builds. The third case (`"...TSan checkpoint, #3848)"`, #3848's own liveness soak) is
 UNCHANGED and remains the sole test still tagged `[tsan-heavy]` - row 9's characterisation of
 it (SQLite-free, genuinely contention-dominated via a real backend deadline/watchdogs/releaser
 pulse, a local-TSan-only signal) is still accurate and this note does not restate it.

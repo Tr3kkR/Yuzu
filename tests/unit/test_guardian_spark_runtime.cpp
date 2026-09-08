@@ -3909,6 +3909,7 @@ TEST_CASE("concurrent pagers + a drainer do not race (TSan checkpoint)",
     for (auto& w : workers)
         w.join();
 
+    INFO("fake store ops=" << rig.store->ops() << " contended=" << rig.store->contended());
     CHECK(rig.journal->records_paged() > 0);
     CHECK(sends.load(std::memory_order_relaxed) > 0);
     CHECK(rig.journal->batches_pruned() > 0);
@@ -3923,9 +3924,12 @@ TEST_CASE("concurrent pagers + a drainer do not race (TSan checkpoint)",
     // had already pushed page_into_window's replay-skip cutoff (last_age_cutoff_) well
     // past kBaseTs; a batch seeded there reads as "retention will delete this anyway"
     // and is skipped by THAT heuristic, not by the stop gate - so the check passed even
-    // with BOTH of page_into_window's stopping_ checks deleted outright, for the wrong
-    // reason. A timestamp this far beyond anything the run's clocks ever reached cannot
-    // be mistaken for already-expired by any cutoff this run could have computed).
+    // with every one of page_into_window's SIX stopping_ gates deleted outright, for the
+    // wrong reason (deleting only the two early-return gates leaves the check green too,
+    // via the surviving mid-scan gate - "every gate" is the reproduction that actually
+    // exercises this fix, not just the first two). A timestamp this far beyond anything
+    // the run's clocks ever reached cannot be mistaken for already-expired by any cutoff
+    // this run could have computed).
     constexpr std::int64_t kPostStopTs = 9'000'000'000'000;
     rig.seed_batch(kPostStopTs, "poststop", 0, "poststop");
     const auto post_stop = rig.journal->page_into_window(*rig.rt, kPostStopTs + 500'000);
@@ -4228,6 +4232,7 @@ TEST_CASE("concurrent persist + page + prune + drain do not race (TSan checkpoin
     for (auto& w : workers)
         w.join();
 
+    INFO("fake store ops=" << rig.store->ops() << " contended=" << rig.store->contended());
     CHECK(persist_successes.load(std::memory_order_relaxed) == kPersistTotal);
     CHECK(rig.journal->batches_pruned() > 0); // BEFORE the settle prune below
     CHECK(rig.journal->records_paged() > 0);
