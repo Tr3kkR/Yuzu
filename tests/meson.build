@@ -299,6 +299,7 @@ agent_test_exe = executable(
     'unit/test_inventory_sync.cpp',
     'unit/test_device_ci_sync.cpp',
     'unit/test_sync_source_app_perf.cpp',
+    'unit/test_sync_source_app_usage.cpp',   # Wave 7 PR7.2: app_usage (last_used) source
     'unit/test_win_str_utils.cpp',
     'unit/test_wmi_bounded.cpp',        # shared bounded WMI helper (roadmap C-8 extraction); header-only, no separate .cpp to list
     'unit/test_installed_apps_registry_utf8.cpp',
@@ -1079,6 +1080,9 @@ if build_server
       'unit/server/test_product_registry_store.cpp',
       'unit/server/test_software_licensing_store.cpp',
       'unit/server/test_software_licensing_ingestion.cpp',
+      'unit/server/test_app_usage_store.cpp',       # Wave 7 PR7.2
+      'unit/server/test_app_usage_ingestion.cpp',   # Wave 7 PR7.2
+      'unit/server/test_app_usage_routes.cpp',      # Wave 7 PR7.2
       'unit/server/test_device_inventory_store.cpp',
       'unit/server/test_agent_decommission.cpp',
       'unit/server/test_app_perf_daily_store.cpp',
