@@ -208,6 +208,47 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
+### vNEXT — the server now elects a background-work leader at startup (HA WS-3; NOT breaking)
+
+New, non-breaking, and inert on a single-server deployment. As one step toward
+making a second server replica safe, the singleton background loops that
+*dispatch* — scheduled instructions, policy remediation, quarantine containment
+reconciliation, and the CRL freshness re-publish — now run only on a fenced
+leader elected over a dedicated Postgres coordination connection (ADR-2002 §3).
+On a single server the sole replica is always the leader, so behaviour is
+unchanged.
+
+> **This is the *attempt-gate* half only — do NOT run a second server replica on
+> the strength of this change alone.** It ensures only the leader *attempts* the
+> dispatching loops; the correctness guarantee that a paused ex-leader cannot
+> still commit a dispatch (the epoch fence in the claim write) lands in a
+> follow-on slice, and a supported active-active deployment additionally needs
+> gateway-fronted routing, shared agent presence, and PKI HA. Running a second
+> replica against this slice alone can double-dispatch destructive singleton work
+> (quarantine, deployment, policy remediation). Single-server is the only
+> supported topology today.
+
+What you will see, on **every** deployment including single-server, are new
+startup log lines — these are routine, not a fault:
+
+- `leader_elector: coordination connection established (host=… port=… dbname=…; dedicated, never-recycled)`
+- `leader_elector: election loop started (poll=5s)`
+- `leader_elector: acquired leadership 'server_background_leader' at epoch N`
+
+If instead you see `[HA] leader_elector could not open its coordination
+connection; FencedLeaderOnly background loops are PAUSED …`, the server could not
+reach its Postgres coordination connection: it keeps serving and re-tries every
+election cycle (so a transient blip self-heals within seconds), but while the
+message persists the four dispatching loops above do not run. This is fail-closed
+by design — a paused loop never double-dispatches — and a persistent occurrence
+is a Postgres-reachability problem to investigate, not a server bug. (The
+operator-triggered paths are unaffected: a manual policy remediation or evaluation,
+and an operator CRL revoke, run on whichever replica received the request — and a
+remediation/evaluation is also *completed* on that same replica, so it still reaches
+a terminal verdict even while that replica is not the leader. Only the leader-owned
+*scheduling* half — the automatic due-policy dispatch and the periodic CRL freshness
+re-publish — pauses.)
+
 ### vNEXT — gateway management plane now pins its peer (#1422, breaking for custom gateway configs)
 
 The gateway's `:50063` command plane requires, on any network-reachable
@@ -2730,6 +2771,8 @@ For containerized deployments (Docker Compose), ensure the host volume backing `
 The server's storage substrate is **PostgreSQL** (ADR-0006/0007; the agent stays SQLite). As of the cut-over (#1320 PR 3) the server **requires a reachable database at boot and fails closed without one** — it constructs a shared connection pool at startup and, if `--postgres-dsn` / `YUZU_POSTGRES_DSN` is unset or the database is unreachable, **refuses to start and exits non-zero** (no SQLite fallback for the server). There is a distinct `[PG] Refusing to start` log line so the cause is unambiguous in `systemd` / `kubectl` logs.
 
 > **Upgrade action (BREAKING):** before upgrading to this release, provision PostgreSQL and set `YUZU_POSTGRES_DSN`. Docker Compose deployments already bundle the `postgres` service and wire the DSN (no action beyond pulling the new images). Native installs must run the provisioning helper below (or point the DSN at a managed PostgreSQL 16+) **first** — otherwise the upgraded server will not boot. Restore pairing (ADR-0010): a database restore must be paired with the matching `--ca-dir` / key-directory restore.
+
+**Dedicated coordination connection (HA WS-3, ADR-2002 §10).** Beyond the pool, each server holds **one** additional, never-recycled Postgres connection for background-work leader election — so budget `N_servers × 1` connections against Postgres `max_connections` on top of the pool size below. Per §10 it is deliberately outside the pool and must reach the primary directly (an HAProxy-to-primary front is fine; a *transaction-mode* pooler is not, as it breaks the session advisory lock leadership rests on).
 
 **Connection-pool sizing.** The server opens up to `--postgres-pool-size` / `YUZU_POSTGRES_POOL_SIZE` connections (default **16**). Each heartbeat persists last-seen with one short-lived lease (≈33/s at 1 000 agents on a 30 s heartbeat — well within 16), and `/viz/fleet` draws one. Raise the size for large fleets (rule of thumb: +1 per ~1 000 agents beyond 5 000, plus headroom per additional Postgres-backed store as they migrate) or for a slow managed-PG link. Tune against the `yuzu_pg_pool_{in_use,open,size}` gauges, the `yuzu_pg_acquire_wait_seconds` histogram (the leading saturation signal), and the `yuzu_pg_{connect_failed,acquire_timeout,unhealthy_discard}_total` counters (`unhealthy_discard` counts pooled connections dropped on a failed health probe); the bundled alert rules (`YuzuPgPoolSaturated`, `YuzuPgAcquireWaitHigh`, `YuzuPgConnectFailing` in `docs/prometheus/yuzu-alerts.yml`) fire before `/readyz` is affected. The heartbeat upsert is best-effort with a 250 ms acquire deadline, so a saturated pool degrades the stale-host display, never the live fleet.
 

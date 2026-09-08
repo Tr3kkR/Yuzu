@@ -37,12 +37,28 @@ spec:
     columns:
       - name: product_code
         type: string
+        description: >-
+          The package's unique identifier: an MSI product code GUID on Windows, or a reverse-domain pkgutil identifier on macOS. Values: Windows: `{GUID}`; macOS: reverse-domain string (e.g. `com.vendor.pkg.Name`).
+        example: "{90160000-008C-0000-1000-0000000FF1CE}"
+        platforms: [windows, darwin]
       - name: name
         type: string
+        description: >-
+          The package's display name — the Windows MsiGetProductInfoA `InstalledProductName` property, or a name derived from the last dot-segment of the macOS pkgutil identifier. Values: free text, or `-` when the underlying property is empty.
+        example: "Office 16 Click-to-Run Extensibility Component"
+        platforms: [windows, darwin]
       - name: version
         type: string
+        description: >-
+          The package's version string — the Windows MsiGetProductInfoA `VersionString` property, or the macOS pkgutil receipt's `version:` field. Values: free text version string, or `-` when unavailable.
+        example: "16.0.19822.20104"
+        platforms: [windows, darwin]
       - name: install_location
         type: string
+        description: >-
+          The package's install path — the Windows MsiGetProductInfoA `InstallLocation` property (frequently unset by the installer), or the macOS receipt's volume and location joined. Values: filesystem path, or `-` when the property is empty or absent.
+        example: "C:\\Program Files (x86)\\NordVPN network TAP\\"
+        platforms: [windows, darwin]
     aggregation:
       groupBy:
         - name
@@ -101,8 +117,16 @@ spec:
     columns:
       - name: product_code
         type: string
+        description: >-
+          The package's unique identifier: an MSI product code GUID on Windows, or a reverse-domain pkgutil identifier on macOS. Values: Windows: `{GUID}`; macOS: reverse-domain string (e.g. `com.vendor.pkg.Name`).
+        example: "com.tailscale.ipn.macsys"
+        platforms: [windows, darwin]
       - name: name
         type: string
+        description: >-
+          The package's display name, matching the `list` action's `name` field (see `windows.software.msi.list`). Values: free text, or `-`.
+        example: "Tailscale"
+        platforms: [windows, darwin]
 
   readablePayload: "List MSI product codes"
 

@@ -514,7 +514,15 @@ DACL via `SetNamedSecurityInfoW` is a tracked follow-up shared with
   server keeps the CRL fresh on its own — a background freshness check
   re-publishes when the latest CRL is missing or within 24h of `nextUpdate`, so a
   fleet with no revocations never serves an expired CRL and a failed startup
-  pre-publish self-heals on the next tick (no permanent 503). A failed republish
+  pre-publish self-heals on the next **successful leader** tick. That freshness
+  re-publish is `FencedLeaderOnly` (WS-3, ADR-2002) — under a leadership pause (a
+  lost coordination connection; look for `[HA] … FencedLeaderOnly background loops
+  are PAUSED`) it does NOT run, so `/api/v1/ca/crl` can stay 503 (or serve a CRL
+  past `nextUpdate`) until leadership is re-acquired. On a single-replica deployment
+  a *transient* coordination loss is momentary, but a *persistent* one keeps it
+  paused until leadership returns — investigate the coordination connection, don't
+  wait it out. The *operator revoke* publish path is unfenced and always
+  republishes promptly. A failed republish
   increments `yuzu_server_ca_crl_publish_failures_total` and audits
   `ca.crl.published` `result=failure` — alert on it: the public CRL is stale while
   server-side enforcement is already live.

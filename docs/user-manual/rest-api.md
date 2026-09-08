@@ -3985,7 +3985,7 @@ leans high (embedded-credential risk).
 
 ### Custom Properties
 
-Custom properties are operator-defined key-value pairs on agents, separate from tags. Properties can have schemas that enforce type, allowed values, and validation rules. Properties are available for use in scope expressions via the `props.<key>` prefix.
+Custom properties are operator-defined key-value pairs on agents, separate from tags. Properties can have schemas that enforce a value type (`string`/`int`/`bool`/`datetime`) and an optional regex-pattern validation rule. Properties are available for use in scope expressions via the `props.<key>` prefix.
 
 #### `GET /api/agents/:id/properties`
 
@@ -4007,21 +4007,26 @@ properties."
 {"error":{"code":503,"message":"custom properties store degraded"},"meta":{"api_version":"v1"}}
 ```
 
-**Response:**
+**Response:** a flat, unwrapped body — this legacy route family predates the `data`/`meta` v1
+envelope and has not been migrated onto it.
 
 ```json
 {
-  "data": [
+  "agent_id": "agent-042",
+  "properties": [
     {
       "key": "department",
-      "value": "Engineering"
+      "value": "Engineering",
+      "type": "string",
+      "updated_at": "2026-08-01T12:00:00Z"
     },
     {
       "key": "cost_center",
-      "value": "CC-4200"
+      "value": "CC-4200",
+      "type": "string",
+      "updated_at": "2026-07-15T09:30:00Z"
     }
-  ],
-  "meta": { "api_version": "v1" }
+  ]
 }
 ```
 
@@ -4038,30 +4043,35 @@ is unchanged). A degraded
 confinement check (management-group store unavailable) denies with `403`, distinct from the `503`
 below for a degraded properties-store write.
 
-**Request body:**
+**Request body:** `type` is optional (default `"string"`) and IS persisted, but a schema on this
+key (below) takes precedence — if one exists, its own `type` overrides whatever the request sent
+before the write, so the stored (and later `GET`-returned) `type` reflects the caller's value only
+when no schema is registered for the key.
 
 ```json
 {
-  "value": "Engineering"
+  "value": "Engineering",
+  "type": "string"
 }
 ```
 
-**Response:**
+**Response:** flat, unwrapped (same family caveat as `GET` above).
 
 ```json
 {
-  "data": { "set": true },
-  "meta": { "api_version": "v1" }
+  "agent_id": "agent-042",
+  "key": "department",
+  "value": "Engineering",
+  "type": "string"
 }
 ```
 
-**Error (400) -- schema validation failure:**
+**Error (400) -- schema validation failure:** the message depends on which schema constraint
+failed -- a type mismatch (`int`/`bool`) or a `validation_regex` mismatch (`GET
+/api/property-schemas` below):
 
 ```json
-{
-  "error": "value 'bogus' not allowed for property 'department'; allowed: Engineering, Sales, Operations, Support",
-  "meta": { "api_version": "v1" }
-}
+{"error": "value does not match validation pattern for 'department'"}
 ```
 
 **Error (503) -- store outage:**
@@ -4095,12 +4105,12 @@ confinement check (management-group store unavailable) denies with `403` -- dist
 degrade conflation noted below, which is a property-store issue on the delete path itself, not the
 authorization check.
 
-**Response:**
+**Response:** flat, unwrapped (same family caveat as `GET`/`PUT` above).
 
 ```json
 {
-  "data": { "deleted": true },
-  "meta": { "api_version": "v1" }
+  "deleted": true,
+  "key": "department"
 }
 ```
 
@@ -4120,37 +4130,39 @@ List all property schemas. Schemas define the allowed keys, types, and validatio
 **Permission:** `Infrastructure:Read`
 
 **Note on database degrade:** a transient database failure during this list currently surfaces as
-a `200` with an empty `data` array — indistinguishable from "no schemas configured." Not yet
+a `200` with an empty `schemas` array — indistinguishable from "no schemas configured." Not yet
 type-widened, predates the Postgres migration. Unlike `PUT`/`POST` above (fixed to a
 distinguishable `503`), this route's underlying `list_schemas` was deliberately left unwidened —
 it's an admin-surface read, not scope/dispatch-feeding, matching `custom_properties_store.hpp`'s
 documented posture — so this stays a tracked gap rather than a fixed one.
 
-**Response:**
+**Response:** flat, unwrapped (same family caveat as the agent-properties routes above).
 
 ```json
 {
-  "data": [
+  "schemas": [
     {
       "key": "department",
       "display_name": "Department",
       "type": "string",
-      "allowed_values": ["Engineering", "Sales", "Operations", "Support"],
-      "required": false
+      "description": "The employee's department",
+      "validation_regex": ""
     },
     {
       "key": "cost_center",
       "display_name": "Cost Center",
       "type": "string",
-      "allowed_values": [],
-      "required": true
+      "description": "",
+      "validation_regex": "^CC-[0-9]{4}$"
     }
-  ],
-  "meta": { "api_version": "v1" }
+  ]
 }
 ```
 
-Schemas with an empty `allowed_values` array accept free-form values.
+`type` is one of `string`, `int`, `bool`, `datetime` -- `int`/`bool` values are type-checked on
+write; `string`/`datetime` accept any text. A non-empty `validation_regex` (RE2 syntax, max 256
+characters) is additionally applied via `RE2::FullMatch` regardless of `type`. An empty
+`validation_regex` accepts any value of the declared type.
 
 ---
 
@@ -4164,11 +4176,11 @@ Create or update a property schema. If a schema with the given key already exist
 
 ```json
 {
-  "key": "department",
-  "display_name": "Department",
+  "key": "cost_center",
+  "display_name": "Cost Center",
   "type": "string",
-  "allowed_values": ["Engineering", "Sales", "Operations", "Support"],
-  "required": false
+  "description": "The agent's billing cost center",
+  "validation_regex": "^CC-[0-9]{4}$"
 }
 ```
 
@@ -4176,16 +4188,21 @@ Create or update a property schema. If a schema with the given key already exist
 |---|---|---|---|
 | `key` | string | Yes | Property key (unique identifier) |
 | `display_name` | string | No | Human-readable label |
-| `type` | string | No | Value type: `string` (default), `integer`, `boolean` |
-| `allowed_values` | array | No | Restrict values to this set (empty = free-form) |
-| `required` | boolean | No | Whether every agent must have this property |
+| `type` | string | No | Value type: `string` (default), `int`, `bool`, `datetime` |
+| `description` | string | No | Free-text description |
+| `validation_regex` | string | No | RE2 pattern (max 256 chars) values must fully match; empty = no pattern constraint |
 
-**Response (201):**
+**Response (201):** flat, unwrapped (same family caveat as the routes above) -- echoes the
+stored schema back, including any server-applied default (`type` defaults to `"string"` if
+omitted).
 
 ```json
 {
-  "data": { "created": true, "key": "department" },
-  "meta": { "api_version": "v1" }
+  "key": "cost_center",
+  "display_name": "Cost Center",
+  "type": "string",
+  "description": "The agent's billing cost center",
+  "validation_regex": "^CC-[0-9]{4}$"
 }
 ```
 
@@ -4640,7 +4657,7 @@ Returns the OpenAPI/Swagger specification for the v1 API as JSON.
 
 Agentic-first discovery family (roadmap Issue 17.1, `docs/agentic-first-principle.md` §A2): "an agentic worker should be able to learn what is possible from the live server alone, without a side-channel doc fetch." Unlike `GET /api/v1/openapi.json` above, every endpoint here is **authenticated** and gates `Infrastructure:Read` (`/discover/instructions` gates `InstructionDefinition:Read` instead). Each response body IS the catalog object directly — no `data`/`meta` envelope wrapper, matching the `GET /api/v1/guaranteed-state/schemas` discovery precedent this family is modeled on.
 
-All five share the same caching contract: a content-derived `ETag` header + `Cache-Control: public, max-age=300`; send `If-None-Match: <etag>` to get a cheap `304 Not Modified` instead of re-downloading. Each is also mirrored as a read-only MCP tool of the same name (`discover_permissions`, `discover_instructions`, `discover_routes`, `discover_scope_kinds`, `discover_plugins`) — REST and MCP share the same builder functions internally, so they cannot drift from each other.
+All six share the same revalidation contract: a content-derived `ETag` header; send `If-None-Match: <etag>` to get a cheap `304 Not Modified` instead of re-downloading. `instructions`, `routes`, `scope-kinds` and `plugin-docs` are `Cache-Control: public, max-age=300`; `permissions` and `plugins` are `private` with a `Vary` header because their bodies depend on the caller. Five are mirrored as read-only MCP tools of the same name (`discover_permissions`, `discover_instructions`, `discover_routes`, `discover_scope_kinds`, `discover_plugins`); `/discover/plugin-docs` is mirrored as the MCP resource `yuzu://plugin-docs` instead. REST and MCP share the same builder functions internally, so they cannot drift from each other.
 
 #### `GET /api/v1/discover/permissions`
 
@@ -4792,7 +4809,7 @@ Plugin/action catalog observed across currently-connected agents (deduplicated b
 **Response:**
 ```json
 {
-  "version": 2,
+  "version": 3,
   "description": "Plugin/action catalog observed across currently-connected agents ...",
   "limitation": "An action carries an inline parameter_schema only when it has a published InstructionDefinition (matched on plugin+action) AND the caller holds InstructionDefinition:Read; otherwise name+description only. GET /api/v1/discover/instructions is the full schema-bearing catalog.",
   "actions_enriched_with_schema": 1,
@@ -4807,7 +4824,54 @@ Plugin/action catalog observed across currently-connected agents (deduplicated b
 
 An action carries an inline `parameter_schema` **only** when it has a published `InstructionDefinition` (matched on plugin + action) **and** the caller holds `InstructionDefinition:Read`; a caller with only `Infrastructure:Read` gets each action's `name` + `description` and no schema. The top-level `actions_enriched_with_schema` counts how many actions were enriched. For the complete schema-bearing catalog, use [`GET /api/v1/discover/instructions`](#get-apiv1discoverinstructions).
 
-> **Consumer note:** this catalog is now `"version": 2` (was `1` — v2 adds the inline `parameter_schema` and top-level `actions_enriched_with_schema` fields). The revision is additive; treat `version` as a **minimum** (`>= 1`), not `== 1`, so future additive revisions do not break your client.
+> **Consumer note:** this catalog is now `"version": 3` (was `1`; v2 added the inline `parameter_schema` and top-level `actions_enriched_with_schema` fields). The revision is additive; treat `version` as a **minimum** (`>= 1`), not `== 1`, so future additive revisions do not break your client.
+
+Each plugin entry also carries `docs`: a build-embedded documentation summary `{summary, kind, platforms, readme, resource}` (`kind` = `{collector, mutating, gathered}`) when the plugin has adopted the README standard (`docs/plugin-readme-standard.md`), or an explicit `null` when it has not (catalog `version` 2 → 3). The full manifest is the endpoint below.
+
+#### `GET /api/v1/discover/plugin-docs`
+
+Per-plugin documentation as data: one manifest per agent plugin that has adopted the README standard, generated by `tools/plugin-doc-gen` from `agents/plugins/<name>/README.md` and embedded at build time (`docs/plugin-readme-standard.md` rule 10). Each manifest carries how the plugin works, per-OS support/rung/mechanism per action (from the CI-verified capability matrix), privileges, inputs, output columns with vocabularies and examples, sample rows per OS, caveats and source paths. Fully static — compiled-in content only, never fleet-derived — so it answers during warmup like `/discover/scope-kinds`, and it is byte-identical to the MCP resource `yuzu://plugin-docs`. A plugin absent here has not adopted the standard yet.
+
+**Permission:** `Infrastructure:Read`
+
+**Response:**
+```json
+{
+  "catalog": "plugin-docs",
+  "version": 1,
+  "source": "build-embedded",
+  "description": "Per-plugin documentation as data ...",
+  "plugin_count": 2,
+  "skipped_invalid": 0,
+  "plugins": [
+    {
+      "manifest_version": 1,
+      "name": "disk_actions",
+      "version": "1.0.0",
+      "description": "Reports physical drive health and the mapping between drives and the logical volumes they back",
+      "kind": {"collector": true, "mutating": false, "gathered": false},
+      "platforms": {"windows": "supported", "macos": "constrained", "linux": "unsupported"},
+      "security": [{"action": "smart", "securable": "Inventory", "operation": "Read", "risk_tier": "Low", "dispatch_class": "ReadOnly", "mutability": "None", "execute_gate": "None"}],
+      "actions": [{"action": "smart", "definition_ids": ["crossplatform.storage.smart"], "legs": {"windows": {"support": "supported", "rung": "1", "mechanism": "IOCTL_STORAGE_QUERY_PROPERTY ...", "fallback": "..."}}}],
+      "definitions": [{"id": "crossplatform.storage.smart", "display_name": "Drive Health", "platforms": ["windows", "darwin"], "approval_mode": "auto", "execute_roles": ["endpoint-admin", "endpoint-operator"]}],
+      "inputs": [],
+      "outputs": [{"definition_id": "crossplatform.storage.smart", "columns": [{"name": "health", "type": "string", "values": ["ok", "warning", "failing", "unknown", "unsupported"], "example": "ok", "platforms": ["windows"]}]}],
+      "how_it_works": "Both actions are reads. ...",
+      "outputs_note": "Pipe-delimited rows, one per drive or volume. Field 0 is a literal discriminator ...",
+      "privileges": [{"os": "Windows", "runs_as": "...", "grant": "None. ...", "measured": "...", "if_refused": "..."}],
+      "result_status": [{"status": "`CONSTRAINED`", "completeness": "partial", "provenance": "`macos:iokit:health_unread`", "when": "..."}],
+      "where_the_data_goes": ["**Instruction result only.** ..."],
+      "samples": {"macos": {"stamp": {"os": "macos", "os_version": "macOS 26.6.2 arm64", "host_class": "bare-metal", "date": "2026-09-07", "privilege": "euid 501", "leg_hash": "f062fb9a3dfd"}, "actions": [{"action": "smart", "rows": ["smart|disk0|APPLE SSD AP0512Z|nvme|ssd|unknown|-|-|..."], "row_count": 2, "result_status": {"status": "CONSTRAINED", "completeness": "PARTIAL", "provenance": "macos:iokit:health_unread"}}]}},
+      "caveats": ["**Health is NVMe-only on Windows.** ..."],
+      "source": {"plugin": ["agents/plugins/disk_actions/src/disk_actions_plugin.cpp"], "tests": ["tests/unit/test_disk_actions_local_dispatcher.cpp"]},
+      "readme": "agents/plugins/disk_actions/README.md",
+      "leg_hash": "f062fb9a3dfd"
+    }
+  ]
+}
+```
+
+Same ETag / `Cache-Control: public, max-age=300` / `If-None-Match` → `304` contract as `/discover/scope-kinds` (the body is identical for every caller). `inputs[]` entries carry `{definition_id, name, type, required, default, constraints, description}`, where `constraints` is the parameter's DSL `validation` object or `null`; the key set of each manifest is the "Manifest schema" table in `docs/plugin-readme-standard.md`, which the docs suite binds to the generator.
 
 ---
 
@@ -7916,7 +7980,8 @@ once the underlying condition clears.
 
 #### `POST /api/nvd/sync`
 
-Trigger a manual NVD database sync. Admin only. Runs asynchronously and returns immediately.
+Trigger a manual NVD database sync. Requires `Infrastructure:Execute` (held by Administrator
+and ITServiceOwner, not Administrator alone). Runs asynchronously and returns immediately.
 
 #### `POST /api/nvd/match`
 
@@ -8322,6 +8387,42 @@ The **agentic-first (A1) structured surface** for the same destructive purge —
 - **503** — command dispatch unavailable, or the audit row could not be persisted (`Sec-Audit-Failed` header; the purge is **not** dispatched without durable evidence).
 
 **Audit:** `tar.source.purge` `result=requested` is written **before** dispatch (fail-closed). **Metric:** `yuzu_tar_source_purge_total{result}`. **Agent version:** same `tar.purge_source` (v0.14.0+) requirement as the fragment.
+
+#### `GET /api/v1/tar/process-tree`
+
+**API-parity read twin (#4027).** The **agentic-first (A1) structured surface** for the process-tree viewer's device picker — JSON twin of the operator-scoped device list `GET /fragments/tar/process-tree` renders into its host-picker `<select>`.
+
+**Permission:** `Infrastructure:Read`. A service-scoped API token is denied outright (403, `tar.device_picker.view` denied) — the fleet-wide device-enumeration guard shared with `GET /api/v1/tar/capture-sources` below, since neither route names a single `agent_id` to confine a service-scoped token's own tag against.
+
+**Request:** no parameters.
+
+**Response:** `{"data":{"devices":[{"agent_id","hostname","os","arch","agent_version","online"}]},"meta":{"api_version":"v1"}}`. Every row carries `online`, which is **always `true` today** — the sole wired provider sources this list from the live-session registry, so a disconnected enrolled device is not included (#4027 fix round, CDX-P1-02/K1 — an earlier revision of this doc claimed offline-inclusive; that was aspirational, not the shipped behavior). Unlike the HTML picker, this list does not additionally hide any row by online status — a future offline-inclusive provider (tracked follow-up) would make that distinction meaningful.
+
+**Audit:** none on success — a device identity/online list, not per-device behavioral content (matches the fragment's own today-unaudited posture).
+
+#### `GET /api/v1/tar/capture-sources`
+
+**API-parity read twin (#4027).** Same shape and gates as `GET /api/v1/tar/process-tree` above — JSON twin of the operator-scoped device list `GET /fragments/tar/capture-sources` renders into its host picker (ADR-0015).
+
+**Permission:** `Infrastructure:Read`. Same service-scoped-token 403 as the process-tree twin.
+
+**Response:** `{"data":{"devices":[{"agent_id","hostname","os","arch","agent_version","online"}]},"meta":{"api_version":"v1"}}`.
+
+#### `GET /api/v1/tar/retention-paused`
+
+**API-parity read twin (#4027).** JSON twin of `GET /fragments/tar/retention-paused`: the **calling operator's** most recent `tar.status` scan (per-username state), filtered to their visible agents, one row per (agent, paused source).
+
+**Permission:** `Infrastructure:Read`.
+
+**Request:** no parameters.
+
+**Response:** `{"data":{"scan_id","scan_count","scan_at","agents_responded","agents_with_no_paused_sources","agents_filtered_out_of_scope","store_degraded","rows":[{"agent_id","agent_display","source","paused_at","live_rows","oldest_ts","value_error","enabled_raw"}]},"meta":{"api_version":"v1"}}`. `scan_id` is `""` when the operator has not dispatched a scan yet — `POST /fragments/tar/retention-paused/scan` is dashboard-only today (a mutating dispatch route, out of scope for #4027).
+
+**Headers:** `Cache-Control: no-store, private` + `Vary: Cookie` — per-operator-scoped data, same UP-11 posture as the fragment.
+
+**Audit:** none on success — scan/config metadata, not per-device behavioral content (matches the fragment's own today-unaudited posture).
+
+**Not twinned (#4027 exception, recorded in `scripts/ci/api-parity/tar.json`):** `GET /fragments/tar/process-tree/result` and `GET /fragments/tar/process-tree/detail` are deliberately not given REST/MCP twins by #4027 — deferred as scope, not impossibility. `/detail`'s cache `token` is a CSPRNG value minted and principal-bound only inside the `/result` handler itself; no other path mints one, so a `/detail` twin genuinely has no usable input today. `/result`'s `pcmd`/`tcmd` command-id pair is an ordinary `tar sql` dispatch result (`Infrastructure:Read`, no execute gate) and could in principle be obtained by an operator through the already-twinned generic dispatch surface (`execute_instruction` / `POST /api/command`) by reproducing the two canned `$Process_Live`/`$TCP_Live` queries verbatim — but that is not a dedicated API path, and a real `/result` twin would still need a new async "not ready yet" polling contract (REST/MCP have no htmx auto-reissue equivalent). Both routes are otherwise reachable today only via the dashboard-only `GET /fragments/tar/process-tree/run` route, itself excluded (a dispatch-shaped GET batched with a later dispatch-twin effort, #3994). Revisit once that later batch ships `/run` (and `/result`) twins that mint these artifacts directly over the API.
 
 #### `GET /fragments/tar/capture-sources`
 
