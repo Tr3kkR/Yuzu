@@ -4365,7 +4365,13 @@ TEST_CASE("Watch establishment (Registry): THREAD_AGNOSTIC correctness control (
     ::RegCloseKey(setup_h);
     const std::wstring sub_w = establish_widen(sub);
 
-    auto run_one = [&](bool thread_agnostic) -> bool {
+    struct RunResult {
+        bool before_write; // fired during the settle sleep, before any write -
+                           // a true here is the thread-exit artifact ITSELF
+        bool after_write;  // fired after the write, observed with before_write's
+                           // own contribution reset out first
+    };
+    auto run_one = [&](bool thread_agnostic) -> RunResult {
         auto fired = std::make_shared<std::atomic<bool>>(false);
         auto ev_holder = std::make_shared<HANDLE>(nullptr);
         auto wait_holder = std::make_shared<PTP_WAIT>(nullptr);
@@ -4386,7 +4392,17 @@ TEST_CASE("Watch establishment (Registry): THREAD_AGNOSTIC correctness control (
         registrant.join();
 
         std::this_thread::sleep_for(100ms); // let any registering-thread-exit
-                                            // artifact settle before writing
+                                            // artifact settle before sampling
+        // Sample and RESET before writing (adversarial-review finding, PR-A
+        // round 2): the original single post-write sample could not tell a
+        // thread-exit artifact from a write-triggered fire - both set the
+        // same sticky bool, read only once, after both candidate causes had
+        // already had a chance to run. Sampling `before_write` here, THEN
+        // clearing the flag, makes the later `after_write` sample
+        // attributable to the write alone.
+        const bool before_write = fired->load(std::memory_order_relaxed);
+        fired->store(false, std::memory_order_relaxed);
+
         DWORD v = 1;
         HKEY writer_h = nullptr;
         ::RegOpenKeyExA(HKEY_CURRENT_USER, sub.c_str(), 0, KEY_SET_VALUE, &writer_h);
@@ -4394,7 +4410,8 @@ TEST_CASE("Watch establishment (Registry): THREAD_AGNOSTIC correctness control (
                          sizeof(v));
         ::RegCloseKey(writer_h);
 
-        const bool ok = eventually([&] { return fired->load(std::memory_order_relaxed); }, 3000ms);
+        const bool after_write =
+            eventually([&] { return fired->load(std::memory_order_relaxed); }, 3000ms);
 
         if (*wait_holder) {
             ::SetThreadpoolWait(*wait_holder, nullptr, nullptr);
@@ -4405,19 +4422,21 @@ TEST_CASE("Watch establishment (Registry): THREAD_AGNOSTIC correctness control (
             ::RegCloseKey(*key_holder);
         if (*ev_holder)
             ::CloseHandle(*ev_holder);
-        return ok;
+        return {before_write, after_write};
     };
 
-    const bool with_flag = run_one(/*thread_agnostic=*/true);
-    CHECK(with_flag); // REG_NOTIFY_THREAD_AGNOSTIC: must survive the registering thread's exit
-    const bool without_flag = run_one(/*thread_agnostic=*/false);
-    WARN("R6 THREAD_AGNOSTIC control: with-flag fired=" << with_flag
-         << " without-flag fired=" << without_flag
-         << " (without-flag NOT hard-asserted - this control characterizes, "
-            "rather than assumes, the failure mode; a false 'fired' there "
-            "would itself be the documented risk: the registering thread's "
-            "own exit signaling the event, indistinguishable from a real "
-            "change)");
+    const RunResult with_flag = run_one(/*thread_agnostic=*/true);
+    CHECK(with_flag.after_write); // REG_NOTIFY_THREAD_AGNOSTIC: must survive the
+                                  // registering thread's exit and see the write
+    const RunResult without_flag = run_one(/*thread_agnostic=*/false);
+    WARN("R6 THREAD_AGNOSTIC control: with-flag before_write=" << with_flag.before_write
+         << " after_write=" << with_flag.after_write << " | without-flag before_write="
+         << without_flag.before_write << " after_write=" << without_flag.after_write
+         << " (without-flag NOT hard-asserted - this control characterizes, rather than "
+            "assumes, the failure mode; without_flag.before_write==true IS the documented "
+            "risk itself - the registering thread's own exit signaling the event, now "
+            "distinguishable from without_flag.after_write, a write the notification "
+            "survived to observe despite lacking THREAD_AGNOSTIC)");
 
     ::RegDeleteKeyA(HKEY_CURRENT_USER, sub.c_str());
 }
