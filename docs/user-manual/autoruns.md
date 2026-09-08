@@ -246,11 +246,10 @@ Both actions are classified `Security` / `ReadOnly` / `Mutability::None` /
 `vuln_scan.*` uses. `catalog` performs no OS call at all; `list` reads
 registry values, files, and plist/task/WMI metadata -- nothing in either
 action opens a write handle, spawns a mutating process, or changes any
-persistence entry it reports on. This classification is not currently pinned
-by an exact capability-catalogue test (existing catalogue tests check for a
-seeded securable, valid operation, minimum risk, and a specified gate, not
-this plugin's specific values) -- a drift from `Security` to a broader
-securable would not fail the existing suite; tracked as a test gap.
+persistence entry it reports on. This classification is pinned exactly by
+`test_capability_catalogue.cpp`'s "autoruns.list and autoruns.catalog pin
+their exact classification" case -- a drift from `Security` to a broader
+securable, or from `ReadOnly`/`None`/`None`, fails that test.
 
 ## Real-hardware verification checklist
 
