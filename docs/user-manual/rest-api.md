@@ -4728,9 +4728,9 @@ re-runs a set's own source query and creates a **sibling** (same parent, new id)
 | 503 | `RESULT_SET_NO_AGENTS` — no agents were reached in the target scope. Deliberately indistinguishable from "every resolved target was outside your reach": a distinct status would disclose devices the caller may not see |
 | 503 | `RESULT_SET_DISPATCH_UNAVAILABLE` / `RESULT_SET_DISPATCH_FAILED` — dispatch not wired, or the dispatch itself raised |
 
-#### `GET /api/v1/inventory/{plugin}/{agent_id}`
+#### `GET /api/v1/inventory/{agent_id}/{plugin}`
 
-Get inventory data for a specific plugin and agent.
+Get inventory data for a specific agent and plugin.
 
 **Permission:** `Inventory:Read`
 
@@ -7642,6 +7642,40 @@ has **no 404** — a not-found tag remains `200 {"deleted": false}`; only the
 store-degrade path is new. `POST /api/tags/set` previously returned `200
 {"status":"ok"}` even when the write failed; it now returns `400` (validation) or
 `503` (store degrade) honestly.
+
+---
+
+### Inventory (Legacy)
+
+Requires `Inventory:Read` (global — not per-agent/management-group scoped; every caller
+holding the permission sees fleet-wide data, unlike the confined `Responses` routes above).
+Distinct from, and predates, `/api/v1/inventory/*` — no v1 replacement currently exists for
+these three routes.
+
+#### `GET /api/inventory/tables`
+
+List available inventory data types across the fleet: `{"tables": [{"plugin", "agent_count",
+"last_collected"}, ...], "count": N}`.
+
+#### `GET /api/inventory/{agent_id}/{plugin}`
+
+Get the most recent inventory record for one agent+plugin pair: `{"agent_id", "plugin",
+"data", "collected_at"}`. `data` is the plugin's raw collected payload, parsed as JSON when
+valid, else returned as a raw string. `404` if no record exists for that agent+plugin pair.
+
+#### `POST /api/inventory/query`
+
+Query inventory records across agents. Request body (all fields optional):
+`{"agent_id": "...", "plugin": "...", "since": <epoch>, "until": <epoch>, "limit": N}`.
+`limit` is capped at 1000 regardless of the requested value. Returns `{"results": [...],
+"count": N, "result_truncated_by_cap": bool}` — `result_truncated_by_cap` is `true` when
+more matching rows existed than `limit` allowed.
+
+**Storage failure (all three routes):** a null/unopened inventory store returns `503`
+(`{"error":{"code":503,"message":"inventory store not available"}}`); a store that opens
+but degrades mid-call also returns `503` (`"inventory store degraded"`) — distinct from the
+`404` on `GET /{agent_id}/{plugin}`, which means the store answered but the record doesn't
+exist. `POST /query` returns `400` on a malformed request body.
 
 ---
 

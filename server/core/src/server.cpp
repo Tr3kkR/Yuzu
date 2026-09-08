@@ -13149,7 +13149,11 @@ private:
 
         // Per-device tier + management-group scope gate (wraps
         // require_scoped_permission). Used by DeviceRoutes' per-device routes so an
-        // operator can only open / read / live-query a device inside their scope.
+        // operator can only open / read / live-query a device inside their scope,
+        // and by several #2542 extracted modules that need the same per-agent
+        // confinement (custom_properties_routes.cpp, tag_routes.cpp) — grep
+        // `scoped_perm_fn` for the current full consumer list rather than trusting
+        // an enumerated one here, since it grows as more modules extract.
         auto scoped_perm_fn = [this](const httplib::Request& req, httplib::Response& res,
                                      const std::string& type, const std::string& op,
                                      const std::string& agent_id) -> bool {
@@ -13167,8 +13171,11 @@ private:
         // require_fleet_read). GET /api/v1/inventory/software's SOLE
         // authorization gate — never stacked with perm_fn (see
         // rest_api_v1.cpp's route comment; same BLOCKING rule as list_read_fn
-        // above). Shared, byte-identical, with the MCP query_installed_software
-        // twin's set_fleet_read_fn wiring below — one conversion, two surfaces.
+        // above). Shared, byte-identical, across several surfaces now
+        // (the MCP query_installed_software twin's set_fleet_read_fn wiring
+        // below, execution_routes.cpp, response_routes.cpp, and workflow
+        // routes) — grep `fleet_read_fn` for the current full consumer list
+        // rather than trusting an enumerated count here.
         auto fleet_read_fn = [this](const httplib::Request& req, httplib::Response& res,
                                     const std::string& type,
                                     const std::string& op) -> yuzu::server::authz::FleetReadGate {
