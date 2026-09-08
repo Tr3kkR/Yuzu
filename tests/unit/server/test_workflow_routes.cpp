@@ -2410,6 +2410,101 @@ TEST_CASE("BR-001 — a non-Forensics/non-Destructive (unclassified) instruction
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// BR2-001 (round-2 branch review) — the workflow execute route's OWN step
+// dispatcher is a second real CommandRequest producer, distinct from
+// /api/instructions/:id/execute (BR-001 above): a workflow can wrap the same
+// Forensics-classified instruction and reach cmd_dispatch_concurrency/
+// cmd_dispatch directly via dispatch_fn, bypassing BR-001's route-level gate
+// entirely. These pin that the SAME evaluate_destructive_targeting call now
+// runs inside dispatch_fn itself, so no sibling route can rediscover this gap.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("BR2-001 — a workflow step naming a Forensics instruction with 2 agent_ids is refused",
+          "[pg][workflow][executions][execute][targeting][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true);
+    h.make_def("def-BR2-1", "Forensics read", "app_usage", "summary");
+    auto wf_id = h.make_workflow("wf-br2-1", "def-BR2-1");
+    h.dispatch_cmd_override = "cmd-br2-1";
+    h.dispatch_sent_override = 2;
+
+    auto res =
+        h.sink.Post("/api/workflows/" + wf_id + "/execute", R"({"agent_ids":["agent-A","agent-B"]})");
+    REQUIRE(res);
+    // The route itself still accepts (202) — the refusal happens inside the
+    // per-step dispatch_fn closure, surfaced as a failed step, not a route-
+    // level 4xx. The load-bearing assertion is dispatch_calls == 0: the
+    // mocked cmd_dispatch_concurrency/cmd_dispatch must never be reached.
+    CHECK(res->status == 202);
+    CHECK(h.dispatch_calls == 0);
+    CHECK(h.last_dispatch_agent_ids.empty());
+}
+
+TEST_CASE("BR2-001 — a workflow step naming a Forensics instruction with exactly 1 agent_id dispatches",
+          "[pg][workflow][executions][execute][targeting][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true);
+    h.make_def("def-BR2-2", "Forensics read", "app_usage", "summary");
+    auto wf_id = h.make_workflow("wf-br2-2", "def-BR2-2");
+    h.dispatch_cmd_override = "cmd-br2-2";
+    h.dispatch_sent_override = 1;
+
+    auto res = h.sink.Post("/api/workflows/" + wf_id + "/execute", R"({"agent_ids":["agent-A"]})");
+    REQUIRE(res);
+    CHECK(res->status == 202);
+    CHECK(h.dispatch_calls == 1);
+    REQUIRE(h.last_dispatch_agent_ids.size() == 1);
+    CHECK(h.last_dispatch_agent_ids[0] == "agent-A");
+}
+
+TEST_CASE("BR2-001 — a workflow step naming a Destructive instruction with 0 agent_ids is refused",
+          "[pg][workflow][executions][execute][targeting][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true);
+    h.make_def("def-BR2-3", "Destructive purge", "tar", "purge_source");
+    auto wf_id = h.make_workflow("wf-br2-3", "def-BR2-3");
+    h.dispatch_cmd_override = "cmd-br2-3";
+    h.dispatch_sent_override = 5;
+
+    // NOTE: the OUTER route (POST /api/workflows/:id/execute) already refuses
+    // an empty `agent_ids` array with 400 BEFORE any step ever reaches
+    // dispatch_fn (pre-existing "agent_ids array is required" check) — so this
+    // case pins that pre-existing defense-in-depth layer, not BR2-001's new
+    // per-step gate itself (BR2-001's own multi-agent/scope cases above DO
+    // reach and are refused by the new gate, since the outer check only
+    // rejects an EMPTY list, not a list of size > 1). The safety property that
+    // matters either way: dispatch_calls stays 0.
+    auto res = h.sink.Post("/api/workflows/" + wf_id + "/execute", R"({"agent_ids":[]})");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(h.dispatch_calls == 0);
+}
+
+TEST_CASE("BR2-001 — a workflow step naming an unclassified instruction is unaffected",
+          "[pg][workflow][executions][execute][targeting]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true);
+    h.make_def("def-BR2-4", "Unclassified");
+    auto wf_id = h.make_workflow("wf-br2-4", "def-BR2-4");
+    h.dispatch_cmd_override = "cmd-br2-4";
+    h.dispatch_sent_override = 3;
+
+    auto res = h.sink.Post("/api/workflows/" + wf_id + "/execute", R"({"agent_ids":["agent-A","agent-B"]})");
+    REQUIRE(res);
+    CHECK(res->status == 202);
+    CHECK(h.dispatch_calls == 1);
+    REQUIRE(h.last_dispatch_agent_ids.size() == 2);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // K-R7-02 — instruction execute dispatch confinement handoff
 //
 // POST /api/instructions/:id/execute now routes through the shared

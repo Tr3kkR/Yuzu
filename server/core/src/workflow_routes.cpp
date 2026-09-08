@@ -1567,9 +1567,10 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     sink.Post(R"(/api/workflows/([^/]+)/execute)", [auth_fn, perm_fn, audit_fn, emit_fn,
                                                     workflow_engine, instruction_store,
                                                     cmd_dispatch, cmd_dispatch_concurrency,
-                                                    caller_fn,
-                                                    approval_manager](const httplib::Request& req,
-                                                                      httplib::Response& res) {
+                                                    caller_fn, approval_manager,
+                                                    capability_registry](  // BR2-001
+                                                        const httplib::Request& req,
+                                                        httplib::Response& res) {
         if (!perm_fn(req, res, "Workflow", "Execute"))
             return;
         if (!workflow_engine || !workflow_engine->is_open()) {
@@ -1705,7 +1706,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // synchronously below, but a value capture is lifetime-safe
         // regardless) so every step narrows to AND identifies the operator.
         auto dispatch_fn =
-            [instruction_store, &cmd_dispatch, &cmd_dispatch_concurrency, caller](
+            [instruction_store, &cmd_dispatch, &cmd_dispatch_concurrency, caller,
+             capability_registry](  // BR2-001
                 const std::string& instruction_id, const std::string& agent_ids_json,
                 const std::string& parameters_json) -> std::expected<std::string, std::string> {
             // Look up the instruction definition to get plugin + action
@@ -1767,6 +1769,37 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                         params[k] = v.is_string() ? v.get<std::string>() : v.dump();
                 }
             } catch (...) {}
+
+            // BR2-001 (round-2 branch review): the instruction-execute route's
+            // BR-001 fix gated `/api/instructions/{id}/execute` but this SIBLING
+            // route's own step dispatcher — reached from workflow execution, not
+            // that route — was a second real CommandRequest producer nobody had
+            // wired. SAME chokepoint (dispatch_destructive_gate.hpp), not a copy:
+            // a Forensics/Destructive-classified step now refuses a multi-agent
+            // or omitted-scope target instead of fanning out to every `target_ids`
+            // entry. `metrics`/`audit_fn` are not threaded into this per-step
+            // closure (it returns std::expected<std::string,std::string>, not an
+            // httplib::Response, and has no `req` to audit against) — the refusal
+            // surfaces as a failed step through workflow_engine's own per-step
+            // error/audit path exactly like every other dispatch_fn failure above
+            // (instruction store down, unknown instruction, no agents reached).
+            if (!capability_registry)
+                return std::unexpected<std::string>("capability registry not available");
+            {
+                const auto gate = yuzu::server::evaluate_destructive_targeting(
+                    capability_registry->classify(def.plugin, def.action),
+                    /*valid_nonempty_agent_ids=*/!target_ids.empty(),
+                    /*scope_key_present=*/false,
+                    /*agent_id_count=*/target_ids.size());
+                switch (gate.verdict) {
+                case yuzu::server::DestructiveTargetingVerdict::NotDestructive:
+                case yuzu::server::DestructiveTargetingVerdict::ClassifyMiss:
+                case yuzu::server::DestructiveTargetingVerdict::Targeted:
+                    break;
+                case yuzu::server::DestructiveTargetingVerdict::RefuseUntargeted:
+                    return std::unexpected<std::string>(std::string(gate.refusal_message));
+                }
+            }
 
             // Dispatch via gRPC. PR 2: workflow-step dispatch path
             // does not yet wire execution_id correlation (CONSIST-2 /
