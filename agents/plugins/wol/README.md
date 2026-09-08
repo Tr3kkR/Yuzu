@@ -5,11 +5,11 @@
 |---|---|
 | **What it does** | Sends Wake-on-LAN magic packets and checks host reachability |
 | **Version** | 1.0.0 |
-| **Kind** | Action · mixed (mutating `wake`, Irreversible · read-only `check`) · on-demand (`gather.ttlSeconds: 0` on both definitions) |
-| **Platforms** | Windows ✅ · macOS ✅ · Linux 🟡 constrained (`check`'s ICMP leg) |
-| **Actions** | `wake` (definition `device.wol.wake`) · `check` (definition `device.wol.check`) |
-| **Security** | `wake` — securable `Infrastructure` · operation Write · risk Medium · dispatch Mutating (Irreversible) · approval gate AdminOrApproval; `check` — securable `Infrastructure` · operation Read · risk Low · dispatch ReadOnly · approval gate AdminOrApproval |
-| **Roles** | execute: endpoint-admin (`wake`) · endpoint-admin, endpoint-operator (`check`) · author: content-author (both) |
+| **Kind** | Action · mutating · gathered (device.wol.wake, device.wol.check) |
+| **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
+| **Actions** | `check` (definition `device.wol.check`) · `wake` (definition `device.wol.wake`) |
+| **Security** | `wake`: securable `Infrastructure` · operation Write · risk Medium · dispatch Mutating · approval gate AdminOrApproval; `check`: securable `Infrastructure` · operation Read · risk Low · dispatch ReadOnly · approval gate AdminOrApproval |
+| **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
 
 ## How it works
@@ -31,19 +31,19 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
+| `check` | ✅ supported · rung 1 · IcmpSendEcho + TCP-connect fallback | ✅ supported · rung 1 · SOCK_DGRAM ICMP ping socket + TCP-connect fallback | 🟡 constrained · rung 1 · SOCK_DGRAM ICMP ping socket + TCP-connect fallback |
 | `wake` | ✅ supported · rung 1 · raw UDP broadcast socket | ✅ supported · rung 1 · raw UDP broadcast socket | ✅ supported · rung 1 · raw UDP broadcast socket |
-| `check` | ✅ supported · rung 1 · `IcmpSendEcho` + TCP-connect fallback | ✅ supported · rung 1 · `SOCK_DGRAM` ICMP ping socket + TCP-connect fallback | 🟡 constrained · rung 1 · `SOCK_DGRAM` ICMP ping socket + TCP-connect fallback |
 
-**Declared limits per leg** (the descriptor's fallback text, verbatim):
+**Declared limits per leg** (descriptor fallback text, verbatim):
 
-- **`check` / Linux** — requires net.ipv4.ping_group_range to admit the process group for ICMP; falls back to a TCP connect on port 443, and reports CONSTRAINED if neither mechanism is usable.
+- **`check` / Linux** — requires net.ipv4.ping_group_range to admit the process group for ICMP; falls back to a TCP connect on port 443, and reports CONSTRAINED if neither mechanism is usable
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | agent service account (LocalSystem today, #1442) | `wake`: none beyond default socket access — Winsock `SOCK_DGRAM` broadcast (`wol_plugin.cpp:215`), no PowerShell; `check`: none — `IcmpSendEcho` (iphlpapi) and the TCP connect are both unprivileged | 2026-09-07, bare metal, as `SYSTEM` | not observed in any sample; `wake`'s only failure path is a `sendto` error, reported as `wake|error|Failed to send magic packet to <mac>` |
+| Windows | agent service account (LocalSystem today, #1442) | `wake`: none beyond default socket access — Winsock `SOCK_DGRAM` broadcast (`wol_plugin.cpp:215`), no PowerShell; `check`: none — `IcmpSendEcho` (iphlpapi) and the TCP connect are both unprivileged | 2026-09-07, bare metal, as `SYSTEM` | not observed in any sample; `wake`'s only failure path is a `sendto` error, reported as `wake\|error\|Failed to send magic packet to <mac>` |
 | macOS | agent daemon (`_yuzu`) | `wake`: none — `docs/agent-privilege-model.md:120` and `wol_plugin.cpp:215` agree: the plugin opens `SOCK_DGRAM`/`IPPROTO_UDP` (not `SOCK_RAW`), which needs no such capability — the doc's grant is over-stated for the current code, see Caveat 1. `check`: none — the unprivileged `SOCK_DGRAM` ICMP ping socket "works out of the box on macOS" (`icmp_probe.hpp:19-20`) | 2026-09-07, bare metal, at euid 501 (unprivileged) | not observed; no permission-denied path is exercised in code or samples |
 | Linux | agent daemon (`yuzu`) | `wake`: none — `docs/agent-privilege-model.md:120` and `wol_plugin.cpp:215` agree: the plugin opens `SOCK_DGRAM`/`IPPROTO_UDP` (not `SOCK_RAW`), which needs no such capability — see Caveat 1. `check`: no agent-side grant — the unprivileged ICMP ping socket needs the *host's* `net.ipv4.ping_group_range` sysctl to admit the process's group, else the leg falls back to the TCP-connect probe (`matrix.md`) | 2026-09-06, container, at euid 0 (root) — see Caveats: the capture never ran unprivileged | a denied ICMP socket open (`EACCES`/`EPERM`) sets `icmp_session_ok=false` (`icmp_probe.hpp:370`) and the action silently falls through to the TCP fallback rather than surfacing a distinct error |
 
@@ -54,12 +54,12 @@ No subprocess is spawned by either action — the historic `ping`/`popen` shell-
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-| Definition | Parameter | Type | Required | Default | Values | Description |
+| Definition | Parameter | Type | Required | Default | Constraints | Description |
 |---|---|---|---|---|---|---|
-| `device.wol.wake` | `mac` | string | yes | - | `^([0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2}$` | Target MAC address in colon- or hyphen-separated format, e.g. `AA:BB:CC:DD:EE:FF`. |
-| `device.wol.wake` | `port` | string | no | `9` | `^[0-9]+$` | UDP port for the magic packet broadcast (standard WoL port is 9; some setups use 7). |
-| `device.wol.check` | `host` | string | yes | - | `^[a-zA-Z0-9.:\-]+$` | Hostname or IPv4/IPv6 address to probe for reachability, e.g. `192.168.1.50`. |
-| `device.wol.check` | `count` | string | no | `3` | `^[0-9]+$` | Number of probe samples attempted per mechanism (1-10). |
+| `device.wol.check` | `host` | string | yes | - | pattern: ^[a-zA-Z0-9.:\-]+$ · minLength 1 · maxLength 253 | Hostname or IPv4/IPv6 address to check for reachability, e.g. 192.168.1.50 or desktop-01.example.com. Must contain only alphanumeric characters, dots, hyphens, and colons. |
+| `device.wol.check` | `count` | string | no | 3 | pattern: ^[0-9]+$ | Number of probe samples attempted per mechanism (1-10); each mechanism stops early on a positive result. Defaults to 3 if not specified. |
+| `device.wol.wake` | `mac` | string | yes | - | pattern: ^([0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2}$ · minLength 17 · maxLength 17 | Target MAC address in colon or hyphen-separated format (e.g., AA:BB:CC:DD:EE:FF or AA-BB-CC-DD-EE-FF). |
+| `device.wol.wake` | `port` | string | no | 9 | pattern: ^[0-9]+$ | UDP port for the magic packet broadcast. Standard WoL port is 9. Some setups use port 7 or other values. |
 <!-- END GENERATED -->
 
 ### Outputs
@@ -67,22 +67,22 @@ No subprocess is spawned by either action — the historic `ping`/`popen` shell-
 Every action writes pipe-delimited rows via `write_output()`; field 0 is a literal discriminator matching the action name. `wake`'s field count is not constant — an error row carries only `status|message`; `port` and `bytes_sent` are appended only on the success path, never padded with `-`. `check` additionally emits a second, separate row discriminated `mechanism` — a real output field that is not declared in `result.columns` below (see Caveats).
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`wake` — `status|message|port|bytes_sent`**
+**`device.wol.check` — `host|status|count`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `status` | string | `error`, `success` | all | `error` |
-| `message` | string | free text (failure reason on `error`; confirmation text on `success`) | all | `Missing required parameter: mac` |
-| `port` | string | `port <n>` (embeds the literal `port ` prefix) | success only; not observed in any sample | not observed in any capture (code: `wol_plugin.cpp:249`) |
-| `bytes_sent` | string | `<n> bytes` (embeds the literal ` bytes` suffix) | success only; not observed in any sample | not observed in any capture (code: `wol_plugin.cpp:249`) |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `host` | string | - | Windows, Linux, macOS | `127.0.0.1` | The `host` parameter value, echoed back unmodified. Values: free text (hostname or IP literal). |
+| `status` | string | - | Windows, Linux, macOS | `reachable` | Reachability verdict: `reachable` if either mechanism produced a positive result, `unreachable` if both were genuinely attempted with no positive result, or `unavailable` if neither mechanism could even be attempted. Values: reachable, unreachable, unavailable. |
+| `count` | string | - | Windows, Linux, macOS | `3` | The `count` parameter value, echoed back as a string. Values: integer 1-10, as a string. |
 
-**`check` — `host|status|count`**
+**`device.wol.wake` — `status|message|port|bytes_sent`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `host` | string | echoes the `host` parameter | all | `127.0.0.1` |
-| `status` | enum | `reachable` `unreachable` `unavailable` | all | `reachable` |
-| `count` | string | echoes the `count` parameter | all | `3` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `status` | string | - | Windows, Linux, macOS | `error` | Outcome of the magic-packet send attempt. Values: error, success. |
+| `message` | string | - | Windows, Linux, macOS | `Missing required parameter: mac` | Failure reason on `error`, or a confirmation of the packet sent on `success`. Values: free text. |
+| `port` | string | - | Windows, Linux, macOS | `not observed in any capture (code: wol_plugin.cpp:249)` | The UDP port the magic packet was sent to, formatted as `port <n>`; emitted only on `success`. Values: `port <n>` (formatted string, not a bare number). |
+| `bytes_sent` | string | - | Windows, Linux, macOS | `not observed in any capture (code: wol_plugin.cpp:249)` | Number of bytes sent, formatted as `<n> bytes`; emitted only on `success`. Values: `<n> bytes` (formatted string, not a bare number). |
 <!-- END GENERATED -->
 
 **Supplementary `mechanism` row.** `check` always emits a second row, `mechanism|<label>`, immediately after the `check` row. `<label>` is one of `icmp`, `tcp-fallback`, `tcp-refused`, `icmp+tcp-fallback` (both mechanisms genuinely attempted, neither succeeded), or `unavailable` (neither could be attempted) — `wol_check_plan.hpp:96-113`.
@@ -99,52 +99,53 @@ Every other outcome — `wake`'s success/error paths, and `check`'s `reachable`/
 
 - **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`.
 - **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — grepping the server tree for `wol` finds only the capability-declaration rows in `plugin_action_catalogue_c.hpp`; nothing else reads this plugin's output.
+- **Sensitivity.** `check`'s `host` row echoes back the caller-supplied hostname or IP address being probed — a device identifier. `wake` has no declared identifying column, though its uncaptured success-path `message` text likely names the target MAC address as confirmation text (see Caveat 3 — never observed in a sample). Neither action's rows carry a person's identity or installed-software information.
 - **Siblings:** `network.probe.icmp` / `network.probe.tcp` (`netprobe.yaml`) share `check`'s underlying `icmp_probe.hpp` mechanism for their own reachability probes.
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("device.wol.wake")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash dcc02549b1eb
 
 ```
 == action=wake
 wake|error|Missing required parameter: mac
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 [rc] 1
 
 == action=check host=127.0.0.1
 check|127.0.0.1|reachable|3
 mechanism|icmp
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash dcc02549b1eb
 
 ```
 == action=wake
 wake|error|Missing required parameter: mac
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 [rc] 1
 
 == action=check host=127.0.0.1
 check|127.0.0.1|reachable|3
 mechanism|icmp
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash pending
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash dcc02549b1eb
 
 ```
 == action=wake
 wake|error|Missing required parameter: mac
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 [rc] 1
 
 == action=check host=127.0.0.1
 check|127.0.0.1|reachable|3
 mechanism|icmp
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 ```
 <!-- END GENERATED -->
 
@@ -159,10 +160,10 @@ mechanism|icmp
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/wol/src/wol_plugin.cpp` (both actions + ABI4 descriptors) · `agents/plugins/wol/src/wol_check_plan.hpp` (pure check-mechanism decision logic)
+- Plugin: `agents/plugins/wol/src/wol_check_plan.hpp` · `agents/plugins/wol/src/wol_plugin.cpp`
 - Definitions: `content/definitions/wol.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_c.hpp`
-- Tests: `tests/unit/test_wol_check_plan.cpp` (10 cases, pure `classify_check()`/`check_mechanism_label()` coverage — no plugin-load/dispatcher test exists for wol)
-- Privilege row: `docs/agent-privilege-model.md` (`wol.wake` only; no row for `check`)
-- Changelog: `changelog.d/20260818-wave2-network-actions-wol-services-native-argv.changed.md` · `changelog.d/2204-declarations-group-c.added.md` · `changelog.d/2209-wol-macos-ping-timeout.added.md` · `changelog.d/2243-os-capability-matrix-sections.changed.md`
+- Tests: `tests/unit/test_wol_check_plan.cpp`
+- Privilege row: `docs/agent-privilege-model.md`
+- Changelog: `changelog.d/20260818-wave2-network-actions-wol-services-native-argv.changed.md` · `changelog.d/2209-wol-macos-ping-timeout.added.md`
 <!-- END GENERATED -->

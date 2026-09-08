@@ -5,11 +5,11 @@
 |---|---|
 | **What it does** | Remote Desktop control — enable/disable RDP (registry + firewall + TermService) |
 | **Version** | 0.1.0 |
-| **Kind** | Action · `status` read-only · `set_state` mutating · on-demand (no scheduled gather) |
-| **Platforms** | Windows ✅ · macOS ⛔ · Linux ⛔ |
+| **Kind** | Action · mutating · on-demand |
+| **Platforms** | Windows ✅ · macOS ⛔ unsupported · Linux ⛔ unsupported |
 | **Actions** | `set_state` (definition `windows.rdp.set_state`) · `status` (definition `windows.rdp.status`) |
-| **Security** | securable `Security` · `set_state`: operation Write · risk High · dispatch Mutating · approval gate AdminOrApproval · `status`: operation Read · risk Low · dispatch ReadOnly · approval gate None |
-| **Roles** | execute: `set_state` endpoint-admin · `status` endpoint-admin, endpoint-operator · author: content-author (both) |
+| **Security** | `set_state`: securable `Security` · operation Write · risk High · dispatch Mutating · approval gate AdminOrApproval; `status`: securable `Security` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
+| **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
 
 ## How it works
@@ -31,12 +31,8 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `set_state` | ✅ supported · rung 1 · Win32 registry + INetFwPolicy2 COM + SCM | ⛔ unsupported · no mechanism bound | ⛔ unsupported · no mechanism bound |
-| `status` | ✅ supported · rung 1 · Win32 registry + INetFwPolicy2 COM + SCM | ⛔ unsupported · no mechanism bound | ⛔ unsupported · no mechanism bound |
-
-**Declared limits per leg** (the descriptor's fallback text, verbatim):
-
-- None declared — every leg's Fallback column is `-`.
+| `set_state` | ✅ supported · rung 1 · Win32 registry + INetFwPolicy2 COM + SCM | ⛔ unsupported | ⛔ unsupported |
+| `status` | ✅ supported · rung 1 · Win32 registry + INetFwPolicy2 COM + SCM | ⛔ unsupported | ⛔ unsupported |
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -54,11 +50,9 @@ None. The Windows leg calls Win32 registry, COM, and Service Control Manager API
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-| Definition | Parameter | Type | Required | Default | Values | Description |
+| Definition | Parameter | Type | Required | Default | Constraints | Description |
 |---|---|---|---|---|---|---|
-| `windows.rdp.set_state` | `state` | string | yes | — | `enable`, `disable` | enable allows Remote Desktop connections; disable blocks them (e.g. `state: enable`). |
-
-`windows.rdp.status` takes no parameters.
+| `windows.rdp.set_state` | `state` | string | yes | - | enum: enable, disable | enable allows Remote Desktop connections; disable blocks them (e.g. state: enable). |
 <!-- END GENERATED -->
 
 ### Outputs
@@ -66,23 +60,23 @@ None. The Windows leg calls Win32 registry, COM, and Service Control Manager API
 Each action's result is a set of independent `key|value` lines — one per gate or step, in emission order — not a single delimited row; the bold lines below list the field order. There is no `-` placeholder convention here: a step or gate that could not be read reports its own `error:<code>` (or `error:com_init` / `error:group_not_found` for the firewall step) instead.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`set_state` — `reg_status|firewall_status|service_status|overall`**
+**`windows.rdp.set_state` — `reg_status|firewall_status|service_status|overall`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `reg_status` | string | `ok`, `error:<win32 code>` | W | `ok` (not observed in any capture — only the rejection path was run) |
-| `firewall_status` | string | `ok`, `error:com_init`, `error:group_not_found`, `error:0x<hresult>` | W | `ok` (not observed in any capture) |
-| `service_status` | string | `running` (enable, confirmed), `untouched` (disable), `error:<win32 code>` | W | `running` (not observed in any capture) |
-| `overall` | string | `ok`, `error` | W | `ok` (not observed in any capture) |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `reg_status` | string | - | Windows | `not observed in any capture` | Outcome of writing HKLM fDenyTSConnections; ok or a Win32 error code. Values: ok, error:<win32 code> (e.g. error:5 = ERROR_ACCESS_DENIED). |
+| `firewall_status` | string | - | Windows | `not observed in any capture` | Outcome of toggling the Remote Desktop firewall rule group via INetFwPolicy2. Values: ok, error:com_init, error:group_not_found, error:0x<hresult>. |
+| `service_status` | string | - | Windows | `not observed in any capture` | TermService outcome — running once start is confirmed by polling (enable), untouched (disable), or a Win32 error. Values: running, untouched, error:<win32 code>. |
+| `overall` | string | - | Windows | `not observed in any capture` | Terminal verdict for the whole set_state call; ok only when every step above succeeded. Values: ok, error. |
 
-**`status` — `deny_ts_connections|firewall_group|term_service|rdp`**
+**`windows.rdp.status` — `deny_ts_connections|firewall_group|term_service|rdp`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `deny_ts_connections` | string | `0` or `1` (raw registry DWORD), or `error:<win32 code>` | W | `0` |
-| `firewall_group` | string | `enabled`, `disabled`, `group_not_found`, `error:com_init`, `error:0x<hresult>` | W | `enabled` |
-| `term_service` | string | `running` `start_pending` `stopped` `stop_pending` `paused` `pause_pending` `continue_pending` `unknown`, or `error:<win32 code>` | W | `running` (not observed in any capture) |
-| `rdp` | string | `on`, `off`, `unknown` | W | `on` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `deny_ts_connections` | string | - | Windows | `0` | Raw fDenyTSConnections registry value (0 = RDP allowed, 1 = RDP denied), or a Win32 error if the read failed. Values: 0, 1, error:<win32 code>. |
+| `firewall_group` | string | - | Windows | `enabled` | Whether the Remote Desktop firewall rule group is enabled, or why it could not be read. Values: enabled, disabled, group_not_found, error:com_init, error:0x<hresult>. |
+| `term_service` | string | - | Windows | `not observed in any capture` | Current SCM state name for TermService, or a Win32 error if the query failed. Values: running, start_pending, stopped, stop_pending, paused, pause_pending, continue_pending, unknown, error:<win32 code>. |
+| `rdp` | string | - | Windows | `on` | Derived RDP posture — on only when all three gates are readable and open, unknown when any gate could not be read, off otherwise. Values: on, off, unknown. |
 <!-- END GENERATED -->
 
 ### Result status
@@ -93,18 +87,19 @@ This plugin does not set a typed result status; the agent records `UNDECLARED` a
 
 - **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (default 90-day retention), queryable at `/api/responses/{id}`.
 - **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics. The plugin is registered only in the agent's instruction catalogue and the capability catalogue — nothing else in `server/` references `rdp_control` or the `windows.rdp.*` ids.
+- **Sensitivity.** Rows carry only boolean/enum posture state (`reg_status`/`firewall_status`/`service_status`/`overall`, `deny_ts_connections`/`firewall_group`/`term_service`/`rdp`) — nothing that identifies a specific device, person, or installed software beyond the device id.
 - **Siblings:** none report combined RDP posture. `registry.get_value`/`registry.set_value` can reach the same `fDenyTSConnections` value in isolation, and `firewall.state`/`firewall.rules` read Windows Firewall generally, but neither combines the registry + firewall-group + service triad this plugin reports together.
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("windows.rdp.status")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash e17062cd8474
 
 ```
 == action=set_state
 error|invalid state (use enable or disable)
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 [rc] 1
 
 == action=status
@@ -112,33 +107,33 @@ deny_ts_connections|0
 firewall_group|enabled
 term_service|running
 rdp|on
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash e17062cd8474
 
 ```
 == action=set_state
 rdp_control|unsupported|Windows Remote Desktop has no macOS equivalent; use Screen Sharing / com.apple.screensharing
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 [rc] 1
 
 == action=status
 rdp_control|unsupported|Windows Remote Desktop has no macOS equivalent; use Screen Sharing / com.apple.screensharing
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash pending
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash e17062cd8474
 
 ```
 == action=set_state
 rdp_control|unsupported|Windows Remote Desktop is not available on this platform
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 [rc] 1
 
 == action=status
 rdp_control|unsupported|Windows Remote Desktop is not available on this platform
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 ```
 <!-- END GENERATED -->
 
@@ -156,7 +151,6 @@ rdp_control|unsupported|Windows Remote Desktop is not available on this platform
 - Plugin: `agents/plugins/rdp_control/src/rdp_control_plugin.cpp`
 - Definitions: `content/definitions/rdp_control.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_c.hpp`
-- Tests: `tests/unit/test_new_plugins.cpp` (descriptor shape + validation-mirror cases) · `tests/test_capability_gate_consistency.py` · `tests/fixtures/1398_pair_gate_table.json`
+- Tests: none found by name
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2204-declarations-group-c.added.md` · `changelog.d/2243-os-capability-matrix-sections.changed.md` · `changelog.d/2277-macos-plugin-parity.added.md`
 <!-- END GENERATED -->

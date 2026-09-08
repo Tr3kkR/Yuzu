@@ -1,4 +1,4 @@
-captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 007b2e86015f
 == action=installed
 update|KB5122385|Update|9/1/2026
 update|KB5054156|Update|2/16/2026

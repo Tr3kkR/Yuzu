@@ -5,10 +5,10 @@
 |---|---|
 | **What it does** | Reports SCCM/ConfigMgr client status, version, and site assignment |
 | **Version** | 1.0.0 |
-| **Kind** | Collector · read-only · on-demand (no scheduled gather) |
-| **Platforms** | Windows ✅ · macOS ⛔ · Linux ⛔ |
+| **Kind** | Collector · read-only · gathered (security.sccm.client_version, security.sccm.site) |
+| **Platforms** | Windows ✅ · macOS ⛔ unsupported · Linux ⛔ unsupported |
 | **Actions** | `client_version` (definition `security.sccm.client_version`) · `site` (definition `security.sccm.site`) |
-| **Security** | securable `SoftwareDeployment` · operation Read · risk Low · dispatch ReadOnly · approval gate none |
+| **Security** | securable `SoftwareDeployment` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
 | **Roles** | execute: endpoint-admin, endpoint-operator, security-admin · author: content-author |
 <!-- END GENERATED -->
 
@@ -33,12 +33,8 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `client_version` | ✅ supported · rung 1 · `registry+scm` | ⛔ unsupported | ⛔ unsupported |
-| `site` | ✅ supported · rung 1 · `registry+com_dispatch` | ⛔ unsupported | ⛔ unsupported |
-
-**Declared limits per leg** (the descriptor's fallback text, verbatim):
-
-- None declared. Every leg's fallback field is `nullptr` in `kActionDescriptors`; the macOS/Linux honest-sentinel text lives in the action bodies, not the descriptor.
+| `client_version` | ✅ supported · rung 1 · registry+scm | ⛔ unsupported | ⛔ unsupported |
+| `site` | ✅ supported · rung 1 · registry+com_dispatch | ⛔ unsupported | ⛔ unsupported |
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -56,9 +52,7 @@ No subprocesses and no network access. `site` opens an in-process COM apartment 
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-`client_version` takes no parameters.
-
-`site` takes no parameters.
+Neither action takes parameters.
 <!-- END GENERATED -->
 
 ### Outputs
@@ -66,24 +60,20 @@ No subprocesses and no network access. `site` opens an in-process COM apartment 
 Pipe-delimited `key|value` rows, one per fact, written via `write_output()`. On Windows a missing value is reported through an explicit sentinel word (`false`, `-`, `not_found`, `not_configured`, `unknown`) chosen per field, never a blank or omitted row. On macOS and Linux each action emits one or two sentinel rows instead of the normal key/value set, naming the reason the platform has no client.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`client_version` — `installed|version|service_status`** (Windows); **`sccm|unsupported|<reason>`** (macOS); **`installed|error`** (Linux)
+**`security.sccm.client_version` — `installed|version|service_status`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `installed` | bool | `true` / `false` | windows, linux | `false` |
-| `version` | string | registry `ProductVersion` value or `-` | windows | `-` |
-| `service_status` | string | `running` `stopped` `exists` `not_found` `unavailable` | windows | `not_found` |
-| `sccm` (macOS sentinel key) | string | literal `unsupported` | darwin | `unsupported` |
-| `error` (Linux sentinel key) | string | literal `platform not supported` | linux | `platform not supported` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `installed` | bool | - | Windows, Linux | `false` | Whether the registry reports a ProductVersion for the SCCM client (Windows only; always false off-Windows). Values: true, false. |
+| `version` | string | - | Windows | `-` | The installed SCCM client version from HKLM\SOFTWARE\Microsoft\SMS\Mobile Client\ProductVersion, or "-" if not present. Values: free text or "-". |
+| `service_status` | string | - | Windows | `not_found` | The ccmexec Windows service state from a live SCM query (OpenSCManagerW/OpenServiceW/QueryServiceStatusEx). Values: running, stopped, exists, not_found, unavailable. |
 
-**`site` — `site_code|management_point`** (Windows); **`sccm|unsupported|<reason>`** (macOS); **`error`** (Linux)
+**`security.sccm.site` — `site_code|management_point`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `site_code` | string | registry value, COM result, or `not_configured` | windows | `not_configured` |
-| `management_point` | string | registry value, enumerated Authority subkey value, COM result, or `unknown` | windows | `unknown` |
-| `sccm` (macOS sentinel key) | string | literal `unsupported` | darwin | `unsupported` |
-| `error` (Linux sentinel key) | string | literal `platform not supported` | linux | `platform not supported` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `site_code` | string | - | Windows | `not_configured` | The assigned SCCM site code, from the registry, the enumerated CCM\Authority subkey, or the Microsoft.SMS.Client COM fallback; "not_configured" if none resolve. Values: free text or not_configured. |
+| `management_point` | string | - | Windows | `unknown` | The current SCCM management point hostname, from the registry, the enumerated CCM\Authority subkey, or the Microsoft.SMS.Client COM fallback; "unknown" if none resolve. Values: free text or unknown. |
 <!-- END GENERATED -->
 
 ### Result status
@@ -94,50 +84,51 @@ This plugin does not set a typed result status; the agent records `UNDECLARED` a
 
 - **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (`response_retention_days`, default 90 days), rendered via `result_parsing.hpp`'s key-value schema (`Agent · Key · Value`) and queryable at `/api/responses/{id}`.
 - **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics. Nothing runs on a schedule; each definition's `gather.ttlSeconds: 60` only caps how often a repeat dispatch is served from cache, it does not trigger one.
+- **Sensitivity.** `client_version`'s `version` names the installed SCCM client software version; `site`'s `site_code`/`management_point` identify the device's organizational deployment grouping — no serial number, MAC, hostname, or username appears in any field.
 - **Siblings:** `msi_packages` (general software inventory), `agent_actions.info` (agent build/identity), `windows_updates` (patch state) — none join with `sccm`'s output.
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("security.sccm.client_version")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 820bfb5e0176
 
 ```
 == action=client_version
 installed|false
 version|-
 service_status|not_found
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 
 == action=site
 site_code|not_configured
 management_point|unknown
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 820bfb5e0176
 
 ```
 == action=client_version
 sccm|unsupported|Windows SCCM/ConfigMgr client has no macOS equivalent; use Jamf/MDM for macOS device management
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 
 == action=site
 sccm|unsupported|Windows SCCM/ConfigMgr client has no macOS equivalent; use Jamf/MDM for macOS device management
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash pending
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 820bfb5e0176
 
 ```
 == action=client_version
 installed|false
 error|platform not supported
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 
 == action=site
 error|platform not supported
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 ```
 <!-- END GENERATED -->
 
@@ -152,10 +143,10 @@ error|platform not supported
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/sccm/src/sccm_plugin.cpp` · `agents/plugins/sccm/src/sccm_parsers.hpp`
+- Plugin: `agents/plugins/sccm/src/sccm_parsers.hpp` · `agents/plugins/sccm/src/sccm_plugin.cpp`
 - Definitions: `content/definitions/sccm.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_d.hpp`
 - Tests: `tests/unit/test_sccm_parsers.cpp` · `tests/unit/test_sccm_win_actions.cpp`
-- Privilege row: no row
-- Changelog: `changelog.d/2204-declarations-group-d.added.md` · `changelog.d/2243-os-capability-matrix-sections.changed.md` · `changelog.d/2277-macos-plugin-parity.added.md` · `changelog.d/wave3-pr33d-windows-updates-sccm-native.changed.md`
+- Privilege row: `docs/agent-privilege-model.md` (no row yet)
+- Changelog: `changelog.d/wave3-pr33d-windows-updates-sccm-native.changed.md`
 <!-- END GENERATED -->

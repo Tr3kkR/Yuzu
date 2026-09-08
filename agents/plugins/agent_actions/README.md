@@ -5,11 +5,11 @@
 |---|---|
 | **What it does** | Agent runtime actions — set log level, query agent info |
 | **Version** | 0.1.0 |
-| **Kind** | Action · mixed: `set_log_level` mutating (Reversible) / `info` read-only · on-demand (`info` gather TTL 300 s, `set_log_level` TTL 0) |
+| **Kind** | Action · mutating · gathered (device.agent_actions.set_log_level, device.agent_actions.info) |
 | **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
-| **Actions** | `set_log_level` (definition `device.agent_actions.set_log_level`) · `info` (definition `device.agent_actions.info`) |
-| **Security** | securable `Infrastructure` · `set_log_level`: operation Write · risk Medium · dispatch Mutating · approval gate None · `info`: operation Read · risk Low · dispatch ReadOnly · approval gate None |
-| **Roles** | execute: `set_log_level` → endpoint-admin · `info` → endpoint-admin, endpoint-operator · author (both): content-author |
+| **Actions** | `info` (definition `device.agent_actions.info`) · `set_log_level` (definition `device.agent_actions.set_log_level`) |
+| **Security** | `set_log_level`: securable `Infrastructure` · operation Write · risk Medium · dispatch Mutating · approval gate None; `info`: securable `Infrastructure` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
+| **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
 
 ## How it works
@@ -31,12 +31,8 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `set_log_level` | ✅ supported · rung 1 · `spdlog_runtime` | ✅ supported · rung 1 · `spdlog_runtime` | ✅ supported · rung 1 · `spdlog_runtime` |
-| `info` | ✅ supported · rung 1 · `agent_config_read` | ✅ supported · rung 1 · `agent_config_read` | ✅ supported · rung 1 · `agent_config_read` |
-
-**Declared limits per leg** (the descriptor's fallback text, verbatim):
-
-- None declared — every `(action, OS)` fallback column is `-`.
+| `info` | ✅ supported · rung 1 · agent_config_read | ✅ supported · rung 1 · agent_config_read | ✅ supported · rung 1 · agent_config_read |
+| `set_log_level` | ✅ supported · rung 1 · spdlog_runtime | ✅ supported · rung 1 · spdlog_runtime | ✅ supported · rung 1 · spdlog_runtime |
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -54,11 +50,9 @@ None. Both actions execute in-process — no subprocess and no network call on a
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-| Action | Parameter | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `set_log_level` | `level` | string | yes | — | Desired spdlog log level, case-insensitive: `trace`, `debug`, `info`, `warn`, `error`, `critical`, `off` (e.g. `info`). |
-
-`info` takes no parameters.
+| Definition | Parameter | Type | Required | Default | Constraints | Description |
+|---|---|---|---|---|---|---|
+| `device.agent_actions.set_log_level` | `level` | string | yes | - | enum: trace, debug, info, warn, error, critical, off | The desired spdlog log level, case-insensitive: trace, debug, info, warn, error, critical, or off (e.g. "info"). |
 <!-- END GENERATED -->
 
 ### Outputs
@@ -66,22 +60,22 @@ None. Both actions execute in-process — no subprocess and no network call on a
 Both actions emit `write_output()` lines of the form `key|value` rather than disk-plugin-style single pipe-delimited rows. `set_log_level` writes exactly two lines on success (`status`, then `level`); a validation failure instead writes one `error|<message>` line that matches neither declared column. `info` writes exactly five lines, one per config key, in a fixed order; an unpopulated key renders the literal `(not set)` rather than being omitted.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`set_log_level` — one `status|<value>` line, then one `level|<value>` line**
+**`device.agent_actions.info` — `agent_id|agent_version|server_address|heartbeat_interval|plugins_count`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `status` | string | `ok` (only value on success; a validation failure emits `error|<message>` instead of this row) | W, M, L | `ok` |
-| `level` | string | `trace` `debug` `info` `warn` `error` `critical` `off` (lowercased echo of the `level` parameter) | W, M, L | `info` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `agent_id` | string | - | Windows, Linux, macOS | `(not set)` | The agent's agent.id config value, or the literal "(not set)" when the config context has not populated it. Values: free text, or literal "(not set)". |
+| `agent_version` | string | - | Windows, Linux, macOS | `(not set)` | The agent's agent.version config value, or the literal "(not set)" when unpopulated. Values: free text, or literal "(not set)". |
+| `server_address` | string | - | Windows, Linux, macOS | `(not set)` | The agent's agent.server_address config value, or the literal "(not set)" when unpopulated. Values: free text, or literal "(not set)". |
+| `heartbeat_interval` | string | - | Windows, Linux, macOS | `(not set)` | The agent's agent.heartbeat_interval config value, or the literal "(not set)" when unpopulated. Values: free text, or literal "(not set)". |
+| `plugins_count` | int32 | - | Windows, Linux, macOS | `(not set)` | The agent's agent.plugins.count config value. Always emitted as text, never a JSON number — the raw config string or the literal "(not set)". Values: free text, or literal "(not set)". |
 
-**`info` — five `key|value` lines, one per config key (`agent.id`, `agent.version`, `agent.server_address`, `agent.heartbeat_interval`, `agent.plugins.count`)**
+**`device.agent_actions.set_log_level` — `status|level`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `agent_id` | string | free text, or literal `(not set)` | W, M, L | `(not set)` |
-| `agent_version` | string | free text, or literal `(not set)` | W, M, L | `(not set)` |
-| `server_address` | string | free text, or literal `(not set)` | W, M, L | `(not set)` |
-| `heartbeat_interval` | string | free text, or literal `(not set)` | W, M, L | `(not set)` |
-| `plugins_count` | int32 (declared) | plugin always emits this as text — the raw `agent.plugins.count` string or literal `(not set)`, never a JSON number | W, M, L | `(not set)` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `status` | string | `ok` | Windows, Linux, macOS | `ok` | Literal "ok" once the level was applied. A missing or unrecognized level instead produces a single "error\|<message>" line that carries neither this column nor level. |
+| `level` | string | `trace` `debug` `info` `warn` `error` `critical` `off` | Windows, Linux, macOS | `info` | The log level the agent applied — a lowercased echo of the level parameter. |
 <!-- END GENERATED -->
 
 ### Result status
@@ -92,19 +86,20 @@ This plugin does not set a typed result status; the agent records `UNDECLARED` a
 
 - **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response into the ResponseStore. The dashboard renders `agent_actions` output as a generic `Agent | Key | Value` table — it is in the `kKeyValuePlugins` set, not a custom schema (`server/core/src/result_parsing.hpp:53-67`).
 - **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — no reference to `agent_actions` or `device.agent_actions.*` exists outside the capability catalogue, `result_parsing.hpp`, and `agent_registry.cpp`'s action-description registry.
+- **Sensitivity.** `info` rows can carry `agent_id` (this device's own identifier) and `agent_version` (the installed agent software's version); `server_address`, `heartbeat_interval`, and `plugins_count` describe the deployment rather than a device, person, or third-party software. `set_log_level` rows carry nothing beyond a log-level name.
 - **Siblings:** none — both actions are this plugin's whole surface; no other definition shares its config-read or log-level mechanism.
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("device.agent_actions.info")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`, rendered as an `Agent | Key | Value` table (`server/core/src/result_parsing.hpp:53-67`).
 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 2688724a5dd5
 
 ```
 == action=set_log_level level=info
 status|ok
 level|info
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 
 == action=info
 agent.id|(not set)
@@ -112,16 +107,16 @@ agent.version|(not set)
 agent.server_address|(not set)
 agent.heartbeat_interval|(not set)
 agent.plugins.count|(not set)
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 2688724a5dd5
 
 ```
 == action=set_log_level level=info
 status|ok
 level|info
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 
 == action=info
 agent.id|(not set)
@@ -129,16 +124,16 @@ agent.version|(not set)
 agent.server_address|(not set)
 agent.heartbeat_interval|(not set)
 agent.plugins.count|(not set)
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash pending
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 2688724a5dd5
 
 ```
 == action=set_log_level level=info
 status|ok
 level|info
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 
 == action=info
 agent.id|(not set)
@@ -146,7 +141,7 @@ agent.version|(not set)
 agent.server_address|(not set)
 agent.heartbeat_interval|(not set)
 agent.plugins.count|(not set)
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 ```
 <!-- END GENERATED -->
 
@@ -161,10 +156,9 @@ agent.plugins.count|(not set)
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/agent_actions/src/agent_actions_plugin.cpp` (single TU — `meson.build` lists exactly one source file, no per-OS split)
+- Plugin: `agents/plugins/agent_actions/src/agent_actions_plugin.cpp`
 - Definitions: `content/definitions/agent_actions.yaml`
-- Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_d.hpp` (lines ~524, ~534)
-- Tests: no dedicated test file for this plugin; `tests/unit/test_plugin_loader.cpp:411-475` covers the config-sync invariant `info` depends on, and `tests/unit/server/test_instruction_yaml.cpp` parses its YAML definitions generically
-- Privilege row: no row in `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2204-declarations-group-d.added.md`
+- Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_d.hpp`
+- Tests: none found by name
+- Privilege row: `docs/agent-privilege-model.md` (no row yet)
 <!-- END GENERATED -->

@@ -5,11 +5,11 @@
 |---|---|
 | **What it does** | Reference example plugin — responds to 'ping' |
 | **Version** | 0.1.0 |
-| **Kind** | Action · read-only · on-demand (no scheduled gather) |
+| **Kind** | Collector · read-only · on-demand |
 | **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
-| **Actions** | `ping` (no definition) · `echo` (no definition) |
-| **Security** | securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate none |
-| **Roles** | no definition YAML — execute/author roles not declared |
+| **Actions** | `echo` · `ping` |
+| **Security** | securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
+| **Roles** | execute: - · author: - |
 <!-- END GENERATED -->
 
 ## How it works
@@ -31,12 +31,8 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `ping` | ✅ supported · rung 1 · in-process | ✅ supported · rung 1 · in-process | ✅ supported · rung 1 · in-process |
 | `echo` | ✅ supported · rung 1 · in-process | ✅ supported · rung 1 · in-process | ✅ supported · rung 1 · in-process |
-
-**Declared limits per leg** (the descriptor's fallback text, verbatim):
-
-None declared — every leg's fallback field is `nullptr` (`example_plugin.cpp:21-30`) and the capability-matrix Fallback column reads `-` for every (action, OS) row.
+| `ping` | ✅ supported · rung 1 · in-process | ✅ supported · rung 1 · in-process | ✅ supported · rung 1 · in-process |
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -54,11 +50,7 @@ No external binaries, no subprocesses, no network access — `example_plugin.cpp
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-| Action | Parameter | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `echo` | `message` | string | no | `(no message)` | Text to echo back, prefixed with `echo: ` (`example_plugin.cpp:70`) |
-
-`ping` takes no parameters (`example_plugin.cpp:64-67`).
+Neither action takes parameters.
 <!-- END GENERATED -->
 
 ### Outputs
@@ -66,17 +58,7 @@ No external binaries, no subprocesses, no network access — `example_plugin.cpp
 Each action writes exactly one line of plain text via `ctx.write_output()` (`example_plugin.cpp:65,71,75`) — there is no pipe-delimited row schema, discriminator field, or empty-row placeholder convention as used by the collector-style plugins. A call on a known action name always produces one output line and returns 0; an unrecognized action name writes `unknown action: <action>` and returns 1 (`example_plugin.cpp:75-76`).
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`ping` — `pong`**
-
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| (line) | string | literal `pong` | W, M, L | `pong` |
-
-**`echo` — `echo: <message>`**
-
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| (line) | string | `echo: ` + the `message` parameter, or `echo: (no message)` when omitted | W, M, L | `echo: (no message)` |
+No definition declares result columns.
 <!-- END GENERATED -->
 
 ### Result status
@@ -87,45 +69,46 @@ This plugin does not set a typed result status; the agent records `UNDECLARED` a
 
 - **MCP / REST.** No definition YAML exists for `example` (no file under `content/definitions/` sets `plugin: example`), so there is no `definition_id` to discover via `discover_instructions`/`get_definition` or run via `execute_instruction` today — `ping` and `echo` are unreachable from the MCP/REST surface until a definition is authored. The only paths that load this plugin today are the plugin-capture driver (`PluginHandle::load` + `LocalDispatcher::run`, used for the samples below) and direct test/tooling loads of the shared library.
 - **Not consumed by** daily-sync, the TAR warehouse, DEX, or metrics — nothing schedules this plugin; it runs only when explicitly loaded.
+- **Sensitivity.** Both actions carry no host state — `ping`'s row is a fixed literal and `echo`'s row is only the operator-supplied `message` parameter echoed back; nothing about the device, an account, or installed software is read or reported.
 - **Siblings:** none — a standalone ABI/host reference plugin, not part of an inventory family (`example_plugin.cpp:1-6`).
 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 23dda8161132
 
 ```
 == action=ping
 pong
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 
 == action=echo
 echo: (no message)
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 23dda8161132
 
 ```
 == action=ping
 pong
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 
 == action=echo
 echo: (no message)
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash pending
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 23dda8161132
 
 ```
 == action=ping
 pong
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 
 == action=echo
 echo: (no message)
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 ```
 <!-- END GENERATED -->
 
@@ -140,10 +123,9 @@ echo: (no message)
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/example/src/example_plugin.cpp` · `agents/plugins/example/meson.build`
-- Definitions: none — no `content/definitions/*.yaml` sets `plugin: example`
-- Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_b.hpp:703` (ping) · `:714` (echo)
-- Tests: none found
-- Privilege row: no row in `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2204-declarations-group-b.added.md`
+- Plugin: `agents/plugins/example/src/example_plugin.cpp`
+- Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_b.hpp`
+- Tests: none found by name
+- Privilege row: `docs/agent-privilege-model.md` (no row yet)
+- Changelog: `changelog.d/1986-getting-started-import-examples.fixed.md`
 <!-- END GENERATED -->

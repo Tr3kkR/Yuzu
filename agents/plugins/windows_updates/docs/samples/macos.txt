@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 007b2e86015f
 == action=installed
 update|macOS 26.5.1|18/07/2026, 01:41
 update|MAContent10_AssetPack_0048_AlchemyPadsDigitalHolyGhost|18/07/2026, 01:44

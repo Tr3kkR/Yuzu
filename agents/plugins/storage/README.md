@@ -5,11 +5,11 @@
 |---|---|
 | **What it does** | Persistent key-value storage — set, get, delete, list, clear |
 | **Version** | 1.0.0 |
-| **Kind** | Action · mixed: read-only (`get`, `list`) / mutating (`set`, `delete`) / destructive (`clear`) · on-demand (no scheduled gather; `gather.ttlSeconds: 60` is a response deadline, not a trigger) |
+| **Kind** | Action · mutating · gathered (agent.storage.set, agent.storage.get, agent.storage.delete, agent.storage.list, agent.storage.clear) |
 | **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
-| **Actions** | `set` (definition `agent.storage.set`) · `get` (`agent.storage.get`) · `delete` (`agent.storage.delete`) · `list` (`agent.storage.list`) · `clear` (`agent.storage.clear`) |
-| **Security** | securable `Infrastructure` (all actions) · operation Read (`get`, `list`) / Write (`set`) / Delete (`delete`, `clear`) · risk Low (`get`, `list`) / Medium (`set`) / High (`delete`, `clear`) · dispatch ReadOnly (`get`, `list`) / Mutating (`set`, `delete`) / Destructive (`clear`) · approval gate none (`get`, `list`) / AdminOrApproval (`set`, `delete`, `clear`) |
-| **Roles** | execute: endpoint-admin (all actions) + endpoint-operator (`get`, `list`) · author: content-author (all actions) |
+| **Actions** | `clear` (definition `agent.storage.clear`) · `delete` (definition `agent.storage.delete`) · `get` (definition `agent.storage.get`) · `list` (definition `agent.storage.list`) · `set` (definition `agent.storage.set`) |
+| **Security** | `set`: securable `Infrastructure` · operation Write · risk Medium · dispatch Mutating · approval gate AdminOrApproval; `get`: securable `Infrastructure` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `delete`: securable `Infrastructure` · operation Delete · risk High · dispatch Mutating · approval gate AdminOrApproval; `list`: securable `Infrastructure` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `clear`: securable `Infrastructure` · operation Delete · risk High · dispatch Destructive · approval gate AdminOrApproval |
+| **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
 
 ## How it works
@@ -34,15 +34,11 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `set` | ✅ supported · rung 1 · in-process agent KV store (`yuzu_ctx_storage_set`) | ✅ supported · rung 1 · in-process agent KV store (`yuzu_ctx_storage_set`) | ✅ supported · rung 1 · in-process agent KV store (`yuzu_ctx_storage_set`) |
-| `get` | ✅ supported · rung 1 · in-process agent KV store (`yuzu_ctx_storage_get`) | ✅ supported · rung 1 · in-process agent KV store (`yuzu_ctx_storage_get`) | ✅ supported · rung 1 · in-process agent KV store (`yuzu_ctx_storage_get`) |
-| `delete` | ✅ supported · rung 1 · in-process agent KV store (`yuzu_ctx_storage_delete`) | ✅ supported · rung 1 · in-process agent KV store (`yuzu_ctx_storage_delete`) | ✅ supported · rung 1 · in-process agent KV store (`yuzu_ctx_storage_delete`) |
-| `list` | ✅ supported · rung 1 · in-process agent KV store (`yuzu_ctx_storage_list`) | ✅ supported · rung 1 · in-process agent KV store (`yuzu_ctx_storage_list`) | ✅ supported · rung 1 · in-process agent KV store (`yuzu_ctx_storage_list`) |
-| `clear` | ✅ supported · rung 1 · in-process agent KV store (`yuzu_ctx_storage_list` + `storage_delete` per key) | ✅ supported · rung 1 · in-process agent KV store (`yuzu_ctx_storage_list` + `storage_delete` per key) | ✅ supported · rung 1 · in-process agent KV store (`yuzu_ctx_storage_list` + `storage_delete` per key) |
-
-**Declared limits per leg** (the descriptor's fallback text, verbatim):
-
-None declared — every action/OS leg's fallback column is `-` (no leg carries constrained or fallback behaviour; `storage_plugin.cpp:30-82`).
+| `clear` | ✅ supported · rung 1 · in-process agent KV store (yuzu_ctx_storage_list + storage_delete per key) | ✅ supported · rung 1 · in-process agent KV store (yuzu_ctx_storage_list + storage_delete per key) | ✅ supported · rung 1 · in-process agent KV store (yuzu_ctx_storage_list + storage_delete per key) |
+| `delete` | ✅ supported · rung 1 · in-process agent KV store (yuzu_ctx_storage_delete) | ✅ supported · rung 1 · in-process agent KV store (yuzu_ctx_storage_delete) | ✅ supported · rung 1 · in-process agent KV store (yuzu_ctx_storage_delete) |
+| `get` | ✅ supported · rung 1 · in-process agent KV store (yuzu_ctx_storage_get) | ✅ supported · rung 1 · in-process agent KV store (yuzu_ctx_storage_get) | ✅ supported · rung 1 · in-process agent KV store (yuzu_ctx_storage_get) |
+| `list` | ✅ supported · rung 1 · in-process agent KV store (yuzu_ctx_storage_list) | ✅ supported · rung 1 · in-process agent KV store (yuzu_ctx_storage_list) | ✅ supported · rung 1 · in-process agent KV store (yuzu_ctx_storage_list) |
+| `set` | ✅ supported · rung 1 · in-process agent KV store (yuzu_ctx_storage_set) | ✅ supported · rung 1 · in-process agent KV store (yuzu_ctx_storage_set) | ✅ supported · rung 1 · in-process agent KV store (yuzu_ctx_storage_set) |
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -60,15 +56,13 @@ No external binaries, no subprocesses, no network access — every action stays 
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-| Definition | Parameter | Type | Required | Default | Values | Description |
+| Definition | Parameter | Type | Required | Default | Constraints | Description |
 |---|---|---|---|---|---|---|
-| `agent.storage.set` | `key` | string | yes | - | - | Storage key name, e.g. `yuzu_capture_tmp`. |
-| `agent.storage.set` | `value` | string | yes | - | - | Value to store, stored and returned byte-for-byte. |
-| `agent.storage.get` | `key` | string | yes | - | - | Storage key to retrieve, e.g. `yuzu_capture_tmp`. |
-| `agent.storage.delete` | `key` | string | yes | - | - | Storage key to delete, e.g. `yuzu_capture_tmp`. |
-| `agent.storage.list` | `prefix` | string | no | - | - | Only return keys starting with this prefix; omit for all keys. |
-
-`clear` takes no parameters.
+| `agent.storage.delete` | `key` | string | yes | - | - | Storage key to delete, e.g. "yuzu_capture_tmp". |
+| `agent.storage.get` | `key` | string | yes | - | - | Storage key to retrieve, e.g. "yuzu_capture_tmp". |
+| `agent.storage.list` | `prefix` | string | no | - | - | Only return keys starting with this prefix, e.g. "yuzu_". Default is all keys. |
+| `agent.storage.set` | `key` | string | yes | - | - | Storage key name, arbitrary text, e.g. "yuzu_capture_tmp". |
+| `agent.storage.set` | `value` | string | yes | - | - | Value to store, arbitrary text, stored and returned byte-for-byte. |
 <!-- END GENERATED -->
 
 ### Outputs
@@ -76,40 +70,40 @@ No external binaries, no subprocesses, no network access — every action stays 
 Each action writes one or more independently-shaped, pipe-delimited lines via `write_output()` (`storage_plugin.cpp:132-198`) rather than a uniform repeating row. `set`, `delete`, and `clear` announce success as a literal `status|ok` line — or, on failure, no `status` line at all and instead a separate `error|<message>` line (not represented in the YAML columns below, since it only appears when the row-producing path is never reached). `get` always writes exactly one `key|<key>|<value-or-not_found>` line, where the sentinel `not_found` means both "no such key" and — per the root-cause note above — "storage was never wired up." `list` writes one `count|<n>` line followed by `n` `key|<k>` lines, with zero `key` rows when `n` is 0.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`set` — success: `status|ok` then `key|<key>`; failure: `error|<message>` (not a YAML column)**
+**`agent.storage.clear` — `status|cleared`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `status` | string | `ok` (this row is absent on failure) | W, M, L | `ok` |
-| `key` | string | free text | W, M, L | `yuzu_capture_tmp` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `status` | string | - | Windows, Linux, macOS | `ok` | Write outcome. Always the literal "ok", written after the clear loop completes. |
+| `cleared` | int32 | - | Windows, Linux, macOS | `-` | Count of keys deleted in this run — the size of the key list read at the start of the pass, not a per-key confirmed-delete count. Values: integer >= 0. |
 
-**`get` — `key|<key>|<value-or-not_found>`**
+**`agent.storage.delete` — `status|key`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `key` | string | free text — the requested key, echoed back unchanged | W, M, L | `yuzu_capture_tmp` |
-| `value` | string | free text, or the literal sentinel `not_found` | W, M, L | `not_found` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `status` | string | - | Windows, Linux, macOS | `ok` | Write outcome. Always the literal "ok" when present — written unconditionally once the delete call returns, without checking whether the delete actually succeeded. |
+| `key` | string | - | Windows, Linux, macOS | `yuzu_capture_tmp` | The key name that was targeted for deletion, echoed back unchanged. Values: free text. |
 
-**`delete` — `status|ok` then `key|<key>` (status is written unconditionally — `storage_plugin.cpp:172-174` never checks the delete's return value)**
+**`agent.storage.get` — `key|value`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `status` | string | `ok` (always, even if the delete failed) | W, M, L | `ok` |
-| `key` | string | free text | W, M, L | `yuzu_capture_tmp` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `key` | string | - | Windows, Linux, macOS | `yuzu_capture_tmp` | The requested key name, echoed back unchanged. (The literal "key" row-discriminator emitted before this field is not itself a separate column.). Values: free text. |
+| `value` | string | - | Windows, Linux, macOS | `not_found` | The stored value, or the literal sentinel "not_found" when the key has no stored value. Values: free text, or the sentinel not_found. |
 
-**`list` — `count|<n>` then `n` × `key|<k>`**
+**`agent.storage.list` — `count|key`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `count` | int32 | integer ≥ 0 | W, M, L | `0` |
-| `key` | string | free text; one row per matching key, no rows when `count` is 0 | W, M, L | `-` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `count` | int32 | - | Windows, Linux, macOS | `0` | Number of keys returned, written once as the first row of every response. Values: integer >= 0. |
+| `key` | string | - | Windows, Linux, macOS | `-` | One row per matching key name; no key rows at all when count is 0. Values: free text. |
 
-**`clear` — `status|ok` then `cleared|<n>`**
+**`agent.storage.set` — `status|key`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `status` | string | `ok` | W, M, L | `ok` |
-| `cleared` | int32 | integer ≥ 0 — size of the key list read at the start of the pass, not a confirmed-delete count | W, M, L | `-` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `status` | string | - | Windows, Linux, macOS | `ok` | Write outcome. Present and equal to "ok" only when the write succeeded; on failure this row is absent and an "error\|<message>" line is written instead (not represented as a column). |
+| `key` | string | - | Windows, Linux, macOS | `yuzu_capture_tmp` | The key name that was stored, echoed back unchanged. Values: free text. |
 <!-- END GENERATED -->
 
 ### Result status
@@ -120,82 +114,83 @@ Each action writes one or more independently-shaped, pipe-delimited lines via `w
 
 - **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`.
 - **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — a grep of `server/core/src` for `"storage"` and for the five `agent.storage.*` ids finds no server-side consumer beyond the generic dispatch/response path.
+- **Sensitivity.** The plugin never interprets its `key`/`value` content — every row is opaque caller-supplied text, so whether a given row identifies a device, a person, or installed software depends entirely on what the calling plugin chose to store there, not on anything this plugin's own columns declare. The `status`/`count`/`cleared` fields carry nothing beyond the device id.
 - **Siblings:** none. `content/definitions/storage.yaml` is the only definitions file with `execution.plugin: storage`; the plugin's five actions are the only definitions that execute against it.
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("agent.storage.get")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash cc5994a9097a
 
 ```
 == action=set key=yuzu_capture_tmp value=1
 error|storage write failed
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 [rc] 1
 
 == action=get key=yuzu_capture_tmp
 key|yuzu_capture_tmp|not_found
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=delete key=yuzu_capture_tmp
 status|ok
 key|yuzu_capture_tmp
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=list
 count|0
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=clear
 [not captured] Destructive/Irreversible: not executed on a live host
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash cc5994a9097a
 
 ```
 == action=set key=yuzu_capture_tmp value=1
 error|storage write failed
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 [rc] 1
 
 == action=get key=yuzu_capture_tmp
 key|yuzu_capture_tmp|not_found
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=delete key=yuzu_capture_tmp
 status|ok
 key|yuzu_capture_tmp
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=list
 count|0
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=clear
 [not captured] Destructive/Irreversible: not executed on a live host
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash pending
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash cc5994a9097a
 
 ```
 == action=set key=yuzu_capture_tmp value=1
 error|storage write failed
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 [rc] 1
 
 == action=get key=yuzu_capture_tmp
 key|yuzu_capture_tmp|not_found
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=delete key=yuzu_capture_tmp
 status|ok
 key|yuzu_capture_tmp
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=list
 count|0
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=clear
 [not captured] Destructive/Irreversible: not executed on a live host
@@ -215,8 +210,7 @@ count|0
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
 - Plugin: `agents/plugins/storage/src/storage_plugin.cpp`
 - Definitions: `content/definitions/storage.yaml`
-- Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_b.hpp` (lines 396-450)
-- Tests: `tests/unit/test_new_plugins.cpp:333` (descriptor-shape assertion only — no `LocalDispatcher`-level behavioral test exercises `set`/`get`/`delete`/`list`/`clear`)
-- Privilege row: no row in `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2204-declarations-group-b.added.md` · `changelog.d/3885-dashboard-destructive-targeting.security.md`
+- Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_b.hpp`
+- Tests: none found by name
+- Privilege row: `docs/agent-privilege-model.md` (no row yet)
 <!-- END GENERATED -->

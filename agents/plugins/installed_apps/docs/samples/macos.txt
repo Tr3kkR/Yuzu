@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 47e1dd9008d0
 == action=list
 app|50onPaletteServer|1.1.0|-|13/08/2026, 03:51
 app|ABAssistantService|14.0|-|13/08/2026, 03:51

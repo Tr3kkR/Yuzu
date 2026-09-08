@@ -1,4 +1,4 @@
-captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash e17062cd8474
 == action=set_state
 error|invalid state (use enable or disable)
 [result_status] UNDECLARED / UNKNOWN / 

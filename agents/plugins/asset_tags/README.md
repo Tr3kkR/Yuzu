@@ -5,10 +5,10 @@
 |---|---|
 | **What it does** | Structured asset tag awareness — syncs server-assigned tags locally and detects changes |
 | **Version** | 0.1.0 |
-| **Kind** | Action · mixed (mutating `sync` · read-only `status`/`get`/`changes`) · on-demand (`sync` also server-triggered on tag-category change) |
+| **Kind** | Action · mutating · gathered (device.asset_tags.sync, device.asset_tags.status, device.asset_tags.get, device.asset_tags.changes) |
 | **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
-| **Actions** | `sync` (definition `device.asset_tags.sync`) · `status` (definition `device.asset_tags.status`) · `get` (definition `device.asset_tags.get`) · `changes` (definition `device.asset_tags.changes`) |
-| **Security** | securable `Tag` · operation Write (`sync`) / Read (`status`, `get`, `changes`) · risk Medium (`sync`) / Low (others) · dispatch Mutating/Reversible (`sync`) / ReadOnly/None (others) · approval gate none (all four) |
+| **Actions** | `changes` (definition `device.asset_tags.changes`) · `get` (definition `device.asset_tags.get`) · `status` (definition `device.asset_tags.status`) · `sync` (definition `device.asset_tags.sync`) |
+| **Security** | `sync`: securable `Tag` · operation Write · risk Medium · dispatch Mutating · approval gate None; `status`: securable `Tag` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `get`: securable `Tag` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `changes`: securable `Tag` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
 | **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
 
@@ -38,12 +38,10 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `sync` | ✅ supported · rung 1 · `local_json_store` | ✅ supported · rung 1 · `local_json_store` | ✅ supported · rung 1 · `local_json_store` |
-| `status` | ✅ supported · rung 1 · `local_json_store` | ✅ supported · rung 1 · `local_json_store` | ✅ supported · rung 1 · `local_json_store` |
-| `get` | ✅ supported · rung 1 · `local_json_store` | ✅ supported · rung 1 · `local_json_store` | ✅ supported · rung 1 · `local_json_store` |
-| `changes` | ✅ supported · rung 1 · `local_json_store` | ✅ supported · rung 1 · `local_json_store` | ✅ supported · rung 1 · `local_json_store` |
-
-**Declared limits per leg** (the descriptor's fallback text, verbatim): none — every (action, OS) fallback field is `-` (`asset_tags_plugin.cpp:176-189`).
+| `changes` | ✅ supported · rung 1 · local_json_store | ✅ supported · rung 1 · local_json_store | ✅ supported · rung 1 · local_json_store |
+| `get` | ✅ supported · rung 1 · local_json_store | ✅ supported · rung 1 · local_json_store | ✅ supported · rung 1 · local_json_store |
+| `status` | ✅ supported · rung 1 · local_json_store | ✅ supported · rung 1 · local_json_store | ✅ supported · rung 1 · local_json_store |
+| `sync` | ✅ supported · rung 1 · local_json_store | ✅ supported · rung 1 · local_json_store | ✅ supported · rung 1 · local_json_store |
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -61,15 +59,13 @@ No external binaries, no subprocesses, no network access — every action is an 
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-| Action | Parameter | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `sync` | `role` | string | no | (none) | The device's operational role, free-form text (e.g. `db-primary`). |
-| `sync` | `environment` | string | no | (none) | Deployment stage for this device — one of `Dev`, `UAT`, `Production`. |
-| `sync` | `location` | string | no | (none) | Physical or logical location of the device, free-form text (e.g. `us-east-dc2`). |
-| `sync` | `service` | string | no | (none) | IT service this device belongs to, free-form text (e.g. `billing-api`). |
-| `get` | `key` | string | yes | — | One of the 4 structured tag categories (e.g. `role`). |
-
-`status` takes no parameters. `changes` takes no parameters.
+| Definition | Parameter | Type | Required | Default | Constraints | Description |
+|---|---|---|---|---|---|---|
+| `device.asset_tags.get` | `key` | string | yes | - | enum: role, environment, location, service | One of the 4 structured tag categories (e.g. "role"). |
+| `device.asset_tags.sync` | `role` | string | no | - | - | The device's operational role, free-form text (e.g. "db-primary"). |
+| `device.asset_tags.sync` | `environment` | string | no | - | enum: Dev, UAT, Production | Deployment stage for this device — one of "Dev", "UAT", "Production". |
+| `device.asset_tags.sync` | `location` | string | no | - | - | Physical or logical location of the device, free-form text (e.g. "us-east-dc2"). |
+| `device.asset_tags.sync` | `service` | string | no | - | - | IT service this device belongs to, free-form text (e.g. "billing-api"). |
 <!-- END GENERATED -->
 
 ### Outputs
@@ -77,43 +73,41 @@ No external binaries, no subprocesses, no network access — every action is an 
 Every action writes one or more pipe-delimited lines via `ctx.write_output`. There is no single row shape shared across an action's own output: `get` emits exactly one `tag|<key>|<value>` line per call, and `changes` emits one `change|<key>|<old_value>|<new_value>|<timestamp>` line per recorded change (or the sentinel line `changes|none` when the log is empty, with no trailing count on that path). `status` and `sync` each emit several *different* line shapes in one response — see Caveats. There is no shared empty-result placeholder convention: an unset tag reports as an empty string, never `-`.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`sync` — `sync|event|key|old_value|new_value`** (variable arity — `old_value`/`new_value` are omitted, not emptied, depending on `event`; see Caveats)
+**`device.asset_tags.changes` — `key|old_value|new_value|timestamp`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `event` | string | `no_changes` `tag_added` `tag_removed` `tag_changed` | W, M, L (declared; never captured) | `-` |
-| `key` | string | `role` `environment` `location` `service`; absent when `event=no_changes` | W, M, L | `-` |
-| `old_value` | string | free text; absent for `tag_added`/`no_changes` | W, M, L | `-` |
-| `new_value` | string | free text; absent for `tag_removed`/`no_changes` | W, M, L | `-` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `key` | string | `role` `environment` `location` `service` | Windows, Linux, macOS | `-` | The tag category the change record is for. |
+| `old_value` | string | - | Windows, Linux, macOS | `-` | The value before the change. Values: free text. |
+| `new_value` | string | - | Windows, Linux, macOS | `-` | The value after the change. Values: free text. |
+| `timestamp` | int64 | - | Windows, Linux, macOS | `-` | Epoch seconds when the change was recorded. Values: integer (unix epoch seconds). |
 
-`sync` additionally emits, on every call regardless of change, 4 `tag|<key>|<value>` lines (current state per category) and a trailing `last_sync|<epoch>` line — neither shape is declared in `content/definitions/asset_tags.yaml`'s `result.columns` for this definition (`asset_tags.yaml:51-60` vs `asset_tags_plugin.cpp:316-323`).
+**`device.asset_tags.get` — `key|value`**
 
-**`status` — `tag|key|value` (one line per category) then `last_sync|value`, `stale|value`, `check_interval|value`, `change_count|value` (one line each)**
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `key` | string | `role` `environment` `location` `service` | Windows, Linux, macOS | `role` | The category key that was requested, echoed back. |
+| `value` | string | - | Windows, Linux, macOS | - | The cached value for that category; empty string if never set. Values: free text or empty. |
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `key` | string | `role` `environment` `location` `service` | W, M, L | `role` |
-| `value` | string | free text or empty | W, M, L | *(empty — every sample shows unset tags)* |
-| `last_sync` | int64 | unix epoch seconds, `0` before any sync | W, M, L | `0` |
-| `stale` | bool | `true` `false` | W, M, L | `true` |
-| `check_interval` | int32 | seconds, floor 30, default 300 | W, M, L | `300` |
-| `change_count` | int32 | integer ≥ 0 | W, M, L | `0` |
+**`device.asset_tags.status` — `key|value|last_sync|stale|check_interval|change_count`**
 
-**`get` — `tag|key|value`**
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `key` | string | `role` `environment` `location` `service` | Windows, Linux, macOS | `role` | The tag category named on a "tag\|key\|value" line. |
+| `value` | string | - | Windows, Linux, macOS | - | The cached value for that category; empty string if the category has never been synced. Values: free text or empty. |
+| `last_sync` | int64 | - | Windows, Linux, macOS | `0` | Epoch seconds of the last successful sync; 0 before any sync has landed. Values: integer (unix epoch seconds). |
+| `stale` | bool | - | Windows, Linux, macOS | `true` | True when no sync has landed within check_interval seconds of the last one, or none has ever landed. |
+| `check_interval` | int32 | - | Windows, Linux, macOS | `300` | The configured staleness-check interval in seconds, read from asset_tags.check_interval and floored at 30; default 300. Values: integer seconds, >= 30. |
+| `change_count` | int32 | - | Windows, Linux, macOS | `0` | Number of entries currently in the in-memory change log (the persisted store keeps only the last 50). Values: integer >= 0. |
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `key` | string | `role` `environment` `location` `service` | W, M, L | `role` |
-| `value` | string | free text or empty | W, M, L | *(empty — captured on a cold store; see Caveats)* |
+**`device.asset_tags.sync` — `event|key|old_value|new_value`**
 
-**`changes` — `change|key|old_value|new_value|timestamp`** (or the sentinel line `changes|none` when the log is empty)
-
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `key` | string | `role` `environment` `location` `service` | W, M, L | `-` (every sample's log is empty) |
-| `old_value` | string | free text | W, M, L | `-` |
-| `new_value` | string | free text | W, M, L | `-` |
-| `timestamp` | int64 | unix epoch seconds | W, M, L | `-` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `event` | string | `no_changes` `tag_added` `tag_removed` `tag_changed` | Windows, Linux, macOS | `-` | What changed in this sync call, relative to the previously cached value. |
+| `key` | string | `role` `environment` `location` `service` | Windows, Linux, macOS | `-` | The tag category this change applies to. Absent from the wire line when event is no_changes. |
+| `old_value` | string | - | Windows, Linux, macOS | `-` | The category's value before this sync call. Omitted from the wire line (not merely empty) when event is tag_added or no_changes. Values: free text. |
+| `new_value` | string | - | Windows, Linux, macOS | `-` | The category's value after this sync call. Omitted from the wire line when event is tag_removed or no_changes. Values: free text. |
 <!-- END GENERATED -->
 
 ### Result status
@@ -126,13 +120,14 @@ This plugin does not set a typed result status; the agent records `UNDECLARED` a
 - `sync`'s trigger additionally increments the Prometheus counter `yuzu_server_system_reserved_push_total{capability="asset_tags.sync"}` (`server.cpp:10771-10779`) — a delivery metric, not row data.
 - `sync` is invoked by the server, never directly by an operator: a structured tag-category write via the dashboard `tag.set` handler (`server.cpp:15550-15574`), the REST API v1 tags route (`server.cpp:21177-21193`), or MCP `set_tag` (`server.cpp:21777-21785`) all call the same `push_asset_tags_to_agent` closure (`server.cpp:11456-11494`).
 - **Not consumed by** daily-sync inventory, the TAR warehouse, or DEX.
+- **Sensitivity.** `role`/`environment`/`location`/`service` values are free-form organizational tags an operator assigns — they can reveal a device's physical site or business role but never carry a device serial, MAC, hostname, username, or installed-software name.
 - **Siblings:** `tags` (`content/definitions/tags.yaml`) — the general-purpose, agent-authoritative free-form key/value tag store; `asset_tags` is deliberately narrower, holding only the 4 server-authoritative categories.
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("device.asset_tags.status")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash d276d67e9d65
 
 ```
 == action=sync
@@ -147,18 +142,18 @@ last_sync|0
 stale|true
 check_interval|300
 change_count|0
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=get key=role
 tag|role|
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=changes
 changes|none
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash d276d67e9d65
 
 ```
 == action=sync
@@ -173,18 +168,18 @@ last_sync|0
 stale|true
 check_interval|300
 change_count|0
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=get key=role
 tag|role|
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=changes
 changes|none
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-07 · euid 0 · leg-hash pending
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-07 · euid 0 · leg-hash d276d67e9d65
 
 ```
 == action=sync
@@ -199,15 +194,15 @@ last_sync|0
 stale|true
 check_interval|300
 change_count|0
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=get key=role
 tag|role|
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=changes
 changes|none
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 ```
 <!-- END GENERATED -->
 
@@ -221,10 +216,9 @@ changes|none
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/asset_tags/src/asset_tags_plugin.cpp` (single file — descriptor and all 4 actions/legs together; `local_json_store` needs no OS-specific code)
+- Plugin: `agents/plugins/asset_tags/src/asset_tags_plugin.cpp`
 - Definitions: `content/definitions/asset_tags.yaml`
-- Capability rows: `server/core/src/capability_decls/core_dispatch_capabilities.hpp` (`sync`, system-reserved) · `server/core/src/capability_decls/plugin_action_catalogue_d.hpp` (`status`, `get`, `changes`)
-- Tests: none dedicated — see Caveats
-- Privilege row: no row in `docs/agent-privilege-model.md`; the generic per-OS agent-identity rows apply (`docs/agent-privilege-model.md:12,14`)
-- Changelog: `changelog.d/1.9-command-capability-registry.added.md` · `changelog.d/2204-declarations-group-d.added.md`
+- Capability rows: `server/core/src/capability_decls/core_dispatch_capabilities.hpp` · `server/core/src/capability_decls/plugin_action_catalogue_d.hpp`
+- Tests: none found by name
+- Privilege row: `docs/agent-privilege-model.md` (no row yet)
 <!-- END GENERATED -->

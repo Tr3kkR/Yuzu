@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash e635d1fd4823
 == action=icmp targets=127.0.0.1
 rtt|127.0.0.1|icmp|5|5|0.0|0.1|0.1|0.0|0.0|ok
 [result_status] UNDECLARED / UNKNOWN / 

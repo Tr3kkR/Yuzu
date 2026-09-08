@@ -1,4 +1,4 @@
-captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash pending
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash cc5994a9097a
 == action=set key=yuzu_capture_tmp value=1
 error|storage write failed
 [result_status] UNDECLARED / UNKNOWN / 

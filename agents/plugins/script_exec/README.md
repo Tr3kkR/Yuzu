@@ -5,9 +5,9 @@
 |---|---|
 | **What it does** | Executes commands and scripts with streaming output (admin-only) |
 | **Version** | 1.1.0 |
-| **Kind** | Action · mutating · on-demand |
-| **Platforms** | Windows 🟡 (exec + powershell; bash unsupported) · macOS 🟡 (exec + bash; powershell unsupported) · Linux 🟡 (exec + bash; powershell unsupported) |
-| **Actions** | `exec` (definition `device.script_exec.exec`) · `powershell` (definition `device.script_exec.powershell`) · `bash` (definition `device.script_exec.bash`) |
+| **Kind** | Action · mutating · gathered (device.script_exec.exec, device.script_exec.powershell, device.script_exec.bash) |
+| **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
+| **Actions** | `bash` (definition `device.script_exec.bash`) · `exec` (definition `device.script_exec.exec`) · `powershell` (definition `device.script_exec.powershell`) |
 | **Security** | securable `Execution` · operation Execute · risk Critical · dispatch Destructive · approval gate AdminOrApproval |
 | **Roles** | execute: endpoint-admin · author: content-author |
 <!-- END GENERATED -->
@@ -31,11 +31,9 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `exec` | ✅ supported · rung 2 · `subprocess_runner:direct_argv` | ✅ supported · rung 2 · `subprocess_runner:direct_argv` | ✅ supported · rung 2 · `subprocess_runner:direct_argv` |
-| `powershell` | ✅ supported · rung 3 · `subprocess_runner:powershell_encodedcommand` | ⛔ unsupported · no mechanism bound | ⛔ unsupported · no mechanism bound |
-| `bash` | ⛔ unsupported · no mechanism bound | ✅ supported · rung 3 · `subprocess_runner:bash_c` | ✅ supported · rung 3 · `subprocess_runner:bash_c` |
-
-**Declared limits per leg** (the descriptor's fallback text, verbatim): none — every leg's fallback field is `nullptr` in `kActionDescriptors` (script_exec_plugin.cpp:667-681); `powershell` and `bash` are cross-platform-unsupported by design (Windows-only / POSIX-only actions), not a degraded leg with a caveat to report.
+| `bash` | ⛔ unsupported | ✅ supported · rung 3 · subprocess_runner:bash_c | ✅ supported · rung 3 · subprocess_runner:bash_c |
+| `exec` | ✅ supported · rung 2 · subprocess_runner:direct_argv | ✅ supported · rung 2 · subprocess_runner:direct_argv | ✅ supported · rung 2 · subprocess_runner:direct_argv |
+| `powershell` | ✅ supported · rung 3 · subprocess_runner:powershell_encodedcommand | ⛔ unsupported | ⛔ unsupported |
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -53,15 +51,15 @@ Subprocesses: yes — the entire plugin exists to spawn one. `exec` launches an 
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-| Action | Parameter | Type | Required | Default | Values | Description |
+| Definition | Parameter | Type | Required | Default | Constraints | Description |
 |---|---|---|---|---|---|---|
-| `exec` (`device.script_exec.exec`) | `command` | string | yes | - | ≤4096 chars | Program path or bare name to execute |
-| `exec` (`device.script_exec.exec`) | `args` | string | no | - | ≤8192 chars | Space-separated arguments passed to the command |
-| `exec` (`device.script_exec.exec`) | `timeout` | int32 | no | 300 | 1–3600 | Timeout (seconds) |
-| `powershell` (`device.script_exec.powershell`) | `script` | string | yes | - | ≤65536 chars | PowerShell Script |
-| `powershell` (`device.script_exec.powershell`) | `timeout` | int32 | no | 300 | 1–3600 | Timeout (seconds) |
-| `bash` (`device.script_exec.bash`) | `script` | string | yes | - | ≤65536 chars | Bash Script |
-| `bash` (`device.script_exec.bash`) | `timeout` | int32 | no | 300 | 1–3600 | Timeout (seconds) |
+| `device.script_exec.bash` | `script` | string | yes | - | maxLength 65536 | The bash script body to execute. Passed to /bin/bash -c. Example: "echo yuzu-capture". |
+| `device.script_exec.bash` | `timeout` | int32 | no | 300 | minimum 1 · maximum 3600 | Maximum execution time in seconds. Range: 1-3600. Example: 600. |
+| `device.script_exec.exec` | `command` | string | yes | - | maxLength 4096 | Full path or name of the program to execute. A path-like value (contains '/', or on Windows '\' or a drive prefix) must already be absolute, or is resolved against a fixed safe directory; a bare name is searched across the app directory, the Windows system directory, then PATH (Windows), or PATH alone (POSIX). Example: "/usr/bin/id" or "notepad.exe". |
+| `device.script_exec.exec` | `args` | string | no | - | maxLength 8192 | Space-separated arguments passed to the command. On Linux/macOS, single or double quotes delimit an argument containing spaces (quote characters stripped, no escaping). On Windows, only double quotes are meaningful, with CRT/CommandLineToArgvW backslash-escaping rules — a single quote has no special meaning there. Example: "-la /tmp" or "\"two words\" --flag". |
+| `device.script_exec.exec` | `timeout` | int32 | no | 300 | minimum 1 · maximum 3600 | Maximum execution time in seconds. Process is terminated if this threshold is exceeded. Range: 1-3600. Example: 600. |
+| `device.script_exec.powershell` | `script` | string | yes | - | maxLength 65536 | The PowerShell script body to execute. Automatically encoded as UTF-16LE Base64 for safe transport. Example: "Get-Service \| Where-Object Status -eq 'Running'". |
+| `device.script_exec.powershell` | `timeout` | int32 | no | 300 | minimum 1 · maximum 3600 | Maximum execution time in seconds. Range: 1-3600. Example: 600. |
 <!-- END GENERATED -->
 
 ### Outputs
@@ -69,32 +67,32 @@ Subprocesses: yes — the entire plugin exists to spawn one. `exec` launches an 
 Each action streams one line per output event via `ctx.write_output()`; every line is exactly two pipe-delimited fields (script_exec_plugin.cpp:17-20). `stream` is the discriminator (`stdout`, `exit_code`, `status`, or the pre-execution-only `error`); `content` is that line's value. A stdout line is emitted verbatim as captured — stdout and stderr are merged into the same stream (`opts.merge_stderr = true`, script_exec_plugin.cpp:335), and a fully blank completed line still emits its own `stdout|` record (script_exec_plugin.cpp:385-390). There is no placeholder/empty-result row: a run that produces zero output still ends with its `exit_code|`/`status|` pair.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`exec` — `stream|content`**
+**`device.script_exec.bash` — `stream|content|exit_code|status`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `stream` | string | `stdout`, `exit_code`, `status`, `error` | W, M, L | `stdout` |
-| `content` | string | free text (captured line, message, or a stringified number) | W, M, L | `yuzu-capture` |
-| `exit_code` | int32 | any int32; `-1` on spawn/resolve failure | W, M, L | `0` |
-| `status` | string | `ok`, `error`, `timeout` | W, M, L | `ok` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `stream` | string | - | Linux, macOS | `stdout` | Which output line this row represents: stdout for a captured output line, exit_code for the final numeric exit code, status for the final ok/error/timeout verdict, or error for an early, pre-execution failure. Values: stdout, exit_code, status, error. |
+| `content` | string | - | Linux, macOS | `yuzu-capture` | The value paired with stream: the captured line text for stdout, the numeric exit code as a string for exit_code, the verdict string for status, or a human-readable failure message for error. Stdout and stderr are merged into this same stream. Values: free text. |
+| `exit_code` | int32 | - | Linux, macOS | `0` | The process exit code, present on the row where stream is exit_code; -1 when the runner reports a spawn error. Values: any int32; -1 = spawn/resolve failure. |
+| `status` | string | - | Linux, macOS | `ok` | The terminal verdict, present on the row where stream is status: ok (exit code 0), error (nonzero exit or spawn error), or timeout (the runner's deadline or a cancellation fired). Values: ok, error, timeout. |
 
-**`powershell` — `stream|content`**
+**`device.script_exec.exec` — `stream|content|exit_code|status`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `stream` | string | `stdout`, `exit_code`, `status`, `error` | W | `stdout` |
-| `content` | string | free text — includes PowerShell's own CLIXML progress-stream noise on a headless run (see Caveats) | W | `yuzu-capture` |
-| `exit_code` | int32 | any int32; `-1` on spawn/resolve failure | W | `0` |
-| `status` | string | `ok`, `error`, `timeout` | W | `ok` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `stream` | string | - | Windows, Linux, macOS | `stdout` | Which output line this row represents: stdout for a captured output line, exit_code for the final numeric exit code, status for the final ok/error/timeout verdict, or error for an early, pre-execution failure. Values: stdout, exit_code, status, error. |
+| `content` | string | - | Windows, Linux, macOS | `yuzu-capture` | The value paired with stream: the captured line text for stdout, the numeric exit code as a string for exit_code, the verdict string for status, or a human-readable failure message for error. Stdout and stderr are merged into this same stream. Values: free text. |
+| `exit_code` | int32 | - | Windows, Linux, macOS | `0` | The process exit code, present on the row where stream is exit_code; -1 when the runner reports a spawn error or the command could not be resolved. Values: any int32; -1 = spawn/resolve failure. |
+| `status` | string | - | Windows, Linux, macOS | `ok` | The terminal verdict, present on the row where stream is status: ok (exit code 0), error (nonzero exit, spawn error, or an early parameter/resolution failure), or timeout (the runner's deadline or a cancellation fired). Values: ok, error, timeout. |
 
-**`bash` — `stream|content`**
+**`device.script_exec.powershell` — `stream|content|exit_code|status`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `stream` | string | `stdout`, `exit_code`, `status`, `error` | M, L | `stdout` |
-| `content` | string | free text (captured line, message, or a stringified number) | M, L | `yuzu-capture` |
-| `exit_code` | int32 | any int32; `-1` on spawn/resolve failure | M, L | `0` |
-| `status` | string | `ok`, `error`, `timeout` | M, L | `ok` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `stream` | string | - | Windows | `stdout` | Which output line this row represents: stdout for a captured output line (including PowerShell's own progress-stream CLIXML text on a headless run), exit_code for the final numeric exit code, status for the final ok/error/timeout verdict, or error for an early, pre-execution failure. Values: stdout, exit_code, status, error. |
+| `content` | string | - | Windows | `yuzu-capture` | The value paired with stream: the captured line text for stdout, the numeric exit code as a string for exit_code, the verdict string for status, or a human-readable failure message for error. Stdout and stderr are merged into this same stream. Values: free text. |
+| `exit_code` | int32 | - | Windows | `0` | The process exit code, present on the row where stream is exit_code; -1 when the runner reports a spawn error or the Windows system directory could not be resolved. Values: any int32; -1 = spawn/resolve failure. |
+| `status` | string | - | Windows | `ok` | The terminal verdict, present on the row where stream is status: ok (exit code 0), error (nonzero exit, spawn error, or an early resolution failure), or timeout (the runner's deadline or a cancellation fired). Values: ok, error, timeout. |
 <!-- END GENERATED -->
 
 ### Result status
@@ -102,7 +100,11 @@ Each action streams one line per output event via `ctx.write_output()`; every li
 | Status | Completeness | Provenance | When |
 |---|---|---|---|
 | `UNDECLARED` (agent default) | — | — | every clean exit (`status\|ok` or `status\|error` from the child's own nonzero exit) — `forward_runner_failure` only reacts to a non-clean `TerminationReason` (script_exec_plugin.cpp:434, comment 423-433) |
-| set via `forward_runner_failure` (ABI4 CC-07 seam) | — | runner `TerminationReason`: `deadline`/`cancelled`/`signaled`/`spawn_error` | any run the runner itself terminated or failed to start (script_exec_plugin.cpp:434, 438-456) — not exercised by any of the three captured samples, all of which exited cleanly |
+| `UNAVAILABLE` / `PARTIAL` | partial | `subprocess_runner:spawn_error` | the runner could not spawn the child process at all (script_exec_plugin.cpp:434, 438-456) — not exercised by any of the three captured samples, all of which exited cleanly |
+| `CONSTRAINED` / `PARTIAL` | partial | `subprocess_runner:deadline` | the runner's `timeout` elapsed while the child was still running, and it was killed |
+| `CONSTRAINED` / `PARTIAL` | partial | `subprocess_runner:cancelled` | the run was cancelled before the child finished |
+| `CONSTRAINED` / `PARTIAL` | partial | `subprocess_runner:signaled` | the child was killed by a signal rather than exiting cleanly |
+| `OK` / `PARTIAL` | partial | `subprocess_runner:line_limit` | the runner capped streamed output at its line limit and killed the still-producing child — a deliberate bounded stop, not a failure |
 
 None of the captured samples hit this path, so every sample line reads `[result_status] UNDECLARED / UNKNOWN /` (docs/samples/{windows,macos,linux}.txt) — including the two `[rc] 1` lines, which are the plugin's own early "wrong OS for this action" refusal (script_exec_plugin.cpp:576-577, 634-635), never a runner-level failure.
 
@@ -111,20 +113,26 @@ None of the captured samples hit this path, so every sample line reads `[result_
 - **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (90-day retention per the `core.crossplatform.scripting` instruction set default, content/definitions/scripting_set.yaml:27), queryable at `/api/responses/{id}`. The server renders `script_exec` results with the generic key-value (`Agent`/`Key`/`Value`) display shape, not a plugin-specific column layout (server/core/src/result_parsing.hpp:61-68).
 - **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — no reference to `script_exec` or any `device.script_exec.*` definition id was found outside the plugin's own files, the capability catalogue, the dispatch-gate/execution-tracker comments, and `scripting_set.yaml`. Nothing runs on a schedule; `gather.ttlSeconds: 3600` in the definition YAML is a response-cache TTL, not a poll schedule (content/definitions/script_exec.yaml:75-76, 150-151, 225-226).
 - **Not consumed by** an early dispatch-time gate either: `Execution`/`AdminOrApproval` is enforced at the shared dispatch chokepoint for every caller including MCP, not duplicated by an earlier check (server/core/src/dispatch_destructive_gate.hpp:53-58).
+- **Sensitivity.** `content` is opaque, operator-chosen free text — the plugin forwards the launched
+  command's/script's stdout (and merged stderr) verbatim, so what it carries depends entirely on what
+  the caller ran. It can trivially include device identifiers (hostnames, IPs), person identifiers
+  (usernames, logged-in account names), and installed-software details (whatever the command chooses
+  to print) — the plugin itself never names or filters any of these, it just streams whatever the
+  child process writes.
 - **Siblings:** `content_dist.execute_staged` — the only other plugin sharing the same `Destructive` + `AdminOrApproval` combination (server/core/src/dispatch_destructive_gate.hpp:54). All three `script_exec` definitions are bundled together in the `core.crossplatform.scripting` instruction set (content/definitions/scripting_set.yaml:19-23).
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("device.script_exec.exec")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash a6cac34c1781
 
 ```
 == action=exec command=cmd args="/c echo yuzu-capture"
 stdout|yuzu-capture
 exit_code|0
 status|ok
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=powershell script="Write-Output yuzu-capture"
 stdout|#< CLIXML
@@ -132,57 +140,57 @@ stdout|yuzu-capture
 stdout|<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04"><Obj S="progress" RefId="0"><TN RefId="0"><T>System.Management.Automation.PSCustomObject</T><T>System.Object</T></TN><MS><I64 N="SourceId">1</I64><PR N="Record"><AV>Preparing modules for first use.</AV><AI>0</AI><Nil /><PI>-1</PI><PC>-1</PC><T>Completed</T><SR>-1</SR><SD> </SD></PR></MS></Obj></Objs>
 exit_code|0
 status|ok
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=bash script="echo yuzu-capture"
 error|bash action is not available on Windows
 status|error
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 [rc] 1
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash a6cac34c1781
 
 ```
 == action=exec command=echo args=yuzu-capture
 stdout|yuzu-capture
 exit_code|0
 status|ok
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=powershell script="Write-Output yuzu-capture"
 error|powershell action is Windows-only
 status|error
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 [rc] 1
 
 == action=bash script="echo yuzu-capture"
 stdout|yuzu-capture
 exit_code|0
 status|ok
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-07 · euid 0 · leg-hash pending
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-07 · euid 0 · leg-hash a6cac34c1781
 
 ```
 == action=exec command=echo args=yuzu-capture
 stdout|yuzu-capture
 exit_code|0
 status|ok
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=powershell script="Write-Output yuzu-capture"
 error|powershell action is Windows-only
 status|error
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 [rc] 1
 
 == action=bash script="echo yuzu-capture"
 stdout|yuzu-capture
 exit_code|0
 status|ok
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 ```
 <!-- END GENERATED -->
 
@@ -197,10 +205,9 @@ status|ok
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/script_exec/src/script_exec_plugin.cpp` (descriptor, actions, runner call) · `script_exec_parsers.hpp` (pure argv-resolution/assembly layer)
-- Definitions: `content/definitions/script_exec.yaml` · `content/definitions/scripting_set.yaml` (bundling instruction set)
-- Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_d.hpp` (lines 303-333)
-- Tests: `tests/unit/test_script_exec_actions.cpp` (9 cases, POSIX runner behaviour) · `tests/unit/test_script_exec_win_actions.cpp` (3 cases, Windows runner behaviour) · `tests/unit/test_script_exec_parsers.cpp` (34 cases, pure resolution/assembly logic)
-- Privilege row: `docs/agent-privilege-model.md` (row 119, `script_exec.exec`/`.bash`/`.powershell`)
-- Changelog: `changelog.d/1398-dispatch-approval-gate.security.md` · `changelog.d/2204-declarations-group-d.added.md` · `changelog.d/5.1-script-exec-runner-convergence.changed.md` · `changelog.d/5.1-windows-system-directory-resolution.security.md` · `changelog.d/runner-adr3002-contract.added.md` · `changelog.d/wave5-pr51-script-exec-appdir-codepage.fixed.md` · `changelog.d/wave5-pr51-windows-inherit-env-filter.security.md`
+- Plugin: `agents/plugins/script_exec/src/script_exec_parsers.hpp` · `agents/plugins/script_exec/src/script_exec_plugin.cpp`
+- Definitions: `content/definitions/script_exec.yaml`
+- Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_d.hpp`
+- Tests: `tests/unit/test_script_exec_actions.cpp` · `tests/unit/test_script_exec_parsers.cpp` · `tests/unit/test_script_exec_win_actions.cpp`
+- Privilege row: `docs/agent-privilege-model.md`
 <!-- END GENERATED -->

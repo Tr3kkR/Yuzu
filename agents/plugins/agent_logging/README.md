@@ -5,10 +5,10 @@
 |---|---|
 | **What it does** | Remote agent log access — retrieve log tail, list key agent files |
 | **Version** | 0.1.0 |
-| **Kind** | Collector · read-only · on-demand |
+| **Kind** | Collector · read-only · gathered (device.agent_logging.get_log, device.agent_logging.get_key_files) |
 | **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
-| **Actions** | `get_log` (definition `device.agent_logging.get_log`) · `get_key_files` (definition `device.agent_logging.get_key_files`) |
-| **Security** | `get_log`: securable `PluginSecret` · operation Read · risk Medium · dispatch ReadOnly · approval gate none · `get_key_files`: securable `Security` · operation Read · risk Medium · dispatch ReadOnly · approval gate none |
+| **Actions** | `get_key_files` (definition `device.agent_logging.get_key_files`) · `get_log` (definition `device.agent_logging.get_log`) |
+| **Security** | `get_log`: securable `PluginSecret` · operation Read · risk Medium · dispatch ReadOnly · approval gate None; `get_key_files`: securable `Security` · operation Read · risk Medium · dispatch ReadOnly · approval gate None |
 | **Roles** | execute: endpoint-admin · author: content-author |
 <!-- END GENERATED -->
 
@@ -35,12 +35,8 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `get_log` | ✅ supported · rung 1 · agent config lookup + `std::ifstream` tail read | ✅ supported · rung 1 · agent config lookup + `std::ifstream` tail read | ✅ supported · rung 1 · agent config lookup + `std::ifstream` tail read |
-| `get_key_files` | ✅ supported · rung 1 · `GetModuleFileNameA` + `std::filesystem` metadata | ✅ supported · rung 1 · `_NSGetExecutablePath` + `realpath(3)` + `std::filesystem` metadata | ✅ supported · rung 1 · `/proc/self/exe` symlink + `std::filesystem` metadata |
-
-**Declared limits per leg** (the descriptor's fallback text, verbatim):
-
-- No leg declares a fallback limit — every action/OS combination lists `-` in the capability matrix.
+| `get_key_files` | ✅ supported · rung 1 · GetModuleFileNameA + std::filesystem metadata | ✅ supported · rung 1 · _NSGetExecutablePath + realpath(3) + std::filesystem metadata | ✅ supported · rung 1 · /proc/self/exe symlink + std::filesystem metadata |
+| `get_log` | ✅ supported · rung 1 · agent config lookup + std::ifstream tail read | ✅ supported · rung 1 · agent config lookup + std::ifstream tail read | ✅ supported · rung 1 · agent config lookup + std::ifstream tail read |
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -58,11 +54,9 @@ No external binaries, no subprocesses, no network access — both actions are na
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-| Action | Parameter | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `get_log` | `lines` | int32 | No | 50 | Number of trailing log lines to return (1-500); values above 500 are clamped, values below 1 are rejected with `status|error`. |
-
-`get_key_files` takes no parameters.
+| Definition | Parameter | Type | Required | Default | Constraints | Description |
+|---|---|---|---|---|---|---|
+| `device.agent_logging.get_log` | `lines` | int32 | no | 50 | - | Number of trailing log lines to return, 1-500 (e.g. 100). Defaults to 50; values above 500 are clamped, values below 1 are rejected with a status\|error result. |
 <!-- END GENERATED -->
 
 ### Outputs
@@ -70,21 +64,21 @@ No external binaries, no subprocesses, no network access — both actions are na
 Output is a stream of pipe-delimited `key|value` lines via `write_output()`, not typed row-per-record output. `get_log` emits `log_file`, `line_count`, then one `line` entry per tailed line — except when no log file resolves, where it emits only `status|empty` and `line_count|0`, or when `lines` is invalid, where it emits only `status|error` and returns non-zero; neither `status` value is a declared result column. `get_key_files` emits one `file|<path>|<size>|<mtime>` row per file found; a missing file is skipped outright rather than emitted as a placeholder row, so an empty result set here means literally nothing was found, not a signal of failure.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`get_log` — `log_file|line_count|line`**
+**`device.agent_logging.get_key_files` — `path|size|modified`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `log_file` | string | absolute path, or field absent | W, M, L (only present when a log file resolves) | field omitted in every captured sample — no capture has resolved a log file |
-| `line_count` | int32 | non-negative integer | W, M, L | `0` |
-| `line` | string | free text, or field absent | W, M, L (only present when a log file resolves) | field omitted in every captured sample |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `path` | string | - | Windows, Linux, macOS | `/private/tmp/claude-501/-Users-alex-yuzu-dev/8d89cd79-001b-4ea8-8930-0c9affb3265e/scratchpad/d2/plugin_capture` | Absolute path of a discovered agent file (executable, log file, config file, data store, plugin file, or TLS certificate/key). Values: absolute path. |
+| `size` | int64 | - | Windows, Linux, macOS | `142208` | File size in bytes; 0 if the size read failed. Values: non-negative integer (bytes). |
+| `modified` | int64 | - | Windows, Linux, macOS | `1788774907` | Last-write time as Unix epoch seconds; 0 if the mtime read failed. Values: non-negative integer (unix epoch seconds). |
 
-**`get_key_files` — `file|path|size|modified`**
+**`device.agent_logging.get_log` — `log_file|line_count|line`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `path` | string | absolute path | W, M, L | `/private/tmp/.../plugin_capture` (macOS sample) |
-| `size` | int64 | non-negative integer (bytes); `0` if the size read failed | W, M, L | `142208` |
-| `modified` | int64 | non-negative integer (Unix epoch seconds); `0` if the mtime read failed | W, M, L | `1788774907` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `log_file` | string | - | Windows, Linux, macOS | `field omitted in every captured sample — no capture has resolved a log file (see status\|empty)` | Absolute path to the log file that was read; the field is omitted from the output entirely when no log file resolves on this host. Values: absolute path, or field absent. |
+| `line_count` | int32 | - | Windows, Linux, macOS | `0` | Count of line entries returned; 0 when no log file resolves. Values: non-negative integer. |
+| `line` | string | - | Windows, Linux, macOS | `field omitted in every captured sample — no capture has resolved a log file` | One raw line from the tailed log file, unescaped and in file order; omitted entirely when no log file resolves. Values: free text, or field absent. |
 <!-- END GENERATED -->
 
 **Empty-result convention.** `get_log`'s empty case is reported entirely through `status|empty` + `line_count|0`, never a placeholder `log_file`/`line` row. `get_key_files` simply emits zero `file|` rows when nothing is found — there is no placeholder row for this action.
@@ -97,49 +91,50 @@ This plugin does not set a typed result status; the agent records `UNDECLARED` a
 
 - **Instruction result only.** Rows travel over the agent's response channel into the ResponseStore (default 90-day retention via `reap_expired()`), queryable at `/api/responses/{id}`.
 - **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics. The plugin executes only when an operator or workflow dispatches `device.agent_logging.get_log` or `device.agent_logging.get_key_files`; outside `agent_registry.cpp`'s static action-description catalogue (a name/description list, not a data sink), no other server code references this plugin.
+- **Sensitivity.** `get_log`'s `line` field is a verbatim tail of the agent's log, which includes the line `"Registered with server (session=..., ...)"` — the agent's live session credential — plus whatever other free text the agent logged, including file paths that may embed a username; `get_key_files`'s `path` rows can likewise embed a username or hostname in the file path. Neither action names installed third-party software.
 - **Siblings:** none — no other plugin's definition references `agent_logging`.
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("device.agent_logging.get_log")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 6e239e35ca05
 
 ```
 == action=get_log
 status|empty|agent log file not configured on this host
 line_count|0
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=get_key_files
 file|D:\yuzu-dev\Yuzu-worktrees\docs-plugin-readme-sweep\build-windows\tools\plugin-capture-tmp\plugin_capture.exe|64512|1788774930
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 6e239e35ca05
 
 ```
 == action=get_log
 status|empty|agent log file not configured on this host
 line_count|0
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=get_key_files
 file|/private/tmp/claude-501/-Users-alex-yuzu-dev/8d89cd79-001b-4ea8-8930-0c9affb3265e/scratchpad/d2/plugin_capture|142208|1788774907
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash pending
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 6e239e35ca05
 
 ```
 == action=get_log
 status|empty|agent log file not configured on this host
 line_count|0
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=get_key_files
 file|/src/builddir/tools/plugin-capture/plugin-capture|75168|1788720500
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 ```
 <!-- END GENERATED -->
 
@@ -154,10 +149,9 @@ file|/src/builddir/tools/plugin-capture/plugin-capture|75168|1788720500
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/agent_logging/meson.build` · `agents/plugins/agent_logging/src/agent_logging_plugin.cpp`
+- Plugin: `agents/plugins/agent_logging/src/agent_logging_plugin.cpp`
 - Definitions: `content/definitions/agent_logging.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_b.hpp`
-- Tests: `tests/unit/test_new_plugins.cpp` (`DESCRIPTOR_TEST("agent_logging", "agent_logging", 2, "get_log", "get_key_files")` — descriptor shape only, no behavioral coverage)
-- Privilege row: no row in `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2204-declarations-group-b.added.md` · `changelog.d/2277-macos-plugin-parity.added.md`
+- Tests: none found by name
+- Privilege row: `docs/agent-privilege-model.md` (no row yet)
 <!-- END GENERATED -->

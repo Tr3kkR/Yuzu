@@ -5,7 +5,7 @@
 |---|---|
 | **What it does** | Disk encryption status — BitLocker, LUKS, FileVault |
 | **Version** | 0.2.0 |
-| **Kind** | Collector · read-only · on-demand (no scheduled gather; `gather.ttlSeconds: 120` is a per-execution deadline, not a cadence) |
+| **Kind** | Collector · read-only · gathered (security.encryption.state) |
 | **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
 | **Actions** | `state` (definition `security.encryption.state`) |
 | **Security** | securable `Security` · operation Read · risk Medium · dispatch ReadOnly · approval gate None |
@@ -31,11 +31,7 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `state` | ✅ supported · rung 1 · `wmi_encryptable_volume` | ✅ supported · rung 2 · `fdesetup+diskutil` | ✅ supported · rung 1 · `libblkid+sysfs` |
-
-**Declared limits per leg** (the descriptor's fallback text, verbatim):
-
-- None declared — every leg's descriptor fallback field is `nullptr` (`bitlocker_plugin.cpp:347-351`). Behavioral limits are documented in Caveats and known gaps below instead.
+| `state` | ✅ supported · rung 1 · wmi_encryptable_volume | ✅ supported · rung 2 · fdesetup+diskutil | ✅ supported · rung 1 · libblkid+sysfs |
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -53,7 +49,7 @@ Binaries/subprocesses: macOS only — `/usr/bin/fdesetup status` and `/usr/bin/d
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-`state` takes no parameters (`content/definitions/bitlocker.yaml:37-39`).
+The action takes no parameters.
 <!-- END GENERATED -->
 
 ### Outputs
@@ -61,15 +57,15 @@ Binaries/subprocesses: macOS only — `/usr/bin/fdesetup status` and `/usr/bin/d
 Rows are pipe-delimited, but the row shape is genuinely different per OS, not one schema with blanks. Windows emits `volume|<drive>|<conversion>|<pct>|<method>|<protection>` — six fields, one row per encryptable volume (`bitlocker_windows_wmi.hpp` `format_volume_row`). Linux emits `volume|<device>|crypto_LUKS|<active|inactive>` — four fields, one row per LUKS superblock (`bitlocker_linux_parsers.hpp` `format_volume_row`). macOS emits a single global `filevault|enabled` / `filevault|disabled` / `filevault|unknown|<diagnostic>` row, followed by zero or more `volume|<label>|<type>|<encrypted|not_encrypted|unknown>` rows, one per APFS volume `diskutil` reported (`bitlocker_plugin.cpp:300-333`). The YAML's five declared `result.columns` (`volume`, `conversion_status`, `percentage_encrypted`, `encryption_method`, `protection_status`) match the Windows row's five post-prefix fields exactly; Linux and macOS populate only the `volume` identifier field from that set — their other fields carry a type/role/state string, not a BitLocker-shaped value, so this table's `Platforms` column is genuinely narrow rather than a stylistic omission. A host that finds nothing still emits one row (`volume|none|no_encryptable_volumes` on Windows, `volume|none|no_encrypted_volumes` on Linux) rather than zero rows, so an empty result is never misread as "the query didn't run".
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`state` — `volume|<volume>|<conversion_status>|<percentage_encrypted>|<encryption_method>|<protection_status>`** (Windows shape; see the paragraph above for the narrower Linux and macOS row shapes)
+**`security.encryption.state` — `volume|conversion_status|percentage_encrypted|encryption_method|protection_status`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `volume` | string | free text — drive letter (Windows), block-device basename (Linux), or APFS volume label (macOS) | W, L, M | `C:` |
-| `conversion_status` | string | `Fully Decrypted` `Fully Encrypted` `Encryption In Progress` `Decryption In Progress` `Encryption Paused` `Decryption Paused` `Unknown` | W | `Fully Decrypted` |
-| `percentage_encrypted` | string | `<integer>%` or `unknown` | W | `0%` |
-| `encryption_method` | string | `None` `AES 128 with Diffuser` `AES 256 with Diffuser` `AES 128` `AES 256` `Hardware Encryption` `XTS-AES 128` `XTS-AES 256` `Unknown` | W | `None` |
-| `protection_status` | string | `Protection On` `Protection Off` `Protection Unknown` | W | `Protection Off` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `volume` | string | - | Windows, Linux, macOS | `C:` | Per-OS volume identifier: drive letter on Windows, block-device basename on Linux, or the APFS volume's display label on macOS. Values: free text. |
+| `conversion_status` | string | `Fully Decrypted` `Fully Encrypted` `Encryption In Progress` `Decryption In Progress` `Encryption Paused` `Decryption Paused` `Unknown` | Windows | `Fully Decrypted` | BitLocker's live conversion/encryption state for the volume, decoded from Win32_EncryptableVolume::GetConversionStatus(). Populated only on Windows; Linux and macOS rows do not carry this field. |
+| `percentage_encrypted` | string | - | Windows | `0%` | Percentage of the volume currently encrypted, from BitLocker's EncryptionPercentage out-parameter. Populated only on Windows. Values: `<integer>%` or `unknown`. |
+| `encryption_method` | string | `None` `AES 128 with Diffuser` `AES 256 with Diffuser` `AES 128` `AES 256` `Hardware Encryption` `XTS-AES 128` `XTS-AES 256` `Unknown` | Windows | `None` | The disk-encryption cipher/mode BitLocker is using for the volume, from GetEncryptionMethod(). Populated only on Windows. |
+| `protection_status` | string | `Protection On` `Protection Off` `Protection Unknown` | Windows | `Protection Off` | Whether BitLocker protection is currently on or off for the volume, from Win32_EncryptableVolume::ProtectionStatus. Populated only on Windows. |
 <!-- END GENERATED -->
 
 ### Result status
@@ -85,32 +81,36 @@ This is the plugin's only `set_result_status` call. Every other run leaves the s
 - **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore at the DSL default 90-day retention (`docs/yaml-dsl-spec.md` `spec.response.retentionDays`, not overridden by this definition), queryable at `/api/responses/{id}` and chartable via the `pie` / `single_series` visualization declared in the YAML (`content/definitions/bitlocker.yaml:69-76`).
 - **Visualization caveat.** `result_parsing.hpp` treats `bitlocker` as a key|value-schema plugin, and the chart filters on `whereField: 0, whereEquals: volume` (`content/definitions/bitlocker.yaml:72-73`). That filter matches every Windows and Linux row and every macOS per-volume `volume|` row, but macOS's global `filevault|...` row has `filevault`, not `volume`, in field 0 — it is silently excluded from the "BitLocker volumes seen across the fleet" pie chart.
 - **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — `bitlocker`/`security.encryption.state` do not appear in `typed_inventory_sources.hpp`, `software_inventory_store.cpp`, or the TAR sources. (DEX's `security.bitlocker_error` observation type, `server/core/src/dex_routes.cpp:109`, is an unrelated tamper/health event taxonomy label, not a consumer of this plugin's rows.)
+- **Sensitivity.** `volume` rows carry a drive letter, block-device basename, or APFS volume label — not a device serial, MAC, hostname, username, or installed-software name; `conversion_status`/`percentage_encrypted`/`encryption_method`/`protection_status` describe the encryption state only.
 - **Bundled in** (not siblings — instruction-set references, not data producers): `core.security.endpoint-security` (`content/definitions/security_set.yaml:30`) and the visualization demo set `demo.visualization.fleet-posture` (`content/definitions/visualization_demo_set.yaml:48`).
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("security.encryption.state")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash ba3cbe6a5b56
 
 ```
+== action=state
 volume|C:|Fully Decrypted|0%|None|Protection Off
 volume|D:|Fully Decrypted|0%|None|Protection Off
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash ba3cbe6a5b56
 
 ```
+== action=state
 filevault|enabled
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash pending
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash ba3cbe6a5b56
 
 ```
+== action=state
 volume|none|no_encrypted_volumes
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 ```
 <!-- END GENERATED -->
 
@@ -125,10 +125,10 @@ volume|none|no_encrypted_volumes
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/bitlocker/src/bitlocker_plugin.cpp` (descriptor + all three legs) · `bitlocker_windows_wmi.hpp` (WMI-row parsing, injectable executor seam) · `bitlocker_linux_parsers.hpp` (dm-crypt/LUKS parsing) · `bitlocker_macos_apfs.hpp` (`diskutil apfs list` parsing)
+- Plugin: `agents/plugins/bitlocker/src/bitlocker_linux_parsers.hpp` · `agents/plugins/bitlocker/src/bitlocker_macos_apfs.hpp` · `agents/plugins/bitlocker/src/bitlocker_plugin.cpp` · `agents/plugins/bitlocker/src/bitlocker_windows_wmi.hpp`
 - Definitions: `content/definitions/bitlocker.yaml`
-- Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_d.hpp:493-507`
-- Tests: `tests/unit/test_bitlocker_windows_wmi.cpp` (23 cases) · `tests/unit/test_bitlocker_linux_parsers.cpp` (12 cases) · `tests/unit/agent/test_bitlocker_macos.cpp` (7 cases) · `tests/unit/test_bitlocker_local_dispatcher.cpp` (1 case, Windows-only, loads the real built plugin)
-- Privilege row: `docs/agent-privilege-model.md:99` and `:122`
-- Changelog: `changelog.d/20260818-wave3-bitlocker-native-acquisition.changed.md` · `changelog.d/2204-declarations-group-d.added.md` · `changelog.d/2277-macos-plugin-parity.added.md`
+- Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_d.hpp`
+- Tests: `tests/unit/agent/test_bitlocker_macos.cpp` · `tests/unit/test_bitlocker_linux_parsers.cpp` · `tests/unit/test_bitlocker_local_dispatcher.cpp` · `tests/unit/test_bitlocker_windows_wmi.cpp`
+- Privilege row: `docs/agent-privilege-model.md`
+- Changelog: `changelog.d/20260818-wave3-bitlocker-native-acquisition.changed.md`
 <!-- END GENERATED -->

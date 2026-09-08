@@ -5,11 +5,11 @@
 |---|---|
 | **What it does** | Content staging — download, verify, execute, and manage staged files (no shell-out) |
 | **Version** | 1.1.0 |
-| **Kind** | Action · read-only (`list_staged`) / mutating (`stage`, `execute_staged`, `cleanup`, `upload_file`) · on-demand |
-| **Platforms** | Windows 🟡 constrained · macOS ✅ · Linux 🟡 constrained |
-| **Actions** | `stage` (definition `agent.content_dist.stage`) · `execute_staged` (definition `agent.content_dist.execute_staged`) · `list_staged` (definition `agent.content_dist.list_staged`) · `cleanup` (definition `agent.content_dist.cleanup`) · `upload_file` (definition `agent.content_dist.upload_file`) |
-| **Security** | `stage`: securable `SoftwareDeployment` · op Write · risk High · dispatch Destructive · gate AdminOrApproval — `execute_staged`: securable `Execution` · op Execute · risk High · dispatch Destructive · gate AdminOrApproval — `list_staged`: securable `SoftwareDeployment` · op Read · risk Low · dispatch ReadOnly · gate none — `cleanup`: securable `SoftwareDeployment` · op Delete · risk High · dispatch Destructive · gate AdminOrApproval — `upload_file`: securable `FileRetrieval` · op Write · risk High · dispatch Destructive · gate AdminOrApproval |
-| **Roles** | execute: endpoint-admin (all actions), endpoint-operator (`list_staged` only) · author: content-author (all actions) |
+| **Kind** | Action · mutating · gathered (agent.content_dist.upload_file) |
+| **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
+| **Actions** | `cleanup` (definition `agent.content_dist.cleanup`) · `execute_staged` (definition `agent.content_dist.execute_staged`) · `list_staged` (definition `agent.content_dist.list_staged`) · `stage` (definition `agent.content_dist.stage`) · `upload_file` (definition `agent.content_dist.upload_file`) |
+| **Security** | `stage`: securable `SoftwareDeployment` · operation Write · risk High · dispatch Destructive · approval gate AdminOrApproval; `execute_staged`: securable `Execution` · operation Execute · risk High · dispatch Destructive · approval gate AdminOrApproval; `list_staged`: securable `SoftwareDeployment` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `cleanup`: securable `SoftwareDeployment` · operation Delete · risk High · dispatch Destructive · approval gate AdminOrApproval; `upload_file`: securable `FileRetrieval` · operation Write · risk High · dispatch Destructive · approval gate AdminOrApproval |
+| **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
 
 ## How it works
@@ -35,16 +35,16 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `stage` | 🟡 constrained · rung 1 · `httplib_tls` | ✅ supported · rung 1 · `httplib_tls` | ✅ supported · rung 1 · `httplib_tls` |
-| `execute_staged` | ✅ supported · rung 2 · `subprocess_runner:staged_payload` | ✅ supported · rung 2 · `subprocess_runner:staged_payload` | 🟡 constrained · rung 2 · `subprocess_runner:staged_payload` |
-| `list_staged` | ✅ supported · rung 1 · `std_filesystem` | ✅ supported · rung 1 · `std_filesystem` | ✅ supported · rung 1 · `std_filesystem` |
-| `cleanup` | ✅ supported · rung 1 · `std_filesystem` | ✅ supported · rung 1 · `std_filesystem` | ✅ supported · rung 1 · `std_filesystem` |
-| `upload_file` | 🟡 constrained · rung 1 · `httplib_tls` | ✅ supported · rung 1 · `httplib_tls` | ✅ supported · rung 1 · `httplib_tls` |
+| `cleanup` | ✅ supported · rung 1 · std_filesystem | ✅ supported · rung 1 · std_filesystem | ✅ supported · rung 1 · std_filesystem |
+| `execute_staged` | ✅ supported · rung 2 · subprocess_runner:staged_payload | ✅ supported · rung 2 · subprocess_runner:staged_payload | 🟡 constrained · rung 2 · subprocess_runner:staged_payload |
+| `list_staged` | ✅ supported · rung 1 · std_filesystem | ✅ supported · rung 1 · std_filesystem | ✅ supported · rung 1 · std_filesystem |
+| `stage` | 🟡 constrained · rung 1 · httplib_tls | ✅ supported · rung 1 · httplib_tls | ✅ supported · rung 1 · httplib_tls |
+| `upload_file` | 🟡 constrained · rung 1 · httplib_tls | ✅ supported · rung 1 · httplib_tls | ✅ supported · rung 1 · httplib_tls |
 
-**Declared limits per leg** (the descriptor's fallback text, verbatim):
+**Declared limits per leg** (descriptor fallback text, verbatim):
 
-- **`stage` / Windows** — requires OpenSSL to be found at build time; HTTPS unavailable if absent
 - **`execute_staged` / Linux** — shebang-interpreted (#!) staged payloads are rejected -- B6 fd-exec (execveat O_CLOEXEC) is incompatible with the kernel's binfmt_script re-open; native executables only
+- **`stage` / Windows** — requires OpenSSL to be found at build time; HTTPS unavailable if absent
 - **`upload_file` / Windows** — requires OpenSSL to be found at build time; HTTPS unavailable if absent
 <!-- END GENERATED -->
 
@@ -63,20 +63,19 @@ Binaries/subprocesses/network: `stage`/`upload_file` open raw TCP/TLS sockets vi
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-| Action | Parameter | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `stage` | `url` | string | yes | — | Source URL; must start with `http://` or `https://`, downloaded directly over a socket the agent opens itself. |
-| `stage` | `filename` | string | yes | — | Destination filename inside the staging directory; alphanumeric, dots, hyphens, underscores only. |
-| `stage` | `sha256` | string | yes | — | Lowercase hex SHA-256 the download must hash to; a mismatch deletes the file and fails the action. |
-| `execute_staged` | `filename` | string | yes | — | Name of a previously staged file with a verified hash on record in agent KV. |
-| `execute_staged` | `args` | string | no | — | Optional whitespace-separated argv tail; rejected if it contains a shell metacharacter. |
-| `list_staged` takes no parameters. | | | | | |
-| `cleanup` | `filename` | string | no | — | Declared but not read by `do_cleanup` today — has no effect (see Caveats). |
-| `upload_file` | `path` | string | yes | — | Local file path on the endpoint to upload (max 4096 chars). |
-| `upload_file` | `grant_id` | string | yes | — | One-time upload grant id minted via `POST /api/v1/upload-grants` (max 64 chars). |
-| `upload_file` | `grant_secret` | string | yes | — | One-time upload grant secret paired with `grant_id` (max 128 chars). |
-| `upload_file` | `base_dir` | string | no | — | If set, `path` must resolve inside this directory after symlink canonicalisation (max 4096 chars). |
-| `upload_file` | `max_size_mb` | int32 | no | `100` | Maximum allowed file size in MB, checked locally before the session opens (1–1000). |
+| Definition | Parameter | Type | Required | Default | Constraints | Description |
+|---|---|---|---|---|---|---|
+| `agent.content_dist.cleanup` | `filename` | string | no | - | - | Declared but NOT read by the current implementation (content_dist_plugin.cpp's do_cleanup only reads "hours") — setting this parameter has no effect on which files are removed. Left in place for API compatibility; see the plugin README's Caveats section. |
+| `agent.content_dist.execute_staged` | `filename` | string | yes | - | - | Name of a previously staged file, e.g. pkg-1.2.3.msi. Must already have a verified hash on record from a prior stage action (agent KV key staged_hash:<filename>) — the hash is re-verified against that record, not against this parameter, before anything runs. |
+| `agent.content_dist.execute_staged` | `args` | string | no | - | - | Optional whitespace-separated argv tail, e.g. "/quiet /norestart". Never shell-parsed (no quoting/escaping); rejected outright if it contains a shell metacharacter such as ; \| & ` $ ( ) { } < >. |
+| `agent.content_dist.stage` | `url` | string | yes | - | - | Source URL, e.g. https://cdn.example.com/pkg-1.2.3.msi. Must start with http:// or https://; downloaded directly over a socket the agent opens itself, never via a shell command. |
+| `agent.content_dist.stage` | `filename` | string | yes | - | - | Destination filename inside the agent's staging directory, e.g. pkg-1.2.3.msi. Alphanumeric, dots, hyphens, and underscores only (no path separators or ".."); any other character is refused. |
+| `agent.content_dist.stage` | `sha256` | string | yes | - | - | Lowercase hex SHA-256 the downloaded file must hash to, e.g. "a94a8fe5ccb19ba61c4c0873d391e987982fbbd3...". A mismatch deletes the downloaded file and fails the action; the verified hash is what execute_staged later re-checks from agent KV, not this parameter. |
+| `agent.content_dist.upload_file` | `path` | string | yes | - | maxLength 4096 | The local file path on the endpoint to upload. |
+| `agent.content_dist.upload_file` | `grant_id` | string | yes | - | maxLength 64 | The one-time upload grant's id, minted operator-side via POST /api/v1/upload-grants. Paired with grant_secret to authenticate the session; both are revealed by the mint response exactly once. |
+| `agent.content_dist.upload_file` | `grant_secret` | string | yes | - | maxLength 128 | The one-time upload grant's secret, minted alongside grant_id. Never logged or echoed back by the server after the mint response. |
+| `agent.content_dist.upload_file` | `base_dir` | string | no | - | maxLength 4096 | If set, path must resolve (after symlink canonicalisation) inside this directory, or the upload is refused before anything is read. |
+| `agent.content_dist.upload_file` | `max_size_mb` | int32 | no | 100 | minimum 1 · maximum 1000 | Maximum allowed file size in megabytes, checked locally before the session opens. Default: 100. |
 <!-- END GENERATED -->
 
 ### Outputs
@@ -84,44 +83,44 @@ Binaries/subprocesses/network: `stage`/`upload_file` open raw TCP/TLS sockets vi
 Every action writes independent `key|value` lines via `ctx.write_output` — not a fixed-width pipe row like a collector's table. A validation or transport failure typically replaces the whole declared line set with a single unstructured `error|<message>` line rather than filling the declared columns with a placeholder value; there is no `-`-for-unknown convention in this plugin.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`stage` — `status`, `staged_path` (two independent lines, not a single pipe row)**
+**`agent.content_dist.cleanup` — `status|files_removed`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `status` | string | `ok` (the only value ever written; a failure emits `error\|` instead, never `status\|error`) | W, M, L | `ok` |
-| `staged_path` | string | absolute path under the staging directory | W, M, L | `-` (no captured sample shows a success) |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `status` | string | - | all | `-` | Declared but never emitted — do_cleanup writes only a "removed\|<n>" line, no "status\|" line at all, on every run (including a hours-parse failure, which is silently ignored rather than reported). |
+| `files_removed` | int32 | - | Windows, Linux, macOS | `-` | Declared column name does not match the wire field: the actual emitted line is "removed\|<n>", not "files_removed\|<n>" — the count of files whose last-write time was older than the cutoff. Values: non-negative integer. |
 
-**`execute_staged` — `status`, `exit_code`, `output` (three independent lines; `output` is omitted when empty)**
+**`agent.content_dist.execute_staged` — `status|exit_code|output`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `status` | string | `ok` / `error` | W, M, L | `-` |
-| `exit_code` | int32 | process exit code, or `-1` on spawn failure / deadline / cancel | W, M, L | `-` |
-| `output` | string | combined stdout+stderr (16 MiB cap) with truncation/termination annotations, or the line is omitted | W, M, L | `-` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `status` | string | `ok` `error` | Windows, Linux, macOS | `ok` | "ok" when the staged file exited 0, "error" for any nonzero exit, spawn failure, or a deadline/cancel kill. On an early rejection (not staged, no trusted hash, hash mismatch, unsafe args) this column is never emitted at all — only an "error\|<message>" line is. |
+| `exit_code` | int32 | - | Windows, Linux, macOS | `-` | The staged process's exit code, or -1 for a spawn failure or a deadline/cancel kill (subprocess_runner's sentinel, never a real process exit status in that case). Values: process exit code, or -1. |
+| `output` | string | - | Windows, Linux, macOS | `-` | Combined stdout+stderr, capped at 16 MiB, with a "[output truncated at 16 MiB]" and/or "[terminated: deadline exceeded]"/"[terminated: cancelled]" annotation appended when applicable. Omitted entirely (no output\| line at all) when the captured text is empty. Values: free text, truncated/terminated annotations, or omitted. |
 
-**`list_staged` — one `file` line per staged file plus a trailing `count` summary (not a declared column)**
+**`agent.content_dist.list_staged` — `file|size|sha256`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `file` | string | filename (relative, no path) | W, M, L | `-` |
-| `size` | int64 | bytes | W, M, L | `-` |
-| `sha256` | string | 64 lowercase hex chars, recomputed on every call | W, M, L | `-` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `file` | string | - | Windows, Linux, macOS | `-` | Filename of one staged file (relative, no path). One row per file in the staging directory; a "count\|<n>" summary line follows the last row and is not itself a declared column. An empty directory emits zero rows and count\|0, never an error. Values: free text. |
+| `size` | int64 | - | Windows, Linux, macOS | `-` | File size in bytes, from std::filesystem::file_size. Values: non-negative integer. |
+| `sha256` | string | - | Windows, Linux, macOS | `-` | Lowercase hex SHA-256 of the file's current on-disk contents, recomputed on every list_staged call (not cached from stage time). Values: 64 lowercase hex characters. |
 
-**`cleanup` — `removed` (wire field; the declared `status`/`files_removed` columns are never emitted / name-mismatched — see Caveats)**
+**`agent.content_dist.stage` — `status|staged_path`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `status` (declared) | string | never emitted — `do_cleanup` writes no `status\|` line | — | `-` |
-| `files_removed` (declared) | int32 | actual wire field is `removed\|<n>`, not `files_removed\|<n>` | W, M, L | `-` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `status` | string | `ok` | Windows, Linux, macOS | `ok` | Literal "ok" on a verified download. content_dist never writes "status\|error" — a failure instead replaces this whole line with a single unstructured "error\|<message>" line, so a failed stage never populates this column at all. |
+| `staged_path` | string | - | Windows, Linux, macOS | `-` | Absolute filesystem path of the downloaded, hash-verified file under the agent's staging directory (content_dist_plugin.cpp's staging_dir(): <agent.data_dir>/staged, or a temp-dir fallback). Only present on success — no captured sample shows a populated value. Values: absolute path. |
 
-**`upload_file` — `status`, `sha256`, `size`, `upload_id` (four independent lines on success)**
+**`agent.content_dist.upload_file` — `status|sha256|size|upload_id`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `status` | string | `ok` (the only value on success; failures use `error\|`) | W, M, L | `ok` |
-| `sha256` | string | server-confirmed SHA-256 of the committed upload | W, M, L | `-` |
-| `size` | int64 | server-reported `actual_size`, matches the local file size | W, M, L | `-` |
-| `upload_id` | string | 32-char lowercase hex session id assigned at session-open | W, M, L | `-` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `status` | string | `ok` | Windows, Linux, macOS | `not observed in any capture (every capture failed at parameter validation, before this line could be reached)` | Outcome of the upload; the only value the plugin emits on success (content_dist_plugin.cpp:1171). |
+| `sha256` | string | - | Windows, Linux, macOS | `not observed in any capture (every capture failed at parameter validation, before this line could be reached)` | Server-confirmed SHA-256 digest of the committed upload, computed from the exact bytes the server acknowledged. Values: hex digest. |
+| `size` | int64 | - | Windows, Linux, macOS | `not observed in any capture (every capture failed at parameter validation, before this line could be reached)` | Server-reported size in bytes of the committed upload (commit_result.actual_size), which must match the local file size. Values: integer (bytes). |
+| `upload_id` | string | - | Windows, Linux, macOS | `not observed in any capture (every capture failed at parameter validation, before this line could be reached)` | Server-assigned session id from the upload grant, used to address the /api/v1/uploads/{id}/... endpoints. Values: free text (opaque session id). |
 <!-- END GENERATED -->
 
 ### Result status
@@ -141,87 +140,88 @@ Every action writes independent `key|value` lines via `ctx.write_output` — not
 - **Instruction result, and the `/auto` Deploy engine.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore. `content_dist.stage`/`execute_staged` are additionally dispatched by the `/auto` Deploy engine (`server/core/src/deployment_engine.cpp:306,331`), which parses this exact wire contract via `server/core/src/deployment_parse.hpp:17-25` to drive its own per-device state machine — `content_dist` needed no new agent code for that surface.
 - **`upload_file`'s `grant_id`/`grant_secret` are redacted before any persisted audit/history copy** (`server/core/src/sensitive_instruction_params.hpp:6`) — never logged or stored beyond the upload store's own hashed record.
 - **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics.
+- **Sensitivity.** `execute_staged`'s `output` line is the combined stdout+stderr of whatever binary the caller staged and ran — it can carry anything that process prints, including usernames, hostnames, or credentials — but the plugin's own declared columns (`staged_path`, `file`, `sha256`, `upload_id`) carry only caller-chosen filenames and content hashes, nothing that independently identifies a device, a person, or installed software.
 - **Siblings:** none in this catalogue — `execute_staged` is the only "run an arbitrary binary" action here; compare `script_exec.exec` for ad hoc admin commands/scripts.
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("agent.content_dist.execute_staged")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`; `content_dist.stage`/`execute_staged` results are also polled by the `/auto` Deploy engine's `deployment_run_store`.
 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 590399d7174c
 
 ```
 == action=stage
 error|missing required parameters: url, filename, sha256
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 [rc] 1
 
 == action=execute_staged
 error|missing required parameter: filename
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 [rc] 1
 
 == action=list_staged
 count|0
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=cleanup
 [not captured] Destructive/Irreversible: not executed on a live host
 
 == action=upload_file
 error|missing required parameters: path, grant_id, grant_secret
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 [rc] 1
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 590399d7174c
 
 ```
 == action=stage
 error|missing required parameters: url, filename, sha256
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 [rc] 1
 
 == action=execute_staged
 error|missing required parameter: filename
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 [rc] 1
 
 == action=list_staged
 count|0
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=cleanup
 [not captured] Destructive/Irreversible: not executed on a live host
 
 == action=upload_file
 error|missing required parameters: path, grant_id, grant_secret
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 [rc] 1
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash pending
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 590399d7174c
 
 ```
 == action=stage
 error|missing required parameters: url, filename, sha256
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 [rc] 1
 
 == action=execute_staged
 error|missing required parameter: filename
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 [rc] 1
 
 == action=list_staged
 count|0
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=cleanup
 [not captured] Destructive/Irreversible: not executed on a live host
 
 == action=upload_file
 error|missing required parameters: path, grant_id, grant_secret
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 [rc] 1
 ```
 <!-- END GENERATED -->
@@ -237,10 +237,9 @@ error|missing required parameters: path, grant_id, grant_secret
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/content_dist/src/content_dist_plugin.cpp` (descriptor, actions) · `content_dist_exec_parsers.hpp` (pure `execute_staged` decision layer) · `content_dist_exec_seam.hpp` (`execute_staged` OS shell) · `content_dist_upload_parsers.hpp` (pure `upload_file` decision layer)
-- Definitions: `content/definitions/content_dist.yaml` (`stage`, `execute_staged`, `list_staged`, `cleanup`) · `content/definitions/t2_capabilities.yaml` (`upload_file`)
+- Plugin: `agents/plugins/content_dist/src/content_dist_exec_parsers.hpp` · `agents/plugins/content_dist/src/content_dist_exec_seam.hpp` · `agents/plugins/content_dist/src/content_dist_plugin.cpp` · `agents/plugins/content_dist/src/content_dist_upload_parsers.hpp`
+- Definitions: `content/definitions/content_dist.yaml` · `content/definitions/t2_capabilities.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_content_dist.hpp`
 - Tests: `tests/unit/test_content_dist_actions.cpp` · `tests/unit/test_content_dist_exec_parsers.cpp` · `tests/unit/test_content_dist_exec_seam.cpp` · `tests/unit/test_content_dist_exec_seam_win.cpp` · `tests/unit/test_content_dist_upload_parsers.cpp`
-- Privilege row: `docs/agent-privilege-model.md` (`content_dist.execute_staged` identity row; staging-directory cache-path row)
-- Changelog: `changelog.d/1.6-content-dist-authenticated-upload.changed.md` · `changelog.d/20260814-deployment-dispatch-caller-security.security.md` · `changelog.d/2204-declarations-group-d.added.md` · `changelog.d/5.1-content-dist-runner-convergence.changed.md` · `changelog.d/runner-adr3002-contract.added.md` · `changelog.d/wave5-pr51-script-exec-appdir-codepage.fixed.md` · `changelog.d/wave5-pr51-windows-inherit-env-filter.security.md`
+- Privilege row: `docs/agent-privilege-model.md`
 <!-- END GENERATED -->

@@ -5,10 +5,10 @@
 |---|---|
 | **What it does** | Scans visible WiFi networks and reports current connection status |
 | **Version** | 1.1.0 |
-| **Kind** | Collector · read-only · on-demand (no scheduled gather) |
+| **Kind** | Collector · read-only · gathered (device.wifi.list_networks, device.wifi.connected) |
 | **Platforms** | Windows ✅ · macOS 🟡 constrained · Linux 🟡 constrained |
-| **Actions** | `list_networks` (definition `device.wifi.list_networks`) · `connected` (definition `device.wifi.connected`) |
-| **Security** | securable `Infrastructure` · operation Read · risk Low · dispatch ReadOnly · approval gate none |
+| **Actions** | `connected` (definition `device.wifi.connected`) · `list_networks` (definition `device.wifi.list_networks`) |
+| **Security** | securable `Infrastructure` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
 | **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
 
@@ -36,15 +36,15 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `list_networks` | ✅ supported · rung 1 · `WlanGetAvailableNetworkList` | 🟡 constrained · rung 2 · `airport -s` / `system_profiler` via argv runner | 🟡 constrained · rung 1 · NetworkManager D-Bus (sd-bus) |
-| `connected` | ✅ supported · rung 1 · `WlanQueryInterface` | 🟡 constrained · rung 1 · CoreWLAN | 🟡 constrained · rung 1 · NetworkManager D-Bus (sd-bus) |
+| `connected` | ✅ supported · rung 1 · WlanQueryInterface | 🟡 constrained · rung 1 · CoreWLAN | 🟡 constrained · rung 1 · NetworkManager D-Bus (sd-bus) |
+| `list_networks` | ✅ supported · rung 1 · WlanGetAvailableNetworkList | 🟡 constrained · rung 2 · airport -s / system_profiler via argv runner | 🟡 constrained · rung 1 · NetworkManager D-Bus (sd-bus) |
 
-**Declared limits per leg** (the descriptor's fallback text, verbatim):
+**Declared limits per leg** (descriptor fallback text, verbatim):
 
-- **`list_networks` / Linux** — reads NetworkManager's cached AccessPoints and does not itself initiate a scan (falls through to nmcli, which rescans, when NM reports no finished scan); then falls back to nmcli via the argv runner (rung 2), then an iw/iwlist text dump. Not yet exercised against a real Wi-Fi radio
-- **`list_networks` / macOS** — airport was removed in macOS 14 (Sonoma); the system_profiler SPAirPortDataType fallback needs Location Services authorisation a background daemon may lack, so an unauthorised modern host yields no networks and an honest wifi|info sentinel
-- **`connected` / Linux** — reports the device interface (e.g. wlan0) in the connection column rather than the NetworkManager profile name; falls back to nmcli via the argv runner (rung 2), then an iwconfig ESSID/Signal blob. Not yet exercised against a real Wi-Fi radio
 - **`connected` / macOS** — Location Services (macOS 14+) may withhold SSID/BSSID from a background daemon
+- **`connected` / Linux** — reports the device interface (e.g. wlan0) in the connection column rather than the NetworkManager profile name; falls back to nmcli via the argv runner (rung 2), then an iwconfig ESSID/Signal blob. Not yet exercised against a real Wi-Fi radio
+- **`list_networks` / macOS** — airport was removed in macOS 14 (Sonoma); the system_profiler SPAirPortDataType fallback needs Location Services authorisation a background daemon may lack, so an unauthorised modern host yields no networks and an honest wifi|info sentinel
+- **`list_networks` / Linux** — reads NetworkManager's cached AccessPoints and does not itself initiate a scan (falls through to nmcli, which rescans, when NM reports no finished scan); then falls back to nmcli via the argv runner (rung 2), then an iw/iwlist text dump. Not yet exercised against a real Wi-Fi radio
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -62,9 +62,7 @@ Binaries/subprocesses/network: Linux spawns `nmcli`, `iw`, `iwlist`, `iwconfig` 
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-`list_networks` takes no parameters.
-
-`connected` takes no parameters.
+Neither action takes parameters.
 <!-- END GENERATED -->
 
 ### Outputs
@@ -72,25 +70,25 @@ Binaries/subprocesses/network: Linux spawns `nmcli`, `iw`, `iwlist`, `iwconfig` 
 Pipe-delimited rows. `list_networks` emits zero or more `wifi|...` rows per scan, or a single `wifi|info|...` / `wifi|error|...` / `wifi|scan_output|...` sentinel row when the scan could not enumerate real access points; `connected` emits exactly one `connected|...` row. Every free-text field (SSID, security, BSSID, raw scan blobs) is escaped through `safe_output_field` at the single emission site in `wifi_plugin.cpp`, because `wifi` is not a key|value plugin server-side and an unescaped `|`/`\n` in an attacker-controlled SSID would shift columns or fabricate a row (wifi_plugin.cpp:75-79, wifi_corewlan.hpp:58-65). The fourth and fifth columns of `list_networks` are OVERLOADED across platforms (see the table below), and its `wifi|scan_output|<blob>` fallback — the raw `iwlist` text after ESSID/Quality/Encryption filtering — does not populate the declared columns at all; it is one opaque field (wifi_plugin.cpp:824-828).
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`list_networks` — `wifi|ssid|signal|security|channel_or_type|bssid_or_connected`**
+**`device.wifi.connected` — `ssid|signal|security|bssid|interface_or_channel`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `ssid` | string | network name; `<hidden>` (empty SSID); `<hex:...>` (Linux D-Bus non-UTF-8 SSID, wifi_parsers.hpp:544-563); `info`/`error`/`scan_output` sentinel discriminator | W, M, L | `info` |
-| `signal` | string | 0-100 quality/percent (Windows/Linux); RSSI in dBm (macOS); free-text message on a sentinel row | W, M, L | `wi-fi scan unavailable; airport removed in macOS 14+ and system_profiler requires Location Services` |
-| `security` | string | free text, e.g. `Open` `WEP` `WPA2-Personal` `WPA3` `802.1X` `OWE` (wifi_parsers.hpp:596-622); `0` on a sentinel row | W, M, L | `0` |
-| `channel_or_type` | string | Linux/macOS: 802.11 channel, `0` unknown; Windows: BSS type `Infrastructure`/`Ad-hoc`/`Unknown` — NOT a channel (wifi_plugin.cpp:702-704) | W, M, L | `0` |
-| `bssid_or_connected` | string | Linux/macOS: AP MAC address, `-` unknown; Windows: literal `true`/`false` for "is this the connected network" — NOT a BSSID (wifi_plugin.cpp:705,708) | W, M, L | `none` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `ssid` | string | - | Windows, Linux, macOS | `none` | The connected network's SSID; sentinel none/unknown when disconnected or undetermined; <ssid-withheld> on macOS when Location Services blocks the read on an otherwise-live association; <hex:...> on the Linux D-Bus leg for a non-UTF-8 SSID. Values: SSID text, none, unknown, <ssid-withheld>, or <hex:...>. |
+| `signal` | string | - | Windows, Linux, macOS | `Not connected` | Signal strength using the same per-OS units as list_networks' signal field; on a disconnected/undetermined sentinel row this carries the free-text message instead (e.g. "Not connected"). Values: integer, or a free-text sentinel message. |
+| `security` | string | - | Windows, Linux, macOS | `0` | Security type of the connected access point; "unknown" on the Linux iwconfig blob fallback; "0" on the disconnected/undetermined sentinel. Values: free text, unknown, or 0. |
+| `bssid` | string | - | Windows, Linux, macOS | `none` | Connected access point's MAC address; - or none when not associated or unknown. Values: MAC address, -, or none. |
+| `interface_or_channel` | string | - | Windows, Linux, macOS | `none` | Wireless interface name on Linux/Windows (e.g. wlan0, an adapter description); 802.11 channel number on macOS; none when undetermined. Values: interface name string, channel number, or none. |
 
-**`connected` — `connected|ssid|signal|security|bssid|interface_or_channel`**
+**`device.wifi.list_networks` — `ssid|signal|security|channel_or_type|bssid_or_connected`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `ssid` | string | connected SSID; `none`/`unknown` sentinel when disconnected/undetermined; `<ssid-withheld>` on macOS when Location Services blocks the read on an otherwise-live association (wifi_corewlan.hpp:60-66); `<hex:...>` on the Linux D-Bus leg | W, M, L | `none` |
-| `signal` | string | same per-OS units as `list_networks`' signal; free-text sentinel message (e.g. `Not connected`) on a disconnected/undetermined row | W, M, L | `Not connected` |
-| `security` | string | free text; `unknown` on the Linux iwconfig blob fallback (wifi_plugin.cpp:1092); `0` on the disconnected/undetermined sentinel | W, M, L | `0` |
-| `bssid` | string | AP MAC address; `-`/`none` when not associated or unknown | W, M, L | `none` |
-| `interface_or_channel` | string | Linux/Windows: interface name (e.g. `wlan0`, an adapter description); macOS: 802.11 channel number; `none` sentinel | W, M, L | `none` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `ssid` | string | - | Windows, Linux, macOS | `info` | The network's SSID, or a sentinel discriminator (info/error/ scan_output) when the row is a status line rather than an access point. Values: SSID text, <hidden> (empty SSID), <hex:...> (Linux D-Bus non-UTF-8 SSID), or info/error/scan_output. |
+| `signal` | string | - | Windows, Linux, macOS | `wi-fi scan unavailable; airport removed in macOS 14+ and system_profiler requires Location Services` | Signal strength: 0-100 quality/percent on Windows and Linux, RSSI in dBm on macOS; on a sentinel row this field carries the free-text message instead. Values: integer 0-100 (Windows/Linux), a dBm integer (macOS), or free text on a sentinel row. |
+| `security` | string | - | Windows, Linux, macOS | `0` | The access point's security type in the emitting leg's own vocabulary (e.g. Open, WPA2-Personal, WPA3, 802.1X); "0" on a sentinel row. Values: free text, or 0 on a sentinel row. |
+| `channel_or_type` | string | - | Windows, Linux, macOS | `0` | 802.11 channel number on Linux/macOS; BSS type (Infrastructure/Ad-hoc/Unknown) on Windows -- the two OS families populate genuinely different data in this column. Values: channel number as a string, 0 when unknown, or Infrastructure/Ad-hoc/Unknown. |
+| `bssid_or_connected` | string | - | Windows, Linux, macOS | `none` | Access point MAC address on Linux/macOS; the literal true/false for whether this network is the one currently connected on Windows -- again a different meaning per OS. Values: MAC address, - when unknown, or true/false. |
 <!-- END GENERATED -->
 
 ### Result status
@@ -104,7 +102,11 @@ Pipe-delimited rows. `list_networks` emits zero or more `wifi|...` rows per scan
 | `UNAVAILABLE` | PARTIAL | `wifi:no_wireless_tools` | Linux `list_networks`: neither nmcli nor `iw` answered and no runner-level failure was already forwarded (wifi_plugin.cpp:857-859) |
 | `UNAVAILABLE` | PARTIAL | `wifi:wlan_open_handle_failed` / `wifi:wlan_enum_interfaces_failed` / `wifi:wlan_query_interface_failed` | Windows `connected`: the WLAN API call itself failed (wifi_plugin.cpp:956-957, 967-968, 1023-1025) |
 | `UNAVAILABLE` | PARTIAL | `wifi:nmcli_and_iwconfig_failed` | Linux `connected`: neither nmcli nor iwconfig answered and no runner-level failure was already forwarded (wifi_plugin.cpp:1111-1113) |
-| (runner-derived) | (runner-derived) | `subprocess_runner:*` (e.g. `spawn_error`) | Any `run_tool()` call whose subprocess itself failed to spawn, hit its deadline, or hit the line cap forwards `yuzu::agent::forward_runner_failure`'s own status instead (wifi_plugin.cpp:768-769, 822-823, 854-855, 1074-1075, 1090-1091, 1109-1110) — this is what the linux.txt sample shows for both actions |
+| `UNAVAILABLE` | PARTIAL | `subprocess_runner:spawn_error` | The child process could not be spawned at all — this is what the linux.txt sample shows for both actions (wifi_plugin.cpp:768-769, 822-823, 854-855, 1074-1075, 1090-1091, 1109-1110) |
+| `CONSTRAINED` | PARTIAL | `subprocess_runner:deadline` | The runner's own deadline elapsed and the child was killed still running, forwarded via the same `forward_runner_failure` call sites |
+| `CONSTRAINED` | PARTIAL | `subprocess_runner:cancelled` | The run was cancelled before it finished, forwarded via the same call sites |
+| `CONSTRAINED` | PARTIAL | `subprocess_runner:signaled` | The child was killed by a signal rather than exiting cleanly, forwarded via the same call sites |
+| `OK` | PARTIAL | `subprocess_runner:line_limit` | A deliberate bounded stop: the runner capped output at its line limit and killed a still-producing child — not a failure, but incomplete |
 
 macOS `connected` and Windows `list_networks` never call `set_result_status` on any path (wifi_plugin.cpp:666-715, 1117-1134); Windows `connected`'s "not found, no error" branch (wifi_plugin.cpp:1028-1030) is the same. All three record `UNDECLARED`/`UNKNOWN` with empty provenance, exactly as the macos.txt and windows.txt samples show.
 
@@ -112,24 +114,25 @@ macOS `connected` and Windows `list_networks` never call `set_result_status` on 
 
 - **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore at the DSL default 90-day retention (`spec.response.retentionDays` is unset in `wifi.yaml`, docs/yaml-dsl-spec.md:190-194), queryable at `/api/responses/{id}`.
 - **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics. Nothing runs on a schedule — `gather.ttlSeconds: 30` bounds the agent's response deadline, not a recurring interval (docs/yaml-dsl-spec.md:184-188) — the plugin executes only when an operator or workflow dispatches one of its two definitions.
+- **Sensitivity.** `bssid`/`bssid_or_connected` rows carry access-point MAC addresses (device identifiers, not the managed host's own) on Linux/macOS `list_networks` and on `connected` across all three OSes; `ssid` free text can itself identify a person or a specific device (e.g. a personal hotspot named after its owner, or the `<hex:...>` fallback for a non-UTF-8 SSID). No column carries the host's own hostname, IP address, or a logged-in username.
 - **Siblings:** none of this plugin's own definitions feed TAR. TAR ships its own, independent `netconn` capture source (`agents/plugins/tar/src/tar_netconn.hpp`, Windows-only, opt-in, default-disabled) that records Wi-Fi connect/fail/disconnect transitions from the OS event log with a stricter allow-list than this plugin — it never extracts SSID, BSSID, or profile names (tar_schema_registry.cpp:838-844).
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("device.wifi.connected")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 08531a51b9d2
 
 ```
 == action=list_networks
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=connected
 connected|none|Not connected|0|none|none
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 08531a51b9d2
 
 ```
 == action=list_networks
@@ -138,10 +141,10 @@ wifi|info|wi-fi scan unavailable; airport removed in macOS 14+ and system_profil
 
 == action=connected
 connected|none|Not connected|0|none|none
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash pending
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 08531a51b9d2
 
 ```
 == action=list_networks
@@ -165,10 +168,10 @@ connected|unknown|Wi-Fi connection state could not be determined (NetworkManager
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/wifi/src/wifi_plugin.cpp` (descriptor + actions) · `wifi_corewlan.hpp` / `wifi_corewlan.mm` (macOS CoreWLAN `connected` leg) · `wifi_parsers.hpp` (pure parse/format helpers)
+- Plugin: `agents/plugins/wifi/src/wifi_corewlan.hpp` · `agents/plugins/wifi/src/wifi_corewlan.mm` · `agents/plugins/wifi/src/wifi_parsers.hpp` · `agents/plugins/wifi/src/wifi_plugin.cpp`
 - Definitions: `content/definitions/wifi.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_c.hpp`
 - Tests: `tests/unit/test_wifi_corewlan.cpp` · `tests/unit/test_wifi_local_dispatcher.cpp` · `tests/unit/test_wifi_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2204-declarations-group-c.added.md` · `changelog.d/2215-wifi-connected-corewlan.added.md` · `changelog.d/native-raii-objcpp.added.md` · `changelog.d/wave4-pr41b-wifi-native-dbus.changed.md`
+- Changelog: `changelog.d/2215-wifi-connected-corewlan.added.md` · `changelog.d/wave4-pr41b-wifi-native-dbus.changed.md`
 <!-- END GENERATED -->

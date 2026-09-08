@@ -5,10 +5,10 @@
 |---|---|
 | **What it does** | Reports logged-on users, sessions, local accounts, admin group members, group membership, primary user, and session history |
 | **Version** | 1.0.0 |
-| **Kind** | Collector · read-only · on-demand |
-| **Platforms** | Windows 🟡 (session_history constrained) · macOS ✅ · Linux ✅ |
-| **Actions** | `logged_on` (definition `device.users.logged_on`) · `sessions` (definition `device.users.sessions`) · `local_users` (definition `device.users.local_users`) · `local_admins` (definition `device.users.local_admins`) · `group_members` (definition `device.users.group_members`) · `primary_user` (definition `device.users.primary_user`) · `session_history` (definition `device.users.session_history`) |
-| **Security** | securable `UserManagement` · operation Read · risk Low · dispatch ReadOnly · approval gate none |
+| **Kind** | Collector · read-only · gathered (device.users.logged_on, device.users.sessions, device.users.local_users, device.users.local_admins, device.users.group_members, device.users.primary_user, device.users.session_history) |
+| **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
+| **Actions** | `group_members` (definition `device.users.group_members`) · `local_admins` (definition `device.users.local_admins`) · `local_users` (definition `device.users.local_users`) · `logged_on` (definition `device.users.logged_on`) · `primary_user` (definition `device.users.primary_user`) · `session_history` (definition `device.users.session_history`) · `sessions` (definition `device.users.sessions`) |
+| **Security** | securable `UserManagement` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
 | **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
 
@@ -32,18 +32,18 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `logged_on` | ✅ supported · rung 1 · `WTSEnumerateSessionsW` + `WTSQuerySessionInformationW` | ✅ supported · rung 2 · runner argv `who` | ✅ supported · rung 1 · utmp (`setutent`/`getutent`) |
-| `sessions` | ✅ supported · rung 1 · `WTSEnumerateSessionsW` + `WTSQuerySessionInformationW` | ✅ supported · rung 2 · runner argv `w -h` | ✅ supported · rung 2 · runner argv `w -h` |
-| `local_users` | ✅ supported · rung 1 · `NetUserEnum` | ✅ supported · rung 2 · runner argv `dscl . -list/-read UserShell/RealName` + `last -y -1 <user>` per account | ✅ supported · rung 2 · `/etc/passwd` read + runner argv `lastlog -u <user>` per account |
-| `local_admins` | ✅ supported · rung 1 · `NetLocalGroupGetMembers` | ✅ supported · rung 2 · runner argv `dscl . -read /Groups/admin GroupMembership` | ✅ supported · rung 1 · `getgrnam(sudo/wheel)` + `getpwuid(0)` |
-| `group_members` | ✅ supported · rung 1 · `NetLocalGroupGetMembers` | ✅ supported · rung 2 · runner argv `dscl . -read /Groups/<name> GroupMembership` | ✅ supported · rung 1 · `getgrnam` + `/etc/passwd` primary-group scan |
-| `primary_user` | ✅ supported · rung 1 · wevtapi (`EvtQuery`/`EvtRender`, Security 4624) | ✅ supported · rung 2 · runner argv `last` (max_lines=200 cap) | ✅ supported · rung 2 · runner argv `last -F` (max_lines=200 cap) |
-| `session_history` | 🟡 constrained · rung 1 · wevtapi (`EvtQuery`/`EvtRender`, Security 4624/4634) | ✅ supported · rung 2 · runner argv `last -n <count>` | ✅ supported · rung 2 · runner argv `last -F -n <count>` |
+| `group_members` | ✅ supported · rung 1 · NetLocalGroupGetMembers | ✅ supported · rung 2 · runner argv 'dscl . -read /Groups/<name> GroupMembership' | ✅ supported · rung 1 · getgrnam + /etc/passwd primary-group scan |
+| `local_admins` | ✅ supported · rung 1 · NetLocalGroupGetMembers | ✅ supported · rung 2 · runner argv 'dscl . -read /Groups/admin GroupMembership' | ✅ supported · rung 1 · getgrnam(sudo/wheel) + getpwuid(0) |
+| `local_users` | ✅ supported · rung 1 · NetUserEnum | ✅ supported · rung 2 · runner argv 'dscl . -list/-read UserShell/RealName' + 'last -y -1 <user>' per account | ✅ supported · rung 2 · /etc/passwd read + runner argv 'lastlog -u <user>' per account |
+| `logged_on` | ✅ supported · rung 1 · WTSEnumerateSessionsW + WTSQuerySessionInformationW | ✅ supported · rung 2 · runner argv 'who' | ✅ supported · rung 1 · utmp (setutent/getutent) |
+| `primary_user` | ✅ supported · rung 1 · wevtapi (EvtQuery/EvtRender, Security 4624) | ✅ supported · rung 2 · runner argv 'last' (max_lines=200 cap) | ✅ supported · rung 2 · runner argv 'last -F' (max_lines=200 cap) |
+| `session_history` | 🟡 constrained · rung 1 · wevtapi (EvtQuery/EvtRender, Security 4624/4634) | ✅ supported · rung 2 · runner argv 'last -n <count>' | ✅ supported · rung 2 · runner argv 'last -F -n <count>' |
+| `sessions` | ✅ supported · rung 1 · WTSEnumerateSessionsW + WTSQuerySessionInformationW | ✅ supported · rung 2 · runner argv 'w -h' | ✅ supported · rung 2 · runner argv 'w -h' |
 
-**Declared limits per leg** (the descriptor's fallback text, verbatim):
+**Declared limits per leg** (descriptor fallback text, verbatim):
 
-- **`primary_user` / Windows** — falls back to a native ProfileList registry enumeration (no login count) when the Security channel is inaccessible.
-- **`session_history` / Windows** — requires an elevated token to read the Security channel; reports an error otherwise.
+- **`primary_user` / Windows** — falls back to a native ProfileList registry enumeration (no login count) when the Security channel is inaccessible
+- **`session_history` / Windows** — requires an elevated token to read the Security channel; reports an error otherwise
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -61,12 +61,10 @@ Binaries/subprocesses: Linux — `w`, `lastlog`, `last` (probed via `probe_tool_
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-| Definition | Parameter | Type | Required | Default | Values | Description |
+| Definition | Parameter | Type | Required | Default | Constraints | Description |
 |---|---|---|---|---|---|---|
-| `device.users.group_members` | `group` | string | yes | — | minLength 1 · maxLength 256 | Name of the local group to enumerate members for (e.g. `Administrators`, `Remote Desktop Users`, `sudo`). |
-| `device.users.session_history` | `count` | string | no | `"50"` | pattern `^[0-9]+$` | Maximum number of session records to return; the plugin clamps any parsed value outside 1–500 back to 50 (`users_plugin.cpp:1253-1259`). |
-
-`logged_on`, `sessions`, `local_users`, `local_admins`, and `primary_user` take no parameters.
+| `device.users.group_members` | `group` | string | yes | - | minLength 1 · maxLength 256 | Name of the local group to enumerate members for (e.g., "Administrators", "Remote Desktop Users", "sudo"). |
+| `device.users.session_history` | `count` | string | no | 50 | pattern: ^[0-9]+$ | Maximum number of session records to return, as a digit string (e.g. "100"); values outside 1-500 are clamped back to the default of 50. |
 <!-- END GENERATED -->
 
 ### Outputs
@@ -74,69 +72,69 @@ Binaries/subprocesses: Linux — `w`, `lastlog`, `last` (probed via `probe_tool_
 Pipe-delimited rows, one per record, discriminated by a literal first field (`user`, `session`, `local_user`, `admin`, `group_member`, `primary_user`, or `session_history`). Unlike some collector plugins, `logged_on`/`sessions`/`group_members` emit **zero rows**, not a placeholder, when there is nothing to report (an empty Windows/Linux `logged_on` and `sessions` capture is exactly this case — see Sample output) — the empty result is legitimate on its own and is not itself a failure signal; only the typed result status (below) tells a genuinely degraded read apart from a clean empty one. A query-level problem (missing/invalid parameter, tool not found, group not found) instead emits a single `<action>|error|<message>` row. `local_users` additionally varies its own field count by OS: Linux and Windows rows carry 4 data fields, macOS rows carry 5 (`console_state` is appended, not padded in with a placeholder) — `users_plugin.cpp:800-806`.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`logged_on` — `user|username|domain|logon_type|session_id`**
+**`device.users.group_members` — `member_name|group_name|member_type`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `username` | string | free text | W, M, L | `alex` |
-| `domain` | string | hostname/domain, or the literal `local` when none | W, M, L | `local` |
-| `logon_type` | enum | `console` `remote` `RDP` (Windows only) | W, M, L | `console` |
-| `session_id` | string | utmp line (L) · tty (M) · numeric WTS session ID (W) | W, M, L | `console` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `member_name` | string | - | Windows, Linux, macOS | `Alex` | The account (or nested group, on Windows) belonging to the queried group. Values: free text. |
+| `group_name` | string | - | Windows, Linux, macOS | `Administrators` | The group name from the "group" parameter, echoed back on every row. Values: free text. |
+| `member_type` | string | - | Windows, Linux, macOS | `user` | The kind of membership. Values: user, primary_group (Linux only); Windows: user, group, well_known_group, alias. |
 
-**`sessions` — `session|session_id|username|state|client|idle`**
+**`device.users.local_admins` — `member_name|member_type|domain_or_group`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `session_id` | string | controlling tty (L, M) or numeric WTS session ID (W) | W, M, L | `console` |
-| `username` | string | free text | W, M, L | `alex` |
-| `state` | enum | `Active` (L, M — always) · W: `Active` `Connected` `Disconnected` `Idle` `Listen` `Other` | W, M, L | `Active` |
-| `client` | string | remote host from `w`'s FROM column (L, M) or RDP client name (W); `-` when none | W, M, L | `-` |
-| `idle` | string | `w`'s idle text (L, M, e.g. `13:35`); always `0` on Windows (idle decode not implemented, `users_plugin.cpp:514-525`) | W, M, L | `13:35` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `member_name` | string | - | Windows, Linux, macOS | `Alex` | The name of an account or group belonging to the local admin membership. Values: free text. |
+| `member_type` | string | - | Windows, Linux, macOS | `user` | The kind of member. Values: user (always on Linux/macOS); Windows: user, group, well_known_group, alias, unknown. |
+| `domain_or_group` | string | - | Windows, Linux, macOS | `DESKTOP-04DNSIG` | The domain owning the member (Windows), or the source group/account name (Linux "sudo"/"wheel"/"root", macOS literal "admin"). Values: free text. |
 
-**`local_users` — `local_user|username|enabled|last_logon|description[|console_state]`**
+**`device.users.local_users` — `username|enabled|last_logon|description|console_state`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `username` | string | free text | W, M, L | `Alex` |
-| `enabled` | bool | `true` `false` | W, M, L | `true` |
-| `last_logon` | string | `YYYY-MM-DD HH:MM:SS` · `Never` · `unknown` | W, M, L | `2026-09-07 11:08:37` |
-| `description` | string | free text or `-` | W, M, L | `Built-in account for administering the computer/domain` |
-| `console_state` | string | `true` `false` `unknown` — field is absent entirely on Linux/Windows, not emitted empty | M only | `true` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `username` | string | - | Windows, Linux, macOS | `Alex` | The local account's username. Values: free text. |
+| `enabled` | bool | - | Windows, Linux, macOS | `true` | Whether the account is enabled. Values: true, false. |
+| `last_logon` | string | - | Windows, Linux, macOS | `2026-09-07 11:08:37` | The account's most recent login timestamp, or a sentinel when unknown or never logged in. Values: "YYYY-MM-DD HH:MM:SS", "Never", "unknown". |
+| `description` | string | - | Windows, Linux, macOS | `Built-in account for administering the computer/domain` | The account's comment/description text (Windows comment, macOS RealName, Linux GECOS field), or "-" when empty. Values: free text or "-". |
+| `console_state` | string | - | macOS | `true` | Tri-state flag for whether this account is the current GUI/console-login user; the field is entirely absent (not empty) on Linux and Windows. Values: true, false, unknown. |
 
-**`local_admins` — `admin|member_name|member_type|domain_or_group`**
+**`device.users.logged_on` — `username|domain|logon_type|session_id`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `member_name` | string | free text | W, M, L | `Alex` |
-| `member_type` | enum | `user` (always on L, M) · W: `user` `group` `well_known_group` `alias` `unknown` | W, M, L | `user` |
-| `domain_or_group` | string | Windows domain name · macOS literal `admin` · Linux `sudo`/`wheel`/`root` | W, M, L | `DESKTOP-04DNSIG` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `username` | string | - | Windows, Linux, macOS | `alex` | The account name of a currently logged-on user. Values: free text. |
+| `domain` | string | - | Windows, Linux, macOS | `local` | The host or domain the session belongs to, or the literal "local" when it has none. Values: hostname/domain or the literal "local". |
+| `logon_type` | string | - | Windows, Linux, macOS | `console` | How the session was established. Values: console, remote, RDP (Windows only). |
+| `session_id` | string | - | Windows, Linux, macOS | `console` | The session's terminal identifier — a utmp line name (Linux), a tty (macOS), or a numeric WTS session ID (Windows). Values: free text. |
 
-**`group_members` — `group_member|member_name|group_name|member_type`**
+**`device.users.primary_user` — `username|login_count|source`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `member_name` | string | free text | W, M, L | `Alex` |
-| `group_name` | string | echoes the `group` parameter | W, M, L | `Administrators` |
-| `member_type` | enum | `user` `primary_group` (L only) · W: `user` `group` `well_known_group` `alias` | W, M, L | `user` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `username` | string | - | Windows, Linux, macOS | `Alex` | The account with the most login events in the examined history, or "unknown" when none could be determined. Values: free text or "unknown". |
+| `login_count` | int32 | - | Windows, Linux, macOS | `118` | The number of login events counted for this user; "0" for the Windows ProfileList fallback, which carries no count. Values: integer. |
+| `source` | string | - | Windows, Linux, macOS | `event_log_4624` | How the answer was derived. Values: last (Linux/macOS); event_log_4624, profile_list (Windows); free text on a query failure. |
 
-**`primary_user` — `primary_user|username|login_count|source`**
+**`device.users.session_history` — `username|event_type|logon_type|source|timestamp|detail`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `username` | string | free text or `unknown` | W, M, L | `Alex` |
-| `login_count` | int32 | integer; `0` for the ProfileList fallback (no count available) | W, M, L | `118` |
-| `source` | string | `last` (L, M) · `event_log_4624` `profile_list` (W) · free text on a query failure | W, M, L | `event_log_4624` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `username` | string | - | Windows, Linux, macOS | `Alex` | The account named in the record. Values: free text. |
+| `event_type` | string | - | Windows, Linux, macOS | `logoff` | Windows: "logon" or "logoff". Linux/macOS: actually the session's tty, not an event-type label — see the plugin README's Caveats. Values: logon, logoff (Windows); a tty name (Linux/macOS). |
+| `logon_type` | string | - | Windows, Linux, macOS | `network` | Windows: the mapped LogonType name or raw numeric code, empty when absent. Linux/macOS: actually last's host/source token, usually empty for a local session. Values: interactive, network, batch, service, unlock, network_cleartext, new_credentials, remote_interactive, cached_interactive, or a raw numeric code (Windows); free text, often empty (Linux/macOS). |
+| `source` | string | - | Windows, Linux, macOS | `-` | Windows: the event's IpAddress, or "-". Linux/macOS: actually the derived console/remote/system classification, not a network source. Values: an IP address or "-" (Windows); console, remote, system (Linux/macOS). |
+| `timestamp` | string | - | Windows, Linux, macOS | `2026-09-07T10:08:37.8345208Z` | Windows: the event's TimeCreated, full-precision UTC. Linux/macOS: actually the completed/active/crash status word, not a timestamp — the real date/time is embedded in "detail". Values: ISO-8601 UTC (Windows); completed, active, crash (Linux/macOS). |
+| `detail` | string | - | Windows, Linux, macOS | `4634` | Windows: the raw EventID text. Linux/macOS: the remainder of the 'last' line verbatim (weekday, date, time, and logout/duration or "still logged in"). Values: free text. |
 
-**`session_history` — `session_history|username|event_type|logon_type|source|timestamp|detail`**
+**`device.users.sessions` — `session_id|username|state|client|idle`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `username` | string | free text | W, M, L | `Alex` |
-| `event_type` | string | W: `logon` `logoff`. L/M: actually the session's tty (positional mismatch — see Caveats) | W, M, L | `logoff` (W) · `console` (M) |
-| `logon_type` | string | W: mapped LogonType name or raw code, `""` if absent. L/M: actually `last`'s host/source token (positional mismatch) | W, M, L | `network` (W) |
-| `source` | string | W: IP address or `-`. L/M: actually `console`/`remote`/`system` (positional mismatch) | W, M, L | `-` (W) · `console` (M) |
-| `timestamp` | string | W: full-precision UTC ISO-8601. L/M: actually `completed`/`active`/`crash` (positional mismatch) | W, M, L | `2026-09-07T10:08:37.8345208Z` (W) · `active` (M) |
-| `detail` | string | W: the raw EventID (`4624`/`4634`). L/M: the rest of the `last` line verbatim (weekday, date, time, duration) | W, M, L | `4634` (W) · `Sep  6 21:20   still logged in` (M) |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `session_id` | string | - | Windows, Linux, macOS | `console` | The session's controlling tty (Linux/macOS) or numeric WTS session ID (Windows). Values: free text. |
+| `username` | string | - | Windows, Linux, macOS | `alex` | The account that owns this session. Values: free text. |
+| `state` | string | - | Windows, Linux, macOS | `Active` | The session's connection state. Values: Active (Linux/macOS, always); Windows: Active, Connected, Disconnected, Idle, Listen, Other. |
+| `client` | string | - | Windows, Linux, macOS | `-` | The remote host the session connects from ('w' FROM column) or the RDP client name on Windows; "-" when none. Values: free text or "-". |
+| `idle` | string | - | Windows, Linux, macOS | `13:35` | Idle time as reported by 'w' on Linux/macOS; always the literal "0" on Windows, where idle-time decoding is unimplemented. Values: free text (Linux/macOS) or the literal "0" (Windows). |
 <!-- END GENERATED -->
 
 ### Result status
@@ -147,7 +145,7 @@ Pipe-delimited rows, one per record, discriminated by a literal first field (`us
 |---|---|---|---|
 | `UNDECLARED` (no call made) | UNKNOWN | — | default; every OS tool/native call `exited` (any exit code) — this is the status on every clean or intentionally-empty read, e.g. every sample's `logged_on`/`sessions` |
 | `OK` | PARTIAL | `subprocess_runner:line_limit` | a POSIX `run_tool()` call hits its `max_lines` cap (`primary_user`'s 200-line bound) before the tool finished — deliberate truncation, not a failure |
-| `CONSTRAINED` | PARTIAL | `subprocess_runner:deadline` / `:cancelled` / `:signaled` | a POSIX tool exceeds the 10s `kUsersCmdDeadline` or is killed/signalled mid-run |
+| `CONSTRAINED` | PARTIAL | `subprocess_runner:deadline` / `subprocess_runner:cancelled` / `subprocess_runner:signaled` | a POSIX tool exceeds the 10s `kUsersCmdDeadline` or is killed/signalled mid-run |
 | `UNAVAILABLE` | PARTIAL | `subprocess_runner:spawn_error` | `probe_tool_path` found no binary, or the spawn itself failed — the 2026-09-06 Linux container sample (`lastlog`/`last` missing) |
 | `PERMISSION_DENIED` | PARTIAL | `users_win_events:access_denied` | Windows Security-channel query denied (`session_history`, `primary_user`'s event-log path) |
 | `UNAVAILABLE` | PARTIAL | `users_win_events:channel_not_found` | Windows Security channel missing/uninstalled |
@@ -158,20 +156,21 @@ Pipe-delimited rows, one per record, discriminated by a literal first field (`us
 
 - **Instruction result only.** Rows travel the agent's mTLS gRPC channel as the command response and land in the `ResponseStore` (90-day default retention, `server/core/src/response_store.hpp:153`), queryable at `/api/responses/{id}`.
 - **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — nothing in this plugin runs on a schedule; `gather.ttlSeconds` (60–300s per definition) is a repeat-query cache TTL, not a cron trigger.
+- **Sensitivity.** Every action's rows name a specific account: `username`/`member_name` (local or logged-on account names, including admin-group members), `domain`/`domain_or_group` (Windows domain or hostname), and `session_history`'s Windows leg carries the raw Security-log event detail for that account's logons/logoffs. `session_id`/`client` can carry a remote hostname or RDP client name — a device identifier for whatever machine connected in. No column carries installed-software data.
 - **Siblings:** `core.crossplatform.users` (`content/definitions/users_set.yaml`, "User Account Management") is the mutating counterpart in a separate plugin — this plugin never creates, deletes, disables, or reassigns an account.
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("device.users.session_history")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 5734018da5be
 
 ```
 == action=logged_on
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=sessions
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=local_users
 local_user|Administrator|false|2021-10-14 11:15:58|Built-in account for administering the computer/domain
@@ -181,21 +180,21 @@ local_user|CodexSandboxOnline|true|Never|-
 local_user|DefaultAccount|false|Never|A user account managed by the system.
 local_user|Guest|false|Never|Built-in account for guest access to the computer/domain
 local_user|WDAGUtilityAccount|false|Never|A user account managed and used by the system for Windows Defender Application Guard scenarios.
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=local_admins
 admin|Administrator|user|DESKTOP-04DNSIG
 admin|Alex|user|DESKTOP-04DNSIG
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=group_members group=Administrators
 group_member|Administrator|Administrators|user
 group_member|Alex|Administrators|user
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=primary_user
 primary_user|Alex|118|event_log_4624
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=session_history
 session_history|Alex|logoff|network|-|2026-09-07T10:08:37.8345208Z|4634
@@ -210,54 +209,41 @@ session_history|Alex|logon|network|-|2026-09-07T10:08:06.0444630Z|4624
 session_history|Alex|logoff|network|-|2026-09-07T10:08:05.9047716Z|4634
 session_history|Alex|logon|network|-|2026-09-07T10:08:05.9044759Z|4624
 session_history|sshd_4452|logon|service|-|2026-09-07T10:08:05.8249284Z|4624
-session_history|Alex|logoff|network|-|2026-09-07T10:08:05.7835346Z|4634
-session_history|sshd_11788|logoff|service|-|2026-09-07T10:08:05.7835247Z|4634
-session_history|Alex|logon|network|-|2026-09-07T10:08:05.5583828Z|4624
-session_history|Alex|logoff|network|-|2026-09-07T10:08:05.4512396Z|4634
-session_history|Alex|logon|network|-|2026-09-07T10:08:05.4509261Z|4624
-session_history|sshd_11788|logon|service|-|2026-09-07T10:08:05.3642841Z|4624
-session_history|Alex|logoff|network|-|2026-09-07T10:08:05.3146636Z|4634
-session_history|sshd_3088|logoff|service|-|2026-09-07T10:08:05.3146477Z|4634
-session_history|Alex|logon|network|-|2026-09-07T10:08:05.0730626Z|4624
-session_history|Alex|logoff|network|-|2026-09-07T10:08:04.9175391Z|4634
-session_history|Alex|logon|network|-|2026-09-07T10:08:04.9172410Z|4624
-session_history|sshd_3088|logon|service|-|2026-09-07T10:08:04.8335760Z|4624
-session_history|Alex|logon|network|-|2026-09-07T10:08:02.2657272Z|4624
-… 25 of 50 rows
-[result_status] UNDECLARED / UNKNOWN / 
+… 12 of 50 rows shown
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 5734018da5be
 
 ```
 == action=logged_on
 user|alex|local|console|console
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=sessions
 session|console|alex|Active|-|13:35
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=local_users
 local_user|alex|true|2026-09-06 21:20:00|Alex Young|true
 local_user|root|true|2026-09-06 21:15:00|System Administrator|false
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=local_admins
 admin|root|user|admin
 admin|alex|user|admin
 admin|_mbsetupuser|user|admin
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=group_members group=admin
 group_member|root|admin|user
 group_member|alex|admin|user
 group_member|_mbsetupuser|admin|user
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=primary_user
 primary_user|alex|35|last
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=session_history
 session_history|alex|console|Sun|console|active|Sep  6 21:20   still logged in
@@ -272,31 +258,18 @@ session_history|reboot|time|Mon|system|completed|Aug 31 09:29
 session_history|alex|ttys000|Fri|remote|completed|Aug 28 09:51 - 09:51  (00:00)
 session_history|alex|console|Fri|console|completed|Aug 28 09:51 - 22:26  (12:35)
 session_history|reboot|time|Fri|system|completed|Aug 28 09:50
-session_history|shutdown|time|Thu|system|completed|Aug 27 23:36
-session_history|alex|ttys000|Thu|remote|completed|Aug 27 20:22 - 20:22  (00:00)
-session_history|alex|console|Thu|console|completed|Aug 27 20:22 - 23:36  (03:14)
-session_history|reboot|time|Thu|system|completed|Aug 27 20:21
-session_history|shutdown|time|Thu|system|completed|Aug 27 18:58
-session_history|alex|ttys000|Thu|remote|completed|Aug 27 09:16 - 09:16  (00:00)
-session_history|alex|console|Thu|console|completed|Aug 27 09:16 - 18:58  (09:42)
-session_history|reboot|time|Thu|system|completed|Aug 27 09:13
-session_history|alex|ttys000|Mon|remote|completed|Aug 24 08:50 - 08:50  (00:00)
-session_history|alex|console|Mon|console|completed|Aug 24 08:50 - 21:06 (2+12:15)
-session_history|reboot|time|Mon|system|completed|Aug 24 08:49
-session_history|shutdown|time|Sun|system|completed|Aug 23 21:02
-session_history|alex|ttys001|Sun|remote|completed|Aug 23 20:16 - 20:16  (00:00)
-… 25 of 50 rows
-[result_status] UNDECLARED / UNKNOWN / 
+… 12 of 50 rows shown
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash pending
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 5734018da5be
 
 ```
 == action=logged_on
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=sessions
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=local_users
 local_user|root|true|unknown|root
@@ -305,10 +278,10 @@ local_user|nobody|false|unknown|nobody
 
 == action=local_admins
 admin|root|user|root
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=group_members group=sudo
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=primary_user
 primary_user|unknown|0|last command failed
@@ -331,10 +304,10 @@ session_history|error|last command failed
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/users/src/users_plugin.cpp` (actions + descriptor legs) · `users_macos_last.hpp` (pure `last -y` weekday/timestamp parsers) · `users_win_events.hpp` (pure Security-channel XML parsers, primary-user selection, session-history row projection)
+- Plugin: `agents/plugins/users/src/users_macos_last.hpp` · `agents/plugins/users/src/users_plugin.cpp` · `agents/plugins/users/src/users_win_events.hpp`
 - Definitions: `content/definitions/users.yaml`
-- Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_b.hpp:152-229`
-- Tests: `tests/unit/test_users_macos_last.cpp` (3 cases, pure parser) · `tests/unit/test_users_win_events.cpp` (27 cases, pure parser) · `tests/unit/test_users_posix_actions.cpp` (5 cases, loads the real built plugin via `PluginHandle::load` + `LocalDispatcher` on macOS/Linux)
-- Privilege row: no row in `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2204-declarations-group-b.added.md` · `changelog.d/2277-macos-plugin-parity.added.md` · `changelog.d/20260817-wave2-users-native-account-apis.changed.md` · `changelog.d/20260817-wave2-discovery-native-arp-icmp.changed.md`
+- Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_b.hpp`
+- Tests: `tests/unit/test_users_macos_last.cpp` · `tests/unit/test_users_posix_actions.cpp` · `tests/unit/test_users_win_events.cpp`
+- Privilege row: `docs/agent-privilege-model.md` (no row yet)
+- Changelog: `changelog.d/20260817-wave2-users-native-account-apis.changed.md`
 <!-- END GENERATED -->

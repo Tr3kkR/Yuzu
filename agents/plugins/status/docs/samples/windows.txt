@@ -1,4 +1,4 @@
-captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 0e82a6f385ea
 == action=version
 version|0.13.1+7854
 build_number|7854

@@ -1,4 +1,4 @@
-captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 3b5c27bfec23
 == action=adapters
 adapter|Ethernet 2|FC:34:97:65:1E:0B|18446744073709|down
 adapter|Tailscale|-|100000|up

@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash d55c173b7ddd
 == action=set key=yuzu_capture_tmp value=1
 tag_set|yuzu_capture_tmp|1
 [result_status] UNDECLARED / UNKNOWN / 

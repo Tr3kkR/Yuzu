@@ -5,10 +5,10 @@
 |---|---|
 | **What it does** | Network diagnostics — listening ports and established connections |
 | **Version** | 0.1.0 |
-| **Kind** | Collector · read-only · on-demand (no scheduled gather) |
+| **Kind** | Collector · read-only · gathered (device.network_diag.listening, device.network_diag.connections) |
 | **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
-| **Actions** | `listening` (definition `device.network_diag.listening`) · `connections` (definition `device.network_diag.connections`) |
-| **Security** | securable `Infrastructure` · operation Read · risk Low · dispatch ReadOnly · approval gate none |
+| **Actions** | `connections` (definition `device.network_diag.connections`) · `listening` (definition `device.network_diag.listening`) |
+| **Security** | securable `Infrastructure` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
 | **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
 
@@ -33,13 +33,13 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `listening` | ✅ supported · rung 1 · `GetExtendedTcpTable` | ✅ supported · rung 1 · libproc | ✅ supported · rung 1 · `/proc/net/tcp[6]` |
-| `connections` | ✅ supported · rung 1 · `GetExtendedTcpTable` | ✅ supported · rung 1 · libproc | ✅ supported · rung 1 · `/proc/net/tcp[6]` |
+| `connections` | ✅ supported · rung 1 · GetExtendedTcpTable | ✅ supported · rung 1 · libproc | ✅ supported · rung 1 · /proc/net/tcp[6] |
+| `listening` | ✅ supported · rung 1 · GetExtendedTcpTable | ✅ supported · rung 1 · libproc | ✅ supported · rung 1 · /proc/net/tcp[6] |
 
-**Declared limits per leg** (the descriptor's fallback text, verbatim):
+**Declared limits per leg** (descriptor fallback text, verbatim):
 
-- **`listening` / macOS** — a socket shared by more than one process (SO_REUSEPORT, prefork) surfaces under one arbitrarily-chosen owning PID, not one row per owner.
-- **`connections` / macOS** — a socket shared by more than one process (SO_REUSEPORT, prefork) surfaces under one arbitrarily-chosen owning PID, not one row per owner.
+- **`connections` / macOS** — a socket shared by more than one process (SO_REUSEPORT, prefork) surfaces under one arbitrarily-chosen owning PID, not one row per owner
+- **`listening` / macOS** — a socket shared by more than one process (SO_REUSEPORT, prefork) surfaces under one arbitrarily-chosen owning PID, not one row per owner
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -57,9 +57,7 @@ No external binaries or subprocesses on any leg (rung 1 native APIs everywhere, 
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-`listening` takes no parameters.
-
-`connections` takes no parameters.
+Neither action takes parameters.
 <!-- END GENERATED -->
 
 ### Outputs
@@ -67,25 +65,25 @@ No external binaries or subprocesses on any leg (rung 1 native APIs everywhere, 
 Pipe-delimited rows, one per socket. Field 0 is a literal discriminator (`listen` or `conn`); a leg that finds nothing emits zero rows, never a placeholder.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`listening` — `listen|proto|local_addr|local_port|pid`**
+**`device.network_diag.connections` — `proto|local_addr|local_port|remote_addr|remote_port|pid`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `proto` | string | always the literal `tcp`, even for an IPv6 socket | W, M, L | `tcp` |
-| `local_addr` | string | dotted IPv4, `*` for an unbound wildcard (macOS), raw hex for IPv6 on Linux | W, M, L | `127.0.0.1` · `*` |
-| `local_port` | int32 | decimal port number | W, M, L | `5432` |
-| `pid` | int32 | real owning PID on Windows/macOS; the socket's `/proc/net/tcp[6]` inode number on Linux, not a PID | W, M, L | `1533` (macOS PID) · `10` (Linux inode) |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `proto` | string | - | Windows, Linux, macOS | `tcp` | The socket's transport protocol. Always the literal "tcp" today — the plugin never distinguishes an IPv6 socket with "tcp6", even though Linux and macOS both source rows from IPv6-capable tables. |
+| `local_addr` | string | - | Windows, Linux, macOS | `192.168.0.66` | The local endpoint address. Dotted IPv4 on all platforms; on Linux an IPv6 address is emitted as raw undecoded hex, not text. Values: free text. |
+| `local_port` | int32 | - | Windows, Linux, macOS | `52882` | The local TCP port number. Values: integer. |
+| `remote_addr` | string | - | Windows, Linux, macOS | `160.79.104.10` | The remote endpoint address. Dotted IPv4 on all platforms; on Linux an IPv6 address is emitted as raw undecoded hex, not text. Values: free text. |
+| `remote_port` | int32 | - | Windows, Linux, macOS | `443` | The remote TCP port number. Values: integer. |
+| `pid` | int32 | - | Windows, Linux, macOS | `9039` | The owning process id on Windows and macOS. On Linux this is NOT a PID — the Linux leg never resolves /proc/[pid]/fd, so the value is the socket's raw /proc/net/tcp[6] inode number. Values: integer. |
 
-**`connections` — `conn|proto|local_addr|local_port|remote_addr|remote_port|pid`**
+**`device.network_diag.listening` — `proto|local_addr|local_port|pid`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `proto` | string | always the literal `tcp`, even for an IPv6 socket | W, M, L | `tcp` |
-| `local_addr` | string | dotted IPv4; raw hex for IPv6 on Linux | W, M, L | `192.168.0.66` |
-| `local_port` | int32 | decimal port number | W, M, L | `52882` |
-| `remote_addr` | string | dotted IPv4; raw hex for IPv6 on Linux | W, M, L | `160.79.104.10` |
-| `remote_port` | int32 | decimal port number | W, M, L | `443` |
-| `pid` | int32 | real owning PID on Windows/macOS; the socket's `/proc/net/tcp[6]` inode number on Linux, not a PID | W, M, L | `9039` (macOS PID) |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `proto` | string | - | Windows, Linux, macOS | `tcp` | The socket's transport protocol. Always the literal "tcp" today — the plugin never distinguishes an IPv6 socket with "tcp6", even though Linux and macOS both source rows from IPv6-capable tables. |
+| `local_addr` | string | - | Windows, Linux, macOS | `127.0.0.1` | The bound local address. Dotted IPv4 on all platforms; "*" for an unbound wildcard on macOS; on Linux an IPv6 address is emitted as raw undecoded hex, not text (hex_to_ip's IPv6 branch is a passthrough). Values: free text. |
+| `local_port` | int32 | - | Windows, Linux, macOS | `5432` | The bound local TCP port number. Values: integer. |
+| `pid` | int32 | - | Windows, Linux, macOS | `1533` | The owning process id on Windows and macOS. On Linux this is NOT a PID — the Linux leg never resolves /proc/[pid]/fd, so the value is the socket's raw /proc/net/tcp[6] inode number. Values: integer. |
 <!-- END GENERATED -->
 
 ### Result status
@@ -96,13 +94,14 @@ This plugin does not set a typed result status; the agent records `UNDECLARED` a
 
 - **Instruction result, plus the device-page "Get live info" panel.** `device_routes.cpp` dispatches `network_diag.listening`/`network_diag.connections` for the dashboard's Listening ports and Active connections cards, and dispatches `connections` a second time (joined by PID) to annotate the Process tree card (`device_routes.cpp:74-93`, `live_kinds.hpp:33-35`, `device_routes.hpp:147-148`). These live-info dispatches are deliberately untracked (`execution_id=""`, no executions-drawer row — `server.cpp:19699-19710`).
 - **Not consumed by** daily-sync inventory, the TAR warehouse, or DEX. Nothing runs on a schedule.
+- **Sensitivity.** Rows carry local/remote IPs, ports, and a bare `pid` (or, on Linux, a socket inode) — enough to identify the device's network activity, but no process name/path, username, or software identifier is ever resolved here (that's `netstat`'s `attribution` action, not this plugin's job).
 - **Siblings.** `netstat`'s `netstat_list` action covers the same TCP table plus UDP, every connection state (not just LISTEN/ESTABLISHED), and always emits a real `state` field; its `attribution` action adds the owning process's name and executable path. `network_diag` is the narrower, faster read the dashboard's live-info cards actually dispatch; `netstat` is the fuller diagnostic table. Both share the macOS libproc walk (`agents/shared/macos_socket_walk.hpp`) to avoid a third hand-rolled copy.
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("device.network_diag.listening")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash f5009a752233
 
 ```
 == action=listening
@@ -118,17 +117,8 @@ listen|tcp|0.0.0.0|49664|1740
 listen|tcp|0.0.0.0|49665|1596
 listen|tcp|0.0.0.0|49666|2448
 listen|tcp|0.0.0.0|49667|3352
-listen|tcp|0.0.0.0|49668|4512
-listen|tcp|0.0.0.0|49676|10096
-listen|tcp|0.0.0.0|49706|1676
-listen|tcp|100.123.53.121|54669|12984
-listen|tcp|0.0.0.0|445|4
-listen|tcp|0.0.0.0|5357|4
-listen|tcp|0.0.0.0|5426|4
-listen|tcp|0.0.0.0|7680|8948
-listen|tcp|0.0.0.0|50051|13676
-listen|tcp|0.0.0.0|50052|13676
-[result_status] UNDECLARED / UNKNOWN /
+… 12 of 22 rows shown
+[result_status] UNDECLARED / UNKNOWN
 
 == action=connections
 conn|tcp|100.123.53.121|22|100.109.177.77|53137|5148
@@ -143,17 +133,11 @@ conn|tcp|127.0.0.1|49749|127.0.0.1|5432|13676
 conn|tcp|127.0.0.1|49750|127.0.0.1|49751|13800
 conn|tcp|127.0.0.1|49751|127.0.0.1|49750|13800
 conn|tcp|127.0.0.1|49754|127.0.0.1|8080|13800
-conn|tcp|127.0.0.1|49759|127.0.0.1|50051|13496
-conn|tcp|192.168.0.131|49794|172.187.86.73|443|5132
-conn|tcp|127.0.0.1|50051|127.0.0.1|49759|13676
-conn|tcp|127.0.0.1|50169|127.0.0.1|5432|13676
-conn|tcp|192.168.0.131|50525|192.200.0.106|443|12984
-conn|tcp|192.168.0.131|50526|176.58.92.254|443|12984
-conn|tcp|192.168.0.131|50710|20.42.73.25|443|5672
-[result_status] UNDECLARED / UNKNOWN /
+… 12 of 19 rows shown
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash f5009a752233
 
 ```
 == action=listening
@@ -169,9 +153,8 @@ listen|tcp|*|7000|973
 listen|tcp|*|5000|973
 listen|tcp|*|5000|973
 listen|tcp|*|3283|898
-listen|tcp|*|49429|872
-listen|tcp|*|49429|872
-[result_status] UNDECLARED / UNKNOWN /
+… 12 of 14 rows shown
+[result_status] UNDECLARED / UNKNOWN
 
 == action=connections
 conn|tcp|100.109.177.77|52882|100.123.53.121|22|9653
@@ -186,31 +169,18 @@ conn|tcp|192.168.0.66|52781|160.79.104.10|443|9039
 conn|tcp|192.168.0.66|52856|160.79.104.10|443|9039
 conn|tcp|192.168.0.66|52783|160.79.104.10|443|9039
 conn|tcp|192.168.0.66|52785|160.79.104.10|443|9039
-conn|tcp|192.168.0.66|52744|160.79.104.10|443|9001
-conn|tcp|192.168.0.66|52748|160.79.104.10|443|9001
-conn|tcp|192.168.0.66|52746|160.79.104.10|443|9001
-conn|tcp|192.168.0.66|52760|160.79.104.10|443|9001
-conn|tcp|192.168.0.66|52791|160.79.104.10|443|9001
-conn|tcp|192.168.0.66|52887|160.79.104.10|443|9001
-conn|tcp|192.168.0.66|52750|160.79.104.10|443|9001
-conn|tcp|192.168.0.66|52890|160.79.104.10|443|9001
-conn|tcp|192.168.0.66|52754|160.79.104.10|443|9001
-conn|tcp|192.168.0.66|52892|160.79.104.10|443|9001
-conn|tcp|192.168.0.66|52756|160.79.104.10|443|9001
-conn|tcp|192.168.0.66|52758|160.79.104.10|443|9001
-conn|tcp|192.168.0.66|52721|160.79.104.10|443|8979
-… 25 of 68 rows
-[result_status] UNDECLARED / UNKNOWN /
+… 12 of 68 rows shown
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash pending
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash f5009a752233
 
 ```
 == action=listening
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 
 == action=connections
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 ```
 <!-- END GENERATED -->
 
@@ -228,7 +198,6 @@ conn|tcp|192.168.0.66|52721|160.79.104.10|443|8979
 - Plugin: `agents/plugins/network_diag/src/network_diag_plugin.cpp`
 - Definitions: `content/definitions/network_diag.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_c.hpp`
-- Tests: `tests/unit/agent/test_wave3_pr31_macos_actions.cpp` (Darwin-only; drives the built `.dylib` through `LocalDispatcher` for `listening` and `connections`)
-- Privilege row: no row in `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/20260819-wave3-pr31-syscall-promotion.changed.md` · `changelog.d/2204-declarations-group-c.added.md`
+- Tests: none found by name
+- Privilege row: `docs/agent-privilege-model.md` (no row yet)
 <!-- END GENERATED -->

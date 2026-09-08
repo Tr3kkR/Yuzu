@@ -5,10 +5,10 @@
 |---|---|
 | **What it does** | RFC 864 character generator — streams rotating ASCII lines |
 | **Version** | 1.0.0 |
-| **Kind** | Action · mutating · on-demand (no scheduled gather) |
+| **Kind** | Action · mutating · gathered (testing.chargen.start, testing.chargen.stop) |
 | **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
 | **Actions** | `chargen_start` (definition `testing.chargen.start`) · `chargen_stop` (definition `testing.chargen.stop`) |
-| **Security** | securable `Execution` · operation Execute · risk Medium · dispatch Mutating · approval gate `chargen_start`: AdminOrApproval · `chargen_stop`: None |
+| **Security** | `chargen_start`: securable `Execution` · operation Execute · risk Medium · dispatch Mutating · approval gate AdminOrApproval; `chargen_stop`: securable `Execution` · operation Execute · risk Medium · dispatch Mutating · approval gate None |
 | **Roles** | execute: endpoint-admin · author: content-author |
 <!-- END GENERATED -->
 
@@ -35,10 +35,6 @@ flowchart LR
 |---|---|---|---|
 | `chargen_start` | ✅ supported · rung 1 · in-process | ✅ supported · rung 1 · in-process | ✅ supported · rung 1 · in-process |
 | `chargen_stop` | ✅ supported · rung 1 · in-process | ✅ supported · rung 1 · in-process | ✅ supported · rung 1 · in-process |
-
-**Declared limits per leg** (the descriptor's fallback text, verbatim):
-
-None declared — every leg's fallback column is `-`.
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -56,11 +52,9 @@ No external binaries, no subprocesses, no network access. The generator is pure 
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-| Action | Parameter | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `chargen_start` | `rate_ms` | int32 | No | `100` | Milliseconds between output lines. Default 100 (10 lines/sec). Minimum 1. |
-
-`chargen_stop` takes no parameters.
+| Definition | Parameter | Type | Required | Default | Constraints | Description |
+|---|---|---|---|---|---|---|
+| `testing.chargen.start` | `rate_ms` | int32 | no | 100 | - | Milliseconds between output lines. Default 100 (10 lines/sec). Minimum 1. |
 <!-- END GENERATED -->
 
 ### Outputs
@@ -68,17 +62,17 @@ No external binaries, no subprocesses, no network access. The generator is pure 
 Output is not a pipe-delimited row set like most plugins — each action streams one `output` message per `write_output()` call. `chargen_start` sends one message per RFC 864 line for as long as the session runs, plus a final `"chargen session ended"` message when it stops; `chargen_stop` sends exactly one message, the literal `"chargen stopped"`. Neither action has an empty-result placeholder: zero output means `execute()` has not yet returned control to the caller (see Caveats).
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`chargen_start` — `output`**
+**`testing.chargen.start` — `output`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `output` | string | RFC 864 line (72 chars) or the literal `chargen session ended` | W, M, L | ` !"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefg` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `output` | string | - | Windows, Linux, macOS | ` !"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefg` | One streamed line: an RFC 864 line (72 rotating printable ASCII characters, offset one position from the previous line), or the literal "chargen session ended" on the final line once the session stops. Values: free text — RFC 864 line, or the literal chargen session ended. |
 
-**`chargen_stop` — `output`**
+**`testing.chargen.stop` — `output`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `output` | string | literal `chargen stopped` | W, M, L | `chargen stopped` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `output` | string | - | Windows, Linux, macOS | `chargen stopped` | Confirmation message sent once every running chargen session has been signalled to stop. Values: free text — the literal chargen stopped. |
 <!-- END GENERATED -->
 
 ### Result status
@@ -90,43 +84,44 @@ This plugin does not set a typed result status; the agent records `UNDECLARED` a
 - **Instruction result only.** Both actions dispatch through `execute_instruction` (definitions `testing.chargen.start` / `testing.chargen.stop`); output lines travel as CommandResponse messages and land in the ResponseStore, queryable at `/api/responses/{id}`.
 - **Also reachable via a legacy REST sink.** `POST /api/chargen/start` and `POST /api/chargen/stop` forward straight to the same `chargen`/`chargen_start`/`chargen_stop` plugin-action pair through `forward_legacy_command`, bypassing the definition id; both routes are confined through the same dispatch chokepoint and RBAC gate as the definition-based path. `GET /chargen` (the old dashboard page) just redirects to `/`.
 - **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics. Nothing runs on a schedule (`gather.ttlSeconds: 0` on both definitions); the plugin only runs when explicitly dispatched.
+- **Sensitivity.** `output` rows are a fixed, rotating ASCII pattern (RFC 864) with no reference to the host — nothing that could identify a device, a person, or installed software.
 - **Siblings:** none — `chargen` is a standalone testing/benchmark plugin, not part of an inventory family.
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("testing.chargen.start")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 5789eff1c673
 
 ```
 == action=chargen_start
-[not captured] driver timed out after 15s (no result status emitted)
+[not captured] Mutating/Reversible: not executed on a live host
 
 == action=chargen_stop
 chargen stopped
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 5789eff1c673
 
 ```
 == action=chargen_start
-[not captured] driver timed out after 15s (no result status emitted)
+[not captured] Mutating/Reversible: not executed on a live host
 
 == action=chargen_stop
 chargen stopped
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash pending
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 5789eff1c673
 
 ```
 == action=chargen_start
-[not captured] driver timed out after 60s (no result status emitted)
+[not captured] Mutating/Reversible: not executed on a live host
 
 == action=chargen_stop
 chargen stopped
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 ```
 <!-- END GENERATED -->
 
@@ -144,7 +139,6 @@ chargen stopped
 - Plugin: `agents/plugins/chargen/src/chargen_plugin.cpp`
 - Definitions: `content/definitions/chargen.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_b.hpp`
-- Tests: no dedicated unit test file for this plugin; covered incidentally by `tests/unit/server/test_dispatch_chokepoint.cpp` (dispatch/authz), `tests/unit/server/test_page_routes.cpp` (legacy `/chargen` redirect), `tests/unit/server/test_body_cap_route_inventory.cpp` (legacy route body-size classification), and `tests/fixtures/1398_pair_gate_table.json` (gate table)
-- Privilege row: no row in `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2204-declarations-group-b.added.md` · `changelog.d/1.9-dispatch-chokepoint.security.md` · `changelog.d/1788-command-per-device-visibility.security.md`
+- Tests: none found by name
+- Privilege row: `docs/agent-privilege-model.md` (no row yet)
 <!-- END GENERATED -->

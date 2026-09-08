@@ -5,10 +5,10 @@
 |---|---|
 | **What it does** | Reports mounted filesystems, per-mount quota-subsystem state, and snapshot-capable volumes |
 | **Version** | 1.0.0 |
-| **Kind** | Collector · read-only · on-demand (no scheduled gather) |
-| **Platforms** | Windows 🟡 constrained · macOS 🟡 mixed · Linux 🟡 constrained |
-| **Actions** | `mounts` (definition `crossplatform.storage.mounts`) · `quotas` (`crossplatform.storage.quotas`) · `snapshots` (`crossplatform.storage.snapshots`) |
-| **Security** | securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate none |
+| **Kind** | Collector · read-only · gathered (crossplatform.storage.mounts, crossplatform.storage.quotas, crossplatform.storage.snapshots) |
+| **Platforms** | Windows 🟡 constrained · macOS ✅ · Linux 🟡 constrained |
+| **Actions** | `mounts` (definition `crossplatform.storage.mounts`) · `quotas` (definition `crossplatform.storage.quotas`) · `snapshots` (definition `crossplatform.storage.snapshots`) |
+| **Security** | securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
 | **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
 
@@ -34,19 +34,20 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `mounts` | 🟡 constrained · rung 1 · `FindFirstVolumeW` + `GetVolumeInformationW` + `GetDriveTypeW` + `GetDiskFreeSpaceExW` | ✅ supported · rung 1 · `getmntinfo(3)` `MNT_NOWAIT` | 🟡 constrained · rung 1 · `/proc/self/mountinfo` + `statvfs(3)` |
-| `quotas` | 🟡 constrained · rung 1 · `IDiskQuotaControl` (`dskquota.h`) | 🟡 constrained · rung 1 · `getattrlist(2)` `ATTR_VOL_QUOTA_SIZE`/`ATTR_VOL_RESERVED_SIZE` | 🟡 constrained · rung 1 · `quotactl(2)` `Q_GETFMT` |
-| `snapshots` | 🟡 constrained · rung 1 · `IVssBackupComponents::Query` (VSS) | ✅ supported · rung 1 · `fs_snapshot_list(2)` | 🟡 constrained · rung 1 · `/proc/self/mountinfo` btrfs subvol + device-mapper source detection |
+| `mounts` | 🟡 constrained · rung 1 · FindFirstVolumeW + GetVolumeInformationW + GetDriveTypeW + GetDiskFreeSpaceExW | ✅ supported · rung 1 · getmntinfo(3) MNT_NOWAIT | 🟡 constrained · rung 1 · /proc/self/mountinfo + statvfs(3) |
+| `quotas` | 🟡 constrained · rung 1 · IDiskQuotaControl (dskquota.h) | 🟡 constrained · rung 1 · getattrlist(2) ATTR_VOL_QUOTA_SIZE/ATTR_VOL_RESERVED_SIZE | 🟡 constrained · rung 1 · quotactl(2) Q_GETFMT |
+| `snapshots` | 🟡 constrained · rung 1 · IVssBackupComponents::Query (VSS) | ✅ supported · rung 1 · fs_snapshot_list(2) | 🟡 constrained · rung 1 · /proc/self/mountinfo btrfs subvol + device-mapper source detection |
 
-**Declared limits per leg** (the descriptor's fallback text, verbatim):
+**Declared limits per leg** (descriptor fallback text, verbatim):
 
-- **`mounts` / Windows** — enumerates local volumes only; a mapped network drive is not a volume and is not listed, and no per-mount option string exists so that column reads '-'.
-- **`mounts` / Linux** — capacity columns are omitted for network filesystems (nfs/cifs/smb/ceph/afs and network FUSE mounts) because a statvfs against an unreachable server blocks the dispatch worker indefinitely; the mount itself is still listed.
-- **`quotas` / Windows** — volume quota state and default limit/threshold only, opened read-only; per-user quota entries are not enumerated; a volume that denies the query reports permission_denied; a build whose SDK lacks dskquota.h reports unavailable; compiled and linked on a live Windows host but not asserted against one with quotas configured, so the populated-quota path is unexercised.
-- **`quotas` / macOS** — volume-level quota and reserved size only; per-user and per-group quotas do not exist on APFS (quotactl returns ENOTSUP on every APFS mount while succeeding on HFS+), so no per-identity rows are reported; a volume the agent may not read reports permission_denied.
-- **`quotas` / Linux** — reports per-mount quota-subsystem state only; per-user and per-group limits are not enumerated, and a mount whose source is not a block device (overlay, tmpfs, network) reports no_block_device; a walk in which every probed device returns EPERM/EACCES reports permission_denied rather than a generic degradation.
-- **`snapshots` / Windows** — enumerates VSS shadow copies machine-wide, one row per snapshot, reporting its snapshot ID and shadow-copy device path but no size or per-file content; REQUIRES ADMINISTRATIVE RIGHTS — the agent runs as LocalSystem today so this succeeds; under an unprivileged service account CreateVssBackupComponents returns E_ACCESSDENIED and the action reports permission_denied rather than an empty snapshot set; any VSS failure is reported distinctly from a genuinely empty set and degrades the result status.
-- **`snapshots` / Linux** — reports snapshot-capable volumes and the mounted btrfs subvolume identity, not a snapshot inventory: a device-mapper source may be dm-crypt, dm-multipath or dm-integrity rather than a snapshot-capable LV, enumerating unmounted btrfs snapshots needs CAP_SYS_ADMIN via BTRFS_IOC_TREE_SEARCH, and telling an LVM snapshot LV from a linear LV needs a device-mapper DM_TABLE_STATUS ioctl -- none of which this read-only plugin performs.
+- **`mounts` / Windows** — enumerates local volumes only; a mapped network drive is not a volume and is not listed, and no per-mount option string exists so that column reads '-'
+- **`mounts` / Linux** — capacity columns are omitted for network filesystems (nfs/cifs/smb/ceph/afs and network FUSE mounts) because a statvfs against an unreachable server blocks the dispatch worker indefinitely; the mount itself is still listed
+- **`quotas` / Windows** — volume quota state and default limit/threshold only, opened read-only; per-user quota entries are not enumerated; a volume that denies the query reports permission_denied; a build whose SDK lacks dskquota.h reports unavailable; compiled and linked on a live Windows host but not asserted against one with quotas configured, so the populated-quota path is unexercised
+- **`quotas` / macOS** — volume-level quota and reserved size only; per-user and per-group quotas do not exist on APFS (quotactl returns ENOTSUP on every APFS mount while succeeding on HFS+), so no per-identity rows are reported; a volume the agent may not read reports permission_denied
+- **`quotas` / Linux** — reports per-mount quota-subsystem state only; per-user and per-group limits are not enumerated, and a mount whose source is not a block device (overlay, tmpfs, network) reports no_block_device; a walk in which every probed device returns EPERM/EACCES reports permission_denied rather than a generic degradation
+- **`snapshots` / Windows** — enumerates VSS shadow copies machine-wide, one row per snapshot, reporting its snapshot ID and shadow-copy device path but no size or per-file content; REQUIRES ADMINISTRATIVE RIGHTS -- the agent runs as LocalSystem today so this succeeds; under an unprivileged service account CreateVssBackupComponents returns E_ACCESSDENIED and the action reports permission_denied rather than an empty snapshot set; any VSS failure is reported distinctly from a genuinely empty set and degrades the result status
+- **`snapshots` / macOS** — one row per (mount point, snapshot): an APFS snapshot visible under two mount points of the same volume lineage is reported under each
+- **`snapshots` / Linux** — reports snapshot-capable volumes and the mounted btrfs subvolume identity, not a snapshot inventory: a device-mapper source may be dm-crypt, dm-multipath or dm-integrity rather than a snapshot-capable LV, enumerating unmounted btrfs snapshots needs CAP_SYS_ADMIN via BTRFS_IOC_TREE_SEARCH, and telling an LVM snapshot LV from a linear LV needs a device-mapper DM_TABLE_STATUS ioctl -- none of which this read-only plugin performs
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -64,11 +65,7 @@ No external binaries, no subprocesses. No network access is initiated by this pl
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-`mounts` takes no parameters.
-
-`quotas` takes no parameters.
-
-`snapshots` takes no parameters.
+No action takes parameters.
 <!-- END GENERATED -->
 
 ### Outputs
@@ -76,38 +73,38 @@ No external binaries, no subprocesses. No network access is initiated by this pl
 Pipe-delimited rows. Field 0 is a literal discriminator (`mount`, `quota`, or `snapshot`); a `std::nullopt` byte count and any inapplicable/unread text field render as the literal `-`, which never means zero. Fields carrying arbitrary OS-supplied text go through the shared `safe_output_field` escaper; fields drawn from a fixed vocabulary (`flags`, the quota `state` token, `scope`, `kind`) are emitted verbatim. A leg that finds nothing for `snapshots` still emits one `kind=none` row rather than zero rows, so an empty result can never be misread as "action did not run".
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`mounts` — `mount|mount_point|device|fstype|options|total_bytes|free_bytes|available_bytes|flags`**
+**`crossplatform.storage.mounts` — `mount_point|device|fstype|options|total_bytes|free_bytes|available_bytes|flags`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `mount_point` | string | path (L, M) or drive/volume path (W) | W, M, L | `/` · `C:/` |
-| `device` | string | OS-reported mount source / volume identifier | W, M, L | `/dev/vda1` · `/dev/disk3s1s1` · `//?/Volume{c9a5f911-…}/` |
-| `fstype` | string | OS-supplied filesystem type name | W, M, L | `ext4` · `apfs` · `NTFS` |
-| `options` | string | comma-separated mount options, or `-` | L only — W and M always emit `-` (no per-mount option string on either leg) | `rw,relatime` |
-| `total_bytes` | int64 or `-` | raw capacity | W, M, L (Linux omits it — nullopt — for network filesystem types) | `485473984512` |
-| `free_bytes` | int64 or `-` | free space | W, M, L (same Linux network-fs omission) | `432465076224` |
-| `available_bytes` | int64 or `-` | space available to an unprivileged caller | W, M, L (same Linux network-fs omission) | `407729119232` |
-| `flags` | enum (comma-joined) | fixed vocabulary: `ro` `rw` `nosuid` `nodev` `noexec` `noatime` `relatime` `removable` `remote` `cdrom` — any other option token is dropped, never passed through | W, M, L | `rw,relatime` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `mount_point` | string | - | Windows, Linux, macOS | `/` | Filesystem path (Linux, macOS) or drive/volume path (Windows) the volume is mounted at. Values: free text. |
+| `device` | string | - | Windows, Linux, macOS | `/dev/vda1` | OS-reported mount source or volume identifier backing this mount point. Values: free text. |
+| `fstype` | string | - | Windows, Linux, macOS | `ext4` | OS-supplied filesystem type name. Values: free text. |
+| `options` | string | - | Linux | `rw,relatime` | Comma-separated mount options as reported by the OS, or "-" when no per-mount option string exists. Values: free text or "-". |
+| `total_bytes` | int64 | - | Windows, Linux, macOS | `485473984512` | Raw filesystem capacity in bytes, or "-" when not read (omitted for network filesystems on Linux to avoid a blocking statvfs call). Values: integer or "-". |
+| `free_bytes` | int64 | - | Windows, Linux, macOS | `432465076224` | Free space in bytes, or "-" under the same conditions as total_bytes. Values: integer or "-". |
+| `available_bytes` | int64 | - | Windows, Linux, macOS | `407729119232` | Space available to an unprivileged caller in bytes, or "-" under the same conditions as total_bytes. Values: integer or "-". |
+| `flags` | string | - | Windows, Linux, macOS | `rw,relatime` | Comma-joined mount flags drawn from a fixed vocabulary; any option outside the vocabulary is dropped rather than passed through. Values: ro, rw, nosuid, nodev, noexec, noatime, relatime, removable, remote, cdrom. |
 
-**`quotas` — `quota|mount_point|scope|state|limit_bytes|reserved_bytes|detail`**
+**`crossplatform.storage.quotas` — `mount_point|scope|state|limit_bytes|reserved_bytes|detail`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `mount_point` | string | path or volume path, or `-` on the aggregate Linux `no_block_device` row | W, M, L | `/` · `C:/` |
-| `scope` | string | fixed literal `volume` (callers cannot vary it in this plugin) | W, M, L | `volume` |
-| `state` | enum | `configured` `none` `not_enabled` `unsupported_fs` `no_block_device` `permission_denied` `unavailable` | W, M, L | `not_enabled` |
-| `limit_bytes` | int64 or `-` | quota limit; only ever numeric when `state=configured` | W, M — Linux never reports a number (no single volume-level limit exists on Linux; presence/format only) | `-` |
-| `reserved_bytes` | int64 or `-` | reserved size; same availability as `limit_bytes` | W, M | `-` |
-| `detail` | string | free text or `-` | W, M, L | `ESRCH` · `volume has no drive letter` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `mount_point` | string | - | Windows, Linux, macOS | `/` | Filesystem path or volume path the quota state applies to, or "-" on the aggregate Linux no_block_device row. Values: free text or "-". |
+| `scope` | string | - | Windows, Linux, macOS | `volume` | Fixed literal identifying the quota scope; this plugin never reports a narrower scope. Values: volume. |
+| `state` | string | - | Windows, Linux, macOS | `not_enabled` | Classified quota-subsystem state for this volume. Values: configured, none, not_enabled, unsupported_fs, no_block_device, permission_denied, unavailable. |
+| `limit_bytes` | int64 | - | Windows, macOS | `-` | Default quota limit in bytes; only populated when state is configured. Values: integer or "-". |
+| `reserved_bytes` | int64 | - | Windows, macOS | `-` | Reserved/threshold size in bytes; only populated when state is configured. Values: integer or "-". |
+| `detail` | string | - | Windows, Linux, macOS | `ESRCH` | Free-text reason or errno/HRESULT name explaining the state, or "-" when nothing further applies. Values: free text or "-". |
 
-**`snapshots` — `snapshot|mount_point|name|kind|detail`**
+**`crossplatform.storage.snapshots` — `mount_point|name|kind|detail`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `mount_point` | string | path or volume path, or `-` on a `kind=none` sentinel row | W, M, L | `/` · `C:/` |
-| `name` | string | snapshot GUID (W), APFS snapshot name (M), btrfs subvol/subvolid or device-mapper source (L), or `-` on a `none` row | W, M, L | `{9F2F924B-2DD2-46D5-A779-709B2F6FFB9B}` · `com.apple.os.update-6058…` |
-| `kind` | enum | fixed vocabulary: `apfs` `btrfs_subvolume` `device_mapper` `vss` `none` | W: `vss`/`none` · M: `apfs`/`none` · L: `btrfs_subvolume`/`device_mapper`/`none` | `vss` |
-| `detail` | string | free text or `-`; on a `none` row this always carries an operator-actionable reason, never blanked | W, M, L | `//?/GLOBALROOT/Device/HarddiskVolumeShadowCopy1` · `no btrfs or device-mapper mount found` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `mount_point` | string | - | Windows, Linux, macOS | `C:/` | Filesystem path or volume path the snapshot (or snapshot-capable volume) belongs to, or "-" on a kind=none sentinel row. Values: free text or "-". |
+| `name` | string | - | Windows, Linux, macOS | `{9F2F924B-2DD2-46D5-A779-709B2F6FFB9B}` | Snapshot identifier — a GUID on Windows, an APFS snapshot name on macOS, a btrfs subvolume path/id or device-mapper source on Linux — or "-" on a none row. Values: free text or "-". |
+| `kind` | string | - | Windows, Linux, macOS | `vss` | Fixed-vocabulary classification of what this row represents. Values: apfs, btrfs_subvolume, device_mapper, vss, none. |
+| `detail` | string | - | Windows, Linux, macOS | `//?/GLOBALROOT/Device/HarddiskVolumeShadowCopy1` | Free-text detail — a device path, an operator-actionable reason on a none row, or "-". Values: free text or "-". |
 <!-- END GENERATED -->
 
 ### Result status
@@ -118,19 +115,24 @@ Surfaced as `plugin_result_status` on the command response. `mark_result_partial
 |---|---|---|---|
 | `UNDECLARED` (agent-derived `OK`) | — | — | clean read on every action; both captured Unix samples for all three actions, and the Windows `snapshots` sample |
 | `CONSTRAINED` | partial | `linux:mountinfo`, `linux:mountinfo:malformed`, `macos:getmntinfo`, `macos:getattrlist`, `macos:fs_snapshot_list`, `windows:volume_enum`, `windows:dskquota`, `windows:vss` | an OS call failed, a malformed/truncated mountinfo, an unrecognized quota state, or a VSS step (`SetContext`, a non-snapshot object) narrowed but did not stop the walk |
+| `CONSTRAINED` | partial | `linux:mountinfo:unreadable`, `linux:mountinfo:entry_cap`, `linux:mountinfo:quotas`, `linux:mountinfo:entry_cap:quotas`, `linux:mountinfo:malformed:quotas`, `linux:mountinfo:snapshots`, `linux:mountinfo:entry_cap:snapshots`, `linux:mountinfo:malformed:snapshots`, `linux:statvfs` | Linux, per action: the `/proc/self/mountinfo` read for `mounts` (`:unreadable`/`:entry_cap`) or for `quotas`/`snapshots` (action-suffixed `:quotas`/`:snapshots` variants) failed outright, hit its entry-count cap, or contained a malformed line; or a per-mount `statvfs(3)` call failed (`linux:statvfs`, `mounts` only) |
 | `PERMISSION_DENIED` | partial | `linux:quotactl` (every probed device `EPERM`/`EACCES`), `macos:getattrlist`, `macos:fs_snapshot_list` (`EACCES`/`EPERM` on a volume root), `windows:dskquota` (`E_ACCESSDENIED`), `windows:vss` (`E_ACCESSDENIED`) | a privilege denial specifically, reported distinctly from every other degradation so a status-keyed consumer can tell "not allowed to read this" from a generic failure |
 
 ### Where the data goes
 
 - **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}` and aggregatable (`mounts` groups by `fstype`, `quotas` by `state`, `snapshots` by `kind`).
 - **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — the plugin's only server-side reference is its `capability_decls` registration; nothing runs on a schedule beyond the per-execution `gather.ttlSeconds` response deadline.
+- **Sensitivity.** Rows carry filesystem and volume metadata only — mount points, device/volume
+  paths (`/dev/vda1`, a Windows volume GUID), capacity figures, quota state, and snapshot
+  GUIDs/names — nothing that names a specific person, a specific installed software product, or a
+  device beyond its id (no hostname, MAC, or username in any column).
 - **Siblings:** `crossplatform.storage.smart`, `crossplatform.storage.volumes` (`disk_actions` — physical drive health and the drive/volume join), `crossplatform.storage.free` (`disk_space`).
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("crossplatform.storage.mounts")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 6094b93f5b9d
 
 ```
 == action=mounts
@@ -154,10 +156,10 @@ snapshot|C:/|{9F2F924B-2DD2-46D5-A779-709B2F6FFB9B}|vss|//?/GLOBALROOT/Device/Ha
 snapshot|C:/|{E6484C8F-1467-4FC8-8577-85677F599D41}|vss|//?/GLOBALROOT/Device/HarddiskVolumeShadowCopy2
 snapshot|C:/|{671203BF-A8FA-4ED5-9360-4CBB9B65272E}|vss|//?/GLOBALROOT/Device/HarddiskVolumeShadowCopy3
 snapshot|C:/|{21E68FE4-CB60-454D-A893-9420AD8EE750}|vss|//?/GLOBALROOT/Device/HarddiskVolumeShadowCopy4
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 6094b93f5b9d
 
 ```
 == action=mounts
@@ -171,7 +173,7 @@ mount|/System/Volumes/iSCPreboot|/dev/disk1s1|apfs|-|524288000|506204160|5062041
 mount|/System/Volumes/Hardware|/dev/disk1s3|apfs|-|524288000|506204160|506204160|rw
 mount|/System/Volumes/Data|/dev/disk3s5|apfs|-|494384795648|313557196800|313557196800|rw
 mount|/System/Volumes/Data/home|map auto_home|autofs|-|0|0|0|rw
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 
 == action=quotas
 quota|/|volume|none|-|-|volume-level only; per-user/group quotas are unsupported on APFS (quotactl returns ENOTSUP on every APFS mount, though it succeeds on HFS+)
@@ -184,14 +186,14 @@ quota|/System/Volumes/iSCPreboot|volume|none|-|-|volume-level only; per-user/gro
 quota|/System/Volumes/Hardware|volume|none|-|-|volume-level only; per-user/group quotas are unsupported on APFS (quotactl returns ENOTSUP on every APFS mount, though it succeeds on HFS+)
 quota|/System/Volumes/Data|volume|none|-|-|volume-level only; per-user/group quotas are unsupported on APFS (quotactl returns ENOTSUP on every APFS mount, though it succeeds on HFS+)
 quota|/System/Volumes/Data/home|volume|unsupported_fs|-|-|volume-level only; per-user/group quotas are unsupported on APFS (quotactl returns ENOTSUP on every APFS mount, though it succeeds on HFS+)
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 
 == action=snapshots
 snapshot|/|com.apple.os.update-60587424F5399FC05D957DF05B4D2F65543462495C77AEF520F790FBB57CB212|apfs|-
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash pending
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 6094b93f5b9d
 
 ```
 == action=mounts
@@ -206,18 +208,18 @@ mount|/dev/shm|shm|tmpfs|rw,nosuid,nodev,noexec,relatime|67108864|67108864|67108
 mount|/etc/resolv.conf|/dev/vda1|ext4|rw,relatime|485473984512|432465076224|407729119232|rw,relatime
 mount|/etc/hostname|/dev/vda1|ext4|rw,relatime|485473984512|432465076224|407729119232|rw,relatime
 mount|/etc/hosts|/dev/vda1|ext4|rw,relatime|485473984512|432465076224|407729119232|rw,relatime
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 
 == action=quotas
 quota|/etc/resolv.conf|volume|not_enabled|-|-|ESRCH
 quota|/etc/hostname|volume|not_enabled|-|-|ESRCH
 quota|/etc/hosts|volume|not_enabled|-|-|ESRCH
 quota|-|volume|no_block_device|-|-|8 non-block-device mounts (overlay/tmpfs/virtual/network) not quota-capable
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 
 == action=snapshots
 snapshot|-|-|none|no btrfs or device-mapper mount found
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 ```
 <!-- END GENERATED -->
 
@@ -232,10 +234,9 @@ snapshot|-|-|none|no btrfs or device-mapper mount found
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/filesystem_posture/src/filesystem_posture_plugin.cpp` (descriptor legs) · `_linux.cpp` · `_macos.cpp` · `_win.cpp` · `_legs.hpp` (row schema, status seam) · `_parsers.hpp` (pure parsing/classification logic)
+- Plugin: `agents/plugins/filesystem_posture/src/filesystem_posture_legs.hpp` · `agents/plugins/filesystem_posture/src/filesystem_posture_linux.cpp` · `agents/plugins/filesystem_posture/src/filesystem_posture_macos.cpp` · `agents/plugins/filesystem_posture/src/filesystem_posture_parsers.hpp` · `agents/plugins/filesystem_posture/src/filesystem_posture_plugin.cpp` · `agents/plugins/filesystem_posture/src/filesystem_posture_win.cpp`
 - Definitions: `content/definitions/filesystem_posture.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_filesystem_posture.hpp`
 - Tests: `tests/unit/test_filesystem_posture_local_dispatcher.cpp` · `tests/unit/test_filesystem_posture_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/wave6-pr61b-filesystem-posture.added.md`
 <!-- END GENERATED -->

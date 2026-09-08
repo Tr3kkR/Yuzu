@@ -5,11 +5,11 @@
 |---|---|
 | **What it does** | Battery, thermal, and power-plan inventory, plus a gated power-plan switch |
 | **Version** | 1.0.0 |
-| **Kind** | Collector + Action · read-only (`battery`, `thermal`, `power_plan`) + mutating (`set_power_plan`) · on-demand (`gather.ttlSeconds` is a response-cache TTL only; no scheduled runner) |
-| **Platforms** | Windows 🟡 mixed (constrained: `thermal`) · macOS 🟡 mixed (constrained: `thermal`; unsupported: `power_plan`, `set_power_plan`) · Linux 🟡 mixed (constrained: `battery`, `thermal`; `power_plan`/`set_power_plan` not implemented) |
-| **Actions** | `battery` (definition `crossplatform.power.battery`) · `thermal` (`crossplatform.power.thermal`) · `power_plan` (`crossplatform.power.power_plan`) · `set_power_plan` (`crossplatform.power.set_power_plan`) |
-| **Security** | `battery`/`thermal`/`power_plan`: securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate none — `set_power_plan`: securable `PowerManagement` · operation Write · risk Medium · dispatch Destructive · approval gate AdminOrApproval |
-| **Roles** | `battery`/`thermal`/`power_plan`: execute endpoint-admin, endpoint-operator · author content-author — `set_power_plan`: execute endpoint-admin · author content-author |
+| **Kind** | Action · mutating · gathered (crossplatform.power.battery, crossplatform.power.thermal, crossplatform.power.power_plan, crossplatform.power.set_power_plan) |
+| **Platforms** | Windows ✅ · macOS ✅ · Linux 🟡 constrained |
+| **Actions** | `battery` (definition `crossplatform.power.battery`) · `power_plan` (definition `crossplatform.power.power_plan`) · `set_power_plan` (definition `crossplatform.power.set_power_plan`) · `thermal` (definition `crossplatform.power.thermal`) |
+| **Security** | `battery`: securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `thermal`: securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `power_plan`: securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `set_power_plan`: securable `PowerManagement` · operation Write · risk Medium · dispatch Destructive · approval gate AdminOrApproval |
+| **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
 
 ## How it works
@@ -33,24 +33,24 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `battery` | ✅ supported · rung 1 · `GetSystemPowerStatus + CallNtPowerInformation(SystemBatteryState)` | ✅ supported · rung 1 · `IOPSCopyPowerSourcesInfo/IOPSCopyPowerSourcesList` | 🟡 constrained · rung 1 · `/sys/class/power_supply uevent parsing` |
-| `thermal` | 🟡 constrained · rung 1 · `PDH \Thermal Zone Information(*)\Temperature` | 🟡 constrained · rung 1 · `NSProcessInfo.thermalState + IOPMGetThermalWarningLevel` | 🟡 constrained · rung 1 · `/sys/class/thermal zone parsing` |
-| `power_plan` | ✅ supported · rung 1 · `PowrProf PowerEnumerate + PowerReadFriendlyName + PowerGetActiveScheme` | ⛔ unsupported · no mechanism bound | ⛔ planned · rung 1 · `platform_profile` |
-| `set_power_plan` | ✅ supported · rung 1 · `PowrProf PowerSetActiveScheme` | ⛔ unsupported · no mechanism bound | ⛔ planned · rung 1 · `platform_profile` |
+| `battery` | ✅ supported · rung 1 · GetSystemPowerStatus + CallNtPowerInformation(SystemBatteryState) | ✅ supported · rung 1 · IOPSCopyPowerSourcesInfo/IOPSCopyPowerSourcesList | 🟡 constrained · rung 1 · /sys/class/power_supply uevent parsing |
+| `power_plan` | ✅ supported · rung 1 · PowrProf PowerEnumerate + PowerReadFriendlyName + PowerGetActiveScheme | ⛔ unsupported | 🟡 planned · rung 1 · platform_profile |
+| `set_power_plan` | ✅ supported · rung 1 · PowrProf PowerSetActiveScheme | ⛔ unsupported | 🟡 planned · rung 1 · platform_profile |
+| `thermal` | 🟡 constrained · rung 1 · PDH \\Thermal Zone Information(*)\\Temperature | 🟡 constrained · rung 1 · NSProcessInfo.thermalState + IOPMGetThermalWarningLevel | 🟡 constrained · rung 1 · /sys/class/thermal zone parsing |
 
-**Declared limits per leg** (the descriptor's fallback text, verbatim):
+**Declared limits per leg** (descriptor fallback text, verbatim):
 
-- **`battery` / Windows** — no-system-battery path measured live on the-rig (BatteryFlag=128); the battery-PRESENT path is now verified on real hardware (HP ZBook Firefly, PR #4009 review), which is what caught the AC-resting state being reported as unknown rather than not_charging.
-- **`battery` / macOS** — IOPS is used deliberately over the AppleSmartBattery IORegistry node, which is present, matched and active even on a battery-less Mac mini and would report a phantom battery; the battery-PRESENT path is fixture-tested and UNVERIFIED on real Mac battery hardware — the run host was a desktop.
-- **`battery` / Linux** — fixture-verified; no live Linux venue in this run.
-- **`thermal` / Windows** — zero live counter instances is the measured normal case on desktop hardware (the-rig, 2026-09-04); reports no_thermal_zones_exposed as an explicit success, never an error or a fabricated zero.
-- **`thermal` / macOS** — reports a 4-level thermal-pressure enum, never a temperature reading.
-- **`thermal` / Linux** — fixture-verified; no live Linux venue in this run.
-- **`power_plan` / Windows** — 4 schemes verified live on the-rig, 2026-09-04 (agrees with powercfg /list).
-- **`power_plan` / macOS** — macOS has no named power schemes; IOPMSetPMPreferences is SPI — not adopted.
-- **`power_plan` / Linux** — declared only; not implemented in this package.
-- **`set_power_plan` / macOS** — macOS has no named power schemes; IOPMSetPMPreferences is SPI — not adopted.
-- **`set_power_plan` / Linux** — declared only; not implemented in this package.
+- **`battery` / Windows** — no-system-battery path measured live on the-rig (BatteryFlag=128); the battery-PRESENT path is now verified on real hardware (HP ZBook Firefly, PR #4009 review), which is what caught the AC-resting state being reported as unknown rather than not_charging
+- **`battery` / macOS** — IOPS is used deliberately over the AppleSmartBattery IORegistry node, which is present, matched and active even on a battery-less Mac mini and would report a phantom battery; the battery-PRESENT path is fixture-tested and UNVERIFIED on real Mac battery hardware — the run host was a desktop
+- **`battery` / Linux** — fixture-verified; no live Linux venue in this run
+- **`power_plan` / Windows** — 4 schemes verified live on the-rig, 2026-09-04 (agrees with powercfg /list)
+- **`power_plan` / macOS** — macOS has no named power schemes; IOPMSetPMPreferences is SPI — not adopted
+- **`power_plan` / Linux** — declared only; not implemented in this package
+- **`set_power_plan` / macOS** — macOS has no named power schemes; IOPMSetPMPreferences is SPI — not adopted
+- **`set_power_plan` / Linux** — declared only; not implemented in this package
+- **`thermal` / Windows** — zero live counter instances is the measured normal case on desktop hardware (the-rig, 2026-09-04); reports no_thermal_zones_exposed as an explicit success, never an error or a fabricated zero
+- **`thermal` / macOS** — reports a 4-level thermal-pressure enum, never a temperature reading
+- **`thermal` / Linux** — fixture-verified; no live Linux venue in this run
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -68,11 +68,9 @@ No external binaries, no subprocesses, no network access — "no WMI, no powercf
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-| Action | Parameter | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `set_power_plan` | `scheme` | string | yes | — | Target power scheme — a GUID, or a friendly name that must match exactly one live scheme (case-insensitive); max 256 characters |
-
-`battery`, `thermal`, and `power_plan` take no parameters.
+| Definition | Parameter | Type | Required | Default | Constraints | Description |
+|---|---|---|---|---|---|---|
+| `crossplatform.power.set_power_plan` | `scheme` | string | yes | - | - | Target power scheme — a GUID, or a friendly name that must match exactly one live scheme (case-insensitive). |
 <!-- END GENERATED -->
 
 ### Outputs
@@ -80,42 +78,42 @@ No external binaries, no subprocesses, no network access — "no WMI, no powercf
 Pipe-delimited rows via `write_output()`, one line per record. `thermal`'s field count varies by row (see below); every other action's row has a fixed field count. `-` marks an absent field, never an empty one.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`battery` — `battery|present|state|percent|time_to_empty_min|cycle_count|health_percent`**
+**`crossplatform.power.battery` — `present|state|percent|time_to_empty_min|cycle_count|health_percent`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `present` | int flag | `1` (battery present), `0` (none) — emitted as a digit, not `true`/`false` (`power_health_parsers.hpp:99`) | W, M, L | `0` |
-| `state` | string | `charging` `discharging` `full` `not_charging` `ac_no_battery` `unknown` | W, M, L | `ac_no_battery` |
-| `percent` | int64 | 0-100 or `-1` (unknown) | W, M, L | `-1` |
-| `time_to_empty_min` | int64 | non-negative or `-1` (unknown) | W, M, L | `-1` |
-| `cycle_count` | int64 | non-negative or `-1` (unknown / not exposed) | L only (Windows/macOS have no source) | `-1` |
-| `health_percent` | int64 | 0-100 or `-1` (unknown / not exposed) | L only (Windows/macOS have no source) | `-1` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `present` | boolean | - | Windows, Linux, macOS | `0` | Whether a power source was found by the platform mechanism. Values: 1 (battery present), 0 (none) — a digit, never true/false. |
+| `state` | string | - | Windows, Linux, macOS | `ac_no_battery` | Reported battery state. Values: charging, discharging, full, not_charging, ac_no_battery, unknown. |
+| `percent` | int64 | - | Windows, Linux, macOS | `-1` | Battery charge percentage. Values: 0-100, or -1 (unknown). |
+| `time_to_empty_min` | int64 | - | Windows, Linux, macOS | `-1` | Estimated minutes until empty. Values: non-negative integer, or -1 (unknown). |
+| `cycle_count` | int64 | - | Linux | `-1` | Battery charge-cycle count. Neither GetSystemPowerStatus/ CallNtPowerInformation (Windows) nor IOPSKeys.h (macOS) expose a cycle counter, so this is structurally -1 on those two platforms; only the Linux leg has a real source (POWER_SUPPLY_CYCLE_COUNT). Values: non-negative integer, or -1 (unknown / not exposed by the platform mechanism). |
+| `health_percent` | int64 | - | Linux | `-1` | Battery health as current-full-charge/design-capacity, derived only when the Linux kernel driver exposes both CHARGE_FULL and CHARGE_FULL_DESIGN. Windows and macOS have no equivalent source and are structurally -1. Values: 0-100, or -1 (unknown / not exposed by the platform mechanism). |
 
-**`thermal` — `thermal|status|zone_or_detail|celsius`** (`celsius` is omitted entirely, not `-`, on any non-ok row and on every macOS row; an ok row with real zones repeats one row per zone)
+**`crossplatform.power.power_plan` — `guid|friendly_name|active|status`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `status` | string | `ok` `constrained` `unavailable` | W, M, L | `ok` |
-| `zone_or_detail` | string | zone/sensor name (W/L ok row), `nominal`\|`fair`\|`serious`\|`critical` (M ok row), or a fixed failure/constrained token | W, M, L | `nominal` |
-| `celsius` | number | decimal degrees Celsius; field absent otherwise | W, L only, and only on an ok row with a real zone | no sample captured this field |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `guid` | string | - | Windows | `381b4222-f694-41f0-9685-ff5bb260df2e` | Power scheme GUID, or "-" when no scheme rows were produced. Values: GUID string, or -. |
+| `friendly_name` | string | - | Windows | `Balanced` | Operator-visible scheme name (Windows PowerReadFriendlyName; operator-settable via powercfg -changename, so it is untrusted input to the pipe-delimited grammar), or "-". Values: free text, or -. |
+| `active` | string | - | Windows, Linux, macOS | `1` | Tri-state: "1" active, "0" not active/inapplicable, "-" only when every scheme WAS enumerated but the active-scheme read itself failed (status=active_unknown). Values: "0", "1", "-". |
+| `status` | string | - | Windows, Linux, macOS | `ok` | Row outcome: ok (a real enumerated scheme), timeout, enumeration_incomplete, no_schemes_enumerated, active_unknown, unsupported_on_macos, or planned_not_implemented. Values: ok, timeout, enumeration_incomplete, no_schemes_enumerated, active_unknown, unsupported_on_macos, planned_not_implemented. |
 
-**`power_plan` — `power_plan|guid|friendly_name|active|status`**
+**`crossplatform.power.set_power_plan` — `status|reason|previous_guid|new_guid`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `guid` | string | GUID string, or `-` | W only | `381b4222-f694-41f0-9685-ff5bb260df2e` |
-| `friendly_name` | string | free text (operator-settable), or `-` | W only | `Balanced` |
-| `active` | string | `"0"` `"1"` `"-"` (unknown; every scheme enumerated but the active read failed) | W, M, L | `1` |
-| `status` | string | `ok` `timeout` `enumeration_incomplete` `no_schemes_enumerated` `active_unknown` `unsupported_on_macos` `planned_not_implemented` | W, M, L | `ok` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `status` | string | - | Windows, Linux, macOS | `error` | Mutation outcome. Values: ok, error. |
+| `reason` | string | - | Windows, Linux, macOS | `missing_param` | Failure token, or "-" on a success row. missing_param, timeout, enumeration_incomplete, ambiguous, no_match, read_prior_failed, set_failed, readback_failed, and readback_mismatch are Windows failure branches; unsupported_on_macos and planned_not_implemented are the permanent macOS/Linux postures. Values: missing_param, timeout, enumeration_incomplete, ambiguous, no_match, read_prior_failed, set_failed, readback_failed, readback_mismatch, unsupported_on_macos, planned_not_implemented, or -. |
+| `previous_guid` | string | - | Windows | `-` | The scheme GUID active before the mutation attempt (read before any mutation runs), or "-" when not reached or not applicable. Values: GUID string, or -. |
+| `new_guid` | string | - | Windows | `-` | The scheme GUID observed by the post-set read-back, or "-" when not reached. Values: GUID string, or -. |
 
-**`set_power_plan` — `set_power_plan|status|reason|previous_guid|new_guid`**
+**`crossplatform.power.thermal` — `status|zone_or_detail|celsius`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `status` | string | `ok`, `error` | W, M, L | `error` |
-| `reason` | string | `missing_param` `timeout` `enumeration_incomplete` `ambiguous` `no_match` `read_prior_failed` `set_failed` `readback_failed` `readback_mismatch` `unsupported_on_macos` `planned_not_implemented`, or `-` | W, M, L | `missing_param` |
-| `previous_guid` | string | GUID string, or `-` | W only | `-` |
-| `new_guid` | string | GUID string, or `-` | W only | `-` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `status` | string | - | Windows, Linux, macOS | `ok` | Thermal read outcome. constrained is a positive claim of no sensors; unavailable means the read itself failed. Values: ok, constrained, unavailable. |
+| `zone_or_detail` | string | - | Windows, Linux, macOS | `nominal` | The zone/sensor name on a Windows or Linux status=ok row, the macOS thermal-pressure level (nominal/fair/serious/critical) on a macOS status=ok row, or a failure/constrained token (no_thermal_zones_exposed, pdh_open_failed, pdh_add_counter_failed, pdh_collect_rejected, pdh_collect_timed_out, pdh_collect_failed, pdh_fetch_failed, pdh_provider_degraded, sys_class_thermal_not_readable) otherwise. Values: free text (zone name), nominal \| fair \| serious \| critical (macOS), or a fixed failure/constrained token. |
+| `celsius` | number | - | Windows, Linux | `-` | Sensor temperature in Celsius. Present only on a status=ok row that carries a real per-zone reading (Windows/Linux); the field is omitted entirely (not "-") on every macOS row and on any non-ok row, which is why this column's field count varies by row — see the plugin README's Outputs section. Values: decimal degrees Celsius, or the field is absent. |
 <!-- END GENERATED -->
 
 ### Result status
@@ -137,29 +135,30 @@ Pipe-delimited rows via `write_output()`, one line per record. `thermal`'s field
 
 - **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`.
 - **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — a grep of `server/core/src` for `power_health`/`crossplatform.power` finds only the capability-catalogue registration and the `PowerManagement` RBAC securable seed (`server/core/src/rbac_store.cpp:582`, `server/core/src/server.cpp:138,22119`), no sync-source or TAR consumer. `gather.ttlSeconds` (300s reads, 60s `set_power_plan`) is a response-cache TTL, not a scheduled dispatch.
+- **Sensitivity.** Rows carry no device, person, or software identifiers — `battery`/`thermal` report only charge/thermal state and percentages, and `power_plan`'s `friendly_name` is a generic, operator-settable scheme label (`Balanced`, `High performance`, `Power saver`), never a serial number, MAC, hostname, or username; nothing here goes beyond the device id.
 - **Siblings:** none — this is the fleet's only power-state source.
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("crossplatform.power.battery")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 082db96f6e05
 
 ```
 == action=battery
 battery|0|ac_no_battery|-1|-1|-1|-1
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=thermal
 thermal|unavailable|pdh_collect_failed
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=power_plan
 power_plan|381b4222-f694-41f0-9685-ff5bb260df2e|Balanced|1|ok
 power_plan|8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c|High performance|0|ok
 power_plan|a1841308-3541-4fab-bc81-f71556f20b4a|Power saver|0|ok
 power_plan|b1000fa2-4bc5-4da1-b3b1-27c753763a67|AMD Ryzen™ Balanced|0|ok
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=set_power_plan
 set_power_plan|error|missing_param|-|-
@@ -167,16 +166,16 @@ set_power_plan|error|missing_param|-|-
 [rc] 1
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 082db96f6e05
 
 ```
 == action=battery
 battery|0|unknown|-1|-1|-1|-1
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=thermal
 thermal|ok|nominal
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=power_plan
 power_plan|-|-|0|unsupported_on_macos
@@ -188,16 +187,16 @@ set_power_plan|error|unsupported_on_macos|-|-
 [rc] 1
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash pending
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 082db96f6e05
 
 ```
 == action=battery
 battery|0|unknown|-1|-1|-1|-1
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=thermal
 thermal|unavailable|sys_class_thermal_not_readable
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=power_plan
 power_plan|-|-|0|planned_not_implemented
@@ -221,10 +220,9 @@ set_power_plan|error|planned_not_implemented|-|-
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/power_health/src/power_health_plugin.cpp` (descriptor legs, dispatch) · `power_health_macos.mm` (Objective-C++ IOKit/Foundation boundary) · `power_health_parsers.hpp` (pure parse/classify/sequencing logic)
+- Plugin: `agents/plugins/power_health/src/power_health_macos.mm` · `agents/plugins/power_health/src/power_health_parsers.hpp` · `agents/plugins/power_health/src/power_health_plugin.cpp`
 - Definitions: `content/definitions/power_health.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_power_health.hpp`
-- Tests: `tests/unit/test_power_health_local_dispatcher.cpp` (loads the real library on all three OSes) · `tests/unit/test_power_health_parsers.cpp`
-- Privilege row: no row in `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/6.2a-power-health.added.md`
+- Tests: `tests/unit/test_power_health_local_dispatcher.cpp` · `tests/unit/test_power_health_parsers.cpp`
+- Privilege row: `docs/agent-privilege-model.md` (no row yet)
 <!-- END GENERATED -->

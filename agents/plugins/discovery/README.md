@@ -5,7 +5,7 @@
 |---|---|
 | **What it does** | Network device discovery — ARP scan and ping sweep |
 | **Version** | 0.1.0 |
-| **Kind** | Collector · read-only · on-demand (gather TTL 600s) |
+| **Kind** | Collector · read-only · gathered (device.discovery.scan_subnet) |
 | **Platforms** | Windows ✅ · macOS ✅ · Linux 🟡 constrained |
 | **Actions** | `scan_subnet` (definition `device.discovery.scan_subnet`) |
 | **Security** | securable `Infrastructure` · operation Read · risk Low · dispatch ReadOnly · approval gate AdminOrApproval |
@@ -38,11 +38,11 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `scan_subnet` | ✅ supported · rung 1 · `GetIpNetTable2` + `IcmpSendEcho` | ✅ supported · rung 1 · sysctl `NET_RT_FLAGS`/`RTF_LLINFO` + `SOCK_DGRAM` ICMP | 🟡 constrained · rung 1 · `/proc/net/arp` + unprivileged `SOCK_DGRAM` ICMP |
+| `scan_subnet` | ✅ supported · rung 1 · GetIpNetTable2 + IcmpSendEcho | ✅ supported · rung 1 · sysctl NET_RT_FLAGS/RTF_LLINFO + SOCK_DGRAM ICMP | 🟡 constrained · rung 1 · /proc/net/arp + unprivileged SOCK_DGRAM ICMP |
 
-**Declared limits per leg** (the descriptor's fallback text, verbatim):
+**Declared limits per leg** (descriptor fallback text, verbatim):
 
-- **`scan_subnet` / Linux** — the ICMP sweep needs `net.ipv4.ping_group_range` to admit the agent's gid; ARP-only results with a CONSTRAINED/PARTIAL status otherwise, or UNAVAILABLE/PARTIAL when the ICMP socket cannot be created at all. netlink `RTM_GETNEIGH` is a recorded future promotion over `/proc/net/arp`.
+- **`scan_subnet` / Linux** — the ICMP sweep needs net.ipv4.ping_group_range to admit the agent's gid; ARP-only results with a CONSTRAINED/PARTIAL status otherwise, or UNAVAILABLE/PARTIAL when the ICMP socket cannot be created at all. netlink RTM_GETNEIGH is a recorded future promotion over /proc/net/arp
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -60,10 +60,10 @@ No external binaries or subprocesses on any leg (the last `popen()`/`ping` spawn
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-| Action | Parameter | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `scan_subnet` | `subnet` | string | yes | — | Target subnet in CIDR notation (e.g., `192.168.1.0/24`). Only `/24` through `/30` is accepted — a wider or narrower prefix is refused rather than scanned. IPv4 only. |
-| `scan_subnet` | `timeout_ms` | int32 | no | `1000` | Per-host ICMP probe timeout in milliseconds, validated to 100-10000. The effective per-host budget is separately clamped to 100-300ms regardless of the requested value. Not the overall scan deadline, which is a fixed 300 seconds. |
+| Definition | Parameter | Type | Required | Default | Constraints | Description |
+|---|---|---|---|---|---|---|
+| `device.discovery.scan_subnet` | `subnet` | string | yes | - | pattern: ^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d{1,2}$ · minLength 9 · maxLength 18 | Target subnet in CIDR notation (e.g., 192.168.1.0/24). The plugin accepts only /24 through /30 (254 down to 2 usable hosts) — a request outside that range is refused with an error ("too many hosts to scan" or "contains no usable host addresses") rather than scanned. Only IPv4 is supported. |
+| `device.discovery.scan_subnet` | `timeout_ms` | int32 | no | 1000 | minimum 100 · maximum 10000 | Per-host ICMP probe timeout in milliseconds, validated to 100-10000. The effective per-host budget is separately clamped to 100-300ms regardless of the requested value, so a value above 300 has no further effect. This is not the overall scan deadline, which is a fixed 300 seconds. |
 <!-- END GENERATED -->
 
 ### Outputs
@@ -71,21 +71,16 @@ No external binaries or subprocesses on any leg (the last `popen()`/`ping` spawn
 The plugin writes four distinct pipe-delimited line shapes, only two of which are structured data: a `host` row per discovered host, and one `scan_complete` summary row per run. `status|` (error/warning) and `progress|` lines are free text used for operator-facing progress and degrade warnings; they are not represented in the definition's `result.columns` schema at all. A run that fails input validation emits only a `status|error|...` line and no `host`/`scan_complete` rows (not the case in any of the current captures, which all completed a real sweep).
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`scan_subnet` — `host|ip_address|mac_address|hostname|managed`**
+**`device.discovery.scan_subnet` — `host|ip_address|mac_address|hostname|managed|scan_complete`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `host` | string | literal `host` | W, M, L | `host` |
-| `ip_address` | string | dotted-quad IPv4 | W, M, L | `127.0.0.1` |
-| `mac_address` | string | colon-hex MAC48, or `unknown` | W, M, L | `unknown` |
-| `hostname` | string | free text (PTR hostname), or `unknown` | W, M, L | `localhost` |
-| `managed` | string | always `unknown` | W, M, L | `unknown` |
-
-**`scan_subnet` — `scan_complete|found|total`**
-
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `scan_complete` | string | literal `scan_complete`; the same line also carries `found` and `total` host counts as two further fields not enumerated as columns | W, M, L | `scan_complete` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `host` | string | `host` | Windows, Linux, macOS | `host` | Literal row-type discriminator marking this line as a discovered-host row, as opposed to a status/progress/ scan_complete line, which this schema does not separately enumerate. |
+| `ip_address` | string | - | Windows, Linux, macOS | `127.0.0.1` | IPv4 address of a host found in the target subnet, either already present in the OS ARP/neighbour table or reached by an ICMP probe. Values: free text (dotted-quad IPv4). |
+| `mac_address` | string | - | Windows, Linux, macOS | `unknown` | Colon-separated lowercase MAC48 read from the ARP/neighbour table, or the literal "unknown" when the host has no ARP entry. Values: colon-hex MAC48, or "unknown". |
+| `hostname` | string | - | Windows, Linux, macOS | `localhost` | Reverse-DNS (PTR) result for the IP, or the literal "unknown" when the lookup found nothing, timed out, or was throttled. Values: free text (PTR hostname), or "unknown". |
+| `managed` | string | `unknown` | Windows, Linux, macOS | `unknown` | Always the literal "unknown" from the agent — the server correlates the IP/MAC against enrolled agents separately. |
+| `scan_complete` | string | `scan_complete` | Windows, Linux, macOS | `scan_complete` | Literal row-type discriminator for the scan's one summary line, emitted once per run; the same line also carries "found" and "total" host counts as two further pipe-fields not enumerated as separate columns here. |
 <!-- END GENERATED -->
 
 ### Result status
@@ -108,39 +103,40 @@ Multiple conditions can fire in one run; they are accumulated by severity (`UNAV
 - **Instruction result.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (server-configured retention via `response_retention_days`, 90-day default), queryable at `/api/responses/{id}`.
 - **Not automatically forwarded to `DiscoveryStore`.** `POST /api/discovery/scan` is a separate REST ingestion surface that upserts device rows (by `ip_address`) into the Postgres-backed `discovery_store` behind `GET /api/discovery/results` and the managed/unmanaged correlation it drives — but nothing in this plugin or the agent daemon calls that endpoint. Today the two are unwired: an operator or external automation must parse this action's rows and POST them to `/api/discovery/scan` separately for a scan to update the managed-device table.
 - **Not consumed by** daily-sync inventory, the TAR warehouse, or DEX. Nothing runs on a schedule beyond the definition's 600-second gather TTL, which caches a repeat dispatch rather than re-triggering a background collection.
+- **Sensitivity.** Each `host` row carries another device's `ip_address`, `mac_address`, and reverse-DNS `hostname` — a network inventory of every device that answered the sweep, not just the scanning device; nothing in the rows names a person or installed software.
 - **Siblings:** none — `scan_subnet` is this plugin's only action and only definition.
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("device.discovery.scan_subnet")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 77514adb726f
 
 ```
 == action=scan_subnet subnet=127.0.0.0/30
 host|127.0.0.1|unknown|kubernetes.docker.internal|unknown
 host|127.0.0.2|unknown|unknown|unknown
 scan_complete|2|2
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 77514adb726f
 
 ```
 == action=scan_subnet subnet=127.0.0.0/30
 host|127.0.0.1|unknown|localhost|unknown
 scan_complete|1|2
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-07 · euid 0 · leg-hash pending
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-07 · euid 0 · leg-hash 77514adb726f
 
 ```
 == action=scan_subnet subnet=127.0.0.0/30
 host|127.0.0.1|unknown|localhost|unknown
 host|127.0.0.2|unknown|unknown|unknown
 scan_complete|2|2
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 ```
 <!-- END GENERATED -->
 
@@ -155,10 +151,10 @@ scan_complete|2|2
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/discovery/src/discovery_plugin.cpp` (descriptor + all three legs) · `discovery_scan_plan.hpp` (pure degrade/severity/bounds decisions) · `discovery_parsers.hpp` (ARP text parsing, MAC formatting, Windows row-state predicate)
+- Plugin: `agents/plugins/discovery/src/discovery_parsers.hpp` · `agents/plugins/discovery/src/discovery_plugin.cpp` · `agents/plugins/discovery/src/discovery_scan_plan.hpp`
 - Definitions: `content/definitions/discovery.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_c.hpp`
-- Tests: `tests/unit/test_discovery_scan_plan.cpp` (pure degrade/bounds logic, all legs) · `tests/unit/test_discovery_parsers.cpp` (ARP parsing/formatting, all legs) · `tests/unit/server/test_discovery_store.cpp` and `tests/unit/server/test_discovery_scan_route.cpp` (the separate `DiscoveryStore`/`POST /api/discovery/scan` ingestion surface this plugin does not call — see Caveat 2)
-- Privilege row: no row in `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/20260817-wave2-discovery-native-arp-icmp.changed.md` · `changelog.d/2204-declarations-group-c.added.md` · `changelog.d/3064-discovery-scan-honest-failure.changed.md` · `changelog.d/3064-discovery-store-postgres.changed.md` · `changelog.d/3253-discovery-degrade-tie-break.fixed.md`
+- Tests: `tests/unit/server/test_discovery_routes.cpp` · `tests/unit/server/test_discovery_scan_route.cpp` · `tests/unit/server/test_discovery_store.cpp` · `tests/unit/test_discovery_parsers.cpp` · `tests/unit/test_discovery_scan_plan.cpp`
+- Privilege row: `docs/agent-privilege-model.md` (no row yet)
+- Changelog: `changelog.d/20260817-wave2-discovery-native-arp-icmp.changed.md` · `changelog.d/3064-discovery-scan-honest-failure.changed.md` · `changelog.d/3064-discovery-store-postgres.changed.md` · `changelog.d/3253-discovery-degrade-tie-break.fixed.md`
 <!-- END GENERATED -->

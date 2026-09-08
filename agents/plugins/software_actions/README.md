@@ -5,10 +5,10 @@
 |---|---|
 | **What it does** | Lists upgradable packages and counts installed software |
 | **Version** | 1.1.0 |
-| **Kind** | Action · read-only · on-demand (no scheduled gather) |
-| **Platforms** | Windows 🟡 constrained · macOS ✅ · Linux ✅ |
-| **Actions** | `list_upgradable` (definition `device.software_actions.list_upgradable`) · `installed_count` (definition `device.software_actions.installed_count`) |
-| **Security** | securable `SoftwareDeployment` · operation Read · risk Low · dispatch ReadOnly · approval gate none |
+| **Kind** | Collector · read-only · gathered (device.software_actions.list_upgradable, device.software_actions.installed_count) |
+| **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
+| **Actions** | `installed_count` (definition `device.software_actions.installed_count`) · `list_upgradable` (definition `device.software_actions.list_upgradable`) |
+| **Security** | securable `SoftwareDeployment` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
 | **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
 
@@ -33,13 +33,13 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `list_upgradable` | 🟡 constrained · rung 2 · winget via bounded argv runner | ✅ supported · rung 2 · softwareupdate -l via bounded argv runner | ✅ supported · rung 2 · apt/yum check-update via bounded argv runner |
 | `installed_count` | ✅ supported · rung 1 · native Reg*W subkey count of the Uninstall key | ✅ supported · rung 2 · pkgutil --pkgs via bounded argv runner | ✅ supported · rung 2 · dpkg-query/rpm via bounded argv runner |
+| `list_upgradable` | 🟡 constrained · rung 2 · winget via bounded argv runner | ✅ supported · rung 2 · softwareupdate -l via bounded argv runner | ✅ supported · rung 2 · apt/yum check-update via bounded argv runner |
 
-**Declared limits per leg** (the descriptor's fallback text, verbatim):
+**Declared limits per leg** (descriptor fallback text, verbatim):
 
-- **`list_upgradable` / Windows** — winget is a PER-USER App Execution Alias under %LOCALAPPDATA%; under the shipped LocalSystem service account that path does not exist, so this leg resolves only when the agent runs in a user-session context. An unresolvable winget reports UNAVAILABLE, never a clean empty result
 - **`installed_count` / Windows** — reads only the default (64-bit) registry view, matching the powershell payload it replaced; 32-bit applications registered under WOW6432Node are not counted
+- **`list_upgradable` / Windows** — winget is a PER-USER App Execution Alias under %LOCALAPPDATA%; under the shipped LocalSystem service account that path does not exist, so this leg resolves only when the agent runs in a user-session context. An unresolvable winget reports UNAVAILABLE, never a clean empty result
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -57,9 +57,7 @@ Subprocesses: `winget.exe` (Windows, `list_upgradable` only), `apt`/`yum`/`dnf` 
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-`list_upgradable` takes no parameters.
-
-`installed_count` takes no parameters.
+Neither action takes parameters.
 <!-- END GENERATED -->
 
 ### Outputs
@@ -67,19 +65,19 @@ Subprocesses: `winget.exe` (Windows, `list_upgradable` only), `apt`/`yum`/`dnf` 
 Pipe-delimited rows, one literal-discriminator field followed by the action's own fields. `list_upgradable` writes one `upgradable|...` line per upgradable package, or a single sentinel row when the query ran clean and nothing is pending; `installed_count` writes exactly one `count|N` line, or none at all on a degraded read — a `count|0` line is never emitted for a failed or absent query.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`list_upgradable` — `upgradable|package_name|current_version|available_version`**
+**`device.software_actions.installed_count` — `count`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `package_name` | string | package/app name, or the literal `none` on the clean-scan sentinel row | W, M, L | `none` |
-| `current_version` | string | version string, or `-` when not read; carries the literal sentence `System is up to date` on the up-to-date row instead of a version | W, M, L | `System is up to date` |
-| `available_version` | string | version string, or `-` when not applicable/not read | W, M, L | `-` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `count` | int32 | - | Windows, Linux, macOS | `124` | Non-negative count of installed packages or applications; the line is omitted entirely (never emitted as 0) when the underlying query failed. Values: non-negative integer. |
 
-**`installed_count` — `count|count`**
+**`device.software_actions.list_upgradable` — `package_name|current_version|available_version`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `count` | int32 | non-negative record count; the line is omitted entirely (never `0`) when the read failed | W, M, L | `124` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `package_name` | string | - | Windows, Linux, macOS | `none` | The package or application name; the literal 'none' on the clean-scan sentinel row when nothing is upgradable. Values: free text, or the literal `none`. |
+| `current_version` | string | - | Windows, Linux, macOS | `System is up to date` | The currently installed version, or '-' when not read; on the up-to-date sentinel row this field carries the literal sentence 'System is up to date' instead of a version. Values: free text, or `-`, or the literal `System is up to date`. |
+| `available_version` | string | - | Windows, Linux, macOS | `-` | The version available to upgrade to, or '-' when not applicable or not read. Values: free text, or `-`. |
 <!-- END GENERATED -->
 
 ### Result status
@@ -88,10 +86,12 @@ Pipe-delimited rows, one literal-discriminator field followed by the action's ow
 |---|---|---|---|
 | `UNDECLARED` (sample shows `UNDECLARED / UNKNOWN /`) | — | — | clean run: rows/count emitted, no `set_result_status` call — every captured sample except the Windows `list_upgradable` failure |
 | `UNAVAILABLE` | PARTIAL | `software_actions:localappdata_unset` | Windows `list_upgradable`: no `%LOCALAPPDATA%` in the token's environment |
-| `UNAVAILABLE` | PARTIAL | forwarded runner failure (e.g. `subprocess_runner:spawn_error`) or `software_actions:winget_failed` / `:softwareupdate_failed` / `:apt_list_upgradable_failed` / `:yum_check_update_failed` | tool capture unusable (spawn error, timeout, truncation, or a failing exit with no rows parsed) |
-| `UNAVAILABLE` | PARTIAL | `software_actions:softwareupdate_not_present` / `:no_supported_package_manager` | the queried tool (or any supported package manager) is not present on this host |
-| `UNAVAILABLE` | PARTIAL | `software_actions:registry_query_failed` / `:dpkg_query_failed` / `:rpm_query_failed` / `:pkgutil_query_failed` / `:pkgutil_not_present` | `installed_count`: the native registry read or the package-manager query failed |
-| `CONSTRAINED` | PARTIAL | `software_actions:winget_header_unrecognized` / `:winget_rows_unmapped` / `:winget_partial_exit` / `:winget_no_table` | winget's table was found but partially unparseable, or every row was dropped |
+| `UNAVAILABLE` | PARTIAL | `subprocess_runner:spawn_error` (forwarded via `forward_runner_failure`) or `software_actions:winget_failed` / `:softwareupdate_failed` / `:apt_list_upgradable_failed` / `:yum_check_update_failed` | the child process could not be spawned at all, or (the plugin fallback) a tool ran but its capture was otherwise unusable — timeout, truncation, or a failing exit with no rows parsed |
+| `CONSTRAINED` | PARTIAL | `subprocess_runner:deadline` / `subprocess_runner:cancelled` / `subprocess_runner:signaled` (forwarded via `forward_runner_failure`) | the runner's deadline elapsed and the child was killed still running, the run was cancelled before finishing, or the child was killed by a signal rather than a clean exit |
+| `OK` | PARTIAL | `subprocess_runner:line_limit` (forwarded via `forward_runner_failure`) | a deliberate bounded stop: the runner capped output at N lines and killed a still-producing child — not a failure, but incomplete |
+| `UNAVAILABLE` | PARTIAL | `software_actions:softwareupdate_not_present` / `software_actions:no_supported_package_manager` | the queried tool (or any supported package manager) is not present on this host |
+| `UNAVAILABLE` | PARTIAL | `software_actions:registry_query_failed` / `software_actions:dpkg_query_failed` / `software_actions:rpm_query_failed` / `software_actions:pkgutil_query_failed` / `software_actions:pkgutil_not_present` | `installed_count`: the native registry read or the package-manager query failed, or (`pkgutil_not_present`) `pkgutil` itself is absent on this host |
+| `CONSTRAINED` | PARTIAL | `software_actions:winget_header_unrecognized` / `software_actions:winget_rows_unmapped` / `software_actions:winget_partial_exit` / `software_actions:winget_no_table` | winget's table was found but partially unparseable, every matched row was dropped as unmapped, winget exited nonzero but real rows still parsed, or no recognisable table was found at all |
 | `CONSTRAINED` | PARTIAL | `software_actions:softwareupdate_partial_exit` | `softwareupdate -l` exited nonzero but real labels still parsed |
 | `CONSTRAINED` | PARTIAL | `software_actions:apt_list_upgradable_failed` | Linux: apt failed but yum/dnf still found rows — real data returned, apt's own failure flagged |
 
@@ -99,13 +99,16 @@ Pipe-delimited rows, one literal-discriminator field followed by the action's ow
 
 - **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (90-day default retention, `kDefaultResponseRetentionDays`), queryable at `/api/responses/{id}`.
 - **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — no grep hit for either definition id outside the plugin/definition/capability files themselves. Nothing runs on a schedule; each definition's `gather.ttlSeconds` (300 for `list_upgradable`, 120 for `installed_count`) only bounds result freshness for a dispatch, it does not trigger one.
+- **Sensitivity.** `list_upgradable` rows name specific installed software and its current/available
+  versions (`package_name`/`current_version`/`available_version`) — an installed-software inventory
+  by another route; `installed_count` carries only a record count, nothing identifying.
 - **Siblings:** `installed_apps` (`list`/`query`/`list_per_user`/`list_inventory`) is the general software inventory — name, version, publisher, install date, per-user breakdown, and the daily-sync `list_inventory` collector; `software_actions` answers only "what needs upgrading" and "roughly how much software is here," with no publisher/version/date detail and no daily-sync leg of its own.
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("device.software_actions.list_upgradable")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash c95c61957b6f
 
 ```
 == action=list_upgradable
@@ -114,31 +117,31 @@ Pipe-delimited rows, one literal-discriminator field followed by the action's ow
 
 == action=installed_count
 count|124
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash c95c61957b6f
 
 ```
 == action=list_upgradable
 upgradable|none|System is up to date|-
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=installed_count
 count|68
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash pending
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash c95c61957b6f
 
 ```
 == action=list_upgradable
 upgradable|none|System is up to date|-
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=installed_count
 count|206
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 ```
 <!-- END GENERATED -->
 
@@ -153,10 +156,9 @@ count|206
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/software_actions/src/software_actions_plugin.cpp` (actions, descriptor legs) · `_parsers.hpp` (winget/apt/yum/softwareupdate/dpkg-query parsing, pure and OS-free)
+- Plugin: `agents/plugins/software_actions/src/software_actions_parsers.hpp` · `agents/plugins/software_actions/src/software_actions_plugin.cpp`
 - Definitions: `content/definitions/software_actions.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_d.hpp`
-- Tests: `tests/unit/test_software_actions_actions.cpp` (real-plugin `LocalDispatcher` run of `installed_count`) · `tests/unit/test_software_actions_parsers.cpp` (pure parser cases)
-- Privilege row: no row in `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2204-declarations-group-d.added.md` · `changelog.d/wave4-pr43b-software-actions-license.changed.md` · `changelog.d/wave4-pr43b-software-actions-license.fixed.md`
+- Tests: `tests/unit/test_software_actions_actions.cpp` · `tests/unit/test_software_actions_parsers.cpp`
+- Privilege row: `docs/agent-privilege-model.md` (no row yet)
 <!-- END GENERATED -->

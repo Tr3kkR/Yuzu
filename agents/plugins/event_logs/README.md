@@ -4,11 +4,11 @@
 | | |
 |---|---|
 | **What it does** | Queries system event logs for errors and filtered events |
-| **Version** | 1.1.0 · plugin ABI 4 · shipped in PR #3578 (2026-08-27) |
-| **Kind** | Collector · read-only · on-demand (no scheduled gather) |
+| **Version** | 1.1.0 |
+| **Kind** | Collector · read-only · gathered (device.event_logs.errors, device.event_logs.query) |
 | **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
 | **Actions** | `errors` (definition `device.event_logs.errors`) · `query` (definition `device.event_logs.query`) |
-| **Security** | securable `AuditLog` · operation Read · risk Medium · dispatch ReadOnly · approval gate none |
+| **Security** | securable `AuditLog` · operation Read · risk Medium · dispatch ReadOnly · approval gate None |
 | **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
 
@@ -37,15 +37,15 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `errors` | ✅ supported · rung 1 · `wevtapi (EvtQuery/EvtRender, Level=2, bounded EvtNext)` | ✅ supported · rung 2 · `log_show` | ✅ supported · rung 1 · `sd_journal (bounded local read, PRIORITY<=err)` |
-| `query` | ✅ supported · rung 1 · `wevtapi (EvtQuery/EvtRender, bounded EvtNext)` | ✅ supported · rung 2 · `log_show` | ✅ supported · rung 1 · `sd_journal (bounded local read, keyword match)` |
+| `errors` | ✅ supported · rung 1 · wevtapi (EvtQuery/EvtRender, Level=2, bounded EvtNext) | ✅ supported · rung 2 · log_show | ✅ supported · rung 1 · sd_journal (bounded local read, PRIORITY<=err) |
+| `query` | ✅ supported · rung 1 · wevtapi (EvtQuery/EvtRender, bounded EvtNext) | ✅ supported · rung 2 · log_show | ✅ supported · rung 1 · sd_journal (bounded local read, keyword match) |
 
-**Declared limits per leg** (the descriptor's fallback text, verbatim):
+**Declared limits per leg** (descriptor fallback text, verbatim):
 
-- **`errors` / macOS** — requires root or a real login session to open the local unified-log data store -- a non-root headless process gets EX_NOPERM/77 regardless of Full Disk Access (docs/darwin-compat.md); no gap in production, which runs as a root LaunchDaemon.
-- **`errors` / Linux** — falls back to a bounded journalctl argv invocation (rung 2) when libsystemd is compiled out (-Dsystemd_guard) or the journal is unreachable.
-- **`query` / macOS** — requires root or a real login session to open the local unified-log data store -- a non-root headless process gets EX_NOPERM/77 regardless of Full Disk Access (docs/darwin-compat.md); no gap in production, which runs as a root LaunchDaemon.
-- **`query` / Linux** — falls back to a bounded journalctl argv invocation (rung 2) when libsystemd is compiled out (-Dsystemd_guard) or the journal is unreachable.
+- **`errors` / macOS** — requires root or a real login session to open the local unified-log data store -- a non-root headless process gets EX_NOPERM/77 regardless of Full Disk Access (docs/darwin-compat.md); no gap in production, which runs as a root LaunchDaemon
+- **`errors` / Linux** — falls back to a bounded journalctl argv invocation (rung 2) when libsystemd is compiled out (-Dsystemd_guard) or the journal is unreachable
+- **`query` / macOS** — requires root or a real login session to open the local unified-log data store -- a non-root headless process gets EX_NOPERM/77 regardless of Full Disk Access (docs/darwin-compat.md); no gap in production, which runs as a root LaunchDaemon
+- **`query` / Linux** — falls back to a bounded journalctl argv invocation (rung 2) when libsystemd is compiled out (-Dsystemd_guard) or the journal is unreachable
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -63,13 +63,13 @@ Binaries/subprocesses/network: none on Windows (wevtapi is in-process) and none 
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-| Action | Parameter | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `errors` | `log` | string | no | `"System"` | The event log to query. Windows: `System`, `Application`, `Security`, etc.; ignored on Linux/macOS, which always read the system journal/unified log. Max 128 characters. |
-| `errors` | `hours` | int32 | no | `24` | Hours to look back for error events, clamped 1–720 (30 days). |
-| `query` | `log` | string | yes | — | The event log to search. Windows: `System`, `Application`, `Security`, etc.; on Linux/macOS the value is accepted but does not select a log. 1–128 characters. |
-| `query` | `filter` | string | yes | — | Case-insensitive substring keyword to match against event messages. Allowlisted to alphanumerics, spaces, dots, hyphens, underscores, and slashes (`sanitize_input`, `sdk/include/yuzu/string_utils.hpp:116`), e.g. `error`, `disk-warning`. 1–256 characters. |
-| `query` | `count` | int32 | no | `50` | Windows: number of newest events *examined* for a match (not the match count). Linux/macOS: maximum number of *matches* returned. Clamped 1–500. |
+| Definition | Parameter | Type | Required | Default | Constraints | Description |
+|---|---|---|---|---|---|---|
+| `device.event_logs.errors` | `log` | string | no | System | maxLength 128 | The event log to query, e.g. "System" or "Application". Windows only — the value is accepted but has no effect on Linux/macOS, which always read the system journal / unified log. Default: "System". |
+| `device.event_logs.errors` | `hours` | int32 | no | 24 | minimum 1 · maximum 720 | Number of hours to look back for error events, e.g. 24 or 168. Range: 1-720 (30 days). Default: 24. |
+| `device.event_logs.query` | `log` | string | yes | - | minLength 1 · maxLength 128 | The event log to search, e.g. "System" or "Application". On Windows this selects the channel; on Linux/macOS the value is accepted but does not select a log (both always read the journal / unified log). |
+| `device.event_logs.query` | `filter` | string | yes | - | minLength 1 · maxLength 256 | Keyword to search for in event messages, e.g. "error" or "disk-warning". Case-insensitive substring match. Only alphanumeric characters, spaces, dots, hyphens, underscores, and slashes are allowed. |
+| `device.event_logs.query` | `count` | int32 | no | 50 | minimum 1 · maximum 500 | Maximum number of recent events EXAMINED for a match on Windows (the filter is applied within that window); the maximum number of matches returned on Linux and macOS. Range: 1-500. Default: 50. |
 <!-- END GENERATED -->
 
 ### Outputs
@@ -77,24 +77,24 @@ Binaries/subprocesses/network: none on Windows (wevtapi is in-process) and none 
 Pipe-delimited rows, one per event; field 0 is a literal discriminator (`error` or `event`). **The row shape differs by OS**, not only by action: the Windows rows carry the full 5/6-field shape below, while Linux and macOS collapse the `event_id`/`source` fields into a single `unit` (Linux) or `process` (macOS) field and never emit `event_id`. A missing/inapplicable value renders `-`, never an empty field. The message field is capped at 200 bytes, backed off to a UTF-8 character boundary (`event_logs_parsers.hpp:66`), so a non-ASCII message can be shorter than 200 characters.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`errors` — Windows: `error|timestamp|event_id|source|message`; Linux/macOS: `error|timestamp|unit|message`**
+**`device.event_logs.errors` — `timestamp|event_id|source|message`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `timestamp` | string | Windows: full-precision UTC `SystemTime` ISO-8601. Linux: `short-iso` local time (`journal_format_short_iso`/`journalctl -o short-iso`). macOS: `log show --style compact` column timestamp | W, L, M | `2026-09-06T14:55:55.0521384Z` (W) · `2026-09-06 10:55:53.370 E` (M) |
-| `event_id` | int, or `-` | Windows `<EventID>` text | W only | `6008` |
-| `source` | string, or `-` | Windows `<Provider Name>` — on Linux/macOS this position instead holds `unit` (`SYSLOG_IDENTIFIER[pid]` or `_SYSTEMD_UNIT`, `-` if neither) or macOS `process`, which is a different field, not `source` | W: provider name · L/M: unit/process, not source | `EventLog` (W) |
-| `message` | string, or `-` | Windows: space-joined `<Data>` parameter values (not the provider-formatted template). Linux: journal `MESSAGE`. macOS: `log show` message text | W, L, M | see Sample output |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `timestamp` | string | - | Windows, Linux, macOS | `2026-09-06T14:55:55.0521384Z` | Event timestamp. Full-precision UTC ISO-8601 on Windows; local short-iso time on Linux; the `log show --style compact` column timestamp on macOS. Values: free text. |
+| `event_id` | string | - | Windows | `6008` | Windows numeric Event ID. Not populated on Linux or macOS. Values: integer. |
+| `source` | string | - | Windows | `EventLog` | Windows event provider name. Not populated on Linux or macOS — those legs report a journal unit or process name in this row position instead, which is a different field outside this schema. Values: free text. |
+| `message` | string | - | Windows, Linux, macOS | `16:11:31 ‎05/‎09/‎2026 105614` | Event message text, truncated to 200 bytes at a UTF-8 character boundary. Values: free text. |
 
-**`query` — Windows: `event|timestamp|level|event_id|source|message`; Linux/macOS: `event|timestamp|unit|message`**
+**`device.event_logs.query` — `timestamp|level|event_id|source|message`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `timestamp` | string | same per-OS formats as `errors.timestamp` | W, L, M | `2026-09-06T14:55:55Z` (W) |
-| `level` | enum, Windows only | `Critical` `Error` `Warning` `Information` `Verbose` `Level<n>` (unmapped numeric level) | W only | not observed in any capture — the Windows `query` run matched no rows; the `errors` row format carries no level field |
-| `event_id` | int, or `-` | Windows `<EventID>` text | W only | `6008` (Windows `errors` sample; `query` matched no rows) |
-| `source` | string, or `-` | Windows provider name; on Linux/macOS this position holds `unit`/`process` instead (see `errors` above) | W: provider · L/M: unit/process | `Kernel-General` (W) |
-| `message` | string, or `-` | matched keyword filter applies here (case-insensitive substring) | W, L, M | see Sample output |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `timestamp` | string | - | Windows, Linux, macOS | `2026-09-06 10:55:53.560` | Event timestamp. Full-precision UTC ISO-8601 on Windows; local short-iso time on Linux; the `log show --style compact` column timestamp on macOS. Values: free text. |
+| `level` | string | - | Windows | `not observed in any capture (the Windows query run matched no rows)` | Windows event level display name derived from the numeric `<Level>`. Not populated on Linux or macOS. Values: Critical, Error, Warning, Information, Verbose, or Level<n> for an unmapped numeric level. |
+| `event_id` | string | - | Windows | `6008 (from the errors sample; the query run matched no rows)` | Windows numeric Event ID. Not populated on Linux or macOS. Values: integer. |
+| `source` | string | - | Windows | `Kernel-General` | Windows event provider name. Not populated on Linux or macOS — those legs report a journal unit or process name in this row position instead, which is a different field outside this schema. Values: free text. |
+| `message` | string | - | Windows, Linux, macOS | `2026-09-06 10:55:53.560 Df WeatherWidget[977:d9fa44] [com.apple.weather:WidgetRefresh] About to compute error refresh policy. (5 min to next refresh).` | Matched event message text, truncated to 200 bytes at a UTF-8 character boundary. The `filter` keyword is matched against this field (and the provider name, on Windows). Values: free text. |
 <!-- END GENERATED -->
 
 ### Result status
@@ -115,25 +115,26 @@ Pipe-delimited rows, one per event; field 0 is a literal discriminator (`error` 
 
 - **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (90-day default retention per `docs/yaml-dsl-spec.md:194`; the definitions carry no `response.retentionDays` override), queryable at `/api/responses/{id}` and aggregatable (`errors` groups by `source`; `query` groups by `level`,`source` — `content/definitions/event_logs.yaml:73-75,172-174`).
 - **Not consumed by** daily-sync inventory, the TAR warehouse, or metrics. `event_logs` is one of `result_parsing.hpp`'s `kKeyValuePlugins` (`server/core/src/result_parsing.hpp:67`), so the server's legacy dashboard row renderer treats its output as generic `Agent|Key|Value` pairs rather than a fixed column set — a consequence of the same per-OS row-shape divergence documented above.
+- **Sensitivity.** `message` is raw log/journal text and can carry usernames, hostnames, or other operator-identifying content depending on what the OS logged; Windows' `source` (provider name) and Linux's `unit` field can themselves be an installed-software or service identifier — this plugin's rows are the least predictable in the catalogue for what they may disclose, by design.
 - **Siblings:** none — `event_logs` is the only plugin in the shipped catalogue reading OS event/journal/unified logs (`server/core/src/agent_registry.cpp:848-849`).
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("device.event_logs.errors")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 81838b2b5566
 
 ```
 == action=errors
 error|2026-09-06T14:55:55.0521384Z|6008|EventLog|16:11:31 ‎05/‎09/‎2026 105614
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=query log=System filter=error
 event|none|-|-|-|No match within the newest events examined (count window full; older events not searched)
 [result_status] CONSTRAINED / PARTIAL / event_logs_win:count_window_full
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 81838b2b5566
 
 ```
 == action=errors
@@ -149,20 +150,8 @@ error|2026-09-06 10:56:10.410 E|-|contactsd[85799:da812c] [com.apple.accounts:co
 error|2026-09-06 10:56:10.411 E|-|contactsd[85798:da812a] [com.apple.accounts:core] "Remote account store returned fatal error: Error Domain=NSCocoaErrorDomain Code=4099 "The connection to service named com.apple.accountsd.accountmana
 error|2026-09-06 10:56:10.411 E|-|contactsd[85794:da8127] [com.apple.accounts:core] "Remote account store returned fatal error: Error Domain=NSCocoaErrorDomain Code=4099 "The connection to service named com.apple.accountsd.accountmana
 error|2026-09-06 10:56:10.412 E|-|contactsd[85796:da812f] [com.apple.accounts:core] "Remote account store returned fatal error: Error Domain=NSCocoaErrorDomain Code=4099 "The connection to service named com.apple.accountsd.accountmana
-error|2026-09-06 10:56:10.413 E|-|contactsd[85796:da812f] [com.apple.accounts:core] "Remote account store returned fatal error: Error Domain=NSCocoaErrorDomain Code=4099 "The connection to service named com.apple.accountsd.accountmana
-error|2026-09-06 10:56:10.413 E|-|contactsd[85796:da812f] [com.apple.accounts:core] "Error connecting to remote account store!"
-error|2026-09-06 10:56:10.413 E|-|contactsd[85796:da8130] [com.apple.AskTo:DaemonConnection] Daemon connection invalidated
-error|2026-09-06 10:56:10.417 E|-|contactsd[85800:da812e] [com.apple.accounts:core] "Remote account store returned fatal error: Error Domain=NSCocoaErrorDomain Code=4099 "The connection to service named com.apple.accountsd.accountmana
-error|2026-09-06 10:56:10.418 E|-|contactsd[85797:da8135] [com.apple.accounts:core] "Remote account store returned fatal error: Error Domain=NSCocoaErrorDomain Code=4099 "The connection to service named com.apple.accountsd.accountmana
-error|2026-09-06 10:56:10.418 E|-|contactsd[85795:da8134] [com.apple.accounts:core] "Remote account store returned fatal error: Error Domain=NSCocoaErrorDomain Code=4099 "The connection to service named com.apple.accountsd.accountmana
-error|2026-09-06 10:56:10.418 E|-|contactsd[85799:da8143] [com.apple.accounts:core] "Remote account store returned fatal error: Error Domain=NSCocoaErrorDomain Code=4099 "The connection to service named com.apple.accountsd.accountmana
-error|2026-09-06 10:56:10.418 E|-|contactsd[85797:da8145] [com.apple.AskTo:DaemonConnection] Daemon connection invalidated
-error|2026-09-06 10:56:10.419 E|-|contactsd[85799:da8143] [com.apple.accounts:core] "Remote account store returned fatal error: Error Domain=NSCocoaErrorDomain Code=4099 "The connection to service named com.apple.accountsd.accountmana
-error|2026-09-06 10:56:10.419 E|-|contactsd[85799:da8143] [com.apple.accounts:core] "Error connecting to remote account store!"
-error|2026-09-06 10:56:10.419 E|-|contactsd[85799:da8144] [com.apple.AskTo:DaemonConnection] Daemon connection invalidated
-error|2026-09-06 10:56:10.419 E|-|contactsd[85795:da8133] [com.apple.AskTo:DaemonConnection] Daemon connection invalidated
-… 25 of 100 rows
-[result_status] UNDECLARED / UNKNOWN / 
+… 12 of 100 rows shown
+[result_status] UNDECLARED / UNKNOWN
 
 == action=query log=system filter=error
 event|Timestamp||           Ty Process[PID:TID]
@@ -177,26 +166,11 @@ event|2026-09-06 10:56:10.411 E|-|contactsd[85798:da812a] [com.apple.accounts:co
 event|2026-09-06 10:56:10.411 E|-|contactsd[85794:da8127] [com.apple.accounts:core] "Remote account store returned fatal error: Error Domain=NSCocoaErrorDomain Code=4099 "The connection to service named com.apple.accountsd.accountmana
 event|2026-09-06 10:56:10.412 E|-|contactsd[85796:da812f] [com.apple.accounts:core] "Remote account store returned fatal error: Error Domain=NSCocoaErrorDomain Code=4099 "The connection to service named com.apple.accountsd.accountmana
 event|2026-09-06 10:56:10.413 E|-|contactsd[85796:da812f] [com.apple.accounts:core] "Remote account store returned fatal error: Error Domain=NSCocoaErrorDomain Code=4099 "The connection to service named com.apple.accountsd.accountmana
-event|2026-09-06 10:56:10.417 E|-|contactsd[85800:da812e] [com.apple.accounts:core] "Remote account store returned fatal error: Error Domain=NSCocoaErrorDomain Code=4099 "The connection to service named com.apple.accountsd.accountmana
-event|2026-09-06 10:56:10.418 E|-|contactsd[85797:da8135] [com.apple.accounts:core] "Remote account store returned fatal error: Error Domain=NSCocoaErrorDomain Code=4099 "The connection to service named com.apple.accountsd.accountmana
-event|2026-09-06 10:56:10.418 E|-|contactsd[85795:da8134] [com.apple.accounts:core] "Remote account store returned fatal error: Error Domain=NSCocoaErrorDomain Code=4099 "The connection to service named com.apple.accountsd.accountmana
-event|2026-09-06 10:56:10.418 E|-|contactsd[85799:da8143] [com.apple.accounts:core] "Remote account store returned fatal error: Error Domain=NSCocoaErrorDomain Code=4099 "The connection to service named com.apple.accountsd.accountmana
-event|2026-09-06 10:56:10.419 E|-|contactsd[85799:da8143] [com.apple.accounts:core] "Remote account store returned fatal error: Error Domain=NSCocoaErrorDomain Code=4099 "The connection to service named com.apple.accountsd.accountmana
-event|2026-09-06 10:56:10.419 E|-|contactsd[85795:da8134] [com.apple.accounts:core] "Remote account store returned fatal error: Error Domain=NSCocoaErrorDomain Code=4099 "The connection to service named com.apple.accountsd.accountmana
-event|2026-09-06 10:56:10.419 E|-|contactsd[85797:da8135] [com.apple.accounts:core] "Remote account store returned fatal error: Error Domain=NSCocoaErrorDomain Code=4099 "The connection to service named com.apple.accountsd.accountmana
-event|2026-09-06 10:56:10.424 E|-|contactsd[85794:da8136] [com.apple.accounts:core] "Remote account store returned fatal error: Error Domain=NSCocoaErrorDomain Code=4099 "The connection to service named com.apple.accountsd.accountmana
-event|2026-09-06 10:56:10.425 E|-|contactsd[85798:da8137] [com.apple.accounts:core] "Remote account store returned fatal error: Error Domain=NSCocoaErrorDomain Code=4099 "The connection to service named com.apple.accountsd.accountmana
-event|2026-09-06 10:56:10.425 E|-|contactsd[85794:da8136] [com.apple.accounts:core] "Remote account store returned fatal error: Error Domain=NSCocoaErrorDomain Code=4099 "The connection to service named com.apple.accountsd.accountmana
-event|2026-09-06 10:56:10.425 E|-|contactsd[85798:da8137] [com.apple.accounts:core] "Remote account store returned fatal error: Error Domain=NSCocoaErrorDomain Code=4099 "The connection to service named com.apple.accountsd.accountmana
-event|2026-09-06 10:56:10.429 E|-|contactsd[85800:da8142] [com.apple.accounts:core] "Remote account store returned fatal error: Error Domain=NSCocoaErrorDomain Code=4099 "The connection to service named com.apple.accountsd.accountmana
-event|2026-09-06 10:56:10.430 E|-|contactsd[85800:da8142] [com.apple.accounts:core] "Remote account store returned fatal error: Error Domain=NSCocoaErrorDomain Code=4099 "The connection to service named com.apple.accountsd.accountmana
-event|2026-09-06 10:56:10.442 E|-|contactsd[85798:da8138] [com.apple.accounts:core] "Remote account store returned fatal error: Error Domain=NSCocoaErrorDomain Code=4099 "The connection to service named com.apple.accountsd.accountmana
-event|2026-09-06 10:56:10.442 E|-|contactsd[85797:da8146] [com.apple.accounts:core] "Remote account store returned fatal error: Error Domain=NSCocoaErrorDomain Code=4099 "The connection to service named com.apple.accountsd.accountmana
-… 25 of 50 rows
-[result_status] UNDECLARED / UNKNOWN / 
+… 12 of 50 rows shown
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash pending
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 81838b2b5566
 
 ```
 == action=errors
@@ -220,10 +194,9 @@ event|none|-|journalctl did not run
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/event_logs/src/event_logs_plugin.cpp` (descriptor, action shells) · `event_logs_parsers.hpp` (pure Windows XML + journal row parsing/formatting) · `event_logs_journal.hpp` (sd_journal I/O) · `event_logs_journalctl.hpp` (journalctl fallback outcome classifier) · `event_logs_macos.hpp` (log show outcome classifier + row/rc decision)
+- Plugin: `agents/plugins/event_logs/src/event_logs_journal.hpp` · `agents/plugins/event_logs/src/event_logs_journalctl.hpp` · `agents/plugins/event_logs/src/event_logs_macos.hpp` · `agents/plugins/event_logs/src/event_logs_parsers.hpp` · `agents/plugins/event_logs/src/event_logs_plugin.cpp`
 - Definitions: `content/definitions/event_logs.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_d.hpp`
-- Tests: `tests/unit/test_event_logs_parsers.cpp` · `tests/unit/test_event_logs_journalctl.cpp` · `tests/unit/test_event_logs_macos.cpp` · `tests/unit/test_event_logs_posix_actions.cpp` · `tests/unit/test_event_logs_win_actions.cpp`
-- Privilege row: `docs/agent-privilege-model.md:90`
-- Changelog: `changelog.d/2204-declarations-group-d.added.md` · `changelog.d/wave4-pr42-event-logs-native.changed.md`
+- Tests: `tests/unit/test_event_logs_journalctl.cpp` · `tests/unit/test_event_logs_macos.cpp` · `tests/unit/test_event_logs_parsers.cpp` · `tests/unit/test_event_logs_posix_actions.cpp` · `tests/unit/test_event_logs_win_actions.cpp`
+- Privilege row: `docs/agent-privilege-model.md`
 <!-- END GENERATED -->

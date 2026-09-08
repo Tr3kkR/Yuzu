@@ -4,12 +4,12 @@
 | | |
 |---|---|
 | **What it does** | Reports agent version, system info, health, modules, connection, switch, and config |
-| **Version** | 0.13.1 |
-| **Kind** | Collector · read-only · on-demand (no scheduled gather) |
+| **Version** | - |
+| **Kind** | Collector · read-only · gathered (device.status.version, device.status.info, device.status.health, device.status.plugins, device.status.modules, device.status.connection, device.status.switch, device.status.config) |
 | **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
-| **Actions** | `version` (definition `device.status.version`) · `info` (definition `device.status.info`) · `health` (definition `device.status.health`) · `plugins` (definition `device.status.plugins`) · `modules` (definition `device.status.modules`) · `connection` (definition `device.status.connection`) · `switch` (definition `device.status.switch`) · `config` (definition `device.status.config`) |
-| **Security** | securable `Inventory` (seven actions) / `PluginSecret` (`switch`) · operation Read · risk Low (Medium for `switch`) · dispatch ReadOnly · approval gate none |
-| **Roles** | execute: endpoint-admin, endpoint-operator (`version`, `info`, `health`, `plugins`, `modules`, `connection`) · endpoint-admin only (`switch`, `config`) · author: content-author |
+| **Actions** | `config` (definition `device.status.config`) · `connection` (definition `device.status.connection`) · `health` (definition `device.status.health`) · `info` (definition `device.status.info`) · `modules` (definition `device.status.modules`) · `plugins` (definition `device.status.plugins`) · `switch` (definition `device.status.switch`) · `version` (definition `device.status.version`) |
+| **Security** | `version`: securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `info`: securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `health`: securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `plugins`: securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `modules`: securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `connection`: securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `switch`: securable `PluginSecret` · operation Read · risk Medium · dispatch ReadOnly · approval gate None; `config`: securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
+| **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
 
 ## How it works
@@ -35,18 +35,14 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
+| `config` | ✅ supported · rung 1 · in-process agent config (agent.*) | ✅ supported · rung 1 · in-process agent config (agent.*) | ✅ supported · rung 1 · in-process agent config (agent.*) |
+| `connection` | ✅ supported · rung 1 · in-process agent config (agent.server_address/tls_enabled/*) | ✅ supported · rung 1 · in-process agent config (agent.server_address/tls_enabled/*) | ✅ supported · rung 1 · in-process agent config (agent.server_address/tls_enabled/*) |
+| `health` | ✅ supported · rung 1 · K32GetProcessMemoryInfo + steady_clock | ✅ supported · rung 1 · task_info(MACH_TASK_BASIC_INFO) + steady_clock | ✅ supported · rung 1 · /proc/self/status VmRSS + steady_clock |
+| `info` | ✅ supported · rung 1 · GetNativeSystemInfo + GetComputerNameA | ✅ supported · rung 1 · uname(2) + gethostname(3) | ✅ supported · rung 1 · uname(2) + gethostname(3) |
+| `modules` | ✅ supported · rung 1 · in-process agent config (agent.modules.*) | ✅ supported · rung 1 · in-process agent config (agent.modules.*) | ✅ supported · rung 1 · in-process agent config (agent.modules.*) |
+| `plugins` | ✅ supported · rung 1 · in-process agent config (agent.plugins.*) | ✅ supported · rung 1 · in-process agent config (agent.plugins.*) | ✅ supported · rung 1 · in-process agent config (agent.plugins.*) |
+| `switch` | ✅ supported · rung 1 · in-process agent config (agent.server_address/session_id/*) | ✅ supported · rung 1 · in-process agent config (agent.server_address/session_id/*) | ✅ supported · rung 1 · in-process agent config (agent.server_address/session_id/*) |
 | `version` | ✅ supported · rung 1 · in-process (compiled version constants) | ✅ supported · rung 1 · in-process (compiled version constants) | ✅ supported · rung 1 · in-process (compiled version constants) |
-| `info` | ✅ supported · rung 1 · `GetNativeSystemInfo` + `GetComputerNameA` | ✅ supported · rung 1 · `uname(2)` + `gethostname(3)` | ✅ supported · rung 1 · `uname(2)` + `gethostname(3)` |
-| `health` | ✅ supported · rung 1 · `K32GetProcessMemoryInfo` + `steady_clock` | ✅ supported · rung 1 · `task_info(MACH_TASK_BASIC_INFO)` + `steady_clock` | ✅ supported · rung 1 · `/proc/self/status` VmRSS + `steady_clock` |
-| `plugins` | ✅ supported · rung 1 · in-process agent config (`agent.plugins.*`) | ✅ supported · rung 1 · in-process agent config (`agent.plugins.*`) | ✅ supported · rung 1 · in-process agent config (`agent.plugins.*`) |
-| `modules` | ✅ supported · rung 1 · in-process agent config (`agent.modules.*`) | ✅ supported · rung 1 · in-process agent config (`agent.modules.*`) | ✅ supported · rung 1 · in-process agent config (`agent.modules.*`) |
-| `connection` | ✅ supported · rung 1 · in-process agent config (`agent.server_address`/`tls_enabled`/*) | ✅ supported · rung 1 · in-process agent config (`agent.server_address`/`tls_enabled`/*) | ✅ supported · rung 1 · in-process agent config (`agent.server_address`/`tls_enabled`/*) |
-| `switch` | ✅ supported · rung 1 · in-process agent config (`agent.server_address`/`session_id`/*) | ✅ supported · rung 1 · in-process agent config (`agent.server_address`/`session_id`/*) | ✅ supported · rung 1 · in-process agent config (`agent.server_address`/`session_id`/*) |
-| `config` | ✅ supported · rung 1 · in-process agent config (`agent.*`) | ✅ supported · rung 1 · in-process agent config (`agent.*`) | ✅ supported · rung 1 · in-process agent config (`agent.*`) |
-
-**Declared limits per leg** (the descriptor's fallback text, verbatim):
-
-- None. Every action/OS leg in `kActionDescriptors` is `YUZU_SUPPORT_SUPPORTED` at rung 1 with a `nullptr` fallback — no action degrades on any platform.
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -64,7 +60,7 @@ No external binaries, no subprocesses, no network access. Every call in `status_
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-`version`, `info`, `health`, `plugins`, `modules`, `connection`, `switch`, and `config` all take no parameters (`spec.parameters.properties: {}` in every one of the eight definitions).
+No action takes parameters.
 <!-- END GENERATED -->
 
 ### Outputs
@@ -72,85 +68,85 @@ No external binaries, no subprocesses, no network access. Every call in `status_
 Every field is written as its own pipe-delimited `key|value` row via `write_output()` — not one row per entity. `plugins` and `modules` are the two exceptions: after their own `<action>_count|<n>` row, each lists one `plugin|name|version|description` or `module|name|version|status` row per item, and `modules` additionally emits a separate `module_description|name|description` row only when a description is non-empty. The YAML declares `bool`/`int` types for several columns (`tls_enabled`, `encrypted`, `debug_mode`, `verbose_logging`, `reconnect_count`, …) purely for consumer convenience — every value actually travels as raw text from the agent's config map, and an unset or not-yet-synced key comes through as an empty string, never a typed `false`/`0`.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`version` — one `key|value` row per field: `version`, `build_number`, `git_commit`**
+**`device.status.config` — `agent_id|agent_version|build_number|git_commit|server_address|tls_enabled|heartbeat_interval|plugin_dir|data_dir|log_level|debug_mode|verbose_logging`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `version` | string | free text (semver + build suffix) | W, M, L | `0.13.1+5871` |
-| `build_number` | string | free text (integer as string) | W, M, L | `5871` |
-| `git_commit` | string | free text (hex hash or `unknown`) | W, M, L | `4c377398e` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `agent_id` | string | - | Windows, Linux, macOS | - | Agent's assigned id, from agent.id. Values: free text. |
+| `agent_version` | string | - | Windows, Linux, macOS | - | Full agent version string with build suffix, from agent.version (set from kFullVersionString). Values: free text. |
+| `build_number` | string | - | Windows, Linux, macOS | - | Build number as text, from agent.build_number. Values: free text (integer as string). |
+| `git_commit` | string | - | Windows, Linux, macOS | - | Short git commit hash, from agent.git_commit. Values: free text. |
+| `server_address` | string | - | Windows, Linux, macOS | - | Configured server address, from agent.server_address. Values: free text (host:port), or empty if unset. |
+| `tls_enabled` | bool | - | Windows, Linux, macOS | - | Raw config value of agent.tls_enabled as text. Values: "true", "false", or empty if unset. |
+| `heartbeat_interval` | string | - | Windows, Linux, macOS | - | Configured heartbeat interval in seconds, as text, from agent.heartbeat_interval. Values: free text (integer seconds as string). |
+| `plugin_dir` | string | - | Windows, Linux, macOS | - | Configured plugin directory path, from agent.plugin_dir. Values: free text (filesystem path). |
+| `data_dir` | string | - | Windows, Linux, macOS | - | Configured data directory path, from agent.data_dir. Values: free text (filesystem path). |
+| `log_level` | string | - | Windows, Linux, macOS | - | Configured log level, from agent.log_level. Values: free text (e.g. "info", "debug"). |
+| `debug_mode` | bool | - | Windows, Linux, macOS | - | Raw config value of agent.debug_mode as text. Values: "true", "false", or empty if unset. |
+| `verbose_logging` | bool | - | Windows, Linux, macOS | - | Raw config value of agent.verbose_logging as text. Values: "true", "false", or empty if unset. |
 
-**`info` — one `key|value` row per field: `os`, `arch`, `hostname`**
+**`device.status.connection` — `server_address|tls_enabled|encrypted|debug_mode|verbose_logging|log_level`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `os` | string | `Darwin`, `Linux`, `Windows` | W, M, L | `Darwin` |
-| `arch` | string | free text on Linux/macOS; on Windows one of `x86_64`, `aarch64`, `x86`, `arm`, `unknown` | W, M, L | `arm64` |
-| `hostname` | string | free text (row omitted if the call fails) | W, M, L | `braga.local` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `server_address` | string | - | Windows, Linux, macOS | - | Configured server address the agent connects to, from agent.server_address. Values: free text (host:port), or empty if unset. |
+| `tls_enabled` | bool | - | Windows, Linux, macOS | - | Raw config value of agent.tls_enabled as text; not validated or cast to bool at read time. Values: "true", "false", or empty if unset. |
+| `encrypted` | bool | - | Windows, Linux, macOS | `true` | Derived field — "false" only when tls_enabled is literally "false"; "true" in every other case, including when tls_enabled is empty. Values: "true", "false". |
+| `debug_mode` | bool | - | Windows, Linux, macOS | - | Raw config value of agent.debug_mode as text. Values: "true", "false", or empty if unset. |
+| `verbose_logging` | bool | - | Windows, Linux, macOS | - | Raw config value of agent.verbose_logging as text. Values: "true", "false", or empty if unset. |
+| `log_level` | string | - | Windows, Linux, macOS | - | Configured log level string, from agent.log_level. Values: free text (e.g. "info", "debug"), or empty if unset. |
 
-**`health` — one `key|value` row per field: `uptime_seconds`, `timestamp_epoch_ms`, `memory_rss_kb`**
+**`device.status.health` — `uptime_seconds|timestamp_epoch_ms|memory_rss_kb`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `uptime_seconds` | int64 | non-negative integer (seconds since `init()`) | W, M, L | `49012` |
-| `timestamp_epoch_ms` | int64 | integer (Unix epoch milliseconds) | W, M, L | `1788774965076` |
-| `memory_rss_kb` | int64 | non-negative integer (kilobytes), row absent on a failed read | W, M, L | `31056` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `uptime_seconds` | int64 | - | Windows, Linux, macOS | `49012` | Seconds since the plugin's init() ran, measured with steady_clock; only meaningful once init() has actually been called by the host. Values: non-negative integer (seconds). |
+| `timestamp_epoch_ms` | int64 | - | Windows, Linux, macOS | `1788774965076` | Wall-clock time the action ran, in epoch milliseconds (system_clock::now()). Values: integer (Unix epoch milliseconds). |
+| `memory_rss_kb` | int64 | - | Windows, Linux, macOS | `31056` | Process resident set size in kilobytes; the row is omitted entirely (not zeroed) if the platform read fails. Values: non-negative integer (kilobytes), or the row is absent. |
 
-**`plugins` — `plugins_count\|<n>` then one `plugin\|name\|version\|description` row per plugin**
+**`device.status.info` — `os|arch|hostname`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `plugins_count` | int32 | non-negative integer | W, M, L | `0` |
-| `plugin_name` | string | free text | W, M, L | `-` |
-| `plugin_version` | string | free text | W, M, L | `-` |
-| `plugin_description` | string | free text | W, M, L | `-` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `os` | string | - | Windows, Linux, macOS | `Darwin` | OS family name. "Darwin"/"Linux" from uname(2) on macOS/Linux, or the literal "Windows" on Windows. Values: "Darwin", "Linux", "Windows". |
+| `arch` | string | - | Windows, Linux, macOS | `arm64` | CPU architecture. uname(2)'s machine field on Linux/macOS; mapped from GetNativeSystemInfo on Windows. Values: free text on Linux/macOS (whatever uname reports); on Windows one of "x86_64", "aarch64", "x86", "arm", "unknown". |
+| `hostname` | string | - | Windows, Linux, macOS | `braga.local` | Agent host's configured hostname (gethostname(3) on Linux/macOS, GetComputerNameA on Windows); the row is simply not emitted if the call fails. Values: free text. |
 
-**`modules` — `modules_count\|<n>` then one `module\|name\|version\|status` row per module, plus an optional `module_description\|name\|description` row**
+**`device.status.modules` — `modules_count|module_name|module_version|module_status|module_description`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `modules_count` | int32 | non-negative integer | W, M, L | `0` |
-| `module_name` | string | free text | W, M, L | `-` |
-| `module_version` | string | free text or empty | W, M, L | `-` |
-| `module_status` | string | `loaded`, `init_failed`, `load_failed` | W, M, L | `-` |
-| `module_description` | string | free text, or the row is absent | W, M, L | `-` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `modules_count` | int32 | - | Windows, Linux, macOS | `0` | Number of modules recorded in the agent's module roster (agent.modules.count), including both successful loads and rejected loads. Values: non-negative integer. |
+| `module_name` | string | - | Windows, Linux, macOS | `-` | Module's file stem name; one "module\|name\|version\|status" row is emitted per module. Values: free text. |
+| `module_version` | string | - | Windows, Linux, macOS | `-` | Module's declared version; empty for a rejected load. Values: free text or empty. |
+| `module_status` | string | - | Windows, Linux, macOS | `-` | Load outcome for the module, as recorded by the agent's loader. Values: "loaded", "init_failed", "load_failed". |
+| `module_description` | string | - | Windows, Linux, macOS | `-` | Human-readable description, or the rejection reason for a failed load; emitted as a separate "module_description\|name\|description" row, and only when non-empty. Values: free text, or the row is absent. |
 
-**`connection` — one `key|value` row per field: `server_address`, `tls_enabled`, `encrypted`, `debug_mode`, `verbose_logging`, `log_level`**
+**`device.status.plugins` — `plugins_count|plugin_name|plugin_version|plugin_description`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `server_address` | string | free text (host:port), or empty if unset | W, M, L | `-` (empty in every capture) |
-| `tls_enabled` | bool | `true`, `false`, or empty if unset | W, M, L | `-` (empty in every capture) |
-| `encrypted` | bool | `true`, `false` — `false` only when `tls_enabled` is literally `"false"` | W, M, L | `true` |
-| `debug_mode` | bool | `true`, `false`, or empty if unset | W, M, L | `-` (empty in every capture) |
-| `verbose_logging` | bool | `true`, `false`, or empty if unset | W, M, L | `-` (empty in every capture) |
-| `log_level` | string | free text, or empty if unset | W, M, L | `-` (empty in every capture) |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `plugins_count` | int32 | - | Windows, Linux, macOS | `0` | Number of plugins currently loaded by the agent, from agent.plugins.count in the in-process config; 0 if the config context isn't yet populated. Values: non-negative integer. |
+| `plugin_name` | string | - | Windows, Linux, macOS | `-` | Loaded plugin's name; one "plugin\|name\|version\|description" row is emitted per loaded plugin. Values: free text. |
+| `plugin_version` | string | - | Windows, Linux, macOS | `-` | Loaded plugin's declared version string. Values: free text. |
+| `plugin_description` | string | - | Windows, Linux, macOS | `-` | Loaded plugin's declared description. Values: free text. |
 
-**`switch` — one `key|value` row per field: `switch_address`, `session_id`, `connected_since`, `reconnect_count`**
+**`device.status.switch` — `switch_address|session_id|connected_since|reconnect_count`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `switch_address` | string | free text (host:port), or empty if unset | W, M, L | `-` (empty in every capture) |
-| `session_id` | string | free text (opaque token), or empty | W, M, L | `-` (empty in every capture) |
-| `connected_since` | string | integer-as-string (Unix ms), or empty | W, M, L | `-` (empty in every capture) |
-| `reconnect_count` | int32 | non-negative integer, or empty string when unset | W, M, L | `-` (empty in every capture) |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `switch_address` | string | - | Windows, Linux, macOS | - | Same value as connection.server_address, from agent.server_address. Values: free text (host:port), or empty if unset. |
+| `session_id` | string | - | Windows, Linux, macOS | - | The agent's live session id, the same value Register/Heartbeat use server-side to resolve identity; classified as a plugin secret, not plain inventory. Values: free text (opaque token), or empty. |
+| `connected_since` | string | - | Windows, Linux, macOS | - | Epoch milliseconds the current session connected, from agent.connected_since. Values: integer-as-string (Unix epoch milliseconds), or empty. |
+| `reconnect_count` | int32 | - | Windows, Linux, macOS | - | Number of reconnect attempts recorded by the register/reconnect loop, from agent.reconnect_count. Values: non-negative integer, or empty string when the config key is unset (despite the declared int32 type). |
 
-**`config` — one `key|value` row per field: `agent_id`, `agent_version`, `build_number`, `git_commit`, `server_address`, `tls_enabled`, `heartbeat_interval`, `plugin_dir`, `data_dir`, `log_level`, `debug_mode`, `verbose_logging`**
+**`device.status.version` — `version|build_number|git_commit`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `agent_id` | string | free text | W, M, L | `-` (empty in every capture) |
-| `agent_version` | string | free text | W, M, L | `-` (empty in every capture) |
-| `build_number` | string | free text (integer as string) | W, M, L | `-` (empty in every capture) |
-| `git_commit` | string | free text | W, M, L | `-` (empty in every capture) |
-| `server_address` | string | free text (host:port), or empty if unset | W, M, L | `-` (empty in every capture) |
-| `tls_enabled` | bool | `true`, `false`, or empty if unset | W, M, L | `-` (empty in every capture) |
-| `heartbeat_interval` | string | free text (integer seconds as string) | W, M, L | `-` (empty in every capture) |
-| `plugin_dir` | string | free text (filesystem path) | W, M, L | `-` (empty in every capture) |
-| `data_dir` | string | free text (filesystem path) | W, M, L | `-` (empty in every capture) |
-| `log_level` | string | free text | W, M, L | `-` (empty in every capture) |
-| `debug_mode` | bool | `true`, `false`, or empty if unset | W, M, L | `-` (empty in every capture) |
-| `verbose_logging` | bool | `true`, `false`, or empty if unset | W, M, L | `-` (empty in every capture) |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `version` | string | - | Windows, Linux, macOS | `0.13.1+5871` | Full agent version string, "<semver>+<build_number>" (yuzu::kFullVersionString). Values: free text (semver + build suffix). |
+| `build_number` | string | - | Windows, Linux, macOS | `5871` | The build's numeric build number, formatted as text (yuzu::kBuildNumber). Values: free text (integer as string). |
+| `git_commit` | string | - | Windows, Linux, macOS | `4c377398e` | Short git commit hash of the build (yuzu::kGitCommitHash), or "unknown" when the build did not set one. Values: free text (hex hash or "unknown"). |
 <!-- END GENERATED -->
 
 ### Result status
@@ -161,40 +157,41 @@ This plugin does not set a typed result status; the agent records `UNDECLARED` a
 
 - **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`; none of the eight definitions override `spec.response.retentionDays`, so the store's default retention applies.
 - **Not consumed by** daily-sync inventory, the TAR warehouse, or DEX — `status_plugin.cpp` has no `sync_source_*`, TAR cursor, or Guardian/DEX integration. Nothing runs on a schedule; every action executes only when an operator or workflow dispatches its definition.
+- **Sensitivity.** `info`'s `hostname` row identifies the device; `plugins`/`modules` rows name the agent's own installed plugin/module inventory (an installed-software listing, though of agent components rather than third-party apps); `switch`'s `session_id` is a live session credential, deliberately gated as `PluginSecret` rather than plain inventory (see Caveat 3); `config`'s `agent_id`, `server_address`, and `plugin_dir`/`data_dir` filesystem paths can also identify the specific device and its install layout. `version`, `health`, and `connection` rows carry nothing beyond build/runtime metadata.
 - **Siblings:** `os_info` (a separate, broader platform-inventory plugin) and `agent_actions.info` (a separate plugin action that also reads "agent runtime info from config context" — overlaps in spirit with `status.info`/`status.config` but is a distinct code path).
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("device.status.version")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 0e82a6f385ea
 
 ```
 == action=version
 version|0.13.1+7854
 build_number|7854
 git_commit|4c377398e
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=info
 os|Windows
 arch|x86_64
 hostname|DESKTOP-04DNSIG
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=health
 uptime_seconds|69196
 timestamp_epoch_ms|1788775738117
 memory_rss_kb|9772
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=plugins
 plugins_count|0
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=modules
 modules_count|0
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=connection
 server_address|
@@ -203,14 +200,14 @@ encrypted|true
 debug_mode|
 verbose_logging|
 log_level|
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=switch
 switch_address|
 session_id|
 connected_since|
 reconnect_count|
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=config
 agent_id|
@@ -225,37 +222,37 @@ data_dir|
 log_level|
 debug_mode|
 verbose_logging|
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 0e82a6f385ea
 
 ```
 == action=version
 version|0.13.1+5871
 build_number|5871
 git_commit|4c377398e
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=info
 os|Darwin
 arch|arm64
 hostname|braga.local
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=health
 uptime_seconds|49012
 timestamp_epoch_ms|1788774965076
 memory_rss_kb|31056
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=plugins
 plugins_count|0
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=modules
 modules_count|0
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=connection
 server_address|
@@ -264,14 +261,14 @@ encrypted|true
 debug_mode|
 verbose_logging|
 log_level|
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=switch
 switch_address|
 session_id|
 connected_since|
 reconnect_count|
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=config
 agent_id|
@@ -286,37 +283,37 @@ data_dir|
 log_level|
 debug_mode|
 verbose_logging|
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash pending
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 0e82a6f385ea
 
 ```
 == action=version
 version|0.13.1+0
 build_number|0
 git_commit|unknown
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=info
 os|Linux
 arch|aarch64
 hostname|988e0b888baf
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=health
 uptime_seconds|184122
 timestamp_epoch_ms|1788722304837
 memory_rss_kb|15020
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=plugins
 plugins_count|0
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=modules
 modules_count|0
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=connection
 server_address|
@@ -325,14 +322,14 @@ encrypted|true
 debug_mode|
 verbose_logging|
 log_level|
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=switch
 switch_address|
 session_id|
 connected_since|
 reconnect_count|
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=config
 agent_id|
@@ -347,7 +344,7 @@ data_dir|
 log_level|
 debug_mode|
 verbose_logging|
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 ```
 <!-- END GENERATED -->
 
@@ -362,10 +359,10 @@ verbose_logging|
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/status/src/status_plugin.cpp` (single-file plugin — descriptor, action legs, and all eight actions)
+- Plugin: `agents/plugins/status/src/status_plugin.cpp`
 - Definitions: `content/definitions/status.yaml`
-- Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_b.hpp` (lines 233-325)
-- Tests: `tests/unit/test_runner_status.cpp` (tests `classify_runner_failure`, the agent's subprocess-runner status mapping — not specific to this plugin) · `tests/unit/test_tar_capture_status.cpp` (tests the TAR subprocess-capture classifier — also not specific to this plugin); no test dispatches the `status` plugin's own actions directly (no `DESCRIPTOR_TEST("status", ...)` entry in `tests/unit/test_new_plugins.cpp`, no `test_status_local_dispatcher.cpp`)
-- Privilege row: no row in `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2204-declarations-group-b.added.md` (added the ABI4 per-action/per-OS declarations for `status`) · `changelog.d/plugin-abi4-descriptor.added.md` (introduced the ABI4 mechanism these declarations use)
+- Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_b.hpp`
+- Tests: none found by name
+- Privilege row: `docs/agent-privilege-model.md` (no row yet)
+- Changelog: `changelog.d/2298-guardian-spark-6d-status-authz.security.md` · `changelog.d/3283-macos-pf-enabled-status.security.md` · `changelog.d/mcp-streamable-pr1-notification-status.changed.md`
 <!-- END GENERATED -->

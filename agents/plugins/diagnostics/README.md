@@ -5,11 +5,11 @@
 |---|---|
 | **What it does** | Agent diagnostics — log level, certificates, connection info |
 | **Version** | 0.2.0 |
-| **Kind** | Collector · read-only · on-demand (no scheduled gather) |
+| **Kind** | Collector · read-only · gathered (device.diagnostics.log_level, device.diagnostics.certificates, device.diagnostics.connection_info) |
 | **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
-| **Actions** | `log_level` (definition `device.diagnostics.log_level`) · `certificates` (`device.diagnostics.certificates`) · `connection_info` (`device.diagnostics.connection_info`) |
-| **Security** | `log_level`: securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate none — `certificates`: securable `Security` · operation Read · risk Medium · dispatch ReadOnly · approval gate none — `connection_info`: securable `PluginSecret` · operation Read · risk Medium · dispatch ReadOnly · approval gate none |
-| **Roles** | `log_level` execute: endpoint-admin, endpoint-operator · `certificates`/`connection_info` execute: endpoint-admin · author (all three): content-author |
+| **Actions** | `certificates` (definition `device.diagnostics.certificates`) · `connection_info` (definition `device.diagnostics.connection_info`) · `log_level` (definition `device.diagnostics.log_level`) |
+| **Security** | `log_level`: securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `certificates`: securable `Security` · operation Read · risk Medium · dispatch ReadOnly · approval gate None; `connection_info`: securable `PluginSecret` · operation Read · risk Medium · dispatch ReadOnly · approval gate None |
+| **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
 
 ## How it works
@@ -33,13 +33,9 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `log_level` | ✅ supported · rung 1 · in-process agent config (`agent.log_level`) | ✅ supported · rung 1 · in-process agent config (`agent.log_level`) | ✅ supported · rung 1 · in-process agent config (`agent.log_level`) |
-| `certificates` | ✅ supported · rung 1 · in-process agent config (`tls.*_cert`/`tls.client_key`) + `std::filesystem::exists` | ✅ supported · rung 1 · in-process agent config (`tls.*_cert`/`tls.client_key`) + `std::filesystem::exists` | ✅ supported · rung 1 · in-process agent config (`tls.*_cert`/`tls.client_key`) + `std::filesystem::exists` |
-| `connection_info` | ✅ supported · rung 1 · in-process agent config (`agent.server_address`/`tls.enabled`/…) | ✅ supported · rung 1 · in-process agent config (`agent.server_address`/`tls.enabled`/…) | ✅ supported · rung 1 · in-process agent config (`agent.server_address`/`tls.enabled`/…) |
-
-**Declared limits per leg** (the descriptor's fallback text, verbatim):
-
-None declared — all nine legs report `nullptr` fallback text.
+| `certificates` | ✅ supported · rung 1 · in-process agent config (tls.*_cert/tls.client_key) + std::filesystem::exists | ✅ supported · rung 1 · in-process agent config (tls.*_cert/tls.client_key) + std::filesystem::exists | ✅ supported · rung 1 · in-process agent config (tls.*_cert/tls.client_key) + std::filesystem::exists |
+| `connection_info` | ✅ supported · rung 1 · in-process agent config (agent.server_address/tls.enabled/*) | ✅ supported · rung 1 · in-process agent config (agent.server_address/tls.enabled/*) | ✅ supported · rung 1 · in-process agent config (agent.server_address/tls.enabled/*) |
+| `log_level` | ✅ supported · rung 1 · in-process agent config (agent.log_level) | ✅ supported · rung 1 · in-process agent config (agent.log_level) | ✅ supported · rung 1 · in-process agent config (agent.log_level) |
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -57,9 +53,7 @@ No external binaries, no subprocesses, no network access. The only filesystem to
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-`log_level` takes no parameters.
-`certificates` takes no parameters.
-`connection_info` takes no parameters.
+No action takes parameters.
 <!-- END GENERATED -->
 
 ### Outputs
@@ -67,32 +61,32 @@ No external binaries, no subprocesses, no network access. The only filesystem to
 One `key|value` row per field via `write_output()` — not a fixed-width pipe schema like most plugins, but a variable-length sequence of labelled rows per call (`agents/plugins/diagnostics/src/diagnostics_plugin.cpp:10-12`). `certificates` additionally prefixes each row with the literal discriminator `cert`. There is no empty-result placeholder row: every action always emits its full fixed set of rows, substituting a fallback string (`"(not configured)"`, `"(none)"`, `"unknown"`, `"0"`, `"false"`, `"info"`) for any config key that is unset — `-` is never used as a placeholder in this plugin.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`log_level` — `log_level|<value>`**
+**`device.diagnostics.certificates` — `cert_type|path|exists`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `log_level` | string | `trace` `debug` `info` `warn` `error` `critical` `off` (per the config store convention; not validated by the plugin) | windows, linux, darwin | `info` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `cert_type` | string | `ca_cert` `client_cert` `client_key` | Windows, Linux, macOS | `ca_cert` | Which certificate/key slot this row reports. |
+| `path` | string | - | Windows, Linux, macOS | `(not configured)` | Filesystem path configured for this slot's config key, or the literal "(not configured)" when unset. Values: free text (path) or "(not configured)". |
+| `exists` | bool | - | Windows, Linux, macOS | `false` | Whether std::filesystem::exists() found a file at path; always false when path is unconfigured. |
 
-**`certificates` — `cert|<cert_type>|<path>|<exists>`**
+**`device.diagnostics.connection_info` — `server_address|tls_enabled|session_id|grpc_channel_state|reconnect_count|latency_ms|uptime_seconds|connected_since`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `cert_type` | string | `ca_cert` `client_cert` `client_key` | windows, linux, darwin | `ca_cert` |
-| `path` | string | free text (path) or `(not configured)` | windows, linux, darwin | `(not configured)` |
-| `exists` | bool | `true` `false` | windows, linux, darwin | `false` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `server_address` | string | - | Windows, Linux, macOS | `(not configured)` | gRPC server endpoint the agent is configured to connect to, or the literal "(not configured)" when unset. Values: free text (host:port) or "(not configured)". |
+| `tls_enabled` | bool | - | Windows, Linux, macOS | `false` | Whether mTLS is enabled for the agent's server connection, read from tls.enabled; false when unset. |
+| `session_id` | string | - | Windows, Linux, macOS | `(none)` | Current gRPC session identifier (the live agent session credential), or the literal "(none)" when there is no active session. Values: free text or "(none)". |
+| `grpc_channel_state` | string | - | Windows, Linux, macOS | `unknown` | Current gRPC channel connectivity state, read verbatim from agent.grpc_channel_state, or "unknown" when unset. Values: free text (e.g. READY, CONNECTING, TRANSIENT_FAILURE) or "unknown". |
+| `reconnect_count` | int32 | - | Windows, Linux, macOS | `0` | Number of times the agent has reconnected to the server since startup; 0 when unset. Values: integer >= 0. |
+| `latency_ms` | int32 | - | Windows, Linux, macOS | `0` | Last measured round-trip latency to the server in milliseconds; 0 when unset. Values: integer >= 0. |
+| `uptime_seconds` | int64 | - | Windows, Linux, macOS | `0` | Seconds since agent.start_time_epoch, computed at read time; 0 when start_time_epoch is unset or unparsable. Values: integer >= 0. |
+| `connected_since` | string | - | Windows, Linux, macOS | `0` | Unix epoch timestamp (as a string) of when the current connection was established, or "0" when unset. Values: free text (epoch seconds) or "0". |
 
-**`connection_info` — `<key>|<value>` (8 rows, one per key)**
+**`device.diagnostics.log_level` — `log_level`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `server_address` | string | free text (`host:port`) or `(not configured)` | windows, linux, darwin | `(not configured)` |
-| `tls_enabled` | bool | `true` `false` | windows, linux, darwin | `false` |
-| `session_id` | string | free text (live session credential) or `(none)` | windows, linux, darwin | `(none)` |
-| `grpc_channel_state` | string | free text (e.g. `READY`, `CONNECTING`, `TRANSIENT_FAILURE`) or `unknown` | windows, linux, darwin | `unknown` |
-| `reconnect_count` | int32 | integer ≥ 0 | windows, linux, darwin | `0` |
-| `latency_ms` | int32 | integer ≥ 0 | windows, linux, darwin | `0` |
-| `uptime_seconds` | int64 | integer ≥ 0, computed from `start_time_epoch` at read time | windows, linux, darwin | `0` |
-| `connected_since` | string | free text (epoch seconds) or `0` | windows, linux, darwin | `0` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `log_level` | string | `trace` `debug` `info` `warn` `error` `critical` `off` | Windows, Linux, macOS | `info` | The agent's current spdlog log level, read verbatim from agent.log_level. |
 <!-- END GENERATED -->
 
 ### Result status
@@ -103,24 +97,25 @@ This plugin does not set a typed result status; the agent records `UNDECLARED` a
 
 - **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (90-day default retention, `server/core/src/response_store.hpp:153`), readable at `/api/responses/{id}`.
 - **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — no server-side store or route reads `device.diagnostics.*` (grepped across `server/`); `server/core/src/agent_registry.cpp:922-925` only carries the action's one-line description for discovery/catalog display, not the result rows.
+- **Sensitivity.** `connection_info`'s `session_id` is the agent's live session credential — why that action sits behind the `PluginSecret` securable rather than `Inventory` — and `certificates`' `path` rows can reveal local filesystem layout; nothing here names a specific person or installed software.
 - **Siblings:** none in this plugin group — `agent_logging` is the closest neighbor (`get_key_files` reports TLS/key file paths under the same `Security` securable; `get_log`/`connection_info` both expose the live session credential under `PluginSecret`).
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("device.diagnostics.connection_info")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash c768172a2281
 
 ```
 == action=log_level
 log_level|info
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 
 == action=certificates
 cert|ca_cert|(not configured)|false
 cert|client_cert|(not configured)|false
 cert|client_key|(not configured)|false
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 
 == action=connection_info
 server_address|(not configured)
@@ -131,21 +126,21 @@ reconnect_count|0
 latency_ms|0
 uptime_seconds|0
 connected_since|0
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash c768172a2281
 
 ```
 == action=log_level
 log_level|info
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 
 == action=certificates
 cert|ca_cert|(not configured)|false
 cert|client_cert|(not configured)|false
 cert|client_key|(not configured)|false
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 
 == action=connection_info
 server_address|(not configured)
@@ -156,21 +151,21 @@ reconnect_count|0
 latency_ms|0
 uptime_seconds|0
 connected_since|0
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash pending
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash c768172a2281
 
 ```
 == action=log_level
 log_level|info
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 
 == action=certificates
 cert|ca_cert|(not configured)|false
 cert|client_cert|(not configured)|false
 cert|client_key|(not configured)|false
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 
 == action=connection_info
 server_address|(not configured)
@@ -181,7 +176,7 @@ reconnect_count|0
 latency_ms|0
 uptime_seconds|0
 connected_since|0
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 ```
 <!-- END GENERATED -->
 
@@ -196,10 +191,9 @@ connected_since|0
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/diagnostics/src/diagnostics_plugin.cpp` · `agents/plugins/diagnostics/meson.build`
+- Plugin: `agents/plugins/diagnostics/src/diagnostics_plugin.cpp`
 - Definitions: `content/definitions/diagnostics.yaml`
-- Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_b.hpp:656-698`
-- Tests: no dedicated test file — `diagnostics` is not referenced in `tests/unit/test_new_plugins.cpp` or elsewhere under `tests/unit/`
-- Privilege row: no row in `docs/agent-privilege-model.md` (general per-platform account rows apply)
-- Changelog: `changelog.d/2204-declarations-group-b.added.md`
+- Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_b.hpp`
+- Tests: none found by name
+- Privilege row: `docs/agent-privilege-model.md` (no row yet)
 <!-- END GENERATED -->

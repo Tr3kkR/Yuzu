@@ -5,11 +5,11 @@
 |---|---|
 | **What it does** | Device tagging — set, get, delete, list tags for scope evaluation |
 | **Version** | 0.1.0 |
-| **Kind** | Action · mixed (mutating `set`/`delete`/`clear` · read-only `get`/`get_all`/`check`/`count`) · on-demand |
+| **Kind** | Action · mutating · gathered (device.tags.set, device.tags.get, device.tags.get_all, device.tags.delete, device.tags.check, device.tags.clear, device.tags.count) |
 | **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
-| **Actions** | `set` (definition `device.tags.set`) · `get` (definition `device.tags.get`) · `get_all` (definition `device.tags.get_all`) · `delete` (definition `device.tags.delete`) · `check` (definition `device.tags.check`) · `clear` (definition `device.tags.clear`) · `count` (definition `device.tags.count`) |
-| **Security** | securable `Tag` · operation Write (`set`) / Read (`get`, `get_all`, `check`, `count`) / Delete (`delete`, `clear`) · risk Medium (`set`) / Low (`get`, `get_all`, `check`, `count`) / High (`delete`, `clear`) · dispatch Mutating/Reversible (`set`, `delete`) / ReadOnly/None (`get`, `get_all`, `check`, `count`) / Destructive/Irreversible (`clear`) · approval gate none (all except `clear`: AdminOrApproval) |
-| **Roles** | execute: endpoint-admin, endpoint-operator (endpoint-admin only for `clear`) · author: content-author |
+| **Actions** | `check` (definition `device.tags.check`) · `clear` (definition `device.tags.clear`) · `count` (definition `device.tags.count`) · `delete` (definition `device.tags.delete`) · `get` (definition `device.tags.get`) · `get_all` (definition `device.tags.get_all`) · `set` (definition `device.tags.set`) |
+| **Security** | `set`: securable `Tag` · operation Write · risk Medium · dispatch Mutating · approval gate None; `get`: securable `Tag` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `get_all`: securable `Tag` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `delete`: securable `Tag` · operation Delete · risk High · dispatch Mutating · approval gate None; `check`: securable `Tag` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `clear`: securable `Tag` · operation Delete · risk High · dispatch Destructive · approval gate AdminOrApproval; `count`: securable `Tag` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
+| **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
 
 ## How it works
@@ -36,15 +36,13 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `set` | ✅ supported · rung 1 · `local_json_store` | ✅ supported · rung 1 · `local_json_store` | ✅ supported · rung 1 · `local_json_store` |
-| `get` | ✅ supported · rung 1 · `local_json_store` | ✅ supported · rung 1 · `local_json_store` | ✅ supported · rung 1 · `local_json_store` |
-| `get_all` | ✅ supported · rung 1 · `local_json_store` | ✅ supported · rung 1 · `local_json_store` | ✅ supported · rung 1 · `local_json_store` |
-| `delete` | ✅ supported · rung 1 · `local_json_store` | ✅ supported · rung 1 · `local_json_store` | ✅ supported · rung 1 · `local_json_store` |
-| `check` | ✅ supported · rung 1 · `local_json_store` | ✅ supported · rung 1 · `local_json_store` | ✅ supported · rung 1 · `local_json_store` |
-| `clear` | ✅ supported · rung 1 · `local_json_store` | ✅ supported · rung 1 · `local_json_store` | ✅ supported · rung 1 · `local_json_store` |
-| `count` | ✅ supported · rung 1 · `local_json_store` | ✅ supported · rung 1 · `local_json_store` | ✅ supported · rung 1 · `local_json_store` |
-
-**Declared limits per leg** (the descriptor's fallback text, verbatim): none — every (action, OS) fallback field is `-` (`tags_plugin.cpp:82-104`).
+| `check` | ✅ supported · rung 1 · local_json_store | ✅ supported · rung 1 · local_json_store | ✅ supported · rung 1 · local_json_store |
+| `clear` | ✅ supported · rung 1 · local_json_store | ✅ supported · rung 1 · local_json_store | ✅ supported · rung 1 · local_json_store |
+| `count` | ✅ supported · rung 1 · local_json_store | ✅ supported · rung 1 · local_json_store | ✅ supported · rung 1 · local_json_store |
+| `delete` | ✅ supported · rung 1 · local_json_store | ✅ supported · rung 1 · local_json_store | ✅ supported · rung 1 · local_json_store |
+| `get` | ✅ supported · rung 1 · local_json_store | ✅ supported · rung 1 · local_json_store | ✅ supported · rung 1 · local_json_store |
+| `get_all` | ✅ supported · rung 1 · local_json_store | ✅ supported · rung 1 · local_json_store | ✅ supported · rung 1 · local_json_store |
+| `set` | ✅ supported · rung 1 · local_json_store | ✅ supported · rung 1 · local_json_store | ✅ supported · rung 1 · local_json_store |
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -62,15 +60,13 @@ No external binaries, no subprocesses, no network access — every action is an 
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-| Definition | Parameter | Type | Required | Default | Values | Description |
+| Definition | Parameter | Type | Required | Default | Constraints | Description |
 |---|---|---|---|---|---|---|
-| `device.tags.set` | `key` | string | yes | - | - | The tag key. Max 64 characters, alphanumeric plus `_-.:` |
-| `device.tags.set` | `value` | string | no | - | - | The tag value. Max 448 bytes. |
-| `device.tags.get` | `key` | string | yes | - | - | The tag key to look up. |
-| `device.tags.delete` | `key` | string | yes | - | - | The tag key to delete. |
-| `device.tags.check` | `key` | string | yes | - | - | The tag key to check for existence. |
-
-`get_all` takes no parameters. `clear` takes no parameters. `count` takes no parameters.
+| `device.tags.check` | `key` | string | yes | - | maxLength 64 | The tag key to check for existence. |
+| `device.tags.delete` | `key` | string | yes | - | maxLength 64 | The tag key to delete. |
+| `device.tags.get` | `key` | string | yes | - | maxLength 64 | The tag key to look up. |
+| `device.tags.set` | `key` | string | yes | - | pattern: ^[a-zA-Z0-9_.:\-]+$ · maxLength 64 | The tag key. Max 64 characters, alphanumeric plus _-.: |
+| `device.tags.set` | `value` | string | no | - | maxLength 448 | The tag value. Max 448 bytes. |
 <!-- END GENERATED -->
 
 ### Outputs
@@ -78,53 +74,53 @@ No external binaries, no subprocesses, no network access — every action is an 
 Every action writes one or more pipe-delimited lines via `ctx.write_output`; there is no shared discriminator across actions — each uses its own literal prefix (`tag_set`, `tag`, `tag_deleted`, `tag_exists`, `tags_cleared`, `count`) rather than the field names declared below. A missing/unset value reports as an empty string (a trailing empty field), never a `-` placeholder (`tags_plugin.cpp:200`; see the macOS sample's `get`). A validation failure returns `rc=1` and a distinct `error|<message>` line instead of the success row (`tags_plugin.cpp:169-172,180-183,193-196,217-220,230-233`).
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`set` — `tag_set|key|value`**
+**`device.tags.check` — `key|exists`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `key` | string | free text | W, M, L | `yuzu_capture_tmp` |
-| `value` | string | free text | W, M, L | `1` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `key` | string | - | Windows, Linux, macOS | `yuzu_capture_tmp` | The tag key that was checked, echoed back from the request. Values: free text. |
+| `exists` | bool | - | Windows, Linux, macOS | `false` | Whether the key currently exists. Values: true, false. |
 
-**`get` — `tag|key|value`**
+**`device.tags.clear` — `cleared_count`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `key` | string | free text | W, M, L | `yuzu_capture_tmp` |
-| `value` | string | free text, empty when unset | W, M, L | *(empty — key was never persisted; see Caveats)* |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `cleared_count` | int32 | - | Windows, Linux, macOS | `-` | Number of tags that were removed by this call — the store's size immediately before clearing. Values: integer >= 0. |
 
-**`get_all` — `tag|key|value` (one line per tag) then `count|value`**
+**`device.tags.count` — `count`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `key` | string | free text | W, M, L | `yuzu_capture_tmp` |
-| `value` | string | free text | W, M, L | `1` |
-| `count` | int32 | integer ≥ 0 | W, M, L | `0` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `count` | int32 | - | Windows, Linux, macOS | `0` | Total number of tags currently stored. Values: integer >= 0. |
 
-**`delete` — `tag_deleted|key|found`**
+**`device.tags.delete` — `key|found`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `key` | string | free text | W, M, L | `yuzu_capture_tmp` |
-| `found` | bool | `true` `false` | W, M, L | `false` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `key` | string | - | Windows, Linux, macOS | `yuzu_capture_tmp` | The tag key that was deleted, echoed back from the request. Values: free text. |
+| `found` | bool | - | Windows, Linux, macOS | `false` | Whether the key existed before this call. Values: true, false. |
 
-**`check` — `tag_exists|key|exists`**
+**`device.tags.get` — `key|value`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `key` | string | free text | W, M, L | `yuzu_capture_tmp` |
-| `exists` | bool | `true` `false` | W, M, L | `false` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `key` | string | - | Windows, Linux, macOS | `yuzu_capture_tmp` | The tag key that was looked up, echoed back from the request. Values: free text. |
+| `value` | string | - | Windows, Linux, macOS | - | The tag's current value, or an empty string when the key is not set. Values: free text, empty when unset. |
 
-**`clear` — `tags_cleared|cleared_count`**
+**`device.tags.get_all` — `key|value|count`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `cleared_count` | int32 | integer ≥ 0 | W, M, L | `-` *(never captured — Destructive/Irreversible, not executed on a live host; see Caveats)* |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `key` | string | - | Windows, Linux, macOS | `yuzu_capture_tmp` | One stored tag's key. One row per tag currently in the store. Values: free text. |
+| `value` | string | - | Windows, Linux, macOS | `1` | That tag's value. Values: free text. |
+| `count` | int32 | - | Windows, Linux, macOS | `0` | Total number of tags currently stored, on a trailing line after the tag rows. Values: integer >= 0. |
 
-**`count` — `count|value`**
+**`device.tags.set` — `key|value`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `count` | int32 | integer ≥ 0 | W, M, L | `0` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `key` | string | - | Windows, Linux, macOS | `yuzu_capture_tmp` | The tag key that was written, echoed back from the request. Values: free text. |
+| `value` | string | - | Windows, Linux, macOS | `1` | The tag value that was written, echoed back from the request. Values: free text. |
 <!-- END GENERATED -->
 
 ### Result status
@@ -138,103 +134,104 @@ This plugin does not set a typed result status; the agent records `UNDECLARED` a
 - Every other key reaches `tag:<key>` scope-DSL evaluation via the store-first resolver (#3295) and management-group targeting.
 - `clear`'s dashboard dispatch is additionally subject to the Destructive-class targeting rule — no fleet broadcast, an explicit in-scope target is required (`changelog.d/3885-dashboard-destructive-targeting.security.md`, which names `tags.clear` directly).
 - **Not consumed by** daily-sync inventory, the TAR warehouse, or DEX.
+- **Sensitivity.** `key`/`value` rows are free-form text chosen entirely by the caller (bounded only by the length limits in Inputs) — whether a given tag identifies a device, a person, or installed software depends on what was set, not on anything the plugin itself constrains. The `count`/`found`/`exists` fields carry nothing beyond the device id.
 - **Siblings:** `asset_tags` — the narrower, server-authoritative 4-category (`role`/`environment`/`location`/`service`) tag sync, which only reacts to a server-pushed `sync`; `tags` is the general-purpose, agent-authoritative free-form key/value store, and the only one of the two an agent can write to unprompted.
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("device.tags.get_all")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash d55c173b7ddd
 
 ```
 == action=set key=yuzu_capture_tmp value=1
 tag_set|yuzu_capture_tmp|1
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=get key=yuzu_capture_tmp
 tag|yuzu_capture_tmp|
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=get_all
 count|0
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=delete key=yuzu_capture_tmp
 tag_deleted|yuzu_capture_tmp|false
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=check key=yuzu_capture_tmp
 tag_exists|yuzu_capture_tmp|false
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=clear
 [not captured] Destructive/Irreversible: not executed on a live host
 
 == action=count
 count|0
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash d55c173b7ddd
 
 ```
 == action=set key=yuzu_capture_tmp value=1
 tag_set|yuzu_capture_tmp|1
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=get key=yuzu_capture_tmp
 tag|yuzu_capture_tmp|
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=get_all
 count|0
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=delete key=yuzu_capture_tmp
 tag_deleted|yuzu_capture_tmp|false
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=check key=yuzu_capture_tmp
 tag_exists|yuzu_capture_tmp|false
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=clear
 [not captured] Destructive/Irreversible: not executed on a live host
 
 == action=count
 count|0
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash pending
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash d55c173b7ddd
 
 ```
 == action=set key=yuzu_capture_tmp value=1
 tag_set|yuzu_capture_tmp|1
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=get key=yuzu_capture_tmp
 tag|yuzu_capture_tmp|
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=get_all
 count|0
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=delete key=yuzu_capture_tmp
 tag_deleted|yuzu_capture_tmp|false
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=check key=yuzu_capture_tmp
 tag_exists|yuzu_capture_tmp|false
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=clear
 [not captured] Destructive/Irreversible: not executed on a live host
 
 == action=count
 count|0
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 ```
 <!-- END GENERATED -->
 
@@ -249,10 +246,10 @@ count|0
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/tags/src/tags_plugin.cpp` (single file — descriptor and all 7 actions/legs together; `local_json_store` needs no OS-specific code)
+- Plugin: `agents/plugins/tags/src/tags_plugin.cpp`
 - Definitions: `content/definitions/tags.yaml`
-- Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_d.hpp:57-128`
-- Tests: none dedicated — see Caveats
-- Privilege row: no row in `docs/agent-privilege-model.md`; the generic per-OS agent-identity rows apply (`docs/agent-privilege-model.md:12,14`)
-- Changelog: `changelog.d/2204-declarations-group-d.added.md` (ABI4 declarations) · `changelog.d/3289-agent-service-tag-seeding.changed.md` · `changelog.d/3289-service-tag-write-hardening.security.md` · `changelog.d/3295-scope-dsl-tag-store-first.security.md` · `changelog.d/3885-dashboard-destructive-targeting.security.md`
+- Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_d.hpp`
+- Tests: none found by name
+- Privilege row: `docs/agent-privilege-model.md` (no row yet)
+- Changelog: `changelog.d/3216-svc-scope-gate-primitives-tagstore.fixed.md`
 <!-- END GENERATED -->

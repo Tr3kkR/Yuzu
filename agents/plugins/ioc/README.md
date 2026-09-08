@@ -4,11 +4,11 @@
 | | |
 |---|---|
 | **What it does** | Indicator of Compromise checking — match IOCs against local endpoint state |
-| **Version** | 1.0.0 · plugin ABI 4 · shipped in PR #2204 (2026-08-14) |
-| **Kind** | Action · read-only · on-demand (`gather.ttlSeconds` 300 is the default execution deadline, not a cadence) |
+| **Version** | 1.0.0 |
+| **Kind** | Collector · read-only · gathered (security.ioc.check) |
 | **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
 | **Actions** | `check` (definition `security.ioc.check`) |
-| **Security** | securable `Security` · operation Read · risk Medium · dispatch ReadOnly · approval gate none |
+| **Security** | securable `Security` · operation Read · risk Medium · dispatch ReadOnly · approval gate None |
 | **Roles** | execute: endpoint-admin, endpoint-operator, security-admin · author: content-author |
 <!-- END GENERATED -->
 
@@ -31,11 +31,11 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `check` | ✅ supported · rung 1 · `iphlpapi_dnsapi` | ✅ supported · rung 1 · `libproc` | ✅ supported · rung 1 · `procfs` |
+| `check` | ✅ supported · rung 1 · iphlpapi_dnsapi | ✅ supported · rung 1 · libproc | ✅ supported · rung 1 · procfs |
 
-**Declared limits per leg** (the descriptor's fallback text, verbatim):
+**Declared limits per leg** (descriptor fallback text, verbatim):
 
-- **`check` / macOS** — UDP rows carry an empty state (no fabricated "LISTEN") — a real UDP listener still matches a port check, but its detail text differs from a TCP match; a port shared by more than one process (SO_REUSEPORT, prefork) reports the pid of one arbitrarily-chosen owner in its match detail, not every owner.
+- **`check` / macOS** — UDP rows carry an empty state (no fabricated "LISTEN") — a real UDP listener still matches a port check, but its detail text differs from a TCP match; a port shared by more than one process (SO_REUSEPORT, prefork) reports the pid of one arbitrarily-chosen owner in its match detail, not every owner
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -53,15 +53,13 @@ No external binaries or subprocesses on any OS — all three legs read OS-native
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-| Action | Parameter | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `check` | `ip_addresses` | string | no | — | Comma-separated IPs checked against active connections' local/remote addresses — TCP+UDP on Windows/macOS, TCP only on Linux |
-| `check` | `domains` | string | no | — | Comma-separated domains — DNS resolver cache on Windows, `/etc/hosts` substring match on Linux/macOS |
-| `check` | `file_hashes` | string | no | — | Comma-separated SHA-256 hashes compared against every path in `file_paths` |
-| `check` | `file_paths` | string | no | — | Comma-separated paths checked for existence and size; also the hash-comparison target set |
-| `check` | `ports` | string | no | — | Comma-separated port numbers checked against the same connection table as `ip_addresses` |
-
-At least one parameter must be supplied — `check` with none takes the error path below (`ioc_plugin.cpp:802-806`).
+| Definition | Parameter | Type | Required | Default | Constraints | Description |
+|---|---|---|---|---|---|---|
+| `security.ioc.check` | `ip_addresses` | string | no | - | - | Comma-separated list of IP addresses (e.g. `192.168.1.100`) to check against active connections' local and remote addresses. Windows and macOS enumerate TCP and UDP; Linux enumerates TCP only (no /proc/net/udp read). |
+| `security.ioc.check` | `domains` | string | no | - | - | Comma-separated list of domain names (e.g. `evil.example.com`) to check. On Windows this queries the DNS resolver cache; on Linux/macOS it is a substring search over /etc/hosts lines (comments stripped), so a short domain can match more than intended. |
+| `security.ioc.check` | `file_hashes` | string | no | - | - | Comma-separated list of SHA-256 hashes (e.g. `2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae`), lower- or upper-case. Compared against every file in file_paths; without file_paths every hash reports unmatched with "No target file paths specified for hash comparison". |
+| `security.ioc.check` | `file_paths` | string | no | - | - | Comma-separated list of file paths (e.g. `C:\bad.exe` or `/tmp/bad.bin`) to check for existence and size. Also used as the target set for file_hashes comparison. |
+| `security.ioc.check` | `ports` | string | no | - | - | Comma-separated list of port numbers (e.g. `4444`) to check against the same connection table as ip_addresses — Linux sees TCP listeners only, Windows and macOS see TCP and UDP. |
 <!-- END GENERATED -->
 
 ### Outputs
@@ -69,14 +67,14 @@ At least one parameter must be supplied — `check` with none takes the error pa
 Pipe-delimited rows, `type|value|matched|detail` (`ioc_plugin.cpp:809`). Unlike the collector-style plugins, the field-name header is itself written as the first output line whenever at least one check ran — it is not a data row and downstream consumers keying on `type` should skip it. Any literal `|` in `value` or `detail` is escaped to `\|` (`ioc_plugin.cpp:107-118`). There is no empty-row placeholder: a parameter that matches nothing simply gets `matched=false` with an explanatory `detail`, and a `check` call with no parameters at all skips the header and emits exactly one `error` row instead (`ioc_plugin.cpp:802-809`).
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`check` — `type|value|matched|detail`**
+**`security.ioc.check` — `type|value|matched|detail`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `type` | string | `ip` `domain` `hash` `file` `port` `error` (`error` only for the no-parameters case) | W, M, L | `ip` |
-| `value` | string | the checked IOC value, pipe-escaped | W, M, L | `127.0.0.1` |
-| `matched` | bool | `true` `false` | W, M, L | `true` |
-| `detail` | string | free text | W, M, L | `Active connection - ESTABLISHED (pid 6436)` (Windows) · `Found in /etc/hosts` (macOS/Linux) |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `type` | string | `ip` `domain` `hash` `file` `port` `error` | Windows, Linux, macOS | `ip` | Which IOC category this row checked. `error` appears only once, in place of all rows, when no IOC parameter was provided at all. |
+| `value` | string | - | Windows, Linux, macOS | `127.0.0.1` | The IOC value that was checked, copied from the input parameter with any literal `\|` escaped to `\\|`. Values: free text. |
+| `matched` | bool | - | Windows, Linux, macOS | `true` | Whether the IOC was found on this endpoint. Always `false` for the single `error` row. Values: true, false. |
+| `detail` | string | - | Windows, Linux, macOS | `Found in /etc/hosts` | Human-readable explanation of the match or non-match (e.g. which PID owns a connection, or why a check could not run). Values: free text. |
 <!-- END GENERATED -->
 
 ### Result status
@@ -87,13 +85,14 @@ This plugin does not set a typed result status; the agent records `UNDECLARED` a
 
 - **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (90-day default retention, `response_store.hpp:8`), queryable at `/api/responses/{id}` and aggregatable by `(type, matched)` count per the definition's own `aggregation` block (`content/definitions/ioc.yaml:112-114`).
 - **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics. Nothing runs on a schedule; the plugin executes only when an operator or workflow dispatches `security.ioc.check`.
+- **Sensitivity.** `value` is the operator-supplied IOC being checked (an IP, domain, hash, path, or port — not host state), and `detail` can name an owning process id (`pid`) on Windows/macOS matches — no row carries a device serial/hostname, a username, or an installed-software name/version.
 - **Siblings:** grouped with `security.quarantine.{isolate,release,status,whitelist}`, `security.certificates.{list,details,delete}`, and `security.sccm.{client_version,site}` under the `core.security.security-response` instruction set (`content/definitions/security_response_set.yaml:20-32`).
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("security.ioc.check")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 4c1360bf4eef
 
 ```
 == action=check ip_addresses=127.0.0.1 domains=localhost ports=22
@@ -101,10 +100,10 @@ type|value|matched|detail
 ip|127.0.0.1|true|Active connection - ESTABLISHED (pid 6436)
 domain|localhost|false|Not in DNS cache
 port|22|true|Listening (pid 5148)
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 4c1360bf4eef
 
 ```
 == action=check ip_addresses=127.0.0.1 domains=localhost ports=22
@@ -112,10 +111,10 @@ type|value|matched|detail
 ip|127.0.0.1|true|Active connection - LISTEN (pid 20945)
 domain|localhost|true|Found in /etc/hosts
 port|22|false|No listening service on this port
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-07 · euid 0 · leg-hash pending
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-07 · euid 0 · leg-hash 4c1360bf4eef
 
 ```
 == action=check ip_addresses=127.0.0.1 domains=localhost ports=22
@@ -123,7 +122,7 @@ type|value|matched|detail
 ip|127.0.0.1|false|Not found in active connections
 domain|localhost|true|Found in /etc/hosts
 port|22|false|No listening service on this port
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 ```
 <!-- END GENERATED -->
 
@@ -138,10 +137,9 @@ port|22|false|No listening service on this port
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/ioc/src/ioc_plugin.cpp` · `agents/plugins/ioc/meson.build`
+- Plugin: `agents/plugins/ioc/src/ioc_plugin.cpp`
 - Definitions: `content/definitions/ioc.yaml`
-- Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_d.hpp:512`
-- Tests: `tests/unit/agent/test_wave3_pr31_macos_actions.cpp` (macOS-only; regression-pins the UDP empty-state port-match fix via a real bound UDP socket)
-- Privilege row: no row in `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2204-declarations-group-d.added.md` · `changelog.d/20260819-wave3-pr31-syscall-promotion.changed.md`
+- Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_d.hpp`
+- Tests: none found by name
+- Privilege row: `docs/agent-privilege-model.md` (no row yet)
 <!-- END GENERATED -->

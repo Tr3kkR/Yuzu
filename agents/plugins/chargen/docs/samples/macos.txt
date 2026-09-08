@@ -1,6 +1,6 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 5789eff1c673
 == action=chargen_start
-[not captured] driver timed out after 15s (no result status emitted)
+[not captured] Mutating/Reversible: not executed on a live host
 
 == action=chargen_stop
 chargen stopped

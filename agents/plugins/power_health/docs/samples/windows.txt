@@ -1,4 +1,4 @@
-captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 082db96f6e05
 == action=battery
 battery|0|ac_no_battery|-1|-1|-1|-1
 [result_status] UNDECLARED / UNKNOWN / 

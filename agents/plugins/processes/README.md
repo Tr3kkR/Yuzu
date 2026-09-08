@@ -5,10 +5,10 @@
 |---|---|
 | **What it does** | Process listing — enumerate and query running processes |
 | **Version** | 0.1.0 |
-| **Kind** | Collector · read-only · on-demand (no scheduled gather) |
+| **Kind** | Collector · read-only · gathered (crossplatform.process.list, crossplatform.process.query) |
 | **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
-| **Actions** | `list` (definition `crossplatform.process.list`) · `list_hashed` (no definition) · `list_tree` (no definition) · `query` (definition `crossplatform.process.query`) |
-| **Security** | securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate none |
+| **Actions** | `list` (definition `crossplatform.process.list`) · `list_hashed` · `list_tree` · `query` (definition `crossplatform.process.query`) |
+| **Security** | securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
 | **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
 
@@ -31,14 +31,10 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `list` | ✅ supported · rung 1 · `CreateToolhelp32Snapshot` | ✅ supported · rung 1 · `sysctl(KERN_PROC_ALL)` | ✅ supported · rung 1 · `/proc` enumeration |
-| `list_hashed` | ✅ supported · rung 1 · `CreateToolhelp32Snapshot` + `QueryFullProcessImageNameW` + SHA-256 | ✅ supported · rung 1 · `sysctl(KERN_PROC_ALL)` + `proc_pidpath` + SHA-256 | ✅ supported · rung 1 · `/proc` enumeration + `readlink(/proc/<pid>/exe)` + SHA-256 |
-| `list_tree` | ✅ supported · rung 1 · `CreateToolhelp32Snapshot` + `QueryFullProcessImageNameW` + SHA-256 | ✅ supported · rung 1 · `sysctl(KERN_PROC_ALL)` + `proc_pidpath` + SHA-256 | ✅ supported · rung 1 · `/proc` enumeration + `readlink(/proc/<pid>/exe)` + SHA-256 |
-| `query` | ✅ supported · rung 1 · `CreateToolhelp32Snapshot` | ✅ supported · rung 1 · `sysctl(KERN_PROC_ALL)` | ✅ supported · rung 1 · `/proc` enumeration |
-
-**Declared limits per leg** (the descriptor's fallback text, verbatim):
-
-- None. Every leg's `fallback` field is `nullptr`/`-` (`agents/plugins/processes/src/processes_plugin.cpp:251-288`) — the descriptor declares no per-leg caveat text; the constraints that exist (hash byte cap, path unresolvability) are runtime behavior, not descriptor fallback strings, and are covered under Data contract and Caveats below.
+| `list` | ✅ supported · rung 1 · CreateToolhelp32Snapshot | ✅ supported · rung 1 · sysctl(KERN_PROC_ALL) | ✅ supported · rung 1 · /proc enumeration |
+| `list_hashed` | ✅ supported · rung 1 · CreateToolhelp32Snapshot + QueryFullProcessImageNameW + SHA-256 | ✅ supported · rung 1 · sysctl(KERN_PROC_ALL) + proc_pidpath + SHA-256 | ✅ supported · rung 1 · /proc enumeration + readlink(/proc/<pid>/exe) + SHA-256 |
+| `list_tree` | ✅ supported · rung 1 · CreateToolhelp32Snapshot + QueryFullProcessImageNameW + SHA-256 | ✅ supported · rung 1 · sysctl(KERN_PROC_ALL) + proc_pidpath + SHA-256 | ✅ supported · rung 1 · /proc enumeration + readlink(/proc/<pid>/exe) + SHA-256 |
+| `query` | ✅ supported · rung 1 · CreateToolhelp32Snapshot | ✅ supported · rung 1 · sysctl(KERN_PROC_ALL) | ✅ supported · rung 1 · /proc enumeration |
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -56,15 +52,9 @@ No external binaries, no subprocesses, no network access — every leg is an in-
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-`list` takes no parameters.
-
-`list_hashed` takes no parameters.
-
-`list_tree` takes no parameters.
-
-| Definition | Parameter | Type | Required | Default | Values | Description |
+| Definition | Parameter | Type | Required | Default | Constraints | Description |
 |---|---|---|---|---|---|---|
-| `crossplatform.process.query` | `name` | string | yes | — | minLength 1, maxLength 256 | Case-insensitive substring to match against process names, 1-256 characters, e.g. "svchost" or "launchd" |
+| `crossplatform.process.query` | `name` | string | yes | - | minLength 1 · maxLength 256 | Case-insensitive substring to match against process names, 1-256 characters, e.g. "svchost" or "launchd". All processes whose name contains this string are returned; an empty string is rejected by the plugin as a missing parameter. |
 <!-- END GENERATED -->
 
 `list_hashed` and `list_tree` have no definition YAML (no MCP/REST-discoverable parameter shape); they are dispatched with an empty parameter object by the two server callers that use them (see *Where the data goes*).
@@ -74,39 +64,20 @@ No external binaries, no subprocesses, no network access — every leg is an in-
 Pipe-delimited rows via `write_output()`, one line per process (or, for `query`, one `found|` line plus zero or more matching rows). A field is never omitted for width — `list_hashed`/`list_tree` always carry the full field count, with an empty (not `-`) string where the executable path or hash could not be resolved. A process name containing `|`, CR, or LF has those bytes replaced with a space before emission, so the pipe format can never desync (`processes_plugin.cpp:71-76`).
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`list` — `proc|pid|name`**
+**`crossplatform.process.list` — `pid|name`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `pid` | int64 | integer | W, M, L | `1936` |
-| `name` | string | free text; `\|`/CR/LF sanitized to space | W, M, L | `svchost.exe` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `pid` | int64 | - | Windows, Linux, macOS | `1936` | The process's numeric identifier, as assigned by the OS kernel at process creation. Values: integer. |
+| `name` | string | - | Windows, Linux, macOS | `svchost.exe` | The process's short name (Windows: PROCESSENTRY32W.szExeFile, the image filename only, no path; Linux: /proc/<pid>/status Name:, kernel-truncated to 15 bytes; macOS: the resolved on-disk executable path when it starts with '/', else the 16-byte-truncated p_comm). '\|', CR and LF are replaced with a space before the row is emitted. Values: free text. |
 
-**`list_hashed` — `proc|pid|name|sha256|path`**
+**`crossplatform.process.query` — `found|pid|name`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `pid` | int64 | integer | W, M, L | `1052` |
-| `name` | string | free text; `\|`/CR/LF sanitized to space | W, M, L | `smss.exe` |
-| `sha256` | string | lowercase hex SHA-256, or empty | W, M, L | `f87219d8e2b4a890dc81c52a089ebd9eac660d7ea7c3e0c13082e0c6a3137e3c` |
-| `path` | string | resolved on-disk executable path, or empty | W, M, L | `C:\Windows\System32\smss.exe` |
-
-**`list_tree` — `proc|pid|ppid|name|sha256|path`**
-
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `pid` | int64 | integer | W, M, L | `1052` |
-| `ppid` | int64 | integer; `0` = root or unresolved parent | W, M, L | `4` |
-| `name` | string | free text; `\|`/CR/LF sanitized to space | W, M, L | `smss.exe` |
-| `sha256` | string | lowercase hex SHA-256, or empty | W, M, L | `f87219d8e2b4a890dc81c52a089ebd9eac660d7ea7c3e0c13082e0c6a3137e3c` |
-| `path` | string | resolved on-disk executable path, or empty | W, M, L | `C:\Windows\System32\smss.exe` |
-
-**`query` — `found|<bool>` then `proc|pid|name` per match**
-
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `found` | bool | `true`, `false` | W, M, L | `true` |
-| `pid` | int64 | integer | W, M, L | `1936` |
-| `name` | string | free text (query rows are NOT sanitized — `processes_plugin.cpp:419` uses `p->name` directly, unlike `list`/`list_hashed`/`list_tree`) | W, M, L | `svchost.exe` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `found` | bool | - | Windows, Linux, macOS | `true` | One leading row: true if at least one process name contains the filter (case-insensitive substring), false otherwise. Values: true, false. |
+| `pid` | int64 | - | Windows, Linux, macOS | `1936` | The matching process's numeric identifier. Absent (no row) when found=false. Values: integer. |
+| `name` | string | - | Windows, Linux, macOS | `svchost.exe` | The matching process's short name, same format and truncation rules as processes.list's name column. Absent (no row) when found=false. Values: free text. |
 <!-- END GENERATED -->
 
 **Empty-field convention.** `sha256`/`path` on `list_hashed`/`list_tree` are an empty string, never `-`, when the path can't be resolved (kernel/pseudo-process, access denied) or `sha256_file()` refuses the read — including a file over the 512 MiB cap, which is refused outright (empty hash) rather than hashed as a truncated prefix (`agents/core/src/plugin_loader.cpp:79-113`). A `query` row set can legitimately be empty (`found|false`, no `proc|` lines) — that is a real "no match", not a read failure, since the plugin sets no typed result status to distinguish the two.
@@ -120,13 +91,14 @@ This plugin does not set a typed result status; the agent records `UNDECLARED` a
 - **Instruction result (`list`/`query`).** Dispatched via `execute_instruction`/`/api/instructions/{id}/execute`, rows land in the ResponseStore (90-day default retention, `server/core/src/response_store.hpp:152`), queryable at `/api/responses/{id}`.
 - **Device "Get live info" (`list_hashed`/`list_tree`).** `POST /api/v1/dex/devices/{id}/live?kind=processes` dispatches `list_hashed` synchronously (`server/core/src/live_kinds.hpp:44`); the dashboard's Processes card dispatches `list_tree` (joined with `network_diag/connections` by PID) via `server/core/src/device_routes.cpp:77`. Both are usage-class behavioral-PII reads, audited under their own verbs (`device.live.processes`, `device.live.process_tree`) through the fail-closed `emit_behavioral_audit` chokepoint (`rest_audit.hpp`) *before* dispatch — a 503 `Sec-Audit-Failed` blocks the command if the audit row can't persist.
 - **Not consumed by** daily-sync inventory, TAR, or metrics. Nothing runs on a schedule.
+- **Sensitivity.** `name` rows name installed applications on the host (process/executable names — an installed-software inventory by another route, e.g. `Code Helper (Plugin)`, `svchost.exe`); `list_hashed`/`list_tree`'s `path` frequently embeds the owning account's home directory on macOS/Linux (e.g. `/Users/alex/.vscode/extensions/...` in the macOS sample), identifying a specific person, while `sha256` alone identifies neither a device nor a person.
 - **Siblings:** `procfetch` (the scheduled fleet-wide hash collector, SHA-1, distinct from this plugin's on-demand SHA-256).
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("crossplatform.process.list")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}` (list/query) or `/api/v1/dex/devices/{id}/live?kind=processes` (list_hashed via the live-read surface).
 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 9139daeb45d2
 
 ```
 == action=list
@@ -142,21 +114,8 @@ proc|1676|services.exe
 proc|1716|winlogon.exe
 proc|1724|LsaIso.exe
 proc|1740|lsass.exe
-proc|1936|svchost.exe
-proc|1968|fontdrvhost.exe
-proc|1976|fontdrvhost.exe
-proc|2016|WUDFHost.exe
-proc|1008|svchost.exe
-proc|1500|svchost.exe
-proc|2060|LogonUI.exe
-proc|2068|dwm.exe
-proc|2128|svchost.exe
-proc|2136|svchost.exe
-proc|2176|svchost.exe
-proc|2192|svchost.exe
-proc|2212|svchost.exe
-… 25 of 184 rows
-[result_status] UNDECLARED / UNKNOWN / 
+… 12 of 184 rows shown
+[result_status] UNDECLARED / UNKNOWN
 
 == action=list_hashed
 proc|0|[System Process]||
@@ -171,21 +130,8 @@ proc|1676|services.exe|ea75ad4d7c72a25d7284311e33b8f31a89aa35a779e1ad9b2c81af4fd
 proc|1716|winlogon.exe|8d0719298efb3289c8df3987ff21933a56617a6c6bbbcee392e80b3b56816838|C:\Windows\System32\winlogon.exe
 proc|1724|LsaIso.exe|324b4d8c93c46033c24c240cae5c325d4fd12aab2d6e528eb53d4cdd76ddb679|C:\Windows\System32\LsaIso.exe
 proc|1740|lsass.exe|b112d00d1b4db2d49d971dbb04484917c673ed747f8811c7d257a81878c7be2a|C:\Windows\System32\lsass.exe
-proc|1936|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
-proc|1968|fontdrvhost.exe|953a875bfb2fc970dba06fb2cce6cbedec839c9478c4a159f39267e5b08ef460|C:\Windows\System32\fontdrvhost.exe
-proc|1976|fontdrvhost.exe|953a875bfb2fc970dba06fb2cce6cbedec839c9478c4a159f39267e5b08ef460|C:\Windows\System32\fontdrvhost.exe
-proc|2016|WUDFHost.exe|ce5ccbb7806fa3ba2075d736812833d6e0d25cb4f3346f0b205f126d30e3e1c2|C:\Windows\System32\WUDFHost.exe
-proc|1008|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
-proc|1500|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
-proc|2060|LogonUI.exe|56346443a0d60b793c9a15b49dc12b885d21aa835e4b22e3d66d30158b70c1ab|C:\Windows\System32\LogonUI.exe
-proc|2068|dwm.exe|00eb3d5e6092e1246bd0956ff0a341c2afa6f96bb805b93d36a7192a9c29e475|C:\Windows\System32\dwm.exe
-proc|2128|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
-proc|2136|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
-proc|2176|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
-proc|2192|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
-proc|2212|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
-… 25 of 184 rows
-[result_status] UNDECLARED / UNKNOWN / 
+… 12 of 184 rows shown
+[result_status] UNDECLARED / UNKNOWN
 
 == action=list_tree
 proc|0|0|[System Process]||
@@ -200,21 +146,8 @@ proc|1676|1596|services.exe|ea75ad4d7c72a25d7284311e33b8f31a89aa35a779e1ad9b2c81
 proc|1716|1588|winlogon.exe|8d0719298efb3289c8df3987ff21933a56617a6c6bbbcee392e80b3b56816838|C:\Windows\System32\winlogon.exe
 proc|1724|1596|LsaIso.exe|324b4d8c93c46033c24c240cae5c325d4fd12aab2d6e528eb53d4cdd76ddb679|C:\Windows\System32\LsaIso.exe
 proc|1740|1596|lsass.exe|b112d00d1b4db2d49d971dbb04484917c673ed747f8811c7d257a81878c7be2a|C:\Windows\System32\lsass.exe
-proc|1936|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
-proc|1968|1596|fontdrvhost.exe|953a875bfb2fc970dba06fb2cce6cbedec839c9478c4a159f39267e5b08ef460|C:\Windows\System32\fontdrvhost.exe
-proc|1976|1716|fontdrvhost.exe|953a875bfb2fc970dba06fb2cce6cbedec839c9478c4a159f39267e5b08ef460|C:\Windows\System32\fontdrvhost.exe
-proc|2016|1676|WUDFHost.exe|ce5ccbb7806fa3ba2075d736812833d6e0d25cb4f3346f0b205f126d30e3e1c2|C:\Windows\System32\WUDFHost.exe
-proc|1008|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
-proc|1500|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
-proc|2060|1716|LogonUI.exe|56346443a0d60b793c9a15b49dc12b885d21aa835e4b22e3d66d30158b70c1ab|C:\Windows\System32\LogonUI.exe
-proc|2068|1716|dwm.exe|00eb3d5e6092e1246bd0956ff0a341c2afa6f96bb805b93d36a7192a9c29e475|C:\Windows\System32\dwm.exe
-proc|2128|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
-proc|2136|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
-proc|2176|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
-proc|2192|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
-proc|2212|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
-… 25 of 184 rows
-[result_status] UNDECLARED / UNKNOWN / 
+… 12 of 184 rows shown
+[result_status] UNDECLARED / UNKNOWN
 
 == action=query name=svchost.exe
 found|true
@@ -229,24 +162,11 @@ proc|2212|svchost.exe
 proc|2232|svchost.exe
 proc|2448|svchost.exe
 proc|2456|svchost.exe
-proc|2464|svchost.exe
-proc|2472|svchost.exe
-proc|2644|svchost.exe
-proc|2652|svchost.exe
-proc|2704|svchost.exe
-proc|2812|svchost.exe
-proc|2904|svchost.exe
-proc|3184|svchost.exe
-proc|3192|svchost.exe
-proc|3304|svchost.exe
-proc|3352|svchost.exe
-proc|3416|svchost.exe
-proc|3424|svchost.exe
-… 24 of 83 rows
-[result_status] UNDECLARED / UNKNOWN / 
+… 12 of 84 rows shown
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 9139daeb45d2
 
 ```
 == action=list
@@ -262,21 +182,8 @@ proc|410|/usr/libexec/uarpassetmanagerd
 proc|411|/usr/libexec/configd
 proc|412|/usr/libexec/endpointsecurityd
 proc|413|/System/Library/CoreServices/powerd.bundle/powerd
-proc|414|/usr/libexec/IOMFB_bics_daemon
-proc|416|/usr/libexec/amfid
-proc|418|/usr/libexec/remoted
-proc|420|/usr/libexec/keybagd
-proc|421|/System/Library/PrivateFrameworks/MobileSoftwareUpdate.framework/Support/softwareupdated
-proc|422|/System/Library/PrivateFrameworks/CoreSpeech.framework/corespeechd_system
-proc|424|/usr/libexec/watchdogd
-proc|428|/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds
-proc|429|/System/Library/CoreServices/iconservicesd
-proc|430|/usr/libexec/kernelmanagerd
-proc|431|/usr/libexec/diskarbitrationd
-proc|434|/usr/libexec/coreduetd
-proc|435|/usr/sbin/syslogd
-… 25 of 817 rows
-[result_status] UNDECLARED / UNKNOWN / 
+… 12 of 817 rows shown
+[result_status] UNDECLARED / UNKNOWN
 
 == action=list_hashed
 proc|1|/sbin/launchd|7b636e967e77705d88aad9ad9ea9af627852d83686cd19ab4d94c6010cd67b09|/sbin/launchd
@@ -291,21 +198,8 @@ proc|410|/usr/libexec/uarpassetmanagerd|d4adb14c3e59f036fab7b2ccea9ed0109b293369
 proc|411|/usr/libexec/configd|35329b490f724f46bd1a5324c91d76af8416b498e772fe4ed8b0f99fa1760367|/usr/libexec/configd
 proc|412|/usr/libexec/endpointsecurityd|3227a07deef4a6970046995557c93fc00e89e4ddc59427ee4d36e82d1daaa53a|/usr/libexec/endpointsecurityd
 proc|413|/System/Library/CoreServices/powerd.bundle/powerd|a27da6756b7d513bace5890b0c1a7fd55a18827c8ea30a6bd1cd3b5c5761da72|/System/Library/CoreServices/powerd.bundle/powerd
-proc|414|/usr/libexec/IOMFB_bics_daemon|ac193fdc9576848a5375c97396abb1ba990b92b10db0269d3654d35b0ac0eda2|/usr/libexec/IOMFB_bics_daemon
-proc|416|/usr/libexec/amfid|71ca97a157a9aa39cb70d5ae2184cab6d4f9e61970a4130f6302c2fbc0f317a0|/usr/libexec/amfid
-proc|418|/usr/libexec/remoted|345bdb3e5444bf5bbaab2f29c514198eed763be5e165e809116f57c877e844f5|/usr/libexec/remoted
-proc|420|/usr/libexec/keybagd|6f1541ba11ee5a97d958119146fa20430dcbd0c9c3db66c021b68085c59b8bab|/usr/libexec/keybagd
-proc|421|/System/Library/PrivateFrameworks/MobileSoftwareUpdate.framework/Support/softwareupdated|ff8fc4960a50f470e4f21ee990a1f7ae41c68a5e2408e6109dd90911ffb30594|/System/Library/PrivateFrameworks/MobileSoftwareUpdate.framework/Support/softwareupdated
-proc|422|/System/Library/PrivateFrameworks/CoreSpeech.framework/corespeechd_system|8c926bad456c8582608328e827ff3380933b4b1b75a91e0d8cceedb3d8988745|/System/Library/PrivateFrameworks/CoreSpeech.framework/corespeechd_system
-proc|424|/usr/libexec/watchdogd|72c2b0a82e39e0cc708e7b3c4fe1801fbccfb1bcb2d7f5080c9d526535cba65d|/usr/libexec/watchdogd
-proc|428|/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds|cb283c61a6a5bea8bb3615eaa7eb05f52dacb2eee41c522c75f9857d05f8c5b7|/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds
-proc|429|/System/Library/CoreServices/iconservicesd|c1014a088b8ff32009ec69931bb8710bec3e0a00698c48da8ff672daab8a9869|/System/Library/CoreServices/iconservicesd
-proc|430|/usr/libexec/kernelmanagerd|24a4fe0623cca5b99d0a092191744a8611fd5342d1c5d3feb4e369e2395c8718|/usr/libexec/kernelmanagerd
-proc|431|/usr/libexec/diskarbitrationd|e55f28b76066b9fa896275f3cebdf0e439d04e13c5ab4bdcd5dcb9cd35089648|/usr/libexec/diskarbitrationd
-proc|434|/usr/libexec/coreduetd|aff0f7ea1f21b7718afc5eac40757ad74fcb80f2537a94d24409924268aa118d|/usr/libexec/coreduetd
-proc|435|/usr/sbin/syslogd|dbfbd04b21b549b9c2cad3baf61ad2b652a161483ac6579ff9c3c602dd924c23|/usr/sbin/syslogd
-… 25 of 817 rows
-[result_status] UNDECLARED / UNKNOWN / 
+… 12 of 817 rows shown
+[result_status] UNDECLARED / UNKNOWN
 
 == action=list_tree
 proc|1|0|/sbin/launchd|7b636e967e77705d88aad9ad9ea9af627852d83686cd19ab4d94c6010cd67b09|/sbin/launchd
@@ -320,50 +214,37 @@ proc|410|1|/usr/libexec/uarpassetmanagerd|d4adb14c3e59f036fab7b2ccea9ed0109b2933
 proc|411|1|/usr/libexec/configd|35329b490f724f46bd1a5324c91d76af8416b498e772fe4ed8b0f99fa1760367|/usr/libexec/configd
 proc|412|1|/usr/libexec/endpointsecurityd|3227a07deef4a6970046995557c93fc00e89e4ddc59427ee4d36e82d1daaa53a|/usr/libexec/endpointsecurityd
 proc|413|1|/System/Library/CoreServices/powerd.bundle/powerd|a27da6756b7d513bace5890b0c1a7fd55a18827c8ea30a6bd1cd3b5c5761da72|/System/Library/CoreServices/powerd.bundle/powerd
-proc|414|1|/usr/libexec/IOMFB_bics_daemon|ac193fdc9576848a5375c97396abb1ba990b92b10db0269d3654d35b0ac0eda2|/usr/libexec/IOMFB_bics_daemon
-proc|416|1|/usr/libexec/amfid|71ca97a157a9aa39cb70d5ae2184cab6d4f9e61970a4130f6302c2fbc0f317a0|/usr/libexec/amfid
-proc|418|1|/usr/libexec/remoted|345bdb3e5444bf5bbaab2f29c514198eed763be5e165e809116f57c877e844f5|/usr/libexec/remoted
-proc|420|1|/usr/libexec/keybagd|6f1541ba11ee5a97d958119146fa20430dcbd0c9c3db66c021b68085c59b8bab|/usr/libexec/keybagd
-proc|421|1|/System/Library/PrivateFrameworks/MobileSoftwareUpdate.framework/Support/softwareupdated|ff8fc4960a50f470e4f21ee990a1f7ae41c68a5e2408e6109dd90911ffb30594|/System/Library/PrivateFrameworks/MobileSoftwareUpdate.framework/Support/softwareupdated
-proc|422|1|/System/Library/PrivateFrameworks/CoreSpeech.framework/corespeechd_system|8c926bad456c8582608328e827ff3380933b4b1b75a91e0d8cceedb3d8988745|/System/Library/PrivateFrameworks/CoreSpeech.framework/corespeechd_system
-proc|424|1|/usr/libexec/watchdogd|72c2b0a82e39e0cc708e7b3c4fe1801fbccfb1bcb2d7f5080c9d526535cba65d|/usr/libexec/watchdogd
-proc|428|1|/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds|cb283c61a6a5bea8bb3615eaa7eb05f52dacb2eee41c522c75f9857d05f8c5b7|/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds
-proc|429|1|/System/Library/CoreServices/iconservicesd|c1014a088b8ff32009ec69931bb8710bec3e0a00698c48da8ff672daab8a9869|/System/Library/CoreServices/iconservicesd
-proc|430|1|/usr/libexec/kernelmanagerd|24a4fe0623cca5b99d0a092191744a8611fd5342d1c5d3feb4e369e2395c8718|/usr/libexec/kernelmanagerd
-proc|431|1|/usr/libexec/diskarbitrationd|e55f28b76066b9fa896275f3cebdf0e439d04e13c5ab4bdcd5dcb9cd35089648|/usr/libexec/diskarbitrationd
-proc|434|1|/usr/libexec/coreduetd|aff0f7ea1f21b7718afc5eac40757ad74fcb80f2537a94d24409924268aa118d|/usr/libexec/coreduetd
-proc|435|1|/usr/sbin/syslogd|dbfbd04b21b549b9c2cad3baf61ad2b652a161483ac6579ff9c3c602dd924c23|/usr/sbin/syslogd
-… 25 of 818 rows
-[result_status] UNDECLARED / UNKNOWN / 
+… 12 of 818 rows shown
+[result_status] UNDECLARED / UNKNOWN
 
 == action=query name=launchd
 found|true
 proc|1|/sbin/launchd
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash pending
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 9139daeb45d2
 
 ```
 == action=list
 proc|1|sh
 proc|8|plugin-capture
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=list_hashed
 proc|1|sh|367967c823a0c391e5049b15a67c6a0a629c88b9b6dcdca75ef13ac9d65334b1|/usr/bin/dash
 proc|8|plugin-capture|e4afbc5e655b3942d6ee315b307eb4449358d82f0c86fe127bdd5312107cf889|/src/builddir/tools/plugin-capture/plugin-capture
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=list_tree
 proc|1|0|sh|367967c823a0c391e5049b15a67c6a0a629c88b9b6dcdca75ef13ac9d65334b1|/usr/bin/dash
 proc|8|1|plugin-capture|e4afbc5e655b3942d6ee315b307eb4449358d82f0c86fe127bdd5312107cf889|/src/builddir/tools/plugin-capture/plugin-capture
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=query name=sh
 found|true
 proc|1|sh
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 ```
 <!-- END GENERATED -->
 
@@ -379,9 +260,8 @@ proc|1|sh
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
 - Plugin: `agents/plugins/processes/src/processes_plugin.cpp`
-- Definitions: `content/definitions/processes.yaml` (`list`, `query` only — `list_hashed`/`list_tree` have no definition)
-- Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_b.hpp:504` (`list`) · `:515` (`list_hashed`) · `:526` (`list_tree`) · `:537` (`query`)
-- Tests: `tests/unit/agent/test_wave3_pr31_macos_actions.cpp:301` (loads the real library, asserts `list` enumerates this process, skips PID 0, sorts ascending by PID)
-- Privilege row: `docs/agent-privilege-model.md:82` (`list`/`query` only — see Caveat 2)
-- Changelog: `changelog.d/2204-declarations-group-b.added.md` (ABI4 descriptors) · `changelog.d/20260819-wave3-pr31-syscall-promotion.changed.md` (macOS moved off `ps` onto `sysctl(KERN_PROC_ALL)`)
+- Definitions: `content/definitions/processes.yaml`
+- Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_b.hpp`
+- Tests: none found by name
+- Privilege row: `docs/agent-privilege-model.md`
 <!-- END GENERATED -->

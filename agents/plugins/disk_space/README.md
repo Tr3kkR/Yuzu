@@ -4,11 +4,11 @@
 | | |
 |---|---|
 | **What it does** | Reports free / total disk space for a single volume |
-| **Version** | 1.0.0 · plugin ABI 4 · shipped in PR #2204 (2026-08-16) |
-| **Kind** | Collector · read-only · on-demand (no scheduled gather; `gather.ttlSeconds` 60 for the /auto pre-flight cache) |
+| **Version** | 1.0.0 |
+| **Kind** | Collector · read-only · gathered (crossplatform.storage.free) |
 | **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
 | **Actions** | `free` (definition `crossplatform.storage.free`) |
-| **Security** | securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate none |
+| **Security** | securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
 | **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
 
@@ -31,20 +31,16 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `free` | ✅ supported · rung 1 · `GetDiskFreeSpaceExW` | ✅ supported · rung 1 · `statfs(2)` | ✅ supported · rung 1 · `statvfs(2)` |
-
-**Declared limits per leg** (the descriptor's fallback text, verbatim):
-
-None declared — all three legs report `nullptr` fallback text.
+| `free` | ✅ supported · rung 1 · GetDiskFreeSpaceExW | ✅ supported · rung 1 · statfs(2) | ✅ supported · rung 1 · statvfs(2) |
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | agent service account (LocalSystem today, #1442) | None. `GetDiskFreeSpaceExW` needs no elevated access. | 2026-09-07, bare-metal, SYSTEM | `error|failed to query disk space for path: <path>`, non-zero return |
-| macOS | agent daemon (root today per `docs/agent-privilege-model.md`) | None. `statfs(2)` on an accessible path needs no privilege. | 2026-09-07, bare-metal, euid 501 (unprivileged — the capture ran outside the real daemon identity) | `error|failed to stat path: <path>`, non-zero return |
-| Linux | agent daemon (`yuzu` user, unprivileged, per `docs/agent-privilege-model.md`) | None. `statvfs(2)` needs no privilege. | 2026-09-06, container, euid 0 | `error|failed to stat path: <path>`, non-zero return |
+| Windows | agent service account (LocalSystem today, #1442) | None. `GetDiskFreeSpaceExW` needs no elevated access. | 2026-09-07, bare-metal, SYSTEM | `error\|failed to query disk space for path: <path>`, non-zero return |
+| macOS | agent daemon (root today per `docs/agent-privilege-model.md`) | None. `statfs(2)` on an accessible path needs no privilege. | 2026-09-07, bare-metal, euid 501 (unprivileged — the capture ran outside the real daemon identity) | `error\|failed to stat path: <path>`, non-zero return |
+| Linux | agent daemon (`yuzu` user, unprivileged, per `docs/agent-privilege-model.md`) | None. `statvfs(2)` needs no privilege. | 2026-09-06, container, euid 0 | `error\|failed to stat path: <path>`, non-zero return |
 
 No external binaries, no subprocesses, no network access — one in-process OS call per platform (`agents/plugins/disk_space/src/disk_space_plugin.cpp:97-134`).
 
@@ -53,9 +49,9 @@ No external binaries, no subprocesses, no network access — one in-process OS c
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-| Definition | Parameter | Type | Required | Default | Values | Description |
+| Definition | Parameter | Type | Required | Default | Constraints | Description |
 |---|---|---|---|---|---|---|
-| `crossplatform.storage.free` | `path` | string | no | `C:\` (Windows) / `/` (Linux, macOS) | - | Directory or volume root to measure (e.g. "C:\", "/", "/var"). Defaults to the platform root if omitted. |
+| `crossplatform.storage.free` | `path` | string | no | - | maxLength 4096 | Directory or volume root to measure (e.g. "C:\", "/", "/var"). Defaults to the platform root if omitted (C:\ on Windows, / on Linux and macOS); reported free space is the caller-usable figure, not raw free blocks. |
 <!-- END GENERATED -->
 
 ### Outputs
@@ -63,14 +59,14 @@ No external binaries, no subprocesses, no network access — one in-process OS c
 One pipe-delimited row per call. Field 0 is the literal discriminator `disk`; the four columns below map to fields 1–4. On failure the plugin emits `error|<message>` instead and returns non-zero — there is no partial-success row.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`free` — `disk|path|total_bytes|free_bytes|percent_used`**
+**`crossplatform.storage.free` — `path|total_bytes|free_bytes|percent_used`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `path` | string | the resolved input path, echoed back verbatim | windows, linux, darwin | `/` |
-| `total_bytes` | int64 | raw volume capacity in bytes (`f_blocks`/`total.QuadPart` times block size) | windows, linux, darwin | `494384795648` |
-| `free_bytes` | int64 | caller-usable free bytes — `FreeBytesAvailableToCaller` (Windows) / `f_bavail` (POSIX), quota-aware, not the raw free-block count | windows, linux, darwin | `313557938176` |
-| `percent_used` | int32 | `(total-free)*100/total`, truncated integer 0-100; `0` if `total_bytes` is 0 | windows, linux, darwin | `36` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `path` | string | - | Windows, Linux, macOS | `/` | The resolved path that was measured, echoed back verbatim from the request. Values: free text. |
+| `total_bytes` | int64 | - | Windows, Linux, macOS | `494384795648` | Raw volume capacity in bytes. Values: integer. |
+| `free_bytes` | int64 | - | Windows, Linux, macOS | `313557938176` | Space usable by an ordinary caller, not raw free blocks (FreeBytesAvailableToCaller on Windows, f_bavail on POSIX). Values: integer. |
+| `percent_used` | int32 | - | Windows, Linux, macOS | `36` | Percent of total_bytes currently used, truncated to an integer 0-100. |
 <!-- END GENERATED -->
 
 ### Result status
@@ -83,34 +79,35 @@ This plugin does not set a typed result status; the agent records `UNDECLARED` a
 - **`/auto` Pre-flight page.** `crossplatform.storage.free`'s raw `disk|<path>|<total>|<free>|<percent_used>` row is one of the five Slice-1 pre-flight checks (`server/core/src/preflight_parse.hpp:53`); the parser reads `free` at field[3] and applies the operator's `min_free_gib` threshold to produce a Pass/Fail/Warn/Unknown verdict per device (`server/core/src/preflight_parse.hpp:18-20`, `:60-67`).
 - **Device-live "disk" card.** The `/device/live?kind=disk` route dispatches `disk_space.free` directly and renders the result as `LiveDiskVolume{path, total, free, percent_used}` (`server/core/src/device_routes.cpp:97`, `server/core/src/device_routes.hpp:164-165`), audited as `device.live.disk`.
 - **Not consumed by** daily-sync inventory, the TAR warehouse, or the DEX performance store.
+- **Sensitivity.** Rows carry only the caller-supplied volume `path` and byte/percentage counts — nothing that identifies a specific device, a person, or installed software.
 - **Siblings:** `disk_actions` (`crossplatform.storage.smart`, `crossplatform.storage.volumes` — physical-drive health and the volume-to-drive join; `total_bytes` there is raw media capacity, not comparable field-for-field with this plugin's), `filesystem_posture` (`crossplatform.storage.mounts` — full mount inventory).
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("crossplatform.storage.free")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`; also drives `/auto` pre-flight verdicts and the device-live disk card.
 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 16f60d46b82f
 
 ```
 == action=free
 disk|C:\|248158089216|20788936704|91
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 16f60d46b82f
 
 ```
 == action=free
 disk|/|494384795648|313557938176|36
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash pending
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 16f60d46b82f
 
 ```
 == action=free
 disk|/|485473984512|407729123328|16
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 ```
 <!-- END GENERATED -->
 
@@ -125,10 +122,9 @@ disk|/|485473984512|407729123328|16
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/disk_space/src/disk_space_plugin.cpp` · `agents/plugins/disk_space/meson.build`
+- Plugin: `agents/plugins/disk_space/src/disk_space_plugin.cpp`
 - Definitions: `content/definitions/disk_space.yaml`
-- Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_b.hpp:565`
-- Tests: `tests/unit/test_new_plugins.cpp:338` (descriptor shape)
-- Privilege row: no row in `docs/agent-privilege-model.md` (general per-platform account rows apply)
-- Changelog: `changelog.d/2204-declarations-group-b.added.md`
+- Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_b.hpp`
+- Tests: none found by name
+- Privilege row: `docs/agent-privilege-model.md` (no row yet)
 <!-- END GENERATED -->

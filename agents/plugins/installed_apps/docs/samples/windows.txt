@@ -1,4 +1,4 @@
-captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 47e1dd9008d0
 == action=list
 app|7-Zip 26.02 (x64)|26.02|Igor Pavlov|-
 app|Age of Empires II: Definitive Edition|-|Forgotten Empires|-

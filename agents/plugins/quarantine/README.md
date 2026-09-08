@@ -5,11 +5,11 @@
 |---|---|
 | **What it does** | Device network isolation (quarantine) with per-IP whitelisting |
 | **Version** | 1.0.0 |
-| **Kind** | Action · mixed: read-only (`status`) + mutating (`quarantine`/`unquarantine`/`whitelist`) · on-demand (no scheduled gather; `gather.ttlSeconds` only bounds cached-result staleness, 60–120s per definition) |
+| **Kind** | Action · mutating · gathered (security.quarantine.isolate, security.quarantine.release, security.quarantine.status, security.quarantine.whitelist) |
 | **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
-| **Actions** | `quarantine` (definition `security.quarantine.isolate`) · `unquarantine` (definition `security.quarantine.release`) · `status` (definition `security.quarantine.status`) · `whitelist` (definition `security.quarantine.whitelist`) |
-| **Security** | securable `Security` · `quarantine`: operation Execute · risk Critical · dispatch Destructive · mutability Irreversible · gate AdminOrApproval · `unquarantine`: Execute · High · Mutating · Reversible · AdminOrApproval · `whitelist`: Execute · High · Mutating · Reversible · AdminOrApproval · `status`: Read · Low · ReadOnly · mutability None · gate none |
-| **Roles** | execute: endpoint-admin, security-admin (`status` also: endpoint-operator) · author: content-author |
+| **Actions** | `quarantine` (definition `security.quarantine.isolate`) · `status` (definition `security.quarantine.status`) · `unquarantine` (definition `security.quarantine.release`) · `whitelist` (definition `security.quarantine.whitelist`) |
+| **Security** | `quarantine`: securable `Security` · operation Execute · risk Critical · dispatch Destructive · approval gate AdminOrApproval; `unquarantine`: securable `Security` · operation Execute · risk High · dispatch Mutating · approval gate AdminOrApproval; `status`: securable `Security` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `whitelist`: securable `Security` · operation Execute · risk High · dispatch Mutating · approval gate AdminOrApproval |
+| **Roles** | execute: endpoint-admin, endpoint-operator, security-admin · author: content-author |
 <!-- END GENERATED -->
 
 ## How it works
@@ -36,22 +36,18 @@ flowchart LR
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
 | `quarantine` | ✅ supported · rung 2 · netsh via bounded runner argv (service-account privilege, no sudo) | ✅ supported · rung 2 · sudo-governed pfctl via bounded runner argv | ✅ supported · rung 2 · sudo-governed iptables via bounded runner argv |
-| `unquarantine` | ✅ supported · rung 2 · netsh via bounded runner argv (service-account privilege, no sudo) | ✅ supported · rung 2 · sudo-governed pfctl via bounded runner argv | ✅ supported · rung 2 · sudo-governed iptables via bounded runner argv |
 | `status` | ✅ supported · rung 2 · netsh via bounded runner argv (service-account privilege, no sudo) | ✅ supported · rung 2 · sudo-governed pfctl via bounded runner argv | ✅ supported · rung 2 · sudo-governed iptables via bounded runner argv |
+| `unquarantine` | ✅ supported · rung 2 · netsh via bounded runner argv (service-account privilege, no sudo) | ✅ supported · rung 2 · sudo-governed pfctl via bounded runner argv | ✅ supported · rung 2 · sudo-governed iptables via bounded runner argv |
 | `whitelist` | ✅ supported · rung 2 · netsh via bounded runner argv (service-account privilege, no sudo) | ✅ supported · rung 2 · sudo-governed pfctl via bounded runner argv | ✅ supported · rung 2 · sudo-governed iptables via bounded runner argv |
-
-**Declared limits per leg** (the descriptor's fallback text, verbatim):
-
-- None declared. Every leg's fourth `YuzuActionDescriptor` field is `nullptr` for all four actions on all three platforms (`quarantine_plugin.cpp:1786-1811`), matching the capability-matrix "-" fallback for every row.
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | Agent service account — LocalSystem today (#1442). Shells directly to `netsh.exe`, resolved via `GetSystemDirectoryW` (`quarantine_plugin.cpp:271-288`) — never a PowerShell cmdlet. | **None today** (LocalSystem already holds firewall-policy privilege). Under the intended least-privilege model (`NT SERVICE\YuzuAgent`, not in `Administrators`) this needs Administrators-group membership or equivalent firewall-policy privilege (`docs/agent-privilege-model.md` row for `quarantine.*`) — see Caveat 4 for where that doc's own description of the mechanism is stale. | 2026-09-07, bare-metal, as `SYSTEM` | `state|uncertain`, note "firewall query failed — containment state could not be determined", ABI4 `UNAVAILABLE`/`PARTIAL` (`quarantine_plugin.cpp:802-805`) |
-| macOS | Agent daemon; production runs under a narrow sudoers NOPASSWD grant for `/sbin/pfctl` (`quarantine_plugin.cpp:139,1540-1543`). | Sudoers entry for `/sbin/pfctl` at `/etc/sudoers.d/yuzu-agent`, verified with `scripts/install-agent-user.sh --check` (`quarantine_plugin.cpp:1541-1543`). | 2026-09-07, bare-metal, **unprivileged, euid 501 (alex)** — deliberately below the production grant. | Reproduced by this capture's own `status` run: `state|uncertain`, note "pf state could not be read -- containment can be neither confirmed nor ruled out", `[result_status] UNAVAILABLE / PARTIAL / quarantine:macos_is_quarantined pf status unreadable`, `[rc] 1` (`quarantine_plugin.cpp:1728-1746`; `docs/samples/macos.txt`). |
-| Linux | Agent daemon; every `iptables`/`ip6tables` call is prefixed `sudo -n --` via `yuzu::shared::sudo_wrap` regardless of the caller's own privilege. | Sudoers NOPASSWD entries for `/usr/sbin/iptables` and `/usr/sbin/ip6tables` (`quarantine_plugin.cpp:130-145`). | 2026-09-06, container, **as root (euid 0)** — the sudo layer is a pass-through here, not exercised as a real escalation. | A failed listing reads `state|uncertain`, ABI4 status forwarded from the runner (`quarantine_plugin.cpp:1279,1362-1363`). This capture instead hit a **missing-binary** refusal (`ip6tables` not installed): `state|uncertain`, note "ipv6_unavailable — IPv6 stack is up but ip6tables is not installed", `[result_status] UNAVAILABLE / PARTIAL / subprocess_runner:spawn_error`, `[rc] 1` (`docs/samples/linux.txt`). |
+| Windows | Agent service account — LocalSystem today (#1442). Shells directly to `netsh.exe`, resolved via `GetSystemDirectoryW` (`quarantine_plugin.cpp:271-288`) — never a PowerShell cmdlet. | **None today** (LocalSystem already holds firewall-policy privilege). Under the intended least-privilege model (`NT SERVICE\YuzuAgent`, not in `Administrators`) this needs Administrators-group membership or equivalent firewall-policy privilege (`docs/agent-privilege-model.md` row for `quarantine.*`) — see Caveat 4 for where that doc's own description of the mechanism is stale. | 2026-09-07, bare-metal, as `SYSTEM` | `state\|uncertain`, note "firewall query failed — containment state could not be determined", ABI4 `UNAVAILABLE`/`PARTIAL` (`quarantine_plugin.cpp:802-805`) |
+| macOS | Agent daemon; production runs under a narrow sudoers NOPASSWD grant for `/sbin/pfctl` (`quarantine_plugin.cpp:139,1540-1543`). | Sudoers entry for `/sbin/pfctl` at `/etc/sudoers.d/yuzu-agent`, verified with `scripts/install-agent-user.sh --check` (`quarantine_plugin.cpp:1541-1543`). | 2026-09-07, bare-metal, **unprivileged, euid 501 (alex)** — deliberately below the production grant. | Reproduced by this capture's own `status` run: `state\|uncertain`, note "pf state could not be read -- containment can be neither confirmed nor ruled out", `[result_status] UNAVAILABLE / PARTIAL / quarantine:macos_is_quarantined pf status unreadable`, `[rc] 1` (`quarantine_plugin.cpp:1728-1746`; `docs/samples/macos.txt`). |
+| Linux | Agent daemon; every `iptables`/`ip6tables` call is prefixed `sudo -n --` via `yuzu::shared::sudo_wrap` regardless of the caller's own privilege. | Sudoers NOPASSWD entries for `/usr/sbin/iptables` and `/usr/sbin/ip6tables` (`quarantine_plugin.cpp:130-145`). | 2026-09-06, container, **as root (euid 0)** — the sudo layer is a pass-through here, not exercised as a real escalation. | A failed listing reads `state\|uncertain`, ABI4 status forwarded from the runner (`quarantine_plugin.cpp:1279,1362-1363`). This capture instead hit a **missing-binary** refusal (`ip6tables` not installed): `state\|uncertain`, note "ipv6_unavailable — IPv6 stack is up but ip6tables is not installed", `[result_status] UNAVAILABLE / PARTIAL / subprocess_runner:spawn_error`, `[rc] 1` (`docs/samples/linux.txt`). |
 
 Binaries: `netsh.exe` (Windows), `/usr/sbin/iptables` + `/usr/sbin/ip6tables` (Linux), `/sbin/pfctl` (macOS) — every call runs through `yuzu::agent::run_bounded_subprocess` with a 15s deadline for mutating calls and 10s for reads (`quarantine_plugin.cpp:97-98`), never a shell. No network access beyond the agent's existing gRPC channel.
 
@@ -60,14 +56,12 @@ Binaries: `netsh.exe` (Windows), `/usr/sbin/iptables` + `/usr/sbin/ip6tables` (L
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-| Definition | Parameter | Type | Required | Default | Values | Description |
+| Definition | Parameter | Type | Required | Default | Constraints | Description |
 |---|---|---|---|---|---|---|
-| `security.quarantine.isolate` | `server_ip` | string | no | — | — | IP address of the Yuzu management server; always whitelisted so the agent connection survives containment. |
-| `security.quarantine.isolate` | `whitelist_ips` | string | no | — | — | Comma-separated list of additional IPs to allow through the quarantine firewall (e.g. DNS server, SIEM collector). |
-| `security.quarantine.whitelist` | `action` | string | yes | — | add, remove | Whether to add or remove the specified IPs from the quarantine whitelist. |
-| `security.quarantine.whitelist` | `ips` | string | yes | — | — | Comma-separated list of IP addresses to add to or remove from the quarantine whitelist. |
-
-`unquarantine` (`security.quarantine.release`) takes no parameters. `status` (`security.quarantine.status`) takes no parameters.
+| `security.quarantine.isolate` | `server_ip` | string | no | - | - | IP address of the Yuzu management server. This IP is always whitelisted to maintain the agent connection during quarantine. |
+| `security.quarantine.isolate` | `whitelist_ips` | string | no | - | - | Comma-separated list of additional IP addresses to allow through the quarantine firewall (e.g. DNS server, SIEM collector). |
+| `security.quarantine.whitelist` | `action` | string | yes | - | enum: add, remove | Whether to add or remove the specified IPs from the quarantine whitelist. |
+| `security.quarantine.whitelist` | `ips` | string | yes | - | - | Comma-separated list of IP addresses to add to or remove from the quarantine whitelist. |
 <!-- END GENERATED -->
 
 ### Outputs
@@ -75,32 +69,32 @@ Binaries: `netsh.exe` (Windows), `/usr/sbin/iptables` + `/usr/sbin/ip6tables` (L
 Every action writes pipe-delimited `key|value` pairs via `ctx.write_output` — not a fixed-position row like the collector plugins' `field0|field1|…` schema, so a caller reads by key name, never by column offset. A hard failure before any mutation is attempted (a missing/invalid parameter, a failed macOS whitelist-read prerequisite) emits `error|<message>` instead of the action's normal `status`/`state` row. Several outcomes also carry extra keys the declared schema below does not enumerate — `prior_policy`, `rules_attempted` and `note` on `quarantine`; `note` on `unquarantine`, `status`, and `whitelist` — see Caveats 5.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`quarantine` — `status|<value>[|rules_applied|<n>][|rules_attempted|<n>][|prior_policy|<text>][|note|<text>]`** (or `error|<message>` on an aborted run)
+**`security.quarantine.isolate` — `status|rules_applied`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `status` | string | `quarantined`, `quarantined_partial`, `failed`, `busy` | windows, linux, darwin | `quarantined` (not observed — `quarantine` was never executed for these samples) |
-| `rules_applied` | int32 | integer ≥ 0 | windows, linux, darwin | `4` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `status` | string | `quarantined` `quarantined_partial` `failed` `busy` | Windows, Linux, macOS | `not observed — quarantine was never executed for these samples` | The quarantine action's outcome: quarantined (full containment applied), quarantined_partial (containment applied but at least one loopback/whitelist exception or v6 mirror failed), failed (no containment applied), or busy (another mutating quarantine action was already in flight). An aborted run before any mutation instead emits an error field with no status field. |
+| `rules_applied` | int32 | - | Windows, Linux, macOS | `4` | Count of firewall rules the action attempted-and-applied this call (Windows/Linux: the mutation tally's succeeded count; macOS: the pf ruleset line count), reported alongside status. Values: integer >= 0. |
 
-**`unquarantine` — `status|<value>[|note|<text>]`** (or `error|<message>` on macOS, if both restore paths fail)
+**`security.quarantine.release` — `status`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `status` | string | `released`, `release_uncertain` | windows, linux, darwin | `released` (not observed — `unquarantine` was never executed for these samples) |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `status` | string | `released` `release_uncertain` | Windows, Linux, macOS | `not observed — unquarantine was never executed for these samples` | The unquarantine action's outcome: released (teardown/policy restore confirmed) or release_uncertain (a genuine runner failure, or a clean rule-delete/policy-restore failure, means the device may still be firewalled). A Windows released result additionally appends a note field when no captured pre-quarantine policy existed to replay; a macOS failure before either restore path succeeds emits an error field instead. |
 
-**`status` — `state|<value>[|note|<text>]`, then (only when `state` != `inactive`) `whitelist|<comma-list>[|note|<text>]`**
+**`security.quarantine.status` — `state|whitelist`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `state` | string | `active`, `partial`, `degraded` (macOS only), `uncertain`, `inactive` | windows, linux, darwin | `uncertain` |
-| `whitelist` | string | free text — comma-separated IP list, or empty | windows, linux, darwin | `` (empty) |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `state` | string | `active` `partial` `degraded` `uncertain` `inactive` | Windows, Linux, macOS | `uncertain` | Current containment verdict from a live re-read of the OS firewall state: active (fully contained), partial (some but not all expected rules/policy present), degraded (macOS only - the pf ruleset is loaded but pf itself is disabled, so nothing is actually blocked), uncertain (the read itself failed or returned nothing recognisable), or inactive (no containment present). |
+| `whitelist` | string | - | Windows, Linux, macOS | - | Comma-separated whitelist of currently-allowed IPs, read fresh from the firewall. Reported only when state is not inactive, and empty when the device is contained with no additional whitelist entries. Values: free text - comma-separated IP list, or empty. |
 
-**`whitelist` — `status|<value>|whitelist|<comma-list>`** (or `error|<message>` on invalid/missing parameters)
+**`security.quarantine.whitelist` — `status|whitelist`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `status` | string | `updated`, `update_uncertain` | windows, linux, darwin | `updated` |
-| `whitelist` | string | free text — comma-separated IP list, or empty | windows, linux, darwin | `` (empty) |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `status` | string | `updated` `update_uncertain` | Windows, Linux, macOS | `updated` | The whitelist action's outcome: updated (every add/remove mutation succeeded) or update_uncertain (a genuine runner failure, or a clean per-IP mutation failure, means the whitelist may be partially applied). Missing/invalid parameters instead return an error field before any mutation is attempted. |
+| `whitelist` | string | - | Windows, Linux, macOS | - | Comma-separated whitelist after the add/remove, read fresh from the firewall (on macOS this is the full pf ruleset whitelist, since add/remove rebuilds the entire main ruleset there). Values: free text - comma-separated IP list, or empty. |
 <!-- END GENERATED -->
 
 ### Result status
@@ -110,7 +104,13 @@ Surfaced as `plugin_result_status` on the command response, set via `ctx.set_res
 | Status | Completeness | Provenance | When |
 |---|---|---|---|
 | `UNDECLARED` (agent default) | — | — | No `set_result_status` call fires on this path: a clean `active`/`inactive` `status` read, or a `whitelist`/`quarantine`/`unquarantine` rejected before any mutation for a missing/invalid parameter. Matches every sample's `[result_status] UNDECLARED / UNKNOWN /` line (`quarantine_plugin.cpp:2263-2289,2327-2334`). |
-| `UNAVAILABLE` | `PARTIAL` | e.g. `subprocess_runner:spawn_error` | A genuine runner failure (spawn/timeout/signal) on any read or mutation, forwarded via `forward_runner_failure` before the action's own status call runs — matches the Linux sample's `ip6tables`-missing capture. |
+| `UNAVAILABLE` | `PARTIAL` | `subprocess_runner:spawn_error` | A genuine runner failure — the child process could not be spawned at all — on any read or mutation, forwarded via `forward_runner_failure` before the action's own status call runs — matches the Linux sample's `ip6tables`-missing capture. |
+| `CONSTRAINED` | `PARTIAL` | `subprocess_runner:deadline` | The runner's deadline elapsed (15s mutating / 10s read) and the still-running child was killed, forwarded via `forward_runner_failure` on any read or mutation. |
+| `CONSTRAINED` | `PARTIAL` | `subprocess_runner:cancelled` | The run was cancelled before it finished, forwarded via `forward_runner_failure` on any read or mutation. |
+| `CONSTRAINED` | `PARTIAL` | `subprocess_runner:signaled` | The child (`netsh`/`iptables`/`ip6tables`/`pfctl`) was killed by a signal rather than exiting cleanly, forwarded via `forward_runner_failure` on any read or mutation. |
+| `OK` | `PARTIAL` | `subprocess_runner:line_limit` | A deliberate bounded stop: the runner capped output at its line limit and killed a still-producing child — not a failure, but incomplete. |
+| `UNAVAILABLE` | `PARTIAL` | `quarantine:do_whitelist macOS whitelist read failed before add` / `…before remove` | `whitelist` on macOS, both `add` and `remove`: the prerequisite `macos_get_whitelist` read failed, so the ruleset rebuild is aborted rather than rewritten from an unproven/empty set (`quarantine_plugin.cpp:2427-2431,2523-2527`). |
+| `UNAVAILABLE` | `PARTIAL` | `quarantine:linux_unquarantine chain flush/delete failed` | `unquarantine` on Linux: a genuine runner failure, or a clean failure to flush/delete the `yuzu-quarantine` chain (and its ip6tables mirror), reported as `release_uncertain` rather than `released` (`quarantine_plugin.cpp:1251-1257`). |
 | `UNAVAILABLE` | `PARTIAL` | `quarantine:win_quarantine …firewall policy not applied` | `quarantine` on Windows, when the all-profiles policy set itself fails (`quarantine_plugin.cpp:568-577`). |
 | `OK` | `PARTIAL` | `quarantine:win_quarantine contained, but …exceptions failed to apply` | `quarantine` on Windows, containment holds but a loopback/whitelist exception failed (`quarantine_plugin.cpp:584-593`). |
 | `OK` | `PARTIAL` | `quarantine:win_unquarantine restored the Windows default policy — no captured pre-quarantine policy…` | `unquarantine` on Windows, release succeeded but no prior policy was available to replay (`quarantine_plugin.cpp:731-737`). |
@@ -119,7 +119,7 @@ Surfaced as `plugin_result_status` on the command response, set via `ctx.set_res
 | `UNAVAILABLE` | `PARTIAL` | `quarantine:macos_unquarantine restore and disable both failed` | `unquarantine` on macOS, both `/etc/pf.conf` reload and `pfctl -d` fail (`quarantine_plugin.cpp:1670-1674`). |
 | `UNAVAILABLE` | `PARTIAL` | `quarantine:macos_is_quarantined pf ruleset loaded but pf is disabled` (`state=degraded`) | `status` on macOS, pf holds the blocking ruleset but is itself disabled (`quarantine_plugin.cpp:1720-1726`). |
 | `UNAVAILABLE` | `PARTIAL` | `quarantine:macos_is_quarantined pf status unreadable` (`state=uncertain`) | `status` on macOS, the pf status read fails or is unparseable — matches this build's macOS sample exactly (`quarantine_plugin.cpp:1742-1744`; `docs/samples/macos.txt`). |
-| `UNAVAILABLE` | `PARTIAL` | `quarantine: another mutating quarantine action is in progress` | Any mutating action refused `status|busy` by the `MutationGate` (`quarantine_plugin.cpp:2028,2168,2318`). |
+| `UNAVAILABLE` | `PARTIAL` | `quarantine: another mutating quarantine action is in progress` | Any mutating action refused `status\|busy` by the `MutationGate` (`quarantine_plugin.cpp:2028,2168,2318`). |
 | `OK` | `PARTIAL` | `quarantine:win_quarantine contained, but the pre-quarantine firewall policy could not be captured/stored…` | `quarantine` on Windows, containment succeeded but the restore image failed to persist (`quarantine_plugin.cpp:2123-2133`). |
 | `OK` | `PARTIAL` | `quarantine:linux_quarantine contained, but the ip6tables-applied marker could not be stored…` | `quarantine` on Linux, containment succeeded but the v6-applied marker failed to persist (`quarantine_plugin.cpp:2145-2151`). |
 | `OK` / `UNAVAILABLE` | `PARTIAL` | `quarantine:do_status containment is incomplete` / `…containment state could not be determined` | `status`, `state=partial` (OK/PARTIAL) or `state=uncertain`/`degraded` (UNAVAILABLE/PARTIAL) (`quarantine_plugin.cpp:2263-2289`). |
@@ -129,13 +129,14 @@ Surfaced as `plugin_result_status` on the command response, set via `ctx.set_res
 - **Instruction result.** Every action's output rows and result status travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`, like any other plugin dispatch.
 - **QuarantineStore (Postgres, authoritative).** MCP `quarantine_device` writes the containment intent — `quarantine_store->quarantine_device(agent_id, session->username, reason, whitelist)` (`server/core/src/mcp_server.cpp:10049`) — before dispatching this plugin's `quarantine` action; the store holds "at most one active record per agent" and is explicitly **not** expendable telemetry — it persists until an administrator lifts it, no clock-guarded retention (`server/core/src/quarantine_store.hpp:8-15`). `QuarantineContainmentReconciler` re-drives containment from that stored record alone (never a fresh/caller-supplied value) on agent reconnect, via the shared `redispatch_stored_containment` chokepoint (`server/core/src/quarantine_reapply.hpp:2-38`).
 - **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics. Nothing runs on a schedule; the plugin executes only when an operator, MCP `quarantine_device`, or the reconciler dispatches one of its four definitions.
+- **Sensitivity.** `whitelist` rows — emitted by `status` (whenever not `inactive`) and by `whitelist` itself — carry the quarantine allow-list as raw IP addresses, network identifiers that can pinpoint a specific device or server. The other fields (`status`, `state`, `rules_applied`, `note`) are counts, enums, and free-text failure descriptions; none names a person or installed software.
 - **Siblings:** `rdp_control.set_state` shares the same `Administrators`-group-or-equivalent grant shape as `quarantine.*` on Windows and cites it directly rather than declaring a new right (`docs/agent-privilege-model.md` row for `rdp_control.set_state`).
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("security.quarantine.isolate")`. Run: `execute_instruction {definition_id, parameters}` (or MCP `quarantine_device` for the record + live-isolate path). Read: `/api/responses/{id}` for the instruction result; `/api/v1/quarantine` for the QuarantineStore-backed active-containment state.
 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash f4d514eecc28
 
 ```
 == action=quarantine
@@ -146,15 +147,15 @@ Surfaced as `plugin_result_status` on the command response, set via `ctx.set_res
 
 == action=status
 state|inactive
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=whitelist
 error|missing required parameter: action (add/remove)
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 [rc] 1
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash f4d514eecc28
 
 ```
 == action=quarantine
@@ -170,11 +171,11 @@ state|uncertain|note|pf state could not be read -- containment can be neither co
 
 == action=whitelist
 error|missing required parameter: action (add/remove)
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 [rc] 1
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash pending
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash f4d514eecc28
 
 ```
 == action=quarantine
@@ -190,7 +191,7 @@ state|uncertain|note|ipv6_unavailable — IPv6 stack is up but ip6tables is not 
 
 == action=whitelist
 error|missing required parameter: action (add/remove)
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 [rc] 1
 ```
 <!-- END GENERATED -->
@@ -206,10 +207,10 @@ error|missing required parameter: action (add/remove)
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/quarantine/meson.build` · `agents/plugins/quarantine/src/quarantine_plugin.cpp` (descriptor legs, execute dispatch) · `quarantine_parsers.hpp` (pure status parsing + argv construction) · `quarantine_serialization.hpp` (`MutationGate`)
+- Plugin: `agents/plugins/quarantine/src/quarantine_parsers.hpp` · `agents/plugins/quarantine/src/quarantine_plugin.cpp` · `agents/plugins/quarantine/src/quarantine_serialization.hpp`
 - Definitions: `content/definitions/quarantine.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_c.hpp`
-- Tests: `tests/unit/test_quarantine_argv.cpp` · `tests/unit/test_quarantine_parsers.cpp` · `tests/unit/test_quarantine_serialization.cpp` · `tests/unit/server/test_quarantine_containment_reconciler.cpp` · `tests/unit/server/test_quarantine_dispatch_decision.cpp` · `tests/unit/server/test_quarantine_dispatch_gate.cpp` · `tests/unit/server/test_quarantine_reapply.cpp` · `tests/unit/server/test_quarantine_store.cpp` · `tests/unit/server/test_rest_quarantine_routes.cpp`
+- Tests: `tests/unit/server/test_quarantine_containment_reconciler.cpp` · `tests/unit/server/test_quarantine_dispatch_decision.cpp` · `tests/unit/server/test_quarantine_dispatch_gate.cpp` · `tests/unit/server/test_quarantine_reapply.cpp` · `tests/unit/server/test_quarantine_store.cpp` · `tests/unit/test_quarantine_argv.cpp` · `tests/unit/test_quarantine_parsers.cpp` · `tests/unit/test_quarantine_serialization.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/1788-quarantine-rest-scoped-gate.security.md` · `changelog.d/20260814-quarantine-store-postgres.changed.md` · `changelog.d/20260818-wave2-quarantine-native-argv.changed.md` · `changelog.d/2204-declarations-group-c.added.md` · `changelog.d/2298-guardian-journal-fleet-rollup.added.md` · `changelog.d/2376-authz-topology-floor.security.md` · `changelog.d/2452-guardian-journal-progress-stamp.fixed.md` · `changelog.d/3127-mcp-quarantine-phantom-isolation.fixed.md` · `changelog.d/3282-linux-ipv6-quarantine.security.md` · `changelog.d/3283-macos-pf-enabled-status.security.md` · `changelog.d/3284-windows-precedence-probe.added.md` · `changelog.d/3284-windows-quarantine-precedence.security.md` · `changelog.d/3286-quarantine-mutation-serialization.fixed.md` · `changelog.d/3424-3511-dispatch-plugin-presence.security.md` · `changelog.d/3425-quarantine-reapply-on-reconnect.security.md` · `changelog.d/3495-shutdown-join-ordering.fixed.md` · `changelog.d/3687-mcp-dispatch-denial-reasons.security.md` · `changelog.d/881-quarantine-dispatch-enforcement.security.md`
+- Changelog: `changelog.d/1788-quarantine-rest-scoped-gate.security.md` · `changelog.d/20260814-quarantine-store-postgres.changed.md` · `changelog.d/20260818-wave2-quarantine-native-argv.changed.md` · `changelog.d/3127-mcp-quarantine-phantom-isolation.fixed.md` · `changelog.d/3282-linux-ipv6-quarantine.security.md` · `changelog.d/3284-windows-quarantine-precedence.security.md` · `changelog.d/3286-quarantine-mutation-serialization.fixed.md` · `changelog.d/3425-quarantine-reapply-on-reconnect.security.md` · `changelog.d/881-quarantine-dispatch-enforcement.security.md`
 <!-- END GENERATED -->

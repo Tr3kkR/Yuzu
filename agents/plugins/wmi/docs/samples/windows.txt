@@ -1,4 +1,4 @@
-captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash a8a6121c1219
 == action=query wql="SELECT Caption FROM Win32_OperatingSystem"
 row0|Caption|Microsoft Windows 11 Pro
 rows|1

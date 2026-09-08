@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash f31d206bb2ee
 == action=netstat_list
 tcp|100.109.177.77|52882|100.123.53.121|22|ESTABLISHED|9653
 tcp|192.168.0.66|52771|160.79.104.10|443|ESTABLISHED|9039

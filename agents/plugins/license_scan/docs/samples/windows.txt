@@ -1,4 +1,4 @@
-captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 93534d76a8aa
 == action=list
 lic|Office 16, Office16O365ProPlusR_Grace edition|Microsoft||retail|retail|unlicensed||os_licensing_api|authoritative|VMFTK||machine|
 lic|Windows(R), Professional edition|Microsoft||retail|retail|licensed||os_licensing_api|authoritative|3V66T||machine|

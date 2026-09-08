@@ -1,4 +1,4 @@
-captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 6094b93f5b9d
 == action=mounts
 mount|//?/Volume{0a35801e-3f40-4114-a073-3d7ea1dd7664}/|//?/Volume{0a35801e-3f40-4114-a073-3d7ea1dd7664}/|NTFS|-|524283904|509657088|509657088|rw
 mount|C:/|//?/Volume{c9a5f911-4689-41b2-b774-5b0e25b60e10}/|NTFS|-|248158089216|20788932608|20788932608|rw

@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 514b81c2df7e
 == action=procfetch_fetch
 10151|plugin_capture|/private/tmp/claude-501/-Users-alex-yuzu-dev/8d89cd79-001b-4ea8-8930-0c9affb3265e/scratchpad/d2/plugin_capture|87ea43e2b7d3dd2eb6e7db6a20041b1f77d20272
 10143|mdworker_shared|/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared|19ca6c856d80cfc6b83800c821b3129f40b135c7

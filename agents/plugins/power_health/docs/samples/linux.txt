@@ -1,4 +1,4 @@
-captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash pending
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 082db96f6e05
 == action=battery
 battery|0|unknown|-1|-1|-1|-1
 [result_status] UNDECLARED / UNKNOWN / 

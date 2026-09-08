@@ -5,10 +5,10 @@
 |---|---|
 | **What it does** | Reports network adapter configuration, IP addresses, DNS servers, and proxy settings |
 | **Version** | 1.0.0 |
-| **Kind** | Collector · read-only · on-demand (no scheduled gather) |
-| **Platforms** | Windows ✅ · macOS 🟡 constrained/unsupported mix · Linux 🟡 constrained |
-| **Actions** | `adapters` (definition `device.network_config.adapters`) · `ip_addresses` (`device.network_config.ip_addresses`) · `dns_servers` (`device.network_config.dns_servers`) · `proxy` (`device.network_config.proxy`) · `dns_cache` (`device.network_config.dns_cache`) · `arp` (`device.network_config.arp`) |
-| **Security** | securable `Infrastructure` · operation Read · risk Low · dispatch ReadOnly · approval gate none |
+| **Kind** | Collector · read-only · gathered (device.network_config.adapters, device.network_config.ip_addresses, device.network_config.dns_servers, device.network_config.proxy, device.network_config.dns_cache, device.network_config.arp) |
+| **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
+| **Actions** | `adapters` (definition `device.network_config.adapters`) · `arp` (definition `device.network_config.arp`) · `dns_cache` (definition `device.network_config.dns_cache`) · `dns_servers` (definition `device.network_config.dns_servers`) · `ip_addresses` (definition `device.network_config.ip_addresses`) · `proxy` (definition `device.network_config.proxy`) |
+| **Security** | securable `Infrastructure` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
 | **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
 
@@ -41,20 +41,20 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `adapters` | ✅ supported · rung 1 · `GetAdaptersAddresses` | ✅ supported · rung 1 · `getifaddrs + SIOCGIFMEDIA` | ✅ supported · rung 1 · `rtnetlink (RTM_GETLINK)` |
-| `ip_addresses` | ✅ supported · rung 1 · `GetAdaptersAddresses` | ✅ supported · rung 1 · `getifaddrs + PF_ROUTE sysctl` | ✅ supported · rung 1 · `rtnetlink (RTM_GETADDR/RTM_GETROUTE)` |
-| `dns_servers` | ✅ supported · rung 1 · `GetAdaptersAddresses` | ✅ supported · rung 1 · `SCDynamicStore` | ✅ supported · rung 1 · `/etc/resolv.conf read` |
-| `proxy` | ✅ supported · rung 1 · `WinHttpGetIEProxyConfigForCurrentUser` | 🟡 constrained · rung 1 · `SCDynamicStoreCopyProxies` | 🟡 constrained · rung 1 · `environment variables` |
-| `dns_cache` | ✅ supported · rung 1 · `DnsGetCacheDataTable (dnsapi.dll)` | ⛔ unsupported · no mechanism | 🟡 constrained · rung 2 · `resolvectl via direct-argv runner` |
-| `arp` | ✅ supported · rung 1 · `GetIpNetTable2` | 🟡 constrained · rung 1 · `PF_ROUTE sysctl RTF_LLINFO` | 🟡 constrained · rung 1 · `/proc/net/arp` |
+| `adapters` | ✅ supported · rung 1 · GetAdaptersAddresses | ✅ supported · rung 1 · getifaddrs + SIOCGIFMEDIA | ✅ supported · rung 1 · rtnetlink (RTM_GETLINK) |
+| `arp` | ✅ supported · rung 1 · GetIpNetTable2 | 🟡 constrained · rung 1 · PF_ROUTE sysctl RTF_LLINFO | 🟡 constrained · rung 1 · /proc/net/arp |
+| `dns_cache` | ✅ supported · rung 1 · DnsGetCacheDataTable (dnsapi.dll) | ⛔ unsupported | 🟡 constrained · rung 2 · resolvectl via direct-argv runner |
+| `dns_servers` | ✅ supported · rung 1 · GetAdaptersAddresses | ✅ supported · rung 1 · SCDynamicStore | ✅ supported · rung 1 · /etc/resolv.conf read |
+| `ip_addresses` | ✅ supported · rung 1 · GetAdaptersAddresses | ✅ supported · rung 1 · getifaddrs + PF_ROUTE sysctl | ✅ supported · rung 1 · rtnetlink (RTM_GETADDR/RTM_GETROUTE) |
+| `proxy` | ✅ supported · rung 1 · WinHttpGetIEProxyConfigForCurrentUser | 🟡 constrained · rung 1 · SCDynamicStoreCopyProxies | 🟡 constrained · rung 1 · environment variables |
 
-**Declared limits per leg** (the descriptor's fallback text, verbatim):
+**Declared limits per leg** (descriptor fallback text, verbatim):
 
-- **`proxy` / Linux** — reads the *_proxy variables from the agent process's own environment only; a system-wide, desktop-session or package-manager proxy the agent did not inherit is not reported
-- **`proxy` / macOS** — reports the HTTP proxy and PAC URL, checking the primary network service first and then each scoped per-interface service; HTTPS/SOCKS/FTP proxies are not reported, so a host configured with only those reads as none
-- **`dns_cache` / Linux** — falls back to systemd-resolve statistics, or reports unavailable, when resolvectl is absent
-- **`arp` / Linux** — IPv4 ARP entries only; /proc/net/arp carries no IPv6 neighbours (they live in the RTM_GETNEIGH table), and non-Ethernet or incomplete entries are not reported
 - **`arp` / macOS** — ip and mac only; the interface name and static/dynamic type are not carried by the RTF_LLINFO dump and are emitted as '-'
+- **`arp` / Linux** — IPv4 ARP entries only; /proc/net/arp carries no IPv6 neighbours (they live in the RTM_GETNEIGH table), and non-Ethernet or incomplete entries are not reported
+- **`dns_cache` / Linux** — falls back to systemd-resolve statistics, or reports unavailable, when resolvectl is absent
+- **`proxy` / macOS** — reports the HTTP proxy and PAC URL, checking the primary network service first and then each scoped per-interface service; HTTPS/SOCKS/FTP proxies are not reported, so a host configured with only those reads as none
+- **`proxy` / Linux** — reads the *_proxy variables from the agent process's own environment only; a system-wide, desktop-session or package-manager proxy the agent did not inherit is not reported
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -77,12 +77,7 @@ traffic on any leg — every read is local to the host.
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-`adapters` takes no parameters.
-`ip_addresses` takes no parameters.
-`dns_servers` takes no parameters.
-`proxy` takes no parameters.
-`dns_cache` takes no parameters.
-`arp` takes no parameters.
+No action takes parameters.
 <!-- END GENERATED -->
 
 ### Outputs
@@ -95,40 +90,56 @@ zero, and it is not used as a "no rows" sentinel (a leg that finds nothing on `a
 distinguished from failure by the typed result status).
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`adapters` — `adapter|name|mac|speed_mbps|status`**
+**`device.network_config.adapters` — `name|mac|speed_mbps|status`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `name` | string | free text | W, M, L | `en0` |
-| `mac` | string | colon-separated hex, or `-` | W, M, L | `d0:11:e5:c0:a0:99` |
-| `speed_mbps` | int64 | integer Mbps, `0` unknown/inactive (L, M); Windows emits an unclamped sentinel instead of `0` — see Caveats | W, M, L | `1000` |
-| `status` | string | `up` `down` (W: OperStatus; M: IFF_UP — administrative, not operational); `up` `down` `unknown` (L: IFLA_OPERSTATE) | W, M, L | `up` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `name` | string | - | Windows, Linux, macOS | `en0` | Adapter's OS-reported display name (Windows friendly name; Linux/macOS kernel interface name). Values: free text. |
+| `mac` | string | - | Windows, Linux, macOS | `d0:11:e5:c0:a0:99` | Adapter's MAC address, colon-separated hex, or '-' when the leg could not resolve one (loopback, tunnel/utun interfaces). |
+| `speed_mbps` | int64 | - | Windows, Linux, macOS | `1000` | Link speed reported by the OS, in megabits per second; 0 when unknown, inactive, or not applicable (loopback/tunnel). Values: integer Mbps, 0 for unknown/inactive (Linux/macOS); Windows emits the unclamped TransmitLinkSpeed sentinel (18446744073709) instead of 0 when the adapter reports no known speed — see Caveats. |
+| `status` | string | - | Windows, Linux, macOS | `up` | Adapter link state. Windows/Linux report the OS's OPERATIONAL state (IfOperStatus / IFLA_OPERSTATE); macOS reports the ADMINISTRATIVE IFF_UP flag instead, so a cable-unplugged Mac NIC can read 'up' where Windows/Linux would read 'down'. Values: up, down (Windows, macOS); up, down, unknown (Linux, when the kernel omits IFLA_OPERSTATE). |
 
-**`ip_addresses` — `ip|adapter|address|prefix_length|gateway`**
+**`device.network_config.arp` — `interface|ip_address|mac_address|entry_type`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `adapter` | string | free text | W, M, L | `en0` |
-| `address` | string | IPv4 or IPv6 literal | W, M, L | `192.168.0.131` |
-| `prefix_length` | int | 0–32 (IPv4) or 0–128 (IPv6) | W, M, L | `24` |
-| `gateway` | string | IPv4 literal, or `-`; per-adapter on Windows, one system-wide value repeated on every row on macOS/Linux | W, M, L | `192.168.0.1` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `interface` | string | - | Windows, Linux, macOS | `Ethernet` | Owning network interface name; always '-' on macOS, where the PF_ROUTE RTF_LLINFO dump carries no interface field. Values: interface name, or '-' (macOS, always). |
+| `ip_address` | string | - | Windows, Linux, macOS | `192.168.0.61` | Neighbour's IPv4 or IPv6 address. Values: IPv4 or IPv6 literal. |
+| `mac_address` | string | - | Windows, Linux, macOS | `1c:53:f9:73:22:6c` | Neighbour's MAC address, colon-separated hex; '-' for a Windows entry with no resolved hardware address yet (incomplete). Linux drops all-zero-MAC rows rather than emitting '-'. Values: colon-separated hex, or '-' (Windows incomplete entries only). |
+| `entry_type` | string | - | Windows, Linux, macOS | `dynamic` | Static/dynamic/incomplete classification; always '-' on macOS, where the PF_ROUTE RTF_LLINFO dump carries no such distinction. Values: static, dynamic, incomplete (Windows only); static, dynamic (Linux); '-' (macOS, always). |
 
-**`dns_servers` — `dns|adapter|server|type`**
+**`device.network_config.dns_cache` — `name|record_type|ttl`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `adapter` | string | adapter name (W); the literal `system` (M, L) | W, M, L | `system` |
-| `server` | string | IPv4 or IPv6 literal | W, M, L | `194.168.4.100` |
-| `type` | enum | `IPv4` `IPv6` | W, M, L | `IPv4` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `name` | string | - | Windows | `windowsupdate.microsoft.com` | Resolved DNS name of the cached entry. Populated only on Windows — Linux emits opaque, unparsed resolvectl/systemd-resolve text under a different row shape, and macOS never populates this action at all. See Caveats. Values: free text (FQDN or reverse-lookup name). |
+| `record_type` | string | - | Windows | `PTR` | DNS resource-record type of the cached entry, decoded from DnsGetCacheDataTable's wType. Populated only on Windows; an unrecognised wType value reports 'unknown'. Values: A, AAAA, CNAME, PTR, MX, SRV, unknown. |
+| `ttl` | int32 | - | Windows | `0` | Always the literal 0 — the Windows leg does not decode a real time-to-live from DnsGetCacheDataTable's cache entry structure, so this is not a measured value. |
 
-**`arp` — `arp|iface|ip|mac|type`**
+**`device.network_config.dns_servers` — `adapter|server|type`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `iface` | string | interface name, or `-` (M, always) | W, L; `-` on M | `Ethernet` |
-| `ip` | string | IPv4 or IPv6 literal | W, M, L | `192.168.0.61` |
-| `mac` | string | colon-separated hex, or `-` (W incomplete entries only) | W, M, L | `1c:53:f9:73:22:6c` |
-| `type` | enum | `static` `dynamic` `incomplete` (W); `static` `dynamic` (L); `-` (M, always) | W, L; `-` on M | `dynamic` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `adapter` | string | - | Windows, Linux, macOS | `system` | Adapter owning this resolver on Windows; Linux and macOS report the system-wide resolver list under the literal value 'system' (resolv.conf and SCDynamicStore are not per-adapter). Values: adapter name (Windows), or the literal 'system' (Linux, macOS). |
+| `server` | string | - | Windows, Linux, macOS | `194.168.4.100` | Configured DNS server address. Values: IPv4 or IPv6 literal. |
+| `type` | string | - | Windows, Linux, macOS | `IPv4` | Address family of the server value. Values: IPv4, IPv6. |
+
+**`device.network_config.ip_addresses` — `adapter|address|prefix_length|gateway`**
+
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `adapter` | string | - | Windows, Linux, macOS | `en0` | Adapter name the address belongs to (same name as the adapters action's name field). Values: free text. |
+| `address` | string | - | Windows, Linux, macOS | `192.168.0.131` | IPv4 or IPv6 unicast address assigned to the adapter; an IPv6 link-local zone suffix ('%ifname') is stripped on macOS. Values: IPv4 or IPv6 literal. |
+| `prefix_length` | int32 | - | Windows, Linux, macOS | `24` | CIDR prefix length of the address's subnet. Values: integer, 0-32 (IPv4) or 0-128 (IPv6). |
+| `gateway` | string | - | Windows, Linux, macOS | `192.168.0.1` | Default gateway address for this row. Windows resolves it per-adapter (FirstGatewayAddress); Linux/macOS resolve a single system-wide default gateway and repeat it on every row. Values: IPv4 literal, or '-' when none or unresolved. |
+
+**`device.network_config.proxy` — `proxy_type|proxy_address|bypass`**
+
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `proxy_type` | string | - | Windows, Linux, macOS | `auto_detect` | Proxy mode. Windows and macOS emit a normalized type; Linux instead emits the literal environment-variable name it read (e.g. 'http_proxy', 'HTTPS_PROXY'), and can emit several proxy_type/proxy_address row pairs in one response if more than one variable is set — see Caveats. Values: none, http, pac, auto_detect (Windows); none, http, pac (macOS); none, or a literal *_proxy/ALL_PROXY variable name (Linux). |
+| `proxy_address` | string | - | Windows, Linux, macOS | `not observed in the captured samples — omitted whenever proxy_type is none or auto_detect` | The proxy host:port (http), the PAC URL (pac), or the raw environment-variable value (Linux). Row is omitted entirely when proxy_type is none/auto_detect. Values: 'host:port', a URL, or a raw environment-variable value. |
+| `bypass` | string | - | Windows, Linux, macOS | `*.local,169.254/16` | Comma-separated proxy-exception/bypass list; the row is omitted entirely when the list is empty. Values: comma-separated free text. |
 <!-- END GENERATED -->
 
 **`proxy` — not one row per record.** Each configured value is its own row: `proxy_type|<value>`,
@@ -174,6 +185,11 @@ entries), `dns_cache|not_available|<reason>` (W/L, tool missing or query failed)
 | `CONSTRAINED`/`UNAVAILABLE` / `PARTIAL` | partial | `network_config:arp_row_cap_reached`, `network_config:proc_net_arp_unreadable`, `network_config:proc_net_arp_read_error` | Linux `arp`, 20k-row cap hit, or `/proc/net/arp` unreadable/errored |
 | `CONSTRAINED`/`UNAVAILABLE` / `PARTIAL` | partial | `network_config:pf_route_arp_sysctl_failed`, `network_config:pf_route_arp_truncated`, `network_config:arp_row_cap_reached` | macOS `arp`, PF_ROUTE ARP sysctl failed/truncated, or 20k-row cap hit |
 | `CONSTRAINED` / `PARTIAL` | partial | `network_config:arp_row_cap_reached` | Windows `arp`, 20k-row cap hit |
+| `UNAVAILABLE` / `PARTIAL` | partial | `subprocess_runner:spawn_error` | Linux `dns_cache`, the `resolvectl`/`systemd-resolve` child process could not be spawned at all |
+| `CONSTRAINED` / `PARTIAL` | partial | `subprocess_runner:deadline` | Linux `dns_cache`, the runner's deadline elapsed while `resolvectl`/`systemd-resolve` was still running, and it was killed |
+| `CONSTRAINED` / `PARTIAL` | partial | `subprocess_runner:cancelled` | Linux `dns_cache`, the `resolvectl`/`systemd-resolve` run was cancelled before it finished |
+| `CONSTRAINED` / `PARTIAL` | partial | `subprocess_runner:signaled` | Linux `dns_cache`, the `resolvectl`/`systemd-resolve` child was killed by a signal rather than exiting cleanly |
+| `OK` / `PARTIAL` | partial | `subprocess_runner:line_limit` | Linux `dns_cache`, the runner capped `resolvectl`/`systemd-resolve` output at its line limit and killed the still-producing child — a deliberate bounded stop, not a failure |
 
 Windows never sets a typed status on `adapters`/`ip_addresses`/`dns_servers`/`proxy`/`dns_cache` — a
 failed API call there returns `rc=1` with an in-band error row instead (see Privileges above); `arp`
@@ -199,6 +215,13 @@ is the one Windows action that does (row-cap `CONSTRAINED`). No action on any OS
   the daily-sync routed concern. A failed `adapters` read aborts the whole CI sync cycle rather than
   syncing a partial record (`sync_source_device_ci.cpp:268-277`).
 - **Not consumed by** TAR, DEX, or Prometheus metrics.
+- **Sensitivity.** `adapters` rows carry the host's own MAC addresses, and `arp` rows carry the MAC
+  and IP address of every other device currently seen on the local subnet — device-identifying data
+  by another route. `ip_addresses`/`dns_servers` rows carry only this host's own IP/resolver
+  configuration. `dns_cache` entries can include hostnames of other devices actually contacted on the
+  network (e.g. `iphone`, `the-rig` in the sample) — potentially device-identifying, not personal.
+  `proxy` rows carry network configuration only, nothing that identifies a person or installed
+  software.
 - **Siblings:** `tar/status` and `tar`'s own ARP collector (`agents/plugins/tar/src/tar_arp_collector.cpp`)
   perform an independent Windows ARP enumeration for the TAR capture surface — it duplicates similar
   RAII-guard logic for `GetIpNetTable2` but is not a consumer of this plugin's `arp` action
@@ -212,7 +235,7 @@ is the one Windows action that does (row-cap `CONSTRAINED`). No action on any OS
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 3b5c27bfec23
 
 ```
 == action=adapters
@@ -225,7 +248,7 @@ adapter|WiFi|84:1B:77:2B:DC:FC|18446744073709|down
 adapter|Local Area Connection* 1|84:1B:77:2B:DC:FD|18446744073709|down
 adapter|Local Area Connection* 2|86:1B:77:2B:DC:FC|18446744073709|down
 adapter|Bluetooth Network Connection|84:1B:77:2B:DD:00|3|down
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 
 == action=ip_addresses
 ip|Ethernet 2|fe80::24d2:a5ae:f55b:9132|64|-
@@ -240,14 +263,8 @@ ip|OpenVPN Data Channel Offload for NordVPN|169.254.133.126|16|-
 ip|Local Area Connection|fe80::669f:e4fb:4130:c7de|64|-
 ip|Local Area Connection|169.254.70.46|16|-
 ip|WiFi|fe80::72f7:7266:9da0:e23c|64|-
-ip|WiFi|169.254.225.27|16|-
-ip|Local Area Connection* 1|fe80::a60d:9224:f8d0:abf7|64|-
-ip|Local Area Connection* 1|169.254.64.8|16|-
-ip|Local Area Connection* 2|fe80::81cf:c175:d2f7:359e|64|-
-ip|Local Area Connection* 2|169.254.218.5|16|-
-ip|Bluetooth Network Connection|fe80::4551:9b1a:5ad9:83a|64|-
-ip|Bluetooth Network Connection|169.254.75.142|16|-
-[result_status] UNDECLARED / UNKNOWN /
+… 12 of 19 rows shown
+[result_status] UNDECLARED / UNKNOWN
 
 == action=dns_servers
 dns|Ethernet 2|194.168.4.100|IPv4
@@ -262,23 +279,12 @@ dns|OpenVPN Data Channel Offload for NordVPN|fec0:0:0:ffff::2|IPv6
 dns|OpenVPN Data Channel Offload for NordVPN|fec0:0:0:ffff::3|IPv6
 dns|Local Area Connection|fec0:0:0:ffff::1|IPv6
 dns|Local Area Connection|fec0:0:0:ffff::2|IPv6
-dns|Local Area Connection|fec0:0:0:ffff::3|IPv6
-dns|WiFi|194.168.4.100|IPv4
-dns|WiFi|194.168.8.100|IPv4
-dns|Local Area Connection* 1|fec0:0:0:ffff::1|IPv6
-dns|Local Area Connection* 1|fec0:0:0:ffff::2|IPv6
-dns|Local Area Connection* 1|fec0:0:0:ffff::3|IPv6
-dns|Local Area Connection* 2|fec0:0:0:ffff::1|IPv6
-dns|Local Area Connection* 2|fec0:0:0:ffff::2|IPv6
-dns|Local Area Connection* 2|fec0:0:0:ffff::3|IPv6
-dns|Bluetooth Network Connection|fec0:0:0:ffff::1|IPv6
-dns|Bluetooth Network Connection|fec0:0:0:ffff::2|IPv6
-dns|Bluetooth Network Connection|fec0:0:0:ffff::3|IPv6
-[result_status] UNDECLARED / UNKNOWN /
+… 12 of 24 rows shown
+[result_status] UNDECLARED / UNKNOWN
 
 == action=proxy
 proxy_type|auto_detect
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 
 == action=dns_cache
 cache_entry|66.24.104.213.in-addr.arpa|PTR|0|
@@ -293,20 +299,8 @@ cache_entry|kubernetes.docker.internal|AAAA|0|
 cache_entry|ocsp.comodoca.com|A|0|
 cache_entry|the-rig.tail128eb2.ts.net|A|0|
 cache_entry|the-rig.tail128eb2.ts.net|AAAA|0|
-cache_entry|65.14.106.213.in-addr.arpa|PTR|0|
-cache_entry|48.14.106.213.in-addr.arpa|PTR|0|
-cache_entry|iphone|CNAME|0|
-cache_entry|the-rig|CNAME|0|
-cache_entry|windowsupdate.microsoft.com|A|0|
-cache_entry|254.92.58.176.in-addr.arpa|PTR|0|
-cache_entry|200.188.252.62.in-addr.arpa|PTR|0|
-cache_entry|www.example.com|A|0|
-cache_entry|9.168.252.62.in-addr.arpa|PTR|0|
-cache_entry|100.136.165.199.in-addr.arpa|PTR|0|
-cache_entry|100.136.165.199.in-addr.arpa|PTR|0|
-cache_entry|ocsp.sectigo.com|A|0|
-… 25 of 52 rows
-[result_status] UNDECLARED / UNKNOWN /
+… 12 of 52 rows shown
+[result_status] UNDECLARED / UNKNOWN
 
 == action=arp
 arp|Loopback Pseudo-Interface 1|224.0.0.22|-|static
@@ -321,24 +315,11 @@ arp|Tailscale|224.0.0.22|-|static
 arp|Tailscale|224.0.0.251|-|static
 arp|Tailscale|239.255.255.250|-|static
 arp|Local Area Connection* 1|224.0.0.22|01:00:5e:00:00:16|static
-arp|Local Area Connection* 2|224.0.0.22|01:00:5e:00:00:16|static
-arp|Bluetooth Network Connection|224.0.0.22|01:00:5e:00:00:16|static
-arp|Ethernet|192.168.0.1|b0:5b:99:ee:d0:32|dynamic
-arp|Ethernet|192.168.0.61|1c:53:f9:73:22:6c|dynamic
-arp|Ethernet|192.168.0.66|d0:11:e5:c0:a0:99|dynamic
-arp|Ethernet|192.168.0.71|00:17:88:a6:b2:13|dynamic
-arp|Ethernet|192.168.0.222|de:75:77:1a:d2:d9|incomplete
-arp|Ethernet|192.168.0.223|94:e2:3c:98:aa:08|dynamic
-arp|Ethernet|192.168.0.237|64:d8:1b:f5:f7:58|dynamic
-arp|Ethernet|192.168.0.246|d8:8c:79:47:1d:43|dynamic
-arp|Ethernet|192.168.0.255|ff:ff:ff:ff:ff:ff|static
-arp|Ethernet|224.0.0.22|01:00:5e:00:00:16|static
-arp|Ethernet|224.0.0.251|01:00:5e:00:00:fb|static
-… 25 of 67 rows
-[result_status] UNDECLARED / UNKNOWN /
+… 12 of 67 rows shown
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 3b5c27bfec23
 
 ```
 == action=adapters
@@ -354,20 +335,8 @@ adapter|en6|ca:36:a7:b0:f6:04|0|up
 adapter|en7|ca:36:a7:b0:f6:06|0|up
 adapter|en2|36:d8:fb:d2:52:c0|0|up
 adapter|en3|36:d8:fb:d2:52:c4|0|up
-adapter|en4|36:d8:fb:d2:52:cc|0|up
-adapter|bridge0|36:d8:fb:d2:52:c0|0|up
-adapter|ap1|3a:e1:c4:86:68:d4|0|up
-adapter|en1|f2:1d:69:00:6f:ee|0|up
-adapter|awdl0|5a:a0:84:32:a9:a3|0|down
-adapter|llw0|5a:a0:84:32:a9:a3|0|up
-adapter|utun0|-|0|up
-adapter|utun1|-|0|up
-adapter|utun2|-|0|up
-adapter|utun3|-|0|up
-adapter|utun4|-|0|up
-adapter|utun5|-|0|up
-adapter|utun6|-|0|up
-[result_status] UNDECLARED / UNKNOWN /
+… 12 of 25 rows shown
+[result_status] UNDECLARED / UNKNOWN
 
 == action=ip_addresses
 ip|en0|fe80::9e:c46b:750c:b2eb|64|192.168.0.1
@@ -382,23 +351,23 @@ ip|utun4|100.109.177.77|32|192.168.0.1
 ip|utun4|fd7a:115c:a1e0::e032:b14f|48|192.168.0.1
 ip|utun5|fe80::b145:6483:7c96:77fa|64|192.168.0.1
 ip|utun6|fe80::68ce:f640:7c7a:bb05|64|192.168.0.1
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 
 == action=dns_servers
 dns|system|100.100.100.100|IPv4
 dns|system|fd7a:115c:a1e0::53|IPv6
 dns|system|194.168.4.100|IPv4
 dns|system|194.168.8.100|IPv4
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 
 == action=proxy
 bypass|*.local,169.254/16
 proxy_type|none
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 
 == action=dns_cache
 dns_cache|unsupported|macOS does not expose DNS resolver cache contents
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 
 == action=arp
 arp|-|192.168.0.1|b0:5b:99:ee:d0:32|-
@@ -413,13 +382,11 @@ arp|-|192.168.0.210|5c:3e:1b:ef:97:02|-
 arp|-|192.168.0.222|de:75:77:1a:d2:d9|-
 arp|-|192.168.0.238|34:cd:b0:ad:8a:b4|-
 arp|-|192.168.0.246|d8:8c:79:47:1d:43|-
-arp|-|192.168.0.255|ff:ff:ff:ff:ff:ff|-
-arp|-|224.0.0.251|01:00:5e:00:00:fb|-
-arp|-|239.255.255.250|01:00:5e:7f:ff:fa|-
-[result_status] UNDECLARED / UNKNOWN /
+… 12 of 15 rows shown
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash pending
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 3b5c27bfec23
 
 ```
 == action=adapters
@@ -433,26 +400,26 @@ adapter|sit0|-|0|down
 adapter|ip6tnl0|-|0|down
 adapter|ip6gre0|-|0|down
 adapter|eth0|8e:8c:e7:4b:5d:b5|10000|up
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 
 == action=ip_addresses
 ip|eth0|172.17.0.4|16|172.17.0.1
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 
 == action=dns_servers
 dns|system|192.168.65.7|IPv4
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 
 == action=proxy
 proxy_type|none
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 
 == action=dns_cache
 dns_cache|not_available|no systemd-resolved
 [result_status] UNAVAILABLE / PARTIAL / network_config:no_resolver_cache_tool
 
 == action=arp
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 ```
 <!-- END GENERATED -->
 
@@ -494,10 +461,9 @@ not assert row count for the same reason: `tests/unit/test_network_config_local_
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/network_config/src/network_config_plugin.cpp` (descriptor legs, all six actions) · `network_config_parsers.hpp` (pure decoders — /proc/net/arp, resolvectl/systemd-resolve line filters, rtnetlink + PF_ROUTE binary decoders, proxy/DNS union+select helpers)
+- Plugin: `agents/plugins/network_config/src/network_config_parsers.hpp` · `agents/plugins/network_config/src/network_config_plugin.cpp`
 - Definitions: `content/definitions/network_config.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_c.hpp`
-- Tests: `tests/unit/test_network_config_local_dispatcher.cpp` (2 cases, loads the real `.dylib`/`.so` on macOS/Linux) · `tests/unit/test_network_config_parsers.cpp` (47 cases, pure parser fixtures)
-- Privilege row: `docs/agent-privilege-model.md` (`network_config.*` — default/default/default, no extra grant on any OS)
-- Changelog: `changelog.d/2204-declarations-group-c.added.md` · `changelog.d/2211-macos-dns-honesty.added.md` · `changelog.d/2277-macos-plugin-parity.added.md`
+- Tests: `tests/unit/test_network_config_local_dispatcher.cpp` · `tests/unit/test_network_config_parsers.cpp`
+- Privilege row: `docs/agent-privilege-model.md`
 <!-- END GENERATED -->

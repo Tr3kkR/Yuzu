@@ -4,11 +4,11 @@
 | | |
 |---|---|
 | **What it does** | Antivirus product detection, status, and Defender exclusions |
-| **Version** | 0.3.0 · plugin ABI 4 · shipped in PR #3369 (2026-08-23) |
-| **Kind** | Collector · read-only · on-demand (no scheduled gather) |
-| **Platforms** | Windows ✅ · macOS 🟡 constrained · Linux 🟡 constrained |
-| **Actions** | `products` (definition `security.antivirus.products`) · `status` (definitions `security.antivirus.defender_status`, `security.antivirus.xprotect_status`) · `av_exclusions` (definition `security.antivirus.av_exclusions`) |
-| **Security** | securable `Security` · operation Read · risk Low (`products`, `status`) / Medium (`av_exclusions`) · dispatch ReadOnly · approval gate none |
+| **Version** | 0.3.0 |
+| **Kind** | Collector · read-only · gathered (security.antivirus.products, security.antivirus.defender_status, security.antivirus.xprotect_status, security.antivirus.av_exclusions) |
+| **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
+| **Actions** | `av_exclusions` (definition `security.antivirus.av_exclusions`) · `products` (definition `security.antivirus.products`) · `status` (definition `security.antivirus.defender_status`, `security.antivirus.xprotect_status`) |
+| **Security** | `products`: securable `Security` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `status`: securable `Security` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `av_exclusions`: securable `Security` · operation Read · risk Medium · dispatch ReadOnly · approval gate None |
 | **Roles** | execute: endpoint-admin, endpoint-operator, security-admin · author: content-author |
 <!-- END GENERATED -->
 
@@ -39,16 +39,16 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `products` | ✅ supported · rung 1 · `wmi_securitycenter2` | ✅ supported · rung 2 · `plistbuddy+systemextensionsctl+pgrep` | ✅ supported · rung 2 · `pgrep+filesystem_probe` |
-| `status` | ✅ supported · rung 1 · `wmi_defender_status` | ✅ supported · rung 2 · `plistbuddy+stat` | ✅ supported · rung 2 · `pgrep+stat` |
-| `av_exclusions` | ✅ supported · rung 1 · `win32_registry` | ⛔ unsupported | ⛔ unsupported |
+| `av_exclusions` | ✅ supported · rung 1 · win32_registry | ⛔ unsupported | ⛔ unsupported |
+| `products` | ✅ supported · rung 1 · wmi_securitycenter2 | ✅ supported · rung 2 · plistbuddy+systemextensionsctl+pgrep | ✅ supported · rung 2 · pgrep+filesystem_probe |
+| `status` | ✅ supported · rung 1 · wmi_defender_status | ✅ supported · rung 2 · plistbuddy+stat | ✅ supported · rung 2 · pgrep+stat |
 
-**Declared limits per leg** (the descriptor's fallback text, verbatim):
+**Declared limits per leg** (descriptor fallback text, verbatim):
 
-- **`status` / Linux** — ClamAV liveness+definitions mtime; CrowdStrike/Sophos presence-only
 - **`av_exclusions` / Windows** — permission_denied sentinel on ACL'd key, never a silent empty list
 - **`av_exclusions` / macOS** — Windows-only concept
 - **`av_exclusions` / Linux** — Windows-only concept
+- **`status` / Linux** — ClamAV liveness+definitions mtime; CrowdStrike/Sophos presence-only
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -66,11 +66,7 @@ Binaries/subprocesses: macOS — `/usr/libexec/PlistBuddy`, `/usr/bin/systemexte
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-`products` takes no parameters.
-
-`status` takes no parameters.
-
-`av_exclusions` takes no parameters.
+No action takes parameters.
 <!-- END GENERATED -->
 
 ### Outputs
@@ -78,39 +74,39 @@ Binaries/subprocesses: macOS — `/usr/libexec/PlistBuddy`, `/usr/bin/systemexte
 Pipe-delimited rows, one per record, with the first field a literal row-type discriminator. `products` also emits ancillary single-purpose rows outside the `av|` shape: `av_count|0` when nothing was found, `xprotect_version|<n>` alongside `av|XProtect|active` on macOS, `edr|<bundle_id>|<version>` per detected macOS endpoint-security extension, and `not_available|<detail>` on Windows when the SecurityCenter2 query itself failed. `av_exclusions` likewise emits `exclusion_count|0` (clean empty read), or a typed `permission_denied|…` / `not_available|…` / `partial|…` row when a subkey read failed, or `unsupported|av_exclusions is Windows-only` on Linux/macOS. A missing WMI property is simply omitted from `status`'s Windows output, never fabricated.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`products` — `av|name|state|definitions`**
+**`security.antivirus.av_exclusions` — `kind|source|value`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `name` | string | OS-supplied product/extension display name, sanitized | W, M, L | `Windows Defender` |
-| `state` | string | Windows: `enabled` `snoozed` `disabled` `unknown`. macOS/Linux: `running` `installed` `active` `unknown` | W, M, L | `snoozed` |
-| `definitions` | string | `current` `stale` `unknown` — Windows only; the row has 3 fields (no `definitions`) on Linux/macOS | W | `current` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `kind` | string | `path` `process` `extension` | Windows | `path` | Which Defender exclusion list the value belongs to. |
+| `source` | string | `local` `policy` `both` | Windows | `local` | Which registry hive the exclusion came from; "both" means it is present in both. |
+| `value` | string | - | Windows | `D:\yuzu-dev` | The excluded path, process, or extension, sanitized. Vendor/operator-controlled free text. |
 
-**`status` (definition `security.antivirus.defender_status`, Windows) — `realtime_protection|definition_version|last_update|last_quick_scan`**
+**`security.antivirus.defender_status` — `realtime_protection|definition_version|last_update|last_quick_scan`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `realtime_protection` | string | `enabled` `disabled`; row omitted entirely if the WMI property is absent | W | `enabled` |
-| `definition_version` | string | free text, vendor signature version string | W | `1.459.88.0` |
-| `last_update` | string | WMI CIM datetime string, not ISO-8601 | W | `20260906211522.000000+000` |
-| `last_quick_scan` | string | WMI CIM datetime string, not ISO-8601 | W | `20260906150800.885000+000` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `realtime_protection` | string | `enabled` `disabled` | Windows | `enabled` | Whether Windows Defender real-time protection is on. Row is omitted entirely when the WMI property is absent — never fabricated. |
+| `definition_version` | string | - | Windows | `1.459.88.0` | Antivirus signature version string as reported by MSFT_MpComputerStatus. Values: free text. |
+| `last_update` | string | - | Windows | `20260906211522.000000+000` | Signature last-updated timestamp, WMI CIM datetime format (not ISO-8601). Values: free text. |
+| `last_quick_scan` | string | - | Windows | `20260906150800.885000+000` | Last quick-scan completion timestamp, WMI CIM datetime format (not ISO-8601). Values: free text. |
 
-**`status` (definition `security.antivirus.xprotect_status`, macOS) — `definition_version|last_update|remediator_version|mrt_version`**
+**`security.antivirus.products` — `name|state|definitions`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `definition_version` | string | XProtect bundle version token | M | `5358` |
-| `last_update` | string | ISO-8601 local time, bundle mtime | M | `2026-08-28T08:11:38` |
-| `remediator_version` | string | XProtect.app version token | M | `157` |
-| `mrt_version` | string | MRT.app version token | M | `1.93` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `name` | string | - | Windows, Linux, macOS | `Windows Defender` | OS-supplied display name of the detected antivirus product or extension. Values: free text. |
+| `state` | string | `enabled` `snoozed` `disabled` `running` `installed` `active` `unknown` | Windows, Linux, macOS | `snoozed` | Protection/liveness state of the product — decoded productState on Windows, presence/liveness token elsewhere. |
+| `definitions` | string | `current` `stale` `unknown` | Windows | `current` | Definitions-freshness state decoded from productState's low byte. Windows only; absent (not blank) on Linux/macOS 3-field rows. |
 
-**`av_exclusions` — `exclusion|kind|source|value`**
+**`security.antivirus.xprotect_status` — `definition_version|last_update|remediator_version|mrt_version`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `kind` | enum | `path` `process` `extension` | W | `path` |
-| `source` | enum | `local` `policy` `both` | W | `local` |
-| `value` | string | free text — a registry value name (path/process/extension), vendor/operator-controlled | W | `D:\yuzu-dev` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `definition_version` | string | - | macOS | `5358` | XProtect definition bundle version token (CFBundleShortVersionString). Values: free text. |
+| `last_update` | string | - | macOS | `2026-08-28T08:11:38` | XProtect bundle Info.plist modification time, ISO-8601 local time. Not the same format as the Windows defender_status last_update. Values: free text. |
+| `remediator_version` | string | - | macOS | `157` | XProtect Remediator (XProtect.app) version token, omitted if unreadable. Values: free text. |
+| `mrt_version` | string | - | macOS | `1.93` | Malware Removal Tool (MRT.app) version token, omitted if unreadable. Values: free text. |
 <!-- END GENERATED -->
 
 ### Result status
@@ -121,75 +117,81 @@ Pipe-delimited rows, one per record, with the first field a literal row-type dis
 | `UNAVAILABLE` | partial | `antivirus:securitycenter2_unavailable` | Windows `products`: the SecurityCenter2 WMI query itself failed |
 | `OK` | partial | `antivirus:securitycenter2_truncated` | Windows `products`: the WMI result set was truncated |
 | `UNAVAILABLE` | partial | `antivirus:defender_namespace_unavailable` | Windows `status`: the Defender WMI namespace/query failed |
-| `PERMISSION_DENIED` | partial | (subkey/kind named in the row) | Windows `av_exclusions`: any of the six subkey opens returned `ERROR_ACCESS_DENIED` (outranks the other two outcomes below) |
+| `PERMISSION_DENIED` | partial | `antivirus:av_exclusions_access_denied` | Windows `av_exclusions`: any of the six subkey opens returned `ERROR_ACCESS_DENIED` (outranks the other two outcomes below) |
 | `UNAVAILABLE` | partial | `antivirus:av_exclusions_open_failed` | Windows `av_exclusions`: a subkey open failed for a reason other than access-denied/not-found |
 | `OK` | partial | `antivirus:av_exclusions_enumeration_incomplete` | Windows `av_exclusions`: a subkey opened but its value-name enumeration could not be confirmed complete |
+| `UNAVAILABLE` | `PARTIAL` | `subprocess_runner:spawn_error` | macOS/Linux legs: the `pgrep`/`PlistBuddy`/`systemextensionsctl` child process could not be spawned at all |
+| `CONSTRAINED` | `PARTIAL` | `subprocess_runner:deadline` | macOS/Linux legs: the runner's 5s deadline elapsed and the still-running child was killed |
+| `CONSTRAINED` | `PARTIAL` | `subprocess_runner:cancelled` | macOS/Linux legs: the run was cancelled before it finished |
+| `CONSTRAINED` | `PARTIAL` | `subprocess_runner:signaled` | macOS/Linux legs: the child was killed by a signal rather than exiting cleanly |
+| `OK` | `PARTIAL` | `subprocess_runner:line_limit` | macOS/Linux legs: the runner deliberately capped output at its line limit and killed a still-producing child — a bounded stop, not a failure |
 
 ### Where the data goes
 
 - **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. `defender_status`'s real-time-protection field also drives a fleet-wide pie-chart visualization defined directly in the YAML.
 - **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — no source under those subsystems references `antivirus` or any `security.antivirus.*` id. The plugin executes only when an operator or workflow dispatches one of its definitions.
+- **Sensitivity.** `products`' `name` field is an installed-software inventory by another route — OS-supplied AV/EDR product or extension display names (e.g. `Windows Defender`, `CrowdStrike Falcon`). `av_exclusions`' `value` field is a free-text, operator/vendor-controlled path, process, or extension name that can embed a Windows username or other host-specific detail (the sample row itself is a filesystem path). `status` rows carry only version strings and timestamps — nothing that identifies a device or a person.
 - **Siblings:** none — no other shipped plugin covers AV product/status/exclusion detection.
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("security.antivirus.products")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash a4abf06e398d
 
 ```
 == action=products
 av|Windows Defender|snoozed|current
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=status
 realtime_protection|enabled
 definition_version|1.459.88.0
 last_update|20260906211522.000000+000
 last_quick_scan|20260906150800.885000+000
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=av_exclusions
 exclusion|path|local|D:\yuzu-dev
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash a4abf06e398d
 
 ```
 == action=products
 av|XProtect|active
 xprotect_version|5358
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=status
 definition_version|5358
 last_update|2026-08-28T08:11:38
 remediator_version|157
 mrt_version|1.93
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=av_exclusions
 unsupported|av_exclusions is Windows-only
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash pending
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash a4abf06e398d
 
 ```
 == action=products
 av_count|0
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=status
 av|ClamAV|not_running
 av|CrowdStrike Falcon|not_detected
 av|Sophos|not_detected
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=av_exclusions
 unsupported|av_exclusions is Windows-only
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 ```
 <!-- END GENERATED -->
 
@@ -204,10 +206,10 @@ unsupported|av_exclusions is Windows-only
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/antivirus/src/antivirus_plugin.cpp` (descriptor, execute, OS legs) · `agents/plugins/antivirus/src/antivirus_parsers.hpp` (pure parse/render helpers, OS-free)
+- Plugin: `agents/plugins/antivirus/src/antivirus_parsers.hpp` · `agents/plugins/antivirus/src/antivirus_plugin.cpp`
 - Definitions: `content/definitions/antivirus.yaml`
-- Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_d.hpp` (antivirus rows at lines 458, 468, 482)
-- Tests: `tests/unit/test_antivirus_parsers.cpp` (29 cases) · `tests/unit/test_antivirus_local_dispatcher.cpp` (1 case, Windows-only, real WMI/registry via `LocalDispatcher`)
-- Privilege row: `docs/agent-privilege-model.md` (line 97)
-- Changelog: `changelog.d/20260716-macos-antivirus-xprotect.fixed.md` · `changelog.d/20260818-wave3-antivirus-av-exclusions.added.md` · `changelog.d/20260818-wave3-antivirus-native-wmi-registry.changed.md` · `changelog.d/2204-declarations-group-d.added.md`
+- Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_d.hpp`
+- Tests: `tests/unit/test_antivirus_local_dispatcher.cpp` · `tests/unit/test_antivirus_parsers.cpp`
+- Privilege row: `docs/agent-privilege-model.md`
+- Changelog: `changelog.d/20260716-macos-antivirus-xprotect.fixed.md` · `changelog.d/20260818-wave3-antivirus-av-exclusions.added.md` · `changelog.d/20260818-wave3-antivirus-native-wmi-registry.changed.md`
 <!-- END GENERATED -->

@@ -5,10 +5,10 @@
 |---|---|
 | **What it does** | Windows Management Instrumentation — WQL queries and instance enumeration |
 | **Version** | 1.1.0 |
-| **Kind** | Action · read-only · on-demand (no scheduled gather) |
-| **Platforms** | Windows ✅ · macOS ⛔ · Linux ⛔ |
-| **Actions** | `query` (definition `windows.wmi.query`) · `get_instance` (definition `windows.wmi.get_instance`) |
-| **Security** | securable `Infrastructure` · operation Read · risk Medium · dispatch ReadOnly · approval gate none |
+| **Kind** | Collector · read-only · on-demand |
+| **Platforms** | Windows ✅ · macOS ⛔ unsupported · Linux ⛔ unsupported |
+| **Actions** | `get_instance` (definition `windows.wmi.get_instance`) · `query` (definition `windows.wmi.query`) |
+| **Security** | securable `Infrastructure` · operation Read · risk Medium · dispatch ReadOnly · approval gate None |
 | **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
 
@@ -33,12 +33,8 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `query` | ✅ supported · rung 1 · `wmi` (IWbemLocator/IWbemServices COM API) | ⛔ unsupported · no mechanism bound | ⛔ unsupported · no mechanism bound |
-| `get_instance` | ✅ supported · rung 1 · `wmi` (IWbemLocator/IWbemServices COM API) | ⛔ unsupported · no mechanism bound | ⛔ unsupported · no mechanism bound |
-
-**Declared limits per leg** (the descriptor's fallback text, verbatim):
-
-- None declared — every leg's fallback field is empty (`wmi_plugin.cpp:89-98`); the constraints below come from the plugin's own input validation, not a per-leg descriptor caveat.
+| `get_instance` | ✅ supported · rung 1 · wmi | ⛔ unsupported | ⛔ unsupported |
+| `query` | ✅ supported · rung 1 · wmi | ⛔ unsupported | ⛔ unsupported |
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -56,12 +52,12 @@ No external binaries and no subprocesses — the Windows leg talks to the local 
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-| Action | Parameter | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `query` | `wql` | string | yes | — | A WQL SELECT statement (e.g., "SELECT * FROM Win32_OperatingSystem"); the plugin rejects anything not starting with SELECT |
-| `query` | `namespace` | string | no | `root\cimv2` | WMI namespace — must be `root\cimv2`, `root\wmi`, or `root\standardcimv2` |
-| `get_instance` | `class` | string | yes | — | WMI class name, alphanumeric and underscores only (e.g., Win32_OperatingSystem) |
-| `get_instance` | `namespace` | string | no | `root\cimv2` | WMI namespace — must be `root\cimv2`, `root\wmi`, or `root\standardcimv2` |
+| Definition | Parameter | Type | Required | Default | Constraints | Description |
+|---|---|---|---|---|---|---|
+| `windows.wmi.get_instance` | `class` | string | yes | - | - | WMI class name, alphanumeric and underscores only (e.g., Win32_OperatingSystem) — the plugin runs `SELECT * FROM <class>` against it. |
+| `windows.wmi.get_instance` | `namespace` | string | no | - | - | WMI namespace to query — one of root\cimv2 (default), root\wmi, or root\standardcimv2; any other value is rejected. |
+| `windows.wmi.query` | `wql` | string | yes | - | - | A WQL SELECT statement (e.g., "SELECT * FROM Win32_OperatingSystem"). Only SELECT statements are allowed; anything else is rejected before the query runs. |
+| `windows.wmi.query` | `namespace` | string | no | - | - | WMI namespace to query — one of root\cimv2 (default), root\wmi, or root\standardcimv2; any other value is rejected. |
 <!-- END GENERATED -->
 
 ### Outputs
@@ -69,19 +65,19 @@ No external binaries and no subprocesses — the Windows leg talks to the local 
 Both actions emit pipe-delimited lines, not the two-column `property`/`value` shape the definition YAML's `result.columns` implies on its own: `query` writes one `row<N>|<property>|<value>` line per returned property (`wmi_plugin.cpp:159-160`) followed by a terminal `rows|<count>` line (`wmi_plugin.cpp:168`) and, if the shared helper's row cap was hit, an `error|row_cap_exceeded` line before it (`wmi_plugin.cpp:163-168`); `get_instance` writes one `property|<name>|<value>` line per property of the single matched instance, with no trailing count line (`wmi_plugin.cpp:201-203`). A property is omitted from either action's output entirely — never emitted with an empty value — when its VARIANT type isn't one `variant_to_string` knows how to stringify, including `VT_NULL`/`VT_EMPTY` (`wmi_bounded.hpp:152-171, 182-184`).
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`query` — `row<N>|property|value`**
+**`windows.wmi.get_instance` — `property|value`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `property` | string | WMI property name | W | `Caption` |
-| `value` | string | stringified property value | W | `Microsoft Windows 11 Pro` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `property` | string | - | Windows | `BootDevice` | The non-system WMI property name for one property of the first matching instance; null/empty/array-typed properties are omitted rather than reported as empty. Values: free text (WMI property name). |
+| `value` | string | - | Windows | `\Device\HarddiskVolume1` | The stringified WMI property value — BSTR text passed through, numeric VARIANTs formatted as decimal text, booleans as `true`/`false`. Values: free text. |
 
-**`get_instance` — `property|property|value`**
+**`windows.wmi.query` — `property|value`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `property` | string | WMI property name | W | `BootDevice` |
-| `value` | string | stringified property value | W | `\Device\HarddiskVolume1` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `property` | string | - | Windows | `Caption` | The non-system WMI property name for one output row; null/empty/array-typed properties are omitted rather than reported as empty. Values: free text (WMI property name). |
+| `value` | string | - | Windows | `Microsoft Windows 11 Pro` | The stringified WMI property value — BSTR text passed through, numeric VARIANTs formatted as decimal text, booleans as `true`/`false`. Values: free text. |
 <!-- END GENERATED -->
 
 ### Result status
@@ -92,19 +88,20 @@ This plugin does not set a typed result status (no `set_result_status`/`yuzu_ctx
 
 - **Instruction result only.** Rows travel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. Nothing in `server/` references `windows.wmi.query`/`windows.wmi.get_instance` or the `wmi` plugin name outside the capability-catalogue declaration (`server/core/src/capability_decls/plugin_action_catalogue_d.hpp:409-431`) — confirmed by grep across `server/`.
 - **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics. Nothing runs on a schedule; the plugin executes only when an operator or workflow dispatches one of its two definitions (`content/definitions/wmi.yaml`, both `spec.execution.concurrency: per-device` with no `gather`).
+- **Sensitivity.** `query`/`get_instance` return whatever properties the requested WMI class exposes, so a row can carry anything that class holds — device identity (the sample capture's own `CSName|DESKTOP-04DNSIG`, plus serials/MACs from other classes), installed software (`Win32_Product` and similar), or user identity (`Win32_UserAccount`, `Win32_ComputerSystem.UserName`). The plugin constrains only the namespace and the SELECT-only/class-name shape, not which properties or classes are readable, so sensitivity is entirely caller- and class-dependent.
 - **Siblings:** none declared — `wmi` is the operator-facing ad-hoc query surface; several other plugins (`hardware`, `license_scan`) use `agents/shared/wmi_bounded.hpp` internally for their own fixed queries (`wmi_bounded.hpp:1-21`), and `bitlocker`'s parser reuses the helper's `WmiRow` type alias (`bitlocker_windows_wmi.hpp:17`) — none of them are peers of this plugin's two definitions.
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("windows.wmi.query")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash a8a6121c1219
 
 ```
 == action=query wql="SELECT Caption FROM Win32_OperatingSystem"
 row0|Caption|Microsoft Windows 11 Pro
 rows|1
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=get_instance class=Win32_OperatingSystem
 property|BootDevice|\Device\HarddiskVolume1
@@ -119,48 +116,35 @@ property|CreationClassName|Win32_OperatingSystem
 property|CurrentTimeZone|60
 property|DataExecutionPrevention_32BitApplications|true
 property|DataExecutionPrevention_Available|true
-property|DataExecutionPrevention_Drivers|true
-property|DataExecutionPrevention_SupportPolicy|2
-property|Debug|false
-property|Distributed|false
-property|EncryptionLevel|256
-property|ForegroundApplicationBoost|2
-property|FreePhysicalMemory|11236684
-property|FreeSpaceInPagingFiles|5688920
-property|FreeVirtualMemory|16229492
-property|InstallDate|20260218171326.000000+000
-property|LastBootUpTime|20260906155541.500643+060
-property|LocalDateTime|20260907110904.636000+060
-property|Locale|0809
-… 25 of 54 rows
-[result_status] UNDECLARED / UNKNOWN / 
+… 12 of 54 rows shown
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash a8a6121c1219
 
 ```
 == action=query wql="SELECT Caption FROM Win32_OperatingSystem"
 error|WMI not available on this platform
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 [rc] 1
 
 == action=get_instance class=Win32_OperatingSystem
 error|WMI not available on this platform
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 [rc] 1
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash pending
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash a8a6121c1219
 
 ```
 == action=query wql="SELECT Caption FROM Win32_OperatingSystem"
 error|WMI not available on this platform
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 [rc] 1
 
 == action=get_instance class=Win32_OperatingSystem
 error|WMI not available on this platform
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 [rc] 1
 ```
 <!-- END GENERATED -->
@@ -176,10 +160,10 @@ error|WMI not available on this platform
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/wmi/src/wmi_plugin.cpp` · shared: `agents/shared/wmi_bounded.hpp` (bounded query helper) · `agents/shared/win_com.hpp` (COM RAII) · `agents/shared/win_str.hpp` (wide/UTF-8 conversion)
+- Plugin: `agents/plugins/wmi/src/wmi_plugin.cpp`
 - Definitions: `content/definitions/wmi.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_d.hpp`
-- Tests: `tests/unit/test_wmi_local_dispatcher.cpp` · `tests/unit/test_wmi_bounded.cpp` · `tests/unit/test_bitlocker_windows_wmi.cpp`
-- Privilege row: no row (`docs/agent-privilege-model.md` has no `wmi`-specific entry)
-- Changelog: `changelog.d/2026-08-wmi-property-omission.changed.md` · `changelog.d/2204-declarations-group-d.added.md` · `changelog.d/3404-hardware-wmi-bounded.fixed.md`
+- Tests: `tests/unit/test_wmi_bounded.cpp` · `tests/unit/test_wmi_local_dispatcher.cpp`
+- Privilege row: `docs/agent-privilege-model.md` (no row yet)
+- Changelog: `changelog.d/2026-08-wmi-property-omission.changed.md` · `changelog.d/20260818-wave3-antivirus-native-wmi-registry.changed.md` · `changelog.d/3404-hardware-wmi-bounded.fixed.md`
 <!-- END GENERATED -->

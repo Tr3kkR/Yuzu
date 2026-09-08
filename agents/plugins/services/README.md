@@ -5,11 +5,11 @@
 |---|---|
 | **What it does** | System services — enumerate, query, and configure service startup types |
 | **Version** | 0.2.0 |
-| **Kind** | Collector + Action · read-only (`list`, `running`) / mutating (`set_start_mode`) · on-demand (no scheduled gather) |
+| **Kind** | Action · mutating · gathered (crossplatform.service.list, crossplatform.service.running) |
 | **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
 | **Actions** | `list` (definition `crossplatform.service.list`) · `running` (definition `crossplatform.service.running`) · `set_start_mode` (definition `crossplatform.service.set_start_mode`) |
-| **Security** | securable `Infrastructure` · operation Read (`list`, `running`) / Write (`set_start_mode`) · risk Low (`list`, `running`) / High (`set_start_mode`) · dispatch ReadOnly (`list`, `running`) / Mutating (`set_start_mode`) · approval gate none (`list`, `running`) / AdminOrApproval (`set_start_mode`) |
-| **Roles** | execute: endpoint-admin, endpoint-operator (`list`, `running`) / endpoint-admin only (`set_start_mode`) · author: content-author |
+| **Security** | `list`: securable `Infrastructure` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `running`: securable `Infrastructure` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `set_start_mode`: securable `Infrastructure` · operation Write · risk High · dispatch Mutating · approval gate AdminOrApproval |
+| **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
 
 ## How it works
@@ -31,11 +31,9 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `list` | ✅ supported · rung 1 · `win32_service_api` | ✅ supported · rung 2 · runner argv `launchctl list` | ✅ supported · rung 2 · runner argv `systemctl list-units` |
-| `running` | ✅ supported · rung 1 · `win32_service_api` | ✅ supported · rung 2 · runner argv `launchctl list` | ✅ supported · rung 2 · runner argv `systemctl list-units` |
-| `set_start_mode` | ✅ supported · rung 1 · `win32_service_api` | ✅ supported · rung 2 · runner argv `sudo -n -- launchctl enable\|disable` | ✅ supported · rung 2 · runner argv `sudo -n -- systemctl enable\|disable\|mask\|unmask` |
-
-**Declared limits per leg** (the descriptor's fallback text, verbatim): none — every leg's fallback field is `nullptr` (`services_plugin.cpp:621-637`); the descriptor declares no fallback text for any action/OS pair.
+| `list` | ✅ supported · rung 1 · win32_service_api | ✅ supported · rung 2 · runner argv 'launchctl list' | ✅ supported · rung 2 · runner argv 'systemctl list-units' |
+| `running` | ✅ supported · rung 1 · win32_service_api | ✅ supported · rung 2 · runner argv 'launchctl list' | ✅ supported · rung 2 · runner argv 'systemctl list-units' |
+| `set_start_mode` | ✅ supported · rung 1 · win32_service_api | ✅ supported · rung 2 · runner argv 'sudo -n -- launchctl enable\|disable' | ✅ supported · rung 2 · runner argv 'sudo -n -- systemctl enable\|disable\|mask\|unmask' |
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -53,14 +51,10 @@ Binaries/subprocesses/network: Linux runs `systemctl` (list-units for reads; ena
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-`list` takes no parameters.
-
-`running` takes no parameters.
-
-| Definition | Parameter | Type | Required | Default | Values | Description |
+| Definition | Parameter | Type | Required | Default | Constraints | Description |
 |---|---|---|---|---|---|---|
-| `crossplatform.service.set_start_mode` | name | string | yes | - | pattern `^[a-zA-Z0-9._@-]+$`, 1–256 chars | The service identifier: a short Win32 service name, a systemd unit name, or a launchd label |
-| `crossplatform.service.set_start_mode` | mode | string | yes | - | `automatic`, `manual`, `disabled` | Target startup type; macOS rejects `manual` (launchd has no manual/auto distinction — only enabled or disabled) |
+| `crossplatform.service.set_start_mode` | `name` | string | yes | - | pattern: ^[a-zA-Z0-9._@-]+$ · minLength 1 · maxLength 256 | The service identifier. On Windows, the short service name (e.g. "Spooler"). On Linux, the systemd unit name (e.g. "nginx.service"). On macOS, the launchd label (e.g. "com.apple.metadata.mds"). |
+| `crossplatform.service.set_start_mode` | `mode` | string | yes | - | enum: automatic, manual, disabled | Target startup type. "automatic" starts the service at boot. "manual" prevents auto-start but allows on-demand start. "disabled" prevents the service from starting entirely (Linux: systemctl mask; macOS: launchctl disable). |
 <!-- END GENERATED -->
 
 ### Outputs
@@ -68,24 +62,31 @@ Binaries/subprocesses/network: Linux runs `systemctl` (list-units for reads; ena
 Rows are pipe-delimited, prefixed `svc|`, one row per service. The row **shape** differs by OS, not just the values: Windows and macOS emit exactly the four fields the `result.columns` schema names (`name|display_name|status|startup_type`), but Linux emits only **three** fields (`name|status|description`) — the systemctl leg never derives a startup type, so the fourth column doesn't exist on the Linux wire, and Linux's second/third fields carry different data than the schema's `display_name`/`status` names suggest (`services_plugin.cpp:730-733`; corroborated independently by the server's own parsing comment at `server/core/src/device_routes.cpp:197`). There is no placeholder-row convention: on Windows an enumeration failure silently returns zero rows with no error and no result status (`services_plugin.cpp:186-191`); on Linux/macOS it instead sets a typed `UNAVAILABLE`/`CONSTRAINED` status via `forward_runner_failure` before whatever rows were parsed (`services_plugin.cpp:121-130`). `set_start_mode` never writes the three schema columns as one pipe row: on success it writes three separate lines, `status|ok` / `service|<name>` / `mode|<mode>`; on any failure it writes a single `error|<message>` line and none of the three (`services_plugin.cpp:446-448`, file header comment lines 13-14).
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`list` — `name|display_name|status|startup_type`**
+**`crossplatform.service.list` — `name|display_name|status|startup_type`**
 
-**`running` — `name|display_name|status|startup_type`**
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `name` | string | - | Windows, Linux, macOS | `ADPSvc` | The service's short identifier: a Win32 service name, a systemd unit name, or a launchd label. Values: free text. |
+| `display_name` | string | - | Windows, macOS | `Aggregated Data Platform Service (windows) · 1111 (darwin)` | Column 2, whose meaning is OS-specific. On Windows it is the Service Control Manager's human-readable display name. On macOS it holds the launchd job's numeric PID as a string, or "-" when not running (the platform has no per-service display name in `launchctl list`). It is NOT emitted on Linux at all -- the Linux leg's row carries only 3 pipe fields (name, status, description), so this column is absent from the wire, not merely empty. Values: free text (windows) · integer PID or "-" (darwin) · field absent (linux). |
+| `status` | string | - | Windows, Linux, macOS | `stopped (windows) · 0 (darwin)` | Column 3, whose meaning is OS-specific. On Windows it is the service's current SCM state. On Linux it is systemd's SUB state from `systemctl list-units`. On macOS it is launchctl's raw last-exit-status code for the job -- an integer as a string, NOT a running/stopped word; use the display_name (PID) column to tell whether a macOS service is currently running. Values: stopped, start_pending, stop_pending, running, continue_pending, pause_pending, paused, unknown (windows) · free text systemd SUB state, e.g. running, dead, exited, failed (linux) · integer exit-status code as a string (darwin). |
+| `startup_type` | string | - | Windows, macOS | `manual (windows) · unknown (darwin)` | Column 4: the service's configured startup type. On Windows this is the SCM's 5-state taxonomy. On macOS it is an honest 3-value read derived from a bulk `launchctl print-disabled` join -- a label with no explicit override reports "unknown" rather than a guessed default. It is NOT emitted on Linux at all (no 4th column on the wire), because the systemctl leg does not derive a startup type. Values: automatic, boot, manual, disabled, system, unknown (windows) · automatic, disabled, unknown (darwin) · field absent (linux). |
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `name` | string | free text — service/unit identifier | W, L, M | `ADPSvc` |
-| `display_name` | string | free text (Windows) · integer PID or `-` (macOS) · field absent (Linux) | W, M | `Aggregated Data Platform Service` (W) · `1111` (M, PID) |
-| `status` | string | `stopped`, `start_pending`, `stop_pending`, `running`, `continue_pending`, `pause_pending`, `paused`, `unknown` (Windows) · systemd SUB state, free text e.g. `running`, `dead`, `exited`, `failed` (Linux) · raw `launchctl` last-exit-status code, an integer as a string — NOT a running/stopped word (macOS) | W, L, M | `stopped` (W) · `0` (M) |
-| `startup_type` | string | `automatic`, `boot`, `manual`, `disabled`, `system`, `unknown` (Windows) · `automatic`, `disabled`, `unknown` (macOS) · field absent (Linux) | W, M | `manual` (W) · `unknown` (M) |
+**`crossplatform.service.running` — `name|display_name|status|startup_type`**
 
-**`set_start_mode` — `status|service|mode` (success) or `error|<message>` (failure)**
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `name` | string | - | Windows, Linux, macOS | `AppXSvc` | The service's short identifier: a Win32 service name, a systemd unit name, or a launchd label. Values: free text. |
+| `display_name` | string | - | Windows, macOS | `AppX Deployment Service (AppXSVC) (windows) · 1111 (darwin)` | Column 2, whose meaning is OS-specific. On Windows it is the Service Control Manager's human-readable display name. On macOS it holds the launchd job's numeric PID as a string, or "-" when not running (the platform has no per-service display name in `launchctl list`). It is NOT emitted on Linux at all -- the Linux leg's row carries only 3 pipe fields (name, status, description), so this column is absent from the wire, not merely empty. Values: free text (windows) · integer PID or "-" (darwin) · field absent (linux). |
+| `status` | string | - | Windows, Linux, macOS | `running (windows) · 0 (darwin)` | Column 3, whose meaning is OS-specific. On Windows it is the service's current SCM state (always "running" for this action's filtered result). On Linux it is systemd's SUB state from `systemctl list-units --state=running`. On macOS it is launchctl's raw last-exit-status code for the job -- an integer as a string, NOT a running/stopped word; this action's own running-filter is applied on the PID column, not this one. Values: running (windows, this action always filters to it) · free text systemd SUB state (linux) · integer exit-status code as a string (darwin). |
+| `startup_type` | string | - | Windows, macOS | `automatic (windows) · unknown (darwin)` | Column 4: the service's configured startup type. On Windows this is the SCM's 5-state taxonomy. On macOS it is an honest 3-value read derived from a bulk `launchctl print-disabled` join -- a label with no explicit override reports "unknown" rather than a guessed default. It is NOT emitted on Linux at all (no 4th column on the wire), because the systemctl leg does not derive a startup type. Values: automatic, boot, manual, disabled, system, unknown (windows) · automatic, disabled, unknown (darwin) · field absent (linux). |
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `status` | string | literal `ok` — the only value ever emitted, and only on success | W, L, M | `ok` |
-| `service` | string | free text — echoes the `name` parameter unmodified | W, L, M | `-` (no successful mutation was captured live; see *Sample output*) |
-| `mode` | string | `automatic`, `disabled` (all OS) · `manual` additionally on Windows/Linux (macOS rejects it) | W, L, M | `-` (no successful mutation was captured live; see *Sample output*) |
+**`crossplatform.service.set_start_mode` — `status|service|mode`**
+
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `status` | string | - | Windows, Linux, macOS | `ok` | Literal "ok" on a successful mode change. On any failure the plugin instead writes a single "error\|<message>" line and this row does not appear at all. Values: ok (the only value ever emitted). |
+| `service` | string | - | Windows, Linux, macOS | `-` | The `name` parameter echoed back unmodified, on a successful mode change only. Values: free text — echoes the name parameter. |
+| `mode` | string | - | Windows, Linux, macOS | `-` | The `mode` parameter echoed back unmodified, on a successful mode change only. Values: automatic, disabled (all OS) · manual additionally on windows/linux (darwin rejects it before this row is ever written). |
 <!-- END GENERATED -->
 
 ### Result status
@@ -94,6 +95,10 @@ Rows are pipe-delimited, prefixed `svc|`, one row per service. The row **shape**
 |---|---|---|---|
 | `UNDECLARED` (default) | UNKNOWN | (empty) | Every successful `list`/`running` read on every OS, and every `set_start_mode` parameter-validation or platform-decision error (missing `name`/`mode`, invalid mode, unsafe name, macOS `manual` rejection) — the plugin never calls `ctx.set_result_status` on these paths (`services_plugin.cpp`, `do_set_start_mode`) |
 | `UNAVAILABLE` or `CONSTRAINED` (via `forward_runner_failure`) | typically PARTIAL | e.g. `subprocess_runner:spawn_error` | Linux/macOS `list`/`running` when the `systemctl`/`launchctl` subprocess fails to spawn, times out, is cancelled, or is signaled (`services_plugin.cpp:121-123`); demonstrated live in `docs/samples/linux.txt:3,7` |
+| `CONSTRAINED` / `PARTIAL` | partial | `subprocess_runner:deadline` | Linux/macOS `list`/`running`, the runner's deadline elapsed while `systemctl`/`launchctl` was still running, and it was killed |
+| `CONSTRAINED` / `PARTIAL` | partial | `subprocess_runner:cancelled` | Linux/macOS `list`/`running`, the `systemctl`/`launchctl` run was cancelled before it finished |
+| `CONSTRAINED` / `PARTIAL` | partial | `subprocess_runner:signaled` | Linux/macOS `list`/`running`, the `systemctl`/`launchctl` child was killed by a signal rather than exiting cleanly |
+| `OK` / `PARTIAL` | partial | `subprocess_runner:line_limit` | Linux/macOS `list`/`running`, the runner capped `systemctl`/`launchctl` output at its line limit and killed the still-producing child — a deliberate bounded stop, not a failure |
 | `CONSTRAINED` | PARTIAL | `services:output_truncated` | Linux/macOS `list`/`running` when the captured subprocess output was cut short by the runner's byte cap but the tool itself exited cleanly (`services_plugin.cpp:124-128`) |
 
 ### Where the data goes
@@ -101,15 +106,22 @@ Rows are pipe-delimited, prefixed `svc|`, one row per service. The row **shape**
 - **Instruction result only.** Rows travel the agent's mTLS gRPC channel as the command response into the ResponseStore (`response_retention_days`, default 90 — `server/core/include/yuzu/server/server.hpp:222`), queryable at `/api/responses/{id}`; the dashboard's generic result viewer renders `services` through its key/value fallback schema (`server/core/src/result_parsing.hpp:65`).
 - **Device pages "Get live info".** The `services` live-snapshot kind (`device.live.services` audit verb) dispatches `list` directly and re-parses the same 3-vs-4-field row shape described above to render the device card (`server/core/src/device_routes.cpp:79-80,197`; `server/core/src/device_ui.cpp:410`).
 - **Not consumed by** daily-sync inventory, TAR, or DEX/metrics — nothing here runs on a schedule; the plugin executes only when dispatched.
+- **Sensitivity.** `name`/`display_name` rows name installed services and applications on the host —
+  Windows service display names (`Battle.net Update Helper Svc`, `CCleaner 7`, `AsusUpdateCheck` in
+  the sample) and macOS launchd labels (`io.tailscale.ipn.macsys.login-item-helper`) are an
+  installed-software inventory by another route; Linux systemd unit names carry the same signal.
+  `status`/`startup_type` carry nothing beyond that service's own state. Nothing in any row
+  identifies a specific device or person.
 - **Siblings:** `agents/plugins/tar/src/tar_service_collector.cpp` performs its own, independently implemented service enumeration (the same three OS mechanisms) for TAR's diff-based change detection; it shares no code with this plugin.
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("crossplatform.service.list")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`; live snapshot via the device page's `services` kind (`device.live.services`).
 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash e724207e0989
 
 ```
+== action=list
 svc|ADPSvc|Aggregated Data Platform Service|stopped|manual
 svc|ALG|Application Layer Gateway Service|stopped|manual
 svc|AppIDSvc|Application Identity|stopped|manual
@@ -122,22 +134,10 @@ svc|ApxSvc|Windows Virtual Audio Device Proxy Service|stopped|manual
 svc|AssignedAccessManagerSvc|AssignedAccessManager Service|stopped|manual
 svc|AsusUpdateCheck|AsusUpdateCheck|stopped|automatic
 svc|AudioEndpointBuilder|Windows Audio Endpoint Builder|running|automatic
-svc|Audiosrv|Windows Audio|running|automatic
-svc|autotimesvc|Cellular Time|stopped|manual
-svc|AxInstSV|ActiveX Installer (AxInstSV)|stopped|manual
-svc|battlenet_helpersvc|Battle.net Update Helper Svc|stopped|manual
-svc|BDESVC|BitLocker Drive Encryption Service|stopped|manual
-svc|BEService|BattlEye Service|stopped|manual
-svc|BFE|Base Filtering Engine|running|automatic
-svc|BITS|Background Intelligent Transfer Service|stopped|manual
-svc|BrokerInfrastructure|Background Tasks Infrastructure Service|running|automatic
-svc|BTAGService|Bluetooth Audio Gateway Service|running|manual
-svc|BthAvctpSvc|AVCTP service|running|manual
-svc|bthserv|Bluetooth Support Service|running|manual
-svc|camsvc|Capability Access Manager Service|running|automatic
-… 25 of 289 rows
-[result_status] UNDECLARED / UNKNOWN /
+… 12 of 289 rows shown
+[result_status] UNDECLARED / UNKNOWN
 
+== action=running
 svc|AppXSvc|AppX Deployment Service (AppXSVC)|running|automatic
 svc|AudioEndpointBuilder|Windows Audio Endpoint Builder|running|automatic
 svc|Audiosrv|Windows Audio|running|automatic
@@ -150,30 +150,19 @@ svc|camsvc|Capability Access Manager Service|running|automatic
 svc|CCleaner7|CCleaner 7|running|automatic
 svc|CDPSvc|Connected Devices Platform Service|running|automatic
 svc|CertPropSvc|Certificate Propagation|running|manual
-svc|CoreMessagingRegistrar|CoreMessaging|running|automatic
-svc|CryptSvc|Cryptographic Services|running|automatic
-svc|DcomLaunch|DCOM Server Process Launcher|running|automatic
-svc|DeviceAssociationService|Device Association Service|running|automatic
-svc|DeviceInstall|Device Install Service|running|manual
-svc|DevQueryBroker|DevQuery Background Discovery Broker|running|manual
-svc|Dhcp|DHCP Client|running|automatic
-svc|DiagTrack|Connected User Experiences and Telemetry|running|automatic
-svc|DispBrokerDesktopSvc|Display Policy Service|running|automatic
-svc|Dnscache|DNS Client|running|automatic
-svc|DoSvc|Delivery Optimization|running|automatic
-svc|DPS|Diagnostic Policy Service|running|automatic
-svc|DsSvc|Data Sharing Service|running|manual
-… 25 of 115 rows
-[result_status] UNDECLARED / UNKNOWN /
+… 12 of 115 rows shown
+[result_status] UNDECLARED / UNKNOWN
 
+== action=set_start_mode
 error|missing required parameter: name
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 [rc] 1
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash e724207e0989
 
 ```
+== action=list
 svc|io.tailscale.ipn.macsys.login-item-helper|-|0|unknown
 svc|com.apple.SafariHistoryServiceAgent|-|0|unknown
 svc|com.apple.progressd|1111|0|unknown
@@ -186,22 +175,10 @@ svc|com.apple.dataaccess.dataaccessd|1223|0|unknown
 svc|com.apple.quicklook|-|0|unknown
 svc|com.apple.parentalcontrols.check|-|0|unknown
 svc|com.apple.mediaremoteagent|1057|0|unknown
-svc|com.apple.FontWorker|1042|0|unknown
-svc|com.apple.bird|941|0|unknown
-svc|com.apple.amp.mediasharingd|-|0|unknown
-svc|com.apple.knowledgeconstructiond|2105|0|unknown
-svc|com.apple.inputanalyticsd|1559|0|unknown
-svc|com.apple.familycontrols.useragent|-|0|unknown
-svc|com.apple.AssetCache.agent|-|0|unknown
-svc|com.apple.GameController.gamecontrolleragentd|974|0|unknown
-svc|com.apple.universalaccessAuthWarn|1227|0|unknown
-svc|com.apple.UserPictureSyncAgent|-|0|unknown
-svc|com.apple.nsurlsessiond|871|0|unknown
-svc|com.apple.devicecheckd|1477|0|unknown
-svc|com.apple.syncservices.uihandler|-|0|unknown
-… 25 of 513 rows
-[result_status] UNDECLARED / UNKNOWN /
+… 12 of 513 rows shown
+[result_status] UNDECLARED / UNKNOWN
 
+== action=running
 svc|com.apple.progressd|1111|0|unknown
 svc|com.apple.cloudphotod|1012|0|unknown
 svc|com.apple.MENotificationService|1099|0|unknown
@@ -214,38 +191,29 @@ svc|com.apple.bird|941|0|unknown
 svc|com.apple.knowledgeconstructiond|2105|0|unknown
 svc|com.apple.inputanalyticsd|1559|0|unknown
 svc|com.apple.GameController.gamecontrolleragentd|974|0|unknown
-svc|com.apple.universalaccessAuthWarn|1227|0|unknown
-svc|com.apple.nsurlsessiond|871|0|unknown
-svc|com.apple.devicecheckd|1477|0|unknown
-svc|com.apple.iconservices.iconservicesagent|1083|0|unknown
-svc|com.apple.diagnosticextensionsd|916|0|unknown
-svc|com.apple.intelligenceplatformd|2003|0|unknown
-svc|com.apple.SafariBookmarksSyncAgent|1270|0|unknown
-svc|com.apple.managedcorespotlightd.D4D2EF40-0450-FD20-B9EA-08B3E5E85211|1980|0|unknown
-svc|com.apple.ndoagent|1003|0|unknown
-svc|com.apple.wallpaper.agent|1190|0|unknown
-svc|com.apple.localizationswitcherd|1080|0|unknown
-svc|com.apple.commerce|1576|0|unknown
-svc|com.apple.ManagedSettingsAgent|920|0|unknown
-… 25 of 279 rows
-[result_status] UNDECLARED / UNKNOWN /
+… 12 of 279 rows shown
+[result_status] UNDECLARED / UNKNOWN
 
+== action=set_start_mode
 error|missing required parameter: name
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 [rc] 1
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash pending
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash e724207e0989
 
 ```
+== action=list
 [result_status] UNAVAILABLE / PARTIAL / subprocess_runner:spawn_error
 [rc] 1
 
+== action=running
 [result_status] UNAVAILABLE / PARTIAL / subprocess_runner:spawn_error
 [rc] 1
 
+== action=set_start_mode
 error|missing required parameter: name
-[result_status] UNDECLARED / UNKNOWN /
+[result_status] UNDECLARED / UNKNOWN
 [rc] 1
 ```
 <!-- END GENERATED -->
@@ -261,10 +229,10 @@ error|missing required parameter: name
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/services/src/services_plugin.cpp` (descriptor, execute, per-OS legs) · `services_parsers.hpp` (Linux/macOS enumeration parsers, `is_safe_service_name`, `decide_set_start_mode_outcome`) · `services_macos_launchd.hpp` (macOS `print-disabled` parser, `startup_type_for`) · `meson.build`
+- Plugin: `agents/plugins/services/src/services_macos_launchd.hpp` · `agents/plugins/services/src/services_parsers.hpp` · `agents/plugins/services/src/services_plugin.cpp`
 - Definitions: `content/definitions/services.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_d.hpp`
-- Tests: `tests/unit/test_services_parsers.cpp` · `tests/unit/agent/test_services_macos.cpp`
-- Privilege row: `docs/agent-privilege-model.md` (`services.list`/`services.running`, `services.set_start_mode`)
-- Changelog: `changelog.d/2204-declarations-group-d.added.md` · `changelog.d/2277-macos-plugin-parity.added.md` · `changelog.d/2277-macos-parity-contracts.changed.md` · `changelog.d/20260818-wave2-network-actions-wol-services-native-argv.changed.md` · `changelog.d/3404-hardware-wmi-bounded.fixed.md`
+- Tests: `tests/unit/agent/test_services_macos.cpp` · `tests/unit/test_services_parsers.cpp`
+- Privilege row: `docs/agent-privilege-model.md`
+- Changelog: `changelog.d/20260818-wave2-network-actions-wol-services-native-argv.changed.md`
 <!-- END GENERATED -->

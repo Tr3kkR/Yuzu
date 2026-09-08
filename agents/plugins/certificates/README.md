@@ -5,11 +5,11 @@
 |---|---|
 | **What it does** | Certificate inventory and management for system stores |
 | **Version** | 1.0.0 |
-| **Kind** | Action · read-only (`list`, `details`) / mutating (`delete`) · on-demand (no scheduled gather) |
-| **Platforms** | Windows ✅ supported · macOS 🟡 constrained (`delete`) · Linux ✅ supported |
-| **Actions** | `list` (definition `security.certificates.list`) · `details` (definition `security.certificates.details`) · `delete` (definition `security.certificates.delete`) |
-| **Security** | `list`/`details`: securable `Security` · operation Read · risk Low · dispatch ReadOnly · approval gate none. `delete`: securable `Security` · operation Delete · risk High · dispatch Destructive · approval gate AdminOrApproval |
-| **Roles** | execute: endpoint-admin, endpoint-operator, security-admin (`list`/`details`); endpoint-admin, security-admin (`delete`) · author: content-author |
+| **Kind** | Action · mutating · gathered (security.certificates.list, security.certificates.details, security.certificates.delete) |
+| **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
+| **Actions** | `delete` (definition `security.certificates.delete`) · `details` (definition `security.certificates.details`) · `list` (definition `security.certificates.list`) |
+| **Security** | `list`: securable `Security` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `details`: securable `Security` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `delete`: securable `Security` · operation Delete · risk High · dispatch Destructive · approval gate AdminOrApproval |
+| **Roles** | execute: endpoint-admin, endpoint-operator, security-admin · author: content-author |
 <!-- END GENERATED -->
 
 ## How it works
@@ -35,15 +35,15 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `list` | ✅ supported · rung 1 · `CryptoAPI (CertEnumCertificatesInStore)` | ✅ supported · rung 2 · `SecItem (System/root, in-process) + security find-certificate argv via subprocess runner (login)` | ✅ supported · rung 1 · `libcrypto X509 (in-process PEM parse)` |
-| `details` | ✅ supported · rung 1 · `CryptoAPI (CertEnumCertificatesInStore)` | ✅ supported · rung 2 · `SecItem (System/root, in-process) + security find-certificate argv via subprocess runner (login)` | ✅ supported · rung 1 · `libcrypto X509 (in-process PEM parse)` |
-| `delete` | ✅ supported · rung 1 · `CryptoAPI (CertDeleteCertificateFromStore)` | 🟡 constrained · rung 2 · `security delete-certificate via subprocess runner` | ✅ supported · rung 1 · `libcrypto X509 lookup + filesystem remove` |
+| `delete` | ✅ supported · rung 1 · CryptoAPI (CertDeleteCertificateFromStore) | 🟡 constrained · rung 2 · security delete-certificate via subprocess runner | ✅ supported · rung 1 · libcrypto X509 lookup + filesystem remove |
+| `details` | ✅ supported · rung 1 · CryptoAPI (CertEnumCertificatesInStore) | ✅ supported · rung 2 · SecItem (System/root, in-process) + security find-certificate argv via subprocess runner (login) | ✅ supported · rung 1 · libcrypto X509 (in-process PEM parse) |
+| `list` | ✅ supported · rung 1 · CryptoAPI (CertEnumCertificatesInStore) | ✅ supported · rung 2 · SecItem (System/root, in-process) + security find-certificate argv via subprocess runner (login) | ✅ supported · rung 1 · libcrypto X509 (in-process PEM parse) |
 
-**Declared limits per leg** (the descriptor's fallback text, verbatim):
+**Declared limits per leg** (descriptor fallback text, verbatim):
 
-- **`list` / macOS** — System.keychain and SystemRootCertificates.keychain are read natively via SecItemCopyMatching (rung 1); the login keychain still requires the launchctl/sudo session hop, run as a pre-split argv through the bounded subprocess runner
-- **`details` / macOS** — System.keychain and SystemRootCertificates.keychain are read natively via SecItemCopyMatching (rung 1); the login keychain still requires the launchctl/sudo session hop, run as a pre-split argv through the bounded subprocess runner
 - **`delete` / macOS** — SystemRootCertificates.keychain is sealed under SIP and rejected outright; only System/MY store deletes are supported
+- **`details` / macOS** — System.keychain and SystemRootCertificates.keychain are read natively via SecItemCopyMatching (rung 1); the login keychain still requires the launchctl/sudo session hop, run as a pre-split argv through the bounded subprocess runner
+- **`list` / macOS** — System.keychain and SystemRootCertificates.keychain are read natively via SecItemCopyMatching (rung 1); the login keychain still requires the launchctl/sudo session hop, run as a pre-split argv through the bounded subprocess runner
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -61,14 +61,14 @@ Binaries/subprocesses/network: Windows — none, in-process CryptoAPI/`crypt32` 
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-| Action | Parameter | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `list` | `store` | string | no | `all` | Filters by store name. Windows: MY, ROOT, CA, Trust, or "all". macOS: "login", "System", "root", or "all". Ignored on Linux. |
-| `list` | `expiring_within_days` | int32 | no | `0` | Only return certificates expiring within this many days; `0` returns all certificates. |
-| `details` | `thumbprint` | string | **yes** | — | SHA-1 thumbprint (40 hex chars, no colons) of the certificate to retrieve; case-insensitive. |
-| `details` | `store` | string | no | `all` | macOS only: restricts the search to one store ("login", "System", "root", "all"). Ignored on Windows and Linux, which always search every store. |
-| `delete` | `thumbprint` | string | **yes** | — | SHA-1 thumbprint (40 hex chars, no colons) of the certificate to delete; case-insensitive. |
-| `delete` | `store` | string | no | `MY` | The store to delete from. Windows: MY, ROOT, CA, Trust. macOS: "MY"/"System" (both target System.keychain); "root" is rejected (sealed by SIP); "login"/"all"/anything else is rejected. Ignored on Linux. |
+| Definition | Parameter | Type | Required | Default | Constraints | Description |
+|---|---|---|---|---|---|---|
+| `security.certificates.delete` | `thumbprint` | string | yes | - | - | SHA-1 thumbprint (hex string, no colons) of the certificate to delete. Case-insensitive. |
+| `security.certificates.delete` | `store` | string | no | MY | - | The certificate store to delete from. On Windows: MY, ROOT, CA, or Trust. Defaults to "MY". On macOS: "MY" (the default) or "System" deletes from /Library/Keychains/System.keychain, matching prior behaviour. "root" is REJECTED (non-zero exit, unsupported) -- SystemRootCertificates.keychain is sealed by System Integrity Protection on modern macOS and cannot actually be modified, so attempting it would report a change that never took effect. "login" and "all" are also not supported for delete and are rejected with an error rather than silently deleting from an unintended store, as is any other unrecognized value. Ignored on Linux. |
+| `security.certificates.details` | `thumbprint` | string | yes | - | - | SHA-1 thumbprint (hex string, no colons) of the certificate to retrieve. Case-insensitive. |
+| `security.certificates.details` | `store` | string | no | all | - | On macOS, restrict the search to one store: "login" (the current console user's login keychain -- returns not_available\|no console session when nobody is logged in at the console, or not_available\|<reason> when the console user could not be determined; in the latter case the search result is PARTIAL and never a definitive status\|not_found, because the login keychain was not opened), "System" (/Library/Keychains/System.keychain), "root" (SystemRootCertificates.keychain), or "all" (System and root, plus login when a console user is present). Ignored on Windows and Linux, which always search every store. Defaults to "all". |
+| `security.certificates.list` | `store` | string | no | all | - | Filter by store name. On Windows: MY, ROOT, CA, Trust, or "all" for all stores. On macOS: "login" (the current console user's login keychain -- returns not_available\|no console session when nobody is logged in at the console, or not_available\|<reason> when the console user could not be determined, e.g. the directory lookup timed out; the two are deliberately distinct, a degraded lookup is never reported as an empty console), "System" (/Library/Keychains/System.keychain), "root" (SystemRootCertificates.keychain), or "all" (System and root, plus login when a console user is present). Ignored on Linux, which always enumerates every available certificate. Defaults to "all". |
+| `security.certificates.list` | `expiring_within_days` | int32 | no | 0 | minimum 0 | Only return certificates expiring within this many days. Set to 0 to return all certificates regardless of expiry. Useful for compliance audits of soon-to-expire certificates. |
 <!-- END GENERATED -->
 
 ### Outputs
@@ -76,24 +76,37 @@ Binaries/subprocesses/network: Windows — none, in-process CryptoAPI/`crypt32` 
 `list` and `details` write a header row followed by zero or more pipe-delimited certificate rows, or a `status|not_found` / `not_available|<reason>` line in place of a row when nothing matched or a store couldn't be read. `delete` writes one line only: `status|<value>`, `error|<message>`, or (macOS only) `not_available|<reason>`. `(unknown)` is the honest per-field sentinel for a value that failed to parse — it never means zero or empty; `subject`/`issuer`/`serial`/`key_usage` are escaped so a hostile value can never inject an extra pipe-delimited column or newline-delimited row.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`list` / `details` — `subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage`**
+**`security.certificates.delete` — `status`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `subject` | string | free text (distinguished name) | W, M, L | `Logitech Inc` |
-| `issuer` | string | free text (distinguished name) | W, M, L | `DigiCert Trusted G4 Code Signing RSA4096 SHA384 2021 CA1` |
-| `thumbprint` | string | 40 uppercase hex chars, or `(unknown)`/`(skipped)` | W, M, L | `FBD3B2C0991549EC5FB12FA1A994D2E0C32D8057` |
-| `not_before` | string | `YYYY-MM-DD`, or `(unknown)` | W, M, L | `2025-01-09` |
-| `not_after` | string | `YYYY-MM-DD`, or `(unknown)` | W, M, L | `2026-01-09` |
-| `serial` | string | free text (hex) | W, M, L | `09CFB6DE3AB5124757FFEFDF3759BBF2` |
-| `store` | string | Windows: MY/ROOT/CA/Trust. macOS: System.keychain/SystemRootCertificates.keychain/login.keychain-db. Linux: `/etc/ssl/certs` | W, M, L | `ROOT` |
-| `key_usage` | string | comma-separated usage names, or `(none)` | W, M, L | `Digital Signature` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `status` | string | - | Windows, Linux, macOS | `error\|thumbprint parameter required` | A successful macOS delete emits status\|deleted; a delete targeting a certificate already provably absent from the keychain emits status\|not_found (rc 0), matching the Windows/Linux contract for an absent cert. store=root is rejected with error\|MESSAGE (SystemRootCertificates.keychain is sealed by System Integrity Protection). Every other macOS rejection or failure -- an unsupported store, a failed delete command, or a post-delete verification that still finds the certificate or could not re-read the keychain -- also emits error\|MESSAGE. Windows and Linux always emit status\|deleted, status\|delete_failed, or status\|not_found. Values: status\|deleted, status\|not_found, status\|delete_failed (Windows/Linux only), error\|<message> (any OS: bad thumbprint, unsupported/rejected store, or a macOS delete that could not be verified), not_available\|<reason> (macOS only, pre-validation). |
 
-**`delete` — single status line**
+**`security.certificates.details` — `subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `status` | string | `status\|deleted`, `status\|not_found`, `status\|delete_failed` (Windows/Linux only), `error\|<message>` (any OS), `not_available\|<reason>` (macOS only, pre-validation) | W, M, L | `error\|thumbprint parameter required` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `subject` | string | - | Windows, Linux, macOS | `CN=com.apple.systemdefault, O=System Identity` | The certificate's Subject distinguished name, rendered by the OS's own name printer (CryptoAPI simple display name on Windows, OpenSSL/libcrypto's default name rendering on Linux and macOS System/root reads, the `security find-certificate` subprocess's `subject=` line on the macOS login keychain). Values: free text (distinguished name). |
+| `issuer` | string | - | Windows, Linux, macOS | `CN=com.apple.systemdefault, O=System Identity` | The certificate's Issuer distinguished name, rendered the same way as subject. Values: free text (distinguished name). |
+| `thumbprint` | string | - | Windows, Linux, macOS | `0C24DA5DE02640D8924F5C7BCB7D5F734815228D` | SHA-1 fingerprint of the certificate's DER encoding, uppercase hex with no separators -- always equal to the request's `thumbprint` parameter (canonicalized to uppercase) on a matching row. Values: 40 uppercase hex characters. |
+| `not_before` | string | - | Windows, Linux, macOS | `2026-07-18` | Validity-period start date, YYYY-MM-DD (no time-of-day). Values: date (YYYY-MM-DD), or "(unknown)" when the source date could not be parsed. |
+| `not_after` | string | - | Windows, Linux, macOS | `2046-07-13` | Validity-period end date, YYYY-MM-DD. Values: date (YYYY-MM-DD), or "(unknown)" when the source date could not be parsed. |
+| `serial` | string | - | Windows, Linux, macOS | `076C11D1` | Certificate serial number as hex text, via the OS's own serial renderer (Windows: little-endian byte reversal; Linux/macOS: `i2a_ASN1_INTEGER` or the openssl `-serial` line). Values: free text (hex). |
+| `store` | string | - | Windows, Linux, macOS | `System.keychain` | Which store/keychain/directory the matching row was found in. Values: Windows: MY, ROOT, CA, Trust. macOS: System.keychain, SystemRootCertificates.keychain, login.keychain-db. Linux: the literal path "/etc/ssl/certs".. |
+| `key_usage` | string | - | Windows, Linux, macOS | `Digital Signature, Key Encipherment, Data Encipherment` | Comma-separated X.509 Key Usage extension names, or "(none)" when the extension is absent, empty, or could not be read. Values: comma-separated usage names, or "(none)". |
+
+**`security.certificates.list` — `subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage`**
+
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `subject` | string | - | Windows, Linux, macOS | `Logitech Inc` | The certificate's Subject distinguished name, rendered by the OS's own name printer (CryptoAPI simple display name on Windows, OpenSSL/libcrypto's default name rendering on Linux and macOS System/root reads, the `security find-certificate` subprocess's `subject=` line on the macOS login keychain). Values: free text (distinguished name). |
+| `issuer` | string | - | Windows, Linux, macOS | `DigiCert Trusted G4 Code Signing RSA4096 SHA384 2021 CA1` | The certificate's Issuer distinguished name, rendered the same way as subject. Values: free text (distinguished name). |
+| `thumbprint` | string | - | Windows, Linux, macOS | `FBD3B2C0991549EC5FB12FA1A994D2E0C32D8057` | SHA-1 fingerprint of the certificate's DER encoding, uppercase hex with no separators -- the identifier `details`/`delete` match against (the request parameter is case-insensitive, this column is always uppercase). "(unknown)" when the row's identity could not be established (a failed/timed-out per-block parse) and "(skipped)" for a Linux file that could not be read at all. Values: 40 uppercase hex characters, or "(unknown)"/"(skipped)". |
+| `not_before` | string | - | Windows, Linux, macOS | `2025-01-09` | Validity-period start date, YYYY-MM-DD (no time-of-day). Values: date (YYYY-MM-DD), or "(unknown)" when the source date could not be parsed. |
+| `not_after` | string | - | Windows, Linux, macOS | `2026-01-09` | Validity-period end date, YYYY-MM-DD. Also the field `expiring_within_days` filters on. Values: date (YYYY-MM-DD), or "(unknown)" when the source date could not be parsed. |
+| `serial` | string | - | Windows, Linux, macOS | `09CFB6DE3AB5124757FFEFDF3759BBF2` | Certificate serial number as hex text, via the OS's own serial renderer (Windows: little-endian byte reversal; Linux/macOS: `i2a_ASN1_INTEGER` or the openssl `-serial` line). Values: free text (hex). |
+| `store` | string | - | Windows, Linux, macOS | `ROOT` | Which store/keychain/directory the row was read from. Values: Windows: MY, ROOT, CA, Trust. macOS: System.keychain, SystemRootCertificates.keychain, login.keychain-db. Linux: the literal path "/etc/ssl/certs" for every row.. |
+| `key_usage` | string | - | Windows, Linux, macOS | `Digital Signature` | Comma-separated X.509 Key Usage extension names, or "(none)" when the extension is absent, empty, or could not be read. Values: comma-separated usage names, or "(none)". |
 <!-- END GENERATED -->
 
 ### Result status
@@ -111,13 +124,14 @@ Windows never calls `set_result_status`; a clean Windows run, and any run that h
 
 - **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (90-day default retention, `server/core/src/response_store.hpp:8,152`), queryable at `/api/responses/{id}` and aggregatable (`list` groups by `store`/`issuer` per its YAML `aggregation` block).
 - **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — no reference to the `certificates` plugin or its definition ids exists outside `server/core/src/capability_decls/plugin_action_catalogue_c.hpp`.
+- **Sensitivity.** `list`/`details` rows carry every certificate's `subject` and `issuer` — for code-signing certs (the Windows sample) this is effectively an installed-software-publisher inventory (e.g. `Logitech Inc`, `Microsoft Corporation`) by another route, and on macOS a successful login-keychain read can surface the signed-in user's own personal certificates; `thumbprint`/`serial` uniquely identify a specific certificate but not a device or person directly.
 - **Siblings:** none in this plugin group; the `diagnostics.certificates` action (a different plugin, TLS cert/key diagnostics) is unrelated despite the similar name.
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("security.certificates.list")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash dd4cae6837a4
 
 ```
 == action=list
@@ -133,35 +147,21 @@ Thawte Timestamping CA|Thawte Timestamping CA|BE36A4562FB2EE05DBB3D32323ADF44508
 Starfield Root Certificate Authority - G2|Starfield Root Certificate Authority - G2|B51C067CEE2B0C3DF855AB2D92F4FE39D4E70F0E|2009-09-01|2037-12-31|00|ROOT|Certificate Signing, CRL Signing
 Microsoft Root Authority|Microsoft Root Authority|A43489159A520F0D93D032CCAF37E7FE20A8B419|1997-01-10|2020-12-31|00C1008B3C3C8811D13EF663ECDF40|ROOT|(none)
 Symantec Enterprise Mobile Root for Microsoft|Symantec Enterprise Mobile Root for Microsoft|92B46C76E13054E104F230517E6E504D43AB10B5|2012-03-15|2032-03-14|0F6B552F9EBF907B0F6629A9BDF4D8CE|ROOT|Certificate Signing, CRL Signing
-Microsoft Root Certificate Authority 2011|Microsoft Root Certificate Authority 2011|8F43288AD272F3103B6FB1428485EA3014C0BCFE|2011-03-22|2036-03-22|3F8BC8B5FC9FB29643B569D66C42E144|ROOT|Digital Signature, Certificate Signing, CRL Signing
-Microsoft Authenticode(tm) Root Authority|Microsoft Authenticode(tm) Root Authority|7F88CD7223F3C813818C994614A89C99FA3B5247|1995-01-01|1999-12-31|01|ROOT|(none)
-Blizzard Battle.net Local Cert|Blizzard Battle.net Local Cert|7E7D281D1DCA51CCE3C81E42320BB9F898AB25B8|2023-03-23|2033-03-20|054082|ROOT|(none)
-DigiCert High Assurance EV Root CA|DigiCert High Assurance EV Root CA|5FB7EE0633E259DBAD0C4C9AE6D38F1A61C7DC25|2006-11-10|2031-11-10|02AC5C266A0B409B8F0B79F2AE462577|ROOT|Digital Signature, Certificate Signing, CRL Signing
-Microsoft Root Certificate Authority 2010|Microsoft Root Certificate Authority 2010|3B1EFD3A66EA28B16697394703A72CA340A05BD5|2010-06-23|2035-06-23|28CC3A25BFBA44AC449A9B586B4339AA|ROOT|Digital Signature, Certificate Signing, CRL Signing
-Microsoft ECC TS Root Certificate Authority 2018|Microsoft ECC TS Root Certificate Authority 2018|31F9FC8BA3805986B721EA7295C65B3A44534274|2018-02-27|2043-02-27|153875E1647ED1B047B4EFAF41128245|ROOT|Digital Signature, Certificate Signing, CRL Signing
-Copyright (c) 1997 Microsoft Corp.|Copyright (c) 1997 Microsoft Corp.|245C97DF7514E7CF2DF8BE72AE957B9E04741E85|1997-05-13|1999-12-30|01|ROOT|(none)
-NO LIABILITY ACCEPTED, (c)97 VeriSign, Inc.|NO LIABILITY ACCEPTED, (c)97 VeriSign, Inc.|18F7C1FCC3090203FD5BAA2F861A754976C8DD25|1997-05-12|2004-01-07|4A19D2388C82591CA55D735F155DDCA3|ROOT|(none)
-Microsoft ECC Product Root Certificate Authority 2018|Microsoft ECC Product Root Certificate Authority 2018|06F1AA330B927B753A40E68CDF22E34BCBEF3352|2018-02-27|2043-02-27|14982666DC7CCD8F4053677BB999EC85|ROOT|Digital Signature, Certificate Signing, CRL Signing
-Microsoft Time Stamp Root Certificate Authority 2014|Microsoft Time Stamp Root Certificate Authority 2014|0119E81BE9A14CD8E22F40AC118C687ECBA3F4D8|2014-10-22|2039-10-22|2FD67A432293329045E953343EE27466|ROOT|Digital Signature, Certificate Signing, CRL Signing
-AC RAIZ FNMT-RCM|AC RAIZ FNMT-RCM|EC503507B215C4956219E2A89A5B42992C4C2C20|2008-10-29|2030-01-01|5D938D306736C8061D1AC754846907|ROOT|Certificate Signing, CRL Signing
-GTS Root R1|GTS Root R1|E58C1CC4913B38634BE9106EE3AD8E6B9DD9814A|2016-06-22|2036-06-22|0203E5936F31B01349886BA217|ROOT|Digital Signature, Certificate Signing, CRL Signing
-IdenTrust Commercial Root CA 1|IdenTrust Commercial Root CA 1|DF717EAA4AD94EC9558499602D48DE5FBCF03A25|2014-01-16|2034-01-16|0A0142800000014523C844B500000002|ROOT|Certificate Signing, CRL Signing
-DigiCert Global Root G2|DigiCert Global Root G2|DF3C24F9BFD666761B268073FE06D1CC8D4F82A4|2013-08-01|2038-01-15|033AF1E6A711A9A0BB2864B11D09FAE5|ROOT|Digital Signature, Certificate Signing, CRL Signing
-… 25 of 80 rows
-[result_status] UNDECLARED / UNKNOWN / 
+… 12 of 81 rows shown
+[result_status] UNDECLARED / UNKNOWN
 
 == action=details thumbprint=FBD3B2C0991549EC5FB12FA1A994D2E0C32D8057
 subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage
 Logitech Inc|DigiCert Trusted G4 Code Signing RSA4096 SHA384 2021 CA1|FBD3B2C0991549EC5FB12FA1A994D2E0C32D8057|2025-01-09|2026-01-09|09CFB6DE3AB5124757FFEFDF3759BBF2|ROOT|Digital Signature
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=delete
 error|thumbprint parameter required
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 [rc] 1
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash dd4cae6837a4
 
 ```
 == action=list
@@ -177,36 +177,21 @@ C=US, O=Internet Security Research Group, CN=ISRG Root X1|C=US, O=Internet Secur
 C=US, O=Apple Inc., CN=Apple Platform Code Signing ECC Root CA - G1|C=US, O=Apple Inc., CN=Apple Platform Code Signing ECC Root CA - G1|E8DA8B1EFCFE2EB2FCEB9D41981E1869A71A9C13|2024-12-13|2049-12-08|521223A7BFF487D04BD387D29127D824|SystemRootCertificates.keychain|Certificate Sign, CRL Sign
 CN=ACCVRAIZ1, OU=PKIACCV, O=ACCV, C=ES|CN=ACCVRAIZ1, OU=PKIACCV, O=ACCV, C=ES|93057A8815C64FCE882FFA9116522878BC536417|2011-05-05|2030-12-31|5EC3B7A6437FA4E0|SystemRootCertificates.keychain|Certificate Sign, CRL Sign
 C=US, O=Certainly, CN=Certainly Root R1|C=US, O=Certainly, CN=Certainly Root R1|A050EE0F2871F427B2126D6F509625BACC8642AF|2021-04-01|2046-04-01|8E0FF94B907168653354F4D44439B7E0|SystemRootCertificates.keychain|Certificate Sign, CRL Sign
-C=PL, O=Asseco Data Systems S.A., OU=Certum Certification Authority, CN=Certum Trusted Root CA|C=PL, O=Asseco Data Systems S.A., OU=Certum Certification Authority, CN=Certum Trusted Root CA|C88344C018AE9FCCF187B78F22D1C5D74584BAE5|2018-03-16|2043-03-16|1EBF5950B8C980374C06F7EB554FB5ED|SystemRootCertificates.keychain|Certificate Sign, CRL Sign
-C=TR, L=Gebze - Kocaeli, O=Turkiye Bilimsel ve Teknolojik Arastirma Kurumu - TUBITAK, OU=Kamu Sertifikasyon Merkezi - Kamu SM, CN=TUBITAK Kamu SM SSL Kok Sertifikasi - Surum 1|C=TR, L=Gebze - Kocaeli, O=Turkiye Bilimsel ve Teknolojik Arastirma Kurumu - TUBITAK, OU=Kamu Sertifikasyon Merkezi - Kamu SM, CN=TUBITAK Kamu SM SSL Kok Sertifikasi - Surum 1|3143649BECCE27ECED3A3F0B8F0DE4E891DDEECA|2013-11-25|2043-10-25|01|SystemRootCertificates.keychain|Certificate Sign, CRL Sign
-C=US, O=Google Trust Services LLC, CN=GTS Root R3|C=US, O=Google Trust Services LLC, CN=GTS Root R3|EDE571802BC892B95B833CD232683F09CDA01E46|2016-06-22|2036-06-22|0203E5B882EB20F825276D3D66|SystemRootCertificates.keychain|Digital Signature, Certificate Sign, CRL Sign
-C=PL, O=Unizeto Technologies S.A., OU=Certum Certification Authority, CN=Certum Trusted Network CA|C=PL, O=Unizeto Technologies S.A., OU=Certum Certification Authority, CN=Certum Trusted Network CA|07E032E020B72C3F192F0628A2593A19A70F069E|2008-10-22|2029-12-31|0444C0|SystemRootCertificates.keychain|Certificate Sign, CRL Sign
-C=US, O=Certainly, CN=Certainly Root E1|C=US, O=Certainly, CN=Certainly Root E1|F9E16DDC0189CFD58245633EC5377DC2EB936F2B|2021-04-01|2046-04-01|062533B1470333275CF98D9AB9BFCCF8|SystemRootCertificates.keychain|Certificate Sign, CRL Sign
-C=RO, O=certSIGN, OU=certSIGN ROOT CA|C=RO, O=certSIGN, OU=certSIGN ROOT CA|FAB7EE36972662FB2DB02AF6BF03FDE87C4B2F9B|2006-07-04|2031-07-04|200605167002|SystemRootCertificates.keychain|Digital Signature, Non Repudiation, Certificate Sign, CRL Sign
-C=CH, O=SwissSign AG, CN=SwissSign Gold CA - G2|C=CH, O=SwissSign AG, CN=SwissSign Gold CA - G2|D8C5388AB7301B1B6ED47AE645253A6F9F1A2761|2006-10-25|2036-10-25|BB401C43F55E4FB0|SystemRootCertificates.keychain|Certificate Sign, CRL Sign
-C=DE, O=T-Systems Enterprise Services GmbH, OU=T-Systems Trust Center, CN=T-TeleSec GlobalRoot Class 2|C=DE, O=T-Systems Enterprise Services GmbH, OU=T-Systems Trust Center, CN=T-TeleSec GlobalRoot Class 2|590D2D7D884F402E617EA562321765CF17D894E9|2008-10-01|2033-10-01|01|SystemRootCertificates.keychain|Certificate Sign, CRL Sign
-O=Entrust.net, OU=www.entrust.net/CPS_2048 incorp. by ref. (limits liab.), OU=(c) 1999 Entrust.net Limited, CN=Entrust.net Certification Authority (2048)|O=Entrust.net, OU=www.entrust.net/CPS_2048 incorp. by ref. (limits liab.), OU=(c) 1999 Entrust.net Limited, CN=Entrust.net Certification Authority (2048)|503006091D97D4F5AE39F7CBE7927D7D652D3431|1999-12-24|2029-07-24|3863DEF8|SystemRootCertificates.keychain|Certificate Sign, CRL Sign
-C=DE, O=D-Trust GmbH, CN=D-TRUST Root Class 3 CA 2 2009|C=DE, O=D-Trust GmbH, CN=D-TRUST Root Class 3 CA 2 2009|58E8ABB0361533FB80F79B1B6D29D3FF8D5F00F0|2009-11-05|2029-11-05|0983F3|SystemRootCertificates.keychain|Certificate Sign, CRL Sign
-C=US, O=DigiCert Inc, OU=www.digicert.com, CN=DigiCert Assured ID Root G2|C=US, O=DigiCert Inc, OU=www.digicert.com, CN=DigiCert Assured ID Root G2|A14B48D943EE0A0E40904F3CE0A4C09193515D3F|2013-08-01|2038-01-15|0B931C3AD63967EA6723BFC3AF9AF44B|SystemRootCertificates.keychain|Digital Signature, Certificate Sign, CRL Sign
-C=TW, O=Chunghwa Telecom Co., Ltd., OU=ePKI Root Certification Authority|C=TW, O=Chunghwa Telecom Co., Ltd., OU=ePKI Root Certification Authority|67650DF17E8E7E5B8240A4F4564BCFE23D69C6F0|2004-12-20|2034-12-20|15C8BD65475CAFB897005EE406D2BC9D|SystemRootCertificates.keychain|(none)
-C=US, O=GeoTrust Inc., OU=(c) 2007 GeoTrust Inc. - For authorized use only, CN=GeoTrust Primary Certification Authority - G2|C=US, O=GeoTrust Inc., OU=(c) 2007 GeoTrust Inc. - For authorized use only, CN=GeoTrust Primary Certification Authority - G2|8D1784D537F3037DEC70FE578B519A99E610D7B0|2007-11-05|2038-01-18|3CB2F4480A00E2FEEB243B5E603EC36B|SystemRootCertificates.keychain|Certificate Sign, CRL Sign
-OU=GlobalSign Root CA - R3, O=GlobalSign, CN=GlobalSign|OU=GlobalSign Root CA - R3, O=GlobalSign, CN=GlobalSign|D69B561148F01C77C54578C10926DF5B856976AD|2009-03-18|2029-03-18|04000000000121585308A2|SystemRootCertificates.keychain|Certificate Sign, CRL Sign
-… 25 of 160 rows
-not_available|login keychain read failed
+… 12 of 162 rows shown
 [result_status] CONSTRAINED / PARTIAL / login-keychain
 
 == action=details thumbprint=0C24DA5DE02640D8924F5C7BCB7D5F734815228D
 subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage
 CN=com.apple.systemdefault, O=System Identity|CN=com.apple.systemdefault, O=System Identity|0C24DA5DE02640D8924F5C7BCB7D5F734815228D|2026-07-18|2046-07-13|076C11D1|System.keychain|Digital Signature, Key Encipherment, Data Encipherment
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=delete
 error|thumbprint parameter required
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 [rc] 1
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash pending
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash dd4cae6837a4
 
 ```
 == action=list
@@ -222,31 +207,17 @@ C=US, O=Microsoft Corporation, CN=Microsoft ECC Root Certificate Authority 2017|
 C=CN, O=TrustAsia Technologies, Inc., CN=TrustAsia Global Root CA G3|C=CN, O=TrustAsia Technologies, Inc., CN=TrustAsia Global Root CA G3|63CFB6C1272B56E4888E1C239AB62E814724C3C7|2021-05-20|2046-05-19|64F60E6577616AAB3BB4EA8584BBB189B871930F|/etc/ssl/certs|Certificate Sign, CRL Sign
 C=US, O=Amazon, CN=Amazon Root CA 2|C=US, O=Amazon, CN=Amazon Root CA 2|5A8CEF45D7A69859767A8C8B4496B578CF474B1A|2015-05-26|2040-05-26|066C9FD29635869F0A0FE58678F85B26BB8A37|/etc/ssl/certs|Digital Signature, Certificate Sign, CRL Sign
 C=BE, O=GlobalSign nv-sa, CN=GlobalSign Root R46|C=BE, O=GlobalSign nv-sa, CN=GlobalSign Root R46|53A2B04BCA6BD645E6398A8EC40DD2BF77C3A290|2019-03-20|2046-03-20|11D2BBB9D723189E405F0A9D2DD0DF2567D1|/etc/ssl/certs|Digital Signature, Certificate Sign, CRL Sign
-CN=Atos TrustedRoot Root CA RSA TLS 2021, O=Atos, C=DE|CN=Atos TrustedRoot Root CA RSA TLS 2021, O=Atos, C=DE|18523B0D0637E4D63ADF23E498FB5B16FB867448|2021-04-22|2041-04-17|53D5CFE619930BFB2B0512D8C22AA2A4|/etc/ssl/certs|Digital Signature, Certificate Sign, CRL Sign
-OU=GlobalSign ECC Root CA - R4, O=GlobalSign, CN=GlobalSign|OU=GlobalSign ECC Root CA - R4, O=GlobalSign, CN=GlobalSign|6BA0B098E171EF5AADFE4815807710F4BD6F0B28|2012-11-13|2038-01-19|0203E57EF53F93FDA50921B2A6|/etc/ssl/certs|Digital Signature, Certificate Sign, CRL Sign
-C=NO, O=Buypass AS-983163327, CN=Buypass Class 3 Root CA|C=NO, O=Buypass AS-983163327, CN=Buypass Class 3 Root CA|DAFAF7FA6684EC068F1450BDC7C281A5BCA96457|2010-10-26|2040-10-26|02|/etc/ssl/certs|Certificate Sign, CRL Sign
-C=GR, L=Athens, O=Hellenic Academic and Research Institutions Cert. Authority, CN=Hellenic Academic and Research Institutions RootCA 2015|C=GR, L=Athens, O=Hellenic Academic and Research Institutions Cert. Authority, CN=Hellenic Academic and Research Institutions RootCA 2015|010C0695A6981914FFBF5FC6B0B695EA29E912A6|2015-07-07|2040-06-30|00|/etc/ssl/certs|Certificate Sign, CRL Sign
-C=IN, OU=emSign PKI, O=eMudhra Technologies Limited, CN=emSign Root CA - G1|C=IN, OU=emSign PKI, O=eMudhra Technologies Limited, CN=emSign Root CA - G1|8AC7AD8F73AC4EC1B5754DA540F4FCCF7CB58E8C|2018-02-18|2043-02-18|31F5E4620C6C58EDD6D8|/etc/ssl/certs|Certificate Sign, CRL Sign
-C=US, O=CommScope, CN=CommScope Public Trust ECC Root-01|C=US, O=CommScope, CN=CommScope Public Trust ECC Root-01|0786C0D8DD8EC080980698D0587AEFDEA6CCA25D|2021-04-28|2046-04-28|43708277CF4D5D34F1CAAE322F37F7F47F75A09E|/etc/ssl/certs|Certificate Sign, CRL Sign
-C=JP, O=SECOM Trust Systems CO.,LTD., OU=Security Communication RootCA2|C=JP, O=SECOM Trust Systems CO.,LTD., OU=Security Communication RootCA2|5F3B8CF2F810B37D78B4CEEC1919C37334B9C774|2009-05-29|2029-05-29|00|/etc/ssl/certs|Certificate Sign, CRL Sign
-CN=ACCVRAIZ1, OU=PKIACCV, O=ACCV, C=ES|CN=ACCVRAIZ1, OU=PKIACCV, O=ACCV, C=ES|93057A8815C64FCE882FFA9116522878BC536417|2011-05-05|2030-12-31|5EC3B7A6437FA4E0|/etc/ssl/certs|Certificate Sign, CRL Sign
-C=ES, O=Firmaprofesional SA, organizationIdentifier=VATES-A62634068, CN=FIRMAPROFESIONAL CA ROOT-A WEB|C=ES, O=Firmaprofesional SA, organizationIdentifier=VATES-A62634068, CN=FIRMAPROFESIONAL CA ROOT-A WEB|A8311174A614150DCA77DD0EE40C5D58FCA072A5|2022-04-06|2047-03-31|319721EDAF89427F354187A167564C6D|/etc/ssl/certs|Certificate Sign, CRL Sign
-C=US, O=Internet Security Research Group, CN=ISRG Root X1|C=US, O=Internet Security Research Group, CN=ISRG Root X1|CABD2A79A1076A31F21D253635CB039D4329A5E8|2015-06-04|2035-06-04|8210CFB0D240E3594463E0BB63828B00|/etc/ssl/certs|Certificate Sign, CRL Sign
-OU=GlobalSign Root CA - R6, O=GlobalSign, CN=GlobalSign|OU=GlobalSign Root CA - R6, O=GlobalSign, CN=GlobalSign|8094640EB5A7A1CA119C1FDDD59F810263A7FBD1|2014-12-10|2034-12-10|45E6BB038333C3856548E6FF4551|/etc/ssl/certs|Certificate Sign, CRL Sign
-C=US, ST=Illinois, L=Chicago, O=Trustwave Holdings, Inc., CN=Trustwave Global ECC P384 Certification Authority|C=US, ST=Illinois, L=Chicago, O=Trustwave Holdings, Inc., CN=Trustwave Global ECC P384 Certification Authority|E7F3A3C8CF6FC3042E6D0E6732C59E68950D5ED2|2017-08-23|2042-08-23|08BD85976C9927A48068473B|/etc/ssl/certs|Certificate Sign, CRL Sign
-C=US, O=DigiCert Inc, OU=www.digicert.com, CN=DigiCert High Assurance EV Root CA|C=US, O=DigiCert Inc, OU=www.digicert.com, CN=DigiCert High Assurance EV Root CA|5FB7EE0633E259DBAD0C4C9AE6D38F1A61C7DC25|2006-11-10|2031-11-10|02AC5C266A0B409B8F0B79F2AE462577|/etc/ssl/certs|Digital Signature, Certificate Sign, CRL Sign
-C=BM, O=QuoVadis Limited, CN=QuoVadis Root CA 1 G3|C=BM, O=QuoVadis Limited, CN=QuoVadis Root CA 1 G3|1B8EEA5796291AC939EAB80A811A7373C0937967|2012-01-12|2042-01-12|78585F2EAD2C194BE3370735341328B596D46593|/etc/ssl/certs|Certificate Sign, CRL Sign
-… 25 of 151 rows
-[result_status] UNDECLARED / UNKNOWN / 
+… 12 of 152 rows shown
+[result_status] UNDECLARED / UNKNOWN
 
 == action=details thumbprint=77D30367B5E00C15F60C3861DF7CE13B92464D47
 subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage
 C=US, O=Google Trust Services LLC, CN=GTS Root R4|C=US, O=Google Trust Services LLC, CN=GTS Root R4|77D30367B5E00C15F60C3861DF7CE13B92464D47|2016-06-22|2036-06-22|0203E5C068EF631A9C72905052|/etc/ssl/certs|Digital Signature, Certificate Sign, CRL Sign
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=delete
 error|thumbprint parameter required
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 [rc] 1
 ```
 <!-- END GENERATED -->
@@ -262,10 +233,10 @@ error|thumbprint parameter required
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/certificates/src/certificates_plugin.cpp` (descriptor legs, `execute()`) · `certificates_x509.hpp` (in-process libcrypto PEM/DER parse) · `certificates_macos_parsers.hpp` (shared pure parse/validate/classify/verdict helpers)
+- Plugin: `agents/plugins/certificates/src/certificates_macos_parsers.hpp` · `agents/plugins/certificates/src/certificates_plugin.cpp` · `agents/plugins/certificates/src/certificates_x509.hpp`
 - Definitions: `content/definitions/certificates.yaml`
-- Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_c.hpp` (lines 317, 327, 337)
-- Tests: `tests/unit/test_certificates_macos.cpp` (67 cases) · `tests/unit/test_certificates_x509.cpp` (19 cases)
-- Privilege row: `docs/agent-privilege-model.md` (rows at lines 93 and 111)
-- Changelog: `changelog.d/20260817-wave2-certificates-in-process-x509.changed.md` · `changelog.d/2204-declarations-group-c.added.md` · `changelog.d/3406-certificates-login-keychain-argv.changed.md`
+- Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_c.hpp`
+- Tests: `tests/unit/test_certificates_macos.cpp` · `tests/unit/test_certificates_x509.cpp`
+- Privilege row: `docs/agent-privilege-model.md`
+- Changelog: `changelog.d/20260817-wave2-certificates-in-process-x509.changed.md` · `changelog.d/3406-certificates-login-keychain-argv.changed.md`
 <!-- END GENERATED -->

@@ -5,10 +5,10 @@
 |---|---|
 | **What it does** | Enumerates running processes with SHA-1 hashes of executables |
 | **Version** | 1.0.0 |
-| **Kind** | Collector · read-only · on-demand (no scheduled gather) |
+| **Kind** | Collector · read-only · gathered (crossplatform.process.fetch) |
 | **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
 | **Actions** | `procfetch_fetch` (definition `crossplatform.process.fetch`) |
-| **Security** | securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate none |
+| **Security** | securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
 | **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
 
@@ -31,11 +31,7 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `procfetch_fetch` | ✅ supported · rung 1 · `CreateToolhelp32Snapshot` + BCrypt SHA-1 | ✅ supported · rung 1 · libproc (`proc_listpids`/`proc_pidpath`) + OpenSSL EVP SHA-1 | ✅ supported · rung 1 · `/proc` enumeration + OpenSSL EVP SHA-1 |
-
-**Declared limits per leg** (the descriptor's fallback text, verbatim):
-
-- None declared — every leg's Fallback field is `-` (`agents/plugins/procfetch/src/procfetch_plugin.cpp:356-367`).
+| `procfetch_fetch` | ✅ supported · rung 1 · CreateToolhelp32Snapshot + BCrypt SHA-1 | ✅ supported · rung 1 · libproc (proc_listpids/proc_pidpath) + OpenSSL EVP SHA-1 | ✅ supported · rung 1 · /proc enumeration + OpenSSL EVP SHA-1 |
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -53,7 +49,7 @@ No external binaries, no subprocesses, no network access — every leg is a nati
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-`procfetch_fetch` takes no parameters.
+The action takes no parameters.
 <!-- END GENERATED -->
 
 ### Outputs
@@ -61,14 +57,14 @@ No external binaries, no subprocesses, no network access — every leg is a nati
 Pipe-delimited rows, one per process, in the fixed field order `pid|name|path|sha1`. `name` and `path` are pipe-escaped (a literal `|` becomes `\|`) before being written, so the delimiter itself is never ambiguous. `path` and `sha1` are empty strings, not `-`, when the OS would not hand back an image path or the file could not be opened/hashed — there is no placeholder row for "no processes": the row is only ever missing fields, never absent.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`procfetch_fetch` — `pid|name|path|sha1`**
+**`crossplatform.process.fetch` — `pid|name|path|sha1`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `pid` | int64 | OS-assigned process ID (`0` is the Windows System Idle Process) | W, M, L | `1052` |
-| `name` | string | free text, OS-reported process/short name, pipe-escaped | W, M, L | `svchost.exe` |
-| `path` | string | absolute executable path, or empty when the OS refuses/cannot resolve it | W, M, L | `/usr/bin/dash` |
-| `sha1` | string | 40-character lowercase hex SHA-1 of the executable file, or empty when it could not be read | W, M, L | `e5355187cbd952a5bc9dfca430d10383f0f8750c` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `pid` | int64 | - | Windows, Linux, macOS | `1052` | The process ID assigned by the OS. Values: integer. |
+| `name` | string | - | Windows, Linux, macOS | `svchost.exe` | The process's short or executable name, as reported by the OS. Values: free text. |
+| `path` | string | - | Windows, Linux, macOS | `/usr/bin/dash` | Absolute path to the process's executable image on disk; empty when the OS refuses or fails to resolve it (a protected process, a permission-denied read, or a pseudo-process with no backing binary). Values: absolute path or empty. |
+| `sha1` | string | - | Windows, Linux, macOS | `e5355187cbd952a5bc9dfca430d10383f0f8750c` | Lowercase hex SHA-1 of the executable file's contents, cached per path so a binary shared by several processes is hashed once; empty when the file could not be opened or its path could not be resolved. Values: 40-char lowercase hex or empty. |
 <!-- END GENERATED -->
 
 ### Result status
@@ -79,15 +75,17 @@ This plugin does not set a typed result status; the agent records `UNDECLARED` a
 
 - **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. The classic dashboard also reaches this action through the legacy `POST /api/procfetch/fetch` route (`server.cpp:14943`), which forwards into the same dispatch chokepoint as the DSL path (`changelog.d/1.9-dispatch-chokepoint.security.md`) rather than a separate mechanism.
 - **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — grepping the server for `procfetch` finds only the dashboard route, the legacy REST forwarder, the capability declaration, and the static result-table column list (`result_parsing.hpp:49`).
+- **Sensitivity.** `name` rows name installed applications on the host (process/executable names — an installed-software inventory by another route, e.g. `XprotectService`, `Code Helper (Plugin)`); `path` frequently embeds the owning account's home directory on macOS/Linux (e.g. `/Users/alex/...` in the macOS sample), identifying a specific person, while `sha1` alone identifies neither a device nor a person.
 - **Siblings:** `crossplatform.process.list` / `crossplatform.process.query` (the `processes` plugin) — PID and name only, no path or hash, cheaper to run.
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("crossplatform.process.fetch")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 514b81c2df7e
 
 ```
+== action=procfetch_fetch
 0|[System Process]||
 4|System||
 332|Secure System||
@@ -100,26 +98,14 @@ This plugin does not set a typed result status; the agent records `UNDECLARED` a
 1716|winlogon.exe|C:\Windows\System32\winlogon.exe|c2c0e4e27796545d94c5ef879ee429c608a42dbf
 1724|LsaIso.exe|C:\Windows\System32\LsaIso.exe|839d5e8e57687cbb0d21420e386f73c6742e8588
 1740|lsass.exe|C:\Windows\System32\lsass.exe|258a9984be57a5000517fd76abff440f5562a315
-1936|svchost.exe|C:\Windows\System32\svchost.exe|0bac26fca769fbecab983e3cfba95140d55e0855
-1968|fontdrvhost.exe|C:\Windows\System32\fontdrvhost.exe|2519f99f9b2ed780505d6942f0d7c12328777e9d
-1976|fontdrvhost.exe|C:\Windows\System32\fontdrvhost.exe|2519f99f9b2ed780505d6942f0d7c12328777e9d
-2016|WUDFHost.exe|C:\Windows\System32\WUDFHost.exe|cfdfb6c7c356dbed78f85cdebca1b12846b5ba80
-1008|svchost.exe|C:\Windows\System32\svchost.exe|0bac26fca769fbecab983e3cfba95140d55e0855
-1500|svchost.exe|C:\Windows\System32\svchost.exe|0bac26fca769fbecab983e3cfba95140d55e0855
-2060|LogonUI.exe|C:\Windows\System32\LogonUI.exe|ff3a9916d3164e1d7ccaefaa03afcf268b2be53d
-2068|dwm.exe|C:\Windows\System32\dwm.exe|f6e9cc66a9847579bf92497a0e8b1e4795f70e14
-2128|svchost.exe|C:\Windows\System32\svchost.exe|0bac26fca769fbecab983e3cfba95140d55e0855
-2136|svchost.exe|C:\Windows\System32\svchost.exe|0bac26fca769fbecab983e3cfba95140d55e0855
-2176|svchost.exe|C:\Windows\System32\svchost.exe|0bac26fca769fbecab983e3cfba95140d55e0855
-2192|svchost.exe|C:\Windows\System32\svchost.exe|0bac26fca769fbecab983e3cfba95140d55e0855
-2212|svchost.exe|C:\Windows\System32\svchost.exe|0bac26fca769fbecab983e3cfba95140d55e0855
-… 25 of 184 rows
-[result_status] UNDECLARED / UNKNOWN / 
+… 12 of 184 rows shown
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 514b81c2df7e
 
 ```
+== action=procfetch_fetch
 10151|plugin_capture|/private/tmp/claude-501/-Users-alex-yuzu-dev/8d89cd79-001b-4ea8-8930-0c9affb3265e/scratchpad/d2/plugin_capture|87ea43e2b7d3dd2eb6e7db6a20041b1f77d20272
 10143|mdworker_shared|/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared|19ca6c856d80cfc6b83800c821b3129f40b135c7
 10125|Code Helper (Plugin)|/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Plugin).app/Contents/MacOS/Code Helper (Plugin)|0478d377b6ffa6659d823d3c72d25dc9b8816bd6
@@ -132,29 +118,17 @@ This plugin does not set a typed result status; the agent records `UNDECLARED` a
 9653|ssh|/usr/bin/ssh|8ccefa7581a171018a6cc737649ef7854e75d4c0
 9647|zsh|/bin/zsh|95f7d2b76c248d1dc8c84c37e3e5cddc93246b6c
 9621|spotlightknowledged|/System/Library/Frameworks/CoreSpotlight.framework/spotlightknowledged|8d9cd67b92a13d9f23b7c546737edce879c47436
-9610|ReportMemoryException|/usr/libexec/ReportMemoryException|7130c3eacc06f42ed150ef8316576941534b7907
-9609|XprotectService|/System/Library/PrivateFrameworks/XprotectFramework.framework/Versions/A/XPCServices/XprotectService.xpc/Contents/MacOS/XprotectService|17e4e6ec70ea67e9a20dba4b83f76180b89e4393
-9603|Python|/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python|e2b3d7e8c8ed1470c315ef6a0de81e10482348ba
-9519|com.apple.SafariPlatformSupport.Helper|/System/Volumes/Preboot/Cryptexes/OS/System/Library/PrivateFrameworks/SafariPlatformSupport.framework/Versions/A/XPCServices/com.apple.SafariPlatformSupport.Helper.xpc/Contents/MacOS/com.apple.SafariPlatformSupport.Helper|35404b3571b1a85095bad171450af8103c10963f
-9518|com.apple.WebKit.WebContent|/System/Volumes/Preboot/Cryptexes/Incoming/OS/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent|c50ee39a4e9ce9c853a7137bd2b123550d52460e
-9100|Code Helper (Renderer)|/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Renderer).app/Contents/MacOS/Code Helper (Renderer)|f2350a895f845b3abf58acee435aaf9f95cf9fa2
-9098|ssh-agent|/usr/bin/ssh-agent|409e33df7093b1556ca4ebf201346c749da658ce
-9064|SpeechSynthesisServerXPC|/System/Library/Frameworks/ApplicationServices.framework/Versions/A/Frameworks/SpeechSynthesis.framework/Versions/A/XPCServices/SpeechSynthesisServerXPC.xpc/Contents/MacOS/SpeechSynthesisServerXPC|26378695d295a43f5c4223e3944d1ec9a28ec2e7
-9039|claude|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude|da44323dee6bf9fbd3aafca303f25884f3e6675e
-9001|claude|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude|da44323dee6bf9fbd3aafca303f25884f3e6675e
-8979|claude|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude|da44323dee6bf9fbd3aafca303f25884f3e6675e
-8969|MTLCompilerService|/System/Library/Frameworks/Metal.framework/Versions/A/XPCServices/MTLCompilerService.xpc/Contents/MacOS/MTLCompilerService|e6aa243d70c17f39af1dc9dc86cb364accbd5cdc
-8968|MTLCompilerService|/System/Library/Frameworks/Metal.framework/Versions/A/XPCServices/MTLCompilerService.xpc/Contents/MacOS/MTLCompilerService|e6aa243d70c17f39af1dc9dc86cb364accbd5cdc
-… 25 of 818 rows
-[result_status] UNDECLARED / UNKNOWN / 
+… 12 of 818 rows shown
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash pending
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 514b81c2df7e
 
 ```
+== action=procfetch_fetch
 1|sh|/usr/bin/dash|e5355187cbd952a5bc9dfca430d10383f0f8750c
 9|plugin-capture|/src/builddir/tools/plugin-capture/plugin-capture|c93a85ef1e07f11e88bcea0d85f828adc1069521
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 ```
 <!-- END GENERATED -->
 
@@ -169,10 +143,9 @@ This plugin does not set a typed result status; the agent records `UNDECLARED` a
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/procfetch/src/procfetch_plugin.cpp` (single TU, all three legs + descriptor)
+- Plugin: `agents/plugins/procfetch/src/procfetch_plugin.cpp`
 - Definitions: `content/definitions/procfetch.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_b.hpp`
-- Tests: no dedicated test file found under `tests/unit/` for this plugin
-- Privilege row: no row in `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/1.9-dispatch-chokepoint.security.md` · `changelog.d/1788-command-per-device-visibility.security.md` · `changelog.d/2204-declarations-group-b.added.md`
+- Tests: none found by name
+- Privilege row: `docs/agent-privilege-model.md` (no row yet)
 <!-- END GENERATED -->

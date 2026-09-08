@@ -4,11 +4,11 @@
 | | |
 |---|---|
 | **What it does** | Host vulnerability scanning — CVE matching and configuration compliance checks |
-| **Version** | 1.0.0 · plugin ABI 4 · capability declarations added in PR #2204 |
-| **Kind** | Collector · read-only · on-demand (no scheduled gather) |
+| **Version** | 1.0.0 |
+| **Kind** | Collector · read-only · gathered (security.vuln_scan.scan, security.vuln_scan.cve_scan, security.vuln_scan.config_scan, security.vuln_scan.summary, security.vuln_scan.inventory) |
 | **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
-| **Actions** | `scan` (definition `security.vuln_scan.scan`) · `cve_scan` (`security.vuln_scan.cve_scan`) · `config_scan` (`security.vuln_scan.config_scan`) · `summary` (`security.vuln_scan.summary`) · `inventory` (`security.vuln_scan.inventory`) |
-| **Security** | securable `Security` (scan, cve_scan, config_scan, summary) · `Inventory` (inventory) · operation Read · risk Low · dispatch ReadOnly · approval gate none |
+| **Actions** | `config_scan` (definition `security.vuln_scan.config_scan`) · `cve_scan` (definition `security.vuln_scan.cve_scan`) · `inventory` (definition `security.vuln_scan.inventory`) · `scan` (definition `security.vuln_scan.scan`) · `summary` (definition `security.vuln_scan.summary`) |
+| **Security** | `scan`: securable `Security` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `cve_scan`: securable `Security` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `config_scan`: securable `Security` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `summary`: securable `Security` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `inventory`: securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
 | **Roles** | execute: endpoint-admin, endpoint-operator, security-admin · author: content-author |
 <!-- END GENERATED -->
 
@@ -45,16 +45,11 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `scan` | ✅ supported · rung 1 · `win32_registry` | ✅ supported · rung 3 · `popen(system_profiler/brew+security-checks)` | ✅ supported · rung 3 · `popen(pkg-manager+iptables/nft/ufw)` |
-| `cve_scan` | ✅ supported · rung 1 · `win32_registry` | ✅ supported · rung 3 · `popen(system_profiler/brew)` | ✅ supported · rung 3 · `popen(dpkg-query/rpm/pacman/apk)` |
-| `config_scan` | ✅ supported · rung 1 · `win32_registry` | ✅ supported · rung 3 · `popen(spctl/fdesetup/csrutil/socketfilterfw)` | ✅ supported · rung 3 · `popen(iptables/nft/ufw)+procfs` |
-| `summary` | ✅ supported · rung 1 · `win32_registry` | ✅ supported · rung 3 · `popen(system_profiler/brew+security-checks)` | ✅ supported · rung 3 · `popen(pkg-manager+iptables/nft/ufw)` |
-| `inventory` | ✅ supported · rung 1 · `win32_registry` | ✅ supported · rung 3 · `popen(system_profiler/brew)` | ✅ supported · rung 3 · `popen(dpkg-query/rpm/pacman/apk)` |
-
-**Declared limits per leg** (the descriptor's fallback text, verbatim):
-
-- None declared. Every leg's fallback field is `nullptr` in the descriptor table, and the
-  capability matrix records `-` for all 15 action×OS rows.
+| `config_scan` | ✅ supported · rung 1 · win32_registry | ✅ supported · rung 3 · popen(spctl/fdesetup/csrutil/socketfilterfw) | ✅ supported · rung 3 · popen(iptables/nft/ufw)+procfs |
+| `cve_scan` | ✅ supported · rung 1 · win32_registry | ✅ supported · rung 3 · popen(system_profiler/brew) | ✅ supported · rung 3 · popen(dpkg-query/rpm/pacman/apk) |
+| `inventory` | ✅ supported · rung 1 · win32_registry | ✅ supported · rung 3 · popen(system_profiler/brew) | ✅ supported · rung 3 · popen(dpkg-query/rpm/pacman/apk) |
+| `scan` | ✅ supported · rung 1 · win32_registry | ✅ supported · rung 3 · popen(system_profiler/brew+security-checks) | ✅ supported · rung 3 · popen(pkg-manager+iptables/nft/ufw) |
+| `summary` | ✅ supported · rung 1 · win32_registry | ✅ supported · rung 3 · popen(system_profiler/brew+security-checks) | ✅ supported · rung 3 · popen(pkg-manager+iptables/nft/ufw) |
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -77,7 +72,7 @@ firewall and `ss`/`netstat` commands query local host state only.
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-`scan`, `cve_scan`, `config_scan`, `summary`, and `inventory` all take no parameters.
+No action takes parameters.
 <!-- END GENERATED -->
 
 ### Outputs
@@ -91,28 +86,46 @@ literal `TOTAL`), then a count — one field more than the two result columns (`
 the definition declares. `inventory` emits raw `name|version` pairs with no discriminator.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`scan` / `cve_scan` / `config_scan` — `severity|category|title|detail`**
+**`security.vuln_scan.config_scan` — `severity|category|title|detail`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `severity` | string | `CRITICAL` `HIGH` `MEDIUM` `LOW` `INFO` | W, M, L | `CRITICAL` |
-| `category` | string | `cve` `config` `scan` (`scan` only on the empty-result placeholder row) | W, M, L | `cve` |
-| `title` | string | free text | W, M, L | `CVE-2021-34527: PrintNightmare: RCE via Windows Print Spooler` |
-| `detail` | string | free text | W, M, L | `Microsoft Windows Desktop Runtime - 6.0.11 (x64) 6.0.11.31823 (fixed in KB5004945)` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `severity` | string | `CRITICAL` `HIGH` `MEDIUM` `LOW` `INFO` | Windows, Linux, macOS | `HIGH` | Finding severity assigned by the compliance check that produced this row. |
+| `category` | string | `config` `scan` | Windows, Linux, macOS | `config` | Always "config" for this action; "scan" only on the placeholder row emitted when there is nothing to report. |
+| `title` | string | - | Windows, Linux, macOS | `SMBv1 Protocol` | The name of the compliance check, e.g. the setting it inspects. Values: free text. |
+| `detail` | string | - | Windows, Linux, macOS | `Enabled - vulnerable to EternalBlue/WannaCry (MS17-010)` | The check's human-readable result text, including why a failing check failed. Values: free text. |
 
-**`summary` — `summary|severity|count`**
+**`security.vuln_scan.cve_scan` — `severity|category|title|detail`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `severity` | string | `TOTAL` `CRITICAL` `HIGH` `MEDIUM` `LOW` `INFO` | W, M, L | `CRITICAL` |
-| `count` | int32 or string | integer, except the `TOTAL` row, whose cell holds the formatted string `"<n> findings (<n> issues)"` | W, M, L | `17` · `24 findings (17 issues)` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `severity` | string | `CRITICAL` `HIGH` `MEDIUM` `LOW` `INFO` | Windows, Linux, macOS | `HIGH` | Finding severity assigned by the CVE rule that matched. |
+| `category` | string | `cve` `scan` | Windows, Linux, macOS | `cve` | Always "cve" for a match; "scan" on the single placeholder row emitted when nothing matches. |
+| `title` | string | - | Windows, Linux, macOS | `CVE-2023-24329: urllib.parse URL parsing bypass via leading whitespace` | "<CVE-ID>: <description>" from the matched rule, or "No vulnerabilities" on the placeholder row. Values: free text. |
+| `detail` | string | - | Windows, Linux, macOS | `Python 3.9.6 (fixed in 3.11.4)` | <installed product> <version> (fixed in <fixed_ver>). Values: free text. |
 
-**`inventory` — `name|version`**
+**`security.vuln_scan.inventory` — `name|version`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `name` | string | free text | W, M, L | `curl` |
-| `version` | string | free text, or empty when the source reports none | W, M, L | `8.14.1-2+deb13u4` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `name` | string | - | Windows, Linux, macOS | `curl` | Installed application or package name, as reported by the OS's own inventory source. Values: free text. |
+| `version` | string | - | Windows, Linux, macOS | `8.14.1-2+deb13u4` | Installed version string, or empty when the source reports none (e.g. a Windows uninstall entry with no DisplayVersion). Values: free text, or empty. |
+
+**`security.vuln_scan.scan` — `severity|category|title|detail`**
+
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `severity` | string | `CRITICAL` `HIGH` `MEDIUM` `LOW` `INFO` | Windows, Linux, macOS | `CRITICAL` | Finding severity assigned by the check that produced this row. |
+| `category` | string | `cve` `config` `scan` | Windows, Linux, macOS | `cve` | Which half of the scan produced this row. |
+| `title` | string | - | Windows, Linux, macOS | `CVE-2021-34527: PrintNightmare: RCE via Windows Print Spooler` | For a cve row, "<CVE-ID>: <description>" from the matched rule; for a config row, the name of the compliance check; "No vulnerabilities" on the single placeholder row emitted when a run finds nothing. Values: free text. |
+| `detail` | string | - | Windows, Linux, macOS | `Microsoft Windows Desktop Runtime - 6.0.11 (x64) 6.0.11.31823 (fixed in KB5004945)` | For a cve row, "<installed product> <version> (fixed in <fixed_ver>)"; for a config row, the check's human-readable result text. Values: free text. |
+
+**`security.vuln_scan.summary` — `severity|count`**
+
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `severity` | string | `TOTAL` `CRITICAL` `HIGH` `MEDIUM` `LOW` `INFO` | Windows, Linux, macOS | `CRITICAL` | The severity this row counts, or the literal "TOTAL" for the first row emitted by every run. |
+| `count` | int32 | - | Windows, Linux, macOS | `17` | The number of findings at this severity. The TOTAL row is an exception: despite the declared int32 type, that row's cell holds the formatted string "<n> findings (<n> issues)", not an integer. Values: integer, except a formatted string on the TOTAL row. |
 <!-- END GENERATED -->
 
 ### Result status
@@ -132,6 +145,10 @@ shows `UNDECLARED / UNKNOWN /` on every action, on every OS.
   algorithm as agents/plugins/vuln_scan/src/cve_rules.hpp".
 - **Not consumed by** daily-sync inventory or TAR; nothing runs on a schedule — every action is
   on-demand only.
+- **Sensitivity.** `scan`/`cve_scan`/`config_scan`'s `detail` field embeds installed application
+  names and versions (e.g. `Microsoft Windows Desktop Runtime - 6.0.11 (x64) 6.0.11.31823`) — an
+  installed-software inventory by another route; `inventory`'s `name`/`version` rows are that
+  inventory directly. Nothing in either row shape names a specific device or person.
 - **Siblings:** `installed_apps` — a separate installed-software collector; the two already
   share the same "installed, held" package-presence convention on Linux without being merged.
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as
@@ -141,7 +158,7 @@ shows `UNDECLARED / UNKNOWN /` on every action, on every OS.
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 20c66f1c0618
 
 ```
 == action=scan
@@ -157,19 +174,8 @@ CRITICAL|cve|CVE-2021-1675: Print Spooler privilege escalation|Microsoft Windows
 CRITICAL|cve|CVE-2021-1675: Print Spooler privilege escalation|Microsoft Windows Desktop Runtime - 6.0.20 (x86) 6.0.20.32621 (fixed in KB5003637)
 CRITICAL|cve|CVE-2021-1675: Print Spooler privilege escalation|Microsoft Windows Desktop Runtime - 8.0.28 (x64) 8.0.28.36119 (fixed in KB5003637)
 CRITICAL|cve|CVE-2021-1675: Print Spooler privilege escalation|Microsoft Windows Desktop Runtime - 8.0.28 (x86) 8.0.28.36119 (fixed in KB5003637)
-CRITICAL|cve|CVE-2021-1675: Print Spooler privilege escalation|Update for x64-based Windows Systems (KB5001716) 8.94.0.0 (fixed in KB5003637)
-CRITICAL|cve|CVE-2021-1675: Print Spooler privilege escalation|Windows 11 Installation Assistant 1.4.19041.5003 (fixed in KB5003637)
-CRITICAL|cve|CVE-2021-1675: Print Spooler privilege escalation|Windows PC Health Check 3.6.2204.08001 (fixed in KB5003637)
-CRITICAL|cve|CVE-2021-1675: Print Spooler privilege escalation|Windows Subsystem for Linux 2.6.3.0 (fixed in KB5003637)
-INFO|config|UAC (User Account Control)|Enabled
-CRITICAL|config|SMBv1 Protocol|Enabled - vulnerable to EternalBlue/WannaCry (MS17-010)
-INFO|config|Auto-Logon|Disabled
-INFO|config|RDP Network Level Authentication|Enabled
-INFO|config|Windows Defender Real-Time Protection|Enabled
-INFO|config|Windows Firewall|Domain profile: Enabled
-INFO|config|Windows Firewall|Private profile: Enabled
-INFO|config|Windows Firewall|Public profile: Enabled
-[result_status] UNDECLARED / UNKNOWN / 
+… 12 of 24 rows shown
+[result_status] UNDECLARED / UNKNOWN
 
 == action=cve_scan
 CRITICAL|cve|CVE-2021-34527: PrintNightmare: RCE via Windows Print Spooler|Microsoft Windows Desktop Runtime - 6.0.11 (x64) 6.0.11.31823 (fixed in KB5004945)
@@ -184,11 +190,8 @@ CRITICAL|cve|CVE-2021-1675: Print Spooler privilege escalation|Microsoft Windows
 CRITICAL|cve|CVE-2021-1675: Print Spooler privilege escalation|Microsoft Windows Desktop Runtime - 6.0.20 (x86) 6.0.20.32621 (fixed in KB5003637)
 CRITICAL|cve|CVE-2021-1675: Print Spooler privilege escalation|Microsoft Windows Desktop Runtime - 8.0.28 (x64) 8.0.28.36119 (fixed in KB5003637)
 CRITICAL|cve|CVE-2021-1675: Print Spooler privilege escalation|Microsoft Windows Desktop Runtime - 8.0.28 (x86) 8.0.28.36119 (fixed in KB5003637)
-CRITICAL|cve|CVE-2021-1675: Print Spooler privilege escalation|Update for x64-based Windows Systems (KB5001716) 8.94.0.0 (fixed in KB5003637)
-CRITICAL|cve|CVE-2021-1675: Print Spooler privilege escalation|Windows 11 Installation Assistant 1.4.19041.5003 (fixed in KB5003637)
-CRITICAL|cve|CVE-2021-1675: Print Spooler privilege escalation|Windows PC Health Check 3.6.2204.08001 (fixed in KB5003637)
-CRITICAL|cve|CVE-2021-1675: Print Spooler privilege escalation|Windows Subsystem for Linux 2.6.3.0 (fixed in KB5003637)
-[result_status] UNDECLARED / UNKNOWN / 
+… 12 of 16 rows shown
+[result_status] UNDECLARED / UNKNOWN
 
 == action=config_scan
 INFO|config|UAC (User Account Control)|Enabled
@@ -199,7 +202,7 @@ INFO|config|Windows Defender Real-Time Protection|Enabled
 INFO|config|Windows Firewall|Domain profile: Enabled
 INFO|config|Windows Firewall|Private profile: Enabled
 INFO|config|Windows Firewall|Public profile: Enabled
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=summary
 summary|TOTAL|24 findings (17 issues)
@@ -208,7 +211,7 @@ summary|HIGH|0
 summary|MEDIUM|0
 summary|LOW|0
 summary|INFO|7
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=inventory
 7-Zip 26.02 (x64)|26.02
@@ -223,24 +226,11 @@ Cities: Skylines II|
 Crusader Kings III|
 DayZ|
 Defraggler|2.22
-Diablo IV|
-DiagnosticsHub_CollectionService|17.14.36412
-Docker Desktop|4.84.0
-Erlang OTP 28.5.0.1 (16.4.0.1)|28.5.0.1
-Flawless Widescreen version 1.0.15|1.0.15
-Football Manager 2024|
-Git|2.54.0
-GitHub CLI|2.89.0
-Google Chrome|149.0.7827.201
-Google Update Helper|1.3.101.0
-HELLDIVERS™ 2|
-Kits Configuration Installer|10.1.26100.7705
-Logi Options+|2.6.944893
-… 25 of 226 rows
-[result_status] UNDECLARED / UNKNOWN / 
+… 12 of 226 rows shown
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 20c66f1c0618
 
 ```
 == action=scan
@@ -252,12 +242,12 @@ INFO|config|System Integrity Protection (SIP)|Enabled
 MEDIUM|config|Application Firewall|Disabled
 MEDIUM|config|Remote Login (SSH)|Enabled - SSH access is open
 INFO|config|Automatic Software Updates|Enabled
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=cve_scan
 HIGH|cve|CVE-2023-24329: urllib.parse URL parsing bypass via leading whitespace|Python 3.9.6 (fixed in 3.11.4)
 MEDIUM|cve|CVE-2024-0450: zipfile quoted-overlap zipbomb protection bypass|Python 3.9.6 (fixed in 3.12.2)
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=config_scan
 INFO|config|Gatekeeper|Enabled - only verified apps can run
@@ -266,7 +256,7 @@ INFO|config|System Integrity Protection (SIP)|Enabled
 MEDIUM|config|Application Firewall|Disabled
 MEDIUM|config|Remote Login (SSH)|Enabled - SSH access is open
 INFO|config|Automatic Software Updates|Enabled
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=summary
 summary|TOTAL|8 findings (4 issues)
@@ -275,7 +265,7 @@ summary|HIGH|1
 summary|MEDIUM|3
 summary|LOW|0
 summary|INFO|4
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=inventory
 App Store|3.0
@@ -290,24 +280,11 @@ Contacts|14.0
 Dictionary|2.3.0
 FaceTime|36
 Find My|4.0
-Font Book|11.0
-Freeform|4.5
-Games|1.0
-Home|10.0
-Image Capture|8.0
-Image Playground|1.0
-Journal|2.0
-Mail|16.0
-Maps|3.0
-Messages|26.0
-Mission Control|1.2
-Music|1.6.6
-ShortcutsActions|
-… 25 of 387 rows
-[result_status] UNDECLARED / UNKNOWN / 
+… 12 of 387 rows shown
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash pending
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 20c66f1c0618
 
 ```
 == action=scan
@@ -321,7 +298,7 @@ MEDIUM|config|SSH Root Login|PermitRootLogin not explicitly set - may default to
 INFO|config|ASLR (Address Space Layout Randomization)|Full randomization enabled (value=2)
 INFO|config|SUID Core Dumps|Restricted (suid_dumpable=0)
 HIGH|config|Firewall|No firewall rules detected - host may be unprotected
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=cve_scan
 HIGH|cve|CVE-2023-24329: urllib.parse URL parsing bypass via leading whitespace|python3-wheel 0.46.1-2 (fixed in 3.11.4)
@@ -330,14 +307,14 @@ CRITICAL|cve|CVE-2024-32002: RCE via crafted repositories with submodules|git 1:
 CRITICAL|cve|CVE-2024-32002: RCE via crafted repositories with submodules|git-man 1:2.47.3-0+deb13u1 (fixed in 2.45.1)
 HIGH|cve|CVE-2023-25652: git apply --reject writes outside worktree|git 1:2.47.3-0+deb13u1 (fixed in 2.40.1)
 HIGH|cve|CVE-2023-25652: git apply --reject writes outside worktree|git-man 1:2.47.3-0+deb13u1 (fixed in 2.40.1)
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=config_scan
 MEDIUM|config|SSH Root Login|PermitRootLogin not explicitly set - may default to prohibit-password
 INFO|config|ASLR (Address Space Layout Randomization)|Full randomization enabled (value=2)
 INFO|config|SUID Core Dumps|Restricted (suid_dumpable=0)
 HIGH|config|Firewall|No firewall rules detected - host may be unprotected
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=summary
 summary|TOTAL|10 findings (8 issues)
@@ -346,7 +323,7 @@ summary|HIGH|4
 summary|MEDIUM|2
 summary|LOW|0
 summary|INFO|2
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 
 == action=inventory
 apt|3.0.3
@@ -361,21 +338,8 @@ binutils-aarch64-linux-gnu|2.44-3
 binutils-common|2.44-3
 bison|2:3.8.2+dfsg-1+b2
 bsdutils|1:2.41.5-0+deb13u1
-ca-certificates|20250419
-cmake|3.31.6-2
-cmake-data|3.31.6-2
-coreutils|9.7-3
-cpp|4:14.2.0-1
-cpp-13|13.3.0-16
-cpp-13-aarch64-linux-gnu|13.3.0-16
-cpp-14|14.2.0-19
-cpp-14-aarch64-linux-gnu|14.2.0-19
-cpp-aarch64-linux-gnu|4:14.2.0-1
-curl|8.14.1-2+deb13u4
-dash|0.5.12-12
-debconf|1.5.91
-… 25 of 206 rows
-[result_status] UNDECLARED / UNKNOWN / 
+… 12 of 206 rows shown
+[result_status] UNDECLARED / UNKNOWN
 ```
 <!-- END GENERATED -->
 
@@ -405,13 +369,9 @@ debconf|1.5.91
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/vuln_scan/src/vuln_scan_plugin.cpp` (descriptor, actions, output) ·
-  `config_checks.hpp` (per-OS compliance checks) · `cve_rules.hpp` (CVE rule table, version
-  comparator)
+- Plugin: `agents/plugins/vuln_scan/src/config_checks.hpp` · `agents/plugins/vuln_scan/src/cve_rules.hpp` · `agents/plugins/vuln_scan/src/vuln_scan_plugin.cpp`
 - Definitions: `content/definitions/vuln_scan.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_a.hpp`
-- Tests: none — no dedicated `vuln_scan` unit-test suite
-- Privilege row: `docs/agent-privilege-model.md` — no row
-- Changelog: `changelog.d/2204-declarations-group-a.added.md` ·
-  `changelog.d/wave4-pr43b-software-actions-license.fixed.md`
+- Tests: none found by name
+- Privilege row: `docs/agent-privilege-model.md` (no row yet)
 <!-- END GENERATED -->

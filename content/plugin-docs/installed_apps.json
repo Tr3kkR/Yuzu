@@ -1,0 +1,742 @@
+{
+  "actions": [
+    {
+      "action": "list",
+      "definition_ids": [
+        "crossplatform.software.inventory"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "dpkg-query/rpm/pacman via bounded argv runner",
+          "rung": "2",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "system_profiler via bounded argv runner",
+          "rung": "2",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "Reg*W enumeration of the Uninstall key(s)",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "list_inventory",
+      "definition_ids": [],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "dpkg-query/rpm/pacman/apk via bounded argv runner",
+          "rung": "2",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "system_profiler + pkgutil via bounded argv runner + native SecCode/CFBundle enrichment",
+          "rung": "2",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "Reg*W enumeration of the Uninstall key(s)",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "list_per_user",
+      "definition_ids": [
+        "crossplatform.software.per_user_inventory"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "dpkg-query/rpm/pacman via bounded argv runner",
+          "rung": "2",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "system_profiler + brew via bounded argv runner",
+          "rung": "2",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "Reg*W enumeration of HKU\\\\<SID>'s Uninstall key, mounting NTUSER.DAT via RegLoadKeyW when not already loaded",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "query",
+      "definition_ids": [
+        "crossplatform.software.query"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "dpkg-query/rpm/pacman via bounded argv runner",
+          "rung": "2",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "system_profiler via bounded argv runner",
+          "rung": "2",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "Reg*W enumeration of the Uninstall key(s)",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    }
+  ],
+  "caveats": [
+    "**Windows `list`/`query` machine scope is invisible to a partial failure.** `enumerate_uninstall_key` returns silently if `RegOpenKeyExW` fails and stops at the first non-`ERROR_SUCCESS` from `RegEnumKeyExW` (`installed_apps_plugin.cpp:312-330`); a partial registry walk still reports success today. `do_list_inventory`'s own comment (`installed_apps_plugin.cpp:817-824`) flags this as pre-existing and needing its own change to close, not something this plugin currently detects.",
+    "**macOS `signature_status` is presence, not validity.** The `#2273` enrichment calls `SecCodeCopySigningInformation` only, never `SecStaticCodeCheckValidity` — a bundle with `Contents/_CodeSignature` deleted, or with bytes appended to its Mach-O, both still read `signed` (`installed_apps_macos_enrich.hpp:13-30`). Deep verification was deliberately left an open decision, not shipped.",
+    "**`list`/`query`/`list_per_user` degrade loudly only on Linux/macOS.** A subprocess that is killed, times out, is truncated, or exits nonzero (outside the tolerated per-ID `pkgutil` lookup) makes these three emit `error|installed_apps: acquisition degraded (...)` and return rc 1 rather than a false-empty/partial list (`installed_apps_plugin.cpp:857-870`). The Windows registry path has no equivalent signal — see caveat 1.",
+    "**`query`'s row omits `install_date`.** `do_query` emits `app|name|version|publisher` (`installed_apps_plugin.cpp:938-940`), one field short of `list`'s `app|name|version|publisher|install_date` (`installed_apps_plugin.cpp:899-902`) — intentional per the YAML contract (`installed_apps.yaml:119-128`), not a truncation bug.",
+    "**The `list_inventory`/`list_per_user` samples were captured under the wrong identity on two of three OSes, and the macOS `list_per_user` `[rc] 1` traces to that.** macOS ran unprivileged (`euid 501`) and Linux ran as root inside a container (`euid 0`); neither matches the agent's actual production identity (root today on macOS, the intended `_yuzu` account on Linux) — see *Privileges and prerequisites*. On macOS, `do_list_per_user` first lists system apps via `system_profiler` (succeeds), then probes for Homebrew and, if found, runs `brew list --versions` (`installed_apps_plugin.cpp:1162-1165`); under the euid-501 capture identity that `brew` invocation exits nonzero, `run_tool` marks it `degraded` on any nonzero exit (`installed_apps_plugin.cpp:186-188`), and `report_if_degraded` then emits the `error|...` row and returns rc 1 (`installed_apps_plugin.cpp:857-870`, called at `:1166-1167`) — the traced cause of the sample's `[rc] 1`, not an unrelated fault."
+  ],
+  "definitions": [
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Enumerates all installed applications on the endpoint. On Windows, reads the registry Uninstall keys (64-bit HKLM, 32-bit WoW64, and HKCU), deduplicates by name+version, and skips system components. The HKCU read is the AGENT SERVICE ACCOUNT's own hive, not a logged-in user's: the agent runs as a system-context service (LocalSystem today, see #1442), so HKCU resolves to that account's profile and carries no end-user applications. This is deliberate machine scope, not a gap -- per-user applications are a separate action (list_per_user) that this one never invokes. On Linux, auto-detects the package manager (dpkg, rpm, or pacman). On macOS, queries system_profiler for GUI applications. Returns application name, version, publisher, and install date.",
+      "display_name": "List Installed Applications",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 300
+      },
+      "id": "crossplatform.software.inventory",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Enumerates installed applications on a per-user basis. On Windows, iterates user profiles and reads each user's Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall -- from the LIVE HKEY_USERS\\<SID> hive when that user is logged in, falling back to an offline mount of their NTUSER.DAT only when it is not loaded. On Linux, reports system-wide packages (dpkg/rpm). On macOS, reports system apps plus per-user Homebrew packages. Output includes the username (or \"system\") alongside each application record.",
+      "display_name": "Per-User Installed Applications",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 600
+      },
+      "id": "crossplatform.software.per_user_inventory",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Searches for a specific installed application by case-insensitive partial name match. Returns a found/not-found indicator followed by matching application records. Useful for compliance checks (e.g. verifying a required security agent is installed) and license auditing.",
+      "display_name": "Query Installed Application",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 300
+      },
+      "id": "crossplatform.software.query",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    }
+  ],
+  "description": "Inventories installed applications and queries by name",
+  "how_it_works": "`list`/`query` read the OS's native application registry: Windows enumerates the Uninstall keys (64-bit HKLM, WoW64 HKLM, and the agent's own HKCU) natively via `Reg*W`; Linux auto-detects dpkg/rpm/pacman; macOS shells out to `system_profiler SPApplicationsDataType`. `query` never re-acquires — it filters the same collection with a case-insensitive substring match and emits a `found|true`/`found|false` discriminator. `list_per_user` is the real per-user surface: on Windows it walks every local profile's registry hive via the shared `win_profiles.hpp` ladder, mounting `NTUSER.DAT` offline when a profile isn't already loaded; Linux/macOS instead report the same system-wide set tagged `username=system`, and macOS additionally runs `brew list --versions` under the calling account. `list_inventory` is a separate acquisition — the ADR-0016 daily-sync collector — emitting an extended 12-field row where a field an ecosystem doesn't store stays honestly empty (never a `-` placeholder), and on macOS it additionally performs a native, budget-capped CFBundle/SecStaticCode enrichment per app for publisher and signature *presence*. The plugin is read-only throughout: it never installs, removes, or verifies a package's cryptographic validity.",
+  "inputs": [
+    {
+      "constraints": {
+        "maxLength": 256,
+        "minLength": 1
+      },
+      "default": null,
+      "definition_id": "crossplatform.software.query",
+      "description": "Case-insensitive substring to match against installed application names. All apps whose name contains this string are returned.\n",
+      "name": "name",
+      "required": true,
+      "type": "string"
+    }
+  ],
+  "kind": {
+    "collector": true,
+    "gathered": true,
+    "mutating": false
+  },
+  "leg_hash": "47e1dd9008d0",
+  "manifest_version": 1,
+  "name": "installed_apps",
+  "outputs": [
+    {
+      "columns": [
+        {
+          "description": "The application's display name as read from the OS-native registry or package database. Values: free text.",
+          "example": "7-Zip 26.02 (x64)",
+          "name": "name",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The installed version string, or \"-\" when the source reports none. Values: free text or \"-\".",
+          "example": "26.02",
+          "name": "version",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The vendor or maintainer name; always \"-\" on macOS, since system_profiler's mini detail carries no publisher field. Values: free text or \"-\".",
+          "example": "Igor Pavlov",
+          "name": "publisher",
+          "platforms": [
+            "windows",
+            "linux"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Install date in the OS's native format (Windows registry InstallDate, rpm's formatted install time); \"-\" when the source reports none, which dpkg-based Linux hosts always do. Values: free text or \"-\".",
+          "example": "20260617",
+          "name": "install_date",
+          "platforms": [
+            "windows",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.software.inventory"
+    },
+    {
+      "columns": [
+        {
+          "description": "The resolved local profile name on Windows (never the SID), the literal \"system\" for the machine-scope Linux/macOS leg, or \"brew\" for macOS per-user Homebrew formulae. Values: profile name, \"system\", \"brew\", or \"-\".",
+          "example": "Alex",
+          "name": "username",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The application's display name. Values: free text.",
+          "example": "Signal 8.18.0",
+          "name": "name",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The installed version string, or \"-\" when the source reports none. Values: free text or \"-\".",
+          "example": "8.18.0",
+          "name": "version",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The vendor or maintainer name; always \"-\" on macOS and for Homebrew rows. Values: free text or \"-\".",
+          "example": "Signal Messenger, LLC",
+          "name": "publisher",
+          "platforms": [
+            "windows",
+            "linux"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Install date in the OS's native format; \"-\" when the source reports none, which dpkg-based Linux hosts and Homebrew rows always do. Values: free text or \"-\".",
+          "example": "20260714",
+          "name": "install_date",
+          "platforms": [
+            "windows",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.software.per_user_inventory"
+    },
+    {
+      "columns": [
+        {
+          "description": "Whether at least one installed application matched the search string. Values: true, false.",
+          "example": "true",
+          "name": "found",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "bool",
+          "values": null
+        },
+        {
+          "description": "The matching application's display name. Values: free text.",
+          "example": "Microsoft Edge",
+          "name": "name",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The matching application's installed version string, or \"-\" when the source reports none. Values: free text or \"-\".",
+          "example": "152.0.4191.66",
+          "name": "version",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The vendor or maintainer name; always \"-\" on macOS, since system_profiler's mini detail carries no publisher field. Values: free text or \"-\".",
+          "example": "Microsoft Corporation",
+          "name": "publisher",
+          "platforms": [
+            "windows",
+            "linux"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.software.query"
+    }
+  ],
+  "outputs_note": "Pipe-delimited rows, one per application, written via `write_output()`. `list`/`query`/`list_per_user` emit the stable `app`/`app`/`user_app`-tagged wire format `content/definitions/installed_apps.yaml` documents; `-` marks a field the OS reported empty. `list_inventory` emits a separate, extended `inv`-tagged 12-field row (blob contract v2, ADR-0016) where a field an ecosystem does not store stays *honestly empty* — never a `-` placeholder (`installed_apps_inventory.hpp:6-11`).\n\n\n\n**Empty-result convention.** `list_inventory` drops a row outright if `name` is empty (`installed_apps_plugin.cpp:845-847`); there is no sentinel row, so an empty collection is empty output at rc 0. A *degraded* collection instead returns rc 1 (`installed_apps_plugin.cpp:834-841`) and the daily sync skips the whole cycle rather than committing a partial inventory as authoritative.",
+  "platforms": {
+    "linux": "supported",
+    "macos": "supported",
+    "windows": "supported"
+  },
+  "privileges": [
+    {
+      "grant": "**None** for `list`/`query`/`list_inventory` — `Reg*W` reads only. `list_per_user`'s offline `NTUSER.DAT` mount fallback rides `SeBackupPrivilege` + `SeRestorePrivilege`, already held by the agent account (`docs/agent-privilege-model.md:87`) — no new privilege is introduced.",
+      "if_refused": "`warning|privilege_missing: SeBackupPrivilege/SeRestorePrivilege could not be enabled for N logged-out profile(s); their per-user apps are not listed` (`installed_apps_plugin.cpp:1123-1128`); machine-scope actions still report",
+      "measured": "2026-09-07, bare-metal, as `SYSTEM` (`windows.txt:1`)",
+      "os": "Windows",
+      "runs_as": "agent service account — LocalSystem today, not the intended virtual service account (`docs/agent-privilege-model.md` Correction, #1442)"
+    },
+    {
+      "grant": "**None** — `docs/agent-privilege-model.md:86` lists `list`/`query`/`list_inventory` as `default`; no keychain/TCC/Location Services grant is touched",
+      "if_refused": "n/a — no privilege is required; a Security framework absent at build time silently no-ops the `#2273` enrichment (empty `publisher`/`signature_status`) rather than refusing (`meson.build:15-23`)",
+      "measured": "2026-09-07, bare-metal, euid 501 (`alex`) (`macos.txt:1`) — captured unprivileged, not the daemon's real root identity",
+      "os": "macOS",
+      "runs_as": "agent daemon — root today (LaunchDaemon carries no `UserName` key; not yet narrowed to the unprivileged `_yuzu` account, #1455)"
+    },
+    {
+      "grant": "**None** — `docs/agent-privilege-model.md:86` lists all four actions as `default`; the dpkg/rpm/pacman/apk databases are world-readable",
+      "if_refused": "n/a — no privilege is required; a missing package-manager binary falls through the ladder and `probe_tool_path` returns empty, yielding an empty (not degraded) collection (`installed_apps_plugin.cpp:400-446`)",
+      "measured": "2026-09-06, container, euid 0 (`linux.txt:1`) — captured as root, not the intended unprivileged account",
+      "os": "Linux",
+      "runs_as": "agent daemon, intended dedicated unprivileged account (`_yuzu`/`yuzu`)"
+    }
+  ],
+  "readme": "agents/plugins/installed_apps/README.md",
+  "result_status": [],
+  "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "list",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 206,
+          "rows": [
+            "app|apt|3.0.3|APT Development Team <deity@lists.debian.org>|-",
+            "app|autoconf|2.72-3.1|Alex Myczko <tar@debian.org>|-",
+            "app|automake|1:1.17-4|Eric Dorland <eric@debian.org>|-",
+            "app|autotools-dev|20240727.1|Henrique de Moraes Holschuh <hmh@debian.org>|-",
+            "app|base-files|13.8+deb13u6|Santiago Vila <sanvila@debian.org>|-"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "query",
+          "not_captured": null,
+          "params": "name=bash",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "found|true",
+            "app|bash|5.2.37-2+b9|Matthias Klose <doko@debian.org>"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "list_per_user",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 206,
+          "rows": [
+            "user_app|system|apt|3.0.3|APT Development Team <deity@lists.debian.org>|-",
+            "user_app|system|autoconf|2.72-3.1|Alex Myczko <tar@debian.org>|-",
+            "user_app|system|automake|1:1.17-4|Eric Dorland <eric@debian.org>|-",
+            "user_app|system|autotools-dev|20240727.1|Henrique de Moraes Holschuh <hmh@debian.org>|-",
+            "user_app|system|base-files|13.8+deb13u6|Santiago Vila <sanvila@debian.org>|-"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "list_inventory",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 206,
+          "rows": [
+            "inv|apt|3.0.3|APT Development Team <deity@lists.debian.org>||package|deb|||arm64||debian|13",
+            "inv|autoconf|2.72|Alex Myczko <tar@debian.org>||package|deb||3.1|all||debian|13",
+            "inv|automake|1.17|Eric Dorland <eric@debian.org>||package|deb|1|4|all||debian|13",
+            "inv|autotools-dev|20240727.1|Henrique de Moraes Holschuh <hmh@debian.org>||package|deb|||all||debian|13",
+            "inv|base-files|13.8+deb13u6|Santiago Vila <sanvila@debian.org>||package|deb|||arm64||debian|13"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-06",
+        "host_class": "container",
+        "leg_hash": "47e1dd9008d0",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    },
+    "macos": {
+      "actions": [
+        {
+          "action": "list",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 322,
+          "rows": [
+            "app|50onPaletteServer|1.1.0|-|13/08/2026, 03:51",
+            "app|ABAssistantService|14.0|-|13/08/2026, 03:51",
+            "app|AMSEngagementViewService|1.0|-|13/08/2026, 03:51",
+            "app|AOSAlertManager|1.07|-|13/08/2026, 03:51",
+            "app|AOSHeartbeat|1.07|-|13/08/2026, 03:51"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "query",
+          "not_captured": null,
+          "params": "name=bash",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "found|false"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "list_per_user",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 323,
+          "rows": [
+            "user_app|system|50onPaletteServer|1.1.0|-|13/08/2026, 03:51",
+            "user_app|system|ABAssistantService|14.0|-|13/08/2026, 03:51",
+            "user_app|system|AMSEngagementViewService|1.0|-|13/08/2026, 03:51",
+            "user_app|system|AOSAlertManager|1.07|-|13/08/2026, 03:51",
+            "user_app|system|AOSHeartbeat|1.07|-|13/08/2026, 03:51"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "list_inventory",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 390,
+          "rows": [
+            "inv|App Store|3.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||",
+            "inv|Apps|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||",
+            "inv|Automator|2.10|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||",
+            "inv|Books|8.5|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||",
+            "inv|Calculator|12.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "47e1dd9008d0",
+        "os": "macos",
+        "os_version": "macOS 26.6.2 arm64",
+        "privilege": "euid 501 (alex)"
+      }
+    },
+    "windows": {
+      "actions": [
+        {
+          "action": "list",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 226,
+          "rows": [
+            "app|7-Zip 26.02 (x64)|26.02|Igor Pavlov|-",
+            "app|Age of Empires II: Definitive Edition|-|Forgotten Empires|-",
+            "app|Application Verifier x64 External Package (DesktopEditions)|10.1.26100.7705|Microsoft|20260617",
+            "app|Application Verifier x64 External Package (OnecoreUAP)|10.1.26100.7705|Microsoft|20260617",
+            "app|Baldur's Gate 3|-|Larian Studios|-"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "query",
+          "not_captured": null,
+          "params": "name=Microsoft",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 57,
+          "rows": [
+            "found|true",
+            "app|Microsoft .NET Host - 6.0.11 (x64)|48.47.50420|Microsoft Corporation",
+            "app|Microsoft .NET Host - 6.0.20 (x86)|48.83.63169|Microsoft Corporation",
+            "app|Microsoft .NET Host - 8.0.28 (x64)|64.112.53549|Microsoft Corporation",
+            "app|Microsoft .NET Host - 8.0.28 (x86)|64.112.53549|Microsoft Corporation"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "list_per_user",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 10,
+          "rows": [
+            "user_app|Alex|Signal 8.18.0|8.18.0|Signal Messenger, LLC|-",
+            "user_app|Alex|Discord|1.0.9255|Discord Inc.|20212118",
+            "user_app|Alex|NordPass|7.9.5|NordPass Team|-",
+            "user_app|Alex|Inno Setup version 6.7.3|6.7.3|jrsoftware.org|20260714",
+            "user_app|Alex|ninja|1.13.2|ninja-build|20260617"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "list_inventory",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 226,
+          "rows": [
+            "inv|7-Zip 26.02 (x64)|26.02|Igor Pavlov||app|windows||||||",
+            "inv|Age of Empires II: Definitive Edition||Forgotten Empires||app|windows||||||",
+            "inv|Application Verifier x64 External Package (DesktopEditions)|10.1.26100.7705|Microsoft|20260617|app|windows||||||",
+            "inv|Application Verifier x64 External Package (OnecoreUAP)|10.1.26100.7705|Microsoft|20260617|app|windows||||||",
+            "inv|Baldur's Gate 3||Larian Studios||app|windows||||||"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "47e1dd9008d0",
+        "os": "windows",
+        "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
+        "privilege": "SYSTEM"
+      }
+    }
+  },
+  "security": [
+    {
+      "action": "list",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Inventory"
+    },
+    {
+      "action": "query",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Inventory"
+    },
+    {
+      "action": "list_per_user",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Inventory"
+    },
+    {
+      "action": "list_inventory",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Inventory"
+    }
+  ],
+  "source": {
+    "capability_rows": [
+      "server/core/src/capability_decls/plugin_action_catalogue_b.hpp"
+    ],
+    "changelog": [],
+    "definitions": [
+      "content/definitions/installed_apps.yaml"
+    ],
+    "plugin": [
+      "agents/plugins/installed_apps/src/installed_apps_inventory.hpp",
+      "agents/plugins/installed_apps/src/installed_apps_macos_enrich.hpp",
+      "agents/plugins/installed_apps/src/installed_apps_parsers.hpp",
+      "agents/plugins/installed_apps/src/installed_apps_plugin.cpp",
+      "agents/plugins/installed_apps/src/installed_apps_registry_utf8.hpp"
+    ],
+    "privilege_row": true,
+    "tests": [
+      "tests/unit/test_installed_apps_actions.cpp",
+      "tests/unit/test_installed_apps_inventory.cpp",
+      "tests/unit/test_installed_apps_macos_enrich.cpp",
+      "tests/unit/test_installed_apps_parsers.cpp",
+      "tests/unit/test_installed_apps_registry_utf8.cpp"
+    ]
+  },
+  "version": "1.1.0",
+  "where_the_data_goes": [
+    "**Instruction result.** `list`/`query`/`list_per_user` rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (operator-configurable retention, 90-day default — `server.hpp:222`), queryable at `/api/responses/{id}`.",
+    "**Daily-sync typed store.** `list_inventory` is never dispatched through `execute_instruction` — it has no definition. The agent's own `SyncSource` (`make_installed_software_source`, `sync_source_installed_software.cpp:181-199`) runs it every 24 hours, canonicalizes the parsed rows into a hash-skip blob, and pushes it to the server's typed `SoftwareInventoryStore` (ADR-0016), served fleet-wide at `GET /api/v1/inventory/software` (`rest_api_v1.cpp:6800`), gated on `Inventory:Read`.",
+    "**Not consumed by** TAR, DEX, or metrics — no reference to `installed_apps`/`crossplatform.software.*` was found in the TAR or DEX collector sources.",
+    "**Sensitivity.** `list_per_user`/`list_inventory` rows carry per-account software names/versions/publishers, and `list_per_user`'s `username` field is a resolved local account name (not a raw SID) — a per-person installed-software inventory; `list`/`query`/`list_inventory` alone already name specific installed software (`name`/`version`/`publisher`) even at machine scope.",
+    "**Siblings:** `msi_packages.*` (Windows-only MSI package detail) and `license_scan.list` (software-licence/entitlement detection) — grouped alongside `installed_apps` in the privilege matrix's read-only row (`docs/agent-privilege-model.md:86`).",
+    "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"crossplatform.software.inventory\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}` for `list`/`query`/`list_per_user`; `list_inventory`'s daily-sync output instead lands at `GET /api/v1/inventory/software`, since it carries no definition and is never dispatched through `execute_instruction`."
+  ]
+}

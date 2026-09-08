@@ -5,11 +5,11 @@
 |---|---|
 | **What it does** | Network actions — DNS flush and ping |
 | **Version** | 0.1.0 |
-| **Kind** | Action · read-only \| mutating · on-demand (no scheduled gather) |
-| **Platforms** | Windows ✅ · macOS ✅ · Linux 🟡 constrained |
+| **Kind** | Action · mutating · gathered (device.network_actions.flush_dns, device.network_actions.ping) |
+| **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
 | **Actions** | `flush_dns` (definition `device.network_actions.flush_dns`) · `ping` (definition `device.network_actions.ping`) |
-| **Security** | `flush_dns`: securable `Infrastructure` · operation Write · risk Medium · dispatch Mutating · approval gate AdminOrApproval<br>`ping`: securable `Infrastructure` · operation Read · risk Low · dispatch ReadOnly · approval gate AdminOrApproval |
-| **Roles** | execute: endpoint-admin (`flush_dns`) / endpoint-admin, endpoint-operator (`ping`) · author: content-author |
+| **Security** | `flush_dns`: securable `Infrastructure` · operation Write · risk Medium · dispatch Mutating · approval gate AdminOrApproval; `ping`: securable `Infrastructure` · operation Read · risk Low · dispatch ReadOnly · approval gate AdminOrApproval |
+| **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
 
 ## How it works
@@ -31,10 +31,10 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `flush_dns` | ✅ supported · rung 2 · `ipconfig` via bounded argv runner | ✅ supported · rung 2 · `dscacheutil` + `killall` via bounded argv runner (sudo -n) | 🟡 constrained · rung 2 · `resolvectl`/`systemd-resolve` via bounded argv runner (sudo -n) |
-| `ping` | ✅ supported · rung 2 · system `ping.exe` via bounded argv runner | ✅ supported · rung 2 · system `ping` via bounded argv runner | ✅ supported · rung 2 · system `ping` via bounded argv runner |
+| `flush_dns` | ✅ supported · rung 2 · ipconfig via bounded argv runner | ✅ supported · rung 2 · dscacheutil + killall via bounded argv runner (sudo -n) | 🟡 constrained · rung 2 · resolvectl/systemd-resolve via bounded argv runner (sudo -n) |
+| `ping` | ✅ supported · rung 2 · system ping.exe via bounded argv runner | ✅ supported · rung 2 · system ping via bounded argv runner | ✅ supported · rung 2 · system ping via bounded argv runner |
 
-**Declared limits per leg** (the descriptor's fallback text, verbatim):
+**Declared limits per leg** (descriptor fallback text, verbatim):
 
 - **`flush_dns` / Linux** — requires resolvectl (systemd-resolved) or the legacy systemd-resolve CLI; an honest failure is reported if neither is present
 <!-- END GENERATED -->
@@ -43,9 +43,9 @@ flowchart LR
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | agent service account (LocalSystem today, #1442) | **None.** `ipconfig.exe` and `PING.EXE` are probed at their fixed `System32` paths and run unprivileged; no elevated cmdlet is used. | 2026-09-07, bare-metal Windows 10.0.26200, SYSTEM | a spawn/deadline/signal failure reports `CONSTRAINED`/`UNAVAILABLE` via `forward_runner_failure`; a nonzero exit reports `status|error` |
-| macOS | agent daemon (measured unprivileged) | **`sudo -n` NOPASSWD grants** for `/usr/bin/dscacheutil -flushcache` and `/usr/bin/killall -HUP mDNSResponder`, installed by `install-agent-user.sh`; skipped only when the agent is already root. | 2026-09-07, bare-metal macOS 26.6.2, euid 501 (alex) | a missing/refused sudo grant reports `status|error` plus a `detail|dscacheutil: ...` / `detail|mDNSResponder: ...` line carrying the captured command output |
-| Linux | agent daemon | **`sudo -n` NOPASSWD grants** for `/usr/bin/systemd-resolve --flush-caches` and `/usr/bin/resolvectl flush-caches`, installed by `install-agent-user.sh`; skipped only when the agent is already root. | 2026-09-06, container Debian GNU/Linux 13 (trixie), euid 0 | neither tool found, or both found and fail: `status|error`, `output|neither resolvectl nor systemd-resolve found` |
+| Windows | agent service account (LocalSystem today, #1442) | **None.** `ipconfig.exe` and `PING.EXE` are probed at their fixed `System32` paths and run unprivileged; no elevated cmdlet is used. | 2026-09-07, bare-metal Windows 10.0.26200, SYSTEM | a spawn/deadline/signal failure reports `CONSTRAINED`/`UNAVAILABLE` via `forward_runner_failure`; a nonzero exit reports `status\|error` |
+| macOS | agent daemon (measured unprivileged) | **`sudo -n` NOPASSWD grants** for `/usr/bin/dscacheutil -flushcache` and `/usr/bin/killall -HUP mDNSResponder`, installed by `install-agent-user.sh`; skipped only when the agent is already root. | 2026-09-07, bare-metal macOS 26.6.2, euid 501 (alex) | a missing/refused sudo grant reports `status\|error` plus a `detail\|dscacheutil: ...` / `detail\|mDNSResponder: ...` line carrying the captured command output |
+| Linux | agent daemon | **`sudo -n` NOPASSWD grants** for `/usr/bin/systemd-resolve --flush-caches` and `/usr/bin/resolvectl flush-caches`, installed by `install-agent-user.sh`; skipped only when the agent is already root. | 2026-09-06, container Debian GNU/Linux 13 (trixie), euid 0 | neither tool found, or both found and fail: `status\|error`, `output\|neither resolvectl nor systemd-resolve found` |
 
 Subprocesses: `ipconfig.exe` / `PING.EXE` (Windows), `dscacheutil` / `killall` / `ping` (macOS), `resolvectl` / `systemd-resolve` / `ping` (Linux) — all spawned through the shared bounded argv runner (`run_bounded_subprocess`). Network: `ping` / `ping.exe` sends ICMP echo requests to the operator-supplied `host`. No direct socket or file-store access.
 
@@ -54,12 +54,10 @@ Subprocesses: `ipconfig.exe` / `PING.EXE` (Windows), `dscacheutil` / `killall` /
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-| Definition | Parameter | Type | Required | Default | Values | Description |
+| Definition | Parameter | Type | Required | Default | Constraints | Description |
 |---|---|---|---|---|---|---|
-| `device.network_actions.ping` | `host` | string | yes | - | pattern `^[a-zA-Z0-9.:\-]+$`, 1-253 chars | Hostname or IP address to ping; alphanumeric, dots, hyphens, and colons only |
-| `device.network_actions.ping` | `count` | string | no | `"4"` | pattern `^[0-9]+$` | Number of ICMP echo requests to send |
-
-`flush_dns` takes no parameters.
+| `device.network_actions.ping` | `host` | string | yes | - | pattern: ^[a-zA-Z0-9.:\-]+$ · minLength 1 · maxLength 253 | Hostname or IP address to ping. Must contain only alphanumeric characters, dots, hyphens, and colons. Maximum length 253 characters. |
+| `device.network_actions.ping` | `count` | string | no | 4 | pattern: ^[0-9]+$ | Number of ICMP echo requests to send. Must be a positive integer. Defaults to 4 if not specified. |
 <!-- END GENERATED -->
 
 ### Outputs
@@ -67,18 +65,18 @@ Subprocesses: `ipconfig.exe` / `PING.EXE` (Windows), `dscacheutil` / `killall` /
 Each output is one `write_output()` call, one field per line as `<field>|<value>` — not a single multi-field pipe row per record. `flush_dns` emits a `status|ok`/`status|error` line and an `output|<captured text>` line, and on a failed macOS run adds a `detail|dscacheutil: ...` and/or `detail|mDNSResponder: ...` line carrying the raw command output for diagnosis. `ping` emits one `output|<line>` row per line of the system ping tool's stdout; a validation failure (missing/invalid `host`, non-numeric `count`) short-circuits before any subprocess runs and instead emits a single `error|<message>` line that is outside the declared result schema.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`flush_dns` — one `status|<value>` line, one `output|<value>` line, and (macOS failure only) a `detail|<value>` line**
+**`device.network_actions.flush_dns` — `status|output`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `status` | enum | `ok` `error` | W, M, L | `ok` |
-| `output` | string | captured stdout+stderr of the underlying command(s), merged; macOS formats it as `dscacheutil rc={} mDNSResponder rc={}` | W, M, L | `dscacheutil rc={} mDNSResponder rc={}` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `status` | string | - | Windows, Linux, macOS | `ok` | Whether the flush succeeded ("ok") or failed ("error"); reflects the real exit code(s) of the underlying command(s), never a blind success. Values: ok, error. |
+| `output` | string | - | Windows, Linux, macOS | `dscacheutil rc={} mDNSResponder rc={}` | Captured stdout+stderr of the underlying flush command(s), merged. On macOS this is a fixed "dscacheutil rc={} mDNSResponder rc={}" summary; on Windows and Linux it is the raw captured command output. Values: free text. |
 
-**`ping` — one `output|<line>` line per line of raw ping-tool output**
+**`device.network_actions.ping` — `output`**
 
-| Field | Type | Values | Available | Example |
-|---|---|---|---|---|
-| `output` | string | free text; one raw line of the system ping tool's stdout | W, M, L | `PING 127.0.0.1 (127.0.0.1): 56 data bytes` |
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `output` | string | - | Windows, Linux, macOS | `PING 127.0.0.1 (127.0.0.1): 56 data bytes` | One raw line of the system ping tool's stdout, emitted per line of output. Not present when host/count validation fails — that path emits a single "error\|<message>" line instead, outside this schema. Values: free text (raw ping-tool output). |
 <!-- END GENERATED -->
 
 ### Result status
@@ -87,7 +85,7 @@ Each output is one `write_output()` call, one field per line as `<field>|<value>
 |---|---|---|---|
 | `OK` | — | — | subprocess exited normally (success or nonzero exit) — `execute()` owns exit-code semantics and never calls `set_result_status`; both `ping` samples show this as the agent's default `UNDECLARED / UNKNOWN` |
 | `UNAVAILABLE` | PARTIAL | `subprocess_runner:spawn_error` | the tool binary was not found or the runner failed to spawn it — the Linux `ping` sample hit this: `UNAVAILABLE / PARTIAL / subprocess_runner:spawn_error`, `[rc] 1` |
-| `CONSTRAINED` | PARTIAL | `subprocess_runner:deadline` / `:cancelled` / `:signaled` | the 10-second per-call deadline elapsed, the runner was cancelled, or the child was signaled |
+| `CONSTRAINED` | PARTIAL | `subprocess_runner:deadline` / `subprocess_runner:cancelled` / `subprocess_runner:signaled` | the 10-second per-call deadline elapsed, the runner was cancelled, or the child was signaled |
 | `OK` | PARTIAL | `subprocess_runner:line_limit` | the runner SIGKILLed a still-producing child once its output line cap was reached |
 
 On a normal subprocess exit, `classify_runner_failure` returns `nullopt` and `execute()` never calls `set_result_status` at all — the agent then records the default `UNDECLARED`/`UNKNOWN`, exactly what both `ping` samples show.
@@ -96,13 +94,14 @@ On a normal subprocess exit, `classify_runner_failure` returns `nullopt` and `ex
 
 - **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. The dashboard renders `network_actions` as a generic key-value table (Agent/Key/Value), and a legacy static action-description registry names both actions for that rendering.
 - **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics. Nothing runs on a schedule; the plugin executes only when an operator or workflow dispatches one of its two definitions.
+- **Sensitivity.** `ping`'s `output` rows echo the operator-supplied `host` back verbatim in the tool's own text (an IP or hostname the operator chose, not one discovered from the device); `flush_dns`'s `output`/`detail` rows carry only command exit codes and generic tool diagnostics. Neither action's rows name a person, an account, or installed software.
 - **Siblings:** `network.probe.icmp` (netprobe's read-only ICMP probe, an alternative mechanism to `ping`), `device.wol.check` (also performs ICMP as part of wake verification), `device.network_config.dns_cache` (the macOS DNS-honesty sibling that reports the resolver cache contents `flush_dns` clears).
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("device.network_actions.ping")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash pending
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash a44c8631e3c1
 
 ```
 == action=flush_dns
@@ -118,10 +117,10 @@ output|Ping statistics for 127.0.0.1:
 output|    Packets: Sent = 4, Received = 4, Lost = 0 (0% loss),
 output|Approximate round trip times in milli-seconds:
 output|    Minimum = 0ms, Maximum = 0ms, Average = 0ms
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash pending
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash a44c8631e3c1
 
 ```
 == action=flush_dns
@@ -136,10 +135,10 @@ output|64 bytes from 127.0.0.1: icmp_seq=3 ttl=64 time=0.137 ms
 output|--- 127.0.0.1 ping statistics ---
 output|4 packets transmitted, 4 packets received, 0.0% packet loss
 output|round-trip min/avg/max/stddev = 0.063/0.118/0.146/0.033 ms
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash pending
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash a44c8631e3c1
 
 ```
 == action=flush_dns
@@ -162,10 +161,9 @@ output|round-trip min/avg/max/stddev = 0.063/0.118/0.146/0.033 ms
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/network_actions/src/network_actions_plugin.cpp` (descriptor + execute) · `network_actions_parsers.hpp` (pure DNS-flush retry decision) · `agents/plugins/network_actions/meson.build`
+- Plugin: `agents/plugins/network_actions/src/network_actions_parsers.hpp` · `agents/plugins/network_actions/src/network_actions_plugin.cpp`
 - Definitions: `content/definitions/network_actions.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_c.hpp`
 - Tests: `tests/unit/test_network_actions_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/20260818-wave2-network-actions-wol-services-native-argv.changed.md` · `changelog.d/2204-declarations-group-c.added.md` · `changelog.d/2211-macos-dns-honesty.added.md`
 <!-- END GENERATED -->
