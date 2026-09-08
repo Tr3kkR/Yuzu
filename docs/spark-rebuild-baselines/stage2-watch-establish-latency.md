@@ -45,13 +45,13 @@ run on Windows." That verification is exactly what the pending DGRHP pass is for
 | R2 | Registry, target absent, ancestor walk depth 6, default pool | n=200, per-call + per-level |
 | R3 | R1 sequence under hive load (200 churn watches, private pool) | n=200 |
 | R4 | R2 sequence under hive load | n=200 |
-| R5 | `WaitForThreadpoolWaitCallbacks(TRUE)` drain, idle vs. a 50ms in-flight callback | n=200 idle / n=20 in-flight |
-| R6 | `REG_NOTIFY_THREAD_AGNOSTIC` correctness control (positive + negative) | 1 each, characterization not a stats sample |
+| R5 | `WaitForThreadpoolWaitCallbacks(TRUE)` drain, idle vs. a 50ms in-flight callback (started-handshake before timing; a not-started-within-1s count is reported separately) | n=200 idle / n=200 in-flight |
+| R6 | `REG_NOTIFY_THREAD_AGNOSTIC` correctness control - positive (asserted) + negative (before-write/after-write, distinguishing a thread-exit artifact from a real write) | 1 each, characterization not a stats sample |
 | S1 | `OpenSCManagerW(SC_MANAGER_CONNECT)` + close | n=200 |
-| S2 | `OpenServiceW` + `NotifyServiceStatusChangeW` across the real service list (`EnumServicesStatusExW`-cycled) | n=200, `GetLastError()` captured same-thread |
-| S3 | S2 sequence under SCM load (two background OpenSCManagerW-churn threads) | n=200 |
+| S2 | `OpenServiceW` + `NotifyServiceStatusChangeW` across the real service list (`EnumServicesStatusExW`-cycled, `resume` reset before the real call) | n=200, `GetLastError()` captured same-thread |
+| S3 | S2's full open+notify sequence under SCM load (two background OpenSCManagerW-churn threads); `resume` reset matches S2 | n=200 |
 | F1 | `is_directory` + `CreateFileW(BACKUP\|OVERLAPPED)` sanity, local temp dir | n=200 |
-| post-fix-cost | Bulk `SparkEngine::arm()` of N=200 Registry keys, TODAY's (pre-PR-B) baseline | N=200, wall-clock total + per-arm split |
+| post-fix-cost | Bulk `SparkEngine::arm()`, TODAY's (pre-PR-B) baseline, one series per mechanism: Registry initial arm (N=200 distinct keys), Registry RE-arm (value-write on all 200, wall-clock to observe all 200 fires), File (N=200 distinct real local dirs), Service (up to N=200, cycling the host's real service list - reports explicitly if the list is shorter than 200, since a wrap makes later arms coalescing re-arms of an already-held key, not fresh arms; arm failures skipped and excluded from the timing series) | N=200 per series, wall-clock total + per-op split |
 
 ## D derivation formula (to apply once real numbers exist)
 
