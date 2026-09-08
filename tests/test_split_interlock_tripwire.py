@@ -92,7 +92,16 @@ def _git_grep_hits(regex: str, search_paths: list[str], exclude_paths: list[str]
     return [ln for ln in proc.stdout.splitlines() if ln.strip()]
 
 
-def main(ledger_path: str = LEDGER) -> int:
+# Distinct exit codes so a caller (the self-test) can tell a DETECTED violation
+# from a crash on malformed input — a bare traceback also exits 1, which would
+# otherwise be indistinguishable from a real detection. CI treats any non-zero as
+# a failed gate, so this split changes no gating behaviour, only diagnosability.
+EXIT_PASS = 0
+EXIT_VIOLATION = 1
+EXIT_ERROR = 2
+
+
+def _check(ledger_path: str) -> int:
     with open(ledger_path, encoding="utf-8") as fh:
         ledger = json.load(fh)
 
@@ -168,11 +177,22 @@ def main(ledger_path: str = LEDGER) -> int:
             "and docs/adr/0032-use-case-admission-protocol.md.",
             file=sys.stderr,
         )
-        return 1
+        return EXIT_VIOLATION
 
     state = "OPEN (all of a-d+h green)" if gate_open else f"CLOSED (red: {', '.join(red_gate_cells)})"
     print(f"split interlock tripwire: OK — merge-gate {state}; no engine-path marker breached it.")
-    return 0
+    return EXIT_PASS
+
+
+def main(ledger_path: str = LEDGER) -> int:
+    """Run the checks; return EXIT_ERROR (not EXIT_VIOLATION) on a malformed or
+    unreadable ledger or a grep failure, so the outcome is never mistaken for a
+    detected interlock violation."""
+    try:
+        return _check(ledger_path)
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, RuntimeError) as exc:
+        _fail(f"could not evaluate the ledger ({ledger_path}): {exc}")
+        return EXIT_ERROR
 
 
 if __name__ == "__main__":

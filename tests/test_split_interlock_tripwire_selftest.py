@@ -44,15 +44,34 @@ EXPECTED_EXCLUDE_PATHS = {
     "tests/test_split_interlock_tripwire.py",
     "tests/test_split_interlock_tripwire_selftest.py",
 }
-EXPECTED_ENGINE_PATH_MARKER_KEYS = {
-    "run_row_store",
-    "invocation_grant",
-    "result_scoped_grant",
-    "finalisation_receipt",
-    "served_from_run_id",
-    "released_input_digest",
-    "reaper_metrics",
+# The FULL marker dicts (keys AND regexes), not just the key sets — pinning keys
+# alone let a silent neuter through: keep a marker's key but narrow its regex to a
+# never-matching string and RULE 1 stops blocking that symbol undetected. Freezing
+# the regexes closes that.
+EXPECTED_ENGINE_PATH_MARKERS = {
+    "run_row_store": {"regex": "use_case_runs"},
+    "invocation_grant": {"regex": "invocation_grant|InvocationGrant"},
+    "result_scoped_grant": {"regex": "release_authorization"},
+    "finalisation_receipt": {"regex": "finalisation_receipt|finalization_receipt|FinalisationReceipt"},
+    "served_from_run_id": {"regex": "served_from_run_id"},
+    "released_input_digest": {"regex": "released_input_digest"},
+    "reaper_metrics": {"regex": "yuzu_use_case_runs|yuzu_use_case_reaper"},
 }
+EXPECTED_SUBSTRATE_MARKERS = {
+    "engine_principal_store": {"cell": "a", "regex": "engine_principal_store"},
+    "principal_quota": {"cell": "m", "regex": "class PrincipalQuota"},
+    "use_case_run_id": {"cell": "c", "regex": "use_case_run_id"},
+    "release_log_store": {"cell": "d", "regex": "release_log|ReleaseLog"},
+    "evaluate_as_operator": {"cell": "b", "regex": "evaluate_as_operator"},
+    "capability_registry": {"cell": "h", "regex": "register_securable|create_securable|ratified_mapping"},
+}
+
+# Tripwire exit codes (mirror tests/test_split_interlock_tripwire.py) — a detected
+# violation is 1, a malformed-ledger/grep error is 2. Asserting the EXACT code keeps
+# a crash from masquerading as a correct detection.
+TRIPWIRE_PASS = 0
+TRIPWIRE_VIOLATION = 1
+TRIPWIRE_ERROR = 2
 
 
 def _fail(msg: str, failures: list) -> None:
@@ -87,13 +106,12 @@ def main() -> int:
     if set(ledger.get("exclude_paths", [])) != EXPECTED_EXCLUDE_PATHS:
         _fail(f"exclude_paths {set(ledger.get('exclude_paths', []))} != frozen {EXPECTED_EXCLUDE_PATHS}", failures)
 
-    # 3. engine-path marker key set pinned (UP-4) — deleting a marker unpins its symbol.
-    if set(ledger.get("engine_path_markers", {})) != EXPECTED_ENGINE_PATH_MARKER_KEYS:
-        _fail(
-            f"engine_path_markers keys {set(ledger.get('engine_path_markers', {}))} "
-            f"!= frozen {EXPECTED_ENGINE_PATH_MARKER_KEYS}",
-            failures,
-        )
+    # 3. marker dicts pinned in FULL (UP-4 + qe-4) — keys AND regexes. Deleting a
+    #    marker unpins its symbol; narrowing its regex silently stops RULE 1 blocking it.
+    if ledger.get("engine_path_markers") != EXPECTED_ENGINE_PATH_MARKERS:
+        _fail("engine_path_markers (keys+regexes) drifted from the frozen set", failures)
+    if ledger.get("substrate_markers") != EXPECTED_SUBSTRATE_MARKERS:
+        _fail("substrate_markers (keys/cells/regexes) drifted from the frozen set", failures)
 
     # 4. every gate-set cell has a substrate marker (UP-2 / hp-1) — a markerless gate
     #    cell can be flipped green with no RULE 2 absence check.
@@ -110,30 +128,39 @@ def main() -> int:
     # 6. the tripwire's own logic still fires (guards against a future edit inverting a
     #    check — the false-green shape). Exercise it against mutated temp ledgers; the
     #    tripwire greps the real repo tree regardless of the ledger's location.
+    def _write(obj, name: str, td: str) -> str:
+        path = os.path.join(td, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(obj, fh)
+        return path
+
     with tempfile.TemporaryDirectory() as td:
-        clean = os.path.join(td, "clean.json")
-        with open(clean, "w", encoding="utf-8") as fh:
-            json.dump(ledger, fh)
-        if _run_tripwire(clean) != 0:
-            _fail("tripwire did not PASS on an unmodified ledger (expected exit 0)", failures)
+        # Clean copy → PASS (exact code, so a crash cannot masquerade as a pass).
+        rc = _run_tripwire(_write(ledger, "clean.json", td))
+        if rc != TRIPWIRE_PASS:
+            _fail(f"tripwire did not PASS on an unmodified ledger (got {rc}, want {TRIPWIRE_PASS})", failures)
 
         # False-certification: flip red gate cell (d) green with its substrate absent.
         fc = json.loads(json.dumps(ledger))
         fc["cells"]["d"]["status"] = "green"
-        fc_path = os.path.join(td, "false_cert.json")
-        with open(fc_path, "w", encoding="utf-8") as fh:
-            json.dump(fc, fh)
-        if _run_tripwire(fc_path) == 0:
-            _fail("tripwire PASSED a false certification (cell d green, substrate absent)", failures)
+        rc = _run_tripwire(_write(fc, "false_cert.json", td))
+        if rc != TRIPWIRE_VIOLATION:
+            _fail(f"tripwire did not DETECT a false certification (got {rc}, want {TRIPWIRE_VIOLATION})", failures)
 
         # Excluded-rationale guard: blank a rationale.
         br = json.loads(json.dumps(ledger))
         br["excluded"]["plan_hash"] = ""
-        br_path = os.path.join(td, "blank_rationale.json")
-        with open(br_path, "w", encoding="utf-8") as fh:
-            json.dump(br, fh)
-        if _run_tripwire(br_path) == 0:
-            _fail("tripwire PASSED an excluded entry with a blank rationale", failures)
+        rc = _run_tripwire(_write(br, "blank_rationale.json", td))
+        if rc != TRIPWIRE_VIOLATION:
+            _fail(f"tripwire did not DETECT a blank excluded rationale (got {rc}, want {TRIPWIRE_VIOLATION})", failures)
+
+        # Malformed ledger → ERROR, distinct from a detected violation (qe-3): drop a
+        # required key and confirm the tripwire reports 2, not a violation-shaped 1.
+        bad = json.loads(json.dumps(ledger))
+        del bad["gate_set"]
+        rc = _run_tripwire(_write(bad, "malformed.json", td))
+        if rc != TRIPWIRE_ERROR:
+            _fail(f"tripwire did not report ERROR on a malformed ledger (got {rc}, want {TRIPWIRE_ERROR})", failures)
 
     if failures:
         print(f"\n{len(failures)} interlock self-test failure(s).", file=sys.stderr)

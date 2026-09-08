@@ -49,8 +49,9 @@ check *reports*, it does not block. So WS-0 arms **two layers**:
 must **land** to turn the gate green. Blocking their first occurrence would deadlock the interlock
 against itself. So they are **substrate markers**: their appearance *flips a ledger cell*, routed to
 reviewers under normal derivation, never blocked (cells a and m carry substrate markers too —
-`engine_principal_store` and `class PrincipalQuota` — and are the two the false-certification guard
-actually exercises today, since they are the only non-red cells). Only **engine-path markers** — the
+`engine_principal_store` and `class PrincipalQuota` — but only cell **a** is non-red today, so the
+false-certification guard, which greps a cell's substrate only while that cell is green, exercises
+exactly that one marker; `class PrincipalQuota`'s marker stays dormant while (m) is red/partial). Only **engine-path markers** — the
 run-row store (`use_case_runs`), the invocation/result-scoped grants (`invocation_grant` /
 `release_authorization`), the finalisation receipt, `served_from_run_id`, `released_input_digest`, and
 the reaper metric family — block, and only while the gate is red. `plan_hash` is **excluded**: its hits
