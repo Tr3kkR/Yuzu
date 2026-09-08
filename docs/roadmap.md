@@ -46,7 +46,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 2.6 | [#160](https://github.com/Tr3kkR/Yuzu/issues/160) | Instruction Progress Tracking and Statistics | Done |
 | | 2.7 | [#163](https://github.com/Tr3kkR/Yuzu/issues/163) | Instruction Rerun and Cancellation | Done |
 | | 2.8 | [#205](https://github.com/Tr3kkR/Yuzu/issues/205) | Error Code Taxonomy (1xxx-4xxx) | Done |
-| | 2.9 | [#206](https://github.com/Tr3kkR/Yuzu/issues/206) | Concurrency Enforcement (real-usage scope) | **Done** — #206 closed 2026-03-18 for the original 5-mode scope; the corrected per-device-only scope shipped via ADR-1007 (2026-09-02) |
+| | 2.9 | [#206](https://github.com/Tr3kkR/Yuzu/issues/206) | Concurrency Enforcement (real-usage scope) | **Partial** — per-device enforcement shipped (ADR-1007, 2026-09-02); the four other originally advertised modes are out of scope by decision, not pending (`docs/adr/1007-concurrency-enforcement-scope.md:88-95,986`) |
 | | 2.10 | [#207](https://github.com/Tr3kkR/Yuzu/issues/207) | YAML Authoring UI (Form + CodeMirror) | Done |
 | | 2.11 | [#208](https://github.com/Tr3kkR/Yuzu/issues/208) | Legacy Command Shim | Done |
 | | 2.12 | [#209](https://github.com/Tr3kkR/Yuzu/issues/209) | Structured Result Envelope | Done |
@@ -159,7 +159,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 |-------|:----:|:----:|:-----:|----------|
 | 0: Foundation | 5 | 0 | 5 | 100% |
 | 1: Data Infrastructure | 7 | 0 | 7 | 100% |
-| 2: Instruction System | 12 | 0 | 12 | 100% |
+| 2: Instruction System | 11 | 1 | 12 | 92% — 2.9 is **Partial**, not Done (per-device concurrency shipped, ADR-1007; the other four modes are out of scope by decision) |
 | 3: Security & RBAC | 9 | 0 | 9 | 100% |
 | 4: Agent Infrastructure | 8 | 0 | 8 | 100% |
 | 5: Policy Engine | 5 | 0 | 5 | 100% |
@@ -174,9 +174,9 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | 14: Scale & Enterprise Readiness | 1 | 5 | 6 | 17% |
 | 15: TAR Dashboard & Scope Walking | 8 | 0 | 8 | 100% |
 | 16: System Guardian — Real-Time GS | 0 | 3 | 3 | 0% — issue-closure only; substantial implementation progress not reflected here, see 16.A/16.B body notes |
-| **Total** | **90** | **36** | **126** | **71%** |
+| **Total** | **89** | **37** | **126** | **71%** |
 
-**Done** requires verified delivery: closed COMPLETED, or closed NOT_PLANNED *with* a cited delivery-evidence path/ADR (e.g. 12.12/#283 shipped differently as ADR-0016's hash-skip sync). **Open** is everything else, including issues closed **NOT_PLANNED with no delivery** (a real decision not to build the thing, distinct from a still-open backlog item — see the Issue Index's "Closed — not planned" rows for the per-issue distinction and `stateReason`). The number moved from 94/126 (75%) to 90/126 (71%) because the first pull used `state` without `stateReason` and miscounted 5 NOT_PLANNED-with-no-delivery closures (9.8, 10.2, 10.3, 10.4, 11.1) as Done while missing 1 NOT_PLANNED-with-delivery closure (12.12) that should have counted — net **−4**.
+**Done** requires verified delivery: closed COMPLETED, or closed NOT_PLANNED *with* a cited delivery-evidence path/ADR (e.g. 12.12/#283 shipped differently as ADR-0016's hash-skip sync). **Open** is everything else, including issues closed **NOT_PLANNED with no delivery** (a real decision not to build the thing, distinct from a still-open backlog item — see the Issue Index's "Closed — not planned" rows for the per-issue distinction and `stateReason`) and **Partial** items (per-device-only concurrency, 2.9 — real but narrower delivery than "Done" implies). The number moved from 94/126 (75%) to 90/126 (71%) then to **89/126 (71%)** in two corrective passes: first, the initial pull used `state` without `stateReason` and miscounted 5 NOT_PLANNED-with-no-delivery closures (9.8, 10.2, 10.3, 10.4, 11.1) as Done while missing 1 NOT_PLANNED-with-delivery closure (12.12) that should have counted — net **−4**; second, 2.9 was reverted from Done to **Partial** per ADR-1007's own text ("Issue 2.9 no longer claims 'Done'; it reflects the real, narrower scope this ADR ships," `docs/adr/1007-concurrency-enforcement-scope.md:986`) — net **−1**. 94 − 4 − 1 = **89**.
 
 **Scaffolded** means DDL/structs/stubs exist but business logic is not wired. See `docs/Instruction-Engine.md` for Phase 2 scaffold details.
 
@@ -400,7 +400,7 @@ Implement the 4-category error code taxonomy from `docs/Instruction-Engine.md` S
 **Files:** `server/core/src/execution_tracker.hpp`, `server/core/src/execution_tracker.cpp`, `agents/core/src/agent.cpp`, `proto/yuzu/common/v1/common.proto`
 
 ### Issue 2.9: Concurrency Enforcement (real-usage scope, ADR-1007)
-**Scope:** Server | **Status:** Done (ADR-1007, landed 2026-09-02)
+**Scope:** Server | **Status:** Partial — per-device enforcement shipped (ADR-1007, 2026-09-02); the four other originally advertised modes are out of scope by decision, not pending. ADR-1007 itself records this: "`docs/roadmap.md` Issue 2.9 no longer claims 'Done'; it reflects the real, narrower scope this ADR ships" (`docs/adr/1007-concurrency-enforcement-scope.md:986`).
 
 Only `per-device` is enforced, server-side, via a dedicated `concurrency_claims` table in
 `execution_tracker`'s Postgres schema (a partial unique index gives race-free claim/release — see
@@ -1771,7 +1771,7 @@ Every failure response includes `correlation_id`, `retry_after_ms` (nullable), `
 *Capabilities currently absent from the roadmap; commonly required for enterprise compliance and lifecycle management. Source: `docs/capability-agentic-audit-2026-05.md` §7 P3. See also: the ADR-1005 execution plan (`docs/adr-1005-execution-plan.md`) — several items in this phase are boundary-affected by the headless-platform decision and must be re-evaluated against ADR-1005 Decision 2 before implementation.*
 
 ### Issue 18.1: Vulnerability Lifecycle
-**Capability:** new | **Scope:** UCE module (was: Server) | **Status:** Proposed — **a server-side store landed ahead of the UCE decision**: `server/core/src/vuln_finding_store.{hpp,cpp}` exists and is `/readyz`-wired (ADR-0023 Decision 8), grandfathered under ADR-1005's placement-only carve-out (see `docs/adr-1005-execution-plan.md` "Relationship to ADR-0023 and ADR-4001") — the UCE module itself is deferred to Phase 7
+**Capability:** new | **Scope:** UCE module (was: Server) | **Status:** Proposed — `vuln_finding_store.{hpp,cpp}` exists as an interim in-server placement grandfathered by ADR-1005 §92 (surface #2, placement-only); it has no production `reconcile_agent` caller at this commit (tests only), so the lifecycle itself is unimplemented. Re-homes under ADR-1005 Phase 7 (#4099).
 
 CVE → CVSS → owner → SLA → remediation tracking. Supplements the existing `vuln_scan` collection plugin with a findings store carrying a triage lifecycle (new / triaged / accepted-risk / remediated / reopened) **in the vulnerability-management use-case engine (UCE) module, not a server-side store** — the execution plan's M3 milestone builds exactly this findings store + lifecycle as part of the module that re-homes the server-side NVD capability (ADR-1005 grandfathered surface #2; see `docs/adr-1005-execution-plan.md`, Module scoping). Integrates with Phase 9 connectors for SCCM/Intune CVE feeds.
 
