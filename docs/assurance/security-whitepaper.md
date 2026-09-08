@@ -193,6 +193,30 @@ audit-logged) to prevent audit-log flooding during a sustained brute-force,
 while the initial lock and any admin unlock/self-clear are each a discrete
 audited event. `docs/auth-architecture.md` "Account lockout".
 
+### 3.8 Secure-deployment configuration required — the shipped defaults are permissive
+
+**Every control described in §3.1-3.7 above exists in the codebase, but four
+of them ship OFF or at their weakest setting by default.** A fresh,
+unconfigured install is not the hardened posture this whitepaper otherwise
+describes — a customer's security reviewer should treat the defaults below
+as the *out-of-box* starting point, not the assured configuration, and
+confirm each has been explicitly flipped before relying on the
+corresponding control.
+
+| Default (out-of-box) | Config field (`server.hpp`) | Flip it with | Effect of the default |
+|---|---|---|---|
+| Idle session timeout **disabled** | `session_inactivity_secs{0}` | `--session-inactivity-secs` / `YUZU_SESSION_INACTIVITY_SECS` (recommended `900` = 15 min) | Only the absolute 8-hour session lifetime applies — a forgotten, unlocked browser tab stays authenticated for up to 8 hours, not 15 minutes. |
+| MFA enforcement **optional** | `mfa_enforcement{"optional"}` | `--mfa-enforcement admin-only\|required` | MFA is available for self-service enrollment but not required at login — an operator account can go unenrolled indefinitely. |
+| Local-password login **enabled** (no SSO-only enforcement) | `auth_mode{"standard"}` | `--auth-mode sso-only` (requires OIDC configured first — refuses to start otherwise) | Any operator can authenticate with a local password instead of going through the configured IdP, bypassing IdP-side conditional-access policy. |
+| RBAC **disabled** | `rbac_store.cpp`'s first-boot seed, `rbac_enabled='false'` | Settings page toggle, or `yuzu-server.cfg`'s `[rbac]\nenabled = true` | Every authenticated user has full fleet-wide access (with a legacy fallback requiring the `admin` session role for write/delete/execute/approve) — no per-role or per-management-group scoping until explicitly turned on. See `docs/user-manual/rbac.md`'s own pre-enable checklist (a lockout risk if flipped without first granting a management-group role). |
+
+None of these defaults are a defect in the sense of a bug — each is a
+documented, intentional choice that keeps a fresh install bootable and
+usable without a mandatory IdP/MFA/RBAC setup wizard. But a CAIQ/security
+review that reads §3.1-3.7 as "these controls are active" without checking
+this table would be wrong for any deployment that has not explicitly
+reconfigured all four.
+
 ## 4. Audit trail and evidence chain
 
 Every operator action is recorded as a structured audit event suitable for
