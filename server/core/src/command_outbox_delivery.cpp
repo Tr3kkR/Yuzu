@@ -156,6 +156,17 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
     // 4. Dispatch through the PLAIN confined path with the STABLE command_id
     //    (R1: no ADR-1007 concurrency claim — a re-drive of an already-delivered
     //    device is absorbed by the agent's command_id dedup).
+    //
+    //    ORDERING (PR-review, made explicit here): the wire send happens BEFORE
+    //    the fenced `mark_sent` below — this loop does NOT claim-before-dispatch
+    //    at the occurrence grain. A momentarily-stale leader that has not yet
+    //    noticed a handover can therefore send the same command before either
+    //    side's fenced write resolves. That double SEND is safe ONLY because of a
+    //    CROSS-COMPONENT dependency: the agent's DURABLE command_id dedup (WS-0,
+    //    ADR-2002 §6 receiver-idempotency) suppresses the re-execution and replays
+    //    the original terminal outcome. Effectively-once is an end-to-end property
+    //    of (this send) + (that dedup), not a property of this loop alone — do not
+    //    "optimise" the fence away on the assumption the loop self-arbitrates.
     const auto outcome = d_.dispatch_fn(c.plugin, c.action, agent_ids, c.scope_expr, params,
                                         c.execution_id, caller, c.command_id);
 
@@ -233,7 +244,18 @@ void CommandOutboxDelivery::audit(const OutboxCommand& c, const std::string& res
     ev.result = result;
     ev.detail = "source=" + c.source + " occurrence_id=" + c.occurrence_id + " plugin=" +
                 c.plugin + " action=" + c.action + " " + detail;
-    (void)d_.audit_store->log(ev);
+    // audit_store.hpp's log() is FAIL-HARD: it returns false when the compliance
+    // row did not persist. This is the delivery loop's ONE audit write and the
+    // whole point of the two-stage `command.outbox_delivered` verb, so a dropped
+    // write must be observable — a background loop has no 503 to return (unlike
+    // the REST `Sec-Audit-Failed` / MCP `audit_persisted:false` callers), so
+    // surface it via a counter + a warn line rather than swallowing the signal.
+    if (!d_.audit_store->log(ev)) {
+        count("yuzu_server_command_outbox_audit_failed_total");
+        spdlog::warn("command_outbox_delivery: audit persist FAILED for occurrence '{}' "
+                     "(command_id={} result={}) — compliance row not recorded",
+                     c.occurrence_id, c.command_id, result);
+    }
 }
 
 void CommandOutboxDelivery::count(const char* name) {

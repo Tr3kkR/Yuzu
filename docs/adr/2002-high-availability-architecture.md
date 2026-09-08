@@ -261,6 +261,21 @@ claim-commit and the external send is unavoidable:
 - **Transactional outbox:** a side-effecting dispatch commits a `pending` outbound-command row (with a
   **stable occurrence/command ID**) in the same transaction as the state transition; a claimed
   delivery loop drives `pending → sent`. A crash re-drives from `pending`.
+  - **Documented exception — the stable-occurrence-key producer (WS-3 3.3, `CommandOutboxStore`).**
+    A producer whose state transition lives in a *different* store than the outbox cannot literally
+    share one transaction with the enqueue. `CommandOutboxStore` therefore ships **two** enqueue APIs:
+    `claim_and_enqueue_on(conn, …)` for a future producer whose state IS in Postgres and CAN share the
+    txn (the literal contract above), and the autocommitting `claim_and_enqueue(…)` for a producer
+    whose transition is a separate write. The **first and only wired producer, `ScheduleRunner`**, uses
+    the latter: its transition (`ScheduleEngine::advance_schedule`) is a separate write, committed
+    *after* the enqueue. This is a **deliberate, reviewed substitute for same-txn atomicity, not a
+    violation of the guarantee**: the `occurrence_id` is a deterministic PRIMARY KEY, so a crash between
+    the enqueue commit and the advance re-derives the identical key and reads `AlreadyEnqueued` on the
+    re-fire — no lost fire (enqueue commits *before* advance, and advance runs only on enqueue success)
+    and no double fire. The one non-atomic consequence — a second producer-side execution row + a
+    duplicate `queued` audit on the re-fire — is suppressed at the producer (the re-fire cancels its
+    duplicate execution row and does not re-audit). Restoring literal same-txn atomicity via
+    `claim_and_enqueue_on` is tracked (#4165) as a cleanliness improvement, not a correctness fix.
 - **Receiver idempotency:** the **agent** dedups on `command_id` at the true endpoint (the gateway
   forwards transparently, no gateway-side dedup today), so an at-least-once re-drive is effectively-once
   — **contingent on WS-0** making the agent's dedup durable (today's `dedup_current_`/`dedup_previous_`

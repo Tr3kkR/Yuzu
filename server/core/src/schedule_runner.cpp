@@ -380,22 +380,29 @@ bool ScheduleRunner::enqueue_occurrence(const InstructionSchedule& s, const std:
     switch (outcome) {
     case OutboxEnqueueOutcome::AlreadyEnqueued:
         // Idempotent re-fire (a crash between a prior enqueue and its advance):
-        // the occurrence already exists with its OWN execution row, so the row
-        // we just created is a duplicate the outbox discarded (ON CONFLICT). Cancel
-        // it so it cannot idle at 'running' to the materialise timeout, then
-        // advance exactly as the first fire would have.
+        // the occurrence already exists with its OWN execution row, so the row we
+        // just created is a duplicate the outbox discarded (ON CONFLICT). Cancel it
+        // so it cannot idle at 'running', then advance exactly as the first fire
+        // would have — but do NOT re-emit the `instruction.schedule_fired`/`queued`
+        // audit: the FIRST fire already audited this occurrence, and a second row
+        // is the one non-cosmetic consequence of enqueue and advance not being a
+        // single transaction (PR-review finding; the enqueue and ScheduleEngine
+        // advance are separate writes — see the ADR-2002 §6 "documented exception"
+        // note). A log line records the idempotent recovery instead.
         if (d_.execution_tracker && !exec_id.empty() &&
             !d_.execution_tracker->mark_cancelled(exec_id, s.created_by))
             spdlog::error("schedule_runner: mark_cancelled failed for duplicate execution_id={}",
                           exec_id);
-        [[fallthrough]];
+        count("yuzu_schedule_fires_idempotent_refire_total");
+        spdlog::info("schedule_runner: schedule '{}' (id={}) idempotent re-fire — occurrence_id={} "
+                     "already enqueued; advancing without a duplicate audit",
+                     s.name, s.id, req.occurrence_id);
+        return true;
     case OutboxEnqueueOutcome::Enqueued: {
         count("yuzu_schedule_fires_total");
         spdlog::info("schedule_runner: schedule '{}' (id={}) queued — occurrence_id={} "
-                     "execution_id={}{}",
-                     s.name, s.id, req.occurrence_id, exec_id,
-                     outcome == OutboxEnqueueOutcome::AlreadyEnqueued ? " (idempotent re-fire)"
-                                                                      : "");
+                     "execution_id={}",
+                     s.name, s.id, req.occurrence_id, exec_id);
         std::string detail = "schedule_id=" + s.id + " occurrence_id=" + req.occurrence_id +
                              " execution_id=" + exec_id;
         if (!approval_id.empty())
