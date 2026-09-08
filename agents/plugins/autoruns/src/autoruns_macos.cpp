@@ -631,13 +631,20 @@ int collect_macos(yuzu::CommandContext& ctx, std::string_view filter) {
         emit_status(ctx, SourceId::mac_emond, YUZU_SUPPORT_SUPPORTED, std::nullopt, "filtered");
     } else {
         std::size_t count = 0;
+        bool any_parse_failed = false;
         const std::string dir_path = "/etc/emond.d/rules";
         const DirConstraint outcome =
             walk_plist_dir(dir_path, [&](const char* name, const std::vector<uint8_t>& bytes,
                                          std::int64_t mtime) {
                 const std::string full_path = dir_path + "/" + name;
                 yuzu::agent::ScopedCFRef<CFPropertyListRef> root;
-                if (!parse_plist_root(bytes, root)) return;
+                if (!parse_plist_root(bytes, root)) {
+                    // A read-but-unparseable rule file (malformed, or a
+                    // valid rules plist truncated by kMaxPlistBytes) must
+                    // not silently vanish behind a supported status (AC4).
+                    any_parse_failed = true;
+                    return;
+                }
 
                 std::vector<CFDictionaryRef> rule_dicts;
                 const CFTypeID type = CFGetTypeID(root.get());
@@ -660,8 +667,11 @@ int collect_macos(yuzu::CommandContext& ctx, std::string_view filter) {
                     ++count;
                 }
             });
-        if (outcome.constrained) {
-            emit_status(ctx, SourceId::mac_emond, YUZU_SUPPORT_CONSTRAINED, count, outcome.reason);
+        std::string reason;
+        if (outcome.constrained) reason = std::string{outcome.reason};
+        if (any_parse_failed) reason += (reason.empty() ? "" : ",") + std::string{"malformed"};
+        if (!reason.empty()) {
+            emit_status(ctx, SourceId::mac_emond, YUZU_SUPPORT_CONSTRAINED, count, reason);
         } else {
             emit_status(ctx, SourceId::mac_emond, YUZU_SUPPORT_SUPPORTED, count, "emond_rule_plist_walk");
         }
