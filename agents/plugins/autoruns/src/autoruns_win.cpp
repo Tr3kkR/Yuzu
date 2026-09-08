@@ -362,9 +362,16 @@ void collect_runonceex_subkeys(HKEY hive, const std::wstring& subkey, REGSAM ext
     if (idx >= kMaxRunOnceExSubkeys) {
         // A capped enumeration is not a complete one (AC4) -- probe one
         // more index past the cap; only note row_cap if a real subkey was
-        // there.
-        if (RegEnumKeyExW(key.get(), idx, name_buf, &name_len, nullptr, nullptr, nullptr, nullptr) ==
-            ERROR_SUCCESS)
+        // there. name_len must be reset to the buffer's full capacity
+        // first -- RegEnumKeyExW's lpcchName is an in/out param, so it
+        // still holds the LAST successful call's returned (possibly
+        // shorter) name length, which could turn a real next subkey's
+        // longer name into a false ERROR_MORE_DATA this probe must still
+        // recognize as proof a subkey is there, not silent completion.
+        name_len = kNameBufLen;
+        const LSTATUS probe_status =
+            RegEnumKeyExW(key.get(), idx, name_buf, &name_len, nullptr, nullptr, nullptr, nullptr);
+        if (probe_status == ERROR_SUCCESS || probe_status == ERROR_MORE_DATA)
             note_constraint(outcome, "row_cap");
     } else if (enum_status != ERROR_NO_MORE_ITEMS) {
         // The enumeration stopped before genuinely finishing (ERROR_NO_MORE_
@@ -649,9 +656,14 @@ void collect_ifeo(std::string_view filter, SourceOutcome& outcome) {
     if (idx >= kMaxIfeoSubkeys) {
         // A capped enumeration is not a complete one (AC4) -- probe one
         // more index past the cap; only note row_cap if a real subkey was
-        // there.
-        if (RegEnumKeyExW(key.get(), idx, name_buf, &name_len, nullptr, nullptr, nullptr, nullptr) ==
-            ERROR_SUCCESS)
+        // there. name_len must be reset first -- see the identical comment
+        // in collect_runonceex_subkeys for why (RegEnumKeyExW's lpcchName
+        // in/out reuse otherwise turns a longer next name into a false
+        // ERROR_MORE_DATA this probe must still catch).
+        name_len = kNameBufLen;
+        const LSTATUS probe_status =
+            RegEnumKeyExW(key.get(), idx, name_buf, &name_len, nullptr, nullptr, nullptr, nullptr);
+        if (probe_status == ERROR_SUCCESS || probe_status == ERROR_MORE_DATA)
             note_constraint(outcome, "row_cap");
     } else if (enum_status != ERROR_NO_MORE_ITEMS) {
         // The enumeration stopped before genuinely finishing and before
