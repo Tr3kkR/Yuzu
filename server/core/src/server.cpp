@@ -182,6 +182,8 @@
 #include "leader_gate.hpp"     // WS-3 3.2: runtime FencedLeaderOnly loop gate over kBackgroundJobs
 #include "policy_evaluator.hpp"
 #include "schedule_arming_check.hpp"
+#include "command_outbox_delivery.hpp" // WS-3 3.3: leader-gated outbox delivery loop
+#include "command_outbox_store.hpp"    // WS-3 3.3: durable command outbox store
 #include "schedule_runner.hpp"
 #include "dashboard_routes.hpp"
 #include "discovery_routes.hpp"
@@ -5538,6 +5540,21 @@ public:
             }
         }
 
+        // CommandOutboxStore — born-on-PG durable command outbox (HA WS-3 3.3,
+        // ADR-2002 §6). Backs the ScheduleRunner enqueue seam + the
+        // CommandOutboxDelivery loop wired much later. Construction fail-CLOSED
+        // (ADR-0012 §1), same posture as its ScheduleEngine sibling above.
+        if (pg_pool_ && !startup_failed_) {
+            command_outbox_store_ = std::make_unique<CommandOutboxStore>(*pg_pool_);
+            command_outbox_store_->set_metrics(&metrics_);
+            if (!command_outbox_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: command outbox migration/open failed "
+                              "(database reachable but the command_outbox_store schema could not "
+                              "be created/opened)");
+                startup_failed_ = true;
+            }
+        }
+
         // ApprovalManager — migrated Postgres store (ADR-0009/0065, schema
         // `approval_manager`; migration-programme PR 5, 2/3). Construction was
         // ALREADY fail-closed in the SQLite era (a failed migration nulled
@@ -8940,6 +8957,11 @@ public:
             schedule_tick_thread_.join();
         }
         schedule_runner_.reset();
+        // WS-3 3.3: the delivery loop ticks in the schedule thread just joined and
+        // borrows execution_tracker_/audit_store_/command_outbox_store_/
+        // leader_elector_ — drop it here so it can't be ticked again before those
+        // are torn down.
+        command_outbox_delivery_.reset();
 
         // WS-3 (ADR-2002 §3): stop the election loop and resign leadership. Joined
         // here, AFTER every FencedLeaderOnly worker thread that reads is_leader()
@@ -9155,6 +9177,13 @@ public:
         execution_event_bus_.reset();
         approval_manager_.reset();
         schedule_engine_.reset();
+        // WS-3 3.3 (CDX-P1-03): command_outbox_store_ borrows pg_pool_ and MUST be
+        // reset before pg_pool_.reset() below — the member-declaration order is not
+        // enough on its own, because stop() resets the pool explicitly here rather
+        // than at member-destruction time. Its delivery-loop borrower
+        // (command_outbox_delivery_) was already dropped above, after the schedule
+        // thread was joined.
+        command_outbox_store_.reset();
 
         // PostgreSQL substrate teardown (ADR-0007). The gRPC drain above has
         // quiesced every handler thread that could hold a pool lease through a
@@ -11322,7 +11351,17 @@ private:
         // `ScheduleRunner`. Every OTHER caller (background pushes, raw
         // plugin/action dispatch with no definition concept) passes neither
         // and gets no gate, unchanged from today.
-        const std::string& definition_id = {}, const std::string& concurrency_mode = {}) {
+        const std::string& definition_id = {}, const std::string& concurrency_mode = {},
+        // WS-3 3.3 (ADR-2002 §6): a caller-supplied STABLE command_id for the
+        // command-outbox delivery path — trailing, defaulted-empty so every
+        // existing caller keeps minting its own. When non-empty (only
+        // CommandOutboxDelivery passes it) the dispatch reuses it verbatim, so a
+        // re-drive of the same occurrence carries the same command_id and the
+        // agent dedups (WS-0) — the effectively-once guarantee. NEVER combine
+        // with `definition_id`/`concurrency_mode`: the delivery path is R1 (no
+        // ADR-1007 concurrency claim), and a supplied id must not enter the
+        // per-device claim's `(command_id, agent_id)` uniqueness.
+        const std::string& supplied_command_id = {}) {
         // Normalize action to lowercase — agent plugins register actions in
         // lowercase and match case-sensitively (was implicit on the MCP path
         // via upstream lowercasing; a safe superset here).
@@ -11340,8 +11379,18 @@ private:
         // probabilistically unlikely, not DB-enforced. See the new
         // `ux_concurrency_claims_command` unique index
         // (execution_tracker.cpp) for the enforcement half of this fix.
-        auto command_id = plugin + "-" +
-                          auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(16));
+        // R1 (arch-F3): a supplied command_id is ONLY the outbox-delivery path,
+        // which must NOT take the ADR-1007 per-device concurrency claim — so it
+        // must never be combined with definition_id/concurrency_mode. Enforce the
+        // invariant the "NEVER combine" comment states, so a future caller cannot
+        // silently violate it and re-enter the (command_id, agent_id) claim.
+        assert(supplied_command_id.empty() ||
+               (definition_id.empty() && concurrency_mode.empty()));
+        auto command_id =
+            supplied_command_id.empty()
+                ? plugin + "-" +
+                      auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(16))
+                : supplied_command_id;
 
         // Same classifier as the /api/command handler (#2500): an explicit
         // agent_ids list ALWAYS wins over a broadcast request; `__all__` is
@@ -13592,6 +13641,7 @@ private:
                              .workflow_engine = workflow_engine_.get(),
                              .schedule_engine = schedule_engine_.get(),
                              .execution_tracker = execution_tracker_.get(),
+                             .command_outbox_store = command_outbox_store_.get(), // WS-3 3.3
                              .api_token_store = api_token_store_.get(),
                              .engine_principal_store = engine_principal_store_.get(),
                              .custom_properties_store = custom_properties_store_.get(),
@@ -13804,6 +13854,25 @@ private:
             return dispatch_confined(plugin, action, agent_ids, scope_expr, parameters,
                                      execution_id, caller, /*broadcast_on_none=*/false,
                                      definition_id, concurrency_mode);
+        };
+
+        // WS-3 3.3 (ADR-2002 §6) — the command-outbox DELIVERY dispatch: the R1
+        // path. PLAIN confined dispatch (empty definition_id/concurrency_mode →
+        // NO ADR-1007 per-device concurrency claim) with the occurrence's
+        // caller-SUPPLIED stable command_id, so a re-drive reuses it and the
+        // agent dedups (WS-0). A concurrency claim here would fail-closed-exclude
+        // an already-delivered device on a same-command_id re-drive and misread
+        // it as "reached nobody" — see command_outbox_delivery.hpp's R1 note.
+        auto command_outbox_deliver_dispatch_fn =
+            [this](const std::string& plugin, const std::string& action,
+                   const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+                   const std::unordered_map<std::string, std::string>& parameters,
+                   const std::string& execution_id, const yuzu::server::DispatchCaller& caller,
+                   const std::string& command_id) -> yuzu::server::ConfinedDispatchOutcome {
+            return dispatch_confined(plugin, action, agent_ids, scope_expr, parameters,
+                                     execution_id, caller, /*broadcast_on_none=*/false,
+                                     /*definition_id=*/{}, /*concurrency_mode=*/{},
+                                     /*supplied_command_id=*/command_id);
         };
 
         // -- Runtime Configuration API (7.3) ------------------------------------
@@ -14848,19 +14917,30 @@ private:
             .approval_manager = approval_manager_.get(),
             .audit_store = audit_store_.get(),
             .metrics = &metrics_,
-            // Review finding (#3133, merged): was command_dispatch_fn
-            // (hardcoded system=true, unfiltered) — every scheduled fire
-            // bypassed the classify+authorize chokepoint's per-action check
-            // regardless of the creator's actual permissions. Now carries the
-            // caller resolve_caller derives, exactly like every other operator
-            // dispatch surface. NOTE for future rebases: this must stay
-            // `command_dispatch_caller_fn` — reverting it to the system
-            // closure silently reopens that bypass.
-            .dispatch_fn = command_dispatch_caller_fn,
-            .dispatch_fn_concurrency = command_dispatch_concurrency_fn,
-            .resolve_caller =
-                [this](const std::string& username) {
-                return derive_dispatch_caller_for_username(username);
+            // WS-3 3.3 (ADR-2002 §6): scheduled fires no longer dispatch inline —
+            // they commit a durable `pending` outbox occurrence, and the
+            // CommandOutboxDelivery loop below performs the actual send (and the
+            // send-time re-authorization / caller resolution that the former
+            // inline `resolve_caller` + `dispatch_fn` did). This seam mints the
+            // occurrence's stable command_id and reads the current leader epoch
+            // for the fenced claim. FencedOut (leadership moved mid-tick) or a
+            // degraded store leaves the schedule due to retry — the stable
+            // occurrence key makes the retry idempotent.
+            .enqueue_fn =
+                [this](const yuzu::server::OutboxEnqueueRequest& req_in)
+                -> yuzu::server::OutboxEnqueueOutcome {
+                if (!command_outbox_store_ || !leader_elector_)
+                    return yuzu::server::OutboxEnqueueOutcome::Degraded;
+                const auto epoch = leader_elector_->epoch();
+                if (!epoch)
+                    return yuzu::server::OutboxEnqueueOutcome::FencedOut; // not leader — defer
+                yuzu::server::OutboxEnqueueRequest req = req_in;
+                if (req.command_id.empty())
+                    req.command_id =
+                        req.plugin + "-" +
+                        auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(16));
+                return command_outbox_store_->claim_and_enqueue(
+                    req, yuzu::server::kServerBackgroundLeaderLock, *epoch);
             },
             // D7/PLAN-003 (p14) — re-verify the arming principal's CURRENT
             // authority for this plugin.action before every fire (both the
@@ -14898,11 +14978,62 @@ private:
             // wiring as QuarantineContainmentReconciler::Deps above.
             .should_stop = [this] { return stop_requested_.load(std::memory_order_acquire); },
         });
+        // WS-3 3.3 (ADR-2002 §6): the leader-gated delivery loop that drains the
+        // command outbox ScheduleRunner now enqueues into, and performs the
+        // actual wire dispatch (R1: plain confined path with the stable supplied
+        // command_id) + the send-time re-authorization / caller resolution.
+        // Runs in the schedule thread's 5s sub-tick below, not a new thread.
+        command_outbox_delivery_ =
+            std::make_unique<CommandOutboxDelivery>(CommandOutboxDelivery::Deps{
+                .outbox = command_outbox_store_.get(),
+                .leader = leader_elector_.get(),
+                .execution_tracker = execution_tracker_.get(),
+                .audit_store = audit_store_.get(),
+                .metrics = &metrics_,
+                .dispatch_fn = command_outbox_deliver_dispatch_fn,
+                .resolve_caller =
+                    [this](const std::string& username) {
+                    return derive_dispatch_caller_for_username(username);
+                },
+                // Same arming seam as ScheduleRunner (schedule_arming_check.hpp) —
+                // re-verified AGAIN here at send time (authority may have changed
+                // between enqueue and delivery), the load-bearing re-authorization.
+                .arming_check = [this](const std::string& principal, const std::string& plugin,
+                                       const std::string& action) -> bool {
+                    return yuzu::server::schedule_arming_permitted(capability_registry_,
+                                                                   rbac_store_.get(), principal,
+                                                                   plugin, action);
+                },
+                .should_stop = [this] { return stop_requested_.load(std::memory_order_acquire); },
+            });
         schedule_tick_thread_ = std::thread([this]() {
-            spdlog::info("Schedule runner thread started (cadence=30s)");
+            spdlog::info("Schedule runner thread started (schedule eval 30s, outbox delivery 5s)");
             while (!stop_requested_.load(std::memory_order_acquire)) {
-                for (int i = 0; i < 6 && !stop_requested_.load(std::memory_order_acquire); ++i)
+                for (int i = 0; i < 6 && !stop_requested_.load(std::memory_order_acquire); ++i) {
                     std::this_thread::sleep_for(std::chrono::seconds{5});
+                    // WS-3 3.3: drive the command-outbox delivery every 5s
+                    // (leader-gated), independent of the 30s schedule-evaluation
+                    // cadence, so a queued fire dispatches within ~5s. Same
+                    // FencedLeaderOnly gate + catch-and-continue posture as the
+                    // schedule tick below.
+                    if (!stop_requested_.load(std::memory_order_acquire) &&
+                        command_outbox_delivery_) {
+                        try {
+                            YUZU_ASSERT_BACKGROUND_JOB("command_outbox.deliver"); // WS-10 FencedLeaderOnly
+                            if (leader_gate_permits<background_job_class("command_outbox.deliver")>(
+                                    leader_elector_.get()))
+                                command_outbox_delivery_->tick();
+                        } catch (const std::exception& e) {
+                            metrics_.counter("yuzu_schedule_tick_errors_total").increment();
+                            spdlog::error("command_outbox_delivery: tick threw ({}) — continuing",
+                                          e.what());
+                        } catch (...) {
+                            metrics_.counter("yuzu_schedule_tick_errors_total").increment();
+                            spdlog::error(
+                                "command_outbox_delivery: tick threw unknown exception — continuing");
+                        }
+                    }
+                }
                 if (stop_requested_.load(std::memory_order_acquire))
                     break;
                 if (schedule_runner_) {
@@ -18450,6 +18581,11 @@ private:
     // [BUS-BEFORE-TRACKER] before approving any change to this block.
     std::unique_ptr<ApprovalManager> approval_manager_;
     std::unique_ptr<ScheduleEngine> schedule_engine_;
+    // WS-3 3.3 (ADR-2002 §6): the durable command outbox (borrows pg_pool_, so
+    // declared after it — destroyed before it) + its leader-gated delivery loop
+    // (borrows the outbox/elector/tracker/audit — reset in stop() before those).
+    std::unique_ptr<CommandOutboxStore> command_outbox_store_;
+    std::unique_ptr<CommandOutboxDelivery> command_outbox_delivery_;
 
     // Phase 3: Security & RBAC
     // ORDER IS LOAD-BEARING (#1453): rbac_store_ MUST be declared before

@@ -249,6 +249,50 @@ a terminal verdict even while that replica is not the leader. Only the leader-ow
 *scheduling* half — the automatic due-policy dispatch and the periodic CRL freshness
 re-publish — pauses.)
 
+### vNEXT — scheduled instruction fires now go through a durable command outbox (HA WS-3 3.3; breaking for SIEM/audit-count assurance)
+
+Scheduled instruction fires no longer dispatch to agents inline from the
+poller. The poller now (a) creates the tracked execution row and (b) commits
+a durable `pending` occurrence to a new born-on-PG store, `CommandOutboxStore`
+(schema `command_outbox_store`); a leader-gated delivery loop drains that
+outbox and performs the actual wire dispatch. No operator action is required
+— the store's schema migration runs automatically on upgrade (fresh-start/
+no-backfill, since this store never existed before 3.3).
+
+**Behaviour changes you will see:**
+
+- **Added dispatch latency.** A scheduled fire is still enqueued within ~30
+  seconds of its due time (the poller cadence is unchanged), but actual
+  dispatch to agents now follows within ~5 seconds of enqueue via the
+  delivery loop — up to ~35 seconds total, where it was previously inline/
+  immediate.
+- **The audit trail for one scheduled fire is now two events, not one.**
+  `instruction.schedule_fired` (result `queued`) marks the enqueue; a new
+  `command.outbox_delivered` (result `success`/`failure`/`denied`) marks the
+  actual delivery outcome. **Any SIEM correlation rule or audit-count
+  assurance built on "one audit event per scheduled fire" must be updated**
+  to expect the pair, or to key off `command.outbox_delivered` for the
+  delivery outcome.
+- **New metrics.** Eight counters and a backlog gauge —
+  `yuzu_server_command_outbox_*` — cover enqueue-side degrade and the
+  delivery loop's outcomes (delivered / no-agents / denied / retry / errors /
+  decode-failed / degrade) plus `yuzu_server_command_outbox_pending`, the
+  primary signal that scheduled dispatch has stalled. Full reference:
+  `docs/user-manual/metrics.md` "Command outbox delivery metrics".
+- **ADR-1007 per-device concurrency is no longer enforced for scheduled
+  fires.** The inline path previously resolved a `concurrency_mode` and
+  gated on it; the outbox delivery path dispatches on the plain confined
+  path without that claim. This is a deliberate, tracked gap — restoring
+  per-device concurrency enforcement for the outbox path is a follow-up, not
+  an oversight.
+
+**Rollback note:** a `pending` outbox row committed by a 3.3-or-later binary
+is invisible to a pre-3.3 binary, which has no outbox reader. Rolling back
+mid-flight leaves that occurrence undelivered until you roll forward again —
+a narrow window, and no data corruption (the row stays durable in Postgres
+and delivers as soon as a 3.3-or-later binary is running and holds
+leadership).
+
 ### vNEXT — gateway management plane now pins its peer (#1422, breaking for custom gateway configs)
 
 The gateway's `:50063` command plane requires, on any network-reachable
