@@ -8155,6 +8155,13 @@ TEST_CASE("MCP Wave7 PR7.2: Forensics + ZERO targets is refused with the forensi
     CHECK(ts.audit_log.back() == "mcp.execute_instruction|denied");
     CHECK(ts.audit_details.back().find(std::string(yuzu::server::kReasonForensicUntargeted)) !=
           std::string::npos);
+    // #3937 follow-up: a Forensics refusal must NOT claim the action "is
+    // classified Destructive" -- it's a distinct, read-only classification
+    // with its own single-target rule (dispatch_destructive_gate.hpp's
+    // remediation_for_refusal_reason).
+    const auto remediation = body["error"]["data"]["remediation"].get<std::string>();
+    CHECK(remediation.find("classified Destructive") == std::string::npos);
+    CHECK(remediation.find("single-target forensic read") != std::string::npos);
 }
 
 TEST_CASE("MCP Wave7 PR7.2: Forensics + TWO explicit agent_ids is refused — exactly-one, not "
@@ -8243,6 +8250,11 @@ TEST_CASE("MCP Wave7 PR7.2: an untargeted Forensics supervised call is refused p
     CHECK(ts.audit_details.back().find(std::string("reason=") +
                                        std::string(yuzu::server::kReasonForensicUntargeted)) !=
           std::string::npos);
+    // #3937 follow-up: same C8 pre-mint site -- remediation text must not
+    // claim "classified Destructive" for a Forensics refusal either.
+    const auto remediation = body["error"]["data"]["remediation"].get<std::string>();
+    CHECK(remediation.find("classified Destructive") == std::string::npos);
+    CHECK(remediation.find("single-target forensic read") != std::string::npos);
 }
 
 // ── 35c. #3687: pre-dispatch authorization dry run — discriminated denials ──
