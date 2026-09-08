@@ -260,26 +260,56 @@ TEST_CASE("launch: a result-alloc failure maps to ResultAllocFailed, not a null 
     CHECK_FALSE(v->has_value()); // but the boxed DetachedResult<T> itself is the error
     CHECK(v->error() == DetachedCallError::ResultAllocFailed);
 
-    // Not WorkerThrew here - but only because this seam discards the box
-    // AFTER Payload::operator()()'s try/catch already ran (boxed.reset()
-    // sits outside it). A REAL result-alloc failure can only happen INSIDE
-    // that try/catch (the inner catch's own "even the error box didn't
-    // fit" branch), which is reachable only after the OUTER catch has
-    // already set `threw = true` - and the outer catch fires whenever
-    // fn() itself throws, OR when fn() SUCCEEDS but boxing its own result
-    // (the make_unique<DetachedResult<T>>(fn()) allocation) throws
-    // bad_alloc - so a genuine ResultAllocFailed in production always
-    // coincides with worker_threw_total also being bumped, regardless of
-    // which of those two ways `threw` ended up true. This CHECK is a
-    // property of the injection method, not of production semantics; do
-    // not read it as "ResultAllocFailed and WorkerThrew are mutually
-    // exclusive in general".
+    // Not WorkerThrew here - this seam discards the box AFTER
+    // Payload::operator()()'s try/catch already ran (boxed.reset() sits
+    // outside it), so it cannot itself distinguish "fn() threw" from
+    // "fn() succeeded but boxing failed" - see the next test case for that
+    // distinction, which IS load-bearing in production since the fix below.
     CHECK(lane.worker_threw_total() == 0);
 
     CHECK(spin_until([&] { return lane.active_workers() == 0; }));
     CHECK(f3->load() == 0);
 
     lane.set_fail_result_alloc_for_test(false);
+}
+
+TEST_CASE("launch: fn() succeeding but its result's box allocation failing is "
+          "ResultAllocFailed, never WorkerThrew",
+          "[spark][detachedcall]") {
+    // adversarial-review finding (PR-A round 2, both external reviewers
+    // independently): an earlier version of operator()() wrapped fn() and
+    // its result's make_unique<DetachedResult<T>> allocation in ONE try, so
+    // a first-box bad_alloc AFTER a successful fn() call was misclassified
+    // as WorkerThrew - the callable didn't throw, only its result's boxing
+    // did. Fixed by splitting fn()'s invocation from the box allocation
+    // into two nested try blocks (spark_detached_call.hpp's operator()()).
+    // MUTATION-TESTED: reverting to the single-try shape turns this red -
+    // `error() == WorkerThrew` and `worker_threw_total() == 1` where this
+    // test expects ResultAllocFailed and 0.
+    auto observed_fn_ran = std::make_shared<std::atomic<bool>>(false);
+    auto f3 = std::make_shared<std::atomic<std::size_t>>(0);
+    SparkDetachedLane lane(f3, /*cap=*/4);
+    lane.set_fail_first_box_alloc_for_test(true);
+
+    auto res = lane.launch([observed_fn_ran]() -> int {
+        observed_fn_ran->store(true, std::memory_order_relaxed); // fn() ran to
+                                                                  // completion -
+                                                                  // it did NOT throw
+        return 7;
+    });
+    REQUIRE(res.status == DetachedLaunch::Launched);
+    auto v = res.call->wait_take(std::chrono::steady_clock::now() + 5s);
+    REQUIRE(v.has_value());
+    CHECK(observed_fn_ran->load(std::memory_order_relaxed)); // the callable really did run
+    CHECK_FALSE(v->has_value());
+    CHECK(v->error() == DetachedCallError::ResultAllocFailed); // NOT WorkerThrew
+
+    CHECK(spin_until([&] { return lane.active_workers() == 0; }));
+    CHECK(f3->load() == 0);
+    CHECK(lane.worker_threw_total() == 0); // the fix: fn() succeeding is never conflated
+                                           // with its result's box allocation failing
+
+    lane.set_fail_first_box_alloc_for_test(false);
 }
 
 TEST_CASE("launch: an abandon()'d, published-but-untaken result-alloc failure is a safe "

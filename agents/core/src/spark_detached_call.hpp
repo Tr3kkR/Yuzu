@@ -142,6 +142,7 @@
 #include <expected>
 #include <memory>
 #include <mutex>
+#include <new> // std::bad_alloc - fail_first_box_alloc_for_test seam
 #include <optional>
 #include <type_traits>
 #include <utility>
@@ -204,7 +205,24 @@ struct LaneState {
     // portable way to make std::make_unique<DetachedResult<T>> itself fail
     // (it would need a global operator-new hook), so this is the only
     // reachable way to exercise take_locked()'s null-result branch at all.
+    // NOTE: this seam's discard happens OUTSIDE operator()()'s try/catch, so
+    // it always leaves worker_threw_total==0 - it cannot exercise the FIRST
+    // box's own allocation failing INSIDE the try/catch (see
+    // fail_first_box_alloc_for_test below for that path specifically).
     std::atomic<bool> fail_result_alloc_for_test{false};
+    // Test seam only: makes the FIRST box allocation (wrapping fn()'s real
+    // return value) throw std::bad_alloc from inside operator()()'s inner
+    // try, deterministically exercising the fix that separates fn()'s own
+    // throw from its result's box-allocation failure - the two are
+    // DELIBERATELY classified differently (ResultAllocFailed here, never
+    // WorkerThrew, since fn() itself ran to completion). Checked only on
+    // the success path (fn() didn't throw); the WorkerThrew error box's own
+    // allocation has no equivalent seam - fail_result_alloc_for_test above
+    // already covers "even the error box didn't fit" via its post-hoc
+    // discard, which is adequate there since that path's classification
+    // (WorkerThrew) doesn't depend on distinguishing which allocation
+    // failed.
+    std::atomic<bool> fail_first_box_alloc_for_test{false};
 };
 
 /// Decrements the lane's active-worker count and the shared F3 counter when
@@ -401,12 +419,30 @@ struct Payload {
         : guard(std::move(g)), cell(std::move(c)), fn(std::forward<F>(f)) {}
 
     /// Runs on the detached worker thread. noexcept: fn() itself is the
-    /// only thing here that may throw, and it is fully contained.
+    /// only thing here that may throw, and it is fully contained. fn()'s
+    /// invocation and the allocation of its result box are DELIBERATELY
+    /// separate try blocks (adversarial-review finding, PR-A round 2): a
+    /// single enclosing try around `make_unique<DetachedResult<T>>(fn())`
+    /// would classify a first-box bad_alloc AFTER a successful fn() call as
+    /// WorkerThrew - the callable didn't throw, only its result's boxing
+    /// did, and that is exactly what ResultAllocFailed exists to name. The
+    /// outer try covers ONLY fn(); a caught exception there is a genuine
+    /// callable throw. The inner try covers ONLY boxing (T's move into the
+    /// box is nothrow per the class static_assert below, so a throw there
+    /// can only be the allocation itself) and never sets `threw`.
     void operator()() noexcept {
         std::unique_ptr<DetachedResult<T>> boxed;
         bool threw = false;
         try {
-            boxed = std::make_unique<DetachedResult<T>>(fn());
+            T value = fn();
+            try {
+                if (guard.lane->fail_first_box_alloc_for_test.load(std::memory_order_relaxed))
+                    throw std::bad_alloc{}; // test seam only - see its own doc comment
+                boxed = std::make_unique<DetachedResult<T>>(std::move(value));
+            } catch (...) {
+                boxed.reset(); // ResultAllocFailed - fn() succeeded; only its
+                              // result's box allocation failed
+            }
         } catch (...) {
             threw = true;
             try {
@@ -713,6 +749,11 @@ public:
     /// Sticky until reset, same convention as set_fail_launch_for_test.
     void set_fail_result_alloc_for_test(bool v) noexcept {
         state_->fail_result_alloc_for_test.store(v, std::memory_order_relaxed);
+    }
+    /// Test seam: see LaneState::fail_first_box_alloc_for_test's doc
+    /// comment. Sticky until reset, same convention as the other two.
+    void set_fail_first_box_alloc_for_test(bool v) noexcept {
+        state_->fail_first_box_alloc_for_test.store(v, std::memory_order_relaxed);
     }
 
 private:
