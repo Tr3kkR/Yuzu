@@ -801,7 +801,7 @@ All API endpoints require session-cookie authentication. Obtain a session by pos
 
 There are two API surface areas with different response envelopes:
 
-**`/api/*` endpoints** (instruction engine, registered in `server.cpp`) use domain-keyed responses:
+**`/api/*` endpoints** (instruction engine, registered in `instruction_routes.cpp`/`execution_routes.cpp` and `server.cpp`) use domain-keyed responses:
 
 ```json
 {

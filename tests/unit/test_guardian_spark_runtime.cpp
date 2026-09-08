@@ -264,6 +264,22 @@ struct FakeBackend : ISparkBackend {
     std::vector<std::uint64_t> armed_ids_;
     std::vector<std::uint64_t> disarmed_ids_;
 
+    /// #2818 poll backstop test seam: report a specific health for a specific id,
+    /// simulating "the engine says this subscription is dead/faulted" independent of
+    /// whether any push notification was ever delivered for it - exactly the fact
+    /// revalidate_subscriptions() queries. Unset ids report Healthy (the base class
+    /// default), matching every pre-existing test that never calls this.
+    void set_health_for_test(std::uint64_t id, SubscriptionHealth h) {
+        std::lock_guard<std::mutex> lk{ids_mu_};
+        health_[id] = h;
+    }
+    SubscriptionHealth subscription_health(std::uint64_t id) override {
+        std::lock_guard<std::mutex> lk{ids_mu_};
+        const auto it = health_.find(id);
+        return it != health_.end() ? it->second : SubscriptionHealth::Healthy;
+    }
+    std::unordered_map<std::uint64_t, SubscriptionHealth> health_;
+
     /// Blocks until a hung arm() has actually entered its wait (avoids a racy
     /// sleep-based poll for "is the worker parked yet").
     bool wait_entered_hang(std::chrono::seconds timeout) {
@@ -469,6 +485,87 @@ TEST_CASE("detach disarms on the ->0 edge; a sibling detach keeps the watcher", 
     rt->detach_rule("r2"); // ->0 -> disarm
     REQUIRE(b->disarms.load() == 1);
     REQUIRE(rt->armed_key_count() == 0);
+}
+
+TEST_CASE("#2818 poll backstop: revalidate_subscriptions detects and reports a dead "
+          "subscription no push notification ever announced",
+          "[spark][runtime]") {
+    // The delivery-guarantee backstop for the case where a genuine Lost notification
+    // was silently dropped by a full Queued consumer channel: this test never triggers
+    // (or relies on) a Lost push at all — b->set_health_for_test reports the exact fact
+    // subscription_health() would, independent of how the subscription actually died.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+    REQUIRE(rt->armed_key_count() == 1);
+    REQUIRE(rt->rule_count() == 1);
+    REQUIRE(b->armed_ids().size() == 1);
+
+    b->set_health_for_test(b->armed_ids().front(), SubscriptionHealth::Dead);
+    rt->revalidate_subscriptions();
+
+    CHECK(rt->armed_key_count() == 0);
+    CHECK(rt->rule_count() == 0);
+    const auto lc = drain_lifecycle(*rt);
+    REQUIRE(!lc.empty());
+    CHECK(std::any_of(lc.begin(), lc.end(), [](const OutboxEntry& e) {
+        return e.rule_id == "r1" && e.lifecycle_kind == "errored";
+    }));
+}
+
+TEST_CASE("#2818 poll backstop: a Healthy/Faulted subscription is left alone",
+          "[spark][runtime]") {
+    // Scoped to Dead only (Dave's call, 2026-09-06): a Faulted key is still armed at
+    // the engine level and may self-heal, so the backstop must not detach it.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+    REQUIRE(b->armed_ids().size() == 1);
+    b->set_health_for_test(b->armed_ids().front(), SubscriptionHealth::Faulted);
+
+    rt->revalidate_subscriptions();
+
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(rt->rule_count() == 1);
+    CHECK(b->disarms.load() == 0);
+}
+
+TEST_CASE("#2818: a stale Lost/Faulted notification (superseded by a fresh re-arm) is a "
+          "safe no-op (quality-engineer Gate 3 finding - the staleness guard was untested)",
+          "[spark][runtime]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+    REQUIRE(b->armed_ids().size() == 1);
+    const auto stale_id = b->armed_ids().front();
+
+    // Detach then re-attach: the key gets a FRESH subscription id, distinct from the
+    // one the (now-stale) notification below still names.
+    rt->detach_rule("r1");
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+    REQUIRE(b->armed_ids().size() == 2);
+    REQUIRE(b->armed_ids().back() != stale_id); // ids are monotonic, never reused
+
+    // A Lost naming the STALE id must be a no-op: r1 stays armed under its fresh id.
+    rt->on_event(SparkEvent{.key = key, .kind = SparkEventKind::Lost, .subscription_id = stale_id});
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(rt->rule_count() == 1);
+
+    // A Faulted naming the STALE id must also be a no-op: no health entry produced.
+    rt->on_event(SparkEvent{.key = key,
+                             .kind = SparkEventKind::Faulted,
+                             .subscription_id = stale_id,
+                             .detail = "stale"});
+    const auto got = drain_all(*rt);
+    CHECK(got.empty());
+    CHECK(rt->armed_key_count() == 1); // still armed - the guard held both times
 }
 
 TEST_CASE("evaluate_key re-reads live state each pass (event is a hint)", "[spark][runtime]") {
@@ -3119,6 +3216,26 @@ TEST_CASE("page_into_window replays a persisted batch with provenance", "[spark]
     CHECK(lc[0].event_id == "e-r1");
     CHECK(lc[0].journal_last_in_batch);         // provenance attached for the sent-label
     CHECK_FALSE(lc[0].journal_batch_key.empty());
+}
+
+TEST_CASE("page_into_window replays an \"errored\" record without quarantining it (#2818, "
+          "enterprise-readiness Gate 6)",
+          "[spark][runtime][journal]") {
+    // Before this fix, guardian_lifecycle_journal.cpp's replay allowlist only recognized
+    // "armed"/"disarmed" - an "errored" record (GuardianSparkRuntime::on_subscription_lost,
+    // #2818) surviving a crash/restart before it drained live would have been silently
+    // QUARANTINED here as tampered, destroying the exact audit record #2818 exists to
+    // produce, in the exact scenario (durability across a restart) it's meant to survive.
+    PageRig rig;
+    rig.persist("r1", "errored");
+    auto stats = rig.journal->page_into_window(*rig.rt, /*now_ms=*/1'700'000'100'000);
+    CHECK(stats.records_paged == 1); // replayed, not quarantined
+    CHECK(rig.journal->quarantined() == 0);
+
+    auto lc = drain_lifecycle(*rig.rt);
+    REQUIRE(lc.size() == 1);
+    CHECK(lc[0].lifecycle_kind == "errored");
+    CHECK(lc[0].event_id == "e-r1");
 }
 
 TEST_CASE("page_into_window does not re-page a windowed entry (skips entries already windowed)",

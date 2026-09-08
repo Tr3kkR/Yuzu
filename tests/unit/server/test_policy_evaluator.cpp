@@ -207,10 +207,64 @@ TEST_CASE("policy evaluator: compliant + non_compliant verdicts (multi-agent fan
     PolicyEvaluator ev(h.deps());
     REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
     h.fake_now += 20; // past grace
-    ev.tick();
+    ev.tick(true);
 
     CHECK(h.status_of(pid, "agentA") == "compliant");
     CHECK(h.status_of(pid, "agentB") == "non_compliant");
+}
+
+TEST_CASE("policy evaluator: an operator evaluate_now completes even when the due-policy "
+          "dispatch is fenced off-leader (WS-3 3.2, PR #4134)",
+          "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.canned["agentA|checkp"] = {1, out_json("hostname", "yuzu-a")};
+    h.canned["agentB|checkp"] = {1, out_json("hostname", "")};
+    auto pid = h.author("result.hostname != ''");
+
+    PolicyEvaluator ev(h.deps());
+    // An operator evaluate_now() is accepted on this replica (both operator paths are
+    // ungated and run on whichever replica received the call).
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    h.fake_now += 20; // past grace
+
+    // Tick with the fenced-leader gate FALSE (this replica is not the leader), exactly
+    // as server.cpp does via leader_gate_permits. The completion half — collect_ready()
+    // — MUST still run, or the operator's evaluate_now strands with no terminal verdict.
+    // This is the two-dispatch-planes contract the gate-the-whole-tick bug violated.
+    ev.tick(/*dispatch_due_allowed=*/false);
+
+    CHECK(h.status_of(pid, "agentA") == "compliant");
+    CHECK(h.status_of(pid, "agentB") == "non_compliant");
+}
+
+TEST_CASE("policy evaluator: the due-policy dispatch is SUPPRESSED under tick(false) and runs "
+          "under tick(true) (WS-3 3.2 gate direction, PR #4134)",
+          "[pg][policy][evaluator]") {
+    // The other half of the tick(bool) contract (adversarial review K1): the fenced
+    // scheduling half must NOT run off-leader. Without this, a future refactor that
+    // drops/inverts `if (dispatch_due_allowed)` passes every other test yet resumes
+    // due-policy dispatch on non-leaders.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.canned["agentA|checkp"] = {1, out_json("hostname", "a")};
+    h.canned["agentB|checkp"] = {1, out_json("hostname", "b")};
+    auto pid = h.author("result.hostname != ''");
+
+    PolicyEvaluator ev(h.deps());
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty()); // dispatch #1 (seeds the interval)
+    CHECK(h.dispatch_calls == 1);
+    h.fake_now += 4000; // default interval (3600s) elapsed -> the policy is now DUE
+
+    // Non-leader tick: dispatch_due() must NOT run — no new dispatch despite being due.
+    ev.tick(/*dispatch_due_allowed=*/false);
+    CHECK(h.dispatch_calls == 1);
+
+    // Leader tick: dispatch_due() claims the due policy and dispatches.
+    ev.tick(/*dispatch_due_allowed=*/true);
+    CHECK(h.dispatch_calls == 2);
 }
 
 TEST_CASE("policy evaluator: evaluate_now does not dispatch when record_dispatch fails "
@@ -280,7 +334,7 @@ TEST_CASE("policy evaluator: non-responder -> unknown, plugin failure -> error",
     PolicyEvaluator ev(h.deps());
     REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
     h.fake_now += 20;
-    ev.tick();
+    ev.tick(true);
 
     CHECK(h.status_of(pid, "agentA") == "error");
     CHECK(h.status_of(pid, "agentB") == "unknown");
@@ -325,7 +379,7 @@ TEST_CASE("policy evaluator: missing CEL field resolves empty -> non_compliant",
     PolicyEvaluator ev(h.deps());
     REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
     h.fake_now += 20;
-    ev.tick();
+    ev.tick(true);
 
     CHECK(h.status_of(pid, "agentA") == "non_compliant");
 }
@@ -345,7 +399,7 @@ TEST_CASE("policy evaluator: CEL evaluation error -> error", "[pg][policy][evalu
     PolicyEvaluator ev(h.deps());
     REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
     h.fake_now += 20;
-    ev.tick();
+    ev.tick(true);
 
     CHECK(h.status_of(pid, "agentA") == "error");
 }
@@ -363,11 +417,11 @@ TEST_CASE("policy evaluator: interval throttles re-dispatch", "[pg][policy][eval
     CHECK(h.dispatch_calls == 1);
 
     h.fake_now += 20;
-    ev.tick(); // collect only; interval (3600s) not elapsed -> no new dispatch
+    ev.tick(true); // collect only; interval (3600s) not elapsed -> no new dispatch
     CHECK(h.dispatch_calls == 1);
 
     h.fake_now += 4000;
-    ev.tick(); // interval elapsed -> dispatch #2
+    ev.tick(true); // interval elapsed -> dispatch #2
     CHECK(h.dispatch_calls == 2);
 }
 
@@ -385,7 +439,7 @@ TEST_CASE("policy evaluator: empty compliance CEL -> error (no false compliant)"
     PolicyEvaluator ev(h.deps());
     REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
     h.fake_now += 20;
-    ev.tick();
+    ev.tick(true);
 
     CHECK(h.status_of(pid, "agentA") == "error");
 }
@@ -402,7 +456,7 @@ TEST_CASE("policy evaluator: remediation attempt cap -> error after 3 fixing tra
     PolicyEvaluator ev(h.deps());
     REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
     h.fake_now += 20;
-    ev.tick();
+    ev.tick(true);
     REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
 
     // Drive remediation with an explicit (in-scope) agent list. Each call marks
@@ -428,7 +482,7 @@ TEST_CASE("policy evaluator: remediation attempt cap -> error after 3 fixing tra
             // -> "unknown") would otherwise overwrite the cap's "error" write
             // this assertion is checking for.
             h.fake_now += 20;
-            ev.tick();
+            ev.tick(true);
         }
     }
     CHECK(h.status_of(pid, "agentA") == "error");
@@ -447,7 +501,7 @@ TEST_CASE("policy evaluator: remediate refuses a second call while a FixWait is 
     PolicyEvaluator ev(h.deps());
     REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
     h.fake_now += 20;
-    ev.tick();
+    ev.tick(true);
     REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
 
     auto rr1 = ev.remediate(pid, {"agentA"});
@@ -477,7 +531,7 @@ TEST_CASE("policy evaluator: verify dispatch failure -> error", "[pg][policy][ev
     PolicyEvaluator ev(h.deps());
     REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
     h.fake_now += 20;
-    ev.tick();
+    ev.tick(true);
     REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
 
     auto rr = ev.remediate(pid, {});
@@ -488,7 +542,7 @@ TEST_CASE("policy evaluator: verify dispatch failure -> error", "[pg][policy][ev
     REQUIRE(h.is.delete_definition("test.verify"));
 
     h.fake_now += 20;
-    ev.tick(); // collect FixWait -> verify dispatch fails -> error
+    ev.tick(true); // collect FixWait -> verify dispatch fails -> error
 
     CHECK(h.status_of(pid, "agentA") == "error");
 }
@@ -504,7 +558,7 @@ TEST_CASE("policy evaluator: manual remediation fix -> verify -> compliant",
     PolicyEvaluator ev(h.deps());
     REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
     h.fake_now += 20;
-    ev.tick();
+    ev.tick(true);
     REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
 
     // Wire up the fix + verify responses, then remediate.
@@ -516,9 +570,9 @@ TEST_CASE("policy evaluator: manual remediation fix -> verify -> compliant",
     CHECK(rr.agents == 1);
 
     h.fake_now += 20;
-    ev.tick(); // collect FixWait -> dispatch verify
+    ev.tick(true); // collect FixWait -> dispatch verify
     h.fake_now += 20;
-    ev.tick(); // collect verify -> final verdict
+    ev.tick(true); // collect verify -> final verdict
 
     CHECK(h.status_of(pid, "agentA") == "compliant");
 }
@@ -534,7 +588,7 @@ TEST_CASE("policy evaluator: remediation rejected when no fix_instruction",
     PolicyEvaluator ev(h.deps());
     REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
     h.fake_now += 20;
-    ev.tick();
+    ev.tick(true);
     REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
 
     auto rr = ev.remediate(pid, {});
@@ -571,16 +625,16 @@ TEST_CASE("policy evaluator: two instances sharing one store dispatch a policy e
     // Both tick at the same logical moment. Only one may win the advisory
     // lock and claim the due policy; the other's dispatch_due() must claim
     // nothing this tick.
-    evA.tick();
-    evB.tick();
+    evA.tick(true);
+    evB.tick(true);
     CHECK(h.dispatch_calls == 1);
 
     // A second simultaneous tick round, still within the 300s interval:
     // neither dispatches again (the durable claim, not either evaluator's
     // own memory, is what prevents the second dispatch).
     h.fake_now += 20;
-    evA.tick();
-    evB.tick();
+    evA.tick(true);
+    evB.tick(true);
     CHECK(h.dispatch_calls == 1);
 
     // Whichever evaluator dispatched is the only one whose in_flight_ holds
@@ -589,8 +643,8 @@ TEST_CASE("policy evaluator: two instances sharing one store dispatch a policy e
     // (the other's collect_ready() has nothing in its own in_flight_ for
     // this execution, so it is a no-op for this check).
     h.fake_now += 300; // past grace AND past the 300s interval
-    evA.tick();
-    evB.tick();
+    evA.tick(true);
+    evB.tick(true);
 
     CHECK(h.status_of(pid, "agentA") == "compliant");
     CHECK(h.status_of(pid, "agentB") == "non_compliant");
@@ -669,7 +723,7 @@ TEST_CASE("policy evaluator: dispatch_due() processes every claimed policy "
     deps.should_stop = [] { return true; };
     PolicyEvaluator ev(deps);
 
-    ev.tick(); // collect_ready() is a no-op (nothing in flight yet); dispatch_due() claims both, must dispatch both
+    ev.tick(true); // collect_ready() is a no-op (nothing in flight yet); dispatch_due() claims both, must dispatch both
 
     REQUIRE(h.dispatch_calls == 2); // NOT 0, NOT 1 — should_stop=true never gates this loop
     REQUIRE(h.dispatched_plugins.size() == 2);
@@ -719,7 +773,7 @@ TEST_CASE("policy evaluator: collect_ready() defers every ready item when "
     h.fake_now += 20; // past grace_seconds (15) — both now "ready" for collect_ready()
 
     stop = true;
-    ev.tick(); // collect_ready() must process NEITHER ready item
+    ev.tick(true); // collect_ready() must process NEITHER ready item
 
     // Neither policy got an agent_status write. (Both policies' next
     // interval due-time was already pushed out by evaluate_now's own
@@ -738,7 +792,7 @@ TEST_CASE("policy evaluator: collect_ready() defers every ready item when "
     // unhappy-path) — proving the bounded-but-real loss this component's
     // design accepts, not a false "it recovers on retry" claim.
     stop = false;
-    ev.tick();
+    ev.tick(true);
     CHECK(h.status_of(pid_a, "agentA") == "<none>");
     CHECK(h.status_of(pid_b, "agentA") == "<none>");
 }
@@ -758,7 +812,7 @@ TEST_CASE("policy evaluator: an unset should_stop claims every due policy, "
     h.author("result.hostname != ''");
 
     PolicyEvaluator ev(h.deps()); // .should_stop left unset (default std::function<bool()>{})
-    ev.tick();
+    ev.tick(true);
 
     CHECK(h.dispatch_calls == 2);
 }

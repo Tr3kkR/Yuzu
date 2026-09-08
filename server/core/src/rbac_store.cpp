@@ -556,7 +556,7 @@ void RbacStore::seed_defaults() {
          "ON CONFLICT (key) DO NOTHING");
 
     // Securable types.
-    const std::array<std::string_view, 30> types = {
+    const std::array<std::string_view, 36> types = {
         "Infrastructure",  "UserManagement",  "InstructionDefinition",
         "InstructionSet",  "Execution",       "Schedule",
         "Approval",        "Tag",             "AuditLog",
@@ -584,6 +584,49 @@ void RbacStore::seed_defaults() {
         // same PluginConfig/UploadGrant precedent, deliberately absent from
         // the explicit Viewer read-list further down this function.
         "PowerManagement",
+        // #4030/#4032: WorkflowEngine's multi-step-orchestration securable.
+        // `workflow_routes.cpp` has gated `GET/POST/DELETE /api/workflows*`
+        // + `POST .../execute` on `perm_fn(req, res, "Workflow", <op>)`
+        // since WorkflowEngine's introduction, but "Workflow" was never
+        // added here (or mirrored into mcp_server.cpp's `kRbacSecurables[]`)
+        // — `securable_types` carries no FK from `role_permissions`, so a
+        // `grant(role, "Workflow", op)` call silently inserted a row naming
+        // a type RBAC's own catalogue didn't recognise: no role, including
+        // Administrator, could ever be granted Workflow:* while RBAC was
+        // enabled. Scoped to Workflow ONLY — the identical bug also exists
+        // on ProductPack/Directory (tracked generally by #4032), fixed
+        // independently by #4029/#4031 in their own worktrees to avoid a
+        // cross-worktree merge conflict on this shared array.
+        "Workflow",
+        // #4029 prerequisite fix: `ProductPack` is used as an RBAC securable
+        // string by the already-shipped `/api/product-packs*` routes
+        // (workflow_routes.cpp, `perm_fn(req, res, "ProductPack", "Read"/
+        // "Write"/"Delete")`) but was never seeded here or into
+        // mcp_server.cpp's `kRbacSecurables[]` mirror — `role_permissions.
+        // securable_type` carries a hard FK to `securable_types(name)`, so no
+        // role, not even Administrator, could ever be granted ProductPack:*
+        // while RBAC is enabled. Administrator gets full CRUD for free via
+        // the types-loop below; Read is additionally granted to Operator/
+        // PlatformEngineer/Viewer further down (the same population that
+        // already holds InstructionDefinition:Read) — Write/Delete stay
+        // Administrator-only, matching the issue's scoped ask.
+        "ProductPack",
+        // #4028 (api-parity programme #2146) — Settings read-twins, split
+        // along sensitivity lines rather than one blanket Settings:Read
+        // (per the issue's own scoping note). All four are Administrator-
+        // only via the CRUD loop below, deliberately absent from every
+        // other role's explicit grant list further down (incl. Viewer's
+        // blanket read-list) — matching today's admin_fn_-only gate on the
+        // 8 /fragments/settings/* routes this PR twins. Every (securable,
+        // "Read") pair here is ALSO added to authz_topology_floor.hpp's
+        // kTopologyFloor[], so an RBAC-off deployment stays admin-gated
+        // instead of silently widening to any authenticated user.
+        "TlsConfig",       // TLS + HTTPS listener config (tls/https fragments)
+        "PluginSigning",   // plugin code-signing trust bundle (distinct from
+                           // PluginConfig, which gates per-plugin runtime
+                           // kill-switch config — a different domain)
+        "ServerConfig",    // gateway/server-config/mcp/data-retention fragments
+        "AnalyticsConfig", // analytics fragment (ClickHouse integration)
         // #4031 prerequisite 1: "Directory" is called at discovery_routes.cpp
         // (perm_fn(..., "Directory", "Read"/"Write")) but was NEVER seeded
         // here — role_permissions.securable_type has a hard FK to
@@ -611,7 +654,8 @@ void RbacStore::seed_defaults() {
         // a wholly unrelated capability (the naming trap the issue calls out).
         // Read granted to Administrator ONLY, same admin-only-gate parity and
         // same topology-floor requirement as Enrollment above.
-        "OidcConfig"};
+        "OidcConfig"
+    };
     for (auto t : types)
         exec("INSERT INTO rbac_store.securable_types (name, is_system) VALUES ($1, TRUE) "
              "ON CONFLICT (name) DO NOTHING",
@@ -717,7 +761,14 @@ void RbacStore::seed_defaults() {
         for (std::string_view o : {"Read", "Write", "Execute", "Delete"})
             grant("PlatformEngineer", t, o);
     for (std::string_view t : {"Execution", "Schedule", "Approval", "Tag", "AuditLog", "Response",
-                               "SoftwareLicensing", "Inventory"})
+                               "SoftwareLicensing", "Inventory",
+                               // #4030: Workflow — read-only, matching Schedule's footprint. Not
+                               // added to the InstructionDefinition/InstructionSet CRUD loop above:
+                               // the issue scopes this prerequisite to granting Read only.
+                               "Workflow",
+                               // #4029: read visibility on installed product packs, matching the
+                               // existing InstructionDefinition:Read population's consistency.
+                               "ProductPack"})
         grant("PlatformEngineer", t, "Read");
     for (std::string_view o : {"Read", "Write", "Delete"})
         grant("PlatformEngineer", "Policy", o);
@@ -752,11 +803,16 @@ void RbacStore::seed_defaults() {
     grant("Operator", "FileRetrieval", "Write");
     grant("Operator", "GuaranteedState", "Read");
     grant("Operator", "GuaranteedState", "Push");
+    // #4029: read visibility on installed product packs.
+    grant("Operator", "ProductPack", "Read");
     // PR1.5/1.6: read visibility only — config and grant LIFECYCLE stay
     // privileged operations, and PluginSecret is deliberately absent here
     // (secret material is never Operator-readable).
     grant("Operator", "PluginConfig", "Read");
     grant("Operator", "UploadGrant", "Read");
+    // #4030: Workflow — read-only (the issue's prerequisite scopes this fix to
+    // granting Read; not added to the CRUD loop above, unlike Schedule/Execution).
+    grant("Operator", "Workflow", "Read");
 
     // ApiTokenManager. "Rotate" merged from origin/dev (P2 #11, SOC 2 CC6.3
     // — self-service human token rotation; same population that already
@@ -774,6 +830,9 @@ void RbacStore::seed_defaults() {
             grant("ITServiceOwner", t, o);
     }
     grant("ITServiceOwner", "GuaranteedState", "Push");
+    // #4030: Workflow — read-only (issue's prerequisite scope is Read only; not
+    // added to the CRUD loop above, unlike Schedule/Execution).
+    grant("ITServiceOwner", "Workflow", "Read");
 
     // Viewer: read on all except Infrastructure.
     // #2376 (task A) — Viewer held Security:Read (the only non-Administrator
@@ -789,7 +848,10 @@ void RbacStore::seed_defaults() {
                                "AuditLog", "Response", "ManagementGroup", "ApiToken", "Security",
                                "Policy", "DeviceToken", "SoftwareDeployment", "License",
                                "FileRetrieval", "GuaranteedState", "Inventory",
-                               "SoftwareLicensing", "EnginePrincipal"})
+                               "SoftwareLicensing", "EnginePrincipal",
+                               "Workflow", // #4030: read-only, matching Schedule's footprint.
+                               // #4029: read visibility on installed product packs.
+                               "ProductPack"})
         grant("Viewer", t, "Read");
 
     // Reviewer.

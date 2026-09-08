@@ -104,12 +104,14 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # see check-capability-matrix.sh's CDX-P2-006 comment for why an un-adjusted
 # baseline is not a real ratchet.
 #
-# #4031 (enrollment/directory/pending read twins, Batch A of #2146) flipped
+# #4031 (enrollment/directory/pending read twins, Batch A of #2146) flips
 # the enrollment domain's five GET rows from "planned:#2146" to "twinned"
 # (two directory-sync REST+MCP twins, three REST-only twins with the MCP gap
-# a reviewed #520 exception — see docs/mcp-server.md), taking this from 265
-# to 260.
-BASELINE_UNTWINNED = 260
+# a reviewed #520 exception — see docs/mcp-server.md), on top of origin/dev's
+# own already-merged #4027/#4028/#4029/#4030 twins (251) -- reconciled
+# post-merge against the actual measured count below, not hand-added from
+# either side's stale pre-merge value.
+BASELINE_UNTWINNED = 246
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.
@@ -407,17 +409,22 @@ def classify_domain(canonical_path, owner_file):
 
 def extract_all_routes():
     """Returns (bucket_a, bucket_b): each a dict {(method, canonical_path):
-    [(owner_file, raw_path), ...]} - fragments/legacy-api and /api/v1/*
-    registrations respectively, across every server/core/src/*.cpp file."""
+    [(owner_file, raw_path), ...]} - fragments/legacy-api and versioned
+    /api/vN/* registrations respectively, across every server/core/src/*.cpp
+    file. bucket_b covers every /api/vN/ generation (v1, and #4144's v2 -
+    the repo's first breaking-change route, docs/api-versioning-policy.md) -
+    each is OpenAPI-completeness-checked the same way; a version bump is not
+    a new tracking mechanism, it is the SAME mechanism at a new prefix."""
     bucket_a = {}
     bucket_b = {}
+    versioned_api_re = re.compile(r"^/api/v\d+/")
     for f in sorted(SERVER_SRC.glob("*.cpp")):
         text = strip_full_line_comments(f.read_text(encoding="utf-8"))
         for method, raw in extract_verb_calls(text, f.name):
-            if raw.startswith("/api/v1/"):
+            if versioned_api_re.match(raw):
                 bucket = bucket_b
             elif raw.startswith("/fragments/") or (
-                raw.startswith("/api/") and not raw.startswith("/api/v1")
+                raw.startswith("/api/") and not versioned_api_re.match(raw)
             ):
                 bucket = bucket_a
             else:
@@ -431,7 +438,9 @@ def extract_openapi_paths():
     """Parses the openapi_spec() literal out of rest_api_v1.cpp (concatenated
     raw-string chunks, MSVC C2026 16KB-cap split - see the source comment
     at rest_api_v1.cpp:664) and returns the set of (METHOD, canonical "/api/
-    v1"+path) tuples in its `paths` table, plus the parsed spec dict."""
+    v1"+path, or "/api/v2"+path for a path-item carrying a "/v2" server
+    override - #4144, the repo's first breaking-change route) tuples in its
+    `paths` table, plus the parsed spec dict."""
     text = REST_API_V1_CPP.read_text(encoding="utf-8")
     anchor = text.index("static const std::string spec =")
     pos = anchor + len("static const std::string spec =")
@@ -466,9 +475,18 @@ def extract_openapi_paths():
     for path, ops in spec.get("paths", {}).items():
         if not isinstance(ops, dict):
             continue
+        # A path-item's own "servers" override (OpenAPI 3.0.3 SS4.7.9.2) means
+        # it resolves against a DIFFERENT base than the top-level "/api/v1"
+        # servers[] entry - #4144's v2 route is the only one today, keyed
+        # "/v2/..." precisely so this is a literal-prefix strip, not a guess.
+        base = "/api/v1"
+        servers = ops.get("servers")
+        if isinstance(servers, list) and servers and path.startswith("/v2/"):
+            base = "/api/v2"
+            path = path[len("/v2"):]
         for m_lower, m_upper in methods.items():
             if m_lower in ops:
-                paths.add((m_upper, canonicalize("/api/v1" + path)))
+                paths.add((m_upper, canonicalize(base + path)))
     return paths, spec
 
 
@@ -631,7 +649,7 @@ def render_doc_block(ledger_rows, bucket_b, openapi_paths, allowlist_set, mcp_to
                  f"**{total_untwinned}** |")
     lines.append("")
     missing_openapi = len(set(bucket_b) - openapi_paths)
-    lines.append(f"Registered `/api/v1/*` routes: {len(bucket_b)}. OpenAPI "
+    lines.append(f"Registered `/api/vN/*` routes: {len(bucket_b)}. OpenAPI "
                  f"`paths` entries: {len(openapi_paths)}. Missing from "
                  f"OpenAPI: {missing_openapi} ({len(allowlist_set)} carried "
                  f"in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` "

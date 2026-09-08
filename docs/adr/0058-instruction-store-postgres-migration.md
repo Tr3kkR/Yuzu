@@ -226,7 +226,8 @@ Sets have no signature concept at all — `"trusted"` would misleadingly imply o
 method, `create_set_seed(const InstructionSet&)`, is the seed-aware entry point
 (`server.cpp`'s `kBundledSets` loop calls it instead of plain `create_set`); the existing
 `create_set` stays exactly as it is today — no lock, no tombstone consultation, used by the
-REST-facing "create a custom instruction set" route (`server.cpp:15408`) exactly as before.
+REST-facing "create a custom instruction set" route (`POST /api/instruction-sets`,
+`instruction_routes.cpp` as of #2542 PR-7, extracted from `server.cpp`) exactly as before.
 Mirrors `import_definition_json`/`import_definition_json_trusted`'s "two named entry points make
 the trust boundary explicit at every call site" pattern, extended by name to match what's actually
 being distinguished here (reseed vs. operator-authored), not signature verification.

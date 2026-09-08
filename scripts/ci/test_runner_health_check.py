@@ -427,8 +427,13 @@ class WorkflowWiringTests(unittest.TestCase):
 
     def test_nightly_alert_does_not_open_a_merge_block_after_cancellation(self) -> None:
         nightly = (ROOT / ".github" / "workflows" / "nightly.yml").read_text(encoding="utf-8")
+        # #4018 added an `inputs.jobs != 'windows-asan'` clause so a windows-asan-only
+        # dispatch doesn't comment on the shared nightly-broken issue; !cancelled()
+        # (the property this test guards) is still the leading status-check function,
+        # unaffected by the AND'd clause after it.
         self.assertIn(
-            "if: ${{ !cancelled() && (failure() || needs.preflight.result == 'failure') }}",
+            "if: ${{ !cancelled() && inputs.jobs != 'windows-asan' && "
+            "(failure() || needs.preflight.result == 'failure') }}",
             nightly,
         )
 

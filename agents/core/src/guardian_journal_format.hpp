@@ -32,7 +32,9 @@ namespace yuzu::agent {
 
 // ── Namespace, format version, caps (design §3, §6; rev-4.1) ──────────────────
 
-/// Distinct kv_store "plugin" namespace - survives full_sync's clear("__guardian__").
+/// Distinct kv_store "plugin" namespace - survives full_sync's rule-record
+/// sweep (a scoped delete of "rule:"-prefixed keys under "__guardian__" as of
+/// #4021; this namespace was never touched by it either before or after).
 inline constexpr std::string_view kJournalNamespace = "__guardian_journal__";
 
 /// Value envelope version. An unknown version on read → quarantine (never trust).
@@ -181,7 +183,9 @@ struct JournalRecord {
     std::uint64_t generation{0};
     std::string event_id; // wire idempotency key; boot-nonce'd; PRESERVED verbatim on replay
     std::int64_t enqueued_ns{0}; // wall ns at enqueue; the frozen wire timestamp source
-    std::string kind;            // "armed" | "disarmed"
+    std::string kind;            // "armed" | "disarmed" | "errored" (#2818) - keep in lockstep
+                                 // with guardian_lifecycle_journal.cpp's replay allowlist AND
+                                 // guardian_outbox.hpp's documented lifecycle_kind vocabulary
     std::string guard_type;
     std::string rule_name;
 };

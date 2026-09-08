@@ -24,6 +24,10 @@
 #include "tag_store.hpp" // F2a PR3: TagStore::validate_key for the cohort export key
 #include "mfa_qr.hpp"
 #include "plugin_signing_helpers.hpp"
+#include "rest_a4_envelope.hpp"      // #4028 — detail::error_json_a4 for the settings read-twins
+#include "rest_a4_envelope_http.hpp" // #4028 — detail::a4_error/ensure_correlation_id
+#include "rest_audit.hpp"            // #4028 — detail::emit_behavioral_audit (fail-closed REST reads)
+#include "settings_model.hpp"        // #4028 — shared REST/fragment read-twin builders
 #include "web_utils.hpp"
 #include <yuzu/server/server.hpp>
 #include <yuzu/server/auth_db.hpp>
@@ -225,85 +229,115 @@ std::string highlight_yaml_kv(const std::string& line) {
 // extract_json_string moved to json_extract.hpp (#2557) — SettingsRoutes
 // lives in namespace yuzu::server, so this unqualified name still resolves.
 
+// #4028 — success-envelope wrapper matching rest_api_v1.cpp's ok_json() wire
+// shape ({"data":...,"meta":{"api_version":"v1"}}) exactly. ok_json() itself
+// is TU-local to rest_api_v1.cpp (declared in its own anonymous namespace,
+// not a shared header), so this file — which already builds every response
+// via nlohmann::json rather than rest_api_v1.cpp's local JObj/JArr string
+// builders (see the existing /api/v1/agent/plugin-policy handler below) —
+// gets its own copy of the same shape rather than reaching across TUs.
+nlohmann::json settings_ok_envelope(nlohmann::json data) {
+    nlohmann::json out;
+    out["data"] = std::move(data);
+    out["meta"] = {{"api_version", "v1"}};
+    return out;
+}
+
 } // anonymous namespace
 
 // ── Fragment renderers ──────────────────────────────────────────────────────
 
 std::string SettingsRoutes::render_server_config_fragment() {
+    // #4028 — shared builder (settings_model.hpp); the REST twin
+    // GET /api/v1/settings/server-config formats the SAME JSON as its
+    // response body instead of re-deriving these fields from cfg_.
+    const auto v = settings_model::build_server_config_settings(*cfg_);
+
     std::string html;
 
     html += "<table class=\"user-table\" style=\"font-size:0.8rem\">"
             "<thead><tr><th>Setting</th><th>Value</th></tr></thead>"
             "<tbody>";
 
-    html += "<tr><td>Agent gRPC Address</td><td><code>" + html_escape(cfg_->listen_address) +
-            "</code></td></tr>";
+    html += "<tr><td>Agent gRPC Address</td><td><code>" +
+            html_escape(v.at("agent_grpc_address").get<std::string>()) + "</code></td></tr>";
     html += "<tr><td>Management gRPC Address</td><td><code>" +
-            html_escape(cfg_->management_address) + "</code></td></tr>";
-    html += "<tr><td>Web UI Address</td><td><code>" + html_escape(cfg_->web_address) +
+            html_escape(v.at("management_grpc_address").get<std::string>()) + "</code></td></tr>";
+    html += "<tr><td>Web UI Address</td><td><code>" +
+            html_escape(v.at("web_address").get<std::string>()) + "</code></td></tr>";
+    html += "<tr><td>Web UI Port</td><td><code>" + std::to_string(v.at("web_port").get<int>()) +
             "</code></td></tr>";
-    html +=
-        "<tr><td>Web UI Port</td><td><code>" + std::to_string(cfg_->web_port) + "</code></td></tr>";
 
     html += "<tr><td>Session Timeout</td><td><code>" +
-            std::to_string(cfg_->session_timeout.count()) + "s</code></td></tr>";
-    html += "<tr><td>Max Agents</td><td><code>" + std::to_string(cfg_->max_agents) +
-            "</code></td></tr>";
+            std::to_string(v.at("session_timeout_seconds").get<std::int64_t>()) +
+            "s</code></td></tr>";
+    html += "<tr><td>Max Agents</td><td><code>" +
+            std::to_string(v.at("max_agents").get<std::int64_t>()) + "</code></td></tr>";
 
-    std::string auth_path_str = cfg_->auth_config_path.empty()
-                                    ? std::string("(default)")
-                                    : html_escape(cfg_->auth_config_path.string());
+    std::string auth_path = v.at("auth_config_path").get<std::string>();
+    std::string auth_path_str =
+        auth_path.empty() ? std::string("(default)") : html_escape(auth_path);
     html += "<tr><td>Auth Config Path</td><td><span class=\"file-name\">" + auth_path_str +
             "</span></td></tr>";
 
-    html += "<tr><td>API Rate Limit</td><td><code>" + std::to_string(cfg_->rate_limit) +
-            "</code> req/s per IP</td></tr>";
-    html += "<tr><td>Login Rate Limit</td><td><code>" + std::to_string(cfg_->login_rate_limit) +
+    html += "<tr><td>API Rate Limit</td><td><code>" +
+            std::to_string(v.at("rate_limit_per_ip").get<int>()) + "</code> req/s per IP</td></tr>";
+    html += "<tr><td>Login Rate Limit</td><td><code>" +
+            std::to_string(v.at("login_rate_limit_per_ip").get<int>()) +
             "</code> req/s per IP</td></tr>";
 
     // Agent OTA pull bounds (#913 / #911). Read-only, like every row here.
     html += "<tr><td>OTA Concurrency (per peer)</td><td><code>" +
-            std::to_string(cfg_->ota_max_concurrent_per_peer) +
+            std::to_string(v.at("ota_max_concurrent_per_peer").get<int>()) +
             "</code> parallel downloads</td></tr>";
     // Format the two doubles to one decimal place: std::to_string renders a
     // double as "1.000000", which is the only row on this fragment that does not
     // read like a configured value.
     {
         char rate_buf[64];
-        std::snprintf(rate_buf, sizeof(rate_buf), "%.1f", cfg_->ota_rate_refill_per_min);
+        std::snprintf(rate_buf, sizeof(rate_buf), "%.1f",
+                      v.at("ota_rate_refill_per_min").get<double>());
         char burst_buf[64];
-        std::snprintf(burst_buf, sizeof(burst_buf), "%.1f", cfg_->ota_rate_capacity);
+        std::snprintf(burst_buf, sizeof(burst_buf), "%.1f", v.at("ota_rate_capacity").get<double>());
         html += std::string("<tr><td>OTA Rate (per peer)</td><td><code>") + rate_buf +
                 "</code>/min, burst <code>" + burst_buf + "</code></td></tr>";
     }
     html += "<tr><td>OTA Transfers (server-wide)</td><td><code>" +
-            std::to_string(cfg_->ota_max_concurrent_total) + "</code> concurrent</td></tr>";
+            std::to_string(v.at("ota_max_concurrent_total").get<int>()) +
+            "</code> concurrent</td></tr>";
     html += "<tr><td>OTA Peer Map Cap</td><td><code>" +
-            std::to_string(cfg_->ota_max_peers_tracked) + "</code> keys</td></tr>";
+            std::to_string(v.at("ota_max_peers_tracked").get<int>()) + "</code> keys</td></tr>";
     html += "<tr><td>OTA Transfer Deadline</td><td><code>" +
-            std::to_string(cfg_->ota_transfer_deadline_secs) + "</code> s (chunk <code>" +
-            std::to_string(cfg_->ota_chunk_write_deadline_secs) + "</code> s)</td></tr>";
+            std::to_string(v.at("ota_transfer_deadline_secs").get<int>()) +
+            "</code> s (chunk <code>" +
+            std::to_string(v.at("ota_chunk_write_deadline_secs").get<int>()) + "</code> s)</td></tr>";
     html += "<tr><td>gRPC Stream Cap</td><td><code>" +
-            std::to_string(cfg_->grpc_max_concurrent_streams) +
+            std::to_string(v.at("grpc_max_concurrent_streams").get<int>()) +
             "</code> streams/connection, quota <code>" +
-            std::to_string(cfg_->grpc_max_resource_memory_mb) + "</code> MiB</td></tr>";
+            std::to_string(v.at("grpc_max_resource_memory_mb").get<int>()) + "</code> MiB</td></tr>";
 
     html += "</tbody></table>";
     return html;
 }
 
 std::string SettingsRoutes::render_tls_fragment() {
-    std::string checked = cfg_->tls_enabled ? " checked" : "";
-    std::string status_color = cfg_->tls_enabled ? "#3fb950" : "#f85149";
-    std::string status_text = cfg_->tls_enabled ? "Enabled" : "Disabled";
-    std::string fields_opacity = cfg_->tls_enabled ? "1" : "0.4";
+    // #4028 — shared builder; GET /api/v1/settings/tls formats the SAME
+    // JSON as its response body instead of re-deriving these fields.
+    const auto v = settings_model::build_tls_settings(*cfg_);
+    const bool tls_enabled = v.at("enabled").get<bool>();
 
-    std::string cert_name =
-        cfg_->tls_server_cert.empty() ? "No file" : html_escape(cfg_->tls_server_cert.string());
-    std::string key_name =
-        cfg_->tls_server_key.empty() ? "No file" : html_escape(cfg_->tls_server_key.string());
-    std::string ca_name =
-        cfg_->tls_ca_cert.empty() ? "No file" : html_escape(cfg_->tls_ca_cert.string());
+    std::string checked = tls_enabled ? " checked" : "";
+    std::string status_color = tls_enabled ? "#3fb950" : "#f85149";
+    std::string status_text = tls_enabled ? "Enabled" : "Disabled";
+    std::string fields_opacity = tls_enabled ? "1" : "0.4";
+
+    auto path_or_no_file = [](const nlohmann::json& j) -> std::string {
+        auto s = j.get<std::string>();
+        return s.empty() ? "No file" : html_escape(s);
+    };
+    std::string cert_name = path_or_no_file(v.at("server_cert_path"));
+    std::string key_name = path_or_no_file(v.at("server_key_path"));
+    std::string ca_name = path_or_no_file(v.at("ca_cert_path"));
 
     std::string html =
         "<form id=\"tls-form\">"
@@ -442,8 +476,9 @@ std::string SettingsRoutes::render_tls_fragment() {
 
     // Insecure-skip-client-verify (one-way TLS) — color red when enabled to flag the
     // weakened posture in the operator dashboard, not just the warm-orange "warning" hue.
-    std::string owt_color = cfg_->insecure_skip_client_verify ? "#f85149" : "#8b949e";
-    std::string owt_text = cfg_->insecure_skip_client_verify
+    const bool insecure_skip = v.at("insecure_skip_client_verify").get<bool>();
+    std::string owt_color = insecure_skip ? "#f85149" : "#8b949e";
+    std::string owt_text = insecure_skip
                                ? "Client cert verification DISABLED (--insecure-skip-client-verify)"
                                : "Disabled (mTLS enforced)";
     html += "<div class=\"form-row\" style=\"margin-top:0.75rem\">"
@@ -454,15 +489,13 @@ std::string SettingsRoutes::render_tls_fragment() {
             "</div>";
 
     // Management TLS overrides
-    std::string mgmt_cert = cfg_->mgmt_tls_server_cert.empty()
-                                ? "Using agent TLS"
-                                : html_escape(cfg_->mgmt_tls_server_cert.string());
-    std::string mgmt_key = cfg_->mgmt_tls_server_key.empty()
-                               ? "Using agent TLS"
-                               : html_escape(cfg_->mgmt_tls_server_key.string());
-    std::string mgmt_ca = cfg_->mgmt_tls_ca_cert.empty()
-                              ? "Using agent TLS"
-                              : html_escape(cfg_->mgmt_tls_ca_cert.string());
+    auto path_or_using_agent = [](const nlohmann::json& j) -> std::string {
+        auto s = j.get<std::string>();
+        return s.empty() ? "Using agent TLS" : html_escape(s);
+    };
+    std::string mgmt_cert = path_or_using_agent(v.at("mgmt_server_cert_path"));
+    std::string mgmt_key = path_or_using_agent(v.at("mgmt_server_key_path"));
+    std::string mgmt_ca = path_or_using_agent(v.at("mgmt_ca_cert_path"));
 
     html +=
         "<div style=\"margin-top:0.75rem;padding-top:0.75rem;border-top:1px solid var(--border)\">"
@@ -2318,7 +2351,11 @@ std::string SettingsRoutes::render_updates_fragment() {
 }
 
 std::string SettingsRoutes::render_gateway_fragment() {
-    bool enabled = gateway_enabled_;
+    // #4028 — shared builder; GET /api/v1/settings/gateway formats the SAME
+    // JSON as its response body instead of re-deriving these fields.
+    auto count = gateway_session_count_fn_ ? gateway_session_count_fn_() : 0;
+    const auto v = settings_model::build_gateway_settings(*cfg_, gateway_enabled_, count);
+    bool enabled = v.at("enabled").get<bool>();
     std::string status_color = enabled ? "#3fb950" : "#484f58";
     std::string status_text = enabled ? "Enabled" : "Disabled";
 
@@ -2335,23 +2372,24 @@ std::string SettingsRoutes::render_gateway_fragment() {
         html += "<div class=\"form-row\">"
                 "  <label>Listen Address</label>"
                 "  <code style=\"font-size:0.8rem\">" +
-                html_escape(cfg_->gateway_upstream_address) +
+                html_escape(v.at("listen_address").get<std::string>()) +
                 "</code>"
                 "</div>";
 
+        const bool gw_mode = v.at("gateway_mode").get<bool>();
         html += "<div class=\"form-row\">"
                 "  <label>Gateway Mode</label>"
                 "  <span style=\"font-size:0.8rem;color:" +
-                std::string(cfg_->gateway_mode ? "#3fb950" : "#8b949e") + "\">" +
-                (cfg_->gateway_mode ? "Active" : "Inactive") +
+                std::string(gw_mode ? "#3fb950" : "#8b949e") + "\">" +
+                (gw_mode ? "Active" : "Inactive") +
                 "</span>"
                 "</div>";
 
-        auto count = gateway_session_count_fn_ ? gateway_session_count_fn_() : 0;
+        auto shown_count = v.at("active_sessions").get<std::int64_t>();
         html += "<div class=\"form-row\">"
                 "  <label>Active Sessions</label>"
                 "  <span style=\"font-size:0.8rem\">" +
-                std::to_string(count) + " agent" + (count != 1 ? "s" : "") +
+                std::to_string(shown_count) + " agent" + (shown_count != 1 ? "s" : "") +
                 " via gateway</span>"
                 "</div>";
     } else {
@@ -2394,10 +2432,15 @@ std::string SettingsRoutes::render_gateway_fragment() {
 }
 
 std::string SettingsRoutes::render_https_fragment() {
+    // #4028 — shared builder; GET /api/v1/settings/https formats the SAME
+    // JSON as its response body instead of re-deriving these fields.
+    const auto v = settings_model::build_https_settings(*cfg_);
+    const bool https_enabled = v.at("enabled").get<bool>();
+
     std::string html;
 
-    std::string status_color = cfg_->https_enabled ? "#3fb950" : "#484f58";
-    std::string status_text = cfg_->https_enabled ? "Enabled" : "Disabled";
+    std::string status_color = https_enabled ? "#3fb950" : "#484f58";
+    std::string status_text = https_enabled ? "Enabled" : "Disabled";
 
     html += "<div class=\"form-row\">"
             "  <label>HTTPS</label>"
@@ -2409,16 +2452,16 @@ std::string SettingsRoutes::render_https_fragment() {
     html += "<div class=\"form-row\">"
             "  <label>HTTPS Port</label>"
             "  <code style=\"font-size:0.8rem\">" +
-            std::to_string(cfg_->https_port) +
+            std::to_string(v.at("port").get<int>()) +
             "</code>"
             "</div>";
 
-    std::string https_cert = cfg_->https_cert_path.empty()
-                                 ? "Not configured"
-                                 : html_escape(cfg_->https_cert_path.string());
-    std::string https_key = cfg_->https_key_path.empty()
-                                ? "Not configured"
-                                : html_escape(cfg_->https_key_path.string());
+    auto path_or_not_configured = [](const nlohmann::json& j) -> std::string {
+        auto s = j.get<std::string>();
+        return s.empty() ? "Not configured" : html_escape(s);
+    };
+    std::string https_cert = path_or_not_configured(v.at("cert_path"));
+    std::string https_key = path_or_not_configured(v.at("key_path"));
 
     html += "<div class=\"form-row\">"
             "  <label>Certificate</label>"
@@ -2433,8 +2476,9 @@ std::string SettingsRoutes::render_https_fragment() {
             "</span>"
             "</div>";
 
-    std::string redir_color = cfg_->https_redirect ? "#3fb950" : "#8b949e";
-    std::string redir_text = cfg_->https_redirect ? "Enabled" : "Disabled";
+    const bool redirect = v.at("redirect").get<bool>();
+    std::string redir_color = redirect ? "#3fb950" : "#8b949e";
+    std::string redir_text = redirect ? "Enabled" : "Disabled";
     html += "<div class=\"form-row\">"
             "  <label>HTTP Redirect</label>"
             "  <span style=\"font-size:0.8rem;color:" +
@@ -2442,7 +2486,7 @@ std::string SettingsRoutes::render_https_fragment() {
             "</span>"
             "</div>";
 
-    if (!cfg_->https_enabled) {
+    if (!https_enabled) {
         html += "<p style=\"font-size:0.75rem;color:#8b949e;margin-top:0.5rem\">"
                 "Start the server with <code>--https --https-cert &lt;path&gt; --https-key "
                 "&lt;path&gt;</code> to enable.</p>";
@@ -2452,10 +2496,19 @@ std::string SettingsRoutes::render_https_fragment() {
 }
 
 std::string SettingsRoutes::render_analytics_fragment() {
+    // #4028 — shared builder; GET /api/v1/settings/analytics formats the
+    // SAME JSON as its response body instead of re-deriving these fields.
+    // SECURITY FIX (#4028 Evidence): the ClickHouse URL is now sanitized of
+    // embedded userinfo credentials by the builder before it ever reaches
+    // this renderer — previously this fragment rendered cfg_->clickhouse_url
+    // verbatim, leaking a credential embedded in the URL even though the
+    // separate clickhouse_password field was masked below.
+    const auto v = settings_model::build_analytics_settings(*cfg_);
+
     std::string html;
 
-    std::string status_color = cfg_->analytics_enabled ? "#3fb950" : "#484f58";
-    std::string status_text = cfg_->analytics_enabled ? "Enabled" : "Disabled";
+    std::string status_color = v.at("enabled").get<bool>() ? "#3fb950" : "#484f58";
+    std::string status_text = v.at("enabled").get<bool>() ? "Enabled" : "Disabled";
 
     html += "<div class=\"form-row\">"
             "  <label>Analytics</label>"
@@ -2467,20 +2520,21 @@ std::string SettingsRoutes::render_analytics_fragment() {
     html += "<div class=\"form-row\">"
             "  <label>Drain Interval</label>"
             "  <code style=\"font-size:0.8rem\">" +
-            std::to_string(cfg_->analytics_drain_interval_seconds) +
+            std::to_string(v.at("drain_interval_seconds").get<int>()) +
             "s</code>"
             "</div>";
 
     html += "<div class=\"form-row\">"
             "  <label>Batch Size</label>"
             "  <code style=\"font-size:0.8rem\">" +
-            std::to_string(cfg_->analytics_batch_size) +
+            std::to_string(v.at("batch_size").get<int>()) +
             "</code>"
             "</div>";
 
-    bool ch_configured = !cfg_->clickhouse_url.empty();
+    bool ch_configured = v.at("clickhouse_configured").get<bool>();
     std::string ch_color = ch_configured ? "#3fb950" : "#484f58";
-    std::string ch_text = ch_configured ? html_escape(cfg_->clickhouse_url) : "Not configured";
+    std::string ch_text =
+        ch_configured ? html_escape(v.at("clickhouse_url").get<std::string>()) : "Not configured";
 
     html +=
         "<div style=\"margin-top:0.75rem;padding-top:0.75rem;border-top:1px solid var(--border)\">"
@@ -2497,33 +2551,32 @@ std::string SettingsRoutes::render_analytics_fragment() {
         html += "<div class=\"form-row\">"
                 "  <label>Database</label>"
                 "  <code style=\"font-size:0.8rem\">" +
-                html_escape(cfg_->clickhouse_database) +
+                html_escape(v.at("clickhouse_database").get<std::string>()) +
                 "</code>"
                 "</div>";
         html += "<div class=\"form-row\">"
                 "  <label>Table</label>"
                 "  <code style=\"font-size:0.8rem\">" +
-                html_escape(cfg_->clickhouse_table) +
+                html_escape(v.at("clickhouse_table").get<std::string>()) +
                 "</code>"
                 "</div>";
+        std::string username = v.at("clickhouse_username").get<std::string>();
         html += "<div class=\"form-row\">"
                 "  <label>Username</label>"
                 "  <code style=\"font-size:0.8rem\">" +
-                (cfg_->clickhouse_username.empty() ? std::string("(default)")
-                                                   : html_escape(cfg_->clickhouse_username)) +
+                (username.empty() ? std::string("(default)") : html_escape(username)) +
                 "</code></div>";
         html += "<div class=\"form-row\">"
                 "  <label>Password</label>"
                 "  <span style=\"font-size:0.8rem;color:#8b949e\">" +
-                (cfg_->clickhouse_password.empty() ? std::string("(not set)")
-                                                   : std::string("********")) +
+                (v.at("clickhouse_password_set").get<bool>() ? std::string("********")
+                                                              : std::string("(not set)")) +
                 "</span></div>";
     }
     html += "</div>";
 
-    std::string jsonl_path = cfg_->analytics_jsonl_path.empty()
-                                 ? "Not configured"
-                                 : html_escape(cfg_->analytics_jsonl_path.string());
+    std::string jsonl = v.at("jsonl_export_path").get<std::string>();
+    std::string jsonl_path = jsonl.empty() ? "Not configured" : html_escape(jsonl);
     html += "<div class=\"form-row\" style=\"margin-top:0.5rem\">"
             "  <label>JSONL Export</label>"
             "  <span class=\"file-name\">" +
@@ -2535,19 +2588,23 @@ std::string SettingsRoutes::render_analytics_fragment() {
 }
 
 std::string SettingsRoutes::render_data_retention_fragment() {
+    // #4028 — shared builder; GET /api/v1/settings/data-retention formats
+    // the SAME JSON as its response body instead of re-deriving these fields.
+    const auto v = settings_model::build_data_retention_settings(*cfg_);
+
     std::string html;
 
     html += "<div class=\"form-row\">"
             "  <label>Response Data</label>"
             "  <code style=\"font-size:0.8rem\">" +
-            std::to_string(cfg_->response_retention_days) +
+            std::to_string(v.at("response_retention_days").get<int>()) +
             " days</code>"
             "</div>";
 
     html += "<div class=\"form-row\">"
             "  <label>Audit Logs</label>"
             "  <code style=\"font-size:0.8rem\">" +
-            std::to_string(cfg_->audit_retention_days) +
+            std::to_string(v.at("audit_retention_days").get<int>()) +
             " days</code>"
             "</div>";
 
@@ -2667,8 +2724,12 @@ std::string SettingsRoutes::render_dex_alerts_fragment() {
 }
 
 std::string SettingsRoutes::render_mcp_fragment() {
+    // #4028 — shared builder; GET /api/v1/settings/mcp formats the SAME
+    // JSON as its response body instead of re-deriving these fields.
+    const auto v = settings_model::build_mcp_settings(*cfg_);
+
     std::string html;
-    bool mcp_enabled = !cfg_->mcp_disable;
+    bool mcp_enabled = v.at("enabled").get<bool>();
 
     std::string status_color = mcp_enabled ? "#3fb950" : "#484f58";
     std::string status_text = mcp_enabled ? "Enabled" : "Disabled";
@@ -2699,9 +2760,10 @@ std::string SettingsRoutes::render_mcp_fragment() {
             "  </label>"
             "</div>";
 
-    std::string readonly_checked = cfg_->mcp_read_only ? " checked" : "";
-    std::string readonly_color = cfg_->mcp_read_only ? "#d29922" : "#484f58";
-    std::string readonly_text = cfg_->mcp_read_only ? "Read-Only" : "Full Access";
+    const bool mcp_read_only = v.at("read_only").get<bool>();
+    std::string readonly_checked = mcp_read_only ? " checked" : "";
+    std::string readonly_color = mcp_read_only ? "#d29922" : "#484f58";
+    std::string readonly_text = mcp_read_only ? "Read-Only" : "Full Access";
     html += "<div class=\"form-row\">"
             "  <label>Access Mode</label>"
             "  <label class=\"toggle\">"
@@ -2725,10 +2787,7 @@ std::string SettingsRoutes::render_mcp_fragment() {
             "select an MCP tier (readonly, operator, or supervised) from the dropdown."
             "</p>";
 
-    std::string proto = cfg_->https_enabled ? "https" : "http";
-    std::string host = cfg_->web_address == "0.0.0.0" ? "localhost" : cfg_->web_address;
-    auto port = cfg_->https_enabled ? cfg_->https_port : cfg_->web_port;
-    std::string url = proto + "://" + host + ":" + std::to_string(port) + "/mcp/v1/";
+    std::string url = v.at("endpoint_url").get<std::string>();
 
     html += "<div style=\"margin-top:0.75rem;padding:0.75rem;background:#0d1117;"
             "border:1px solid var(--border);border-radius:0.3rem\">"
@@ -2936,15 +2995,51 @@ std::optional<std::expected<TrustBundleStats, std::string>> read_on_disk_bundle(
 std::string SettingsRoutes::render_plugin_signing_fragment() {
     std::string html;
 
+    // #4028 — shared builder (also feeds the hardened
+    // GET /api/v2/agent/plugin-policy, plugin-signing's only REST twin —
+    // #4144 moved it from /v1/, now deprecated);
+    // this renderer reads the view's fields rather than `bundle`/`required`
+    // directly, so both surfaces present the identical underlying data.
     auto bundle = read_on_disk_bundle();
-    const bool enabled = bundle && bundle->has_value();
-    const bool required =
-        runtime_config_store_ &&
-        runtime_config_store_->get_value(plugin_signing::kPluginSigningRequiredKey) == "true";
+
+    // #4028 fix-round finding UP-3/CH-2 (governance Gate 4/5, re-derived by
+    // sre/compliance-officer/enterprise-readiness): `get_value()` collapses
+    // a genuine runtime_config_store read failure to "", identically to a
+    // healthy "not required" — and this badge/toggle IS the deliverable an
+    // operator reads to know the require-signature state (I3: the caller
+    // cannot tell degraded from healthy). This flag is a status RECORD
+    // only — no server-side check consumes it today (see the corrected
+    // runtime_config_store.hpp file header; an earlier round of this fix
+    // wrongly cited ProductPackStore::require_signed_packs_ here, which
+    // governs YAML product-pack content, a different artifact from
+    // compiled plugin binaries — consistency-auditor's Gate 8 catch).
+    // Plugin-binary signature verification, where configured, is local to
+    // each agent via its own --plugin-require-signature/--plugin-trust-
+    // bundle flags. So this is a display-honesty fix, not an
+    // enforcement-bypass fix. `get()` lets a degraded read say so instead
+    // of silently reporting "false". The REST handler below applies the
+    // identical `get()` switch — keep both in sync (sre finding: a
+    // REST/dashboard divergence here would be worse than the original
+    // bug).
+    bool required = false;
+    bool required_status_unknown = false;
+    if (runtime_config_store_) {
+        auto rc = runtime_config_store_->get(plugin_signing::kPluginSigningRequiredKey);
+        if (!rc.has_value()) {
+            required_status_unknown = true;
+        } else {
+            required = rc->has_value() && rc->value().value == "true";
+        }
+    }
+    const auto v = settings_model::build_plugin_signing_settings(required, bundle);
+    const bool enabled = v.at("enabled").get<bool>();
 
     // Status badge
     std::string badge_color, badge_text;
-    if (enabled && required) {
+    if (required_status_unknown) {
+        badge_color = "#da3633"; // red -- distinct from every real state below
+        badge_text = "Require-signature status unknown (config store unavailable)";
+    } else if (enabled && required) {
         badge_color = "#238636"; // green
         badge_text = "Enforced (required)";
     } else if (enabled) {
@@ -2958,21 +3053,31 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
             "  <span style=\"font-size:0.75rem;background:" +
             badge_color + ";color:#fff;padding:0.2rem 0.6rem;border-radius:4px;font-weight:600\">" +
             badge_text + "</span></div>";
+    if (required_status_unknown) {
+        html += "<div class=\"feedback feedback-error\">Runtime config store is unavailable, "
+                "so the Require-signature toggle's saved value could not be read. This flag "
+                "is a status record only -- no server-side check consumes it today. Plugin "
+                "signature verification, where an agent is configured for it, is local to "
+                "that agent (its own <code>--plugin-require-signature</code> / "
+                "<code>--plugin-trust-bundle</code> flags) and is unaffected by this outage. "
+                "It means this page cannot currently show whether Require is on or off. "
+                "Retry shortly.</div>";
+    }
 
     // Current state
-    if (enabled && bundle->has_value()) {
-        const auto& stats = bundle->value();
+    if (enabled) {
         html += "<div class=\"form-row\"><label>Trust anchors</label>"
                 "<span style=\"font-size:0.8rem\">" +
-                std::to_string(stats.cert_count) + " certificate(s)</span></div>";
+                std::to_string(v.at("cert_count").get<int>()) + " certificate(s)</span></div>";
         html += "<div class=\"form-row\"><label>Bundle SHA-256</label>"
                 "<code style=\"font-size:0.7rem;word-break:break-all\">" +
-                stats.sha256_hex + "</code></div>";
-        if (!stats.subjects.empty()) {
+                v.at("sha256").get<std::string>() + "</code></div>";
+        const auto subjects = v.at("subjects").get<std::vector<std::string>>();
+        if (!subjects.empty()) {
             html += "<div class=\"form-row\" style=\"align-items:flex-start\">"
                     "<label>Subjects</label>"
                     "<div style=\"font-size:0.75rem;flex:1;min-width:0\">";
-            for (const auto& s : stats.subjects) {
+            for (const auto& s : subjects) {
                 html += "<div "
                         "style=\"font-family:monospace;color:var(--mds-color-theme-text-secondary);"
                         "overflow-wrap:anywhere\">" +
@@ -2980,9 +3085,9 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
             }
             html += "</div></div>";
         }
-    } else if (bundle && !bundle->has_value()) {
+    } else if (v.at("bundle_unreadable").get<bool>()) {
         html += "<div class=\"feedback feedback-error\">Bundle on disk is unreadable: " +
-                html_escape(bundle->error()) + "</div>";
+                html_escape(v.at("bundle_error").get<std::string>()) + "</div>";
     } else {
         html += "<p style=\"font-size:0.75rem;color:var(--mds-color-theme-text-tertiary)\">"
                 "No trust bundle uploaded. Plugin signature verification is off "
@@ -3020,8 +3125,18 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
             "Upload &amp; verify</button></div>";
     html += "</form>";
 
-    // Toggle: require signature (only meaningful when bundle is loaded)
-    if (enabled) {
+    // Toggle: require signature (only meaningful when bundle is loaded).
+    // #4028 fix-round finding (consistency-auditor/unhappy-path, Gate 8):
+    // also gated on !required_status_unknown -- otherwise this form
+    // renders with the checkbox defaulted UNCHECKED (since `required`
+    // stays false when its true value could not be read) while the
+    // banner above says the value is unknown, and submitting Save writes
+    // "false" unconditionally, silently discarding whatever the real
+    // prior value was the moment the store recovers. Suppress the whole
+    // form (and the Clear button below it) until a real read succeeds --
+    // forcing a retry is strictly safer than presenting a write control
+    // whose displayed state the page itself just declared untrustworthy.
+    if (enabled && !required_status_unknown) {
         html += "<form hx-post=\"/api/settings/plugin-signing/require\" "
                 "hx-target=\"#plugin-signing-section\" hx-swap=\"innerHTML\" "
                 "style=\"margin-top:0.75rem\">";
@@ -3064,9 +3179,11 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
             "margin:1rem 0\">";
     html += "<p style=\"font-size:0.75rem;color:var(--mds-color-theme-text-tertiary);"
             "margin-bottom:0.4rem\"><strong>Agent distribution.</strong> The bundle "
-            "is served at <code>GET /api/v1/agent/plugin-policy</code> "
+            "is served at <code>GET /api/v2/agent/plugin-policy</code> "
             "(<em>admin-only</em> — operators distribute to agents via the "
-            "standard config-management flow). Agents are pointed at a local "
+            "standard config-management flow; the deprecated "
+            "<code>/v1/</code> shape still works during its announced "
+            "removal window). Agents are pointed at a local "
             "file via <code>--plugin-trust-bundle</code>; automatic agent-side "
             "fetch is a forthcoming change, at which point this endpoint will "
             "gain a dedicated agent identity.</p>";
@@ -3092,13 +3209,14 @@ void SettingsRoutes::register_routes(
     AuditStore* audit_store, bool gateway_enabled, GatewaySessionCountFn gateway_session_count_fn,
     AgentsJsonFn agents_json_fn, std::shared_mutex& oidc_mu,
     std::unique_ptr<oidc::OidcProvider>& oidc_provider, yuzu::MetricsRegistry* metrics_registry,
-    StepUpFn step_up_fn) {
+    StepUpFn step_up_fn, AuditReadFn audit_read_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(admin_fn), std::move(perm_fn),
                     std::move(audit_fn), cfg, auth_mgr, auto_approve, api_token_store,
                     mgmt_group_store, tag_store, update_registry, runtime_config_store, audit_store,
                     gateway_enabled, std::move(gateway_session_count_fn), std::move(agents_json_fn),
-                    oidc_mu, oidc_provider, metrics_registry, std::move(step_up_fn));
+                    oidc_mu, oidc_provider, metrics_registry, std::move(step_up_fn),
+                    std::move(audit_read_fn));
 }
 
 void SettingsRoutes::register_routes(
@@ -3109,12 +3227,13 @@ void SettingsRoutes::register_routes(
     AuditStore* audit_store, bool gateway_enabled, GatewaySessionCountFn gateway_session_count_fn,
     AgentsJsonFn agents_json_fn, std::shared_mutex& oidc_mu,
     std::unique_ptr<oidc::OidcProvider>& oidc_provider, yuzu::MetricsRegistry* metrics_registry,
-    StepUpFn step_up_fn) {
+    StepUpFn step_up_fn, AuditReadFn audit_read_fn) {
     // Store dependency pointers
     auth_fn_ = std::move(auth_fn);
     admin_fn_ = std::move(admin_fn);
     perm_fn_ = std::move(perm_fn);
     audit_fn_ = std::move(audit_fn);
+    audit_read_fn_ = std::move(audit_read_fn);
     cfg_ = &cfg;
     auth_mgr_ = &auth_mgr;
     auto_approve_ = &auto_approve;
@@ -3154,6 +3273,32 @@ void SettingsRoutes::register_routes(
                      return;
                  res.set_content(render_tls_fragment(), "text/html; charset=utf-8");
              });
+
+    // #4028 — REST v1 read-twin. TlsConfig:Read (Administrator-only via the
+    // rbac_store.cpp seed, floored in authz_topology_floor.hpp so an
+    // RBAC-off deployment stays admin-gated). Audited fail-closed (§4):
+    // TLS/mTLS posture + cert paths are named recon value in #4028's
+    // Evidence section (same reasoning the plugin-signing route below
+    // already carries in its own comment).
+    sink.Get("/api/v1/settings/tls", [this](const httplib::Request& req, httplib::Response& res) {
+        if (!perm_fn_(req, res, "TlsConfig", "Read"))
+            return;
+        if (!detail::emit_behavioral_audit(audit_read_fn_, req, res, "settings.tls.read",
+                                           "success", "TlsConfig", "tls", "REST settings read")) {
+            res.status = 503;
+            res.set_content(detail::a4_error(res,
+                                             "audit subsystem unavailable; refusing to "
+                                             "serve settings data without durable evidence",
+                                             detail::A4ErrorOpts{
+                                                 .retry_after_ms = 5000,
+                                                 .remediation = "retry after the audit subsystem "
+                                                                "recovers"}),
+                            "application/json");
+            return;
+        }
+        res.set_content(settings_ok_envelope(settings_model::build_tls_settings(*cfg_)).dump(),
+                        "application/json");
+    });
 
     sink.Get(
         "/fragments/settings/users", [this](const httplib::Request& req, httplib::Response& res) {
@@ -3293,11 +3438,37 @@ void SettingsRoutes::register_routes(
                  res.set_content(render_gateway_fragment(), "text/html; charset=utf-8");
              });
 
+    // #4028 — REST v1 read-twin. ServerConfig:Read (Administrator-only,
+    // floored in authz_topology_floor.hpp). NOT audited — "nothing secret"
+    // per #4028's Evidence section (operational/infra config), matching this
+    // fragment's own unaudited posture today.
+    sink.Get("/api/v1/settings/gateway",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn_(req, res, "ServerConfig", "Read"))
+                     return;
+                 auto count = gateway_session_count_fn_ ? gateway_session_count_fn_() : 0;
+                 res.set_content(settings_ok_envelope(settings_model::build_gateway_settings(
+                                                          *cfg_, gateway_enabled_, count))
+                                     .dump(),
+                                 "application/json");
+             });
+
     sink.Get("/fragments/settings/server-config",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!admin_fn_(req, res))
                      return;
                  res.set_content(render_server_config_fragment(), "text/html; charset=utf-8");
+             });
+
+    // #4028 — REST v1 read-twin. ServerConfig:Read. NOT audited — "nothing
+    // secret" per #4028's Evidence section.
+    sink.Get("/api/v1/settings/server-config",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn_(req, res, "ServerConfig", "Read"))
+                     return;
+                 res.set_content(
+                     settings_ok_envelope(settings_model::build_server_config_settings(*cfg_)).dump(),
+                     "application/json");
              });
 
     sink.Get("/fragments/settings/https",
@@ -3307,11 +3478,65 @@ void SettingsRoutes::register_routes(
                  res.set_content(render_https_fragment(), "text/html; charset=utf-8");
              });
 
+    // #4028 — REST v1 read-twin. TlsConfig:Read (grouped with tls — same
+    // sub-area, #4028 acceptance criteria). Audited fail-closed (§4) — same
+    // recon-value reasoning as GET /api/v1/settings/tls.
+    sink.Get("/api/v1/settings/https", [this](const httplib::Request& req, httplib::Response& res) {
+        if (!perm_fn_(req, res, "TlsConfig", "Read"))
+            return;
+        if (!detail::emit_behavioral_audit(audit_read_fn_, req, res, "settings.https.read",
+                                           "success", "TlsConfig", "https", "REST settings read")) {
+            res.status = 503;
+            res.set_content(detail::a4_error(res,
+                                             "audit subsystem unavailable; refusing to "
+                                             "serve settings data without durable evidence",
+                                             detail::A4ErrorOpts{
+                                                 .retry_after_ms = 5000,
+                                                 .remediation = "retry after the audit subsystem "
+                                                                "recovers"}),
+                            "application/json");
+            return;
+        }
+        res.set_content(settings_ok_envelope(settings_model::build_https_settings(*cfg_)).dump(),
+                        "application/json");
+    });
+
     sink.Get("/fragments/settings/analytics",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!admin_fn_(req, res))
                      return;
                  res.set_content(render_analytics_fragment(), "text/html; charset=utf-8");
+             });
+
+    // #4028 — REST v1 read-twin. AnalyticsConfig:Read. Audited fail-closed
+    // (§4) — "mixed, leans high (embedded credential risk)" per #4028's
+    // Evidence section. The ClickHouse URL is sanitized of userinfo by the
+    // shared builder before it reaches this response (see
+    // settings_model::sanitize_url_userinfo); the raw password is never
+    // read into the payload at all.
+    sink.Get("/api/v1/settings/analytics",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn_(req, res, "AnalyticsConfig", "Read"))
+                     return;
+                 if (!detail::emit_behavioral_audit(audit_read_fn_, req, res,
+                                                    "settings.analytics.read", "success",
+                                                    "AnalyticsConfig", "analytics",
+                                                    "REST settings read")) {
+                     res.status = 503;
+                     res.set_content(
+                         detail::a4_error(res,
+                                          "audit subsystem unavailable; refusing to serve "
+                                          "settings data without durable evidence",
+                                          detail::A4ErrorOpts{
+                                              .retry_after_ms = 5000,
+                                              .remediation = "retry after the audit subsystem "
+                                                             "recovers"}),
+                         "application/json");
+                     return;
+                 }
+                 res.set_content(
+                     settings_ok_envelope(settings_model::build_analytics_settings(*cfg_)).dump(),
+                     "application/json");
              });
 
     sink.Get("/fragments/settings/data-retention",
@@ -3321,12 +3546,37 @@ void SettingsRoutes::register_routes(
                  res.set_content(render_data_retention_fragment(), "text/html; charset=utf-8");
              });
 
+    // #4028 — REST v1 read-twin. ServerConfig:Read. NOT audited — "lowest
+    // sensitivity of the eight" per #4028's Evidence section.
+    sink.Get("/api/v1/settings/data-retention",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn_(req, res, "ServerConfig", "Read"))
+                     return;
+                 res.set_content(settings_ok_envelope(
+                                     settings_model::build_data_retention_settings(*cfg_))
+                                     .dump(),
+                                 "application/json");
+             });
+
     sink.Get("/fragments/settings/mcp",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!admin_fn_(req, res))
                      return;
                  res.set_content(render_mcp_fragment(), "text/html; charset=utf-8");
              });
+
+    // #4028 — REST v1 read-twin. ServerConfig:Read. NOT audited — "low
+    // sensitivity... an MCP client with a valid token already knows this
+    // endpoint exists" per #4028's Evidence section. #520 (see this PR's
+    // commit message / docs/mcp-server.md): this route stays REST-only —
+    // NOT itself a candidate MCP tool, since #520 explicitly bars MCP
+    // tokens from server administration surfaces including "settings".
+    sink.Get("/api/v1/settings/mcp", [this](const httplib::Request& req, httplib::Response& res) {
+        if (!perm_fn_(req, res, "ServerConfig", "Read"))
+            return;
+        res.set_content(settings_ok_envelope(settings_model::build_mcp_settings(*cfg_)).dump(),
+                        "application/json");
+    });
 
     // -- F1: DEX alerting (per-signal routing + blast-radius thresholds) ------
     sink.Get("/fragments/settings/dex-alerts",
@@ -3532,6 +3782,12 @@ void SettingsRoutes::register_routes(
                  res.set_content(render_plugin_signing_fragment(), "text/html; charset=utf-8");
              });
 
+    // #4028 — no parallel `/api/v1/settings/plugin-signing` route: the
+    // acceptance criteria is explicit that plugin-signing's REST twin is the
+    // hardened `GET /api/v2/agent/plugin-policy` below (already existed
+    // off-ledger at /v1/; #4144 moved the hardening there — see that
+    // handler's own comment), not a second route duplicating its data.
+
     // -- Plugin Code Signing: upload PEM trust bundle (admin) -----------------
     sink.Post("/api/settings/plugin-signing/upload", [this](const httplib::Request& req,
                                                             httplib::Response& res) {
@@ -3721,21 +3977,33 @@ void SettingsRoutes::register_routes(
         res.set_content(render_plugin_signing_fragment(), "text/html; charset=utf-8");
     });
 
-    // -- Plugin Code Signing: distribution endpoint --------------------------
+    // -- Plugin Code Signing: distribution endpoint (v1, FROZEN) -------------
     //
-    // Returns the current trust bundle and require flag as JSON for
-    // out-of-band distribution to agents (operators curl this into
-    // /etc/yuzu/plugin-trust-bundle.pem on each agent host, then pass
-    // --plugin-trust-bundle to the agent). Future automatic agent-side
-    // fetch will use the same shape.
+    // #4144 review fix (external colleague review, BLOCKING, confirmed
+    // against docs/api-versioning-policy.md by direct fetch): this route
+    // predates #4028 (present since the F2 OpenAPI backfill), and #4028's
+    // hardening reshaped its response envelope (flat body -> data/meta) and
+    // added new fields/error codes IN PLACE at this same /api/v1/ path — a
+    // breaking change per the policy's own "changing an error envelope's
+    // shape" clause, shipped with no version bump, no deprecation cycle, and
+    // no ADR-1005 exception-ledger entry. The policy's narrow
+    // security-tightening carve-out doesn't apply here (it requires a
+    // CHANGELOG Security entry citing a tracked vulnerability; this PR's own
+    // changelog carries a SEPARATE .security.md fragment for its actual
+    // security fix — the ClickHouse sanitizer — proving the classification
+    // was deliberate, not an oversight).
     //
-    // Authorization: admin only. The bundle PEM holds X.509 certificates
-    // (no private keys) so the security blast radius of disclosure is
-    // small, but a non-admin token holder learning when the trust anchor
-    // rotates (sha256 changes) is useful reconnaissance for a
-    // supply-chain attacker. CC6.1 least-privilege requires we restrict
-    // even read access to security-critical config to admin principals
-    // (governance hardening round 1: sec-LOW-4 / UP-13 / CC6.1).
+    // Fix: this handler is now FROZEN at exactly its pre-#4028 shape (see
+    // git show <pre-#4028 SHA>:server/core/src/settings_routes.cpp for the
+    // byte-for-byte source) — flat body, admin_fn_ gate, no audit call, the
+    // old ad hoc error envelope. All of #4028's hardening (RBAC securable,
+    // audit-fail-closed, A4 envelope, new fields, the TOCTOU fix) lives
+    // ONLY at GET /api/v2/agent/plugin-policy below. Per
+    // docs/api-versioning-policy.md's deprecation cycle: this v1 route is
+    // formally deprecated (see changelog.d/4144-plugin-policy-v1-deprecated
+    // .deprecated.md + docs/user-manual/upgrading.md) and stays live for the
+    // full window (>= 90 days AND >= one intervening feature release) before
+    // removal.
     sink.Get("/api/v1/agent/plugin-policy", [this](const httplib::Request& req,
                                                    httplib::Response& res) {
         if (!admin_fn_(req, res))
@@ -3781,6 +4049,165 @@ void SettingsRoutes::register_routes(
         out["cert_count"] = disk->value().cert_count;
         out["sha256"] = disk->value().sha256_hex;
         res.set_content(out.dump(), "application/json");
+    });
+
+    // -- Plugin Code Signing: distribution endpoint (v2) ----------------------
+    //
+    // Returns the current trust bundle and require flag as JSON for
+    // out-of-band distribution to agents (operators curl this into
+    // /etc/yuzu/plugin-trust-bundle.pem on each agent host, then pass
+    // --plugin-trust-bundle to the agent). Future automatic agent-side
+    // fetch will use the same shape.
+    //
+    // #4028 — HARDENED onto the A4 envelope + the shared
+    // settings_model::build_plugin_signing_settings builder (the SAME
+    // builder the /fragments/settings/plugin-signing HTML fragment calls)
+    // rather than duplicating a second bespoke JSON shape for this route.
+    // This route stays the SUPERSET over the fragment's own data: it alone
+    // adds `trust_bundle_pem` (the raw bundle bytes), applied as an explicit
+    // override below rather than via the builder's own omit-when-empty
+    // default (the fragment renderer passes an empty string on purpose so
+    // the field is absent there).
+    //
+    // #4144 review fix: promoted to /api/v2/ — see the v1 handler above's
+    // comment for why. #4144 ALSO fixed the TOCTOU the earlier #4028 fix
+    // round only partially closed (Important finding, confirmed by direct
+    // source read): the old two-read design (read_on_disk_bundle() for
+    // stats, a SEPARATE ifstream re-read for the raw PEM bytes) guarded
+    // against the bundle being DELETED between the two reads, but not
+    // REPLACED (the upload handler does write-temp-then-atomic-rename(), so
+    // a second read against a concurrently-replaced file simply succeeds —
+    // against the NEW file). That let a response pair the OLD read's
+    // sha256/cert_count/subjects with the NEW read's trust_bundle_pem bytes,
+    // defeating the integrity property (sha256 describes trust_bundle_pem)
+    // this route exists to provide. Fixed: ONE read of the raw bytes,
+    // validate_trust_bundle_pem() derives cert_count/sha256/subjects from
+    // THOSE SAME bytes — sha256 and trust_bundle_pem can no longer disagree,
+    // by construction.
+    //
+    // Authorization: PluginSigning:Read (dedicated securable, minted by
+    // #4028 — Administrator-only via the rbac_store.cpp seed, floored in
+    // authz_topology_floor.hpp so an RBAC-off deployment stays admin-gated).
+    // That flooring alone is NOT the same practical posture the prior
+    // admin_fn_ (require_admin) gate had for an MCP-tier token: require_admin
+    // rejects every mcp_tier session outright regardless of role, while the
+    // topology floor's legacy-role fallback admits an admin-owned MCP token
+    // exactly like an interactive admin session (mcp_policy.hpp's tier_allows()
+    // comment). The actual parity fix is at that chokepoint: TlsConfig/
+    // PluginSigning/ServerConfig/AnalyticsConfig are denied at every MCP tier
+    // there, so an MCP token 403s before it ever reaches this route's
+    // perm_fn_ call. The bundle PEM holds X.509 certificates (no private
+    // keys) so the security
+    // blast radius of disclosure is small, but a non-admin token holder
+    // learning when the trust anchor rotates (sha256 changes) is useful
+    // reconnaissance for a supply-chain attacker. CC6.1 least-privilege
+    // requires we restrict even read access to security-critical config to
+    // admin principals (governance hardening round 1: sec-LOW-4 / UP-13 /
+    // CC6.1) — now also audited fail-closed (§4) under the
+    // `settings.plugin_signing.read` verb.
+    sink.Get("/api/v2/agent/plugin-policy", [this](const httplib::Request& req,
+                                                   httplib::Response& res) {
+        if (!perm_fn_(req, res, "PluginSigning", "Read"))
+            return;
+        if (!detail::emit_behavioral_audit(audit_read_fn_, req, res, "settings.plugin_signing.read",
+                                           "success", "PluginSigning", "trust_bundle",
+                                           "agent plugin-policy fetch")) {
+            res.status = 503;
+            res.set_content(detail::a4_error(res,
+                                             "audit subsystem unavailable; refusing to "
+                                             "serve settings data without durable evidence",
+                                             detail::A4ErrorOpts{
+                                                 .retry_after_ms = 5000,
+                                                 .remediation = "retry after the audit subsystem "
+                                                                "recovers"}),
+                            "application/json");
+            return;
+        }
+
+        // #4028 fix-round finding UP-3/CH-2 (governance Gate 4/5, re-derived
+        // by sre/compliance-officer/enterprise-readiness): this route's
+        // `required` field IS the deliverable an operator or automation
+        // polls to learn the require-signature state -- `get_value()`
+        // collapsed a genuine runtime_config_store read failure to "",
+        // identical to a healthy "not required" (I3: the caller cannot
+        // tell degraded from healthy). This flag is a status RECORD only
+        // -- no server-side check consumes it today (an earlier round of
+        // this fix wrongly cited ProductPackStore::require_signed_packs_
+        // here, which governs YAML product-pack content, a different
+        // artifact from compiled plugin binaries -- consistency-auditor's
+        // Gate 8 catch; see the corrected runtime_config_store.hpp file
+        // header). Plugin-binary signature verification, where
+        // configured, is local to each agent via its own
+        // --plugin-require-signature/--plugin-trust-bundle flags. So this
+        // is a display-honesty fix, not an enforcement-bypass fix: a
+        // degraded read now fails the REQUEST closed (503) rather than
+        // answer with a value it cannot stand behind. The dashboard
+        // fragment renderer above applies the identical `get()` switch --
+        // keep both in sync.
+        bool required = false;
+        if (runtime_config_store_) {
+            auto rc = runtime_config_store_->get(plugin_signing::kPluginSigningRequiredKey);
+            if (!rc.has_value()) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(
+                        res,
+                        "runtime config store unavailable; plugin-signing required status "
+                        "could not be determined",
+                        detail::A4ErrorOpts{
+                            .retry_after_ms = 5000,
+                            .remediation =
+                                "Retry shortly; if this persists, check Postgres connectivity "
+                                "for the runtime_config_store schema. This flag is a status "
+                                "record only -- no server-side check consumes it, and "
+                                "plugin-binary verification (where an agent is configured for "
+                                "it, via that agent's own local flags) is unaffected by this "
+                                "outage."}),
+                    "application/json");
+                return;
+            }
+            required = rc->has_value() && rc->value().value == "true";
+        }
+
+        // #4144 review fix: ONE filesystem read for both the raw PEM bytes
+        // and the derived stats — see this route's header comment above for
+        // the TOCTOU this closes. Bundle absent (does not exist on disk) is
+        // a normal operational state (CONS-B1 part 2): falls through with
+        // enabled=false, empty pem.
+        std::error_code ec;
+        auto bundle_path = trust_bundle_path();
+        std::optional<std::expected<plugin_signing::TrustBundleStats, std::string>> stats;
+        std::string pem;
+        if (std::filesystem::exists(bundle_path, ec)) {
+            std::ifstream f(bundle_path, std::ios::binary);
+            if (!f) {
+                // Existed a moment ago (exists() above); a concurrent
+                // upload/clear removed it before this open() — same
+                // "changed while serving this request" fail-closed posture
+                // #4028 introduced, just guarding the (now sole) read.
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(
+                        res, "trust bundle changed while serving this request",
+                        detail::A4ErrorOpts{
+                            .retry_after_ms = 1000,
+                            .remediation = "retry -- the bundle was modified concurrently"}),
+                    "application/json");
+                return;
+            }
+            pem.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+            stats = plugin_signing::validate_trust_bundle_pem(pem);
+            if (!stats->has_value()) {
+                // Bundle unreadable (exists on disk, failed to parse) → 500.
+                res.status = 500;
+                res.set_content(detail::a4_error(res, "Trust bundle on disk is unreadable"),
+                                "application/json");
+                return;
+            }
+        }
+        auto data = settings_model::build_plugin_signing_settings(required, stats);
+        data["trust_bundle_pem"] = pem; // superset field — always present on this route alone
+        res.set_content(settings_ok_envelope(std::move(data)).dump(), "application/json");
     });
 
     sink.Get("/fragments/settings/nvd",

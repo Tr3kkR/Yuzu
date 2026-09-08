@@ -33,6 +33,24 @@
 /// not authorization topology. `ApiToken:Read` and `ManagementGroup:Read`
 /// were likewise considered and excluded for the same reason.
 ///
+/// #4028 (api-parity programme #2146) extended the floor's ORIGINAL
+/// "authorization topology" framing above to a second, related case: the
+/// eight Settings read-twins (`GET /api/v1/settings/*` +
+/// `GET /api/v2/agent/plugin-policy` — its deprecated `/v1/` predecessor
+/// stayed on `require_admin`, #4144) were previously gated by
+/// `AuthRoutes::require_admin` — a whole-route role check with no RBAC-off
+/// fallback at all. Migrating them onto RBAC securables
+/// (`TlsConfig`/`PluginSigning`/`ServerConfig`/`AnalyticsConfig`, all
+/// `Read`) without also flooring them here would silently WIDEN every one
+/// of them from admin-only to any-authenticated-user on the RBAC-off
+/// default install — the exact defect class this file exists to close, even
+/// though TLS/plugin-signing config isn't "authorization topology" in the
+/// narrow sense the paragraph above describes. Any future route that
+/// migrates an admin-only gate onto a new Read securable should apply the
+/// same reasoning: the floor exists to preserve an EXISTING admin-only
+/// posture across the RBAC-off toggle, not only to protect the RBAC graph
+/// itself.
+///
 /// EXTEND this set, never fork it — a second copy of a floor set is exactly
 /// the kind of drift the repo's other chokepoints (`dispatch_confined_arms.hpp`,
 /// `principal_quota_gate.hpp`) exist to prevent.
@@ -53,6 +71,13 @@ inline constexpr TopologyFloorEntry kTopologyFloor[] = {
     {"AccessReview", "Read"},
     {"UserManagement", "Read"},
     {"EnginePrincipal", "Read"},
+    // #4028 — Settings read-twins, migrated off admin_fn_ onto RBAC; see the
+    // file-header note above for why these floor despite not being
+    // "authorization topology" in the original narrow sense.
+    {"TlsConfig", "Read"},
+    {"PluginSigning", "Read"},
+    {"ServerConfig", "Read"},
+    {"AnalyticsConfig", "Read"},
     // #4031: Enrollment (auto-approve rules + pending-agent visibility) and
     // OidcConfig (OIDC SSO config) REST v1 twins moved these two reads off
     // `admin_fn_` (a role gate, unconditional regardless of the RBAC

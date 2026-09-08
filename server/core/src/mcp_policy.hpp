@@ -24,7 +24,7 @@ inline bool tier_allows(std::string_view mcp_tier,
                         std::string_view operation) {
     if (mcp_tier.empty()) return true;  // Not an MCP token
 
-    // ── #520/#4031: MCP tokens must never administer the server itself ───
+    // ── #520/#4028/#4031: MCP tokens must never administer the server ────
     //
     // `AuthRoutes::require_admin()` (auth_routes.cpp:577-606) unconditionally
     // denies ANY non-empty mcp_tier before it even looks at role — "MCP
@@ -35,20 +35,25 @@ inline bool tier_allows(std::string_view mcp_tier,
     // actually calls THIS function), separately promises tier enforcement
     // "applies on all transports... so a token cannot bypass the tier by
     // switching endpoints" — but that promise is only as strong as
-    // `tier_allows()` itself, which it delegates to. It did NOT hold for
-    // Enrollment/OidcConfig: this function (the chokepoint every REST/MCP
-    // permission check funnels through, per the ROUND-3 FINDING below) had
-    // no securable-type awareness at any tier, so a "readonly"-tier token —
-    // or "supervised", which allows everything unconditionally further down
-    // — could reach the #4031 REST v1 Enrollment/OidcConfig routes
-    // (auto-approve rules, pending-agent visibility, OIDC SSO config) purely
-    // because `tier_allows()` only ever checked the OPERATION ("Read"), never
-    // the SECURABLE. Deny both explicitly, at every tier, before any
-    // tier-specific branch runs — mirroring require_admin's unconditional
-    // posture for this same class of surface. Directory is deliberately
-    // NOT included here: AD/Entra directory-synced user listing has real MCP
-    // twins (list_directory_users/get_directory_status) by design and must
-    // stay reachable at readonly tier.
+    // `tier_allows()` itself, which it delegates to. It did NOT hold once
+    // #4028's Settings read-twins and #4031's Enrollment/OidcConfig read
+    // twins migrated their routes off `require_admin` (which rejected every
+    // mcp_tier token outright) onto `require_permission`: this function
+    // (the chokepoint every REST/MCP permission check funnels through, per
+    // the ROUND-3 FINDING below) had no securable-type awareness at any
+    // tier, so a "readonly"-tier token — or "supervised", which allows
+    // everything unconditionally further down — could reach these
+    // server-administration routes purely because `tier_allows()` only ever
+    // checked the OPERATION ("Read"), never the SECURABLE. Deny all of them
+    // explicitly, at every tier, before any tier-specific branch runs —
+    // mirroring require_admin's unconditional posture for this same class
+    // of surface. Directory is deliberately NOT included here: AD/Entra
+    // directory-synced user listing has real MCP twins
+    // (list_directory_users/get_directory_status) by design and must stay
+    // reachable at readonly tier. AccessReview/UserManagement/EnginePrincipal
+    // are a DIFFERENT, already-accepted category (authorization-topology
+    // reads, not server-administration) that deliberately keeps
+    // admin-MCP-token reachability — see docs/auth-architecture.md.
     //
     // Per the ROUND-3 FINDING below (a distinct prior incident, same
     // lesson): a route-local or tool-local exception is structurally
@@ -56,9 +61,12 @@ inline bool tier_allows(std::string_view mcp_tier,
     // `AuthRoutes::require_permission`/`require_scoped_permission` (every
     // REST transport) and mcp_server.cpp's generic C8 gate (the MCP
     // transport) consult for EVERY call — so the fix belongs HERE, not at
-    // EnrollmentDirectoryRoutes' call sites.
-    if (securable_type == "Enrollment" || securable_type == "OidcConfig")
+    // any individual route's call sites.
+    if (securable_type == "TlsConfig" || securable_type == "PluginSigning" ||
+        securable_type == "ServerConfig" || securable_type == "AnalyticsConfig" ||
+        securable_type == "Enrollment" || securable_type == "OidcConfig") {
         return false;
+    }
 
     // ── readonly: only Read operations ──────────────────────────────────
     if (mcp_tier == "readonly") {
