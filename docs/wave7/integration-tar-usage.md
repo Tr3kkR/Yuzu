@@ -14,16 +14,19 @@ semantics). Only `usage_live` and `usage_daily` come from this row;
 migration (already landed with this package — no registry action needed for
 those three).
 
-`default_enabled = false` — `usage` is a usage-class per-machine aggregate
-built from `process` event content, so it ships opt-in like
-module/procperf/netqual, not always-on like `process`/`tcp`/`service`/`user`.
+`default_enabled = true` — `usage` is a usage-class per-machine aggregate
+built from `process` event content, so it originally shipped opt-in like
+module/procperf/netqual. Superseded 2026-09-06 (ADR-0024 Decision 15's
+usage-collection supersession note): it ships default-ON instead, matching
+the works-council-class posture `power`/`removable` established, and
+`tar_schema_registry.cpp` sets it accordingly.
 
 ```cpp
         // ── Usage (derived fold over process_live, P21/wave 2) ────────────
         {
             .name = "usage",
             .dollar_name = "Usage",
-            .default_enabled = false,
+            .default_enabled = true,
             .os_support = {
                 {"windows", OsSupportStatus::kSupported, "derived",
                  "Derived fold over process_live -- inherits process's OS "
