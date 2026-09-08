@@ -293,19 +293,19 @@ Operator                     Server                                  Agent
 
 Most HTTP surfaces the server exposes — REST, dashboard fragments, MCP — are registered by a
 **route owner**: a class with a `register_routes(...)` method that the server calls once at
-startup. `server.cpp` wires those owners, *and* registers a further **30 routes inline** on
-`web_server_->{Get,Post,Put,Delete}` — the health and readiness probes and much of the `/api/*`
-dashboard JSON. It constructs no persistent `HttplibRouteSink` of its own for these remaining
-inline routes, so none of them is reachable from the in-process test harness. (Ten surfaces this
-prose previously credited to this inline count have since moved to their own `HttpRouteSink`
-modules and are no longer part of it: `POST /api/command` is `command_routes.cpp` (#2557); the
-page-shell/static-asset surface — `/static/*`, `/`, `/chargen`, `/procfetch`, `/api/help*`,
-`/help`, `/tar`, `/result-sets`, `/viz/fleet`, `/viz/host/:id`, `/instructions`; 25 routes — is
-`page_routes.{hpp,cpp}` (#2542 PR-2); a #2542 follow-up split 10 further scattered routes into
-`dashboard_api_routes.{hpp,cpp}` (`/api/me`, `/api/agents`, `/api/audit`, `POST
-/api/export/json-to-csv`, `POST /api/scope/validate`, `/api/analytics/{status,recent}`; 7 routes)
-and `nvd_routes.{hpp,cpp}` (`/api/nvd/{status,sync,match}`; 3 routes); the 5-route Custom
-Properties API (7.6) — `/api/agents/:id/properties[/:key]`, `/api/property-schemas` — is
+startup. `server.cpp` wires those owners, *and* registers a further **24 routes inline** on
+`web_server_->{Get,Post,Put,Delete}` — much of the `/api/*` dashboard JSON. It constructs no
+persistent `HttplibRouteSink` of its own for these remaining inline routes, so none of them is
+reachable from the in-process test harness. (Eleven surfaces this prose previously credited to this
+inline count have since moved to their own `HttpRouteSink` modules and are no longer part of it:
+`POST /api/command` is `command_routes.cpp` (#2557); the page-shell/static-asset surface —
+`/static/*`, `/`, `/chargen`, `/procfetch`, `/api/help*`, `/help`, `/tar`, `/result-sets`,
+`/viz/fleet`, `/viz/host/:id`, `/instructions`; 25 routes — is `page_routes.{hpp,cpp}` (#2542 PR-2);
+a #2542 follow-up split 10 further scattered routes into `dashboard_api_routes.{hpp,cpp}`
+(`/api/me`, `/api/agents`, `/api/audit`, `POST /api/export/json-to-csv`, `POST
+/api/scope/validate`, `/api/analytics/{status,recent}`; 7 routes) and `nvd_routes.{hpp,cpp}`
+(`/api/nvd/{status,sync,match}`; 3 routes); the 5-route Custom Properties API (7.6) —
+`/api/agents/:id/properties[/:key]`, `/api/property-schemas` — is
 `custom_properties_routes.{hpp,cpp}` (#2542 PR-4); the Result Sets fragment API —
 `/fragments/result-sets/{sidebar,create}` plus the three `:id`-scoped
 `/fragments/result-sets/:id/{detail,pin,unpin,delete}`; 6 routes — is
@@ -319,9 +319,11 @@ API — `GET/POST /api/instructions`, `GET/PUT/DELETE /api/instructions/:id`,
 `GET /api/executions/:id/{summary,agents,children}`, `POST /api/executions/:id/{rerun,cancel}` —
 is `execution_routes.{hpp,cpp}` (#2542 PR-7); the 4-route Schedules API —
 `GET/POST /api/schedules`, `DELETE /api/schedules/:id`, `POST /api/schedules/:id/enable` — is
-`schedule_routes.{hpp,cpp}` (#2542 PR-8); and the 4-route Approval API — `GET /api/approvals`,
+`schedule_routes.{hpp,cpp}` (#2542 PR-8); the 4-route Approval API — `GET /api/approvals`,
 `GET /api/approvals/pending/count`, `POST /api/approvals/:id/{approve,reject}` — is
-`approval_routes.{hpp,cpp}` (#2542 PR-9). All nine owner files register against the same
+`approval_routes.{hpp,cpp}` (#2542 PR-9); and the 6-route Health/Infra cluster — `GET /metrics`,
+`GET /health`, `GET /api/health`, `GET /livez`, `GET /readyz`, `GET /fragments/health/summary` — is
+`health_routes.{hpp,cpp}` (#2542 PR-10). All ten owner files register against the same
 stack-local `inline_sink`, constructed in `start_web_server()`.)
 
 Counting the surface therefore needs a receiver-agnostic pattern, not a search for one variable
@@ -372,13 +374,15 @@ use — `server.cpp` still calls `mcp_server_->register_routes(*web_server_, ...
 as it does for every other owning-class module), the Instruction Definitions + Instruction Sets /
 legacy pre-v1 Executions extraction (`instruction_routes.{hpp,cpp}` +
 `execution_routes.{hpp,cpp}`, PR-7, 13 + 7 = 20 routes, also against `inline_sink`), the Schedules
-API extraction (`schedule_routes.{hpp,cpp}`, PR-8, 4 routes, also against `inline_sink`), and the
-Approval API extraction (`approval_routes.{hpp,cpp}`, PR-9, 4 routes, also against `inline_sink`)
-— `server.cpp`'s own 30 inline routes are the only registrations left outside the sink, and they
-are not a route-owner class. Whether a further campaign PR touches them is #2542's own call, not
-this paragraph's to predict — an earlier version of this sentence claimed "no further PR touches
-them" and was falsified twice by subsequent campaign PRs; check `gh issue view 2542` for current
-scope. Count these with the anchored pattern
+API extraction (`schedule_routes.{hpp,cpp}`, PR-8, 4 routes, also against `inline_sink`), the
+Approval API extraction (`approval_routes.{hpp,cpp}`, PR-9, 4 routes, also against `inline_sink`),
+and the Health/Infra cluster extraction (`health_routes.{hpp,cpp}`, PR-10, 6 routes — `/metrics`,
+`/health`, `/api/health`, `/livez`, `/readyz`, `/fragments/health/summary` — also against
+`inline_sink`) — `server.cpp`'s own 24 inline routes are the only registrations left outside the
+sink, and they are not a route-owner class. Whether a further campaign PR touches them is #2542's
+own call, not this paragraph's to predict — an earlier version of this sentence claimed "no further
+PR touches them" and has since been falsified repeatedly by subsequent campaign PRs; check
+`gh issue view 2542` for current scope. Count these with the anchored pattern
 `grep -cE '^\s*web_server_->(Get|Post|Put|Delete|Patch|Options)\('
 server/core/src/server.cpp`, not a bare `grep -c` of the receiver-agnostic pattern above — the
 unanchored form over-counts by picking up at least one comment-line false match, which is how a
@@ -392,8 +396,9 @@ registrations in `mcp_server.cpp` (verify with
 which were never counted by the `web_server_->` pattern above in the first place since they were
 never inline in `server.cpp` — dropped to 38 once the Instruction Definitions + Instruction Sets /
 legacy pre-v1 Executions extraction (-20, PR-7) landed, 34 once the Schedules API extraction (-4,
-PR-8) also landed, and is 30 now that the Approval API extraction (-4, PR-9) has also landed. 30
-registrations remain outside the sink in total.
+PR-8) also landed, 30 once the Approval API extraction (-4, PR-9) also landed, and is 24 now that
+the Health/Infra cluster extraction (-6, PR-10) has also landed. 24 registrations remain outside
+the sink in total.
 
 ## Storage Architecture
 
