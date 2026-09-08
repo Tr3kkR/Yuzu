@@ -1,0 +1,68 @@
+Tree: tests/unit/fixtures/wave9/peripherals/linux/sysfs_tree/
+Package: P91-5 (peripherals Linux leg)
+date: 2026-09-08
+
+== sys/bus/pci/devices/ -- REAL CAPTURE ==
+host: this Mac, Docker Desktop's Linux VM (linuxkit)
+command: docker run --rm debian:12 sh -c 'for d in /sys/bus/pci/devices/*; do
+  cat $d/vendor $d/device $d/class $d/subsystem_vendor $d/subsystem_device;
+  readlink -f $d/driver; done'
+container image digest: debian:12 (pulled 2026-09-08)
+status: REAL CAPTURE, materialised attribute-by-attribute into this tree
+  (one file per sysfs attribute, matching the container's own file content
+  exactly -- no synthesised values). The container exposed 14 PCI devices,
+  13 of them virtio (vendor 0x1af4); 10 of the 13 virtio devices are
+  reproduced here to stay inside the fixture's file-count budget. Two
+  ("0000:00:01.0" virtio-net, "0000:00:0e.0" virtio-rng) additionally carry
+  a `driver` file holding the driver name as plain text -- the fixture
+  substitution this package's spec calls for in place of a real symlink
+  (`readlink -f $d/driver` showed `virtio-pci` for both); the rest omit
+  `driver` entirely to exercise the "-" fallback for a device with no
+  bound-driver attribute captured.
+lines: 58 files total across pci+usb+thunderbolt (budget 60)
+
+== sys/bus/usb/devices/ -- REAL CAPTURE ==
+host: same container as above
+command: docker run --rm debian:12 sh -c 'for h in usb1 usb2; do for a in
+  idVendor idProduct bDeviceClass bDeviceSubClass manufacturer product
+  serial speed; do cat /sys/bus/usb/devices/$h/$a; done; done'
+status: REAL CAPTURE. usb1 and usb2 are the container's two vhci_hcd root
+  hubs (class 09 == hub); both carry their real idVendor/idProduct/class/
+  subclass. usb1 additionally captures manufacturer/product/serial/speed;
+  usb2 omits them to exercise read_attr's ENOENT -> "-" fallback path (the
+  attribute files genuinely do not exist for a Linux 7.0.12-linuxkit
+  vhci_hcd root hub in this container -- not a fixture omission). The
+  container's own per-hub interface entries ("1-0:1.0", "2-0:1.0", real
+  device names, real bInterfaceClass=09 content) are reproduced verbatim to
+  exercise the ':' skip rule against genuine interface-entry names, not a
+  synthesised one.
+
+== sys/bus/thunderbolt/devices/ -- RECONSTRUCTION ==
+status: RECONSTRUCTED, not captured. Neither this Mac nor the Docker Linux
+  VM exposes a Thunderbolt bus (`docker run --rm debian:12 sh -c 'ls
+  /sys/bus/thunderbolt 2>&1'` -> No such file or directory), so no live
+  Linux venue was available to capture from -- the same gap
+  peripherals_plugin.cpp's descriptor already documents for this leg
+  ("walk verified against a sysfs fixture tree only; no live Linux venue
+  with a Thunderbolt bus in this run").
+basis: Documentation/ABI/testing/sysfs-bus-thunderbolt (upstream Linux
+  kernel documentation) for the attribute set and naming grammar:
+    - What: /sys/bus/thunderbolt/devices/domainX
+      (domain == host controller; X is a small integer)
+    - What: /sys/bus/thunderbolt/devices/domainX/security
+      (per-domain security level: none|user|secure|dponly|usbonly)
+    - What: /sys/bus/thunderbolt/devices/<domain>-<port>[.<port>...]
+      (a router; N-M is a first-hop device, N-M.K a deeper one)
+    - What: .../<device>/vendor_name, device_name, unique_id, generation,
+      authorized
+      (the device identity/state attributes this package's spec names)
+    - Retimer child nodes are named "<parent>:<index>.<index>" (a ':'
+      separates the retimer suffix from its parent router's own N-M name)
+  domain0 carries a real ABI attribute (security=user). 0-0 and 0-1 are
+  synthesised devices (Apple Inc. vendor/model strings, RFC-4122-shaped
+  unique_id, generation 4 == USB4/TB4) built from the documented attribute
+  grammar, not read from any real hardware. 0-0:1.1 is a retimer child of
+  0-0 (per the ':' grammar above) carrying a device_name attribute
+  specifically so the walk test can prove it is skipped despite having
+  readable, valid-looking content -- a retimer entry that happened to be
+  empty would not exercise the ':' filter at all.
