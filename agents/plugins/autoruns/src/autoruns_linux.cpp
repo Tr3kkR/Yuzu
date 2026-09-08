@@ -74,6 +74,17 @@ std::string errno_token_for(int e) {
     }
 }
 
+/// Lower-cases an errno_token_for() result so every reason in this schema
+/// stays lower_snake_case for a downstream string-matching consumer,
+/// matching permission_denied / symlink_refused / oversized / not_regular /
+/// absent above -- shared by classify_read_error and list_dir's own
+/// unclassified-opendir-failure fallback, which used to skip this step.
+std::string lowercase_errno_token(std::string_view token) {
+    std::string out{token};
+    for (char& c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return out;
+}
+
 struct ReadError {
     std::string errno_token;
 };
@@ -152,13 +163,8 @@ FileStatus classify_read_error(const ReadError& err, bool required_by_catalog) {
     if (err.errno_token == "ENOENT")
         return required_by_catalog ? FileStatus{YUZU_SUPPORT_CONSTRAINED, "absent"}
                                     : FileStatus{YUZU_SUPPORT_SUPPORTED, "absent"};
-    // Fallback: any other errno token (e.g. "ENOTDIR", "ERRNO_13") lower-
-    // cased so every reason in this schema stays lower_snake_case for a
-    // downstream string-matching consumer, matching permission_denied /
-    // symlink_refused / oversized / not_regular / absent above.
-    std::string reason = err.errno_token;
-    for (char& c : reason) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return {YUZU_SUPPORT_CONSTRAINED, reason};
+    // Fallback: any other errno token (e.g. "ENOTDIR", "ERRNO_13").
+    return {YUZU_SUPPORT_CONSTRAINED, lowercase_errno_token(err.errno_token)};
 }
 
 // ── directory listing ────────────────────────────────────────────────────
@@ -180,7 +186,7 @@ DirListing list_dir(const std::string& path, std::size_t cap = kMaxDirEntries) {
         int e = errno;
         if (e == ENOENT) out.absent = true;
         else if (e == EACCES || e == EPERM) out.permission_denied = true;
-        else out.other_token = errno_token_for(e);
+        else out.other_token = lowercase_errno_token(errno_token_for(e));
         return out;
     }
     out.opened = true;
