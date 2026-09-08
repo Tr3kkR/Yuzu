@@ -50,7 +50,7 @@ namespace {
 // updating too — that is the intended failure mode: a securable this
 // catalogue references but rbac_store.cpp stops seeding should fail loudly,
 // not silently pass.
-constexpr std::array<std::string_view, 28> kSeededSecurableTypes{{
+constexpr std::array<std::string_view, 30> kSeededSecurableTypes{{
     "Infrastructure",
     "UserManagement",
     "InstructionDefinition",
@@ -73,10 +73,20 @@ constexpr std::array<std::string_view, 28> kSeededSecurableTypes{{
     "Inventory",
     "AccessReview",
     "SoftwareLicensing",
+    "EnginePrincipal", // #4030 Gate 8 fix: was missing (pre-existing gap,
+                       // predates #4030 -- already flagged by #4029's own
+                       // Gate 8 pass on its own worktree; closed here since
+                       // this file is already being touched for "Workflow"
+                       // below).
     "PluginConfig",
     "PluginSecret",
     "UploadGrant",
     "PowerManagement",
+    "Workflow", // #4030: this PR's own new securable (rbac_store.cpp) --
+                // this mirror was the third of three hand-maintained
+                // copies (rbac_store.cpp's types[], mcp_server.cpp's
+                // kRbacSecurables[], and this one) and was the one left
+                // stale (cpp-expert, Gate 3).
     "Forensics",
     "Decommission",
 }};

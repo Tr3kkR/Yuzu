@@ -9,12 +9,14 @@
 #include "execution_event_scope.hpp"
 #include "http_route_sink.hpp"
 #include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (UP-1)
+#include "product_pack_model.hpp" // #4029: shared row/detail builders + error classifiers
 #include "rest_a4_envelope.hpp"     // detail::error_json_a4, make_correlation_id
 #include "rest_a4_envelope_http.hpp" // detail::a4_denial (deny_service_scoped_scope_estimate) —
                                      // mints/reuses X-Correlation-Id so header and body agree
 #include "scope_engine.hpp"
 #include "sensitive_instruction_params.hpp" // redact_sensitive_instruction_params (#3136 blocker)
 #include "web_utils.hpp"
+#include "workflow_model.hpp" // #4030: shared workflow/workflow-execution/schedule row builders
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -32,35 +34,12 @@
 
 namespace yuzu::server {
 
-// Mirrors rest_api_v1.cpp's license_error_status/sw_deploy_error_status shape: ProductPackStore
-// widened list()/get() to std::expected and uninstall() now returns a machine-checkable
-// "not_found: " prefix (product_pack_store.hpp) as part of its PG migration — this classifier
-// keeps the REST surface's status codes correct instead of collapsing every failure to the
-// pre-migration 400/503-by-is_open()-only split. `kProductPackDbErrorPrefix` (a genuine DB/lease
-// failure) -> 503; `"not_found:"` -> 404 (a REST contract change for DELETE — the pre-migration
-// route always returned 400 for a missing id); anything else (signature rejection, validation,
-// business-rule error) -> 400.
-static int product_pack_error_status(const std::string& err) {
-    if (err.starts_with("not_found:"))
-        return 404;
-    if (err.starts_with(yuzu::server::kProductPackDbErrorPrefix))
-        return 503;
-    return 400;
-}
-
-// Mirrors rest_api_v1.cpp's sw_deploy_client_message/device_token_client_message: a
-// kProductPackDbErrorPrefix error carries a raw PQerrorMessage() fragment (connection string
-// detail, occasionally host:port) that is internal implementation detail, not caller-actionable
-// feedback (gov Gate 2 security-guardian). Logs the real error server-side and returns a generic
-// constant instead. A not_found/validation error (never carries the prefix) is safe to echo
-// verbatim — it's operator-authored request feedback, not database internals.
-static std::string product_pack_client_message(const char* op, const std::string& err) {
-    if (err.starts_with(yuzu::server::kProductPackDbErrorPrefix)) {
-        spdlog::error("{}: {}", op, err);
-        return "service unavailable";
-    }
-    return err;
-}
+// #4029: `product_pack_error_status`/`product_pack_client_message` moved to
+// product_pack_model.hpp — the new GET /api/v1/product-packs* routes and the
+// MCP list_product_packs/get_product_pack tools need the same classifiers,
+// and a second file-local copy is exactly the duplication
+// docs/api-twin-recipe.md's Rule 1 exists to prevent. See that header for the
+// (unchanged) behavior/rationale.
 
 // F031/#3481: the same per-kind delete dispatch is needed in two places now — DELETE
 // /api/product-packs/:id's uninstall_fn, and POST /api/product-packs's new compensate_fn
@@ -2044,11 +2023,30 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     });
 
     // GET /api/workflow-executions/:id -- get execution status
-    sink.Get(R"(/api/workflow-executions/([^/]+))", [perm_fn,
+    sink.Get(R"(/api/workflow-executions/([^/]+))", [fleet_read_fn,
                                                      workflow_engine](const httplib::Request& req,
                                                                       httplib::Response& res) {
-        if (!perm_fn(req, res, "Workflow", "Read"))
+        // #4030 Gate 8 fix: was `perm_fn` (plain permission check, no
+        // confinement at all) -- swapped for `fleet_read_fn`, the SAME
+        // gate the v1 twin below uses, per FleetReadFn's own doc comment
+        // ("MUST be that route's SOLE authorization gate -- never stacked
+        // with perm_fn for the same securable/operation"). This route
+        // predates "Workflow" existing as a cataloged RBAC securable at
+        // all (rbac_store.cpp, this same PR's seeding commit) -- under
+        // RBAC-enabled deployments it was previously unreachable to ANY
+        // role, including Administrator. This PR's own seeding is what
+        // makes it reachable to confined, non-admin roles for the first
+        // time (security-guardian Gate 2 finding #2).
+        if (!fleet_read_fn) {
+            res.status = 503;
+            res.set_content(
+                R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
+                "application/json");
             return;
+        }
+        auto gate = fleet_read_fn(req, res, "Workflow", "Read");
+        if (!gate.admitted)
+            return; // gate already wrote the response.
         if (!workflow_engine) {
             res.status = 503;
             res.set_content(
@@ -2078,13 +2076,28 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         const auto& exec = **exec_result;
+        // #4030 Gate 8 fix: record-level confinement gate -- no audit call
+        // existed on this route before this fix (unlike the v1 twin,
+        // which audits every fetch) and none is added here; adding a
+        // first-ever audit call to this route is a separate, unrelated
+        // decision, out of scope for this fix. Denial 404-collapses
+        // identically to the not-found body above (byte-identical -- same
+        // literal string, anti-enumeration).
+        if (!workflow_execution_visible(exec, gate.scope)) {
+            res.status = 404;
+            res.set_content(
+                R"({"error":{"code":404,"message":"execution not found"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            return;
+        }
 
         nlohmann::json steps_arr = nlohmann::json::array();
         for (const auto& sr : exec.step_results) {
             steps_arr.push_back({{"step_index", sr.step_index},
                                  {"instruction_id", sr.instruction_id},
                                  {"status", sr.status},
-                                 {"result", nlohmann::json::parse(sr.result_json, nullptr, false)},
+                                 {"result", confined_workflow_step_result_json(
+                                                sr.result_json, static_cast<bool>(gate.scope))},
                                  {"started_at", sr.started_at},
                                  {"completed_at", sr.completed_at},
                                  {"attempt", sr.attempt}});
@@ -2093,8 +2106,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         res.set_content(nlohmann::json({{"id", exec.id},
                                         {"workflow_id", exec.workflow_id},
                                         {"status", exec.status},
-                                        {"agent_ids", nlohmann::json::parse(exec.agent_ids_json,
-                                                                            nullptr, false)},
+                                        {"agent_ids", confined_workflow_agent_ids_json(
+                                                          exec.agent_ids_json, gate.scope)},
                                         {"current_step", exec.current_step},
                                         {"started_at", exec.started_at},
                                         {"completed_at", exec.completed_at},
@@ -2102,6 +2115,271 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                             .dump(),
                         "application/json");
     });
+
+    // -- REST v1 twins (#4030: executions/workflows/schedules read-twin programme) --
+    //
+    // Each route below is a genuine v1 twin of an existing unversioned/fragment
+    // route above: same gate, same store call, same data -- but the JSON body
+    // is built by a SHARED pure function from workflow_model.hpp
+    // (workflow_row_json/workflow_detail_json/workflow_execution_detail_json/
+    // schedule_row_json) that the MCP twins (list_workflows/get_workflow/
+    // get_workflow_execution/list_schedules, mcp_server.cpp) call too --
+    // docs/api-twin-recipe.md Rule 1: REST and MCP cannot drift on field set
+    // by construction. New v1 error paths use the A4 envelope helpers
+    // (detail::a4_error) per the recipe's guidance, unlike this file's older
+    // unversioned handlers above (predate the recipe; left as-is, out of
+    // scope for this twin PR).
+
+    // GET /api/v1/workflows -- v1 twin of GET /api/workflows above.
+    sink.Get("/api/v1/workflows", [perm_fn, workflow_engine](const httplib::Request& req,
+                                                             httplib::Response& res) {
+        if (!perm_fn(req, res, "Workflow", "Read"))
+            return;
+        if (!workflow_engine || !workflow_engine->is_open()) {
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "workflow engine not available"),
+                            "application/json");
+            return;
+        }
+        WorkflowQuery q;
+        if (req.has_param("name"))
+            q.name_filter = req.get_param_value("name");
+        try {
+            if (req.has_param("limit"))
+                q.limit = std::stoi(req.get_param_value("limit"));
+        } catch (const std::exception&) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
+                            "application/json");
+            return;
+        }
+        if (q.limit <= 0) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, "limit must be a positive integer"),
+                            "application/json");
+            return;
+        }
+        // #4030 Gate 8 fix (architect, Gate 3): was floor-only -- no upper
+        // clamp reached Postgres, asymmetric with this route's own MCP twin
+        // (clamped to 500) and the sibling GET /api/v1/executions (also
+        // capped 500).
+        q.limit = std::min(q.limit, 500);
+        auto workflows_result = workflow_engine->list_workflows(q);
+        if (!workflows_result) {
+            res.status = 503;
+            res.set_content(detail::a4_error(res,
+                                             yuzu::server::genericize_db_error(
+                                                 "list_workflows", workflows_result.error()),
+                                             {.retry_after_ms = 5000}),
+                            "application/json");
+            return;
+        }
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& w : *workflows_result)
+            arr.push_back(workflow_row_json(w));
+        // #4030 Gate 8 fix (sre, Gate 6): the sibling Executions v1 routes
+        // set X-Correlation-Id unconditionally (success and error); this
+        // route only got it on error paths (via a4_error) before this fix.
+        detail::ensure_correlation_id(res);
+        res.set_content(
+            nlohmann::json(
+                {{"data", arr},
+                 {"pagination", {{"total", arr.size()}, {"start", 0}, {"page_size", 50}}},
+                 {"meta", {{"api_version", "v1"}}}})
+                .dump(),
+            "application/json");
+    });
+
+    // GET /api/v1/workflows/:id -- v1 twin of GET /api/workflows/:id above.
+    sink.Get(R"(/api/v1/workflows/([^/]+))",
+            [perm_fn, workflow_engine](const httplib::Request& req, httplib::Response& res) {
+                if (!perm_fn(req, res, "Workflow", "Read"))
+                    return;
+                if (!workflow_engine) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto id = req.matches[1].str();
+                auto workflow_result = workflow_engine->get_workflow(id);
+                if (!workflow_result) {
+                    res.status = 503;
+                    res.set_content(
+                        detail::a4_error(res,
+                                         yuzu::server::genericize_db_error(
+                                             "get_workflow", workflow_result.error()),
+                                         {.retry_after_ms = 5000}),
+                        "application/json");
+                    return;
+                }
+                if (!*workflow_result) {
+                    res.status = 404;
+                    res.set_content(detail::a4_error(res, "workflow not found"),
+                                    "application/json");
+                    return;
+                }
+                // #4030 Gate 8 fix (sre, Gate 6): X-Correlation-Id parity
+                // with the success path (see GET /api/v1/workflows above).
+                detail::ensure_correlation_id(res);
+                res.set_content(nlohmann::json({{"data", workflow_detail_json(**workflow_result)},
+                                                {"meta", {{"api_version", "v1"}}}})
+                                    .dump(),
+                                "application/json");
+            });
+
+    // GET /api/v1/workflow-executions/:id -- v1 twin of
+    // GET /api/workflow-executions/:id above. #4030 confinement decision:
+    // WorkflowExecution.agent_ids_json names agents directly, so this route
+    // gates on fleet_read_fn (not the legacy route's plain perm_fn) and
+    // confines the emitted agent_ids array to the caller's visible scope --
+    // reviewer-flagged scope point in the issue, resolved here.
+    sink.Get(R"(/api/v1/workflow-executions/([^/]+))",
+            [fleet_read_fn, audit_fn, workflow_engine](const httplib::Request& req,
+                                                        httplib::Response& res) {
+                if (!fleet_read_fn) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto gate = fleet_read_fn(req, res, "Workflow", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the response.
+                if (!workflow_engine) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto id = req.matches[1].str();
+                auto exec_result = workflow_engine->get_execution(id);
+                if (!exec_result) {
+                    res.status = 503;
+                    res.set_content(
+                        detail::a4_error(res,
+                                         yuzu::server::genericize_db_error(
+                                             "get_execution", exec_result.error()),
+                                         {.retry_after_ms = 5000}),
+                        "application/json");
+                    return;
+                }
+                if (!*exec_result) {
+                    res.status = 404;
+                    res.set_content(detail::a4_error(res, "execution not found"),
+                                    "application/json");
+                    return;
+                }
+                const auto& exec = **exec_result;
+                // #4030 Gate 8 fix: record-level confinement gate --
+                // workflow_execution_detail_json only ever field-filters
+                // `agent_ids`; it has no way to withhold `status`/
+                // `current_step`/`steps[]` for a caller with zero
+                // visibility into this execution (security-guardian Gate 2
+                // finding: the original cut called the builder
+                // unconditionally for any id the caller supplied). Denial
+                // 404-collapses identically to the not-found body above
+                // (same `detail::a4_error` call, same message -- byte-
+                // identical body, anti-enumeration) and is audited
+                // DISTINCTLY from a successful fetch -- never folded into
+                // the "success" call below, which would audit a denied
+                // read as a success immediately before refusing it (Gate 4
+                // unhappy-path finding UP-1 / chaos_test 2).
+                if (!workflow_execution_visible(exec, gate.scope)) {
+                    if (audit_fn)
+                        audit_fn(req, "workflow_execution.detail.fetch", "denied",
+                                "WorkflowExecution", exec.id,
+                                "not found or outside caller's fleet-read scope "
+                                "(management-group confinement)");
+                    res.status = 404;
+                    res.set_content(detail::a4_error(res, "execution not found"),
+                                    "application/json");
+                    return;
+                }
+                // #4030 audit decision: workflow-execution results carry
+                // operator-supplied step parameters/output, worth the same
+                // audit posture as instruction executions -- audited, verb
+                // `workflow_execution.detail.fetch` (new; distinct from the
+                // aggregate `execution.detail.fetch` verb, a different data
+                // model per the issue's own disambiguation). This file's
+                // AuditFn is void-returning (predates rest_audit.hpp's
+                // checked-bool try_persist_audit/emit_behavioral_audit --
+                // widening that type ripples through every call site + the
+                // server.cpp wiring lambda, out of scope for this twin PR),
+                // so this is a set-and-proceed call, not REST's usual
+                // fail-closed posture.
+                if (audit_fn)
+                    audit_fn(req, "workflow_execution.detail.fetch", "success",
+                            "WorkflowExecution", exec.id, "");
+                // #4030 Gate 8 fix (sre, Gate 6): X-Correlation-Id parity
+                // with the success path (see GET /api/v1/workflows above).
+                detail::ensure_correlation_id(res);
+                res.set_content(
+                    nlohmann::json({{"data", workflow_execution_detail_json(exec, gate.scope)},
+                                    {"meta", {{"api_version", "v1"}}}})
+                        .dump(),
+                    "application/json");
+            });
+
+    // GET /api/v1/schedules -- v1 twin of GET /fragments/schedules above; same
+    // two-stage gate (deny_service_scoped_schedule_list, already declared
+    // above, then Schedule:Read) -- schedules carry no per-agent axis, so
+    // fleet_read_fn does not apply here (matches the fragment's own gate
+    // shape, not a per-agent list).
+    sink.Get("/api/v1/schedules",
+            [perm_fn, schedule_engine, deny_service_scoped_schedule_list](
+                const httplib::Request& req, httplib::Response& res) {
+                if (deny_service_scoped_schedule_list(req, res))
+                    return;
+                if (!perm_fn(req, res, "Schedule", "Read"))
+                    return;
+                if (!schedule_engine) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "schedule engine not available"),
+                                    "application/json");
+                    return;
+                }
+                // #4030 review finding (blocking): was the unchecked
+                // query_schedules(), which collapsed a pool-exhaustion or
+                // query failure into the same empty vector a genuinely
+                // empty table returns -- matches GET /api/v1/workflows
+                // above, which already has this checked/503 shape.
+                auto scheds_result = schedule_engine->query_schedules_checked();
+                if (!scheds_result) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res,
+                                                     yuzu::server::genericize_db_error(
+                                                         "list_schedules", scheds_result.error()),
+                                                     {.retry_after_ms = 5000}),
+                                    "application/json");
+                    return;
+                }
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& s : scheds_result->schedules)
+                    arr.push_back(schedule_row_json(s));
+                // #4030 Gate 8 fix (sre, Gate 6): X-Correlation-Id parity
+                // with the success path (see GET /api/v1/workflows above).
+                detail::ensure_correlation_id(res);
+                // #4030 review finding (blocking): `total` below is the
+                // COUNT RETURNED, not necessarily the fleet's true count --
+                // query_schedules_checked() hard-caps at kScheduleListCap
+                // rows with no way for this route to page past it. Before
+                // this fix `total` silently asserted completeness even when
+                // truncated; now a truncated response says so explicitly
+                // (precedent: MCP query_responses's result_truncated_by_cap)
+                // instead of the caller having no way to tell.
+                nlohmann::json pagination{
+                    {"total", arr.size()}, {"start", 0}, {"page_size", 50}};
+                if (scheds_result->truncated)
+                    pagination["result_truncated_by_cap"] = true;
+                res.set_content(
+                    nlohmann::json(
+                        {{"data", arr},
+                         {"pagination", pagination},
+                         {"meta", {{"api_version", "v1"}}}})
+                        .dump(),
+                    "application/json");
+            });
 
     // -- Single Instruction Execution API --------------------------------------
 
@@ -2642,22 +2920,12 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         auto& packs = *packs_result;
+        // #4029: shared builder (product_pack_model.hpp) — the same function
+        // GET /api/v1/product-packs and MCP list_product_packs call, so this
+        // route's shape cannot silently drift from theirs.
         nlohmann::json arr = nlohmann::json::array();
-        for (const auto& p : packs) {
-            nlohmann::json items_arr = nlohmann::json::array();
-            for (const auto& item : p.items) {
-                items_arr.push_back(
-                    {{"kind", item.kind}, {"item_id", item.item_id}, {"name", item.name}});
-            }
-            arr.push_back({{"id", p.id},
-                           {"name", p.name},
-                           {"version", p.version},
-                           {"description", p.description},
-                           {"item_count", p.items.size()},
-                           {"items", items_arr},
-                           {"installed_at", p.installed_at},
-                           {"verified", p.verified}});
-        }
+        for (const auto& p : packs)
+            arr.push_back(product_pack_row_json(p));
         res.set_content(nlohmann::json({{"product_packs", arr}, {"count", arr.size()}}).dump(),
                         "application/json");
     });
@@ -2873,24 +3141,9 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
         auto& pack = *pack_result;
 
-        nlohmann::json items_arr = nlohmann::json::array();
-        for (const auto& item : pack->items) {
-            items_arr.push_back({{"kind", item.kind},
-                                 {"item_id", item.item_id},
-                                 {"name", item.name},
-                                 {"yaml_source", item.yaml_source}});
-        }
-
-        res.set_content(nlohmann::json({{"id", pack->id},
-                                        {"name", pack->name},
-                                        {"version", pack->version},
-                                        {"description", pack->description},
-                                        {"yaml_source", pack->yaml_source},
-                                        {"items", items_arr},
-                                        {"installed_at", pack->installed_at},
-                                        {"verified", pack->verified}})
-                            .dump(),
-                        "application/json");
+        // #4029: shared builder (product_pack_model.hpp) — the same function
+        // GET /api/v1/product-packs/{id} and MCP get_product_pack call.
+        res.set_content(product_pack_detail_json(*pack).dump(), "application/json");
     });
 
     // DELETE /api/product-packs/:id -- uninstall product pack

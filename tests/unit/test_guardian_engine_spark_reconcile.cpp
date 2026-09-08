@@ -353,20 +353,17 @@ struct SparkReconcileFixture {
 
 } // namespace
 
-TEST_CASE("#2818 PIN — Guardian's subscription is erased by a sibling's failed watch and "
-          "Guardian keeps reporting the rule armed",
+TEST_CASE("#2818 — Guardian is notified when a sibling's failed watch kills their shared "
+          "key, and reports the rule errored instead of still-armed",
           "[spark][guardian][reconcile]") {
-    // The engine-level halves of this gap are pinned in test_spark_mechanism.cpp. THIS
-    // case is the one that says why it matters: it shows the silent kill landing on
-    // GUARDIAN, the real consumer, and shows what Guardian reports afterwards.
+    // The engine-level halves of this fix are pinned in test_spark_mechanism.cpp. THIS
+    // case is the one that says why it matters: it shows the notification landing on
+    // GUARDIAN, the real consumer, and shows what Guardian now reports afterwards.
     //
     // Guardian cannot be its own sibling — GuardianSparkRuntime's arming_keys_ plus the
     // executor's AlreadyRunning rejection make two concurrent Guardian arms of one key
     // impossible. So the sibling here is a RAW SparkEngine consumer, which is exactly the
     // situation Stage 2 creates the moment anything other than Guardian arms a spark.
-    //
-    // PIN, NOT A REGRESSION TEST: every assertion below states the CURRENT, DEFECTIVE
-    // behaviour. The fix (#2818, PR-2d) will flip the last two.
     SparkReconcileFixture f;
 
     // A raw consumer arms the SAME spec Guardian derives from make_service_rule("r1")
@@ -409,17 +406,29 @@ TEST_CASE("#2818 PIN — Guardian's subscription is erased by a sibling's failed
     armer.join();
     CHECK_FALSE(raw_sub.has_value()); // the raw consumer learns its arm failed
 
-    // THE DEFECT, at the layer that matters. Nothing is armed and nothing is watched…
+    // Nothing is armed and nothing is watched at the engine level…
     CHECK(f.spark_engine.stats().armed_sparks == 0);
     CHECK(f.spark_engine.stats().subscriptions == 0);
     CHECK(f.mechanism->watching_count() == 0);
-    // …and Guardian still reports the rule as armed, because nobody told it otherwise.
-    // Its PerKey subscription id now names nothing, no re-arm is attempted, and the rule
-    // will sit in this state until something unrelated causes a re-reconcile.
-    CHECK(f.engine->spark_armed_rule_count() == 1);
-    // The legacy path did NOT pick the rule up either — this is not a silent fallback to
-    // IGuard, it is a genuine detection hole.
+    // …and Guardian is now told, asynchronously (the Lost notification crosses its own
+    // "guardian-spark" consumer's dispatch thread), and detaches the rule as errored
+    // rather than continuing to report it armed.
+    REQUIRE(yuzu::test::spin_until([&] { return f.engine->spark_armed_rule_count() == 0; }));
+    // No self-heal in this PR (Dave's call, 2026-09-06): the rule sits errored until the
+    // next server-issued PushRules or an agent restart re-attaches it.
+    // The legacy path does NOT pick the rule up either — this is not a silent fallback to
+    // IGuard, it stays a genuine, honestly-reported detection hole until re-attached.
     CHECK(f.engine->armed_guard_count() == 0);
+
+    // The lifecycle audit reflects WHY the rule stopped being enforced: "errored", not
+    // "disarmed" (guardian_outbox.hpp's documented vocabulary) — Guardian didn't
+    // withdraw the rule, its enforcement broke out from under it.
+    REQUIRE(yuzu::test::spin_until([&] {
+        std::lock_guard<std::mutex> lk{f.sent_mu};
+        return std::any_of(f.sent.begin(), f.sent.end(), [](const OutboxEntry& e) {
+            return e.rule_id == "r1" && e.lifecycle_kind == "errored";
+        });
+    }));
 }
 
 TEST_CASE("a supported type arms via spark, never in legacy guards_",
