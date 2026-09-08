@@ -71,6 +71,7 @@
 #include "principal_quota_gate.hpp"
 #include "rest_a4_envelope_http.hpp"
 #include "inventory_store.hpp"
+#include "data_inventory_routes.hpp" // #2542 PR-11: the 3-route Inventory API, extracted onto the HttpRouteSink seam
 #include "app_perf_daily_store.hpp"
 #include "app_perf_fleet_store.hpp"
 #include "app_perf_cohort_reader.hpp"
@@ -112,6 +113,7 @@
 #include "scope_yaml.hpp"
 #include "rbac_store.hpp"
 #include "response_store.hpp"
+#include "response_routes.hpp" // #2542 PR-11: the 3-route Responses API, extracted onto the HttpRouteSink seam
 #include "dispatch_caller.hpp" // PLAN-006: DispatchCaller — the principal threaded to dispatch_confined
 #include "dispatch_target_shape.hpp" // check_targeting_shape / targeting_supplied (#2500)
 #include "authz_model.hpp" // #1788: per-arm visibility intersection (in_scope/filter_to_scope)
@@ -196,6 +198,7 @@
 #include "schedule_engine.hpp"
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
+#include "tag_routes.hpp" // #2542 PR-11: the 4-route Tags API, extracted onto the HttpRouteSink seam
 #include "service_scope_policy.hpp" // authz::kServiceTagKey — #3289 single confinement-key definition
 #include "update_registry.hpp"
 #include "legacy_sqlite_probe.hpp"
@@ -13347,6 +13350,71 @@ private:
                              .schedule_engine = schedule_engine_.get(),
                          });
 
+        // #2542 PR-11: the 3-route legacy pre-v1 Responses API
+        // (/api/responses/:id/{aggregate,export}, /api/responses/(.+)),
+        // extracted onto the same inline_sink seam. Needs `fleet_read_fn`
+        // (defined above, shared with the execution_routes/rest_api_v1/mcp
+        // callers) + `audit_fn`. REGISTRATION ORDER PRESERVED: aggregate,
+        // then export, then the catch-all — see response_routes.hpp's file
+        // header for why this order is load-bearing.
+        yuzu::server::response::register_response_routes(
+            inline_sink, yuzu::server::response::Deps{
+                             .fleet_read_fn = fleet_read_fn,
+                             .audit_fn = audit_fn,
+                             .store = response_store_.get(),
+                         });
+
+        // #2542 PR-11: wraps AuthRoutes::deny_service_scoped_service_tag_mutation
+        // (#3289) — the Tags API's TOCTOU guard against a service-scoped
+        // token rewriting/deleting its own cohort's `service` tag. Only
+        // tag_routes.cpp calls this today.
+        auto deny_service_scoped_tag_mutation_fn =
+            [this](const httplib::Request& req, httplib::Response& res,
+                   const std::string& action, const std::string& agent_id,
+                   const std::string& key) -> bool {
+            return auth_routes_->deny_service_scoped_service_tag_mutation(req, res, action,
+                                                                           agent_id, key);
+        };
+        // #2542 PR-11: wraps ServerImpl::ensure_service_management_group
+        // (server.cpp:11305 area) — POST /api/tags/set's side effect when the
+        // `service` tag changes. Only tag_routes.cpp calls this today.
+        auto ensure_service_management_group_fn = [this](const std::string& service_value) {
+            ensure_service_management_group(service_value);
+        };
+        // #2542 PR-11: wraps ServerImpl::push_asset_tags_to_agent — POST
+        // /api/tags/set's side effect when a structured category tag
+        // changes. Only tag_routes.cpp calls this today.
+        auto push_asset_tags_to_agent_fn = [this](const std::string& agent_id) {
+            push_asset_tags_to_agent(agent_id);
+        };
+
+        // #2542 PR-11: the 4-route Tags API (/api/tags[/set|/delete|/query]),
+        // extracted onto the same inline_sink seam. Needs
+        // scoped_perm_fn/auth_fn (defined above) plus the three
+        // just-defined closures.
+        yuzu::server::tag::register_tag_routes(
+            inline_sink, yuzu::server::tag::Deps{
+                             .auth_fn = auth_fn,
+                             .perm_fn = perm_fn,
+                             .scoped_perm_fn = scoped_perm_fn,
+                             .deny_service_scoped_tag_mutation_fn =
+                                 deny_service_scoped_tag_mutation_fn,
+                             .audit_fn = audit_fn,
+                             .ensure_service_management_group_fn =
+                                 ensure_service_management_group_fn,
+                             .push_asset_tags_to_agent_fn = push_asset_tags_to_agent_fn,
+                             .store = tag_store_.get(),
+                         });
+
+        // #2542 PR-11: the 3-route generic plugin-data Inventory API
+        // (Issue 7.17: /api/inventory/{tables,query,:agent_id/:plugin}),
+        // extracted onto the same inline_sink seam. Only needs perm_fn.
+        yuzu::server::data_inventory::register_data_inventory_routes(
+            inline_sink, yuzu::server::data_inventory::Deps{
+                             .perm_fn = perm_fn,
+                             .store = inventory_store_.get(),
+                         });
+
         // Shared command-dispatch closure — sends a CommandRequest to agents via
         // gRPC. Hoisted here (was inline in the WorkflowRoutes block) so every
         // background consumer drives the EXACT same dispatch path.
@@ -14687,641 +14755,6 @@ private:
                                 "application/json");
             });
 
-        // -- Response API ---------------------------------------------------------
-
-        // Aggregate endpoint — must be registered before the catch-all responses route
-        web_server_->Get(R"(/api/responses/([^/]+)/aggregate)", [this](const httplib::Request& req,
-                                                                       httplib::Response& res) {
-            auto gate = require_fleet_read(req, res, "Response", "Read");
-            if (!gate.admitted)
-                return; // gate already wrote the response.
-
-            auto instruction_id = req.matches[1].str();
-            if (!response_store_ || !response_store_->is_open()) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"response store not available"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            auto group_by = req.get_param_value("group_by");
-            if (group_by.empty())
-                group_by = "status";
-
-            AggregateOp op = AggregateOp::Count;
-            auto op_str = req.get_param_value("op");
-            if (op_str == "sum")
-                op = AggregateOp::Sum;
-            else if (op_str == "avg")
-                op = AggregateOp::Avg;
-            else if (op_str == "min")
-                op = AggregateOp::Min;
-            else if (op_str == "max")
-                op = AggregateOp::Max;
-
-            // Validate CLIENT input against ResponseStore::aggregate()'s own
-            // allow-lists BEFORE calling in (#2691, Doomgoose finding #2): an
-            // allow-list miss inside aggregate() itself returns nullopt,
-            // which this handler otherwise maps unconditionally to 503 "store
-            // degraded" below — a typo'd group_by/op_column would page the
-            // degrade alert for a healthy database. Bad TARGETED client input
-            // is a 400, not a 503.
-            if (std::find(ResponseStore::allowed_group_by().begin(),
-                          ResponseStore::allowed_group_by().end(),
-                          group_by) == ResponseStore::allowed_group_by().end()) {
-                res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"invalid group_by"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            auto op_column_param = req.get_param_value("op_column");
-            const std::string effective_op_column = op_column_param.empty() ? "id" : op_column_param;
-            if (std::find(ResponseStore::allowed_op_column().begin(),
-                          ResponseStore::allowed_op_column().end(),
-                          effective_op_column) == ResponseStore::allowed_op_column().end()) {
-                res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"invalid op_column"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            AggregationQuery aq;
-            aq.group_by = group_by;
-            aq.op = op;
-            aq.op_column = op_column_param;
-
-            ResponseQuery filter;
-            if (req.has_param("agent_id"))
-                filter.agent_id = req.get_param_value("agent_id");
-            try {
-                if (req.has_param("status"))
-                    filter.status = std::stoi(req.get_param_value("status"));
-                if (req.has_param("since"))
-                    filter.since = std::stoll(req.get_param_value("since"));
-                if (req.has_param("until"))
-                    filter.until = std::stoll(req.get_param_value("until"));
-            } catch (const std::exception&) {
-                res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            // #1634 management-group scope. Resolve the responding agents only to
-            // retain the existing distinct-drop audit; the gate's VisibleSet is the
-            // authority and the engaged AggregateScope is applied before folding.
-            AggregateScope agg_scope; // nullopt = no restriction
-            std::size_t agg_dropped = 0;
-            if (gate.scope) {
-                auto distinct = response_store_->distinct_agent_ids(instruction_id);
-                if (!distinct) {
-                    res.status = 503;
-                    res.set_content(
-                        R"({"error":{"code":503,"message":"response store unavailable"},"meta":{"api_version":"v1"}})",
-                        "application/json");
-                    return;
-                }
-                std::vector<std::string> in_scope;
-                in_scope.reserve(distinct->size());
-                for (auto& aid : *distinct) {
-                    if (authz::in_scope(gate.scope, aid))
-                        in_scope.push_back(std::move(aid));
-                    else
-                        ++agg_dropped;
-                }
-                agg_scope = std::move(in_scope); // engaged-empty means no rows
-            }
-            // CC7.2 evidence: a scope-drop is a security-relevant filtering event — record
-            // it so a cross-operator access attempt that was suppressed is auditable on this
-            // surface too (#1634 compliance review; parity with the MCP denied row / the
-            // visualization scope_dropped detail).
-            if (agg_dropped > 0)
-                (void)audit_log(req, "response.read", "denied", "Execution", instruction_id,
-                                "scope_dropped=" + std::to_string(agg_dropped) + " surface=aggregate");
-
-            auto results_opt = response_store_->aggregate(instruction_id, aq, filter, agg_scope);
-            if (!results_opt) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"response store degraded"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            const auto& results = *results_opt;
-
-            int64_t total_rows = 0;
-            nlohmann::json groups = nlohmann::json::array();
-            for (const auto& r : results) {
-                total_rows += r.count;
-                groups.push_back({{"group_value", r.group_value},
-                                  {"count", r.count},
-                                  {"aggregate_value", r.aggregate_value}});
-            }
-
-            res.set_content(nlohmann::json({{"instruction_id", instruction_id},
-                                            {"groups", groups},
-                                            {"total_groups", results.size()},
-                                            {"total_rows", total_rows}})
-                                .dump(),
-                            "application/json");
-        });
-
-        // Export endpoint — must be registered before the catch-all responses route
-        web_server_->Get(R"(/api/responses/([^/]+)/export)", [this](const httplib::Request& req,
-                                                                    httplib::Response& res) {
-            auto gate = require_fleet_read(req, res, "Response", "Read");
-            if (!gate.admitted)
-                return; // gate already wrote the response.
-
-            auto instruction_id = req.matches[1].str();
-            if (!response_store_ || !response_store_->is_open()) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"response store not available"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            ResponseQuery q;
-            if (req.has_param("agent_id"))
-                q.agent_id = req.get_param_value("agent_id");
-            try {
-                if (req.has_param("status"))
-                    q.status = std::stoi(req.get_param_value("status"));
-                if (req.has_param("since"))
-                    q.since = std::stoll(req.get_param_value("since"));
-                if (req.has_param("until"))
-                    q.until = std::stoll(req.get_param_value("until"));
-                if (req.has_param("limit"))
-                    q.limit = std::stoi(req.get_param_value("limit"));
-                else
-                    q.limit = 10000; // higher default for exports
-            } catch (const std::exception&) {
-                res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            // #1634 / ADR-0017 INV-3 (CRITICAL): resolve the in-scope agent set and push it
-            // into the SQL WHERE clause BEFORE LIMIT/OFFSET, not as a post-fetch filter — a
-            // post-fetch filter on a paginated read can hand a confined caller a short or
-            // empty page even though visible rows exist past the hidden ones LIMIT already
-            // truncated. Mirrors the /aggregate sibling's resolve-then-scope pattern above.
-            AggregateScope scope_arg; // nullopt = unrestricted
-            std::size_t export_dropped = 0;
-            if (gate.scope) {
-                auto distinct = response_store_->distinct_agent_ids(instruction_id);
-                if (!distinct) {
-                    res.status = 503;
-                    res.set_content(
-                        R"({"error":{"code":503,"message":"response store degraded"},"meta":{"api_version":"v1"}})",
-                        "application/json");
-                    return;
-                }
-                std::vector<std::string> in_scope;
-                in_scope.reserve(distinct->size());
-                for (auto& aid : *distinct) {
-                    if (authz::in_scope(gate.scope, aid))
-                        in_scope.push_back(std::move(aid));
-                    else
-                        ++export_dropped;
-                }
-                scope_arg = std::move(in_scope); // engaged-empty means no rows
-            }
-
-            auto results_opt = response_store_->query(instruction_id, q, scope_arg);
-            if (!results_opt) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"response store degraded"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            auto results = std::move(*results_opt);
-
-            // CC7.2 evidence: record the scope-drop on this surface (#1634 compliance review).
-            if (export_dropped > 0)
-                (void)audit_log(req, "response.read", "denied", "Execution", instruction_id,
-                                "scope_dropped=" + std::to_string(export_dropped) + " surface=export");
-
-            auto format = req.get_param_value("format");
-
-            if (format == "csv") {
-                std::string csv =
-                    "id,instruction_id,agent_id,timestamp,status,output,error_detail\r\n";
-                for (const auto& r : results) {
-                    csv += std::to_string(r.id) + ",";
-                    csv += data_export::csv_escape(r.instruction_id) + ",";
-                    csv += data_export::csv_escape(r.agent_id) + ",";
-                    csv += std::to_string(r.timestamp) + ",";
-                    csv += std::to_string(r.status) + ",";
-                    csv += data_export::csv_escape(r.output) + ",";
-                    csv += data_export::csv_escape(r.error_detail) + "\r\n";
-                }
-                res.set_header("Content-Disposition",
-                               "attachment; filename=\"responses-" + instruction_id + ".csv\"");
-                res.set_content(csv, "text/csv; charset=utf-8");
-            } else {
-                nlohmann::json arr = nlohmann::json::array();
-                for (const auto& r : results) {
-                    arr.push_back({{"id", r.id},
-                                   {"instruction_id", r.instruction_id},
-                                   {"agent_id", r.agent_id},
-                                   {"timestamp", r.timestamp},
-                                   {"status", r.status},
-                                   {"output", r.output},
-                                   {"error_detail", r.error_detail}});
-                }
-                nlohmann::json envelope = {{"instruction_id", instruction_id},
-                                           {"count", results.size()},
-                                           {"responses", arr}};
-                res.set_header("Content-Disposition",
-                               "attachment; filename=\"responses-" + instruction_id + ".json\"");
-                res.set_content(envelope.dump(2), "application/json; charset=utf-8");
-            }
-        });
-
-        web_server_->Get(R"(/api/responses/(.+))", [this](const httplib::Request& req,
-                                                          httplib::Response& res) {
-            auto gate = require_fleet_read(req, res, "Response", "Read");
-            if (!gate.admitted)
-                return; // gate already wrote the response.
-
-            auto instruction_id = req.matches[1].str();
-            if (instruction_id.empty()) {
-                res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"instruction_id required"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            if (!response_store_ || !response_store_->is_open()) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"response store not available"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            ResponseQuery q;
-            if (req.has_param("agent_id"))
-                q.agent_id = req.get_param_value("agent_id");
-            try {
-                if (req.has_param("status"))
-                    q.status = std::stoi(req.get_param_value("status"));
-                if (req.has_param("since"))
-                    q.since = std::stoll(req.get_param_value("since"));
-                if (req.has_param("until"))
-                    q.until = std::stoll(req.get_param_value("until"));
-                if (req.has_param("limit"))
-                    q.limit = std::stoi(req.get_param_value("limit"));
-                if (req.has_param("offset"))
-                    q.offset = std::stoi(req.get_param_value("offset"));
-            } catch (const std::exception&) {
-                res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            // #1634 / ADR-0017 INV-3 (CRITICAL): resolve the in-scope agent set and push it
-            // into the SQL WHERE clause BEFORE LIMIT/OFFSET — see the /export sibling above
-            // for the full rationale (post-fetch filtering a paginated read can hand a
-            // confined caller a short or empty page).
-            AggregateScope scope_arg; // nullopt = unrestricted
-            std::size_t get_dropped = 0;
-            if (gate.scope) {
-                auto distinct = response_store_->distinct_agent_ids(instruction_id);
-                if (!distinct) {
-                    res.status = 503;
-                    res.set_content(
-                        R"({"error":{"code":503,"message":"response store degraded"},"meta":{"api_version":"v1"}})",
-                        "application/json");
-                    return;
-                }
-                std::vector<std::string> in_scope;
-                in_scope.reserve(distinct->size());
-                for (auto& aid : *distinct) {
-                    if (authz::in_scope(gate.scope, aid))
-                        in_scope.push_back(std::move(aid));
-                    else
-                        ++get_dropped;
-                }
-                scope_arg = std::move(in_scope); // engaged-empty means no rows
-            }
-
-            auto results_opt = response_store_->query(instruction_id, q, scope_arg);
-            if (!results_opt) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"response store degraded"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            auto results = std::move(*results_opt);
-
-            // CC7.2 evidence: record the scope-drop on this surface (#1634 compliance review).
-            if (get_dropped > 0)
-                (void)audit_log(req, "response.read", "denied", "Execution", instruction_id,
-                                "scope_dropped=" + std::to_string(get_dropped) + " surface=get");
-
-            nlohmann::json arr = nlohmann::json::array();
-            for (const auto& r : results) {
-                arr.push_back({{"id", r.id},
-                               {"instruction_id", r.instruction_id},
-                               {"agent_id", r.agent_id},
-                               {"timestamp", r.timestamp},
-                               {"status", r.status},
-                               {"output", r.output},
-                               {"error_detail", r.error_detail}});
-            }
-            res.set_content(nlohmann::json({{"responses", arr}, {"count", arr.size()}}).dump(),
-                            "application/json");
-        });
-
-        // -- Tags API ---------------------------------------------------------
-        web_server_->Get("/api/tags", [this](const httplib::Request& req, httplib::Response& res) {
-            if (!require_permission(req, res, "Tag", "Read"))
-                return;
-
-            if (!tag_store_ || !tag_store_->is_open()) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"tag store not available"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            auto agent_id = req.get_param_value("agent_id");
-            if (agent_id.empty()) {
-                res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"agent_id parameter required"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            auto tags = tag_store_->get_all_tags(agent_id);
-            if (!tags) {
-                // Degrade → 503, never an empty list (#3097 classification).
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"tag store unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            nlohmann::json arr = nlohmann::json::array();
-            for (const auto& t : *tags) {
-                arr.push_back({{"key", t.key},
-                               {"value", t.value},
-                               {"source", t.source},
-                               {"updated_at", t.updated_at}});
-            }
-            res.set_content(nlohmann::json({{"agent_id", agent_id}, {"tags", arr}}).dump(),
-                            "application/json");
-        });
-
-        web_server_->Post("/api/tags/set", [this](const httplib::Request& req,
-                                                  httplib::Response& res) {
-            // CDX-R4-02: authenticate BEFORE any store/body work (401 first).
-            if (!require_auth(req, res))
-                return;
-            if (!tag_store_) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"tag store not available"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            auto agent_id = extract_json_string(req.body, "agent_id");
-            auto key = extract_json_string(req.body, "key");
-            auto value = extract_json_string(req.body, "value");
-
-            if (agent_id.empty() || key.empty()) {
-                res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"agent_id and key required"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            if (!TagStore::validate_key(key)) {
-                res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"invalid tag key"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            // #3289 hardening-round follow-up: normalize category keys to
-            // lowercase BEFORE anything downstream compares against them —
-            // mirrors the REST v1 twin (rest_api_v1.cpp), which already did
-            // this. Without it, a caller writing `key="Service"` (capital)
-            // stored the tag under the wrong case and silently skipped the
-            // `ensure_service_management_group` side effect below (a
-            // case-sensitive literal comparison), even though it isn't a
-            // security issue — the #3289 guard's own key check is already
-            // case-insensitive regardless of this normalization. Uses
-            // `kCategoryKeys` (the same constant the tag-push block 40 lines
-            // below already reads) rather than a second hardcoded literal
-            // list.
-            {
-                std::string lower_key = key;
-                std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(),
-                               [](unsigned char c) { return std::tolower(c); });
-                for (auto cat_key : kCategoryKeys) {
-                    if (cat_key == lower_key) {
-                        key = lower_key;
-                        break;
-                    }
-                }
-            }
-
-            // #3289: a service-scoped token authorizing this write via
-            // require_scoped_permission below reads the PRE-WRITE `service`
-            // tag to decide admission — so without this guard it could
-            // authorize the very write that changes that tag out from under
-            // its own confinement. Value-blind, checked before the scoped
-            // gate. See deny_service_scoped_service_tag_mutation's doc
-            // comment (auth_routes.hpp).
-            if (auth_routes_->deny_service_scoped_service_tag_mutation(req, res, "tag.set",
-                                                                       agent_id, key))
-                return;
-
-            // K-04/CDX-R4-08: per-TARGET authorization -- NOT a global Tag:Write
-            // gate. The old require_permission("Tag","Write") admitted a
-            // service-scoped token on its ITServiceOwner grant with no target
-            // check, so a service-A token could rewrite the `service` tag on a
-            // service-B agent and escape its own #1788 dispatch confinement (and
-            // it 403'd management-group-scoped operators). require_scoped_permission
-            // enforces Tag:Write scoped to agent_id, the same gate the REST v1
-            // twin (rest_api_v1.cpp) and MCP set_tag (mcp_server.cpp) use.
-            if (!require_scoped_permission(req, res, "Tag", "Write", agent_id))
-                return;
-
-            // Surface the write result (#3097 classification): db_error →
-            // 503, caller/validation error → 400 — a swallowed failed write
-            // used to report "Tag updated" over nothing written.
-            if (auto set_res = tag_store_->set_tag(agent_id, key, value, "api"); !set_res) {
-                const bool db_error = set_res.error().starts_with(kTagDbErrorPrefix);
-                (void)audit_log(req, "tag.set", "failure", "tag", agent_id + ":" + key,
-                                set_res.error());
-                res.status = db_error ? 503 : 400;
-                res.set_content(nlohmann::json{{"error",
-                                                {{"code", res.status},
-                                                 {"message", db_error ? "tag store unavailable"
-                                                                      : set_res.error()}}},
-                                               {"meta", {{"api_version", "v1"}}}}
-                                    .dump(),
-                                "application/json");
-                return;
-            }
-            if (key == "service")
-                ensure_service_management_group(value);
-            // Push updated tags to agent if a structured category changed
-            // Case-insensitive: API may receive "Role" but kCategoryKeys are lowercase
-            {
-                std::string lower_key = key;
-                std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(),
-                               [](unsigned char c) { return std::tolower(c); });
-                for (auto cat_key : kCategoryKeys) {
-                    if (cat_key == lower_key) {
-                        push_asset_tags_to_agent(agent_id);
-                        break;
-                    }
-                }
-            }
-            (void)audit_log(req, "tag.set", "success", "tag", agent_id + ":" + key, value);
-            res.set_header("HX-Trigger",
-                           R"({"showToast":{"message":"Tag updated","level":"success"}})");
-            res.set_content(R"({"status":"ok"})", "application/json");
-        });
-
-        web_server_->Post("/api/tags/delete", [this](const httplib::Request& req,
-                                                     httplib::Response& res) {
-            // CDX-R4-02: authenticate BEFORE any store/body work (401 first).
-            if (!require_auth(req, res))
-                return;
-            if (!tag_store_) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"tag store not available"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            auto agent_id = extract_json_string(req.body, "agent_id");
-            auto key = extract_json_string(req.body, "key");
-
-            if (agent_id.empty() || key.empty()) {
-                res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"agent_id and key required"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            // Gate 4/#3289 hardening round: normalize category keys to
-            // lowercase, matching the /api/tags/set twin above — without
-            // this, deleting a key by the same case a caller just set it
-            // with (e.g. "Service") silently no-ops (TagStore::delete_tag
-            // finds no row stored under that exact case) instead of removing
-            // the tag, since /api/tags/set now stores the normalized form.
-            {
-                std::string lower_key = key;
-                std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(),
-                               [](unsigned char c) { return std::tolower(c); });
-                for (auto cat_key : kCategoryKeys) {
-                    if (cat_key == lower_key) {
-                        key = lower_key;
-                        break;
-                    }
-                }
-            }
-
-            // #3289: same TOCTOU guard as /api/tags/set — a service-scoped
-            // token must not delete its own confinement key. See
-            // deny_service_scoped_service_tag_mutation's doc comment.
-            if (auth_routes_->deny_service_scoped_service_tag_mutation(req, res, "tag.delete",
-                                                                       agent_id, key))
-                return;
-
-            // K-04/CDX-R4-08: per-TARGET authorization (see /api/tags/set) --
-            // a service-scoped token must not delete a tag on an out-of-scope
-            // agent, and a group-scoped operator must be admitted on in-scope
-            // targets. Same gate as the REST v1 twin and MCP delete_tag.
-            if (!require_scoped_permission(req, res, "Tag", "Delete", agent_id))
-                return;
-
-            auto deleted = tag_store_->delete_tag(agent_id, key);
-            if (!deleted) {
-                // Degrade → 503, never "not deleted" (#3097 classification;
-                // the pre-migration bool conflated failure with not-found).
-                (void)audit_log(req, "tag.delete", "failure", "tag", agent_id + ":" + key);
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"tag store unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            (void)audit_log(req, "tag.delete", *deleted ? "success" : "not_found", "tag",
-                            agent_id + ":" + key);
-            if (*deleted) {
-                res.set_header("HX-Trigger",
-                               R"({"showToast":{"message":"Tag deleted","level":"success"}})");
-            }
-            res.set_content(nlohmann::json({{"deleted", *deleted}}).dump(), "application/json");
-        });
-
-        web_server_->Post("/api/tags/query", [this](const httplib::Request& req,
-                                                    httplib::Response& res) {
-            if (!require_permission(req, res, "Tag", "Read"))
-                return;
-            if (!tag_store_) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"tag store not available"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            auto key = extract_json_string(req.body, "key");
-            auto value = extract_json_string(req.body, "value");
-
-            if (key.empty()) {
-                res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"key required"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            auto agents = tag_store_->agents_with_tag(key, value);
-            if (!agents) {
-                // Degrade → 503, never an empty agent list — this result
-                // feeds operator targeting decisions (#3097 classification).
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"tag store unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            nlohmann::json arr = nlohmann::json::array();
-            for (const auto& a : *agents)
-                arr.push_back(a);
-            res.set_content(nlohmann::json({{"agents", arr}, {"count", arr.size()}}).dump(),
-                            "application/json");
-        });
-
         // -- Approval API -----------------------------------------------------
 
         web_server_->Get("/api/approvals", [this](const httplib::Request& req,
@@ -15673,140 +15106,6 @@ private:
                 }
                 res.set_content(html, "text/html; charset=utf-8");
             });
-
-        // -- Inventory REST endpoints (Issue 7.17) --------------------------------
-
-        // GET /api/inventory/tables — list available inventory data types
-        web_server_->Get("/api/inventory/tables", [this](const httplib::Request& req,
-                                                         httplib::Response& res) {
-            if (!require_permission(req, res, "Inventory", "Read"))
-                return;
-            if (!inventory_store_ || !inventory_store_->is_open()) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"inventory store not available"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            auto tables = inventory_store_->list_tables();
-            if (!tables) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"inventory store degraded"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            nlohmann::json arr = nlohmann::json::array();
-            for (const auto& t : *tables) {
-                arr.push_back({{"plugin", t.plugin},
-                               {"agent_count", t.agent_count},
-                               {"last_collected", t.last_collected}});
-            }
-            res.set_content(nlohmann::json({{"tables", arr}, {"count", arr.size()}}).dump(),
-                            "application/json");
-        });
-
-        // GET /api/inventory/:agent_id/:plugin — get inventory for agent+plugin
-        web_server_->Get(R"(/api/inventory/([^/]+)/([^/]+))", [this](const httplib::Request& req,
-                                                                     httplib::Response& res) {
-            if (!require_permission(req, res, "Inventory", "Read"))
-                return;
-            if (!inventory_store_ || !inventory_store_->is_open()) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"inventory store not available"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            auto agent_id = req.matches[1].str();
-            auto plugin = req.matches[2].str();
-            auto record = inventory_store_->get(agent_id, plugin);
-            if (!record.has_value()) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"inventory store degraded"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            if (!record->has_value()) {
-                res.status = 404;
-                res.set_content(
-                    R"({"error":{"code":404,"message":"no inventory data found"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            const InventoryRecord& rec = **record;
-            nlohmann::json data_obj;
-            try {
-                data_obj = nlohmann::json::parse(rec.data_json);
-            } catch (...) {
-                data_obj = rec.data_json;
-            }
-            res.set_content(nlohmann::json({{"agent_id", rec.agent_id},
-                                            {"plugin", rec.plugin},
-                                            {"data", data_obj},
-                                            {"collected_at", rec.collected_at}})
-                                .dump(),
-                            "application/json");
-        });
-
-        // POST /api/inventory/query — query inventory across agents
-        web_server_->Post("/api/inventory/query", [this](const httplib::Request& req,
-                                                         httplib::Response& res) {
-            if (!require_permission(req, res, "Inventory", "Read"))
-                return;
-            if (!inventory_store_ || !inventory_store_->is_open()) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"inventory store not available"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            auto body = nlohmann::json::parse(req.body, nullptr, false);
-            if (body.is_discarded()) {
-                res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"invalid JSON"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            InventoryQuery q;
-            q.agent_id = body.value("agent_id", "");
-            q.plugin = body.value("plugin", "");
-            q.since = body.value("since", int64_t{0});
-            q.until = body.value("until", int64_t{0});
-            q.limit = body.value("limit", 100);
-            if (q.limit > 1000)
-                q.limit = 1000;
-
-            bool inventory_truncated = false;
-            auto records = inventory_store_->query(q, &inventory_truncated);
-            if (!records) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"inventory store degraded"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            nlohmann::json arr = nlohmann::json::array();
-            for (const auto& r : *records) {
-                nlohmann::json data_obj;
-                try {
-                    data_obj = nlohmann::json::parse(r.data_json);
-                } catch (...) {
-                    data_obj = r.data_json;
-                }
-                arr.push_back({{"agent_id", r.agent_id},
-                               {"plugin", r.plugin},
-                               {"data", data_obj},
-                               {"collected_at", r.collected_at}});
-            }
-            res.set_content(nlohmann::json({{"results", arr},
-                                            {"count", arr.size()},
-                                            {"result_truncated_by_cap", inventory_truncated}})
-                                .dump(),
-                            "application/json");
-        });
 
         // PolicyEvaluator — drives the compliance check -> verdict pipeline.
         // A background thread ticks it: dispatch due policies' check

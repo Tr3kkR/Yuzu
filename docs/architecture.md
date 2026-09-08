@@ -293,10 +293,10 @@ Operator                     Server                                  Agent
 
 Most HTTP surfaces the server exposes — REST, dashboard fragments, MCP — are registered by a
 **route owner**: a class with a `register_routes(...)` method that the server calls once at
-startup. `server.cpp` wires those owners, *and* registers a further **34 routes inline** on
+startup. `server.cpp` wires those owners, *and* registers a further **24 routes inline** on
 `web_server_->{Get,Post,Put,Delete}` — the health and readiness probes and much of the `/api/*`
 dashboard JSON. It constructs no persistent `HttplibRouteSink` of its own for these remaining
-inline routes, so none of them is reachable from the in-process test harness. (Nine surfaces this
+inline routes, so none of them is reachable from the in-process test harness. (Twelve surfaces this
 prose previously credited to this inline count have since moved to their own `HttpRouteSink`
 modules and are no longer part of it: `POST /api/command` is `command_routes.cpp` (#2557); the
 page-shell/static-asset surface — `/static/*`, `/`, `/chargen`, `/procfetch`, `/api/help*`,
@@ -317,10 +317,18 @@ API — `GET/POST /api/instructions`, `GET/PUT/DELETE /api/instructions/:id`,
 `POST /api/instructions/validate-yaml` — is `instruction_routes.{hpp,cpp}` (#2542 PR-7); the
 7-route legacy pre-v1 Executions API — `GET /api/executions`, `GET /api/executions/:id`,
 `GET /api/executions/:id/{summary,agents,children}`, `POST /api/executions/:id/{rerun,cancel}` —
-is `execution_routes.{hpp,cpp}` (#2542 PR-7); and the 4-route Schedules API —
+is `execution_routes.{hpp,cpp}` (#2542 PR-7); the 4-route Schedules API —
 `GET/POST /api/schedules`, `DELETE /api/schedules/:id`, `POST /api/schedules/:id/enable` — is
-`schedule_routes.{hpp,cpp}` (#2542 PR-8). All eight owner files register against the same
-stack-local `inline_sink`, constructed in `start_web_server()`.)
+`schedule_routes.{hpp,cpp}` (#2542 PR-8); the 3-route legacy pre-v1 Responses API — `GET
+/api/responses/:id/aggregate`, `GET /api/responses/:id/export`, `GET /api/responses/(.+)` — is
+`response_routes.{hpp,cpp}` (#2542 PR-11); the 4-route Tags API — `GET /api/tags`, `POST
+/api/tags/set`, `POST /api/tags/delete`, `POST /api/tags/query` — is `tag_routes.{hpp,cpp}` (#2542
+PR-11); and the 3-route generic plugin-data Inventory API (Issue 7.17) — `GET
+/api/inventory/tables`, `GET /api/inventory/:agent_id/:plugin`, `POST /api/inventory/query` — is
+`data_inventory_routes.{hpp,cpp}` (#2542 PR-11, namespace `yuzu::server::data_inventory` to avoid
+colliding with `inventory_routes.hpp`'s unrelated `/inventory` dashboard, which lives directly in
+`yuzu::server`). All eleven owner files register against the same stack-local `inline_sink`,
+constructed in `start_web_server()`.)
 
 Counting the surface therefore needs a receiver-agnostic pattern, not a search for one variable
 name:
@@ -369,10 +377,15 @@ matching every other owning-class route module (`DeviceRoutes`, `ComplianceRoute
 use — `server.cpp` still calls `mcp_server_->register_routes(*web_server_, ...)` unchanged, exactly
 as it does for every other owning-class module), the Instruction Definitions + Instruction
 Sets / legacy pre-v1 Executions extraction (`instruction_routes.{hpp,cpp}` +
-`execution_routes.{hpp,cpp}`, PR-7, 13 + 7 = 20 routes, also against `inline_sink`), and the
-Schedules API extraction (`schedule_routes.{hpp,cpp}`, PR-8, 4 routes, also against `inline_sink`)
-— `server.cpp`'s own 34 inline routes are the only registrations left outside the sink, and they
-are not a route-owner class, so no further campaign PR touches them. Count these with the anchored
+`execution_routes.{hpp,cpp}`, PR-7, 13 + 7 = 20 routes, also against `inline_sink`), the
+Schedules API extraction (`schedule_routes.{hpp,cpp}`, PR-8, 4 routes, also against `inline_sink`),
+and the Data APIs extraction — the legacy pre-v1 Responses API
+(`response_routes.{hpp,cpp}`, 3 routes), the Tags API (`tag_routes.{hpp,cpp}`, 4 routes), and the
+generic plugin-data Inventory API (`data_inventory_routes.{hpp,cpp}`, 3 routes) — three separate
+single-store modules landing together as one bundle PR (#2542 PR-11, 3 + 4 + 3 = 10 routes, also
+against `inline_sink`) — `server.cpp`'s own 24 inline routes are the only registrations left
+outside the sink, and they are not a route-owner class, so no further campaign PR touches them.
+Count these with the anchored
 pattern `grep -cE '^\s*web_server_->(Get|Post|Put|Delete|Patch|Options)\('
 server/core/src/server.cpp`, not a bare `grep -c` of the receiver-agnostic pattern above — the
 unanchored form over-counts by picking up at least one comment-line false match, which is how a
@@ -385,8 +398,9 @@ registrations in `mcp_server.cpp` (verify with
 `grep -cE '\bsvr\.(Get|Post|Put|Delete|Patch|Options)\(' server/core/src/mcp_server.cpp`, now 0),
 which were never counted by the `web_server_->` pattern above in the first place since they were
 never inline in `server.cpp` — dropped to 38 once the Instruction Definitions + Instruction Sets /
-legacy pre-v1 Executions extraction (-20, PR-7) landed, and is 34 now that the Schedules API
-extraction (-4, PR-8) has also landed. 34 registrations remain outside the sink in total.
+legacy pre-v1 Executions extraction (-20, PR-7) landed, dropped to 34 once the Schedules API
+extraction (-4, PR-8) landed, and is 24 now that the Data APIs bundle extraction (-10: Responses -3,
+Tags -4, Inventory -3, PR-11) has also landed. 24 registrations remain outside the sink in total.
 
 ## Storage Architecture
 
