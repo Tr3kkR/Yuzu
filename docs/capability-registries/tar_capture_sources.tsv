@@ -45,3 +45,6 @@ power	macos	planned	pmset_log
 removable	windows	planned	wevtapi
 removable	linux	planned	udev_netlink
 removable	macos	planned	diskarbitration
+usage	windows	supported	derived_process
+usage	linux	supported	derived_process
+usage	macos	constrained	derived_process

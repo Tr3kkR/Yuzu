@@ -1270,7 +1270,7 @@ TEST_CASE("TarDatabase: a fresh open creates no tar_events table (#760 UP-8)",
     { TarDatabase discard = std::move(t.db); }
     auto reopened = TarDatabase::open(t.path);
     REQUIRE(reopened.has_value());
-    CHECK(reopened->schema_version() == 5);
+    CHECK(reopened->schema_version() == 6);
     auto q2 = reopened->execute_query(count_sql);
     REQUIRE(q2.has_value());
     CHECK(q2->rows[0][0] == "0");
@@ -1304,7 +1304,7 @@ TEST_CASE("TarDatabase: a pre-v3 database still has tar_events dropped on open",
     {
         auto db = TarDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 5); // the 2→3→4→5 walk ran
+        CHECK(db->schema_version() == 6); // the 2→3→4→5→6 walk ran
         auto q =
             db->execute_query("SELECT COUNT(*) FROM sqlite_master WHERE name = 'tar_events' OR "
                               "name LIKE 'idx_tar_events%'");
@@ -1344,7 +1344,7 @@ TEST_CASE("TarDatabase: schema v5 drops tar_events from an ALREADY-MIGRATED data
     {
         auto db = TarDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 5);
+        CHECK(db->schema_version() == 6);
         auto q = db->execute_query("SELECT COUNT(*) FROM sqlite_master WHERE name = 'tar_events' "
                                    "OR name LIKE 'idx_tar_events%'");
         REQUIRE(q.has_value());
@@ -1421,7 +1421,7 @@ TEST_CASE("TarDatabase: schema v4 ALTERs version onto a pre-existing procperf ti
     {
         auto db = TarDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 5); // the v3→v4→v5 walk ran
+        CHECK(db->schema_version() == 6); // the v3→v4→v5→v6 walk ran
 
         // Both tiers now carry `version` (added by the ALTER, not the DDL).
         for (const char* tbl : {"procperf_live", "procperf_hourly"}) {

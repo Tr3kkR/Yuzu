@@ -277,6 +277,7 @@ Six roles are created automatically and cannot be deleted:
 | `GuaranteedState` | Guardian (Guaranteed State) policy rules, events, and status |
 | `Inventory` | Installed-software inventory synced from endpoints (ADR-0016) |
 | `EnginePrincipal` | Engine-principal inventory and fleet-wide grant-graph reads (list/get engine principals, list their assigned roles) — cut away from `Security` (#2376) so this narrower read is not gated by the same broad permission that also covers CA/quarantine/KEK operational reads. See "The authorization topology floor" below. |
+| `Forensics` | Forensic-artefact reads (Windows execution artefacts — ShimCache/AmCache/Prefetch; per-device application-usage projection). Administrator-only by default (absent from the Viewer read-list); every catalogue row on it is single-target (exactly one agent id, no fleet/scope fan-out) and `AdminOrApproval`-gated. Wave 7 PR7.2/PR7.3. |
 | `Decommission` | Device-level agent-erasure gate for `DELETE /api/v1/sle/agents/{id}` (ADR-0024 Decision 9, amended Wave 7 PR7.2). `Decommission:Delete` authorizes for the whole decommission cascade's blast radius (five per-agent stores spanning `Inventory`, `GuaranteedState`, and `SoftwareLicensing`; a companion package adds a sixth, `Forensics`-governed store) in one grant, replacing a hand-maintained per-store conjunction. |
 
 ## Operations
@@ -441,7 +442,7 @@ curl -s -b cookies.txt \
 }
 ```
 
-(Truncated for brevity. The full ITServiceOwner role contains 91 permissions across 18 securable types.)
+(Truncated for brevity. The full ITServiceOwner role contains 92 permissions across 18 securable types — the 92nd is the targeted `Decommission:Delete` grant, Wave 7 PR7.2.)
 
 ### Custom Roles (Planned)
 
