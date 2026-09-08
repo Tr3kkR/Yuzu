@@ -13661,9 +13661,9 @@ private:
             return auth_routes_->deny_service_scoped_service_tag_mutation(req, res, action,
                                                                            agent_id, key);
         };
-        // #2542 PR-11: wraps ServerImpl::ensure_service_management_group
-        // (server.cpp:11305 area) — POST /api/tags/set's side effect when the
-        // `service` tag changes. Only tag_routes.cpp calls this today.
+        // #2542 PR-11: wraps ServerImpl::ensure_service_management_group —
+        // POST /api/tags/set's side effect when the `service` tag changes.
+        // Only tag_routes.cpp calls this today.
         auto ensure_service_management_group_fn = [this](const std::string& service_value) {
             ensure_service_management_group(service_value);
         };
@@ -14099,17 +14099,6 @@ private:
                     },
                 });
         }
-
-        // #2542 PR-12: the 5-route Chargen + Procfetch diagnostic API,
-        // extracted onto the HttpRouteSink seam (diagnostics_routes.cpp).
-
-
-        // #2542 PR-12: the 2-route Instructions HTMX fragment pair,
-        // extracted onto the HttpRouteSink seam
-        // (instruction_fragment_routes.cpp).
-
-        // #2542 PR-12: the Approvals HTMX fragment, extracted onto the
-        // HttpRouteSink seam (approvals_fragment_routes.cpp).
 
         // PolicyEvaluator — drives the compliance check -> verdict pipeline.
         // A background thread ticks it: dispatch due policies' check

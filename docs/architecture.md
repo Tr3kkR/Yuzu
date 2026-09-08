@@ -360,8 +360,9 @@ grep -rnE '\b[A-Za-z_][A-Za-z0-9_]*(\.|->)(Get|Post|Put|Delete|Patch|Options)\('
 ```
 
 Route owners name their receiver `svr` or `sink`; `server.cpp` names its `web_server_`. Grepping
-only for `svr\.` returns nothing from `server.cpp` and reads as "no inline routes" — a false
-negative that was published in this document and in #2542 before it was caught. `/api/command`'s
+only for `svr\.` returned nothing from `server.cpp` and read as "no inline routes" — a false
+negative published in this document and in #2542 before it was caught; the receiver-agnostic
+pattern above exists so a future inline registration can't hide the same way. `/api/command`'s
 untestability is tracked by #2557; the owner-side migration by #2542.
 
 **The registration seam.** A route owner's real `register_routes` takes `HttpRouteSink&`
@@ -385,7 +386,7 @@ fragments shipped a destructive operation with no route-handler coverage until #
 **Invariant.** New route owners register through `HttpRouteSink&`; new routes on an existing owner
 register through the sink that owner already uses. Do not add a handler that only the
 `httplib::Server&` overload — or an inline `web_server_->` call in `server.cpp` — can reach.
-Registrations outside the sink are pre-existing debt, not a precedent to copy: after #2542 PR-1
+A registration outside the sink is a regression, not debt to extend: after #2542 PR-1
 (`VerifyRoutes` and `NotificationRoutes` joined the sink pattern), the page-shell/static-asset
 extraction (`page_routes.{hpp,cpp}`, PR-2, 25 routes registered against `inline_sink`), a #2542
 follow-up (`dashboard_api_routes.{hpp,cpp}` + `nvd_routes.{hpp,cpp}`, 10 more scattered routes
