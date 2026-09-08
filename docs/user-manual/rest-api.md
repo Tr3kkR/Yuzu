@@ -7649,8 +7649,10 @@ store-degrade path is new. `POST /api/tags/set` previously returned `200
 
 Requires `Inventory:Read` (global — not per-agent/management-group scoped; every caller
 holding the permission sees fleet-wide data, unlike the confined `Responses` routes above).
-Distinct from, and predates, `/api/v1/inventory/*` — no v1 replacement currently exists for
-these three routes.
+Predates, and is distinct from, `/api/v1/inventory/*` (§ above) — the v1 routes cover the
+same three operations (`tables`, `{agent_id}/{plugin}`, `query`) wrapped in the standard A4
+envelope; prefer the v1 surface for new integrations. These legacy routes retain their
+historical, non-A4 response shapes and remain live for existing callers.
 
 #### `GET /api/inventory/tables`
 
