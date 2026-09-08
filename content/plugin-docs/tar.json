@@ -2802,6 +2802,7 @@
       "changelog.d/2854-restart-loop-alert.added.md",
       "changelog.d/2f-pr3a-mcp-terminal-starvation.fixed.md",
       "changelog.d/3885-dashboard-destructive-targeting.security.md",
+      "changelog.d/4027-tar-read-twins.added.md",
       "changelog.d/5.2-tar-arp-posix.added.md",
       "changelog.d/5.2-tar-mapdrive-macos.added.md",
       "changelog.d/5.2-tar-popen-rehome.changed.md",

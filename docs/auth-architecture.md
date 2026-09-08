@@ -566,7 +566,9 @@ account policy)"* — this ships **both** halves.
 
 - **`--auth-mode <standard|sso-only>`** (`YUZU_AUTH_MODE`, default `standard`).
   Under `sso-only` the local-password login path is disabled fleet-wide — only
-  OIDC SSO (`/auth/callback`, untouched) mints a session. The rejection at
+  an SSO provider mints a session: OIDC (`/auth/callback`) or SAML (`/saml/acs`),
+  both untouched by the gate (the `POST /login` gate keys on `auth_mode` alone,
+  never on which provider is wired). The rejection at
   `POST /login` returns the **same generic 401** as a bad password (no
   "disabled"/"sso-only" wording, no `Retry-After`) so the response BODY carries
   no enumeration/mode/arm-state oracle, and `verify_password` (PBKDF2) is
@@ -577,13 +579,31 @@ account policy)"* — this ships **both** halves.
   the lockout *blocked* path avoids; the CC6.3 evidence is the boot-posture
   banner + this counter (the `{target}` label, cardinality 2, flags probing of
   the break-glass account itself for SIEM alerting).
-- **Boot guard (fail-closed).** `sso-only` **refuses to start** when OIDC is not
-  **fully** configured — the guard requires both `--oidc-issuer` **and**
-  `--oidc-client-id` (the same predicate the OIDC provider's `is_enabled()` uses;
-  issuer-without-client-id leaves SSO silently non-functional). Otherwise every
-  operator is locked out. The break-glass account is for an IdP **outage**, not
-  for never wiring SSO. The active posture is logged once at boot for CC6.3
-  evidence.
+- **Boot guard (fail-closed).** `sso-only` **refuses to start** unless at least
+  one SSO provider is configured well enough to actually mint a session —
+  otherwise every operator is locked out (the break-glass account is for an IdP
+  **outage**, not for never wiring SSO). The testable core is
+  `sso_only_boot_guard_ok` (`sso_boot_guard.{hpp,cpp}`), mirroring the SCIM boot
+  guard; it accepts **either**:
+  - **OIDC** — both `--oidc-issuer` **and** `--oidc-client-id` (the same
+    predicate the OIDC provider's `is_enabled()` uses; issuer-without-client-id
+    leaves SSO silently non-functional, review #1735 HIGH-1); **or**
+  - **SAML** (non-Windows) — all five SP fields (`--saml-idp-sso-url`,
+    `--saml-idp-cert`, `--saml-sp-entity-id`, `--saml-sp-acs-url`,
+    `--saml-idp-entity-id`) **and HTTPS enabled**. HTTPS is part of the gate, not
+    deferred to runtime: `server.cpp` leaves the SAML provider disabled under
+    `--no-https` (its Secure browser-binding cookie is dropped over plain HTTP,
+    so `/auth/saml/start` would 404), so a SAML-only `--no-https` deployment would
+    otherwise pass a presence-only gate and boot straight into a fleet-wide
+    lockout. SAML is excluded on Windows because the provider is a compile-time
+    stub there (it can never mint a session; running the *server* on Windows is
+    out of scope regardless).
+
+  The gate checks config **presence**, not runtime validity: a SAML config whose
+  IdP cert / SP key is unreadable, oversized, or non-RSA still passes the boot
+  guard and is then disabled **loudly** by `server.cpp` — exactly as OIDC
+  issuer/JWKS runtime validity is not gate-checked either. The active SSO
+  path(s) are named in the boot banner for CC6.3 evidence.
 - **Break-glass account.** `--break-glass-user <name>` (`YUZU_BREAK_GLASS_USER`)
   designates the single local account exempt from `sso-only`, exempt **only
   while armed**. "Armed" is `users.break_glass_armed_until` (migration v4) — a
@@ -632,10 +652,13 @@ account policy)"* — this ships **both** halves.
 Implementation: gate at `auth_routes.cpp` `POST /login` (between the lockout
 pre-check and `verify_password`); accessors `AuthDB::break_glass_status` /
 `arm_break_glass` (single `UPDATE ... RETURNING`, no `sqlite3_changes()` —
-#1033); flags + boot guard + arm one-shot in `main.cpp`; `Config::auth_mode` /
-`break_glass_user` / `break_glass_window_secs` in `server.hpp`. Tests:
-`tests/unit/server/test_auth_break_glass.cpp` (DB accessors) +
-`test_auth_routes_hardened.cpp` (wire path).
+#1033); the boot guard's testable core is `sso_only_boot_guard_ok`
+(`sso_boot_guard.{hpp,cpp}`, shared with `server.cpp` via `saml_config_complete`),
+called from a thin wrapper in `main.cpp` alongside the flags + arm one-shot;
+`Config::auth_mode` / `break_glass_user` / `break_glass_window_secs` in
+`server.hpp`. Tests: `tests/unit/server/test_auth_break_glass.cpp` (DB
+accessors) + `test_auth_routes_hardened.cpp` (login-gate wire path) +
+`test_sso_boot_guard.cpp` (boot-guard predicate — OIDC/SAML/HTTPS/platform).
 
 ## RBAC group provisioning (#1832)
 
@@ -1264,12 +1287,29 @@ when SAML is in use, and configure your IdP to enforce MFA at login time. Avoid
 gates. The recommended pattern for a SAML deployment is `optional` with IdP-side
 MFA enforcement.
 
-### `--auth-mode=sso-only` is OIDC-only in this release
+### `--auth-mode=sso-only` covers SAML (SOC 2 CC6.3)
 
-`--auth-mode=sso-only` requires OIDC configuration (`--oidc-issuer` +
-`--oidc-client-id`); a SAML-only deployment cannot disable local-password login
-in this release. The boot guard explicitly requires OIDC — SAML configuration
-alone does not satisfy it and the server refuses to start.
+A SAML-only deployment **can** run under `--auth-mode=sso-only`: the boot guard
+accepts a complete SAML SP config (all five `--saml-*` fields) **with HTTPS
+enabled** as an SSO path, exactly as it accepts a complete OIDC config — see the
+Hardened-mode boot-guard bullet above for the full predicate. A dual OIDC+SAML
+deployment satisfies it via either provider. On Windows the SAML provider is a
+stub, so a Windows *server* still needs OIDC for `sso-only` (running the server
+on Windows is out of scope regardless).
+
+Two limitations a SAML-only `sso-only` operator should know (neither is new to
+this change; both are pre-existing SAML properties that simply become more
+visible without a local-password fallback):
+
+- **No privilege elevation for SAML operators.** A SAML session cannot perform a
+  local TOTP step-up and has no OIDC `amr` proof, so JIT admin elevation
+  (`POST /api/v1/elevate`) is unavailable to it. A SAML-only deployment that
+  needs elevation should grant standing admin via the group→role mapping
+  (`--saml-admin-group`) rather than rely on JIT.
+- **No SAML button on the login page.** `/login` still renders a password form
+  (which always returns the generic 401 under `sso-only`) and, if OIDC is also
+  configured, its SSO button; SAML operators navigate to `GET /auth/saml/start`
+  directly.
 
 ### HA / multi-replica
 
@@ -1320,9 +1360,6 @@ key. Design:
 
 - **Login-page SSO button.** There is no "Sign in with SAML" button on the
   login page; users must navigate directly to `GET /auth/saml/start`.
-- **`--auth-mode=sso-only` for SAML.** A SAML-only deployment cannot disable
-  local-password login. Compliance impact: CC6.3 (local-password fallback
-  remains active). OIDC is the path to `sso-only`.
 - **AttributeStatement parsing beyond group/name/email.** Group→role mapping
   (`--saml-group-attribute`) plus the display-name/email session-enrichment
   attributes (`--saml-name-attribute`/`--saml-email-attribute`, see
@@ -2456,6 +2493,28 @@ counter registrations). Tests: `tests/unit/server/test_saml_scim_link.cpp`,
 - **OIDC SSO** — Full PKCE flow, Entra ID discovery, JWT validation, group-to-role mapping.
 - **AD/Entra integration** — Microsoft Graph API for user/group import.
 
+### `ProductPack` securable seeding fix (#4029)
+
+`ProductPack` was used as an RBAC securable-type string by the shipped
+`/api/product-packs*` routes (`workflow_routes.cpp`, `perm_fn(req, res,
+"ProductPack", "Read"/"Write"/"Delete")`) but was never seeded into
+`RbacStore::seed_defaults()`'s `types[]` array or `mcp_server.cpp`'s
+mirrored `kRbacSecurables[]`. `role_permissions.securable_type` carries a
+hard FK to `securable_types(name)`, so no role — not even Administrator —
+could ever be granted `ProductPack:*` while RBAC was enabled; the routes
+were reachable only via the RBAC-off legacy fallback or an elevated-session
+bypass. Fixed as part of #4029 (the same class of gap #2376's
+`EnginePrincipal` cut fixed for a different securable, see above): `types[]`
+now includes `ProductPack` (Administrator gets full CRUD for free via the
+existing cross-type loop), and `Read` is additionally granted to
+Operator/PlatformEngineer/Viewer — the same population that already holds
+`InstructionDefinition:Read`, for consistency across the content/catalog
+domain. Write/Delete stay Administrator-only (the issue's ask was scoped to
+the read twins; a follow-up could widen this if an operator role needs to
+author/uninstall packs directly). `#4032` tracks the identical gap for
+`Workflow` and `Directory`, fixed by sibling issues in their own PRs — this
+fix touches `ProductPack` only.
+
 ## The authorization topology floor (#2376)
 
 **The defect.** `RbacStore::rbac_enabled_` defaults `false`, so a fresh
@@ -2493,9 +2552,20 @@ MCP twins).
    RBAC-enabled enforcement; only the RBAC-off legacy posture changes (see
    below).
 2. **The topology floor itself**: `{AccessReview:Read, UserManagement:Read,
-   EnginePrincipal:Read}` require the `admin` session role regardless of
-   the RBAC on/off toggle, via `authz_topology_floor.hpp`'s
-   `topology_floor_applies()`. It is consulted **only** inside the legacy
+   EnginePrincipal:Read}` — plus, as of #4028, `{TlsConfig:Read,
+   PluginSigning:Read, ServerConfig:Read, AnalyticsConfig:Read}` (see
+   "Settings read-twins" below) — require the `admin` session role
+   regardless of the RBAC on/off toggle, via `authz_topology_floor.hpp`'s
+   `topology_floor_applies()`. The two groups are different categories that
+   happen to share this one mechanism: the original three are
+   authorization-topology reads (the RBAC role graph, the engine-principal
+   grant graph, the access-review export) that intentionally stay reachable
+   by an admin-owned session on ANY transport, MCP tokens included, per the
+   legacy-role-fallback note below; the #4028 four are
+   server-administration reads that #520 additionally excludes from every
+   MCP tier outright (`mcp_policy.hpp`'s `tier_allows()`), so an admin-owned
+   MCP token cannot reach them even though it would otherwise satisfy this
+   same floor check. It is consulted **only** inside the legacy
    (RBAC-off) fallback of `require_permission`/`require_scoped_permission`
    — never ahead of, or instead of, the live-RBAC branch. That ordering is
    load-bearing, not incidental: #2324 cut the dedicated `AccessReview`
@@ -2554,6 +2624,120 @@ only when a change cannot be expressed as an idempotent additive re-seed
 (`rbac_store.cpp`'s legacy SQLite v4 migration *deletes* rows, which is why
 it needed one — distinct from the PG schema's own migration sequence,
 ADR-0041, currently at v3).
+
+## Settings read-twins (#4028, api-parity programme #2146)
+
+Eight `/fragments/settings/*` dashboard sub-areas (TLS, HTTPS, gateway, server-config, MCP,
+data-retention, analytics, plugin-signing) were gated **only** by `AuthRoutes::require_admin` — a
+whole-route role check, not an RBAC securable/operation pair, with no REST v1 twin and no RBAC-off
+fallback at all. #4028 migrated all eight onto four new securables, split along sensitivity lines
+rather than one blanket `Settings:Read` (the same reasoning `EnginePrincipal` above was cut for):
+
+- **`TlsConfig`** — the `tls` and `https` fragments (mTLS/HTTPS listener posture, cert/key/CA file
+  paths).
+- **`PluginSigning`** — the `plugin-signing` fragment and its REST twin, the hardened
+  `GET /api/v2/agent/plugin-policy` (deliberately distinct from the unrelated `PluginConfig`
+  securable, which gates per-plugin runtime kill-switch config — a different domain). Its
+  deprecated `/api/v1/` predecessor is frozen on `require_admin`, not this securable — see
+  `docs/api-versioning-policy.md` and #4144.
+- **`ServerConfig`** — the `gateway`, `server-config`, `mcp`, and `data-retention` fragments
+  (operational/infra config, "nothing secret" per #4028's own evidence).
+- **`AnalyticsConfig`** — the `analytics` fragment (ClickHouse integration; embedded-credential
+  risk, see below).
+
+Each is `Read`-only today, seeded to `Administrator` only (via the existing cross-type CRUD loop in
+`seed_defaults()` — matching every other admin-only securable's precedent, e.g. `PluginConfig`,
+`PluginSecret`, `UploadGrant`, `PowerManagement` above), deliberately absent from `Viewer`'s blanket
+read-list and every other role's explicit grant list — this is a mechanical RBAC-ification of an
+already-admin-only gate, not a broadening. All four `(securable, "Read")` pairs are also added to
+`authz_topology_floor.hpp`'s `kTopologyFloor[]` (see that file's own doc comment for why: migrating
+an admin-only gate onto a Read securable without flooring it would silently widen every one of these
+eight routes from admin-only to any-authenticated-user on an RBAC-off install, the out-of-the-box
+default) — extending that file's floor beyond its original "authorization topology" framing to a
+second, related case: preserving an *existing* admin-only posture across the RBAC-off toggle.
+
+**The MCP question (#520).** `require_admin`'s own comment states the deliberate design this issue
+had to resolve explicitly, not silently override: "MCP tokens are for fleet management (queries,
+instruction execution) and must not be used to administer the server itself (settings, users, TLS,
+OIDC)." #4028 ships all eight sub-areas **REST-only** — no MCP tool touches any of them — treating
+read-only settings visibility as a meaningfully different exposure than the fleet-query surface #520
+was written to keep MCP confined to, but one that still requires its own reviewed amendment to #520
+rather than a side effect of a routine twin PR. See [MCP Server](mcp-server.md) for the policy
+itself.
+
+Shipping no MCP *tool* is not, by itself, sufficient to preserve #520's intent, because these eight
+routes are also reachable over REST, and an MCP *token* can call any REST route its tier and role
+admit — an MCP tool registration and an MCP token's REST reach are two independent things. The
+topology floor above requires `admin` role in the RBAC-off legacy fallback, but `require_permission`
+does not otherwise distinguish an admin-owned MCP token from an ordinary admin session: an MCP token
+carries its **creator's** real legacy role there by design (see "The authorization topology floor"
+above), so an admin-owned MCP token — at any tier, including `readonly` — would satisfy the floor
+exactly like an interactive admin session would, unless something stops it earlier. Hardening
+this route off `require_admin` (which rejected every `mcp_tier` token
+outright, regardless of role) onto `require_permission` — now `GET /api/v2/agent/plugin-policy`,
+split from the still-`require_admin`-gated, deprecated `/api/v1/` shape by #4144 — would have
+silently reopened it to admin-owned MCP tokens without an explicit second control. #4028's actual enforcement point is
+`mcp_policy.hpp`'s `tier_allows()`: `TlsConfig`, `PluginSigning`, `ServerConfig`, and
+`AnalyticsConfig` are denied at **every** tier there (readonly/operator/supervised) for **every**
+operation, so `require_permission`'s tier check 403s an MCP token before it ever reaches the
+topology-floor/legacy-role fallback that would otherwise admit it. This deliberately puts these four
+securables in a different category from the pre-existing three topology-floor pairs
+(`AccessReview`/`UserManagement`/`EnginePrincipal`), which keep the admin-owned-MCP-token
+reachability described above by design (see the topology floor section) — those are
+authorization-topology reads, not server-administration reads, and #520's language is specific to
+the latter. Coverage: `test_mcp_server.cpp` ("no tier admits the #4028 server-administration
+securables") pins `tier_allows()` directly; `test_auth_routes.cpp` ("no MCP tier ... reaches the
+#4028 settings-administration securables") exercises the same guarantee through the real
+`require_permission()` end-to-end path, with an admin-owned readonly-tier token and RBAC disabled —
+the exact combination that would otherwise have passed.
+
+**Analytics also fixed a leak, not just added RBAC.** `render_analytics_fragment` (and the new
+`GET /api/v1/settings/analytics` twin) previously rendered the ClickHouse URL verbatim, masking only
+the separate `clickhouse_password` field — a URL with embedded userinfo credentials
+(`clickhouse://user:pass@host:9000/db`) leaked the credential regardless. The shared builder now
+strips URL userinfo unconditionally (`settings_model::sanitize_url_userinfo`) before either surface
+ever sees it, and never reads the raw password into a response at all — only a
+`clickhouse_password_set` bool. Fix-round hardening (governance Gate 2-8, three rounds, plus two
+external adversarial-review passes, `/home/dgr/advrev-4028`) found the initial strip itself
+incomplete: an unescaped `@`, `/`, or `?` inside the userinfo let part or all of a credential
+through, and a query-string credential form (`?password=...`, no `@` at all) was not modeled. A
+first attempt tried to locate the authority boundary (the path-starting `/`) and search for `@`
+only within it, widening past an embedded `/` via a "does this look like a `host[:port]`"
+heuristic — governance re-review found that unfixable (a digit-only password segment before the
+`/` is lexically identical to a real port, so the heuristic cannot tell them apart) and it shipped
+a regression on top of the bypass it was meant to close. A second design deleted that heuristic
+entirely — the userinfo delimiter became simply the LAST `@` anywhere in the URL, with the query
+string or fragment dropped afterward — which deliberately over-strips when the path itself
+contains a later, harmless `@` (`.../db@table` becomes `.../table`), an accepted trade-off since
+the alternative is a heuristic that can be fooled into leaving a real credential in place. That
+second design itself shipped with two further bypasses an adversarial-review round found: a
+schemeless URL whose query string contains a nested `://` could fool scheme-boundary detection
+into skipping the strip entirely, and a query string that itself contains an `@` could make the
+query-strip (which ran against the already-userinfo-stripped string) miss its own delimiter and
+leave a password fragment exposed.
+
+**Current (third) design closes both, plus one further gap the fix itself introduced.**
+`sanitize_url_userinfo` bounds the scheme scan to a genuine RFC 3986 §3.1 grammar match
+(`ALPHA *(ALPHA/DIGIT/"+"/"-"/".")` immediately followed by `"://"`, evaluated from position 0
+only — never an unbounded search), and computes both the userinfo-ending `@` and the
+query/fragment-start cut points against the ORIGINAL string, unioning the two removal ranges
+rather than mutating sequentially; when the two ranges overlap (an inherently ambiguous shape —
+a real `?`-corrupted password vs. no userinfo at all with the query containing its own `@`), it
+over-strips to the scheme prefix, the same conservative resolution the design already applies
+elsewhere. A subsequent adversarial-review round of this exact fix (finding CDX-01) found the
+scheme scan itself accepted a DIGIT (or `+`/`-`/`.`) as the *first* scheme byte, contrary to RFC
+3986's ALPHA-first requirement — a schemeless credential URL whose "username" happened to be
+scheme-shaped and digit-led (e.g. `9name://pass@host:9000/db`) had that digit-led prefix wrongly
+preserved as if it were a real scheme. Requiring the first scheme byte be a letter closed this.
+All three findings (`g8b-sanitizer-scheme-boundary`, `g8b-sanitizer-query-at-ordering`, and
+CDX-01) are closed and verified — compiled, linked against the real object, and exercised against
+every adversarial shape either external reviewer or this fix round constructed, including a
+2,000,000-case fuzz run under ASan/UBSan. Regression tests for all three shapes live in
+`tests/unit/server/test_settings_model.cpp`. Treat this sanitizer as a hand-rolled, adversarially
+verified deny-list transform, not an RFC-3986-conformant parser — it has been through four design
+iterations and three rounds of independent review specifically because ad hoc string surgery on
+URLs is a narrow, easy-to-misjudge problem; a future editor changing this function should read its
+full round-by-round history in `settings_model.cpp`'s header comment before touching it again.
 
 ## On-behalf-of assertions rejected (ADR-1005 Interim rules)
 
