@@ -202,16 +202,39 @@ void emit_status(yuzu::CommandContext& ctx, SourceId id, YuzuSupportLevel suppor
 }
 
 /// Reads `name` inside the directory backing `dir_fd`, refusing a symlink
+/// (constrained, reason) for a failed read_file_bounded call -- benign
+/// absence (ENOENT: a raced deletion between listing and reading) contra a
+/// real per-entry constraint (permission denied, a refused symlink, a
+/// non-regular leaf) that must not be silently folded into "this file
+/// contributes nothing" (AC4).
+struct PlistReadOutcome {
+    bool constrained = false;
+    std::string_view reason{};
+};
+
 /// (O_NOFOLLOW) at the leaf itself, capped at kMaxPlistBytes. Returns false
 /// on any open/fstat/read failure or on a rejected symlink — this is a
 /// best-effort collector: a file it cannot read contributes nothing rather
-/// than aborting the whole directory's walk.
+/// than aborting the whole directory's walk, but a real failure (as opposed
+/// to a benign race) is reported via `outcome` for the caller to surface.
 bool read_file_bounded(int dir_fd, const char* name, std::vector<uint8_t>& out,
-                       std::int64_t& mtime) {
+                       std::int64_t& mtime, PlistReadOutcome& outcome) {
     FdHandle fd(openat(dir_fd, name, O_RDONLY | O_NOFOLLOW));
-    if (!fd.valid()) return false;
+    if (!fd.valid()) {
+        const int err = errno;
+        if (!is_benign_absent_errno(err)) outcome = {true, dir_open_constraint_token(err)};
+        return false;
+    }
     struct stat st{};
-    if (fstat(fd.get(), &st) != 0 || !S_ISREG(st.st_mode)) return false;
+    if (fstat(fd.get(), &st) != 0) {
+        const int err = errno;
+        if (!is_benign_absent_errno(err)) outcome = {true, dir_open_constraint_token(err)};
+        return false;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        outcome = {true, "not_regular"};
+        return false;
+    }
     mtime = static_cast<std::int64_t>(st.st_mtime);
     const std::size_t want = static_cast<std::size_t>(st.st_size) > kMaxPlistBytes
                                  ? kMaxPlistBytes
@@ -222,6 +245,8 @@ bool read_file_bounded(int dir_fd, const char* name, std::vector<uint8_t>& out,
         const ssize_t n = read(fd.get(), out.data() + total, want - total);
         if (n < 0) {
             if (errno == EINTR) continue;
+            const int err = errno;
+            if (!is_benign_absent_errno(err)) outcome = {true, dir_open_constraint_token(err)};
             return false;
         }
         if (n == 0) break;
@@ -232,18 +257,35 @@ bool read_file_bounded(int dir_fd, const char* name, std::vector<uint8_t>& out,
 }
 
 /// Enumerates `*.plist` entries in an already-opened directory (no
+/// Outcome of a directory-plist walk: whether the entry cap was hit with
+/// real entries left unread, and whether any listed file failed to read
+/// for a real reason (not a benign raced-deletion). Deliberately holds no
+/// DirHandle -- a plain, trivially-returned value type, same shape as
+/// DirConstraint but with the two signals kept separate so a caller can
+/// choose which one wins when combining with its own constraint state.
+struct DirWalkOutcome {
+    bool truncated = false;
+    bool file_constrained = false;
+    std::string_view file_constrained_reason{};
+};
+
+/// Enumerates `*.plist` entries in an already-opened directory (no
 /// recursion), capped at kMaxEntriesPerDir, and hands each one's bytes +
-/// mtime to `on_plist`. Returns true when the cap was hit AND at least one
-/// more entry remained unread (probed via one extra `readdir()` after the
-/// loop) -- a listing that happened to have exactly kMaxEntriesPerDir
-/// entries is NOT truncated. A caller that hits the cap must surface it as
-/// a constraint (`row_cap`), never silently report a partial listing as a
-/// complete one. An invalid handle (directory absent, or a component along
-/// the way was refused) silently contributes zero rows, untruncated -- the
+/// mtime to `on_plist`. `truncated` is true when the cap was hit AND at
+/// least one more entry remained unread (probed via one extra `readdir()`
+/// after the loop) -- a listing that happened to have exactly
+/// kMaxEntriesPerDir entries is NOT truncated. `file_constrained` is true
+/// when a listed `*.plist` failed to read for a real reason (permission
+/// denied, a refused symlink, a non-regular leaf) rather than a benign
+/// raced deletion -- a caller must surface either signal as a constraint
+/// (AC4), never silently report a partial/lossy listing as complete. An
+/// invalid handle (directory absent, or a component along the way was
+/// refused) silently contributes zero rows and an empty outcome -- the
 /// same "absence is not an error" contract every rung-1 leg here follows.
 template <typename OnPlist>
-bool walk_plist_dir_handle(const DirHandle& dir, OnPlist&& on_plist) {
-    if (!dir.valid()) return false;
+DirWalkOutcome walk_plist_dir_handle(const DirHandle& dir, OnPlist&& on_plist) {
+    DirWalkOutcome outcome;
+    if (!dir.valid()) return outcome;
     const int dfd = dirfd(dir.get());
     std::size_t seen = 0;
     struct dirent* entry = nullptr;
@@ -254,10 +296,18 @@ bool walk_plist_dir_handle(const DirHandle& dir, OnPlist&& on_plist) {
         if (!ends_with(name, ".plist")) continue;
         std::vector<uint8_t> bytes;
         std::int64_t mtime = 0;
-        if (!read_file_bounded(dfd, entry->d_name, bytes, mtime)) continue;
+        PlistReadOutcome read_outcome;
+        if (!read_file_bounded(dfd, entry->d_name, bytes, mtime, read_outcome)) {
+            if (read_outcome.constrained) {
+                outcome.file_constrained = true;
+                outcome.file_constrained_reason = read_outcome.reason;
+            }
+            continue;
+        }
         on_plist(entry->d_name, bytes, mtime);
     }
-    return seen >= kMaxEntriesPerDir && readdir(dir.get()) != nullptr;
+    outcome.truncated = seen >= kMaxEntriesPerDir && readdir(dir.get()) != nullptr;
+    return outcome;
 }
 
 /// Enumerates `*.plist` entries directly under `dir_path` (no recursion) by
@@ -279,8 +329,9 @@ struct DirConstraint {
 template <typename OnPlist>
 DirConstraint walk_plist_dir(const std::string& dir_path, OnPlist&& on_plist) {
     DirOpenOutcome open = open_dir_no_follow_checked(dir_path);
-    const bool truncated = walk_plist_dir_handle(open.handle, std::forward<OnPlist>(on_plist));
-    if (truncated) return DirConstraint{true, "row_cap"};
+    const auto walk_outcome = walk_plist_dir_handle(open.handle, std::forward<OnPlist>(on_plist));
+    if (walk_outcome.truncated) return DirConstraint{true, "row_cap"};
+    if (walk_outcome.file_constrained) return DirConstraint{true, walk_outcome.file_constrained_reason};
     return DirConstraint{open.constrained, open.reason};
 }
 
@@ -359,35 +410,47 @@ EmondRuleFields emond_fields_from_dict(CFDictionaryRef dict) {
 }
 
 /// Outcome of collect_launchd_dir_handle: rows emitted, plus whether
-/// kMaxEntriesPerDir was hit with real entries left unread (AC4: a capped
+/// kMaxEntriesPerDir was hit with real entries left unread, or a listed
+/// plist failed to read/parse for a real reason (AC4: a capped or lossy
 /// listing is not a complete one).
 struct LaunchdDirOutcome {
     std::size_t rows = 0;
     bool truncated = false;
+    bool file_constrained = false;
+    std::string_view file_constrained_reason{};
 };
 
 /// Emits one `autorun|` row per successfully-parsed `*.plist` under
-/// `dir_path`, all attributed to `source_id`/`scope`; a plist this host's CF
-/// implementation cannot parse contributes nothing (never a fabricated
-/// row — PlistError is silently skipped here because the row-level contract
-/// this plugin's schema offers has no per-row error field, only a per-source
-/// row count; the header's own test exercises the typed-error path
-/// directly).
+/// `dir_path`, all attributed to `source_id`/`scope`. A plist this host's CF
+/// implementation cannot parse (PlistError) contributes no row -- never a
+/// fabricated one -- but is now counted as a real per-entry constraint
+/// (`malformed`), not silently absorbed the way a directory-level read
+/// failure already is not.
 LaunchdDirOutcome collect_launchd_dir_handle(yuzu::CommandContext& ctx, SourceId source_id,
                                              const DirHandle& dir, const std::string& location,
                                              Scope scope, std::string_view user_override) {
     std::size_t count = 0;
-    const bool truncated =
+    bool parse_failed = false;
+    const auto walk_outcome =
         walk_plist_dir_handle(dir, [&](const char* name, const std::vector<uint8_t>& bytes,
                                        std::int64_t mtime) {
             auto parsed = plist_to_launchd_fields(std::span<const uint8_t>{bytes.data(), bytes.size()});
-            if (!parsed) return;
+            if (!parsed) {
+                parse_failed = true;
+                return;
+            }
             Row row = launchd_row_from_fields(source_id, *parsed, location + "/" + name, scope, mtime);
             if (!user_override.empty()) row.user = std::string{user_override};
             ctx.write_output(format_row(row));
             ++count;
         });
-    return LaunchdDirOutcome{count, truncated};
+    LaunchdDirOutcome outcome{count, walk_outcome.truncated, walk_outcome.file_constrained,
+                              walk_outcome.file_constrained_reason};
+    if (parse_failed && !outcome.file_constrained) {
+        outcome.file_constrained = true;
+        outcome.file_constrained_reason = "malformed";
+    }
+    return outcome;
 }
 
 /// A whole `collect_*` call's outcome: rows emitted, plus whether ANY
@@ -418,6 +481,7 @@ DirCollectOutcome collect_launchd_dir(yuzu::CommandContext& ctx, SourceId source
     outcome.rows = result.rows;
     if (open.constrained) note_dir_constraint(outcome, open.reason);
     if (result.truncated) note_dir_constraint(outcome, "row_cap");
+    if (result.file_constrained) note_dir_constraint(outcome, result.file_constrained_reason);
     return outcome;
 }
 
@@ -473,6 +537,7 @@ DirCollectOutcome collect_user_launchagents(yuzu::CommandContext& ctx) {
                                                         home + "/Library/LaunchAgents", Scope::user, name);
         outcome.rows += result.rows;
         if (result.truncated) note_dir_constraint(outcome, "row_cap");
+        if (result.file_constrained) note_dir_constraint(outcome, result.file_constrained_reason);
     }
     if (seen >= kMaxEntriesPerDir && readdir(users_open.handle.get()) != nullptr)
         note_dir_constraint(outcome, "row_cap");
