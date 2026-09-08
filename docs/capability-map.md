@@ -31,7 +31,7 @@ Each capability is rated on two axes:
 > outside its own domain, and each entry counts once against its `T1`/`T2`/`T3` tier label.
 > Reproduce with:
 > `awk '/^### [0-9]+\.[0-9]+/ { if ($0 ~ /:white_check_mark:/) d++; else if ($0 ~ /:large_orange_diamond:/) p++; else if ($0 ~ /:x:/) n++ } END { print d, p, n, d+p+n }' docs/capability-map.md`
-> → `206 20 39 265`. Tier tallies (`Foundation`=T1, `Advanced`=T2, `Future`=T3) add the same
+> → `197 22 46 265`. Tier tallies (`Foundation`=T1, `Advanced`=T2, `Future`=T3) add the same
 > awk pattern filtered on `` `T1` ``/`` `T2` ``/`` `T3` ``. The former "New (Ph 8-16)" interim
 > row is retired — those phases are now ordinary domains 25-31, and 2026 additions land as
 > domains 32-39 rather than an undifferentiated bucket. **Domains 32-39 were verified for
@@ -42,22 +42,22 @@ Each capability is rated on two axes:
 > carry their own inline evidence citation and verification date. **Rows regraded or added on
 > 2026-09-07 carry the marker `*(verified 2026-09-07)*`; all other rows carry their v3.0
 > (2026-03-30) grade unchanged and were NOT re-verified in this pass** — reproduce with
-> `grep -c '\*(verified 2026-09-07)\*' docs/capability-map.md` → `60` (58 `###` rows across
-> §14, §18, §20-22, §24, §26-28, §30-31, all of §32-39, plus one Appendix A caption note, plus
-> this sentence's own citation of the literal marker string). Of the 265 total rows, 207
-> (265 - 58) are un-regraded v3.0 carry-overs — this document does NOT represent
-> whole-document verification against dev @ d295db964, only the 58 marked rows do.
+> `grep -c '\*(verified 2026-09-07)\*' docs/capability-map.md` → `69` (67 `###` rows across
+> §5, §7, §10, §12-14, §18, §20-22, §24, §26-28, §30-31, all of §32-39, plus one Appendix A
+> caption note, plus this sentence's own citation of the literal marker string). Of the 265
+> total rows, 198 (265 - 67) are un-regraded v3.0 carry-overs — this document does NOT
+> represent whole-document verification against dev @ d295db964, only the 67 marked rows do.
 > Four hand-maintained views
 > must be updated together whenever a row's icon or tier changes: the headline/tier bars below,
 > the per-domain summary table, Appendix A's plugin count, and Appendix B's Foundation tally —
 > nothing in `tests/` or CI checks them against the awk yet (tracked as a governance follow-up).
 
 ```
-Foundation   [===============================-]  58/59 done  (98%)
-Advanced     [==========================------]  137/172 done (80%) (16 partial)
-Future       [==========----------------------]  11/34 done  (32%) (3 partial)
+Foundation   [==============================--]  55/59 done  (93%) (1 partial)
+Advanced     [=========================-------]  133/172 done (77%) (18 partial)
+Future       [========------------------------]  9/34 done   (26%) (3 partial)
 ─────────────────────────────────────────────────────────────────
-Overall      [=========================-------]  206/265 done (78%) (20 partial)
+Overall      [========================--------]  197/265 done (74%) (22 partial)
 ```
 
 | Domain | Total | Done | Partial | Not Started |
@@ -66,20 +66,20 @@ Overall      [=========================-------]  206/265 done (78%) (20 partial)
 | 2. Command Execution and Orchestration | 13 | 13 | 0 | 0 |
 | 3. Device and Endpoint Information | 10 | 8 | 1 | 1 |
 | 4. Network Information and Discovery | 11 | 9 | 0 | 2 |
-| 5. Process and Service Management | 5 | 4 | 0 | 1 |
+| 5. Process and Service Management | 5 | 2 | 0 | 3 |
 | 6. User and Session Management | 5 | 5 | 0 | 0 |
-| 7. Software and Application Management | 6 | 6 | 0 | 0 |
+| 7. Software and Application Management | 6 | 4 | 1 | 1 |
 | 8. Patch and Update Management | 9 | 3 | 4 | 2 |
 | 9. Security and Compliance | 10 | 8 | 1 | 1 |
-| 10. File System Operations | 15 | 14 | 0 | 1 |
+| 10. File System Operations | 15 | 13 | 0 | 2 |
 | 11. Script and Command Execution | 4 | 4 | 0 | 0 |
-| 12. Registry and System Configuration | 7 | 7 | 0 | 0 |
-| 13. Content Distribution | 5 | 4 | 0 | 1 |
+| 12. Registry and System Configuration | 7 | 5 | 0 | 2 |
+| 13. Content Distribution | 5 | 3 | 0 | 2 |
 | 14. User Interaction | 6 | 5 | 0 | 1 |
 | 15. Inventory and Data Collection | 5 | 4 | 0 | 1 |
 | 16. Policy and Compliance Engine | 8 | 8 | 0 | 0 |
 | 17. Triggers and Event-Driven Automation | 7 | 7 | 0 | 0 |
-| 18. Server: Authentication and Authorization | 10 | 10 | 0 | 0 |
+| 18. Server: Authentication and Authorization | 10 | 9 | 1 | 0 |
 | 19. Server: Device and Group Management | 7 | 7 | 0 | 0 |
 | 20. Server: Response Collection and Reporting | 8 | 8 | 0 | 0 |
 | 21. Server: Notifications and Audit | 6 | 5 | 0 | 1 |
@@ -101,7 +101,7 @@ Overall      [=========================-------]  206/265 done (78%) (20 partial)
 | 37. Internal PKI / Certificate Authority | 5 | 5 | 0 | 0 |
 | 38. Server Storage Substrate — PostgreSQL | 4 | 4 | 0 | 0 |
 | 39. Headless Platform — Engine Principals & On-Behalf-Of (ADR-1005) | 3 | 3 | 0 | 0 |
-| **TOTAL** | **265** | **206** | **20** | **39** |
+| **TOTAL** | **265** | **197** | **22** | **46** |
 
 > **Scaffolded vs production-quality.** The percentages above measure feature presence, not enterprise hardening. "Done" means "implemented and functional" — not "hardened, observable, and proven at large-fleet scale" on every domain. Known gaps at the §-level (e.g. configurable heartbeat in §1.2, unified diagnostics bundle in §1.3, runtime plugin install in §1.5) remain even where a domain is marked Done. The `docs/capability-agentic-audit-2026-05.md` audit (figures as of 2026-05 — its counts predate this v4.0 tally) is the source for the production-quality dimension; subsequent reviews should keep it current.
 
@@ -326,19 +326,17 @@ Not implemented. Probe specified ports on target devices for service discovery.
 
 `processes` plugin (cross-platform). `procfetch` for formatted view with executable hash.
 
-### 5.2 Process Termination :white_check_mark: `T1`
+### 5.2 Process Termination :x: `T1` *(verified 2026-09-07)*
 
-`processes` plugin supports kill.
-
-> **Gap:** No multi-process kill by pattern or batch.
+**Corrected 2026-09-08 (external audit, Codex Astra C1):** the `processes` plugin has no `kill` action. Its full and only action set, quoted from the dispatcher, is `acts[] = {"list", "list_hashed", "list_tree", "query", nullptr}` (`agents/plugins/processes/src/processes_plugin.cpp:301`); an unrecognized action is rejected (`:331`). No other plugin declares a process-kill action (`grep -rl '"kill"' agents/plugins/*/src/*.cpp` → 0 hits). **Generic scripting can terminate a process** — `taskkill`/`Stop-Process` (Windows) or `kill` (POSIX) via the `script_exec` plugin's `os_command`/inline-script actions — but that is a different contract from a native, governed, RBAC-scoped `processes.kill` action: no dedicated action descriptor, no typed parameters, no per-action authorization classification. *(Evidence: `processes_plugin.cpp:301,331`; previously mis-graded Done.)*
 
 ### 5.3 Service Enumeration :white_check_mark: `T1`
 
 `services` plugin (cross-platform).
 
-### 5.4 Service Control :white_check_mark: `T1`
+### 5.4 Service Control :x: `T1` *(verified 2026-09-07)*
 
-`services` plugin supports start/stop/restart.
+**Corrected 2026-09-08 (external audit, Codex Astra C1):** the `services` plugin has no immediate start/stop/restart action. Its full and only action set, quoted from the dispatcher, is `acts[] = {"list", "running", "set_start_mode", nullptr}` (`agents/plugins/services/src/services_plugin.cpp:650`, dispatched at `:666`). `set_start_mode` configures a service's Windows-boot startup type (auto/manual/disabled) — a different operation from starting, stopping, or restarting a currently-running service. **Generic scripting can control a service** — `sc.exe`/`Stop-Service`/`Restart-Service` (Windows) or `systemctl` (Linux) via `script_exec` — but that is a different contract from a native, governed, RBAC-scoped service-control action. *(Evidence: `services_plugin.cpp:650,666`; previously mis-graded Done — the row conflated startup-mode configuration with immediate service control.)*
 
 ### 5.5 Open Windows Enumeration :x: `T3`
 
@@ -388,17 +386,17 @@ Not implemented. Desktop interaction to enumerate visible application windows.
 
 `sccm` plugin (Windows).
 
-### 7.4 Software Uninstall :white_check_mark: `T2`
+### 7.4 Software Uninstall :x: `T2` *(verified 2026-09-07)*
 
-`software_actions` plugin.
+**Corrected 2026-09-08 (external audit, Codex Astra C1):** the `software_actions` plugin has no uninstall action. Its full and only action set, quoted from the dispatcher, is `acts[] = {"list_upgradable", "installed_count", nullptr}` (`agents/plugins/software_actions/src/software_actions_plugin.cpp:555`, dispatched at `:573`) — inventory reads, not mutation. `msi_packages` is likewise read-only: `acts[] = {"list", "product_codes", nullptr}`. **Generic scripting can uninstall software** — `msiexec /x`, package-manager uninstall commands, or vendor uninstallers via `script_exec` — but that is a different contract from a native, governed, RBAC-scoped uninstall action. *(Evidence: `software_actions_plugin.cpp:555,573`, `msi_packages_plugin.cpp:351`; previously mis-graded Done — no evidence text at all, just "`software_actions` plugin" with no action named.)*
 
 ### 7.5 Per-User Application Inventory :white_check_mark: `T2`
 
 `installed_apps` plugin extended with per-user hive enumeration (`list_per_user`): each local profile's `Software\Microsoft\Windows\CurrentVersion\Uninstall` is read from the live `HKEY_USERS\<SID>` hive when the user is logged in, falling back to an offline `NTUSER.DAT` mount otherwise — via the shared ladder in `agents/shared/win_profiles.hpp` (#2771), not a literal `HKCU` read (which under the agent's system-context identity resolves to the service account's own profile, not an end user's — see §12.7). Distinguishes system-wide from user-specific installs in output; on Linux/macOS `list_per_user` reports system-scope packages/apps plus (macOS) the calling account's own Homebrew formulae, not a per-profile walk.
 
-### 7.6 Software Deployment (Install/Upgrade) :white_check_mark: `T2`
+### 7.6 Software Deployment (Install/Upgrade) :large_orange_diamond: `T2` *(verified 2026-09-07)*
 
-`SoftwareDeploymentStore` (PostgreSQL, ADR-0051) with package registration, deployment lifecycle (staged/deploying/verifying/completed/cancelled/rolled_back/failed), per-agent status tracking. REST endpoints: `GET/POST /api/v1/software-packages`, `GET/POST /api/v1/software-deployments`, `/start`, `/rollback`, `/cancel`. **Dormant** (same family as `LicenseStore`/ADR-0048) — the store is migrated and tested but not constructed by the server, so these routes do not register today.
+**Regraded 2026-09-08 (external audit, Codex Astra C2), like §22.3: implemented and tested, not constructed by the server — routes do not register today.** `SoftwareDeploymentStore` (PostgreSQL, ADR-0051) with package registration, deployment lifecycle (staged/deploying/verifying/completed/cancelled/rolled_back/failed), per-agent status tracking. REST endpoints: `GET/POST /api/v1/software-packages`, `GET/POST /api/v1/software-deployments`, `/start`, `/rollback`, `/cancel`. The production registration call passes `nullptr` for this store — `/*sw_deploy_store=*/nullptr` (`server/core/src/server.cpp:20856`) — and route registration is conditional on it (`rest_api_v1.cpp`, gated block). **This is a distinct capability from the live `/auto` Deploy workflow (§36.2)**, which is NOT dormant: `DeploymentRunStore` is constructed at `server.cpp:4057`, `DeploymentRoutes` registers live, and `DeploymentEngine` dispatches `content_dist.stage` then `content_dist.execute_staged` (`deployment_engine.cpp:305,331`) — Yuzu can and does install software today through that path; only this catalog/package-registry API is unreachable. *(Evidence: `server.cpp:20856`, `deployment_engine.cpp:305,331`; previously mis-graded Done despite the row's own "Dormant" text.)*
 
 ---
 
@@ -582,9 +580,9 @@ Not implemented. Modify allow/block lists on endpoint security products.
 
 `filesystem` plugin.
 
-### 10.5 File Deletion :white_check_mark: `T1`
+### 10.5 File Deletion :x: `T1` *(verified 2026-09-07)*
 
-`filesystem` plugin.
+**Corrected 2026-09-08 (external audit, Codex Astra C1):** the `filesystem` plugin has no whole-file delete action. Its full and only action set, quoted from the dispatcher, is `acts[] = {"exists", "list_dir", "file_hash", "create_temp", "create_temp_dir", "read", "get_acl", "get_signature", "find_by_hash", "search_dir", "get_version_info", "search", "replace", "write_content", "append", "delete_lines", nullptr}` (`agents/plugins/filesystem/src/filesystem_plugin.cpp:584`, dispatched at `:606-654`, unrecognized actions rejected at `:656`). `delete_lines` removes matching lines *from within* a file's content — it does not delete the file itself. No other plugin declares a generic file-delete action (`disk_actions` is `smart`/`volumes` only; `content_dist` stages/executes, it does not delete arbitrary paths). **Generic scripting can delete a file** — `rm`/`Remove-Item` via `script_exec` — but that is a different contract from a native, governed, RBAC-scoped delete action. *(Evidence: `filesystem_plugin.cpp:584,656`; previously mis-graded Done — no action named at all in the prior row text.)*
 
 ### 10.6 Path Existence Check :white_check_mark: `T1`
 
@@ -658,13 +656,13 @@ gRPC streaming delivers output in real time.
 
 `wmi` plugin with `query` action. Execute WQL SELECT statements against any WMI namespace with structured property/value output.
 
-### 12.2 WMI Method Invocation :white_check_mark: `T2`
+### 12.2 WMI Method Invocation :x: `T2` *(verified 2026-09-07)*
 
-`wmi` plugin with `get_instance` action. Get all properties of a WMI class instance.
+**Corrected 2026-09-08 (external audit, Codex Astra C1):** the `wmi` plugin has no method-invocation action (no `ExecMethod`-equivalent). Its full and only action set, quoted from the dispatcher, is `acts[] = {"query", "get_instance"}` (`agents/plugins/wmi/src/wmi_plugin.cpp:129-131`) — both read-only. `get_instance` builds `SELECT * FROM <class>` (`:181`) and runs a bounded query (`:196`); it reads instance properties, it never calls a class method. **Generic scripting can invoke a WMI method** — `Invoke-CimMethod`/`InvokeMethod` via `script_exec` — but that is a different contract from a native, governed, RBAC-scoped method-invocation action. *(Evidence: `wmi_plugin.cpp:129-131,181,196`; previously mis-graded Done — the row conflated a class-instance property read with method invocation.)*
 
-### 12.3 WMI Namespace Enumeration :white_check_mark: `T3`
+### 12.3 WMI Namespace Enumeration :x: `T3` *(verified 2026-09-07)*
 
-`wmi` plugin supports configurable namespace parameter (default `root\cimv2`).
+**Corrected 2026-09-08 (external audit, Codex Astra C1):** the `wmi` plugin does not enumerate namespaces. The `namespace` parameter is restricted to a fixed three-item allowlist — `root\cimv2`, `root\wmi`, `root\standardcimv2` — validated by `is_valid_wmi_namespace()` (`agents/plugins/wmi/src/wmi_plugin.cpp:144`); an operator *selects* one of three known namespaces, they cannot discover what namespaces exist on a given host. Only `query`/`get_instance` dispatch (`:129-131`); there is no `enumerate_namespaces` action. *(Evidence: `wmi_plugin.cpp:129-131,144`; previously mis-graded Done — a configurable parameter restricted to an allowlist is not enumeration.)*
 
 ### 12.4 Registry Key/Value Read :white_check_mark: `T2`
 
@@ -702,9 +700,9 @@ The ladder itself lives in `agents/shared/win_profiles.hpp` and is the single im
 
 `http_client` plugin with `download` action. Download files from arbitrary URLs with optional SHA256 hash verification. `get` and `head` actions for HTTP requests.
 
-### 13.4 HTTP POST (Agent-Initiated) :white_check_mark: `T3`
+### 13.4 HTTP POST (Agent-Initiated) :x: `T3` *(verified 2026-09-07)*
 
-`http_client` plugin supports HTTP operations. Agent can fetch content from external URLs.
+**Corrected 2026-09-08 (external audit, Codex Astra C1):** the `http_client` plugin has no `post` action. Its full and only action set, quoted from the dispatcher, is `acts[] = {"download", "get", "head", nullptr}` (`agents/plugins/http_client/src/http_client_plugin.cpp:440`, dispatched at `:458`; unrecognized actions rejected). Fetch-only, no generic outbound POST. (Specialized, narrowly-scoped upload paths exist elsewhere in the product for specific content-distribution/inventory-ingest flows, but those are not a general-purpose agent-initiated HTTP POST primitive.) **Generic scripting can issue an HTTP POST** — `curl`/`Invoke-WebRequest` via `script_exec` — but that is a different contract from a native, governed, RBAC-scoped POST action. *(Evidence: `http_client_plugin.cpp:440,458`; previously mis-graded Done.)*
 
 ### 13.5 Peer-to-Peer Content Distribution :x: `T3`
 
@@ -874,9 +872,9 @@ Session-cookie auth with PBKDF2-hashed passwords.
 
 `ApiTokenStore` with SQLite backend. Tokens generated via `POST /api/v1/tokens` with optional expiry. Auth via `Authorization: Bearer` header or `X-Yuzu-Token` header. RBAC permissions: `ApiToken:Read`, `ApiToken:Write`, `ApiToken:Delete`. Tokens support optional `mcp_tier` field for MCP integration (readonly/operator/supervised). Settings UI token management with create/revoke.
 
-### 18.8 Device Authorization Tokens :white_check_mark: `T2`
+### 18.8 Device Authorization Tokens :large_orange_diamond: `T2` *(verified 2026-09-07)*
 
-`DeviceTokenStore` (PostgreSQL, ADR-0052) with SHA-256 hashed tokens, device_id and definition_id scoping. REST: `GET/POST/DELETE /api/v1/device-tokens`. **Dormant** (same family as `LicenseStore`/ADR-0048 and `SoftwareDeploymentStore`/ADR-0051) — the store is migrated and tested but not constructed by the server, so these routes do not register today.
+**Regraded 2026-09-08 (external audit, Codex Astra C2), like §22.3: implemented and tested, not constructed by the server — routes do not register today (`server.cpp:20857`).** `DeviceTokenStore` (PostgreSQL, ADR-0052) with SHA-256 hashed tokens, device_id and definition_id scoping. REST: `GET/POST/DELETE /api/v1/device-tokens`, gated `if (device_token_store)` (`rest_api_v1.cpp:8669`, GET at `:8670`, POST at `:8707`). The production registration call passes `nullptr` for this store — `/*device_token_store=*/nullptr` (`server/core/src/server.cpp:20857`) — so these routes never register in a running deployment. Same dormant family as `LicenseStore`/ADR-0048 (§22.3) and `SoftwareDeploymentStore`/ADR-0051 (§7.6). Ordinary session-cookie and API-token authentication (§18.1, §18.7) are unaffected — this dormancy is scoped to the device-token mechanism only. *(Evidence: `server.cpp:20857`, `rest_api_v1.cpp:8669-8670,8707`; previously mis-graded Done despite the row's own "Dormant" text.)*
 
 ### 18.9 HTTPS for Web Dashboard :white_check_mark: `T1`
 
@@ -1582,7 +1580,7 @@ The server rejects — not silently ignores — any on-behalf-of assertion on ev
 
 ## Appendix B: Foundation Tier Status
 
-**Foundation tier: 58/59 done (98%)** — the tier has grown to 59 entries since this appendix was written; the one open `T1` item is §9.4 (Partial). The list below records the gaps closed as of 2026-03-18 (re-baselined 2026-09-07):
+**Foundation tier: 55/59 done (93%)** — the tier has grown to 59 entries since this appendix was written. Open `T1` items as of the 2026-09-08 plugin-action-accuracy correction: §9.4 (Partial); §5.2 Process Termination, §5.4 Service Control, and §10.5 File Deletion (all regraded Done → Not Started — the named plugins have no native kill/start-stop-restart/delete action; see each row's evidence citation). The list below records the gaps closed as of 2026-03-18 (re-baselined 2026-09-07):
 
 - **1.4** Agent OTA updates -- `agents/core/src/updater.cpp`
 - **1.8** Connection diagnostics -- `connection_info` action in diagnostics plugin
