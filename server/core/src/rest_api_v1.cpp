@@ -781,7 +781,14 @@ const std::string& openapi_spec() {
           "review_comment": {"type": "string"},
           "scope_expression": {"type": "string"}
         }
-      }
+      })json"
+        // Split literal (#4033 follow-up): the new /devices, /devices/{id},
+        // and /management-groups/agent-count-preview OpenAPI entries below
+        // pushed the previous single literal to 17,284 bytes, past MSVC's
+        // 16,380-byte C2026 cap (docs/cpp-conventions.md). Adjacent string
+        // literals are concatenated at compile time, so the emitted OpenAPI
+        // JSON is byte-identical to the unsplit form.
+        R"json(
     }
   },
   "security": [{"bearerAuth": [], "apiKeyHeader": [], "cookieAuth": []}],
