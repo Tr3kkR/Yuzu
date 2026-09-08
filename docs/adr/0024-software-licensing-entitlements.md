@@ -2,7 +2,7 @@
 status: proposed
 date: 2026-07-06
 owner: Alex Young
-deciders: product-owner direction; planning Q&A 2026-07-04 (rev 2 same day); privacy & secrets review rounds 2026-07-06; grilling session 2026-07-06; industry-direction review 2026-07-08 (metric-typed quantities, Java/SWID surfaces, Direction section)
+deciders: product-owner direction; planning Q&A 2026-07-04 (rev 2 same day); privacy & secrets review rounds 2026-07-06; grilling session 2026-07-06; industry-direction review 2026-07-08 (metric-typed quantities, Java/SWID surfaces, Direction section); PLAN-01 ruling 2026-09-06 (Decision 9 reversal)
 scope: capability §27 — agent licence discovery, the discovery stores and read surface, RBAC, and the per-user privacy carve-out (built in-server); multi-source entitlement ingestion, server-side compliance evaluation, usage metering & reclamation, and the compliance UI/MCP surfaces re-scoped to the SAM use-case-engine module per "Placement under ADR-1005"; plus the recorded target-state direction
 context-refs: capability §27 issues #264–#267; #266 (entitlement-register reversal); ADR-0017 flip-wave (#1634, #1715); superseded standalone ADR PR #1870 (rev 1–5 review history); deferred — #1921 (KEK operator surface), #1922 (oidc_client_secret gap), #1923 (round-3 review items)
 ---
@@ -375,35 +375,48 @@ Decision numbers are stable, since other documents cite them.
    (surface + tracking issue #2102 + revisit-by date) **is recorded** in ADR-1005's
    twin-existence exception ledger, alongside the SCIM-v2 REST-only precedent — entered
    pre-acceptance as voluntary early compliance, which ADR-1005's Binding-status note
-   expressly invites. That erasure is authorized by a **CONJUNCTION over every
-   securable the cascade erases THROUGH** — the caller must hold, per-device scoped, all
-   of **`SoftwareLicensing:Delete` AND `Inventory:Delete` AND `GuaranteedState:Delete`**.
+   expressly invites. That erasure is authorized by the **device-level `Decommission`
+   securable** — the caller must hold **`Decommission:Delete`**, per-device scoped.
    The cascade's blast radius is wider than the route's name: of the five per-agent stores
-   it erases, `SoftwareLicensingStore` is the licensing one; `InventoryStore`,
-   `SoftwareInventoryStore` and `DeviceInventoryStore` are governed by the **`Inventory`**
-   securable; and `AppPerfDailyStore` is DEX behavioural PII governed by
-   **`GuaranteedState`** (its read routes gate on `GuaranteedState:Read`). Gating on the
-   licensing securable alone would let an operator-authored role erase inventory data it
-   cannot otherwise touch — and, worse, **destroy a device's per-app performance series it
-   has no right even to READ**. This is latent under the seeded matrix (both Delete-holding
-   roles — Administrator, ITServiceOwner — hold full CRUD on all three), so the conjunction
-   changes nothing that ships, but RBAC is operator-editable and the gate must authorize for
-   what the operation *destroys*, not for what it is *named*. The store list and the gate
-   are pinned together by a drift guard (`test_agent_decommission.cpp`): adding a store to
-   the cascade fails the build until its governing securable joins the conjunction.
-   *Rejected: a dedicated device-level `Decommission` securable — the honest modelling of a
-   cross-securable destructive operation, and the right answer once a second caller
-   (enrollment removal, a fleet-management purge) needs it; deferred because it is a new
-   seeded securable with a migration and a matrix change, for zero behavioural gain over the
-   conjunction today. **Revisit if the conjunction ever reaches a fourth securable** — at
-   that width the conjunction is the wrong shape and this decision reverses.* Per Placement under
+   it erases, `SoftwareLicensingStore` is the licensing one (read-gated by
+   `SoftwareLicensing`); `InventoryStore`, `SoftwareInventoryStore` and
+   `DeviceInventoryStore` are read-gated by **`Inventory`**; and `AppPerfDailyStore` is DEX
+   behavioural PII read-gated by **`GuaranteedState`**. A companion package
+   (Wave 7 PR7.2) adds a sixth store, `AppUsageStore`, read-gated by `Forensics` — the
+   very fourth-securable arrival that triggered this decision's reversal below. One
+   `Decommission:Delete` grant authorizes for the
+   whole radius rather than the individual securables each store's READ gates on. The
+   store list and the gate are pinned together by a drift guard
+   (`test_agent_decommission.cpp`): adding a store to the cascade fails the build until
+   `kCascadeStoreCount` is bumped and the store is added to the documented radius.
+   *Reversed 2026-09-06 (Wave 7 PR7.2):* originally rejected as *a dedicated device-level
+   `Decommission` securable — the honest modelling of a cross-securable destructive
+   operation, and the right answer once a second caller (enrollment removal, a
+   fleet-management purge) needs it; deferred because it is a new seeded securable with a
+   migration and a matrix change, for zero behavioural gain over the conjunction today.
+   **Revisit if the conjunction ever reaches a fourth securable** — at that width the
+   conjunction is the wrong shape and this decision reverses.* That fourth securable
+   arrived: `AppUsageStore` (Wave 7 PR7.2) is governed by `Forensics`, so the
+   `SoftwareLicensing:Delete AND Inventory:Delete AND GuaranteedState:Delete` conjunction
+   this decision originally specified would have needed a fourth conjunct — the repo's own
+   STOP rule fired (PLAN-01 ruling (b), Alex 2026-09-06), and the rejected option above is
+   adopted: one `Decommission:Delete` grant, REPLACING the conjunction rather than adding
+   to it (so a custom role needs one grant, not four). Compat: the seeded matrix is
+   unchanged (Administrator + ITServiceOwner already had full CRUD on all three old
+   securables and now hold `Decommission` too, granted with no migration via
+   `seed_defaults()`); an operator-authored custom role that had assembled the three old
+   Delete grants is refused (403 naming `Decommission:Delete`) until granted the new
+   securable — breaking by design, since the promotion's whole point is one nameable grant
+   for what the operation destroys. The three old grants are NOT revoked and keep gating
+   their own stores' other routes. Per Placement under
    ADR-1005, the **Compliance, Entitlements, and Reclamation** sub-views and the
    **compliance MCP tool `get_license_compliance_summary`** are the SAM UCE host's UI and
    read API — not built in-server. The software
    catalog stays on `/inventory`, cross-linked. RBAC grants on the `SoftwareLicensing`
    securable follow the established per-role shape, stated so nothing is left to
    inference: **Viewer and PlatformEngineer Read; Operator Read + Write; ITServiceOwner
-   full CRUD**; **ApiTokenManager none**; admin roles per their global pattern. **No MFA
+   full CRUD**; **ApiTokenManager none**; admin roles per their global pattern.
+   **Decommission: Administrator CRUD-loop, ITServiceOwner Delete, nobody else.** **No MFA
    step-up anywhere in §27** — nothing here executes on endpoints; RBAC Write plus full
    audit (including denied rows) is the control. The nav entry and nav-drift
    reconciliation are bounded to the in-server Licences view; the UCE host owns its own
@@ -460,10 +473,10 @@ Decision numbers are stable, since other documents cite them.
     is **never** in the cascade (decommission drops an agent's match links, never a shared
     canonical product). There is **no row-level erasure API**, a stated gap. The cascade's
     production trigger is `DELETE /api/v1/sle/agents/{id}`, authorized by the scoped
-    `SoftwareLicensing:Delete` **AND** `Inventory:Delete` **AND** `GuaranteedState:Delete`
-    conjunction (Decision 9) — because this fan-out reaches the `Inventory`-securable
-    stores and the `GuaranteedState`-governed `AppPerfDailyStore`, not only the licensing
-    one. The effective mode is **centrally verifiable**: the
+    `Decommission:Delete` securable (Decision 9, amended Wave 7 PR7.2) — one grant
+    covering this fan-out's whole blast radius, because it reaches the `Inventory`-securable
+    stores, the `GuaranteedState`-governed `AppPerfDailyStore`, and the `Forensics`-governed
+    `AppUsageStore`, not only the licensing one. The effective mode is **centrally verifiable**: the
     stable effective-mode value rides the canonical blob as a config-stable record
     (verifiable fleet-wide from stored state, including for offline agents), while
     flapping surface diagnostics never touch the blob and are fetched live via the
