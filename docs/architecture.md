@@ -373,7 +373,10 @@ Sets / legacy pre-v1 Executions extraction (`instruction_routes.{hpp,cpp}` +
 Health/Infra cluster extraction (`health_routes.{hpp,cpp}`, PR-10, 6 routes — `/metrics`,
 `/health`, `/api/health`, `/livez`, `/readyz`, `/fragments/health/summary` — also against
 `inline_sink`) — `server.cpp`'s own 32 inline routes are the only registrations left outside the
-sink, and they are not a route-owner class, so no further campaign PR touches them. Count these
+sink, and they are not a route-owner class. Whether a further campaign PR touches them is #2542's
+own call, not this paragraph's to predict — this exact "no further PR touches them" claim has
+already been falsified once by this file's own history (see the identical clause this PR just
+replaced, about the pre-PR-10 count). Check `gh issue view 2542` for current scope. Count these
 with the anchored pattern `grep -cE '^\s*web_server_->(Get|Post|Put|Delete|Patch|Options)\('
 server/core/src/server.cpp`, not a bare `grep -c` of the receiver-agnostic pattern above — the
 unanchored form over-counts by picking up at least one comment-line false match, which is how a

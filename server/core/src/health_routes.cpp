@@ -66,12 +66,22 @@
 namespace yuzu::server::health {
 
 void register_health_routes(HttpRouteSink& sink, Deps deps) {
-    // See this file's header comment ("DEPS NULL-SAFETY") for why these two
-    // (and only these two) are hard registration-time requirements.
+    // See this file's header comment ("DEPS NULL-SAFETY") for why these are
+    // hard registration-time requirements: an unbound closure is a wiring
+    // bug caught at boot, not a runtime condition to degrade around (same
+    // rationale as dashboard_api_routes.hpp's visible_agents_json_fn check).
     if (!deps.cfg)
         throw std::invalid_argument("register_health_routes: deps.cfg must be bound");
     if (!deps.metrics)
         throw std::invalid_argument("register_health_routes: deps.metrics must be bound");
+    if (!deps.auth_fn)
+        throw std::invalid_argument("register_health_routes: deps.auth_fn must be bound");
+    if (!deps.resolve_session_fn)
+        throw std::invalid_argument(
+            "register_health_routes: deps.resolve_session_fn must be bound");
+    if (!deps.deny_service_scoped_fn)
+        throw std::invalid_argument(
+            "register_health_routes: deps.deny_service_scoped_fn must be bound");
 
     // -- Prometheus metrics endpoint ----------------------------------------
     // Per-scrape serialization lock for the NVD failure-count delta loop
@@ -452,6 +462,14 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
     });
 
     sink.Get("/readyz", [deps](const httplib::Request&, httplib::Response& res) {
+        // NOTE (Gate 3/Gate 2 governance, #2542 PR-10): unlike every other
+        // graceful-degrade Deps field in this file, a null `draining` fails
+        // OPEN here (falls through to the normal store sweep, i.e. "not
+        // draining") rather than closed. The one production Deps{} call site
+        // always sets `.draining = &draining_`, so this is unreachable today
+        // -- but if a future caller (a new wiring path, a test fixture)
+        // constructs Deps without this field, /readyz would silently stop
+        // reporting drain state rather than erring toward "not ready".
         if (deps.draining && deps.draining->load(std::memory_order_acquire)) {
             res.status = 503;
             res.set_content(R"({"status":"draining"})", "application/json");

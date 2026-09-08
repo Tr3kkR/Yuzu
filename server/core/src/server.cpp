@@ -7,7 +7,6 @@
 
 #include <yuzu/metrics.hpp>
 #include <yuzu/secure_zero.hpp>
-#include <yuzu/version.hpp>
 #include "bundled_content.hpp"
 #include "cert_reloader.hpp"
 #include "file_utils.hpp"

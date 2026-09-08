@@ -40,18 +40,22 @@
 ///     result_set_routes.hpp's header comment (PR-5).
 ///
 /// DEPS NULL-SAFETY — two different rules, by field:
-///   - `cfg` and `metrics` are REQUIRED: `register_health_routes` throws
-///     `std::invalid_argument` if either is null. Both are non-pointer
-///     `ServerImpl` members (`Config cfg_`, `MetricsRegistry metrics_`),
-///     never null in production — same "wiring bug caught at boot, not a
-///     runtime condition to degrade around" rationale as
-///     `dashboard_api_routes.hpp`'s `VisibleAgentsJsonFn`. `cfg` gates
-///     ~7 conditional store checks across `/health`/`/readyz` with mixed
-///     lenient/strict effects; a null value would silently mis-shape
-///     readiness data in a way a reviewer could not reason about, unlike
-///     the graceful degrades below (which have one obvious fail-closed
-///     meaning apiece). `metrics` IS the entire point of `/metrics` — no
-///     degrade is coherent.
+///   - `cfg`, `metrics`, and the three hoisted closures (`auth_fn`,
+///     `resolve_session_fn`, `deny_service_scoped_fn`) are REQUIRED:
+///     `register_health_routes` throws `std::invalid_argument` if any is
+///     unbound. `cfg`/`metrics` are non-pointer `ServerImpl` members
+///     (`Config cfg_`, `MetricsRegistry metrics_`), never null in
+///     production; the three closures are always bound at the one real
+///     call site — same "wiring bug caught at boot, not a runtime condition
+///     to degrade around" rationale as `dashboard_api_routes.hpp`'s
+///     `VisibleAgentsJsonFn` (an unbound `std::function` would otherwise
+///     throw `std::bad_function_call` on first request instead of at
+///     registration). `cfg` gates ~7 conditional store checks across
+///     `/health`/`/readyz` with mixed lenient/strict effects; a null value
+///     would silently mis-shape readiness data in a way a reviewer could
+///     not reason about, unlike the graceful degrades below (which have one
+///     obvious fail-closed meaning apiece). `metrics` IS the entire point
+///     of `/metrics` — no degrade is coherent.
 ///   - Every other pointer field defaults to null and degrades gracefully,
 ///     matching the SAME `ptr && ptr->method()` idiom this cluster's own
 ///     handler bodies already use for the ~40 store pointers below (never

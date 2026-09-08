@@ -171,6 +171,52 @@ TEST_CASE("health_routes: throws std::invalid_argument if cfg or metrics is unbo
     }
 }
 
+TEST_CASE("health_routes: throws std::invalid_argument if any of the three hoisted "
+          "closures is unbound",
+          "[server][routes][health_routes]") {
+    // Same rationale as cfg/metrics above (see health_routes.hpp's "DEPS
+    // NULL-SAFETY" header comment) — an unbound std::function is a wiring
+    // bug that should fail loud at registration, not throw
+    // std::bad_function_call on the first request that reaches it.
+    Config cfg{};
+    yuzu::MetricsRegistry metrics;
+    auto valid_deps = [&]() {
+        health::Deps deps;
+        deps.cfg = &cfg;
+        deps.metrics = &metrics;
+        deps.auth_fn = [](const httplib::Request&,
+                          httplib::Response&) -> std::optional<auth::Session> {
+            return std::nullopt;
+        };
+        deps.resolve_session_fn =
+            [](const httplib::Request&) -> std::optional<auth::Session> { return std::nullopt; };
+        deps.deny_service_scoped_fn = [](const httplib::Request&, httplib::Response&,
+                                         const std::string&, const std::string&,
+                                         const std::string&, const std::string&) -> bool {
+            return false;
+        };
+        return deps;
+    };
+    {
+        yuzu::server::test::TestRouteSink sink;
+        auto deps = valid_deps();
+        deps.auth_fn = nullptr;
+        CHECK_THROWS_AS(health::register_health_routes(sink, deps), std::invalid_argument);
+    }
+    {
+        yuzu::server::test::TestRouteSink sink;
+        auto deps = valid_deps();
+        deps.resolve_session_fn = nullptr;
+        CHECK_THROWS_AS(health::register_health_routes(sink, deps), std::invalid_argument);
+    }
+    {
+        yuzu::server::test::TestRouteSink sink;
+        auto deps = valid_deps();
+        deps.deny_service_scoped_fn = nullptr;
+        CHECK_THROWS_AS(health::register_health_routes(sink, deps), std::invalid_argument);
+    }
+}
+
 // ── /metrics — unauthenticated, no gate ─────────────────────────────────────
 
 TEST_CASE("health_routes: GET /metrics is reachable with no session and emits "
@@ -294,6 +340,15 @@ TEST_CASE("health_routes: GET /readyz with a null draining pointer degrades "
     health::Deps deps;
     deps.cfg = &h.cfg;
     deps.metrics = &h.metrics;
+    deps.auth_fn = [](const httplib::Request&,
+                      httplib::Response&) -> std::optional<auth::Session> {
+        return std::nullopt;
+    };
+    deps.resolve_session_fn =
+        [](const httplib::Request&) -> std::optional<auth::Session> { return std::nullopt; };
+    deps.deny_service_scoped_fn = [](const httplib::Request&, httplib::Response&,
+                                     const std::string&, const std::string&, const std::string&,
+                                     const std::string&) -> bool { return false; };
     // deps.draining intentionally left null
     health::register_health_routes(sink2, deps);
 
@@ -380,6 +435,13 @@ TEST_CASE("health_routes: /health's TLS block degrades gracefully with a "
     deps.resolve_session_fn = [](const httplib::Request&) -> std::optional<auth::Session> {
         return std::nullopt;
     };
+    deps.auth_fn = [](const httplib::Request&,
+                      httplib::Response&) -> std::optional<auth::Session> {
+        return std::nullopt;
+    };
+    deps.deny_service_scoped_fn = [](const httplib::Request&, httplib::Response&,
+                                     const std::string&, const std::string&, const std::string&,
+                                     const std::string&) -> bool { return false; };
     // default_cert_set intentionally left null
     health::register_health_routes(sink, deps);
 
