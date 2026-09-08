@@ -374,13 +374,14 @@ static const ToolDef kTools[] = {
     // admit-then-filter chokepoint; SAME gate their REST twins use, NOT the two
     // pre-existing HTML fragment siblings, which stay on the legacy bare
     // require_permission gate this round — see tar_tree_routes.cpp's
-    // recorded-exception comments at their registration). Unlike list_agents'
-    // agents_fn (fleet-wide, no per-operator narrowing), these three read
-    // through the SAME operator-scoped provider (tar_devices_fn_) /
-    // DashboardRoutes gatherer their REST twins use — see
-    // set_tar_devices_fn/set_dashboard_routes (mcp_server.hpp) — with
-    // fleet_read_fn_'s own VisibleSet applied as an additional intersection
-    // filter on top (same rationale as the REST twins' comment).
+    // recorded-exception comments at their registration). #4143 review fix:
+    // all three now read from an UNFILTERED source (all_devices_fn_ /
+    // DashboardRoutes::gather_tar_retention_paused with
+    // extra_scope_is_authoritative=true) exactly like list_agents' own
+    // agents_fn, with fleet_read_fn_'s gate.scope as the SOLE filter — no
+    // longer intersected with a separate per-operator-scoped provider. See
+    // set_all_devices_fn's doc comment (mcp_server.hpp) for the full
+    // rationale.
     // GET /fragments/tar/process-tree/result and .../detail are DELIBERATELY NOT
     // twinned by #4027 (see tar_tree_routes.hpp's file comment) — no REST/MCP-only
     // path exists to mint their required pcmd/tcmd/token inputs today.

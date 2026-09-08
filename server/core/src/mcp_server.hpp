@@ -472,16 +472,6 @@ public:
                                            const std::string& operation)>;
     void set_fleet_read_fn(FleetReadFn fn) { fleet_read_fn_ = std::move(fn); }
 
-    /// #4027: the SAME provider `TarTreeRoutes::DevicesFn` threads into the
-    /// two un-migrated HTML fragment device-picker routes (server.cpp wires
-    /// the IDENTICAL lambda into both). NOT used by `list_tar_process_tree_
-    /// devices`/`list_tar_capture_sources_devices` any more — see
-    /// `all_devices_fn_` below (#4143 review fix). Kept here only in case a
-    /// future MCP tool needs the fragment-parity (per-operator direct-
-    /// membership) shape specifically.
-    using TarDevicesFn = std::function<std::vector<DeviceRow>(const std::string& username)>;
-    void set_tar_devices_fn(TarDevicesFn fn) { tar_devices_fn_ = std::move(fn); }
-
     /// #4143 review fix (external colleague review, BLOCKING, confirmed against
     /// ADR-0017 INV-4/INV-7 by direct source inspection): `list_tar_process_
     /// tree_devices`/`list_tar_capture_sources_devices` previously intersected
@@ -737,8 +727,6 @@ private:
     UploadGrantListReadFn upload_grant_list_read_fn_;
     // #3290 Phase 2 — see set_fleet_read_fn above.
     FleetReadFn fleet_read_fn_;
-    // #4027 — see set_tar_devices_fn/set_dashboard_routes above.
-    TarDevicesFn tar_devices_fn_;
     // #4143 review fix — see set_all_devices_fn above.
     AllDevicesFn all_devices_fn_;
     DashboardRoutes* dashboard_routes_{nullptr};

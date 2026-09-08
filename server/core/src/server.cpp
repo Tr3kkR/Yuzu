@@ -21963,18 +21963,12 @@ private:
             // decision for the same caller (same conversion, same underlying
             // require_fleet_read call).
             mcp_server_->set_fleet_read_fn(fleet_read_fn);
-            // #4027 — the SAME devices_fn lambda TarTreeRoutes' REST/fragment
-            // routes use (registered above), so list_tar_process_tree_devices/
-            // list_tar_capture_sources_devices/list_tar_retention_paused read
-            // through the identical operator-scoped data source REST already
-            // does (contrast list_agents' agents_fn, a deliberate pre-existing
-            // exception this twin does not extend). #4027 fix round
-            // (CDX-P1-01/K4): the RBAC/management-group AXIS for these three
-            // tools is the fleet_read_fn_ already wired above (the SAME
-            // instance query_installed_software uses). dashboard_routes_ is
-            // guaranteed constructed by this point (registered well above, in
-            // the same function, before MCP setup begins).
-            mcp_server_->set_tar_devices_fn(devices_fn);
+            // #4027 fix round (CDX-P1-01/K4): the RBAC/management-group AXIS
+            // for these three tools is the fleet_read_fn_ already wired above
+            // (the SAME instance query_installed_software uses).
+            // dashboard_routes_ is guaranteed constructed by this point
+            // (registered well above, in the same function, before MCP setup
+            // begins).
             // #4143 review fix — see mcp_server.hpp's set_all_devices_fn doc
             // comment; identical lambda wired into tar_tree_routes_ above so
             // both transports read from the exact same unfiltered snapshot.
