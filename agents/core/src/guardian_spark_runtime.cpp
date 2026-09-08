@@ -1155,17 +1155,8 @@ GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id, std::string
     const std::string rule_name = known ? rit->second->assertion.rule_name : std::string{};
     const char* guard_type = known ? guard_type_for(rit->second->assertion.kind) : "";
     const auto key_opt = index_->key_for_rule(rule_id); // capture BEFORE removal
-    if (known)
-        rit->second->active = false; // in-flight evals will not commit
-    const auto disarm_key = index_->remove_rule(rule_id);
-    if (known)
-        rules_.erase(rule_id);
-    {
-        std::lock_guard<std::mutex> ob{outbox_mu_};
-        outbox_.drop_rule(rule_id); // compliance/health only - Lifecycle lives in lifecycle_log_
-    }
-    // #2233 item 3 / rung 9c R5.2: the confirmed-state mutation above (index_/rules_/
-    // keys_) and the "disarmed" audit below are the durable commit; the actual
+    // #2233 item 3 / rung 9c R5.2: the confirmed-state mutation below (index_/rules_/
+    // keys_) and the "disarmed" audit at the end are the durable commit; the actual
     // backend_->disarm() call is the CALLER's job, off-lock, by driving the DISARM
     // CLAIM queued here (submit_disarm_off_lock). Queued in THIS critical section, the
     // same one that erases keys_[key]: a same-key attach that lands in the off-lock
@@ -1173,24 +1164,93 @@ GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id, std::string
     // entry, no claim" and dispatching an arm ahead of the teardown. Changes WHERE
     // the call runs, not whether its success is confirmed - disarm() is void and was
     // never awaited for success even in the old inline call.
+    //
+    // Adversarial re-review r2 C1 (#3831's arm-before-mutation discipline, applied
+    // here): EVERY fallible step of building and queueing that claim - the
+    // make_shared, the key string copy, the claims_ node, the deque push - runs
+    // BEFORE index_->remove_rule / rules_.erase / keys_.erase, while keys_[key] still
+    // owns the subscription. A bad_alloc in any of them therefore leaves the
+    // confirmed state exactly as it was (the claim, if already pushed, is popped
+    // again below). Previously the claim was built AFTER the erases, so a throw there
+    // stranded a live subscription in keys_ with no rule, no index entry and no
+    // claim - and the next same-key attach then hit the keys_.emplace hard error.
+    // The ->0 edge is PREDICTED from the refcount (same lock, nothing can change it
+    // between here and remove_rule) instead of learned from remove_rule's return.
     std::shared_ptr<KeyClaim> work;
+    bool claim_pushed = false;
+    std::optional<std::uint64_t> inline_disarm; // inline type: disarmed synchronously below
+    const bool last_on_key = key_opt && index_->refcount(*key_opt) == 1;
+    if (last_on_key) {
+        if (const auto kit = keys_.find(*key_opt); kit != keys_.end()) {
+            if (const auto ioc = io_class_for_spark_type(kit->second->spec.type)) {
+                detach_fault_here_for_test(); // seam: "the claim allocation threw"
+                auto c = std::make_shared<KeyClaim>();
+                c->kind = ClaimKind::Disarm;
+                c->key = *key_opt;
+                c->io_class = *ioc;
+                c->subscription = kit->second->subscription;
+                const auto [eit, inserted] = claims_.try_emplace(*key_opt);
+                // A disarm is only ever created on a key with no live claim (an arm
+                // never writes keys_ until it commits, and commit erases the entry).
+                assert(eit->second.fifo.empty());
+                try {
+                    eit->second.fifo.push_back(c);
+                } catch (...) {
+                    if (inserted)
+                        claims_.erase(eit); // never leave an empty entry behind
+                    throw;
+                }
+                work = c;
+                claim_pushed = true;
+            } else {
+                inline_disarm = kit->second->subscription;
+            }
+        }
+    }
+    if (known)
+        rit->second->active = false; // in-flight evals will not commit
+    std::optional<std::string> disarm_key;
+    try {
+        // remove_rule is strong-guarantee (its one allocation precedes its mutation);
+        // on a throw pop the pre-pushed claim so the key is left exactly as found -
+        // subscription still owned by keys_, rule still confirmed.
+        disarm_key = index_->remove_rule(rule_id);
+    } catch (...) {
+        if (claim_pushed) {
+            if (const auto eit = claims_.find(work->key); eit != claims_.end()) {
+                eit->second.fifo.pop_back();
+                if (eit->second.fifo.empty())
+                    claims_.erase(eit);
+            }
+        }
+        if (known)
+            rit->second->active = true;
+        detach_claim_failures_.fetch_add(1, std::memory_order_relaxed);
+        throw;
+    }
+    // From here to the claim hand-off nothing can throw: rules_.erase, keys_.erase and
+    // the shared_ptr copy are noexcept and the claim already sits at the head of its
+    // entry (mutation-site audit in the PR body).
+    if (known)
+        rules_.erase(rule_id);
+    {
+        std::lock_guard<std::mutex> ob{outbox_mu_};
+        outbox_.drop_rule(rule_id); // compliance/health only - Lifecycle lives in lifecycle_log_
+    }
+    assert(disarm_key.has_value() == last_on_key); // the prediction and the edge agree
     if (disarm_key) {
         const auto kit = keys_.find(*disarm_key);
         if (kit != keys_.end()) {
-            if (const auto ioc = io_class_for_spark_type(kit->second->spec.type)) {
-                auto c = std::make_shared<KeyClaim>();
-                c->kind = ClaimKind::Disarm;
-                c->key = *disarm_key;
-                c->io_class = *ioc;
-                c->subscription = kit->second->subscription;
-                auto& entry = claims_[*disarm_key];
-                // A disarm is only ever created on a key with no live claim (an arm
-                // never writes keys_ until it commits, and commit erases the entry).
-                assert(entry.fifo.empty());
-                entry.fifo.push_back(c);
-                work = c;
-            } else {
-                backend_->disarm(kit->second->subscription); // inline type: unchanged, synchronous
+            if (inline_disarm) {
+                backend_->disarm(*inline_disarm); // inline type: unchanged, synchronous
+            } else if (!claim_pushed) {
+                // Cannot happen by construction (the prediction ran under this same
+                // lock); counted last resort so a subscription is NEVER stranded.
+                detach_claim_failures_.fetch_add(1, std::memory_order_relaxed);
+                try {
+                    backend_->disarm(kit->second->subscription);
+                } catch (...) {
+                }
             }
             keys_.erase(kit); // the in-flight pass (if any) holds its own shared_ptr; safe
         }
@@ -2256,6 +2316,10 @@ std::vector<std::string> GuardianSparkRuntime::keys_with_pending_initial() const
 
 void GuardianSparkRuntime::set_drain_fault_point_for_test(int point) noexcept {
     drain_fault_point_for_test_.store(point);
+}
+
+void GuardianSparkRuntime::set_detach_fault_for_test(bool on) noexcept {
+    detach_fault_for_test_.store(on);
 }
 
 void GuardianSparkRuntime::set_drain_gap_hook_for_test(std::function<void()> hook) {

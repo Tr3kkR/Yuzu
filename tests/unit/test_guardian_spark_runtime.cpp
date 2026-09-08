@@ -5071,3 +5071,48 @@ TEST_CASE("rung 9c R5.2 (adversarial review C2/K5): a throw after the first comm
     CHECK(b->disarmed_ids()[0] == b->armed_ids()[0]);
     CHECK(rt->armed_key_count() == 0);
 }
+
+// rung 9c R5.2 - adversarial re-review r2 (C1, found by both reviewers): the DISARM
+// claim is built and queued BEFORE the durable detach mutation (index_/rules_/keys_),
+// so an allocation failure leaves the rule fully consistent and the subscription still
+// owned by keys_ - never stranded with no rule, no index entry and no claim.
+TEST_CASE("rung 9c R5.2 (adversarial re-review r2 C1): a bad_alloc building the disarm claim "
+          "leaves the rule consistent - a retried detach disarms once and a fresh attach arms "
+          "cleanly",
+          "[spark][runtime][liveness]") {
+    // Mutation (the pre-fix order): build the claim AFTER index_->remove_rule /
+    // rules_.erase -> the throw strands the subscription in keys_: rule_count() reads 0
+    // right after the throw, the retry finds nothing to disarm (disarms stays 0), and
+    // the fresh attach fails on the keys_.emplace hard error.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+    REQUIRE(b->armed_ids().size() == 1);
+    const auto key = spark_key(file_spec("/a"));
+
+    rt->set_detach_fault_for_test(true);
+    REQUIRE_THROWS_AS(rt->detach_rule("r1"), std::bad_alloc);
+
+    // Nothing durable moved: the rule is still confirmed, the key still armed, no
+    // half-built claim left behind, and no rollback was needed (the seam fires before
+    // the erase).
+    CHECK(rt->rule_count() == 1);
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 0);
+    CHECK(b->disarms.load() == 0);
+    CHECK(rt->detach_claim_failures() == 0);
+
+    // The retry succeeds and disarms exactly the armed subscription, once.
+    rt->detach_rule("r1");
+    CHECK(rt->rule_count() == 0);
+    CHECK(rt->armed_key_count() == 0);
+    REQUIRE(b->disarmed_ids().size() == 1);
+    CHECK(b->disarmed_ids()[0] == b->armed_ids()[0]);
+    CHECK(rt->claim_queue_depth_for_test(key) == 0);
+
+    // A fresh attach on the same key arms cleanly (no keys_.emplace hard error).
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+    CHECK(b->arms.load() == 2);
+    CHECK(rt->armed_key_count() == 1);
+}

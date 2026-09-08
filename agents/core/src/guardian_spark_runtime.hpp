@@ -69,6 +69,7 @@
 
 #include <algorithm> // (std::min) in drop_oldest_pending_for_test
 #include <atomic>
+#include <new> // std::bad_alloc (detach_fault_here_for_test)
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -601,6 +602,17 @@ public:
     /// of a successful arm); 2 = a throw right after the first commit adopted the
     /// subscription (before its verdict is staged). 0 = off.
     void set_drain_fault_point_for_test(int point) noexcept;
+    /// R5.2 detach fault seam (adversarial re-review r2 C1): consumed once by the next
+    /// detach_rule_locked that builds a DISARM claim - throws std::bad_alloc at the
+    /// claim allocation, i.e. before the durable index_/rules_/keys_ mutation.
+    void set_detach_fault_for_test(bool on) noexcept;
+    /// R5.2: detach_rule_locked found itself unable to hand the subscription to a
+    /// disarm claim (a throw inside index_->remove_rule after the claim was pushed,
+    /// or the cannot-happen prediction mismatch) and took the counted rollback / last
+    /// resort. Expected 0. Lock-free.
+    [[nodiscard]] std::uint64_t detach_claim_failures() const noexcept {
+        return detach_claim_failures_.load(std::memory_order_relaxed);
+    }
 
     /// Phase 1 of shutdown: set the stopping flag and mark every generation
     /// inactive under the registry lock, so no in-flight or late eval commits.
@@ -1026,8 +1038,15 @@ private:
     std::atomic<std::uint64_t> disarm_retained_{0};       ///< R5.2: disarm claims retained after an admission refusal
     std::atomic<std::uint64_t> claims_dropped_at_stop_{0}; ///< R5.2: queued claims dropped by begin_stop / Stopped
     std::atomic<std::uint64_t> claim_drain_failures_{0};  ///< R5.2: on_arm_complete firewall fired
+    std::atomic<std::uint64_t> detach_claim_failures_{0}; ///< R5.2: detach_rule_locked rollback / last resort fired
     std::function<void()> drain_gap_hook_for_test_; ///< registry_mu_-guarded; see the setter
     std::atomic<int> drain_fault_point_for_test_{0};  ///< see the setter
+    std::atomic<bool> detach_fault_for_test_{false};  ///< see the setter
+    /// Seam body for set_detach_fault_for_test; consumed once.
+    void detach_fault_here_for_test() {
+        if (detach_fault_for_test_.exchange(false))
+            throw std::bad_alloc{};
+    }
 
     mutable std::mutex outbox_mu_;
     GuardianOutbox outbox_;
