@@ -520,6 +520,7 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
             case IoFailure::AlreadyRunning:     reason = "arm already in progress for this key"; break;
             case IoFailure::LaunchFailed:       reason = "arm worker launch failed"; break;
             case IoFailure::WorkerThrew:        reason = "arm worker threw"; break;
+            case IoFailure::CeilingExhausted:   reason = "arm rejected at alive-worker ceiling"; break;
             }
             if (io_result.error() == IoFailure::Timeout)
                 backend_op_timeouts_.fetch_add(1, std::memory_order_relaxed);

@@ -701,3 +701,389 @@ TEST_CASE("the detached-worker role marker is set on the marked thread and nowhe
     CHECK_FALSE(cleared_after.load());
     CHECK_FALSE(on_guardian_detached_worker_thread()); // still false here after the join
 }
+
+// ---------------------------------------------------------------------------
+// rung 9c R5.1: submit(), the non-waiting dispatch form. Each case names the
+// mutation that makes it RED (recorded in the PR's mutation table).
+// ---------------------------------------------------------------------------
+
+namespace {
+constexpr std::size_t kReg = io_class_index(IoClass::Registry);
+
+// Shared observation cell for a submit() completion: value, thread identity,
+// invocation count - all written by the worker, read by the test after spin_until.
+struct Completion {
+    std::atomic<int> calls{0};
+    std::atomic<int> value{-1};
+    std::atomic<bool> had_value{false};
+    std::atomic<int> error{-1};
+    std::atomic<bool> on_test_thread{true}; // default true so a missed write fails loudly
+    std::thread::id test_thread{std::this_thread::get_id()};
+    void record(IoResult<int>&& r) {
+        ++calls;
+        had_value.store(r.has_value());
+        if (r)
+            value.store(*r);
+        else
+            error.store(static_cast<int>(r.error()));
+        on_test_thread.store(std::this_thread::get_id() == test_thread);
+    }
+};
+} // namespace
+
+TEST_CASE("submit: delivers fn's value to on_complete exactly once, on the worker thread",
+          "[spark][ioexecutor]") {
+    // Mutation: invoke on_complete twice, or call it synchronously on the caller.
+    GuardianIoExecutor ex;
+    auto c = std::make_shared<Completion>();
+    auto adm = ex.submit(IoClass::File, "k", [] { return 7; },
+                         [c](IoResult<int>&& r) { c->record(std::move(r)); });
+    REQUIRE(adm.has_value());
+    REQUIRE(spin_until([&] { return c->calls.load() == 1; }));
+    CHECK(spin_until([&] { return ex.active_worker_count() == 0; })); // worker fully exited
+    std::this_thread::sleep_for(50ms);                                // no second delivery
+    CHECK(c->calls.load() == 1);
+    CHECK(c->had_value.load());
+    CHECK(c->value.load() == 7);
+    CHECK_FALSE(c->on_test_thread.load());
+    CHECK(ex.stats().quota_held_total == 0);
+}
+
+TEST_CASE("submit: a throwing fn is delivered as WorkerThrew through on_complete",
+          "[spark][ioexecutor]") {
+    // Mutation: skip the callback on throw (or let the exception escape).
+    GuardianIoExecutor ex;
+    auto c = std::make_shared<Completion>();
+    auto adm = ex.submit(
+        IoClass::Service, "k", []() -> int { throw std::runtime_error("boom"); },
+        [c](IoResult<int>&& r) { c->record(std::move(r)); });
+    REQUIRE(adm.has_value());
+    REQUIRE(spin_until([&] { return c->calls.load() == 1; }));
+    CHECK_FALSE(c->had_value.load());
+    CHECK(c->error.load() == static_cast<int>(IoFailure::WorkerThrew));
+    CHECK(spin_until([&] { return ex.active_worker_count() == 0; }));
+    CHECK(ex.stats().counters[kSvc].worker_exceptions == 1);
+    CHECK(c->calls.load() == 1);
+}
+
+TEST_CASE("submit: the quota slot and single-flight key release at fn() return, before "
+          "on_complete runs",
+          "[spark][ioexecutor]") {
+    // Mutation: move release_quota_locked() to after on_complete -> the same-key submit
+    // returns AlreadyRunning and the run() on the other key returns CapacityExhausted.
+    GuardianIoExecutor ex{{.file_quota = 1, .registry_quota = 1, .service_quota = 1}};
+    auto park = std::make_shared<Gate>();
+    auto entered = std::make_shared<std::promise<void>>();
+    auto entered_fut = entered->get_future();
+    auto adm = ex.submit(IoClass::File, "k", [] { return 1; },
+                         [park, entered](IoResult<int>&&) {
+                             entered->set_value(); // proves on_complete is running
+                             park->wait();
+                         });
+    REQUIRE(adm.has_value());
+    REQUIRE(entered_fut.wait_for(5s) == std::future_status::ready);
+
+    // Inside the parked-callback window: no quota held, but the thread is alive.
+    auto s = ex.stats();
+    CHECK(s.quota_held_total == 0);
+    CHECK(s.quota_held_by_class[kFile] == 0);
+    CHECK(s.active_total == 1);
+    CHECK(ex.active_worker_count() >= 1);
+
+    // Same key, same class: ADMITTED (the key was freed at fn() return).
+    auto second = std::make_shared<Completion>();
+    auto adm2 = ex.submit(IoClass::File, "k", [] { return 2; },
+                          [second](IoResult<int>&& r) { second->record(std::move(r)); });
+    REQUIRE(adm2.has_value());
+    REQUIRE(spin_until([&] { return second->calls.load() == 1; }));
+    CHECK(second->value.load() == 2);
+
+    // Same class, other key, blocking form: the single File slot is free (the parked
+    // worker released it), so this returns a value rather than CapacityExhausted.
+    auto r = ex.run(IoClass::File, "k2", 5s, [] { return 3; });
+    REQUIRE(r.has_value());
+    CHECK(*r == 3);
+    CHECK(ex.stats().counters[kFile].rejected_key == 0);
+    CHECK(ex.stats().counters[kFile].rejected_capacity == 0);
+
+    park->release();
+    CHECK(spin_until([&] { return ex.active_worker_count() == 0; }));
+}
+
+TEST_CASE("submit: the physical alive-worker ceiling refuses admission while quota is free",
+          "[spark][ioexecutor]") {
+    // Mutation: drop the alive_total >= alive_ceiling check in admit_locked -> the 7th
+    // submit is admitted and rejected_ceiling stays 0.
+    GuardianIoExecutor ex{{.file_quota = 1, .registry_quota = 1, .service_quota = 1}};
+    REQUIRE(ex.alive_ceiling() == 6); // 2 x (1+1+1)
+    auto park = std::make_shared<Gate>();
+    auto entered = std::make_shared<std::atomic<int>>(0);
+    auto done = std::make_shared<std::atomic<int>>(0);
+    for (int i = 0; i < 6; ++i) {
+        auto adm = ex.submit(IoClass::File, "c" + std::to_string(i), [] { return 1; },
+                             [park, entered, done](IoResult<int>&&) {
+                                 ++*entered;
+                                 park->wait();
+                                 ++*done;
+                             });
+        REQUIRE(adm.has_value());
+        // Each worker frees its File slot at fn() return; waiting for the callback to
+        // be ENTERED before the next submit guarantees the quota check cannot be the
+        // one that fires (the slot is provably free), isolating the ceiling.
+        REQUIRE(spin_until([&] { return entered->load() == i + 1; }));
+    }
+    CHECK(ex.active_worker_count() == 6);
+    CHECK(ex.stats().quota_held_total == 0);
+
+    auto c7 = std::make_shared<Completion>();
+    auto adm7 = ex.submit(IoClass::File, "c7", [] { return 1; },
+                          [c7](IoResult<int>&& r) { c7->record(std::move(r)); });
+    REQUIRE_FALSE(adm7.has_value());
+    CHECK(adm7.error() == IoFailure::CeilingExhausted);
+    // The blocking form is refused the same way, and a Registry op too (the ceiling
+    // is per instance, not per class).
+    auto r = ex.run(IoClass::Registry, "reg", 5s, [] { return 1; });
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() == IoFailure::CeilingExhausted);
+    auto s = ex.stats();
+    CHECK(s.counters[kFile].rejected_ceiling == 1);
+    CHECK(s.counters[kReg].rejected_ceiling == 1);
+    CHECK(s.counters[kFile].rejected_capacity == 0);
+    CHECK(s.counters[kReg].rejected_capacity == 0);
+    std::this_thread::sleep_for(50ms);
+    CHECK(c7->calls.load() == 0); // a refused submit never fires its callback
+
+    park->release();
+    REQUIRE(spin_until([&] { return done->load() == 6; }));
+    CHECK(spin_until([&] { return ex.active_worker_count() == 0; }));
+    // Recovery: admitted again once the callback-phase workers have exited.
+    auto c8 = std::make_shared<Completion>();
+    auto adm8 = ex.submit(IoClass::File, "c8", [] { return 8; },
+                          [c8](IoResult<int>&& r) { c8->record(std::move(r)); });
+    REQUIRE(adm8.has_value());
+    REQUIRE(spin_until([&] { return c8->calls.load() == 1; }));
+    CHECK(c8->value.load() == 8);
+    CHECK(spin_until([&] { return ex.active_worker_count() == 0; }));
+}
+
+TEST_CASE("submit: active_worker_count() stays nonzero across the completion-callback "
+          "window after the quota slot released (#4147)",
+          "[spark][ioexecutor]") {
+    // Mutation: report quota_held_total from active_worker_count() -> reads 0 while the
+    // callback is parked, the exact F3 regression #4147 guards against.
+    GuardianIoExecutor ex;
+    auto park = std::make_shared<Gate>();
+    auto entered = std::make_shared<std::promise<void>>();
+    auto entered_fut = entered->get_future();
+    auto adm = ex.submit(IoClass::File, "k", [] { return 1; },
+                         [park, entered](IoResult<int>&&) {
+                             entered->set_value();
+                             park->wait();
+                         });
+    REQUIRE(adm.has_value());
+    REQUIRE(entered_fut.wait_for(5s) == std::future_status::ready);
+    CHECK(ex.active_worker_count() == 1);
+    CHECK(ex.active_worker_count(IoClass::File) == 1);
+    auto s = ex.stats();
+    CHECK(s.active_total == 1);
+    CHECK(s.active_by_class[kFile] == 1);
+    CHECK(s.quota_held_total == 0);
+    CHECK(s.quota_held_by_class[kFile] == 0);
+    park->release();
+    CHECK(spin_until([&] { return ex.active_worker_count() == 0; }));
+}
+
+TEST_CASE("submit: stop() snapshots the alive count, rejects new submits, and does not "
+          "suppress a late completion (completed_after_stop)",
+          "[spark][ioexecutor]") {
+    // Mutation: skip on_complete when st->stopping is set -> calls stays 0.
+    GuardianIoExecutor ex;
+    auto gate = std::make_shared<Gate>();
+    auto started = std::make_shared<std::promise<void>>();
+    auto started_fut = started->get_future();
+    auto c = std::make_shared<Completion>();
+    auto adm = ex.submit(
+        IoClass::File, "k",
+        [gate, started] {
+            started->set_value(); // the body genuinely started (not just admitted)
+            gate->wait();
+            return 1;
+        },
+        [c](IoResult<int>&& r) { c->record(std::move(r)); });
+    REQUIRE(adm.has_value());
+    REQUIRE(started_fut.wait_for(5s) == std::future_status::ready);
+
+    ex.stop();
+    CHECK(ex.stats().active_at_shutdown[kFile] == 1);
+    auto late = std::make_shared<Completion>();
+    auto adm2 = ex.submit(IoClass::File, "k2", [] { return 2; },
+                          [late](IoResult<int>&& r) { late->record(std::move(r)); });
+    REQUIRE_FALSE(adm2.has_value());
+    CHECK(adm2.error() == IoFailure::Stopped);
+    std::this_thread::sleep_for(50ms);
+    CHECK(late->calls.load() == 0); // refused: never fires
+
+    gate->release();
+    REQUIRE(spin_until([&] { return c->calls.load() == 1; }));
+    CHECK(c->value.load() == 1);
+    CHECK(spin_until([&] { return ex.active_worker_count() == 0; }));
+    CHECK(ex.stats().counters[kFile].completed_after_stop == 1);
+    CHECK(c->calls.load() == 1);
+}
+
+TEST_CASE("submit: a throwing on_complete is contained and counted; the slot and key were "
+          "already released",
+          "[spark][ioexecutor]") {
+    // Mutation: remove the try/catch around on_complete -> std::terminate (the worker
+    // lambda is noexcept), observed as a crashed test binary.
+    GuardianIoExecutor ex;
+    auto calls = std::make_shared<std::atomic<int>>(0);
+    auto adm = ex.submit(IoClass::File, "k", [] { return 1; },
+                         [calls](IoResult<int>&&) {
+                             ++*calls;
+                             throw std::runtime_error("callback boom");
+                         });
+    REQUIRE(adm.has_value());
+    REQUIRE(spin_until([&] { return ex.stats().counters[kFile].completion_failures == 1; }));
+    CHECK(calls->load() == 1);
+    // Same key, blocking form: admitted (key + slot released before the callback ran).
+    auto r = ex.run(IoClass::File, "k", 5s, [] { return 9; });
+    REQUIRE(r.has_value());
+    CHECK(*r == 9);
+    CHECK(spin_until([&] { return ex.active_worker_count() == 0; }));
+}
+
+TEST_CASE("submit: a failed launch rolls admission back and never fires on_complete",
+          "[spark][ioexecutor]") {
+    // Mutation: in ~TicketCore skip the quota decrement when !quota_released -> the
+    // quota leaks and the retry on a {1,1,1} Config returns CapacityExhausted.
+    GuardianIoExecutor ex{{.file_quota = 1, .registry_quota = 1, .service_quota = 1}};
+    auto c = std::make_shared<Completion>();
+    ex.set_fail_launch_for_test(true);
+    auto adm = ex.submit(IoClass::File, "k", [] { return 1; },
+                         [c](IoResult<int>&& r) { c->record(std::move(r)); });
+    REQUIRE_FALSE(adm.has_value());
+    CHECK(adm.error() == IoFailure::LaunchFailed);
+    std::this_thread::sleep_for(50ms);
+    CHECK(c->calls.load() == 0);
+    auto s = ex.stats();
+    CHECK(s.counters[kFile].launch_failures == 1);
+    CHECK(s.active_total == 0);
+    CHECK(s.quota_held_total == 0);
+    ex.set_fail_launch_for_test(false);
+    // Same key, same class: the rollback freed slot + key + alive count.
+    auto adm2 = ex.submit(IoClass::File, "k", [] { return 4; },
+                          [c](IoResult<int>&& r) { c->record(std::move(r)); });
+    REQUIRE(adm2.has_value());
+    REQUIRE(spin_until([&] { return c->calls.load() == 1; }));
+    CHECK(c->value.load() == 4);
+    CHECK(spin_until([&] { return ex.active_worker_count() == 0; }));
+}
+
+TEST_CASE("submit: a nested run() from inside on_complete on the same key is admitted (refill)",
+          "[spark][ioexecutor]") {
+    // Mutation: release the slot/key after on_complete instead of before -> the nested
+    // run() returns AlreadyRunning and nested_value stays -1.
+    GuardianIoExecutor ex{{.file_quota = 1, .registry_quota = 1, .service_quota = 1}};
+    auto nested_done = std::make_shared<std::atomic<bool>>(false);
+    auto nested_value = std::make_shared<std::atomic<int>>(-1);
+    auto nested_error = std::make_shared<std::atomic<int>>(-1);
+    auto adm = ex.submit(IoClass::File, "k", [] { return 1; },
+                         [&ex, nested_done, nested_value, nested_error](IoResult<int>&&) {
+                             auto r = ex.run(IoClass::File, "k", 5s, [] { return 2; });
+                             if (r)
+                                 nested_value->store(*r);
+                             else
+                                 nested_error->store(static_cast<int>(r.error()));
+                             nested_done->store(true);
+                         });
+    REQUIRE(adm.has_value());
+    REQUIRE(spin_until([&] { return nested_done->load(); }));
+    INFO("nested error code (if any): " << nested_error->load());
+    CHECK(nested_value->load() == 2);
+    CHECK(spin_until([&] { return ex.active_worker_count() == 0; }));
+    CHECK(ex.stats().counters[kFile].rejected_key == 0);
+    CHECK(ex.stats().counters[kFile].rejected_capacity == 0);
+}
+
+TEST_CASE("the detached-worker role marker is worn by run() and submit() workers, fn and "
+          "callbacks included",
+          "[spark][ioexecutor]") {
+    // Mutation: drop the GuardianDetachedWorkerRole from either worker lambda -> the
+    // corresponding flag reads false.
+    GuardianIoExecutor ex;
+    auto in_submit_fn = std::make_shared<std::atomic<bool>>(false);
+    auto in_on_complete = std::make_shared<std::atomic<bool>>(false);
+    auto joined_on_worker = std::make_shared<std::atomic<bool>>(true);
+    auto done = std::make_shared<std::atomic<bool>>(false);
+    auto adm = ex.submit(
+        IoClass::File, "s",
+        [in_submit_fn, joined_on_worker] {
+            in_submit_fn->store(on_guardian_detached_worker_thread());
+            joined_on_worker->store(on_guardian_joined_thread());
+            return 1;
+        },
+        [in_on_complete, done](IoResult<int>&&) {
+            in_on_complete->store(on_guardian_detached_worker_thread());
+            done->store(true);
+        });
+    REQUIRE(adm.has_value());
+    REQUIRE(spin_until([&] { return done->load(); }));
+    CHECK(in_submit_fn->load());
+    CHECK(in_on_complete->load());
+    CHECK_FALSE(joined_on_worker->load());
+
+    // run(): fn and the on_abandoned path (a late result after the caller timed out).
+    auto in_run_fn = std::make_shared<std::atomic<bool>>(false);
+    auto in_on_abandoned = std::make_shared<std::atomic<bool>>(false);
+    auto abandoned_seen = std::make_shared<std::atomic<bool>>(false);
+    auto gate = std::make_shared<Gate>();
+    auto r = ex.run(
+        IoClass::Service, "r", 30ms,
+        [in_run_fn, gate] {
+            in_run_fn->store(on_guardian_detached_worker_thread());
+            gate->wait();
+            return 1;
+        },
+        [in_on_abandoned, abandoned_seen](int&&) {
+            in_on_abandoned->store(on_guardian_detached_worker_thread());
+            abandoned_seen->store(true);
+        });
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() == IoFailure::Timeout);
+    gate->release();
+    REQUIRE(spin_until([&] { return abandoned_seen->load(); }));
+    CHECK(in_run_fn->load());
+    CHECK(in_on_abandoned->load());
+    CHECK_FALSE(on_guardian_detached_worker_thread()); // never leaks onto the caller
+    CHECK(spin_until([&] { return ex.active_worker_count() == 0; }));
+}
+
+TEST_CASE("submit: the executor may be destroyed while a completion callback is still "
+          "parked (no UAF)",
+          "[spark][ioexecutor]") {
+    // ASan/TSan checkpoint (mirror of the run()/on_abandoned case above). State stays
+    // alive through the worker's own shared_ptr.
+    auto park = std::make_shared<Gate>();
+    auto entered = std::make_shared<std::promise<void>>();
+    auto entered_fut = entered->get_future();
+    auto done = std::make_shared<std::promise<void>>();
+    auto fut = done->get_future();
+    {
+        GuardianIoExecutor ex;
+        auto adm = ex.submit(IoClass::File, "k", [] { return 1; },
+                             [park, entered, done](IoResult<int>&&) {
+                                 entered->set_value(); // confirmed INSIDE on_complete
+                                 park->wait();
+                                 done->set_value();
+                             });
+        REQUIRE(adm.has_value());
+        REQUIRE(entered_fut.wait_for(5s) == std::future_status::ready);
+        CHECK(ex.active_worker_count() == 1);
+        // ex is destroyed here while the worker is parked mid-callback.
+    }
+    park->release();
+    REQUIRE(fut.wait_for(5s) == std::future_status::ready);
+    std::this_thread::sleep_for(50ms); // let the trampoline destroy the captures + ticket
+    SUCCEED("submit worker released after executor destruction, mid-callback, without UAF");
+}

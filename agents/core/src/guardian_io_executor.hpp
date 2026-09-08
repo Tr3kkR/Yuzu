@@ -2,7 +2,8 @@
 
 /**
  * guardian_io_executor.hpp - a bounded, cancellable, single-flight I/O executor
- * for the Guardian spark state reader (ADR-0021 Stage 2 rung 5, F3).
+ * for the Guardian spark state reader (ADR-0021 Stage 2 rung 5, F3) and, since
+ * rung 9c (R5.1), the non-waiting dispatch form Guardian's arm/disarm consumer uses.
  *
  * WHY: the IStateReader contract (guardian_spark_runtime.hpp) requires every read
  * be bounded/cancellable - a convergence-lane join and the consumer detach both
@@ -16,43 +17,85 @@
  * workload is cold (convergence 60s/5-15min lanes, events debounced) and a pool
  * only adds a stale-job queue plus the same wedged-worker problem.
  *
- * INVARIANTS (each is a Sol BLOCKING/SHOULD fix, code-verified):
- *  - Keyed single-flight: an op key = (IoClass, spark_key) is ACTIVE until the
- *    WORKER EXITS (not until the submitter times out). A run for an already-active
- *    key returns AlreadyRunning WITHOUT spawning. The key is the canonical
- *    spark_key (length-prefixed, injective) and EXCLUDES the file hash-cap and the
- *    registry value plan - those can change while the same physical read is stuck,
- *    and letting that change bypass single-flight recreates the wedged-slot bug.
- *  - Per-type bulkheads: per-class inflight quotas (File/Registry/Service) PLUS a
- *    total process bound, so a dead mount saturating the file lane never starves a
- *    healthy service reconcile. Combined with single-flight so one key cannot eat
- *    its whole type budget.
+ * TWO DISPATCH FORMS (rung 9c R5.1):
+ *  - run(): the caller BLOCKS for the result with an absolute deadline; a late
+ *    result is routed to the optional on_abandoned callback (#3816).
+ *  - submit(): the caller does NOT block. Admission is still synchronous and
+ *    identical; the result is handed to on_complete(IoResult<T>&&) on the worker
+ *    thread after fn() returns. A non-waiting call can dispatch a fresh operation
+ *    from inside its completion ("refill"), and that refill must not be starved by
+ *    its own predecessor's still-held slot - which is why submit() releases quota
+ *    at fn() return (below), and why a separate PHYSICAL ceiling exists.
+ *
+ * INVARIANTS (each is a Sol BLOCKING/SHOULD fix, code-verified; R5.1 additions marked):
+ *  - Keyed single-flight: an op key = (IoClass, spark_key) is held from admission
+ *    until the RELEASE POINT of the dispatch form (table below). A run/submit for an
+ *    already-active key returns AlreadyRunning WITHOUT spawning. The key is the
+ *    canonical spark_key (length-prefixed, injective) and EXCLUDES the file hash-cap
+ *    and the registry value plan - those can change while the same physical read
+ *    is stuck, and letting that change bypass single-flight recreates the
+ *    wedged-slot bug. The caller never releases a key in either form.
+ *  - TWO COUNTS, not one (R5.1): a QUOTA-HELD count (per class + total, what
+ *    admission checks against the class quotas) and a PHYSICAL ALIVE count (every
+ *    worker whose OS thread has not exited, what active_worker_count() / Stats::
+ *    active_* report and what GuardianEngine::active_io_workers() sums for the F3
+ *    orphan grace - #4147). They diverge only for submit(): its worker frees quota
+ *    at fn() return but stays alive through on_complete.
+ *  - Per-type bulkheads: per-class quota-held quotas (File/Registry/Service) PLUS a
+ *    total bound derived as their sum (rung 9a R3, exact bulkheads), so a dead
+ *    mount saturating the file lane never starves a healthy service reconcile.
+ *    Combined with single-flight so one key cannot eat its whole type budget.
+ *  - PHYSICAL CEILING (R5.1): admission is also refused (CeilingExhausted) once
+ *    alive_total >= alive_ceiling = kAliveCeilingFactor * total_quota, regardless
+ *    of quota availability. Quota alone no longer bounds alive workers once a
+ *    completion callback can outlive its slot. The factor is a policy allowance,
+ *    not a structural proof (successive submissions can reuse released quota while
+ *    earlier callbacks are still alive), so the ceiling is a per-instance backstop
+ *    that can impose cross-class back-pressure; a hit means workers are outstanding
+ *    past fn() with quota free (slow or wedged callbacks, delayed ticket release),
+ *    NOT that a backend target is dead. Provably inert for run()-only workloads:
+ *    run() holds quota until thread exit, so alive == quota_held <= total_quota <
+ *    ceiling. The quota check runs before the ceiling check, so CeilingExhausted is
+ *    only ever reported when quota has room - the one diagnostically distinct case.
  *  - RAII admission ticket: admission is a transaction (the one throwing mutation,
  *    set::insert, runs before the nothrow counter increments; the ticket is armed
- *    last). A shared_ptr<TicketCore> owns the slot + active key. The KEY is freed by
- *    the worker at publish time (release_key_locked(), so a fast sequential re-read
- *    of the same key is not spuriously single-flighted); the INFLIGHT COUNTERS
- *    (what active_worker_count() reports) are freed only in the destructor, when the
- *    LAST holder dies - the worker's own captured copy, destroyed by the trampoline
- *    after the worker lambda has fully returned, i.e. at true OS-thread-exit time.
- *    The caller drops its copy after a successful launch, so a timed-out submitter
- *    does NOT release either - the worker does, on its own schedule.
+ *    last). A shared_ptr<TicketCore> owns the slot + active key. Release points:
+ *
+ *        form                 | single-flight key        | quota slot            | physical (alive)
+ *        run(), published     | worker publish           | ~TicketCore (thread exit) | ~TicketCore
+ *        run(), abandoned     | ~TicketCore              | ~TicketCore           | ~TicketCore
+ *        submit()             | release_quota_locked() at fn() return, before on_complete | same call | ~TicketCore
+ *
+ *    ~TicketCore runs when the LAST holder dies - the worker's own captured copy,
+ *    destroyed by the trampoline after the worker lambda has fully returned, i.e.
+ *    at true OS-thread-exit time. A timed-out run() submitter does NOT release
+ *    anything - the worker does, on its own schedule. Exactly-once decrement
+ *    handshake: `quota_released` flips under the same State::mu acquisition as the
+ *    quota decrement, and the destructor decrements quota only if it is still
+ *    false, so no path can double-decrement (a double-decrement would inflate the
+ *    quota and silently oversubscribe the lane).
  *  - No std::terminate path: the worker is launched DETACHED-at-creation
  *    (pthread_create PTHREAD_CREATE_DETACHED / _beginthreadex + CloseHandle), so
  *    there is no joinable std::thread whose destructor could terminate and no
  *    detach() that could throw. The worker trampoline is fully exception-contained
- *    (only the user fn() may throw, and it is caught); the result is heap-boxed and
- *    published into the cell by a nothrow unique_ptr move, so publication cannot
- *    throw for any result type (including MSVC's std::unordered_map, whose move is
- *    not noexcept).
+ *    (only the user fn() may throw, and it is caught). run() heap-boxes its result
+ *    and publishes into the cell by a nothrow unique_ptr move, so publication
+ *    cannot throw for any result type (including MSVC's std::unordered_map, whose
+ *    move is not noexcept). submit() has no cross-thread publication: its result
+ *    lives on the worker's own stack (std::optional, in-place) and is moved into
+ *    on_complete directly, so it has neither a box nor a null-box case.
  *  - Typed outcome: std::expected<T, IoFailure>; the reader maps each IoFailure to
  *    a precise bounded Unknown string (it lands in guard.unhealthy detail).
  *  - Absolute deadline captured at run() ENTRY (per-class deadline chosen by the
  *    reader), so allocation + launch time counts against the caller's budget.
- *  - Exactly-once result delivery (#3816): every result fn() returns normally goes
- *    to exactly one of run()'s return value (caller still waiting) or the optional
- *    on_abandoned(T&&) callback (caller already timed out / the executor is
- *    stopping). The wait-side lock is acquired ONCE, before spawn_detached, and
+ *    submit() takes NO deadline: there is no waiter to time out, a wedged fn()
+ *    holds its slot and key for as long as it stays wedged (the dead-target
+ *    bulkhead is unchanged), and per-key deadlines/quarantine are the consumer's
+ *    (design doc R5.2/R5.3, rung 9c PR-5).
+ *  - Exactly-once result delivery (#3816, run()): every result fn() returns normally
+ *    goes to exactly one of run()'s return value (caller still waiting) or the
+ *    optional on_abandoned(T&&) callback (caller already timed out / the executor
+ *    is stopping). The wait-side lock is acquired ONCE, before spawn_detached, and
  *    held across launch into cv.wait_until - so the caller's abandon decision and
  *    the worker's publish decision always serialize on the SAME mutex acquisition
  *    (a plain ResultCell::abandoned bool, no atomics needed) and there is no
@@ -62,25 +105,63 @@
  *    set_throw_before_wait_lock_for_test); cv.wait_until's own internal re-lock on
  *    wake is not a throwing failure mode (std::terminate per the standard if it
  *    cannot reacquire), so there is no catchable post-launch failure to guard.
+ *  - Exactly-once completion (R5.1, submit()): if submit() returns success, then
+ *    on_complete fires exactly once, on the worker thread, if and when the admitted
+ *    operation finishes (a WorkerThrew is delivered through the same callback; a
+ *    permanently stuck fn() never delivers). It never fires on an admission
+ *    failure, not even synchronously - so a caller's rollback of pre-dispatch
+ *    bookkeeping can never double up with a callback. It DOES fire after stop()
+ *    (counted as completed_after_stop): this executor is T-agnostic and cannot
+ *    clean up a late-succeeding arm, so suppressing the callback would be the
+ *    #3816 leak class; the consumer's own stopping branch decides what a late
+ *    result means (R5.5). It may run BEFORE submit() returns to the caller (a fast
+ *    fn()), so every piece of caller-side bookkeeping the callback relies on must
+ *    exist before submit() is called. There is no wait-lock held across spawn on
+ *    the submit side: run() needs that to serialize the caller's abandon decision
+ *    with the worker's publish decision, and submit() has no caller-side decision
+ *    after admission. The caller drops its ticket copy unlocked after launch; in
+ *    the worst case it is the last holder and the physical decrement runs on the
+ *    caller thread LATE (after the worker already returned), never early - safe
+ *    for F3 and the ceiling. A throwing on_complete is contained and counted
+ *    (completion_failures); the slot and key were already released before it ran.
+ *  - Nested dispatch from on_complete is legal (R5.1 refill): the predecessor's
+ *    slot and key are already released and the callback thread holds no executor
+ *    lock, so a run()/submit() on the same executor (same key included) from inside
+ *    on_complete admits normally. A callback that BLOCKS in a nested run() counts
+ *    as one alive worker holding no quota for as long as it blocks.
+ *  - Every worker body wears GuardianDetachedWorkerRole (both forms) from its first
+ *    statement, and destroys its owned user callables (fn, on_abandoned /
+ *    on_complete) inside that marked scope, so fn(), the callbacks and their
+ *    capture destructors all run marked: any GuardianEngine::mtx_ acquisition on the
+ *    thread aborts in debug/sanitizer builds (WorkerHostileMutex's second role,
+ *    guardian_detached_worker_role.hpp). The ticket's own destruction, by the
+ *    trampoline after the lambda returns, is outside the marked scope and takes
+ *    only State::mu.
  *
  * ORPHAN PROCESS-EXIT CONTRACT (rung-5 scope: expose + document; ENFORCEMENT
  * LANDED rung 7, see below):
- *  A shared_ptr keeps State and the result cell alive for a wedged detached worker,
- *  so there is no use-after-free. It does NOT make it safe for that worker to run
- *  libc / OpenSSL / libsystemd / Win32-RPC code THROUGH normal C++ static/DSO
- *  teardown. The process MUST NOT perform normal C++ teardown while
- *  active_worker_count() > 0. Rung 5 exposed that count (total + per class) here
- *  and re-exposed it through GuardianStateReader; rung 7's hard_exit.hpp is the
+ *  A shared_ptr keeps State (and, for run(), the result cell) alive for a wedged
+ *  detached worker, so there is no use-after-free. It does NOT make it safe for
+ *  that worker to run libc / OpenSSL / libsystemd / Win32-RPC code THROUGH normal
+ *  C++ static/DSO teardown. The process MUST NOT perform normal C++ teardown while
+ *  active_worker_count() > 0. That count is the PHYSICAL ALIVE count (#4147): it
+ *  includes a submit() worker that has already returned from fn() and released
+ *  its quota but is still inside on_complete, and it is bounded per instance by
+ *  alive_ceiling. Rung 5 exposed that count (total + per class) here and
+ *  re-exposed it through GuardianStateReader; rung 7's hard_exit.hpp is the
  *  enforcement: main.cpp/service_win.cpp construct an OrphanExitGuard before
  *  Agent::run(), sample guardian_active_io_workers() after it returns, and
  *  hard_exit() (TerminateProcess/_exit, skipping normal teardown entirely) if
  *  still nonzero after a bounded grace. Verified on POSIX (full test suite +
  *  TSan + real boot/SIGTERM smoke tests); the Windows SCM path
  *  (service_win.cpp) needs a DGRHP build+run before it's considered verified
- *  the same way. Currently inert in production either way - GuardianEngine's
- *  spark path (the only source of a nonzero active_worker_count()) has zero
- *  production wire_spark_engine() call sites yet.
+ *  the same way. GuardianEngine's spark path is wired at agent boot since rung
+ *  7.7a (agent.cpp, the wire_spark_engine() call site) with prefer_spark false,
+ *  so the arm/disarm executor exists in production but sees no traffic until the
+ *  flip; the state-read executor is live wherever spark state reads run.
  */
+
+#include "guardian_detached_worker_role.hpp" // rung 9c R5.1: worker role marker
 
 #include <array>
 #include <atomic>
@@ -132,18 +213,22 @@ inline constexpr std::size_t kIoClassCount = 3;
     return "unknown";
 }
 
-/// Why a bounded read did not return a value. Six materially different operational
-/// meanings (they end up in guard.unhealthy detail, so the reader maps each to a
-/// precise string rather than a single "timed out or cancelled").
+/// Why a bounded operation did not return a value. Seven materially different
+/// operational meanings (they end up in guard.unhealthy detail, so the reader maps
+/// each to a precise string rather than a single "timed out or cancelled").
 enum class IoFailure {
-    Timeout,           ///< the per-class deadline elapsed before the worker published
+    Timeout,           ///< the per-class deadline elapsed before the worker published (run() only)
     Stopped,           ///< the executor is stopping (shutdown); the submitter was woken / rejected
-    CapacityExhausted, ///< the per-class or total inflight quota was full
-    AlreadyRunning,    ///< a read for this exact (class, key) is already in flight (single-flight)
+    CapacityExhausted, ///< the per-class or total QUOTA was full (a backend call is holding a slot)
+    AlreadyRunning,    ///< an op for this exact (class, key) is already in flight (single-flight)
     LaunchFailed,      ///< the OS refused to create the worker thread, an allocation failed, or
                        ///< the pre-launch wait-lock acquisition failed (#3816 - folded here
                        ///< rather than a new enumerator, since it is now provably pre-launch)
-    WorkerThrew,       ///< the read body threw (should not happen; contained, never terminates)
+    WorkerThrew,       ///< the body threw (should not happen; contained, never terminates)
+    CeilingExhausted,  ///< rung 9c R5.1: the per-instance PHYSICAL alive-worker ceiling is hit
+                       ///< while quota has room - workers are outstanding past fn() (slow or
+                       ///< wedged completion callbacks), a runtime-side condition, not a dead
+                       ///< backend target; remediation differs from CapacityExhausted
 };
 
 template <class T>
@@ -211,7 +296,7 @@ template <class Fn>
 
 class GuardianIoExecutor {
 public:
-    /// Ceiling on concurrent bounded-I/O workers PER EXECUTOR INSTANCE (renamed in
+    /// Ceiling on QUOTA-HELD bounded-I/O workers PER EXECUTOR INSTANCE (renamed in
     /// spirit but not in name - sre Gate 6, #2233 item 3: this was a genuine
     /// process-wide ceiling until that PR added a second, deliberately-independent
     /// GuardianIoExecutor instance for Guardian spark arm/disarm alongside
@@ -226,7 +311,24 @@ public:
     /// its 3 slots with nothing wedged). A new IoClass or a raised default that
     /// pushes the sum past this ceiling fails the static_assert below: raise the
     /// ceiling deliberately, or shrink a class - never silently oversubscribe.
+    /// Since rung 9c R5.1 this bounds QUOTA, not alive threads: a submit() worker
+    /// frees its quota at fn() return and stays alive through its completion
+    /// callback, so alive threads are bounded by kMaxAliveIoWorkers instead.
     static constexpr int kMaxProcessIoWorkers = 10;
+
+    /// rung 9c R5.1: alive_ceiling = kAliveCeilingFactor * total_quota per instance.
+    /// A policy allowance, pinned here and in the implementing PR's description (per
+    /// §7.7b item 5): at most one quota holder plus one predecessor still in its
+    /// callback per slot is the STRUCTURAL population under the consumer's
+    /// one-nested-refill-per-callback shape, but successive submissions can reuse
+    /// released quota while earlier callbacks are still alive, so the factor is a
+    /// backstop rather than a proof. Derived from the CLAMPED total_quota, never a
+    /// Config knob (an injected ceiling <= sum(quotas) would recreate the R3
+    /// starvation).
+    static constexpr int kAliveCeilingFactor = 2;
+    /// The ceiling for the shipped Config (2 x 10 = 20), per executor instance - not
+    /// a process-wide total across instances.
+    static constexpr int kMaxAliveIoWorkers = kAliveCeilingFactor * kMaxProcessIoWorkers;
 
     struct Config {
         int file_quota{4};
@@ -254,13 +356,27 @@ public:
         /// (that delivery still happened; this counts that its cleanup failed),
         /// not instead of it - the two are not mutually exclusive.
         std::uint64_t abandonment_cleanup_failures{0};
+        /// rung 9c R5.1: admission refused at the physical alive-worker ceiling
+        /// while quota had room (CeilingExhausted).
+        std::uint64_t rejected_ceiling{0};
+        /// rung 9c R5.1: a submit() worker reached its completion after stop() had
+        /// been called; on_complete still fired (the analogue of `abandoned`).
+        std::uint64_t completed_after_stop{0};
+        /// rung 9c R5.1: on_complete itself threw; contained, counted in addition to
+        /// the delivery (which happened), mirroring abandonment_cleanup_failures.
+        std::uint64_t completion_failures{0};
     };
 
     /// A by-value snapshot (never a reference into State after the lock releases).
     struct Stats {
+        /// PHYSICAL alive workers (OS thread not yet exited) - the F3 count.
         std::size_t active_total{0};
         std::array<std::size_t, kIoClassCount> active_by_class{};
         std::array<std::size_t, kIoClassCount> active_at_shutdown{};
+        /// rung 9c R5.1: QUOTA-HELD slots, what admission checks against the quotas.
+        std::size_t quota_held_total{0};
+        std::array<std::size_t, kIoClassCount> quota_held_by_class{};
+        std::size_t alive_ceiling{0};
         std::array<Counters, kIoClassCount> counters{};
         bool stopping{false};
     };
@@ -289,6 +405,9 @@ public:
         // guard (belt-and-braces, provably inert for a well-formed Config).
         const int sum = f + r + s;
         state_->total_quota = sum <= kMaxProcessIoWorkers ? sum : kMaxProcessIoWorkers;
+        // rung 9c R5.1: the physical ceiling is derived from the CLAMPED quota total, so
+        // it is always strictly above it (factor >= 2, static-asserted below).
+        state_->alive_ceiling = kAliveCeilingFactor * state_->total_quota;
     }
     GuardianIoExecutor(const GuardianIoExecutor&) = delete;
     GuardianIoExecutor& operator=(const GuardianIoExecutor&) = delete;
@@ -342,24 +461,8 @@ public:
             ticket = std::make_shared<TicketCore>(state_); // unarmed until admitted
             {
                 std::unique_lock<std::mutex> lk{state_->mu};
-                if (state_->stopping)
-                    return IoResult<T>{std::unexpect, IoFailure::Stopped};
-                if (state_->active_keys.contains({static_cast<int>(ci), key})) {
-                    ++state_->counters[ci].rejected_key;
-                    return IoResult<T>{std::unexpect, IoFailure::AlreadyRunning};
-                }
-                if (state_->total_inflight >= state_->total_quota ||
-                    state_->class_inflight[ci] >= state_->class_quota[ci]) {
-                    ++state_->counters[ci].rejected_capacity;
-                    return IoResult<T>{std::unexpect, IoFailure::CapacityExhausted};
-                }
-                // Admission transaction: set::insert (the ONLY throwing step, strong
-                // guarantee) runs BEFORE the nothrow counter bumps, so a bad_alloc here
-                // leaves State unmutated. Arm the ticket last (all nothrow).
-                auto it = state_->active_keys.insert({static_cast<int>(ci), std::move(key)}).first;
-                ++state_->total_inflight;
-                ++state_->class_inflight[ci];
-                ticket->arm(ci, it);
+                if (const auto rejected = admit_locked(ci, key, ticket))
+                    return IoResult<T>{std::unexpect, *rejected};
             }
 
             // #saf3821-5 test seam: simulate the wait-lock acquisition failing,
@@ -375,9 +478,16 @@ public:
             wait_lk = std::unique_lock<std::mutex>{state_->mu};
 
             auto st = state_;
+            // The user callables are held in optionals so the worker can destroy them
+            // INSIDE its role-marked scope (rung 9c R5.1) - their destructors are
+            // consumer code. The decayed copy/move still happens here, in capture-init,
+            // exactly as before (ThrowOnCopyFunctor's owns_lock()==true seam relies on it).
             auto worker = [st, cell, ticket, ci,
-                           on_abandoned = std::decay_t<OnAbandoned>(std::forward<OnAbandoned>(on_abandoned)),
-                           fn = std::decay_t<F>(std::forward<F>(fn))]() mutable noexcept {
+                           on_abandoned = std::optional<std::decay_t<OnAbandoned>>(
+                               std::in_place, std::forward<OnAbandoned>(on_abandoned)),
+                           fn = std::optional<std::decay_t<F>>(std::in_place,
+                                                               std::forward<F>(fn))]() mutable noexcept {
+                const GuardianDetachedWorkerRole role_marker; // first statement, see INVARIANTS
                 // Construct the result on the heap OUTSIDE the publish lock; this is
                 // the only potentially-throwing step (fn() itself, or the boxing
                 // allocation) and it is fully contained. A null box means even the
@@ -386,7 +496,7 @@ public:
                 std::unique_ptr<IoResult<T>> boxed;
                 bool threw = false;
                 try {
-                    boxed = std::make_unique<IoResult<T>>(fn());
+                    boxed = std::make_unique<IoResult<T>>((*fn)());
                 } catch (...) {
                     threw = true;
                     try {
@@ -411,7 +521,7 @@ public:
                         cell->result = std::move(boxed); // nothrow: unique_ptr pointer move
                         cell->done = true;
                         ticket->release_key_locked(); // free the single-flight key now;
-                                                       // the inflight counters stay held
+                                                       // the quota + alive counts stay held
                                                        // until this ticket's destructor
                                                        // runs (worker's own copy, at true
                                                        // OS-thread-exit time)
@@ -423,17 +533,17 @@ public:
                     // on_abandoned returns would be a new throwing call inside this
                     // noexcept lambda. TicketCore's own destructor (already a single
                     // unconditional acquisition, already runs at true worker-thread-
-                    // exit) frees the key together with the inflight counters
-                    // instead - no new lock acquisition on this, the ORDINARY
-                    // abandoned-publish path (the separate, rare cleanup-failure
-                    // sub-path below DOES take one more, to count the failure).
+                    // exit) frees the key together with the counters instead - no
+                    // new lock acquisition on this, the ORDINARY abandoned-publish
+                    // path (the separate, rare cleanup-failure sub-path below DOES
+                    // take one more, to count the failure).
                 }
                 st->cv.notify_all(); // after releasing the lock (unconditional,
                                      // matching the pre-existing idiom - harmless
                                      // for any other waiter sharing this cv)
                 if (was_abandoned && boxed && boxed->has_value()) {
                     try {
-                        on_abandoned(std::move(boxed->value()));
+                        (*on_abandoned)(std::move(boxed->value()));
                     } catch (...) {
                         try {
                             std::lock_guard<std::mutex> lk{st->mu};
@@ -442,7 +552,10 @@ public:
                         }
                     }
                 }
-                // `ticket` copy destroyed at worker scope end -> releases the counters
+                // Destroy the user callables inside the marked scope (R5.1).
+                on_abandoned.reset();
+                fn.reset();
+                // `ticket` copy destroyed at worker scope end -> releases the counts
                 // (and, on the abandoned branch, the key too - see above)
             };
 
@@ -505,10 +618,130 @@ public:
         return IoResult<T>{std::unexpect, IoFailure::Timeout};
     }
 
+    /// rung 9c R5.1 - the NON-WAITING dispatch form. Runs `fn()` on a detached
+    /// worker exactly like run(), with the same synchronous admission (Stopped /
+    /// AlreadyRunning / CapacityExhausted / CeilingExhausted / LaunchFailed returned
+    /// here, nothing launched, `on_complete` never invoked), but the caller does
+    /// NOT block: on success `on_complete(IoResult<T>&&)` fires exactly once on the
+    /// worker thread after fn() returns (WorkerThrew is delivered through it too).
+    /// The quota slot AND the single-flight key are released at fn() return, BEFORE
+    /// on_complete runs; the physical alive count is released only at OS-thread
+    /// exit. No deadline: see the INVARIANTS block for the contract in full (fires
+    /// after stop(), may fire before this returns, nested dispatch from the callback
+    /// is legal, a throwing callback is contained and counted). `T` must not be
+    /// void (same limitation as run(); `emplace(fn())` cannot express it).
+    template <class F, class OnComplete>
+    [[nodiscard]] IoResult<void> submit(IoClass cls, std::string key, F&& fn,
+                                        OnComplete&& on_complete) {
+        using T = std::decay_t<std::invoke_result_t<F&>>;
+        static_assert(!std::is_void_v<T>,
+                      "GuardianIoExecutor::submit(): fn must return a value (not void), same "
+                      "as run(); return a dummy int for a fire-and-forget body");
+        static_assert(std::is_invocable_v<std::decay_t<OnComplete>&, IoResult<T>&&>,
+                      "GuardianIoExecutor::submit(): on_complete must accept IoResult<T>&&");
+        const std::size_t ci = io_class_index(cls);
+
+        Ticket ticket; // function scope: armed under the lock; RAII rollback on unwind
+        try {
+            ticket = std::make_shared<TicketCore>(state_); // unarmed until admitted
+            auto st = state_;
+            // Build the worker BEFORE admission: every fallible preparation (the two
+            // decayed callable copies, the closure) has already happened by the time
+            // a slot is reserved, so an admitted operation is never later reported
+            // LaunchFailed because its own preparation threw. `ticket` is shared, so
+            // arming it under the lock below is visible to this closure's copy.
+            auto worker = [st, ticket, ci,
+                           on_complete = std::optional<std::decay_t<OnComplete>>(
+                               std::in_place, std::forward<OnComplete>(on_complete)),
+                           fn = std::optional<std::decay_t<F>>(std::in_place,
+                                                               std::forward<F>(fn))]() mutable noexcept {
+                const GuardianDetachedWorkerRole role_marker; // first statement, see INVARIANTS
+                // The result lives on THIS stack: no cross-thread publication, no box,
+                // no null-box case. A throwing fn() leaves `r` disengaged and the
+                // fallback emplace (an enum, nothrow) fills it.
+                std::optional<IoResult<T>> r;
+                bool threw = false;
+                try {
+                    r.emplace((*fn)());
+                } catch (...) {
+                    threw = true;
+                }
+                if (!r)
+                    r.emplace(std::unexpect, IoFailure::WorkerThrew);
+                // ONE lock acquisition = the worker's whole decision point: count, read
+                // `stopping` for completed_after_stop, release the quota slot and the
+                // single-flight key. on_complete then runs OFF the lock, so a refill it
+                // dispatches admits against an already-freed slot and key.
+                {
+                    std::lock_guard<std::mutex> lk{st->mu};
+                    if (threw)
+                        ++st->counters[ci].worker_exceptions;
+                    if (st->stopping)
+                        ++st->counters[ci].completed_after_stop;
+                    ticket->release_quota_locked(); // slot + key; alive stays until ~TicketCore
+                }
+                // No cv notify: nothing waits on quota (run() waiters wait on their
+                // own cell->done / stopping).
+                try {
+                    (*on_complete)(std::move(*r));
+                } catch (...) {
+                    try {
+                        std::lock_guard<std::mutex> lk{st->mu};
+                        ++st->counters[ci].completion_failures;
+                    } catch (...) {
+                    }
+                }
+                // Destroy the user callables inside the marked scope (R5.1).
+                on_complete.reset();
+                fn.reset();
+                // `ticket` copy destroyed at worker scope end (by the trampoline, after
+                // this lambda returns) -> physical alive decrement, the F3 moment.
+            };
+
+            {
+                std::unique_lock<std::mutex> lk{state_->mu};
+                if (const auto rejected = admit_locked(ci, key, ticket))
+                    return IoResult<void>{std::unexpect, *rejected};
+            }
+
+            bool launched = false;
+            if (!fail_launch_for_test_.load(std::memory_order_relaxed))
+                launched = io_detail::spawn_detached(std::move(worker));
+            if (!launched) {
+                {
+                    std::lock_guard<std::mutex> lk{state_->mu};
+                    ++state_->counters[ci].launch_failures;
+                }
+                return IoResult<void>{std::unexpect, IoFailure::LaunchFailed}; // ticket rolls back
+            }
+        } catch (...) {
+            // bad_alloc from the ticket / worker allocation, from set::insert, or from
+            // spawn_detached's payload. No lock is held at any throw site here, so a
+            // fresh acquisition is safe; the armed ticket's destructor rolls admission
+            // back on return.
+            try {
+                std::lock_guard<std::mutex> lk{state_->mu};
+                ++state_->counters[ci].launch_failures;
+            } catch (...) {
+            }
+            return IoResult<void>{std::unexpect, IoFailure::LaunchFailed};
+        }
+
+        // Success: drop the caller copy UNLOCKED. Unlike run() there is no caller-side
+        // decision left to serialize with the worker. If the worker already finished
+        // and dropped its copy, this reset runs the destructor here - the physical
+        // decrement lands LATE (after the worker returned), never early, which is
+        // safe for F3 and the ceiling.
+        ticket.reset();
+        return {};
+    }
+
     /// Wake every waiting submitter and reject new submissions. Idempotent,
     /// nonblocking; does NOT cancel the detached OS calls (they run to completion
-    /// or their own per-call timeout). Snapshots the per-class inflight count at
-    /// the first stop for telemetry.
+    /// or their own per-call timeout), and does NOT suppress a submit() worker's
+    /// on_complete (counted as completed_after_stop instead). Snapshots the
+    /// per-class PHYSICAL alive count at the first stop for telemetry (F3: OS
+    /// threads alive at stop; quota-held is meaningless once admission is closed).
     void stop() {
         {
             std::lock_guard<std::mutex> lk{state_->mu};
@@ -516,21 +749,30 @@ public:
                 state_->stopping = true;
                 for (std::size_t i = 0; i < kIoClassCount; ++i)
                     state_->active_at_shutdown[i] =
-                        static_cast<std::size_t>(state_->class_inflight[i] > 0
-                                                     ? state_->class_inflight[i]
+                        static_cast<std::size_t>(state_->alive_by_class[i] > 0
+                                                     ? state_->alive_by_class[i]
                                                      : 0);
             }
         }
         state_->cv.notify_all();
     }
 
+    /// PHYSICAL alive workers (OS thread not yet exited), the F3 orphan-grace count
+    /// (#4147). Includes a submit() worker still inside on_complete after its quota
+    /// was released. Never the quota-held count.
     [[nodiscard]] std::size_t active_worker_count() const {
         std::lock_guard<std::mutex> lk{state_->mu};
-        return static_cast<std::size_t>(state_->total_inflight);
+        return static_cast<std::size_t>(state_->alive_total);
     }
     [[nodiscard]] std::size_t active_worker_count(IoClass c) const {
         std::lock_guard<std::mutex> lk{state_->mu};
-        return static_cast<std::size_t>(state_->class_inflight[io_class_index(c)]);
+        return static_cast<std::size_t>(state_->alive_by_class[io_class_index(c)]);
+    }
+    /// rung 9c R5.1: the derived per-instance physical ceiling (kAliveCeilingFactor x
+    /// the clamped quota total).
+    [[nodiscard]] std::size_t alive_ceiling() const {
+        std::lock_guard<std::mutex> lk{state_->mu};
+        return static_cast<std::size_t>(state_->alive_ceiling);
     }
     [[nodiscard]] bool stopping() const {
         std::lock_guard<std::mutex> lk{state_->mu};
@@ -539,17 +781,22 @@ public:
     [[nodiscard]] Stats stats() const {
         std::lock_guard<std::mutex> lk{state_->mu};
         Stats s;
-        s.active_total = static_cast<std::size_t>(state_->total_inflight);
+        s.active_total = static_cast<std::size_t>(state_->alive_total);
         for (std::size_t i = 0; i < kIoClassCount; ++i)
-            s.active_by_class[i] = static_cast<std::size_t>(state_->class_inflight[i]);
+            s.active_by_class[i] = static_cast<std::size_t>(state_->alive_by_class[i]);
         s.active_at_shutdown = state_->active_at_shutdown;
+        s.quota_held_total = static_cast<std::size_t>(state_->quota_held_total);
+        for (std::size_t i = 0; i < kIoClassCount; ++i)
+            s.quota_held_by_class[i] = static_cast<std::size_t>(state_->quota_held_by_class[i]);
+        s.alive_ceiling = static_cast<std::size_t>(state_->alive_ceiling);
         s.counters = state_->counters;
         s.stopping = state_->stopping;
         return s;
     }
 
     /// Test seam: force the next launch to fail, exercising the LaunchFailed
-    /// rollback path without depending on real thread-resource exhaustion.
+    /// rollback path without depending on real thread-resource exhaustion. Gates
+    /// both run() and submit().
     void set_fail_launch_for_test(bool v) { fail_launch_for_test_.store(v); }
 
     /// Test seam (#3816/#saf3821-5): force every run() to throw immediately
@@ -558,6 +805,7 @@ public:
     /// state_->mu (a real std::mutex::lock() failure cannot be induced portably).
     /// Sticky until reset (same semantics as set_fail_launch_for_test above) - a
     /// test that sets this must reset it before any later run() on this instance.
+    /// run()-only by construction: submit() has no wait lock.
     void set_throw_before_wait_lock_for_test(bool v) {
         throw_before_wait_lock_for_test_.store(v);
     }
@@ -569,36 +817,52 @@ private:
         mutable std::mutex mu;
         std::condition_variable cv;
         bool stopping{false};
-        int total_inflight{0};                              // guarded by mu
-        std::array<int, kIoClassCount> class_inflight{};    // guarded by mu
-        std::set<std::pair<int, std::string>> active_keys;  // (classIdx, spark_key); guarded by mu
+        // PHYSICAL alive workers (F3): incremented at admission, decremented ONLY in
+        // ~TicketCore at OS-thread-exit time. What active_worker_count() reports.
+        int alive_total{0};                                   // guarded by mu
+        std::array<int, kIoClassCount> alive_by_class{};      // guarded by mu
+        // QUOTA-HELD slots (rung 9c R5.1): what admission checks against the quotas.
+        // run() frees these in ~TicketCore too; submit() frees them at fn() return.
+        int quota_held_total{0};                              // guarded by mu
+        std::array<int, kIoClassCount> quota_held_by_class{}; // guarded by mu
+        std::set<std::pair<int, std::string>> active_keys;    // (classIdx, spark_key); guarded by mu
         std::array<std::size_t, kIoClassCount> active_at_shutdown{};
         std::array<Counters, kIoClassCount> counters{};
-        std::array<int, kIoClassCount> class_quota{};       // immutable after ctor
-        int total_quota{0};                                 // immutable after ctor
+        std::array<int, kIoClassCount> class_quota{};         // immutable after ctor
+        int total_quota{0};                                   // immutable after ctor
+        int alive_ceiling{0};                                 // immutable after ctor (R5.1)
     };
 
-    /// RAII admission slot. Two DISTINCT release moments, deliberately not merged:
-    ///   - release_key_locked() frees only the single-flight KEY, called by the
+    /// RAII admission slot. THREE release moments, deliberately not merged:
+    ///   - release_key_locked() frees only the single-flight KEY, called by the run()
     ///     worker in its publish critical section, so a fast sequential re-read of
     ///     the same key is not spuriously single-flighted the instant the result is
     ///     visible to a waiting submitter.
-    ///   - the COUNTERS (total_inflight / class_inflight - what active_worker_count()
-    ///     reports) are freed ONLY in the destructor, i.e. when the LAST shared
-    ///     holder dies. The worker's own captured copy is that last holder, and it
-    ///     is destroyed by the trampoline AFTER the worker lambda body has fully
-    ///     returned (notify_all included) - i.e. at the latest point observable
-    ///     before the OS thread itself exits. This is load-bearing for the
-    ///     orphan-exit contract: active_worker_count() must not read 0 while any
-    ///     worker code can still execute in the process image, even the trivial
-    ///     capture-destruction tail after a result has published. Splitting the two
-    ///     lets the key-reuse fix and the orphan-count accuracy both hold - merging
-    ///     them (as an earlier revision did) made active_worker_count() reach 0
-    ///     while the worker's OS thread was still unwinding.
+    ///   - release_quota_locked() (rung 9c R5.1) frees the QUOTA slot and the key
+    ///     together, called by the submit() worker the moment fn() returns, before
+    ///     on_complete runs, so a refill dispatched from the callback is never
+    ///     starved by its own predecessor. `quota_released` flips under the same
+    ///     lock acquisition as the decrement and the destructor skips the quota
+    ///     decrement when it is set: the exactly-once handshake §7.7b item 5 asked
+    ///     for (a double-decrement would inflate the quota).
+    ///   - the PHYSICAL alive counts (alive_total / alive_by_class - what
+    ///     active_worker_count() reports) are freed ONLY in the destructor, i.e.
+    ///     when the LAST shared holder dies. The worker's own captured copy is that
+    ///     last holder, and it is destroyed by the trampoline AFTER the worker
+    ///     lambda body has fully returned (notify_all / on_complete included) -
+    ///     i.e. at the latest point observable before the OS thread itself exits.
+    ///     This is load-bearing for the orphan-exit contract: active_worker_count()
+    ///     must not read 0 while any worker code can still execute in the process
+    ///     image, even the trivial capture-destruction tail after a result has
+    ///     published. Splitting the moments lets the key-reuse fix, the refill
+    ///     guarantee and the orphan-count accuracy all hold - merging them (as an
+    ///     earlier revision did) made active_worker_count() reach 0 while the
+    ///     worker's OS thread was still unwinding.
     /// `armed` is false until admission succeeds, so a ticket destroyed before /
-    /// without admission is a no-op. A ticket destroyed WITHOUT release_key_locked()
+    /// without admission is a no-op. A ticket destroyed WITHOUT either release
     /// having run first (the rollback / never-launched / never-published paths)
-    /// still frees the key here - `key_released` guards against a double-erase.
+    /// still frees the key and the quota here - `key_released` / `quota_released`
+    /// guard against a double release.
     struct TicketCore {
         explicit TicketCore(std::shared_ptr<State> s) noexcept : state(std::move(s)) {}
         ~TicketCore() {
@@ -606,10 +870,17 @@ private:
                 return;
             {
                 std::lock_guard<std::mutex> lk{state->mu};
-                if (state->total_inflight > 0)
-                    --state->total_inflight;
-                if (state->class_inflight[ci] > 0)
-                    --state->class_inflight[ci];
+                if (!quota_released) {
+                    if (state->quota_held_total > 0)
+                        --state->quota_held_total;
+                    if (state->quota_held_by_class[ci] > 0)
+                        --state->quota_held_by_class[ci];
+                    quota_released = true;
+                }
+                if (state->alive_total > 0)
+                    --state->alive_total;
+                if (state->alive_by_class[ci] > 0)
+                    --state->alive_by_class[ci];
                 if (!key_released)
                     state->active_keys.erase(key_it); // nothrow: erase by valid iterator
             }
@@ -621,14 +892,27 @@ private:
             armed = true;
         }
         // Free ONLY the single-flight key; the CALLER must hold State::mu. Does NOT
-        // touch the inflight counters (see the class comment above) - a wedged
-        // worker never reaches this call (it never publishes), preserving the
-        // dead-target single-flight guard.
+        // touch the counts (see the class comment above) - a wedged run() worker
+        // never reaches this call (it never publishes), preserving the dead-target
+        // single-flight guard.
         void release_key_locked() noexcept {
             if (!armed || key_released)
                 return;
             state->active_keys.erase(key_it);
             key_released = true;
+        }
+        // rung 9c R5.1: free the QUOTA slot and the key; the CALLER must hold
+        // State::mu. Idempotent via `quota_released`; the alive counts stay held
+        // until the destructor.
+        void release_quota_locked() noexcept {
+            if (!armed || quota_released)
+                return;
+            if (state->quota_held_total > 0)
+                --state->quota_held_total;
+            if (state->quota_held_by_class[ci] > 0)
+                --state->quota_held_by_class[ci];
+            quota_released = true;
+            release_key_locked();
         }
         TicketCore(const TicketCore&) = delete;
         TicketCore& operator=(const TicketCore&) = delete;
@@ -638,10 +922,44 @@ private:
         std::set<std::pair<int, std::string>>::iterator key_it{};
         bool armed{false};
         bool key_released{false};
+        bool quota_released{false};
     };
     using Ticket = std::shared_ptr<TicketCore>;
 
-    /// Per-run result slot. `done` + `result` are written once by the worker under
+    /// Shared admission transaction for both dispatch forms; the CALLER holds
+    /// State::mu. Order: stopping -> single-flight key -> quota -> physical ceiling
+    /// (quota before ceiling so CeilingExhausted is only ever reported when quota
+    /// has room). set::insert is the ONLY throwing step and runs BEFORE the nothrow
+    /// count bumps, so a bad_alloc leaves State unmutated; the ticket is armed last.
+    /// On success `key` has been moved into the active set. Returns the rejection,
+    /// or nullopt when admitted.
+    [[nodiscard]] std::optional<IoFailure> admit_locked(std::size_t ci, std::string& key,
+                                                        const Ticket& ticket) {
+        if (state_->stopping)
+            return IoFailure::Stopped;
+        if (state_->active_keys.contains({static_cast<int>(ci), key})) {
+            ++state_->counters[ci].rejected_key;
+            return IoFailure::AlreadyRunning;
+        }
+        if (state_->quota_held_total >= state_->total_quota ||
+            state_->quota_held_by_class[ci] >= state_->class_quota[ci]) {
+            ++state_->counters[ci].rejected_capacity;
+            return IoFailure::CapacityExhausted;
+        }
+        if (state_->alive_total >= state_->alive_ceiling) {
+            ++state_->counters[ci].rejected_ceiling;
+            return IoFailure::CeilingExhausted;
+        }
+        auto it = state_->active_keys.insert({static_cast<int>(ci), std::move(key)}).first;
+        ++state_->quota_held_total;
+        ++state_->quota_held_by_class[ci];
+        ++state_->alive_total;
+        ++state_->alive_by_class[ci];
+        ticket->arm(ci, it);
+        return std::nullopt;
+    }
+
+    /// Per-run() result slot. `done` + `result` are written once by the worker under
     /// State::mu; the submitter reads them under the same lock. The result is held
     /// by unique_ptr so publication is an unconditional nothrow pointer move (a
     /// result type whose own move is potentially-throwing, e.g. MSVC's
@@ -651,7 +969,8 @@ private:
     /// Timeout/Stopped instead of consuming a result; read by the worker, under the
     /// SAME lock, to decide whether to publish or route to on_abandoned. A plain
     /// bool is sufficient - both writers/readers always hold State::mu, there is no
-    /// lock-free path to this cell.
+    /// lock-free path to this cell. submit() has no cell: its result never crosses
+    /// a thread boundary.
     template <class T>
     struct ResultCell {
         bool done{false};
@@ -683,5 +1002,12 @@ static_assert(GuardianIoExecutor::Config{}.file_quota
                       + GuardianIoExecutor::Config{}.service_quota
                   <= GuardianIoExecutor::kMaxProcessIoWorkers,
               "per-class I/O quotas oversubscribe kMaxProcessIoWorkers");
+// (3) rung 9c R5.1: the physical alive-worker ceiling must sit STRICTLY above the
+// quota total, or a full complement of callback-phase workers re-creates the exact
+// cross-class starvation R3 eliminated (§7.7b item 5).
+static_assert(GuardianIoExecutor::kAliveCeilingFactor >= 2,
+              "kAliveCeilingFactor must be >= 2 so the alive ceiling exceeds the quota sum");
+static_assert(GuardianIoExecutor::kMaxAliveIoWorkers > GuardianIoExecutor::kMaxProcessIoWorkers,
+              "kMaxAliveIoWorkers must be strictly greater than kMaxProcessIoWorkers");
 
 } // namespace yuzu::agent
