@@ -110,9 +110,9 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 9.7 | [#262](https://github.com/Tr3kkR/Yuzu/issues/262) | CSV / File Upload Connector | **Deferred** — see Phase 9 body note |
 | | 9.8 | [#263](https://github.com/Tr3kkR/Yuzu/issues/263) | Inventory Consolidation & Normalization | **Closed — not planned** (NOT_PLANNED, 2026-07-14) — no dedup/normalization code found, see body note |
 | **10** | 10.1 | [#264](https://github.com/Tr3kkR/Yuzu/issues/264) | Software Catalog Store | **Done** (NOT_PLANNED, 2026-07-14, delivered differently: ADR-0024 keeps the product registry permanently server-resident core, shipped as `ProductRegistryStore`) |
-| | 10.2 | [#265](https://github.com/Tr3kkR/Yuzu/issues/265) | Software Usage Tracking | **Closed — not planned** (NOT_PLANNED, 2026-07-14) — ADR-0024 places usage metering/reclamation in the UCE module (Decision D15); no agent usage-sync source exists in-server |
-| | 10.3 | [#266](https://github.com/Tr3kkR/Yuzu/issues/266) | License Entitlements & Compliance | **Closed — not planned** (NOT_PLANNED, 2026-07-14) — ADR-0024 places the entitlement plane in the UCE module (Decision D12); not built in-server |
-| | 10.4 | [#267](https://github.com/Tr3kkR/Yuzu/issues/267) | Software Tags | **Closed — not planned** (NOT_PLANNED, 2026-07-14) — no server-side software-tags code found |
+| | 10.2 | [#265](https://github.com/Tr3kkR/Yuzu/issues/265) | Software Usage Tracking | **Closed — not planned** (NOT_PLANNED, 2026-07-14) — ADR-0024 places usage metering/reclamation in the **SAM UCE module** (Decision D15, distinct from ADR-1005's vulnerability UCE); no agent usage-sync source exists in-server |
+| | 10.3 | [#266](https://github.com/Tr3kkR/Yuzu/issues/266) | License Entitlements & Compliance | **Closed — not planned** (NOT_PLANNED, 2026-07-14) — ADR-0024 places the entitlement plane in the **SAM UCE module** (Decision D12, distinct from ADR-1005's vulnerability UCE); not built in-server |
+| | 10.4 | [#267](https://github.com/Tr3kkR/Yuzu/issues/267) | Software Tags | **Closed — not planned** (NOT_PLANNED, 2026-07-14) — no server-side software-tags code found; NOT UCE-scoped (ADR-0024 Decision 15 keeps product tags core), just not yet built (tracked as a future `product_tags` migration, "PR4") |
 | **11** | 11.1 | [#268](https://github.com/Tr3kkR/Yuzu/issues/268) | Consumer Application Registration | **Closed — not planned** (NOT_PLANNED, 2026-07-14) — the auth/token substance was absorbed into ADR-1005 engine principals (`EnginePrincipalStore`, delivered); the push/consumer-deploy fanout this issue described was never built, see body note |
 | | 11.2 | [#269](https://github.com/Tr3kkR/Yuzu/issues/269) | Event Source Management | Open |
 | | 11.3 | [#270](https://github.com/Tr3kkR/Yuzu/issues/270) | PowerShell Module | Open |
@@ -188,7 +188,7 @@ Capability that shipped without being scheduled on this roadmap — each item is
 
 - **Postgres substrate program** (ADR-0006–0065) — server storage substrate migrated store-by-store from SQLite to PostgreSQL; only `server/core/src/nvd_db.cpp` remains SQLite (scheduled for deletion under ADR-1005 Phase 7).
 - **SCIM / SAML / OIDC identity linkage** (ADR-2001, `docs/adr/2001-scim-oidc-identity-linkage.md`).
-- **HA workstreams landed so far** (ADR-2002, as of dev @ `d295db964`) — WS-0 (agent command idempotency+replay), WS-1 (server-plane state → Postgres, milestones 1a/1b/1c), WS-7 (HA-Postgres Patroni+etcd+HAProxy compose profile), WS-2a (durable event outbox + #3924 cross-replica SSE delivery), and WS-10 10.1/10.2 (#4092, background-job replica-safety classification) are done; WS-3 slice 3.1 (#4011, fenced `LeaderElector` primitive) is done but inert (no loop wired). See `docs/ha-delivery-matrix.md`.
+- **HA workstreams landed so far** (ADR-2002, as of dev @ `d295db964` — verified by merge-commit ancestry, not `gh pr view` state) — WS-0 (agent command idempotency+replay), WS-1 (server-plane state → Postgres, milestones 1a/1b/1c), WS-7 (HA-Postgres Patroni+etcd+HAProxy compose profile), and WS-2a (durable event outbox + #3924 cross-replica SSE delivery, IS an ancestor of the pin) are done; WS-3 slice 3.1 (#4011, fenced `LeaderElector` primitive, IS an ancestor) is done but inert (no loop wired). **WS-10 (#4092) is NOT an ancestor of the pin** — merged 2026-09-07 12:58 UTC, ~1 hour after `d295db964`'s 11:01 UTC — so it stays open/not-done at this pin. See `docs/ha-delivery-matrix.md`.
 - **ADR-1005 engine principals + on-behalf guard** — `server/core/src/on_behalf_guard.hpp` (rejects on-behalf-of assertions on every ingress except the four health-probe paths).
 - **`/auto` pre-flight + deployment** — `server/core/src/preflight_routes.cpp`, `server/core/src/deployment_routes.cpp`.
 - **DEX / network quality / device pages** — `server/core/src/dex_routes.cpp`, `server/core/src/network_routes.cpp`, `server/core/src/device_routes.cpp`.
@@ -1172,16 +1172,23 @@ Multi-source inventory cleanup pipeline (never built):
 
 > **Superseded by ADR-0024 (2026-07-06, status: proposed).** This phase's design is superseded by
 > `docs/adr/0024-software-licensing-entitlements.md` ("Software Licensing &
-> Entitlements", capability §27 — renamed by the same ADR), which also re-scopes most of it: only
-> **licence discovery** (a new agent `license_scan` plugin on the ADR-0016 daily-sync framework) and
-> the **product registry** (the SQLite `CatalogStore` sketch becomes the born-on-Postgres
+> Entitlements", capability §27 — renamed by the same ADR). **Note the two use-case-engine (UCE)
+> modules in play across this roadmap are distinct** — ADR-1005 Phase 7 re-homes the **vulnerability
+> UCE** (NVD/CVE matching); ADR-0024 re-scopes part of its own design to a separate **SAM UCE**
+> (Software Asset Management) module. Neither is the other. Against that ADR: only **licence
+> discovery** (a new agent `license_scan` plugin on the ADR-0016 daily-sync framework) and the
+> **product registry** (the SQLite `CatalogStore` sketch becomes the born-on-Postgres
 > `ProductRegistryStore`) are built in-server. The **entitlement plane** (5 sources: manual, CSV, M365
-> connector, agent-observed FlexLM/KMS — Decisions D12/D14), **usage metering & reclamation**
-> (Decision D15), and **software tags** are re-scoped to the vulnerability/SAM use-case-engine (UCE)
-> module per ADR-1005 and are **not built in-server** — the 10.2–10.4 sketches below did not ship as
-> designed and their GitHub issues closed NOT_PLANNED, not delivered. REST is unified under
-> `/api/v1/sle/*` for what did ship. The issue breakdown is retained for traceability (10.1–10.4 ↔
-> #264–#267).
+> connector, agent-observed FlexLM/KMS — Decisions D12/D14) and **usage metering & reclamation**
+> (Decision D15) are re-scoped to the **SAM UCE module** and are **not built in-server** — 10.2/10.3
+> below did not ship as designed and their GitHub issues closed NOT_PLANNED, not delivered.
+> **Software tags are a separate case, not UCE-scoped**: ADR-0024 Decision 15 explicitly states
+> "product tags on `ProductRegistryStore` stay core" (`docs/adr/0024-software-licensing-entitlements.md:530`)
+> — the design keeps them **in-server**, but the implementation (a `product_tags` migration) hasn't
+> landed yet (`product_registry_store.cpp` marks it "PR4 — do NOT add it here"); 10.4/#267 closed
+> NOT_PLANNED because the issue's own REST-surface sketch wasn't built, not because tags were ruled
+> out of the server. REST is unified under `/api/v1/sle/*` for what did ship. The issue breakdown is
+> retained for traceability (10.1–10.4 ↔ #264–#267).
 
 ### Issue 10.1: Software Catalog Store
 **Capability:** new | **Scope:** Server | **Status:** **Done** (#264 closed NOT_PLANNED, 2026-07-14 — delivered differently: ADR-0024 keeps the product registry permanently server-resident core, shipped as `ProductRegistryStore`, see banner above)
@@ -1197,7 +1204,7 @@ Canonical software registry:
 **Files (as shipped):** `server/core/src/product_registry_store.{hpp,cpp}` — not the sketched `catalog_store.cpp`/`entitlement_store.cpp`, which don't exist.
 
 ### Issue 10.2: Software Usage Tracking
-**Capability:** new | **Scope:** Agent + Server | **Status:** **Closed — not planned** (#265 closed NOT_PLANNED, 2026-07-14) — **not delivered**: ADR-0024 places usage metering/reclamation in the UCE module (Decision D15, "usage joined with entitlement data for a reclamation purpose"); no `software_usage` agent plugin and no agent usage-sync source exist in-server (verified 2026-09-07)
+**Capability:** new | **Scope:** Agent + Server | **Status:** **Closed — not planned** (#265 closed NOT_PLANNED, 2026-07-14) — **not delivered**: ADR-0024 places usage metering/reclamation in the **SAM UCE module** (Decision D15, "usage joined with entitlement data for a reclamation purpose" — distinct from ADR-1005 Phase 7's *vulnerability* UCE); no `software_usage` agent plugin and no agent usage-sync source exist in-server (verified 2026-09-07)
 **Depends on:** 10.1
 
 Agent-side application usage metering (never built in-server):
@@ -1211,7 +1218,7 @@ Agent-side application usage metering (never built in-server):
 **Files:** New `agents/plugins/software_usage/`, `server/core/src/catalog_store.cpp` — neither exists.
 
 ### Issue 10.3: License Entitlements & Compliance
-**Capability:** new | **Scope:** Server | **Status:** **Closed — not planned** (#266 closed NOT_PLANNED, 2026-07-14) — **not delivered**: ADR-0024 places the entitlement plane (`SoftwareEntitlementStore`, Decision D12) in the UCE module; no `entitlement_store.cpp` or entitlement REST surface exists in-server (verified 2026-09-07)
+**Capability:** new | **Scope:** Server | **Status:** **Closed — not planned** (#266 closed NOT_PLANNED, 2026-07-14) — **not delivered**: ADR-0024 places the entitlement plane (`SoftwareEntitlementStore`, Decision D12) in the **SAM UCE module** (distinct from ADR-1005 Phase 7's *vulnerability* UCE); no `entitlement_store.cpp` or entitlement REST surface exists in-server (verified 2026-09-07)
 **Depends on:** 10.1
 
 License compliance calculation (never built in-server):
@@ -1224,16 +1231,16 @@ License compliance calculation (never built in-server):
 **Files:** New `server/core/src/entitlement_store.cpp`, `server/core/src/rest_api_v1.cpp` — the store doesn't exist.
 
 ### Issue 10.4: Software Tags
-**Capability:** new | **Scope:** Server | **Status:** **Closed — not planned** (#267 closed NOT_PLANNED, 2026-07-14) — **not delivered**: no server-side software-tags code found (verified 2026-09-07)
+**Capability:** new | **Scope:** Server | **Status:** **Closed — not planned** (#267 closed NOT_PLANNED, 2026-07-14) — **not delivered, but NOT UCE-scoped either**: ADR-0024 Decision 15 explicitly keeps "product tags on `ProductRegistryStore`" **core** (`docs/adr/0024-software-licensing-entitlements.md:530`); the gap is purely that the implementation hasn't landed — `product_registry_store.cpp:43` marks the `product_tags` migration "PR4 — do NOT add it here" (verified 2026-09-07)
 **Depends on:** 10.1
 
-Server-side tags on software catalog entries (never built):
+Server-side tags on software catalog entries (design decided core-scoped, implementation not yet built):
 - Tag software titles for categorization (e.g., "approved", "prohibited", "eval")
 - Used for Management Group rules ("devices with software tagged X")
 - REST: `GET/POST/DELETE /api/v1/catalog/software/{id}/tags`
 - Dashboard: tag management in catalog view
 
-**Files:** `server/core/src/catalog_store.cpp`, `server/core/src/management_group_store.cpp` — the catalog-tags surface doesn't exist; `management_group_store.cpp` exists but has no software-tag linkage.
+**Files:** `server/core/src/catalog_store.cpp`, `server/core/src/management_group_store.cpp` — the catalog-tags surface doesn't exist yet; `product_registry_store.cpp` is where it lands (per its own "PR4" comment) once built; `management_group_store.cpp` exists but has no software-tag linkage today.
 
 ---
 
@@ -1411,14 +1418,14 @@ New `app_control` plugin:
 **Files:** New `agents/plugins/app_control/`
 
 ### Issue 12.12: Inventory Replication (Delta Sync)
-**Capability:** 15.5 | **Scope:** Agent + Server | **Status:** Open
+**Capability:** 15.5 | **Scope:** Agent + Server | **Status:** **Done** (#283 closed NOT_PLANNED, 2026-07-14, delivered differently: ADR-0016's hash-skip conditional sync — the agent sends only a content hash, not the full payload, on steady state — `docs/adr/0016-agent-daily-sync-framework.md`, `agents/core/src/sync_scheduler.hpp`)
 
-Agent-side inventory cache with delta sync:
+Agent-side inventory cache with delta sync (original sketch — see the ADR-0016 evidence above for the as-shipped mechanism):
 - Agent-side: inventory cache in SQLite KV store, track hash of last-sent inventory per plugin
 - Server-side: track per-agent sync state (last_sync_at, inventory_hash)
 - Only send changed inventory since last sync, reducing bandwidth for large fleets
 
-**Files:** `agents/core/src/agent.cpp`, `server/core/src/inventory_store.cpp`
+**Files (as shipped):** `agents/core/src/sync_scheduler.{hpp,cpp}`, `server/core/src/device_inventory_store.cpp`, `server/core/src/software_inventory_store.cpp` — not the `agent.cpp`/`inventory_store.cpp` sketch below.
 
 ### Issue 12.13: Binary Resource Distribution
 **Capability:** 22.7 | **Scope:** Server | **Status:** Open
@@ -1568,7 +1575,7 @@ Extend the connector framework with additional integrations:
 ### Issue 14.6: High Availability
 **Capability:** new | **Scope:** Server | **Status:** Open (stale — **superseded by ADR-2002**, see body note)
 
-> **Superseded by ADR-2002 (High Availability Architecture).** The active-passive-over-shared-SQLite/NFS design sketched below is explicitly disavowed by the ADR itself as "pre-Postgres and now wrong." The current HA design targets **active-active** on the Postgres substrate (both self-managed on-prem and future SaaS), decomposed into workstreams WS-0…WS-14 tracked in `docs/ha-delivery-matrix.md`. **As of dev @ `d295db964` (2026-09-07):** WS-0, WS-1, WS-7, and **WS-2a (both 2a-1 and 2a-2, #3924 — cross-replica SSE delivery)** are done; **WS-3 slice 3.1** (fenced `LeaderElector` primitive, #4011) is done but inert — no loop wired yet, no runtime behaviour change; **WS-10** (background-job replica-safety classification, #4092) is done for 10.1/10.2, with 10.3 (fenced-leader-only *enforcement*) pending WS-3 3.2. The remaining workstreams (WS-2b, WS-3 3.2/3.3/3.4, WS-4, WS-5, WS-6, WS-8-readyz, WS-9, WS-11…WS-14) are not started. See "Delivered outside the roadmap" above and the Dependency Graph below.
+> **Superseded by ADR-2002 (High Availability Architecture).** The active-passive-over-shared-SQLite/NFS design sketched below is explicitly disavowed by the ADR itself as "pre-Postgres and now wrong." The current HA design targets **active-active** on the Postgres substrate (both self-managed on-prem and future SaaS), decomposed into workstreams WS-0…WS-14 tracked in `docs/ha-delivery-matrix.md`. **As of dev @ `d295db964` (2026-09-07, pinned 12:01 UTC+1 / 11:01 UTC)** — verified by `git merge-base --is-ancestor <merge-sha> d295db964`, not `gh pr view` state (a PR's current state can postdate the pin): WS-0, WS-1, WS-7, and **WS-2a (both 2a-1 and 2a-2, #3924 — cross-replica SSE delivery, merged 2026-09-03, IS an ancestor)** are done; **WS-3 slice 3.1** (fenced `LeaderElector` primitive, #4011, merged 2026-09-06, IS an ancestor) is done but inert — no loop wired yet, no runtime behaviour change. **WS-10 is NOT done at the pin** — #4092 (background-job replica-safety classification) merged 2026-09-07 **12:58 UTC**, roughly an hour *after* the pin, and is confirmed NOT an ancestor of `d295db964`; at the pin, WS-10 remains **PR #4092 open**, matching `docs/ha-delivery-matrix.md`'s own state at the pin (which also still records WS-2a-2 outstanding and WS-3 as merely "planned" — that file's own re-stamp commits landed on `dev` after this pin too; the roadmap follows verified PR-ancestry facts over the matrix file's stamp date, and the matrix will catch up on its own schedule). The remaining workstreams (WS-2b, WS-3 3.2/3.3/3.4, WS-4, WS-5, WS-6, WS-8-readyz, WS-9, WS-10, WS-11…WS-14) are not started at the pin. See "Delivered outside the roadmap" above and the Dependency Graph below.
 
 <details><summary>Original active-passive design (superseded — kept for history)</summary>
 
@@ -1632,7 +1639,7 @@ Relocate the existing `/fragments/tar-sql` route onto the TAR dashboard page. Wi
 **Files:** `server/core/src/definition_store.cpp`, `server/core/src/policy_store.cpp`, `docs/yaml-dsl-spec.md`. Design: `docs/scope-walking-design.md` §7.
 
 ### Issue 15.F: Reference Walkthrough — Chrome IR End-to-End Integration Test
-**Capability:** new (regression net) | **Scope:** Tests | **Status:** **In progress** (`feat/tar-15f-chrome-ir-e2e`, 2026-07-01)
+**Capability:** new (regression net) | **Scope:** Tests | **Status:** **Done** (#552 closed NOT_PLANNED, 2026-07-14, delivered differently — see "As built" below)
 **Depends on:** 15.B, 15.C, 15.D, 15.E
 
 Drives the §10 walkthrough (inventory-ground → TAR-query narrow → instruction-result narrow → pin) and asserts: the lineage chain is complete (`GET /{id}/lineage` reconstructs root→leaf); the audit trail is complete (one `result_set.create` per step + the pin); pinning prevents mid-incident GC (a pinned set survives `gc_sweep()` and cannot be deleted until unpinned); and the chain tears down cleanly.
@@ -1915,14 +1922,20 @@ Phase 9 (Connector Framework) — DEFERRED, see Phase 9 body banner
   ├── 9.1 Connector Core ──────── independent (new subsystem) — not started
   ├── 9.2 Repository Model ────── requires 9.1 — not started
   ├── 9.3–9.7 Connectors ─────── require 9.1 (all independent of each other) — not started
-  └── 9.8 Consolidation ──────── requires 9.2 — DONE, shipped independently as `software_catalog_rollup.cpp`
-                                    (part of the ADR-0024 SLE program below, not the deferred 9.1–9.7 stack)
+  └── 9.8 Consolidation ──────── requires 9.2 — CLOSED — NOT PLANNED (#263, no delivery): no dedup/
+                                    normalization code exists; `software_catalog_rollup.{hpp,cpp}` is a
+                                    separate, narrower rollup that does not substitute for this scope
 
-Phase 10 (Software Catalog) — DONE, shipped as ADR-0024 "Software Licensing & Entitlements" (SLE)
-  ├── 10.1 Catalog Store ──────── shipped as `ProductRegistryStore` (born-on-Postgres)
-  ├── 10.2 Usage Tracking ─────── shipped opt-in/machine-scope (not on-by-default)
-  ├── 10.3 Entitlements ───────── shipped as the 5-source entitlement plane
-  └── 10.4 Software Tags ─────── shipped
+Phase 10 (Software Catalog) — PARTIALLY DONE under ADR-0024 "Software Licensing & Entitlements" (SLE);
+  NOT fully shipped — only 10.1 delivered in-server, 10.2–10.4 closed NOT_PLANNED with no delivery
+  ├── 10.1 Catalog Store ──────── DONE — shipped as `ProductRegistryStore` (born-on-Postgres)
+  ├── 10.2 Usage Tracking ─────── CLOSED — NOT PLANNED (#265, no delivery): ADR-0024 re-scopes this to
+  │                                 the SAM UCE module (Decision D15); no in-server usage-sync source
+  ├── 10.3 Entitlements ───────── CLOSED — NOT PLANNED (#266, no delivery): ADR-0024 re-scopes this to
+  │                                 the SAM UCE module (Decision D12); no in-server entitlement store
+  └── 10.4 Software Tags ──────── CLOSED — NOT PLANNED (#267, no delivery) — NOT UCE-scoped: ADR-0024
+                                    Decision 15 keeps product tags core, just not yet built (tracked as
+                                    a future `product_tags` migration)
 
 Phase 11 (Consumer Model)
   ├── 11.1 Consumer Registration ── independent
@@ -1962,9 +1975,13 @@ Postgres substrate migration (ADR-0006, ADR-0007, ADR-0008, ADR-0010, ADR-0012, 
   └── DONE — server storage substrate is PostgreSQL; only `server/core/src/nvd_db.cpp` remains SQLite,
       scheduled for deletion under ADR-1005 Phase 7 (below)
 
-Software Licensing & Entitlements (ADR-0024) — supersedes the Phase 10 sketch above
-  └── DONE — `ProductRegistryStore` + 5-source entitlement plane; Phase 10's #264–267 shipped under
-      this design, not the SQLite `CatalogStore` originally sketched
+Software Licensing & Entitlements (ADR-0024, status: proposed) — supersedes the Phase 10 sketch above;
+  spans TWO placements, not one — see the Phase 9/10 block above for the per-issue breakdown
+  ├── In-server (DONE): `ProductRegistryStore` (#264/10.1) — the SQLite `CatalogStore` sketch's
+  │     replacement; product tags (10.4/#267) are core-scoped by Decision 15 but not yet built
+  └── Re-scoped to the **SAM UCE module** (NOT built in-server, #265/10.2 + #266/10.3 closed
+        NOT_PLANNED with no delivery): the 5-source entitlement plane (D12) and usage metering/
+        reclamation (D15) — distinct from ADR-1005 Phase 7's *vulnerability* UCE below
 
 Phase 15 (TAR Dashboard & Scope Walking) — DONE, all 8 issues (15.A–15.H) shipped
   └── requires ResponseStore (Phase 1.1), ScopeEngine (Phase 1.6), TAR plugin (Phase 7.19)
@@ -1991,14 +2008,18 @@ Phase 9 (Connector Framework) ── DEMOTED, NOT a dependent of ADR-1005 Phase 
   (see Phase 9 body banner)
 
 High Availability (ADR-2002, `docs/ha-delivery-matrix.md`) — supersedes Phase 14.6 above
-  [as of dev @ `d295db964`, 2026-09-07 — re-check `docs/ha-delivery-matrix.md` before acting on any
-   "not started" claim below; PR/workstream state moves within hours]
+  [as of dev @ `d295db964`, 2026-09-07, 11:01 UTC — every claim below is merge-commit-ancestry-verified
+   (`git merge-base --is-ancestor <merge-sha> d295db964`), NOT `gh pr view` current state, which can
+   postdate the pin; re-check before acting — PR/workstream state moves within hours]
   ├── Phase A (WS-0, WS-1, WS-2a, WS-7, WS-10) ── WS-0/WS-1/WS-7 DONE; WS-2a DONE (2a-1 + 2a-2,
-  │                                                 #3924 cross-replica SSE delivery); WS-10 DONE for
-  │                                                 10.1/10.2 (#4092), 10.3 enforcement pending WS-3 3.2
+  │                                                 #3924 merged 2026-09-03, IS an ancestor); WS-10 NOT
+  │                                                 DONE at the pin — #4092 merged 2026-09-07 12:58 UTC,
+  │                                                 ~1h AFTER the pin, confirmed NOT an ancestor; stays
+  │                                                 PR #4092 open / not started here
   ├── Phase B (WS-3..WS-6, WS-8-readyz, WS-13) ── ALL required before a 2nd server replica; mostly not
   │                                                 started, EXCEPT WS-3 slice 3.1 (fenced `LeaderElector`
-  │                                                 primitive, #4011) — done but INERT, no loop wired yet
+  │                                                 primitive, #4011 merged 2026-09-06, IS an ancestor)
+  │                                                 — done but INERT, no loop wired yet
   └── Phase C (enable/validate/operate: WS-9, WS-11, WS-12, WS-14) ── not started
 
 Route-sink refactor (#2542) — cross-cutting, ongoing
@@ -2025,13 +2046,22 @@ before acting on any "open" / "in progress" claim:
    into the vulnerability-management use-case engine module; deletes `server/core/src/nvd_db.cpp`,
    the **last server-side SQLite store** — closing out the Postgres substrate migration. See
    `docs/adr-1005-execution-plan.md` Phase 7. (No dependency on Phase 9 — see Phase 9's own entry.)
-2. **High Availability (ADR-2002).** As of dev @ `d295db964`: Phase A done (WS-0/WS-1/WS-7/WS-2a
-   — both 2a-1 and 2a-2, #3924 merged; WS-10 10.1/10.2 done, #4092 merged); WS-2b outstanding. Phase B
-   has one early slice landed — WS-3 3.1 (fenced `LeaderElector` primitive, #4011 merged) is done but
-   **inert** (no loop wired, no runtime change) — the rest of Phase B (WS-3 3.2/3.3/3.4, WS-4, WS-5,
-   WS-6, WS-8-readyz, WS-13) plus WS-10's 10.3 enforcement (needs WS-3 3.2) remain the gate for a 2nd
-   server replica. See `docs/ha-delivery-matrix.md`; re-verify PR states before acting — they moved
-   twice in the 24 hours around this pin (#3924, #4011, #4092 all merged 2026-09-03 → 2026-09-07).
+2. **High Availability (ADR-2002).** As of dev @ `d295db964` (11:01 UTC) — verified by merge-commit
+   ancestry (`git merge-base --is-ancestor`), not `gh pr view` state: Phase A partly done — WS-0/WS-1/
+   WS-7/WS-2a (both 2a-1 and 2a-2, #3924 merged 2026-09-03, IS an ancestor) are done; **WS-10 is NOT
+   done at the pin** — #4092 merged 2026-09-07 12:58 UTC, ~1h *after* the pin, confirmed NOT an
+   ancestor, so WS-10 stays PR #4092 open here. Phase B has one early slice landed — WS-3 3.1 (fenced
+   `LeaderElector` primitive, #4011 merged 2026-09-06, IS an ancestor) is done but **inert** (no loop
+   wired, no runtime change) — the rest of Phase B (WS-3 3.2/3.3/3.4, WS-4, WS-5, WS-6, WS-8-readyz,
+   WS-13) plus all of WS-10 remain the gate for a 2nd server replica. `docs/ha-delivery-matrix.md` at
+   the pin agrees (WS-2a-2 outstanding / WS-3 planned / WS-10 planned there too) — the matrix's own
+   re-stamp for WS-2a-2 and WS-3 together (`a38fe5dac`) landed on `dev` 2026-09-06 19:14 UTC+1, and
+   WS-10's docs update ships inside PR #4092 itself (merged 2026-09-07 12:58 UTC) — both **after**
+   this pin, so the matrix and this roadmap should converge once `dev` moves past them; the roadmap
+   here follows verified ancestry, not the matrix file's stamp date or `gh pr view`'s live state. See
+   `docs/ha-delivery-matrix.md`; re-verify before acting — this cluster of PRs merged within a 4-day
+   window straddling the pin (#3924 2026-09-03, #4011 2026-09-06, #4092 2026-09-07 12:58 — the pin
+   itself is 2026-09-07 11:01, between #4011 and #4092).
 3. **Guardian hardening (Phase 16).** 16.A Windows-first soak continues (Spark engine, BaselineStore,
    `/guaranteed-state` UI — 59 merged guardian PRs); 16.B Linux delivery has already started
    (`guard_systemd.cpp`) ahead of the stated 16.A-soak gate — **sequencing decision pending (PO)**:
