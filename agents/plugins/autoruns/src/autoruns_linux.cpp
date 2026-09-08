@@ -168,6 +168,8 @@ struct DirListing {
     bool absent = false;
     bool permission_denied = false;
     std::string other_token; // non-empty for any other opendir() failure
+    bool truncated = false;  // cap hit AND a real entry remained unread (AC4: a
+                             // capped listing is not a complete one)
 };
 
 DirListing list_dir(const std::string& path, std::size_t cap = kMaxDirEntries) {
@@ -190,7 +192,16 @@ DirListing list_dir(const std::string& path, std::size_t cap = kMaxDirEntries) {
     while (struct dirent* ent = ::readdir(d)) {
         std::string_view name{ent->d_name};
         if (name == "." || name == "..") continue;
-        if (out.names.size() >= cap) break; // silently capped -- defensive bound only
+        if (out.names.size() >= cap) {
+            // Probe one more real entry before declaring truncation -- a
+            // directory with exactly `cap` entries is not truncated.
+            do {
+                ent = ::readdir(d);
+            } while (ent != nullptr && (std::string_view{ent->d_name} == "." ||
+                                        std::string_view{ent->d_name} == ".."));
+            out.truncated = ent != nullptr;
+            break;
+        }
         out.names.emplace_back(name);
     }
     return out;
@@ -318,6 +329,7 @@ SystemdPresence check_systemd_presence() {
 struct TimerScan {
     std::vector<Row> rows;
     bool any_dir_readable = false;
+    bool any_truncated = false; // a scanned dir hit its entry cap (AC4: row_cap)
 };
 
 void scan_systemd_timer_dir(const std::string& dir, Scope scope, const std::string& user,
@@ -325,6 +337,7 @@ void scan_systemd_timer_dir(const std::string& dir, Scope scope, const std::stri
     auto listing = list_dir(dir);
     if (!listing.opened) return; // absent / permission_denied / other -- not readable
     out.any_dir_readable = true;
+    if (listing.truncated) out.any_truncated = true;
     for (const auto& name : listing.names) {
         if (name.size() < 7 || name.compare(name.size() - 6, 6, ".timer") != 0) continue;
         std::string full = dir + "/" + name;
@@ -482,7 +495,9 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                     ++n;
                 }
             }
-            ctx.write_output(format_source_status(id, YUZU_SUPPORT_SUPPORTED, n, "-"));
+            ctx.write_output(format_source_status(
+                id, listing.truncated ? YUZU_SUPPORT_CONSTRAINED : YUZU_SUPPORT_SUPPORTED, n,
+                listing.truncated ? "row_cap" : "-"));
         }
     }
 
@@ -492,6 +507,7 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
         std::size_t n = 0;
         bool any_dir_readable = false;
         bool any_permission_denied = false;
+        bool any_truncated = false;
         for (const char* leaf : {"hourly", "daily", "weekly", "monthly"}) {
             std::string dir = std::string{"/etc/cron."} + leaf;
             auto listing = list_dir(dir);
@@ -500,6 +516,7 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                 continue;
             }
             any_dir_readable = true;
+            if (listing.truncated) any_truncated = true;
             for (const auto& name : listing.names) {
                 if (!run_parts_valid_name(name)) continue;
                 std::string full = dir + "/" + name;
@@ -524,10 +541,16 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
         if (any_dir_readable) {
             // A permission-denied on a SIBLING cron.{hourly,...} directory
             // must not be silently absorbed into an unqualified "-" reason
-            // just because at least one of the four was readable.
+            // just because at least one of the four was readable -- but a
+            // capped (row_cap) directory always escalates to CONSTRAINED,
+            // matching the row_cap contract used everywhere else in this
+            // codebase (a capped listing is not a complete one, AC4).
+            std::string reason;
+            if (any_permission_denied) reason = "partial_permission_denied";
+            if (any_truncated) reason += (reason.empty() ? "" : ",") + std::string{"row_cap"};
             ctx.write_output(format_source_status(
-                id, YUZU_SUPPORT_SUPPORTED, n,
-                any_permission_denied ? "partial_permission_denied" : "-"));
+                id, any_truncated ? YUZU_SUPPORT_CONSTRAINED : YUZU_SUPPORT_SUPPORTED, n,
+                reason.empty() ? "-" : reason));
         } else if (any_permission_denied) {
             ctx.write_output(format_source_status(id, YUZU_SUPPORT_CONSTRAINED, std::size_t{0},
                                                   "permission_denied"));
@@ -543,6 +566,7 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
         bool any_dir_readable = false;
         bool any_permission_denied = false;
         bool any_file_permission_denied = false;
+        bool any_truncated = false;
         for (const char* dir : {"/var/spool/cron/crontabs", "/var/spool/cron"}) {
             auto listing = list_dir(dir);
             if (!listing.opened) {
@@ -550,6 +574,7 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                 continue;
             }
             any_dir_readable = true;
+            if (listing.truncated) any_truncated = true;
             for (const auto& name : listing.names) {
                 std::string full = std::string{dir} + "/" + name;
                 struct stat st{};
@@ -583,15 +608,21 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
             // A denial on a sibling directory or file must not be silently
             // absorbed into an unqualified "-" just because SOME rows were
             // captured -- see lnx_cron_periodic's identical treatment above.
+            // A capped directory always escalates to CONSTRAINED (row_cap
+            // contract, AC4).
+            std::string reason;
+            if (any_permission_denied || any_file_permission_denied) reason = "partial_permission_denied";
+            if (any_truncated) reason += (reason.empty() ? "" : ",") + std::string{"row_cap"};
             ctx.write_output(format_source_status(
-                id, YUZU_SUPPORT_SUPPORTED, n,
-                (any_permission_denied || any_file_permission_denied) ? "partial_permission_denied"
-                                                                       : "-"));
+                id, any_truncated ? YUZU_SUPPORT_CONSTRAINED : YUZU_SUPPORT_SUPPORTED, n,
+                reason.empty() ? "-" : reason));
         } else if (any_permission_denied || any_file_permission_denied) {
             ctx.write_output(format_source_status(id, YUZU_SUPPORT_CONSTRAINED, std::size_t{0},
                                                   "permission_denied"));
         } else if (any_dir_readable) {
-            ctx.write_output(format_source_status(id, YUZU_SUPPORT_SUPPORTED, std::size_t{0}, "-"));
+            ctx.write_output(format_source_status(
+                id, any_truncated ? YUZU_SUPPORT_CONSTRAINED : YUZU_SUPPORT_SUPPORTED, std::size_t{0},
+                any_truncated ? "row_cap" : "-"));
         } else {
             ctx.write_output(format_source_status(id, YUZU_SUPPORT_SUPPORTED, std::size_t{0}, "absent"));
         }
@@ -678,15 +709,21 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                 ctx.write_output(format_row(row));
                 ++n;
             }
-            if (n > 0)
+            if (n > 0) {
+                std::string reason;
+                if (any_permission_denied) reason = "partial_permission_denied";
+                if (listing.truncated) reason += (reason.empty() ? "" : ",") + std::string{"row_cap"};
                 ctx.write_output(format_source_status(
-                    id, YUZU_SUPPORT_SUPPORTED, n,
-                    any_permission_denied ? "partial_permission_denied" : "-"));
-            else if (any_permission_denied)
+                    id, listing.truncated ? YUZU_SUPPORT_CONSTRAINED : YUZU_SUPPORT_SUPPORTED, n,
+                    reason.empty() ? "-" : reason));
+            } else if (any_permission_denied) {
                 ctx.write_output(format_source_status(id, YUZU_SUPPORT_CONSTRAINED, std::size_t{0},
                                                       "permission_denied"));
-            else
-                ctx.write_output(format_source_status(id, YUZU_SUPPORT_SUPPORTED, std::size_t{0}, "-"));
+            } else {
+                ctx.write_output(format_source_status(
+                    id, listing.truncated ? YUZU_SUPPORT_CONSTRAINED : YUZU_SUPPORT_SUPPORTED,
+                    std::size_t{0}, listing.truncated ? "row_cap" : "-"));
+            }
         }
     }
 
@@ -720,8 +757,10 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                 }
                 if (scan.any_dir_readable) {
                     for (const auto& row : scan.rows) ctx.write_output(format_row(row));
-                    ctx.write_output(format_source_status(SourceId::lnx_systemd_timers_system,
-                                                          YUZU_SUPPORT_SUPPORTED, scan.rows.size(), "-"));
+                    ctx.write_output(format_source_status(
+                        SourceId::lnx_systemd_timers_system,
+                        scan.any_truncated ? YUZU_SUPPORT_CONSTRAINED : YUZU_SUPPORT_SUPPORTED,
+                        scan.rows.size(), scan.any_truncated ? "row_cap" : "-"));
                 } else {
                     // Rung-2 fallback -- autoruns/collect_linux#1 (docs/wave7/
                     // integration-autoruns-linux.md). ONLY reached when none
@@ -757,6 +796,7 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
             if (want_user_timers) {
                 TimerScan scan;
                 auto home_listing = list_dir("/home");
+                if (home_listing.truncated) scan.any_truncated = true;
                 if (home_listing.opened) {
                     for (const auto& user : home_listing.names) {
                         std::string dir = "/home/" + user + "/.config/systemd/user";
@@ -767,8 +807,10 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                                        owner_uid_string("/root/.config/systemd/user"), scan);
                 for (const auto& row : scan.rows) ctx.write_output(format_row(row));
                 if (scan.any_dir_readable || home_listing.opened) {
-                    ctx.write_output(format_source_status(SourceId::lnx_systemd_timers_user,
-                                                          YUZU_SUPPORT_SUPPORTED, scan.rows.size(), "-"));
+                    ctx.write_output(format_source_status(
+                        SourceId::lnx_systemd_timers_user,
+                        scan.any_truncated ? YUZU_SUPPORT_CONSTRAINED : YUZU_SUPPORT_SUPPORTED,
+                        scan.rows.size(), scan.any_truncated ? "row_cap" : "-"));
                 } else if (home_listing.permission_denied) {
                     ctx.write_output(format_source_status(SourceId::lnx_systemd_timers_user,
                                                           YUZU_SUPPORT_CONSTRAINED, std::size_t{0},
@@ -815,7 +857,9 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                 ctx.write_output(format_row(row));
                 ++n;
             }
-            ctx.write_output(format_source_status(id, YUZU_SUPPORT_SUPPORTED, n, "-"));
+            ctx.write_output(format_source_status(
+                id, listing.truncated ? YUZU_SUPPORT_CONSTRAINED : YUZU_SUPPORT_SUPPORTED, n,
+                listing.truncated ? "row_cap" : "-"));
         }
     }
 
@@ -824,11 +868,13 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
         const SourceId id = SourceId::lnx_xdg_autostart_user;
         auto home_listing = list_dir("/home");
         std::size_t n = 0;
+        bool any_truncated = home_listing.truncated;
         if (home_listing.opened) {
             for (const auto& user : home_listing.names) {
                 std::string dir = "/home/" + user + "/.config/autostart";
                 auto listing = list_dir(dir);
                 if (!listing.opened) continue; // most users have none -- not an error
+                if (listing.truncated) any_truncated = true;
                 const std::string uid = owner_uid_string(dir);
                 for (const auto& name : listing.names) {
                     constexpr std::string_view kSuffix = ".desktop";
@@ -854,7 +900,9 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                     ++n;
                 }
             }
-            ctx.write_output(format_source_status(id, YUZU_SUPPORT_SUPPORTED, n, "-"));
+            ctx.write_output(format_source_status(
+                id, any_truncated ? YUZU_SUPPORT_CONSTRAINED : YUZU_SUPPORT_SUPPORTED, n,
+                any_truncated ? "row_cap" : "-"));
         } else if (home_listing.permission_denied) {
             ctx.write_output(format_source_status(id, YUZU_SUPPORT_CONSTRAINED, std::size_t{0},
                                                   "permission_denied"));
@@ -864,12 +912,25 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
     }
 
     // ── /etc/rc.local (row only when present AND executable) ────────────
+    // A bounded, symlink-refusing read reuses the same errno classification
+    // every other required-ish file in this leg uses (classify_read_error),
+    // so ENOENT -> supported/absent, a real read error (permission denied,
+    // a refused symlink, a non-regular leaf) -> constrained/<reason>, and a
+    // present-but-non-executable file is its own honest zero-row case --
+    // never all four collapsed into the same unsupported|absent line
+    // (which contradicted the catalog's own YUZU_SUPPORT_SUPPORTED
+    // declaration for this source, and the spec's own worked example of
+    // an absent /etc/rc.local as supported|0|absent).
     if (source_wanted(filter, SourceId::lnx_rc_local)) {
         const SourceId id = SourceId::lnx_rc_local;
-        struct stat st{};
-        const bool exists = ::stat("/etc/rc.local", &st) == 0;
-        const bool executable = exists && ::access("/etc/rc.local", X_OK) == 0 && S_ISREG(st.st_mode);
-        if (executable) {
+        auto content = read_file_bounded("/etc/rc.local");
+        if (!content) {
+            auto cls = classify_read_error(content.error(), /*required_by_catalog=*/false);
+            ctx.write_output(format_source_status(id, cls.support, std::size_t{0}, cls.reason));
+        } else if (::access("/etc/rc.local", X_OK) != 0) {
+            ctx.write_output(
+                format_source_status(id, YUZU_SUPPORT_SUPPORTED, std::size_t{0}, "not_executable"));
+        } else {
             Row row;
             row.source_id = id;
             row.catalog_version = kAutorunSourceCatalogVersion;
@@ -880,11 +941,9 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
             row.scope = Scope::system;
             row.user = "-";
             row.signed_state = Signed::not_checked;
-            row.mtime = static_cast<std::int64_t>(st.st_mtime);
+            row.mtime = mtime_of("/etc/rc.local");
             ctx.write_output(format_row(row));
             ctx.write_output(format_source_status(id, YUZU_SUPPORT_SUPPORTED, std::size_t{1}, "-"));
-        } else {
-            ctx.write_output(format_source_status(id, YUZU_SUPPORT_UNSUPPORTED, std::size_t{0}, "absent"));
         }
     }
 
@@ -916,7 +975,9 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                 ctx.write_output(format_row(row));
                 ++n;
             }
-            ctx.write_output(format_source_status(id, YUZU_SUPPORT_CONSTRAINED, n, "listing_only"));
+            ctx.write_output(format_source_status(
+                id, YUZU_SUPPORT_CONSTRAINED, n,
+                listing.truncated ? "listing_only,row_cap" : "listing_only"));
         }
     }
 

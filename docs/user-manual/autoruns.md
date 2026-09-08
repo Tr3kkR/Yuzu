@@ -156,7 +156,7 @@ source|lnx_systemd_timers_system|unsupported|0|no_systemd
 source|lnx_systemd_timers_user|unsupported|0|no_systemd
 source|lnx_xdg_autostart_system|supported|0|absent
 source|lnx_xdg_autostart_user|supported|0|-
-source|lnx_rc_local|unsupported|0|absent
+source|lnx_rc_local|supported|0|absent
 source|lnx_init_d|constrained|1|listing_only
 ```
 
