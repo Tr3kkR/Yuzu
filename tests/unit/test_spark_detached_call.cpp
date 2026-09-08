@@ -405,3 +405,69 @@ TEST_CASE("spark_deadline_below_guardian_backend_op: tripwire matches the mirror
     CHECK_FALSE(spark_deadline_below_guardian_backend_op(std::chrono::milliseconds(5000)));
     CHECK_FALSE(spark_deadline_below_guardian_backend_op(std::chrono::milliseconds(5001)));
 }
+
+// ── F3 regression: the counter survives its OWNING OBJECT's destruction
+//    while a worker is still parked (agent.cpp accounting) ─────────────────
+//
+// This is the direct regression test for the round-3 F3 finding (plan's "F3
+// orphan-exit accounting — Route A (corrected)" section): Astra found that
+// summing F3 through GuardianEngine's wired SparkEngine pointer (an earlier
+// "Route B" design) misses a detached worker in the window between the
+// worker's own launch and whatever later, separate step wires or frees
+// that pointer — agent.cpp's real spark boot block resets spark_engine_ on
+// an exception AFTER a mechanism (and thus a lane) may already have spawned
+// workers. Route A's fix is a counter that is summed directly in AgentImpl
+// (agent.cpp's guardian_active_io_workers(), verified by compile + code
+// inspection in this session — not exercised by a source-grepping test or
+// a new test seam on the exported Agent interface, deliberately, per the
+// same "don't test the mechanism, test the property" spirit as the rest of
+// this file) and is NEVER read through spark_engine_/spark_boot_done_.
+//
+// PR-A has no real mechanism yet to reproduce agent.cpp's exact
+// SparkEngine→mechanism→lane ownership chain (that is PR-B's job) — this
+// test reproduces the SHAPE of the hazard directly against the primitive
+// itself: construct a lane with a shared F3 counter (standing in for
+// agent.cpp's spark_detached_workers_, which a real mechanism's
+// SparkDetachedLane will be constructed with in PR-B), launch a gated
+// (still in-flight) worker, then destroy the LANE OBJECT ITSELF — standing
+// in for a mechanism, and thus SparkEngine, being torn down (agent.cpp's
+// exception-reset path resets spark_engine_ while a mechanism's own
+// threads may still be running) — while the worker is still parked. The
+// counter must stay nonzero throughout, readable via the SAME independent
+// shared_ptr<atomic<size_t>> the whole time, without going through
+// anything the destroyed lane owned.
+TEST_CASE("F3: the shared counter survives its lane's destruction while a worker is still "
+          "parked — the exact shape of agent.cpp's SparkEngine-exception-reset hazard",
+          "[spark][detachedcall][f3]") {
+    auto f3 = std::make_shared<std::atomic<std::size_t>>(0);
+    Gate gate;
+
+    {
+        SparkDetachedLane lane(f3, /*cap=*/4);
+        auto res = lane.launch([&gate]() -> int {
+            gate.wait();
+            return 1;
+        });
+        REQUIRE(res.status == DetachedLaunch::Launched);
+        CHECK(f3->load() == 1);
+        [[maybe_unused]] auto call = std::move(*res.call); // drop the handle too — the
+                                                            // hazard is about the WORKER
+                                                            // staying counted, not about
+                                                            // any owner-side handle
+        // `lane` (and `call`) go out of scope HERE — the worker is still
+        // gated/in-flight. This is the moment agent.cpp's exception-reset
+        // path (spark_engine_.reset() in the boot block's catch clauses)
+        // stands in for: whatever owned the lane is gone, but the counter
+        // it was constructed with must not silently lose track of a still-
+        // running worker.
+    }
+
+    // The lane object no longer exists at all — read the counter through
+    // ONLY the independent shared_ptr the test itself still holds, exactly
+    // as AgentImpl::guardian_active_io_workers() reads spark_detached_workers_
+    // without ever touching spark_engine_.
+    CHECK(f3->load() == 1);
+
+    gate.release();
+    REQUIRE(spin_until([&] { return f3->load() == 0; }, 5s));
+}
