@@ -85,6 +85,7 @@ CREATE TABLE outbox (
     parameters      TEXT        NOT NULL DEFAULT '',
     execution_id    TEXT        NOT NULL DEFAULT '',
     principal       TEXT        NOT NULL DEFAULT '',
+    approval_id     TEXT        NOT NULL DEFAULT '',
     state           TEXT        NOT NULL DEFAULT 'pending',
     attempts        INTEGER     NOT NULL DEFAULT 0,
     note            TEXT        NOT NULL DEFAULT '',
@@ -145,15 +146,15 @@ OutboxEnqueueOutcome CommandOutboxStore::claim_and_enqueue_on(PGconn* conn,
     const std::string sql =
         "INSERT INTO command_outbox_store.outbox "
         "(occurrence_id, command_id, source, plugin, action, scope_expr, agent_ids, "
-        " parameters, execution_id, principal, state, attempts, claimed_epoch) "
-        "SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending',0,$11 "
+        " parameters, execution_id, principal, approval_id, state, attempts, claimed_epoch) "
+        "SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'pending',0,$12 "
         "WHERE " + fence + " "
         "ON CONFLICT (occurrence_id) DO NOTHING "
         "RETURNING occurrence_id";
     const std::vector<std::string> params{
-        req.occurrence_id, req.command_id, req.source, req.plugin,       req.action,
-        req.scope_expr,    req.agent_ids,  req.parameters, req.execution_id, req.principal,
-        std::to_string(leader_epoch)};
+        req.occurrence_id, req.command_id, req.source,        req.plugin,   req.action,
+        req.scope_expr,    req.agent_ids,  req.parameters,    req.execution_id, req.principal,
+        req.approval_id,   std::to_string(leader_epoch)};
     OutboxEnqueueOutcome outcome = interpret_enqueue(conn, req, sql, params);
     if (outcome == OutboxEnqueueOutcome::Degraded)
         count_degrade("enqueue", "db_error");
@@ -205,7 +206,7 @@ CommandOutboxStore::list_pending(int limit) const {
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "SELECT occurrence_id, command_id, source, plugin, action, scope_expr, agent_ids, "
-        "       parameters, execution_id, principal, attempts "
+        "       parameters, execution_id, principal, approval_id, attempts "
         "FROM command_outbox_store.outbox "
         "WHERE state = 'pending' AND next_attempt_at <= now() "
         "ORDER BY next_attempt_at ASC, created_at ASC "
@@ -232,7 +233,8 @@ CommandOutboxStore::list_pending(int limit) const {
         c.parameters = PQgetvalue(res.get(), i, 7);
         c.execution_id = PQgetvalue(res.get(), i, 8);
         c.principal = PQgetvalue(res.get(), i, 9);
-        c.attempts = std::atoi(PQgetvalue(res.get(), i, 10));
+        c.approval_id = PQgetvalue(res.get(), i, 10);
+        c.attempts = std::atoi(PQgetvalue(res.get(), i, 11));
         out.push_back(std::move(c));
     }
     return out;

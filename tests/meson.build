@@ -937,6 +937,7 @@ if build_server
       'unit/server/test_leader_gate.cpp',
       'unit/server/test_coord_dsn.cpp',
       'unit/server/test_command_outbox_store.cpp', # WS-3 3.3: transactional command outbox
+      'unit/server/test_command_outbox_delivery.cpp', # WS-3 3.3: leader-gated delivery loop
 
       'unit/server/test_execution_event_bus.cpp',
       'unit/server/test_approval_manager.cpp',

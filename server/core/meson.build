@@ -410,6 +410,7 @@ yuzu_server_core_lib = static_library(
     'src/execution_routes.cpp',
     'src/leader_elector.cpp',
     'src/command_outbox_store.cpp',
+    'src/command_outbox_delivery.cpp',
     'src/execution_event_bus.cpp',
     'src/fleet_topology_store.cpp',
     'src/heartbeat_ingestion.cpp',

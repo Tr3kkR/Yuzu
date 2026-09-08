@@ -136,6 +136,13 @@ struct OutboxEnqueueRequest {
                                 ///< RE-RESOLVES the caller/authority from this at send
                                 ///< time (never a serialized DispatchCaller — that would
                                 ///< re-create the #1398 provenance-forgery hazard).
+    std::string approval_id;    ///< Non-empty iff this occurrence cleared an approval gate at
+                                ///< enqueue time. The delivery consumer stamps
+                                ///< `DispatchCaller::approval_provenance = Ticket` from it, so a
+                                ///< re-authorized AlwaysApproval/AdminOrApproval action still
+                                ///< passes the #1398 ExecuteGate at send time (the approval that
+                                ///< admitted it already happened; the caller's *authority* is
+                                ///< re-checked fresh, the *approval provenance* is carried).
 };
 
 /// A pending occurrence handed to the leader-gated delivery loop.
@@ -150,6 +157,7 @@ struct OutboxCommand {
     std::string parameters;
     std::string execution_id;
     std::string principal;
+    std::string approval_id; ///< see OutboxEnqueueRequest::approval_id
     int attempts{0};
 };
 
