@@ -1,5 +1,6 @@
 #include "instruction_store.hpp"
 #include "instruction_definition_model.hpp" // #4029: export_definition_json delegates to the shared builder
+#include "instruction_yaml.hpp"
 #include "reserved_definition_id.hpp" // the ONE reserved-namespace rule (#2442)
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
@@ -300,6 +301,25 @@ std::optional<std::string> validate_definition_scope(const std::string& yaml_sou
     auto asn = yaml_scan::extract_yaml_section(yaml_source, "spec.assignment");
     return validate_scope_block(sb, yaml_scan::extract_yaml_value(asn, "mode"),
                                 !yaml_scan::extract_yaml_list(asn, "managementGroups").empty());
+}
+
+// #2542 PR-7: promoted verbatim from ServerImpl::validate_yaml_source
+// (server.cpp) — see instruction_store.hpp's doc comment for why this is a
+// promotion, not a duplication (a #2557 json_extract.hpp-style call site
+// straddling an extraction boundary: /fragments/instructions/yaml-preview
+// stays inline in server.cpp and shares this exact function).
+std::vector<std::string> validate_yaml_source(const std::string& yaml_source) {
+    // Shared with the POST /api/instructions/yaml save path so validate
+    // and save can never diverge on what a complete definition is (#1993).
+    auto errors = instruction_yaml::validate_definition_yaml(yaml_source);
+    // Also run the store-level gates (scope-walking combos, flow-mapping
+    // scope) that create/update enforce — same contract, one verdict
+    // (governance UP-3). Skip when byte-level errors already fired.
+    if (errors.empty()) {
+        if (auto err = validate_definition_scope(yaml_source))
+            errors.push_back(*err);
+    }
+    return errors;
 }
 
 // ---------------------------------------------------------------------------

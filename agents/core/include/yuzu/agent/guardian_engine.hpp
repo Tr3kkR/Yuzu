@@ -417,6 +417,32 @@ public:
     /// production caller.
     [[nodiscard]] std::string last_rearm_degrade_message_for_test() const;
 
+    /// #4021: the `expected_hash` a file-hash-equals rule's most recent legacy arm
+    /// attempt ended up with — empty if never armed as file-hash-equals, the
+    /// authored value if `expected_hash` was set, or a SEEDED persisted baseline
+    /// if one existed for this rule_id/target. This is what
+    /// start_guard_for_rule_locked built INTO `FileGuard::Config` before calling
+    /// `start()` — set regardless of whether `start()` itself actually arms
+    /// (FileGuard is Windows-only for the MVP; off Windows this is the only
+    /// observable proof the seed-lookup ran and produced the right value, since no
+    /// FileGuard object survives to observe otherwise). Locked, returned by value
+    /// — same rationale as last_rearm_degrade_message_for_test above. No
+    /// production caller.
+    [[nodiscard]] std::string last_file_expected_hash_for_test() const;
+
+    /// Gate 3 quality-engineer follow-up (#4021): `last_file_expected_hash_for_test`
+    /// only proves the SEED lookup ran — it says nothing about whether the
+    /// CAPTURE callback (`FileGuard::Config::on_baseline`) was actually attached,
+    /// since a seeded (non-empty `expected_hash`) rule never re-enters the
+    /// capture branch at all. Set unconditionally, right after the assignment,
+    /// on every file-hash-equals arm attempt — true regardless of seeding, so a
+    /// test can assert the wiring itself happened (deleting the assignment
+    /// would otherwise leave every Linux test green, since no real FileGuard
+    /// runs off Windows to observe the callback firing). Locked, returned by
+    /// value — same rationale as the sibling accessors above. No production
+    /// caller.
+    [[nodiscard]] bool last_file_on_baseline_wired_for_test() const;
+
     /// Live bounded-I/O worker count on the spark reader (0 if never wired) -
     /// the F3 orphan-exit obligation's plumbing (rung 7.6 is the enforcement).
     [[nodiscard]] std::size_t active_io_workers() const;
@@ -579,6 +605,12 @@ private:
     std::function<void(const std::string&)> rearm_fault_hook_for_test_;
     /// TEST-ONLY (see last_rearm_degrade_message_for_test); empty = no degrade this run.
     std::string last_rearm_degrade_message_for_test_;
+    /// TEST-ONLY (see last_file_expected_hash_for_test); empty = no file-hash-equals
+    /// arm attempt has run yet.
+    std::string last_file_expected_hash_for_test_;
+    /// TEST-ONLY (see last_file_on_baseline_wired_for_test); false = no
+    /// file-hash-equals arm attempt has run yet.
+    bool last_file_on_baseline_wired_for_test_{false};
     std::unordered_map<std::string, std::unique_ptr<IGuard>> guards_;
 
     /// rule_id -> SparkType for every rule CURRENTLY classified RulePlacement::Unsupported
@@ -664,5 +696,20 @@ guardian_dispatch_push_bytes_for_test(GuardianEngine& engine,
 /// by the #1307 regression test to assert the event_id embeds the agent_id.
 YUZU_EXPORT void guardian_emit_drift_for_test(GuardianEngine& engine,
                                               const GuardDrift& drift);
+
+/// Test-support helpers (#4021 adversarial-review K1/C2-1 regression net): reach
+/// the persist-side overwrite guard and the seed-side lookup directly, since the
+/// real call site (`FileGuard::Config::on_baseline`) fires only from a running
+/// Windows-only guard worker thread — not exercisable end-to-end on this
+/// platform's tests. Both are thin forwarders into guardian_engine.cpp's
+/// anonymous-namespace `guardian_persist_baseline`/`guardian_seed_baseline`
+/// (internal linkage) — not friends, no GuardianEngine state involved. No
+/// production caller.
+YUZU_EXPORT void guardian_persist_baseline_for_test(KvStore& kv, const std::string& rule_id,
+                                                    const std::string& fingerprint,
+                                                    const std::string& hash);
+YUZU_EXPORT std::optional<std::string>
+guardian_seed_baseline_for_test(KvStore& kv, const std::string& rule_id,
+                                const std::string& fingerprint);
 
 } // namespace yuzu::agent

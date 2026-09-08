@@ -143,9 +143,15 @@ public:
 
     explicit PolicyEvaluator(Deps deps);
 
-    /// One scheduler cycle: collect matured in-flight checks, then dispatch due
-    /// policies. Safe to call from a single background thread.
-    void tick();
+    /// One scheduler cycle: collect matured in-flight checks (ALWAYS), then — only
+    /// when `dispatch_due_allowed` — dispatch due policies. `collect_ready()` is the
+    /// completion path for the operator-synchronous evaluate_now()/remediate() plane
+    /// and MUST run per-replica; `dispatch_due()` is the leader-owned scheduling half
+    /// and is the caller's WS-3 fenced-leader gate (PR #4134). Safe to call from a
+    /// single background thread. NO default: the fenced scheduling half must be an
+    /// EXPLICIT opt-in so a future caller writing `tick()` cannot silently run the
+    /// leader-only due-policy dispatch ungated (adversarial review K2, PR #4134).
+    void tick(bool dispatch_due_allowed);
 
     /// Force an immediate check of one policy, ignoring its interval. Returns
     /// the dispatch execution_id, or "" if the policy is missing / has no check

@@ -9,7 +9,7 @@
 /// agentic worker should be able to learn what is possible from the live
 /// server alone, without a side-channel doc fetch."
 ///
-/// Five endpoints, modeled on the existing discovery precedent
+/// Six endpoints, modeled on the existing discovery precedent
 /// `GET /api/v1/guaranteed-state/schemas` (rest_api_v1.cpp) — same
 /// ETag + `Cache-Control: public, max-age=300` + 304-revalidation contract:
 ///   - `/discover/permissions`   — RBAC securable_type x operation catalog + role grid
@@ -17,6 +17,7 @@
 ///   - `/discover/routes`        — subset of the OpenAPI document (honesty-flagged)
 ///   - `/discover/scope-kinds`   — Scope DSL kinds + operators (fully static)
 ///   - `/discover/plugins`       — plugin/action catalog observed across the fleet
+///   - `/discover/plugin-docs`   — per-plugin documentation manifest (fully static)
 ///
 /// NAMING NOTE: the obvious filename `discovery_routes.{hpp,cpp}` /
 /// `DiscoveryRoutes` is already taken by an unrelated, pre-existing module
@@ -26,7 +27,7 @@
 /// `DiscoverRoutes` (singular, matching the `/api/v1/discover/*` URL prefix)
 /// to avoid clobbering it.
 ///
-/// The five builder functions (`build_*_catalog`) are pure — no I/O beyond
+/// The six builder functions (`build_*_catalog`) are pure — no I/O beyond
 /// reading the store/registry pointer passed in — and are declared here
 /// specifically so `mcp_server.cpp` can call the SAME functions for the
 /// mirrored `discover_*` MCP tools (A2: "Each is mirrored as an MCP tool...
@@ -104,6 +105,30 @@ DiscoveryDoc build_routes_catalog(const std::string& openapi_json);
 /// even when every store is down, like guardian_schema_catalog(). Built once
 /// (static local) and cached.
 const DiscoveryDoc& scope_kinds_catalog();
+
+/// `/discover/plugin-docs`. Fully static, like `scope_kinds_catalog()`: the
+/// per-plugin documentation manifests `tools/plugin-doc-gen` generates from
+/// each `agents/plugins/<name>/README.md` (docs/plugin-readme-standard.md
+/// rule 10), embedded at build time as `kBundledPluginDocs`
+/// (bundled_content.cpp) and served verbatim — compiled-in content only,
+/// never fleet-derived: no live agent, telemetry or operator-supplied text
+/// ever reaches this route at runtime (that's the property this route
+/// controls). It is still human-authored README prose per plugin, reviewed
+/// like any other source change, not literally hardcoded by the server
+/// team — the compiled-in guarantee bounds WHERE the content can come from,
+/// it is not a claim that the content is adversary-proof. One builder,
+/// three surfaces: this REST route, the MCP resource
+/// `yuzu://plugin-docs` (byte-identical), and the per-plugin `docs` summary
+/// `build_plugins_catalog` joins into `/discover/plugins` / `discover_plugins`.
+/// A manifest that fails to parse is skipped with a warning and counted in
+/// `skipped_invalid` so the gap is visible rather than silent. Built once and
+/// cached; answers even when every store is down.
+const DiscoveryDoc& plugin_docs_catalog();
+
+/// The per-plugin summary `build_plugins_catalog` joins by plugin name, or
+/// `nullptr` when no manifest documents that plugin. Exposed for the join and
+/// its tests; the full manifest is `plugin_docs_catalog()`.
+const nlohmann::json* plugin_docs_summary(std::string_view plugin_name);
 
 /// One row per `yuzu::scope::CompOp` value, hand-maintained (C++ has no enum
 /// reflection). Shared by `build_routes_catalog`'s scope-kinds sibling

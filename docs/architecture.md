@@ -293,11 +293,38 @@ Operator                     Server                                  Agent
 
 Most HTTP surfaces the server exposes — REST, dashboard fragments, MCP — are registered by a
 **route owner**: a class with a `register_routes(...)` method that the server calls once at
-startup. `server.cpp` wires those owners, *and* registers a further **105 routes inline** on
-`web_server_->{Get,Post,Put,Delete}` — the health and readiness probes, the static-asset surface,
-much of the `/api/*` dashboard JSON, and `POST /api/command`
-(`server/core/src/server.cpp:7951`). It constructs no `HttplibRouteSink` of its own, so none of
-those inline routes is reachable from the in-process test harness.
+startup. `server.cpp` wires those owners, *and* registers a further **24 routes inline** on
+`web_server_->{Get,Post,Put,Delete}` — much of the `/api/*` dashboard JSON. It constructs no
+persistent `HttplibRouteSink` of its own for these remaining inline routes, so none of them is
+reachable from the in-process test harness. (Eleven surfaces this prose previously credited to this
+inline count have since moved to their own `HttpRouteSink` modules and are no longer part of it:
+`POST /api/command` is `command_routes.cpp` (#2557); the page-shell/static-asset surface —
+`/static/*`, `/`, `/chargen`, `/procfetch`, `/api/help*`, `/help`, `/tar`, `/result-sets`,
+`/viz/fleet`, `/viz/host/:id`, `/instructions`; 25 routes — is `page_routes.{hpp,cpp}` (#2542 PR-2);
+a #2542 follow-up split 10 further scattered routes into `dashboard_api_routes.{hpp,cpp}`
+(`/api/me`, `/api/agents`, `/api/audit`, `POST /api/export/json-to-csv`, `POST
+/api/scope/validate`, `/api/analytics/{status,recent}`; 7 routes) and `nvd_routes.{hpp,cpp}`
+(`/api/nvd/{status,sync,match}`; 3 routes); the 5-route Custom Properties API (7.6) —
+`/api/agents/:id/properties[/:key]`, `/api/property-schemas` — is
+`custom_properties_routes.{hpp,cpp}` (#2542 PR-4); the Result Sets fragment API —
+`/fragments/result-sets/{sidebar,create}` plus the three `:id`-scoped
+`/fragments/result-sets/:id/{detail,pin,unpin,delete}`; 6 routes — is
+`result_set_routes.{hpp,cpp}` (#2542 PR-5); the 13-route Instruction Definitions + Instruction Sets
+API — `GET/POST /api/instructions`, `GET/PUT/DELETE /api/instructions/:id`,
+`GET /api/instructions/:id/export`, `POST /api/instructions/import`,
+`GET/POST /api/instruction-sets`, `DELETE /api/instruction-sets/:id`,
+`GET /fragments/instructions/editor`, `POST /api/instructions/yaml`,
+`POST /api/instructions/validate-yaml` — is `instruction_routes.{hpp,cpp}` (#2542 PR-7); the
+7-route legacy pre-v1 Executions API — `GET /api/executions`, `GET /api/executions/:id`,
+`GET /api/executions/:id/{summary,agents,children}`, `POST /api/executions/:id/{rerun,cancel}` —
+is `execution_routes.{hpp,cpp}` (#2542 PR-7); the 4-route Schedules API —
+`GET/POST /api/schedules`, `DELETE /api/schedules/:id`, `POST /api/schedules/:id/enable` — is
+`schedule_routes.{hpp,cpp}` (#2542 PR-8); the 4-route Approval API — `GET /api/approvals`,
+`GET /api/approvals/pending/count`, `POST /api/approvals/:id/{approve,reject}` — is
+`approval_routes.{hpp,cpp}` (#2542 PR-9); and the 6-route Health/Infra cluster — `GET /metrics`,
+`GET /health`, `GET /api/health`, `GET /livez`, `GET /readyz`, `GET /fragments/health/summary` — is
+`health_routes.{hpp,cpp}` (#2542 PR-10). All ten owner files register against the same
+stack-local `inline_sink`, constructed in `start_web_server()`.)
 
 Counting the surface therefore needs a receiver-agnostic pattern, not a search for one variable
 name:
@@ -333,11 +360,45 @@ fragments shipped a destructive operation with no route-handler coverage until #
 register through the sink that owner already uses. Do not add a handler that only the
 `httplib::Server&` overload — or an inline `web_server_->` call in `server.cpp` — can reach.
 Registrations outside the sink are pre-existing debt, not a precedent to copy: after #2542 PR-1
-(`VerifyRoutes` and `NotificationRoutes` joined the sink pattern), `mcp_server.cpp` is the only
-remaining route owner registering directly on a raw `svr.{Get,Post,Delete}` (3 registrations) —
-plus `server.cpp`'s own 105 inline routes (a bare `grep -c` of the pattern above returns 106; one
-hit at `server.cpp:9468` is a comment, not a registration), which are not a route-owner class and
-are untouched by this migration; 108 registrations remain outside the sink in total.
+(`VerifyRoutes` and `NotificationRoutes` joined the sink pattern), the page-shell/static-asset
+extraction (`page_routes.{hpp,cpp}`, PR-2, 25 routes registered against `inline_sink`), a #2542
+follow-up (`dashboard_api_routes.{hpp,cpp}` + `nvd_routes.{hpp,cpp}`, 10 more scattered routes
+registered against the same `inline_sink`), the Custom Properties API extraction
+(`custom_properties_routes.{hpp,cpp}`, 5 routes, #2542 PR-4), the Result Sets fragment
+extraction (`result_set_routes.{hpp,cpp}`, PR-5, 6 routes, also against `inline_sink`), and the
+3-route MCP JSON-RPC endpoint (`mcp_server.{hpp,cpp}`, #2542 PR-6 — `McpServer::register_routes`
+gained the `HttpRouteSink&` overload; its `httplib::Server&` overload is now the thin wrapper,
+matching every other owning-class route module (`DeviceRoutes`, `ComplianceRoutes`, `DexRoutes`,
+...) rather than the free-function `Deps`-struct + `inline_sink` pattern the other modules above
+use — `server.cpp` still calls `mcp_server_->register_routes(*web_server_, ...)` unchanged, exactly
+as it does for every other owning-class module), the Instruction Definitions + Instruction Sets /
+legacy pre-v1 Executions extraction (`instruction_routes.{hpp,cpp}` +
+`execution_routes.{hpp,cpp}`, PR-7, 13 + 7 = 20 routes, also against `inline_sink`), the Schedules
+API extraction (`schedule_routes.{hpp,cpp}`, PR-8, 4 routes, also against `inline_sink`), the
+Approval API extraction (`approval_routes.{hpp,cpp}`, PR-9, 4 routes, also against `inline_sink`),
+and the Health/Infra cluster extraction (`health_routes.{hpp,cpp}`, PR-10, 6 routes — `/metrics`,
+`/health`, `/api/health`, `/livez`, `/readyz`, `/fragments/health/summary` — also against
+`inline_sink`) — `server.cpp`'s own 24 inline routes are the only registrations left outside the
+sink, and they are not a route-owner class. Whether a further campaign PR touches them is #2542's
+own call, not this paragraph's to predict — an earlier version of this sentence claimed "no further
+PR touches them" and has since been falsified repeatedly by subsequent campaign PRs; check
+`gh issue view 2542` for current scope. Count these with the anchored pattern
+`grep -cE '^\s*web_server_->(Get|Post|Put|Delete|Patch|Options)\('
+server/core/src/server.cpp`, not a bare `grep -c` of the receiver-agnostic pattern above — the
+unanchored form over-counts by picking up at least one comment-line false match, which is how a
+105/106 figure was previously published here; the anchored count was 104 immediately before the
+page-shell extraction (independently re-verified during that extraction), 79 after it, 64 once both
+the `dashboard_api_routes`/`nvd_routes` follow-up (-10) and the Custom Properties API extraction
+(-5) had landed together, 58 once the Result Sets fragment extraction (-6) also landed, stayed 58
+after the MCP extraction (#2542 PR-6) — that PR removed the last 3 raw `svr.{Get,Post,Delete}`
+registrations in `mcp_server.cpp` (verify with
+`grep -cE '\bsvr\.(Get|Post|Put|Delete|Patch|Options)\(' server/core/src/mcp_server.cpp`, now 0),
+which were never counted by the `web_server_->` pattern above in the first place since they were
+never inline in `server.cpp` — dropped to 38 once the Instruction Definitions + Instruction Sets /
+legacy pre-v1 Executions extraction (-20, PR-7) landed, 34 once the Schedules API extraction (-4,
+PR-8) also landed, 30 once the Approval API extraction (-4, PR-9) also landed, and is 24 now that
+the Health/Infra cluster extraction (-6, PR-10) has also landed. 24 registrations remain outside
+the sink in total.
 
 ## Storage Architecture
 

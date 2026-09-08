@@ -622,6 +622,25 @@ TEST_CASE("is_valid_principal: rejects control bytes, injection metacharacters, 
     CHECK_FALSE(is_valid_principal("oidc:https://idp/#sub with space"));
 }
 
+TEST_CASE("is_valid_principal: rejects an embedded NUL in every position "
+          "(#4020/#2755e3871 Gate 2/4 re-review follow-up)",
+          "[settings][users][principal][security]") {
+    // A plain string literal truncates at an embedded '\0', so every case
+    // here is built by concatenating clean literal pieces around a single
+    // explicit '\0' char, avoiding any error-prone manual byte-counting -
+    // std::string::operator+ computes each piece's length correctly. Mirrors
+    // the exact attack shape (a NUL-mangled username reaching
+    // AuthDB::get_user via url_decode).
+    CHECK_FALSE(is_valid_principal(std::string(1, '\0') + "admin"));   // leading
+    CHECK_FALSE(is_valid_principal(std::string("admin") + '\0'));      // trailing
+    CHECK_FALSE(is_valid_principal(std::string("adm") + '\0' + "in")); // mid, non-prefixed
+    // Inside a reserved-prefix (SSO) principal, both before and after the
+    // colon - proves the reserved-prefix branch's c<0x20 scan covers the
+    // WHOLE string, not just the portion after the prefix.
+    CHECK_FALSE(is_valid_principal(std::string("oi") + '\0' + "dc:https://idp#sub"));
+    CHECK_FALSE(is_valid_principal(std::string("oidc:https://idp#su") + '\0' + "b"));
+}
+
 TEST_CASE("is_valid_principal: rejects an over-255-byte principal", "[settings][users][principal]") {
     std::string long_sub(300, 'a');
     CHECK_FALSE(is_valid_principal("oidc:https://idp/#" + long_sub));

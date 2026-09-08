@@ -436,6 +436,13 @@ constexpr TwinRow kExpectedTwins[] = {
     // the new GET /api/v1/product-packs* routes.
     {"list_product_packs", "ProductPack", "Read", true},
     {"get_product_pack", "ProductPack", "Read", true},
+    // #4027 — TAR process-tree/capture-sources/retention-paused read twins.
+    // Same Infrastructure:Read gate as GET /fragments/tar/process-tree,
+    // .../capture-sources, .../retention-paused (tar_tree_routes.cpp /
+    // dashboard_routes.cpp).
+    {"list_tar_process_tree_devices", "Infrastructure", "Read", true},
+    {"list_tar_capture_sources_devices", "Infrastructure", "Read", true},
+    {"list_tar_retention_paused", "Infrastructure", "Read", true},
 };
 
 } // namespace
@@ -488,11 +495,19 @@ TEST_CASE("operator surface MCP twins: every tool satisfies the A5 contract",
         REQUIRE(schema_it != schemas.end());
         CHECK(schema_it->schema_json.find("\"type\":\"object\"") != std::string::npos);
         CHECK(schema_it->schema_json.find("\"properties\"") != std::string::npos);
-        // A bare {"type":"object","properties":{}} with no further structure
-        // would be the free-form-object footgun the spec forbids for every
-        // tool that takes an argument at all — every one of these 11 takes
-        // at least one property.
-        CHECK(schema_it->schema_json != R"({"type":"object","properties":{}})");
+        // A bare {"type":"object","properties":{}} with no further structure would
+        // be the free-form-object footgun the spec forbids for a tool that DOES
+        // take an argument (an empty schema then accepts anything, undocumented).
+        // #4027's three list_tar_* tools are genuinely zero-argument reads (same
+        // shape as list_agents, not in this table) — {"type":"object",
+        // "properties":{}} is the CORRECT, most literal schema for "takes no
+        // arguments," not the footgun; exempted here rather than weakened for
+        // every other row, which still must take ≥1 property.
+        if (expected.tool != "list_tar_process_tree_devices" &&
+            expected.tool != "list_tar_capture_sources_devices" &&
+            expected.tool != "list_tar_retention_paused") {
+            CHECK(schema_it->schema_json != R"({"type":"object","properties":{}})");
+        }
     }
 }
 

@@ -434,7 +434,7 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
 
     // POST /api/instructions/import — JSON instruction-definition import,
     // whole raw body forwarded verbatim to `import_definition_json`
-    // (server.cpp:11130 -> instruction_store.cpp:954 -> create_definition_
+    // (instruction_routes.cpp -> instruction_store.cpp:954 -> create_definition_
     // impl:434, which DOES hard-reject an oversized `yaml_source` field at
     // 1048576 bytes via validate_definition_scope, instruction_store.cpp:
     // 411). That real check does NOT bound the whole request, though: an
@@ -453,8 +453,8 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // yaml, POST /fragments/instructions/yaml-preview — three FORM-encoded
     // (application/x-www-form-urlencoded) twins of one shape: a single
     // `yaml_source` field (save also carries a small `id` field), all three
-    // routed through the SAME check — server.cpp:6493 `validate_yaml_source`
-    // -> `instruction_yaml::validate_definition_yaml`, which hard-rejects
+    // routed through the SAME check — instruction_store.cpp's
+    // `validate_yaml_source` -> `instruction_yaml::validate_definition_yaml`, which hard-rejects
     // `yaml_source.size() > 1048576` at instruction_yaml.cpp:165 (the exact
     // 1 MiB decoded-value contract create/update also enforce). This is the
     // SAME raw-vs-decoded shape as tar_dashboard_sql (C1) — the pre-routing

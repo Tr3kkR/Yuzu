@@ -495,6 +495,19 @@ int dispatch_with_capture(const YuzuPluginDescriptor* descriptor, const char* ac
     return rc;
 }
 
+// StandalonePluginContext (local_dispatcher.hpp): the one way a non-daemon
+// host obtains a real PluginContextImpl for descriptor->init/shutdown. Kept
+// here for the same reason as dispatch_with_capture — PluginContextImpl is
+// this TU's private type.
+StandalonePluginContext::StandalonePluginContext(std::string plugin_name,
+                                                 std::unordered_map<std::string, std::string> config)
+    : impl_(new PluginContextImpl{std::move(config), nullptr, nullptr, std::move(plugin_name)},
+            [](void* p) { delete static_cast<PluginContextImpl*>(p); }) {}
+
+YuzuPluginContext* StandalonePluginContext::get() const noexcept {
+    return reinterpret_cast<YuzuPluginContext*>(impl_.get());
+}
+
 // cpp-expert A4 test seam (no public header — same convention as
 // derive_effective_result_status/dispatch_with_capture above): drives a
 // status value through the REAL yuzu_ctx_set_result_status() entry point
