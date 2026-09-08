@@ -187,6 +187,29 @@ inline constexpr std::string_view kForensicUntargetedMessage{
 /// redefined, to avoid a second copy of that reason string drifting apart.
 inline constexpr std::string_view kReasonForensicUntargeted{"forensic_untargeted"};
 
+/// The two `RefuseUntargeted` remediation strings, spelled ONCE so both
+/// `execute_instruction` refusal sites in `mcp_server.cpp` never re-diverge
+/// (they previously both hardcoded the Destructive wording unconditionally,
+/// even for a Forensics refusal — a Forensics row is a distinct, read-only
+/// classification with its own single-target rule, not "classified
+/// Destructive"). Branch on `DestructiveTargetingDecision::refusal_reason`
+/// via `remediation_for_refusal_reason` below rather than re-deriving which
+/// applies from the capability.
+inline constexpr std::string_view kDestructiveUntargetedRemediation{
+    "this plugin.action is classified Destructive: name explicit agent_ids "
+    "(no scope, no broadcast) and re-call"};
+inline constexpr std::string_view kForensicUntargetedRemediation{
+    "this is a single-target forensic read: specify exactly one explicit, "
+    "in-scope agent_id (no scope, no broadcast) and re-call"};
+
+/// The remediation text for a `RefuseUntargeted` decision, discriminated by
+/// `refusal_reason` — never assume Destructive wording unconditionally.
+[[nodiscard]] inline std::string_view
+remediation_for_refusal_reason(std::string_view refusal_reason) noexcept {
+    return refusal_reason == kReasonForensicUntargeted ? kForensicUntargetedRemediation
+                                                        : kDestructiveUntargetedRemediation;
+}
+
 /// True for a row this gate's single-target rule applies to: every
 /// `DispatchClass::Destructive` row (the existing rule), OR any row on the
 /// `Forensics` securable (Wave 7 PR7.2 — a forensic read is not Destructive

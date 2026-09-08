@@ -4822,12 +4822,17 @@ McpServer::HandlerFn McpServer::build_handler(
                                         " " + yuzu::server::detail::sanitize_detail_value(p) +
                                         ":" + yuzu::server::detail::sanitize_detail_value(a) +
                                         " correlation_id=" + cid);
+                                // #3937 follow-up: branch the remediation text by
+                                // refusal reason — a Forensics single-target refusal
+                                // is a distinct, read-only classification and must
+                                // not claim the action "is classified Destructive"
+                                // (dispatch_destructive_gate.hpp's
+                                // remediation_for_refusal_reason).
                                 res.set_content(
                                     a4_error(kInvalidParams, gate.refusal_message,
-                                             "this plugin.action is classified Destructive: "
-                                             "name explicit agent_ids (no scope, no broadcast) "
-                                             "and re-call; no approval ticket was created or "
-                                             "consumed",
+                                             std::string(yuzu::server::remediation_for_refusal_reason(
+                                                 gate.refusal_reason)) +
+                                                 "; no approval ticket was created or consumed",
                                              -1, cid, audit_ok),
                                     "application/json");
                                 return;
@@ -8490,10 +8495,12 @@ McpServer::HandlerFn McpServer::build_handler(
                                 yuzu::server::detail::sanitize_detail_value(plugin) + ":" +
                                 yuzu::server::detail::sanitize_detail_value(action) +
                                 " correlation_id=" + cid);
+                        // #3937 follow-up: branch the remediation text by refusal
+                        // reason — see the C8 pre-mint site above.
                         res.set_content(
                             a4_error(kInvalidParams, gate.refusal_message,
-                                     "this plugin.action is classified Destructive: name "
-                                     "explicit agent_ids (no scope, no broadcast) and re-call",
+                                     yuzu::server::remediation_for_refusal_reason(
+                                         gate.refusal_reason),
                                      -1, cid, audit_ok),
                             "application/json");
                         return;
