@@ -598,6 +598,8 @@ TEST_CASE("autoruns Linux leg: list_dir reports permission_denied, not absent, f
           "read_file permission test) rather than a geteuid()==0 precheck, since "
           "even a non-root but capability-elevated runner can bypass the check)",
           "[autoruns][actions][linux]") {
+    using yuzu::autoruns::list_dir;
+
     yuzu::test::TempDir dir("yuzu_test_autoruns_denied_");
     std::filesystem::create_directories(dir.path);
     std::error_code ec;
