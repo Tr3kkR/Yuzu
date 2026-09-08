@@ -1,0 +1,641 @@
+#pragma once
+
+/**
+ * spark_detached_call.hpp — a bounded, detached "launch and let the owner
+ * sweep" call primitive for Spark mechanisms (ADR-0021 Stage 2, #2012/#3840
+ * plan: "bound File/Registry/Service watch establishment off the per-type
+ * lock" — PR-A, "Shared primitive" section).
+ *
+ * WHY: within one mechanism type, a blocking OS call inside watch()/unwatch()
+ * today holds SparkEngine::mech_ops_mu_by_type_[type] for its full, unbounded
+ * duration and starves every other same-type arm/disarm. PR-B (a later,
+ * separate piece of work) restructures File/Registry/Service to reserve
+ * under their own mu_, unlock, run the blocking OS call on a detached,
+ * counted worker bounded by a deadline D, relock, re-check staleness, and
+ * commit or discard. THIS FILE is the primitive PR-B's mechanisms build on —
+ * it does not itself touch any mechanism.
+ *
+ * PULL MODEL: the detached worker touches ONLY its own result cell; the
+ * OWNER sweeps (try_take/wait_take/abandon). No callback ever runs on the
+ * worker thread touching owner state — unlike GuardianIoExecutor::run's
+ * on_abandoned callback (see "Versus GuardianIoExecutor::run" below), this
+ * design has no push path at all, so there is no window where a worker
+ * thread could reach into a mechanism's own mu_-guarded state.
+ *
+ * OWNERSHIP FIX (round-3 plan finding, replacing an earlier "launch_forget"
+ * design this file does NOT ship): launch() takes ownership of the caller's
+ * `Fn` ONLY on DetachedLaunch::Launched. On Rejected (lane cap) or
+ * LaunchFailed (OS refused the thread, or an allocation failed), `Fn` is
+ * handed back to the caller UNCONSUMED via the returned
+ * DetachedLaunchResult::fn. The earlier "launch_forget" sketch took
+ * ownership of a moved-in RAII payload unconditionally and could destroy it
+ * SYNCHRONOUSLY ON THE CALLING THREAD on the rejected/failed path — exactly
+ * the "blocking close under a lock" hazard the whole design exists to avoid.
+ * See launch()'s own comments for how this is achieved even across every
+ * allocation-failure path (not just the common OS-refused-thread path).
+ *
+ * F3 / §24 (`docs/yuzu-guardian-design-v1.1.md:2478-2484`): the process must
+ * not run normal C++ teardown while any detached worker is alive — "a source
+ * left out of the sum would silently reinstate the use-after-free the
+ * joined-thread rule used to prevent by a different mechanism." Every
+ * SparkDetachedLane is constructed with a shared `f3_counter` (agent-
+ * lifetime-scoped, NOT lane- or SparkEngine-scoped — see agent.cpp's
+ * spark_detached_workers_ member and its own doc comment for why it must
+ * never be read through spark_engine_/spark_boot_done_). The counter is
+ * incremented at admission and decremented ONLY when the worker's own
+ * closure (Payload<T, DFn>, below) is fully destroyed — which, by
+ * construction (see "Ticketing" below), is strictly after every piece of
+ * worker-side code has finished running, including a self-disposed
+ * (abandoned-before-publish) result's own destructor and any RAII state
+ * `Fn` itself still holds after being called once. A lane's OWN
+ * active_workers() count is a separate, lane-scoped mirror of the same
+ * lifetime, incremented/decremented in lockstep with the shared F3 counter.
+ *
+ * TICKETING (mirrors GuardianIoExecutor's AliveTicket rule,
+ * guardian_io_executor.hpp:586-597 — read-only reference, this file does
+ * not include or modify that class): CountGuard (below) decrements the
+ * lane's active count + the shared F3 counter when it is destroyed, at
+ * true OS-thread-exit time (i.e. when the worker's Payload is destroyed by
+ * spawn_detached's trampoline, after the worker's own operator()() has
+ * fully returned — same "OS-thread-exit" wording GuardianIoExecutor already
+ * uses for the equivalent case). CountGuard is deliberately the FIRST-
+ * declared member of Payload<T, DFn> (cell and fn follow it) — struct
+ * members destroy in REVERSE declaration order (specified by the standard,
+ * unlike lambda-capture destruction order, which is UNSPECIFIED — an
+ * earlier draft of this file captured {cell, ticket, fn} directly in a
+ * worker lambda and relied on compiler behavior for the ordering; do not
+ * copy that shape elsewhere), so `fn` (which may still hold live RAII state
+ * of its own, separate from whatever T it returned) is ALWAYS destroyed
+ * BEFORE CountGuard's destructor runs and decrements the counters. A
+ * self-disposed T (the abandoned-before-publish path) is disposed even
+ * earlier still — inside Payload::operator()()'s own local scope, before
+ * that function even returns — so it is unconditionally covered by the same
+ * property.
+ *
+ * EXACTLY-ONCE DELIVERY: the result lands in exactly one of {owner
+ * try_take()/wait_take(), owner abandon()-returned-for-disposal, worker
+ * self-disposes}. Cell<T> (mutex + cv + an atomic<bool> done HINT only +
+ * `taken`/`abandoned` under the mutex + a boxed result) is shared between
+ * the worker (via Payload) and the owner (via DetachedCall<T>) by
+ * shared_ptr; every state transition is decided under cell.mu, so the
+ * atomic done flag is never load-bearing for correctness, only for a
+ * lock-free done() poll.
+ *
+ * Versus GuardianIoExecutor::run — deliberately omitted (that class solves
+ * a related but different problem: a bounded, single-flight, keyed,
+ * quota'd, WAIT-until-deadline read; this primitive is a bounded LAUNCH the
+ * owner polls/sweeps later, potentially well past any per-call deadline):
+ *   - per-class quotas: one SparkDetachedLane per mechanism concern already
+ *     IS the bulkhead — a mechanism owning multiple lanes (e.g. Registry's
+ *     probe lane + drain lane, PR-B) gets the same effect by construction.
+ *   - keyed single-flight: the owner's own per-entry Pending/Arming state
+ *     (PR-B's DirWatch/RegWatch/SvcWatch) IS the single-flight — this file
+ *     has no notion of a "key" at all.
+ *   - stop()/Stopped: GuardianIoExecutor wakes every waiter and rejects new
+ *     submissions on stop(). This file has no stop() — the owning
+ *     mechanism's own mu_-guarded stop() decides when to stop calling
+ *     launch() and to abandon() every outstanding DetachedCall<T>; a lane
+ *     that outlives its mechanism (destroyed while a worker is still
+ *     parked — the F3 regression scenario) is a supported, tested state.
+ *   - push-style on_abandoned callback: would run on the worker thread and
+ *     touch owner state — the whole reason the pull model exists is to
+ *     avoid this. A mechanism wanting "do something when a late result
+ *     shows up" polls for it (PR-B's sweeper threads).
+ *   - DetachedWaiter (an earlier design-round sketch of a returned waitable
+ *     handle): omitted — PR-B's sweepers are poll-based (try_take() in a
+ *     loop against their own cadence), so there is no present consumer for
+ *     a separate wait-composition primitive. Add one if/when a real
+ *     multi-waiter or cv-composition need arises; wait_take(deadline)
+ *     already covers the single-waiter case this file's own tests need.
+ *
+ * NOT REUSABLE: agents/shared/bounded_wait.hpp::bounded_call_ex — discards
+ * late results (a leaked handle from this primitive's point of view),
+ * shares a process-global cap with DNS/discovery work unrelated to Spark,
+ * and its worker count is invisible to F3. Left untouched; this file
+ * deliberately avoids the "BoundedCall" name to avoid implying kinship.
+ */
+
+#include "guardian_io_executor.hpp" // io_detail::spawn_detached — reused as a
+                                    // low-level primitive ONLY; this file does
+                                    // not otherwise depend on GuardianIoExecutor.
+
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstddef>
+#include <cstdint>
+#include <expected>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <type_traits>
+#include <utility>
+
+namespace yuzu::agent {
+
+/// Outcome of one launch() call.
+enum class DetachedLaunch : std::uint8_t {
+    Launched,     ///< admitted and spawned; a DetachedCall<T> handle is returned
+    Rejected,     ///< the lane's cap was full — Fn is returned, unconsumed
+    LaunchFailed, ///< the OS refused the thread, or an allocation failed —
+                 ///< Fn is returned, unconsumed
+};
+
+/// Why a launched call's result is not a plain T.
+enum class DetachedCallError : std::uint8_t {
+    WorkerThrew,       ///< fn() threw; contained, the worker never terminates
+    ResultAllocFailed, ///< the worker could not even box the WorkerThrew error
+                       ///< (allocation-starved worker) — done() is still true
+};
+
+template <class T>
+using DetachedResult = std::expected<T, DetachedCallError>;
+
+namespace detached_detail {
+
+/// Per-run result slot, shared by the worker (via Payload) and the owner
+/// (via DetachedCall<T>). `done_hint` is a lock-free HINT only — every
+/// actual state transition (publish, take, abandon) is decided under `mu`;
+/// `done_hint` exists solely so DetachedCall<T>::done() can poll without
+/// taking the lock.
+template <class T>
+struct Cell {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::atomic<bool> done_hint{false};
+    bool done{false};      // guarded by mu
+    bool taken{false};     // guarded by mu
+    bool abandoned{false}; // guarded by mu
+    std::unique_ptr<DetachedResult<T>> result; // guarded by mu; null after take()
+};
+
+/// Shared per-lane state: the admission cap/count, the shared agent-lifetime
+/// F3 counter, and cumulative counters. Held by shared_ptr so a worker's
+/// CountGuard (below) keeps it alive even after the owning SparkDetachedLane
+/// (and the mechanism that owns THAT) is destroyed — the exact scenario the
+/// F3 regression test exercises: a lane destroyed while a worker is still
+/// parked must not silently stop counting that worker.
+struct LaneState {
+    std::shared_ptr<std::atomic<std::size_t>> f3_counter; // may be null (tests)
+    std::atomic<std::size_t> active{0};
+    std::atomic<std::size_t> cap{0};
+    std::atomic<std::uint64_t> rejected_total{0};
+    std::atomic<std::uint64_t> launch_failed_total{0};
+    std::atomic<std::uint64_t> worker_threw_total{0};
+    std::atomic<bool> fail_launch_for_test{false};
+};
+
+/// Decrements the lane's active-worker count and the shared F3 counter when
+/// destroyed. See this file's header comment ("Ticketing") for why its
+/// position as Payload's FIRST-declared member (destroyed LAST) is
+/// load-bearing, not cosmetic. Move-only (needed so a temporary can be
+/// forwarded into Payload's constructor — see launch()'s "Ownership fix"
+/// comments for why this specific shape lets a failed make_shared leave the
+/// caller's Fn provably untouched).
+struct CountGuard {
+    std::shared_ptr<LaneState> lane;
+    bool armed{false};
+
+    CountGuard() = default;
+    explicit CountGuard(std::shared_ptr<LaneState> l) noexcept : lane(std::move(l)), armed(true) {}
+    CountGuard(const CountGuard&) = delete;
+    CountGuard& operator=(const CountGuard&) = delete;
+    CountGuard(CountGuard&& other) noexcept : lane(std::move(other.lane)), armed(other.armed) {
+        other.armed = false;
+    }
+    CountGuard& operator=(CountGuard&&) = delete; // not needed — constructed in place once
+    ~CountGuard() {
+        if (!armed)
+            return;
+        lane->active.fetch_sub(1, std::memory_order_acq_rel);
+        if (lane->f3_counter)
+            lane->f3_counter->fetch_sub(1, std::memory_order_acq_rel);
+    }
+};
+
+} // namespace detached_detail
+
+/// Owner-side handle to one launched call. Move-only. Destroying a handle
+/// while its call is still in flight ("parked") is safe (no UAF, tested
+/// under ASan/TSan) and behaves like an implicit abandon() — a not-yet-
+/// published result is disposed by the WORKER when it eventually completes;
+/// an already-published-but-untaken result is disposed right here, on
+/// whichever thread destroys the handle (fast: T is a result value or an
+/// RAII handle to close, never the original blocking OS call itself).
+template <class T>
+class DetachedCall {
+public:
+    DetachedCall() noexcept = default; // empty handle; every method is then a safe no-op
+    DetachedCall(const DetachedCall&) = delete;
+    DetachedCall& operator=(const DetachedCall&) = delete;
+    DetachedCall(DetachedCall&&) noexcept = default;
+    DetachedCall& operator=(DetachedCall&&) noexcept = default;
+
+    ~DetachedCall() { dispose_or_abandon(); }
+
+    /// Lock-free poll — a HINT only (see Cell<T>'s doc comment). Never
+    /// blocks, never mutates state.
+    [[nodiscard]] bool done() const noexcept {
+        return !cell_ || cell_->done_hint.load(std::memory_order_acquire);
+    }
+
+    /// Non-blocking. Returns the result exactly once — nullopt if not yet
+    /// done, or if it was already taken (by a prior try_take/wait_take/
+    /// abandon call).
+    [[nodiscard]] std::optional<DetachedResult<T>> try_take() {
+        if (!cell_)
+            return std::nullopt;
+        std::lock_guard<std::mutex> lk(cell_->mu);
+        return take_locked();
+    }
+
+    /// Blocks until `deadline` or the result is published, whichever comes
+    /// first. A timeout returns nullopt WITHOUT abandoning the call — a
+    /// later wait_take()/try_take() can still take the late result exactly
+    /// once (this is the "gated fn -> Timeout then exactly-once late take"
+    /// contract).
+    [[nodiscard]] std::optional<DetachedResult<T>>
+    wait_take(std::chrono::steady_clock::time_point deadline) {
+        if (!cell_)
+            return std::nullopt;
+        std::unique_lock<std::mutex> lk(cell_->mu);
+        cell_->cv.wait_until(lk, deadline, [this] { return cell_->done; });
+        return take_locked();
+    }
+
+    /// Give up on this call. Published-but-untaken -> the result is
+    /// returned to the caller here (for disposal); not-yet-published -> the
+    /// worker is told to self-dispose when it eventually completes, and
+    /// nullopt is returned. Exactly once — a second abandon() (or a
+    /// try_take/wait_take after one) always returns nullopt. noexcept: T's
+    /// destructor (the only thing that can run here besides lock
+    /// acquisition) is assumed not to throw, per ordinary RAII convention.
+    [[nodiscard]] std::optional<DetachedResult<T>> abandon() noexcept {
+        if (!cell_)
+            return std::nullopt;
+        std::lock_guard<std::mutex> lk(cell_->mu);
+        auto out = take_locked();
+        cell_->abandoned = true;
+        return out;
+    }
+
+    /// Constructs a handle directly over an existing cell. PUBLIC (not
+    /// friend-restricted to SparkDetachedLane) deliberately: std::optional<
+    /// DetachedCall<T>>::emplace(...) — which DetachedLaunchResult's
+    /// construction inside launch() relies on — performs its placement-new
+    /// from INSIDE <optional>'s own implementation, not from SparkDetachedLane's
+    /// lexical scope, so friendship granted to SparkDetachedLane does not
+    /// propagate through that call (a well-known C++ access-control gotcha:
+    /// friendship is not transitive through a library helper). `cell` lives
+    /// in the detached_detail:: implementation-namespace, which is
+    /// sufficient practical protection against external misuse without the
+    /// access-control complexity of befriending std::optional's
+    /// instantiation itself.
+    explicit DetachedCall(std::shared_ptr<detached_detail::Cell<T>> cell) noexcept
+        : cell_(std::move(cell)) {}
+
+private:
+    /// Caller must hold cell_->mu.
+    std::optional<DetachedResult<T>> take_locked() {
+        if (!cell_->done || cell_->taken)
+            return std::nullopt;
+        cell_->taken = true;
+        auto out = std::move(*cell_->result);
+        cell_->result.reset();
+        return out;
+    }
+
+    void dispose_or_abandon() noexcept {
+        if (!cell_)
+            return;
+        std::lock_guard<std::mutex> lk(cell_->mu);
+        if (cell_->taken)
+            return;
+        if (cell_->done) {
+            cell_->taken = true;
+            cell_->result.reset(); // dispose here, on the destructing thread
+        } else {
+            cell_->abandoned = true; // tell the worker to self-dispose later
+        }
+    }
+
+    std::shared_ptr<detached_detail::Cell<T>> cell_;
+};
+
+namespace detached_detail {
+
+/// The worker's own closure. Members declared in this EXACT order —
+/// `guard` first, `fn` last — so reverse-declaration-order destruction
+/// destroys `fn` (and any RAII state it still holds) before `guard`
+/// decrements the lane/F3 counters. See this file's header comment
+/// ("Ticketing") for the full argument. The templated constructor exists
+/// (rather than a plain by-value `DFn fn` parameter) so launch() can pass
+/// `std::forward<Fn>(fn_in)` all the way through to `make_shared`, which
+/// only performs the actual move INSIDE the placement-new it runs strictly
+/// after its own allocation succeeds — the property launch()'s "Ownership
+/// fix" comments rely on to guarantee Fn is untouched on every allocation-
+/// failure path, not just the OS-refused-thread one.
+template <class T, class DFn>
+struct Payload {
+    CountGuard guard;
+    std::shared_ptr<Cell<T>> cell;
+    DFn fn;
+
+    template <class F>
+    Payload(CountGuard g, std::shared_ptr<Cell<T>> c, F&& f)
+        : guard(std::move(g)), cell(std::move(c)), fn(std::forward<F>(f)) {}
+
+    /// Runs on the detached worker thread. noexcept: fn() itself is the
+    /// only thing here that may throw, and it is fully contained.
+    void operator()() noexcept {
+        std::unique_ptr<DetachedResult<T>> boxed;
+        bool threw = false;
+        try {
+            boxed = std::make_unique<DetachedResult<T>>(fn());
+        } catch (...) {
+            threw = true;
+            try {
+                boxed = std::make_unique<DetachedResult<T>>(std::unexpect,
+                                                            DetachedCallError::WorkerThrew);
+            } catch (...) {
+                boxed.reset(); // ResultAllocFailed — even the error box didn't fit
+            }
+        }
+        bool was_abandoned = false;
+        {
+            std::lock_guard<std::mutex> lk(cell->mu);
+            was_abandoned = cell->abandoned;
+            if (!was_abandoned) {
+                cell->result = std::move(boxed); // nothrow: unique_ptr pointer move
+                cell->done = true;
+                cell->done_hint.store(true, std::memory_order_release);
+            }
+        }
+        if (threw)
+            guard.lane->worker_threw_total.fetch_add(1, std::memory_order_relaxed);
+        cell->cv.notify_all(); // after releasing the lock — harmless if no one is waiting
+        // If was_abandoned, `boxed` is still held LOCALLY here (never moved
+        // into the cell) — it is disposed when this function returns (T's
+        // destructor runs as part of this function's own stack unwind),
+        // strictly BEFORE `guard` (this object's own first-declared, thus
+        // last-destroyed, member) can decrement the lane/F3 counters. This
+        // is the self-dispose path's whole safety argument — it does not
+        // depend on member-destruction order at all, only on this function
+        // fully completing before Payload itself is destroyed (true by
+        // construction: Payload is destroyed by spawn_detached's trampoline
+        // strictly after operator()() returns).
+    }
+};
+
+} // namespace detached_detail
+
+/// Result of one launch() call. `call` is engaged iff status == Launched;
+/// `fn` is engaged iff status != Launched (Rejected or LaunchFailed) and
+/// holds the caller's ORIGINAL, unconsumed callable — see this file's
+/// header comment ("Ownership fix").
+template <class T, class DFn>
+struct DetachedLaunchResult {
+    DetachedLaunch status{DetachedLaunch::LaunchFailed};
+    std::optional<DetachedCall<T>> call;
+    std::optional<DFn> fn;
+};
+
+/// One lane: an admission cap + a lock-free active-worker count, backed by
+/// LaneState shared with every in-flight worker (so a lane destroyed while a
+/// worker is still parked does not stop that worker from being counted —
+/// see this file's header comment on F3). A mechanism owns one
+/// SparkDetachedLane per detached-call concern (PR-B: one per mechanism, or
+/// two for Registry's separate probe/drain lanes) — the lane itself IS the
+/// per-concern bulkhead; see "Versus GuardianIoExecutor::run" above for why
+/// no separate quota/keying layer is added on top.
+class SparkDetachedLane {
+public:
+    /// `f3_counter` is the process/agent-lifetime-scoped counter every lane
+    /// in the process shares (may be null in a test that only cares about
+    /// the lane's own active_workers()). `cap` is the maximum number of
+    /// concurrently in-flight workers this lane admits; 0 is a valid,
+    /// well-defined "never admit" configuration (used by the cap-rejection
+    /// regression test), not clamped up to 1.
+    explicit SparkDetachedLane(std::shared_ptr<std::atomic<std::size_t>> f3_counter,
+                               std::size_t cap)
+        : state_(std::make_shared<detached_detail::LaneState>()) {
+        state_->f3_counter = std::move(f3_counter);
+        state_->cap.store(cap, std::memory_order_relaxed);
+    }
+
+    SparkDetachedLane(const SparkDetachedLane&) = delete;
+    SparkDetachedLane& operator=(const SparkDetachedLane&) = delete;
+    SparkDetachedLane(SparkDetachedLane&&) noexcept = default;
+    SparkDetachedLane& operator=(SparkDetachedLane&&) noexcept = default;
+
+    /// Launches `fn` (a nullary callable) on a detached worker if the lane
+    /// has capacity. `fn`'s return type T becomes the call's result type.
+    ///
+    /// OWNERSHIP: `fn` is consumed (moved from) ONLY on DetachedLaunch::
+    /// Launched. On Rejected or LaunchFailed, the returned
+    /// DetachedLaunchResult::fn holds the caller's original, unconsumed
+    /// callable — see this file's header comment for the full argument,
+    /// including why this holds even across an allocation failure deep
+    /// inside launch()'s own admission machinery, not merely the common
+    /// OS-refused-thread case.
+    template <class Fn>
+    [[nodiscard]] auto launch(Fn&& fn_in) {
+        using DFn = std::decay_t<Fn>;
+        static_assert(std::is_invocable_v<DFn&>,
+                      "SparkDetachedLane::launch: Fn must be callable with no arguments — "
+                      "it is invoked as fn() on the detached worker.");
+        using T = std::invoke_result_t<DFn&>;
+        static_assert(
+            std::is_nothrow_move_constructible_v<T>,
+            "SparkDetachedLane::launch: the result type T must be nothrow-move-constructible "
+            "— the worker publishes its result into the cell by a move (boxed inside a "
+            "unique_ptr, so the move itself happens once, at construction of the box); a "
+            "throwing move there has no defined recovery in this design.");
+        static_assert(
+            std::is_nothrow_move_constructible_v<DFn>,
+            "SparkDetachedLane::launch: Fn itself must be nothrow-move-constructible — a "
+            "rejected or failed launch hands Fn back to the caller by a move, and a "
+            "throwing move there would leave that handoff in an indeterminate state (see "
+            "this file's header comment, 'Ownership fix').");
+
+        using Result = DetachedLaunchResult<T, DFn>;
+        using P = detached_detail::Payload<T, DFn>;
+
+        // Phase 1: admission. fn_in is NOT touched anywhere in this phase —
+        // see the header comment. active.fetch_add(1)+1 > cap -> Rejected,
+        // rolled back, fn_in returned unconsumed.
+        const std::size_t prev = state_->active.fetch_add(1, std::memory_order_acq_rel);
+        if (prev + 1 > state_->cap.load(std::memory_order_acquire)) {
+            state_->active.fetch_sub(1, std::memory_order_acq_rel);
+            state_->rejected_total.fetch_add(1, std::memory_order_relaxed);
+            Result r;
+            r.status = DetachedLaunch::Rejected;
+            r.fn.emplace(std::forward<Fn>(fn_in));
+            return r;
+        }
+        if (state_->f3_counter)
+            state_->f3_counter->fetch_add(1, std::memory_order_acq_rel);
+
+        const auto roll_back_admission = [this] {
+            state_->active.fetch_sub(1, std::memory_order_acq_rel);
+            if (state_->f3_counter)
+                state_->f3_counter->fetch_sub(1, std::memory_order_acq_rel);
+        };
+
+        // Test seam: force a deterministic LaunchFailed before touching
+        // fn_in or spawning anything real (set_fail_launch_for_test).
+        if (state_->fail_launch_for_test.load(std::memory_order_relaxed)) {
+            roll_back_admission();
+            state_->launch_failed_total.fetch_add(1, std::memory_order_relaxed);
+            Result r;
+            r.status = DetachedLaunch::LaunchFailed;
+            r.fn.emplace(std::forward<Fn>(fn_in));
+            return r;
+        }
+
+        // Phase 2: construct the Cell + Payload. If EITHER allocation
+        // throws (bad_alloc), fn_in is guaranteed untouched: Cell's
+        // allocation never involves fn at all, and Payload's constructor
+        // only moves fn from within the placement-new make_shared performs
+        // STRICTLY AFTER its own control-block allocation succeeds — see
+        // Payload's own doc comment. The temporary CountGuard{state_}
+        // constructed as make_shared's first argument is, if the
+        // allocation fails, destroyed by ordinary exception-unwind of the
+        // failed full-expression — which itself performs exactly the
+        // rollback roll_back_admission() would, so this catch block does
+        // NOT call roll_back_admission() a second time on this path either
+        // (see the comment at the catch site).
+        std::shared_ptr<detached_detail::Cell<T>> cell;
+        std::shared_ptr<P> payload;
+        bool countguard_temporary_may_have_rolled_back = false;
+        try {
+            cell = std::make_shared<detached_detail::Cell<T>>();
+            countguard_temporary_may_have_rolled_back = true; // past this point, a throw
+                                                               // unwinds a constructed
+                                                               // CountGuard temporary
+            payload =
+                std::make_shared<P>(detached_detail::CountGuard{state_}, cell, std::forward<Fn>(fn_in));
+        } catch (...) {
+            if (!countguard_temporary_may_have_rolled_back)
+                roll_back_admission(); // threw before the CountGuard temporary
+                                       // existed (Cell's own allocation) — no
+                                       // auto-rollback happened, so do it here
+            state_->launch_failed_total.fetch_add(1, std::memory_order_relaxed);
+            Result r;
+            r.status = DetachedLaunch::LaunchFailed;
+            r.fn.emplace(std::forward<Fn>(fn_in));
+            return r;
+        }
+
+        // Phase 3: spawn. `payload` (this call's own shared_ptr copy) stays
+        // alive across spawn_detached, mirroring GuardianIoExecutor's
+        // `ticket` idiom — on success the worker's own copy (captured in
+        // the small trampoline closure below) becomes the reservation's
+        // sole owner once we drop ours below; on failure our copy is what
+        // lets us recover `fn` from the still-alive Payload, since
+        // spawn_detached's OWN internal failure path destroys only ITS
+        // copy of the trampoline closure, never Payload itself while we
+        // still hold a reference.
+        const bool launched =
+            io_detail::spawn_detached([payload]() mutable noexcept { (*payload)(); });
+        if (!launched) {
+            state_->launch_failed_total.fetch_add(1, std::memory_order_relaxed);
+            Result r;
+            r.status = DetachedLaunch::LaunchFailed;
+            r.fn.emplace(std::move(payload->fn));
+            // Deliberately NOT calling roll_back_admission() here: `payload`
+            // (our last live reference — spawn_detached's own internal
+            // failure path already destroyed ITS copy before returning
+            // false) is about to go out of scope, which destroys Payload,
+            // whose LAST-destroyed member is `guard` — its destructor
+            // performs exactly this rollback. Calling roll_back_admission()
+            // here too would double-decrement.
+            return r;
+        }
+
+        // Success: drop OUR copy explicitly (mirrors GuardianIoExecutor's
+        // `ticket.reset(); // success: drop the caller copy`) — the
+        // worker's own copy, captured in the trampoline closure
+        // spawn_detached just launched, is now the reservation's sole
+        // owner; CountGuard's destructor runs when THAT copy is destroyed,
+        // at true worker-thread-exit time.
+        payload.reset();
+        Result r;
+        r.status = DetachedLaunch::Launched;
+        r.call.emplace(std::move(cell));
+        return r;
+    }
+
+    /// This LANE's own outstanding-worker count (mirrors the shared F3
+    /// counter's contribution from this lane specifically). Lock-free.
+    [[nodiscard]] std::size_t active_workers() const noexcept {
+        return state_->active.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] std::uint64_t rejected_total() const noexcept {
+        return state_->rejected_total.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t launch_failed_total() const noexcept {
+        return state_->launch_failed_total.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t worker_threw_total() const noexcept {
+        return state_->worker_threw_total.load(std::memory_order_relaxed);
+    }
+
+    /// Test seam: change the admission cap live. A cap of 0 always rejects
+    /// — a deliberate, well-defined configuration (the cap-rejection
+    /// regression test uses it to force Rejected deterministically, without
+    /// needing a real concurrent saturating worker), not clamped up to 1.
+    void set_cap_for_test(std::size_t cap) noexcept {
+        state_->cap.store(cap, std::memory_order_relaxed);
+    }
+    /// Test seam: force the next launch() to fail immediately after
+    /// admission, before touching Fn or spawning anything real. Sticky
+    /// until reset (matches GuardianIoExecutor::set_fail_launch_for_test's
+    /// convention) — a test that sets this must reset it before any later
+    /// launch() on this lane that is expected to succeed.
+    void set_fail_launch_for_test(bool v) noexcept {
+        state_->fail_launch_for_test.store(v, std::memory_order_relaxed);
+    }
+
+private:
+    std::shared_ptr<detached_detail::LaneState> state_;
+};
+
+/// Mirrors GuardianSparkRuntimeConfig::backend_op_deadline's default
+/// (agents/core/src/guardian_spark_runtime.hpp:198 — GuardianEngine's own
+/// wall-clock bound on one backend arm/disarm call). Copied here as a VALUE,
+/// not read from that struct: backend_op_deadline is a runtime-configurable
+/// std::chrono::milliseconds MEMBER, not a compile-time constant, so a
+/// static_assert cannot reach across that header boundary — and this file
+/// must not start depending on guardian_spark_runtime.hpp (Spark's
+/// mechanism layer and Guardian's runtime layer are deliberately separate;
+/// see this file's own top comment). If guardian_spark_runtime.hpp's
+/// default ever changes, this mirror needs a matching update by hand — it
+/// is a documentation tripwire, not a functional coupling.
+inline constexpr std::chrono::milliseconds kGuardianBackendOpDeadlineMirror{5000};
+
+/// Compile-time tripwire pattern for a per-mechanism deadline constant D.
+/// PR-A does not define any real D value itself — those come from the
+/// PR-A latency harness's measured output (docs/spark-rebuild-baselines/
+/// stage2-watch-establish-latency.md), consumed by PR-B. PR-B's
+/// Registry/Service/File deadline constants should each carry, at the
+/// point they are defined:
+///   static_assert(spark_deadline_below_guardian_backend_op(kSomeD), "...");
+[[nodiscard]] constexpr bool
+spark_deadline_below_guardian_backend_op(std::chrono::milliseconds d) noexcept {
+    return d.count() > 0 && d < kGuardianBackendOpDeadlineMirror;
+}
+
+/// Overload matching the plan's ceiling note ("per-type queue-depth × D
+/// must stay inside Guardian's 5000ms") — e.g. PR-B's Registry re-arm path
+/// bounds "≤ 4 stalled re-arms park the private pool for D", so the
+/// relevant check there is queue_depth * D, not D alone.
+[[nodiscard]] constexpr bool
+spark_deadline_below_guardian_backend_op(std::chrono::milliseconds d,
+                                         std::size_t queue_depth) noexcept {
+    return queue_depth > 0 && d.count() > 0 &&
+          (d * static_cast<std::chrono::milliseconds::rep>(queue_depth)) <
+              kGuardianBackendOpDeadlineMirror;
+}
+
+} // namespace yuzu::agent
