@@ -309,21 +309,25 @@ WantsListing build_wants_listing(const std::string& wants_dir) {
 /// when NEITHER candidate `.wants` directory could even be opened -- a
 /// genuine "cannot tell", not the common "not linked" case.
 ///
-/// `systemctl enable` always writes the enablement symlink under
-/// `/etc/systemd/system/<target>.wants/`, pointing back at the unit file
-/// wherever it actually lives -- for a package-installed timer that is
-/// `/usr/lib/systemd/system` or `/lib/systemd/system`, NOT the directory
-/// being scanned. So the wants-dir candidates are probed both next to the
-/// unit file itself (covers the vendor-"static" case, where the unit ships
-/// its own `.wants/` symlink alongside it, and the `/etc/systemd/system`
-/// scan pass) AND, unconditionally, under `/etc/systemd/system` -- the one
-/// location every `systemctl enable` writes to regardless of where the unit
-/// file lives.
+/// `systemctl enable` (system scope) always writes the enablement symlink
+/// under `/etc/systemd/system/<target>.wants/`; `systemctl --user enable`
+/// (user scope) writes it under `/etc/systemd/user/<target>.wants/` --
+/// NEVER `/etc/systemd/system`, which holds only system-scope enablement
+/// state and has no relationship to a user timer regardless of where that
+/// timer's unit file lives. Each scope's own global wants root is the one
+/// location every enable of that scope writes to, so the candidate list is
+/// scope-conditional: probed both next to the unit file itself (covers the
+/// vendor-"static" case, where the unit ships its own `.wants/` symlink
+/// alongside it -- this also covers a per-user timer's own
+/// `~/.config/systemd/user/timers.target.wants`, since that IS the unit's
+/// own directory for a per-user scan) AND, unconditionally, under this
+/// scope's own global wants root.
 Enabled timer_enabled(const std::string& unit_dir, const std::string& timer_filename,
-                      const std::string& wanted_by) {
-    static constexpr std::string_view kSystemWantsBase = "/etc/systemd/system";
+                      const std::string& wanted_by, Scope scope) {
+    const std::string_view wants_root =
+        scope == Scope::system ? "/etc/systemd/system" : "/etc/systemd/user";
     std::vector<std::string> wants_base_dirs = {unit_dir};
-    if (unit_dir != kSystemWantsBase) wants_base_dirs.emplace_back(kSystemWantsBase);
+    if (unit_dir != wants_root) wants_base_dirs.emplace_back(wants_root);
 
     bool any_opened = false;
     for (const auto& base : wants_base_dirs) {
@@ -358,6 +362,11 @@ struct TimerScan {
     bool any_file_constrained = false; // a listed unit file failed to read for a real
                                        // reason (not a raced deletion) -- AC4
     std::string file_constrained_reason;
+    bool any_permission_denied = false; // a candidate dir (e.g. one user's
+                                        // ~/.config/systemd/user) refused to
+                                        // open -- distinct from "absent",
+                                        // matching lnx_cron_periodic's
+                                        // partial_permission_denied treatment
 };
 
 /// A directory's (dev, ino) identity, for deduping two path spellings of the
@@ -382,7 +391,10 @@ void scan_systemd_timer_dir_unique(const std::string& dir, Scope scope, const st
 void scan_systemd_timer_dir(const std::string& dir, Scope scope, const std::string& user,
                             TimerScan& out) {
     auto listing = list_dir(dir);
-    if (!listing.opened) return; // absent / permission_denied / other -- not readable
+    if (!listing.opened) {
+        if (listing.permission_denied) out.any_permission_denied = true;
+        return; // absent / permission_denied / other -- not readable
+    }
     out.any_dir_readable = true;
     if (listing.truncated) out.any_truncated = true;
     for (const auto& name : listing.names) {
@@ -424,7 +436,7 @@ void scan_systemd_timer_dir(const std::string& dir, Scope scope, const std::stri
                 row.args += triggers[i];
             }
         }
-        row.enabled = timer_enabled(dir, name, fields.wanted_by);
+        row.enabled = timer_enabled(dir, name, fields.wanted_by, scope);
         row.scope = scope;
         row.user = user;
         row.signed_state = Signed::not_checked;
@@ -447,9 +459,12 @@ void scan_systemd_timer_dir_unique(const std::string& dir, Scope scope, const st
 /// file-read constraint are independent conditions, so both are named when
 /// both occurred.
 std::pair<YuzuSupportLevel, std::string> timer_scan_status(const TimerScan& scan) {
-    if (!scan.any_truncated && !scan.any_file_constrained) return {YUZU_SUPPORT_SUPPORTED, "-"};
+    if (!scan.any_truncated && !scan.any_file_constrained && !scan.any_permission_denied)
+        return {YUZU_SUPPORT_SUPPORTED, "-"};
     std::string reason;
-    if (scan.any_file_constrained) reason = scan.file_constrained_reason;
+    if (scan.any_permission_denied) reason = "partial_permission_denied";
+    if (scan.any_file_constrained)
+        reason += (reason.empty() ? "" : ",") + scan.file_constrained_reason;
     if (scan.any_truncated) reason += (reason.empty() ? "" : ",") + std::string{"row_cap"};
     return {YUZU_SUPPORT_CONSTRAINED, reason};
 }
@@ -1124,7 +1139,11 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
 
     // ── /etc/init.d/* (listing only -- always CONSTRAINED per catalog) ──
     if (!source_wanted(filter, SourceId::lnx_init_d)) {
-        ctx.write_output(format_source_status(SourceId::lnx_init_d, YUZU_SUPPORT_SUPPORTED,
+        // CONSTRAINED even filtered-out -- the catalog declares lnx_init_d's
+        // own intrinsic support level as CONSTRAINED (listing-only, no
+        // runlevel-wiring read), and a filtered status must report that
+        // source's own level, never a blanket SUPPORTED (autoruns_catalog.hpp).
+        ctx.write_output(format_source_status(SourceId::lnx_init_d, YUZU_SUPPORT_CONSTRAINED,
                                               std::nullopt, "filtered"));
     } else {
         const SourceId id = SourceId::lnx_init_d;

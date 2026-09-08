@@ -802,6 +802,10 @@ std::string hr_token(HRESULT hr) {
 /// (SysAllocString), it has no adopt-an-existing-BSTR constructor.
 using BStrGuard = std::unique_ptr<std::remove_pointer_t<BSTR>, decltype(&::SysFreeString)>;
 
+/// Same rationale as BStrGuard, for a PWSTR returned by SHGetKnownFolderPath
+/// -- CoTaskMemFree is the required deallocator, never SysFreeString/delete.
+using CoTaskMemGuard = std::unique_ptr<std::remove_pointer_t<PWSTR>, decltype(&::CoTaskMemFree)>;
+
 // Defensive bound on folder-tree NESTING DEPTH, independent of row count --
 // `cap` alone does not bound recursion: an all-empty folder chain never
 // grows `outcome.rows`, so a pathological deeply-nested folder tree (or a
@@ -888,8 +892,13 @@ void walk_task_folder(ITaskFolder* folder, SourceOutcome& outcome, std::size_t c
             const std::string entry_base = wstring_to_utf8(last_path_component(path_w));
             const std::string location = wstring_to_utf8(path_w);
             const std::string user = info.user_id.empty() ? "-" : info.user_id;
-            const Enabled enabled_state =
-                (enabled_b == VARIANT_TRUE) ? Enabled::enabled : Enabled::disabled;
+            // The Enabled COM property alone overstates reach: a task with
+            // <Triggers/> empty (no triggers defined) is Enabled==true yet
+            // Task Scheduler will never invoke it on its own -- only a
+            // manual Run counts, which is not persistence. Both must hold.
+            const Enabled enabled_state = (enabled_b == VARIANT_TRUE && info.has_triggers)
+                                              ? Enabled::enabled
+                                              : Enabled::disabled;
 
             // Task Scheduler executes every <Exec> action in sequence -- one
             // row per action (index-suffixed once there's more than one) so
@@ -1126,16 +1135,17 @@ int collect_windows(yuzu::CommandContext& ctx, std::string_view filter) {
         // "just not set" -- a missing/oversized var or a redirected known
         // folder previously read as a silent supported|0 rather than a
         // flagged constraint.
-        PWSTR known_path = nullptr;
+        PWSTR known_path_raw = nullptr;
         const HRESULT hr =
-            SHGetKnownFolderPath(FOLDERID_CommonStartup, 0, nullptr, &known_path);
+            SHGetKnownFolderPath(FOLDERID_CommonStartup, 0, nullptr, &known_path_raw);
+        CoTaskMemGuard known_path(known_path_raw, &::CoTaskMemFree);
         if (SUCCEEDED(hr) && known_path) {
-            collect_startup_folder(std::wstring(known_path), SourceId::win_startup_folder_common,
-                                   Scope::system, "-", startup_folder_common);
+            collect_startup_folder(std::wstring(known_path.get()),
+                                   SourceId::win_startup_folder_common, Scope::system, "-",
+                                   startup_folder_common);
         } else {
             note_constraint(startup_folder_common, hr_token(hr));
         }
-        if (known_path) CoTaskMemFree(known_path);
     }
 
     SourceOutcome scheduled_tasks;
