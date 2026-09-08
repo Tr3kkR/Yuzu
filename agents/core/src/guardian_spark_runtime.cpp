@@ -372,6 +372,25 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
     // contract) without any notify-order reasoning.
     std::optional<std::uint64_t> compensating; // a live subscription nobody adopted
     std::vector<std::shared_ptr<KeyClaim>> finished;
+    // Verdicts are STAGED here during step (1) and written into the claims only in
+    // step (3): a waiter's predicate reads the claim's own outcome/commit_exception,
+    // and claim_cv_ is runtime-wide, so any other key's notify (or a spurious wake)
+    // would otherwise let a waiter observe its verdict before the compensating disarm
+    // in step (2) has run. Notification is not publication; the field write is.
+    struct Verdict {
+        std::optional<std::expected<std::uint64_t, std::string>> outcome;
+        std::exception_ptr ex;
+        ClaimEnd end{ClaimEnd::None};
+    };
+    std::vector<std::pair<std::shared_ptr<KeyClaim>, Verdict>> verdicts;
+    const auto stage = [&](const std::shared_ptr<KeyClaim>& c,
+                           std::optional<std::expected<std::uint64_t, std::string>> outcome,
+                           std::exception_ptr ex, ClaimEnd end) {
+        for (auto& [pc, v] : verdicts)
+            if (pc == c)
+                return; // first verdict for a claim wins
+        verdicts.emplace_back(c, Verdict{std::move(outcome), std::move(ex), end});
+    };
     std::function<void()> waker;
     std::function<void()> outbox_waker;
     bool firewalled = false;
@@ -387,9 +406,8 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                 // defensive: never leak the subscription, never touch a foreign entry.
                 if (armed_live)
                     compensating = **r;
-                if (!claim->outcome)
-                    claim->outcome = std::unexpected(std::string{"arm claim orphaned"});
-                claim->end = ClaimEnd::AdmissionRejected;
+                stage(claim, std::unexpected(std::string{"arm claim orphaned"}), nullptr,
+                      ClaimEnd::AdmissionRejected);
                 lk.unlock();
                 claim_drain_failures_.fetch_add(1, std::memory_order_relaxed);
             } else {
@@ -409,11 +427,8 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                     // live). No "armed" audit - nothing committed.
                     for (const auto& c : finished) {
                         release_claim_index_locked(*c);
-                        if (!c->outcome)
-                            c->outcome = std::unexpected(
-                                std::string{stopping_ ? "stopping" : "withdrawn"});
-                        if (c->end == ClaimEnd::None)
-                            c->end = stopping_ ? ClaimEnd::Stopped : ClaimEnd::Withdrawn;
+                        stage(c, std::unexpected(std::string{stopping_ ? "stopping" : "withdrawn"}),
+                              nullptr, stopping_ ? ClaimEnd::Stopped : ClaimEnd::Withdrawn);
                     }
                     if (armed_live) {
                         compensating = **r;
@@ -438,21 +453,16 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                         backend_op_timeouts_.fetch_add(1, std::memory_order_relaxed);
                     for (const auto& c : finished) {
                         release_claim_index_locked(*c);
-                        if (!c->outcome)
-                            c->outcome = std::unexpected(reason);
-                        if (c->end == ClaimEnd::None)
-                            c->end = r.error() == IoFailure::WorkerThrew ? ClaimEnd::WorkerThrew
-                                                                        : ClaimEnd::AdmissionRejected;
+                        stage(c, std::unexpected(reason), nullptr,
+                              r.error() == IoFailure::WorkerThrew ? ClaimEnd::WorkerThrew
+                                                                 : ClaimEnd::AdmissionRejected);
                     }
                 } else if (!armed_live) {
                     // backend_->arm() itself refused (synchronously, on the worker) - the
                     // key genuinely could not be armed, so every sibling fails with it.
                     for (const auto& c : finished) {
                         release_claim_index_locked(*c);
-                        if (!c->outcome)
-                            c->outcome = std::unexpected(r->error());
-                        if (c->end == ClaimEnd::None)
-                            c->end = ClaimEnd::BackendRefused;
+                        stage(c, std::unexpected(r->error()), nullptr, ClaimEnd::BackendRefused);
                     }
                 } else {
                     // Success: commit every live claim, in FIFO order, against the ONE
@@ -491,24 +501,23 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                                 adopted_by = c->rule_id;
                             } catch (...) {
                                 release_claim_index_locked(*c);
-                                c->commit_exception = std::current_exception();
-                                c->end = ClaimEnd::CommitThrew;
+                                stage(c, std::nullopt, std::current_exception(),
+                                      ClaimEnd::CommitThrew);
                                 // `compensating` still holds `sub`: the remaining live
                                 // claims cannot adopt a subscription whose PerKey does
                                 // not exist, so they fail with a plain reason.
                                 for (const auto& other : live) {
-                                    if (other == c || other->outcome || other->commit_exception)
+                                    if (other == c)
                                         continue;
                                     release_claim_index_locked(*other);
-                                    other->outcome = std::unexpected(std::string{"arm commit failed"});
-                                    other->end = ClaimEnd::CommitThrew;
+                                    stage(other, std::unexpected(std::string{"arm commit failed"}),
+                                          nullptr, ClaimEnd::CommitThrew);
                                 }
                                 break;
                             }
                             compensating.reset(); // adopted
                             c->index_held = false; // ownership passed to rules_/keys_
-                            c->outcome = c->generation;
-                            c->end = ClaimEnd::Committed;
+                            stage(c, c->generation, nullptr, ClaimEnd::Committed);
                         } else {
                             // A later sibling joins the existing shared watcher - the
                             // pre-existing reuse path, one commit per claim. A throw here
@@ -519,27 +528,24 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                                                              std::move(c->rg), c->attach_now,
                                                              waker, outbox_waker);
                                 c->index_held = false;
-                                c->outcome = c->generation;
-                                c->end = ClaimEnd::Committed;
+                                stage(c, c->generation, nullptr, ClaimEnd::Committed);
                             } catch (...) {
                                 rules_.erase(c->rule_id);
                                 pk->pending_initial.erase(c->rule_id);
                                 release_claim_index_locked(*c);
-                                c->commit_exception = std::current_exception();
-                                c->end = ClaimEnd::CommitThrew;
+                                stage(c, std::nullopt, std::current_exception(),
+                                      ClaimEnd::CommitThrew);
                             }
                         }
                     }
                     // Claims that were withdrawn/abandoned while their siblings adopted.
                     for (const auto& c : finished) {
-                        if (c->outcome || c->commit_exception)
-                            continue;
                         release_claim_index_locked(*c);
-                        c->outcome = std::unexpected(
-                            std::string{c->withdrawn ? "withdrawn" : "arm timed out"});
-                        if (c->end == ClaimEnd::None)
-                            c->end = c->withdrawn ? ClaimEnd::Withdrawn
-                                                  : ClaimEnd::WaiterTimedOutDispatched;
+                        stage(c, std::unexpected(std::string{c->withdrawn ? "withdrawn"
+                                                                          : "arm timed out"}),
+                              nullptr,
+                              c->withdrawn ? ClaimEnd::Withdrawn
+                                           : ClaimEnd::WaiterTimedOutDispatched);
                     }
                 }
             }
@@ -598,8 +604,21 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
         const auto eit = claims_.find(key);
         if (eit != claims_.end()) {
             auto& fifo = eit->second.fifo;
-            // Pop every claim this drain finished (they are a prefix of the fifo; new
-            // claims that queued behind the head during (2) follow them).
+            // PUBLISH the staged verdicts, then pop every claim this drain finished
+            // (they are a prefix of the fifo; new claims that queued behind the head
+            // during (2) follow them). A claim that already carries an outcome (a
+            // withdrawal published by detach_rule_locked, an abandonment by its waiter)
+            // keeps it - the staged verdict fills only an empty slot.
+            for (auto& [c, v] : verdicts) {
+                if (c->outcome || c->commit_exception)
+                    continue;
+                if (v.ex)
+                    c->commit_exception = v.ex;
+                else
+                    c->outcome = std::move(v.outcome);
+                if (c->end == ClaimEnd::None)
+                    c->end = v.end;
+            }
             for (const auto& c : finished) {
                 if (!c->outcome && !c->commit_exception) {
                     release_claim_index_locked(*c);
