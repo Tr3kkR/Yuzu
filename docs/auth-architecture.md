@@ -566,7 +566,9 @@ account policy)"* — this ships **both** halves.
 
 - **`--auth-mode <standard|sso-only>`** (`YUZU_AUTH_MODE`, default `standard`).
   Under `sso-only` the local-password login path is disabled fleet-wide — only
-  OIDC SSO (`/auth/callback`, untouched) mints a session. The rejection at
+  an SSO provider mints a session: OIDC (`/auth/callback`) or SAML (`/saml/acs`),
+  both untouched by the gate (the `POST /login` gate keys on `auth_mode` alone,
+  never on which provider is wired). The rejection at
   `POST /login` returns the **same generic 401** as a bad password (no
   "disabled"/"sso-only" wording, no `Retry-After`) so the response BODY carries
   no enumeration/mode/arm-state oracle, and `verify_password` (PBKDF2) is
@@ -577,13 +579,31 @@ account policy)"* — this ships **both** halves.
   the lockout *blocked* path avoids; the CC6.3 evidence is the boot-posture
   banner + this counter (the `{target}` label, cardinality 2, flags probing of
   the break-glass account itself for SIEM alerting).
-- **Boot guard (fail-closed).** `sso-only` **refuses to start** when OIDC is not
-  **fully** configured — the guard requires both `--oidc-issuer` **and**
-  `--oidc-client-id` (the same predicate the OIDC provider's `is_enabled()` uses;
-  issuer-without-client-id leaves SSO silently non-functional). Otherwise every
-  operator is locked out. The break-glass account is for an IdP **outage**, not
-  for never wiring SSO. The active posture is logged once at boot for CC6.3
-  evidence.
+- **Boot guard (fail-closed).** `sso-only` **refuses to start** unless at least
+  one SSO provider is configured well enough to actually mint a session —
+  otherwise every operator is locked out (the break-glass account is for an IdP
+  **outage**, not for never wiring SSO). The testable core is
+  `sso_only_boot_guard_ok` (`sso_boot_guard.{hpp,cpp}`), mirroring the SCIM boot
+  guard; it accepts **either**:
+  - **OIDC** — both `--oidc-issuer` **and** `--oidc-client-id` (the same
+    predicate the OIDC provider's `is_enabled()` uses; issuer-without-client-id
+    leaves SSO silently non-functional, review #1735 HIGH-1); **or**
+  - **SAML** (non-Windows) — all five SP fields (`--saml-idp-sso-url`,
+    `--saml-idp-cert`, `--saml-sp-entity-id`, `--saml-sp-acs-url`,
+    `--saml-idp-entity-id`) **and HTTPS enabled**. HTTPS is part of the gate, not
+    deferred to runtime: `server.cpp` leaves the SAML provider disabled under
+    `--no-https` (its Secure browser-binding cookie is dropped over plain HTTP,
+    so `/auth/saml/start` would 404), so a SAML-only `--no-https` deployment would
+    otherwise pass a presence-only gate and boot straight into a fleet-wide
+    lockout. SAML is excluded on Windows because the provider is a compile-time
+    stub there (it can never mint a session; running the *server* on Windows is
+    out of scope regardless).
+
+  The gate checks config **presence**, not runtime validity: a SAML config whose
+  IdP cert / SP key is unreadable, oversized, or non-RSA still passes the boot
+  guard and is then disabled **loudly** by `server.cpp` — exactly as OIDC
+  issuer/JWKS runtime validity is not gate-checked either. The active SSO
+  path(s) are named in the boot banner for CC6.3 evidence.
 - **Break-glass account.** `--break-glass-user <name>` (`YUZU_BREAK_GLASS_USER`)
   designates the single local account exempt from `sso-only`, exempt **only
   while armed**. "Armed" is `users.break_glass_armed_until` (migration v4) — a
@@ -632,10 +652,13 @@ account policy)"* — this ships **both** halves.
 Implementation: gate at `auth_routes.cpp` `POST /login` (between the lockout
 pre-check and `verify_password`); accessors `AuthDB::break_glass_status` /
 `arm_break_glass` (single `UPDATE ... RETURNING`, no `sqlite3_changes()` —
-#1033); flags + boot guard + arm one-shot in `main.cpp`; `Config::auth_mode` /
-`break_glass_user` / `break_glass_window_secs` in `server.hpp`. Tests:
-`tests/unit/server/test_auth_break_glass.cpp` (DB accessors) +
-`test_auth_routes_hardened.cpp` (wire path).
+#1033); the boot guard's testable core is `sso_only_boot_guard_ok`
+(`sso_boot_guard.{hpp,cpp}`, shared with `server.cpp` via `saml_config_complete`),
+called from a thin wrapper in `main.cpp` alongside the flags + arm one-shot;
+`Config::auth_mode` / `break_glass_user` / `break_glass_window_secs` in
+`server.hpp`. Tests: `tests/unit/server/test_auth_break_glass.cpp` (DB
+accessors) + `test_auth_routes_hardened.cpp` (login-gate wire path) +
+`test_sso_boot_guard.cpp` (boot-guard predicate — OIDC/SAML/HTTPS/platform).
 
 ## RBAC group provisioning (#1832)
 
@@ -1264,12 +1287,29 @@ when SAML is in use, and configure your IdP to enforce MFA at login time. Avoid
 gates. The recommended pattern for a SAML deployment is `optional` with IdP-side
 MFA enforcement.
 
-### `--auth-mode=sso-only` is OIDC-only in this release
+### `--auth-mode=sso-only` covers SAML (SOC 2 CC6.3)
 
-`--auth-mode=sso-only` requires OIDC configuration (`--oidc-issuer` +
-`--oidc-client-id`); a SAML-only deployment cannot disable local-password login
-in this release. The boot guard explicitly requires OIDC — SAML configuration
-alone does not satisfy it and the server refuses to start.
+A SAML-only deployment **can** run under `--auth-mode=sso-only`: the boot guard
+accepts a complete SAML SP config (all five `--saml-*` fields) **with HTTPS
+enabled** as an SSO path, exactly as it accepts a complete OIDC config — see the
+Hardened-mode boot-guard bullet above for the full predicate. A dual OIDC+SAML
+deployment satisfies it via either provider. On Windows the SAML provider is a
+stub, so a Windows *server* still needs OIDC for `sso-only` (running the server
+on Windows is out of scope regardless).
+
+Two limitations a SAML-only `sso-only` operator should know (neither is new to
+this change; both are pre-existing SAML properties that simply become more
+visible without a local-password fallback):
+
+- **No privilege elevation for SAML operators.** A SAML session cannot perform a
+  local TOTP step-up and has no OIDC `amr` proof, so JIT admin elevation
+  (`POST /api/v1/elevate`) is unavailable to it. A SAML-only deployment that
+  needs elevation should grant standing admin via the group→role mapping
+  (`--saml-admin-group`) rather than rely on JIT.
+- **No SAML button on the login page.** `/login` still renders a password form
+  (which always returns the generic 401 under `sso-only`) and, if OIDC is also
+  configured, its SSO button; SAML operators navigate to `GET /auth/saml/start`
+  directly.
 
 ### HA / multi-replica
 
@@ -1320,9 +1360,6 @@ key. Design:
 
 - **Login-page SSO button.** There is no "Sign in with SAML" button on the
   login page; users must navigate directly to `GET /auth/saml/start`.
-- **`--auth-mode=sso-only` for SAML.** A SAML-only deployment cannot disable
-  local-password login. Compliance impact: CC6.3 (local-password fallback
-  remains active). OIDC is the path to `sso-only`.
 - **AttributeStatement parsing beyond group/name/email.** Group→role mapping
   (`--saml-group-attribute`) plus the display-name/email session-enrichment
   attributes (`--saml-name-attribute`/`--saml-email-attribute`, see
