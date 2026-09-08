@@ -48,7 +48,7 @@ TEST_CASE("background-job table classifies every audited pass correctly",
     // Count tripwire — forces a conscious table update when a pass is added or
     // removed (a silent count change is exactly what WS-10 exists to prevent).
     // Update this number ONLY alongside a real classification change.
-    CHECK(kBackgroundJobs.size() == 41);
+    CHECK(kBackgroundJobs.size() == 42);
 
     // The load-bearing per-pass calls — a regression here is the WS-10 hazard.
     SECTION("MUST-run-per-replica passes are ReplicaSafe, never leader-gated") {
@@ -89,7 +89,8 @@ TEST_CASE("background-job table classifies every audited pass correctly",
     }
     SECTION("side-effecting singletons are FencedLeaderOnly") {
         for (std::string_view p : {"schedule_runner.tick", "policy_evaluator.dispatch_due",
-                                   "quarantine_reconciler.tick", "ca.publish_crl"}) {
+                                   "quarantine_reconciler.tick", "ca.publish_crl",
+                                   "command_outbox.deliver"}) {
             auto* j = find(p);
             INFO("missing/misclassified: " << p);
             REQUIRE(j != nullptr);

@@ -271,21 +271,16 @@ struct Harness {
               .instruction_store = &is,
               .execution_tracker = &tracker,
               .approval_manager = &approvals,
-              .dispatch_fn =
-                  [this](const std::string& plugin, const std::string& action,
-                         const std::vector<std::string>&, const std::string&,
-                         const std::unordered_map<std::string, std::string>&,
-                         const std::string&,
-                         const DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
-                      dispatched_actions.push_back(plugin + "." + action);
-                      return {.sent = 1, .command_id = "cmd-" + std::to_string(dispatched_actions.size())};
-                  },
-              // #3133 review fix: resolve_caller re-resolves a real caller
-              // from the schedule's creator at fire time — see
-              // test_schedule_runner.cpp's identical wiring.
-              .resolve_caller =
-                  [](const std::string& username) {
-                      return DispatchCaller{.principal = username, .system = false};
+              // WS-3 3.3: scheduled fires enqueue a durable outbox occurrence
+              // instead of dispatching inline (the delivery loop sends). The
+              // arming gate still runs at fire time BEFORE the enqueue, so a
+              // denied fire records nothing here exactly as a denied dispatch did
+              // — which is what these operator-surface-twin cases assert.
+              .enqueue_fn =
+                  [this](const yuzu::server::OutboxEnqueueRequest& req)
+                      -> yuzu::server::OutboxEnqueueOutcome {
+                      dispatched_actions.push_back(req.plugin + "." + req.action);
+                      return yuzu::server::OutboxEnqueueOutcome::Enqueued;
                   },
               .arming_check =
                   [this](const std::string& principal, const std::string& plugin,

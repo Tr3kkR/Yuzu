@@ -19,6 +19,7 @@
 #include "directory_sync.hpp"
 #include "discovery_store.hpp"
 #include "engine_principal_store.hpp"
+#include "command_outbox_store.hpp" // WS-3 3.3
 #include "execution_tracker.hpp"
 #include "fleet_topology_store.hpp"
 #include "guaranteed_state_store.hpp"
@@ -93,6 +94,16 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
     // is deleted by this extraction.
     auto scrape_mu = std::make_shared<std::mutex>();
     sink.Get("/metrics", [deps, scrape_mu](const httplib::Request&, httplib::Response& res) {
+        // WS-3 3.3 (sre-F2/WS-11): refresh the command-outbox delivery-backlog
+        // gauge on scrape (regardless of leadership — a stuck loop that never
+        // acquires leadership shows flat event counters, so this gauge is the
+        // only signal that scheduled dispatch has silently stopped). A degraded
+        // read returns nullopt → leave the last value rather than publish a false 0.
+        if (deps.command_outbox_store && deps.command_outbox_store->is_open()) {
+            if (auto pending = deps.command_outbox_store->count_pending(); pending.has_value())
+                deps.metrics->gauge("yuzu_server_command_outbox_pending")
+                    .set(static_cast<double>(*pending));
+        }
         // Refresh management group gauges before serializing
         if (deps.mgmt_group_store && deps.mgmt_group_store->is_open()) {
             deps.metrics->gauge("yuzu_server_management_groups_total")
@@ -302,6 +313,9 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
         // InstructionDbPool fed /readyz only; approval_ok above is the ONE
         // sibling that already had full probe coverage pre-migration).
         bool execution_tracker_ok = deps.execution_tracker && deps.execution_tracker->is_open();
+        // WS-3 3.3 (arch-F1/sre-F1): born-on-PG command outbox on the live
+        // scheduled-dispatch path — mirrors its /readyz row.
+        bool command_outbox_ok = deps.command_outbox_store && deps.command_outbox_store->is_open();
 
         // Determine overall status
         bool all_stores_ok =
@@ -313,7 +327,7 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
             mgmt_group_ok && discovery_ok && deployment_ok && quarantine_ok &&
             notification_ok && upload_grant_ok && tag_ok && runtime_config_ok &&
             patch_manager_ok && session_store_ok && directory_sync_ok && workflow_engine_ok &&
-            schedule_engine_ok && execution_tracker_ok;
+            schedule_engine_ok && execution_tracker_ok && command_outbox_ok;
         std::string status = all_stores_ok ? "healthy" : "degraded";
 
         nlohmann::json health = {
@@ -363,7 +377,8 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
               {"directory_sync", directory_sync_ok ? "ok" : "error"},
               {"workflow_engine", workflow_engine_ok ? "ok" : "error"},
               {"schedule_engine", schedule_engine_ok ? "ok" : "error"},
-              {"execution_tracker", execution_tracker_ok ? "ok" : "error"}}},
+              {"execution_tracker", execution_tracker_ok ? "ok" : "error"},
+              {"command_outbox_store", command_outbox_ok ? "ok" : "error"}}},
             // #401: was hardcoded "0.1.0" — now derived from the
             // meson-generated yuzu/version.hpp so the health endpoint
             // tracks the actual build instead of a stale literal.
@@ -557,6 +572,13 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
             // caller ever checked availability). Net-new row: the SQLite era
             // had no equivalent probe at all.
             {"schedule_engine", deps.schedule_engine && deps.schedule_engine->is_open()},
+            // WS-3 3.3 (gov HC-1, arch-F1/sre-F1): the born-on-PG command outbox
+            // is on the live scheduled-dispatch path. Construction is already
+            // fail-closed (startup_failed_), so this row guards the RUNTIME
+            // is_open()-flip case — without it a post-boot PG hiccup leaves
+            // /readyz green while every scheduled fire silently stops delivering.
+            {"command_outbox_store",
+             deps.command_outbox_store && deps.command_outbox_store->is_open()},
             // gov R3 HC-1: FleetTopologyStore became load-bearing for
             // /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology.
             // Pure in-memory store with no is_open(); pointer-not-null is
