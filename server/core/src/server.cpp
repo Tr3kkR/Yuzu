@@ -3904,6 +3904,10 @@ public:
                        !cfg_.saml_sp_entity_id.empty() || !cfg_.saml_sp_acs_url.empty() ||
                        !cfg_.saml_idp_entity_id.empty()) {
                 // Partial config — warn so the operator knows which flags are missing.
+                // NB: this OR-list is the COMPLEMENT of saml_config_complete()
+                // (some-but-not-all set), so it cannot call that predicate; if a
+                // sixth required SAML field is ever added there, add it here too —
+                // the two field lists are coupled by construction.
                 spdlog::warn("SAML: incomplete configuration (need --saml-idp-sso-url, "
                              "--saml-idp-cert, --saml-sp-entity-id, --saml-sp-acs-url, "
                              "--saml-idp-entity-id) — SAML login disabled");

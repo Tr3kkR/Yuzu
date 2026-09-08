@@ -137,9 +137,11 @@ TEST_CASE("sso_only_boot_guard_ok: sso-only + complete SAML but --no-https — f
     cfg.https_enabled = false;
     std::string err;
     CHECK_FALSE(sso_only_boot_guard_ok(cfg, err));
-    // The HTTPS-specific message must mention HTTPS — this is the exact
-    // SAML-only + --no-https lockout the gate exists to prevent.
-    CHECK(err.find("HTTPS") != std::string::npos);
+    // Must fire the DEDICATED SAML+no-HTTPS branch, not the generic
+    // no-provider fallthrough — assert on a phrase unique to that branch so a
+    // future refactor deleting it can't pass vacuously (the generic message
+    // also contains "HTTPS"). This is the exact lockout the gate prevents.
+    CHECK(err.find("still requires HTTPS") != std::string::npos);
 }
 
 TEST_CASE("sso_only_boot_guard_ok: sso-only + partial SAML (missing one field) — fails",

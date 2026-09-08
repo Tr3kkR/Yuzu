@@ -43,11 +43,20 @@ bool sso_only_boot_guard_ok(const Config& cfg, std::string& err) {
     }
 #endif
 
+#ifdef _WIN32
+    // SAML is a compile-time stub on Windows, so it is never a remedy here —
+    // naming it would send a Windows operator into a config loop (UP-4). OIDC only.
+    err = "--auth-mode=sso-only disables local-password login but OIDC is not fully "
+          "configured, so every operator would be locked out. Configure OIDC (need both "
+          "--oidc-issuer and --oidc-client-id), or use --auth-mode=standard. (SAML is not "
+          "available on Windows server builds.)";
+#else
     err = "--auth-mode=sso-only disables local-password login but no SSO provider is "
           "fully configured, so every operator would be locked out. Configure OIDC "
           "(need both --oidc-issuer and --oidc-client-id) or SAML (need "
           "--saml-idp-sso-url, --saml-idp-cert, --saml-sp-entity-id, --saml-sp-acs-url "
           "and --saml-idp-entity-id, plus HTTPS enabled), or use --auth-mode=standard.";
+#endif
     return false;
 }
 

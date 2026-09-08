@@ -480,8 +480,10 @@ int main(int argc, char* argv[]) {
     app.add_option("--auth-mode", cfg.auth_mode,
                    "Local-password login policy (default: standard). \"standard\" = "
                    "password login enabled. \"sso-only\" = local-password login is "
-                   "disabled fleet-wide (only OIDC SSO mints a session); the server "
-                   "refuses to start without OIDC configured. A single --break-glass-user "
+                   "disabled fleet-wide (only SSO mints a session); the server refuses to "
+                   "start unless an SSO provider is configured — OIDC (--oidc-issuer + "
+                   "--oidc-client-id), or on Linux/macOS with HTTPS a complete SAML SP "
+                   "config. A single --break-glass-user "
                    "is exempt while armed (see --break-glass-arm).")
         ->default_val("standard")
         ->check(CLI::IsMember({"standard", "sso-only"}))
