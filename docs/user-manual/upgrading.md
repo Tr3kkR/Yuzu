@@ -3142,9 +3142,10 @@ If a migration fails:
 `DELETE /api/v1/sle/agents/{id}` (the whole-device erasure cascade — see
 [REST API § Software Licensing (SLE)](rest-api.md#software-licensing-sle)) used to gate on a
 **three-securable conjunction**: `SoftwareLicensing:Delete` **and** `Inventory:Delete` **and**
-`GuaranteedState:Delete`, all required together. Wave 7 PR7.2 added a sixth per-agent store
-(`app_usage`) to the cascade, and rather than grow the conjunction to a fourth securable, ADR-0024
-Decision 9 was amended to promote a single dedicated **`Decommission`** securable — the route now
+`GuaranteedState:Delete`, all required together. A companion Wave 7 PR7.2 package adds a sixth
+per-agent store (`app_usage`) to the cascade, and rather than grow the conjunction to a fourth
+securable, ADR-0024 Decision 9 was amended ahead of that landing to promote a single dedicated
+**`Decommission`** securable — the route now
 gates on **`Decommission:Delete` alone**, replacing the old conjunction outright (not adding to it).
 
 **Seeded roles are auto-preserved** — the same `INSERT OR IGNORE` role-default seeding as the SLE
