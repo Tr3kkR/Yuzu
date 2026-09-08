@@ -2330,7 +2330,18 @@ test('windows sdk contract',
   _python3_test,
   args: [files('test_windows_sdk_contract.py')],
   suite: 'docs',
-  timeout: 10,
+  # Was 10s -- three consecutive Windows CI runs (2026-09-08, PR #4162)
+  # TIMED OUT, reporting durations of 10.19s/10.18s/10.13s. That number is
+  # NOT how close the test came to finishing -- meson's mtest.py kills the
+  # process on timeout and THEN measures elapsed time, so a TIMEOUT always
+  # reports ~= configured_timeout + kill-overhead regardless of how much
+  # longer the test actually needed (#4164). The real evidence for 30s is
+  # empirical: five recent Windows-debug CI runs on dev (unrelated PRs,
+  # 2026-09-05..08) all passed at 2.34-3.12s, ~10x margin -- the three
+  # timeouts were a sharp anomaly against a normally-fast test, not steady
+  # erosion of a tight budget. 30s matches this file's other _python3_test
+  # entries' explicit/default timeout.
+  timeout: 30,
 )
 
 # The nightly TSan gdb capture's pure-logic selftest (#1038): junit -> failing
