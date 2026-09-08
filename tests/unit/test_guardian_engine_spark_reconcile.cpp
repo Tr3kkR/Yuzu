@@ -13,6 +13,7 @@
 #include "guardian_convergence_scheduler.hpp" // ConvergenceScheduler (started_for_test, #2238)
 #include "guardian_journal_format.hpp" // kJournalNamespace, parse_journal_batch (item 7 PR-Ag)
 #include "guardian_joined_thread_role.hpp" // GuardianJoinedThreadRole (death test below)
+#include "guardian_io_executor.hpp" // GuardianIoExecutor::submit() (rung 9c R5.1 death test)
 #include "guardian_journal_heartbeat.hpp" // emit_guardian_journal_heartbeat_tags (aggregate inertness)
 #include "guardian_lifecycle_journal.hpp" // GuardianLifecycleJournal (for the _for_test fault seam)
 #include "guardian_outbox.hpp" // OutboxEntry, SendResult - full definitions for the test's send_fn
@@ -1523,6 +1524,86 @@ TEST_CASE("a worker-thread mtx_ acquisition aborts the process (death test)",
     INFO("child exit code (if it exited normally): " << (WIFEXITED(status) ? WEXITSTATUS(status)
                                                                           : -1));
     REQUIRE(WIFSIGNALED(status));            // died by signal, not a clean exit
+    CHECK(WTERMSIG(status) == SIGABRT);      // and specifically via std::abort()
+}
+
+TEST_CASE("a GuardianIoExecutor::submit() completion callback taking mtx_ aborts the process "
+          "(death test, rung 9c R5.1)",
+          "[spark][guardian][reconcile][death]") {
+    // The SECOND WorkerHostileMutex role (guardian_detached_worker_role.hpp): a detached
+    // executor worker can never be joined and may outlive stop() or the F3 orphan grace,
+    // so an mtx_ acquisition from its body or its completion callback is a
+    // lock-vs-lifetime fault the tripwire must turn into a loud abort. Drives the hostile
+    // call through the REAL dispatch form (submit() + on_complete on the worker), not a
+    // hand-marked thread - the marker is applied by the executor's own worker lambda,
+    // which is exactly the wiring under test. Mutation: revert abort_if_worker_thread()'s
+    // predicate to the joined-thread role alone -> the child exits 94 (no abort).
+    if constexpr (!yuzu::agent::worker_mutex_guard_enabled()) {
+        SUCCEED("WorkerHostileMutex is compiled out in this build; nothing to prove");
+        return;
+    }
+
+    // fork() WITHOUT exec, same posture as the case above. NOTE the enlarged suite: an
+    // earlier case's detached executor worker can, in principle, still be alive at this
+    // fork (every such case spins for active_worker_count()==0 before returning, which
+    // bounds but does not prove it). Only the forking thread is duplicated, and the
+    // child does nothing but open a KvStore, start an engine, spawn ONE worker and touch
+    // mtx_, so a libc lock held by a stray thread at fork time is the residual risk;
+    // an isolated child executable would remove it and is noted as the follow-up.
+    const pid_t pid = ::fork();
+    REQUIRE(pid >= 0);
+
+    if (pid == 0) {
+        // ---- child ----
+        ::signal(SIGABRT, SIG_DFL);
+
+        auto opened = KvStore::open(unique_kv_path());
+        if (!opened)
+            ::_exit(90);
+        KvStore kv{std::move(*opened)};
+        GuardianEngine engine{&kv, "agent-death-submit", /*prefer_spark=*/true};
+        if (!engine.start_local())
+            ::_exit(92);
+
+        yuzu::agent::GuardianIoExecutor ex;
+        const auto adm = ex.submit(yuzu::agent::IoClass::File, "death", [] { return 1; },
+                                   [&engine](yuzu::agent::IoResult<int>&&) {
+                                       (void)engine.journal_stats(); // takes mtx_ on the
+                                                                     // detached worker -> abort
+                                   });
+        if (!adm)
+            ::_exit(91); // admission refused: setup failure, not a verdict
+
+        // If the guard works we never get here - the process aborts inside the worker.
+        // Give it a bounded window, then report "no abort" with a distinct code.
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        ::_exit(94);
+    }
+
+    // ---- parent ---- (poll, never block: a regressed guard leaves the child alive)
+    int status = 0;
+    bool reaped = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (std::chrono::steady_clock::now() < deadline) {
+        const pid_t r = ::waitpid(pid, &status, WNOHANG);
+        if (r == pid) {
+            reaped = true;
+            break;
+        }
+        REQUIRE(r == 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    if (!reaped) {
+        ::kill(pid, SIGKILL);
+        ::waitpid(pid, &status, 0);
+        FAIL("child never exited: the submit() worker took mtx_ and neither aborted nor "
+             "returned - the lock-vs-lifetime wedge WorkerHostileMutex's second role exists "
+             "to prevent");
+    }
+
+    INFO("child exit code (if it exited normally): " << (WIFEXITED(status) ? WEXITSTATUS(status)
+                                                                          : -1));
+    REQUIRE(WIFSIGNALED(status));            // died by signal, not a clean exit (94 = no abort)
     CHECK(WTERMSIG(status) == SIGABRT);      // and specifically via std::abort()
 }
 
