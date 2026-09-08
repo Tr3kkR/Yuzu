@@ -7,7 +7,6 @@
 
 #include <yuzu/metrics.hpp>
 #include <yuzu/secure_zero.hpp>
-#include <yuzu/version.hpp>
 #include "bundled_content.hpp"
 #include "cert_reloader.hpp"
 #include "file_utils.hpp"
@@ -71,7 +70,6 @@
 #include "principal_quota_gate.hpp"
 #include "rest_a4_envelope_http.hpp"
 #include "inventory_store.hpp"
-#include "data_inventory_routes.hpp" // #2542 PR-11: the 3-route Inventory API, extracted onto the HttpRouteSink seam
 #include "app_perf_daily_store.hpp"
 #include "app_perf_fleet_store.hpp"
 #include "app_perf_cohort_reader.hpp"
@@ -113,7 +111,6 @@
 #include "scope_yaml.hpp"
 #include "rbac_store.hpp"
 #include "response_store.hpp"
-#include "response_routes.hpp" // #2542 PR-11: the 3-route Responses API, extracted onto the HttpRouteSink seam
 #include "dispatch_caller.hpp" // PLAN-006: DispatchCaller — the principal threaded to dispatch_confined
 #include "dispatch_target_shape.hpp" // check_targeting_shape / targeting_supplied (#2500)
 #include "authz_model.hpp" // #1788: per-arm visibility intersection (in_scope/filter_to_scope)
@@ -129,6 +126,12 @@
 #include "result_set_routes.hpp" // #2542 PR-5: the 6-route Result Sets fragment API, extracted onto the HttpRouteSink seam
 #include "instruction_routes.hpp" // #2542 PR-7: the 13-route Instruction Definitions + Instruction Sets API, extracted onto the HttpRouteSink seam
 #include "execution_routes.hpp" // #2542 PR-7: the 7-route legacy pre-v1 Executions API, extracted onto the HttpRouteSink seam
+#include "schedule_routes.hpp" // #2542 PR-8: the 4-route Schedules API, extracted onto the HttpRouteSink seam
+#include "approval_routes.hpp" // #2542 PR-9: the 4-route Approval API, extracted onto the HttpRouteSink seam
+#include "health_routes.hpp" // #2542 PR-10: the 6-route Health/Infra cluster, extracted onto the HttpRouteSink seam
+#include "response_routes.hpp" // #2542 PR-11: the 3-route legacy pre-v1 Responses API, extracted onto the HttpRouteSink seam
+#include "tag_routes.hpp" // #2542 PR-11: the 4-route Tags API, extracted onto the HttpRouteSink seam
+#include "data_inventory_routes.hpp" // #2542 PR-11: the 3-route generic plugin-data Inventory API, extracted onto the HttpRouteSink seam
 #include "command_capability.hpp" // PR1.9c: CommandCapabilityRegistry — the dispatch classification vocabulary
 #include "command_capability_parsers.hpp" // PR1.9c: encode_dispatch_tag / compute_plan_hash
 // PR1.9c: the seven capability spans build_classified_command's registry composes over —
@@ -172,9 +175,11 @@
 #include "preflight_runner.hpp"
 #include "tar_tree_routes.hpp"
 #include "background_jobs.hpp" // WS-10: pass-classification table + YUZU_ASSERT_BACKGROUND_JOB gate
+#include "coord_dsn.hpp"       // WS-3: build the elector's dedicated coordination DSN (testable)
+#include "leader_elector.hpp"  // WS-3: fenced leader-election primitive (ADR-2002 §3/§6/§10)
+#include "leader_gate.hpp"     // WS-3 3.2: runtime FencedLeaderOnly loop gate over kBackgroundJobs
 #include "policy_evaluator.hpp"
 #include "schedule_arming_check.hpp"
-#include "schedule_routes.hpp"
 #include "schedule_runner.hpp"
 #include "dashboard_routes.hpp"
 #include "discovery_routes.hpp"
@@ -198,7 +203,6 @@
 #include "schedule_engine.hpp"
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
-#include "tag_routes.hpp" // #2542 PR-11: the 4-route Tags API, extracted onto the HttpRouteSink seam
 #include "service_scope_policy.hpp" // authz::kServiceTagKey — #3289 single confinement-key definition
 #include "update_registry.hpp"
 #include "legacy_sqlite_probe.hpp"
@@ -255,6 +259,7 @@ template <typename Req> auto yuzu_req_get_file(const Req& req, const std::string
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <atomic>
 #include <semaphore>
 #include <cctype>
@@ -273,6 +278,7 @@ template <typename Req> auto yuzu_req_get_file(const Req& req, const std::string
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <shared_mutex>
 #include <ranges>
 #include <set>
@@ -338,6 +344,38 @@ std::string trim_ascii_whitespace(std::string_view s) {
 }
 
 namespace {
+
+// ---- WS-3 slice 3.2: leader-election wiring helpers (ADR-2002 §3/§6/§10) ----
+
+// Election-loop cadences (steady_clock, immune to NTP jumps). A healthy follower
+// polls to acquire on kLeaderPoll; a leader heartbeats on the same cadence; a
+// connection failure backs off exponentially between kLeaderBackoffMin and
+// kLeaderBackoffMax so a repeated reconnect during a failover window does not
+// hammer Postgres (#4013). Jitter up to kLeaderJitterMax is added to every wait
+// so replicas do not stampede the lock in lockstep after a primary failover.
+constexpr std::chrono::seconds kLeaderPoll{5};
+constexpr std::chrono::seconds kLeaderBackoffMin{2};
+constexpr std::chrono::seconds kLeaderBackoffMax{30};
+constexpr std::chrono::seconds kLeaderJitterMax{3};
+
+// A boot-time random identity for the LeaderElector's leader_state.holder_id
+// (ADR-2002 §10 attributability; the elector fails closed on an empty one). Not
+// a security token — just enough entropy that two replicas' rows are
+// distinguishable in the leadership registry.
+std::string random_holder_id() {
+    std::random_device rd;
+    std::uniform_int_distribution<int> hex(0, 15);
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string id = "srv-";
+    for (int i = 0; i < 16; ++i)
+        id += kHex[hex(rd)];
+    return id;
+}
+
+// build_coord_dsn (the LeaderElector's dedicated coordination DSN, ADR-2002 §10)
+// moved to the header `coord_dsn.hpp` so it is unit-testable (test_coord_dsn.cpp) —
+// adversarial review K3/CDX-P2-03.
+
 // Best-effort row count for a legacy-file detect-and-warn check (currently
 // PolicyStore's boot path; postgres-store-playbook.md's Backfill bullet
 // mandates a count, not just file-existence, so a schema-only legacy file
@@ -2665,6 +2703,20 @@ public:
             metrics_.counter("yuzu_auth_read_degrade_total",
                              {{"route", "login"}, {"reason", reason}});
         }
+        // Gate 5 chaos-injector CH-3/UP-6 follow-up (#4020): the ONE
+        // caller-visible signal that get_user_role() is about to floor a
+        // legacy-API-token-authenticated request's role to Role::user
+        // (auth_routes.cpp's `.value_or(Role::user)`) on a genuine AuthDB
+        // store error - not a plain not-found. Single call site, single
+        // failure shape reaches it (AuthDBError::QueryFailed; UserNotFound/
+        // InvalidUsername are excluded before the increment), so no label
+        // set - pre-seeded to 0 so an increase() alert is meaningful.
+        metrics_.describe("yuzu_auth_get_user_role_store_error_total",
+                          "get_user_role() AuthDB lookups that failed on a genuine store error "
+                          "(not a plain not-found/invalid-username miss) - each one floors the "
+                          "caller's legacy-API-token-authenticated request to Role::user",
+                          "counter");
+        metrics_.counter("yuzu_auth_get_user_role_store_error_total");
         // HA WS-1/1a: durable SessionStore degradation on the auth hot path
         // (validate/create/touch/generation-refresh/reap). Mirrors the
         // yuzu_auth_read_degrade_total / yuzu_server_rbac_read_degrade_total
@@ -3002,6 +3054,33 @@ public:
                           "AVAILABILITY signal, not a termination event; correlate with "
                           "PostgreSQL health, do not treat as a CC6.8 deprovision-deny",
                           "counter");
+        // #4107 — the local-auth analogue of the OIDC/SAML post-mint
+        // recheck above, with one more undifferentiated cause than those:
+        // AuthManager::create_local_session (password login, MFA login-
+        // challenge TOTP/recovery verify at /login/mfa, MFA enrollment-
+        // confirm) returns its caller-facing empty-string
+        // sentinel on EITHER a plain SessionStore persist failure (an
+        // ordinary availability event, unrelated to any role check) OR a
+        // post_mint_role_recheck denial (role diverged from AuthDB during
+        // the check-then-mint window, or the post-mint AuthDB read itself
+        // hit a store error) - the route layer cannot distinguish any of
+        // the three from the sentinel alone (see auth_routes.cpp's
+        // `reason=session_mint_failed;cause=undifferentiated` audit
+        // detail), so unlike the OIDC/SAML counters' genuine-vs-store-
+        // unavailable split, this one is NOT purely a role-recheck signal
+        // and must not be alerted on as one (cpp-expert/security-guardian/
+        // authdb Gate 8: an earlier draft of this text asserted only the
+        // post_mint_role_recheck causes).
+        metrics_.describe("yuzu_auth_login_session_mint_denied_total",
+                          "TOTAL local-auth logins (password, MFA login-challenge TOTP/"
+                          "recovery verify, MFA enrollment-confirm) whose session mint was "
+                          "denied - EITHER an ordinary "
+                          "SessionStore persist failure OR a post_mint_role_recheck denial "
+                          "(#4107 role-recheck: role diverged from AuthDB during the "
+                          "check-then-mint window, or the post-mint AuthDB read hit a store "
+                          "error) - undifferentiated, unlike the OIDC/SAML analogues above; "
+                          "do not alert on this as a role-recheck-specific signal",
+                          "counter");
         // describe() only registers HELP/TYPE metadata; the series is absent
         // from /metrics until first .increment(). Instantiate each bare
         // counter at 0 now so absent()-style alert rules on the CC6.8
@@ -3019,6 +3098,7 @@ public:
         metrics_.counter("yuzu_auth_saml_deprovisioned_denied_total");
         metrics_.counter("yuzu_auth_saml_deprovisioned_denied_genuine_total");
         metrics_.counter("yuzu_auth_saml_deprovisioned_denied_store_unavailable_total");
+        metrics_.counter("yuzu_auth_login_session_mint_denied_total");
         metrics_.counter("yuzu_scim_saml_link_unmatched_total");
         metrics_.counter("yuzu_scim_saml_link_ambiguous_total");
         metrics_.counter("yuzu_scim_saml_link_lookup_failures_total");
@@ -3957,6 +4037,17 @@ public:
                 }
             }
         }
+
+        // WS-3 (ADR-2002 §3/§6/§10): the fenced leader elector + its election loop
+        // are constructed and STARTED in run(), NOT here — see the #1867-shaped
+        // block just before start_web_server(). Spawning the thread in the
+        // constructor is unsafe: ~3000 lines of construction follow, and a throw in
+        // any of them skips ~ServerImpl (so stop()'s join never runs), which would
+        // leave a joinable std::thread → std::terminate (cpp-safety BLOCKING, this
+        // review round). The elector OBJECT could live here safely (a constructed
+        // member is destroyed on a constructor throw), but keeping construction and
+        // loop-start together in run() is clearer and matches the NVD/web/health
+        // thread pattern.
 
         // First born-on-Postgres store (#1320 PR 3): last-known endpoint state,
         // so offline hosts render stale-flagged on /viz/fleet. Only built when
@@ -7074,6 +7165,18 @@ public:
                 // the CA key for an anonymous caller (the public handler is
                 // serve-or-503, it does NOT build). Best-effort: a failure just means
                 // /ca/crl returns 503 until the next revoke republishes.
+                //
+                // WS-3 note (adversarial review CDX-P1-01/K7): this boot-time one-shot
+                // is an AUTOMATIC CRL publish that is deliberately NOT leader-gated —
+                // it runs before the elector is constructed (below), and gating it
+                // would skip the boot CRL on the single-replica deployment (leadership
+                // is acquired asynchronously). It is a SEPARATE call site from WS-10's
+                // classified `ca.publish_crl` background pass (the freshness re-publish
+                // in the health loop, which IS gated). Cross-replica crlNumber-
+                // allocation atomicity for BOTH sites is WS-6's job (durable CRL
+                // numbering); until then a concurrent multi-replica *boot* could race
+                // the number — E6-capped today (single-replica is the only supported
+                // topology). Tracked: #4126 (WS-6).
                 if (!publish_crl())
                     spdlog::warn("PKI: initial CRL publish failed; GET /api/v1/ca/crl will 503 until "
                                  "the next revocation republishes");
@@ -7227,6 +7330,89 @@ public:
         // thread wedged in an uncancellable fetch.
         if (nvd_sync_) {
             nvd_sync_->start();
+        }
+
+        // WS-3 (ADR-2002 §3/§6/§10): construct the fenced leader elector and start
+        // its election loop HERE in run() — past every fail-closed check (same
+        // #1867 rationale as the NVD thread above: a construction/early-run failure
+        // returns before this point, so ~ServerImpl never has to join a thread that
+        // was never started), and BEFORE start_web_server() + the health thread
+        // below spawn the FencedLeaderOnly worker loops. Leadership is acquired
+        // ASYNCHRONOUSLY inside the election thread, typically within one round-trip
+        // of thread start, so a worker's very first tick may legitimately observe
+        // not-leader and skip once (harmless — ticks are periodic and single-replica
+        // acquisition is milliseconds); it is not a synchronous ordering guarantee
+        // (adversarial review K6/CDX-P2-05). The elector takes a DEDICATED coordination
+        // connection (§10), derived from the same reachable DSN the pool proved,
+        // augmented with connect_timeout + keepalives so a half-open backend fails
+        // fast rather than stalling the loop (#4013).
+        if (pg_pool_ && !startup_failed_) {
+            leader_elector_ = std::make_unique<LeaderElector>(LeaderElector::Config{
+                .dsn = build_coord_dsn(cfg_.postgres_dsn), .holder_id = random_holder_id()});
+            if (!leader_elector_->is_open()) {
+                // Do NOT fail boot. On the single-replica deployment the loop below
+                // re-acquires within one cycle and the gated loops resume; the pause
+                // touches ONLY the FencedLeaderOnly loops, which is the fail-closed
+                // posture (never double-dispatch), not a data-loss one. A persistent
+                // failure is a coordination-substrate problem (§10) — loud, never
+                // silent. WS-11 (#4014) adds the metric/alert/readyz surface.
+                spdlog::error("[HA] leader_elector could not open its coordination connection; "
+                              "FencedLeaderOnly background loops are PAUSED until leadership is "
+                              "acquired (single-replica: self-heals within one election cycle; "
+                              "persistent: a coordination-substrate fault, ADR-2002 §10)");
+            }
+            leader_thread_ = std::thread([this]() {
+                using namespace std::chrono;
+                spdlog::info("leader_elector: election loop started (poll={}s)", kLeaderPoll.count());
+                std::mt19937 rng{std::random_device{}()};
+                seconds backoff{0};
+                while (!stop_requested_.load(std::memory_order_acquire)) {
+                    // Per-iteration try/catch, mirroring the three sibling background
+                    // tick loops (policy/quarantine/schedule): an exception escaping a
+                    // std::thread entry is std::terminate — the whole process, over a
+                    // best-effort coordination iteration. The body allocates (rng, the
+                    // spdlog formats), so bad_alloc alone makes it reachable
+                    // (adversarial review K2/CDX-P2-02). Catch, log, keep leading/
+                    // polling.
+                    seconds wait = kLeaderPoll;
+                    try {
+                        // Sole writer of leadership state: heartbeat while leading, else
+                        // attempt to acquire. is_leader()/epoch() readers are lock-free.
+                        const bool leading = leader_elector_->is_leader()
+                                                 ? leader_elector_->heartbeat()
+                                                 : leader_elector_->try_acquire();
+                        if (leading || leader_elector_->is_open()) {
+                            // Leader (heartbeating), or a HEALTHY follower whose acquire
+                            // was simply refused because another replica holds the lock:
+                            // steady cadence, no backoff (fast failover).
+                            backoff = seconds{0};
+                            wait = kLeaderPoll;
+                        } else {
+                            // Connection trouble (is_open() went false): exponential
+                            // backoff so a reconnect storm during a failover window does
+                            // not hammer Postgres (#4013).
+                            backoff = backoff == seconds{0}
+                                          ? kLeaderBackoffMin
+                                          : std::min(backoff * 2, kLeaderBackoffMax);
+                            wait = backoff;
+                        }
+                        std::uniform_int_distribution<int> jitter(
+                            0, static_cast<int>(kLeaderJitterMax.count()));
+                        wait += seconds{jitter(rng)};
+                    } catch (const std::exception& e) {
+                        spdlog::error("leader_elector: election iteration threw ({}) — continuing",
+                                      e.what());
+                        wait = kLeaderBackoffMin; // brief backoff so a persistent throw can't spin
+                    } catch (...) {
+                        spdlog::error("leader_elector: election iteration threw unknown — continuing");
+                        wait = kLeaderBackoffMin;
+                    }
+                    for (seconds::rep i = 0;
+                         i < wait.count() && !stop_requested_.load(std::memory_order_acquire); ++i)
+                        std::this_thread::sleep_for(seconds{1});
+                }
+                spdlog::info("leader_elector: election loop stopped");
+            });
         }
 
         // Create AuthRoutes — must precede start_web_server which uses it
@@ -7663,11 +7849,22 @@ public:
                             !latest || (latest->next_update - now_epoch) < 24 * 3600;
                         if (stale) {
                             YUZU_ASSERT_BACKGROUND_JOB("ca.publish_crl"); // WS-10 FencedLeaderOnly (crlNumber)
-                            if (publish_crl())
-                                spdlog::info(
-                                    "PKI: CRL re-published for freshness (nextUpdate window)");
-                            else
-                                crl_freshness_retry_after_ = now_steady + std::chrono::minutes(5);
+                            // WS-3 3.2: the background freshness re-publish bumps
+                            // crlNumber (a DB single-writer), so gate it to the fenced
+                            // leader — two replicas must not diverge the number. The
+                            // OPERATOR revoke path (ca_routes.cpp) publishes on its own
+                            // plane and is deliberately NOT gated here (two-dispatch-
+                            // planes rule; it carries no background-job assert).
+                            // Numbering correctness itself is WS-6.
+                            if (leader_gate_permits<background_job_class("ca.publish_crl")>(
+                                    leader_elector_.get())) {
+                                if (publish_crl())
+                                    spdlog::info(
+                                        "PKI: CRL re-published for freshness (nextUpdate window)");
+                                else
+                                    crl_freshness_retry_after_ =
+                                        now_steady + std::chrono::minutes(5);
+                            }
                         }
                     }
                 }
@@ -8736,6 +8933,20 @@ public:
             schedule_tick_thread_.join();
         }
         schedule_runner_.reset();
+
+        // WS-3 (ADR-2002 §3): stop the election loop and resign leadership. Joined
+        // here, AFTER every FencedLeaderOnly worker thread that reads is_leader()
+        // is joined, so no tick observes leadership after we resign; the elector
+        // (dedicated connection, no pg_pool_ dependency) outlives the join and is
+        // destroyed at ~ServerImpl. stop_requested_ was set at the top of stop(),
+        // so the loop has already stopped re-acquiring. resign() hands the lock
+        // back promptly for a clean handover rather than waiting for the session
+        // connection to drop.
+        if (leader_elector_)
+            leader_elector_->resign();
+        if (leader_thread_.joinable()) {
+            leader_thread_.join();
+        }
 
         // Join the result-set maintenance thread (borrows result_set_store_,
         // execution_tracker_, response_store_ — must stop before teardown)
@@ -10330,10 +10541,11 @@ private:
     // -- HTML helpers ---------------------------------------------------------
 
     // log_safe moved to web_utils.hpp (#2542 PR-7) — instruction_routes.cpp
-    // needs it alongside the /api/approvals/:id/{approve,reject} call sites
-    // immediately below, which stay inline here. Promoted, not duplicated
-    // (#2557 json_extract.hpp precedent); unqualified call sites in this
-    // class resolve to yuzu::server::log_safe via ordinary lookup.
+    // and approval_routes.cpp (#2542 PR-9, reconciled at merge time onto
+    // this same promotion rather than PR-9's own now-deleted log_safe.hpp)
+    // both need it. Promoted, not duplicated (#2557 json_extract.hpp
+    // precedent); unqualified call sites in this class resolve to
+    // yuzu::server::log_safe via ordinary lookup.
 
     static std::string html_escape(const std::string& s) {
         std::string out;
@@ -13291,13 +13503,15 @@ private:
 
         // NON-BLOCKING session resolve (never writes to `res` on failure) —
         // distinct from `auth_fn` above, which wraps `require_auth` and DOES
-        // write a 401. Shared by three #2542 modules' post-gate "who is
+        // write a 401. Shared by four #2542 modules' post-gate "who is
         // calling" lookups: PR-7's `instruction_routes.cpp` (POST
         // /api/instructions's best-effort `created_by`) and every
         // `execution_routes.cpp` route under an engaged fleet-read scope,
+        // PR-9's `approval_routes.cpp` (approve/reject need the CALLER's
+        // identity as `reviewer` even when perm_fn's gate already passed),
         // and PR-8's `schedule_routes.cpp` (DELETE/enable/create's
         // owner-scoping lookup after `perm_fn` has already proven a session
-        // exists). See any of the three modules' header comments for the
+        // exists). See any of the four modules' header comments for the
         // full rationale.
         auto resolve_session_fn =
             [this](const httplib::Request& req) -> std::optional<auth::Session> {
@@ -13305,12 +13519,85 @@ private:
         };
 
         // #2542 PR-7: wraps ServerImpl::emit_event's 4-argument shape (no
-        // caller in either new module passes a non-default Severity).
+        // caller in the three modules below that take it — instruction,
+        // execution, approval; schedule_routes does not — passes a
+        // non-default Severity).
         auto emit_event_fn = [this](const std::string& event_type, const httplib::Request& req,
                                     const nlohmann::json& attrs,
                                     const nlohmann::json& payload_data) {
             emit_event(event_type, req, attrs, payload_data);
         };
+
+        // #2542 PR-10: the 6-route Health/Infra cluster (/metrics, /health,
+        // /api/health, /livez, /readyz, /fragments/health/summary),
+        // extracted onto the same inline_sink seam. Placed here (after
+        // deny_service_scoped_fn, auth_fn, resolve_session_fn are all in
+        // scope, before instruction/execution routes) rather than beside
+        // page_routes/dashboard_api/nvd's earlier calls, since this module
+        // needs all three of those closures. `health::Deps::cfg` and
+        // `::metrics` are the only two REQUIRED fields (registration throws
+        // if either is null) — see health_routes.hpp's header comment for
+        // the full null-safety rationale covering every other field below.
+        yuzu::server::health::register_health_routes(
+            inline_sink, yuzu::server::health::Deps{
+                             .auth_fn = auth_fn,
+                             .resolve_session_fn = resolve_session_fn,
+                             .deny_service_scoped_fn = deny_service_scoped_fn,
+                             .cfg = &cfg_,
+                             .metrics = &metrics_,
+                             .registry = &registry_,
+                             .process_health_sampler = &process_health_sampler_,
+                             .auth_mgr = &auth_mgr_,
+                             .default_cert_set = &default_cert_set_,
+                             .draining = &draining_,
+                             .server_start_time = server_start_time_,
+                             .pg_pool = pg_pool_.get(),
+                             .response_store = response_store_.get(),
+                             .audit_store = audit_store_.get(),
+                             .instruction_store = instruction_store_.get(),
+                             .approval_manager = approval_manager_.get(),
+                             .policy_store = policy_store_.get(),
+                             .rbac_store = rbac_store_.get(),
+                             .tag_store = tag_store_.get(),
+                             .mgmt_group_store = mgmt_group_store_.get(),
+                             .guaranteed_state_store = guaranteed_state_store_.get(),
+                             .baseline_store = baseline_store_.get(),
+                             .offload_target_store = offload_target_store_.get(),
+                             .webhook_store = webhook_store_.get(),
+                             .ca_store = ca_store_.get(),
+                             .update_registry = update_registry_.get(),
+                             .offline_endpoint_store = offline_endpoint_store_.get(),
+                             .software_inventory_store = software_inventory_store_.get(),
+                             .vuln_finding_store = vuln_finding_store_.get(),
+                             .app_perf_daily_store = app_perf_daily_store_.get(),
+                             .app_perf_fleet_store = app_perf_fleet_store_.get(),
+                             .device_inventory_store = device_inventory_store_.get(),
+                             .inventory_store = inventory_store_.get(),
+                             .result_set_store = result_set_store_.get(),
+                             .discovery_store = discovery_store_.get(),
+                             .deployment_store = deployment_store_.get(),
+                             .quarantine_store = quarantine_store_.get(),
+                             .notification_store = notification_store_.get(),
+                             .upload_grant_store = upload_grant_store_.get(),
+                             .runtime_config_store = runtime_config_store_.get(),
+                             .patch_manager = patch_manager_.get(),
+                             .directory_sync = directory_sync_.get(),
+                             .workflow_engine = workflow_engine_.get(),
+                             .schedule_engine = schedule_engine_.get(),
+                             .execution_tracker = execution_tracker_.get(),
+                             .api_token_store = api_token_store_.get(),
+                             .engine_principal_store = engine_principal_store_.get(),
+                             .custom_properties_store = custom_properties_store_.get(),
+                             .fleet_topology_store = fleet_topology_store_.get(),
+                             .access_review_store = access_review_store_.get(),
+                             .software_licensing_store = software_licensing_store_.get(),
+                             .product_registry_store = product_registry_store_.get(),
+                             .product_pack_store = product_pack_store_.get(),
+                             .scim_store = scim_store_.get(),
+                             .analytics_store = analytics_store_.get(),
+                             .nvd_db = nvd_db_.get(),
+                             .nvd_sync = nvd_sync_.get(),
+                         });
 
         // #2542 PR-7: the 13-route Instruction Definitions + Instruction
         // Sets API cluster, extracted onto the same inline_sink seam.
@@ -13337,6 +13624,23 @@ private:
                              .audit_fn = audit_fn,
                              .emit_event_fn = emit_event_fn,
                              .execution_tracker = execution_tracker_.get(),
+                         });
+
+        // #2542 PR-9: the 4-route Approval API (/api/approvals,
+        // /api/approvals/pending/count, /api/approvals/:id/{approve,reject}),
+        // extracted onto the same inline_sink seam. Placed here rather than
+        // alongside page_routes's call above (like PR-4/PR-5's siblings)
+        // because this module needs resolve_session_fn (defined just above;
+        // instruction_routes.cpp, PR-7, was its first extracted caller) +
+        // audit_fn + emit_event_fn, none of which is in scope yet at that
+        // earlier point.
+        yuzu::server::approval::register_approval_routes(
+            inline_sink, yuzu::server::approval::Deps{
+                             .perm_fn = perm_fn,
+                             .resolve_session_fn = resolve_session_fn,
+                             .audit_fn = audit_fn,
+                             .emit_event_fn = emit_event_fn,
+                             .approval_manager = approval_manager_.get(),
                          });
 
         // #2542 PR-8: the 4-route Schedules API (/api/schedules[/:id[/enable]]),
@@ -13494,758 +13798,6 @@ private:
                                      execution_id, caller, /*broadcast_on_none=*/false,
                                      definition_id, concurrency_mode);
         };
-
-        // -- Prometheus metrics endpoint ----------------------------------------
-        web_server_->Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
-            // Refresh management group gauges before serializing
-            if (mgmt_group_store_ && mgmt_group_store_->is_open()) {
-                metrics_.gauge("yuzu_server_management_groups_total")
-                    .set(static_cast<double>(mgmt_group_store_->count_groups()));
-                metrics_.gauge("yuzu_server_group_members_total")
-                    .set(static_cast<double>(mgmt_group_store_->count_all_members()));
-            }
-            // Refresh NVD backfill gauges (multi-hour background job — needs to be
-            // observable; governance sre BLOCKING).
-            if (nvd_db_ && nvd_db_->is_open()) {
-                metrics_.gauge("yuzu_nvd_total_cves")
-                    .set(static_cast<double>(nvd_db_->total_cve_count()));
-                if (nvd_sync_) {
-                    auto st = nvd_sync_->status();
-                    metrics_.gauge("yuzu_nvd_backfill_complete").set(st.backfill_complete ? 1 : 0);
-                    // Pull model (#1909): the manager holds the authoritative monotonic
-                    // per-reason failure counts; emit them as yuzu_nvd_sync_failures_total by
-                    // incrementing the exported series by the delta since the last scrape
-                    // (Counter has no set()). No sync-thread→metrics_ callback → no teardown race.
-                    // The whole loop is serialized so two CONCURRENT /metrics scrapes (an HA
-                    // Prometheus pair) can't both read the same value(), compute the same delta,
-                    // and double-increment the counter (which would then stall until the real
-                    // tally re-exceeds it).
-                    std::lock_guard<std::mutex> emit_lock{nvd_metrics_scrape_mu_};
-                    for (auto r : kNvdCountedReasons) {
-                        const int i = nvd_reason_index(r);
-                        auto& c = metrics_.counter("yuzu_nvd_sync_failures_total",
-                                                   {{"reason", nvd_reason_label(r)}});
-                        const double delta = static_cast<double>(st.failure_counts[i]) - c.value();
-                        if (delta > 0)
-                            c.increment(delta);
-                    }
-                }
-            }
-            res.set_content(metrics_.serialize(), "text/plain; version=0.0.4; charset=utf-8");
-        });
-
-        // -- Health endpoint (7.2) ------------------------------------------------
-        // Mounted on both /health and /api/health (issue #620). The /api alias
-        // exists so monitoring integrations that prefix every REST call with
-        // /api/ keep working — a side-effect of #401's move from /api/health → /health.
-        auto health_handler = [this](const httplib::Request& req, httplib::Response& res) {
-            // Resolve auth FIRST so we can gate expensive work on it.
-            // Governance Gate 7 round 2 (security MEDIUM): /health and
-            // /api/health are rate-limit-exempt for monitoring stability;
-            // the bounded but non-trivial work below (a pending-agents scan
-            // and bounded execution_tracker reads — two PG pool leases,
-            // ADR-0065) must only run for authenticated callers, otherwise
-            // an unauth flood becomes a DoS amplification primitive. Unauth
-            // callers get the cheap
-            // probe response — status, uptime, agent count from in-memory
-            // registry, store ok flags from is_open() (constant-time member
-            // checks), and version. Authed callers additionally get
-            // pending-agent count, execution stats, and process sampler.
-            bool is_authenticated = static_cast<bool>(auth_routes_->resolve_session(req));
-
-            auto now = std::chrono::steady_clock::now();
-            auto uptime_sec =
-                std::chrono::duration_cast<std::chrono::seconds>(now - server_start_time_).count();
-
-            // Cheap: in-memory agent registry count.
-            auto online = registry_.agent_count();
-
-            // Store health — all checks are constant-time and perform no DB I/O.
-            // Match /readyz's non-lease-consuming Postgres reachability signal:
-            // valid() checks configuration and the breaker records real connect
-            // failures without treating a saturated-but-healthy pool as down.
-            bool pg_pool_ok = pg_pool_ && pg_pool_->valid() && !pg_pool_->connect_breaker_open();
-            auto response_ok = response_store_ && response_store_->is_open();
-            auto audit_ok = audit_store_ && audit_store_->is_open();
-            auto instruction_ok = instruction_store_ && instruction_store_->is_open();
-            auto policy_ok = policy_store_ && policy_store_->is_open();
-            // Guardian store is load-bearing for the /api/v1/guaranteed-state/*
-            // surface; prior to inclusion here /healthz reported "healthy" while
-            // every Guardian endpoint returned 503. Mirrors the /readyz conjunction.
-            bool guaranteed_state_ok =
-                guaranteed_state_store_ && guaranteed_state_store_->is_open();
-            // Guardian Baselines store — load-bearing for the Baseline dashboard +
-            // deploy surface; same rationale as the Guard store row above.
-            bool baseline_ok = baseline_store_ && baseline_store_->is_open();
-            // Phase 8.3 #255 — same pattern as Guardian above. Without
-            // this row /healthz would report "healthy" while every
-            // /api/v1/offload-targets endpoint and every fire_event call
-            // silently no-ops on a migration failure (HC-1 from Gate 6).
-            bool offload_target_ok = offload_target_store_ && offload_target_store_->is_open();
-            // #3261 governance hardening (Gate 6 SRE) - same HC-1 gap class
-            // as offload_target above; webhook_store was missing from this
-            // probe even though its sibling was already covered.
-            bool webhook_ok = webhook_store_ && webhook_store_->is_open();
-            // #1238 B-3: ca_store is load-bearing whenever default certs are active
-            // (issuance / revocation / CRL). It was wired into /readyz but missing
-            // here, so /healthz could report "healthy" with a dead ca_store. Mirrors
-            // the /readyz conjunction; trivially true when not on default certs
-            // (the operator brought their own, so ca_store isn't required).
-            bool ca_ok = !cfg_.using_default_certs || (ca_store_ && ca_store_->is_open());
-            // ADR-0061: UpdateRegistry — only load-bearing when cfg_.ota_enabled
-            // is true (default ON, opt-out via --no-ota). Mirrors /readyz's own
-            // entry; NOT analogous to ca_ok just above (using_default_certs is
-            // itself true for the ordinary out-of-box self-signed deployment,
-            // not an "off by default" gate).
-            bool update_registry_ok =
-                !cfg_.ota_enabled || (update_registry_ && update_registry_->is_open());
-            // Born-on-Postgres stores (ADR-0012). They were wired into /readyz but
-            // not here, so /healthz could report "healthy" with a degraded store —
-            // the same gap the Guardian/CA rows above closed. The server fails
-            // closed at boot if PG is unreachable, so on a running server these are
-            // normally open; the row catches a post-boot store-level failure.
-            bool offline_endpoint_ok =
-                offline_endpoint_store_ && offline_endpoint_store_->is_open();
-            bool software_inventory_ok =
-                software_inventory_store_ && software_inventory_store_->is_open();
-            bool vuln_finding_ok = vuln_finding_store_ && vuln_finding_store_->is_open();
-            bool app_perf_daily_ok = app_perf_daily_store_ && app_perf_daily_store_->is_open();
-            bool app_perf_fleet_ok = app_perf_fleet_store_ && app_perf_fleet_store_->is_open();
-            bool device_inventory_ok =
-                device_inventory_store_ && device_inventory_store_->is_open();
-            // Generic InventoryStore (ADR-0037) — was wired into /readyz but missing
-            // here (governance IS2: the file's own comments document this exact
-            // readyz-vs-healthz drift as a previously-shipped bug for other stores).
-            bool inventory_ok = inventory_store_ && inventory_store_->is_open();
-            // Load-bearing for the MCP write surface + REST approvals (sre-BLOCKING-1).
-            bool approval_ok = approval_manager_ && approval_manager_->is_open();
-            // RbacStore (authorization substrate, ADR-0041) — now born-on-PG and
-            // load-bearing for every RBAC/authz check. It was in /readyz but not
-            // here; a degraded rbac_store fails authz reads CLOSED (denies), so a
-            // "healthy" report over a dead authz store would be misleading.
-            bool rbac_ok = rbac_store_ && rbac_store_->is_open();
-            // #2636: ResultSetStore was wired into /readyz but missing here — same
-            // readyz-vs-healthz drift class the InventoryStore row above documents.
-            // Fixed alongside the ADR-0038 GuaranteedStateStore migration since both
-            // land in the same PR.
-            bool result_set_ok = result_set_store_ && result_set_store_->is_open();
-            // Management-group CONFINEMENT substrate (ADR-0042) — was wired into
-            // /readyz but missing here, the same readyz-vs-healthz drift the
-            // rows above document. A degraded confinement store fails RbacStore's
-            // list gate closed, so surface it.
-            bool mgmt_group_ok = mgmt_group_store_ && mgmt_group_store_->is_open();
-            // DiscoveryStore (ADR-0044) — wired into /readyz; adding here too so
-            // this store never joins the readyz-vs-healthz drift class the rows
-            // above were added to fix.
-            bool discovery_ok = discovery_store_ && discovery_store_->is_open();
-            // DeploymentStore (ADR-0043, gov sre finding, hardening
-            // round) — parity with every other migrated authoritative store's
-            // readyz/healthz wiring; construction is already fail-closed, this
-            // is belt-and-braces against a runtime is_open() flip.
-            bool deployment_ok = deployment_store_ && deployment_store_->is_open();
-            // QuarantineStore (ADR-0047) — wired into /readyz; adding here
-            // too so this store never joins the readyz-vs-healthz drift
-            // class the rows above were added to fix.
-            bool quarantine_ok = quarantine_store_ && quarantine_store_->is_open();
-            // NotificationStore (ADR-0046) — born-on-PG (as of this migration),
-            // same readyz-vs-healthz drift class the rows above document; wire
-            // it into both from the start rather than shipping the gap and
-            // fixing it in a later governance round (Gate 3 sre, Pattern E).
-            bool notification_ok = notification_store_ && notification_store_->is_open();
-            // UploadGrantStore (ADR-3004, PR1.6a) — review finding (#3135):
-            // constructed fail-closed at boot (server.cpp startup_failed_ flip
-            // if migration/open fails) but was absent from both /healthz and
-            // /readyz, the same readyz-vs-healthz drift class the rows above
-            // document. Startup fail-closed limits the immediate blast radius,
-            // but if is_open() ever flips false post-startup, /api/v1/upload-
-            // grants* would 503 while both probes still reported healthy.
-            bool upload_grant_ok = upload_grant_store_ && upload_grant_store_->is_open();
-            // TagStore (ADR-0050) — born-on-PG (as of this migration), wired
-            // into both /readyz and /healthz from the start (the
-            // readyz-vs-healthz drift class the rows above document). A
-            // degraded tag store fails scope resolution and service-scoped
-            // confinement CLOSED, so a "healthy" report over it would be
-            // misleading.
-            bool tag_ok = tag_store_ && tag_store_->is_open();
-            // ADR-0060: /readyz's StoreCheck vector already names this store; /healthz
-            // omitted it (governance Gate 3 finding, architect + sre independently) --
-            // /readyz is what actually gates traffic, so this was a monitoring-signal
-            // gap, not an availability one, but the two probes should agree on which
-            // stores exist.
-            bool runtime_config_ok = runtime_config_store_ && runtime_config_store_->is_open();
-            // ADR-0062 (Wave 4 non-`*Store` migration) — same readyz-vs-healthz
-            // drift class the rows above document; wired into both from the
-            // start rather than shipping the gap. Construction is fail-closed,
-            // so this is belt-and-braces against a runtime is_open() flip.
-            bool patch_manager_ok = patch_manager_ && patch_manager_->is_open();
-            // HA WS-1/1a: durable operator sessions. /readyz's StoreCheck vector
-            // names this store; mirror it here so the two probes agree (same
-            // anti-drift rule as runtime_config above) and match the documented
-            // "reported at /readyz and /healthz" contract. is_session_store_ok()
-            // is true on legacy config-file-only deployments (no store wired).
-            bool session_store_ok = auth_mgr_.is_session_store_ok();
-            // ADR-0063 (migration-programme PR 3) — same readyz-vs-healthz
-            // drift class the rows above document; wired into both from the
-            // start rather than shipping the gap. Construction is fail-closed,
-            // so this is belt-and-braces against a runtime is_open() flip.
-            bool directory_sync_ok = directory_sync_ && directory_sync_->is_open();
-            // ADR-0064 (Wave 4 non-`*Store` migration) — same readyz-vs-healthz drift class:
-            // workflow_engine was already in /readyz's StoreCheck vector (below) but absent
-            // here in the SQLite era.
-            bool workflow_engine_ok = workflow_engine_ && workflow_engine_->is_open();
-            // ADR-0065 (migration-programme PR 5, 1/3) — same readyz-vs-healthz
-            // drift class the rows above document; wired into both from the
-            // start rather than shipping the gap. Net-new: the SQLite era had
-            // no is_open()/availability flag for this store at all.
-            bool schedule_engine_ok = schedule_engine_ && schedule_engine_->is_open();
-            // ADR-0065 (migration-programme PR 5, 3/3) — net-new: the SQLite era
-            // had no /healthz entry for this store at all (its shared
-            // InstructionDbPool fed /readyz only; approval_ok above is the ONE
-            // sibling that already had full probe coverage pre-migration).
-            bool execution_tracker_ok = execution_tracker_ && execution_tracker_->is_open();
-
-            // Determine overall status
-            bool all_stores_ok =
-                pg_pool_ok && response_ok && audit_ok && instruction_ok && policy_ok &&
-                guaranteed_state_ok && baseline_ok && offload_target_ok && webhook_ok && ca_ok &&
-                update_registry_ok && offline_endpoint_ok && software_inventory_ok &&
-                vuln_finding_ok && app_perf_daily_ok && app_perf_fleet_ok &&
-                device_inventory_ok && inventory_ok && approval_ok && rbac_ok && result_set_ok &&
-                mgmt_group_ok && discovery_ok && deployment_ok && quarantine_ok &&
-                notification_ok && upload_grant_ok && tag_ok && runtime_config_ok &&
-                patch_manager_ok && session_store_ok && directory_sync_ok && workflow_engine_ok &&
-                schedule_engine_ok && execution_tracker_ok;
-            std::string status = all_stores_ok ? "healthy" : "degraded";
-
-            nlohmann::json health = {
-                {"status", status},
-                {"uptime_seconds", uptime_sec},
-                {"agents", {{"online", online}}}, // pending added below for authed callers
-                {"stores",
-                 {{"pg_pool", pg_pool_ok ? "ok" : "error"},
-                  {"responses", response_ok ? "ok" : "error"},
-                  {"audit", audit_ok ? "ok" : "error"},
-                  {"instructions", instruction_ok ? "ok" : "error"},
-                  {"policies", policy_ok ? "ok" : "error"},
-                  {"guaranteed_state", guaranteed_state_ok ? "ok" : "error"},
-                  {"baselines", baseline_ok ? "ok" : "error"},
-                  {"offload_target", offload_target_ok ? "ok" : "error"},
-                  {"webhook_store", webhook_ok ? "ok" : "error"},
-                  // Scoped-governance sre + consistency-auditor (2-way
-                  // convergence): approval_ok already gated all_stores_ok
-                  // below but had no entry here — the mirror of the
-                  // webhook_ok bug this same commit fixes. A degraded
-                  // approval_manager_ flipped top-level status to
-                  // "degraded" with no per-store detail to explain why.
-                  // /readyz already names it "approval_manager" (its own
-                  // StoreCheck vector); matching that name here.
-                  {"approval_manager", approval_ok ? "ok" : "error"},
-                  {"ca", ca_ok ? "ok" : "error"},
-                  {"update_registry", update_registry_ok ? "ok" : "error"},
-                  {"offline_endpoint_store", offline_endpoint_ok ? "ok" : "error"},
-                  {"software_inventory_store", software_inventory_ok ? "ok" : "error"},
-                  {"vuln_finding_store", vuln_finding_ok ? "ok" : "error"},
-                  {"app_perf_daily_store", app_perf_daily_ok ? "ok" : "error"},
-                  {"app_perf_fleet_store", app_perf_fleet_ok ? "ok" : "error"},
-                  {"device_inventory_store", device_inventory_ok ? "ok" : "error"},
-                  {"inventory_store", inventory_ok ? "ok" : "error"},
-                  {"rbac_store", rbac_ok ? "ok" : "error"},
-                  {"result_set_store", result_set_ok ? "ok" : "error"},
-                  {"management_group_store", mgmt_group_ok ? "ok" : "error"},
-                  {"discovery_store", discovery_ok ? "ok" : "error"},
-                  {"deployment_store", deployment_ok ? "ok" : "error"},
-                  {"quarantine_store", quarantine_ok ? "ok" : "error"},
-                  {"notification_store", notification_ok ? "ok" : "error"},
-                  {"upload_grant_store", upload_grant_ok ? "ok" : "error"},
-                  {"tag_store", tag_ok ? "ok" : "error"},
-                  {"runtime_config_store", runtime_config_ok ? "ok" : "error"},
-                  {"patch_manager", patch_manager_ok ? "ok" : "error"},
-                  {"session_store", session_store_ok ? "ok" : "error"},
-                  {"directory_sync", directory_sync_ok ? "ok" : "error"},
-                  {"workflow_engine", workflow_engine_ok ? "ok" : "error"},
-                  {"schedule_engine", schedule_engine_ok ? "ok" : "error"},
-                  {"execution_tracker", execution_tracker_ok ? "ok" : "error"}}},
-                // #401: was hardcoded "0.1.0" — now derived from the
-                // meson-generated yuzu/version.hpp so the health endpoint
-                // tracks the actual build instead of a stale literal.
-                {"version", std::string(yuzu::kVersionString)}};
-
-            // TLS posture — intentionally UNAUTHENTICATED: operators and
-            // monitoring MUST be able to see when the install is on built-in
-            // default certs. The CA fingerprint is public.
-            health["tls"] = {
-                {"default_certs_active", cfg_.using_default_certs},
-                {"ca_fingerprint", default_cert_set_.ca_fingerprint_sha256},
-                {"ca_expires_at",
-                 cfg_.using_default_certs ? static_cast<int64_t>(std::chrono::system_clock::to_time_t(
-                                                default_cert_set_.ca_expires_at))
-                                          : int64_t{0}}};
-
-            // Authenticated extension — heavier work, only run when the caller
-            // has a session. Adds: agents.pending (SQLite scan), executions.*
-            // (two bounded execution_tracker pool leases, ADR-0065 + a
-            // 1h-window loop), system.* (process_health_sampler).
-            if (is_authenticated) {
-                auto pending_agents = auth_mgr_.list_pending_agents();
-                int pending_count = 0;
-                for (const auto& a : pending_agents) {
-                    if (a.status == auth::PendingStatus::pending)
-                        ++pending_count;
-                }
-                health["agents"]["pending"] = pending_count;
-
-                int in_flight = 0;
-                int completed_last_hour = 0;
-                int failed_last_hour = 0;
-                if (execution_tracker_) {
-                    auto running = execution_tracker_->query_executions({.status = "running"});
-                    in_flight = static_cast<int>(running.size());
-                    auto now_epoch = std::chrono::duration_cast<std::chrono::seconds>(
-                                         std::chrono::system_clock::now().time_since_epoch())
-                                         .count();
-                    auto hour_ago = now_epoch - 3600;
-                    auto recent = execution_tracker_->query_executions({.limit = 1000});
-                    for (const auto& e : recent) {
-                        if (e.completed_at >= hour_ago) {
-                            if (e.status == "completed")
-                                ++completed_last_hour;
-                            else if (e.status == "failed")
-                                ++failed_last_hour;
-                        }
-                    }
-                }
-                health["executions"] = {{"in_flight", in_flight},
-                                        {"completed_last_hour", completed_last_hour},
-                                        {"failed_last_hour", failed_last_hour}};
-
-                // Process health (22.1) — leaks process internals so
-                // intentionally authenticated-only.
-                auto ph = process_health_sampler_.sample();
-                health["system"] = {{"cpu_percent", ph.cpu_percent},
-                                    {"memory_rss_bytes", static_cast<int64_t>(ph.memory_rss_bytes)},
-                                    {"memory_vss_bytes", static_cast<int64_t>(ph.memory_vss_bytes)},
-                                    {"grpc_connections", static_cast<int>(online)},
-                                    {"command_queue_depth", in_flight}};
-            }
-
-            res.set_content(health.dump(), "application/json");
-        };
-        // Both URLs MUST be served by the SAME handler instance — do not split
-        // into two lambda bodies. The unauthenticated `system.*` gating above
-        // is load-bearing and must run identically on both routes; forking the
-        // body invites a future regression where the alias diverges in subtle
-        // ways. Governance Gate 7, architect NICE-2.
-        web_server_->Get("/health", health_handler);
-        web_server_->Get("/api/health", health_handler);
-
-        // -- Kubernetes probe endpoints (/livez, /readyz) -------------------------
-        web_server_->Get("/livez", [](const httplib::Request&, httplib::Response& res) {
-            res.set_content(R"({"status":"ok"})", "application/json");
-        });
-
-        web_server_->Get("/readyz", [this](const httplib::Request&, httplib::Response& res) {
-            if (draining_.load(std::memory_order_acquire)) {
-                res.status = 503;
-                res.set_content(R"({"status":"draining"})", "application/json");
-                return;
-            }
-
-            // Check every store that is load-bearing for request handling.
-            // A store with a failed migration has had db_ closed and nullified
-            // inside create_tables(), so is_open() will correctly return false.
-            struct StoreCheck {
-                const char* name;
-                bool ok;
-            };
-            std::vector<StoreCheck> checks = {
-                {"response_store", response_store_ && response_store_->is_open()},
-                {"audit_store", audit_store_ && audit_store_->is_open()},
-                {"instruction_store", instruction_store_ && instruction_store_->is_open()},
-                {"api_token_store", api_token_store_ && api_token_store_->is_open()},
-                {"engine_principal_store",
-                 engine_principal_store_ && engine_principal_store_->is_open()},
-                // Load-bearing for the MCP write surface + REST /api/approvals/*
-                // (governance sre-BLOCKING-1). is_open() is false after a failed
-                // consumed_at migration, so a broken approval schema fails readyz.
-                {"approval_manager", approval_manager_ && approval_manager_->is_open()},
-                {"policy_store", policy_store_ && policy_store_->is_open()},
-                {"rbac_store", rbac_store_ && rbac_store_->is_open()},
-                {"tag_store", tag_store_ && tag_store_->is_open()},
-                {"management_group_store", mgmt_group_store_ && mgmt_group_store_->is_open()},
-                {"runtime_config_store", runtime_config_store_ && runtime_config_store_->is_open()},
-                {"inventory_store", inventory_store_ && inventory_store_->is_open()},
-                {"workflow_engine", workflow_engine_ && workflow_engine_->is_open()},
-                // ADR-0063 (migration-programme PR 3): DirectorySync became a
-                // fail-closed Postgres store (was fail-open SQLite, never
-                // checked here before) — load-bearing for /api/directory/*
-                // and the access-review export's optional email enrichment.
-                {"directory_sync", directory_sync_ && directory_sync_->is_open()},
-                {"custom_properties_store",
-                 custom_properties_store_ && custom_properties_store_->is_open()},
-                {"guaranteed_state_store",
-                 guaranteed_state_store_ && guaranteed_state_store_->is_open()},
-                {"baseline_store", baseline_store_ && baseline_store_->is_open()},
-                // PR 5b: AuthDB integrity-check coverage. Reports "ok" on
-                // legacy config-file-only deployments (auth_db_ == nullptr
-                // in AuthManager) and false only when an opted-in AuthDB
-                // failed the integrity check or migration. SOC 2 evidence:
-                // an operator can detect a corrupt auth.db without scraping
-                // spdlog; pairs with docs/ops-runbooks/auth-db-recovery.md.
-                {"auth_db", auth_mgr_.is_auth_db_ok()},
-                // HA WS-1/1a (ADR-2002 §4): durable operator sessions. Reports
-                // "ok" on legacy config-file-only deployments (no store wired in
-                // AuthManager) and false only when a wired SessionStore failed
-                // to migrate/open — a half-open store cannot mint or validate
-                // durable sessions, so the node is not ready to front the LB.
-                // Same is_*_ok() fail-closed shape as auth_db above.
-                {"session_store", auth_mgr_.is_session_store_ok()},
-                // Phase 8.3 #255 — load-bearing for /api/v1/offload-targets
-                // and the AgentService fan-out path. A migration failure
-                // would silently no-op all offload deliveries while the
-                // probe reported "ready" (HC-1 gap from Gate 6 SRE).
-                {"offload_target_store", offload_target_store_ && offload_target_store_->is_open()},
-                // #3261 governance hardening (Gate 6 SRE) - WebhookStore is
-                // load-bearing for /api/webhooks and the same AgentService
-                // fan-out path as offload_target_store above, but was
-                // missing from this probe (its two siblings,
-                // offload_target_store and notification_store below, were
-                // already covered) - same HC-1 gap class.
-                {"webhook_store", webhook_store_ && webhook_store_->is_open()},
-                // ADR-0065 (migration-programme PR 5, 3/3): ExecutionTracker
-                // became a fail-closed Postgres store (was fail-open SQLite
-                // sharing InstructionDbPool, now deleted — migration failure
-                // set a flag, `migration_ok_`/`schema_ok()`, that nothing here
-                // ever checked; only the pool's own `is_open()` gated
-                // construction and fed this probe). Re-keyed from
-                // `instr_db_pool_->is_open() && execution_tracker_->schema_ok()`
-                // to the store's own `is_open()` — same governance UAT 2026-05-06
-                // SRE-1 / gov B-1 property this row has always protected: a
-                // failed migration must surface as /readyz=503, not a green
-                // probe over silently-wedged executions.
-                {"execution_tracker", execution_tracker_ && execution_tracker_->is_open()},
-                // ADR-0065 (migration-programme PR 5, 1/3): ScheduleEngine became
-                // a fail-closed Postgres store (was fail-open SQLite with no
-                // is_open() of its own — migration failure was log-only and no
-                // caller ever checked availability). Net-new row: the SQLite era
-                // had no equivalent probe at all.
-                {"schedule_engine", schedule_engine_ && schedule_engine_->is_open()},
-                // gov R3 HC-1: FleetTopologyStore became load-bearing for
-                // /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology.
-                // Pure in-memory store with no is_open(); pointer-not-null is
-                // the right probe. Without this, a store-construction failure
-                // would leave /readyz "ready" while every viz request 503s.
-                {"fleet_topology_store", fleet_topology_store_ != nullptr},
-                // #1320 PR 3 (#1368 Pattern E): the Postgres substrate is
-                // load-bearing — without it every Postgres-backed store is
-                // dead. Cheap, NON-lease-consuming signal: valid() (conninfo
-                // parsed) AND the connect breaker is closed. The breaker arms
-                // on real connect failures (PG unreachable) but NOT on pool
-                // saturation, so this reflects runtime reachability without the
-                // false-negative a lease-consuming probe would hit under load
-                // (gov UP-2 — a busy-but-healthy server must NOT be evicted
-                // from the LB). Saturation is surfaced via the acquire-wait
-                // histogram + pool gauges + their alert rules, not /readyz.
-                {"pg_pool", pg_pool_ != nullptr && pg_pool_->valid() &&
-                                !pg_pool_->connect_breaker_open()},
-                // First migrated store (#1368). The server fails closed without
-                // Postgres, so this is true whenever it serves; a false here is
-                // the loud signal that the migration path is broken even though
-                // the pool answered.
-                {"offline_endpoint_store",
-                 offline_endpoint_store_ && offline_endpoint_store_->is_open()},
-                // ADR-0016 born-on-Pg store. Fail-closed at boot, but a not-open
-                // state post-boot makes ReportInventory silently ack with no
-                // ingest and no readiness signal — surface it (gov Pattern E).
-                {"software_inventory_store",
-                 software_inventory_store_ && software_inventory_store_->is_open()},
-                // CAVM born-on-PG store (ADR-0012). Fail-closed at boot; a
-                // not-open post-boot state means the PR-4 matching engine would
-                // silently no-op findings persistence — surface it (Pattern E).
-                {"vuln_finding_store",
-                 vuln_finding_store_ && vuln_finding_store_->is_open()},
-                // Periodic Access Reviews (SOC 2 CC6.2) born-on-PG store. AUTHORITATIVE
-                // per ADR-0012 §1 — the /api/v1/access-reviews campaign lifecycle
-                // (open/attest/close) is dead without it. The read-only export route
-                // does not depend on this store, but the campaign-based evidence surface
-                // is the feature's core deliverable, so a not-open state must be visible
-                // at /readyz, not just returning 503 per-request unnoticed.
-                {"access_review_store",
-                 access_review_store_ && access_review_store_->is_open()},
-                {"app_perf_daily_store",
-                 app_perf_daily_store_ && app_perf_daily_store_->is_open()},
-                {"app_perf_fleet_store",
-                 app_perf_fleet_store_ && app_perf_fleet_store_->is_open()},
-                // ADR-0016 device-CI born-on-Pg store — same rationale as the
-                // software_inventory_store row above (silent no-ingest ack if dead).
-                {"device_inventory_store",
-                 device_inventory_store_ && device_inventory_store_->is_open()},
-                // ADR-0024 SLE born-on-Pg stores (roadmap G-10, HC-1 Pattern E). Same
-                // rationale as the inventory stores: fail-closed at boot, but a not-open
-                // state post-boot makes ReportInventory silently ack the licensing blob
-                // with no ingest (software_licensing_store) and the /api/v1/sle/* reads
-                // degrade to 503 (both) — surface it so an LB/operator sees the half-state.
-                {"software_licensing_store",
-                 software_licensing_store_ && software_licensing_store_->is_open()},
-                {"product_registry_store",
-                 product_registry_store_ && product_registry_store_->is_open()},
-                // gov W7.4 R1 sre-B1: ProductPackStore became more load-bearing
-                // post-#802. UP-2 from the W7.4 Gate 4 risk register: a store
-                // that fails to open AND `--allow-unsigned-packs` set produces
-                // a silent half-state — the audit row at startup says "unsigned
-                // packs allowed" but every install returns 503 because the
-                // store is dead. Without this readyz entry, an LB or operator
-                // dashboard would not detect the half-state. Pairs with the
-                // workflow_routes.cpp install handler's `is_open()` guard.
-                {"product_pack_store", product_pack_store_ && product_pack_store_->is_open()},
-                // gov PR-E OBS-1: ResultSetStore became load-bearing — every
-                // scoped command dispatch and the /api/scope/estimate preview
-                // resolve from_result_set: aliases and owner-check membership
-                // against it. A failed migration/backfill (migrated to Postgres,
-                // schema `result_set_store`, ADR-0036) would silently degrade
-                // every scoped dispatch to zero targets while /readyz reported
-                // "ready" — this construction is already fail-closed
-                // (startup_failed_) per ADR-0012 §1, but the readyz entry stays
-                // as belt-and-braces against a runtime is_open() flip.
-                {"result_set_store", result_set_store_ && result_set_store_->is_open()},
-                // Migrated Postgres store (ADR-0043, gov sre finding, hardening
-                // round). Load-bearing for all 4 /api/deployment-jobs routes;
-                // construction is already fail-closed (startup_failed_), but the
-                // readyz entry stays for parity with every OTHER migrated
-                // authoritative store on this ladder (all of which are wired in
-                // here) as belt-and-braces against a runtime is_open() flip.
-                {"deployment_store", deployment_store_ && deployment_store_->is_open()},
-                // PKI PR2: ca_store is load-bearing only when the install is on
-                // built-in default certs (PR3+ make it load-bearing for mTLS
-                // issuance/revocation). When the operator brought their own certs
-                // it is not on the request path, so report ok.
-                {"ca_store", !cfg_.using_default_certs || (ca_store_ && ca_store_->is_open())},
-                {"ca_root", !cfg_.using_default_certs || (ca_store_ && ca_store_->has_root())},
-                // SRE Gate 6 HC-1: ScimStore is only constructed when
-                // --scim-enable is set (opt-in, mirrors the ca_store pattern
-                // above); a failed open/migration would otherwise silently
-                // reject every /scim/v2/* request while /readyz reported
-                // "ready". H3 (2026-07-08 review, defense-in-depth): also
-                // requires has_token() — the primary fix is that a failed
-                // set_token() at boot now sets startup_failed_ (server never
-                // reaches run()'s serve loop at all), but this term keeps
-                // /readyz honest on its own terms too, independent of that
-                // guard.
-                {"scim_store", !cfg_.scim_enable ||
-                                   (scim_store_ && scim_store_->is_open() &&
-                                    scim_store_->has_token())},
-                // ADR-0061: UpdateRegistry is only constructed when
-                // cfg_.ota_enabled is true, which defaults ON (opt-out via
-                // --no-ota) — unlike ca_store/scim_store's construction
-                // (unconditional whenever pg_pool_ is up; only their /readyz
-                // CHECK above is flag-gated), this store's CONSTRUCTION itself
-                // has the opt-out. So the check below
-                // covers the ordinary default deployment, not an opt-in
-                // minority. A failed migration/open would otherwise silently
-                // disable OTA (CheckForUpdate/DownloadUpdate always answering
-                // "no update") while /readyz reported "ready".
-                {"update_registry", !cfg_.ota_enabled ||
-                                        (update_registry_ && update_registry_->is_open())},
-                // Wave 2 migrated Postgres store (ADR-0006/0009/0044, schema
-                // `discovery_store`). AUTHORITATIVE per ADR-0012 §1 — the
-                // operator-set `managed` flag is real state. Construction
-                // fail-closed already makes a not-open state unreachable in
-                // production (startup_failed_ stops the server before it
-                // serves), so this is belt-and-braces against a runtime
-                // is_open() flip, matching result_set_store's equivalent row.
-                {"discovery_store", discovery_store_ && discovery_store_->is_open()},
-                // Wave 2 migrated Postgres store (ADR-0006/0009/0047, schema
-                // `quarantine_store`). AUTHORITATIVE per ADR-0012 §1 — an
-                // active quarantine record is live security containment
-                // state. Construction fail-closed already makes a not-open
-                // state unreachable in production (startup_failed_ stops
-                // the server before it serves), so this is belt-and-braces
-                // against a runtime is_open() flip, matching
-                // discovery_store's equivalent row.
-                {"quarantine_store", quarantine_store_ && quarantine_store_->is_open()},
-                // ADR-0046 born-on-PG (as of this migration) store — same
-                // rationale as the other rows above: fail-closed at boot, but
-                // a not-open post-boot state would leave the notification
-                // feed silently dead while /readyz reported "ready" (gov
-                // Pattern E).
-                {"notification_store",
-                 notification_store_ && notification_store_->is_open()},
-                // ADR-3004 (PR1.6a) — review finding (#3135): same
-                // readyz-vs-healthz drift class as the rows above.
-                // Fail-closed at boot, but a not-open post-boot state would
-                // leave /api/v1/upload-grants* silently 503ing while
-                // /readyz still reported "ready".
-                {"upload_grant_store",
-                 upload_grant_store_ && upload_grant_store_->is_open()},
-                // ADR-0062 (Wave 4 non-`*Store` migration) — was in neither
-                // /readyz nor /healthz in the SQLite era (no caller ever
-                // checked is_open() at all). Load-bearing for every
-                // /api/patches/* route now that construction is fail-closed.
-                {"patch_manager", patch_manager_ && patch_manager_->is_open()},
-            };
-
-            // Non-gating (governance Gate 2, 2026-08-16): ADR-0049's own construction
-            // posture is deliberately NOT fatal for this one store (analytics is a
-            // non-critical telemetry spool, on by default, every caller null-guards
-            // it) — folding it into `checks` above would flip /readyz to 503 for the
-            // WHOLE node on a transient migration hiccup here, directly contradicting
-            // that posture and the comment that used to sit on this row. Reported
-            // separately so on-call can still tell feature-off from feature-on-but-
-            // dead without pulling a healthy node out of LB/orchestrator rotation.
-            std::vector<StoreCheck> notices = {
-                {"analytics_event_store",
-                 !cfg_.analytics_enabled || (analytics_store_ && analytics_store_->is_open())},
-            };
-
-            std::string failed_list;
-            for (const auto& c : checks) {
-                if (!c.ok) {
-                    if (!failed_list.empty())
-                        failed_list += ",";
-                    failed_list += "\"";
-                    failed_list += c.name;
-                    failed_list += "\"";
-                }
-            }
-            std::string degraded_list;
-            for (const auto& c : notices) {
-                if (!c.ok) {
-                    if (!degraded_list.empty())
-                        degraded_list += ",";
-                    degraded_list += "\"";
-                    degraded_list += c.name;
-                    degraded_list += "\"";
-                }
-            }
-
-            if (failed_list.empty()) {
-                res.set_content(degraded_list.empty()
-                                    ? R"({"status":"ready"})"
-                                    : "{\"status\":\"ready\",\"degraded\":[" + degraded_list + "]}",
-                                "application/json");
-            } else {
-                res.status = 503;
-                std::string body = "{\"status\":\"not ready\",\"failed_stores\":[" + failed_list + "]";
-                if (!degraded_list.empty())
-                    body += ",\"degraded\":[" + degraded_list + "]";
-                body += "}";
-                res.set_content(body, "application/json");
-            }
-        });
-
-        // -- Health summary dashboard fragment (7.2) ----------------------------
-        // guardian-confinement-2298 PR3 §3e: require_auth-only, no
-        // per-target parameter — reports agent count, in-flight execution
-        // count, and store health fleet-wide.
-        web_server_->Get("/fragments/health/summary", [this](const httplib::Request& req,
-                                                             httplib::Response& res) {
-            if (auth_routes_->deny_service_scoped_session(
-                    req, res, "health.fragment.access_denied",
-                    "service-scoped tokens may not read the fleet-wide health summary"))
-                return;
-            auto session = require_auth(req, res);
-            if (!session)
-                return;
-
-            auto now = std::chrono::steady_clock::now();
-            auto uptime_sec =
-                std::chrono::duration_cast<std::chrono::seconds>(now - server_start_time_).count();
-
-            // Store health
-            bool response_ok = response_store_ && response_store_->is_open();
-            bool audit_ok = audit_store_ && audit_store_->is_open();
-            bool instruction_ok = instruction_store_ && instruction_store_->is_open();
-            bool policy_ok = policy_store_ && policy_store_->is_open();
-            bool guaranteed_state_ok =
-                guaranteed_state_store_ && guaranteed_state_store_->is_open();
-            bool baseline_ok = baseline_store_ && baseline_store_->is_open();
-            bool all_ok = response_ok && audit_ok && instruction_ok && policy_ok &&
-                          guaranteed_state_ok && baseline_ok;
-
-            // Execution stats
-            int in_flight = 0;
-            if (execution_tracker_) {
-                auto running = execution_tracker_->query_executions({.status = "running"});
-                in_flight = static_cast<int>(running.size());
-            }
-
-            // Format uptime
-            auto days = uptime_sec / 86400;
-            auto hours = (uptime_sec % 86400) / 3600;
-            auto mins = (uptime_sec % 3600) / 60;
-            std::string uptime_str;
-            if (days > 0)
-                uptime_str = std::to_string(days) + "d " + std::to_string(hours) + "h";
-            else if (hours > 0)
-                uptime_str = std::to_string(hours) + "h " + std::to_string(mins) + "m";
-            else
-                uptime_str = std::to_string(mins) + "m";
-
-            auto online = registry_.agent_count();
-
-            // Process health for dashboard
-            auto ph = process_health_sampler_.sample();
-            auto rss_mb = ph.memory_rss_bytes / (1024 * 1024);
-            char cpu_buf[16];
-            std::snprintf(cpu_buf, sizeof(cpu_buf), "%.1f", ph.cpu_percent);
-
-            // Only render the strip if there are issues
-            if (all_ok && in_flight == 0) {
-                // Minimal healthy summary
-                std::string html =
-                    "<div class=\"health-strip health-ok\" "
-                    "style=\"display:flex;gap:1.5rem;align-items:center;"
-                    "padding:0.4rem 1rem;background:var(--surface-1);"
-                    "border-left:3px solid var(--green);border-radius:4px;"
-                    "font-size:0.8rem;color:var(--text-secondary);margin-bottom:0.75rem\">"
-                    "<span>Server healthy</span>"
-                    "<span>Uptime: " +
-                    uptime_str +
-                    "</span>"
-                    "<span>Agents online: " +
-                    std::to_string(online) +
-                    "</span>"
-                    "<span>CPU: " +
-                    std::string(cpu_buf) +
-                    "%</span>"
-                    "<span>Mem: " +
-                    std::to_string(rss_mb) +
-                    " MB</span>"
-                    "</div>";
-                res.set_content(html, "text/html; charset=utf-8");
-                return;
-            }
-
-            // Degraded or busy — show warning strip
-            std::string html =
-                "<div class=\"health-strip health-warn\" "
-                "style=\"display:flex;gap:1.5rem;align-items:center;"
-                "padding:0.4rem 1rem;background:var(--surface-1);"
-                "border-left:3px solid var(--yellow);border-radius:4px;"
-                "font-size:0.8rem;color:var(--text-secondary);margin-bottom:0.75rem\">";
-
-            if (!all_ok) {
-                html += "<span style=\"color:var(--yellow)\">Stores degraded: ";
-                if (!response_ok)
-                    html += "responses ";
-                if (!audit_ok)
-                    html += "audit ";
-                if (!instruction_ok)
-                    html += "instructions ";
-                if (!policy_ok)
-                    html += "policies ";
-                html += "</span>";
-            }
-
-            html += "<span>Uptime: " + uptime_str + "</span>";
-            html += "<span>Agents: " + std::to_string(online) + "</span>";
-            html += "<span>CPU: " + std::string(cpu_buf) + "%</span>";
-            html += "<span>Mem: " + std::to_string(rss_mb) + " MB</span>";
-            if (in_flight > 0)
-                html += "<span>In-flight: " + std::to_string(in_flight) + "</span>";
-
-            html += "</div>";
-            res.set_content(html, "text/html; charset=utf-8");
-        });
 
         // -- Runtime Configuration API (7.3) ------------------------------------
         web_server_->Get("/api/config", [this](const httplib::Request& req,
@@ -14762,152 +14314,6 @@ private:
                                 "application/json");
             });
 
-        // -- Approval API -----------------------------------------------------
-
-        web_server_->Get("/api/approvals", [this](const httplib::Request& req,
-                                                  httplib::Response& res) {
-            if (!require_permission(req, res, "Approval", "Read"))
-                return;
-            if (!approval_manager_) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            ApprovalQuery q;
-            if (req.has_param("status"))
-                q.status = req.get_param_value("status");
-            if (req.has_param("submitted_by"))
-                q.submitted_by = req.get_param_value("submitted_by");
-
-            auto approvals = approval_manager_->query(q);
-            nlohmann::json arr = nlohmann::json::array();
-            for (const auto& a : approvals) {
-                arr.push_back({{"id", a.id},
-                               {"definition_id", a.definition_id},
-                               {"status", a.status},
-                               {"submitted_by", a.submitted_by},
-                               {"submitted_at", a.submitted_at},
-                               {"reviewed_by", a.reviewed_by},
-                               {"reviewed_at", a.reviewed_at},
-                               {"review_comment", a.review_comment},
-                               {"scope_expression", a.scope_expression}});
-            }
-            res.set_content(nlohmann::json({{"approvals", arr}}).dump(), "application/json");
-        });
-
-        web_server_->Get("/api/approvals/pending/count", [this](const httplib::Request& req,
-                                                                httplib::Response& res) {
-            if (!require_permission(req, res, "Approval", "Read"))
-                return;
-            if (!approval_manager_) {
-                res.set_content(R"({"count":0})", "application/json");
-                return;
-            }
-            auto count = approval_manager_->pending_count();
-            res.set_content(nlohmann::json({{"count", count}}).dump(), "application/json");
-        });
-
-        web_server_->Post(R"(/api/approvals/([^/]+)/approve)", [this](const httplib::Request& req,
-                                                                      httplib::Response& res) {
-            if (!require_permission(req, res, "Approval", "Approve"))
-                return;
-            if (!approval_manager_) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            auto id = req.matches[1].str();
-            auto comment = extract_json_string(req.body, "comment");
-            auto session = auth_routes_->resolve_session(req);
-            auto reviewer = session ? session->username : "unknown";
-
-            auto result = approval_manager_->approve(id, reviewer, comment);
-            if (!result) {
-                res.status = 400;
-                // A denied review is an access-control decision (e.g. the
-                // self-approval segregation-of-duties block) — leave an audit
-                // trace like the other denial paths in this file (governance
-                // compliance CC6.1/CC6.3), and a greppable server-side line.
-                (void)audit_log(req, "approval.approve", "denied", "approval", id,
-                                result.error());
-                spdlog::warn("approval approve denied: id={} reviewer={} reason={}",
-                             log_safe(id), reviewer, log_safe(result.error(), 256));
-                // htmx doesn't swap a non-2xx response, so without a trigger
-                // the denial (e.g. the self-approval block) is a silent no-op
-                // in the dashboard (#1821). HX-Trigger headers ARE processed
-                // on error responses — surface the reason as a toast. dump()
-                // uses `replace`: the error can echo the raw URL id, and the
-                // default handler throws on invalid UTF-8 (governance UP-5).
-                nlohmann::json trigger = {
-                    {"showToast", {{"message", result.error()}, {"level", "error"}}}};
-                res.set_header("HX-Trigger",
-                               trigger.dump(-1, ' ', false,
-                                            nlohmann::json::error_handler_t::replace));
-                res.set_content(nlohmann::json({{"error", result.error()}})
-                                    .dump(-1, ' ', false,
-                                          nlohmann::json::error_handler_t::replace),
-                                "application/json");
-                return;
-            }
-            (void)audit_log(req, "approval.approve", "success", "approval", id);
-            emit_event("approval.approved", req, {{"reviewer", reviewer}}, {{"approval_id", id}});
-            res.set_header("HX-Trigger",
-                           R"({"showToast":{"message":"Approved","level":"success"}})");
-            res.set_content(R"({"status":"approved"})", "application/json");
-        });
-
-        web_server_->Post(R"(/api/approvals/([^/]+)/reject)", [this](const httplib::Request& req,
-                                                                     httplib::Response& res) {
-            if (!require_permission(req, res, "Approval", "Approve"))
-                return;
-            if (!approval_manager_) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            auto id = req.matches[1].str();
-            auto comment = extract_json_string(req.body, "comment");
-            auto session = auth_routes_->resolve_session(req);
-            auto reviewer = session ? session->username : "unknown";
-
-            auto result = approval_manager_->reject(id, reviewer, comment);
-            if (!result) {
-                res.status = 400;
-                // Same as the approve branch: audit the denial, log it, and
-                // surface it as a toast (#1821) — htmx swallows non-2xx
-                // bodies but processes HX-Trigger on them.
-                (void)audit_log(req, "approval.reject", "denied", "approval", id,
-                                result.error());
-                spdlog::warn("approval reject denied: id={} reviewer={} reason={}",
-                             log_safe(id), reviewer, log_safe(result.error(), 256));
-                nlohmann::json trigger = {
-                    {"showToast", {{"message", result.error()}, {"level", "error"}}}};
-                res.set_header("HX-Trigger",
-                               trigger.dump(-1, ' ', false,
-                                            nlohmann::json::error_handler_t::replace));
-                res.set_content(nlohmann::json({{"error", result.error()}})
-                                    .dump(-1, ' ', false,
-                                          nlohmann::json::error_handler_t::replace),
-                                "application/json");
-                return;
-            }
-            (void)audit_log(req, "approval.reject", "success", "approval", id);
-            emit_event("approval.rejected", req, {{"reviewer", reviewer}, {"comment", comment}},
-                       {{"approval_id", id}});
-            res.set_header("HX-Trigger",
-                           R"({"showToast":{"message":"Rejected","level":"warning"}})");
-            res.set_content(R"({"status":"rejected"})", "application/json");
-        });
-
         // -- HTMX Fragment Routes for Instructions UI -------------------------
 
         web_server_->Get(
@@ -15149,8 +14555,20 @@ private:
                     // so a single bad policy must not take the process (or silently
                     // kill compliance evaluation). Catch, log, and keep ticking.
                     try {
-                        YUZU_ASSERT_BACKGROUND_JOB("policy_evaluator.tick"); // WS-10 FencedLeaderOnly
-                        policy_evaluator_->tick();
+                        // WS-3 3.2 (PR #4134 review): tick() SPLITS into two passes.
+                        // collect_ready() runs on EVERY replica — it is the completion
+                        // path for the operator-synchronous evaluate_now()/remediate()
+                        // plane (both accepted on any replica and NOT gated), so a
+                        // non-leader must still mature their in-flight records to a
+                        // terminal verdict (two-dispatch-planes rule). Only dispatch_due()
+                        // — the leader-owned durable due-policy scheduling (ADR-0056) — is
+                        // fenced. Gating the whole tick() would strand an operator
+                        // remediation as `fixing` forever on any non-leader.
+                        YUZU_ASSERT_BACKGROUND_JOB("policy_evaluator.collect_ready"); // WS-10 ReplicaSafe
+                        YUZU_ASSERT_BACKGROUND_JOB("policy_evaluator.dispatch_due");  // WS-10 FencedLeaderOnly
+                        policy_evaluator_->tick(
+                            leader_gate_permits<background_job_class("policy_evaluator.dispatch_due")>(
+                                leader_elector_.get()));
                     } catch (const std::exception& e) {
                         spdlog::error("policy_eval: tick threw ({}) — thread continuing", e.what());
                     } catch (...) {
@@ -15330,7 +14748,19 @@ private:
                     // already carry this shape).
                     try {
                         YUZU_ASSERT_BACKGROUND_JOB("quarantine_reconciler.tick"); // WS-10 FencedLeaderOnly
-                        quarantine_reconciler_->tick();
+                        // WS-3 3.2: gated leader-only via the uniform kBackgroundJobs
+                        // classification (no special-casing — the runtime gate must
+                        // not fork from the checked-in table). NOTE (BLOCKING for a
+                        // 2nd replica, tracked #4119): once WS-4 gateway-fronting
+                        // routes agents to specific core nodes, containment re-apply
+                        // must follow STREAM LOCALITY (the node holding an agent's
+                        // Subscribe stream reconciles it); a leader-only gate would
+                        // then strand agents homed on non-leader nodes. WS-4/5 MUST
+                        // reclassify this pass to a ReplicaSafe stream-partitioned
+                        // form. Correct + inert today (single replica == leader).
+                        if (leader_gate_permits<background_job_class("quarantine_reconciler.tick")>(
+                                leader_elector_.get()))
+                            quarantine_reconciler_->tick();
                     } catch (const std::exception& e) {
                         spdlog::error("quarantine_reconciler: tick threw ({}) — thread continuing",
                                       e.what());
@@ -15465,7 +14895,14 @@ private:
                     // the process. Catch, log, keep ticking.
                     try {
                         YUZU_ASSERT_BACKGROUND_JOB("schedule_runner.tick"); // WS-10 FencedLeaderOnly
-                        schedule_runner_->tick();
+                        // WS-3 3.2: the genuinely unprotected loop — evaluate_due() is
+                        // a bare SELECT and fire-then-advance has no cross-replica
+                        // claim, so two replicas would double-fire schedules. Gate it
+                        // leader-only now; the claim-before-dispatch + command outbox
+                        // that makes a re-drive effectively-once is slice 3.3.
+                        if (leader_gate_permits<background_job_class("schedule_runner.tick")>(
+                                leader_elector_.get()))
+                            schedule_runner_->tick();
                     } catch (const std::exception& e) {
                         metrics_.counter("yuzu_schedule_tick_errors_total").increment();
                         spdlog::error("schedule_runner: tick threw ({}) — thread continuing",
@@ -16830,6 +16267,30 @@ private:
                 return yuzu::server::DispatchCaller{
                     .exec_visible = yuzu::server::authz::deny_all()};
             });
+        // #4027 fix round (CDX-P1-01/K4) — the SAME fleet_read_fn lambda wired
+        // into dashboard_routes_/mcp_server_ below/elsewhere (#3290 Phase 2), so
+        // the two REST device-picker twins (`GET /api/v1/tar/process-tree`,
+        // `GET /api/v1/tar/capture-sources`) apply the real ADR-0017
+        // admit-then-filter chokepoint instead of the bare `require_permission`
+        // they shipped with. Injected via setter (not a register_routes param)
+        // so this doesn't churn the call above or any test fixture's call —
+        // an un-set fn fails closed (503 unwired), same contract as
+        // DashboardRoutes'/McpServer's own fleet_read_fn seam. The two
+        // pre-existing `/fragments/tar/...` HTML routes stay on perm_fn_ this
+        // round — see the recorded-exception comment at their registration.
+        tar_tree_routes_->set_fleet_read_fn(fleet_read_fn);
+        // #4143 review fix — same unfiltered source list_agents' agents_fn and
+        // GET /api/v1/devices (#4033) read from; gate.scope (fleet_read_fn_
+        // above) is the SOLE filter now, not an intersection with devices_fn's
+        // direct-membership pre-filter. See set_all_devices_fn's doc comment.
+        tar_tree_routes_->set_all_devices_fn([this, make_device_row]() -> std::vector<DeviceRow> {
+            std::vector<DeviceRow> out;
+            auto arr = registry_.to_json_obj();
+            out.reserve(arr.size());
+            for (const auto& a : arr)
+                out.push_back(make_device_row(a));
+            return out;
+        });
 
         // VizRoutes — /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology
         // (PR 3 of feat/viz-engine ladder)
@@ -18334,6 +17795,24 @@ private:
             // decision for the same caller (same conversion, same underlying
             // require_fleet_read call).
             mcp_server_->set_fleet_read_fn(fleet_read_fn);
+            // #4027 fix round (CDX-P1-01/K4): the RBAC/management-group AXIS
+            // for these three tools is the fleet_read_fn_ already wired above
+            // (the SAME instance query_installed_software uses).
+            // dashboard_routes_ is guaranteed constructed by this point
+            // (registered well above, in the same function, before MCP setup
+            // begins).
+            // #4143 review fix — see mcp_server.hpp's set_all_devices_fn doc
+            // comment; identical lambda wired into tar_tree_routes_ above so
+            // both transports read from the exact same unfiltered snapshot.
+            mcp_server_->set_all_devices_fn([this, make_device_row]() -> std::vector<DeviceRow> {
+                std::vector<DeviceRow> out;
+                auto arr = registry_.to_json_obj();
+                out.reserve(arr.size());
+                for (const auto& a : arr)
+                    out.push_back(make_device_row(a));
+                return out;
+            });
+            mcp_server_->set_dashboard_routes(dashboard_routes_.get());
             // PR1.5c/1.6c (p14) — ADR-0031 operator surface MCP twins,
             // wired UNCONDITIONALLY exactly like kek_ops above (never
             // gated behind an unrelated conditional — see the KEK comment
@@ -18876,9 +18355,10 @@ private:
     // NVD CVE feed
     std::shared_ptr<NvdDatabase> nvd_db_;
     std::unique_ptr<NvdSyncManager> nvd_sync_;
-    // Serializes the /metrics emit of yuzu_nvd_sync_failures_total so two concurrent scrapes
-    // can't double-apply the same per-reason delta (#1912 review).
-    mutable std::mutex nvd_metrics_scrape_mu_;
+    // The /metrics emit's per-scrape serialization lock moved to a local
+    // inside health_routes.cpp's register_health_routes (#2542 PR-10) — it
+    // had exactly one use site (that handler), so it is no longer a
+    // ServerImpl member. See health_routes.hpp's header comment.
 
     // OTA agent updates — born-on-PG store (ADR-0061). Borrows pg_pool_
     // (declared earlier, destructs later) and is borrowed by agent_service_'s
@@ -19395,6 +18875,15 @@ private:
     std::thread preflight_runner_thread_; // joined before stores in stop()
     std::thread schedule_tick_thread_;    // drives ScheduleRunner (#1191); joined before stores
     std::thread result_set_maint_thread_;
+
+    // WS-3 (ADR-2002 §3/§6/§10): the fenced leader elector + its election loop.
+    // The elector owns a dedicated coordination connection (NOT pg_pool_), so it
+    // has no store-teardown ordering dependency; leader_thread_ is ALWAYS joined
+    // in stop() before ~ServerImpl (a joinable std::thread destructor terminates).
+    // FencedLeaderOnly background loops (schedule/policy/quarantine/CRL) gate on
+    // leader_elector_->is_leader() via leader_gate.hpp — slice 3.2.
+    std::unique_ptr<LeaderElector> leader_elector_;
+    std::thread leader_thread_;
 
     // Periodic reminder when running with --insecure-skip-client-verify (issue #79)
     std::thread insecure_tls_reminder_thread_;

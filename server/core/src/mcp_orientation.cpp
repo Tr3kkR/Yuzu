@@ -108,8 +108,13 @@ constexpr std::string_view kAgenticHelpers[] = {"get_fleet_posture_fast",
 constexpr std::string_view kDiscovery[] = {"discover_permissions", "discover_instructions",
                                            "discover_routes", "discover_scope_kinds",
                                            "discover_plugins"};
+// #4027 — TAR (Timeline / Activity Recorder) had zero MCP presence before this
+// read-twin batch; its own family rather than folding into an unrelated one.
+constexpr std::string_view kTar[] = {"list_tar_process_tree_devices",
+                                     "list_tar_capture_sources_devices",
+                                     "list_tar_retention_paused"};
 
-constexpr std::array<ToolFamily, 24> kFamilies{{
+constexpr std::array<ToolFamily, 25> kFamilies{{
     {"Fleet & agents", "connected agents, their OS/arch/version, and details", kFleet},
     {"Tags", "read and write agent tags, and find agents by tag", kTags},
     {"Instructions & schedules", "instruction definitions and recurring schedules", kDefinitions},
@@ -151,6 +156,10 @@ constexpr std::array<ToolFamily, 24> kFamilies{{
      kAgenticHelpers},
     {"Discovery", "enumerate permissions, instructions, routes, scope kinds, and plugins",
      kDiscovery},
+    {"TAR process-tree & retention", "operator-scoped device pickers for the TAR process-tree "
+                                     "and capture-sources frames, and the caller's own "
+                                     "retention-paused source scan",
+     kTar},
 }};
 
 }  // namespace

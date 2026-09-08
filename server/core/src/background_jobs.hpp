@@ -23,7 +23,13 @@
 ///   - FencedLeaderOnly     — side-effecting singleton work that double-fires
 ///                            across replicas (agent dispatch, CRL numbering).
 ///                            Runs only on the WS-3 fenced leader; ENFORCEMENT is
-///                            slice 10.3 (rides WS-3 3.2), not this file.
+///                            slice 10.3 (rides WS-3 3.2), not this file. ADDING a
+///                            FencedLeaderOnly pass REQUIRES wrapping its dispatch
+///                            site with `leader_gate_permits<background_job_class(
+///                            "<pass>")>(leader_elector_.get())` (leader_gate.hpp) —
+///                            the consteval class lookup pins the CLASS but not gate
+///                            PRESENCE, so a new row without a gate site compiles and
+///                            double-fires (adversarial review K5; CI sweep #4121).
 ///   - DisabledUntilFixed   — not yet replica-safe and not yet leader-gated; must
 ///                            not run per-replica until its named fix lands.
 ///
@@ -84,7 +90,7 @@ struct BackgroundJobDecl {
     std::string_view mechanism;     ///< why the class holds (the recorded rationale)
 };
 
-/// The exhaustive inventory (40 passes). Verified against the source sweep
+/// The exhaustive inventory (41 passes). Verified against the source sweep
 /// 2026-09-07 per the SWEEP METHODOLOGY above; keep the count tripwire in
 /// `test_background_jobs.cpp` in step with any add/remove here.
 inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
@@ -135,9 +141,14 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
     {"deployment_run_store.run_retention_prune", "preflight_runner_thread_", BackgroundJobClass::ReplicaSafe,
      "clock-guarded + advisory lock (WS-10 10.2); piggybacks the preflight thread"},
 
-    // ---- policy_eval_thread_ (10s tick) ----
-    {"policy_evaluator.tick", "policy_eval_thread_", BackgroundJobClass::FencedLeaderOnly,
-     "side-effecting remediation dispatch; ADR-0056 claim_due_policies is fleet-safe but the loop is leader-only (WS-3 3.2/3.4)"},
+    // ---- policy_eval_thread_ (10s tick) — tick() SPLITS into two passes (PR #4134) ----
+    {"policy_evaluator.collect_ready", "policy_eval_thread_", BackgroundJobClass::ReplicaSafe,
+     "MUST run per-replica: the ONLY completion path that matures an in-flight Check/FixWait created by "
+     "the operator-synchronous evaluate_now()/remediate() plane (accepted on any replica, ungated) to a "
+     "terminal verdict — gating it strands an operator remediation as `fixing` forever on a non-leader "
+     "(two-dispatch-planes rule). Replica-local + in-memory, no durable claim to fence"},
+    {"policy_evaluator.dispatch_due", "policy_eval_thread_", BackgroundJobClass::FencedLeaderOnly,
+     "side-effecting due-policy scheduling dispatch; ADR-0056 claim_due_policies is fleet-safe but the leader-only gate cuts non-leader churn (WS-3 3.2/3.4)"},
 
     // ---- schedule_tick_thread_ (30s tick) ----
     {"schedule_runner.tick", "schedule_tick_thread_", BackgroundJobClass::FencedLeaderOnly,
@@ -213,6 +224,21 @@ consteval int background_job_index(std::string_view pass) {
         if (kBackgroundJobs[i].pass == pass)
             return static_cast<int>(i);
     return -1;
+}
+
+/// The class of a background pass, resolved at COMPILE TIME (slice 3.2's runtime
+/// gate, `leader_gate.hpp`, dispatches on this). Pairs with
+/// `YUZU_ASSERT_BACKGROUND_JOB` at the same site: an unclassified `pass` throws
+/// in constant evaluation, which is a hard BUILD FAILURE — the gate can never be
+/// applied to an unclassified pass, and never silently defaults to a class. This
+/// is what makes the runtime leader-gate unable to drift from this table: change
+/// a pass's class here and its gate follows, because the gate reads it FROM here.
+consteval BackgroundJobClass background_job_class(std::string_view pass) {
+    const int i = background_job_index(pass);
+    if (i < 0)
+        throw "background pass is not classified in kBackgroundJobs "
+              "(server/core/src/background_jobs.hpp)";
+    return kBackgroundJobs[static_cast<std::size_t>(i)].cls;
 }
 
 /// Assert (at compile time) that a background pass is classified in

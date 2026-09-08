@@ -21,6 +21,7 @@
 #include "token_rotation_lookup.hpp" // shared REST/MCP human-token rotation successor lookup (P2 #11)
 
 #include "agent_registry.hpp"           // AgentRegistry (discover_plugins tool)
+#include "dashboard_routes.hpp"         // DashboardRoutes::gather_tar_retention_paused (#4027)
 #include "discover_routes.hpp"          // A2 discovery builders shared with REST /discover/*
 #include "engine_principal_store.hpp"   // EnginePrincipalStore (fwd-declared only in mcp_server.hpp)
 #include "openapi_spec_access.hpp"      // openapi_spec_json() (discover_routes tool)
@@ -367,6 +368,52 @@ static const ToolDef kTools[] = {
     {"list_agents", "List all connected agents with hostname, OS, architecture, and version.",
      R"({"type":"object","properties":{}})",
      R"j({"type":"object","properties":{"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"}},"required":["agent_id","hostname","os","arch","agent_version"]}}},"required":["agents"]})j"},
+
+    // ── #4027 API-parity read twins: TAR process-tree / capture-sources device
+    // pickers + retention-paused source list. Requires Infrastructure:Read,
+    // enforced via fleet_read_fn_ (#4027 fix round, CDX-P1-01/K4 — the ADR-0017
+    // admit-then-filter chokepoint; SAME gate their REST twins use, NOT the two
+    // pre-existing HTML fragment siblings, which stay on the legacy bare
+    // require_permission gate this round — see tar_tree_routes.cpp's
+    // recorded-exception comments at their registration). #4143 review fix:
+    // all three now read from an UNFILTERED source (all_devices_fn_ /
+    // DashboardRoutes::gather_tar_retention_paused with
+    // extra_scope_is_authoritative=true) exactly like list_agents' own
+    // agents_fn, with fleet_read_fn_'s gate.scope as the SOLE filter — no
+    // longer intersected with a separate per-operator-scoped provider. See
+    // set_all_devices_fn's doc comment (mcp_server.hpp) for the full
+    // rationale.
+    // GET /fragments/tar/process-tree/result and .../detail are DELIBERATELY NOT
+    // twinned by #4027 (see tar_tree_routes.hpp's file comment) — no REST/MCP-only
+    // path exists to mint their required pcmd/tcmd/token inputs today.
+    {"list_tar_process_tree_devices",
+     "List the operator-scoped device picker for the TAR process-tree viewer. "
+     "Each row carries `online`, which is always true today — the sole wired "
+     "provider sources this list from the live-session registry, so a "
+     "disconnected enrolled device is not included (#4027 fix round, "
+     "CDX-P1-02/K1). Requires Infrastructure:Read. Read-only twin of GET "
+     "/fragments/tar/process-tree's device picker / GET /api/v1/tar/process-tree.",
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{"devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"},"online":{"type":"boolean"}},"required":["agent_id","hostname","os","arch","agent_version","online"]}}},"required":["devices"]})j"},
+
+    {"list_tar_capture_sources_devices",
+     "List the operator-scoped device picker for the TAR capture-sources (ADR-0015 "
+     "enable/disable) frame. Same row shape as list_tar_process_tree_devices — "
+     "`online` is always true today, same reason. Requires Infrastructure:Read. "
+     "Read-only twin of GET /fragments/tar/capture-sources's device picker / "
+     "GET /api/v1/tar/capture-sources.",
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{"devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"},"online":{"type":"boolean"}},"required":["agent_id","hostname","os","arch","agent_version","online"]}}},"required":["devices"]})j"},
+
+    {"list_tar_retention_paused",
+     "List the calling operator's most recent TAR retention-paused source scan "
+     "(per-username state; filtered to the operator's visible agents), one row per "
+     "(agent, paused source). Requires Infrastructure:Read. Read-only twin of GET "
+     "/fragments/tar/retention-paused / GET /api/v1/tar/retention-paused. Returns "
+     "scan_id=\"\" when the operator has not dispatched a scan yet (call "
+     "POST /fragments/tar/retention-paused/scan first, dashboard-only today).",
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{"scan_id":{"type":"string"},"scan_count":{"type":"integer"},"scan_at":{"type":"integer"},"agents_responded":{"type":"integer"},"agents_with_no_paused_sources":{"type":"integer"},"agents_filtered_out_of_scope":{"type":"integer"},"store_degraded":{"type":"boolean"},"rows":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"agent_display":{"type":"string"},"source":{"type":"string"},"paused_at":{"type":"integer"},"live_rows":{"type":"integer"},"oldest_ts":{"type":"integer"},"value_error":{"type":"boolean"},"enabled_raw":{"type":"string"}},"required":["agent_id","agent_display","source","paused_at","live_rows","oldest_ts","value_error","enabled_raw"]}}},"required":["scan_id","scan_count","scan_at","agents_responded","agents_with_no_paused_sources","agents_filtered_out_of_scope","store_degraded","rows"]})j"},
 
     {"get_agent_details",
      "Get detailed info for a single agent including tags and inventory. "
@@ -1854,6 +1901,19 @@ struct ToolSecurityEntry {
 static const ToolSecurityEntry kToolSecurityRows[] = {
     // Phase 1 read-only tools
     {"list_agents", {"Infrastructure", "Read"}},
+    // #4027 — default (2-element) form, matching list_agents: service-scoped
+    // tokens are structurally denied at the generic C8 chokepoint. #4027 fix
+    // round (CDX-P1-01/K4): the handlers below migrated from tier_allows+
+    // perm_fn to fleet_read_fn_ for the RBAC/management-group axis, but this
+    // C8 classification is DELIBERATELY UNCHANGED — parity with the two
+    // device-picker REST twins' deny_fleet_wide_device_enumeration guard and
+    // the retention twin's own explicit service-scope 403
+    // (dashboard_routes.cpp) — none of the six #4027 surfaces admits a
+    // service-scoped caller; this fix round closes the management-group gap
+    // only, never widens the service-scope one.
+    {"list_tar_process_tree_devices", {"Infrastructure", "Read"}},
+    {"list_tar_capture_sources_devices", {"Infrastructure", "Read"}},
+    {"list_tar_retention_paused", {"Infrastructure", "Read"}},
     // #1700 / #3290 Phase 2: migrated onto require_fleet_read, which gives
     // this tool a REAL confinement mechanism (meet(management-group,
     // service-scope)) — reclassified from the default `denied` to
@@ -2337,6 +2397,12 @@ struct ToolAnnotation {
 static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     // ── Read-only tools (effect ReadOnly, idempotent) ─────────────────────────
     {"list_agents", {ToolEffect::ReadOnly, true, "List agents"}},
+    {"list_tar_process_tree_devices",
+     {ToolEffect::ReadOnly, true, "List TAR process-tree device picker"}},
+    {"list_tar_capture_sources_devices",
+     {ToolEffect::ReadOnly, true, "List TAR capture-sources device picker"}},
+    {"list_tar_retention_paused",
+     {ToolEffect::ReadOnly, true, "List TAR retention-paused sources"}},
     {"get_agent_details", {ToolEffect::ReadOnly, true, "Get agent details"}},
     {"query_audit_log", {ToolEffect::ReadOnly, true, "Query audit log"}},
     {"list_definitions", {ToolEffect::ReadOnly, true, "List instruction definitions"}},
@@ -5423,6 +5489,140 @@ McpServer::HandlerFn McpServer::build_handler(
                                                          JObj().raw("agents", arr.str()).str(),
                                                          kObjectOutputSchema)),
                     "application/json");
+                return;
+            }
+
+            // ── #4027 read twins: TAR process-tree / capture-sources device
+            // pickers + retention-paused source list. #4027 fix round
+            // (CDX-P1-01/K4): all three now gate SOLELY on fleet_read_fn_
+            // (require_fleet_read, the ADR-0017 admit-then-filter chokepoint),
+            // NOT the former tier_allows+perm_fn pair — fleet_read_fn_ already
+            // covers the MCP tier axis internally (authz_gates.cpp's
+            // mcp::tier_allows check precedes its RBAC branch), exactly mirroring
+            // query_installed_software's established migration a few hundred
+            // lines above ("fleet_read_fn_ is now the SOLE gate... no separate
+            // tier_allows/perm_fn call here"). Service-scoped tokens are
+            // unaffected by this migration — all three tools keep their default
+            // `ServiceScopeClass::denied` classification in kToolSecurityRows
+            // below, so the generic C8 chokepoint still denies them before this
+            // code is ever reached (parity with the REST retention twin's own
+            // explicit deny — see dashboard_routes.cpp). Unaudited-on-success
+            // posture for the two device pickers would match their REST
+            // siblings, but every other MCP tool in this file (including
+            // list_agents just above) calls mcp_audit("success") as baseline
+            // MCP-transport access logging regardless of the REST-side audit
+            // decision — followed here for consistency rather than introducing
+            // a fourth posture into an already-three-posture table
+            // (docs/api-twin-recipe.md §4).
+            //
+            // #4143 review fix (external colleague review, BLOCKING + SILENTFAIL-1,
+            // both confirmed by direct source inspection): the two device pickers
+            // now read the SAME shared builder their REST twin calls
+            // (api-twin-recipe.md Rule 1) from an UNFILTERED registry snapshot
+            // (all_devices_fn_ — same source list_agents' agents_fn and
+            // GET /api/v1/devices (#4033) use), with gate.scope as the SOLE
+            // filter — not an intersection with tar_devices_fn_'s direct-
+            // membership-only pre-filter (see set_all_devices_fn's doc comment
+            // above for why the old intersection design was an ADR-0017
+            // INV-4/INV-7 violation). And both now fail LOUD (503-equivalent
+            // kInternalError) when their provider is unwired, matching
+            // list_tar_retention_paused's existing posture below — the previous
+            // code silently answered "0 devices in your scope" on a misconfigured
+            // call site for these two tools only, indistinguishable from a
+            // genuinely-empty-scope caller (a false "closed" that reads as data,
+            // not an outage; the same class of bug the loud unwired-fleet_read_fn_
+            // branch just above already guards against). ──
+            if (tool_name == "list_tar_process_tree_devices") {
+                if (!fleet_read_fn_ || !all_devices_fn_) {
+                    spdlog::error("list_tar_process_tree_devices: fleet_read_fn_/"
+                                  "all_devices_fn_ unwired — misconfigured call site; "
+                                  "failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto gate = fleet_read_fn_(req, res, "Infrastructure", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the A4 error body + status
+                std::vector<DeviceRow> devices = all_devices_fn_();
+                if (gate.scope) {
+                    std::vector<DeviceRow> visible;
+                    visible.reserve(devices.size());
+                    for (auto& d : devices)
+                        if (authz::in_scope(gate.scope, d.agent_id))
+                            visible.push_back(std::move(d));
+                    devices.swap(visible);
+                }
+                const std::string devices_json = tar_process_tree_frame_json(devices);
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id,
+                                      tool_result_split(devices_json,
+                                                         JObj().raw("devices", devices_json).str(),
+                                                         kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "list_tar_capture_sources_devices") {
+                if (!fleet_read_fn_ || !all_devices_fn_) {
+                    spdlog::error("list_tar_capture_sources_devices: fleet_read_fn_/"
+                                  "all_devices_fn_ unwired — misconfigured call site; "
+                                  "failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto gate = fleet_read_fn_(req, res, "Infrastructure", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the A4 error body + status
+                std::vector<DeviceRow> devices = all_devices_fn_();
+                if (gate.scope) {
+                    std::vector<DeviceRow> visible;
+                    visible.reserve(devices.size());
+                    for (auto& d : devices)
+                        if (authz::in_scope(gate.scope, d.agent_id))
+                            visible.push_back(std::move(d));
+                    devices.swap(visible);
+                }
+                const std::string devices_json = tar_capture_sources_devices_json(devices);
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id,
+                                      tool_result_split(devices_json,
+                                                         JObj().raw("devices", devices_json).str(),
+                                                         kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "list_tar_retention_paused") {
+                if (!fleet_read_fn_) {
+                    spdlog::error("list_tar_retention_paused: fleet_read_fn_ unwired — "
+                                  "misconfigured call site; failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto gate = fleet_read_fn_(req, res, "Infrastructure", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the A4 error body + status
+                if (!dashboard_routes_) {
+                    res.set_content(
+                        a4_error(kInternalError, "TAR retention-paused surface unavailable",
+                                 "this is a server configuration/wiring fault, not a caller "
+                                 "error; contact an administrator"),
+                        "application/json");
+                    return;
+                }
+                // #4143 review fix: gate.scope is authoritative here — see
+                // gather_tar_retention_paused's doc comment.
+                const std::string payload =
+                    tar_retention_paused_json(dashboard_routes_->gather_tar_retention_paused(
+                        session->username, gate.scope, /*extra_scope_is_authoritative=*/true));
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(payload, kObjectOutputSchema)),
+                                "application/json");
                 return;
             }
 

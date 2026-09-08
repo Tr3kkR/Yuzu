@@ -171,12 +171,14 @@ inline std::string html_escape(const std::string& s) {
 /// Truncates for good measure; callers already substr to bound length.
 /// Promoted from `ServerImpl::log_safe` (#2542 PR-7, `instruction_routes.cpp`
 /// needs it alongside the pre-existing `/api/approvals/:id/{approve,reject}`
-/// call sites that stay inline in server.cpp) — mirrors the #2557
+/// call sites, which PR-9 later extracted into `approval_routes.cpp` —
+/// reconciled at merge time onto this same promotion rather than PR-9's own
+/// independently-promoted `log_safe.hpp`) — mirrors the #2557
 /// `json_extract.hpp` precedent: a pure, `this`-free static helper with
 /// call sites both inside and outside an about-to-be-extracted route
 /// cluster is promoted to a shared free function, never duplicated, so the
 /// two calling sites can't silently diverge.
-inline std::string log_safe(const std::string& s, std::size_t max = 64) {
+[[nodiscard]] inline std::string log_safe(const std::string& s, std::size_t max = 64) {
     std::string out;
     out.reserve(std::min(s.size(), max));
     for (std::size_t i = 0; i < s.size() && i < max; ++i) {
