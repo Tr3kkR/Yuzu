@@ -4710,6 +4710,11 @@ TEST_CASE("Watch establishment: post-fix fast-path cost, bulk engine.arm() (N=20
         SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset - skipping establishment latency harness");
         return;
     }
+    // Extended to cover File and Service, plus a Registry RE-ARM series, not
+    // just Registry's initial arm (adversarial-review finding, PR-A round
+    // 2): the plan requires "bulk engine.arm() of N=200 local keys per
+    // mechanism and Registry re-arm wall-clock" - the original scaffold
+    // covered only the first of those three.
     constexpr int kBulkKeys = 200;
     const std::string base =
         "SOFTWARE\\YuzuTest\\SparkEst_" + std::to_string(yuzu::test::process_random_salt()) +
@@ -4719,13 +4724,50 @@ TEST_CASE("Watch establishment: post-fix fast-path cost, bulk engine.arm() (N=20
                               nullptr, &base_h, nullptr) == ERROR_SUCCESS);
     ::RegCloseKey(base_h);
 
+    // Real service names to cycle through for the Service series - same
+    // enumeration shape S2/S3 already use. Independent of the SparkEngine
+    // below (plain SCM calls), so gathered up front.
+    std::vector<std::wstring> service_names;
+    {
+        SC_HANDLE scm =
+            ::OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT | SC_MANAGER_ENUMERATE_SERVICE);
+        REQUIRE(scm != nullptr);
+        DWORD needed = 0, count = 0, resume = 0;
+        ::EnumServicesStatusExW(scm, SC_ENUM_PROCESS_INFO, SERVICE_WIN32, SERVICE_STATE_ALL,
+                                nullptr, 0, &needed, &count, &resume, nullptr);
+        resume = 0;
+        std::vector<BYTE> buf(needed);
+        REQUIRE(::EnumServicesStatusExW(scm, SC_ENUM_PROCESS_INFO, SERVICE_WIN32,
+                                        SERVICE_STATE_ALL, buf.data(),
+                                        static_cast<DWORD>(buf.size()), &needed, &count, &resume,
+                                        nullptr));
+        REQUIRE(count > 0);
+        const auto* entries = reinterpret_cast<const ENUM_SERVICE_STATUS_PROCESSW*>(buf.data());
+        for (DWORD i = 0; i < count; ++i)
+            service_names.emplace_back(entries[i].lpServiceName);
+        ::CloseServiceHandle(scm);
+    }
+
+    yuzu::test::TempDir file_base("yuzu_test_spark_est_bulk_file_");
+    {
+        std::error_code ec;
+        std::filesystem::create_directory(file_base.path, ec);
+        REQUIRE(!ec);
+    }
+
     SparkEngine engine;
     REQUIRE(engine.register_mechanism(SparkType::Registry, make_registry_mechanism()).has_value());
+    REQUIRE(engine.register_mechanism(SparkType::File, make_file_mechanism()).has_value());
+    REQUIRE(engine.register_mechanism(SparkType::Service, make_service_mechanism()).has_value());
     Collector got;
     auto c = engine.register_consumer("c", got.handler());
     REQUIRE(c.has_value());
     engine.start();
 
+    // --- Registry: initial arm, then re-arm (value-write triggers each
+    // key's TP_WAIT callback -> on_fire() -> reconcile()) ---
+    std::vector<std::string> registry_subs;
+    registry_subs.reserve(kBulkKeys);
     std::vector<std::int64_t> t_arm;
     const auto bulk_t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < kBulkKeys; ++i) {
@@ -4734,6 +4776,7 @@ TEST_CASE("Watch establishment: post-fix fast-path cost, bulk engine.arm() (N=20
         REQUIRE(::RegCreateKeyExA(HKEY_CURRENT_USER, sub.c_str(), 0, nullptr, 0, KEY_ALL_ACCESS,
                                   nullptr, &h, nullptr) == ERROR_SUCCESS);
         ::RegCloseKey(h);
+        registry_subs.push_back(sub);
         time_call(t_arm, [&] {
             auto r = engine.arm(*c, registry_spec("HKCU", sub));
             REQUIRE(r.has_value());
@@ -4746,6 +4789,93 @@ TEST_CASE("Watch establishment: post-fix fast-path cost, bulk engine.arm() (N=20
          << std::chrono::duration_cast<std::chrono::milliseconds>(bulk_t1 - bulk_t0).count()
          << "ms (compare against CH-5-UAT's spark_p99 <= 15s gate once this same case is "
             "re-run on the PR-B build)");
+
+    // Registry sparks fire on CHANGE only, not on the initial arm, so this
+    // is expected to already be 0 - captured as a baseline (not REQUIRE'd
+    // as exactly 0) so a stray unrelated event can't hard-fail this
+    // by-hand-only harness case; the re-arm wall clock below measures the
+    // DELTA off this baseline either way.
+    const auto rearm_baseline = got.count();
+    const auto rearm_t0 = std::chrono::steady_clock::now();
+    for (const auto& sub : registry_subs) {
+        HKEY h = nullptr;
+        if (::RegOpenKeyExA(HKEY_CURRENT_USER, sub.c_str(), 0, KEY_SET_VALUE, &h) ==
+            ERROR_SUCCESS) {
+            DWORD v = 1;
+            ::RegSetValueExA(h, "V", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&v), sizeof(v));
+            ::RegCloseKey(h);
+        }
+    }
+    const bool rearm_ok = eventually(
+        [&] { return got.count() >= rearm_baseline + static_cast<std::size_t>(kBulkKeys); },
+        30000ms);
+    const auto rearm_t1 = std::chrono::steady_clock::now();
+    WARN("post-fix-cost Registry re-arm: " << kBulkKeys << " value-writes, "
+         << (rearm_ok ? "all" : "NOT ALL") << " observed (got.count()=" << got.count()
+         << "), wall clock total = "
+         << std::chrono::duration_cast<std::chrono::milliseconds>(rearm_t1 - rearm_t0).count()
+         << "ms");
+
+    // --- File: N=200 real, distinct local directories ---
+    std::vector<std::int64_t> t_file_arm;
+    const auto file_t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < kBulkKeys; ++i) {
+        const auto dir = file_base.path / ("d" + std::to_string(i));
+        std::error_code ec;
+        std::filesystem::create_directory(dir, ec);
+        REQUIRE(!ec);
+        time_call(t_file_arm, [&] {
+            auto r = engine.arm(*c, file_spec(dir.string()));
+            REQUIRE(r.has_value());
+        });
+    }
+    const auto file_t1 = std::chrono::steady_clock::now();
+    warn_establish("post-fix-cost bulk arm (TODAY's baseline - re-run on PR-B build)",
+                   "SparkEngine::arm (File)", t_file_arm);
+    WARN("post-fix-cost bulk arm (File): " << kBulkKeys << " arms, wall clock total = "
+         << std::chrono::duration_cast<std::chrono::milliseconds>(file_t1 - file_t0).count()
+         << "ms");
+
+    // --- Service: cycle the REAL service list up to N=200 arms. If the
+    // host has fewer than kBulkKeys services, this wraps and later arms
+    // become coalescing re-arms of an already-held key (a materially
+    // DIFFERENT, cheaper operation than a fresh arm) rather than N=200
+    // distinct fresh arms - reported explicitly so the number is never
+    // read as more than it is. ---
+    // Failures are SKIPPED, not REQUIRE'd, and excluded from the timing
+    // series (same defensive posture as S2's t_open_failed): a real-world
+    // enumerated service name could in principle fail valid_service_name()
+    // and reach that rejection fast, without any real OS call - blending
+    // that near-zero timing into t_svc_arm would understate the series,
+    // and a hard REQUIRE would abort the whole by-hand DGRHP run over one
+    // oddly-named service.
+    std::vector<std::int64_t> t_svc_arm;
+    int svc_arm_failed = 0;
+    const auto svc_t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < kBulkKeys; ++i) {
+        const std::wstring& name_w = service_names[static_cast<std::size_t>(i) %
+                                                    service_names.size()];
+        const std::string name(name_w.begin(), name_w.end()); // ASCII service names only
+        bool ok = false;
+        time_call(t_svc_arm, [&] {
+            auto r = engine.arm(*c, service_spec(name));
+            ok = r.has_value();
+        });
+        if (!ok) {
+            ++svc_arm_failed;
+            t_svc_arm.pop_back();
+        }
+    }
+    const auto svc_t1 = std::chrono::steady_clock::now();
+    warn_establish("post-fix-cost bulk arm (TODAY's baseline - re-run on PR-B build)",
+                   "SparkEngine::arm (Service)", t_svc_arm);
+    WARN("post-fix-cost bulk arm (Service): " << kBulkKeys << " arms over "
+         << service_names.size() << " real services (wraps=" << (kBulkKeys > static_cast<int>(
+             service_names.size())) << " - a wrap means later arms are coalescing re-arms of an "
+            "already-held key, NOT fresh arms; " << svc_arm_failed << " arm(s) failed and are "
+            "excluded from the timing series above), wall clock total = "
+         << std::chrono::duration_cast<std::chrono::milliseconds>(svc_t1 - svc_t0).count()
+         << "ms");
 
     engine.stop();
     establish_cleanup_tree(base); // base\k0..k199 - RegDeleteKeyA would silently
