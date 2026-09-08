@@ -71,6 +71,7 @@
 
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -355,6 +356,12 @@ void collect_runonceex_subkeys(HKEY hive, const std::wstring& subkey, REGSAM ext
         }
         collect_reg_values(sub.get(), location_prefix + L"\\" + numbered_w, id, scope, "-", outcome);
     }
+    // A capped enumeration is not a complete one (AC4) -- probe one more
+    // index past the cap; only note row_cap if a real subkey was there.
+    if (idx >= kMaxRunOnceExSubkeys &&
+        RegEnumKeyExW(key.get(), idx, name_buf, &name_len, nullptr, nullptr, nullptr, nullptr) ==
+            ERROR_SUCCESS)
+        note_constraint(outcome, "row_cap");
 }
 
 void collect_hklm_run_family(std::string_view filter, SourceOutcome& run, SourceOutcome& runonce,
@@ -626,18 +633,47 @@ void collect_ifeo(std::string_view filter, SourceOutcome& outcome) {
         }
         outcome.rows.push_back(std::move(row));
     }
+    // A capped enumeration is not a complete one (AC4) -- probe one more
+    // index past the cap; only note row_cap if a real subkey was there.
+    if (idx >= kMaxIfeoSubkeys &&
+        RegEnumKeyExW(key.get(), idx, name_buf, &name_len, nullptr, nullptr, nullptr, nullptr) ==
+            ERROR_SUCCESS)
+        note_constraint(outcome, "row_cap");
 }
 
 // ── 6. Startup folders (common + per-user) ───────────────────────────────
 
 constexpr std::size_t kMaxStartupFolderEntries = 1024;
 
+/// RAII owner for a FindFirstFileW search handle: closes via FindClose on
+/// every exit path, including a throwing allocation (wstring/vector) inside
+/// the enumeration loop -- a bare local HANDLE with FindClose only reached
+/// at normal loop exit leaks the handle if anything in the loop body
+/// throws. INVALID_HANDLE_VALUE (not nullptr) is FindFirstFileW's failure
+/// sentinel. Local to this file, matching filesystem_posture_win.cpp's
+/// ScopedVolumeFindHandle (same shape, different closer: FindVolumeClose
+/// there, FindClose here).
+class ScopedFindHandle {
+public:
+    explicit ScopedFindHandle(HANDLE h) noexcept : h_(h) {}
+    ~ScopedFindHandle() {
+        if (valid()) FindClose(h_);
+    }
+    ScopedFindHandle(const ScopedFindHandle&) = delete;
+    ScopedFindHandle& operator=(const ScopedFindHandle&) = delete;
+    [[nodiscard]] HANDLE get() const noexcept { return h_; }
+    [[nodiscard]] bool valid() const noexcept { return h_ != nullptr && h_ != INVALID_HANDLE_VALUE; }
+
+private:
+    HANDLE h_ = INVALID_HANDLE_VALUE;
+};
+
 void collect_startup_folder(const std::wstring& dir, SourceId id, Scope scope,
                            std::string_view user, SourceOutcome& outcome) {
     WIN32_FIND_DATAW find_data{};
     const std::wstring pattern = dir + L"\\*";
-    HANDLE h = FindFirstFileW(pattern.c_str(), &find_data);
-    if (h == INVALID_HANDLE_VALUE) {
+    const ScopedFindHandle find(FindFirstFileW(pattern.c_str(), &find_data));
+    if (!find.valid()) {
         const DWORD err = GetLastError();
         // A genuinely-absent folder is not an error; anything else (access
         // denied foremost) is a real constraint (AC4: failure != empty).
@@ -668,8 +704,7 @@ void collect_startup_folder(const std::wstring& dir, SourceId id, Scope scope,
         row.mtime = filetime_to_unix(find_data.ftLastWriteTime);
         outcome.rows.push_back(std::move(row));
         ++count;
-    } while (FindNextFileW(h, &find_data));
-    FindClose(h);
+    } while (FindNextFileW(find.get(), &find_data));
 }
 
 // ── 7. Scheduled Tasks (ITaskService) ────────────────────────────────────
@@ -684,13 +719,26 @@ std::string hr_token(HRESULT hr) {
     return out;
 }
 
+/// RAII owner for a BSTR returned by an out-parameter (e.g. IRegisteredTask::
+/// get_Path/get_Xml), so the allocation is freed on every exit path --
+/// including a throwing conversion between the accessor call and the manual
+/// SysFreeString that used to follow it. Local to this file for the same
+/// reason agents/plugins/windows_updates/src/windows_updates_plugin.cpp's
+/// identical BStrGuard is: agents/shared/win_com.hpp's BStr only allocates
+/// (SysAllocString), it has no adopt-an-existing-BSTR constructor.
+using BStrGuard = std::unique_ptr<std::remove_pointer_t<BSTR>, decltype(&::SysFreeString)>;
+
 void walk_task_folder(ITaskFolder* folder, SourceOutcome& outcome, std::size_t cap) {
     if (outcome.rows.size() >= cap) return;
 
     yuzu::shared::win::ComPtr<IRegisteredTaskCollection> tasks;
-    if (SUCCEEDED(folder->GetTasks(TASK_ENUM_HIDDEN, tasks.put())) && tasks) {
+    const HRESULT tasks_hr = folder->GetTasks(TASK_ENUM_HIDDEN, tasks.put());
+    if (FAILED(tasks_hr)) {
+        note_constraint(outcome, hr_token(tasks_hr));
+    } else if (tasks) {
         LONG count = 0;
-        tasks->get_Count(&count);
+        const HRESULT count_hr = tasks->get_Count(&count);
+        if (FAILED(count_hr)) note_constraint(outcome, hr_token(count_hr));
         for (LONG i = 1; i <= count; ++i) {
             if (outcome.rows.size() >= cap) {
                 note_constraint(outcome, "row_cap");
@@ -701,18 +749,30 @@ void walk_task_folder(ITaskFolder* folder, SourceOutcome& outcome, std::size_t c
             idx.vt = VT_I4;
             idx.lVal = i;
             yuzu::shared::win::ComPtr<IRegisteredTask> task;
-            if (FAILED(tasks->get_Item(idx, task.put())) || !task) continue;
+            const HRESULT item_hr = tasks->get_Item(idx, task.put());
+            if (FAILED(item_hr) || !task) {
+                note_constraint(outcome, FAILED(item_hr) ? hr_token(item_hr) : "null_task");
+                continue;
+            }
 
-            BSTR path_b = nullptr;
-            BSTR xml_b = nullptr;
+            BSTR path_raw = nullptr;
+            const HRESULT path_hr = task->get_Path(&path_raw);
+            BStrGuard path_b(path_raw, &::SysFreeString);
+            if (FAILED(path_hr)) note_constraint(outcome, hr_token(path_hr));
+
             VARIANT_BOOL enabled_b = VARIANT_TRUE;
-            task->get_Path(&path_b);
-            task->get_Enabled(&enabled_b);
-            task->get_Xml(&xml_b);
-            const std::wstring path_w = path_b ? std::wstring(path_b, SysStringLen(path_b)) : L"";
-            const std::wstring xml_w = xml_b ? std::wstring(xml_b, SysStringLen(xml_b)) : L"";
-            if (path_b) SysFreeString(path_b);
-            if (xml_b) SysFreeString(xml_b);
+            const HRESULT enabled_hr = task->get_Enabled(&enabled_b);
+            if (FAILED(enabled_hr)) note_constraint(outcome, hr_token(enabled_hr));
+
+            BSTR xml_raw = nullptr;
+            const HRESULT xml_hr = task->get_Xml(&xml_raw);
+            BStrGuard xml_b(xml_raw, &::SysFreeString);
+            if (FAILED(xml_hr)) note_constraint(outcome, hr_token(xml_hr));
+
+            const std::wstring path_w =
+                path_b ? std::wstring(path_b.get(), SysStringLen(path_b.get())) : L"";
+            const std::wstring xml_w =
+                xml_b ? std::wstring(xml_b.get(), SysStringLen(xml_b.get())) : L"";
 
             const std::string xml_utf8 = wstring_to_utf8(xml_w);
             const auto info = parse_task_xml(xml_utf8);
@@ -744,18 +804,30 @@ void walk_task_folder(ITaskFolder* folder, SourceOutcome& outcome, std::size_t c
     }
 
     yuzu::shared::win::ComPtr<ITaskFolderCollection> subfolders;
-    if (SUCCEEDED(folder->GetFolders(0, subfolders.put())) && subfolders) {
-        LONG count = 0;
-        subfolders->get_Count(&count);
-        for (LONG i = 1; i <= count && outcome.rows.size() < cap; ++i) {
-            VARIANT idx;
-            VariantInit(&idx);
-            idx.vt = VT_I4;
-            idx.lVal = i;
-            yuzu::shared::win::ComPtr<ITaskFolder> sub;
-            if (FAILED(subfolders->get_Item(idx, sub.put())) || !sub) continue;
-            walk_task_folder(sub.get(), outcome, cap);
+    const HRESULT folders_hr = folder->GetFolders(0, subfolders.put());
+    if (FAILED(folders_hr)) {
+        note_constraint(outcome, hr_token(folders_hr));
+        return;
+    }
+    if (!subfolders) return;
+    LONG count = 0;
+    const HRESULT count_hr = subfolders->get_Count(&count);
+    if (FAILED(count_hr)) note_constraint(outcome, hr_token(count_hr));
+    for (LONG i = 1; i <= count && outcome.rows.size() < cap; ++i) {
+        VARIANT idx;
+        VariantInit(&idx);
+        idx.vt = VT_I4;
+        idx.lVal = i;
+        yuzu::shared::win::ComPtr<ITaskFolder> sub;
+        const HRESULT sub_hr = subfolders->get_Item(idx, sub.put());
+        if (FAILED(sub_hr) || !sub) {
+            // A subfolder this call can't resolve means its ENTIRE subtree
+            // (recursion is the only path into it) goes unwalked -- a real
+            // constraint, not a benign zero-subfolder result.
+            note_constraint(outcome, FAILED(sub_hr) ? hr_token(sub_hr) : "null_subfolder");
+            continue;
         }
+        walk_task_folder(sub.get(), outcome, cap);
     }
 }
 
