@@ -102,26 +102,64 @@ private:
     int fd_;
 };
 
-/// Opens `path` refusing to follow a symlink at that exact component
-/// (O_NOFOLLOW) and hands DIR* ownership to fdopendir() on success. Returns
-/// an invalid DirHandle (never throws, never crashes) on any failure,
-/// including a genuinely-absent directory (ENOENT) — several of this leg's
-/// paths are legitimately absent on a given host (emond is removed on every
-/// captured host; a fresh install may have no /Library/LaunchDaemons
-/// entries at all), and "absent" is not this leg's error to report.
-DirHandle open_dir_no_follow(const std::string& path) {
-    const int fd = open(path.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
-    if (fd < 0) return DirHandle{nullptr};
-    DIR* d = fdopendir(fd);
-    if (d == nullptr) {
-        close(fd);
-        return DirHandle{nullptr};
+/// Outcome of an O_NOFOLLOW directory open: the handle (invalid on any
+/// failure), plus whether that failure is a real constraint (permission
+/// denied, a refused symlink, a path component that wasn't a directory —
+/// anything but a genuinely-absent path) and, if so, a reason token for the
+/// `constrained` status line. `reason` is empty whenever `constrained` is
+/// false, whether the open succeeded or the path was simply absent.
+struct DirOpenOutcome {
+    DirHandle handle;
+    bool constrained = false;
+    std::string_view reason{};
+};
+
+/// `errno` -> a stable reason token for a `constrained` source status.
+std::string_view dir_open_constraint_token(int err) noexcept {
+    switch (err) {
+        case EACCES: return "permission_denied";
+        case ELOOP: return "symlink_refused";
+        case ENOTDIR: return "not_a_directory";
+        default: return "dir_open_failed";
     }
-    return DirHandle{d};
 }
 
-/// Same contract as open_dir_no_follow, but resolves exactly one path
-/// COMPONENT (`name`) via `openat(parent_fd, ...)` rather than a fresh
+/// Classifies an already-attempted `open`/`openat` result (`fd`, with
+/// `errno` still current from that call if `fd < 0`) into a DirOpenOutcome,
+/// completing the open via `fdopendir()` on success. A genuinely-absent
+/// directory (ENOENT) is reported as a plain invalid handle with
+/// `constrained=false` — several of this leg's paths are legitimately
+/// absent on a given host (emond is removed on every captured host; a fresh
+/// install may have no /Library/LaunchDaemons entries at all), and "absent"
+/// is not this leg's error to report. Any OTHER open failure (permission
+/// denied, a refused symlink, a non-directory component) is a real
+/// constraint the caller must surface, never silently folded into "zero
+/// rows" (autoruns' AC4: failure != empty).
+DirOpenOutcome dir_open_outcome_from_fd(int fd) {
+    if (fd < 0) {
+        const int err = errno;
+        if (is_benign_absent_errno(err)) return DirOpenOutcome{DirHandle{nullptr}, false, {}};
+        return DirOpenOutcome{DirHandle{nullptr}, true, dir_open_constraint_token(err)};
+    }
+    DIR* d = fdopendir(fd);
+    if (d == nullptr) {
+        const int err = errno;
+        close(fd);
+        if (is_benign_absent_errno(err)) return DirOpenOutcome{DirHandle{nullptr}, false, {}};
+        return DirOpenOutcome{DirHandle{nullptr}, true, dir_open_constraint_token(err)};
+    }
+    return DirOpenOutcome{DirHandle{d}, false, {}};
+}
+
+/// Opens `path` refusing to follow a symlink at that exact component
+/// (O_NOFOLLOW). See dir_open_outcome_from_fd for the absence-vs-constraint
+/// contract.
+DirOpenOutcome open_dir_no_follow_checked(const std::string& path) {
+    return dir_open_outcome_from_fd(open(path.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW));
+}
+
+/// Same contract as open_dir_no_follow_checked, but resolves exactly one
+/// path COMPONENT (`name`) via `openat(parent_fd, ...)` rather than a fresh
 /// `open()` on a joined path string. This is the primitive
 /// collect_user_launchagents needs to stay confined to a caller-verified
 /// home directory: opening "home/Library/LaunchAgents" as one string lets
@@ -132,15 +170,8 @@ DirHandle open_dir_no_follow(const std::string& path) {
 /// parent fd (mirroring agents/core/src/confined_fs_posix.cpp's
 /// `open_dir_at`) makes every component's own O_NOFOLLOW check independent
 /// of how the previous one resolved.
-DirHandle open_dir_no_follow_at(int parent_fd, const char* name) {
-    const int fd = openat(parent_fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
-    if (fd < 0) return DirHandle{nullptr};
-    DIR* d = fdopendir(fd);
-    if (d == nullptr) {
-        close(fd);
-        return DirHandle{nullptr};
-    }
-    return DirHandle{d};
+DirOpenOutcome open_dir_no_follow_at_checked(int parent_fd, const char* name) {
+    return dir_open_outcome_from_fd(openat(parent_fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW));
 }
 
 bool ends_with(std::string_view s, std::string_view suffix) noexcept {
@@ -228,12 +259,23 @@ void walk_plist_dir_handle(const DirHandle& dir, OnPlist&& on_plist) {
 /// opening the whole path in one shot — safe ONLY when `dir_path` is a
 /// single trusted component below a root the OS already protects (e.g.
 /// `/Library/LaunchDaemons`), never below a path segment an unprivileged
-/// user controls (see open_dir_no_follow_at's banner and
+/// user controls (see open_dir_no_follow_at_checked's banner and
 /// collect_user_launchagents, which does NOT use this).
+/// Whether a directory-level walk hit a real constraint opening its root
+/// (vs. a genuine absence) — deliberately holds no DirHandle so it's a
+/// plain, trivially-returned value type.
+struct DirConstraint {
+    bool constrained = false;
+    std::string_view reason{};
+};
+
+/// Same enumeration as above, plus the directory-open outcome so the caller
+/// can distinguish "genuinely absent" from a real constraint (AC4).
 template <typename OnPlist>
-void walk_plist_dir(const std::string& dir_path, OnPlist&& on_plist) {
-    DirHandle dir = open_dir_no_follow(dir_path);
-    walk_plist_dir_handle(dir, std::forward<OnPlist>(on_plist));
+DirConstraint walk_plist_dir(const std::string& dir_path, OnPlist&& on_plist) {
+    DirOpenOutcome open = open_dir_no_follow_checked(dir_path);
+    walk_plist_dir_handle(open.handle, std::forward<OnPlist>(on_plist));
+    return DirConstraint{open.constrained, open.reason};
 }
 
 /// Enumerates every non-directory entry (regular file or symlink — periodic
@@ -243,13 +285,13 @@ void walk_plist_dir(const std::string& dir_path, OnPlist&& on_plist) {
 /// to `on_entry`. No content is read here — periodic scripts carry no
 /// structured metadata this plugin decodes, only their existence and mtime.
 template <typename OnEntry>
-void walk_dir_names(const std::string& dir_path, OnEntry&& on_entry) {
-    DirHandle dir = open_dir_no_follow(dir_path);
-    if (!dir.valid()) return;
-    const int dfd = dirfd(dir.get());
+DirConstraint walk_dir_names(const std::string& dir_path, OnEntry&& on_entry) {
+    DirOpenOutcome open = open_dir_no_follow_checked(dir_path);
+    if (!open.handle.valid()) return DirConstraint{open.constrained, open.reason};
+    const int dfd = dirfd(open.handle.get());
     std::size_t seen = 0;
     struct dirent* entry = nullptr;
-    while (seen < kMaxEntriesPerDir && (entry = readdir(dir.get())) != nullptr) {
+    while (seen < kMaxEntriesPerDir && (entry = readdir(open.handle.get())) != nullptr) {
         ++seen;
         const std::string_view name(entry->d_name);
         if (name == "." || name == "..") continue;
@@ -258,6 +300,7 @@ void walk_dir_names(const std::string& dir_path, OnEntry&& on_entry) {
         if (!S_ISREG(st.st_mode) && !S_ISLNK(st.st_mode)) continue;
         on_entry(entry->d_name, static_cast<std::int64_t>(st.st_mtime));
     }
+    return DirConstraint{};
 }
 
 /// Local CF plist parse for emond rules: identical primitive to
@@ -330,11 +373,33 @@ std::size_t collect_launchd_dir_handle(yuzu::CommandContext& ctx, SourceId sourc
     return count;
 }
 
-std::size_t collect_launchd_dir(yuzu::CommandContext& ctx, SourceId source_id,
-                                const std::string& dir_path, Scope scope,
-                                std::string_view user_override) {
-    DirHandle dir = open_dir_no_follow(dir_path);
-    return collect_launchd_dir_handle(ctx, source_id, dir, dir_path, scope, user_override);
+/// A whole `collect_*` call's outcome: rows emitted, plus whether ANY
+/// directory it opened along the way hit a real constraint rather than a
+/// genuine absence (AC4) — `note_dir_constraint` accumulates every distinct
+/// token seen (a per-user walk can hit the same token, e.g.
+/// `permission_denied`, on several different users' homes; it is recorded
+/// once, not once per user).
+struct DirCollectOutcome {
+    std::size_t rows = 0;
+    bool constrained = false;
+    std::string reason{};
+};
+
+void note_dir_constraint(DirCollectOutcome& outcome, std::string_view token) {
+    outcome.constrained = true;
+    if (outcome.reason.find(token) != std::string::npos) return; // already recorded
+    if (!outcome.reason.empty()) outcome.reason += ',';
+    outcome.reason.append(token);
+}
+
+DirCollectOutcome collect_launchd_dir(yuzu::CommandContext& ctx, SourceId source_id,
+                                      const std::string& dir_path, Scope scope,
+                                      std::string_view user_override) {
+    DirOpenOutcome open = open_dir_no_follow_checked(dir_path);
+    DirCollectOutcome outcome;
+    outcome.rows = collect_launchd_dir_handle(ctx, source_id, open.handle, dir_path, scope, user_override);
+    if (open.constrained) note_dir_constraint(outcome, open.reason);
+    return outcome;
 }
 
 /// /Users/*/Library/LaunchAgents — one real per-user home per iteration.
@@ -346,14 +411,15 @@ std::size_t collect_launchd_dir(yuzu::CommandContext& ctx, SourceId source_id,
 /// (the mac_user_launchagents scope's documented identity), not a
 /// getpwuid() lookup — this leg reads files, it does not call into Open
 /// Directory.
-std::size_t collect_user_launchagents(yuzu::CommandContext& ctx) {
-    std::size_t count = 0;
+DirCollectOutcome collect_user_launchagents(yuzu::CommandContext& ctx) {
+    DirCollectOutcome outcome;
     constexpr const char* kUsersDir = "/Users";
-    DirHandle dir = open_dir_no_follow(kUsersDir);
-    if (!dir.valid()) return count;
+    DirOpenOutcome users_open = open_dir_no_follow_checked(kUsersDir);
+    if (users_open.constrained) note_dir_constraint(outcome, users_open.reason);
+    if (!users_open.handle.valid()) return outcome;
     std::size_t seen = 0;
     struct dirent* entry = nullptr;
-    while (seen < kMaxEntriesPerDir && (entry = readdir(dir.get())) != nullptr) {
+    while (seen < kMaxEntriesPerDir && (entry = readdir(users_open.handle.get())) != nullptr) {
         ++seen;
         const std::string_view name(entry->d_name);
         if (name == "." || name == "..") continue;
@@ -361,7 +427,11 @@ std::size_t collect_user_launchagents(yuzu::CommandContext& ctx) {
         // O_NOFOLLOW on the home directory itself: a symlinked "user" entry
         // under /Users is not a real per-user home this leg will read into.
         const int home_fd = open(home.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
-        if (home_fd < 0) continue;
+        if (home_fd < 0) {
+            const int err = errno;
+            if (!is_benign_absent_errno(err)) note_dir_constraint(outcome, dir_open_constraint_token(err));
+            continue;
+        }
         FdHandle home_handle(home_fd);
         struct stat st{};
         if (fstat(home_handle.get(), &st) != 0) continue;
@@ -371,15 +441,18 @@ std::size_t collect_user_launchagents(yuzu::CommandContext& ctx) {
         // open() on the joined "home/Library/LaunchAgents" string would let
         // the kernel resolve the intermediate "Library" component through
         // normal symlink-following path resolution, escaping confinement to
-        // this user's own home (see open_dir_no_follow_at's banner).
-        DirHandle library_dir = open_dir_no_follow_at(home_handle.get(), "Library");
-        if (!library_dir.valid()) continue;
-        DirHandle agents_dir = open_dir_no_follow_at(dirfd(library_dir.get()), "LaunchAgents");
-        if (!agents_dir.valid()) continue;
-        count += collect_launchd_dir_handle(ctx, SourceId::mac_user_launchagents, agents_dir,
-                                            home + "/Library/LaunchAgents", Scope::user, name);
+        // this user's own home (see open_dir_no_follow_at_checked's banner).
+        DirOpenOutcome library_open = open_dir_no_follow_at_checked(home_handle.get(), "Library");
+        if (library_open.constrained) note_dir_constraint(outcome, library_open.reason);
+        if (!library_open.handle.valid()) continue;
+        DirOpenOutcome agents_open =
+            open_dir_no_follow_at_checked(dirfd(library_open.handle.get()), "LaunchAgents");
+        if (agents_open.constrained) note_dir_constraint(outcome, agents_open.reason);
+        if (!agents_open.handle.valid()) continue;
+        outcome.rows += collect_launchd_dir_handle(ctx, SourceId::mac_user_launchagents, agents_open.handle,
+                                                   home + "/Library/LaunchAgents", Scope::user, name);
     }
-    return count;
+    return outcome;
 }
 
 } // namespace
@@ -401,17 +474,26 @@ int collect_macos(yuzu::CommandContext& ctx, std::string_view filter) {
             emit_status(ctx, spec.id, YUZU_SUPPORT_SUPPORTED, std::nullopt, "filtered");
             continue;
         }
-        const std::size_t count = collect_launchd_dir(ctx, spec.id, spec.path, Scope::system, {});
-        emit_status(ctx, spec.id, YUZU_SUPPORT_SUPPORTED, count, "launchd_plist_walk");
+        const auto outcome = collect_launchd_dir(ctx, spec.id, spec.path, Scope::system, {});
+        if (outcome.constrained) {
+            emit_status(ctx, spec.id, YUZU_SUPPORT_CONSTRAINED, outcome.rows, outcome.reason);
+        } else {
+            emit_status(ctx, spec.id, YUZU_SUPPORT_SUPPORTED, outcome.rows, "launchd_plist_walk");
+        }
     }
 
     if (!source_in_filter(filter, SourceId::mac_user_launchagents)) {
         emit_status(ctx, SourceId::mac_user_launchagents, YUZU_SUPPORT_SUPPORTED, std::nullopt,
                    "filtered");
     } else {
-        const std::size_t count = collect_user_launchagents(ctx);
-        emit_status(ctx, SourceId::mac_user_launchagents, YUZU_SUPPORT_SUPPORTED, count,
-                   "launchd_plist_walk");
+        const auto outcome = collect_user_launchagents(ctx);
+        if (outcome.constrained) {
+            emit_status(ctx, SourceId::mac_user_launchagents, YUZU_SUPPORT_CONSTRAINED, outcome.rows,
+                       outcome.reason);
+        } else {
+            emit_status(ctx, SourceId::mac_user_launchagents, YUZU_SUPPORT_SUPPORTED, outcome.rows,
+                       "launchd_plist_walk");
+        }
     }
 
     // Login Items: no file this leg can read, ever — always this exact
@@ -423,30 +505,37 @@ int collect_macos(yuzu::CommandContext& ctx, std::string_view filter) {
         emit_status(ctx, SourceId::mac_periodic, YUZU_SUPPORT_SUPPORTED, std::nullopt, "filtered");
     } else {
         std::size_t count = 0;
+        DirCollectOutcome outcome;
         for (const char* sub : {"daily", "weekly", "monthly"}) {
             const std::string dir_path = std::string{"/etc/periodic/"} + sub;
-            walk_dir_names(dir_path, [&](const char* name, std::int64_t mtime) {
-                Row row;
-                row.source_id = SourceId::mac_periodic;
-                row.catalog_version = kAutorunSourceCatalogVersion;
-                row.location = dir_path;
-                row.entry = name;
-                row.target = dir_path + "/" + name;
-                // periodic(8) executes every script found here unconditionally
-                // -- there is no separate enable/disable flag, so presence
-                // itself is the documented default: Enabled::enabled, not
-                // `unknown` (reserved for a source with no default to reason
-                // from at all).
-                row.enabled = Enabled::enabled;
-                row.scope = Scope::system;
-                row.user = "-";
-                row.signed_state = signed_from_path(row.target);
-                row.mtime = mtime;
-                ctx.write_output(format_row(row));
-                ++count;
-            });
+            const DirConstraint dir_outcome =
+                walk_dir_names(dir_path, [&](const char* name, std::int64_t mtime) {
+                    Row row;
+                    row.source_id = SourceId::mac_periodic;
+                    row.catalog_version = kAutorunSourceCatalogVersion;
+                    row.location = dir_path;
+                    row.entry = name;
+                    row.target = dir_path + "/" + name;
+                    // periodic(8) executes every script found here unconditionally
+                    // -- there is no separate enable/disable flag, so presence
+                    // itself is the documented default: Enabled::enabled, not
+                    // `unknown` (reserved for a source with no default to reason
+                    // from at all).
+                    row.enabled = Enabled::enabled;
+                    row.scope = Scope::system;
+                    row.user = "-";
+                    row.signed_state = signed_from_path(row.target);
+                    row.mtime = mtime;
+                    ctx.write_output(format_row(row));
+                    ++count;
+                });
+            if (dir_outcome.constrained) note_dir_constraint(outcome, dir_outcome.reason);
         }
-        emit_status(ctx, SourceId::mac_periodic, YUZU_SUPPORT_SUPPORTED, count, "periodic_dir_walk");
+        if (outcome.constrained) {
+            emit_status(ctx, SourceId::mac_periodic, YUZU_SUPPORT_CONSTRAINED, count, outcome.reason);
+        } else {
+            emit_status(ctx, SourceId::mac_periodic, YUZU_SUPPORT_SUPPORTED, count, "periodic_dir_walk");
+        }
     }
 
     if (!source_in_filter(filter, SourceId::mac_emond)) {
@@ -454,34 +543,39 @@ int collect_macos(yuzu::CommandContext& ctx, std::string_view filter) {
     } else {
         std::size_t count = 0;
         const std::string dir_path = "/etc/emond.d/rules";
-        walk_plist_dir(dir_path, [&](const char* name, const std::vector<uint8_t>& bytes,
-                                     std::int64_t mtime) {
-            const std::string full_path = dir_path + "/" + name;
-            yuzu::agent::ScopedCFRef<CFPropertyListRef> root;
-            if (!parse_plist_root(bytes, root)) return;
+        const DirConstraint outcome =
+            walk_plist_dir(dir_path, [&](const char* name, const std::vector<uint8_t>& bytes,
+                                         std::int64_t mtime) {
+                const std::string full_path = dir_path + "/" + name;
+                yuzu::agent::ScopedCFRef<CFPropertyListRef> root;
+                if (!parse_plist_root(bytes, root)) return;
 
-            std::vector<CFDictionaryRef> rule_dicts;
-            const CFTypeID type = CFGetTypeID(root.get());
-            if (type == CFArrayGetTypeID()) {
-                const auto arr = static_cast<CFArrayRef>(root.get());
-                const CFIndex n = CFArrayGetCount(arr);
-                for (CFIndex i = 0; i < n; ++i) {
-                    const auto elem_ref = static_cast<CFTypeRef>(CFArrayGetValueAtIndex(arr, i));
-                    if (elem_ref != nullptr && CFGetTypeID(elem_ref) == CFDictionaryGetTypeID())
-                        rule_dicts.push_back(static_cast<CFDictionaryRef>(elem_ref));
+                std::vector<CFDictionaryRef> rule_dicts;
+                const CFTypeID type = CFGetTypeID(root.get());
+                if (type == CFArrayGetTypeID()) {
+                    const auto arr = static_cast<CFArrayRef>(root.get());
+                    const CFIndex n = CFArrayGetCount(arr);
+                    for (CFIndex i = 0; i < n; ++i) {
+                        const auto elem_ref = static_cast<CFTypeRef>(CFArrayGetValueAtIndex(arr, i));
+                        if (elem_ref != nullptr && CFGetTypeID(elem_ref) == CFDictionaryGetTypeID())
+                            rule_dicts.push_back(static_cast<CFDictionaryRef>(elem_ref));
+                    }
+                } else if (type == CFDictionaryGetTypeID()) {
+                    rule_dicts.push_back(static_cast<CFDictionaryRef>(root.get()));
                 }
-            } else if (type == CFDictionaryGetTypeID()) {
-                rule_dicts.push_back(static_cast<CFDictionaryRef>(root.get()));
-            }
 
-            for (CFDictionaryRef rule_dict : rule_dicts) {
-                const Row row = parse_emond_rule_plist_fields(emond_fields_from_dict(rule_dict),
-                                                              full_path, mtime);
-                ctx.write_output(format_row(row));
-                ++count;
-            }
-        });
-        emit_status(ctx, SourceId::mac_emond, YUZU_SUPPORT_SUPPORTED, count, "emond_rule_plist_walk");
+                for (CFDictionaryRef rule_dict : rule_dicts) {
+                    const Row row = parse_emond_rule_plist_fields(emond_fields_from_dict(rule_dict),
+                                                                  full_path, mtime);
+                    ctx.write_output(format_row(row));
+                    ++count;
+                }
+            });
+        if (outcome.constrained) {
+            emit_status(ctx, SourceId::mac_emond, YUZU_SUPPORT_CONSTRAINED, count, outcome.reason);
+        } else {
+            emit_status(ctx, SourceId::mac_emond, YUZU_SUPPORT_SUPPORTED, count, "emond_rule_plist_walk");
+        }
     }
 
     return 0; // a degraded per-source read is reported via source| lines, not this rc

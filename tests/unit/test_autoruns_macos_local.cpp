@@ -32,6 +32,7 @@
 
 #include "local_dispatcher.hpp"
 
+#include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -255,6 +256,20 @@ TEST_CASE("autoruns macOS: a well-formed plist whose root is not a dictionary "
 }
 
 #endif // __APPLE__
+
+// ── is_benign_absent_errno (portable -- every OS) ──────────────────────────
+
+TEST_CASE("autoruns macOS: is_benign_absent_errno distinguishes a genuinely-absent "
+          "path from a real open constraint (RECONSTRUCTION: pins the fix for a "
+          "code-review finding -- open_dir_no_follow used to discard errno entirely, "
+          "reporting EACCES the same as ENOENT: an unreadable location as an empty "
+          "success instead of constrained + reason)",
+          "[autoruns][macos]") {
+    CHECK(is_benign_absent_errno(ENOENT));
+    CHECK_FALSE(is_benign_absent_errno(EACCES));
+    CHECK_FALSE(is_benign_absent_errno(ELOOP));
+    CHECK_FALSE(is_benign_absent_errno(ENOTDIR));
+}
 
 // ── the real plugin, via LocalDispatcher (every OS) ────────────────────────
 

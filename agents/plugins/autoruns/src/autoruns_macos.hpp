@@ -20,6 +20,7 @@
 
 #include "autoruns_parsers.hpp" // LaunchdFields
 
+#include <cerrno>
 #include <cstdint>
 #include <expected>
 #include <optional>
@@ -43,6 +44,18 @@ namespace yuzu::autoruns {
 /// further than "not usable" — the caller counts it and moves on; it never
 /// crashes and never fabricates a Row from it.
 enum class PlistError { unparseable };
+
+/// True when `err` (an errno from open/openat/fdopendir on a path this leg
+/// walks) reflects a genuinely-absent location -- not a permission failure,
+/// not a symlink refused by O_NOFOLLOW, not a resource limit, not a path
+/// component that turned out not to be a directory. Only ENOENT is benign:
+/// every other errno is a real constraint the caller must surface via a
+/// `constrained` status + reason, never silently folded into "zero rows"
+/// (autoruns' own acceptance criterion: an unreadable location yields
+/// constrained + reason, never an empty success -- failure != empty).
+/// Portable (plain errno arithmetic, no CF dependency) so it is testable
+/// without an Apple-only build.
+inline bool is_benign_absent_errno(int err) noexcept { return err == ENOENT; }
 
 #if defined(__APPLE__)
 
