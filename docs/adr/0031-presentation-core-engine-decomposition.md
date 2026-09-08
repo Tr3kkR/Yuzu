@@ -330,6 +330,17 @@ the build on any that is absent from the published OpenAPI. **That test does not
 a deliverable of migration step 3, and until it lands this invariant is enforced by review, like the
 rule it replaces.
 
+> **Update (2026-09-08): the enumerate-every-route-vs-OpenAPI contract test LANDED** — out-of-band from
+> the split delivery matrix, under **#842 / #3991 / #3992**. `scripts/ci/check-api-parity.py` is the
+> whole-tree source-parse CI gate (fails on any registered `/api/v1/*` route absent from
+> `openapi_spec()`); `tests/unit/server/test_openapi_spec_completeness.cpp` is the in-process unit half
+> (registers `RestApiV1::register_routes()` into a `TestRouteSink` and diffs against `openapi_spec_json()`,
+> TSan-safe, no socket); #3992 backfilled 39 routes so the `/api/v1` baseline is drift-zero (1 allowlisted
+> CORS `OPTIONS` catch-all). So this invariant is now enforced by a test, not only by review.
+> **What remains for WS-A4** (split matrix): the *per-family* seam+contract enforcement that gates the
+> WS-B2 strangler cutover, the "handlers/renderers call the API, never a `Store*`" seam refactor, and the
+> behavioural-PII audit relocation — none of which #842 delivered.
+
 **INV-31-6 — Every store that a component depends on appears in that component's readiness probe.**
 Stated as an invariant rather than a habit, because the existing `stores_ok` conjunction in `/readyz`
 grew one row at a time, and every row was added after a store died while the server reported healthy.
@@ -384,7 +395,9 @@ none of them today:
 1. **A private core endpoint.** INV-31-4 forbids it; nothing enforces it. The contract test that
    would — enumerate every registered route (25 `register_routes` families, and the handler
    registrations under them) and fail the build on any not present in the published OpenAPI —
-   **does not exist**. It is a deliverable of migration step 3.
+   **does not exist**. It is a deliverable of migration step 3. *(Update 2026-09-08: it landed — see
+   the INV-31-4 update note above; `scripts/ci/check-api-parity.py` + `test_openapi_spec_completeness.cpp`,
+   #842/#3991/#3992. This gap is closed for `/api/v1/*`; the per-family + seam-refactor halves of WS-A4 remain.)*
 2. **A REST route with no MCP twin.** Structurally invisible to the build.
 3. **A database grant handed to presentation or the engine.** Prevented by Postgres role
    configuration (2c D1), not by the compiler.
