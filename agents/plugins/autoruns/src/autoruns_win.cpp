@@ -258,6 +258,17 @@ struct SourceOutcome {
 
 void note_constraint(SourceOutcome& outcome, std::string_view token) {
     outcome.constrained = true;
+    // Dedup by exact-substring match, matching autoruns_macos.cpp's
+    // note_dir_constraint: an unqualified token (e.g. "enumeration_
+    // incomplete", "row_cap") repeating identically across many profiles/
+    // iterations must not grow the reason string once per occurrence
+    // (governance Gate 4 unhappy-path: an enterprise host with hundreds of
+    // affected profiles could otherwise produce a reason string hundreds
+    // of tokens long). A SID-qualified token (e.g. "<sid>:privilege_
+    // missing") is unique per profile by construction, so this dedup never
+    // collapses genuinely distinct per-profile failures -- only literal
+    // repeats.
+    if (outcome.reason.find(token) != std::string::npos) return;
     if (!outcome.reason.empty()) outcome.reason += ',';
     outcome.reason += token;
 }
