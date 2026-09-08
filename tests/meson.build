@@ -691,6 +691,8 @@ endif
 # ── TAR plugin unit tests ────────────────────────────────────────────────────
 tar_test_deps = [yuzu_agent_core_dep, yuzu_sdk_dep, nlohmann_dep, spdlog_dep, sqlite3_dep, catch2_dep]
 tar_test_cpp_args = []
+# Wave 7 PR7.2: committed fixture root for the tar test exe (mirrors agent_test_exe's YUZU_TEST_FIXTURE_DIR / YUZU_AGENT_SRC_DIR precedent)
+tar_test_cpp_args += ['-DYUZU_TEST_FIXTURE_DIR="' + (meson.project_source_root() / 'tests' / 'unit' / 'fixtures').replace('\\', '/') + '"']
 if host_machine.system() == 'windows'
   # tar_perf.cpp (compiled directly into this exe) → GetIfTable2 / FreeMibTable
   tar_test_deps += cxx.find_library('iphlpapi')
@@ -742,8 +744,10 @@ tar_test_exe = executable(
     'unit/test_tar_capture_status.cpp', # BR-001 remediation: pure subprocess-capture completeness predicate
     'unit/test_tar_win_raii_guards.cpp', # Gate 3 remediation: injectable-closer RAII guard coverage (Windows-only body, empty TU elsewhere)
     'unit/test_tar_cursor.cpp',                  # Wave 6: cursor-source seam — lifecycle + persistence, atomic event+cursor commit, record_key dedupe, ack-by-sequence incl. the R-005 overflow regression (on-disk TarDb via unique_temp_path)
+    'unit/test_tar_usage.cpp',                   # Wave 7 PR7.2: process-event pairing fold + usage_daily (on-disk TarDb via unique_temp_path)
     'unit/test_fleet_snapshot.cpp',
     '../agents/plugins/tar/src/tar_db.cpp',
+    '../agents/plugins/tar/src/tar_usage.cpp',  # Wave 7 PR7.2: the fold, compiled into the test exe like tar_db.cpp
     # Wave 6: the cursor seam's factory AND lookback_seconds_or_forward_only,
     # the fail-closed reader for the lookback privacy control (tar_cursor.hpp
     # rule 5). Linking it also means the suite exercises the real factory
