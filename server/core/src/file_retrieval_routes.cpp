@@ -3,6 +3,7 @@
 #include "body_cap_policy.hpp" // kBodyCapTable binding assert below
 #include "evp_raii.hpp"
 #include "http_route_sink.hpp"
+#include "rest_a4_envelope_http.hpp" // detail::a4_error — operator-route A4 envelope
 #include "rest_audit.hpp" // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
 #include "upload_grant_parsers.hpp"
 
@@ -59,20 +60,15 @@ std::int64_t resolve_now(const Deps& deps) {
 /// input/availability failures — the frozen `reason` set (see
 /// upload_grant_parsers.hpp) is scoped to the agent-facing grant/session
 /// protocol; a mint-validation 400 or a 503 "database unavailable" is not
-/// one of those ten outcomes, so it gets the same envelope shape MINUS the
-/// `reason` field rather than inventing an eleventh value — matching the
-/// repo-standard `{"error":{"code":...,"message":...},"meta":{...}}` shape
-/// used everywhere else outside this protocol's ten reasons (e.g.
-/// auth_routes.cpp), `code` included.
-std::string generic_error_json(int status, const std::string& message) {
-    nlohmann::json envelope = {{"error", {{"code", status}, {"message", message}}},
-                               {"meta", {{"api_version", "v1"}}}};
-    return envelope.dump();
-}
-
+/// one of those ten outcomes, so it gets the standard A4 envelope
+/// (`detail::a4_error`, `rest_a4_envelope_http.hpp`) rather than inventing
+/// an eleventh reason — matching the repo-standard error shape used
+/// everywhere else outside this protocol's ten reasons (e.g. auth_routes.cpp).
+/// `send_reason`/`upload_grant::error_envelope` below is the DISTINCT, frozen
+/// agent-facing wire shape and must NOT be folded into this helper.
 void send_generic(httplib::Response& res, int status, const std::string& message) {
     res.status = status;
-    res.set_content(generic_error_json(status, message), "application/json");
+    res.set_content(detail::a4_error(res, message), "application/json");
 }
 
 void send_reason(httplib::Response& res, Reason r, const std::string& message,

@@ -588,7 +588,14 @@ TEST_CASE("POST /login/mfa with invalid pending token returns 401 + audit",
         "application/x-www-form-urlencoded");
     REQUIRE(res);
     CHECK(res->status == 401);
-    CHECK(res->body == R"({"error":{"code":401,"message":"Invalid verification code"},"meta":{"api_version":"v1"}})");
+    // Field-level, not exact-body: the A4 envelope (#1552 sweep) now stamps
+    // a fresh per-request `correlation_id`, so the anti-enumeration
+    // `message`/`code` pair stays uniform while the body as a whole
+    // legitimately varies request to request.
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["code"] == 401);
+    CHECK(body["error"]["message"] == "Invalid verification code");
+    CHECK(body["error"].contains("correlation_id"));
     CHECK(h.count_audits("mfa.login.failed") >= 1);
 }
 
@@ -1360,7 +1367,7 @@ TEST_CASE("POST /login: N bad passwords locks the account, applied audit fires o
     CHECK(h.count_audits("auth.lockout.applied", "alice") == 1);
 }
 
-TEST_CASE("POST /login: locked-account 401 body is byte-identical to a bad-password 401 (no oracle)",
+TEST_CASE("POST /login: locked-account 401 body is shape-identical to a bad-password 401 (no oracle)",
           "[pg][mfa][routes][auth_routes][lockout]") {
     AuthRoutesHarness h;
     h.cfg.auth_lockout_threshold = 2;
@@ -1381,8 +1388,18 @@ TEST_CASE("POST /login: locked-account 401 body is byte-identical to a bad-passw
     REQUIRE(locked);
     CHECK(locked->status == 401);
     // The whole point: a locked account is indistinguishable from a wrong
-    // password — same status AND same body, no Retry-After, no "locked" word.
-    CHECK(locked->body == bad->body);
+    // password — same status AND same code/message shape, no Retry-After,
+    // no "locked" word. NOT byte-identical bodies any more: the A4 envelope
+    // (#1552 sweep) stamps a fresh per-request `correlation_id` on every
+    // response, so `bad` and `locked` legitimately carry DIFFERENT
+    // correlation ids — that is itself evidence there is no shared-object
+    // artifact, not a new oracle (a correlation id is minted identically on
+    // every failure path regardless of WHY it failed).
+    auto bad_json = nlohmann::json::parse(bad->body);
+    auto locked_json = nlohmann::json::parse(locked->body);
+    CHECK(locked_json["error"]["code"] == bad_json["error"]["code"]);
+    CHECK(locked_json["error"]["message"] == bad_json["error"]["message"]);
+    CHECK(locked_json["error"]["correlation_id"] != bad_json["error"]["correlation_id"]);
     CHECK(locked->body.find("locked") == std::string::npos);
     CHECK(locked->get_header_value("Retry-After").empty());
 }

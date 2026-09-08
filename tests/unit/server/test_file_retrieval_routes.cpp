@@ -13,6 +13,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "file_retrieval_routes.hpp"
+#include "rest_a4_envelope_http.hpp" // detail::a4_error — the #2057 negative test below
 #include "rest_api_v1.hpp"
 #include "test_route_sink.hpp"
 #include "upload_grant_parsers.hpp" // kCredentialIdHexLen — the credential grammar
@@ -112,12 +113,18 @@ namespace {
 /// openapi.json handler is a static-string return (`openapi_spec()`) that
 /// touches none of register_routes' many store/auth/audit dependencies, so
 /// every one of them is safely null/empty here — no PG, no RBAC, hermetic.
+/// #2057: the route is now gated `perm_fn(..., "Infrastructure", "Read")` —
+/// a null (default-constructed) `PermFn` would `std::bad_function_call`
+/// rather than 403, so this harness supplies an always-grant stub (the
+/// negative "denied without a session" case is covered separately below).
 struct OpenApiHarness {
     RestApiV1 api;
     TestRouteSink sink;
 
-    OpenApiHarness() {
-        api.register_routes(sink, RestApiV1::AuthFn{}, RestApiV1::PermFn{}, RestApiV1::AuditFn{},
+    explicit OpenApiHarness(RestApiV1::PermFn perm_fn = [](const httplib::Request&,
+                                                           httplib::Response&, const std::string&,
+                                                           const std::string&) { return true; }) {
+        api.register_routes(sink, RestApiV1::AuthFn{}, std::move(perm_fn), RestApiV1::AuditFn{},
                             /*rbac_store=*/nullptr, /*mgmt_store=*/nullptr,
                             /*token_store=*/nullptr, /*quarantine_store=*/nullptr,
                             /*response_store=*/nullptr, /*instruction_store=*/nullptr,
@@ -193,6 +200,33 @@ TEST_CASE("OpenAPI doc: the new upload-grant and plugin-config paths are present
     REQUIRE(paths.contains("/plugin-config/{plugin}/kill-switch"));
     CHECK(paths["/plugin-config/{plugin}/kill-switch"].contains("get"));
     CHECK(paths["/plugin-config/{plugin}/kill-switch"].contains("put"));
+}
+
+TEST_CASE("OpenAPI doc: GET /api/v1/openapi.json is gated Infrastructure:Read (#2057)",
+          "[server][routes][openapi][auth]") {
+    // #2057: was unauthenticated. A denying perm_fn must refuse the request
+    // with an A4-shaped body (code/message/correlation_id) — perm_fn itself
+    // owns writing the denial status + body (matching every other
+    // `Infrastructure:Read`-gated route in this file's sibling tests), so
+    // this pins the observable outcome (denied, A4 body), not perm_fn's
+    // internal mechanics.
+    OpenApiHarness h{[](const httplib::Request&, httplib::Response& res, const std::string&,
+                        const std::string&) {
+        res.status = 403;
+        res.set_content(
+            yuzu::server::detail::a4_error(res, "permission denied"),
+            "application/json");
+        return false;
+    }};
+    auto res = h.sink.dispatch("GET", "/api/v1/openapi.json");
+    REQUIRE(res != nullptr);
+    CHECK((res->status == 401 || res->status == 403));
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"].contains("correlation_id"));
+    CHECK(body["error"].contains("code"));
+    CHECK(body["error"].contains("message"));
 }
 
 // ── Operator routes ─────────────────────────────────────────────────────

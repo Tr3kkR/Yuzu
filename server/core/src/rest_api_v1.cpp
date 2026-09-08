@@ -1962,7 +1962,15 @@ void RestApiV1::register_routes(
                  [](const httplib::Request&, httplib::Response& res) { res.status = 204; });
 
     // ── OpenAPI spec endpoint (/api/v1/openapi.json) ─────────────────────
-    sink.Get("/api/v1/openapi.json", [](const httplib::Request&, httplib::Response& res) {
+    // #2057: was unauthenticated. Gated on the same (securable, operation)
+    // pair as the MCP twin `yuzu://openapi` resource (mcp_server.cpp,
+    // `tier_allows(..., "Infrastructure", "Read")` + `perm_fn(..., "Infrastructure",
+    // "Read")`), matching the sibling `/api/v1/discover/*` docs surface
+    // (discover_routes.cpp). `perm_fn` writes its own A4 denial body + header
+    // on refusal, so no separate envelope call is needed here.
+    sink.Get("/api/v1/openapi.json", [perm_fn](const httplib::Request& req, httplib::Response& res) {
+        if (!perm_fn(req, res, "Infrastructure", "Read"))
+            return;
         res.set_content(openapi_spec(), "application/json");
     });
 

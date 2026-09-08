@@ -5,6 +5,7 @@
 #include "settings_routes.hpp"
 
 #include "ota_signature_sidecar.hpp"
+#include "rest_a4_envelope_http.hpp" // detail::a4_error
 
 #include <atomic>
 #include <cstdio>
@@ -3594,6 +3595,15 @@ void SettingsRoutes::register_routes(
             res.status = 503;
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"Config store unavailable","level":"error"}})");
+            // A4 body alongside the dashboard's own HX-Trigger toast (NOT
+            // redundant/dead — do not strip): the dashboard's global htmx
+            // config sets responseHandling swap:false for every 4xx/5xx
+            // response (see dex_routes.cpp/guardian_routes.cpp), so htmx
+            // never renders this body — but a non-htmx caller (REST client,
+            // agentic worker) hitting this same /api/settings/* endpoint
+            // gets a real A4 envelope instead of an empty body.
+            res.set_content(detail::a4_error(res, "Config store unavailable"),
+                            "application/json");
             return;
         }
         // Collect every checked "types" value from the urlencoded body and
@@ -3653,9 +3663,9 @@ void SettingsRoutes::register_routes(
             res.status = 500;
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"Failed to save routing","level":"error"}})");
-            res.set_content("<span class=\"feedback-error\">" + html_escape(rc.error()) +
-                                "</span>",
-                            "text/html; charset=utf-8");
+            // A4 body alongside the toast (swap:false discards it on the
+            // dashboard, but a non-htmx caller now gets a real envelope).
+            res.set_content(detail::a4_error(res, rc.error()), "application/json");
             return;
         }
         if (dex_alert_apply_fn_)
@@ -3678,6 +3688,8 @@ void SettingsRoutes::register_routes(
             res.status = 503;
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"Config store unavailable","level":"error"}})");
+            res.set_content(detail::a4_error(res, "Config store unavailable"),
+                            "application/json");
             return;
         }
         // Clamp server-side to the same ranges update_alert_shape enforces, so
@@ -3709,8 +3721,8 @@ void SettingsRoutes::register_routes(
             res.set_header(
                 "HX-Trigger",
                 R"({"showToast":{"message":"Failed to save thresholds","level":"error"}})");
-            res.set_content("<span class=\"feedback-error\">Failed to persist thresholds.</span>",
-                            "text/html; charset=utf-8");
+            res.set_content(detail::a4_error(res, "Failed to persist thresholds"),
+                            "application/json");
             return;
         }
         if (dex_alert_apply_fn_)
@@ -3734,6 +3746,8 @@ void SettingsRoutes::register_routes(
             res.status = 503;
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"Config store unavailable","level":"error"}})");
+            res.set_content(detail::a4_error(res, "Config store unavailable"),
+                            "application/json");
             return;
         }
         // extract_form_value already percent-decodes (':' → %3A is in the
@@ -3747,8 +3761,9 @@ void SettingsRoutes::register_routes(
             res.set_header(
                 "HX-Trigger",
                 R"j({"showToast":{"message":"Invalid tag key ([A-Za-z0-9_.:-], max 64)","level":"error"}})j");
-            res.set_content("<span class=\"feedback-error\">Invalid tag key.</span>",
-                            "text/html; charset=utf-8");
+            res.set_content(
+                detail::a4_error(res, "Invalid tag key ([A-Za-z0-9_.:-], max 64)"),
+                "application/json");
             return;
         }
         auto session = auth_fn_(req, res);
@@ -3759,9 +3774,7 @@ void SettingsRoutes::register_routes(
             res.set_header(
                 "HX-Trigger",
                 R"({"showToast":{"message":"Failed to save export key","level":"error"}})");
-            res.set_content("<span class=\"feedback-error\">" + html_escape(rc.error()) +
-                                "</span>",
-                            "text/html; charset=utf-8");
+            res.set_content(detail::a4_error(res, rc.error()), "application/json");
             return;
         }
         if (dex_alert_apply_fn_)
@@ -4027,14 +4040,11 @@ void SettingsRoutes::register_routes(
             return;
         }
         if (!disk->has_value()) {
-            // Structured envelope (A4 / CONS-B1) — same shape as
-            // every other /api/v1/* error site (auth_routes,
-            // rest_api_v1, etc.).
+            // A4 envelope — same shape as every other error site
+            // (auth_routes, rest_api_v1, etc.).
             res.status = 500;
-            nlohmann::json err = {
-                {"error", {{"code", 500}, {"message", "Trust bundle on disk is unreadable"}}},
-                {"meta", {{"api_version", "v1"}}}};
-            res.set_content(err.dump(), "application/json");
+            res.set_content(detail::a4_error(res, "Trust bundle on disk is unreadable"),
+                            "application/json");
             return;
         }
 
@@ -4741,7 +4751,10 @@ void SettingsRoutes::register_routes(
             res.set_header(
                 "HX-Trigger",
                 R"({"showToast":{"message":"Invalid username: must be 1-64 chars, alphanumeric + ._- only","level":"error"}})");
-            res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
+            res.set_content(
+                detail::a4_error(res, "Invalid username: must be 1-64 chars, alphanumeric + ._- "
+                                       "only"),
+                "application/json");
             return;
         }
 
@@ -4759,7 +4772,10 @@ void SettingsRoutes::register_routes(
             res.set_header(
                 "HX-Trigger",
                 R"({"showToast":{"message":"Username cannot begin with a reserved prefix: oidc:, saml:, or ad:","level":"error"}})");
-            res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
+            res.set_content(
+                detail::a4_error(res, "Username cannot begin with a reserved prefix: oidc:, "
+                                       "saml:, or ad:"),
+                "application/json");
             return;
         }
 
@@ -4772,7 +4788,8 @@ void SettingsRoutes::register_routes(
             res.set_header(
                 "HX-Trigger",
                 R"({"showToast":{"message":"Username already exists","level":"error"}})");
-            res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
+            res.set_content(detail::a4_error(res, "Username already exists"),
+                            "application/json");
             return;
         }
         // C1 FIX: Self-password-change is allowed, but role is always 'user' on creation.
@@ -4788,7 +4805,8 @@ void SettingsRoutes::register_routes(
             res.set_header(
                 "HX-Trigger",
                 R"({"showToast":{"message":"Password must be at least 12 characters","level":"error"}})");
-            res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
+            res.set_content(detail::a4_error(res, "Password must be at least 12 characters"),
+                            "application/json");
             return;
         }
         if (!auth_mgr_->save_config()) {
@@ -4846,7 +4864,7 @@ void SettingsRoutes::register_routes(
             res.set_header(
                 "HX-Trigger",
                 R"({"showToast":{"message":"Invalid username format","level":"error"}})");
-            res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
+            res.set_content(detail::a4_error(res, "Invalid username format"), "application/json");
             return;
         }
         // Self-deletion lockout guard (#397). Deleting the currently
@@ -4871,7 +4889,8 @@ void SettingsRoutes::register_routes(
             res.set_header(
                 "HX-Trigger",
                 R"({"showToast":{"message":"Cannot delete your own account","level":"error"}})");
-            res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
+            res.set_content(detail::a4_error(res, "Cannot delete your own account"),
+                            "application/json");
             return;
         }
         // Owner-delete guard (design doc §3.1, GOVERNANCE HARD PRECONDITION).
@@ -4913,8 +4932,10 @@ void SettingsRoutes::register_routes(
                     "HX-Trigger",
                     R"({"showToast":{"message":"Cannot delete: user owns an active engine )"
                     R"(principal — transfer ownership first","level":"error"}})");
-                res.set_content(render_users_fragment(session->username),
-                                "text/html; charset=utf-8");
+                res.set_content(
+                    detail::a4_error(res, "Cannot delete: user owns an active engine "
+                                           "principal — transfer ownership first"),
+                    "application/json");
                 return;
             }
         }
@@ -4941,8 +4962,9 @@ void SettingsRoutes::register_routes(
                     "HX-Trigger",
                     R"({"showToast":{"message":"Failed to resolve linked identities — try )"
                     R"(again","level":"error"}})");
-                res.set_content(render_users_fragment(session->username),
-                                "text/html; charset=utf-8");
+                res.set_content(
+                    detail::a4_error(res, "Failed to resolve linked identities — try again"),
+                    "application/json");
                 return;
             }
             if (!api_token_store_->is_open()) {
@@ -4957,8 +4979,8 @@ void SettingsRoutes::register_routes(
                     "HX-Trigger",
                     R"({"showToast":{"message":"Credential store unavailable — try )"
                     R"(again","level":"error"}})");
-                res.set_content(render_users_fragment(session->username),
-                                "text/html; charset=utf-8");
+                res.set_content(detail::a4_error(res, "Credential store unavailable — try again"),
+                                "application/json");
                 return;
             }
             auto revoke_result =
@@ -4983,8 +5005,10 @@ void SettingsRoutes::register_routes(
                     "HX-Trigger",
                     R"({"showToast":{"message":"Failed to revoke API tokens for one or more )"
                     R"(linked identities — try again","level":"error"}})");
-                res.set_content(render_users_fragment(session->username),
-                                "text/html; charset=utf-8");
+                res.set_content(
+                    detail::a4_error(res, "Failed to revoke API tokens for one or more linked "
+                                           "identities — try again"),
+                    "application/json");
                 return;
             }
         } else {
@@ -5013,7 +5037,8 @@ void SettingsRoutes::register_routes(
                 "HX-Trigger",
                 R"({"showToast":{"message":"Credential store unavailable — try )"
                 R"(again","level":"error"}})");
-            res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
+            res.set_content(detail::a4_error(res, "Credential store unavailable — try again"),
+                            "application/json");
             return;
         }
 
@@ -5025,16 +5050,17 @@ void SettingsRoutes::register_routes(
             audit_fn_(req, "user.delete", "success", "User", username, revoke_detail);
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"User deleted","level":"success"}})");
-        } else {
-            // remove_user() returns false when the username is not in the
-            // user store. A no-op DELETE is still a privileged-mutation
-            // attempt and must surface in the audit chain.
-            audit_fn_(req, "user.delete", "denied", "User", username, "user_not_found");
-            res.status = 404;
-            res.set_header("HX-Trigger",
-                           R"({"showToast":{"message":"User not found","level":"error"}})");
+            res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
+            return;
         }
-        res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
+        // remove_user() returns false when the username is not in the
+        // user store. A no-op DELETE is still a privileged-mutation
+        // attempt and must surface in the audit chain.
+        audit_fn_(req, "user.delete", "denied", "User", username, "user_not_found");
+        res.status = 404;
+        res.set_header("HX-Trigger",
+                       R"({"showToast":{"message":"User not found","level":"error"}})");
+        res.set_content(detail::a4_error(res, "User not found"), "application/json");
     });
 
     // -- Settings API: Role change (admin only, C1 fix) -------------------------
@@ -5072,7 +5098,7 @@ void SettingsRoutes::register_routes(
             res.set_header(
                 "HX-Trigger",
                 R"({"showToast":{"message":"Invalid username format","level":"error"}})");
-            res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
+            res.set_content(detail::a4_error(res, "Invalid username format"), "application/json");
             return;
         }
 
@@ -5087,7 +5113,8 @@ void SettingsRoutes::register_routes(
             res.set_header(
                 "HX-Trigger",
                 R"({"showToast":{"message":"Cannot change your own role","level":"error"}})");
-            res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
+            res.set_content(detail::a4_error(res, "Cannot change your own role"),
+                            "application/json");
             return;
         }
 
@@ -5102,8 +5129,8 @@ void SettingsRoutes::register_routes(
                 res.set_header(
                     "HX-Trigger",
                     R"({"showToast":{"message":"Missing or invalid 'role' field","level":"error"}})");
-                res.set_content(render_users_fragment(session->username),
-                                "text/html; charset=utf-8");
+                res.set_content(detail::a4_error(res, "Missing or invalid 'role' field"),
+                                "application/json");
                 return;
             }
             requested_role = json["role"].get<std::string>();
@@ -5112,7 +5139,7 @@ void SettingsRoutes::register_routes(
             res.status = 400;
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"Invalid JSON body","level":"error"}})");
-            res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
+            res.set_content(detail::a4_error(res, "Invalid JSON body"), "application/json");
             return;
         }
 
@@ -5128,7 +5155,8 @@ void SettingsRoutes::register_routes(
             res.set_header(
                 "HX-Trigger",
                 R"({"showToast":{"message":"Invalid role: must be 'admin' or 'user'","level":"error"}})");
-            res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
+            res.set_content(detail::a4_error(res, "Invalid role: must be 'admin' or 'user'"),
+                            "application/json");
             return;
         }
 
@@ -5139,7 +5167,7 @@ void SettingsRoutes::register_routes(
             res.status = 404;
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"User not found","level":"error"}})");
-            res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
+            res.set_content(detail::a4_error(res, "User not found"), "application/json");
             return;
         }
         auth::Role old_role = *current_entry_opt;
@@ -5164,7 +5192,7 @@ void SettingsRoutes::register_routes(
             res.status = 500;
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"Failed to update role","level":"error"}})");
-            res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
+            res.set_content(detail::a4_error(res, "Failed to update role"), "application/json");
             return;
         }
 
@@ -5198,9 +5226,8 @@ void SettingsRoutes::register_routes(
                 ttl_hours = std::stoi(ttl_s);
         } catch (const std::exception&) {
             res.status = 400;
-            res.set_content(
-                R"({"error":{"code":400,"message":"invalid numeric parameter"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "invalid numeric parameter"),
+                            "application/json");
             return;
         }
 
@@ -5246,17 +5273,14 @@ void SettingsRoutes::register_routes(
                 ttl_hours = std::stoi(ttl_s);
         } catch (const std::exception&) {
             res.status = 400;
-            res.set_content(
-                R"({"error":{"code":400,"message":"invalid numeric parameter"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "invalid numeric parameter"),
+                            "application/json");
             return;
         }
 
         if (count < 1 || count > 10000) {
             res.status = 400;
-            res.set_content(
-                R"({"error":{"code":400,"message":"count must be 1-10000"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "count must be 1-10000"), "application/json");
             return;
         }
 
@@ -5451,9 +5475,9 @@ void SettingsRoutes::register_routes(
             res.set_header(
                 "HX-Trigger",
                 R"({"showToast":{"message":"Token store unavailable — please retry","level":"error"}})");
-            res.set_content("<div class=\"error-fragment\" style=\"color:#f85149\">"
-                            "Token store unavailable — please retry.</div>",
-                            "text/html; charset=utf-8");
+            res.set_content(
+                detail::a4_error(res, "Token store unavailable — please retry", {.retry_after_ms = 2000}),
+                "application/json");
             return;
         }
         auto& tok = *existing; // std::optional<ApiToken>
@@ -5487,9 +5511,7 @@ void SettingsRoutes::register_routes(
             res.status = 404;
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"Token not found","level":"error"}})");
-            res.set_content("<div class=\"error-fragment\" style=\"color:#f85149\">"
-                            "Token not found.</div>",
-                            "text/html; charset=utf-8");
+            res.set_content(detail::a4_error(res, "Token not found"), "application/json");
             return;
         }
 
@@ -5518,9 +5540,9 @@ void SettingsRoutes::register_routes(
             res.set_header(
                 "HX-Trigger",
                 R"({"showToast":{"message":"Revoke did not persist — please retry","level":"error"}})");
-            res.set_content("<div class=\"error-fragment\" style=\"color:#f85149\">"
-                            "Revoke did not persist — please retry.</div>",
-                            "text/html; charset=utf-8");
+            res.set_content(
+                detail::a4_error(res, "Revoke did not persist — please retry", {.retry_after_ms = 2000}),
+                "application/json");
             return;
         }
         if (!*revoked) {
@@ -5530,9 +5552,7 @@ void SettingsRoutes::register_routes(
             res.status = 404;
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"Token not found","level":"error"}})");
-            res.set_content("<div class=\"error-fragment\" style=\"color:#f85149\">"
-                            "Token not found.</div>",
-                            "text/html; charset=utf-8");
+            res.set_content(detail::a4_error(res, "Token not found"), "application/json");
             return;
         }
 
@@ -5876,7 +5896,11 @@ void SettingsRoutes::register_routes(
                            R"({"showToast":{"message":"That signature file is not a PEM CMS )"
                            R"(signature (expected a -----BEGIN CMS----- block). Nothing was )"
                            R"(changed.","level":"error"}})");
-            res.set_content(render_updates_fragment(), "text/html; charset=utf-8");
+            res.set_content(
+                detail::a4_error(res, "That signature file is not a PEM CMS signature "
+                                       "(expected a -----BEGIN CMS----- block). Nothing was "
+                                       "changed."),
+                "application/json");
             return;
         }
 
@@ -6350,9 +6374,7 @@ void SettingsRoutes::register_routes(
             return true;
         }
         res.status = 403;
-        res.set_content(
-            R"({"error":{"code":403,"message":"cross-origin POST refused"},"meta":{"api_version":"v1"}})",
-            "application/json");
+        res.set_content(detail::a4_error(res, "cross-origin POST refused"), "application/json");
         audit_fn_(req, "csrf.denied", "error", "Endpoint", action_for_audit,
                   "Origin/Referer host mismatch (Origin=" + sanitise(origin) +
                       " Referer=" + sanitise(referer) + " Host=" + sanitise(host) + ")");
