@@ -1823,9 +1823,9 @@ public:
                           "returned",
                           "counter");
         metrics_.describe("yuzu_inventory_stale_agents",
-                          "Agents whose installed-software inventory has not synced within the "
-                          "staleness window (two missed daily cycles) - a freshness/liveness signal, "
-                          "by source",
+                          "Agents whose inventory has not synced within the staleness window (two "
+                          "missed daily cycles) - a freshness/liveness signal, by source "
+                          "(installed_software, app_usage)",
                           "gauge");
         metrics_.describe("yuzu_inventory_stale_count_unavailable_total",
                           "Times the stale-agents freshness count could not be computed (pool "
@@ -7499,6 +7499,32 @@ public:
                     if (auto stale = software_inventory_store_->count_stale_agents(cutoff))
                         metrics_.gauge("yuzu_inventory_stale_agents",
                                        {{"source", "installed_software"}})
+                            .set(static_cast<double>(*stale));
+                    else
+                        metrics_.counter("yuzu_inventory_stale_count_unavailable_total").increment();
+                }
+                // App-usage projection freshness gauge — same shape as the
+                // installed-software one above (`yuzu_inventory_stale_agents` is
+                // already described "by source"): app_usage is also an ADR-0016
+                // §5 daily-sync source (app_usage_store.hpp), so the same
+                // two-missed-cycle staleness window and the same bounded
+                // acquire(250ms)/statement_timeout(250ms) budget in
+                // AppUsageStore::count_stale_agents apply verbatim. A degrade
+                // (nullopt) holds the gauge at its prior value and bumps the
+                // SAME shared yuzu_inventory_stale_count_unavailable_total
+                // counter the installed-software sweep uses — that counter's
+                // description is source-agnostic ("the stale-agents freshness
+                // count could not be computed"), so it already covers any
+                // inventory-family sweep, not just this one.
+                if (app_usage_store_) {
+                    constexpr std::int64_t kAppUsageStaleWindowSecs = 2 * 24 * 60 * 60;
+                    const std::int64_t cutoff =
+                        std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count() -
+                        kAppUsageStaleWindowSecs;
+                    if (auto stale = app_usage_store_->count_stale_agents(cutoff))
+                        metrics_.gauge("yuzu_inventory_stale_agents", {{"source", "app_usage"}})
                             .set(static_cast<double>(*stale));
                     else
                         metrics_.counter("yuzu_inventory_stale_count_unavailable_total").increment();
