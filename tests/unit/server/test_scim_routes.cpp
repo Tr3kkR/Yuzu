@@ -1436,6 +1436,16 @@ TEST_CASE("revoke_deprovision_credentials: revokes tokens and sessions for EVERY
          "the resolved set",
          "[pg][scim][adr2001][orchestrator]") {
     Fixture f;
+    // #4107 Gate 8 CI finding: create_local_session() now fails closed
+    // (via post_mint_role_recheck) when the account has no AuthDB `users`
+    // row at all - the same UserNotFound branch that denies a genuinely
+    // removed account. In production every create_local_session() caller
+    // reaches it only after a real local-auth verify_password() call,
+    // which already guarantees the row exists; this test used to mint a
+    // session for "yolanda" directly, with no such row, an unrealistic
+    // precondition no real caller can produce. Seed it for real instead of
+    // weakening the production fail-closed check.
+    REQUIRE(f.auth_mgr.upsert_user("yolanda", "yolandapassword1", auth::Role::user));
     auto slug_token = f.token_store->create_token("t1", "yolanda");
     REQUIRE(slug_token.has_value());
     const std::string oidc_principal =
