@@ -759,8 +759,22 @@ std::string hr_token(HRESULT hr) {
 /// (SysAllocString), it has no adopt-an-existing-BSTR constructor.
 using BStrGuard = std::unique_ptr<std::remove_pointer_t<BSTR>, decltype(&::SysFreeString)>;
 
-void walk_task_folder(ITaskFolder* folder, SourceOutcome& outcome, std::size_t cap) {
+// Defensive bound on folder-tree NESTING DEPTH, independent of row count --
+// `cap` alone does not bound recursion: an all-empty folder chain never
+// grows `outcome.rows`, so a pathological deeply-nested folder tree (or a
+// COM implementation that misreports GetFolders) could recurse until stack
+// exhaustion with the row cap never triggering. Real Task Scheduler
+// hierarchies are a handful of levels deep, so this is a generous ceiling,
+// not a realistic one.
+constexpr std::size_t kMaxScheduledTaskFolderDepth = 256;
+
+void walk_task_folder(ITaskFolder* folder, SourceOutcome& outcome, std::size_t cap,
+                      std::size_t depth = 0) {
     if (outcome.rows.size() >= cap) return;
+    if (depth >= kMaxScheduledTaskFolderDepth) {
+        note_constraint(outcome, "row_cap");
+        return;
+    }
 
     yuzu::shared::win::ComPtr<IRegisteredTaskCollection> tasks;
     const HRESULT tasks_hr = folder->GetTasks(TASK_ENUM_HIDDEN, tasks.put());
@@ -858,7 +872,7 @@ void walk_task_folder(ITaskFolder* folder, SourceOutcome& outcome, std::size_t c
             note_constraint(outcome, FAILED(sub_hr) ? hr_token(sub_hr) : "null_subfolder");
             continue;
         }
-        walk_task_folder(sub.get(), outcome, cap);
+        walk_task_folder(sub.get(), outcome, cap, depth + 1);
     }
 }
 
