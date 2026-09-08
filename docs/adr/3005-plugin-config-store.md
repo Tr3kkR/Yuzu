@@ -11,7 +11,7 @@ context-refs: ["#2568", "#2580", "docs/postgres-store-playbook.md"]
 
 # 3005 — Plugin config/secret plane + per-action kill switch
 
-> **Implementation status (2026-09-07 ADR reconciliation):** Shipped — `PluginConfigStore::get_kill_switch`/`set_kill_switch` (`server/core/src/plugin_config_store.hpp:29,188,192`) and `plugin_config_routes.{hpp,cpp}` exist and are wired. Shipped: PR #3134 ("feat(server): plugin config/secret/kill-switch plane + typed schedule params (PR1.5a/b)"), merged 2026-08-15.
+> **Implementation status (2026-09-07 ADR reconciliation):** Accepted — governance-resolved on merge of PR #3134, 2026-08-15. `PluginConfigStore::get_kill_switch`/`set_kill_switch` (`server/core/src/plugin_config_store.hpp:29,188,192`) and `plugin_config_routes.{hpp,cpp}` exist and are wired ("feat(server): plugin config/secret/kill-switch plane + typed schedule params (PR1.5a/b)").
 
 ## Context
 

@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: proposed
 date: 2026-07-06
 owner: Alex Young
 deciders: product-owner direction; planning Q&A 2026-07-04 (rev 2 same day); privacy & secrets review rounds 2026-07-06; grilling session 2026-07-06; industry-direction review 2026-07-08 (metric-typed quantities, Java/SWID surfaces, Direction section)
@@ -9,7 +9,7 @@ context-refs: capability §27 issues #264–#267; #266 (entitlement-register rev
 
 # 0024 — Software Licensing & Entitlements (SLE: agent-discovered licences + multi-source entitlements)
 
-> **Implementation status (2026-09-07 ADR reconciliation):** Shipped — `ProductRegistryStore`/`SoftwareLicensingStore` (`server/core/src/product_registry_store.cpp`, `software_licensing_store.cpp` — not `license_store.cpp`, which is the dormant Yuzu product-licence store of ADR-0048), `sle_routes.cpp`, and the agent `license_scan` plugin all exist and are wired. Shipped: PR #1950 ("feat(sle): PR1a - Software Licensing & Entitlements discovery plane (ADR-0024)"), merged 2026-07-13. Scope note: this covers the in-server discovery plane per the frontmatter `scope:` split — the SAM use-case-engine-module portion (multi-source entitlement ingestion, compliance UI/MCP) remains re-scoped under ADR-1005, unaffected by this flip.
+> **Implementation status (2026-09-08 ADR reconciliation):** Implemented — discovery plane shipped (PR #1950, merged 2026-07-13): `software_licensing_store.cpp`, `product_registry_store.cpp`, `sle_routes.cpp`, `license_scan` plugin. **Ratification pending**: the two maintainer sign-offs required at §Ratification (:49) are not recorded; flip to Accepted when they are. Not to be confused with `license_store.cpp` (ADR-0048 product licensing).
 
 ## Summary
 

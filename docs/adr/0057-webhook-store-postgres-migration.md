@@ -1,7 +1,8 @@
 # ADR-0057: WebhookStore → PostgreSQL (Wave 3, first SecretCodec-migrating store past AuthDB)
 
-- **Status:** Accepted — shipped PR #3563, merged 2026-08-25; `webhook_store.cpp` is PG-native
-  (`PgPool`/`pg_exec`), zero live `sqlite3_` calls (comments only), re-verified 2026-09-07.
+- **Status:** Accepted — governance-resolved on merge of PR #3563, 2026-08-25;
+  `webhook_store.cpp` is PG-native (`PgPool`/`pg_exec`), zero live `sqlite3_` calls (comments
+  only), re-verified 2026-09-07.
 - **Date:** 2026-08-20
 - **Deciders:** pg workstream; security-guardian + cpp-safety + docs-writer (Gate 2/3)
 - **Parents:** ADR-0006/0007/0008/0009/0012 (substrate/backfill/store contract); ADR-0010
