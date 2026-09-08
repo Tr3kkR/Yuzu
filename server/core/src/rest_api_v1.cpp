@@ -7081,9 +7081,14 @@ void RestApiV1::register_routes(
     // filtered read here (exact parity with GET /api/v1/inventory/software
     // above). fleet_read_fn is the SOLE gate — never stacked with perm_fn
     // (its own doc comment has the BLOCKING falsifier). Row shape matches
-    // MCP's PRE-EXISTING list_agents tool exactly (device_agent_row_json,
-    // device_routes.hpp — the shared builder both now share): 5 fields
-    // (agent_id/hostname/os/arch/agent_version). The richer dashboard-only
+    // MCP's PRE-EXISTING list_agents tool's IDENTICAL 5-field output
+    // (agent_id/hostname/os/arch/agent_version) — this route builds it via
+    // device_agent_row_json (device_routes.hpp); MCP's list_agents builds
+    // the same shape inline and is NOT (yet) refactored onto that builder
+    // (fixed by adversarial review, #4033 follow-up: an earlier version of
+    // this comment claimed the two "now share" the builder — false; see
+    // device_routes.hpp's header comment for the corrected posture). The
+    // richer dashboard-only
     // DeviceRow shape (online/segment/tags/dex_score) and the fragment's
     // q/os/status filters are deliberately NOT reproduced here — this route
     // matches list_agents' capability, not the fragment's; a fleet-scale

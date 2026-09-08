@@ -1,8 +1,12 @@
 // test_group_agent_count_preview.cpp — pure-function coverage for #4033's
 // shared create-group agent-count preview model (group_agent_count_preview.hpp),
-// the builder REST (GET /api/v1/management-groups/agent-count-preview), MCP
-// (preview_management_group_agent_count), and the /fragments/create-group-form
-// dashboard fragment all share (recipe Rule 1 — no drift by construction).
+// the builder REST (GET /api/v1/management-groups/agent-count-preview) and MCP
+// (preview_management_group_agent_count) share (recipe Rule 1 — those two
+// cannot drift from each other by construction). Fixed by adversarial review
+// (#4033 follow-up): an earlier version of this comment claimed the
+// /fragments/create-group-form dashboard fragment shares it too — false; the
+// fragment keeps its own separate, behaviourally-equivalent inline
+// implementation (dashboard_routes.cpp), unchanged by this PR.
 //
 // No httplib, no MCP, no Postgres: these are direct calls against the pure
 // functions. The real facet_agent_count store-backed count is

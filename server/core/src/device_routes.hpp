@@ -52,20 +52,28 @@ namespace yuzu::server {
 class HttpRouteSink;
 class GuaranteedStateStore;
 
-// ── Shared builders (REST + MCP; #4033/#2146 Batch A) ──────────────────────
-// PURE JSON builders — no httplib.h, no mcp_jsonrpc.hpp — the recipe's Rule 1
-// (docs/api-twin-recipe.md §1): REST's GET /api/v1/devices[/{id}] and MCP's
-// pre-existing list_agents/get_agent_details tools all build the device row/
-// detail shape from ONE function so the two transports cannot drift. Built
-// from a single AgentRegistry JSON entry — the SAME 5-field shape
-// `AgentRegistry::to_json_obj()`/MCP's `agents_fn()` already produce
-// (agent_id/hostname/os/arch/agent_version) — deliberately NOT `DeviceRow`
-// (the dashboard-fragment-only richer shape with online/segment/tags/
-// dex_score; see this file's header). list_agents/get_agent_details are not
-// refactored onto these by this PR (out of scope; see #4033) — the builders
-// exist so the NEW REST routes match those tools' served shape byte-for-byte
-// from day one, and so a future refactor of the MCP handlers has a function
-// to call instead of a third inline copy.
+// ── Shared builders (REST-only today; #4033/#2146 Batch A) ─────────────────
+// PURE JSON builders — no httplib.h, no mcp_jsonrpc.hpp — used TODAY only by
+// REST's GET /api/v1/devices[/{id}]. MCP's pre-existing list_agents/
+// get_agent_details tools independently build an IDENTICAL 5-field shape
+// inline (mcp_server.cpp) — they are NOT refactored onto these by this PR
+// (out of scope; see #4033), so this pair does NOT yet satisfy the twin
+// recipe's Rule 1 (docs/api-twin-recipe.md §1: REST, MCP, and the dashboard
+// fragment must call the SAME function so no two transports can drift).
+// Fixed by adversarial review (#4033 follow-up): an earlier version of this
+// comment claimed Rule 1 was already satisfied across REST+MCP — false; the
+// ledger's `twinned` status for these rows reflects the ledger's own
+// weaker, verified capability-level definition (docs/api-parity-ledger.md:
+// "a twin exists and is verified against the current source" — the 5-field
+// shape IS byte-identical across REST/MCP today), not Rule-1 same-function
+// conformance. Built from a single AgentRegistry JSON entry — the SAME
+// 5-field shape `AgentRegistry::to_json_obj()`/MCP's `agents_fn()` already
+// produce (agent_id/hostname/os/arch/agent_version) — deliberately NOT
+// `DeviceRow` (the dashboard-fragment-only richer shape with online/segment/
+// tags/dex_score; see this file's header). The builders exist so the NEW
+// REST routes match those tools' served shape byte-for-byte from day one,
+// and so a future refactor of the MCP handlers has a function to call
+// instead of a third inline copy.
 
 /// PURE: one device row — `agent_id`/`hostname`/`os`/`arch`/`agent_version`,
 /// defensively extracted (`.value(key, "")`) so a short/malformed source

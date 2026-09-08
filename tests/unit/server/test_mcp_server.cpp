@@ -11606,10 +11606,14 @@ TEST_CASE("MCP query_installed_software: a degraded store errors, never success+
 }
 
 // ── preview_management_group_agent_count (#4033, #2146 API-parity Batch A) ──
-// MCP twin of GET /api/v1/management-groups/agent-count-preview and
-// /fragments/create-group-form's own live count — all three call the SAME
-// shared builder (group_agent_count_preview.hpp). No Postgres substrate
-// needed here: response_store_for_test stays nullptr, which exercises the
+// MCP twin of GET /api/v1/management-groups/agent-count-preview — REST and
+// MCP call the SAME shared builder (group_agent_count_preview.hpp) so those
+// two cannot drift from each other. Fixed by adversarial review (#4033
+// follow-up): an earlier version of this comment claimed
+// /fragments/create-group-form's own live count shares it too (a third
+// "all three" surface) — false; the fragment keeps its own separate inline
+// implementation (dashboard_routes.cpp), unchanged by this PR. No Postgres
+// substrate needed here: response_store_for_test stays nullptr, which exercises the
 // "empty filters -> genuine 0, no store call" branch and the "non-empty
 // filters against an unconfigured store -> degrade" branch, both entirely
 // store-free per the shared model's own contract (see
