@@ -12,8 +12,13 @@ This self-test is the lock. It pins the ledger's LOAD-BEARING CONSTANTS against
 frozen values HERE, in test code, so neutering the gate requires editing these
 constants too — which fails CI loudly and is a reviewable change the routed-concern
 row routes to security review. It also exercises the tripwire's own logic against
-mutated ledgers, so a future edit that inverts a check (the false-green shape) is
-caught rather than shipping a silently-inert gate.
+mutated ledgers — the false-certification (RULE 2) path, the excluded-rationale guard,
+the malformed-ledger error path, AND that RULE 1 actually FIRES on an engine-path
+marker present in the tree while the gate is red (the last one closes the blind spot a
+constant-pin cannot: a logic edit that inverts or removes the engine-path block itself,
+which pinning keys/regexes does not catch). Coverage is not exhaustive — it locks the
+checks probed here, not every possible logic edit — but it catches the inert-gate shapes
+this gate's own prose names as the central risk.
 
 Changing the interlock legitimately (e.g. WS-A6 lands a new gate prerequisite) means
 editing BOTH the ledger and the matching constant below, in the same reviewed PR —
@@ -54,7 +59,7 @@ EXPECTED_ENGINE_PATH_MARKERS = {
     "run_row_store": {"regex": "use_case_runs"},
     "invocation_grant": {"regex": "invocation_grant|InvocationGrant"},
     "result_scoped_grant": {"regex": "release_authorization"},
-    "finalisation_receipt": {"regex": "finalisation_receipt|finalization_receipt|FinalisationReceipt"},
+    "finalisation_receipt": {"regex": "finalisation_receipt|finalization_receipt|FinalisationReceipt|FinalizationReceipt"},
     "served_from_run_id": {"regex": "served_from_run_id"},
     "released_input_digest": {"regex": "released_input_digest"},
     "reaper_metrics": {"regex": "yuzu_use_case_runs|yuzu_use_case_reaper"},
@@ -163,6 +168,25 @@ def main() -> int:
         rc = _run_tripwire(_write(bad, "malformed.json", td))
         if rc != TRIPWIRE_ERROR:
             _fail(f"tripwire did not report ERROR on a malformed ledger (got {rc}, want {TRIPWIRE_ERROR})", failures)
+
+        # RULE 1 actually FIRES (closes the blind spot a key/regex pin cannot: a logic
+        # edit that inverts or drops the engine-path block). Inject a probe marker whose
+        # regex matches an ALREADY-TRACKED code symbol (`compute_plan_hash`, the dispatch
+        # grammar — present in server/ and NOT a real engine-path marker), while the gate
+        # is red, and require the tripwire to BLOCK it. If someone inverts `if not
+        # gate_open:` or deletes the RULE-1 loop, this probe stops being detected → the
+        # tripwire returns PASS → this assertion fails. `compute_plan_hash` stays
+        # `excluded` in the real ledger, so this proves RULE 1 without a false positive there.
+        r1 = json.loads(json.dumps(ledger))
+        r1["engine_path_markers"]["__rule1_fires_probe__"] = {"regex": "compute_plan_hash"}
+        rc = _run_tripwire(_write(r1, "rule1_probe.json", td))
+        if rc != TRIPWIRE_VIOLATION:
+            _fail(
+                f"RULE 1 did not FIRE on an engine-path marker present in the tree while the "
+                f"gate is red (got {rc}, want {TRIPWIRE_VIOLATION}) — the engine-path block is "
+                f"inverted, removed, or otherwise inert",
+                failures,
+            )
 
     if failures:
         print(f"\n{len(failures)} interlock self-test failure(s).", file=sys.stderr)

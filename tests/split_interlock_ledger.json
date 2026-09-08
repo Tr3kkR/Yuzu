@@ -36,7 +36,7 @@
     "e": {"status": "red", "title": "G1 cross-process event transport", "note": "Gates Decision 9 only, not the merge-gate. Buses process-local. Rides HA WS-2a event_outbox.", "issues": []},
     "f": {"status": "red", "title": "per-action mutability in the plugin ABI", "note": "Gates fact-acquisition dispatch only. plugin.h carries action names only (ABI v3->v4).", "issues": []},
     "g": {"status": "red", "title": "derived-state confinement", "note": "Gates any module persisting cross-run derived state. Nothing exists.", "issues": []},
-    "h": {"status": "red", "title": "runtime capability-declaration registry + credential columns", "note": "Securables are a compile-time std::array<27> at rbac_store.cpp:559 with NO runtime create-path. Registry + admitting/requesting-credential columns UNBUILT. Substrate marker below pins the runtime create-path symbol so (h) cannot be flipped green without it.", "issues": []},
+    "h": {"status": "red", "title": "runtime capability-declaration registry + credential columns", "note": "Securables are a compile-time std::array<27> at rbac_store.cpp:559 with NO runtime create-path. Registry + admitting/requesting-credential columns UNBUILT. The substrate marker below pins the registry CREATE-PATH symbol only; the credential columns (ADR-0032:956) live on use_case_runs + the Execution Plan, which are ENGINE-PATH markers RULE 1 blocks pre-gate, so they cannot be mechanized here without deadlocking the interlock. Therefore, like (b)'s #2665 half, flipping (h) green REQUIRES a HUMAN ATTESTATION that the admitting/requesting-credential columns also landed — the registry symbol alone is NOT sufficient.", "issues": []},
     "i": {"status": "red", "title": "execution semantics: outcome correlation + coverage envelope", "note": "Gates every distributed fact read and effect. Coverage fields 0-in-code; workflow_engine.cpp marks steps successful on dispatch.", "issues": []},
     "j": {"status": "red", "title": "capability projection (generated OpenAPI + tools/list)", "note": "tools/list iterates a compile-time array; OpenAPI is a hand-typed literal. INV-31-4 test cannot exist until this lands.", "issues": []},
     "k": {"status": "red", "title": "operational readiness (new stores in readyz + reaper liveness)", "note": "Gates admitting a run in production. Six new stores, none in /readyz; reaper has no liveness signal.", "issues": []},
@@ -56,7 +56,7 @@
     "run_row_store": {"regex": "use_case_runs"},
     "invocation_grant": {"regex": "invocation_grant|InvocationGrant"},
     "result_scoped_grant": {"regex": "release_authorization"},
-    "finalisation_receipt": {"regex": "finalisation_receipt|finalization_receipt|FinalisationReceipt"},
+    "finalisation_receipt": {"regex": "finalisation_receipt|finalization_receipt|FinalisationReceipt|FinalizationReceipt"},
     "served_from_run_id": {"regex": "served_from_run_id"},
     "released_input_digest": {"regex": "released_input_digest"},
     "reaper_metrics": {"regex": "yuzu_use_case_runs|yuzu_use_case_reaper"}
