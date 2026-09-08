@@ -319,6 +319,8 @@ API — `GET/POST /api/instructions`, `GET/PUT/DELETE /api/instructions/:id`,
 `GET /api/executions/:id/{summary,agents,children}`, `POST /api/executions/:id/{rerun,cancel}` —
 is `execution_routes.{hpp,cpp}` (#2542 PR-7); the 4-route Schedules API —
 `GET/POST /api/schedules`, `DELETE /api/schedules/:id`, `POST /api/schedules/:id/enable` — is
+`schedule_routes.{hpp,cpp}` (#2542 PR-8); the 4-route Approval API — `GET /api/approvals`,
+`GET /api/approvals/pending/count`, `POST /api/approvals/:id/{approve,reject}` — is
 `approval_routes.{hpp,cpp}` (#2542 PR-9); the 6-route Health/Infra cluster — `GET /metrics`,
 `GET /health`, `GET /api/health`, `GET /livez`, `GET /readyz`, `GET /fragments/health/summary` — is
 `health_routes.{hpp,cpp}` (#2542 PR-10); the 3-route legacy pre-v1 Responses API — `GET
