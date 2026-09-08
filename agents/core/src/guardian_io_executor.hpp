@@ -54,7 +54,7 @@
  *    that can impose cross-class back-pressure; a hit means workers are outstanding
  *    past fn() with quota free (slow or wedged callbacks, delayed ticket release),
  *    NOT that a backend target is dead. Provably inert for run()-only workloads:
- *    run() holds quota until thread exit, so alive == quota_held <= total_quota <
+ *    run() holds quota until its payload is destroyed, so alive == quota_held <= total_quota <
  *    ceiling. The quota check runs before the ceiling check, so CeilingExhausted is
  *    only ever reported when quota has room - the one diagnostically distinct case.
  *  - RAII admission ticket: admission is a transaction (the one throwing mutation,
@@ -62,13 +62,16 @@
  *    last). A shared_ptr<TicketCore> owns the slot + active key. Release points:
  *
  *        form                 | single-flight key        | quota slot            | physical (alive)
- *        run(), published     | worker publish           | ~TicketCore (thread exit) | ~TicketCore
+ *        run(), published     | worker publish           | ~TicketCore (payload dtor) | ~TicketCore
  *        run(), abandoned     | ~TicketCore              | ~TicketCore           | ~TicketCore
  *        submit()             | release_quota_locked() at fn() return, before on_complete | same call | ~TicketCore
  *
  *    ~TicketCore runs when the LAST holder dies - the worker's own captured copy,
- *    destroyed by the trampoline after the worker lambda has fully returned, i.e.
- *    at true OS-thread-exit time. A timed-out run() submitter does NOT release
+ *    destroyed by the trampoline after the worker lambda has fully returned: the
+ *    latest point the detached thread can self-observe before it exits (the tail
+ *    after it - State release, notify, trampoline epilogue, CRT thread exit - runs
+ *    no library code, and F3's orphan grace absorbs it; a self-decremented count
+ *    cannot certify its own thread's exit). A timed-out run() submitter does NOT release
  *    anything - the worker does, on its own schedule. Exactly-once decrement
  *    handshake: `quota_released` flips under the same State::mu acquisition as the
  *    quota decrement, and the destructor decrements quota only if it is still
@@ -523,8 +526,9 @@ public:
                         ticket->release_key_locked(); // free the single-flight key now;
                                                        // the quota + alive counts stay held
                                                        // until this ticket's destructor
-                                                       // runs (worker's own copy, at true
-                                                       // OS-thread-exit time)
+                                                       // runs (worker's own copy, at
+                                                       // payload destruction, the latest
+                                                       // self-observable pre-exit point)
                     } else if (boxed && boxed->has_value()) {
                         ++st->counters[ci].abandoned;
                     }
@@ -818,7 +822,8 @@ private:
         std::condition_variable cv;
         bool stopping{false};
         // PHYSICAL alive workers (F3): incremented at admission, decremented ONLY in
-        // ~TicketCore at OS-thread-exit time. What active_worker_count() reports.
+        // ~TicketCore when the trampoline destroys the worker payload (the latest
+        // self-observable point before OS-thread exit). What active_worker_count() reports.
         int alive_total{0};                                   // guarded by mu
         std::array<int, kIoClassCount> alive_by_class{};      // guarded by mu
         // QUOTA-HELD slots (rung 9c R5.1): what admission checks against the quotas.

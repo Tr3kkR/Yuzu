@@ -361,9 +361,10 @@ TEST_CASE("#2818 — Guardian is notified when a sibling's failed watch kills th
     // case is the one that says why it matters: it shows the notification landing on
     // GUARDIAN, the real consumer, and shows what Guardian now reports afterwards.
     //
-    // Guardian cannot be its own sibling — GuardianSparkRuntime's arming_keys_ plus the
-    // executor's AlreadyRunning rejection make two concurrent Guardian arms of one key
-    // impossible. So the sibling here is a RAW SparkEngine consumer, which is exactly the
+    // Guardian cannot be its own sibling - GuardianSparkRuntime's per-key claim FIFO
+    // (rung 9c R5.2: a second same-key attach queues behind the in-flight head and joins
+    // its subscription, never dispatching a second backend arm) makes two concurrent
+    // Guardian arms of one key impossible. So the sibling here is a RAW SparkEngine consumer, which is exactly the
     // situation Stage 2 creates the moment anything other than Guardian arms a spark.
     SparkReconcileFixture f;
 

@@ -358,10 +358,16 @@ executor worker threads, so nothing dispatched this way can ever take
 **Two counts, one F3 binding (#4147, pinned in the PR-1 doc pass, 2026-09-08).** After
 the split, `GuardianIoExecutor` keeps two counts: a *quota-held* count (per class and
 total, checked against the class quotas at admission) and a *physical alive* count
-(every detached worker whose OS thread has not exited, including one that has already
-returned from `fn()` and is running its completion callback while holding no quota).
-`GuardianIoExecutor::active_worker_count()` reports the PHYSICAL count, released only
-at OS-thread exit (`TicketCore`'s destructor, `guardian_io_executor.hpp`), and that is
+(every detached worker whose payload has not yet been destroyed, including one that has
+already returned from `fn()` and is running its completion callback while holding no
+quota). `GuardianIoExecutor::active_worker_count()` reports the PHYSICAL count, released
+in `TicketCore`'s destructor when the trampoline destroys the worker's payload
+(`guardian_io_executor.hpp`): the latest point a detached worker can self-observe before
+its OS thread exits. The uncounted tail after that release is the `State` handle release,
+a notify, the trampoline epilogue and the CRT thread exit; none of it runs library code
+through DSO teardown, which is the hazard F3 guards, and the existing orphan grace is
+what absorbs it. A self-decremented count cannot certify its own thread's exit, so the
+release point is stated as what it is rather than as "OS-thread exit". That count is
 the count `GuardianEngine::active_io_workers()` (`guardian_engine.cpp`) sums for the
 F3 orphan-exit grace; F3 never binds to the early-releasing quota count.
 `GuardianDetachedWorkerRole` workers are in that sum by construction, callback phase
@@ -375,8 +381,13 @@ workers are outstanding past `fn()` with quota free (slow or wedged completion
 callbacks, delayed ticket release), possibly all of one mechanism type. The factor is a
 policy allowance, not a structural bound: successive submissions can reuse released
 quota while earlier callbacks are still alive, so it is a per-instance backstop that
-can impose cross-class back-pressure, and a refused nested disarm is retained as a
-claim (R5.2), never dropped.
+can impose cross-class back-pressure. Two disarms behave differently under a refusal:
+the caller-driven R5.2 disarm claim (`submit_disarm_off_lock`) is RETAINED at the head
+of its key entry and re-driven by the next same-key event, never dropped; the drain's
+own compensating disarm (a subscription nobody adopted) runs as a bounded `run()` on
+the worker and, on a non-timeout refusal at admission, falls back to a direct
+`backend_->disarm` call on that worker: alive-counted for F3, outside the class
+bulkhead, never a retained claim (`guardian_spark_runtime.cpp`, `on_arm_complete`).
 
 **R5.2 - Runtime: a per-key claim/queue state machine.** Each spark key gets a single
 entry tracking its current claim (an in-flight arm or disarm, or none) and a FIFO queue
@@ -581,8 +592,9 @@ is unchanged — this design's non-waiting dispatch path is covered by the same
 accounting the state-read and existing arm/disarm executors already use, and that
 accounting is the PHYSICAL alive-worker count (R5.1, #4147):
 `GuardianEngine::active_io_workers()` sums each
-`GuardianIoExecutor::active_worker_count()`, released only at OS-thread exit, never the
-early-releasing quota count, so a worker that has returned from `fn()` and is still
+`GuardianIoExecutor::active_worker_count()`, released when the worker's payload is
+destroyed in the trampoline (the latest self-observable point before OS-thread exit,
+see R5.1), never the early-releasing quota count, so a worker that has returned from `fn()` and is still
 inside its completion callback holds the process open exactly as a worker still inside
 the OS call does.
 
