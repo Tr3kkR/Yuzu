@@ -157,6 +157,26 @@ struct InstructionSet {
 /// rejects (#1993 / governance UP-3). Returns the error, or nullopt when OK.
 std::optional<std::string> validate_definition_scope(const std::string& yaml_source);
 
+/// Full byte-level + store-level YAML validation, shared by `POST
+/// /api/instructions/validate-yaml`, the `POST /api/instructions/yaml` save
+/// path, and `POST /fragments/instructions/yaml-preview` — one contract, so
+/// YAML that passes validation can always be saved (#1993). Runs
+/// `instruction_yaml::validate_definition_yaml` (byte-level: required
+/// fields, structural shape) first, then `validate_definition_scope` above
+/// (store-level: size cap, scope-walking combos) only when the byte-level
+/// pass is already clean. Returns human-readable errors; empty means valid.
+///
+/// Promoted from `ServerImpl::validate_yaml_source` (#2542 PR-7) rather than
+/// duplicated into `instruction_routes.cpp`: `/fragments/instructions/
+/// yaml-preview` is NOT one of the 13 routes that extraction moved (it stays
+/// inline in server.cpp) and shares this exact function, so copying it would
+/// have created a second copy of the very validate/save consistency
+/// contract this function's own doc comment promises — the #2557
+/// `json_extract.hpp` precedent for a call-site-straddling helper.
+/// Unqualified call sites inside `ServerImpl` (a `yuzu::server` member)
+/// resolve here via ordinary namespace lookup; no call site changed.
+std::vector<std::string> validate_yaml_source(const std::string& yaml_source);
+
 class InstructionStore {
 public:
     /// Borrows the shared pool and runs the `instruction_store` schema migration on a pinned

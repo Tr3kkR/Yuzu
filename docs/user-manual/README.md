@@ -52,7 +52,7 @@ The following features are documented within the files listed above:
 | Device Quarantine | [Security Hardening](security-hardening.md#device-quarantine) | Network isolation for compromised devices |
 | IOC Checking | [Security Hardening](security-hardening.md#ioc-checking) | Indicator of Compromise scanning for threat hunting |
 | Certificate Inventory | [Security Hardening](security-hardening.md#certificate-inventory) | System certificate enumeration, inspection, and deletion |
-| WiFi & WoL | [Agent Plugins](agent-plugins.md#wifi) | WiFi network scanning and Wake-on-LAN magic packets |
+| WiFi & WoL | [Agent Plugins](agent-plugins.md) · `agents/plugins/wifi/README.md`, `agents/plugins/wol/README.md` | WiFi network scanning and Wake-on-LAN magic packets |
 | Patch Management | [REST API](rest-api.md) | Patch deployment, status tracking, and fleet compliance (via `PatchManager`) |
 | Webhooks | [REST API](rest-api.md) | Event-driven HTTP notifications to external systems |
 | Product Packs | [REST API](rest-api.md) | Signed YAML bundles containing definitions, policies, and templates |
@@ -66,6 +66,8 @@ The following features are documented within the files listed above:
 | [Disaster Recovery](../operations/disaster-recovery.md) | Backup strategy, restore procedures, and failover architecture |
 | [Certificate Renewal](../operations/certificate-renewal.md) | TLS certificate lifecycle, rotation, and automated renewal |
 | [Capacity Planning](../operations/capacity-planning.md) | Server sizing, storage growth, network bandwidth, and scaling patterns |
+| [TAR Power Source](tar-power.md) | TAR power capture source: AC-line and sleep/wake history — on by default |
+| [TAR Removable Source](tar-removable.md) | TAR removable-media capture source: attach/detach and executed-from-removable evidence — on by default |
 
 ---
 

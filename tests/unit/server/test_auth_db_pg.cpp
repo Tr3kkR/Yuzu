@@ -524,6 +524,63 @@ TEST_CASE("AuthDB upsert_sso_identity provisions and refreshes without clobberin
     CHECK(rejected.error() == AuthDBError::InvalidUsername);
 }
 
+// ── get_user() input validation (Gate 4 governance BLOCKING finding) ───────
+//
+// Unlike ~20 sibling AuthDB methods, get_user() never validated its input
+// before this fix — harmless while every caller was admin-invoked, but #4020
+// made it reachable, unauthenticated, from POST /login's raw username field.
+// PQexecParams (paramLengths=nullptr) reads a text parameter as a
+// NUL-terminated C string, so "admin\0<garbage>" matches the real "admin" row
+// at the DB layer while the FULL raw string (including everything after the
+// NUL) is what AuthManager::find_user_or_hydrate uses as its in-memory
+// users_ cache key - every distinct garbage suffix an unauthenticated caller
+// sends creates a new, permanent, never-evicted cache entry, and if the
+// caller also knows the real password, mints a session whose username field
+// never matches the canonical name compared during remove_user()/
+// update_role()'s session-invalidation sweep.
+
+TEST_CASE("get_user rejects a username containing an embedded NUL byte",
+          "[pg][auth_db][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("admin", "hash", "salt", yuzu::server::auth::Role::admin)
+                .has_value());
+
+    // The exact attack shape: a real, active username's bytes followed by a
+    // NUL and arbitrary garbage - what url_decode("admin%00garbage-1")
+    // produces. Must be rejected outright, never match the real "admin" row.
+    const std::string mangled = std::string("admin", 5) + '\0' + "garbage-1";
+    REQUIRE(mangled.size() == 15); // std::string preserves the embedded NUL + suffix
+    auto result = h.db.get_user(mangled);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == AuthDBError::InvalidUsername);
+
+    // The real username is completely unaffected.
+    auto real = h.db.get_user("admin");
+    REQUIRE(real.has_value());
+    CHECK(real->role == yuzu::server::auth::Role::admin);
+}
+
+TEST_CASE("get_user still resolves a legitimate SSO principal after the NUL-byte fix",
+          "[pg][auth_db][security]") {
+    // Regression guard for the fix above: get_user() must stay usable with a
+    // colon-containing SSO principal (auth_routes.cpp's legacy API-token
+    // session synthesis calls get_user_role(api_token.principal_id), and a
+    // human SSO user's token principal_id IS such a string) - a naive fix
+    // gating on the STRICT is_valid_username (which rejects ':') would have
+    // silently demoted every SSO-authenticated API-token request to
+    // Role::user instead of closing a security hole.
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    const std::string principal = "oidc:https://idp.example#nul-fix-check";
+    REQUIRE(h.db.upsert_sso_identity(principal, "https://idp.example", "nul-fix-check", "Bob",
+                                     "oidc")
+                .has_value());
+    auto entry = h.db.get_user(principal);
+    REQUIRE(entry.has_value());
+    CHECK(entry->identity_source == "oidc");
+}
+
 TEST_CASE("AuthDB find_reserved_prefix_users scans active and soft-deleted rows", "[pg][auth_db]") {
     YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
     Harness h{db.dsn()};
