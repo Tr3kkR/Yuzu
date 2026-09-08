@@ -9167,6 +9167,13 @@ public:
         execution_event_bus_.reset();
         approval_manager_.reset();
         schedule_engine_.reset();
+        // WS-3 3.3 (CDX-P1-03): command_outbox_store_ borrows pg_pool_ and MUST be
+        // reset before pg_pool_.reset() below — the member-declaration order is not
+        // enough on its own, because stop() resets the pool explicitly here rather
+        // than at member-destruction time. Its delivery-loop borrower
+        // (command_outbox_delivery_) was already dropped above, after the schedule
+        // thread was joined.
+        command_outbox_store_.reset();
 
         // PostgreSQL substrate teardown (ADR-0007). The gRPC drain above has
         // quiesced every handler thread that could hold a pool lease through a

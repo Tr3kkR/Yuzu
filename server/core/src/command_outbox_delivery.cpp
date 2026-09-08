@@ -111,10 +111,17 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
         spdlog::warn("command_outbox_delivery: occurrence '{}' arming denied at delivery — "
                      "principal='{}' target={}.{}",
                      c.occurrence_id, c.principal, c.plugin, c.action);
-        (void)d_.outbox->mark_failed(c.occurrence_id, lock_name, epoch, "authority_denied");
-        if (d_.execution_tracker && !c.execution_id.empty())
-            (void)d_.execution_tracker->mark_cancelled(c.execution_id, c.principal);
-        audit(c, "denied", "authority_denied_at_delivery");
+        // CDX-P1-02: gate the exec-cancel + terminal audit on OWNING the mark
+        // (same rule as the success path). A fenced-out (false) / degraded
+        // (unexpected) mark_failed means the row stays pending for the true
+        // leader — this replica must not cancel the exec row or audit a terminal
+        // it did not own.
+        auto marked = d_.outbox->mark_failed(c.occurrence_id, lock_name, epoch, "authority_denied");
+        if (marked.has_value() && *marked) {
+            if (d_.execution_tracker && !c.execution_id.empty())
+                (void)d_.execution_tracker->mark_cancelled(c.execution_id, c.principal);
+            audit(c, "denied", "authority_denied_at_delivery");
+        }
         return;
     }
 
@@ -127,10 +134,14 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
         spdlog::error("command_outbox_delivery: occurrence '{}' payload decode failed — "
                       "marking failed",
                       c.occurrence_id);
-        (void)d_.outbox->mark_failed(c.occurrence_id, lock_name, epoch, "payload_decode_failed");
-        if (d_.execution_tracker && !c.execution_id.empty())
-            (void)d_.execution_tracker->mark_cancelled(c.execution_id, c.principal);
-        audit(c, "failure", "payload_decode_failed");
+        // CDX-P1-02: own-the-mark gating, same as the denial + success paths.
+        auto marked =
+            d_.outbox->mark_failed(c.occurrence_id, lock_name, epoch, "payload_decode_failed");
+        if (marked.has_value() && *marked) {
+            if (d_.execution_tracker && !c.execution_id.empty())
+                (void)d_.execution_tracker->mark_cancelled(c.execution_id, c.principal);
+            audit(c, "failure", "payload_decode_failed");
+        }
         return;
     }
 
