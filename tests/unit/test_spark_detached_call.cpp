@@ -406,6 +406,98 @@ TEST_CASE("launch: abandon() after publish returns the result exactly once",
     CHECK(f3->load() == 0);
 }
 
+TEST_CASE("take_locked: a taken result's unique_ptr is left engaged (moved-from), never "
+          "reset, under the cell's own lock",
+          "[spark][detachedcall]") {
+    // White-box regression for the Gate 8 fix (spark_detached_call.hpp's
+    // take_locked()): an earlier version called cell_->result.reset() while
+    // still holding cell_->mu, running ~T() on the moved-from remnant UNDER
+    // THE LOCK - contradicting this class's own "disposal never runs under
+    // the lock" contract. Constructs a Cell<T> directly (DetachedCall's
+    // cell-wrapping constructor is deliberately public - see its own doc
+    // comment) rather than going through a real launch(), so the take can
+    // be observed synchronously with no worker thread involved at all.
+    // MUTATION-TESTED: reinstating the removed `cell_->result.reset();`
+    // line turns CHECK(cell->result != nullptr) below red.
+    auto cell = std::make_shared<detached_detail::Cell<int>>();
+    cell->done = true;
+    cell->done_hint.store(true, std::memory_order_relaxed);
+    cell->result = std::make_unique<DetachedResult<int>>(42);
+
+    DetachedCall<int> handle(cell);
+    auto out = handle.try_take();
+    REQUIRE(out.has_value());
+    REQUIRE(out->has_value());
+    CHECK(**out == 42);
+    CHECK(cell->taken); // exactly-once gate - this, not result's nullness, is authoritative
+    CHECK(cell->result != nullptr); // the fix: left engaged (moved-from), not reset to null
+
+    // A second take on the same handle is still correctly exactly-once,
+    // regardless of result's non-null state - `taken` is what gates it.
+    CHECK_FALSE(handle.try_take().has_value());
+}
+
+TEST_CASE("move-assign: overwriting a live, published-but-untaken handle disposes the OLD "
+          "call, not just the new one",
+          "[spark][detachedcall]") {
+    // Regression for the Gate 8 fix (DetachedCall::operator=(DetachedCall&&),
+    // changed from `= default` to a user-defined version): the defaulted
+    // version silently overwrote cell_ without ever calling
+    // dispose_or_abandon() on the PRIOR cell - a fourth, undocumented
+    // delivery path outside this class's own exactly-once enumeration.
+    // White-box (same technique as the take_locked test above): two
+    // Cell<T>s constructed directly, no lane/worker/thread involved, so
+    // the assignment's effect is observable synchronously. This case
+    // exercises dispose_or_abandon()'s published-but-untaken branch.
+    // MUTATION-TESTED: reverting operator= to `= default` turns
+    // CHECK(old_cell->taken) below red (stays false).
+    auto old_cell = std::make_shared<detached_detail::Cell<int>>();
+    old_cell->done = true;
+    old_cell->done_hint.store(true, std::memory_order_relaxed);
+    old_cell->result = std::make_unique<DetachedResult<int>>(1);
+
+    auto new_cell = std::make_shared<detached_detail::Cell<int>>();
+    new_cell->done = true;
+    new_cell->done_hint.store(true, std::memory_order_relaxed);
+    new_cell->result = std::make_unique<DetachedResult<int>>(2);
+
+    DetachedCall<int> old_handle(old_cell);
+    DetachedCall<int> new_handle(new_cell);
+
+    old_handle = std::move(new_handle); // the move-assignment under test
+
+    CHECK(old_cell->taken); // the OLD (published) call was disposed by the assignment
+    auto out = old_handle.try_take();
+    REQUIRE(out.has_value());
+    REQUIRE(out->has_value());
+    CHECK(**out == 2); // the handle now genuinely holds the NEW call's result
+}
+
+TEST_CASE("move-assign: overwriting a live, not-yet-published handle abandons the OLD call",
+          "[spark][detachedcall]") {
+    // Same regression, the not-yet-published branch of dispose_or_abandon():
+    // `done` stays false, so the correct outcome is `abandoned = true`
+    // (telling a would-be worker to self-dispose later), never `taken`.
+    auto old_cell = std::make_shared<detached_detail::Cell<int>>(); // done=false: not published
+
+    auto new_cell = std::make_shared<detached_detail::Cell<int>>();
+    new_cell->done = true;
+    new_cell->done_hint.store(true, std::memory_order_relaxed);
+    new_cell->result = std::make_unique<DetachedResult<int>>(2);
+
+    DetachedCall<int> old_handle(old_cell);
+    DetachedCall<int> new_handle(new_cell);
+
+    old_handle = std::move(new_handle);
+
+    CHECK(old_cell->abandoned); // told to self-dispose once/if it eventually completes
+    CHECK_FALSE(old_cell->taken);
+    auto out = old_handle.try_take();
+    REQUIRE(out.has_value());
+    REQUIRE(out->has_value());
+    CHECK(**out == 2); // the handle now genuinely holds the NEW call's result
+}
+
 TEST_CASE("launch: an abandoned-before-publish result's disposal keeps the lane/F3 counter "
           "nonzero until the captured object's OWN destructor completes - not merely until "
           "the worker decides not to publish",

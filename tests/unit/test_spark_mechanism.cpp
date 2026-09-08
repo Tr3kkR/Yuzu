@@ -4083,18 +4083,26 @@ struct EstablishChurnWatch {
     // below can still be calling SetThreadpoolWait on `wait` at the exact
     // moment the destructor's own SetThreadpoolWait(nullptr,nullptr)/
     // WaitForThreadpoolWaitCallbacks/CloseThreadpoolWait sequence runs on
-    // it. This harness's own comment elsewhere claims it "mirrors
-    // spark_registry.cpp's reconcile() ordering," but production's
-    // equivalent race-freedom argument rests on a real mutex-guarded
-    // active flag (spark_registry.cpp's mu_), not on cancel+drain alone -
-    // and that production pattern's own correctness is ITSELF flagged as
-    // unverified-on-Windows elsewhere in this project (tracked as "T6" in
-    // the delivery plan), so mechanically copying an unverified production
-    // pattern into this harness would not actually establish safety here
-    // either. Fixing this needs real Windows hardware to verify against,
-    // not a guess from a Linux session with no compiler for this file -
-    // recorded here for whoever runs this harness on DGRHP, not silently
-    // hidden.
+    // it. Worst case (governance Gate 8 sharpening): CloseThreadpoolWait
+    // running while another pool thread is mid-SetThreadpoolWait on the
+    // SAME object - a genuine use-after-close, not merely a benign
+    // duplicate notification. This harness's own comment elsewhere claims
+    // it "mirrors spark_registry.cpp's reconcile() ordering," but
+    // production's equivalent race-freedom argument rests on a real
+    // mutex-guarded active flag (spark_registry.cpp's mu_), not on
+    // cancel+drain alone - and that production pattern's own correctness
+    // is ITSELF flagged as unverified-on-Windows elsewhere in this project
+    // (tracked as "T6" in `~/.claude/plans/let-s-take-a-step-jazzy-
+    // jellyfish.md`, a session-local, uncommitted delivery-plan file - see
+    // that same document for this harness's own governance history), so
+    // mechanically copying an unverified production pattern into this
+    // harness would not actually establish safety here either. Fixing
+    // this needs real Windows hardware to verify against, not a guess
+    // from a Linux session with no compiler for this file - recorded here
+    // for whoever runs this harness on DGRHP, not silently hidden. This
+    // harness-local instance is distinct from T6 (T6 is production's
+    // spark_registry.cpp; this is test-only code) and does not yet have
+    // its own tracked issue.
     static void CALLBACK on_fire(PTP_CALLBACK_INSTANCE, void* ctx, PTP_WAIT, TP_WAIT_RESULT) {
         auto* self = static_cast<EstablishChurnWatch*>(ctx);
         if (self->stop->load(std::memory_order_relaxed))

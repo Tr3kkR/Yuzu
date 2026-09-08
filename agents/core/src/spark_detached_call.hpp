@@ -182,7 +182,12 @@ struct Cell {
     bool done{false};      // guarded by mu
     bool taken{false};     // guarded by mu
     bool abandoned{false}; // guarded by mu
-    std::unique_ptr<DetachedResult<T>> result; // guarded by mu; null after take()
+    std::unique_ptr<DetachedResult<T>> result; // guarded by mu; MOVED-FROM (not null) after
+                                               // take() - see take_locked()'s own comment for
+                                               // why the pointer itself is deliberately never
+                                               // reset (governance Gate 8 finding: this comment
+                                               // said "null after take()" and was made false by
+                                               // this same round's take_locked() fix)
 };
 
 /// Shared per-lane state: the admission cap/count, the shared agent-lifetime
@@ -258,13 +263,16 @@ struct CountGuard {
 } // namespace detached_detail
 
 /// Owner-side handle to one launched call. Move-only. Destroying a handle
-/// while its call is still in flight ("parked") is safe (no UAF, TSan-
-/// confirmed - zero races across the full [spark] tag; ASan attempted but
-/// blocked on this box by a pre-existing, unrelated protobuf/abseil static-
-/// init false-positive that reproduces for ANY test in this binary,
-/// confirmed via an unrelated tag - governance finding, PR-A round 2, not a
-/// claim this file's own code was ASan-clean, just that ASan could not be
-/// run here) and behaves like an implicit abandon() - a not-yet-
+/// while its call is still in flight ("parked") is safe (no data races,
+/// TSan-confirmed - zero races across the full [spark] tag; UAF-freedom
+/// argued by construction - see this file's "Ticketing"/exactly-once
+/// commentary above - but NOT independently confirmed by a sanitizer:
+/// ASan was attempted this session and blocked on this box by a pre-
+/// existing, unrelated protobuf/abseil static-init false-positive that
+/// reproduces for ANY test in this binary, confirmed via an unrelated tag
+/// - governance finding, PR-A round 2, tightened at Gate 8 - TSan proves
+/// race-freedom, not UAF-freedom, and conflating the two overclaimed what
+/// was actually verified here) and behaves like an implicit abandon() - a not-yet-
 /// published result is disposed by the WORKER when it eventually completes;
 /// an already-published-but-untaken result is disposed right here, on
 /// whichever thread destroys the handle (fast: T is a result value or an
