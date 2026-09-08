@@ -3834,6 +3834,26 @@ TEST_CASE("concurrent pagers + a drainer do not race (TSan checkpoint)",
         return SendResult::Sent;
     };
 
+    // Governance Gate 8 finding (#4153 round 3, four independent reviewers, one
+    // empirically reproduced with a live 285s hang): if `first_pass` never releases
+    // because of a counting/latch regression - NOT a genuine deadlock inside
+    // page_into_window itself, which no test-side mechanism can un-stick - the pruner
+    // below used to sit in an unbounded `first_pass.wait()` even after main's own
+    // bounded_wait (further below) already FAILed and started tearing down; `workers`'
+    // destructor then hung forever trying to join it. `stoppable_wait` gives the pruner
+    // a std::stop_token (jthread supplies one automatically to a callable that accepts
+    // it) so `~jthread`'s implicit request_stop() actually releases it - false only for
+    // a real production hang inside page_into_window, which stays fundamentally
+    // untestable this way.
+    const auto stoppable_wait = [](auto&& ready, std::stop_token stoken) {
+        while (!ready()) {
+            if (stoken.stop_requested())
+                return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds{5});
+        }
+        return true;
+    };
+
     std::vector<std::jthread> workers;
     for (int p = 0; p < 3; ++p)
         workers.emplace_back([&, p] {
@@ -3857,7 +3877,8 @@ TEST_CASE("concurrent pagers + a drainer do not race (TSan checkpoint)",
     // family), and the very next call, seeing the identical fact set, proceeds and
     // evicts. TRIPWIRE (governance Gate 4 finding, #4153 round 3): this decline-then-
     // proceed sequence depends on `already_reported`'s dedup key NOT including now_ms
-    // (guardian_lifecycle_journal.cpp's Facts comparison) - if a future change adds a
+    // (common/include/yuzu/audit_retention_rules.hpp's Facts, compared in
+    // guardian_lifecycle_journal.cpp) - if a future change adds a
     // clock reading to that key, every pass here reads as a NEW anomaly, eviction never
     // proceeds, and `prune_evicted` never fires; the `bounded_wait` below will FAIL this
     // test with an attributed message rather than hang, but a red run on exactly this
@@ -3875,8 +3896,9 @@ TEST_CASE("concurrent pagers + a drainer do not race (TSan checkpoint)",
     // additionally blocks on `prune_evicted` before calling request_stop() (also #4153
     // round 2), which is what actually makes this deterministic; the step size here
     // only keeps that wait short.
-    workers.emplace_back([&] {
-        first_pass.wait();
+    workers.emplace_back([&](std::stop_token stoken) {
+        if (!stoppable_wait([&] { return first_pass.try_wait(); }, stoken))
+            return; // request_stop() fired before first_pass ever released - nothing to prune
         std::int64_t t = kBaseTs;
         for (int i = 0; i < kIters; ++i) {
             rig.journal->prune(t);
@@ -3902,17 +3924,21 @@ TEST_CASE("concurrent pagers + a drainer do not race (TSan checkpoint)",
     // be mid-loop - exactly the shape of the production drain-worker/reconnect race
     // this checkpoint exists to prove race-free.
     //
-    // Both waits below are bounded (governance Gate 4/5/6 finding, folded #4153 round
-    // 3): every worker's own loop is fixed-iteration, so under normal operation these
-    // release in well under a second - the 30s ceiling only ever fires on a genuine
-    // stuck-thread regression, converting what would otherwise be a silent, unattributed
-    // ride to Meson's external 240s entry timeout into a named FAIL() pointing at which
-    // rendezvous never happened. latch/atomic have no timed wait, so this polls
-    // try_wait()/load() against a steady_clock deadline rather than blocking outright -
-    // deliberately NOT a wall-clock cap on the test's PASS/FAIL logic itself (that
-    // failure mode is what tests/meson.build's own history warns against): a fast run
-    // and a run that takes 29s both still pass identically, only a run stuck past 30s
-    // fails, and only with an explicit reason.
+    // Both waits below are bounded (governance Gate 4/5/6/8 finding, folded #4153
+    // round 3): every worker's own loop is fixed-iteration, so under normal operation
+    // these release in well under a second - the 30s ceiling only ever fires on a
+    // genuine stuck-thread regression, converting what would otherwise be a silent,
+    // unattributed ride to Meson's external 240s entry timeout into a named FAIL()
+    // pointing at which rendezvous never happened. latch/atomic have no timed wait, so
+    // this polls try_wait()/load() against a steady_clock deadline rather than blocking
+    // outright - deliberately NOT a wall-clock cap on the test's PASS/FAIL logic itself
+    // (that failure mode is what tests/meson.build's own history warns against): a fast
+    // run and a run that takes 29s both still pass identically, only a run stuck past
+    // 30s fails, and only with an explicit reason. The pruner's own `first_pass` wait
+    // above uses `stoppable_wait`, not this, so a FAIL() here also unblocks it during
+    // teardown (see that lambda's comment) rather than leaving it to hang - the one
+    // exception being a genuine deadlock inside page_into_window itself, which no
+    // wait-side mechanism on either thread can un-stick.
     const auto bounded_wait = [](auto&& ready, const char* what) {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
         while (!ready()) {

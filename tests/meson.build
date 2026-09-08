@@ -691,7 +691,8 @@ if get_option('b_sanitize') != 'none'
   # #4018's stalls - they moved to [tsan] and now run in the fast entry above, in every build.
   # 600s here was ORIGINALLY sized off the measured ~480s (8-minute) stall when this entry held
   # all three cases; #4153 removed the two tests that stall belonged to, so #3848 alone now
-  # runs against this budget with generous headroom (measured ~3s uncontended, well under 600s) -
+  # runs against this budget with generous headroom (measured ~3s uncontended, within the ~4-15s
+  # range above once real contention is added, both well under 600s) -
   # left unchanged rather than tightened, since a single-test entry has no other case to protect
   # from a stall's blast radius, and #3848's own 30s watchdogs already bound its own worst case.
   # Not the plain suite's ~28-60s fast-entry baseline above; nightly's own --timeout-multiplier 2
