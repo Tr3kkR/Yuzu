@@ -674,6 +674,72 @@ TEST_CASE("AuthDB recovery codes regenerate + single-use consume", "[pg][auth_db
     CHECK_FALSE(h.db.mfa_consume_recovery_code("rec", "ZZZZZ-ZZZZZ").value());
 }
 
+// ── #3779: concurrent recovery-code regenerate must serialize ───────────────
+//
+// mfa_regenerate_recovery_codes runs DELETE-all + INSERT-10. Without the
+// SELECT … FOR UPDATE guard on auth.users, two concurrent regenerates each
+// DELETE the committed rows (neither sees the other's uncommitted INSERTs under
+// READ COMMITTED) and each INSERT 10 → 20 rows persist, and each caller is
+// handed a 10-code set that no longer matches storage. The row lock serializes
+// them: BOTH still succeed (regenerate has no "already"-loser — it is
+// idempotently repeatable), but exactly one set of 10 persists (clean
+// sequential last-writer-wins) and it is the set that consumes. Assert on COUNTS
+// (recovery_codes_remaining == 10, not 20) so the test is deterministic; each
+// thread writes only its own codes slot via a distinct pointer.
+TEST_CASE("AuthDB MFA: concurrent recovery-code regenerate persists exactly one set of 10",
+          "[pg][auth_db][secrets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()}; // pool size 4 — enough for two concurrent regenerates
+    REQUIRE(h.db.upsert_user("regenrace", "h", "s", yuzu::server::auth::Role::user).has_value());
+
+    std::atomic<int> ok{0};
+    std::atomic<int> err{0};
+    std::atomic<bool> go{false};
+    std::vector<std::string> v1, v2;
+    auto submit = [&](std::vector<std::string>* slot) {
+        while (!go.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        auto r = h.db.mfa_regenerate_recovery_codes("regenrace");
+        if (r.has_value()) {
+            *slot = *r;
+            ok.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            err.fetch_add(1, std::memory_order_relaxed);
+        }
+    };
+    std::thread t1(submit, &v1);
+    std::thread t2(submit, &v2);
+    go.store(true, std::memory_order_release);
+    t1.join();
+    t2.join();
+
+    // Both regenerates succeed; serialization only orders them.
+    CHECK(ok.load() == 2);
+    CHECK(err.load() == 0);
+    REQUIRE(v1.size() == 10);
+    REQUIRE(v2.size() == 10);
+
+    // Core assertion: exactly one set of 10 persists — NOT 20 (the pre-fix
+    // torn-interleave count).
+    auto status = h.db.mfa_status("regenrace");
+    REQUIRE(status.has_value());
+    CHECK(status->recovery_codes_remaining == 10);
+
+    // Returned == persisted: exactly one of the two returned sets is the live one
+    // (its first code consumes), the other is cleanly dead (its first code does
+    // not) — deterministic regardless of which thread committed last. Pre-fix,
+    // ALL 20 rows are present so both would consume (this CHECK would fail).
+    const bool v1_live = h.db.mfa_consume_recovery_code("regenrace", v1[0]).value();
+    const bool v2_live = h.db.mfa_consume_recovery_code("regenrace", v2[0]).value();
+    CHECK(v1_live != v2_live);
+
+    // The consume above spent one code from the live set → 9 remain.
+    auto after = h.db.mfa_status("regenrace");
+    REQUIRE(after.has_value());
+    CHECK(after->recovery_codes_remaining == 9);
+}
+
 // ── MFA enroll -> verify round trip THROUGH SecretCodec ──────────────────
 
 TEST_CASE("AuthDB MFA enroll -> verify round trip is envelope-encrypted end to end",

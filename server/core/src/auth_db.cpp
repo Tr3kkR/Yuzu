@@ -309,6 +309,15 @@ constexpr int kRecoveryCodePbkdfIters = 100'000;
 // CALLER already holds inside an open transaction (mirrors the SQLite-era
 // `regenerate_recovery_codes_locked`, ported from `TxnGuard` to
 // `pool.with_txn_for`'s callback connection).
+//
+// CONTRACT: the caller MUST already hold the `auth.users` row lock for
+// `username` (a `SELECT … FOR UPDATE` or a guarded row `UPDATE`) for the life
+// of this call. DELETE-all + INSERT is NOT self-serializing — two concurrent
+// callers without that lock each persist 10 rows (20 total under READ
+// COMMITTED, since neither DELETE sees the other's uncommitted INSERTs) and
+// each receive a code set that does not match storage (#3779).
+// `mfa_verify_enrollment` holds it via its guarded `UPDATE`;
+// `mfa_regenerate_recovery_codes` via a `SELECT … FOR UPDATE`.
 [[nodiscard]] std::expected<std::vector<std::string>, AuthDBError>
 regenerate_recovery_codes_locked(PGconn* conn, const std::string& username) {
     pg::PgResult del = pg::exec_params(conn, "DELETE FROM auth.mfa_recovery_codes WHERE username = $1",
@@ -1822,6 +1831,41 @@ AuthDB::mfa_regenerate_recovery_codes(const std::string& username) {
     std::vector<std::string> raw_codes;
     AuthDBError txn_error = AuthDBError::WriteFailed;
     const bool ok = impl_->pool.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        // Serialize on the auth.users row BEFORE the DELETE-all + INSERT-10 in
+        // regenerate_recovery_codes_locked (#3779). That helper is not
+        // self-serializing: without a row lock two concurrent regenerates each
+        // DELETE the committed rows and INSERT 10 → 20 persist, and each caller
+        // is handed a set that no longer matches storage. This FOR UPDATE joins
+        // regenerate to the same per-user serialization group every other MFA
+        // writer already takes (mfa_verify_enrollment / mfa_verify_login_code /
+        // mfa_disable / remove_user all lock this row), so the loser blocks then
+        // re-runs against the winner's committed state → returned == persisted for
+        // each caller in turn (clean sequential last-writer-wins).
+        //
+        // `is_active = TRUE` is load-bearing, not cosmetic: it cross-serializes
+        // against remove_user (UPDATE+DELETE on this row). Without it a regen
+        // racing a deactivation could DELETE, block behind remove_user, then
+        // INSERT 10 fresh codes onto a now-deactivated account — live recovery
+        // codes on a dead login, the stale-code hazard docs/auth-mfa-design.md
+        // warns of. Post-lock the loser re-reads is_active = FALSE → 0 rows →
+        // UserNotFound.
+        //
+        // No lock_timeout on purpose: the row is held across 10x PBKDF2 (100k
+        // iters, ~0.3-0.6s), so a short lock_timeout would surface the loser's
+        // legitimate wait as a false QueryFailed; the wait stays well under the
+        // pool's statement timeout. (A follow-up can shrink the hold by
+        // minting+hashing before taking the lock.)
+        pg::PgResult lock = pg::exec_params(
+            conn, "SELECT id FROM auth.users WHERE username = $1 AND is_active = TRUE FOR UPDATE",
+            std::vector<std::string>{username});
+        if (lock.status() != PGRES_TUPLES_OK) {
+            txn_error = AuthDBError::QueryFailed; // read outage → fail closed (503)
+            return false;
+        }
+        if (PQntuples(lock.get()) == 0) {
+            txn_error = AuthDBError::UserNotFound; // no active user → never issue codes
+            return false;
+        }
         auto codes = regenerate_recovery_codes_locked(conn, username);
         if (!codes) {
             txn_error = codes.error();
