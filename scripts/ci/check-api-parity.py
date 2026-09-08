@@ -103,7 +103,7 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # stated reason, raise) this in the SAME change that changes the real count -
 # see check-capability-matrix.sh's CDX-P2-006 comment for why an un-adjusted
 # baseline is not a real ratchet.
-BASELINE_UNTWINNED = 265
+BASELINE_UNTWINNED = 262
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.

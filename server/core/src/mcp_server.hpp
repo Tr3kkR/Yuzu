@@ -45,6 +45,10 @@
 #include "schedule_engine.hpp"
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
+// #4027: DeviceRow (via device_routes.hpp) + TarRetentionPausedScan/
+// TarPausedSourceRow + the tar_*_json pure builders the read-twin MCP tools
+// share with their REST siblings (api-twin-recipe.md Rule 1).
+#include "tar_tree_routes.hpp"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -81,6 +85,10 @@ class DirectorySync;
 // UploadGrantStore itself is NOT forward-declared here — it arrives fully
 // defined via file_retrieval_routes.hpp's own include above.
 class PluginConfigStore;
+// #4027: backs list_tar_retention_paused — forward-declared (pointer-only via
+// set_dashboard_routes below); the .cpp includes dashboard_routes.hpp for the
+// full definition.
+class DashboardRoutes;
 }
 
 namespace yuzu::server::detail {
@@ -465,6 +473,35 @@ public:
                                            const std::string& operation)>;
     void set_fleet_read_fn(FleetReadFn fn) { fleet_read_fn_ = std::move(fn); }
 
+    /// #4143 review fix (external colleague review, BLOCKING, confirmed against
+    /// ADR-0017 INV-4/INV-7 by direct source inspection): `list_tar_process_
+    /// tree_devices`/`list_tar_capture_sources_devices` previously intersected
+    /// `fleet_read_fn_`'s admit-scope with `tar_devices_fn_`'s direct-
+    /// membership-only pre-filter — two divergent resolvers, so an operator
+    /// admitted via an ancestor-ward management-group role (not a DIRECT
+    /// member) could see an incomplete or empty list despite being admitted
+    /// (INV-4/INV-7 violation, not a merely-conservative narrowing). Fixed:
+    /// both tools now read this UNFILTERED registry snapshot — the SAME
+    /// zero-arg source `list_agents`' own `agents_fn` and REST's
+    /// `GET /api/v1/devices` (#4033) use (`registry_.to_json_obj()`) — with
+    /// `gate.scope` as the SOLE filter. `list_agents`' unscoped `agents_fn` was
+    /// never the gap: `require_fleet_read`'s `gate.scope` is the actual
+    /// authorization boundary in that pattern, applied after the unfiltered
+    /// read, exactly as here.
+    using AllDevicesFn = std::function<std::vector<DeviceRow>()>;
+    void set_all_devices_fn(AllDevicesFn fn) { all_devices_fn_ = std::move(fn); }
+
+    /// #4027: `list_tar_retention_paused`'s data source — the SAME
+    /// `DashboardRoutes::gather_tar_retention_paused` the REST twin
+    /// `GET /api/v1/tar/retention-paused` calls, reached via a raw borrowed
+    /// pointer (same lifetime contract as `tar_tree_routes_`/
+    /// `dashboard_routes_` in `server.cpp`'s `ServerImpl`: a persistent
+    /// `std::unique_ptr` member that outlives the web server, per `stop()`'s
+    /// join-before-destruct ordering — safe to borrow raw, same reasoning as
+    /// `set_stream_bridge`/`set_kek_ops` above). Nullable; the tool answers a
+    /// clean "unavailable" error rather than crashing when unset.
+    void set_dashboard_routes(DashboardRoutes* routes) { dashboard_routes_ = routes; }
+
     /// Republish-CRL callback (PR4 B-2): mirrors `CaRoutes::PublishCrlFn` so the
     /// MCP `revoke_certificate` tool republishes the CRL after a revoke exactly as
     /// the REST `/api/v1/ca/revoke` handler does. Returns the new CRL DER, or
@@ -734,6 +771,9 @@ private:
     UploadGrantListReadFn upload_grant_list_read_fn_;
     // #3290 Phase 2 — see set_fleet_read_fn above.
     FleetReadFn fleet_read_fn_;
+    // #4143 review fix — see set_all_devices_fn above.
+    AllDevicesFn all_devices_fn_;
+    DashboardRoutes* dashboard_routes_{nullptr};
 };
 
 // The (tool, securable, operation) test-only accessors that formerly lived here

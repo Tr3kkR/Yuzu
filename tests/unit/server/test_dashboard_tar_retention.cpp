@@ -29,6 +29,7 @@
 #include "management_group_store.hpp"
 #include "pg/pg_pool.hpp"
 #include "response_store.hpp"
+#include "tar_tree_routes.hpp" // TarRetentionPausedScan's full definition (#4143 review fix test)
 #include "test_mgmt_group_pg_helper.hpp"
 
 #include "../test_helpers.hpp"
@@ -38,6 +39,7 @@
 #include <initializer_list>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 
 namespace yuzu::server {
 
@@ -240,6 +242,54 @@ TEST_CASE("render_tar_retention_paused: each visible agent appears; out-of-scope
     // reviewer flagged is the store-side per-(command_id, agent_id) cap tracked
     // in #561 — not reproducible at unit scale and out of scope for this render
     // harness; the per-agent dedup proven above bounds parse work, not the fetch.
+}
+
+// #4143 review fix regression (TESTS-1 + BLOCKING, ADR-0017 INV-4/INV-7):
+// gather_tar_retention_paused's extra_scope fold had zero test coverage — the
+// gap that let the two-resolver divergence ship. This exercises the fold
+// directly (gather_tar_retention_paused is public) against a real
+// ManagementGroupStore, proving `extra_scope_is_authoritative=true` (the
+// REST/MCP twins) makes gate.scope the SOLE filter, bypassing the flat
+// direct-membership `visible_set` check entirely — mo agent-C is NOT a
+// direct member of any group kUser holds a role on (visible_set would drop
+// it, modelling an ancestor-scoped-not-direct-member admit), but agent-C IS
+// named in extra_scope (modelling gate.scope's ancestor-ward expansion).
+TEST_CASE("gather_tar_retention_paused: extra_scope_is_authoritative bypasses "
+          "the flat visible_set (#4143 review fix, ADR-0017 INV-4/INV-7)",
+          "[pg][server][tar][retention-render][adr-0017]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    yuzu::test::ManagementGroupStorePg mg_bundle;
+    ManagementGroupStore& mg = *mg_bundle;
+    grant_visibility(mg, {"agent-A"}); // kUser's direct-membership visible_set = {agent-A} only
+
+    rs.store(mk_resp("agent-A", 10,
+                     "config|process_enabled|false\nconfig|process_paused_at|1710000000\n"));
+    rs.store(mk_resp("agent-C", 10,
+                     "config|service_enabled|false\nconfig|service_paused_at|1710000900\n"));
+
+    DashboardTarRetentionTestAccess acc;
+    acc.set_stores(&rs, &mg);
+    acc.set_scan(kUser, kScan, 2, 1);
+
+    const authz::VisibleSet gate_scope{std::unordered_set<std::string>{"agent-A", "agent-C"}};
+
+    SECTION("default (fragment caller): visible_set is ANDed in — agent-C stays dropped") {
+        const auto scan = acc.routes.gather_tar_retention_paused(kUser, gate_scope);
+        bool found_c = false;
+        for (const auto& r : scan.rows) if (r.agent_id == "agent-C") found_c = true;
+        CHECK_FALSE(found_c); // agent-C: in gate_scope, but not a direct member — dropped
+        CHECK(scan.agents_filtered_out_of_scope >= 1);
+    }
+
+    SECTION("REST/MCP twins: extra_scope is the sole filter — agent-C is included") {
+        const auto scan =
+            acc.routes.gather_tar_retention_paused(kUser, gate_scope, /*extra_scope_is_authoritative=*/true);
+        bool found_c = false;
+        for (const auto& r : scan.rows) if (r.agent_id == "agent-C") found_c = true;
+        CHECK(found_c); // was silently dropped pre-fix despite being gate-authorized
+    }
 }
 
 TEST_CASE("render_tar_retention_paused: paused_at==0 sorts oldest with schema badge (#558)",

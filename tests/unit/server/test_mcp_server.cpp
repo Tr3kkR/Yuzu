@@ -3279,6 +3279,77 @@ TEST_CASE("MCP Integration: tools/call list_agents", "[mcp][integration]") {
     CHECK(ts.audit_log.back() == "mcp.list_agents|success");
 }
 
+// ── #4027: TAR read-twin round-trip — proves registration (kTools/
+// kToolSecurityRows/kWriteTools/kToolAnnotation) actually dispatches through the
+// JSON-RPC surface, matching this file's own recipe-cited job for a round-trip
+// test (the kExpectedTwins table-parity check proves registration is internally
+// consistent; this proves the handler is reachable and answers the documented
+// shape). McpTestServer doesn't wire set_all_devices_fn/set_dashboard_routes
+// (neither existed before #4027 and no other test needs them), so these pin the
+// nullable-seam contract rather than real device/scan data — that data-shape
+// coverage lives in test_tar_tree_routes.cpp's REST twin tests, which call the
+// SAME shared builder (api-twin-recipe.md Rule 1).
+//
+// #4143 review fix (SILENTFAIL-1): an unwired all_devices_fn_ now answers a
+// LOUD "unavailable" error, same contract as list_tar_retention_paused's own
+// unwired-DashboardRoutes test below — previously these two tools alone
+// answered a silent empty list on this exact misconfiguration, indistinguishable
+// from a genuinely-empty-scope caller.
+TEST_CASE("MCP Integration: tools/call list_tar_process_tree_devices (unwired seam)",
+          "[mcp][integration][tar]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":41,"params":)"
+        R"({"name":"list_tar_process_tree_devices"}})");
+    REQUIRE(res);
+    CHECK(res->status == 200); // JSON-RPC errors still answer HTTP 200
+
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["id"] == 41);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"] == "service unavailable");
+}
+
+TEST_CASE("MCP Integration: tools/call list_tar_capture_sources_devices (unwired seam)",
+          "[mcp][integration][tar]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":42,"params":)"
+        R"({"name":"list_tar_capture_sources_devices"}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"] == "service unavailable");
+}
+
+TEST_CASE("MCP Integration: tools/call list_tar_retention_paused answers a clean "
+          "\"unavailable\" when DashboardRoutes is unwired, never a crash",
+          "[mcp][integration][tar]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":43,"params":)"
+        R"({"name":"list_tar_retention_paused"}})");
+    REQUIRE(res);
+    CHECK(res->status == 200); // JSON-RPC errors still answer HTTP 200
+
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["id"] == 43);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"] ==
+         "TAR retention-paused surface unavailable");
+}
+
 // ── Guardian schema discovery on the MCP plane (contract §4 dec.3 / §9 G9) ───
 // The schema catalog must be discoverable on BOTH the REST plane and the MCP
 // plane, byte-for-byte identical (single source: guardian_schema_catalog), so an

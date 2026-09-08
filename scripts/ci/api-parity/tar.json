@@ -3,9 +3,12 @@
     "method": "GET",
     "path": "/fragments/tar/capture-sources",
     "capability_id": "get.fragments-tar-capture-sources",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/tar/capture-sources"
+    },
+    "mcp_twin": "list_tar_capture_sources_devices",
+    "status": "twinned"
   },
   {
     "method": "GET",
@@ -27,9 +30,12 @@
     "method": "GET",
     "path": "/fragments/tar/process-tree",
     "capability_id": "get.fragments-tar-process-tree",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/tar/process-tree"
+    },
+    "mcp_twin": "list_tar_process_tree_devices",
+    "status": "twinned"
   },
   {
     "method": "GET",
@@ -37,7 +43,7 @@
     "capability_id": "get.fragments-tar-process-tree-detail",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "exception:#4027 deferred -- reads a token-keyed reconstruction cache; the token is a CSPRNG value minted and principal-bound ONLY inside the /result handler itself (which in turn needs a pcmd/tcmd pair from the dashboard-only /run route, excluded from #4027 as dispatch-shaped, batched with #3994). No REST/MCP-only path exists to obtain a valid token today -- a genuinely unobtainable input, not merely an indirect one. Revisit once Batch C ships /run + /result twins."
   },
   {
     "method": "GET",
@@ -53,7 +59,7 @@
     "capability_id": "get.fragments-tar-process-tree-result",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "exception:#4027 deferred as scope, not impossibility -- requires an already-dispatched pcmd/tcmd command-id pair, ordinarily minted by the dashboard-only /run route (excluded from #4027 as dispatch-shaped, batched with #3994). The underlying tar/sql dispatch action is Infrastructure:Read/execute_gate=None and IS reachable via the already-twinned generic dispatch surface (execute_instruction / POST /api/command), so a caller could in principle reproduce the two canned $Process_Live/$TCP_Live SELECTs themselves and obtain valid pcmd/tcmd -- but that is not a dedicated API path, and a real REST/MCP twin of this route would still need a new async not-ready-yet polling contract (no htmx auto-reissue equivalent on REST/MCP). Revisit once Batch C ships a /run twin that mints pcmd/tcmd directly."
   },
   {
     "method": "GET",
@@ -67,9 +73,12 @@
     "method": "GET",
     "path": "/fragments/tar/retention-paused",
     "capability_id": "get.fragments-tar-retention-paused",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/tar/retention-paused"
+    },
+    "mcp_twin": "list_tar_retention_paused",
+    "status": "twinned"
   },
   {
     "method": "POST",
