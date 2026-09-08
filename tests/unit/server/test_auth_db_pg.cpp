@@ -740,6 +740,38 @@ TEST_CASE("AuthDB MFA: concurrent recovery-code regenerate persists exactly one 
     CHECK(after->recovery_codes_remaining == 9);
 }
 
+// #3779: the new `SELECT … FOR UPDATE` 0-row branch — regenerate for a
+// nonexistent user returns UserNotFound (never a false store-outage grade).
+TEST_CASE("AuthDB MFA: regenerate for a nonexistent user returns UserNotFound",
+          "[pg][auth_db][secrets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    auto r = h.db.mfa_regenerate_recovery_codes("nobody");
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() == AuthDBError::UserNotFound);
+}
+
+// #3779: the sequential form of the regenerate-vs-remove_user race — the
+// `is_active = TRUE` predicate refuses a regenerate once the account is
+// deactivated, so no fresh recovery codes land on a dead login. (remove_user
+// soft-deletes: is_active=FALSE + DELETE codes; the subsequent regenerate's
+// FOR UPDATE matches 0 active rows and returns UserNotFound before any INSERT.)
+TEST_CASE("AuthDB MFA: regenerate refuses a deactivated account (no live codes)",
+          "[pg][auth_db][secrets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("gone", "h", "s", yuzu::server::auth::Role::user).has_value());
+    REQUIRE(h.db.mfa_regenerate_recovery_codes("gone").has_value()); // seed a live set
+    REQUIRE(h.db.remove_user("gone").has_value());                   // deactivate
+
+    auto r = h.db.mfa_regenerate_recovery_codes("gone");
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() == AuthDBError::UserNotFound);
+    // mfa_status on a deactivated account also returns UserNotFound — there is no
+    // active row to carry recovery codes, so none were (or could be) reissued.
+    CHECK_FALSE(h.db.mfa_status("gone").has_value());
+}
+
 // ── MFA enroll -> verify round trip THROUGH SecretCodec ──────────────────
 
 TEST_CASE("AuthDB MFA enroll -> verify round trip is envelope-encrypted end to end",

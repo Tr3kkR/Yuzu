@@ -251,10 +251,15 @@ each caller is handed a set that no longer matches storage. The row lock — the
 same one `mfa_verify_enrollment`, `mfa_verify_login_code`, `mfa_disable` and
 `remove_user` already take for the user — orders them into clean sequential
 last-writer-wins (returned == persisted for each caller in turn). The
-`is_active = TRUE` predicate also cross-serializes against `mfa_disable` /
-`remove_user`, so a regenerate racing a deactivation can never leave live
-recovery codes on a disabled account; a regenerate for no active user returns
-`UserNotFound`.
+`is_active = TRUE` predicate additionally **refuses** a regenerate once
+`remove_user` has deactivated the account: the loser re-reads `is_active =
+FALSE`, matches zero rows, and returns `UserNotFound` — so a regenerate racing an
+account **deactivation** can never leave live recovery codes on a disabled
+account. (An `mfa_disable` leaves `is_active = TRUE`, so a regenerate racing it is
+serialized by the row lock but still issues codes; those are inert — a recovery
+code is only consumable through an MFA challenge, which a disabled account cannot
+present — and the next enroll/disable clears them. The `is_active` refusal is
+specific to `remove_user`, not `mfa_disable`.)
 
 `mfa_disable` deletes the user's recovery codes alongside clearing the
 secret — leaving them around would let a disabled user authenticate via

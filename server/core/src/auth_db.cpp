@@ -1850,11 +1850,19 @@ AuthDB::mfa_regenerate_recovery_codes(const std::string& username) {
         // warns of. Post-lock the loser re-reads is_active = FALSE → 0 rows →
         // UserNotFound.
         //
-        // No lock_timeout on purpose: the row is held across 10x PBKDF2 (100k
-        // iters, ~0.3-0.6s), so a short lock_timeout would surface the loser's
-        // legitimate wait as a false QueryFailed; the wait stays well under the
-        // pool's statement timeout. (A follow-up can shrink the hold by
-        // minting+hashing before taking the lock.)
+        // Lock_timeout: this deliberately does NOT scope lock_timeout to
+        // kWriteTimeout the way the #4107 sibling (mfa_verify_login_code /
+        // recheck_role_locked, ~line 969) does. That sibling narrows it to 2000ms
+        // because its critical section is microsecond-scale; here the row is held
+        // across 10x PBKDF2 (100k iters, ~0.3-0.6s), so a 2s bound would surface a
+        // legitimate loser's wait as a false QueryFailed. The pool's inherited
+        // per-connection lock_timeout (10000ms, pg_pool.hpp) still bounds a
+        // wedged-connection hang; a loser that genuinely waits >10s (≈20 piled
+        // same-user regenerates) gets SQLSTATE 55P03 → QueryFailed → 503, which is
+        // acceptable graceful degradation for a self-service action. The real fix —
+        // shrinking the hold to microseconds by minting+hashing BEFORE the lock —
+        // is a shared-helper refactor (it touches the enrollment path too) tracked
+        // as a follow-up, not folded here.
         pg::PgResult lock = pg::exec_params(
             conn, "SELECT id FROM auth.users WHERE username = $1 AND is_active = TRUE FOR UPDATE",
             std::vector<std::string>{username});
