@@ -277,6 +277,65 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        (#3789)"; wire reference: `docs/user-manual/rest-api.md`'s
        "Executions" section.
 
+   - **2026-09-07 — 8 Settings read-twins (`GET /api/v1/settings/{tls,https,
+     gateway,server-config,mcp,data-retention,analytics}` +
+     `GET /api/v2/agent/plugin-policy` — its predecessor `/api/v1/agent/
+     plugin-policy` deprecated by #4144 per `docs/api-versioning-policy.md`,
+     not covered by this exception, #4028).** REST-only, no MCP twin — a
+     "no" on Decision 1's both-surfaces requirement. Recorded rather than
+     fixed pre-merge because:
+     - **The gap is a deliberate, pre-existing security boundary, not a
+       build-order gap.** #520 (this issue's own scoping note, echoed in
+       `docs/mcp-server.md`'s MCP-tier reference) holds that MCP tokens are
+       for fleet management and must not be used to administer the server
+       itself — settings, users, TLS, OIDC. `mcp_policy.hpp`'s `tier_allows()`
+       hard-denies the four securables gating these eight routes
+       (`TlsConfig`/`PluginSigning`/`ServerConfig`/`AnalyticsConfig`) at
+       EVERY MCP tier, including `readonly` — an admin-owned MCP token
+       cannot read this data either. This PR's job was hardening the eight
+       sub-areas onto REST v1 + dedicated RBAC securables (previously an
+       undifferentiated `admin_fn_`-only gate on the dashboard fragment
+       route alone); it did not — and, per #520, should not casually — add
+       an MCP surface alongside that hardening.
+     - **This entry corrects a same-PR ledger error, not a fresh
+       classification call.** An earlier round of this PR flipped these 8
+       rows straight to `status: "twinned"` in
+       `scripts/ci/api-parity/settings.json` despite `mcp_twin: null`,
+       understating the untwinned ratchet by 8
+       (`scripts/ci/check-api-parity.py`'s `BASELINE_UNTWINNED` moved
+       265 → 257) and recording the #520 decision nowhere this ADR's own
+       exception-ledger mechanism could see it — an adversarial two-model
+       review (`/home/dgr/advrev-4028`) caught the mislabel independently of
+       the credential-leak finding on the same branch. The rows are now
+       `status: "exception:#520"`, `BASELINE_UNTWINNED` is restored to 265,
+       and this entry is the exception-ledger record ADR-1005's own
+       Decision 1 requires for it.
+     - **Not a tracked follow-up — revisit only if #520 itself is amended.**
+       Unlike the SCIM entry above, there is no scoped MCP-surface work
+       item to point at: adding an MCP twin here means amending #520's
+       fleet-management/server-administration boundary, which
+       `docs/mcp-server.md:21` already states explicitly requires "its own
+       security-guardian-reviewed amendment... not a side effect of a
+       routine REST-twin PR." This stands as a standing exception until
+       that amendment happens, not a numbered issue with a revisit date.
+     - **The exception relaxes no control.** Every route requires its
+       dedicated RBAC securable (`Read`) and is floored in
+       `authz_topology_floor.hpp` so an RBAC-off deployment stays
+       admin-gated rather than silently widening to any authenticated user.
+       Four of the eight (TLS, HTTPS, plugin-signing, analytics — the
+       higher-sensitivity sub-areas) are additionally audited fail-closed
+       (`settings.*.read` / `plugin_signing.*`, `settings_routes.hpp`'s
+       dedicated `AuditFn`); the other four (gateway, server-config,
+       data-retention, MCP) are deliberately unaudited, matching their
+       pre-existing dashboard-fragment posture and #4028's own Evidence
+       classification of that data as non-sensitive (each REST handler's
+       comment states this explicitly). The MCP deny-list changes nothing
+       about REST-side access control either way.
+     - Design record: `server/core/src/mcp_policy.hpp`'s `#4028/#520`
+       comment; `docs/auth-architecture.md`'s "Settings read-twins" section;
+       wire reference: `docs/user-manual/rest-api.md`'s Settings routes,
+       `docs/mcp-server.md`'s MCP-tier reference.
+
 ## Interim rules (until the named follow-ups ship)
 
 - **No engine principal class exists** until the auth-architecture follow-up lands. Until then, integrations authenticate as themselves via existing API tokens, and the server accepts **no** on-behalf-of assertion on any surface — any such header/field is rejected, not ignored.

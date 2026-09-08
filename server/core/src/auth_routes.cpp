@@ -1663,8 +1663,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
 
         // ── Hardened mode: local-password login disabled (SOC 2 CC6.3) ───
         // Under --auth-mode=sso-only the local-password path is closed
-        // fleet-wide; only OIDC SSO (/auth/callback, untouched) mints a
-        // session. The single configured break-glass account is exempt ONLY
+        // fleet-wide; only SSO (OIDC /auth/callback or SAML /saml/acs, both
+        // untouched) mints a session. The single configured break-glass account is exempt ONLY
         // while armed — an out-of-band host operator ran --break-glass-arm
         // within the window. A non-exempt or un-armed attempt is rejected with
         // the SAME generic 401 as a bad password (no "disabled"/"sso-only"
