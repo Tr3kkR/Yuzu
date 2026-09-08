@@ -13,6 +13,7 @@
 #include <yuzu/agent/kv_store.hpp>
 #include <yuzu/agent/spark.hpp>
 
+#include "fake_journal_store.hpp" // FakeJournalStore (#4153)
 #include "test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -445,6 +446,42 @@ struct PageRig {
                               .enqueued_ns = 1'700'000'000'000'000'000, .kind = kind,
                               .guard_type = "file", .rule_name = "n"})};
         REQUIRE(journal->persist(pending, nullptr, kJournalPersistUnbounded, kJournalPersistUnbounded) == 1);
+    }
+};
+
+// A component + runtime + FakeJournalStore rig (#4153) for the two concurrency
+// checkpoints that used to run against a real on-disk KvStore. `store` is declared
+// FIRST so it is fully constructed before `journal` captures `store.get()`, and it
+// outlives `journal` on teardown too (member destruction is reverse-declaration-order,
+// so `journal`, a non-owning raw pointer holder, is destroyed before the store it
+// points at - though it does nothing in its destructor that would matter either way).
+struct FakeStoreRig {
+    std::unique_ptr<yuzu::test::FakeJournalStore> store =
+        std::make_unique<yuzu::test::FakeJournalStore>();
+    std::shared_ptr<GuardianSparkRuntime> rt =
+        make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>());
+    std::unique_ptr<GuardianLifecycleJournal> journal =
+        std::make_unique<GuardianLifecycleJournal>(store.get());
+
+    // Seed one batch DIRECTLY into the store with an EXPLICIT timestamp, bypassing
+    // persist() entirely - persist() stamps real wall-clock system_clock::now(), which
+    // would make a pruner clock walking a controlled historical range never actually
+    // reach the batch's age (the pre-#4153 pagers test's "walks forward to drive the
+    // age-cutoff logic" claim was hollow for exactly this reason: it seeded via
+    // PageRig::persist() while pruning against a fixed 2023 clock). `ts_ms` doubling
+    // as the only source of key uniqueness across a rig's seed calls is deliberate -
+    // every caller in this file seeds a distinct ts_ms per batch, so the default
+    // nonce/seq never collide.
+    void seed_batch(std::int64_t ts_ms, const std::string& rule, std::uint64_t seq = 0,
+                    const std::string& nonce = "seed") {
+        const std::vector<JournalRecord> entries{
+            JournalRecord{.rule_id = rule, .generation = 1, .event_id = "e-" + rule,
+                          .enqueued_ns = ts_ms * 1'000'000, .kind = "armed",
+                          .guard_type = "file", .rule_name = "n"}};
+        const std::string key = journal_batch_key(ts_ms, nonce, seq);
+        REQUIRE(store->insert_if_absent(kJournalNamespace, key,
+                                        serialize_journal_batch(ts_ms, entries)) ==
+               KvInsert::Inserted);
     }
 };
 } // namespace
@@ -3747,49 +3784,141 @@ TEST_CASE("a paged batch's last entry, when sent, gets a sent-label (send-wrap l
 }
 
 TEST_CASE("concurrent pagers + a drainer do not race (TSan checkpoint)",
-          "[spark][runtime][journal][tsan][tsan-heavy]") {
-    PageRig rig;
-    for (int i = 0; i < 20; ++i)
-        rig.persist("r" + std::to_string(i));
+          "[spark][runtime][journal][tsan]") {
+    // #4153: redesigned off a real on-disk KvStore + unbounded `while(!stop)` worker
+    // loops, whose termination depended on the MAIN thread winning lock races against
+    // spinning workers - that starved under contention and caused real CI stalls
+    // (#2373, #2345, #4018). Every worker below instead runs a FIXED, bounded number
+    // of iterations against an in-memory FakeJournalStore, so termination depends on
+    // nothing but each worker's own loop counter, never on main's progress. Dependency
+    // graph (acyclic, every wait is on finite work, nothing ever waits on main): the 3
+    // pagers each count down `first_pass` once, after their OWN first completed
+    // page_into_window call; main blocks on `first_pass` before doing its own passes;
+    // the drainer polls `pagers_done` (a non-blocking try_wait, real work every
+    // iteration) between drain_bounded calls and issues one final drain once it fires.
+    // `workers` is declared LAST (after the rig and every latch) so it destructs FIRST
+    // on any REQUIRE unwind, joining every thread - each bounded by its own fixed loop,
+    // none blocked on anything main provides - before the latches they might still be
+    // touching are destroyed.
+    FakeStoreRig rig;
 
-    std::atomic<bool> stop{false};
-    std::vector<std::thread> pagers;
+    // Seed 20 batches with EXPLICIT 2023 timestamps, never via persist() (which stamps
+    // real wall-clock NOW and made the pre-#4153 test's "walks forward to drive the
+    // age-cutoff logic" claim hollow: a fixed-2023 prune clock can never age-evict a
+    // real-2026-stamped persist() batch).
+    constexpr std::int64_t kBaseTs = 1'672'531'200'000; // 2023-01-01T00:00:00Z
+    for (int i = 0; i < 20; ++i)
+        rig.seed_batch(kBaseTs + i, "r" + std::to_string(i));
+
+    // Retention small enough that the pruner's own forward-walking clock (below)
+    // genuinely crosses the age boundary within this test's bounded iteration count -
+    // real age eviction, not merely the count/byte caps QE-1 (below) already exercises.
+    rig.journal->set_retention_limits_for_test(/*days=*/1, /*max_batches=*/1000,
+                                               /*max_bytes=*/static_cast<std::size_t>(-1),
+                                               /*max_quarantine=*/100);
+
+    constexpr int kIters = 300;
+    constexpr int kMain = 200;
+    std::latch first_pass{3};
+    std::latch pagers_done{3};
+    std::atomic<bool> prune_evicted{false}; // set once the pruner's age eviction has landed
+    std::atomic<std::size_t> sends{0};
+    // The production journaled_send wrap (guardian_engine.cpp): a paged batch's LAST
+    // entry, once sent, gets a durable sent-label - the journal's THIRD store caller,
+    // exercised here (not just claimed) alongside the pagers and the pruner.
+    const auto send = [&](const OutboxEntry& e) {
+        if (e.domain == OutboxDomain::Lifecycle && e.journal_last_in_batch &&
+            !e.journal_batch_key.empty())
+            rig.journal->mark_batch_sent(e.journal_batch_key);
+        sends.fetch_add(1, std::memory_order_relaxed);
+        return SendResult::Sent;
+    };
+
+    std::vector<std::jthread> workers;
     for (int p = 0; p < 3; ++p)
-        pagers.emplace_back([&, p] {
-            std::int64_t t = 1'700'000'000'000 + p * 1000;
-            while (!stop.load(std::memory_order_relaxed)) {
+        workers.emplace_back([&, p] {
+            std::int64_t t = kBaseTs + p * 1000;
+            for (int i = 0; i < kIters; ++i) {
                 rig.journal->page_into_window(*rig.rt, t);
-                t += 10'000; // advance the clock so the bucket keeps refilling
+                if (i == 0)
+                    first_pass.count_down();
+                t += 10'000; // advance the clock so the paging bucket keeps refilling
             }
+            pagers_done.count_down();
         });
-    std::thread drainer([&] {
-        while (!stop.load(std::memory_order_relaxed))
-            rig.rt->drain([](const OutboxEntry&) { return SendResult::Sent; });
-    });
-    // A RETENTION thread, not only pagers (#2345 Gate 8 cpp-safety). prune_locked_ and
+    // A RETENTION thread, not only pagers (#2345 Gate 8 cpp-safety): prune_locked_ and
     // page_into_window hand three non-atomic members between them - last_prune_now_ms_,
-    // last_age_cutoff_, pruned_cutoff_valid_ - and with pagers alone that handoff is never
-    // exercised concurrently, so a TSan pass over this test said nothing about it. The clock
-    // walks forward fast enough here to drive the age-cutoff logic, not just the lock.
-    std::thread pruner([&] {
-        std::int64_t t = 1'700'000'000'000;
-        while (!stop.load(std::memory_order_relaxed)) {
+    // last_age_cutoff_, pruned_cutoff_valid_ - a handoff pagers alone never exercise
+    // concurrently. The ~8.3-hour step stays well under the 1-day retention window, so
+    // no single pass ever trips the forward-clock-jump guard on step size alone - but by
+    // the 4th call the CUMULATIVE walk has already crossed 1 day, ageing all 20 seeded
+    // batches out at once: that pass is declined once (the guard's own
+    // would-wipe-everything protection - #2360/#2361's "clock-guarded retention"
+    // family), and the very next call, seeing the identical fact set, proceeds and
+    // evicts. Waits on `first_pass` FIRST - the same gate main waits on - so the pagers
+    // get at least one crack at the seeded batches (the paging bucket starts pre-filled
+    // to its burst size, so even an unadvanced first pass can place several) before
+    // ageing can start; without that gate, a pruner that happened to run ahead of every
+    // pager under contention could evict all 20 seeded batches before any of them were
+    // ever paged, leaving records_paged()/sends/sent_labels_written() at zero (#4153
+    // round 2, measured under load). Once unblocked, the eviction itself must still
+    // land within the first handful of iterations, not near the end of this loop's
+    // budget: request_stop() (below, from main) makes every subsequent prune() call a
+    // no-op. That is not by itself a GUARANTEE the pruner beats main to it either - main
+    // additionally blocks on `prune_evicted` before calling request_stop() (also #4153
+    // round 2), which is what actually makes this deterministic; the step size here
+    // only keeps that wait short.
+    workers.emplace_back([&] {
+        first_pass.wait();
+        std::int64_t t = kBaseTs;
+        for (int i = 0; i < kIters; ++i) {
             rig.journal->prune(t);
-            t += 60'000;
+            if (rig.journal->batches_pruned() > 0) {
+                prune_evicted.store(true, std::memory_order_release);
+                prune_evicted.notify_all();
+            }
+            t += 30'000'000;
         }
     });
+    workers.emplace_back([&] {
+        while (!pagers_done.try_wait())
+            rig.rt->drain_bounded(send, {.max_entries = 64});
+        rig.rt->drain_bounded(send, {}); // final drain: whatever the last pass paged
+    });
 
-    // Interleave from the main thread too, then signal stop (also exercises the stop-race gate).
-    for (int i = 0; i < 200; ++i)
-        rig.journal->page_into_window(*rig.rt, 1'700'000'500'000 + i * 1000);
+    // Main interleaves once every pager has completed at least one pass, then blocks
+    // until the pruner has ACTUALLY evicted for age at least once - request_stop()
+    // (next) turns every subsequent prune() call into a no-op, so calling it before the
+    // pruner's own eviction pass would race that pass rather than deterministically
+    // letting it land first. Only once both are satisfied does main signal stop (also
+    // exercising the stop-race gate) while the fixed-iteration workers above may still
+    // be mid-loop - exactly the shape of the production drain-worker/reconnect race
+    // this checkpoint exists to prove race-free.
+    first_pass.wait();
+    for (int i = 0; i < kMain; ++i)
+        rig.journal->page_into_window(*rig.rt, kBaseTs + 500'000 + i * 1000);
+    {
+        bool evicted = prune_evicted.load(std::memory_order_acquire);
+        while (!evicted) {
+            prune_evicted.wait(false, std::memory_order_acquire);
+            evicted = prune_evicted.load(std::memory_order_acquire);
+        }
+    }
 
     rig.journal->request_stop();
-    stop.store(true, std::memory_order_relaxed);
-    for (auto& t : pagers)
-        t.join();
-    drainer.join();
-    pruner.join();
-    SUCCEED("no data race / crash across concurrent pagers + retention + drain");
+    for (auto& w : workers)
+        w.join();
+
+    CHECK(rig.journal->records_paged() > 0);
+    CHECK(sends.load(std::memory_order_relaxed) > 0);
+    CHECK(rig.journal->batches_pruned() > 0);
+    CHECK(rig.journal->sent_labels_written() > 0);
+
+    // Functional stop-gate check, sequential on main: a pass AFTER request_stop() must
+    // not enqueue anything - proving the gate actually holds, not merely that nothing
+    // raced while it was up.
+    const auto post_stop = rig.journal->page_into_window(*rig.rt, kBaseTs + 2'000'000);
+    CHECK(post_stop.records_paged == 0);
 }
 
 TEST_CASE("page_into_window quarantines a corrupt batch instead of replaying it (M6)",
@@ -3979,61 +4108,120 @@ TEST_CASE("a hostile rule_name is rejected from the journal but never crashes th
 }
 
 TEST_CASE("concurrent persist + page + prune + drain do not race (TSan checkpoint, QE-1)",
-          "[spark][runtime][journal][tsan][tsan-heavy]") {
-    PageRig rig;
-    // A small retention cap keeps the pruner trimming the journal so page-passes stay O(small):
-    // TSan finds a race from the INTERLEAVING, not from volume, so a short bounded run suffices.
+          "[spark][runtime][journal][tsan]") {
+    // #4153: same redesign as the pagers+drainer checkpoint above - see its header
+    // comment for the full rationale (real KvStore -> FakeJournalStore, unbounded
+    // stop-flag loops -> fixed per-thread iteration counts, std::jthread for RAII join
+    // safety, `workers` declared after the rig/latches/atomics for unwind safety). This
+    // test additionally exercises persist() - a REAL write path serialised only by the
+    // store's own lock, no paging_mutex_ - racing page/prune's paging_mutex_-guarded
+    // path: the FR5 prune-vs-paging serialization under genuinely concurrent I/O.
+    FakeStoreRig rig;
+    // A small retention cap keeps the pruner trimming the journal so page-passes stay
+    // O(small): TSan finds a race from the INTERLEAVING, not from volume, so a short
+    // bounded run suffices. `days` is deliberately huge (never age-evicts) - this test
+    // exercises COUNT eviction only; the pagers+drainer checkpoint above is the one
+    // that exercises AGE eviction.
     rig.journal->set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/16,
                                                /*max_bytes=*/static_cast<std::size_t>(-1),
                                                /*max_quarantine=*/100);
+    constexpr std::int64_t kBaseTs = 1'700'000'000'000;
     for (int i = 0; i < 16; ++i)
-        rig.persist("seed" + std::to_string(i));
+        rig.seed_batch(kBaseTs + i, "seed" + std::to_string(i));
 
-    std::atomic<bool> stop{false};
-    std::vector<std::thread> workers;
-    // Pagers: page_into_window (paging_mutex_ -> KvStore.mu_).
+    constexpr int kIters = 300;
+    constexpr int kPersistTotal = 40;
+    std::atomic<int> pruner_passes{0};
+    std::atomic<int> persist_successes{0};
+    std::latch producers_done{4}; // 2 pagers + pruner + persister (not the drainer)
+    std::atomic<std::size_t> sends{0};
+    const auto send = [&](const OutboxEntry& e) {
+        if (e.domain == OutboxDomain::Lifecycle && e.journal_last_in_batch &&
+            !e.journal_batch_key.empty())
+            rig.journal->mark_batch_sent(e.journal_batch_key);
+        sends.fetch_add(1, std::memory_order_relaxed);
+        return SendResult::Sent;
+    };
+
+    std::vector<std::jthread> workers;
+    // Pagers: page_into_window (paging_mutex_ -> the fake store's own mutex).
     for (int p = 0; p < 2; ++p)
         workers.emplace_back([&, p] {
-            std::int64_t t = 1'700'000'000'000 + p * 1000;
-            while (!stop.load(std::memory_order_relaxed)) {
+            std::int64_t t = kBaseTs + p * 1000;
+            for (int i = 0; i < kIters; ++i) {
                 rig.journal->page_into_window(*rig.rt, t);
                 t += 10'000;
             }
+            producers_done.count_down();
         });
-    // Pruner: prune() (paging_mutex_ -> KvStore.mu_) - the FR5 prune-vs-paging serialization this
-    // test exists to exercise under TSan (previously only single-threaded).
+    // Pruner: prune() (paging_mutex_ -> the store) - the FR5 prune-vs-paging
+    // serialization this test exists to exercise under TSan. Publishes its own pass
+    // count so the persister below can genuinely interleave with it via a BLOCKING
+    // wait, instead of racing to finish first.
     workers.emplace_back([&] {
-        std::int64_t t = 1'700'000'000'000;
-        while (!stop.load(std::memory_order_relaxed)) {
+        std::int64_t t = kBaseTs;
+        for (int i = 0; i < kIters; ++i) {
             rig.journal->prune(t);
             t += 5'000;
+            pruner_passes.fetch_add(1, std::memory_order_release);
+            pruner_passes.notify_all();
         }
+        producers_done.count_down();
     });
-    // Persister: persist() (KvStore.mu_, no paging_mutex_) - a single writer, as in production
-    // (always under the engine mtx_); it races page/prune only on the shared KvStore + atomics.
-    // Bounded to keep the run short; the pruner recycles the batch budget as it writes.
+    // Persister: persist() (the store only, no paging_mutex_) - a single writer, as in
+    // production (always under the engine mtx_); it races page/prune only on the
+    // shared store + atomics. Three tranches gated on the pruner's OWN pass count (a
+    // blocking std::atomic::wait on a finite worker, never a spin) so count-eviction
+    // genuinely interleaves with writes rather than one finishing before the other starts.
     workers.emplace_back([&] {
-        for (int n = 0; n < 40 && !stop.load(std::memory_order_relaxed); ++n) {
+        int n = 0;
+        const auto persist_one = [&] {
             std::vector<std::shared_ptr<const JournalRecord>> pending{
                 std::make_shared<const JournalRecord>(JournalRecord{
                     .rule_id = "w" + std::to_string(n), .generation = 1,
-                    .event_id = "we-" + std::to_string(n), .enqueued_ns = 1'700'000'000'000'000'000,
-                    .kind = "armed", .guard_type = "file", .rule_name = "n"})};
-            (void)rig.journal->persist(pending, nullptr, kJournalPersistUnbounded, kJournalPersistUnbounded);
-        }
+                    .event_id = "we-" + std::to_string(n),
+                    .enqueued_ns = 1'700'000'000'000'000'000, .kind = "armed",
+                    .guard_type = "file", .rule_name = "n"})};
+            if (rig.journal->persist(pending, nullptr, kJournalPersistUnbounded,
+                                     kJournalPersistUnbounded) == 1)
+                persist_successes.fetch_add(1, std::memory_order_relaxed);
+            ++n;
+        };
+        const auto wait_for_pass = [&](int target) {
+            int cur = pruner_passes.load(std::memory_order_acquire);
+            while (cur < target) {
+                pruner_passes.wait(cur, std::memory_order_acquire);
+                cur = pruner_passes.load(std::memory_order_acquire);
+            }
+        };
+        for (int i = 0; i < kPersistTotal / 3; ++i)
+            persist_one();
+        wait_for_pass(1);
+        for (int i = 0; i < kPersistTotal / 3; ++i)
+            persist_one();
+        wait_for_pass(2);
+        while (n < kPersistTotal)
+            persist_one();
+        producers_done.count_down();
     });
     // Drainer.
     workers.emplace_back([&] {
-        while (!stop.load(std::memory_order_relaxed))
-            rig.rt->drain([](const OutboxEntry&) { return SendResult::Sent; });
+        while (!producers_done.try_wait())
+            rig.rt->drain(send);
+        rig.rt->drain(send); // final drain
     });
 
     for (int i = 0; i < 60; ++i)
-        rig.journal->page_into_window(*rig.rt, 1'700'000'500'000 + i * 1000);
+        rig.journal->page_into_window(*rig.rt, kBaseTs + 500'000 + i * 1000);
 
-    stop.store(true, std::memory_order_relaxed);
     for (auto& w : workers)
         w.join();
+
+    CHECK(persist_successes.load(std::memory_order_relaxed) == kPersistTotal);
+    CHECK(rig.journal->batches_pruned() > 0); // BEFORE the settle prune below
+    CHECK(rig.journal->records_paged() > 0);
+    CHECK(sends.load(std::memory_order_relaxed) > 0);
+    CHECK(rig.journal->sent_labels_written() > 0);
 
     // request_stop() comes AFTER the settle prune below, not before it. Calling it first made
     // that prune return at its shutdown gate without doing anything, so the rebase the
@@ -4046,10 +4234,12 @@ TEST_CASE("concurrent persist + page + prune + drain do not race (TSan checkpoin
     // under the real concurrent persist/prune interleaving, not just data-race-free. A final
     // settle prune rebases to on-disk truth; the
     // gauges must then exactly equal what namespace_size sees on disk - proving no lost update
-    // and no drift accumulated across the concurrent run.
-    rig.journal->prune(1'700'000'900'000);
+    // and no drift accumulated across the concurrent run (deterministic single-threaded pin:
+    // test_guardian_lifecycle_journal.cpp's "rebase-as-delta preserves a concurrent persist's
+    // increment" case).
+    rig.journal->prune(kBaseTs + 900'000);
     rig.journal->request_stop();
-    auto sz = rig.kv->namespace_size(kJournalNamespace, kBatchKeyPrefix);
+    auto sz = rig.store->namespace_size(kJournalNamespace, kBatchKeyPrefix);
     REQUIRE(sz.has_value());
     CHECK(rig.journal->journal_batch_count() == sz->count);
     CHECK(rig.journal->journal_bytes() == sz->bytes);
