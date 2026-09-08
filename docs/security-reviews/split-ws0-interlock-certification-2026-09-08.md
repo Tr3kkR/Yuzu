@@ -79,9 +79,11 @@ engine-path marker has breached it.
 ## 2. The interlock ledger (a)–(n)
 
 Command shape for a marker: `git grep -nE '<regex>' origin/dev -- . :(exclude)docs/ :(exclude).claude/
-:(exclude)tests/split_interlock_ledger.json :(exclude)tests/test_split_interlock_tripwire*.py` — the
-whole tree minus the self-naming files (matching the tripwire's `search_paths`/`exclude_paths`), so a
-future engine binary directory (`server/engine/`, `gateway/`, …) cannot be silently uncovered.
+:(exclude)changelog.d/ :(exclude)governance.d/ :(exclude)tests/split_interlock_ledger.json
+:(exclude)tests/test_split_interlock_tripwire*.py` — the whole tree minus the prose/evidence trees
+(`docs/`, `.claude/`, `changelog.d/`, `governance.d/` — which legitimately name markers in prose) and
+the self-naming test files (matching the tripwire's `search_paths`/`exclude_paths`), so a future engine
+binary directory (`server/engine/`, `gateway/`, …) cannot be silently uncovered.
 
 | # | Prerequisite | Status | Tree evidence (re-runnable) |
 |---|---|---|---|

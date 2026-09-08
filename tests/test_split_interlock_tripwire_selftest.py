@@ -40,6 +40,8 @@ EXPECTED_SEARCH_PATHS = ["."]                   # whole tree; narrowing hides en
 EXPECTED_EXCLUDE_PATHS = {
     "docs/",
     ".claude/",
+    "changelog.d/",       # prose/evidence dirs that legitimately name markers
+    "governance.d/",      # (this run's ledger records engine-path marker strings)
     "tests/split_interlock_ledger.json",
     "tests/test_split_interlock_tripwire.py",
     "tests/test_split_interlock_tripwire_selftest.py",

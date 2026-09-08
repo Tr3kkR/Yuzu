@@ -22,6 +22,8 @@
   "exclude_paths": [
     "docs/",
     ".claude/",
+    "changelog.d/",
+    "governance.d/",
     "tests/split_interlock_ledger.json",
     "tests/test_split_interlock_tripwire.py",
     "tests/test_split_interlock_tripwire_selftest.py"
