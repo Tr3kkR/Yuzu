@@ -75,6 +75,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 namespace yuzu::autoruns {
@@ -340,12 +341,14 @@ void collect_runonceex_subkeys(HKEY hive, const std::wstring& subkey, REGSAM ext
     wchar_t name_buf[kNameBufLen]{};
     DWORD idx = 0;
     DWORD name_len = kNameBufLen;
-    while (idx < kMaxRunOnceExSubkeys &&
-          RegEnumKeyExW(key.get(), idx, name_buf, &name_len, nullptr, nullptr, nullptr,
-                       nullptr) == ERROR_SUCCESS) {
+    LSTATUS enum_status = ERROR_SUCCESS;
+    while (idx < kMaxRunOnceExSubkeys) {
+        name_len = kNameBufLen;
+        enum_status =
+            RegEnumKeyExW(key.get(), idx, name_buf, &name_len, nullptr, nullptr, nullptr, nullptr);
+        if (enum_status != ERROR_SUCCESS) break;
         const std::wstring numbered_w(name_buf, name_len);
         ++idx;
-        name_len = kNameBufLen;
 
         RegKey sub;
         const LSTATUS sub_status = RegOpenKeyExW(key.get(), numbered_w.c_str(), 0, KEY_READ, sub.put());
@@ -356,12 +359,20 @@ void collect_runonceex_subkeys(HKEY hive, const std::wstring& subkey, REGSAM ext
         }
         collect_reg_values(sub.get(), location_prefix + L"\\" + numbered_w, id, scope, "-", outcome);
     }
-    // A capped enumeration is not a complete one (AC4) -- probe one more
-    // index past the cap; only note row_cap if a real subkey was there.
-    if (idx >= kMaxRunOnceExSubkeys &&
-        RegEnumKeyExW(key.get(), idx, name_buf, &name_len, nullptr, nullptr, nullptr, nullptr) ==
+    if (idx >= kMaxRunOnceExSubkeys) {
+        // A capped enumeration is not a complete one (AC4) -- probe one
+        // more index past the cap; only note row_cap if a real subkey was
+        // there.
+        if (RegEnumKeyExW(key.get(), idx, name_buf, &name_len, nullptr, nullptr, nullptr, nullptr) ==
             ERROR_SUCCESS)
-        note_constraint(outcome, "row_cap");
+            note_constraint(outcome, "row_cap");
+    } else if (enum_status != ERROR_NO_MORE_ITEMS) {
+        // The enumeration stopped before genuinely finishing (ERROR_NO_MORE_
+        // ITEMS) and before hitting the cap -- e.g. ERROR_MORE_DATA (a
+        // subkey name exceeded the fixed buffer) or another registry error.
+        // A real constraint, not silent completion.
+        note_constraint(outcome, reg_open_constraint_token(enum_status));
+    }
 }
 
 void collect_hklm_run_family(std::string_view filter, SourceOutcome& run, SourceOutcome& runonce,
@@ -591,13 +602,15 @@ void collect_ifeo(std::string_view filter, SourceOutcome& outcome) {
     wchar_t name_buf[kNameBufLen]{};
     DWORD idx = 0;
     DWORD name_len = kNameBufLen;
-    while (idx < kMaxIfeoSubkeys &&
-          RegEnumKeyExW(key.get(), idx, name_buf, &name_len, nullptr, nullptr, nullptr,
-                       nullptr) == ERROR_SUCCESS) {
+    LSTATUS enum_status = ERROR_SUCCESS;
+    while (idx < kMaxIfeoSubkeys) {
+        name_len = kNameBufLen;
+        enum_status =
+            RegEnumKeyExW(key.get(), idx, name_buf, &name_len, nullptr, nullptr, nullptr, nullptr);
+        if (enum_status != ERROR_SUCCESS) break;
         const std::wstring exe_name_w(name_buf, name_len);
         const std::string exe_name = wstring_to_utf8(exe_name_w);
         ++idx;
-        name_len = kNameBufLen;
 
         RegKey sub;
         const LSTATUS sub_status = RegOpenKeyExW(key.get(), exe_name_w.c_str(), 0, KEY_READ, sub.put());
@@ -633,12 +646,18 @@ void collect_ifeo(std::string_view filter, SourceOutcome& outcome) {
         }
         outcome.rows.push_back(std::move(row));
     }
-    // A capped enumeration is not a complete one (AC4) -- probe one more
-    // index past the cap; only note row_cap if a real subkey was there.
-    if (idx >= kMaxIfeoSubkeys &&
-        RegEnumKeyExW(key.get(), idx, name_buf, &name_len, nullptr, nullptr, nullptr, nullptr) ==
+    if (idx >= kMaxIfeoSubkeys) {
+        // A capped enumeration is not a complete one (AC4) -- probe one
+        // more index past the cap; only note row_cap if a real subkey was
+        // there.
+        if (RegEnumKeyExW(key.get(), idx, name_buf, &name_len, nullptr, nullptr, nullptr, nullptr) ==
             ERROR_SUCCESS)
-        note_constraint(outcome, "row_cap");
+            note_constraint(outcome, "row_cap");
+    } else if (enum_status != ERROR_NO_MORE_ITEMS) {
+        // The enumeration stopped before genuinely finishing and before
+        // hitting the cap -- a real registry error, not silent completion.
+        note_constraint(outcome, reg_open_constraint_token(enum_status));
+    }
 }
 
 // ── 6. Startup folders (common + per-user) ───────────────────────────────
