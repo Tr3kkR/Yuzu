@@ -735,7 +735,7 @@ TEST_CASE("discover.plugins: parameter_schema enriched when caller holds Instruc
     REQUIRE(res);
     CHECK(res->status == 200);
     auto j = nlohmann::json::parse(res->body);
-    CHECK(j["version"] == 2);
+    CHECK(j["version"] == 3); // 2 -> 3: the per-plugin `docs` summary join
     REQUIRE(j.contains("actions_enriched_with_schema"));
     CHECK(j["actions_enriched_with_schema"].get<int>() >= 1);
     bool found_schema = false;
@@ -787,4 +787,124 @@ TEST_CASE("discover.plugins: null AgentRegistry -> 503", "[discovery][plugins][p
     auto res = h.sink.Get("/api/v1/discover/plugins");
     REQUIRE(res);
     CHECK(res->status == 503);
+}
+
+// ── /discover/plugin-docs (docs/plugin-readme-standard.md rule 10) ──────────
+//
+// The build-embedded per-plugin documentation manifests. Static like
+// scope-kinds: no store dependency, answers during warmup, publicly cacheable.
+// The manifests themselves are content (content/plugin-docs/*.json, generated
+// by tools/plugin-doc-gen and byte-gated by tests/test_plugin_readmes.py);
+// these cases pin the ENVELOPE, the join into /discover/plugins, and the gate.
+
+TEST_CASE("discover.plugin-docs: static manifest catalog shape + ETag revalidation",
+          "[discovery][plugin_docs][pg]") {
+    DiscoverHarness h;
+    auto res = h.sink.Get("/api/v1/discover/plugin-docs");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    const std::string etag = res->get_header_value("ETag");
+    CHECK_FALSE(etag.empty());
+    CHECK(h.last_securable_type == "Infrastructure");
+    CHECK(h.last_operation == "Read");
+
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["catalog"] == "plugin-docs");
+    CHECK(j["version"] == 1);
+    CHECK(j["source"] == "build-embedded");
+    REQUIRE(j.contains("plugins"));
+    REQUIRE(j["plugins"].is_array());
+    CHECK(j["plugin_count"].get<std::size_t>() == j["plugins"].size());
+    CHECK(j["skipped_invalid"] == 0);
+    // The two pilots ship with this tree; an empty table would make the loop
+    // below vacuous, so the count is asserted, not just the shape.
+    CHECK(j["plugin_count"].get<std::size_t>() >= 2);
+    for (const auto& m : j["plugins"]) {
+        CHECK(m["manifest_version"].is_number_integer());
+        CHECK(m["name"].is_string());
+        CHECK(m["description"].is_string());
+        CHECK(m["actions"].is_array());
+        CHECK(m["platforms"].is_object());
+        CHECK(m["readme"].is_string());
+    }
+
+    // Byte-identical to the shared builder the MCP resource serves.
+    CHECK(res->body == yuzu::server::plugin_docs_catalog().json);
+
+    // No store dependency — answers 200 even with everything unwired.
+    DiscoverHarness bare(/*wire_rbac=*/false, /*wire_instr=*/false, /*wire_registry=*/false);
+    auto bare_res = bare.sink.Get("/api/v1/discover/plugin-docs");
+    REQUIRE(bare_res);
+    CHECK(bare_res->status == 200);
+
+    auto cached = h.sink.Get("/api/v1/discover/plugin-docs", {{"If-None-Match", etag}});
+    REQUIRE(cached);
+    CHECK(cached->status == 304);
+}
+
+TEST_CASE("discover.plugin-docs: permission denied -> 403, no body leak",
+          "[discovery][plugin_docs][pg]") {
+    DiscoverHarness h;
+    h.grant_perms = false;
+    auto res = h.sink.Get("/api/v1/discover/plugin-docs");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("\"plugins\"") == std::string::npos);
+}
+
+TEST_CASE("discover.plugins: docs summary joined by plugin name, null when undocumented",
+          "[discovery][plugins][plugin_docs][pg]") {
+    DiscoverHarness h;
+    auto info = make_agent_info("agent-1", "windows", "WIN-TESTBOX");
+    // A plugin whose README has adopted the standard — whichever manifest the
+    // embedded catalog lists first, so the case does not depend on which
+    // pilots ship — and one that has not.
+    const auto catalog = nlohmann::json::parse(yuzu::server::plugin_docs_catalog().json);
+    REQUIRE(catalog["plugins"].is_array());
+    REQUIRE_FALSE(catalog["plugins"].empty());
+    const std::string documented_name = catalog["plugins"][0]["name"].get<std::string>();
+    auto* documented = info.add_plugins();
+    documented->set_name(documented_name);
+    documented->set_version("1.0.0");
+    documented->set_description("drive health");
+    documented->add_capabilities("smart");
+    auto* undocumented = info.add_plugins();
+    undocumented->set_name("no_such_plugin_for_docs");
+    undocumented->set_version("0.0.1");
+    undocumented->set_description("never documented");
+    undocumented->add_capabilities("noop");
+    (void)h.registry.register_agent(info);
+
+    // The join reads the same index the catalog serves — a manifest present
+    // there MUST surface as a summary here, and vice versa.
+    REQUIRE(yuzu::server::plugin_docs_summary(documented_name) != nullptr);
+    CHECK(yuzu::server::plugin_docs_summary("no_such_plugin_for_docs") == nullptr);
+
+    auto res = h.sink.Get("/api/v1/discover/plugins");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["version"] == 3);
+    bool saw_documented = false, saw_undocumented = false;
+    for (const auto& pl : j["plugins"]) {
+        REQUIRE(pl.contains("docs")); // always present: object or explicit null
+        if (pl["name"] == documented_name) {
+            saw_documented = true;
+            REQUIRE(pl["docs"].is_object());
+            CHECK(pl["docs"]["summary"].is_string());
+            CHECK_FALSE(pl["docs"]["summary"].get<std::string>().empty());
+            CHECK(pl["docs"]["platforms"].is_object());
+            REQUIRE(pl["docs"]["kind"].is_object());
+            CHECK(pl["docs"]["kind"]["collector"].is_boolean());
+            CHECK(pl["docs"]["kind"]["mutating"].is_boolean());
+            CHECK(pl["docs"]["kind"]["gathered"].is_boolean());
+            CHECK(pl["docs"]["readme"] == "agents/plugins/" + documented_name + "/README.md");
+            CHECK(pl["docs"]["resource"] == "yuzu://plugin-docs");
+        } else if (pl["name"] == "no_such_plugin_for_docs") {
+            saw_undocumented = true;
+            CHECK(pl["docs"].is_null());
+        }
+    }
+    CHECK(saw_documented);
+    CHECK(saw_undocumented);
 }
