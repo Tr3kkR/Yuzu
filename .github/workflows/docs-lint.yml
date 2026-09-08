@@ -50,6 +50,14 @@ jobs:
       - name: Issue-lifecycle docs hygiene (CLAUDE.md cap, do-not-close.txt)
         run: python3 tests/test_issue_docs.py
 
+      # ADR-0032 sequencing-interlock merge-gate (WS-0). No engine-path code may
+      # merge until the unconditional set (a)-(d)+(h) lands. Governance runs from
+      # the author's working tree, so a stale branch can silently run the old
+      # pipeline and miss the routed-concern row; this test runs on the merge ref
+      # on every PR, so the gate actually binds. Data: tests/split_interlock_ledger.json.
+      - name: Split interlock merge-gate tripwire (ADR-0032)
+        run: python3 tests/test_split_interlock_tripwire.py
+
   # Plugin README touch rule (docs/plugin-readme-standard.md rule 7): a change
   # under agents/plugins/<x>/src/** must also change agents/plugins/<x>/README.md
   # unless the PR body states `docs-unchanged: <section> — <reason>`. The

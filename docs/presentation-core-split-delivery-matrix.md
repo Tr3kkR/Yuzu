@@ -7,9 +7,10 @@ tracks *what ships, in what order, who reviews it, and how we know it's done*. *
 with the ADRs, the ADR wins; on delivery status, this matrix is the source of truth.** The `/split`
 skill is a pointer to both and loses to both.
 
-**Verified against the tree 2026-09-07.** Re-stamp this line whenever the table is revised — a matrix
-from a stale checkout is worse than none, and the current-state claims below were wrong in the first
-draft because they were copied from stale ADR status columns. Grep the tree, don't trust a doc.
+**Verified against the tree 2026-09-08** (`origin/dev` @ `d2e89ffaa`; WS-0 certification landed). Re-stamp
+this line whenever the table is revised — a matrix from a stale checkout is worse than none, and the
+current-state claims below were wrong in the first draft because they were copied from stale ADR status
+columns. Grep the tree, don't trust a doc.
 
 > **⚠️ Standing instruction — update on close.** Every PR that closes or materially changes the status
 > of a workstream in this matrix MUST update that row **and** re-stamp the Verified line in the SAME PR.
@@ -118,7 +119,7 @@ Columns: **WS · Delivers · Axis · Owner · Depends · Gates cutover? · Revie
 
 | WS | Delivers | Axis | Owner | Depends | Gates? | Reviewers | Status |
 |----|----------|:---:|-------|---------|:---:|-----------|--------|
-| **WS-0** | Reconciliation & **interlock certification** — re-verify every deferred item **against the tree**; certify interlock (a)/(b#2665)/(c)/(d)/(h); certify no in-flight engine-path ballot ships before the merge-gate closes; ratify HA §1c with the **ADR-1005 owner (Dave Rae)** — **DONE: ratified decoupled 2026-09-07** (dissent recorded-with-rebuttal); bottom out #2665 as the engine-gate's real open question | — | THIS | — | **predecessor of all** | architect + security-guardian | planned |
+| **WS-0** | Reconciliation & **interlock certification** — re-verify every deferred item **against the tree**; certify interlock (a)/(b#2665)/(c)/(d)/(h); certify no in-flight engine-path ballot ships before the merge-gate closes; ratify HA §1c with the **ADR-1005 owner (Dave Rae)** — **DONE: ratified decoupled 2026-09-07** (dissent recorded-with-rebuttal); bottom out #2665 as the engine-gate's real open question. **DONE 2026-09-08** — certification `docs/security-reviews/split-ws0-interlock-certification-2026-09-08.md`; merge-gate armed as a hard CI tripwire (`tests/test_split_interlock_tripwire.py` + `tests/split_interlock_ledger.json`, wired into `docs-lint.yml`) PLUS a routed-concern row; gate CLOSED (b/c/d/h red — (b) is #2665 deny-precedence + #2675 seam); no in-flight engine-path ballot; ADR-0032 cells (a)/(m) found STALE → #4124 | — | THIS | — | **predecessor of all** | architect + security-guardian | **done** |
 | **WS-A1** | Baseline execution-semantics repair (step 1); also interlock (i) | A | THIS | WS-0 | — | architect + cpp-safety | planned |
 | **WS-A2r** | In-process public-API contracts, **read/command paths** (step 2, read half) | A | THIS | WS-A1 | — | architect | planned |
 | **WS-A2a** | In-process **admission / grant / finalisation-receipt** contracts (step 2, admission half) — **under the standing merge-gate** | A | THIS | WS-A1, WS-A6(c/d/h) | — | architect + security-guardian | blocked on interlock |
