@@ -294,21 +294,47 @@ each backed by a metric verified present in the codebase and, where one
 ships, the exact Prometheus alert that pages on it: `docs/ops-runbooks/slo.md`.
 A first backup/restore drill has been **executed** (not merely documented)
 against the `pg_dump`/`pg_restore`/`tar` procedure already in
-`docker-compose.reference.yml`'s header, with measured RTO (42s, this run)
-and an explicit RPO framing (= backup cadence — see the gap below), plus a
-post-restore row-count and audit-chain integrity check:
-`docs/ops-runbooks/restore-drill-2026-09.md`. That drill surfaced two
-concrete gaps carried forward rather than closed: **(1) no scheduled backup
-job exists** (the procedure is a documented manual/scriptable command, not
-a cron/systemd-timer unit), and **(2) `docs/prometheus/yuzu-alerts.yml`'s
-61 alert rules were, until this change, evaluated by no shipped Prometheus
-stack at all** — closed for the UAT rig by the new
+`docker-compose.reference.yml`'s header, run **verbatim** (attempt 2, the
+primary transcript — an earlier attempt 1 that deviated from the header's
+exact commands is kept as a labelled appendix), with measured RTO (4m27s
+end-to-end; 3m30s of that is the header's own `docker compose down server`
+step alone, bound by `stop_grace_period: 210s` — the mechanical
+backup/restore work is ~23s) and an explicit RPO framing (= backup cadence
+— see the gap below), plus a post-restore row-count and audit-chain
+integrity check, including a deliberately-injected post-backup corruption
+row proven rolled back exactly by the restore (stronger evidence than a
+row-count match alone):
+`docs/ops-runbooks/restore-drill-2026-09.md`. **Caveat:** that audit-chain
+check verified the legacy SQLite `audit.db` chain, not the PostgreSQL
+`audit_store` schema (ADR-0040) — the drill's server image build predates
+that migration; see the runbook's "Image note" and "Gaps found" #6. That
+drill surfaced concrete gaps carried forward rather than closed: **(1) no
+scheduled backup job exists** (the procedure is a documented
+manual/scriptable command, not a cron/systemd-timer unit); **(2) the header
+procedure's own literal commands have four independent bugs** (runbook
+"Gaps found" #2-4b), confirmed by running the header's exact text, not by
+substituting different commands and describing them as the header's — a
+bare `-v server-data:/data`-style volume reference that does not account
+for Compose's project-name volume prefixing (silently backs up an empty
+auto-created volume instead of the real one); `pg_restore --role=yuzu`
+throwing 2 non-fatal `vector`-extension-ownership errors regardless of
+which user connects; the documented `docker compose down server` step
+taking 3m30s in this run (`stop_grace_period: 210s`, dominating the
+restore's wall-clock cost); and the restore section never restoring the
+certs volume its own backup section captures separately — all four filed
+against `docker-compose.reference.yml`, not fixed by this change; and
+**(3) `docs/prometheus/yuzu-alerts.yml`'s 115 alert rules + 1 recording
+rule (116 total, per `promtool check rules`) were, until this change,
+evaluated by no shipped Prometheus stack at all** — closed for the UAT rig
+by the new
 `deploy/docker/docker-compose.observability.yml` overlay (issue #2857;
 `promtool check rules` passes, `docker compose ... config` confirms the
-rules load). The Alertmanager-routing and alerts-file-checksum halves of
-#2857 remain open follow-ups, not addressed by this change. Incident
-response lifecycle and capacity plans for 1k/5k/10k+ agents remain
-undocumented — not addressed by this change, still open.
+rules load — that overlay applies to the UAT rig specifically;
+`docker-compose.reference.yml` ships no Prometheus at all). The
+Alertmanager-routing and alerts-file-checksum halves of #2857 remain open
+follow-ups, not addressed by this change. Incident response lifecycle and
+capacity plans for 1k/5k/10k+ agents remain undocumented — not addressed by
+this change, still open.
 
 ---
 

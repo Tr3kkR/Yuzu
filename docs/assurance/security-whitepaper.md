@@ -230,13 +230,18 @@ the exact Prometheus alert that pages on it: `docs/ops-runbooks/slo.md`. A
 backup/restore drill was executed (not merely described) against the
 documented `pg_dump`/`pg_restore`/`tar` procedure, with measured RTO/RPO and
 a row-count/audit-chain integrity check post-restore:
-`docs/ops-runbooks/restore-drill-2026-09.md`. The optional HA-Postgres
-profile's separately-measured failover figures:
+`docs/ops-runbooks/restore-drill-2026-09.md`. **Caveat carried from that
+drill:** the audit-chain integrity check verified the **legacy SQLite
+`audit.db`** chain, not the PostgreSQL `audit_store` schema (ADR-0040) —
+the drill's server image build predates that migration; see the drill
+runbook's "Image note" and "Gaps found" #4 for the full account and what
+re-running against a newer image would additionally prove. The optional
+HA-Postgres profile's separately-measured failover figures:
 `docs/user-manual/ha-postgres.md`.
 
 **Planned, not yet shipped:** a direct `/readyz`-content availability probe
 (today's proxy is Prometheus scrape health of the `/metrics` endpoint, not a
-dedicated blackbox probe of `/readyz` itself — tracked #2956); a second
+dedicated blackbox probe of `/readyz` itself — tracked #2459); a second
 server replica (ADR-2002 Phase B) to raise the single-replica 99.5%/30d
 availability target to 99.9%/30d; a scheduled (cron/systemd-timer) backup
 job (today's procedure is a documented manual/scriptable command, not an
@@ -274,18 +279,30 @@ ordering, kill switches, and audit pattern as every other ingress:
 `docs/mcp-server.md`. Tool annotations (destructive-hint truthfulness,
 bounded input/output schemas, honest `retry_after_ms`) are a machine-verifiable
 contract, not prose-only documentation — `docs/agentic-first-principle.md`
-invariant A5. **Planned:** a first-class MCP session concept (in-memory,
-principal-bound, TTL/caps, revocation cuts live streams) via ADR-1005
-execution-plan track 2f — not shipped as of this writing.
+invariant A5. **Correction — shipped, not planned:** a spec-compliant MCP
+**Streamable HTTP transport** — the session-lifecycle + transport pre-check
+half of ADR-1005 execution-plan Decision 15 / track 2f (in-memory,
+principal-bound session ids, GET SSE channel, `notifications/progress`) —
+**is live** (`server/core/src/mcp_transport.hpp`, `mcp_session.hpp`;
+`docs/mcp-server.md` "Phase 2.5 (Implemented — MCP Streamable HTTP
+transport, track 2f PR 1 + PR 2)"). Track 2f's Phase 3 (further hardening
+beyond PR 1/PR 2) remains planned — see `docs/mcp-server.md` for the
+current boundary between what has shipped and what hasn't within this
+track.
 
 ## 9. Headless platform posture (ADR-1005)
 
-Every capability is required to be reachable by an authenticated external
-principal via both versioned REST **and** MCP (or a recorded exception in
-the ADR-1005 ledger) — there is no UI-only capability surface, and
-on-behalf-of header assertions are rejected at every ingress except the four
-health-probe paths (so a header-stamping proxy cannot crash-loop the
-server). Full policy: `docs/adr/1005-headless-platform-use-case-engines.md`;
+**ADR-1005 is accepted (2026-09-07, #4099)** — as of the version anchor
+above, this is a `dev`-only fact; it has not reached a tagged release (see
+the version anchor at the top of this document). Once accepted, its
+requirement is that every capability be reachable by an authenticated
+external principal via both versioned REST **and** MCP (or a recorded
+exception in the ADR-1005 ledger) — there is no UI-only capability surface
+— and that on-behalf-of header assertions are rejected at every ingress
+except the four health-probe paths (so a header-stamping proxy cannot
+crash-loop the server). **Phase 7 (the NVD-sync strangler re-home) has not
+started** — do not represent that migration as complete or in-flight to a
+reviewer. Full policy: `docs/adr/1005-headless-platform-use-case-engines.md`;
 current phase status: `docs/adr-1005-execution-plan.md`.
 
 ---

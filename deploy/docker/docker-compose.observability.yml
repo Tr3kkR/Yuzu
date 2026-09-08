@@ -2,6 +2,20 @@
 # running Prometheus so the shipped alert rules are actually evaluated by a
 # live system rather than only promtool fixtures (#2857).
 #
+# REQUIRED WORKING DIRECTORY: deploy/docker/. This file's own bind-mount
+# paths (`./prometheus-observability.yml`, `../../docs/prometheus/...`) are
+# relative to THIS FILE's location (modern `docker compose` resolves each
+# `-f` file's relative paths against that file's own directory, not the
+# invoking shell's cwd) — layering it alongside docker-compose.uat.yml with
+# BOTH given as fully-qualified paths from elsewhere (e.g.
+# `-f deploy/docker/docker-compose.uat.yml -f deploy/docker/docker-compose.observability.yml`
+# run from the repo root) has been verified to resolve correctly; running
+# it with BARE filenames from any directory other than deploy/docker/ fails
+# to locate the `-f` files at all (loud, not silent) — the risk this note
+# guards against is a copy-pasted bare-filename command run from the wrong
+# directory, not a proven silent merge failure. When in doubt, `cd
+# deploy/docker` first, as below.
+#
 # Usage (layer on top of the base UAT rig — do NOT run standalone, it has no
 # `services:` of its own beyond the override below):
 #   cd deploy/docker
@@ -9,6 +23,10 @@
 #   docker compose -f docker-compose.uat.yml -f docker-compose.observability.yml config
 #     # confirm `rule_files:` + the rules mount are present in the merged
 #     # prometheus service before trusting `up -d` above.
+#
+# Applies to the UAT rig ONLY. `docker-compose.reference.yml` (the
+# production single-server template) ships no Prometheus service at all —
+# this overlay has nothing to attach to there.
 #
 # What this does: replaces the `prometheus` service's config-file mount
 # (same container-internal target path, ../prometheus/prometheus-uat.yml ->

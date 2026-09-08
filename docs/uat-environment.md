@@ -25,6 +25,32 @@ bash scripts/start-UAT.sh status   # show running processes
 
 `scripts/start-demo.sh` stands up a three-tier **chiselled** Docker stack (server + gateway + N agent replicas) from release-pinned GHCR images. **Cannot run alongside `start-viz-uat.sh` or `start-UAT.sh`** — all three bind host ports 8080 and 50051 (the launcher pre-checks and refuses to start if they are busy). Clean-start by default (wipes `/tmp/yuzu-demo/` + compose volumes); `--keep` preserves state. Distinct from the viz-UAT rig. The **agent-bundle** delivery image (`docs/agent-bundle.md`, `scripts/build-agent-bundle.sh`) ships the agent for `linux-x64` / `windows-x64` / `macos-arm64` to design partners who can only `docker pull` — published + cosign-signed + SBOM'd by the `docker-publish-agent-bundle` release job. Full runbook: `docs/demo-environment.md`.
 
+## Observability overlay (alert rules wired into UAT, #2857)
+
+`deploy/docker/docker-compose.observability.yml` layers onto the UAT rig
+(`docker-compose.uat.yml`) only — `docker-compose.reference.yml` (the
+production single-server template) ships no Prometheus service at all, so
+there is nothing for this overlay to attach to there. It replaces the UAT
+Prometheus config-file mount with `prometheus-observability.yml` (the same
+scrape config as `prometheus-uat.yml`, plus `rule_files:`) and mounts
+`docs/prometheus/yuzu-alerts.yml` read-only into the rules directory
+Prometheus already watches — so the 115 shipped alert rules + 1 recording
+rule are actually evaluated by a running Prometheus, not just parsed by
+`promtool` in CI. **Run it from `deploy/docker/`** (its own bind-mount
+paths are relative to that directory):
+
+```bash
+cd deploy/docker
+docker compose -f docker-compose.uat.yml -f docker-compose.observability.yml up -d
+docker compose -f docker-compose.uat.yml -f docker-compose.observability.yml config   # verify the merge before trusting up -d
+```
+
+Out of scope today, tracked as #2857 follow-ups: an Alertmanager (the
+`severity:` labels route nowhere without one) and a version marker/checksum
+on `yuzu-alerts.yml` so a deployed copy's drift from the shipped file is
+detectable. Only `docker-compose.uat.yml` is overlaid; `docker-compose.full-uat.yml`
+would need its own equivalent overlay, not shipped yet.
+
 ## Port assignments
 
 Server and gateway defaults do not conflict — all three components can run on the same box without overrides:

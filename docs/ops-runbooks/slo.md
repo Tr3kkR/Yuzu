@@ -28,7 +28,9 @@ no blackbox_exporter anywhere in `deploy/`, no `up`-based dead-man's-switch
 for the server process — `docs/ops-runbooks/audit-store-clock-guard.md`
 names this gap explicitly under `YuzuServerRestartLoop`: *"There is no
 dead-man's-switch (`up == 0`) rule for the server process in this file
-today (tracked: #2956)"*). The practical proxy is Prometheus's own scrape
+today (tracked: #2956)"* (quoted verbatim as that doc currently reads;
+**the live tracker for this gap has since moved to #2459** — cite #2459
+going forward, not #2956). The practical proxy is Prometheus's own scrape
 health of the `/metrics` endpoint on the same server process: `up{job="yuzu-server"}`
 (`deploy/prometheus/prometheus.yml` / `prometheus-uat.yml` / `prometheus-full-uat.yml`,
 job name `yuzu-server`). This proves the HTTP listener is alive; it does
@@ -36,7 +38,7 @@ job name `yuzu-server`). This proves the HTTP listener is alive; it does
 that is up but reporting a degraded store — e.g. `stores.audit` closed —
 would still show `up == 1` here). Closing that gap needs a blackbox-exporter
 job scraping `/readyz` directly and asserting on HTTP status, which is not
-part of this change — tracked as a follow-up alongside #2956.
+part of this change — tracked as a follow-up alongside #2459.
 
 **Target:** **99.5% / 30d for a single-replica deployment** (~3h39m of
 allowed downtime/month) — what ships today. Target rises to **99.9% / 30d**
@@ -54,7 +56,7 @@ listener — see that doc's "What you get").
 ```yaml
 # PROPOSED — NOT SHIPPED. Mirrors YuzuGatewayDown's up{job=~".*gateway.*"}==0
 # pattern (docs/prometheus/yuzu-alerts.yml) applied to the server job, closing
-# the gap #2956 names. For the PO/workflow owner to route into the real file.
+# the gap tracked in #2459. For the PO/workflow owner to route into the real file.
 - alert: YuzuServerDown
   expr: up{job="yuzu-server"} == 0
   for: 2m
@@ -103,9 +105,22 @@ alert's own window below).
 **Metric:** `yuzu_agents_connected` − `yuzu_fleet_agents_healthy` (both
 gauges, `server/core/src/agent_registry.cpp:191,349,369` and `:2237`
 respectively; described `server.cpp:498`). A positive value means agents are
-connected but not producing a recent heartbeat.
+connected but not producing a recent heartbeat. **Caveat:** the two gauges
+are independently updated (connect/disconnect events vs. a periodic
+healthy-count recomputation), so under churn — agents connecting and
+disconnecting in the same window the healthy-count sweep runs — the raw
+difference can transiently go **negative** (a stale, higher `healthy` count
+briefly outpacing a just-dropped `connected` count). That's harmless for
+the existing `> 0` alert threshold below (a negative value also fails
+`> 0`, so it never falsely pages), but an SLO **error-budget quantity**
+built from this metric should use `clamp_min(yuzu_agents_connected -
+yuzu_fleet_agents_healthy, 0)` — treat "stale-connected agents" as never
+less than zero — rather than the raw signed difference, which would
+otherwise let a negative reading offset/cancel a real positive reading when
+averaged over a window.
 
-**Target:** 0 stale-connected agents for ≥99.5% of time / 30d.
+**Target:** 0 stale-connected agents for ≥99.5% of time / 30d (computed on
+the `clamp_min(..., 0)` form above).
 
 **Window:** 30-day rolling.
 
@@ -253,5 +268,6 @@ that does, for the UAT rig).
 - `docs/ops-runbooks/restore-drill-2026-09.md` — the executed backup/restore
   drill and its measured RTO/RPO for the non-HA, single-replica deployment
   this document's §1 target describes.
-- Issue #2956 — the server dead-man's-switch gap this document's §1 proposed
-  alert would close.
+- Issue #2459 — the server dead-man's-switch gap this document's §1 proposed
+  alert would close (the same gap `docs/ops-runbooks/audit-store-clock-guard.md`
+  names against #2956; that citation moved to #2459 — see §1 above).
