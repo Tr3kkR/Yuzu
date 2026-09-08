@@ -34,6 +34,7 @@
 #include "ca_routes.hpp"
 #include "ca_store.hpp"
 #include "default_certs.hpp"
+#include "sso_boot_guard.hpp" // saml_config_complete — shared with the sso-only boot guard
 #include "kek_op_lock.hpp"
 #include "kek_rotate_control.hpp"
 #include "kek_routes.hpp"
@@ -3769,12 +3770,12 @@ public:
                              cfg_.saml_group_attribute, cfg_.saml_admin_group);
             }
 
-            const bool saml_config_complete = !cfg_.saml_idp_sso_url.empty() &&
-                                              !cfg_.saml_idp_cert.empty() &&
-                                              !cfg_.saml_sp_entity_id.empty() &&
-                                              !cfg_.saml_sp_acs_url.empty() &&
-                                              !cfg_.saml_idp_entity_id.empty();
-            if (saml_config_complete) {
+            // Single source of truth for "SAML SP config is complete" — shared
+            // with the --auth-mode=sso-only boot guard (sso_boot_guard.hpp) so the
+            // two predicates can never drift. The bare 5-field check stays here
+            // (HTTPS is handled by the explicit gate just below) so a complete-
+            // but-plaintext config still reaches the HTTPS-disabled error path.
+            if (yuzu::server::saml_config_complete(cfg_)) {
                 // HTTPS gate: SAML ACS is delivered over the browser's back-channel
                 // POST.  The __Host-yuzu_saml_bind binding cookie requires Secure
                 // attribute (baked into the cookie string) which browsers only send
@@ -3904,6 +3905,10 @@ public:
                        !cfg_.saml_sp_entity_id.empty() || !cfg_.saml_sp_acs_url.empty() ||
                        !cfg_.saml_idp_entity_id.empty()) {
                 // Partial config — warn so the operator knows which flags are missing.
+                // NB: this OR-list is the COMPLEMENT of saml_config_complete()
+                // (some-but-not-all set), so it cannot call that predicate; if a
+                // sixth required SAML field is ever added there, add it here too —
+                // the two field lists are coupled by construction.
                 spdlog::warn("SAML: incomplete configuration (need --saml-idp-sso-url, "
                              "--saml-idp-cert, --saml-sp-entity-id, --saml-sp-acs-url, "
                              "--saml-idp-entity-id) — SAML login disabled");
