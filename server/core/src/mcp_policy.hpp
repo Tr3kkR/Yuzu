@@ -20,6 +20,31 @@ inline bool tier_allows(std::string_view mcp_tier,
                         std::string_view operation) {
     if (mcp_tier.empty()) return true;  // Not an MCP token
 
+    // #4028/#520: server-administration securables are excluded from EVERY
+    // MCP tier, including readonly Reads. Without this, an admin-owned MCP
+    // token (any tier) would satisfy tier_allows(Read) below, fall through
+    // require_permission's topology-floor legacy-role check (which admits
+    // any session — MCP-tier included — whose effective_role is admin;
+    // see auth_routes.cpp's "an admin's MCP token passes the floor here...
+    // that is intended, not a gap to fix" note), and reach settings data
+    // that require_admin's own #520 comment names explicitly: "MCP tokens
+    // ... must not be used to administer the server itself (settings,
+    // users, TLS, OIDC)". The settings read-twins (#4028) hardened one of
+    // these routes (GET /api/v2/agent/plugin-policy — its deprecated
+    // /v1/ predecessor is frozen back on require_admin, #4144) off
+    // require_admin (which rejected every mcp_tier token outright) onto
+    // require_permission
+    // — this deny-list is what keeps that hardening from silently widening
+    // MCP-token reach into TLS/plugin-signing/server-process/analytics
+    // config. AccessReview/UserManagement/EnginePrincipal are a DIFFERENT,
+    // already-accepted category (authorization-topology reads, not
+    // server-administration) that deliberately keeps the admin-MCP-token
+    // reachability described above — see docs/auth-architecture.md.
+    if (securable_type == "TlsConfig" || securable_type == "PluginSigning" ||
+        securable_type == "ServerConfig" || securable_type == "AnalyticsConfig") {
+        return false;
+    }
+
     // ── readonly: only Read operations ──────────────────────────────────
     if (mcp_tier == "readonly") {
         return operation == "Read";
