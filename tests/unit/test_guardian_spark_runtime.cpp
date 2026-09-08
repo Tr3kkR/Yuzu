@@ -3916,8 +3916,19 @@ TEST_CASE("concurrent pagers + a drainer do not race (TSan checkpoint)",
 
     // Functional stop-gate check, sequential on main: a pass AFTER request_stop() must
     // not enqueue anything - proving the gate actually holds, not merely that nothing
-    // raced while it was up.
-    const auto post_stop = rig.journal->page_into_window(*rig.rt, kBaseTs + 2'000'000);
+    // raced while it was up. Seeds a BRAND-NEW batch first, far ahead of any timestamp
+    // this run's pruner or pagers ever used (#4153 mutation-testing round, second fix:
+    // the FIRST fix - seeding near kBaseTs - was still not a clean test, because the
+    // concurrent pruner's own clock (now far advanced, ~kBaseTs + 300 * 30'000'000ms)
+    // had already pushed page_into_window's replay-skip cutoff (last_age_cutoff_) well
+    // past kBaseTs; a batch seeded there reads as "retention will delete this anyway"
+    // and is skipped by THAT heuristic, not by the stop gate - so the check passed even
+    // with BOTH of page_into_window's stopping_ checks deleted outright, for the wrong
+    // reason. A timestamp this far beyond anything the run's clocks ever reached cannot
+    // be mistaken for already-expired by any cutoff this run could have computed).
+    constexpr std::int64_t kPostStopTs = 9'000'000'000'000;
+    rig.seed_batch(kPostStopTs, "poststop", 0, "poststop");
+    const auto post_stop = rig.journal->page_into_window(*rig.rt, kPostStopTs + 500'000);
     CHECK(post_stop.records_paged == 0);
 }
 
