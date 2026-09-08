@@ -391,6 +391,35 @@ TEST_CASE("autoruns: parse_task_xml does not confuse <Actions> with a longer tag
     CHECK(info.actions.empty());
 }
 
+TEST_CASE("autoruns: a raw '>' or '/>' inside a QUOTED attribute value does not defeat "
+          "tag detection (RECONSTRUCTION: pins round 7's blocker -- XML 1.0 permits a raw "
+          "'>' inside a quoted attribute value, only '<' and '&' must be escaped there, and "
+          "Task Scheduler's trigger/action Id/id attributes are plain xs:string, so both "
+          "shapes are schema-valid; the round-5 exact-'>'-scan mistook an in-quote '>' for "
+          "the tag terminator (dropping a live trigger as 'truncated') and an in-quote '/>' "
+          "for a genuine self-close (silently discarding the element's real content))",
+          "[autoruns][parsers]") {
+    SECTION("a '>' inside the quoted Id value -- must not be read as the tag terminator, "
+            "and the trigger must still be found as a real (non-self-closed) element") {
+        const std::string xml =
+            "<Task><Triggers><LogonTrigger Id=\"a>b\"><Enabled>true</Enabled>"
+            "</LogonTrigger></Triggers></Task>";
+        CHECK(parse_task_xml(xml).has_triggers);
+    }
+
+    SECTION("a '/>' sequence inside the quoted id value -- must not be read as a genuine "
+            "self-close, so the action's real Command/Arguments still reach the row") {
+        const std::string xml =
+            "<Task><Actions Context=\"Author\">"
+            "<Exec id=\"a/>b\"><Command>C:\\payload.exe</Command><Arguments>-x</Arguments></Exec>"
+            "</Actions></Task>";
+        const auto info = parse_task_xml(xml);
+        REQUIRE(info.actions.size() == 1);
+        CHECK(info.actions[0].command == "C:\\payload.exe");
+        CHECK(info.actions[0].arguments == "-x");
+    }
+}
+
 TEST_CASE("autoruns: parse_task_xml decodes the 5 predefined XML entities in "
           "Command/Arguments (RECONSTRUCTION: pins round 5's minor finding -- get_Xml's "
           "raw markup escapes reserved characters, and leaving them un-decoded breaks "

@@ -757,12 +757,14 @@ void collect_startup_folder(const std::wstring& dir, SourceId id, Scope scope,
         return;
     }
     std::size_t count = 0;
+    bool capped = false;
     do {
         const std::wstring name = find_data.cFileName;
         if (name == L"." || name == L"..") continue;
         if (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
         if (count >= kMaxStartupFolderEntries) {
             note_constraint(outcome, "row_cap");
+            capped = true;
             break;
         }
         Row row;
@@ -779,6 +781,17 @@ void collect_startup_folder(const std::wstring& dir, SourceId id, Scope scope,
         outcome.rows.push_back(std::move(row));
         ++count;
     } while (FindNextFileW(find.get(), &find_data));
+    // FindNextFileW returning FALSE means either a clean end of the listing
+    // (GetLastError()==ERROR_NO_MORE_FILES) or a real I/O error partway
+    // through -- indistinguishable from the loop-exit condition alone, and
+    // a real error must not be silently reported as a complete listing.
+    // Only meaningful when the loop ended via that FALSE return, not via the
+    // row_cap break above -- GetLastError() after a successful FindNextFileW
+    // call is unspecified, so checking it post-break would be a false read.
+    if (!capped) {
+        if (const DWORD err = GetLastError(); err != ERROR_NO_MORE_FILES)
+            note_constraint(outcome, "enumeration_error");
+    }
 }
 
 // ── 7. Scheduled Tasks (ITaskService) ────────────────────────────────────

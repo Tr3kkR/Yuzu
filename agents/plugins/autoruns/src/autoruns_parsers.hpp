@@ -589,6 +589,34 @@ inline std::optional<std::string> extract_tag(std::string_view xml, std::string_
 }
 
 /// Like extract_tag, but the opening tag may carry attributes (e.g.
+/// Finds the position of a tag's REAL terminating '>' starting the scan at
+/// `from`, tracking open/close-quote state so a `>` inside a quoted
+/// attribute value is never mistaken for the tag's end. XML 1.0 permits a
+/// raw `>` inside a quoted attribute value (only `<` and `&` must be
+/// escaped there), and Task Scheduler's trigger/action `Id`/`id` attributes
+/// are plain `xs:string` -- so `<LogonTrigger Id="a>b"/>` and
+/// `<Exec id="a/>b">` are both schema-valid and, before this function
+/// existed, defeated the bare `xml.find('>', start)` this file's two
+/// tag-scanning helpers both used: an in-quote `>` was mistaken for the
+/// terminator (leaving the real close tag unfound -- "truncated", a live
+/// trigger reported disabled), and an in-quote `/>` was mistaken for a
+/// genuine self-close (silently dropping the element's real content --  a
+/// live task's Command/Arguments vanishing from the row). Returns npos if
+/// the tag is truncated (no unquoted '>' before the document ends).
+inline std::size_t find_tag_end(std::string_view xml, std::size_t from) {
+    char quote = '\0';
+    for (std::size_t i = from; i < xml.size(); ++i) {
+        const char c = xml[i];
+        if (quote != '\0') {
+            if (c == quote) quote = '\0';
+            continue;
+        }
+        if (c == '"' || c == '\'') { quote = c; continue; }
+        if (c == '>') return i;
+    }
+    return std::string_view::npos;
+}
+
 /// `<Actions Context="Author">`), which extract_tag's exact `<tag>` match
 /// would miss entirely. Returns the CONTENT span between the opening tag's
 /// '>' and the matching closing tag -- nullopt if the opening or closing
@@ -607,7 +635,7 @@ inline std::optional<std::string_view> extract_tagged_block(std::string_view xml
         start = xml.find(open_prefix, start + 1);
     }
     if (start == std::string_view::npos) return std::nullopt;
-    const std::size_t gt = xml.find('>', start);
+    const std::size_t gt = find_tag_end(xml, start);
     if (gt == std::string_view::npos) return std::nullopt;
     if (gt > 0 && xml[gt - 1] == '/') return std::string_view{}; // self-closed: empty content
     const std::string close = "</" + std::string{tag} + ">";
@@ -646,7 +674,7 @@ inline std::vector<std::string_view> find_all_tagged_blocks(std::string_view xml
             start = xml.find(open_prefix, start + 1);
         }
         if (start == std::string_view::npos) break;
-        const std::size_t gt = xml.find('>', start);
+        const std::size_t gt = find_tag_end(xml, start);
         if (gt == std::string_view::npos) break; // truncated: stop, keep what's already found
         if (gt > 0 && xml[gt - 1] == '/') {
             out.push_back(std::string_view{}); // self-closed: empty content

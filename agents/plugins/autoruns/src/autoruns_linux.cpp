@@ -211,6 +211,9 @@ DirListing list_dir(const std::string& path, std::size_t cap = kMaxDirEntries) {
             if (d) ::closedir(d);
         }
     } guard{d};
+    errno = 0; // readdir() only sets errno on failure -- must be cleared first to
+               // tell "a real I/O error stopped the scan early" apart from "clean
+               // end of directory", which a bare null-return check cannot do.
     while (struct dirent* ent = ::readdir(d)) {
         std::string_view name{ent->d_name};
         if (name == "." || name == "..") continue;
@@ -229,6 +232,14 @@ DirListing list_dir(const std::string& path, std::size_t cap = kMaxDirEntries) {
         }
         out.names.emplace_back(name);
     }
+    // The loop above can also end because readdir() itself failed partway
+    // through (a real I/O error, e.g. the underlying filesystem going away
+    // mid-scan) -- indistinguishable from a clean end-of-directory by the
+    // null-return check alone. Folded into the SAME `truncated` signal
+    // every caller already escalates to Constrained on: a partial listing
+    // from either cause must never be reported as a complete Supported
+    // result.
+    if (errno != 0) out.truncated = true;
     return out;
 }
 
@@ -269,6 +280,11 @@ bool source_wanted(std::string_view filter, SourceId id) {
 struct WantsListing {
     std::string text; // "<name>[ -> <target>]\n" per entry -- see autoruns_parsers.hpp:timer_enabled_from_wants
     bool opened = false;
+    bool enumeration_error = false; // readdir() failed partway through -- the listing
+                                    // is genuinely incomplete, distinct from "opened
+                                    // fine, nothing here"; a caller must not treat
+                                    // `opened && no match found` as a confident
+                                    // Enabled::disabled when this is set.
 };
 
 WantsListing build_wants_listing(const std::string& wants_dir) {
@@ -283,6 +299,7 @@ WantsListing build_wants_listing(const std::string& wants_dir) {
         }
     } guard{d};
     std::size_t count = 0;
+    errno = 0;
     while (struct dirent* ent = ::readdir(d)) {
         if (count >= kMaxDirEntries) break;
         std::string_view name{ent->d_name};
@@ -298,7 +315,9 @@ WantsListing build_wants_listing(const std::string& wants_dir) {
         }
         out.text += '\n';
         ++count;
+        errno = 0;
     }
+    if (errno != 0) out.enumeration_error = true;
     return out;
 }
 
@@ -346,16 +365,25 @@ Enabled timer_enabled(const std::string& unit_dir, const std::string& timer_file
     }
 
     bool any_opened = false;
+    bool any_enumeration_error = false;
     for (const auto& base : wants_base_dirs) {
         auto w1 = build_wants_listing(base + "/timers.target.wants");
         any_opened |= w1.opened;
+        any_enumeration_error |= w1.enumeration_error;
         if (w1.opened && timer_enabled_from_wants(w1.text, timer_filename)) return Enabled::enabled;
         if (!wanted_by.empty()) {
             auto w2 = build_wants_listing(base + "/" + wanted_by + ".wants");
             any_opened |= w2.opened;
+            any_enumeration_error |= w2.enumeration_error;
             if (w2.opened && timer_enabled_from_wants(w2.text, timer_filename)) return Enabled::enabled;
         }
     }
+    // A wants directory that failed partway through enumeration may have
+    // missed the very symlink that would have proven this timer enabled --
+    // reporting a confident `disabled` there is the same false-negative
+    // "live persistence mechanism read as inert" defect class this file's
+    // other fixes exist to close.
+    if (any_enumeration_error) return Enabled::unknown;
     return any_opened ? Enabled::disabled : Enabled::unknown;
 }
 

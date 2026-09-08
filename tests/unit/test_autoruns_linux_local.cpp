@@ -283,6 +283,17 @@ TEST_CASE("autoruns Linux leg: systemd sources are self-consistent with /run/sys
         // the row count each carries depends on the host's real unit dirs.
         CHECK(sys_st->reason != "no_systemd");
         CHECK(usr_st->reason != "no_systemd");
+
+        // lnx_systemd_timers_user is a permanent catalog-declared exception
+        // (autoruns_catalog.hpp) -- CONSTRAINED with narrow_search_path_coverage
+        // named in the reason on every reportable path, real ones included.
+        // Drives the ACTUAL collect_linux integration points via a live
+        // dispatch (RECONSTRUCTION: pins round 7's should-fix -- the
+        // apply_narrow_search_path_coverage TEST_CASE above only calls the
+        // function directly, so a later edit removing one of the three real
+        // call sites would leave that test green while this one catches it).
+        CHECK(usr_st->status == "constrained");
+        CHECK(usr_st->reason.find("narrow_search_path_coverage") != std::string::npos);
     }
 }
 

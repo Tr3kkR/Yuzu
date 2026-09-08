@@ -289,6 +289,9 @@ DirWalkOutcome walk_plist_dir_handle(const DirHandle& dir, OnPlist&& on_plist) {
     const int dfd = dirfd(dir.get());
     std::size_t seen = 0;
     struct dirent* entry = nullptr;
+    errno = 0; // readdir() only sets errno on failure -- cleared first so a real
+               // I/O error stopping the scan early can be told apart from a clean
+               // end of directory, which a bare null-return check cannot do.
     while (seen < kMaxEntriesPerDir && (entry = readdir(dir.get())) != nullptr) {
         ++seen;
         const std::string_view name(entry->d_name);
@@ -302,11 +305,15 @@ DirWalkOutcome walk_plist_dir_handle(const DirHandle& dir, OnPlist&& on_plist) {
                 outcome.file_constrained = true;
                 outcome.file_constrained_reason = read_outcome.reason;
             }
+            errno = 0; // read_file_bounded may itself have set errno
             continue;
         }
         on_plist(entry->d_name, bytes, mtime);
+        errno = 0;
     }
-    outcome.truncated = seen >= kMaxEntriesPerDir && readdir(dir.get()) != nullptr;
+    const bool readdir_error = errno != 0; // captured before the cap lookahead below
+    outcome.truncated =
+        (seen >= kMaxEntriesPerDir && readdir(dir.get()) != nullptr) || readdir_error;
     return outcome;
 }
 
@@ -348,17 +355,24 @@ DirConstraint walk_dir_names(const std::string& dir_path, OnEntry&& on_entry) {
     const int dfd = dirfd(open.handle.get());
     std::size_t seen = 0;
     struct dirent* entry = nullptr;
+    errno = 0;
     while (seen < kMaxEntriesPerDir && (entry = readdir(open.handle.get())) != nullptr) {
         ++seen;
         const std::string_view name(entry->d_name);
         if (name == "." || name == "..") continue;
         struct stat st{};
-        if (fstatat(dfd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) continue;
+        if (fstatat(dfd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+            errno = 0; // fstatat may itself have set errno
+            continue;
+        }
         if (!S_ISREG(st.st_mode) && !S_ISLNK(st.st_mode)) continue;
         on_entry(entry->d_name, static_cast<std::int64_t>(st.st_mtime));
+        errno = 0;
     }
+    const bool readdir_error = errno != 0;
     if (seen >= kMaxEntriesPerDir && readdir(open.handle.get()) != nullptr)
         return DirConstraint{true, "row_cap"};
+    if (readdir_error) return DirConstraint{true, "readdir_error"};
     return DirConstraint{};
 }
 
@@ -502,8 +516,17 @@ DirCollectOutcome collect_user_launchagents(yuzu::CommandContext& ctx) {
     if (!users_open.handle.valid()) return outcome;
     std::size_t seen = 0;
     struct dirent* entry = nullptr;
+    errno = 0;
     while (seen < kMaxEntriesPerDir && (entry = readdir(users_open.handle.get())) != nullptr) {
         ++seen;
+        // Resets errno to 0 on EVERY exit from this iteration (any of the
+        // several `continue`s below, or falling off the end) -- the body
+        // makes many syscalls that can themselves set errno, and only the
+        // NEXT readdir() call's own errno (checked once, after the loop
+        // ends) is meant to answer "did the scan stop on a real error".
+        struct ErrnoResetGuard {
+            ~ErrnoResetGuard() { errno = 0; }
+        } reset_errno_guard;
         const std::string_view name(entry->d_name);
         if (name == "." || name == "..") continue;
         const std::string home = std::string{kUsersDir} + "/" + entry->d_name;
@@ -539,8 +562,10 @@ DirCollectOutcome collect_user_launchagents(yuzu::CommandContext& ctx) {
         if (result.truncated) note_dir_constraint(outcome, "row_cap");
         if (result.file_constrained) note_dir_constraint(outcome, result.file_constrained_reason);
     }
+    const bool readdir_error = errno != 0;
     if (seen >= kMaxEntriesPerDir && readdir(users_open.handle.get()) != nullptr)
         note_dir_constraint(outcome, "row_cap");
+    if (readdir_error) note_dir_constraint(outcome, "readdir_error");
     return outcome;
 }
 
