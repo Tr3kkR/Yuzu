@@ -178,6 +178,12 @@ def main() -> int:
         # tripwire returns PASS → this assertion fails. `compute_plan_hash` stays
         # `excluded` in the real ledger, so this proves RULE 1 without a false positive there.
         r1 = json.loads(json.dumps(ledger))
+        # Force every gate cell red so the probe is valid regardless of the LIVE ledger's
+        # state — once WS-A6 flips the real gate green, RULE 1 no-ops and this probe would
+        # otherwise misfire. Forcing red also leaves no green cell, so RULE 2 greps nothing
+        # and the only possible failure is RULE 1 firing on the injected marker.
+        for _c in r1["gate_set"]:
+            r1["cells"][_c]["status"] = "red"
         r1["engine_path_markers"]["__rule1_fires_probe__"] = {"regex": "compute_plan_hash"}
         rc = _run_tripwire(_write(r1, "rule1_probe.json", td))
         if rc != TRIPWIRE_VIOLATION:
