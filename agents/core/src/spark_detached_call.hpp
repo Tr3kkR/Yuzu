@@ -182,12 +182,20 @@ struct Cell {
     bool done{false};      // guarded by mu
     bool taken{false};     // guarded by mu
     bool abandoned{false}; // guarded by mu
-    std::unique_ptr<DetachedResult<T>> result; // guarded by mu; MOVED-FROM (not null) after
-                                               // take() - see take_locked()'s own comment for
-                                               // why the pointer itself is deliberately never
-                                               // reset (governance Gate 8 finding: this comment
-                                               // said "null after take()" and was made false by
-                                               // this same round's take_locked() fix)
+    std::unique_ptr<DetachedResult<T>> result; // guarded by mu. `taken` is the SOLE re-entry/
+                                               // validity gate for this field, independent of
+                                               // its nullness: it can be null (never boxed, a
+                                               // ResultAllocFailed publish), moved-from-non-null
+                                               // (an ordinary take_locked() success), or
+                                               // moved-from-and-null (dispose_or_abandon()'s
+                                               // published-but-untaken path) once `taken` is
+                                               // true - see take_locked()'s own comment for why
+                                               // the pointer is deliberately never reset
+                                               // (Gate 4 re-review finding: an earlier version
+                                               // of THIS comment claimed a blanket "not null
+                                               // after take()", true of only one of those three
+                                               // reachable states - dropped the nullability
+                                               // claim rather than re-narrowing it again)
 };
 
 /// Shared per-lane state: the admission cap/count, the shared agent-lifetime

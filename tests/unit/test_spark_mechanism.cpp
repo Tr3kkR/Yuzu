@@ -4039,32 +4039,30 @@ struct EstablishChurnWatch {
     EstablishChurnWatch() = default;
     EstablishChurnWatch(const EstablishChurnWatch&) = delete;
     EstablishChurnWatch& operator=(const EstablishChurnWatch&) = delete;
-    // Movable, NOT deleted (unlike a first draft of this fix): std::vector<>
-    // ::resize()'s contract requires MoveInsertable regardless of whether a
-    // given call actually reallocates, so a non-movable element type risks
-    // failing to compile at the resize() call site below. Transfers
-    // ownership and nulls the source (same shape as SlowDtor's move ctor
-    // elsewhere in this repo's tests), so the moved-from object's
-    // destructor becomes a safe no-op - no double-close risk. In practice
-    // this is never exercised: EstablishHiveLoad's ctor resize()s ONCE from
-    // empty, before any address is captured by CreateThreadpoolWait, so no
-    // element is ever moved after its address is registered with the OS.
+    // Move-CONSTRUCTIBLE, NOT deleted (unlike a first draft of this fix):
+    // std::vector<>::resize()'s contract requires MoveInsertable regardless
+    // of whether a given call actually reallocates, so a non-movable
+    // element type risks failing to compile at the resize() call site
+    // below. Transfers ownership and nulls the source (same shape as
+    // SlowDtor's move ctor elsewhere in this repo's tests), so the
+    // moved-from object's destructor becomes a safe no-op - no double-close
+    // risk. In practice this is never exercised: EstablishHiveLoad's ctor
+    // resize()s ONCE from empty, before any address is captured by
+    // CreateThreadpoolWait, so no element is ever moved after its address
+    // is registered with the OS.
     EstablishChurnWatch(EstablishChurnWatch&& o) noexcept
         : hkey(o.hkey), event(o.event), wait(o.wait), stop(o.stop) {
         o.event = nullptr;
         o.wait = nullptr;
     }
-    EstablishChurnWatch& operator=(EstablishChurnWatch&& o) noexcept {
-        if (this != &o) {
-            hkey = o.hkey;
-            event = o.event;
-            wait = o.wait;
-            stop = o.stop;
-            o.event = nullptr;
-            o.wait = nullptr;
-        }
-        return *this;
-    }
+    // Move-assignment is deliberately DELETED, not defaulted/hand-rolled
+    // (Gate 4 re-review finding): resize()'s MoveInsertable requirement
+    // needs only the move constructor above - it never move-ASSIGNS an
+    // existing element. A hand-rolled assignment operator here would repeat
+    // the exact "overwrite without disposing the target's prior owned
+    // state" defect this same round fixed for DetachedCall::operator=,
+    // except with no call site to ever exercise or test it.
+    EstablishChurnWatch& operator=(EstablishChurnWatch&&) = delete;
 
     ~EstablishChurnWatch() {
         if (wait) {
@@ -4088,21 +4086,27 @@ struct EstablishChurnWatch {
     // SAME object - a genuine use-after-close, not merely a benign
     // duplicate notification. This harness's own comment elsewhere claims
     // it "mirrors spark_registry.cpp's reconcile() ordering," but
-    // production's equivalent race-freedom argument rests on a real
-    // mutex-guarded active flag (spark_registry.cpp's mu_), not on
-    // cancel+drain alone - and that production pattern's own correctness
-    // is ITSELF flagged as unverified-on-Windows elsewhere in this project
-    // (tracked as "T6" in `~/.claude/plans/let-s-take-a-step-jazzy-
-    // jellyfish.md`, a session-local, uncommitted delivery-plan file - see
-    // that same document for this harness's own governance history), so
-    // mechanically copying an unverified production pattern into this
-    // harness would not actually establish safety here either. Fixing
+    // production's equivalent race-freedom rests on a real mutex-guarded
+    // active flag (spark_registry.cpp's mu_, confirmed gating re-arm at
+    // unwatch()/stop() - not independently re-verified end-to-end on
+    // Windows in this session), not on cancel+drain alone; this harness
+    // has no equivalent flag, so mechanically copying production's
+    // cancel+drain shape does not by itself establish safety here. Fixing
     // this needs real Windows hardware to verify against, not a guess
     // from a Linux session with no compiler for this file - recorded here
     // for whoever runs this harness on DGRHP, not silently hidden. This
-    // harness-local instance is distinct from T6 (T6 is production's
-    // spark_registry.cpp; this is test-only code) and does not yet have
-    // its own tracked issue.
+    // harness-local instance does not yet have its own tracked issue, and
+    // is a DIFFERENT concern from "T6" in `~/.claude/plans/let-s-deliver-
+    // this-claude-plans-spark-20-shiny-jellyfish.md` (this PR's own
+    // delivery-plan authority, also cited at the top of docs/spark-
+    // rebuild-baselines/stage2-watch-establish-latency.md): T6 names a
+    // production deadlock - unwatch() holding the per-type lock
+    // (mech_ops_mu_by_type_) waiting on a callback drain, while that
+    // callback is itself parked inside an inline consumer trying to
+    // re-arm and hitting the same per-type lock. This harness has no
+    // per-type lock at all, so T6 does not cover this race; it's named
+    // here only so a reader chasing "what else is unverified in this
+    // delivery" lands on the right document and the right concern.
     static void CALLBACK on_fire(PTP_CALLBACK_INSTANCE, void* ctx, PTP_WAIT, TP_WAIT_RESULT) {
         auto* self = static_cast<EstablishChurnWatch*>(ctx);
         if (self->stop->load(std::memory_order_relaxed))
