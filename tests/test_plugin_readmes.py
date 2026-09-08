@@ -41,7 +41,7 @@ import plugin_doc_gen as g  # noqa: E402
 
 # Every plugin directory minus the pilots (disk_actions, firewall). DECREASE
 # this as READMEs land; it cannot be increased without a reviewed decision.
-RATCHET_BASELINE_MISSING = 49
+RATCHET_BASELINE_MISSING = 0
 
 def missing_readmes(repo: Path) -> list[str]:
     return [n for n in g.plugin_dirs(repo) if not (repo / "agents" / "plugins" / n / "README.md").exists()]
