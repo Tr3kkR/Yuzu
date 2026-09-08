@@ -418,6 +418,55 @@ TEST_CASE("autoruns: parse_crontab rejects and counts a 4-field line", "[autorun
     CHECK(result.rejected_lines == 1);
 }
 
+TEST_CASE("autoruns: parse_crontab recognizes @reboot in system-format text",
+          "[autoruns][parsers]") {
+    const std::string text = "@reboot root /usr/bin/true\n";
+    const auto result = parse_crontab(text, /*system_format=*/true);
+    REQUIRE(result.entries.size() == 1);
+    CHECK(result.entries[0].schedule == "@reboot");
+    CHECK(result.entries[0].user == "root");
+    CHECK(result.entries[0].command == "/usr/bin/true");
+    CHECK(result.rejected_lines == 0);
+}
+
+TEST_CASE("autoruns: parse_crontab recognizes @reboot in a per-user crontab",
+          "[autoruns][parsers]") {
+    const std::string text = "@reboot /usr/bin/true\n";
+    const auto result = parse_crontab(text, /*system_format=*/false);
+    REQUIRE(result.entries.size() == 1);
+    CHECK(result.entries[0].schedule == "@reboot");
+    CHECK(result.entries[0].user == "-");
+    CHECK(result.entries[0].command == "/usr/bin/true");
+    CHECK(result.rejected_lines == 0);
+}
+
+TEST_CASE("autoruns: parse_crontab recognizes every crontab(5) nickname and "
+          "keeps a multi-word command intact",
+          "[autoruns][parsers]") {
+    const std::string text =
+        "@yearly /usr/bin/a\n"
+        "@annually /usr/bin/b\n"
+        "@monthly /usr/bin/c\n"
+        "@weekly /usr/bin/d\n"
+        "@daily /usr/bin/e --flag arg\n"
+        "@midnight /usr/bin/f\n"
+        "@hourly /usr/bin/g\n";
+    const auto result = parse_crontab(text, /*system_format=*/false);
+    REQUIRE(result.entries.size() == 7);
+    CHECK(result.entries[4].schedule == "@daily");
+    CHECK(result.entries[4].command == "/usr/bin/e --flag arg");
+    CHECK(result.rejected_lines == 0);
+}
+
+TEST_CASE("autoruns: parse_crontab rejects a nickname line missing its command",
+          "[autoruns][parsers]") {
+    // A nickname with nothing after it (or, in system format, no command
+    // after the user) is still malformed and must be counted, not dropped.
+    const auto result = parse_crontab("@reboot\n", /*system_format=*/false);
+    CHECK(result.entries.empty());
+    CHECK(result.rejected_lines == 1);
+}
+
 // ── 10. parse_anacrontab ──────────────────────────────────────────────────
 
 TEST_CASE("autoruns: parse_anacrontab parses period/delay/job/command "

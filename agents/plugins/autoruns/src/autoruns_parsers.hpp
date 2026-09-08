@@ -694,6 +694,20 @@ inline bool is_comment_or_blank_or_assignment(std::string_view line) {
     return first.find('=') != std::string_view::npos;
 }
 
+// crontab(5) nickname shortcuts -- each replaces the 5 schedule fields with
+// a single leading token, so a line using one tokenizes far shorter than
+// the 5-field form and must be recognized before the field-count check.
+inline bool is_cron_nickname(std::string_view token) {
+    static constexpr std::string_view kNicknames[] = {
+        "@reboot", "@yearly", "@annually", "@monthly",
+        "@weekly", "@daily",  "@midnight", "@hourly",
+    };
+    for (auto n : kNicknames) {
+        if (token == n) return true;
+    }
+    return false;
+}
+
 } // namespace detail
 
 /// Parses crontab(5) text. `system_format` selects the 6-field shape
@@ -716,7 +730,23 @@ inline CrontabParseResult parse_crontab(std::string_view text, bool system_forma
             continue;
         }
         auto tokens = detail::split_ws(line, required);
-        if (tokens.size() < required) {
+        if (!tokens.empty() && detail::is_cron_nickname(tokens[0])) {
+            // Nickname form: "@reboot [user] command" -- 2 fields (per-user)
+            // or 3 (system), never the 5-field schedule shape.
+            const std::size_t nick_required = system_format ? 3 : 2;
+            auto nick_tokens = detail::split_ws(line, nick_required);
+            if (nick_tokens.size() < nick_required) {
+                ++result.rejected_lines;
+            } else {
+                CronEntry e;
+                e.schedule = std::string{nick_tokens[0]};
+                std::size_t cmd_idx = 1;
+                if (system_format) { e.user = std::string{nick_tokens[1]}; cmd_idx = 2; }
+                else e.user = "-";
+                e.command = std::string{nick_tokens[cmd_idx]};
+                result.entries.push_back(std::move(e));
+            }
+        } else if (tokens.size() < required) {
             ++result.rejected_lines;
         } else {
             CronEntry e;
