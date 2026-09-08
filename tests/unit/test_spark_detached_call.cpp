@@ -264,12 +264,16 @@ TEST_CASE("launch: a result-alloc failure maps to ResultAllocFailed, not a null 
     // AFTER Payload::operator()()'s try/catch already ran (boxed.reset()
     // sits outside it). A REAL result-alloc failure can only happen INSIDE
     // that try/catch (the inner catch's own "even the error box didn't
-    // fit" branch, itself only reachable once fn() has already thrown and
-    // set `threw = true`) - so a genuine ResultAllocFailed in production
-    // always coincides with worker_threw_total also being bumped. This
-    // CHECK is a property of the injection method, not of production
-    // semantics; do not read it as "ResultAllocFailed and WorkerThrew are
-    // mutually exclusive in general".
+    // fit" branch), which is reachable only after the OUTER catch has
+    // already set `threw = true` - and the outer catch fires whenever
+    // fn() itself throws, OR when fn() SUCCEEDS but boxing its own result
+    // (the make_unique<DetachedResult<T>>(fn()) allocation) throws
+    // bad_alloc - so a genuine ResultAllocFailed in production always
+    // coincides with worker_threw_total also being bumped, regardless of
+    // which of those two ways `threw` ended up true. This CHECK is a
+    // property of the injection method, not of production semantics; do
+    // not read it as "ResultAllocFailed and WorkerThrew are mutually
+    // exclusive in general".
     CHECK(lane.worker_threw_total() == 0);
 
     CHECK(spin_until([&] { return lane.active_workers() == 0; }));
@@ -281,12 +285,15 @@ TEST_CASE("launch: a result-alloc failure maps to ResultAllocFailed, not a null 
 TEST_CASE("launch: an abandon()'d, published-but-untaken result-alloc failure is a safe "
           "no-op, not a null deref",
           "[spark][detachedcall]") {
-    // Same defect class as above, reached through dispose_or_abandon()'s
-    // code path instead of take_locked()'s: abandon() calls take_locked()
-    // internally, so this mostly re-confirms the same fix from a different
-    // call site, plus exercises that a subsequent DetachedCall destructor
-    // (dispose_or_abandon() again, now with cell_->taken already true) is a
-    // clean no-op rather than a double-dispose.
+    // Same defect class as above, reached through abandon() rather than
+    // wait_take() - both call take_locked() internally, so this mostly
+    // re-confirms the same fix from a second call site (the mutation test
+    // in the previous commit actually aborted on THIS case first, before
+    // the wait_take() one even ran). Also exercises that a subsequent
+    // DetachedCall destructor (dispose_or_abandon() again, now with
+    // cell_->taken already true from the abandon() above) takes its
+    // early-return `if (cell_->taken) return;` branch - a clean no-op,
+    // not a second dispose.
     auto f3 = std::make_shared<std::atomic<std::size_t>>(0);
     SparkDetachedLane lane(f3, /*cap=*/4);
     lane.set_fail_result_alloc_for_test(true);
