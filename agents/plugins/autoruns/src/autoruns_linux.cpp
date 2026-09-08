@@ -74,6 +74,19 @@ std::string errno_token_for(int e) {
     }
 }
 
+/// Accumulates a per-entry constraint reason with a dedup contract matching
+/// autoruns_macos.cpp's note_dir_constraint: a token repeating identically
+/// across many entries/profiles in one scan collapses to a single mention
+/// rather than growing the reason string once per occurrence (a directory
+/// or per-user timer scan spanning many entries/profiles could otherwise
+/// produce an unbounded, mostly-duplicate reason string).
+void note_file_constraint(bool& any_constrained, std::string& reason, std::string_view token) {
+    any_constrained = true;
+    if (reason.find(token) != std::string::npos) return;
+    if (!reason.empty()) reason += ',';
+    reason += token;
+}
+
 /// Lower-cases an errno_token_for() result so every reason in this schema
 /// stays lower_snake_case for a downstream string-matching consumer,
 /// matching permission_denied / symlink_refused / oversized / not_regular /
@@ -362,10 +375,8 @@ void scan_systemd_timer_dir(const std::string& dir, Scope scope, const std::stri
             // symlink, oversized, non-regular) is a real per-entry
             // constraint the dir-level "readable" status must not hide.
             auto cls = classify_read_error(content.error(), /*required_by_catalog=*/false);
-            if (cls.support == YUZU_SUPPORT_CONSTRAINED) {
-                out.any_file_constrained = true;
-                out.file_constrained_reason = cls.reason;
-            }
+            if (cls.support == YUZU_SUPPORT_CONSTRAINED)
+                note_file_constraint(out.any_file_constrained, out.file_constrained_reason, cls.reason);
             continue;
         }
         auto fields = parse_systemd_timer(*content);
@@ -425,6 +436,20 @@ struct FallbackTimer {
     std::string unit;
     std::string activates;
 };
+
+/// Drops a possibly-partial trailing line from subprocess output that did
+/// NOT terminate cleanly (deadline/cancelled/signaled/line_limit) -- a
+/// non-clean stop can cut the buffered output mid-write, and a line with no
+/// trailing newline may be a partial write (e.g. a truncated ACTIVATES
+/// column). Never trims a clean run's output, and never trims a clean
+/// run's real final line even if it happens to lack a trailing newline
+/// (systemctl's own output always ends with one, so a missing one is
+/// itself evidence of truncation only on a non-clean stop).
+std::string_view trim_possibly_truncated_tail(std::string_view output, bool exited_cleanly) {
+    if (exited_cleanly || output.empty() || output.back() == '\n') return output;
+    const auto last_nl = output.find_last_of('\n');
+    return last_nl == std::string_view::npos ? std::string_view{} : output.substr(0, last_nl + 1);
+}
 
 std::vector<FallbackTimer> parse_list_timers_fallback(std::string_view text) {
     std::vector<FallbackTimer> out;
@@ -517,10 +542,8 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                 auto content = read_file_bounded(full);
                 if (!content) {
                     auto cls = classify_read_error(content.error(), /*required_by_catalog=*/false);
-                    if (cls.support == YUZU_SUPPORT_CONSTRAINED) {
-                        any_file_constrained = true;
-                        file_constrained_reason = cls.reason;
-                    }
+                    if (cls.support == YUZU_SUPPORT_CONSTRAINED)
+                        note_file_constraint(any_file_constrained, file_constrained_reason, cls.reason);
                     continue;
                 }
                 auto parsed = parse_crontab(*content, /*system_format=*/true);
@@ -820,7 +843,10 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                     auto res = yuzu::agent::run_bounded_subprocess(
                         argv, yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{20}});
                     yuzu::agent::forward_runner_failure(ctx, res);
-                    auto parsed = parse_list_timers_fallback(res.output);
+                    const bool exited_cleanly =
+                        res.termination_reason == yuzu::agent::TerminationReason::exited;
+                    auto parsed = parse_list_timers_fallback(
+                        trim_possibly_truncated_tail(res.output, exited_cleanly));
                     for (const auto& t : parsed) {
                         Row row;
                         row.source_id = SourceId::lnx_systemd_timers_system;
@@ -892,10 +918,8 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                 auto content = read_file_bounded(full);
                 if (!content) {
                     auto cls = classify_read_error(content.error(), /*required_by_catalog=*/false);
-                    if (cls.support == YUZU_SUPPORT_CONSTRAINED) {
-                        any_file_constrained = true;
-                        file_constrained_reason = cls.reason;
-                    }
+                    if (cls.support == YUZU_SUPPORT_CONSTRAINED)
+                        note_file_constraint(any_file_constrained, file_constrained_reason, cls.reason);
                     continue;
                 }
                 auto entry = parse_desktop_entry(*content);
@@ -946,10 +970,8 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                     auto content = read_file_bounded(full);
                     if (!content) {
                         auto cls = classify_read_error(content.error(), /*required_by_catalog=*/false);
-                        if (cls.support == YUZU_SUPPORT_CONSTRAINED) {
-                            any_file_constrained = true;
-                            file_constrained_reason = cls.reason;
-                        }
+                        if (cls.support == YUZU_SUPPORT_CONSTRAINED)
+                            note_file_constraint(any_file_constrained, file_constrained_reason, cls.reason);
                         continue;
                     }
                     auto entry = parse_desktop_entry(*content);

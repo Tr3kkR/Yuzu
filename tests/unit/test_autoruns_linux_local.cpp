@@ -421,6 +421,41 @@ TEST_CASE("autoruns Linux leg: timer_scan_status combines truncation and per-fil
     }
 }
 
+TEST_CASE("autoruns Linux leg: note_file_constraint dedups a repeated token "
+          "(RECONSTRUCTION: pins a governance-Gate-4 finding -- a per-file "
+          "constraint hit across many entries/profiles used to grow the "
+          "reason string once per occurrence instead of once per distinct "
+          "reason)",
+          "[autoruns][actions][linux]") {
+    bool any = false;
+    std::string reason;
+    yuzu::autoruns::note_file_constraint(any, reason, "permission_denied");
+    yuzu::autoruns::note_file_constraint(any, reason, "permission_denied");
+    yuzu::autoruns::note_file_constraint(any, reason, "permission_denied");
+    CHECK(any);
+    CHECK(reason == "permission_denied");
+
+    yuzu::autoruns::note_file_constraint(any, reason, "oversized");
+    CHECK(reason == "permission_denied,oversized");
+}
+
+TEST_CASE("autoruns Linux leg: trim_possibly_truncated_tail drops a partial "
+          "trailing line only on a non-clean subprocess stop "
+          "(RECONSTRUCTION: pins a governance-Gate-4 finding -- the rung-2 "
+          "systemctl fallback could silently emit a truncated field as if "
+          "it were a real, complete value)",
+          "[autoruns][actions][linux]") {
+    using yuzu::autoruns::trim_possibly_truncated_tail;
+
+    CHECK(trim_possibly_truncated_tail("a.timer b.service\n", true) == "a.timer b.service\n");
+    CHECK(trim_possibly_truncated_tail("a.timer b.service", true) == "a.timer b.service");
+    CHECK(trim_possibly_truncated_tail("a.timer b.service\n", false) == "a.timer b.service\n");
+    CHECK(trim_possibly_truncated_tail("a.timer b.service\nc.timer d.se", false) ==
+         "a.timer b.service\n");
+    CHECK(trim_possibly_truncated_tail("c.timer d.se", false).empty());
+    CHECK(trim_possibly_truncated_tail("", false).empty());
+}
+
 #endif // defined(__linux__)
 
 TEST_CASE("autoruns Linux leg: an unknown action is refused, not silently ignored",
