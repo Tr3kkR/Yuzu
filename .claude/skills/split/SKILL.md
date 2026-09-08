@@ -94,11 +94,11 @@ green while core is down (INV-31-6), or an engine enlarging authority core never
 
 ### 1d. Non-obvious model decisions (survived a three-model adversarial panel)
 
-- **Split ⇎ HA are decoupled (provisionally), but the split *consumes* HA.** Not a prerequisite
-  for a 2nd replica (HA §1c is *provisionally* decoupled, pending ADR-1005-owner (Dave Rae)
-  ratification — the agent `Subscribe` blocker is gateway-fronting, HA WS-4, not the split). But it
-  *inherits* HA WS-1 (sessions, done), rides HA WS-2a's `event_outbox` for the spine, and takes MCP
-  replay durability from HA WS-2b — one-way dependencies.
+- **Split ⇎ HA are decoupled, but the split *consumes* HA.** Not a prerequisite for a 2nd replica
+  (HA §1c decoupled — ratified by the ADR-1005 owner Dave Rae, 2026-09-07; the agent `Subscribe`
+  blocker is gateway-fronting, HA WS-4, not the split). But it *inherits* HA WS-1 (sessions, done),
+  rides HA WS-2a's `event_outbox` for the spine, and takes MCP replay durability from HA WS-2b —
+  one-way dependencies.
 - **Inherit ADR-2002's event spine wholesale** — never a parallel non-durable transport.
   MCP replay durabilizes (ADR-2002 §4/§5 supersedes exec-plan D15d).
 - **Capability parity is THIS-owned per-family** (ADR-0031 §3), not deferred to M3

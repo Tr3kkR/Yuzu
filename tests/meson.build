@@ -929,7 +929,9 @@ if build_server
       'unit/server/test_instruction_store.cpp',
       'unit/server/test_instruction_store_signing.cpp',
       'unit/server/test_instruction_yaml.cpp',
+      'unit/server/test_instruction_routes.cpp', # #2542 PR-7: the 13-route Instruction Definitions + Instruction Sets API, extracted onto the HttpRouteSink seam
       'unit/server/test_execution_tracker.cpp',
+      'unit/server/test_execution_routes.cpp', # #2542 PR-7: the 7-route legacy pre-v1 Executions API, extracted onto the HttpRouteSink seam
       'unit/server/test_leader_elector.cpp',
       'unit/server/test_execution_event_bus.cpp',
       'unit/server/test_approval_manager.cpp',
@@ -1078,6 +1080,7 @@ if build_server
       'unit/server/test_dispatch_destructive_gate.cpp', # #3685: Destructive targeting gate — pure verdict + confinement + refusal-string pins
       'unit/server/test_dashboard_destructive_gate.cpp', # PR6.0b: the same gate wired into POST /api/dashboard/execute
       'unit/server/test_default_certs.cpp',
+      'unit/server/test_mcp_route_registration.cpp', # #2542 PR-6: McpServer register_routes(HttpRouteSink&, ...) seam — registration shape + kill-switch-before-auth ordering + server.cpp wiring tripwire
       'unit/server/test_mcp_server.cpp',
       'unit/server/test_mcp_session.cpp',
       'unit/server/test_mcp_stream.cpp',

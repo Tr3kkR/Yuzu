@@ -1,5 +1,6 @@
 #include "mcp_server.hpp"
 
+#include "http_route_sink.hpp" // HttpRouteSink / HttplibRouteSink — #2542 PR-6 seam migration
 #include "mcp_server_testonly.hpp" // decls for the tool_*_for_test() defs below
 #include "engine_store_error_class.hpp" // shared REST/MCP store-error classifier
 #include "mcp_agentic_catalog.hpp" // agentic demo catalog: incident playbooks
@@ -14340,37 +14341,85 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 std::size_t mcp_max_streams_per_principal,
                                 StreamPrincipalAuditFn principal_audit_fn,
                                 CallerFn caller_fn) {
+    HttplibRouteSink sink(svr);
+    register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
+                    std::move(agents_fn), rbac_store, instruction_store, execution_tracker,
+                    response_store, audit_store, tag_store, inventory_store, policy_store,
+                    mgmt_store, approval_manager, schedule_engine, read_only_mode, mcp_disabled,
+                    std::move(dispatch_fn), ca_store, std::move(publish_crl_fn),
+                    guaranteed_state_store, std::move(dex_perf_fn), std::move(net_perf_fn),
+                    std::move(response_scope_fn), software_inventory_store, metrics,
+                    std::move(app_perf_providers), quarantine_store, std::move(tag_push_fn),
+                    agent_registry, std::move(scoped_perm_fn), sessions, mcp_streaming_disabled,
+                    mcp_streamed_post_enabled, std::move(allowed_origins),
+                    software_licensing_store, engine_principal_store, access_review_store,
+                    auth_db, directory_sync, stream_budget, std::move(revalidate_fn),
+                    mcp_max_streams_per_principal, std::move(principal_audit_fn),
+                    std::move(caller_fn));
+}
+
+void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
+                                AuditFn audit_fn, AgentsJsonFn agents_fn, RbacStore* rbac_store,
+                                InstructionStore* instruction_store,
+                                ExecutionTracker* execution_tracker, ResponseStore* response_store,
+                                AuditStore* audit_store, TagStore* tag_store,
+                                InventoryStore* inventory_store, PolicyStore* policy_store,
+                                ManagementGroupStore* mgmt_store, ApprovalManager* approval_manager,
+                                ScheduleEngine* schedule_engine, const bool& read_only_mode,
+                                const bool& mcp_disabled, DispatchFn dispatch_fn, CaStore* ca_store,
+                                PublishCrlFn publish_crl_fn,
+                                GuaranteedStateStore* guaranteed_state_store,
+                                DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn,
+                                ResponseScopeFn response_scope_fn,
+                                SoftwareInventoryStore* software_inventory_store,
+                                yuzu::MetricsRegistry* metrics,
+                                AppPerfProviders app_perf_providers,
+                                QuarantineStore* quarantine_store, TagPushFn tag_push_fn,
+                                yuzu::server::detail::AgentRegistry* agent_registry,
+                                ScopedPermFn scoped_perm_fn, McpSessionRegistry* sessions,
+                                const bool* mcp_streaming_disabled,
+                                const bool* mcp_streamed_post_enabled,
+                                std::vector<std::string> allowed_origins,
+                                SoftwareLicensingStore* software_licensing_store,
+                                EnginePrincipalStore* engine_principal_store,
+                                AccessReviewStore* access_review_store, AuthDB* auth_db,
+                                DirectorySync* directory_sync,
+                                yuzu::server::detail::StreamBudget* stream_budget,
+                                StreamRevalidateFn revalidate_fn,
+                                std::size_t mcp_max_streams_per_principal,
+                                StreamPrincipalAuditFn principal_audit_fn,
+                                CallerFn caller_fn) {
     // GET + DELETE first: they COPY auth_fn / audit_fn / allowed_origins, which
     // build_handler std::move()s below. &mcp_disabled is a live pointer into the
     // cfg_ member (outlives the handlers).
-    svr.Get("/mcp/v1/", build_get_handler(auth_fn, audit_fn, &mcp_disabled, mcp_streaming_disabled,
-                                          sessions, allowed_origins, stream_budget, revalidate_fn,
-                                          metrics, mcp_max_streams_per_principal,
-                                          principal_audit_fn));
-    svr.Delete("/mcp/v1/", build_delete_handler(auth_fn, audit_fn, &mcp_disabled,
-                                                mcp_streaming_disabled, sessions, allowed_origins));
+    sink.Get("/mcp/v1/", build_get_handler(auth_fn, audit_fn, &mcp_disabled, mcp_streaming_disabled,
+                                           sessions, allowed_origins, stream_budget, revalidate_fn,
+                                           metrics, mcp_max_streams_per_principal,
+                                           principal_audit_fn));
+    sink.Delete("/mcp/v1/", build_delete_handler(auth_fn, audit_fn, &mcp_disabled,
+                                                 mcp_streaming_disabled, sessions, allowed_origins));
 
-    svr.Post("/mcp/v1/",
-             build_handler(std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
-                           std::move(agents_fn), rbac_store, instruction_store, execution_tracker,
-                           response_store, audit_store, tag_store, inventory_store, policy_store,
-                           mgmt_store, approval_manager, schedule_engine, read_only_mode,
-                           mcp_disabled, std::move(dispatch_fn), ca_store,
-                           std::move(publish_crl_fn), guaranteed_state_store,
-                           std::move(dex_perf_fn), std::move(net_perf_fn),
-                           std::move(response_scope_fn), software_inventory_store, metrics,
-                           std::move(app_perf_providers), quarantine_store,
-                           std::move(tag_push_fn), agent_registry, std::move(scoped_perm_fn),
-                           sessions, mcp_streaming_disabled, mcp_streamed_post_enabled,
-                           std::move(allowed_origins),
-                           software_licensing_store, engine_principal_store, access_review_store,
-                           auth_db, directory_sync, std::move(caller_fn),
-                           // 2f PR 3b: the streamed-POST arm leases from the SAME
-                           // budget as the GET channel above (which COPIED these, so
-                           // moving here is safe) - one arithmetic for every
-                           // held-open worker, whichever verb pinned it.
-                           stream_budget, std::move(revalidate_fn),
-                           std::move(principal_audit_fn)));
+    sink.Post("/mcp/v1/",
+              build_handler(std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
+                            std::move(agents_fn), rbac_store, instruction_store, execution_tracker,
+                            response_store, audit_store, tag_store, inventory_store, policy_store,
+                            mgmt_store, approval_manager, schedule_engine, read_only_mode,
+                            mcp_disabled, std::move(dispatch_fn), ca_store,
+                            std::move(publish_crl_fn), guaranteed_state_store,
+                            std::move(dex_perf_fn), std::move(net_perf_fn),
+                            std::move(response_scope_fn), software_inventory_store, metrics,
+                            std::move(app_perf_providers), quarantine_store,
+                            std::move(tag_push_fn), agent_registry, std::move(scoped_perm_fn),
+                            sessions, mcp_streaming_disabled, mcp_streamed_post_enabled,
+                            std::move(allowed_origins),
+                            software_licensing_store, engine_principal_store, access_review_store,
+                            auth_db, directory_sync, std::move(caller_fn),
+                            // 2f PR 3b: the streamed-POST arm leases from the SAME
+                            // budget as the GET channel above (which COPIED these, so
+                            // moving here is safe) - one arithmetic for every
+                            // held-open worker, whichever verb pinned it.
+                            stream_budget, std::move(revalidate_fn),
+                            std::move(principal_audit_fn)));
 
     // Streaming is ON only when a registry is wired AND the kill switch is off —
     // report the true state, not just the kill-switch bit (governance arch/sre NICE).
