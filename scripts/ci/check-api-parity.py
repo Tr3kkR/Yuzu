@@ -103,21 +103,11 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # stated reason, raise) this in the SAME change that changes the real count -
 # see check-capability-matrix.sh's CDX-P2-006 comment for why an un-adjusted
 # baseline is not a real ratchet.
-BASELINE_UNTWINNED = 262  # #4028: 8 settings rows (tls/https/gateway/server-config/mcp/
-                          # data-retention/analytics/plugin-signing) corrected from
-                          # planned:#2146 -> exception:#520. An earlier round of this PR
-                          # flipped these straight to "twinned" (rule 2 above only
-                          # validates that a CLAIMED twin exists -- it accepts either
-                          # rest_v1_twin or mcp_twin alone, since it is not this script's
-                          # job to adjudicate ADR-1005's both-surfaces policy, only ledger
-                          # self-consistency), which understated the untwinned count by 8
-                          # and recorded no exception-ledger entry for the deliberate #520
-                          # REST-only decision. See
-                          # docs/adr/1005-headless-platform-use-case-engines.md's exception
-                          # ledger for the recorded entry. Merged with origin/dev's
-                          # own independent -3 fix (265 -> 262, unrelated routes twinned
-                          # on a different already-merged PR) -- reconciled to the actual
-                          # post-merge measured count below, not hand-added.
+BASELINE_UNTWINNED = 257  # #4029 twinned 6 rows (3 instruction-definition + 3 product-pack
+                          # read twins) on top of origin/dev's own already-merged #4027
+                          # TAR twins and #4028 settings twins -- reconciled post-merge
+                          # against the actual measured count below, not hand-added from
+                          # either side's stale pre-merge value.
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.

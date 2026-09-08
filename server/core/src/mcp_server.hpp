@@ -85,6 +85,10 @@ class DirectorySync;
 // UploadGrantStore itself is NOT forward-declared here — it arrives fully
 // defined via file_retrieval_routes.hpp's own include above.
 class PluginConfigStore;
+// #4029 — backs list_product_packs/get_product_pack. Forward-declared
+// (pointer-only in build_handler/register_routes); the .cpp includes
+// product_pack_model.hpp, which pulls in product_pack_store.hpp.
+class ProductPackStore;
 // #4027: backs list_tar_retention_paused — forward-declared (pointer-only via
 // set_dashboard_routes below); the .cpp includes dashboard_routes.hpp for the
 // full definition.
@@ -609,7 +613,11 @@ public:
                             // to today, which is the correct degradation.
                             yuzu::server::detail::StreamBudget* stream_budget = nullptr,
                             StreamRevalidateFn revalidate_fn = {},
-                            StreamPrincipalAuditFn principal_audit_fn = {});
+                            StreamPrincipalAuditFn principal_audit_fn = {},
+                            // #4029 — backs list_product_packs/get_product_pack. Trailing
+                            // optional dep; nullptr leaves those two tools answering
+                            // "Product pack store unavailable" (kInternalError).
+                            ProductPackStore* product_pack_store = nullptr);
 
     /// Build the GET/DELETE handlers for /mcp/v1/ (Streamable HTTP transport).
     /// Separate builders so tests can drive them without the httplib acceptor
@@ -698,7 +706,9 @@ public:
                          StreamPrincipalAuditFn principal_audit_fn = {},
                          // #1788 / PLAN-006: per-request DispatchCaller deriver,
                          // forwarded to build_handler for MCP dispatch confinement.
-                         CallerFn caller_fn = {});
+                         CallerFn caller_fn = {},
+                         // #4029 — backs list_product_packs/get_product_pack.
+                         ProductPackStore* product_pack_store = nullptr);
 
     /// HttpRouteSink overload — testable in-process via TestRouteSink (no httplib
     /// acceptor; the #438 TSan trap). The httplib::Server& overload above wraps
@@ -737,7 +747,9 @@ public:
                          std::size_t mcp_max_streams_per_principal =
                              kMcpStreamsPerPrincipalDefault,
                          StreamPrincipalAuditFn principal_audit_fn = {},
-                         CallerFn caller_fn = {});
+                         CallerFn caller_fn = {},
+                         // #4029 — backs list_product_packs/get_product_pack.
+                         ProductPackStore* product_pack_store = nullptr);
 
 private:
     // ── Engine-principal lifecycle wiring (ADR-1005 item 2b, plan PR 4.3) ──
