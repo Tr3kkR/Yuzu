@@ -5,6 +5,7 @@ export const PLUGIN_ENTRIES = [
   { file: 'agents/plugins/agent_logging/README', slug: 'plugins/agent_logging', title: 'agent_logging' },
   { file: 'agents/plugins/antivirus/README', slug: 'plugins/antivirus', title: 'antivirus' },
   { file: 'agents/plugins/asset_tags/README', slug: 'plugins/asset_tags', title: 'asset_tags' },
+  { file: 'agents/plugins/autoruns/README', slug: 'plugins/autoruns', title: 'autoruns' },
   { file: 'agents/plugins/bitlocker/README', slug: 'plugins/bitlocker', title: 'bitlocker' },
   { file: 'agents/plugins/certificates/README', slug: 'plugins/certificates', title: 'certificates' },
   { file: 'agents/plugins/chargen/README', slug: 'plugins/chargen', title: 'chargen' },

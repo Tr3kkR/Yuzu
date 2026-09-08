@@ -42,6 +42,28 @@
  * non-directory or a reparse-point root; it has no opinion on WHICH
  * directories are appropriate targets.
  *
+ * ── CATASTROPHIC-IF-VIOLATED invariants (routed-concern row, relocated) ──
+ * (1) Below the root, ZERO path-resolving opens: everything is
+ *     parent-handle-relative (POSIX `openat`/`fstatat`/`renameat`/`unlinkat`;
+ *     Windows `NtCreateFile` with `OBJECT_ATTRIBUTES.RootDirectory`). The
+ *     only path opens are `open_root`'s own plus the `/dev/urandom` entropy
+ *     read; one reached from below the root re-opens the attacker's swap
+ *     target and voids the primitive. `openat(fd, ".")` is the one
+ *     exemption.
+ * (2) `stop_reason == None` means every entry was VISITED and everything
+ *     the walk was meant to act on was acted on. A deliberate policy
+ *     refusal (symlink/reparse/device-boundary/non-regular/invalid name)
+ *     counts as acted on and leaves `None`; a BUDGET (`DepthCap`,
+ *     `ByteCap`) does not. Do NOT "fix" this to "any skip => non-None":
+ *     that makes every symlink refusal an incomplete walk. Incompleteness
+ *     is derived centrally in `note_outcome` -- six defects here were this
+ *     same shape, so new causes go THERE.
+ * (3) A consumer MUST record a decision on `kCaptureNamePrefix` orphans (a
+ *     crash mid capture-then-measure leaves one, `Reason::CaptureOrphaned`).
+ * (4) Confinement holds absolutely; SELECTION and ACCOUNTING are
+ *     best-effort against a writer controlling the parent dir -- never
+ *     restate them as absolute.
+ *
  * ── Zero-adoption ruling: FileIdentity / capture_identity ────────────────
  * `FileIdentity` + `capture_identity` are the ONLY helper hoisted out of the
  * three existing agent-core sites that each already do something in this
