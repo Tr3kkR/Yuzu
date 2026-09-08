@@ -61,6 +61,7 @@ class MetricsRegistry; // optional bundle-metrics sink (yuzu_bundle_*)
 }
 
 namespace yuzu::server {
+class HttpRouteSink; // #2542 PR-6: register_routes(HttpRouteSink&, ...) overload
 class SoftwareInventoryStore; // typed daily-sync software store (ADR-0016)
 class SoftwareLicensingStore; // ADR-0024 discovery store (query_software_licenses)
 // EnginePrincipalStore backs BOTH the PR 4.2 role-assignment MCP twins
@@ -598,8 +599,12 @@ public:
                                    const bool* streaming_disabled, McpSessionRegistry* sessions,
                                    std::vector<std::string> allowed_origins);
 
-    /// Register the /mcp/v1/ POST route on `svr` and emit the startup log line.
-    /// Production callers use this; tests prefer build_handler() above.
+    /// Register the /mcp/v1/ GET/POST/DELETE routes on `svr` and emit the startup
+    /// log line. Production callers use this (it wraps `svr` in an
+    /// HttplibRouteSink and delegates to the HttpRouteSink& overload below);
+    /// tests prefer build_handler()/build_get_handler()/build_delete_handler()
+    /// directly, or the HttpRouteSink& overload for registration-shape coverage
+    /// (#2542 PR-6 — in-process via TestRouteSink, no httplib acceptor, #438).
     void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
                          AgentsJsonFn agents_fn, RbacStore* rbac_store,
                          InstructionStore* instruction_store, ExecutionTracker* execution_tracker,
@@ -656,6 +661,45 @@ public:
                          StreamPrincipalAuditFn principal_audit_fn = {},
                          // #1788 / PLAN-006: per-request DispatchCaller deriver,
                          // forwarded to build_handler for MCP dispatch confinement.
+                         CallerFn caller_fn = {});
+
+    /// HttpRouteSink overload — testable in-process via TestRouteSink (no httplib
+    /// acceptor; the #438 TSan trap). The httplib::Server& overload above wraps
+    /// `svr` in an HttplibRouteSink and delegates here; every parameter is
+    /// otherwise identical (#2542 PR-6).
+    void register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
+                         AgentsJsonFn agents_fn, RbacStore* rbac_store,
+                         InstructionStore* instruction_store, ExecutionTracker* execution_tracker,
+                         ResponseStore* response_store, AuditStore* audit_store,
+                         TagStore* tag_store, InventoryStore* inventory_store,
+                         PolicyStore* policy_store, ManagementGroupStore* mgmt_store,
+                         ApprovalManager* approval_manager, ScheduleEngine* schedule_engine,
+                         const bool& read_only_mode, const bool& mcp_disabled,
+                         DispatchFn dispatch_fn = nullptr, CaStore* ca_store = nullptr,
+                         PublishCrlFn publish_crl_fn = nullptr,
+                         GuaranteedStateStore* guaranteed_state_store = nullptr,
+                         DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
+                         ResponseScopeFn response_scope_fn = {},
+                         SoftwareInventoryStore* software_inventory_store = nullptr,
+                         yuzu::MetricsRegistry* metrics = nullptr,
+                         AppPerfProviders app_perf_providers = {},
+                         QuarantineStore* quarantine_store = nullptr,
+                         TagPushFn tag_push_fn = {},
+                         yuzu::server::detail::AgentRegistry* agent_registry = nullptr,
+                         ScopedPermFn scoped_perm_fn = {},
+                         McpSessionRegistry* sessions = nullptr,
+                         const bool* mcp_streaming_disabled = nullptr,
+                         const bool* mcp_streamed_post_enabled = nullptr,
+                         std::vector<std::string> allowed_origins = {},
+                         SoftwareLicensingStore* software_licensing_store = nullptr,
+                         EnginePrincipalStore* engine_principal_store = nullptr,
+                         AccessReviewStore* access_review_store = nullptr,
+                         AuthDB* auth_db = nullptr, DirectorySync* directory_sync = nullptr,
+                         yuzu::server::detail::StreamBudget* stream_budget = nullptr,
+                         StreamRevalidateFn revalidate_fn = {},
+                         std::size_t mcp_max_streams_per_principal =
+                             kMcpStreamsPerPrincipalDefault,
+                         StreamPrincipalAuditFn principal_audit_fn = {},
                          CallerFn caller_fn = {});
 
 private:

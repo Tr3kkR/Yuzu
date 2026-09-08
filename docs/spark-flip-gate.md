@@ -29,13 +29,13 @@ separately as **#3849**.
 
 | | |
 |---|---|
-| Gate state | **OPEN** - 0 of 9 flip-green criteria evidenced |
+| Gate state | **OPEN** - 1 of 9 flip-green criteria evidenced |
 | Shipped posture today | `prefer_spark=false`: legacy `IGuard` is the sole live *detection/enforcement* path. Spark itself is **not** dormant - `SparkEngine` is constructed and runs observe-only from boot (`agent.cpp:1207/1225-1226`, logging "instantiated OBSERVE-ONLY"), attempting to register all three mechanisms (`:1222-1224`), though registration is platform-gated and silently no-ops off-platform (`spark_mechanism.hpp:25-31`): all three succeed on Windows, only Service succeeds on Linux-with-libsystemd, and none succeed on macOS or Linux without libsystemd. A Guardian consumer (`guardian-spark`) **is** registered with `SparkEngine` at every boot that instantiates it (not under `--spark-disable`, §6, nor after a boot-time construction failure), independent of `prefer_spark_` (`guardian_engine.cpp:1406`) - what's actually absent is any *armed* rule: `reconcile_rule_locked`'s `try_spark = prefer_spark_ && spark_availability_ == Available` gate (`guardian_engine.cpp:1244`) is always false in production, so the registered consumer's handler is never invoked. This is the fact that determines today's blast radius if `prefer_spark_` were ever flipped outside the documented process: the consumer plumbing is already live, so such a flip would take effect immediately with no additional wiring step in the way - not a safety margin. (Three pre-existing code sites - `agent.cpp:1194/1226`, `:3935-3936` - still say "no consumer at rung 1" in comments/log text; that's now stale relative to the corrected claim above, tracked as a separate doc/code drift, not fixed in this PR.) Nothing in this doc describes current production *enforcement* behavior - it is a readiness gate for a future flip (PR-5, not yet written). |
 | Evidence commit | _(placeholder - filled by PR-6, the evidence closeout PR)_ |
-| Sign-off | _(blank - filled by PR-6 once every §2 criterion is green **AND** every §3 row not at a terminal disposition (RULED closed / DONE with no residual / Moved to P3 / Fixed) is itself resolved or explicitly risk-accepted - §2 alone is not the whole gate. Row 4 (#3847) is now fully DONE (items 1/6 via #3884, item 4 via #3961) - superseded by its own residuals, **#3953** and **#3966**, both RESOLVED on branch `fix/3953-3966-outbox-hardening` (PR #3982, not yet merged as of this edit; five of #3953's six items fixed directly, item 5 filed separately as #3972 - **not** risk-accepted, see §5's entry for why). Row 3's #3816 residual is now DONE via **PR-2e** (`fix/3816-guardian-io-executor-abandonment-signal`, merged to `dev` ahead of PR #3982) - #3831, row 3's other residual, was already DONE via #3884. As of this PR the remaining gating items are row 9 (#3848 - PR-2c done, **PR-2d now confirmed-needed**, see §5) and #3972 - checked here, not folded into a 10th criterion)_ |
-| This PR | PR-1 of 7: PR-1 (this doc) → **PR-2a (#2233 items 1/6/7 → #3847's original 1/6 slice + #2993; + #3831 batch) - DONE, merged as #3884, 2026-09-03** → **#2233 item 4, #3847 narrowed to this alone - DONE, merged as #3961, 2026-09-04T15:20:25Z - fixed the drain worker's stalled-sink hazard: `drain_bounded()`'s injected `send` now runs on a detached `GuardianOutboxSendExecutor` (guardian_outbox_send_executor.hpp) - one single-flight instance per lane (lifecycle, compliance/health) - instead of the worker's own joined thread, so a stalled sink no longer wedges journal maintenance or the next drain tick; covered by the orphan-exit contract (`GuardianEngine::active_io_workers()`), same as the existing state-reader/arm-disarm executors** → **PR-2c (fault-injection seams + item-9 TSan rerun, #3848) - DONE for #2815/#2833/#2839, merged to `dev`** → **PR-2d (the #2818 fix) - CONFIRMED-NEEDED, not contingency: PR-2c's matrix demonstrated the defect, so this is now a hard pre-PR-5 prerequisite, not yet started - see §5** → **PR-4 (promtool CH-2/CH-5-PROM) - DONE, merged as #3858, 2026-09-02T13:00:49Z** → **PR-2e (#3816's design PR) - `GuardianIoExecutor` abandonment-signal API, shared by `GuardianSparkRuntime` + `GuardianStateReader` - DONE, merged to `dev`** (filed 2026-09-01, predating this doc, missing from this doc's first draft and added only after a PR review caught the omission; see §3 row 3 for the fix itself) → **#3953/#3966's fix (PR #3982, this branch) - closes row 4's residuals, item 5 filed separately as #3972** → PR-5 (the flip) → PR-6 (evidence closeout). Sequencing note for §8: PR-4 landed independently of #3816 (neither blocked the other), so Rig A/B provisioning (which follows PR-2a/PR-2c per §8) was never delayed by #3816. PR-3 (#2233 item 8) was dropped before this doc was written - item 8 moved to the P3 lane (§3 row 8). PR-2b (item 5) is dropped by this doc (§3 row 5). |
+| Sign-off | _(blank - filled by PR-6 once every §2 criterion is green **AND** every §3 row not at a terminal disposition (RULED closed / DONE with no residual / Moved to P3 / Fixed) is itself resolved or explicitly risk-accepted - §2 alone is not the whole gate. Row 4 (#3847) is now fully DONE (items 1/6 via #3884, item 4 via #3961) - superseded by its own residuals, **#3953** and **#3966**, both RESOLVED via `fix/3953-3966-outbox-hardening`, **merged as PR #3982** (`1e7a5346c`, 2026-09-05T18:09:10Z; verified 2026-09-06 via `gh pr view 3982`, not carried forward stale); five of #3953's six items fixed directly, item 5 filed separately as #3972 - **not** risk-accepted, see §5's entry for why. Row 3's #3816 residual is now DONE via **PR-2e** (`fix/3816-guardian-io-executor-abandonment-signal`, merged to `dev` ahead of PR #3982) - #3831, row 3's other residual, was already DONE via #3884. As of this PR the remaining gating items are #3972 plus the three PR-2d follow-up items recorded in §5's own register - `guard.errored` census recognition (C-1), the three sre observability gaps, and the `yuzu.guardian_backend` server-side-reader gap (compliance-officer) - row 9 (#3848/#2818) is otherwise fully DONE on-code (PR-2c merged; PR-2d's fix is complete, governed, and merged with `origin/dev` on its own branch `fix/2818-subscription-death-notification`, but has **not yet been pushed or opened as a PR** - #2818 itself is still OPEN on GitHub as of this edit; do not read "fully DONE" as "both merged", see §5) - checked here, not folded into a 10th criterion. **Non-gating but tracked** (found during this PR's own criterion-5 evidence-gathering, pre-existing production defects unrelated to `prefer_spark` - see §2 criterion 5): **#4020** (P0, `AuthManager` has no AuthDB fallback on a cache miss) and **#4021** (P0/security, Guardian's baseline-on-arm rebaselining silently reclassifies a still-drifted no-`expected` rule as compliant on any unrelated fleet mutation) - named here so neither exits this ledger by omission, per compliance-officer's Gate 6 finding. **#4044** (P2/task, `guard.compliant` fires on a Linux Service-type spark rule contrary to `guaranteed-state.md`'s documented legacy-guard limitation, with a dormant compliance-census double-counting risk once resolved - see §2 criterion 5/§8) joins this list too, flagged in its own body as gating PR-5/F14 per #3816's precedent, not risk-accepted in §5)_ |
+| This PR | PR-1 of 7: PR-1 (this doc) → **PR-2a (#2233 items 1/6/7 → #3847's original 1/6 slice + #2993; + #3831 batch) - DONE, merged as #3884, 2026-09-03** → **#2233 item 4, #3847 narrowed to this alone - DONE, merged as #3961, 2026-09-04T15:20:25Z - fixed the drain worker's stalled-sink hazard: `drain_bounded()`'s injected `send` now runs on a detached `GuardianOutboxSendExecutor` (guardian_outbox_send_executor.hpp) - one single-flight instance per lane (lifecycle, compliance/health) - instead of the worker's own joined thread, so a stalled sink no longer wedges journal maintenance or the next drain tick; covered by the orphan-exit contract (`GuardianEngine::active_io_workers()`), same as the existing state-reader/arm-disarm executors** → **PR-2c (fault-injection seams + item-9 TSan rerun, #3848) - DONE for #2815/#2833/#2839, merged to `dev`** → **PR-2d (the #2818 fix, `fix/2818-subscription-death-notification`) - DONE, see §5** → **PR-4 (promtool CH-2/CH-5-PROM) - DONE, merged as #3858, 2026-09-02T13:00:49Z** → **PR-2e (#3816's design PR) - `GuardianIoExecutor` abandonment-signal API, shared by `GuardianSparkRuntime` + `GuardianStateReader` - DONE, merged to `dev`** (filed 2026-09-01, predating this doc, missing from this doc's first draft and added only after a PR review caught the omission; see §3 row 3 for the fix itself) → **#3953/#3966's fix - DONE, merged as PR #3982 (`1e7a5346c`, 2026-09-05T18:09:10Z) - closes row 4's residuals, item 5 filed separately as #3972** → PR-5 (the flip) → PR-6 (evidence closeout). Sequencing note for §8: PR-4 landed independently of #3816 (neither blocked the other), so Rig A/B provisioning (which follows PR-2a/PR-2c per §8) was never delayed by #3816. PR-3 (#2233 item 8) was dropped before this doc was written - item 8 moved to the P3 lane (§3 row 8). PR-2b (item 5) is dropped by this doc (§3 row 5). |
 | Re-verified against | `origin/dev @ bd387afec` (2026-09-02); the kickoff plan's citations were pinned to `880900f1e1` - every file:line citation below was re-checked against the newer HEAD, not copied blind. Drift is called out inline where found. |
-| Last full re-verification | 2026-09-02, this PR, against `origin/dev @ e333b6cb2` post-rebase (no cited file changed between `bd387afec` and `e333b6cb2` - checked directly). Two later fix rounds (same date) added content re-verified against the same base: #3816 itself (§3 row 3, citing `guardian_spark_runtime.cpp:379-389`, `guardian_io_executor.hpp:376-388`, and `guardian_state_reader.cpp:59-71`), plus independent review nits folded into the same rounds (the "Shipped posture" rewrite citing `agent.cpp:1207/1222-1226`, `guardian_engine.cpp:1244/1406`, `spark_mechanism.hpp:25-31`; the §6 em-dash fix at `agent.cpp:1196`; the §5 "unbounded" addition at `spark_engine.hpp:540-543`). A third round, this PR's own PR-4-merged update, re-based this branch on `origin/dev` post-#3857-merge and re-verified its new citations (`tests/prometheus/yuzu-guardian-journal-extracted.test.yml`'s CH-2a/b/c and CH-5-PROM cases 1-6, `docs/prometheus/yuzu-alerts.yml`'s `TelemetryDark` rule expression) directly against `origin/dev` at that later point, not against `e333b6cb2`. A future reader should treat any citation as unverified past this point until re-run; there is no automated staleness check on this doc. A fourth round, this PR's own item-4 fix, re-based this branch on `origin/dev` post-#3884-merge (`c7febf76a`) and re-verified §3 rows 1/6/7 and row 3's #3831 sub-clause against #3884's actual merged content (`gh pr view 3884`, merge commit `282c3b58a`) rather than the peer-session summary that first reported it - directly, not by re-derivation from the earlier citations above. A fifth round, this PR's own governance fix-up (two BLOCKING concurrency defects found independently by two Gate 2/3 reviewers in the fix's first draft, both fixed; a new direct-coverage test file added), re-based this branch a SECOND time onto `origin/dev` at `e2f745606` (an unrelated ccache/CI PR, #3917, had merged in between) and re-verified every row-4 file:line citation against the post-fix-round tree directly. A sixth round, a fresh doc-only follow-up PR after #3961 merged (`acd83bd48`, 2026-09-04), fixed row 4's stale "awaiting merge" status, its `wrapped_send()` line-number drift (`:389`→`:408`), a self-contradiction where the row still stated a residual count the same PR's own synthesis doc claimed had been dropped, updated the §1 Sign-off row to point at #3953 and #3966 (superseding row 4/#3847 as the gating items, item 4 now DONE), and folded #3966 (a post-merge external adversarial review's admission-race finding, not fixed by anything in this branch) into row 4's own body text as well. This round went through its OWN governance (Gate 2 security-guardian+docs-writer, Gate 4 happy-path+unhappy-path+consistency-auditor, Gate 6 compliance-officer+sre+enterprise-readiness) after an earlier ungoverned push of the same PR was caught and corrected; that review found and fixed three more instances of the identical staleness class in locations the first pass missed - §1's "This PR" ladder row (still framed item 4 as in-flight), a §0 intro-paragraph clause with the same problem, and an overstated "same bounded-by-join reasoning" claim about #3966 relative to the row's other, dormancy-bounded residuals - plus a #3966/#3953 scope-conflation defect the first commit introduced and a markdown bold-span break caught before commit via a bold-marker-count check. Verified directly against `origin/dev @ acd83bd48` - the merge commit itself, not a peer-session summary. **Separately, PR-2e** (a later, distinct PR on branch `fix/3816-guardian-io-executor-abandonment-signal`, built off `origin/dev @ 6d40b3993`) re-verified and fixed row 3's stale `#3816` citations (`guardian_spark_runtime.cpp:379-389` had drifted to `:487-506` pre-fix; row 3's `guardian_io_executor.hpp:376-388`/`:386`/`:387` citations were rewritten to describe the post-fix code, which no longer has that structure) and shipped the fix those citations were tracking - see row 3's own closing paragraph. **Separately, PR-2c** (this PR, #3848, branch `test/3848-spark-fault-injection-matrix`) added §5's #2815/#2818/#2833/#2839 register in three rounds: an initial pass (`6dec4c379`) against the tree at that time; a correction (`792eab501`) after adversarial review (Kimi+Codex) found stale #2839 Windows-evidence wording; and this round (`1fcd82499` + this edit), after governance Gate 4 (consistency-auditor) found the §1 status ladder had fallen out of sync with §5's own PR-2d escalation, and Gate 6 (compliance-officer) found the #2839 entry's "4/4 stable" Windows-hardware sentence had narrowed in scope without being reworded, once two later commits (`1a2855e43`, `0cdd6bb2a`) added further Windows-only production code after it was written - closed with a second real DGRHP hardware round covering both, see the #2839 entry above. |
+| Last full re-verification | 2026-09-02, this PR, against `origin/dev @ e333b6cb2` post-rebase (no cited file changed between `bd387afec` and `e333b6cb2` - checked directly). Two later fix rounds (same date) added content re-verified against the same base: #3816 itself (§3 row 3, citing `guardian_spark_runtime.cpp:379-389`, `guardian_io_executor.hpp:376-388`, and `guardian_state_reader.cpp:59-71`), plus independent review nits folded into the same rounds (the "Shipped posture" rewrite citing `agent.cpp:1207/1222-1226`, `guardian_engine.cpp:1244/1406`, `spark_mechanism.hpp:25-31`; the §6 em-dash fix at `agent.cpp:1196`; the §5 "unbounded" addition at `spark_engine.hpp:540-543`). A third round, this PR's own PR-4-merged update, re-based this branch on `origin/dev` post-#3857-merge and re-verified its new citations (`tests/prometheus/yuzu-guardian-journal-extracted.test.yml`'s CH-2a/b/c and CH-5-PROM cases 1-6, `docs/prometheus/yuzu-alerts.yml`'s `TelemetryDark` rule expression) directly against `origin/dev` at that later point, not against `e333b6cb2`. A future reader should treat any citation as unverified past this point until re-run; there is no automated staleness check on this doc. A fourth round, this PR's own item-4 fix, re-based this branch on `origin/dev` post-#3884-merge (`c7febf76a`) and re-verified §3 rows 1/6/7 and row 3's #3831 sub-clause against #3884's actual merged content (`gh pr view 3884`, merge commit `282c3b58a`) rather than the peer-session summary that first reported it - directly, not by re-derivation from the earlier citations above. A fifth round, this PR's own governance fix-up (two BLOCKING concurrency defects found independently by two Gate 2/3 reviewers in the fix's first draft, both fixed; a new direct-coverage test file added), re-based this branch a SECOND time onto `origin/dev` at `e2f745606` (an unrelated ccache/CI PR, #3917, had merged in between) and re-verified every row-4 file:line citation against the post-fix-round tree directly. A sixth round, a fresh doc-only follow-up PR after #3961 merged (`acd83bd48`, 2026-09-04), fixed row 4's stale "awaiting merge" status, its `wrapped_send()` line-number drift (`:389`→`:408`), a self-contradiction where the row still stated a residual count the same PR's own synthesis doc claimed had been dropped, updated the §1 Sign-off row to point at #3953 and #3966 (superseding row 4/#3847 as the gating items, item 4 now DONE), and folded #3966 (a post-merge external adversarial review's admission-race finding, not fixed by anything in this branch) into row 4's own body text as well. This round went through its OWN governance (Gate 2 security-guardian+docs-writer, Gate 4 happy-path+unhappy-path+consistency-auditor, Gate 6 compliance-officer+sre+enterprise-readiness) after an earlier ungoverned push of the same PR was caught and corrected; that review found and fixed three more instances of the identical staleness class in locations the first pass missed - §1's "This PR" ladder row (still framed item 4 as in-flight), a §0 intro-paragraph clause with the same problem, and an overstated "same bounded-by-join reasoning" claim about #3966 relative to the row's other, dormancy-bounded residuals - plus a #3966/#3953 scope-conflation defect the first commit introduced and a markdown bold-span break caught before commit via a bold-marker-count check. Verified directly against `origin/dev @ acd83bd48` - the merge commit itself, not a peer-session summary. **Separately, PR-2e** (a later, distinct PR on branch `fix/3816-guardian-io-executor-abandonment-signal`, built off `origin/dev @ 6d40b3993`) re-verified and fixed row 3's stale `#3816` citations (`guardian_spark_runtime.cpp:379-389` had drifted to `:487-506` pre-fix; row 3's `guardian_io_executor.hpp:376-388`/`:386`/`:387` citations were rewritten to describe the post-fix code, which no longer has that structure) and shipped the fix those citations were tracking - see row 3's own closing paragraph. **Separately, PR-2c** (this PR, #3848, branch `test/3848-spark-fault-injection-matrix`) added §5's #2815/#2818/#2833/#2839 register in three rounds: an initial pass (`6dec4c379`) against the tree at that time; a correction (`792eab501`) after adversarial review (Kimi+Codex) found stale #2839 Windows-evidence wording; and this round (`1fcd82499` + this edit), after governance Gate 4 (consistency-auditor) found the §1 status ladder had fallen out of sync with §5's own PR-2d escalation, and Gate 6 (compliance-officer) found the #2839 entry's "4/4 stable" Windows-hardware sentence had narrowed in scope without being reworded, once two later commits (`1a2855e43`, `0cdd6bb2a`) added further Windows-only production code after it was written - closed with a second real DGRHP hardware round covering both, see the #2839 entry above. **Separately again, this doc-only follow-up** (branch `docs/spark-flip-gate-ch5-findings`, built off `origin/dev @ 57ec64433`, 2026-09-05): records the DGRHP exploratory CH-5-UAT pass (§4, §8) and its two production-defect findings, re-verified directly against this same base - `spark_registry.cpp`'s watcher-callback path and `guardian_spark_runtime.cpp`'s `build_entries()` for the event_id-timestamp semantics (§4), `agent.cpp:2269/:2643` for the Heartbeat deadline claim and its subsequent retraction via a live bounded repro on the DGRHP rig itself (not a citation-only check), and `spark_mechanism.hpp:25-31` for the BigColin platform-blocker citation (§8). Not a numbered PR-1..PR-6 slot - this is evidence toward the CH-5-UAT driver step in §4's own PR-sequence paragraph, which sits outside that ladder. **A seventh round, this same doc-only PR's own `/governance` pass** (Gate 2 security-guardian+docs-writer, a discretionary Gate 3 `authdb` review given the section's falsifiable AuthManager/AuthDB claims): corrected an already-wrong-once root-cause claim's remaining incompleteness (the "not against Postgres" framing omitted the post-password `is_active` check; filed **#4020** for a distinct, more serious cold-cache gap it surfaced), replaced an unresolved "arm-on-spark not independently confirmed" hedge with direct log evidence (`agent.log`'s `detection backend = spark` line, same restart, same second, verified against `agent.cpp`'s own comment that it shares the heartbeat tag's derivation function), connected the baseline-on-arm observation to the already-filed `#3990` and filed **#4021** for the compounding gap, corrected a wrong constant attribution for the ~5-minute periodic cadence (`kGuardianFileLaneCadenceMs`, not `errored_refresh_ms` - the latter structurally cannot re-fire on a persisting divergence), fixed a "twice" vs "three times" self-contradiction, and fixed a cross-reference claiming content was "recorded in §4/§8 below" that was never actually added there. Verified directly against `origin/dev @ a7b47ebda` (fetched and merged fresh into this branch before the review started). **An eighth round, Gate 4 of the same `/governance` pass** (happy-path+unhappy-path+consistency-auditor): found the dashboard-edge claim (`guardian_routes.cpp`'s `render_events_fragment`, `guardian_ui.cpp`'s `.et-drift_detected` class) was source-traced but never actually observed - fixed by fetching `GET /fragments/guardian/events` live against DGRHP and citing the real rendered response; found the "three times, in ONE arm window" header still contradicted the "two arm windows" summary after the seventh round's own fix (the header, not the summary, was wrong); found PR #3982 was cited as "not yet merged" in three places (§1 rows, §3 row 4) when `gh pr view 3982` shows it merged 2026-09-05T18:09:10Z as `1e7a5346c`, predating even the eighth round's own base; found a §3-vs-§4 cross-reference misattribution for the #3989 retraction; and found #4021 (but not #4020, judged out of this doc's own spark/guardian tracking scope) needed a §5 cross-reference next to the existing #3990 entry it compounds with. Verified directly against `origin/dev @ a7b47ebda`, same base as the seventh round - no new upstream commits landed during Gate 2-4's run. **A ninth round, a separate live Linux Service-type drift session on Rig B/BigColin** (branch re-based onto `origin/dev @ c926a171d`, 44 commits ahead of the eighth round's base by this point - the branch had gone stale again in the interim): added the sudoers-grant/Baseline-deploy/`guard.compliant` content in §8, re-verified directly against this new base - `guardian_engine.cpp`'s `attach_rule`/`emit_compliant_edge` call, `guardian_routes.cpp`'s "not deployed" badge and baseline create/deploy fragment routes, `docs/user-manual/guaranteed-state.md`'s Linux service compliant-edge limitation, `docs/os-capability-matrix.md`'s Linux service enforcement-deferred note. This round's own `/governance` pass (Gate 2/3 security-guardian+docs-writer+architect, Gate 4 happy-path+unhappy-path+consistency-auditor) found and fixed: an overclaim ("no error anywhere" - the dashboard actually shows a badge), an unfiled ADR-1005 gap (cross-referenced to the existing duplicate **#3266** instead of filing new), the `guard.compliant`-on-Linux discrepancy (filed **#4044**), a closing-summary overclaim implying dashboard-confirmation parity between DGRHP's and Rig B's evidence when DGRHP's own text disclaims catching its own rule's event, a citation-fidelity nit (a truncated quote), and this ledger row's own staleness (no ninth-round entry existed until this sentence). **Separately, PR-2d** (this PR, branch `fix/2818-subscription-death-notification`, built off `origin/dev` after both PR-2c/#3985 and #3982 had merged) fixed #2818 itself - see the #2818 entry above for the full shape - and updated this row's own §1 Sign-off/"This PR" ladder lines and Owner/Milestone/Revisit-trigger fields to reflect that all four issues in this register row are now resolved. Verified directly against the tree at that branch point, not a peer-session summary. |
 
 ## 2. Flip-green criteria (1)–(9)
 
@@ -75,10 +75,176 @@ All start unchecked. Each gets its evidence link recorded here by PR-6.
       added here for precision.)
 - [ ] **4. Gateway path evidence** - spark detection/heartbeat data surviving a gateway-proxied
       agent, not just direct-connect.
-- [ ] **5. UAT smoke**: arm on spark → induced drift → dashboard edge; `--spark-disable` rollback
-      drill restores legacy enforcement (procedure in §6); journal gauges live; `/status`
+- [x] **5. UAT smoke**: arm on spark → induced drift → dashboard edge; `--spark-disable` rollback
+      drill restores legacy enforcement (procedure in §6); journal gauges live (two
+      `GET /metrics` reads against Rig B, 2026-09-06, ~15 min apart: `_pages` advanced
+      124 → 154, confirming genuine progression, not just a non-zero snapshot;
+      `_sent_labels`/`_batch_count`/`_batches_written` stayed flat between the two reads,
+      consistent with their own metric descriptions - activity-triggered, not continuously
+      incrementing - so only `_pages`'s progression is cited as proof of "live"; distinct
+      from §4's CH-5-PROM alerting-rule logic); `/status`
       reports real `errored_rules` (this is PR #3175's fix - confirmed shipped, see "#2298
-      sub-item confirmation" below).
+      sub-item confirmation" below). **The rollback-drill half was DONE 2026-09-04/05 (Rig B on
+      BigColin, §6, §8)** - `--spark-disable` restart confirmed to restore legacy enforcement in
+      ~8.6s, with a subsequent 14-hour clean run showing zero spark-state leak. **The
+      arm-on-spark → induced-drift → dashboard-edge half is now ALSO DONE (2026-09-06, DGRHP,
+      Windows, `file-change` mechanism)** - root-caused and fixed the two blockers the prior
+      attempt left open, then attempted the full path three times across two arm windows (a
+      second data point on Linux/`service-status-change` followed the same day, Rig B/BigColin -
+      see §8's later update for that half): the
+      first (corroborating-only - its `Emit` fired but was lost to an outbox stall before
+      reaching the server, so it doesn't close the loop on its own) in the first window; the
+      second and third (no restart between them) in the second window, each closing the full
+      arm-to-dashboard loop:
+      - **Root cause of the prior blocker, not just a retry** (corrected 2026-09-06: an
+        earlier draft of this section attributed the stale login to `AuthDB`'s seed-once
+        bootstrap making cfg edits inert; a peer session ("Rig Test", reviewing this PR
+        before push) traced the opposite on the same build, and re-reading the source
+        confirms that reading): `main.cpp` calls `auth_mgr.load_config(cfg_path)`
+        unconditionally on every boot, populating `AuthManager`'s in-memory `users_` map
+        straight from the cfg file's `username:role:salt_hex:hash_hex` line -
+        `verify_password()`/`authenticate()` (`auth.cpp`) check the PASSWORD against *that*
+        map, not against Postgres. So a cfg edit + a full server restart genuinely does
+        reset a stale login, no `auth.users` touch needed - **but only for an admin row that
+        already exists and is active; this recipe does NOT generalize to every account** (see
+        the fenced scope below and #4020). That said, "not against Postgres" is
+        narrower than it may read: both functions still make a live `auth_db_->get_user()`
+        call AFTER the password check to confirm the account is still active
+        (`auth.cpp` - "verify user is still active in DB (could have been soft-deleted)"),
+        so a deactivated (not merely stale-password) admin row would still fail login with
+        the identical generic 401 even after a correct cfg edit - only the credential check
+        itself, not the whole login decision, bypasses Postgres. (Filed **#4020** for a
+        related, more serious gap this review surfaced: `authenticate()`/`verify_password()`
+        have no AuthDB fallback on a `users_` cache miss at all, so a dashboard-created user
+        - never in the cfg file - can't log in after a fresh process restart; out of scope
+        for this doc-only PR.) `AuthDB::seed_admin_if_empty()` is a separate, one-time
+        Postgres bootstrap (seeds `auth.users` only when empty, for role/MFA lookups) and
+        plays no part in either check above. The actual blocker in this session was the
+        `/login` request shape below; a `DELETE FROM auth.users` + restart done along the
+        way was not the fix and is not needed to reset this rig's admin login - a cfg edit
+        + restart suffices. Separately, `/login` takes
+        `application/x-www-form-urlencoded` (`extract_form_value`), not JSON - the wrong
+        content-type alone produces the same generic 401 as a bad password, which is what
+        actually cost the time here. The prior attempt's broken agent log capture (bare WMI
+        `Win32_Process.Create`, no redirect) is fixed for good by launching with
+        `yuzu-agent.exe`'s own `--log-file` flag - redirect-independent, survives any future
+        WMI-launched restart.
+      - **Live repro across two arm windows (no restart between the second and third edit)**:
+        armed rule `dgrhp-drift-test-file` (`file-hash-equals` on
+        `C:\rigA\drift-test.txt`, spark type `file-change`) confirmed armed via
+        `/api/v1/guaranteed-state/rules` (armed at 2026-09-06T10:21:05Z, per the
+        `guard.armed`/`guard.compliant` pair at that timestamp in the events log - the file's
+        content at that instant became the new baseline `expected_value`. Whether that
+        auto-rebaselining is correct for a rule with no explicit configured `expected`
+        value is itself an open question this session didn't resolve - and a governance
+        review of this doc found it compounds with an already-known trigger, **#3990**'s
+        fleet-wide `full_sync` re-arm: any UNRELATED rule mutation anywhere in the fleet can
+        silently reclassify a genuinely-still-drifted no-`expected` rule as compliant,
+        with no remediation having happened. Filed **#4021** to track the fix; not
+        addressed in this doc-only PR). DGRHP is one of this workstream's designated
+        `prefer_spark` test rigs (§6 step 1's own procedure opens with "confirm ... agent
+        running with `prefer_spark` active, spark armed" before any of this applies - the
+        "Shipped posture today" row above is about the production default, not these rigs),
+        and this is now directly confirmed rather than inferred from the `RIGA-DEBUG` log
+        prefix alone (a locally-patched debug line, not present in this repo's source tree,
+        so not by itself proof of which code path it instruments): the SAME agent restart
+        that re-armed the rule at 10:21:05Z also logged, in the SAME second,
+        `Guardian: spark path WIRED (prefer_spark=true); detection backend = spark` -
+        `agent.cpp`'s own comment states this line is derived from the identical function
+        (`guardian_backend_from_state`) the `yuzu.guardian_backend` heartbeat tag uses, "so
+        this log and the tag can never drift apart" - so it is not merely circumstantial.
+        This also closes a governance-review concern that the legacy Windows file guard
+        (`guard_file.cpp`, `ReadDirectoryChangesW`) is itself event-driven, so an `Emit`
+        firing "in the same second" cannot by itself discriminate spark from legacy - this
+        log line can, and does. This confirmation is boot-scoped (it proves the backend at
+        the 10:21:05Z restart, not independently re-checked at each later edit) - but
+        `prefer_spark_` is set once at `GuardianEngine` construction and never reassigned
+        anywhere in this codebase (no live-reload/toggle call site exists, confirmed by
+        grep), and no further agent or server restart happened before the third edit, so the
+        boot-time confirmation holds for the whole window. Separately, `reconcile_rule_locked`
+        is the sole per-rule arm/disarm chokepoint enforcing mutual exclusion between the
+        legacy and spark paths, and errors an arm failure rather than silently falling back
+        (CLAUDE.md's routed-concerns spark row; not re-derived from this doc's own text),
+        which rules out "backend is spark but this specific rule fell back to legacy
+        anyway." First induced edit (2026-09-06T10:18:19Z, before the
+        10:21:05Z re-arm above) fired an agent-side `Emit` in the SAME SECOND (`agent.log`),
+        confirming the IOCP path fires immediately - but the resulting entry never reached
+        the server (see the outbox finding below), so it doesn't count as a demonstration on
+        its own. After restarting the agent and confirming a clean 0-pending outbox, a SECOND
+        induced edit (2026-09-06T10:25:37Z) fired `Emit` in the same second again, and a
+        `drift.detected` event carrying that same detection timestamp was visible via
+        `GET /api/v1/guaranteed-state/events?rule_id=dgrhp-drift-test-file` when checked
+        roughly 8 minutes later - `{"event_type":"drift.detected","detected_value":
+        "80517dbd...","expected_value":"5584d13c...","timestamp":"2026-09-06T10:25:37Z"}`, a
+        real hash mismatch, not a coincidental compliant re-arm (server-side ingest latency
+        was not separately measured). A THIRD induced edit (2026-09-06T10:52:02Z), with NO
+        agent or server restart since the second edit, produced a fresh `Emit` in the agent
+        log at the same second (`11:52:02.118` local, PID `31856` - the same event-driven
+        worker PID as the second edit, distinct from the periodic re-verification loop's PID
+        `15844` seen re-flagging the still-unremediated second divergence every ~5 minutes in
+        between - the convergence scheduler's file lane, `kGuardianFileLaneCadenceMs`
+        [10-minute default, halved locally on this rig for this testing only, per §8's own
+        note] - NOT `errored_refresh_ms`, which only re-fires on an Unhealthy/read-error
+        state and structurally cannot be what's re-flagging a persisting compliant-vs-drifted
+        divergence) and a NEW `drift.detected` event at `2026-09-06T10:52:02Z` - confirmed via
+        REST within seconds this time. Its `detected_value` was the empty-file SHA-256
+        (`e3b0c442...`), not the marker text's hash - the write raced the eval (PowerShell's
+        `Out-File` truncates before it writes content, and the IOCP callback fired on the
+        truncate), a real but benign timing artifact of the test method, not the mechanism -
+        the divergence was still real and still detected. **Caveat this session didn't rule
+        out**: if `ReadDirectoryChangesW`/the IOCP layer coalesces the truncate and the
+        content write into a single notification rather than firing on the truncate alone,
+        the persisted event's `e3b0c442...` value could be a permanent, misleading record of
+        a state the file was never actually left in (post-write content never separately
+        evaluated until the next periodic tick) - not re-investigated here since it doesn't
+        change this criterion's own conclusion (a real divergence was detected end-to-end
+        either way), but worth flagging for anyone citing this specific event later.
+        **Dashboard-edge evidence,
+        actually observed, not just source-traced** (a governance review caught that the
+        first draft of this paragraph asserted the render path from source alone -
+        `GuardianRoutes::render_events_fragment` in `guardian_routes.cpp` calling the same
+        `GuaranteedStateStore::query_events()` the REST handler reads, and `guardian_ui.cpp`'s
+        `.et-drift_detected` CSS class for the `drift.detected` type - without ever actually
+        fetching the page; that source trace still stands, but it's plausibility, not
+        observation, and the checklist item literally says "dashboard edge"): a live,
+        authenticated `GET /fragments/guardian/events?type=drift.detected` against DGRHP
+        (2026-09-06T12:10:12Z, after this paragraph's own review) returned real rendered
+        rows, e.g. `<div class="event-item">...<span class="event-type
+        et-drift_detected">drift.detected</span>...<strong>riga-reg-0800</strong> on
+        <strong>ba901a98-...</strong></div>` - confirming the render mechanism live. The
+        specific rows returned were from a different (registry-type, `riga-reg-*`) rule
+        family, not `dgrhp-drift-test-file` itself - the fragment has no `rule_id`/`agent_id`
+        filter and returns only the most recent 20 fleet-wide, and this rig had a large
+        burst of other rules' drift events between this criterion's own edits and the later
+        fetch. The mechanism is now directly observed; this specific rule's own row was not
+        re-captured before being pushed out of the top-20 window.
+      - **Retires an open campaign question, not just closes the checklist item**: the
+        "one-shot registry/file watch" observation from the prior CH-5-UAT exploratory
+        campaign (a second divergence in the same arm-window going undetected - not itself
+        folded into this doc's own §3/§4/§8 before now, only into that campaign's own session
+        record) was flagged there as possibly an artifact of outbox congestion rather than a
+        real mechanism limit, never cleanly isolated. This
+        session produced a SECOND and a THIRD distinct divergence inside the same arm-window
+        (the third with no restart at all since the second, and a confirmed-healthy 0-pending
+        outbox throughout), and both were detected immediately - the one-shot theory does not
+        hold under clean conditions for the `file-change` mechanism; downgrade it from
+        "unresolved" to "disproven as a general defect for file-change, was congestion-shaped."
+        The original observation was on a registry-type rule, not re-tested here (Registry
+        mechanism is also Windows-only File/Registry-class, same watcher family) - scoping the
+        retraction to what was actually re-tested rather than the whole family. Not re-opening
+        it as an issue.
+      - **Also reproduces, live, a related-but-separate existing finding - not new, no issue
+        filed**: after the server restart done during the login-fix sequence above (the
+        `DELETE FROM auth.users` + restart step; agent process itself untouched at that
+        point), the outbox `pending` count
+        climbed from 787 to 1088 over several minutes and never drained, mirroring the
+        `#2049`-shaped "Subscribe doesn't reliably reconnect after a server-only restart"
+        symptom this workstream already has open threads on (§3 row 4's #3953/#3966 family;
+        §4's retracted #3989 causal chain). The FIRST induced edit's `Emit` was almost certainly
+        lost into this exact stall (its entry never surfaced server-side); the agent restart
+        that unblocked the SECOND edit is the same documented workaround, not a new fix.
+        Recorded here as corroborating evidence for the existing tracked gap, not filed
+        separately.
 - [ ] **6. Legacy-vs-spark parity capture**, any diff fully explained by
       `docs/spark-legacy-delta-registry.md`.
 - [ ] **7. Resource evidence** vs `docs/spark-rebuild-baselines/`.
@@ -108,7 +274,7 @@ grown substantially, largely from PR #3821's rework); drift is called out per ro
 | 1 | Boot ordering | **DONE - both halves of the issue's bar now tested** | `guardian_->start_local()` runs at `agent.cpp:1292`, after `wire_spark_engine()` (call at `:1254`) and after `SparkEngine` construction (`:1207`) + `start()` (`:1225`) - ordering confirmed correct. #3884 (merged 2026-09-03, `282c3b58a`) added two tests in `test_guardian_engine_spark_reconcile.cpp`: `"PRODUCTION boot order: wire_spark_engine before start_local"` (`:1431`) proves the behavioral half - the issue's own bar verbatim, "test a non-empty cached KV policy armed during pre-network startup" - in the real production call order; `"source tripwire: Agent::run() calls guardian start_local() before opening the Subscribe stream (#2233 item 1, the pre-network property)"` (`:1558`) closes the half the behavioral test cannot reach (there is no Agent-level mocked-gRPC test harness): it asserts, by reading `agent.cpp`'s own source text, that `guardian_->start_local()` appears before `stub->Subscribe(&sub_ctx)` - a textual ordering guarantee, not a runtime one, but one that fails loudly if a future edit reorders them. Line numbers verified against THIS PR's own tree (this PR's own edits to the same file - the item-4 death-test rewrite and a comment fix, both in §3 row 4's scope - net to the same line count as #3884's original `282c3b58a`, so the citations happen to match both, but that is this tree's state, not a claim about `282c3b58a` in isolation), not from #3884's own PR description alone. |
 | 2 | Enforcement posture | **RULED, closed** | Dave, 2026-08-28 (issue comment): hard flip, no enforcement preservation, no operator warning required, no `spark_enforce_active` signal required. |
 | 3 | Arm/disarm liveness | **DONE - the liveness wedge, the #3831 residual, and #3816 are all fixed (#3816 by PR-2e, merged to `dev`)** | PR #3821, merged 2026-09-02. Routes File/Registry/Service arm/disarm off `registry_mu_` onto `GuardianIoExecutor`; fixes a `policy_generation_` undercount via a new 3-state `ReconcileOutcome`. A scoped Gate-8 re-review on the PR itself found and fixed 2 more guard-arming gaps of the same shape; one more (`arming_rollback`) deferred as **#3831** (title: "attach_rule's arming_rollback is armed after its own protected mutation"). **Fixed in code by #3884** (merged 2026-09-03, `282c3b58a`): `arming_rollback` is now promoted to function scope (`guardian_spark_runtime.cpp:225`, `.committed = true` at `:503`) - the same idiom PR #3821 already used for the other three guards it fixed, mirroring `prior_disarm_rollback` - relying on C++ stack-unwind ordering as the safety argument. Verified directly against `origin/dev @ 282c3b58a`, not from #3884's own PR description alone. **Tracking gap, not a code gap**: `gh issue view 3831` still reports **OPEN** as of this PR's re-verification - #3884's body lists #3831 among what it addressed but did not use a closing keyword, and nothing has closed it since; a future PR or a manual close should reconcile this, but the fix itself is confirmed shipped. *(Pre-PR-2e history, kept for context only - every claim in this paragraph through "flagged here so the full set is visible rather than #3816 alone" below describes code PR-2e has since removed; see the "#3816 fixed by PR-2e" paragraph at the end of this cell for the current state.)* A second, distinct residual was #3816 (filed OPEN - "GuardianIoExecutor has no abandonment-signal API - a late-succeeding arm/read ... can leak a live subscription/handle"; this row narrows that title-level framing - see below): a backend arm that succeeds just after its caller has timed out and abandoned it could leak a live subscription. `attach_rule`'s generation-based self-check (formerly `guardian_spark_runtime.cpp:379-389` pre-PR-2e; that self-check no longer exists on this tree, see below) narrowed this to a rare scheduling race on the caller's bounded-timeout path, but the code's own comment stated plainly "this is NOT airtight." A second, distinct trigger for the same leak was found later (`FortitudeEtc`, #3816 comment, 2026-09-02, during the #3831-batch Gate 8 review): `GuardianIoExecutor::run()`'s post-launch `cv.wait_until` wait (`guardian_io_executor.hpp:376-388`) sits outside `run()`'s own try/catch (which covers only admission/launch, `:294-372`); if that lock construction throws (a rare `std::mutex::lock()` failure, not a timeout - derived SHOULD/MEDIUM, E5 rare/near-E6), the caller-side exception can unwind before the erase that would make `still_wanted` return false, so the same leak can fire without any caller timeout at all. Neither trigger is fixed today. `submit_disarm_off_lock` (the disarm side) and `GuardianStateReader` (state reads) have no equivalent self-check at all - but their late-completion cost is narrower than a leak: a disarm or a state read that lands late simply completes with no caller left to consume it (`GuardianStateReader`'s blocking read helpers return by value with their OS handles - `FdGuard`/`HandleGuard`/`RegKeyGuard`/etc. - scoped as function-locals that close before return, per `guardian_state_reader.cpp:59-71`'s own comment: "the reader opens and closes within one call; nothing escapes") - wasted work, not a leaked handle. This narrows #3816's own title ("arm/read ... can leak a live subscription/handle") to arm-only; the issue's body agrees with this row, only the title is broader. The abandonment-signal API gap is shared by all three call sites; only the arm case actually leaks. Different defect class from #3831 (a mutation-ordering bug in the rollback path) - not subsumed by it or by anything else in this row. **Detection signal: none today** - `GuardianIoExecutor::Stats.counters[..].timed_out` (incremented at `guardian_io_executor.hpp:386`, one line before the discard-comment return at `:387`) and `GuardianSparkRuntime::backend_op_timeouts()` are both read only by unit tests, never wired to a heartbeat tag, log line, or metric; a real occurrence would be invisible fleet-side. #3816's own filed text states it "should gate the `prefer_spark_` flip (F14)", per the governance disposition that raised it (`ent-1`, `governance.d/2233-arm-disarm-liveness-M.4BNt5t.jsonl`); no ruling exists overriding that, so this doc treats it as **gating PR-5 only** (not PR-4, which is independent - see §1). A fully airtight fix needs `GuardianIoExecutor` extended with an abandonment-signal API shared by both `GuardianSparkRuntime` and `GuardianStateReader` - a design change, not a line-count fix, so it does not fit PR-2a's mechanical batch alongside #3831/#3847; no PR slot is assigned yet (§1). PR-5 cannot proceed until #3816 is either fixed or explicitly risk-accepted by a future ruling - it is deliberately NOT added to §5's risk-accept register here, since #3816's own text asks not to "silently ride along unaddressed." **Siblings, not ruled on here**: #2233 item 3's governance run (`governance.d/2233-arm-disarm-liveness-M.4BNt5t.jsonl`) produced seven open follow-up issues in total - #3816 and #3831 (both discussed above) plus five more, all confirmed OPEN: #3810 (backend-op-deadline config override, self-described as "dormant today ... becomes live at the F14 flip" - not a self-declared gate), #3811 (`rollback_spark_wiring_locked()` doesn't wait for `active_backend_op_workers()==0`, shares #3816's orphaned-worker shape, its own text corrects an earlier "fully dormant" assumption since `wire_spark_engine()`'s wiring/rollback path runs at boot lifecycle-only - but does not itself claim to gate the flip), #3812/#3813/#3814 (status-visibility and counter-precision gaps, no gating language found in any of the three). Of the seven, only #3816 self-declares flip-gating; whether any of the other five (#3831 is DONE in code, per above) should is not this row's call - flagged here so the full set is visible rather than #3816 alone. **#3816 fixed by PR-2e** (branch `fix/3816-guardian-io-executor-abandonment-signal`, merged to `dev`): `GuardianIoExecutor::run()` now delivers every result `fn()` returns normally exactly once - either to the caller's return value, or (if the caller already decided Timeout/Stopped) to a new `on_abandoned(T&&)` callback (a thrown `fn()`/`WorkerThrew` has no `T` to deliver and correctly reaches neither destination), both decisions serialized on the SAME wait-side lock (constructed once, held across `spawn_detached`, reused for `cv.wait_until` - no lock is ever constructed after launch). `attach_rule`'s old `still_wanted` self-check against `arming_keys_` (the "NOT airtight" mitigation this row previously described) is removed entirely - the executor itself now owns the decision, closing both triggers named above: the caller-timeout race (trigger 1) is closed architecturally by the exactly-once contract, and the wait-path exception (trigger 2, `FortitudeEtc`'s finding) no longer has a catchable post-launch failure to speak of - a `std::mutex::lock()` failure on the wait-side lock now happens strictly pre-launch and folds into the existing `IoFailure::LaunchFailed` (no new enumerator; `set_throw_before_wait_lock_for_test` is the regression seam, closing `#saf3821-5`). `attach_rule`'s `on_abandoned` disarms a late-succeeding arm and counts it separately (`GuardianSparkRuntime::backend_op_late_arms()`, #3813's distinction kept at the source); `submit_disarm_off_lock` and `GuardianStateReader` are unchanged (a late disarm/read still costs nothing to discard, per this row's own earlier analysis). Mutation-verified: the rewritten regression test (`test_guardian_spark_runtime.cpp`, formerly "C1/c1") asserts `FakeBackend`'s exact armed/disarmed id vectors match, not just balanced counts, and goes red when the `on_abandoned` wiring is removed. **Detection signal: still none today** - the new `Counters::abandoned` (executor) and `backend_op_late_arms_` (runtime) counters exist and are test-asserted, but neither is wired to a heartbeat tag; #3415 (OPEN) already owns that egress and should point at these new counters rather than a new issue being filed. Deliberately does not overlap #2818's engine-level "subscription death" gap (a related but separable defect the sibling `#3848` fault-injection work owns) - #3816's fix touches only the executor/runtime abandonment contract, not `SparkEngine`'s whole-key teardown. |
-| 4 | Stalled sink cannot freeze the runtime | **DONE - PR #3961, merged 2026-09-04T15:20:25Z (`acd83bd48`); #3953/#3966 residuals RESOLVED on branch `fix/3953-3966-outbox-hardening` (PR #3982, not yet merged as of this edit) - item 5 tracked separately at #3972** | Confirmed the hazard exactly as the previous re-verification narrowed it: `drain_mu_` (`guardian_spark_runtime.cpp:1353`, `lock_guard` held for the whole `drain_bounded()` call) has one production caller chain, `GuardianOutboxDrainWorker::drain_bounded()`, and the worker thread was wedged for the duration of a stalled `send()` with nothing else progressing until it unwedged. #3847's own acceptance bar is explicit that dropping `drain_mu_` around `send()` is NOT sufficient (a no-op with one production caller - the worker thread is still inside `Write()` either way); it requires "the drain worker's next tick proceeds while a prior send is artificially stalled." Fixed by detaching the call: a new `GuardianOutboxSendExecutor` (`agents/core/src/guardian_outbox_send_executor.hpp`, new file) runs `send` on a single-flight detached worker (mirroring `guardian_io_executor.hpp`'s spawn-per-attempt shape, NOT its `run()` - `run()` discards a late result on timeout, which is correct for an idempotent read and wrong for a send: a discarded `Sent` would drop the entry without ever retrying it). `GuardianOutboxDrainWorker::wrapped_send()` (`guardian_outbox_drain_worker.hpp:408`) bounds the worker's own wait to `kGuardianSendOfferWait` (200ms) and retains the head if the real send hasn't finished by then, letting journal maintenance and the next tick proceed; the send itself keeps running detached until it completes. Single-flight by construction (one gRPC stream write in flight at a time), keyed on `OutboxEntry::event_id` (the existing wire-idempotency key) so a generation-supersede purge mid-send is detected rather than misapplied. Covered by the orphan-exit contract already established for the state-reader and arm/disarm executors: `active_send_workers()` (`guardian_outbox_drain_worker.hpp:380`) sums into `GuardianEngine::active_io_workers()` (`guardian_engine.cpp:1551`), so `send`'s capture of `AgentImpl` state stays safe under `hard_exit.hpp`'s existing grace-then-kill contract exactly as it did before, just via a different mechanism (previously: synchronous join; now: the orphan-exit sum). **Not fixed**: `stream_write_mu_` contention (`agent.cpp`) - a detached send still holds that mutex for the stall's duration, so another sender sharing the same stream (a response, a DEX signal) still blocks on it; this narrows the drain WORKER's own availability, not the shared stream's. The send path remains unreachable in production today (`prefer_spark_` is false at rung 7.7a), so this is pre-flip hardening, not a live-traffic fix. Tests: `test_guardian_outbox_drain_worker.cpp` gained two new cases proving journal maintenance keeps advancing and the send stays single-flight while artificially stalled (CV-gated, not a real network stall), plus a strengthened CH-1 proving `stop()` now decouples from an 800ms send entirely (previously only asserted a bound that happened to be looser than the send). The existing role-marker test and the `test_guardian_engine_spark_reconcile.cpp` mtx_-abort death test both needed updating: `send` no longer runs on the thread `stop()` joins, so `on_guardian_joined_thread()` correctly now reads false inside it - the death test's hostile call was moved to a directly-spawned thread wearing the same marker, since it no longer has a live vehicle through `send`. **Governance found and fixed FOUR BLOCKING concurrency defects across four review rounds before this PR was pushed** - BLOCKING and SHOULD findings are recorded here in full rather than only the final clean state, since that is what a future flip-readiness auditor needs (LOW/INFO residuals are NOT all repeated here - `governance.d/3847-outbox-send-executor.rGvKq2.jsonl` is the complete ledger; its deferred LOW/INFO residuals are consolidated and tracked at #3953, acceptance criteria: each resolved or explicitly risk-accepted before the F14 flip - see #3953 itself for the current count, not a number restated here; a later adversarial-review pass's own findings are in `governance.d/3847-adversarial-review-synthesis.md`): **(1)** `launch()` wrote its bookkeeping (`in_flight`/`done`) AFTER `spawn_detached()` instead of before, so a fast-completing send could have its published `done=true` clobbered back to `false` by the launcher's own write, silently wedging that one entry forever (cpp-expert, empirically reproduced ~1-in-1000 in a standalone harness). **(2)** `offer()`'s mismatch branch (the head changed under a stalled send - an ORDINARY coalesce/withdrawal, not a rare race) never reclaimed the slot once the orphaned worker finished, so `in_flight` stayed permanently true against an `event_id` that could never recur again - wedging the ENTIRE outbox for the life of the process, not just one entry (security-guardian and cpp-safety, independently). **(3)** A single shared `GuardianOutboxSendExecutor` instance served BOTH the lifecycle log and the compliance/health log (`drain_bounded()` calls `drain_log_unlocked` once per log, `guardian_spark_runtime.cpp:1442/1454`) - a merely-slow-but-succeeding lifecycle send made the compliance call hit the SAME executor's mismatch-orphan branch and return Retain WITHOUT the compliance send ever being invoked, silently starving an entire Guardian audit lane for as long as lifecycle stayed busy (unhappy-path finding UP-1; security-guardian separately flagged this as I1 audit-control-failure, not merely I5 availability). Fixed by giving each lane its OWN executor instance (`lifecycle_send_exec_` / `compliance_send_exec_`, `guardian_outbox_drain_worker.hpp:442-443`), routed by `OutboxEntry::domain` (`:409-410`). **(4)** Round (1)'s own fix placed the `in_flight_event_id` string-copy bookkeeping one statement BEFORE the try/catch meant to guard allocation failures, so a `bad_alloc` on that specific copy reopened defect (1)'s wedge class (cpp-safety, re-review). All four fixed and independently re-confirmed by follow-up governance passes; direct regression coverage added in `tests/unit/test_guardian_outbox_send_executor.cpp` (defect 2, mutation-verified RED) and `tests/unit/test_guardian_outbox_drain_worker.cpp`'s `"item 4 regression: a stalled lifecycle send does not starve compliance delivery"` test (defect 3, mutation-verified RED against the pre-fix single-executor code - a first draft of that test used a bounded 400ms stall and passed on BOTH pre- and post-fix code, since a bounded stall only DELAYS compliance rather than skipping it; the test had to stall lifecycle indefinitely to actually discriminate the two designs). **Two SHOULD-level optimizations were built, wired, and deliberately REVERTED**: waking a parked `offer()` call early on `stop()` (would have shaved up to `kGuardianSendOfferWait` off shutdown latency) and a completion-waker firing the drain worker's cadence on every finished send - each broke a different pre-existing, load-bearing timing test in this file (a `stop()`-join durability-ordering test; a refill-rearm-without-external-wake test) when tried; both were reverted rather than redesigning either pre-existing test under this PR's time budget. The second revert leaves a real cadence regression versus pre-fix behavior, not merely a missed optimization (sre finding): pre-fix, a 300ms send blocked the loop inline and the next tick started as soon as it returned; post-fix, a send that runs longer than `kGuardianSendOfferWait` (200ms) but still succeeds hits `offer()`'s Retain path and isn't re-checked until the next enqueue or the periodic backstop (`kDefaultPeriodicBoundMs`, 5s in production) - e.g. a 300ms send waits out roughly 16x its own duration before the next check, up to roughly 25x for a send finishing just past the 200ms threshold, shrinking toward 1x as it approaches the 5s backstop. Both trade-offs are left as documented notes on `GuardianOutboxSendExecutor::offer()`'s `wait_until` call and `stop()`. **Open, deliberately not fixed here** (sre, Gate 6): no heartbeat tag/counter/log exists for "a send has been stalled for N seconds" - a loud pre-fix hang traded for a silent post-fix slow-drain with no operator-visible signal once this ships live; tracked at #3953, recommended before the F14 flip, the same way row 3 tracks #3816's "Detection signal: none today." A TOCTOU fix landed in a later commit on this same branch closed a related admission-race defect inside `GuardianOutboxSendExecutor::launch()` (adversarial-review finding, `governance.d/3847-adversarial-review-synthesis.md`) and found a structurally identical, deeper residual one call frame out in `GuardianOutboxDrainWorker::stop()`'s own non-atomic shutdown sequencing - also tracked at #3953, not fixed in this row. **Post-merge**: an independent `/pr-review` adversarial pass (Kimi K2.7 + Codex, fully dynamic, dedicated 200k/30k-round race harnesses) found a THIRD, related admission-race that all prior review rounds on this row - including the PR's own author-run adversarial pass - missed: `launch()`'s `AliveTicket` (the sole source `active_worker_count()` reports) is armed in a second, independent lock acquisition released and re-acquired after the `stopping`-recheck block the TOCTOU fix added, so `stop()` can return with `stopping=true` already set while `active_worker_count()` still transiently reads 0, even though admission is already committed - deviates from `GuardianIoExecutor`'s own precedent of arming its ticket inside the single admission lock. Non-blocking today because `GuardianOutboxDrainWorker::stop()`'s unconditional `thread_.join()` plus `GuardianEngine`'s shared mutex between `stop()` and `active_io_workers()` means no caller can observe the gap - a DIFFERENT, more durable safety argument than the rest of this row's residuals, most of which are bounded only by `prefer_spark_=false` and stop being safe the moment F14 flips it: this one is a property of the call graph, independent of that flag (sre, Gate 6 re-review). Filed **#3966** with the fix already spelled out (arm the ticket inside the existing lock); tracked as a sibling to #3953, not yet folded into it. **Resolved**: `fix/3953-3966-outbox-hardening` (PR #3982) arms `AliveTicket` inside the same admission lock (closing #3966), closes both lane executors before publishing `sig_->stopping` (closing #3953 item 6, the structurally identical residual one call frame out), adds an internal wait-clamp so a stalled send is re-checked within ~200ms instead of riding out the periodic backstop (item 3), counts+logs orphan exceptions and send stalls with both surfaced on the heartbeat (items 1+2), and asserts the Lifecycle-vs-Compliance/Health domain split (item 4). Item 5 (cross-lane wire reordering) is filed separately as #3972 rather than folded in here, since its watertight fix (merge-drain by global sequence) is real follow-on work, not a same-PR fix. A second governance run on PR #3982 itself (Gate 8 re-review of its own fix round) also filed **#3980**: a deeper, unbounded stall-undercounting case on a lane whose log empties while its orphan is still in flight - needs new API surface, deliberately out of scope for #3982. |
+| 4 | Stalled sink cannot freeze the runtime | **DONE - PR #3961, merged 2026-09-04T15:20:25Z (`acd83bd48`); #3953/#3966 residuals RESOLVED - merged as PR #3982 (`1e7a5346c`, 2026-09-05T18:09:10Z) - item 5 tracked separately at #3972** | Confirmed the hazard exactly as the previous re-verification narrowed it: `drain_mu_` (`guardian_spark_runtime.cpp:1353`, `lock_guard` held for the whole `drain_bounded()` call) has one production caller chain, `GuardianOutboxDrainWorker::drain_bounded()`, and the worker thread was wedged for the duration of a stalled `send()` with nothing else progressing until it unwedged. #3847's own acceptance bar is explicit that dropping `drain_mu_` around `send()` is NOT sufficient (a no-op with one production caller - the worker thread is still inside `Write()` either way); it requires "the drain worker's next tick proceeds while a prior send is artificially stalled." Fixed by detaching the call: a new `GuardianOutboxSendExecutor` (`agents/core/src/guardian_outbox_send_executor.hpp`, new file) runs `send` on a single-flight detached worker (mirroring `guardian_io_executor.hpp`'s spawn-per-attempt shape, NOT its `run()` - `run()` discards a late result on timeout, which is correct for an idempotent read and wrong for a send: a discarded `Sent` would drop the entry without ever retrying it). `GuardianOutboxDrainWorker::wrapped_send()` (`guardian_outbox_drain_worker.hpp:408`) bounds the worker's own wait to `kGuardianSendOfferWait` (200ms) and retains the head if the real send hasn't finished by then, letting journal maintenance and the next tick proceed; the send itself keeps running detached until it completes. Single-flight by construction (one gRPC stream write in flight at a time), keyed on `OutboxEntry::event_id` (the existing wire-idempotency key) so a generation-supersede purge mid-send is detected rather than misapplied. Covered by the orphan-exit contract already established for the state-reader and arm/disarm executors: `active_send_workers()` (`guardian_outbox_drain_worker.hpp:380`) sums into `GuardianEngine::active_io_workers()` (`guardian_engine.cpp:1551`), so `send`'s capture of `AgentImpl` state stays safe under `hard_exit.hpp`'s existing grace-then-kill contract exactly as it did before, just via a different mechanism (previously: synchronous join; now: the orphan-exit sum). **Not fixed**: `stream_write_mu_` contention (`agent.cpp`) - a detached send still holds that mutex for the stall's duration, so another sender sharing the same stream (a response, a DEX signal) still blocks on it; this narrows the drain WORKER's own availability, not the shared stream's. The send path remains unreachable in production today (`prefer_spark_` is false at rung 7.7a), so this is pre-flip hardening, not a live-traffic fix. Tests: `test_guardian_outbox_drain_worker.cpp` gained two new cases proving journal maintenance keeps advancing and the send stays single-flight while artificially stalled (CV-gated, not a real network stall), plus a strengthened CH-1 proving `stop()` now decouples from an 800ms send entirely (previously only asserted a bound that happened to be looser than the send). The existing role-marker test and the `test_guardian_engine_spark_reconcile.cpp` mtx_-abort death test both needed updating: `send` no longer runs on the thread `stop()` joins, so `on_guardian_joined_thread()` correctly now reads false inside it - the death test's hostile call was moved to a directly-spawned thread wearing the same marker, since it no longer has a live vehicle through `send`. **Governance found and fixed FOUR BLOCKING concurrency defects across four review rounds before this PR was pushed** - BLOCKING and SHOULD findings are recorded here in full rather than only the final clean state, since that is what a future flip-readiness auditor needs (LOW/INFO residuals are NOT all repeated here - `governance.d/3847-outbox-send-executor.rGvKq2.jsonl` is the complete ledger; its deferred LOW/INFO residuals are consolidated and tracked at #3953, acceptance criteria: each resolved or explicitly risk-accepted before the F14 flip - see #3953 itself for the current count, not a number restated here; a later adversarial-review pass's own findings are in `governance.d/3847-adversarial-review-synthesis.md`): **(1)** `launch()` wrote its bookkeeping (`in_flight`/`done`) AFTER `spawn_detached()` instead of before, so a fast-completing send could have its published `done=true` clobbered back to `false` by the launcher's own write, silently wedging that one entry forever (cpp-expert, empirically reproduced ~1-in-1000 in a standalone harness). **(2)** `offer()`'s mismatch branch (the head changed under a stalled send - an ORDINARY coalesce/withdrawal, not a rare race) never reclaimed the slot once the orphaned worker finished, so `in_flight` stayed permanently true against an `event_id` that could never recur again - wedging the ENTIRE outbox for the life of the process, not just one entry (security-guardian and cpp-safety, independently). **(3)** A single shared `GuardianOutboxSendExecutor` instance served BOTH the lifecycle log and the compliance/health log (`drain_bounded()` calls `drain_log_unlocked` once per log, `guardian_spark_runtime.cpp:1442/1454`) - a merely-slow-but-succeeding lifecycle send made the compliance call hit the SAME executor's mismatch-orphan branch and return Retain WITHOUT the compliance send ever being invoked, silently starving an entire Guardian audit lane for as long as lifecycle stayed busy (unhappy-path finding UP-1; security-guardian separately flagged this as I1 audit-control-failure, not merely I5 availability). Fixed by giving each lane its OWN executor instance (`lifecycle_send_exec_` / `compliance_send_exec_`, `guardian_outbox_drain_worker.hpp:442-443`), routed by `OutboxEntry::domain` (`:409-410`). **(4)** Round (1)'s own fix placed the `in_flight_event_id` string-copy bookkeeping one statement BEFORE the try/catch meant to guard allocation failures, so a `bad_alloc` on that specific copy reopened defect (1)'s wedge class (cpp-safety, re-review). All four fixed and independently re-confirmed by follow-up governance passes; direct regression coverage added in `tests/unit/test_guardian_outbox_send_executor.cpp` (defect 2, mutation-verified RED) and `tests/unit/test_guardian_outbox_drain_worker.cpp`'s `"item 4 regression: a stalled lifecycle send does not starve compliance delivery"` test (defect 3, mutation-verified RED against the pre-fix single-executor code - a first draft of that test used a bounded 400ms stall and passed on BOTH pre- and post-fix code, since a bounded stall only DELAYS compliance rather than skipping it; the test had to stall lifecycle indefinitely to actually discriminate the two designs). **Two SHOULD-level optimizations were built, wired, and deliberately REVERTED**: waking a parked `offer()` call early on `stop()` (would have shaved up to `kGuardianSendOfferWait` off shutdown latency) and a completion-waker firing the drain worker's cadence on every finished send - each broke a different pre-existing, load-bearing timing test in this file (a `stop()`-join durability-ordering test; a refill-rearm-without-external-wake test) when tried; both were reverted rather than redesigning either pre-existing test under this PR's time budget. The second revert leaves a real cadence regression versus pre-fix behavior, not merely a missed optimization (sre finding): pre-fix, a 300ms send blocked the loop inline and the next tick started as soon as it returned; post-fix, a send that runs longer than `kGuardianSendOfferWait` (200ms) but still succeeds hits `offer()`'s Retain path and isn't re-checked until the next enqueue or the periodic backstop (`kDefaultPeriodicBoundMs`, 5s in production) - e.g. a 300ms send waits out roughly 16x its own duration before the next check, up to roughly 25x for a send finishing just past the 200ms threshold, shrinking toward 1x as it approaches the 5s backstop. Both trade-offs are left as documented notes on `GuardianOutboxSendExecutor::offer()`'s `wait_until` call and `stop()`. **Open, deliberately not fixed here** (sre, Gate 6): no heartbeat tag/counter/log exists for "a send has been stalled for N seconds" - a loud pre-fix hang traded for a silent post-fix slow-drain with no operator-visible signal once this ships live; tracked at #3953, recommended before the F14 flip, the same way row 3 tracks #3816's "Detection signal: none today." A TOCTOU fix landed in a later commit on this same branch closed a related admission-race defect inside `GuardianOutboxSendExecutor::launch()` (adversarial-review finding, `governance.d/3847-adversarial-review-synthesis.md`) and found a structurally identical, deeper residual one call frame out in `GuardianOutboxDrainWorker::stop()`'s own non-atomic shutdown sequencing - also tracked at #3953, not fixed in this row. **Post-merge**: an independent `/pr-review` adversarial pass (Kimi K2.7 + Codex, fully dynamic, dedicated 200k/30k-round race harnesses) found a THIRD, related admission-race that all prior review rounds on this row - including the PR's own author-run adversarial pass - missed: `launch()`'s `AliveTicket` (the sole source `active_worker_count()` reports) is armed in a second, independent lock acquisition released and re-acquired after the `stopping`-recheck block the TOCTOU fix added, so `stop()` can return with `stopping=true` already set while `active_worker_count()` still transiently reads 0, even though admission is already committed - deviates from `GuardianIoExecutor`'s own precedent of arming its ticket inside the single admission lock. Non-blocking today because `GuardianOutboxDrainWorker::stop()`'s unconditional `thread_.join()` plus `GuardianEngine`'s shared mutex between `stop()` and `active_io_workers()` means no caller can observe the gap - a DIFFERENT, more durable safety argument than the rest of this row's residuals, most of which are bounded only by `prefer_spark_=false` and stop being safe the moment F14 flips it: this one is a property of the call graph, independent of that flag (sre, Gate 6 re-review). Filed **#3966** with the fix already spelled out (arm the ticket inside the existing lock); tracked as a sibling to #3953, not yet folded into it. **Resolved**: `fix/3953-3966-outbox-hardening` (PR #3982) arms `AliveTicket` inside the same admission lock (closing #3966), closes both lane executors before publishing `sig_->stopping` (closing #3953 item 6, the structurally identical residual one call frame out), adds an internal wait-clamp so a stalled send is re-checked within ~200ms instead of riding out the periodic backstop (item 3), counts+logs orphan exceptions and send stalls with both surfaced on the heartbeat (items 1+2), and asserts the Lifecycle-vs-Compliance/Health domain split (item 4). Item 5 (cross-lane wire reordering) is filed separately as #3972 rather than folded in here, since its watertight fix (merge-drain by global sequence) is real follow-on work, not a same-PR fix. A second governance run on PR #3982 itself (Gate 8 re-review of its own fix round) also filed **#3980**: a deeper, unbounded stall-undercounting case on a lane whose log empties while its orphan is still in flight - needs new API surface, deliberately out of scope for #3982. |
 | 5 | Firewall both teardown scope guards, make them noncopyable | **DONE - confirmed via commit archaeology; PR-2b is dropped from the delivery plan** | The issue cites two copyable guards with implicitly-noexcept destructors at `guardian_engine.cpp:66–79` / `guardian_spark_runtime.cpp:31–44`. `git show 25f73e231` (2026-07-18, part of **PR #2283**, "Guardian spark PR-1a: send-path + exception-safety + drain hardening, items 1-4", merged 2026-07-18 - a full 6 weeks before #3821) deletes the identical `struct ScopeExit { std::function<void()> fn; bool committed{false}; ~ScopeExit() { if (!committed && fn) fn(); } };` from each of `guardian_engine.cpp` (old hunk `@@ -64,20 +65,11 @@`, struct at old lines ~67-79, matching the issue's `66-79` citation almost exactly) and `guardian_spark_runtime.cpp` (old hunk `@@ -28,21 +29,6 @@`, struct within old lines 28-48, containing the issue's `31-44` citation) - copyable, implicitly-noexcept destructor invoking a throwing `std::function`, the exact shape item 5 describes, at the exact lines item 5 cites. The commit's own body states it explicitly: "B3: the two Guardian ScopeExit guards are replaced by one terminate-safe GuardianRollback (guardian_scope_guard.*): its dtor swallows a cleanup throw (which would std::terminate the agent mid-unwind) and counts it." `GuardianRollback` (`agents/core/src/guardian_scope_guard.hpp`) is noncopyable (copy/assign deleted) and its destructor never propagates (`try { fn(); } catch (...) { count + best-effort log }`) - now used 3× in `guardian_engine.cpp` (lines 242, 623, 1384) and 6× in `guardian_spark_runtime.cpp` (lines 216, 265, 288, 321, 424, 547) - counted by direct `grep -nE '^\s*GuardianRollback [a-z_]+;'`, cross-checked by two independent governance reviewers. Confirmed as part of **PR #2283** (`gh pr view 2283 --json mergeCommit` + `git merge-base --is-ancestor 25f73e231 <that commit>` both check out), merged 2026-07-18 - one day after #2233's creation timestamp (2026-07-17), and a full 6 weeks before #3821. Because the issue's own citations match the pre-fix code exactly, item 5's text was accurate at the time it was written and simply never updated once PR #2283 landed - not a case of speculative or drifted citations. **PR-2b in the delivery plan (item 5, "teardown-path-specific, merges immediately before item 9 runs") had no remaining work and is dropped** - confirmed by the operator 2026-09-02, recorded on #3438; the delivery plan's Lane A now runs PR-1 → PR-2a → PR-2c directly. No successor tracking issue needed. |
 | 6 | Hard agent-side file-hash maximum | **DONE - scope grew to a server-side reject, single-sourced** | #3884 (merged 2026-09-03, `282c3b58a`) landed a new shared header, `common/include/yuzu/guardian_file_hash_limits.hpp` (`kMaxFileHashBytes = 1073741824` / 1 GiB), consumed on BOTH sides: the agent clamps at `guardian_engine.cpp:1057` and `guardian_spark_bridge.hpp:295` (the legacy/spark paths this row originally flagged as unclamped), and the server now REJECTS an over-ceiling authored value at authoring time in `guardian_rule_spec.cpp:152/161`, with the ceiling also published into the JSON schema (`guardian_schema_registry.cpp:177`) - a `static_assert` at `guardian_rule_spec.cpp:25` pins a human-readable error string to the same constant so the two cannot drift textually either. One accepted residual, ruled by Dave 2026-09-02 (ledger commit `5ae6e05db`): a `file-hash-equals` rule authored ABOVE 1 GiB *before* this PR shows a false `<oversize>` drift on upgrade, since the new server-side reject cannot retroactively catch an already-stored rule - mitigated via `docs/user-manual/upgrading.md`'s Version Compatibility table (pointing at `GET /api/v1/guaranteed-state/rules` to find affected rows), not a startup-time enumeration. Verified directly against `origin/dev @ 282c3b58a`, not from #3884's own PR description alone. |
 | 7 | Backpressure-drop surfacing (=#2993) | **DONE** | The lifecycle-log outbox capacity default is 4096 (`guardian_spark_runtime.hpp:170`, `outbox_capacity{4096}`; issue didn't cite a line). #3884 (merged 2026-09-03, `282c3b58a`) wired `outbox_backpressure_drops()` into fleet visibility: a new `uint64_t` counter field + accessor, no longer test-only-consumed. (Same PR also closed #2233 item 7, the sibling lifecycle-audit-log backpressure counter, `lifecycle_backpressure_log_fires_` - a separate counter for a separate log, not this row's own #2993 scope, but landed alongside it in the same batch.) Verified directly against `origin/dev @ 282c3b58a`, not from #3884's own PR description alone. |
@@ -174,8 +340,56 @@ Do not conflate them:**
   a 0 reading is ambiguous without this stage). **OPEN: no latency pass/fail threshold is defined
   anywhere** - no percentile, sample-size, or platform-matrix target exists in the design doc or
   any other committed source, despite this being "the flip's genuine go/no-go" per that doc's
-  own item 7. Tracked as **#3850** (filed while writing this doc); must be resolved before Rig A
-  (§8) can produce an objective pass/fail result rather than a subjective call.
+  own item 7. Tracked as **#3850** (filed while writing this doc, still OPEN) - the exploratory
+  pass below deliberately did not propose a threshold from a 12-30 sample run; this update does
+  not resolve #3850.
+
+  **Exploratory pass run (2026-09-04/05, DGRHP - Windows, not BigColin; see §8 for why),
+  Sol (`gpt-5.6-sol`) + Fable reviewed, all findings independently re-verified against code
+  before being recorded here.** Found the "hold at the hard ceiling" premise above is not
+  mechanically achievable under sustained load: `prune_locked_` resets the journal fully to the
+  soft cap (1000 batches) every single 120s pass regardless of delivery/sent-label status, so
+  occupancy above 1000 can only exist transiently within a single 120s window - the hard ceiling
+  (2000/64MiB) is a backstop for a "chronically-failing prune" per its own doc comment, not a
+  load-reachable steady state. Reaching it needs a burst (>1000 net-new batches within one
+  120s window) or a prune-fail injection; neither was attempted this pass. **The design doc's
+  own item 7 wording ("holding the journal at its hard ceiling") needs the same correction** -
+  flagged here, not yet fixed in that doc. The achievable organic/moderate-load regime found on
+  this rig was ~550-750 batches (~24-27 batches/120s churn ceiling - more parallelism made
+  things worse past ~24 lanes, likely a server-side per-client limit).
+
+  A 30-sample stratified latency probe taken in that regime (churn-paused window, fresh agent
+  restart, ms-precision via `event_id`'s embedded wall-clock - NOT `updated_at`, which truncates
+  to whole seconds before reaching Postgres) measured **6.6-7.0s (mean 6837ms)**. Label this
+  **detection-to-server-ingest latency, not stimulus-to-detection**: tracing the registry
+  watcher path confirms `event_id`'s embedded timestamp is minted in
+  `GuardianSparkRuntime::build_entries()` at evaluation-completion time (post OS-notification
+  callback, pre-outbox-enqueue, on the consumer thread per ADR-0021's queued tier) - not the raw
+  instant the underlying value changed. The figure most likely reflects the downstream
+  outbox/transport/Postgres-write path rather than registry-notification lag, but that was never
+  isolated by direct measurement. No pass/fail threshold is proposed from these samples; this
+  feeds #3850, it does not resolve it.
+
+  **Two real production defects surfaced, neither flip-blocking on its own but both worth
+  folding into flip-readiness review**: (1) `GuardianOutbox` (4096-entry capacity) can stall
+  completely when its drain worker's send target is dead - confirmed via a dedicated stall test
+  (`pending_` climbed to 4096 and pinned there, `backpressure_drops()` climbed into the tens of
+  thousands, and the backlog drained instantly the moment a live stream reopened - a
+  head-of-line block, not a capacity fill from cumulative churn, which was separately ruled out).
+  Commented on the existing **#2993** (no telemetry consumer for this counter) with this
+  real-world reproduction. (2) The stall's root cause was initially attributed to the Heartbeat
+  RPC having no client-side deadline (filed **#3989**), but a follow-up isolated repro
+  **retracted that causal claim**: a clean server stop/restart detects the dead session and
+  recovers within one heartbeat tick regardless of the missing deadline (still worth fixing as
+  defensive hygiene, matching `Register`/`ReportInventory`'s convention - correction comment
+  posted on #3989). **#2049** (`TryCancel()` not reliably unblocking a transport-stalled
+  Subscribe read) is the likelier primary mechanism for the actual stall instead - now two
+  independent occurrences on that issue, commented there. Separately, a single global
+  `policy_generation` counter means ANY rule mutation anywhere triggers a fleet-wide `full_sync`
+  teardown+rearm on every agent's next heartbeat - not only a persistently-failing rule as
+  **#2278** originally scoped. Split out as its own sibling issue, **#3990**, since the two are
+  different triggers (one-shot burst per mutation vs. a standing retry loop) sharing the same
+  root counter - a follow-up on #2278 records the distinction and points there.
 
 Both gate the flip independently; neither substitutes for the other.
 
@@ -203,6 +417,17 @@ that is stated explicitly rather than inferred or invented.
 - Owner: not assigned in source material - needs an owner before hardening package 1 starts.
 - Milestone: hardening package 1, immediately post-P3.
 - Revisit trigger: before alert-enablement AND before any production fleet.
+- **Related finding, not itself risk-accepted here (2026-09-04/05, DGRHP exploratory pass,
+  §4/§8)**: a single global `policy_generation` counter makes ANY rule mutation fleet-wide
+  trigger the same full-teardown/rebuild storm #2278 describes, not only a persistently-failing
+  rule - filed as sibling issue **#3990**. Widens how often this package's #2278 half is
+  actually exercised in practice; worth re-weighing this row's milestone/priority once #3990 is
+  triaged, not assumed unchanged. **A second, distinct compounding finding (2026-09-06,
+  criterion 5's own governance review, see §2)**: because a no-`expected`-value hash rule
+  captures the CURRENT target content as its baseline on every arm, and `#3990`'s `full_sync`
+  re-arms every rule unconditionally on any unrelated mutation, a genuinely-still-drifted such
+  rule can be silently reclassified as compliant with no remediation having happened - filed
+  as **#4021**, also not risk-accepted here.
 
 **#2815 + #2818 + #2833 + #2839** (teardown UAF-class; #2797's legacy half and #2012/#2011
 tracked separately below)
@@ -230,16 +455,98 @@ tracked separately below)
   `~SparkEngine` waits UNBOUNDED - the unbounded one is what actually closes the UAF. Note
   the shipped agent was never exposed: F3's `OrphanExitGuard` `hard_exit()`s before
   `~Agent` while any Guardian I/O worker is live. Any other embedder, and every test, was.
-- **#2818 - CONFIRMED, NOT FIXED. Escalates to its own PR-2d, a hard pre-PR-5
-  prerequisite**, per this section's own revisit trigger. A second consumer that dedups
-  onto a key whose watch is still in flight is handed a success id; when that watch fails,
-  `drop_key_locked` erases every subscription on the key and tells nobody. Pinned at both
-  layers in PR-2c (engine and Guardian). The Guardian pin is the one that matters: after
-  the kill, nothing is armed and nothing is watched, Guardian still reports the rule armed,
-  and the legacy path did not pick it up either - a genuine detection hole, not a fallback.
-  **PR-2d is NOT gated on PR-2e (#3816) landing.** That dependency was an inference and is
-  withdrawn: #3816 supplies an executor-level caller-abandonment signal, #2818 needs an
-  engine-level consumer-death notification. Different primitives, different layers.
+- **#2818 - CONFIRMED and FIXED in PR-2d** (`fix/2818-subscription-death-notification`,
+  branched off `origin/dev` after PR-2c/#3985 and #3982 had both merged). A second
+  consumer that dedups onto a key whose watch is still in flight was handed a success id;
+  when that watch failed, `drop_key_locked` erased every subscription on the key and told
+  nobody - the engine-level and Guardian-level PIN tests from PR-2c (`test_spark_
+  mechanism.cpp`, `test_guardian_engine_spark_reconcile.cpp`) both flip from asserting the
+  gap to asserting the fix in this PR.
+  - **Fix shape: push, plus a poll backstop.** `SparkEvent` gained `SparkEventKind{Fired,
+    Lost, Faulted, Recovered}` plus a per-recipient `subscription_id` and a `detail`
+    string. `drop_key_locked`'s sole call site (`arm_impl`'s failed-watch teardown) now
+    snapshots every live subscriber before erasing the key and delivers a `Lost` event
+    through the SAME Inline/Queued dispatch channel `deliver()` already uses for an
+    ordinary fire - no new registration surface, and a defensive `mech->unwatch(key)`
+    (verified a safe no-op on all three real mechanisms for a never/partially-registered
+    key) closes the orphan-reclamation gap the original issue also named.
+    `report_fault`'s existing B1 health-toggle edge got the same treatment
+    (`Faulted`/`Recovered`), closing the milder "armed but not watching, and the
+    consumer is never told" gap in the same PR, per Dave's scope call (2026-09-06) to
+    fold both into one PR rather than split a PR-2e.
+  - On the Guardian side: `GuardianSparkRuntime::on_subscription_lost` detaches every
+    rule on the dead key as `"errored"` (guardian_outbox.hpp's existing lifecycle
+    vocabulary, not `"disarmed"` - the rule didn't withdraw, its enforcement broke),
+    staleness-guarded against `PerKey::subscription` so a fresh re-arm racing the async
+    notification wins. **No self-heal in this PR** (Dave's call: smaller, safer diff, no
+    new blocking-retry policy). **Recovery path, corrected (governance Gate 4
+    unhappy-path UP-4 - an earlier version of this row overclaimed "the next
+    server-issued PushRules")**: a subscription death is local to the agent and never
+    changes the server's policy generation, so `server.cpp`'s heartbeat reconcile gate
+    (which re-pushes only when the server's generation has moved past what the agent
+    last reported) is NOT triggered by this event on its own. An errored rule recovers
+    only via an UNRELATED rule/policy edit bumping the server generation, or an agent
+    restart (whose boot re-arm calls `reconcile_rule_locked` unconditionally) - absent
+    either, it can sit un-enforced for the deployment's lifetime with no proactive
+    operator signal beyond the "errored" audit entry itself. Tracked as a pre-PR-5
+    hardening candidate (see the risk-accept register addendum below). **Scope residual
+    (Gate 5 chaos-injector CH-7):** `Lost` is structurally reachable only from
+    `drop_key_locked`'s sole call site - a brand-new key's FIRST watch failing. A
+    previously-healthy, already-armed watch that later dies completely (not merely
+    faults) has no `Lost` path today; it surfaces only via a sustained `Faulted` if the
+    mechanism itself calls `report_fault`, or not at all. Deliberate scope per #2818's
+    own text, not a defect - recorded here as an undocumented-until-now residual rather
+    than left implicit.
+    `on_subscription_faulted` mirrors this for the
+    health-toggle edge without touching `keys_`/`rules_` (the key is still armed).
+  - **Poll backstop, folded into the same PR** (Dave's call): a full Queued consumer
+    channel drops entries under backpressure (`queued_dropped_total`), so a push-only fix
+    leaves a residual, probabilistic version of the same silent-death failure. A new
+    `ISparkBackend::subscription_health()` (non-pure, default `Healthy` - zero changes to
+    any pre-existing test double) plus `GuardianSparkRuntime::revalidate_
+    subscriptions()` are wired into `ConvergenceScheduler`'s existing ~5s priority lane
+    (no new thread) and report/detach a `Dead` subscription exactly as a delivered `Lost`
+    would, whether or not one was ever actually delivered. Scoped to `Dead` only - a
+    missed `Faulted`/`Recovered` toggle is health-reporting-only, lower severity, not
+    backstopped here.
+  - **Verification**: full `[spark]` suite (plain, TSan `[tsan]`+`[tsan-heavy]`, and real
+    ASan against the `x64-linux-asan` instrumented triplet - the stock `x64-linux` tree
+    reproduces exactly the phantom protobuf-static-init `use-after-poison` §2 criterion 2
+    already documents) all clean, with one exception stated plainly: `test_guardian_
+    engine_spark_reconcile.cpp` has a pre-existing, ASan-only flake affecting roughly
+    18-29 assertions per run, confirmed present on completely unmodified `origin/dev`
+    too. A dedicated re-verification pass (run separately, after this branch had merged
+    a further-advanced `origin/dev`) root-caused it precisely: `spark_spec_from_rule()`'s
+    Service-type `service_name` param lookup (`guardian_spark_bridge.hpp:146-150`)
+    intermittently reads back empty under ASan only (10/10 clean on a plain build, ~1/3
+    failure under ASan), reproduces identically on an untouched sibling test, and never
+    triggers an actual `ERROR: AddressSanitizer` report across dozens of runs - a
+    logic-level race ASan's overhead makes more likely to surface, not memory corruption
+    ASan itself would catch. This PR's own new test in that file uses a bare `CHECK` (not
+    `spin_until` - an earlier draft of this fix speculatively wrapped it in
+    `spin_until`, which only turned a fast flaky failure into a slow one without curing
+    it, and was reverted once the real cause was found) and flakes at exactly the same
+    rate as its siblings, for the same reason - not a new correctness defect introduced
+    by this PR. Filed as **#4067**; not fixed here, out of PR-2d's scope. The `arm_impl`
+    alloc-budget test's failed-watch-path literal
+    (`test_spark_alloc_budget.cpp`) was re-measured, not guessed, per that file's own
+    methodology: 2 -> 6, the four new allocations named in its own updated comment.
+  - **Re-verification round (governance Gate 3, cpp-safety): this "Verification"
+    paragraph was written before a real BLOCKING finding, and describes the pre-fix
+    tree.** cpp-safety found `report_fault()`'s new `deliver()` call reachable from
+    `start()`'s pre-start-replay loop while that loop's own `mech_ops_mu_by_type_`
+    guard was still held - a self-deadlock class this PR's own audit had covered for
+    `arm_impl`'s Lost-delivery path but missed on this pre-existing call site. Fixed by
+    scoping the lock to just the staleness-check + `watch_guarded()` call. Confirmed
+    empirically, not just by lock-order reasoning: a new regression test genuinely
+    hung (killed by a 12s timeout, zero output) with the fix reverted, and passed
+    clean with it restored. The full `[spark]` suite (plain/TSan/ASan) was re-run
+    against the corrected tree above and remains clean under the same terms.
+  - **`PR-2d was NOT gated on PR-2e (#3816) landing`** (already merged as PR #3979
+    before this PR started) - confirmed correct in hindsight: #3816 supplied an
+    executor-level caller-abandonment signal, #2818 needed an engine-level
+    consumer-death notification. Different primitives, different layers, no ordering
+    constraint materialized.
 - **#2833 - CONFIRMED but DOMINATED; accepted by documentation, no code change.** The
   unwatch-failure counters do increment during shutdown **on the `dirs_`/direct-unwatch
   path** — the ancestor-teardown path (`arm_ancestor()`/`release_ancestor()`'s own
@@ -276,8 +583,11 @@ tracked separately below)
   a decision PR-5's sign-off can revisit, not an unexamined default. Today, absent this,
   the local rotating log file (`main.cpp`'s `rotating_file_sink_mt`) is the only egress
   for these counters, forever, unless a customer's own log-shipping tails it.
-- **#2839 - CONFIRMED and FIXED in PR-2c; Windows evidence CAPTURED (corrected
-  2026-09-04).** `push_retiring` took the owning `unique_ptr` by value and pushed before
+- **#2839 - CONFIRMED and FIXED in PR-2c; Windows evidence CAPTURED (corrected 2026-09-04;
+  further corrected 2026-09-05/06: ASan-infeasibility claim retracted and real Windows ASan
+  evidence verified clean in isolated repro on `dev` HEAD - the CI dispatch itself timed out,
+  #4018).** `push_retiring` took the owning `unique_ptr` by
+  value and pushed before
   allocating, so a `bad_alloc` destroyed a `DirWatch` whose `ReadDirectoryChangesW` was
   still outstanding. Review found three further gaps beyond the original reorder: the
   gauge-crossing log runs after the transfer and can itself throw, `release_ancestor` is a
@@ -314,17 +624,297 @@ tracked separately below)
   this same hardware before the wedge-idiom rewrite). Worktree left at
   `C:/Users/daver/yuzu-3848-zombie` for reuse.
 
-  **MSVC `/fsanitize=address` was separately confirmed INFEASIBLE**
-  under this repo's current toolchain (a real, general finding, not specific to this PR): an
-  ASan-instrumented build compiles clean but fails to LINK, 1266 `LNK2038` mismatches,
-  because vcpkg's binary-cache grpc/protobuf/abseil aren't ASan-instrumented and no triplet
-  rebuilds them with matching instrumentation - a substantial, separate, not-yet-scoped
-  prerequisite if Windows ASan is ever wanted. So the evidence above is real MSVC-compiled,
-  real-kernel-I/O red/green verification, genuinely NOT ASan proof, described honestly as
-  such.
+  **Correction (2026-09-05): the INFEASIBLE claim below is false - retracted.** It was written
+  from a one-off scratch build's 1266 `LNK2038` link failures and concluded MSVC ASan could not
+  be made to work at all under this toolchain. That conclusion does not hold: a working,
+  coverage-limited Windows ASan CI leg has existed and run green since 2026-07-08
+  (`.github/workflows/nightly.yml`'s `windows-asan` job). It reuses the standard,
+  non-instrumented `x64-windows` vcpkg triplet and passes `-D_DISABLE_STRING_ANNOTATION
+  -D_DISABLE_VECTOR_ANNOTATION` - the documented MSVC workaround for exactly the LNK2038 class
+  the scratch build hit - and its own header comment records: "spiked 2026-07-08 on DGRHP: full
+  agent suite green, zero ASan reports, both with and without this flag pair changing anything
+  except making the link succeed." This leg DOES catch heap/stack-buffer-overflow and
+  use-after-free - the exact class `#2839`'s defect is (a `DirWatch` UAF while Windows still
+  owns an outstanding `ReadDirectoryChangesW`) - so `#2839`'s own test
+  (`tests/unit/test_spark_mechanism.cpp`, inside the `_WIN32` section) is already part of
+  `yuzu_agent_tests`, the exact binary this job builds and runs, and needed no new wiring. It
+  does NOT catch STL container-overflow, because the annotation-disable flags turn that
+  checking off globally, not just for the vendored deps - that gap is `#2016`'s separate,
+  correctly-deferred, from-source-instrumented-triplet project, and is irrelevant to `#2839`'s
+  UAF-class defect. Root cause of the scratch build's failure confirmed directly (its worktree
+  was still on disk at `C:/Users/daver/yuzu-2839-asan-check`, `build-windows-asan-addr`): its
+  meson configure log shows `b_sanitize=address` set but **no** `cpp_args` entry at all - the
+  `-D_DISABLE_STRING_ANNOTATION -D_DISABLE_VECTOR_ANNOTATION` workaround was simply never
+  passed - and its compile log's 1268 `LNK2038` lines (close to, though not identical to, the
+  retracted claim's cited 1266 - both are exact counts, not a rounding artifact, and the
+  2-line gap is unexplained)
+  are all `mismatch detected for 'annotate_string'/'annotate_vector': value '0' doesn't match
+  value '1'` - exactly the container-annotation mismatch those flags exist to suppress. Not "a
+  different build config" as speculated originally: the one thing that would have fixed it was
+  omitted. The recipe's own nightly history independently confirms it links and passes on
+  `main`; the real run recorded immediately below confirms it also passes on `dev` HEAD in
+  isolation from CI. The CI dispatch's own 240s timeout is a separate, unresolved finding
+  recorded below - not attributed here to the recipe itself. Original (retracted) text,
+  kept for the record:
+
+  > MSVC `/fsanitize=address` was separately confirmed INFEASIBLE under this repo's current
+  > toolchain (a real, general finding, not specific to this PR): an ASan-instrumented build
+  > compiles clean but fails to LINK, 1266 `LNK2038` mismatches, because vcpkg's binary-cache
+  > grpc/protobuf/abseil aren't ASan-instrumented and no triplet rebuilds them with matching
+  > instrumentation - a substantial, separate, not-yet-scoped prerequisite if Windows ASan is
+  > ever wanted. So the evidence above is real MSVC-compiled, real-kernel-I/O red/green
+  > verification, genuinely NOT ASan proof, described honestly as such.
+
+  **Real Windows ASan evidence for #2839 (2026-09-05/06) - clean pass on `dev` HEAD, after
+  a CI-only timeout that does not reproduce in isolation.** The commits, run URL, timings and
+  SHAs below are a 2026-09-05/06 point-in-time snapshot - re-verify against current CI history
+  before relying on them if reading this much later. Dispatched `nightly.yml` via `workflow_dispatch`
+  against `origin/dev`
+  HEAD (`1e7a5346c70a3b6d85f6c1924a6fb4858ebb4265`, at/after the required `8355d4cb2b8`):
+  <https://github.com/Tr3kkR/Yuzu/actions/runs/33997171977>. This is the **first-ever
+  `windows-asan` execution against `dev`**: checking `nightly.yml`'s full run history (143 runs
+  via the GitHub API, not just the most recent page) shows only three runs ever targeted `dev` -
+  two on 2026-05-15, both before the `windows-asan` job existed (added 2026-07-08, confirmed
+  absent from those two runs' job lists) - and this dispatch. So the established "green since
+  2026-07-08" history is entirely against `main` (currently `88f9397d355ef18794da3f7d8c7ca1b47ded8742`,
+  confirmed still green on the very next regularly-scheduled nightly, 2026-09-06T06:22Z) - it
+  proves the disable-macro recipe links and runs clean on `main`'s code, not that `dev`'s
+  current, larger HEAD passes under it.
+
+  The job's `Test` step **timed out at 240.16s** (meson's 240s ceiling for this suite, chosen
+  per `tests/meson.build`'s own comment on the `agent` suite's `timeout:` (line number drifts;
+  search for "is ~8x headroom") as ~8x the plain, non-ASan-instrumented,
+  `[tsan-heavy]`-excluded baseline of ~28s - but that 8x is headroom over the PLAIN baseline,
+  not the ASan-instrumented one; the DGRHP reruns below put a clean ASan run at ~135-139s on
+  dedicated, uncontended hardware, so the real headroom this ceiling gives an ASan run is only
+  ~1.7-1.8x even there, not 8x - and the one data point actually observed on the shared,
+  contended Wee Tam pool is this same run, which didn't finish inside it at all)
+  with `Ok: 0, Fail: 0, Timeout: 1`, so this run gives
+  **no** pass/fail signal for `#2839`'s own tests specifically. Downloaded the complete,
+  non-truncated `meson-testlog-windows-asan` artifact (`testlog.txt` - meson's own
+  `--print-errorlogs` dump shows only the last 100 lines in GitHub's log view; the full artifact
+  has the same content, confirming it isn't a truncation artifact) to check whether this is a
+  genuine stall or a suite that now legitimately runs past 240s. Correlating the binary's own
+  spdlog timestamps against the step's GHA-UTC timestamps (first app log line `23:55:35.988`
+  local against the step's `22:55:35.858Z` launch - a clean +1h offset, i.e. the runner's local
+  clock, not a divergent one) puts the last captured line
+  (`KvStore opened: ...yuzu_test_page-..._367`) at UTC `22:58:34.049`, then **~61.9 seconds of
+  complete silence** before the forced kill at `22:59:35.962`. That line is from the `PageRig`
+  fixture (`test_guardian_spark_runtime.cpp:412-413`; verified absent from `main` via
+  `git show origin/main:tests/unit/test_guardian_spark_runtime.cpp` - the file doesn't exist
+  there at all, so this is `dev`-only code, added for item 7 PR-Ag C5 Guardian-outbox-paging).
+  This build's Catch2 defaults to `--order rand` (confirmed via `--help`, not assumed) - test
+  execution order is reshuffled every run from a fresh seed, so which specific `TEST_CASE` was
+  executing could not be identified from CI's log alone; the order-matched repro below pins it
+  down: `_366` and `_367` are the two store-opening `PageRig`-fixture `TEST_CASE`s in that
+  stretch of the run order (`test_guardian_spark_runtime.cpp`; five silent, non-store-opening
+  tests run between them, so "consecutive" means consecutive stores, not consecutive tests) -
+  `"page_into_window prunes an expired batch before replaying (boot barrier)"` (line 3534) at
+  `_366`, then `"concurrent persist + page + prune + drain do not race (TSan checkpoint,
+  QE-1)"` (line 3864, tagged `[tsan][tsan-heavy]`) at `_367`, the last thing CI's log shows.
+  Going completely silent for over a minute looked like a stall rather than ordinary slowness,
+  but resolving contention-vs-code needed an isolated repro away from the shared, 4-runner-per-box
+  Wee Tam pool - including, since order is seed-dependent, one attempt using the SAME seed CI's
+  own run printed, so as to run under CI's own order rather than a merely different random one.
+
+  **Isolated repro on dedicated hardware (2026-09-06, DGRHP)**, same commit and recipe as the
+  CI job (`--buildtype=debugoptimized -Db_sanitize=address -Dcpp_args="-D_DISABLE_STRING_ANNOTATION
+  -D_DISABLE_VECTOR_ANNOTATION"`, `x64-windows` triplet, `ASAN_OPTIONS=halt_on_error=1`),
+  `yuzu_agent_tests.exe` run directly with a 20-minute cap instead of meson's 240s one (running
+  an ASan-instrumented binary directly, outside `meson test`'s wrapper, needs the MSVC toolchain's
+  `bin\Hostx64\x64` dir on `PATH` for `clang_rt.asan_dynamic-x86_64.dll`, in addition to the
+  usual `agents\core` DLL-dependency dir).
+  First pass, default `--order rand` (a fresh, different seed from CI's): completed cleanly in
+  ~139s, exit code 0 - a real result, but a weaker one on its own, since a different random
+  shuffle could simply have avoided whatever CI's specific order hit. Second and third passes
+  both used `--rng-seed 1414877821` (the exact seed CI's own run printed, `testlog.txt` line 12,
+  confirmed echoed back correctly: "Randomness seeded to: 1414877821"), which - per Catch2's
+  order mechanism below - means both ran under CI's own order, not just CI's seed value. Second
+  pass: also completed cleanly, exit code 0, ~136s (this pass's own output capture was lossy -
+  a PowerShell `Register-ObjectEvent`/`BeginOutputReadLine` async stdout capture raced its own
+  writer and lost most lines - so only the exit code and a handful of surviving lines are from
+  this run specifically). Third pass, same seed again,
+  this time with a synchronous `*>` redirect to get a complete, correctly-ordered capture: **also
+  completed cleanly, ~135s, exit code 0** ("All tests passed (52387 assertions in 2636 test
+  cases)") - and this complete capture is what lets the order match be checked directly rather
+  than assumed.
+  Verified Catch2 v3.13.0's `--order rand` mechanism from its own source
+  (`src/catch2/internal/catch_test_case_registry_impl.cpp` + `catch_test_case_info_hasher.cpp`,
+  tag `v3.13.0`): it computes an FNV-1a hash of each test's `name` + `className` + tags XORed
+  with the seed, then sorts by that hash - registration order and cross-TU link order play no
+  role except as an exact-hash-collision tie-break - so an identical set of registered tests
+  (same commit, same recipe here) plus an identical seed should deterministically produce an
+  identical order. Confirmed this empirically too, not just by trusting the mechanism: diffed
+  this third pass's complete `KvStore opened: ...` sequence against CI's `testlog.txt`,
+  normalizing away the per-process PID and the SYSTEM-vs-`daver` temp-dir username. **All 242 of
+  CI's opens match, in the same order, with the same fixture-type-and-counter value at every
+  position** - not a sample, the full set. Both start identically too: `SparkEngine stopped` x2,
+  the same `Trigger 'does-not-exist' not found` warning, then `KvStore opened` for
+  `guardian_reconcile` at global counter `_1`. **This is the same test order as CI's run, not
+  merely the same seed value.**
+
+  Past CI's last logged event is where the two runs diverge. CI went silent for the ~61.9s
+  described above and was killed at the 240s timeout. DGRHP's order-matched third pass shows
+  what ran in that exact window, and got through all of it in ~136ms with no delay: the `_367`
+  test itself - `"concurrent persist + page + prune + drain do not race (TSan checkpoint,
+  QE-1)"` - is the most obvious candidate on its own description alone (a multi-threaded
+  concurrency stress test, explicitly a TSan checkpoint, running on a box shared 4-ways with
+  other CI jobs competing for the same CPUs is a plausible place for contention to bite even
+  though it finished instantly here). After it, before the next KvStore opens at `_369` at
+  `12:18:32.399` (~136ms after `_367` at `12:18:32.263`), the log shows a trigger
+  register/unregister, a `disk_actions` plugin load, a `SparkEngine` file-watch arm/fault/recover/
+  stop cycle, a `sync: software_licensing` HMAC-persist warning, a skipped `http_client`
+  descriptor test (DLL not present in this build), and a `TriggerEngine` start/stop - lower on
+  suspicion than the concurrency test but not ruled out, since which of these actually stalled on
+  Wee Tam cannot be determined from CI's log, which recorded nothing after `_367`. The whole
+  suite finished clean roughly 12s after `_367` (`_367` at `12:18:32.263`, last KvStore `_417` at
+  `12:18:44.326`; total wall time for the full 2636-case run was ~135s end to end). This narrows
+  CI's silent window to a named `TEST_CASE` and a short, named list of what follows it, rather
+  than leaving it at an unidentified "position 367."
+
+  **Conclusion: running the SAME test order as CI's own run, on dedicated hardware, sails
+  straight through the exact point CI stalled at, with no slowdown. This does NOT resolve #4018
+  - it stays open, and neither it nor #4019 blocks #2839** (see the closing summary below for
+  the full statement of that). This is materially
+  stronger than "a different random order also passed" - it rules out the possibility that
+  DGRHP's clean runs just got lucky with an order that happened to avoid whatever CI's order hit,
+  since this run used CI's own order and still didn't hit anything. It does not identify what
+  Wee Tam-specific factor caused the 240s timeout (contention from the shared 4-runner pool is
+  the leading candidate given CLAUDE.md's documented always-shared-box architecture - both
+  self-hosted CI pools run 4 runner agents as one shared OS identity on one box - and the
+  concurrency-stress-test candidate named above, but it wasn't directly observed - no process
+  inventory was captured on Wee Tam at the time), and a single clean pass under CI's order
+  cannot rule out a rare intermittent race independent of environment; this dispatch is also the
+  FIRST-EVER `windows-asan` execution against `dev` (established above), so there is no
+  recurrence-rate data yet to say whether this was a one-off or something that fails on some
+  fraction of future `dev` runs. But three clean runs on
+  the same commit and recipe - one under a different random order, two under CI's own seed and
+  therefore CI's own order (the third of the three confirmed by a complete capture matching all
+  242 of CI's opens) - is strong evidence against a reliably-reproducing, order-dependent
+  code-level hang, and is the practical limit of what an isolated repro without Wee Tam's own
+  process-level telemetry can establish.
+
+  The same dispatch's Linux `sanitize-asan` and `sanitize-tsan` legs also failed, but this is a
+  separate finding, not corroboration of the above: both failed in the SAME two files
+  (`test_guardian_engine_spark_reconcile.cpp`, `test_subprocess_runner.cpp`; not
+  `test_guardian_spark_runtime.cpp`/`PageRig`) with the SAME assertion lines under both
+  independent sanitizers - a deterministic signature, not sanitizer flakiness - but neither
+  file is `[tsan-heavy]`-tagged and `ci.yml`'s plain (non-sanitizer) build was green at this
+  exact commit, so these are real but narrower in scope: something specific to running under
+  sanitizer instrumentation (e.g. `test_subprocess_runner.cpp`'s `run_bounded_subprocess` case
+  got `termination_reason == 4` where `exited (0)` was expected - a spawned child behaving
+  differently, or being killed, under instrumentation). A deterministic cross-sanitizer failure
+  is at least as consistent with a genuine defect the plain build's coverage happens to miss as
+  with instrumentation-only fragility - #4019 does not presume which, and root
+  causing it is exactly what that issue is for. Not a `dev` merge regression and not
+  the same failure as today's `main` nightly's unrelated Linux ASan failure (a `server`-binary
+  test, different file, different exit code). Filed as **#4019**, separate from `#2839`
+  and from the Windows finding above (filed as **#4018**). (A concurrent, unrelated macOS runner-inventory drift,
+  `#2301`, also surfaced while checking CI history and is noted only to rule it out - it does
+  not touch Wee Tam or Big Tam.)
+
+  `#2839`'s specific tests now pass clean under real Windows ASan on `dev` HEAD (three DGRHP
+  isolated runs above, two under CI's own seed/order, one confirmed by a complete 242-open
+  capture match). The "genuinely NOT ASan proof" caveat from the original claim no longer
+  applies. What caused the specific CI timeout
+  remains unidentified but narrowed to a named `TEST_CASE` - `"concurrent persist + page + prune
+  + drain do not race (TSan checkpoint, QE-1)"`, the test whose `KvStore` open was CI's last
+  logged line - and a short, named list of what runs immediately after it (leading theory for
+  the environment factor: Wee Tam pool contention, not directly observed) - filed as **#4018**,
+  as is the separate Linux sanitizer-environment finding whose own root cause (genuine defect
+  vs. instrumentation artifact) is undetermined (**#4019**) - neither is a `#2839` blocker, and
+  neither is resolved by anything in this entry: this dispatch is the first-ever `windows-asan`
+  run against `dev`, so recurrence rate is unknown, and this ASan coverage - real, but limited
+  to heap/stack-overflow and UAF, not STL container-overflow, and not yet demonstrated to run to
+  completion in CI against `dev` even once (it has run green against `main` since 2026-07-08,
+  per the retraction above) - is not a complete safety net against future Windows-specific
+  defects in this code.
 - Owner: not assigned in source material.
-- Milestone: PR-2c DONE for #2815 / #2833 / #2839; **PR-2d owed for #2818 before PR-5**.
-- Revisit trigger: fired. #2818 escalated per the rule.
+- Milestone: PR-2c DONE for #2815 / #2833 / #2839; **PR-2d DONE for #2818**.
+- Revisit trigger: fired, and resolved. All four of this row's issues are now fixed or
+  accepted-by-documentation.
+
+**PR-2d follow-up hardening (governance Gates 3/4/5/6, filed 2026-09-06)** - findings from
+PR-2d's own review, none blocking (all SHOULD; most are OOM/backpressure-only, dormant-
+until-flip, or bounded by the ~5s poll backstop - QE-2 below is the one exception, a
+test-coverage-only gap), tracked here rather than re-litigated as new #2815-class entries
+since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in it:
+- **#4051** (P1) - the dedup-race window named in `revalidate_subscriptions()`'s own doc
+  comment: a Lost notification can be discarded as stale by `on_subscription_lost`'s
+  staleness guard if it's processed before the sibling arm's own commit lands, stranding
+  a dead subscription for up to the poll backstop's ~5s cadence instead of catching it
+  instantly. Needs a new pre-commit test seam to reproduce deterministically - real but
+  small design work, not rushed into PR-2d.
+- **#4052** (P2) - `revalidate_subscriptions()`'s sweep has no per-key throw isolation
+  (`firewalled_sweep` aborts the WHOLE pass on one key's throw) and a `bad_alloc` mid-
+  detach can strand a `keys_` row with no self-heal path. Both require allocation
+  failure to trigger.
+- **#4053** (P2) - `guardian_outbox`'s `enqueue_all` all-or-nothing semantics can drop an
+  entire multi-rule Health batch under backpressure, with larger fan-out (more rules
+  sharing a key) making total loss MORE likely exactly when blast radius is biggest.
+- **QE-2 (quality-engineer Gate 3), non-gating, tracked here rather than filed standalone** -
+  `on_subscription_faulted`'s `OutboxEntry` content (`rule_id`, `generation`, `healthy`,
+  `detail`) has no direct Guardian-layer test; only the engine-level Faulted/Recovered
+  delivery is covered. Health-only path, no state-machine risk, bounded blast radius -
+  a genuine but small coverage gap, worth closing alongside any future work that already
+  touches `guardian_spark_runtime.cpp` rather than its own PR.
+- **C-1, folded here rather than filed standalone** (consistency-auditor,
+  dormant-until-flip, PRE-PR-5 GATING) - `server/core/src/guaranteed_state_store.cpp`'s
+  `event_state_from_type` does not recognize the new `guard.errored` wire event (falls
+  through to "no census change", identically to the pre-existing `armed`/`disarmed`
+  events). A rule detached as errored keeps showing its LAST PRIOR compliance verdict
+  (e.g. "compliant") on the dashboard/REST census even though it is no longer armed or
+  evaluated - a real, customer-visible staleness gap once `prefer_spark_` flips, though
+  inert today. Not filed as its own issue (chaos-injector's recommendation): it lands
+  squarely on the Guardian routed-concern row (`security-guardian` + `docs-writer`
+  trigger on any `guaranteed_state*` change) regardless of when it's picked up, and
+  belongs with this doc's own pre-PR-5 checklist rather than a freestanding ticket that
+  could drift out of sync with it. **Must be resolved (or explicitly re-risk-accepted)
+  before PR-5's sign-off** - added to this doc's own gating surface, not merely noted.
+- **Journal-quarantine finding (enterprise-readiness Gate 6) - FOUND AND FIXED IN PR-2d
+  ITSELF, not deferred.** `guardian_lifecycle_journal.cpp`'s replay-validation allowlist
+  only recognized `"armed"`/`"disarmed"` - the exact same class of gap as C-1 above, but
+  more severe: a `guard.errored` record surviving a crash/restart before it drained live
+  would have been silently QUARANTINED as tampered, destroying the very audit record
+  #2818 exists to produce, in the exact scenario (durability across a restart) it's meant
+  to survive. Fixed by widening the allowlist to include `"errored"`, with a new
+  regression test that empirically proved red (the record was genuinely quarantined,
+  `records_paged==0`) before the fix and green after. Kept here as a record that this
+  class of gap was checked and closed for `"errored"` specifically, not just C-1's
+  narrower census-display symptom.
+- **Observability gaps (sre Gate 6), PRE-PR-5 GATING, not fixed here** - three related
+  findings, none new resource cost, all folded into this checklist rather than filed
+  standalone since they're small additions to existing telemetry surfaces, not new
+  designs: (1) the new `subscription_lost_total` stat joins the already-known-dark
+  `SparkEngineStats` set - `spark_heartbeat.hpp` is untouched by this PR, so nothing
+  polls it; **a future "just add the heartbeat tag" fix must also account for the poll
+  backstop path**, which calls `on_subscription_lost` directly and never increments this
+  counter at all, so a naive fix would under-report exactly the population the backstop
+  exists to catch. (2) `revalidate_subscriptions()`'s own tick has no liveness/repair
+  telemetry - no counter/log distinguishes "ticked, found nothing" from "ticked, repaired
+  N" from "didn't tick" (the nearest signal, `ConvergenceScheduler`'s shared
+  `sweep_exceptions_`, is shared across five call sites and can't attribute a throw to
+  this sweep specifically). (3) an errored rule has no age/duration gauge, breaking house
+  convention (`GuardianJournalAgeStats`'s AGE-gauge pattern, flip item 6/#2364, is the
+  established shape for "a single stuck instance is the fleet signal" and has no
+  equivalent here) - combined with C-1, an on-call engineer has zero signal short of
+  reading the per-agent lifecycle journal file directly.
+- **Dormant-claim verifiability (compliance-officer Gate 6), PRE-PR-5 GATING, cross-PR scope** -
+  every "dormant while `prefer_spark_=false`" disposition in this row (and elsewhere in
+  this doc) rests on a code-reading assertion, not an auditor-checkable per-deployment
+  signal. The wire-level tag already exists (`kGuardianBackendTag`/`yuzu.guardian_backend`,
+  correctly distinguishing legacy vs. spark enforcement per agent) and is ingested
+  server-side into the per-agent `status_tags` map, but **no server code reads it** - no
+  REST field, no dashboard surface. Not specific to #2818 (it's a general PR-5-readiness
+  gap), so not filed as its own #2818-scoped issue; recorded here since several of this
+  PR's own non-blocking dispositions depend on it.
+- Owner: not assigned for any item above.
+- Milestone: pre-PR-5 hardening package (#4051/#4052/#4053) + three pre-PR-5 GATING items
+  (guard.errored census recognition; the three sre observability gaps; the
+  yuzu.guardian_backend server-side-reader gap) - no issue numbers, tracked here.
+- Revisit trigger: before PR-5's sign-off, everything above re-checked; #4051 specifically
+  re-checked before any production fleet (dedup races become far more frequent under
+  real load than in this PR's own governance testing).
 
 **#2012 + #2011 + #3840** (+#2014, confirm at execution)
 - Detection signal: **none today**, named explicitly in the source ruling - a stuck
@@ -571,6 +1161,123 @@ close to merging (PR-2b is dropped per §3 row 5, confirmed by the operator 2026
 when this rig-dependent evidence-collection phase is actually about to begin. The capacity
 numbers above are a 2026-09-02 point-in-time reading; re-verify immediately before
 provisioning rather than trusting this reading weeks later.
+
+**UPDATE (2026-09-04/05): Rig A actually ran on DGRHP (Windows), not BigColin.** BigColin's
+attempt hit a platform blocker: File/Registry spark mechanisms are dead on Linux
+(`spark_mechanism.hpp:25-31` - only Service registers there without libsystemd-dependent
+support), so a Linux rig cannot exercise the same mechanism mix this gate needs. Moved to
+DGRHP after checking coordination with a peer session already using that box. Actual duration
+was one overnight exploratory pass, not the 4-7 days estimated in the table above - the "hold
+at the hard ceiling" premise doesn't work mechanically under sustained load (§4's exploratory
+findings), so the long-duration plan the table describes was never the right shape for what's
+actually achievable; see §4 for what was measured and found instead. Cadence constants
+(`kGuardianFileLaneCadenceMs`, `errored_refresh_ms`) were halved **locally on DGRHP for this
+testing only, never committed or pushed**, to make the achievable regime reachable in one
+night rather than several days - a testing-only acceleration, not a claim about production
+cadence, and not evidence toward criterion 7 (resource evidence) at the halved rate. **Rig
+debt, worth purging before the next evidence-gathering session on this rig (SRE, Gate 6,
+2026-09-06)**: DGRHP still carries these halved constants AND thousands of leftover
+load-test rules that rearm on every agent boot, producing large unrelated `drift.detected`
+bursts (a `riga-reg-*` registry-rule burst measurably interfered with criterion 5's own
+dashboard-fragment fetch - see §2). Neither is committed/pushed and neither blocks this PR,
+but a successor session inheriting this rig without knowing about them will get confusing
+readings the same way this one did.
+
+**UPDATE (2026-09-05): Rig B's rollback drill ran, on BigColin as originally planned - correcting
+the "has not been run yet" note above (it was already run and recorded in the rig's own logs
+before this doc's first draft; not caught until re-verified this pass).** `--spark-disable`
+restart confirmed legacy enforcement resumed in ~8.6s (`T0`→boot-log confirmation), followed by a
+clean 14-hour run with zero spark-state leak observed. UAT smoke's arm-on-spark →
+induced-drift → dashboard-edge sequence was attempted on Rig B too but blocked (Linux: no
+sudo-free service-state flip, no `file-change` mechanism at all) and moved to DGRHP.
+
+**UPDATE (2026-09-06): the induced-drift half is now ALSO DONE, on DGRHP.** See §2 criterion 5
+for the full evidence (root cause of the prior login/logging blockers, the three-edit repro, the
+`drift.detected` REST events, and the one-shot-watch/#2049-adjacent findings that came out of it).
+Criterion 5 is fully green. Linux (Rig B / BigColin) remains structurally unable to exercise
+`file-change` at all - that platform gap is unchanged.
+
+**UPDATE (2026-09-06, later): the previously-optional Linux Service-type drift data point is
+now also DONE, on Rig B/BigColin.** Dave authorized the scoped `NOPASSWD` sudoers grant
+(`docs/agent-privilege-model.md`'s sudoers-construction pattern, narrowed to `dgr ALL=(root)
+NOPASSWD: /usr/bin/systemctl stop yuzu-drift-test-dummy.service, /usr/bin/systemctl start
+yuzu-drift-test-dummy.service` - a scratch no-op unit created for this test only, never a real
+system service) and ran it himself since the assistant has no passwordless sudo on that box. The
+unit file lives at the standard `/etc/systemd/system/` path, root:root-owned via `install`; both
+the sudoers entry and the scratch unit were left in place after the test, narrowly scoped to
+that one unit only. **Risk-accept entry, per §5's own convention rather than a bare aside**:
+this is root-privilege config living on BigColin, Dave's own multi-session dev/rig box (a
+different machine, and a different sharing model, from CLAUDE.md's "Big Tam"/"Wee Tam" CI
+runner pools - a citation error in an earlier draft of this paragraph, corrected here) - not
+equivalent to a scratch dir on a single-user Windows box (§8's own precedent for "left behind"
+state elsewhere in this file) precisely because BigColin runs multiple concurrent dev sessions
+and rigs day to day. Owner: Dave - he authorized and ran the grant, named here explicitly rather
+than left as "unassigned." Detection signal: none (no expiry, no periodic audit of
+`/etc/sudoers.d/`). Revisit trigger: before this box's next CI-relevant provisioning change, or
+on a fixed schedule if one doesn't come sooner. Not filed as a GitHub issue - config-cleanup
+debt, not a code defect - but recorded here as genuinely open, not resolved by "narrowly
+scoped."
+
+**Real, non-obvious blocker found and fixed along the way**: a freshly-created Guardian rule
+does not arm just because it exists in the store - per CLAUDE.md's own Guardian invariant, a
+**Baseline** is the deployable unit, and enforcement gates on `deployed_member_rule_ids()` from
+a baseline's `deployed_snapshot`, not the live rule set. The new rule (`rigb-drift-test-dummy-
+service`) sat silently un-armed through TWO agent restarts (confirmed via `Guardian engine
+started (cached_rules=3, ...)` / `network-connected (..., rules=3)` never reflecting the 4th
+rule) with no error via the REST create response or the agent logs - the signal an operator
+debugging this WOULD find is on the dashboard itself: the Guards list shows an explicit
+"not deployed" badge per rule, and the guard detail page says "not in a deployed Baseline"
+(`guardian_routes.cpp`) - this session went straight to the logs/REST and didn't check there
+first, so "no error anywhere" (an earlier draft's framing) overstated it. Creating the rule via
+`POST /api/v1/guaranteed-state/rules` alone was never going to work regardless; it needed a new
+Baseline (`POST /fragments/guardian/baselines` - no clean JSON API exists for baseline
+create/deploy, HTMX-form-only, a known gap tracked at **#3266**, this session corroborated it)
+containing it, then an explicit `.../deploy` call. Rig B's agent build for this whole test:
+`0.13.1+7666 (7c3c7d3fa)` (`yuzu-agent --version`) - same commit as DGRHP's build earlier in
+this section. Once deployed: `SparkEngine: armed 'service|29:yuzu-drift-test-dummy.service'`
+confirmed via agent log, and a `guard.armed`/`guard.compliant` pair via REST at
+`2026-09-06T15:44:39Z`: `{"event_type":"guard.compliant","guard_type":"service",
+"detected_value":"running","expected_value":"running"}`. **This `guard.compliant` emission
+itself is worth flagging**: `docs/user-manual/guaranteed-state.md` documents the LEGACY Linux
+systemd service guard as "still observe-only on the compliant edge - it detects and reports
+drift but does not yet emit `guard.compliant` or feed the census, so a compliant Linux service
+reads as 'pending' until that parity gap closes." This rule ran the SPARK path instead
+(`guardian_engine.cpp`'s `attach_rule` call passes `emit_compliant_edge=true` unconditionally,
+not platform-gated the way the legacy guard is) - so this may be live evidence that spark's
+Linux Service mechanism closes that documented legacy parity gap, not a discrepancy. Filed as
+**#4044** to track the reconciliation (either update `guaranteed-state.md` to scope the
+limitation to the legacy guard specifically, or confirm this emission is unintended) - a Gate 6
+`sre` review of this same round found a real, currently-dormant consequence either way:
+`guardian_routes.cpp`'s fleet and by-baseline compliance rollups don't guard against
+double-counting a Linux rule that has a real status row AND still reads as platform-unsupported,
+unlike the per-device drill-down, which already does; folded into #4044 rather than filed
+separately, and #4044 is flagged there as gating the `prefer_spark` flip (F14), following #3816's
+precedent - not resolved in this doc-only PR. `sudo -n systemctl
+stop` (same second: `2026-09-06T15:45:06Z` for both the command and the resulting `drift.detected`
+event) produced `{"event_type":"drift.detected","guard_type":"service","detected_value":
+"stopped","expected_value":"running"}` - confirmed via REST AND the live dashboard fragment
+(`GET /fragments/guardian/events?type=drift.detected` rendered this exact rule/event at the top
+of the list, `.et-drift_detected` class, no ambiguity with another rule family this time).
+Service manually restored via the same granted `systemctl start`, within seconds of the stop
+(not separately timestamped - low stakes for a scratch no-op unit, but noted as the one link in
+this chain without its own citation, unlike every other step above). Not Guardian remediation -
+Linux service enforcement remains deferred/observe-only per `docs/os-capability-matrix.md`;
+this test exercised detection only. This closes the gate doc's own explicit "genuinely
+optional... not attempted here" deferral for the `service-status-change` mechanism specifically
+(Rig B) - confirmed via REST AND a live dashboard-fragment fetch of THIS rule's own event,
+unlike DGRHP's `file-change` mechanism (§2 criterion 5), where the dashboard fetch confirmed the
+render path/mechanism live but caught a different rule's event, not `dgrhp-drift-test-file`'s
+own row (that one was already pushed out of the fragment's top-20 window by the time it was
+fetched). Both mechanisms have live, event-driven detection evidence; only Rig B's is also
+dashboard-confirmed for its own specific event. Outbox pending count was not explicitly checked
+before/after this specific test (unlike the DGRHP repro, which confirmed a clean 0-pending
+window each time) - the same-second stop-to-`drift.detected` correlation is itself strong
+evidence nothing stalled here, but this session doesn't claim to have positively ruled it out
+the way DGRHP's did. **Scope note on #4044's eventual resolution**: if it resolves as "spark
+correctly closes the legacy gap," `guaranteed-state.md`'s Linux-parity wording should NOT be
+updated on that finding alone - per Gate 6 `enterprise-readiness`, the capability doesn't exist
+for any real deployment until `prefer_spark` actually flips to `true` in production (PR-5), so
+update that doc when the flip ships, not before.
 
 ## Also closed out by this PR
 
