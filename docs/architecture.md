@@ -293,12 +293,14 @@ Operator                     Server                                  Agent
 
 Most HTTP surfaces the server exposes — REST, dashboard fragments, MCP — are registered by a
 **route owner**: a class with a `register_routes(...)` method that the server calls once at
-startup. `server.cpp` wires those owners, *and* registers a further **30 routes inline** on
-`web_server_->{Get,Post,Put,Delete}` — the health and readiness probes and much of the `/api/*`
-dashboard JSON. It constructs no persistent `HttplibRouteSink` of its own for these remaining
-inline routes, so none of them is reachable from the in-process test harness. (Ten surfaces this
-prose previously credited to this inline count have since moved to their own `HttpRouteSink`
-modules and are no longer part of it: `POST /api/command` is `command_routes.cpp` (#2557); the
+startup. `server.cpp` wires those owners, *and* registers a further **16 routes inline** on
+`web_server_->{Get,Post,Put,Delete}` — the health/readiness probes (`/health`, `/api/health`,
+`/livez`, `/readyz`, `/fragments/health/summary`), `/metrics`, and the response/tags/inventory
+`/api/*` JSON surfaces not yet extracted. It constructs no persistent `HttplibRouteSink` of its own
+for these remaining inline routes, so none of them is reachable from the in-process test harness.
+(Sixteen surfaces this prose previously credited to this inline count have since moved to their
+own `HttpRouteSink` modules and are no longer part of it: `POST /api/command` is
+`command_routes.cpp` (#2557); the
 page-shell/static-asset surface — `/static/*`, `/`, `/chargen`, `/procfetch`, `/api/help*`,
 `/help`, `/tar`, `/result-sets`, `/viz/fleet`, `/viz/host/:id`, `/instructions`; 25 routes — is
 `page_routes.{hpp,cpp}` (#2542 PR-2); a #2542 follow-up split 10 further scattered routes into
@@ -319,10 +321,30 @@ API — `GET/POST /api/instructions`, `GET/PUT/DELETE /api/instructions/:id`,
 `GET /api/executions/:id/{summary,agents,children}`, `POST /api/executions/:id/{rerun,cancel}` —
 is `execution_routes.{hpp,cpp}` (#2542 PR-7); the 4-route Schedules API —
 `GET/POST /api/schedules`, `DELETE /api/schedules/:id`, `POST /api/schedules/:id/enable` — is
-`schedule_routes.{hpp,cpp}` (#2542 PR-8); and the 4-route Approval API — `GET /api/approvals`,
+`schedule_routes.{hpp,cpp}` (#2542 PR-8); the 4-route Approval API — `GET /api/approvals`,
 `GET /api/approvals/pending/count`, `POST /api/approvals/:id/{approve,reject}` — is
-`approval_routes.{hpp,cpp}` (#2542 PR-9). All nine owner files register against the same
-stack-local `inline_sink`, constructed in `start_web_server()`.)
+`approval_routes.{hpp,cpp}` (#2542 PR-9); and #2542 PR-12 (the Infra/Misc bundle — six small,
+heterogeneous modules with no single owning store, matching the `dashboard_api_routes`/`nvd_routes`
+bundling precedent) split a further 14 routes into six modules: the 2-route Runtime Configuration
+API (7.3) — `GET /api/config`, `PUT /api/config/:key` — is `config_routes.{hpp,cpp}`; the 5-route
+Chargen + Procfetch diagnostic API — `POST /api/chargen/{start,stop}`,
+`POST /api/procfetch/fetch`, `GET /api/chargen/status`, `GET /api/procfetch/status` — is
+`diagnostics_routes.{hpp,cpp}`; the legacy `GET /events` SSE stream is
+`legacy_events_routes.{hpp,cpp}`; the 2-route Instructions HTMX fragment pair —
+`GET /fragments/instructions`, `POST /fragments/instructions/yaml-preview` — is
+`instruction_fragment_routes.{hpp,cpp}` (deliberately not part of PR-7's `instruction_routes.cpp`
+— see that module's header comment); the Approvals HTMX fragment — `GET /fragments/approvals` — is
+`approvals_fragment_routes.{hpp,cpp}` (deliberately not part of PR-9's `approval_routes.cpp`); and
+the 3-route MCP-disabled stub triple — `POST/GET/DELETE /mcp/v1/`, registered only when
+`cfg_.mcp_disable` is true — is `mcp_disabled_routes.{hpp,cpp}`. Of the fifteen #2542 owner files
+(everything above except `command_routes.cpp`, which is #2557), fourteen — `page_routes.cpp`
+through `approval_routes.cpp` plus PR-12's `config_routes.cpp`, `diagnostics_routes.cpp`,
+`legacy_events_routes.cpp`, `instruction_fragment_routes.cpp`, and
+`approvals_fragment_routes.cpp` — register against the same stack-local `inline_sink`, constructed
+in `start_web_server()`. `mcp_disabled_routes.cpp` is the one exception: it registers against its
+own local sink inside the `if (cfg_.mcp_disable)` block, the same own-local-sink pattern
+`command_routes.cpp` itself uses, since `inline_sink` is not assumed still in scope that far into
+the function.)
 
 Counting the surface therefore needs a receiver-agnostic pattern, not a search for one variable
 name:
@@ -372,9 +394,14 @@ use — `server.cpp` still calls `mcp_server_->register_routes(*web_server_, ...
 as it does for every other owning-class module), the Instruction Definitions + Instruction Sets /
 legacy pre-v1 Executions extraction (`instruction_routes.{hpp,cpp}` +
 `execution_routes.{hpp,cpp}`, PR-7, 13 + 7 = 20 routes, also against `inline_sink`), the Schedules
-API extraction (`schedule_routes.{hpp,cpp}`, PR-8, 4 routes, also against `inline_sink`), and the
-Approval API extraction (`approval_routes.{hpp,cpp}`, PR-9, 4 routes, also against `inline_sink`)
-— `server.cpp`'s own 30 inline routes are the only registrations left outside the sink, and they
+API extraction (`schedule_routes.{hpp,cpp}`, PR-8, 4 routes, also against `inline_sink`), the
+Approval API extraction (`approval_routes.{hpp,cpp}`, PR-9, 4 routes, also against `inline_sink`),
+and the Infra/Misc bundle (PR-12, 14 routes across six modules — `config_routes.{hpp,cpp}`,
+`diagnostics_routes.{hpp,cpp}`, `legacy_events_routes.{hpp,cpp}`,
+`instruction_fragment_routes.{hpp,cpp}`, and `approvals_fragment_routes.{hpp,cpp}` against
+`inline_sink`; `mcp_disabled_routes.{hpp,cpp}` against its own local sink inside
+`if (cfg_.mcp_disable)`, the same pattern `command_routes.cpp` uses) — `server.cpp`'s own 16 inline
+routes are the only registrations left outside the sink, and they
 are not a route-owner class. Whether a further campaign PR touches them is #2542's own call, not
 this paragraph's to predict — an earlier version of this sentence claimed "no further PR touches
 them" and was falsified twice by subsequent campaign PRs; check `gh issue view 2542` for current
@@ -392,8 +419,9 @@ registrations in `mcp_server.cpp` (verify with
 which were never counted by the `web_server_->` pattern above in the first place since they were
 never inline in `server.cpp` — dropped to 38 once the Instruction Definitions + Instruction Sets /
 legacy pre-v1 Executions extraction (-20, PR-7) landed, 34 once the Schedules API extraction (-4,
-PR-8) also landed, and is 30 now that the Approval API extraction (-4, PR-9) has also landed. 30
-registrations remain outside the sink in total.
+PR-8) also landed, 30 once the Approval API extraction (-4, PR-9) also landed, and is 16 now that
+the Infra/Misc bundle (-14, PR-12) has also landed. 16 registrations remain outside the sink in
+total.
 
 ## Storage Architecture
 
