@@ -344,6 +344,42 @@ TEST_CASE("autoruns Linux leg: read_file_bounded/classify_read_error distinguish
     }
 }
 
+TEST_CASE("autoruns Linux leg: list_dir reports truncated for exactly one real entry "
+          "beyond the cap (RECONSTRUCTION: pins the fix for an adversarial-review "
+          "falsifier -- an earlier version discarded the over-cap entry itself while "
+          "probing for a SECOND one, so cap=2 with exactly 3 real entries reported "
+          "truncated=false)",
+          "[autoruns][actions][linux]") {
+    yuzu::test::TempDir tmp("yuzu_test_autoruns_linux_listdir_");
+    std::error_code ec;
+    std::filesystem::create_directories(tmp.path, ec);
+    REQUIRE_FALSE(ec);
+    for (const char* name : {"a.txt", "b.txt", "c.txt"}) {
+        std::ofstream(tmp.path / name) << "x";
+    }
+
+    SECTION("cap+1 real entries -> truncated") {
+        auto listing = yuzu::autoruns::list_dir(tmp.path.string(), /*cap=*/2);
+        CHECK(listing.opened);
+        CHECK(listing.names.size() == 2);
+        CHECK(listing.truncated);
+    }
+
+    SECTION("exactly cap entries -> not truncated") {
+        auto listing = yuzu::autoruns::list_dir(tmp.path.string(), /*cap=*/3);
+        CHECK(listing.opened);
+        CHECK(listing.names.size() == 3);
+        CHECK_FALSE(listing.truncated);
+    }
+
+    SECTION("cap well above the real entry count -> not truncated") {
+        auto listing = yuzu::autoruns::list_dir(tmp.path.string(), /*cap=*/4096);
+        CHECK(listing.opened);
+        CHECK(listing.names.size() == 3);
+        CHECK_FALSE(listing.truncated);
+    }
+}
+
 #endif // defined(__linux__)
 
 TEST_CASE("autoruns Linux leg: an unknown action is refused, not silently ignored",
