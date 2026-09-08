@@ -870,6 +870,7 @@ if build_server
       'unit/server/test_auth_jit_elevation.cpp',
       'unit/server/test_auth_sso_identity.cpp',
       'unit/server/test_auth_routes_hardened.cpp',
+      'unit/server/test_sso_boot_guard.cpp',
       'unit/server/test_settings_routes_mfa.cpp',
       'unit/server/test_totp.cpp',
       'unit/server/test_mfa_step_up.cpp',
@@ -1139,6 +1140,8 @@ if build_server
       'unit/server/test_settings_routes_ota_audit.cpp',
       'unit/server/test_settings_routes_management_groups.cpp', # stored-XSS regression (mgmt-group name/id escaping)
       'unit/server/test_settings_routes_oidc.cpp',
+      'unit/server/test_settings_model.cpp',        # #4028 — pure Settings read-twin builder unit tests
+      'unit/server/test_settings_read_twins.cpp',   # #4028 — REST v1 read-twin route coverage
       'unit/server/test_plugin_signing_helpers.cpp',
       'unit/server/test_store_errors.cpp',
       'unit/server/test_static_js_bundle.cpp',
@@ -1147,6 +1150,7 @@ if build_server
       'unit/server/test_rest_visualization.cpp',
       'unit/server/test_response_templates_engine.cpp',
       'unit/server/test_rest_response_templates.cpp',
+      'unit/server/test_rest_instructions_productpacks.cpp', # #4029: GET /api/v1/instructions*, /api/v1/product-packs*
       'unit/server/test_offload_target_store.cpp',
       'unit/server/test_rest_offload_targets.cpp',
       'unit/server/test_directory_sync.cpp', # ADR-0063: directory_sync Postgres migration

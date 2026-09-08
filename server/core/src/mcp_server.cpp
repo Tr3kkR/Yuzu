@@ -23,6 +23,8 @@
 #include "agent_registry.hpp"           // AgentRegistry (discover_plugins tool)
 #include "dashboard_routes.hpp"         // DashboardRoutes::gather_tar_retention_paused (#4027)
 #include "discover_routes.hpp"          // A2 discovery builders shared with REST /discover/*
+#include "instruction_definition_model.hpp" // #4029: shared row/detail/export builders
+#include "product_pack_model.hpp" // #4029: ProductPackStore (fwd-declared only in mcp_server.hpp) + shared builders
 #include "engine_principal_store.hpp"   // EnginePrincipalStore (fwd-declared only in mcp_server.hpp)
 #include "openapi_spec_access.hpp"      // openapi_spec_json() (discover_routes tool)
 #include "guardian_schema_registry.hpp" // guardian_schema_catalog (Guardian discovery surface)
@@ -429,13 +431,45 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{"entries":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"timestamp":{"type":"integer"},"principal":{"type":"string"},"action":{"type":"string"},"target_type":{"type":"string"},"target_id":{"type":"string"},"detail":{"type":"string"},"result":{"type":"string"}},"required":["id","timestamp","principal","action","target_type","target_id","detail","result"]}}},"required":["entries"]})j"},
 
     {"list_definitions",
-     "List available instruction definitions (commands that can be dispatched to agents).",
-     R"({"type":"object","properties":{"plugin":{"type":"string"},"type":{"type":"string","enum":["question","action"]},"enabled":{"type":"boolean"}}})",
-     R"j({"type":"object","properties":{"definitions":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"version":{"type":"string"},"type":{"type":"string"},"plugin":{"type":"string"},"action":{"type":"string"},"description":{"type":"string"},"enabled":{"type":"boolean"}},"required":["id","name","version","type","plugin","action","description","enabled"]}}},"required":["definitions"]})j"},
+     // #4029: full filter set (was plugin/type only) — mirrors GET /api/v1/instructions.
+     // `enabled` (never honored by the dispatch code) is replaced by `enabled_only`,
+     // matching the REST fragment's own field name.
+     "List available instruction definitions (commands that can be dispatched to agents). "
+     "Mirrors GET /api/v1/instructions.",
+     R"({"type":"object","properties":{"name":{"type":"string","description":"Name filter"},"plugin":{"type":"string"},"type":{"type":"string","enum":["question","action"]},"set_id":{"type":"string","description":"Filter to definitions in this instruction set"},"enabled_only":{"type":"boolean","description":"Only return enabled definitions"},"limit":{"type":"integer","minimum":1,"maximum":1000,"default":100}}})",
+     // #4029: row shape widened to the reconciled superset (instruction_set_id/
+     // created_at/updated_at were REST-fragment-only before this PR — see
+     // instruction_definition_model.hpp).
+     R"j({"type":"object","properties":{"definitions":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"version":{"type":"string"},"type":{"type":"string"},"plugin":{"type":"string"},"action":{"type":"string"},"description":{"type":"string"},"enabled":{"type":"boolean"},"instruction_set_id":{"type":"string"},"created_at":{"type":"integer"},"updated_at":{"type":"integer"}},"required":["id","name","version","type","plugin","action","description","enabled","instruction_set_id","created_at","updated_at"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["definitions"]})j"},
 
-    {"get_definition", "Get a single instruction definition with its parameter and result schemas.",
+    {"get_definition",
+     "Get a single instruction definition with its parameter and result schemas. Mirrors "
+     "GET /api/v1/instructions/{id}.",
      R"({"type":"object","properties":{"id":{"type":"string","description":"Definition ID"}},"required":["id"]})",
-     R"j({"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"version":{"type":"string"},"type":{"type":"string"},"plugin":{"type":"string"},"action":{"type":"string"},"description":{"type":"string"},"approval_mode":{"type":"string"},"parameter_schema":{"type":"string","description":"Serialized JSON Schema for the definition's parameters"},"result_schema":{"type":"string","description":"Serialized JSON Schema for the definition's result"},"yaml_source":{"type":"string"}},"required":["id","name","version","type","plugin","action","description","approval_mode","parameter_schema","result_schema","yaml_source"]})j"},
+     // #4029: reconciled superset — was missing gather_ttl_seconds/response_ttl_days/
+     // created_by/instruction_set_id/created_at/updated_at (the REST fragment's fields)
+     // before this PR — see instruction_definition_model.hpp.
+     R"j({"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"version":{"type":"string"},"type":{"type":"string"},"plugin":{"type":"string"},"action":{"type":"string"},"description":{"type":"string"},"enabled":{"type":"boolean"},"instruction_set_id":{"type":"string"},"created_at":{"type":"integer"},"updated_at":{"type":"integer"},"gather_ttl_seconds":{"type":"integer"},"response_ttl_days":{"type":"integer"},"created_by":{"type":"string"},"approval_mode":{"type":"string"},"parameter_schema":{"type":"string","description":"Serialized JSON Schema for the definition's parameters"},"result_schema":{"type":"string","description":"Serialized JSON Schema for the definition's result"},"yaml_source":{"type":"string"},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["id","name","version","type","plugin","action","description","enabled","instruction_set_id","created_at","updated_at","gather_ttl_seconds","response_ttl_days","created_by","approval_mode","parameter_schema","result_schema","yaml_source"]})j"},
+
+    {"export_definition",
+     "Export a single instruction definition as its full JSON document (every field, including "
+     "yaml_source and the operator-facing metadata list/get omit). Mirrors GET "
+     "/api/v1/instructions/{id}/export. Requires InstructionDefinition:Read.",
+     R"({"type":"object","properties":{"id":{"type":"string","minLength":1,"description":"Definition ID"}},"required":["id"]})",
+     R"j({"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"version":{"type":"string"},"type":{"type":"string"},"plugin":{"type":"string"},"action":{"type":"string"},"description":{"type":"string"},"enabled":{"type":"boolean"},"instruction_set_id":{"type":"string"},"created_at":{"type":"integer"},"updated_at":{"type":"integer"},"gather_ttl_seconds":{"type":"integer"},"response_ttl_days":{"type":"integer"},"created_by":{"type":"string"},"approval_mode":{"type":"string"},"parameter_schema":{"type":"string"},"result_schema":{"type":"string"},"yaml_source":{"type":"string"},"concurrency_mode":{"type":"string"},"platforms":{"type":"string"},"min_agent_version":{"type":"string"},"required_plugins":{"type":"string"},"readable_payload":{"type":"string"},"visualization_spec":{"type":"string"},"response_templates_spec":{"type":"string"},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["id","name","version","type","plugin","action","description"]})j"},
+
+    {"list_product_packs",
+     "List installed product packs (bundles of InstructionDefinition/PolicyFragment/Policy/"
+     "Workflow documents installed together). Mirrors GET /api/v1/product-packs. Requires "
+     "ProductPack:Read.",
+     R"({"type":"object","properties":{"name":{"type":"string","description":"Name filter"},"limit":{"type":"integer","minimum":1,"maximum":1000,"default":100}}})",
+     R"j({"type":"object","properties":{"product_packs":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"version":{"type":"string"},"description":{"type":"string"},"item_count":{"type":"integer"},"items":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"item_id":{"type":"string"},"name":{"type":"string"}},"required":["kind","item_id","name"]}},"installed_at":{"type":"integer"},"verified":{"type":"boolean"}},"required":["id","name","version","description","item_count","items","installed_at","verified"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["product_packs"]})j"},
+
+    {"get_product_pack",
+     "Get a single installed product pack's detail, including each item's own yaml_source. "
+     "Mirrors GET /api/v1/product-packs/{id}. Requires ProductPack:Read.",
+     R"({"type":"object","properties":{"id":{"type":"string","minLength":1,"description":"Product pack ID"}},"required":["id"]})",
+     R"j({"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"version":{"type":"string"},"description":{"type":"string"},"yaml_source":{"type":"string"},"items":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"item_id":{"type":"string"},"name":{"type":"string"},"yaml_source":{"type":"string"}},"required":["kind","item_id","name","yaml_source"]}},"installed_at":{"type":"integer"},"verified":{"type":"boolean"},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["id","name","version","description","yaml_source","items","installed_at","verified"]})j"},
 
     {"query_responses",
      "Query command response data. Provide execution_id to collect exactly the "
@@ -1925,6 +1959,9 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"query_audit_log", {"AuditLog", "Read"}},
     {"list_definitions", {"InstructionDefinition", "Read"}},
     {"get_definition", {"InstructionDefinition", "Read"}},
+    {"export_definition", {"InstructionDefinition", "Read"}},
+    {"list_product_packs", {"ProductPack", "Read"}},
+    {"get_product_pack", {"ProductPack", "Read"}},
     // #1634 (adversarial-review C3/D7) — migrated onto fleet_read_fn_, which
     // gives these a REAL confinement mechanism (meet(management-group,
     // service-scope)), same as get_agent_details above — reclassified from
@@ -2184,6 +2221,11 @@ constexpr std::string_view kRbacOps[] = {"Read",   "Write",  "Execute", "Delete"
 // seeds them for the new plugin/upload securables, and letting this mirror drift would fail the
 // seeded-catalogues binding test in test_rbac_store.cpp or, for a typo'd entry, silently fail open
 // exactly as above.
+//
+// #4028 adds TlsConfig/PluginSigning/ServerConfig/AnalyticsConfig for the same reason — rbac_store.cpp's
+// `types[]` now seeds them for the Settings read-twins. None of the four is used by any MCP tool
+// today (#4028 ships those 8 routes REST-only per #520 — see docs/mcp-server.md); they are mirrored
+// here purely to keep this catalogue in lockstep with the seeded set, same as every other entry.
 constexpr std::string_view kRbacSecurables[] = {
     "Infrastructure", "UserManagement",     "InstructionDefinition", "InstructionSet",
     "Execution",      "Schedule",           "Approval",              "Tag",
@@ -2192,7 +2234,13 @@ constexpr std::string_view kRbacSecurables[] = {
     "License",        "FileRetrieval",      "GuaranteedState",       "Inventory",
     "AccessReview",   "SoftwareLicensing",  "EnginePrincipal",       "PluginConfig",
     "PluginSecret",   "UploadGrant",
-    "PowerManagement"};
+    "PowerManagement",
+    // #4029 prerequisite fix: mirrors rbac_store.cpp's seed_defaults() `types[]`
+    // addition — ProductPack was used as an RBAC securable string by the
+    // already-shipped /api/product-packs* routes but was never seeded on
+    // either side, so no role could ever be granted ProductPack:*.
+    "ProductPack",
+    "TlsConfig",      "PluginSigning",      "ServerConfig",          "AnalyticsConfig"};
 
 // Borrowed (name, input_schema_json) row for the registration validator's
 // 4th sequence (#2405). Views are valid only for the duration of the call.
@@ -2407,6 +2455,9 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"query_audit_log", {ToolEffect::ReadOnly, true, "Query audit log"}},
     {"list_definitions", {ToolEffect::ReadOnly, true, "List instruction definitions"}},
     {"get_definition", {ToolEffect::ReadOnly, true, "Get instruction definition"}},
+    {"export_definition", {ToolEffect::ReadOnly, true, "Export instruction definition"}},
+    {"list_product_packs", {ToolEffect::ReadOnly, true, "List product packs"}},
+    {"get_product_pack", {ToolEffect::ReadOnly, true, "Get product pack"}},
     {"query_responses", {ToolEffect::ReadOnly, true, "Query responses"}},
     {"aggregate_responses", {ToolEffect::ReadOnly, true, "Aggregate responses"}},
     {"query_inventory", {ToolEffect::ReadOnly, true, "Query inventory"}},
@@ -3175,7 +3226,7 @@ McpServer::HandlerFn McpServer::build_handler(
     EnginePrincipalStore* engine_principal_store, AccessReviewStore* access_review_store,
     AuthDB* auth_db, DirectorySync* directory_sync, CallerFn caller_fn,
     yuzu::server::detail::StreamBudget* stream_budget, StreamRevalidateFn revalidate_fn,
-    StreamPrincipalAuditFn principal_audit_fn) {
+    StreamPrincipalAuditFn principal_audit_fn, ProductPackStore* product_pack_store) {
 
     // Live reads via a pointer captured by value in the [=] handler below, so a
     // runtime settings-UI toggle of mcp_read_only / mcp_disable reaches this
@@ -5816,6 +5867,10 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             // ── list_definitions ──────────────────────────────────────────
+            // #4029: full filter set (name/plugin/type/set_id/enabled_only/limit,
+            // mirrors GET /api/v1/instructions) and the reconciled row builder
+            // (instruction_definition_model.hpp) — was plugin/type-only with a
+            // narrower row shape before this PR.
             if (tool_name == "list_definitions") {
                 if (!tier_allows(tier, "InstructionDefinition", "Read")) {
                     res.set_content(
@@ -5832,8 +5887,20 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 InstructionQuery iq;
+                iq.name_filter = param_str(args, "name");
                 iq.plugin_filter = param_str(args, "plugin");
                 iq.type_filter = param_str(args, "type");
+                iq.set_id_filter = param_str(args, "set_id");
+                if (args.contains("enabled_only") && args["enabled_only"].is_boolean())
+                    iq.enabled_only = args["enabled_only"].get<bool>();
+                const auto limit_opt = param_int_strict(args, "limit", iq.limit);
+                if (!limit_opt) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "limit must be a JSON integer"),
+                        "application/json");
+                    return;
+                }
+                iq.limit = static_cast<int>(*limit_opt);
                 auto defs_result = instruction_store->query_definitions(iq);
                 if (!defs_result) {
                     res.set_content(
@@ -5842,28 +5909,29 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 JArr arr;
-                for (const auto& d : *defs_result) {
-                    arr.add(JObj()
-                                .add("id", d.id)
-                                .add("name", d.name)
-                                .add("version", d.version)
-                                .add("type", d.type)
-                                .add("plugin", d.plugin)
-                                .add("action", d.action)
-                                .add("description", d.description)
-                                .add("enabled", d.enabled));
-                }
-                mcp_audit("success");
+                for (const auto& d : *defs_result)
+                    arr.add_raw(instruction_definition_row_json(d).dump());
+                // #4029 audit posture (docs/api-twin-recipe.md §4): set-and-proceed,
+                // generic mcp.<tool_name> action (unchanged from before this PR) —
+                // check-and-surface the persist outcome rather than silently
+                // discarding it, matching the reconciled posture applied to every
+                // tool this PR touches.
+                const bool audit_ok = mcp_audit("success");
+                JObj structured;
+                structured.raw("definitions", arr.str());
+                if (!audit_ok)
+                    structured.add("audit_persisted", false);
                 res.set_content(
                     success_response(
-                        id, tool_result_split(arr.str(),
-                                              JObj().raw("definitions", arr.str()).str(),
-                                              kObjectOutputSchema)),
+                        id, tool_result_split(arr.str(), structured.str(), kObjectOutputSchema)),
                     "application/json");
                 return;
             }
 
             // ── get_definition ────────────────────────────────────────────
+            // #4029: reconciled superset builder (instruction_definition_model.hpp)
+            // — was the REST fragment's fields OR MCP's fields, never both, before
+            // this PR.
             if (tool_name == "get_definition") {
                 if (!tier_allows(tier, "InstructionDefinition", "Read")) {
                     res.set_content(
@@ -5893,22 +5961,155 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                const auto& def = **def_result;
-                auto obj = JObj()
-                               .add("id", def.id)
-                               .add("name", def.name)
-                               .add("version", def.version)
-                               .add("type", def.type)
-                               .add("plugin", def.plugin)
-                               .add("action", def.action)
-                               .add("description", def.description)
-                               .add("approval_mode", def.approval_mode)
-                               .add("parameter_schema", def.parameter_schema)
-                               .add("result_schema", def.result_schema)
-                               .add("yaml_source", def.yaml_source);
-                mcp_audit("success", def_id);
-                res.set_content(success_response(id, tool_result(obj.str(), kObjectOutputSchema)),
-                                "application/json");
+                const bool audit_ok = mcp_audit("success", def_id);
+                nlohmann::json obj = instruction_definition_detail_json(**def_result);
+                if (!audit_ok)
+                    obj["audit_persisted"] = false;
+                res.set_content(
+                    success_response(id, tool_result(obj.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // ── export_definition ─────────────────────────────────────────
+            // #4029: new tool, twin of GET /api/v1/instructions/{id}/export. Fetches
+            // via get_definition (not the store's own export_definition_json) so it
+            // can distinguish 404 (kInvalidParams) from a genuine store failure
+            // itself, and calls the SAME pure builder export_definition_json's own
+            // store method now delegates to (instruction_definition_model.hpp) — no
+            // second store round-trip, no independent field list.
+            if (tool_name == "export_definition") {
+                if (!tier_allows(tier, "InstructionDefinition", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "InstructionDefinition", "Read"))
+                    return;
+                if (!instruction_store) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Instruction store unavailable"),
+                        "application/json");
+                    return;
+                }
+                auto def_id = param_str(args, "id");
+                auto def_result = instruction_store->get_definition(def_id);
+                if (!def_result) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Instruction store unavailable"),
+                        "application/json");
+                    return;
+                }
+                if (!*def_result) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "Definition not found: " + def_id),
+                        "application/json");
+                    return;
+                }
+                const bool audit_ok = mcp_audit("success", def_id);
+                nlohmann::json obj = instruction_definition_export_json(**def_result);
+                if (!audit_ok)
+                    obj["audit_persisted"] = false;
+                res.set_content(
+                    success_response(id, tool_result(obj.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // ── list_product_packs ────────────────────────────────────────
+            // #4029: new tool, twin of GET /api/v1/product-packs. No pre-existing
+            // MCP shape to reconcile — calls the same builder the REST v1 route and
+            // the (now-refactored) legacy /api/product-packs route call.
+            if (tool_name == "list_product_packs") {
+                if (!tier_allows(tier, "ProductPack", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "ProductPack", "Read"))
+                    return;
+                if (!product_pack_store || !product_pack_store->is_open()) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Product pack store unavailable"),
+                        "application/json");
+                    return;
+                }
+                ProductPackQuery q;
+                q.name_filter = param_str(args, "name");
+                const auto limit_opt = param_int_strict(args, "limit", q.limit);
+                if (!limit_opt) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "limit must be a JSON integer"),
+                        "application/json");
+                    return;
+                }
+                q.limit = static_cast<int>(*limit_opt);
+                auto packs_result = product_pack_store->list(q);
+                if (!packs_result) {
+                    res.set_content(
+                        error_response(id, kInternalError,
+                                       product_pack_client_message("list_product_packs",
+                                                                   packs_result.error())),
+                        "application/json");
+                    return;
+                }
+                JArr arr;
+                for (const auto& p : *packs_result)
+                    arr.add_raw(product_pack_row_json(p).dump());
+                const bool audit_ok = mcp_audit("success");
+                JObj structured;
+                structured.raw("product_packs", arr.str());
+                if (!audit_ok)
+                    structured.add("audit_persisted", false);
+                res.set_content(
+                    success_response(
+                        id, tool_result_split(arr.str(), structured.str(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // ── get_product_pack ──────────────────────────────────────────
+            // #4029: new tool, twin of GET /api/v1/product-packs/{id}.
+            if (tool_name == "get_product_pack") {
+                if (!tier_allows(tier, "ProductPack", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "ProductPack", "Read"))
+                    return;
+                if (!product_pack_store || !product_pack_store->is_open()) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Product pack store unavailable"),
+                        "application/json");
+                    return;
+                }
+                auto pack_id = param_str(args, "id");
+                auto pack_result = product_pack_store->get(pack_id);
+                if (!pack_result) {
+                    res.set_content(
+                        error_response(id, kInternalError,
+                                       product_pack_client_message("get_product_pack",
+                                                                   pack_result.error())),
+                        "application/json");
+                    return;
+                }
+                if (!*pack_result) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "Product pack not found: " + pack_id),
+                        "application/json");
+                    return;
+                }
+                const bool audit_ok = mcp_audit("success", pack_id);
+                nlohmann::json obj = product_pack_detail_json(**pack_result);
+                if (!audit_ok)
+                    obj["audit_persisted"] = false;
+                res.set_content(
+                    success_response(id, tool_result(obj.dump(), kObjectOutputSchema)),
+                    "application/json");
                 return;
             }
 
@@ -14540,7 +14741,7 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 StreamRevalidateFn revalidate_fn,
                                 std::size_t mcp_max_streams_per_principal,
                                 StreamPrincipalAuditFn principal_audit_fn,
-                                CallerFn caller_fn) {
+                                CallerFn caller_fn, ProductPackStore* product_pack_store) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
                     std::move(agents_fn), rbac_store, instruction_store, execution_tracker,
@@ -14555,7 +14756,7 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                     software_licensing_store, engine_principal_store, access_review_store,
                     auth_db, directory_sync, stream_budget, std::move(revalidate_fn),
                     mcp_max_streams_per_principal, std::move(principal_audit_fn),
-                    std::move(caller_fn));
+                    std::move(caller_fn), product_pack_store);
 }
 
 void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
@@ -14588,7 +14789,7 @@ void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                                 StreamRevalidateFn revalidate_fn,
                                 std::size_t mcp_max_streams_per_principal,
                                 StreamPrincipalAuditFn principal_audit_fn,
-                                CallerFn caller_fn) {
+                                CallerFn caller_fn, ProductPackStore* product_pack_store) {
     // GET + DELETE first: they COPY auth_fn / audit_fn / allowed_origins, which
     // build_handler std::move()s below. &mcp_disabled is a live pointer into the
     // cfg_ member (outlives the handlers).
@@ -14619,7 +14820,7 @@ void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                             // moving here is safe) - one arithmetic for every
                             // held-open worker, whichever verb pinned it.
                             stream_budget, std::move(revalidate_fn),
-                            std::move(principal_audit_fn)));
+                            std::move(principal_audit_fn), product_pack_store));
 
     // Streaming is ON only when a registry is wired AND the kill switch is off —
     // report the true state, not just the kill-switch bit (governance arch/sre NICE).

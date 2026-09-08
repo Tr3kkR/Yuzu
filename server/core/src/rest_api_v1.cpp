@@ -20,9 +20,11 @@
 #include "guardian_rule_spec.hpp"
 #include "guardian_schema_registry.hpp"
 #include "http_route_sink.hpp"
+#include "instruction_definition_model.hpp" // #4029: shared row/detail/export builders
 #include "inventory_eval.hpp"
 #include "openapi_spec_access.hpp" // external-linkage accessor for discover_routes.cpp / mcp_server.cpp
 #include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (UP-1)
+#include "product_pack_model.hpp" // #4029: shared row/detail builders + error classifiers
 #include "quarantine_reapply.hpp" // quarantine_whitelist_tokens_safe / kQuarantineWhitelistMaxLen (#3425 gate3-rest-whitelist-validation-gap)
 #include "rest_a4_envelope.hpp"
 #include "sensitive_instruction_params.hpp" // redact_sensitive_instruction_params (#3136 blocker)
@@ -946,6 +948,24 @@ const std::string& openapi_spec() {
     "/inventory/software": {
       "get": {"summary": "Fleet-wide installed-software inventory (typed daily-sync store, ADR-0016)", "tags": ["Inventory"], "description": "Installed-software rows across the fleet from the typed SoftwareInventoryStore (DISTINCT from the generic /inventory/* routes, which read the generic blob store). Rows carry name, version, publisher, install_date plus the blob-v2 package fields: kind (package|app), ecosystem (rpm|deb|apk|pacman|windows|macos|homebrew), epoch, release, arch, signature_status (rpm stored-tag), distro_id, distro_version — fields an ecosystem does not store are empty, never synthesised. Requires Inventory:Read (#3290 Phase 2: the SOLE gate is the ADR-0017 admit-then-filter fleet-read gate, never stacked with a separate permission check). Results are scoped to the caller's management groups AND, for a service-scoped API token, to that token's service-tagged agents (the intersection of both when both apply); out-of-scope devices are dropped and counted in devices_omitted (a positive value means matching software exists outside your scope — an empty/short result does NOT mean the software is absent fleet-wide). A correctly-confined service-scoped token now gets a real filtered read here rather than an outright 403. Capped at limit rows (max 1000); result_truncated_by_cap=true means more exist past the cap (keyset pagination is a follow-up). On store degradation, or the caller's tag-scope lookup degrading, the endpoint returns 503 (never an empty 200) so a vulnerability query cannot read a transient outage as 'installed nowhere'.", "parameters": [{"name": "name", "in": "query", "schema": {"type": "string"}, "description": "Exact software-name filter (optional)"}, {"name": "agent_id", "in": "query", "schema": {"type": "string"}, "description": "Exact agent filter (optional)"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "{data:{software[], count, devices_omitted, result_truncated_by_cap?, audit_persisted?}}"}, "400": {"description": "Non-integer limit"}, "401": {"description": "Unauthenticated"}, "403": {"description": "No management-group grant for Inventory:Read (or a service-scoped token whose RBAC/ITServiceOwner grant is missing/RBAC disabled)"}, "503": {"description": "Software inventory store unavailable/degraded, RBAC/management-group/tag store unavailable, or the fleet-read gate unwired"}}}
     },)json"
+        // #4029 (api-parity Batch A content/catalog half) — GET /api/v1/instructions*
+        // and GET /api/v1/product-packs*. Own segment (MSVC C2026 16,380-byte cap).
+        R"json(
+    "/instructions": {
+      "get": {"summary": "List instruction definitions (full filter set)", "tags": ["Instructions"], "description": "Requires InstructionDefinition:Read. Twin of the legacy GET /api/instructions, reconciled onto the same builder MCP list_definitions calls (instruction_definition_row_json) — cannot drift from it by construction. Not audited (content/catalog metadata, not per-agent behavioural PII — matches the legacy route's own unaudited posture).", "parameters": [{"name": "name", "in": "query", "schema": {"type": "string"}}, {"name": "plugin", "in": "query", "schema": {"type": "string"}}, {"name": "type", "in": "query", "schema": {"type": "string", "enum": ["question", "action"]}}, {"name": "set_id", "in": "query", "schema": {"type": "string"}, "description": "Filter to definitions in this instruction set"}, {"name": "enabled_only", "in": "query", "schema": {"type": "boolean"}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100}}], "responses": {"200": {"description": "{data:[{id,name,version,type,plugin,action,description,enabled,instruction_set_id,created_at,updated_at}], pagination, meta}"}, "400": {"description": "Non-integer limit"}, "403": {"description": "Requires InstructionDefinition:Read"}, "503": {"description": "Instruction store unavailable, or a genuine read failure"}}}
+    },
+    "/instructions/{id}": {
+      "get": {"summary": "Get a single instruction definition (reconciled superset)", "tags": ["Instructions"], "description": "Requires InstructionDefinition:Read. Twin of the legacy GET /api/instructions/{id} AND of MCP get_definition — reconciles both pre-existing shapes onto one builder (instruction_definition_detail_json): the legacy fragment's gather_ttl_seconds/response_ttl_days/created_by/timestamps AND MCP's approval_mode/parameter_schema/result_schema/yaml_source, together.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{data:{id,name,version,type,plugin,action,description,enabled,instruction_set_id,created_at,updated_at,gather_ttl_seconds,response_ttl_days,created_by,approval_mode,parameter_schema,result_schema,yaml_source}, meta}"}, "403": {"description": "Requires InstructionDefinition:Read"}, "404": {"description": "No definition with that id"}, "503": {"description": "Instruction store unavailable, or a genuine read failure"}}}
+    },
+    "/instructions/{id}/export": {
+      "get": {"summary": "Export a single instruction definition as its full JSON document", "tags": ["Instructions"], "description": "Requires InstructionDefinition:Read. Twin of the legacy GET /api/instructions/{id}/export and the new MCP export_definition tool — all three call the same builder (instruction_definition_export_json), which InstructionStore::export_definition_json itself now delegates to as well. DIVERGES from the legacy route on a not-found id: the legacy route returns 200 \"{}\" (a store-export quirk); this route resolves the definition first and returns a real 404.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{data:{...every InstructionDefinition field, including yaml_source/concurrency_mode/platforms/min_agent_version/required_plugins/readable_payload/visualization_spec/response_templates_spec}, meta}"}, "403": {"description": "Requires InstructionDefinition:Read"}, "404": {"description": "No definition with that id"}, "503": {"description": "Instruction store unavailable, or a genuine read failure"}}}
+    },
+    "/product-packs": {
+      "get": {"summary": "List installed product packs", "tags": ["Product Packs"], "description": "Requires ProductPack:Read (#4029 prerequisite fix: ProductPack was used as this route's securable string by the legacy GET /api/product-packs but was never seeded into RBAC's securable-types catalogue — no role, not even Administrator, could be granted it; fixed as part of this issue). Twin of the legacy route and of the new MCP list_product_packs tool, all three sharing product_pack_row_json.", "parameters": [{"name": "name", "in": "query", "schema": {"type": "string"}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100}}], "responses": {"200": {"description": "{data:[{id,name,version,description,item_count,items:[{kind,item_id,name}],installed_at,verified}], pagination, meta}"}, "400": {"description": "Non-integer limit"}, "403": {"description": "Requires ProductPack:Read"}, "503": {"description": "Product pack store unavailable, or a genuine read failure"}}}
+    },
+    "/product-packs/{id}": {
+      "get": {"summary": "Get a single installed product pack's detail", "tags": ["Product Packs"], "description": "Requires ProductPack:Read. Twin of the legacy GET /api/product-packs/{id} and the new MCP get_product_pack tool, all three sharing product_pack_detail_json (includes each item's own yaml_source, unlike the list row above).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{data:{id,name,version,description,yaml_source,items:[{kind,item_id,name,yaml_source}],installed_at,verified}, meta}"}, "403": {"description": "Requires ProductPack:Read"}, "404": {"description": "No product pack with that id"}, "503": {"description": "Product pack store unavailable, or a genuine read failure"}}}
+    },)json"
         // SLE (Software Licensing & Entitlements, ADR-0024) — /api/v1/sle/* read
         // surface, gated on the SoftwareLicensing securable (DISTINCT from `License`,
         // Yuzu's own product licence §22.3, and from Inventory:Read which still gates
@@ -1241,7 +1261,36 @@ const std::string& openapi_spec() {
       "get": {"summary": "Aggregated fleet execution statistics (capability 22.6)", "tags": ["Statistics"], "description": "Requires Infrastructure:Read. Same underlying ExecutionTracker fleet summary as GET /execution-statistics, reshaped under an executions sub-object.", "responses": {"200": {"description": "{executions: {total, today, success_rate, avg_duration_seconds}, active_agents}"}}}
     },
     "/agent/plugin-policy": {
-      "get": {"summary": "Plugin trust-bundle distribution endpoint", "tags": ["Settings"], "description": "Admin only (whole-endpoint admin gate, not an RBAC securable — CC6.1 least-privilege: the SHA-256 fingerprint discloses when the trust anchor rotates, useful reconnaissance for a supply-chain attacker). Returns the current PEM trust bundle and the require-signature flag for out-of-band agent-config distribution (operators curl this into --plugin-trust-bundle on each agent host). Pilot-stable: the /api/v1/agent/... path and response shape may change before the GA v1 contract is finalized; the field set is unlikely to shrink.", "responses": {"200": {"description": "Bundle uploaded: {enabled: true, required, trust_bundle_pem, cert_count, sha256}. No bundle uploaded (still 200, not 404 — a normal operational state): {enabled: false, required, trust_bundle_pem: \"\"}"}, "500": {"description": "Trust bundle exists on disk but is unreadable"}}}
+      "get": {"deprecated": true, "summary": "Plugin trust-bundle distribution endpoint (DEPRECATED — see GET /api/v2/agent/plugin-policy)", "tags": ["Settings"], "description": "#4144 review fix: this v1 shape is FROZEN and deprecated (docs/api-versioning-policy.md deprecation cycle; see docs/user-manual/upgrading.md for the migration and the announced removal window). #4028 originally hardened this route's response shape in place, which was itself a policy violation (a breaking envelope-shape change with no version bump) — corrected by moving the hardened behavior to GET /api/v2/agent/plugin-policy and restoring this v1 route to its exact pre-#4028 shape: admin only (whole-endpoint admin gate, not an RBAC securable — CC6.1 least-privilege: the SHA-256 fingerprint discloses when the trust anchor rotates, useful reconnaissance for a supply-chain attacker). Returns the current PEM trust bundle and the require-signature flag for out-of-band agent-config distribution (operators curl this into --plugin-trust-bundle on each agent host).", "responses": {"200": {"description": "Bundle uploaded: {enabled: true, required, trust_bundle_pem, cert_count, sha256}. No bundle uploaded (still 200, not 404 — a normal operational state): {enabled: false, required, trust_bundle_pem: \"\"}"}, "500": {"description": "Trust bundle exists on disk but is unreadable"}}}
+    },
+    "/v2/agent/plugin-policy": {
+      "servers": [{"url": "/api/v2", "description": "API v2 base path — the repo's first breaking-change route (docs/api-versioning-policy.md); this Path Item Object override (OpenAPI 3.0.3 §4.7.9.2) is the ONLY /api/v2/* path today, so the top-level servers[] entry stays /api/v1"}],
+      "get": {"summary": "Plugin trust-bundle distribution endpoint (plugin-signing's REST v2 twin)", "tags": ["Settings"], "description": "#4144 review fix: the hardened successor to the now-deprecated GET /api/v1/agent/plugin-policy (docs/api-versioning-policy.md — the v1 route's response envelope could not be reshaped in place without a version bump). Gated on PluginSigning:Read (dedicated RBAC securable, Administrator-only, floored in authz_topology_floor.hpp) + the A4 envelope + the shared settings_model::build_plugin_signing_settings builder the Settings plugin-signing fragment (GET /fragments/settings/plugin-signing) also calls — this route alone adds trust_bundle_pem (the superset). Audited fail-closed (settings.plugin_signing.read): a non-admin token holder learning when the trust anchor rotates (sha256 changes) is useful reconnaissance for a supply-chain attacker (CC6.1 least-privilege). cert_count/sha256/subjects/trust_bundle_pem are derived from a SINGLE filesystem read (#4144 TOCTOU fix) — they can no longer describe two different bundle versions on a concurrent upload race, unlike the v1 route's original design.", "responses": {"200": {"description": "{data: {enabled, required, cert_count, sha256, subjects[], bundle_unreadable, trust_bundle_pem}, meta}. Bundle absent (still 200, not 404 — a normal operational state): {enabled: false, required, cert_count: 0, sha256: \"\", subjects: [], bundle_unreadable: false, trust_bundle_pem: \"\"}"}, "403": {"description": "Permission denied (PluginSigning:Read)"}, "500": {"description": "Trust bundle exists on disk but is unreadable (A4 error envelope)"}, "503": {"description": "Audit subsystem unavailable — refuses to serve without durable evidence; or the trust bundle changed concurrently while serving this request (A4 error envelope, correlation_id)"}}}
+    },
+    "/settings/tls": {
+      "get": {"summary": "TLS/mTLS listener settings", "tags": ["Settings"], "description": "#4028 — REST v1 read-twin of GET /fragments/settings/tls, sharing its builder (settings_model::build_tls_settings). Requires TlsConfig:Read (dedicated securable, Administrator-only, floored in authz_topology_floor.hpp). Audited fail-closed (settings.tls.read) — TLS/mTLS posture and cert/key/CA file paths are reconnaissance value for an attacker learning the mTLS enforcement posture. MCP: deliberately REST-only — #520 bars MCP tokens from server-administration surfaces including \"settings\" and \"TLS\" by name; not carved out here (see this PR's commit message).", "responses": {"200": {"description": "{data: {enabled, server_cert_path, server_key_path, ca_cert_path, insecure_skip_client_verify, mgmt_server_cert_path, mgmt_server_key_path, mgmt_ca_cert_path}, meta}"}, "403": {"description": "Permission denied (TlsConfig:Read)"}, "503": {"description": "Audit subsystem unavailable — refuses to serve without durable evidence"}}}
+    },
+    "/settings/https": {
+      "get": {"summary": "HTTPS listener settings", "tags": ["Settings"], "description": "#4028 — REST v1 read-twin of GET /fragments/settings/https, sharing its builder (settings_model::build_https_settings). Requires TlsConfig:Read (same securable as /settings/tls — grouped sub-area per the #4028 acceptance criteria). Audited fail-closed (settings.https.read). MCP: deliberately REST-only (#520, see /settings/tls).", "responses": {"200": {"description": "{data: {enabled, port, cert_path, key_path, redirect}, meta}"}, "403": {"description": "Permission denied (TlsConfig:Read)"}, "503": {"description": "Audit subsystem unavailable — refuses to serve without durable evidence"}}}
+    },)json"
+        // #4028 — split per the MSVC C2026 16,380-byte cap; concatenated at
+        // compile time, so the emitted OpenAPI JSON is byte-identical to the
+        // unsplit form (same technique as the #3992 F2 backfill above).
+        R"json(
+    "/settings/gateway": {
+      "get": {"summary": "Erlang gateway upstream status", "tags": ["Settings"], "description": "#4028 — REST v1 read-twin of GET /fragments/settings/gateway, sharing its builder (settings_model::build_gateway_settings). Requires ServerConfig:Read (dedicated securable grouping the operational/infra Settings sub-areas, Administrator-only, floored in authz_topology_floor.hpp). NOT audited — operational status, nothing secret. MCP: deliberately REST-only (#520, see /settings/tls).", "responses": {"200": {"description": "{data: {enabled, listen_address, gateway_mode, active_sessions}, meta}. listen_address/gateway_mode/active_sessions are defaulted (empty/false/0) when enabled=false."}, "403": {"description": "Permission denied (ServerConfig:Read)"}}}
+    },
+    "/settings/server-config": {
+      "get": {"summary": "Core server configuration (addresses, timeouts, OTA/gRPC tuning)", "tags": ["Settings"], "description": "#4028 — REST v1 read-twin of GET /fragments/settings/server-config, sharing its builder (settings_model::build_server_config_settings). Requires ServerConfig:Read. NOT audited — nothing secret. MCP: deliberately REST-only (#520, see /settings/tls).", "responses": {"200": {"description": "{data: {agent_grpc_address, management_grpc_address, web_address, web_port, session_timeout_seconds, max_agents, auth_config_path, rate_limit_per_ip, login_rate_limit_per_ip, ota_max_concurrent_per_peer, ota_rate_refill_per_min, ota_rate_capacity, ota_max_concurrent_total, ota_max_peers_tracked, ota_transfer_deadline_secs, ota_chunk_write_deadline_secs, grpc_max_concurrent_streams, grpc_max_resource_memory_mb}, meta}"}, "403": {"description": "Permission denied (ServerConfig:Read)"}}}
+    },
+    "/settings/mcp": {
+      "get": {"summary": "MCP server status and client-connection info", "tags": ["Settings"], "description": "#4028 — REST v1 read-twin of GET /fragments/settings/mcp, sharing its builder (settings_model::build_mcp_settings). Requires ServerConfig:Read. NOT audited — low sensitivity (an MCP client with a valid token already knows this endpoint exists). This route describes the MCP surface but is itself REST-only, deliberately (#520, see /settings/tls) — it is not, and does not become, an MCP tool.", "responses": {"200": {"description": "{data: {enabled, read_only, endpoint_url}, meta}"}, "403": {"description": "Permission denied (ServerConfig:Read)"}}}
+    },
+    "/settings/data-retention": {
+      "get": {"summary": "Response/audit data retention windows", "tags": ["Settings"], "description": "#4028 — REST v1 read-twin of GET /fragments/settings/data-retention, sharing its builder (settings_model::build_data_retention_settings). Requires ServerConfig:Read. NOT audited — lowest sensitivity of the 8 Settings read-twins (two integers). MCP: deliberately REST-only (#520, see /settings/tls).", "responses": {"200": {"description": "{data: {response_retention_days, audit_retention_days}, meta}"}, "403": {"description": "Permission denied (ServerConfig:Read)"}}}
+    },
+    "/settings/analytics": {
+      "get": {"summary": "Analytics drain + ClickHouse integration settings", "tags": ["Settings"], "description": "#4028 — REST v1 read-twin of GET /fragments/settings/analytics, sharing its builder (settings_model::build_analytics_settings). Requires AnalyticsConfig:Read (dedicated securable). Audited fail-closed (settings.analytics.read) — mixed, leans high (embedded-credential risk). SECURITY FIX bundled with this twin: clickhouse_url is sanitized of embedded userinfo credentials (settings_model::sanitize_url_userinfo) before being returned — previously the sibling HTML fragment rendered it verbatim, masking only the separate clickhouse_password field. The raw password itself is never returned, only clickhouse_password_set. MCP: deliberately REST-only (#520, see /settings/tls).", "responses": {"200": {"description": "{data: {enabled, drain_interval_seconds, batch_size, clickhouse_configured, clickhouse_url (userinfo-sanitized), clickhouse_database, clickhouse_table, clickhouse_username, clickhouse_password_set, jsonl_export_path}, meta}"}, "403": {"description": "Permission denied (AnalyticsConfig:Read)"}, "503": {"description": "Audit subsystem unavailable — refuses to serve without durable evidence"}}}
     },
     "/tar/retention-paused/purge": {
       "post": {"summary": "Dispatch a destructive single-device TAR source purge (A1 structured surface)", "tags": ["Dashboard TAR"], "description": "Requires Infrastructure:Delete, enforced per-device and management-group-scoped (fail-closed if the scope gate is unwired). Agentic-first JSON twin of POST /fragments/tar/retention-paused/purge: permanently drops every warehouse row for a paused source on one device while leaving the collector paused. IRREVERSIBLE. Audit (tar.source.purge, result=requested) is written BEFORE dispatch, fail-closed — the purge is never dispatched without durable evidence. Async: agent computes rows_deleted (and the agent-side source_not_paused refusal, if the source was re-enabled between scan and purge) into the command's response record, polled by command_id, not returned in the 202 body. Requires an agent implementing tar.purge_source (v0.14.0+).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["device_id", "source"], "properties": {"device_id": {"type": "string", "description": "Target agent; must be within the caller's management scope."}, "source": {"type": "string", "enum": ["process", "tcp", "service", "user"]}}}}}}, "responses": {"202": {"description": "{command_id, device_id, source, agents_reached}. X-Correlation-Id header on every response."}, "400": {"description": "Invalid JSON, missing device_id/source, or source not one of process|tcp|service|user"}, "403": {"description": "Permission denied (scoped Infrastructure:Delete gate)"}, "404": {"description": "Device out of scope, or dispatch reached zero agents (device offline/quarantined/containment-withheld)"}, "500": {"description": "Scope gate not configured (server misconfiguration)"}, "503": {"description": "Command dispatch unavailable, or the pre-dispatch audit row could not be persisted (Sec-Audit-Failed header; purge not dispatched)", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when the mutation succeeded but its own audit row failed to persist."}}}}}
@@ -5410,6 +5459,223 @@ void RestApiV1::register_routes(
                                  .add("created_at", d.created_at));
                  }
                  res.set_content(list_json(arr.str(), static_cast<int64_t>(defs.size())),
+                                 "application/json");
+             });
+
+    // ── Instructions / Product Packs (#4029, api-parity Batch A content/catalog
+    // half) ──────────────────────────────────────────────────────────────────
+    //
+    // Twins of the legacy GET /api/instructions[/{id}[/export]] and
+    // GET /api/product-packs[/{id}] routes (server.cpp / workflow_routes.cpp),
+    // reconciled onto the shared instruction_definition_model.hpp /
+    // product_pack_model.hpp builders (docs/api-twin-recipe.md §1) — MCP's
+    // list_definitions/get_definition dispatch branches call the SAME builders
+    // (mcp_server.cpp), so REST and MCP cannot drift from each other by
+    // construction. Audit: content/catalog definition reads, matching the
+    // majority unaudited posture already on all five underlying legacy routes
+    // -- no emit_behavioral_audit here, this is not per-agent behavioural PII.
+    // (Gate 6 compliance-officer correction: the audit-tier rationale for
+    // "not per-agent PII -> no REST audit needed" is docs/api-twin-recipe.md
+    // §8's SoftwareDeployment worked example, NOT §4 -- §4 is the per-surface
+    // FAILURE-mode table for an audit call that already exists, it has no
+    // "when is REST unaudited at all" row.) MCP's twins still call the
+    // generic `mcp.<tool_name>` audit (list_definitions/get_definition already
+    // did before this PR; export_definition/list_product_packs/
+    // get_product_pack now do the same for consistency) — that MCP-side audit
+    // predates this PR for two of the five and is preserved, not silently
+    // dropped; REST stays silent for all five, matching the legacy fragments.
+
+    sink.Get("/api/v1/instructions", [perm_fn, instruction_store](const httplib::Request& req,
+                                                                  httplib::Response& res) {
+        if (!perm_fn(req, res, "InstructionDefinition", "Read"))
+            return;
+        if (!instruction_store || !instruction_store->is_open()) {
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "instruction store not available"),
+                            "application/json");
+            return;
+        }
+
+        InstructionQuery q;
+        if (req.has_param("name"))
+            q.name_filter = req.get_param_value("name");
+        if (req.has_param("plugin"))
+            q.plugin_filter = req.get_param_value("plugin");
+        if (req.has_param("type"))
+            q.type_filter = req.get_param_value("type");
+        if (req.has_param("set_id"))
+            q.set_id_filter = req.get_param_value("set_id");
+        // #4029 Gate 4/8 fix: presence alone used to mean "filter to
+        // enabled-only" regardless of value, so `?enabled_only=false` still
+        // filtered -- silently returning a narrower result set than asked
+        // for, with nothing in the response to signal the mismatch (I3).
+        // This route's own OpenAPI schema (below) advertises a real
+        // `type: boolean`, and the MCP twin (mcp_server.cpp list_definitions)
+        // already reads the value, not just presence -- so this now matches
+        // both its own documented contract and its sibling surface. Follows
+        // the same value/"true"|"1" convention already used by
+        // inventory_routes.cpp:230 and notification_routes.cpp:34, rather
+        // than introducing a new "invalid boolean" error branch. The
+        // legacy, unversioned (non-OpenAPI) `/api/instructions` route
+        // (server.cpp:16298) keeps its original presence-only behavior --
+        // deliberately out of scope; changing an already-shipped route's
+        // semantics would itself be the breaking change.
+        q.enabled_only = req.has_param("enabled_only") &&
+                          (req.get_param_value("enabled_only") == "true" ||
+                           req.get_param_value("enabled_only") == "1");
+        if (req.has_param("limit")) {
+            try {
+                q.limit = std::stoi(req.get_param_value("limit"));
+            } catch (const std::exception&) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
+                                "application/json");
+                return;
+            }
+        }
+
+        auto defs_result = instruction_store->query_definitions(q);
+        if (!defs_result) {
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "instruction store read failed"),
+                            "application/json");
+            return;
+        }
+        JArr arr;
+        for (const auto& d : *defs_result)
+            arr.add_raw(instruction_definition_row_json(d).dump());
+        res.set_content(list_json(arr.str(), static_cast<int64_t>(defs_result->size())),
+                        "application/json");
+    });
+
+    sink.Get(R"(/api/v1/instructions/([^/]+))",
+             [perm_fn, instruction_store](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "InstructionDefinition", "Read"))
+                     return;
+                 if (!instruction_store || !instruction_store->is_open()) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "instruction store not available"),
+                                     "application/json");
+                     return;
+                 }
+                 auto id = req.matches[1].str();
+                 auto def_result = instruction_store->get_definition(id);
+                 if (!def_result) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "instruction store read failed"),
+                                     "application/json");
+                     return;
+                 }
+                 if (!*def_result) {
+                     res.status = 404;
+                     res.set_content(detail::a4_error(res, "not found"), "application/json");
+                     return;
+                 }
+                 res.set_content(ok_json(instruction_definition_detail_json(**def_result).dump()),
+                                 "application/json");
+             });
+
+    // NOTE on divergence from the legacy (non-v1) export route: the legacy
+    // GET /api/instructions/{id}/export returns 200 "{}" for an unknown id
+    // (InstructionStore::export_definition_json's own not-found sentinel,
+    // never distinguished from "found but empty" by that route). This v1
+    // twin instead resolves the definition itself first, so an unknown id
+    // is a real 404 — a deliberate correction, not a copied quirk.
+    sink.Get(R"(/api/v1/instructions/([^/]+)/export)",
+             [perm_fn, instruction_store](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "InstructionDefinition", "Read"))
+                     return;
+                 if (!instruction_store || !instruction_store->is_open()) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "instruction store not available"),
+                                     "application/json");
+                     return;
+                 }
+                 auto id = req.matches[1].str();
+                 auto def_result = instruction_store->get_definition(id);
+                 if (!def_result) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "instruction store read failed"),
+                                     "application/json");
+                     return;
+                 }
+                 if (!*def_result) {
+                     res.status = 404;
+                     res.set_content(detail::a4_error(res, "not found"), "application/json");
+                     return;
+                 }
+                 res.set_content(ok_json(instruction_definition_export_json(**def_result).dump()),
+                                 "application/json");
+             });
+
+    sink.Get("/api/v1/product-packs", [perm_fn, product_pack_store](const httplib::Request& req,
+                                                                     httplib::Response& res) {
+        if (!perm_fn(req, res, "ProductPack", "Read"))
+            return;
+        if (!product_pack_store || !product_pack_store->is_open()) {
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "product pack store not available"),
+                            "application/json");
+            return;
+        }
+
+        ProductPackQuery q;
+        if (req.has_param("name"))
+            q.name_filter = req.get_param_value("name");
+        if (req.has_param("limit")) {
+            try {
+                q.limit = std::stoi(req.get_param_value("limit"));
+            } catch (const std::exception&) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
+                                "application/json");
+                return;
+            }
+        }
+
+        auto packs_result = product_pack_store->list(q);
+        if (!packs_result) {
+            res.status = product_pack_error_status(packs_result.error());
+            res.set_content(detail::a4_error(res, product_pack_client_message(
+                                                       "GET /api/v1/product-packs",
+                                                       packs_result.error())),
+                            "application/json");
+            return;
+        }
+        JArr arr;
+        for (const auto& p : *packs_result)
+            arr.add_raw(product_pack_row_json(p).dump());
+        res.set_content(list_json(arr.str(), static_cast<int64_t>(packs_result->size())),
+                        "application/json");
+    });
+
+    sink.Get(R"(/api/v1/product-packs/([^/]+))",
+             [perm_fn, product_pack_store](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "ProductPack", "Read"))
+                     return;
+                 if (!product_pack_store || !product_pack_store->is_open()) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "product pack store not available"),
+                                     "application/json");
+                     return;
+                 }
+                 auto id = req.matches[1].str();
+                 auto pack_result = product_pack_store->get(id);
+                 if (!pack_result) {
+                     res.status = product_pack_error_status(pack_result.error());
+                     res.set_content(detail::a4_error(res, product_pack_client_message(
+                                                                "GET /api/v1/product-packs/{id}",
+                                                                pack_result.error())),
+                                     "application/json");
+                     return;
+                 }
+                 if (!*pack_result) {
+                     res.status = 404;
+                     res.set_content(detail::a4_error(res, "product pack not found"),
+                                     "application/json");
+                     return;
+                 }
+                 res.set_content(ok_json(product_pack_detail_json(**pack_result).dump()),
                                  "application/json");
              });
 

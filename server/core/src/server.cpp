@@ -34,6 +34,7 @@
 #include "ca_routes.hpp"
 #include "ca_store.hpp"
 #include "default_certs.hpp"
+#include "sso_boot_guard.hpp" // saml_config_complete — shared with the sso-only boot guard
 #include "kek_op_lock.hpp"
 #include "kek_rotate_control.hpp"
 #include "kek_routes.hpp"
@@ -64,6 +65,7 @@
 #include "grpc_on_behalf_interceptor.hpp"
 #include "guardian_health_fleet_tags.hpp" // Guardian M1 health-stream fleet gauge names + HELP (#2298 item 6d)
 #include "guardian_journal_fleet_tags.hpp" // Guardian journal fleet gauge names + HELP (#2298)
+#include "instruction_definition_model.hpp" // #4029: shared row/detail/export builders
 #include "instruction_store.hpp"
 #include "on_behalf_guard.hpp"
 #include "principal_class.hpp"
@@ -3771,12 +3773,12 @@ public:
                              cfg_.saml_group_attribute, cfg_.saml_admin_group);
             }
 
-            const bool saml_config_complete = !cfg_.saml_idp_sso_url.empty() &&
-                                              !cfg_.saml_idp_cert.empty() &&
-                                              !cfg_.saml_sp_entity_id.empty() &&
-                                              !cfg_.saml_sp_acs_url.empty() &&
-                                              !cfg_.saml_idp_entity_id.empty();
-            if (saml_config_complete) {
+            // Single source of truth for "SAML SP config is complete" — shared
+            // with the --auth-mode=sso-only boot guard (sso_boot_guard.hpp) so the
+            // two predicates can never drift. The bare 5-field check stays here
+            // (HTTPS is handled by the explicit gate just below) so a complete-
+            // but-plaintext config still reaches the HTTPS-disabled error path.
+            if (yuzu::server::saml_config_complete(cfg_)) {
                 // HTTPS gate: SAML ACS is delivered over the browser's back-channel
                 // POST.  The __Host-yuzu_saml_bind binding cookie requires Secure
                 // attribute (baked into the cookie string) which browsers only send
@@ -3906,6 +3908,10 @@ public:
                        !cfg_.saml_sp_entity_id.empty() || !cfg_.saml_sp_acs_url.empty() ||
                        !cfg_.saml_idp_entity_id.empty()) {
                 // Partial config — warn so the operator knows which flags are missing.
+                // NB: this OR-list is the COMPLEMENT of saml_config_complete()
+                // (some-but-not-all set), so it cannot call that predicate; if a
+                // sixth required SAML field is ever added there, add it here too —
+                // the two field lists are coupled by construction.
                 spdlog::warn("SAML: incomplete configuration (need --saml-idp-sso-url, "
                              "--saml-idp-cert, --saml-sp-entity-id, --saml-sp-acs-url, "
                              "--saml-idp-entity-id) — SAML login disabled");
@@ -14058,7 +14064,17 @@ private:
             })
                              : SettingsRoutes::GatewaySessionCountFn{},
             [this]() -> std::string { return registry_.to_json(); }, oidc_mu_, oidc_provider_,
-            /*metrics_registry=*/&metrics_, step_up_fn);
+            /*metrics_registry=*/&metrics_, step_up_fn,
+            // #4028 — bool-returning audit hook for the fail-closed REST
+            // settings read-twins (SettingsRoutes::AuditReadFn); same
+            // underlying audit_log() the void-returning audit_fn_ lambda
+            // above already wraps, just with the persisted-or-not bool
+            // preserved instead of discarded.
+            [this](const httplib::Request& req, const std::string& action,
+                   const std::string& result, const std::string& target_type,
+                   const std::string& target_id, const std::string& detail) -> bool {
+                return audit_log(req, action, result, target_type, target_id, detail);
+            });
         // F1: live-apply hook for the DEX alerts settings (wired before the
         // listener starts, so no request races the set).
         settings_routes_->set_dex_alert_apply_fn([this]() { apply_dex_alert_config(); });
@@ -18015,7 +18031,9 @@ private:
                 // /api/command's visible-set half uses, now carrying identity too.
                 [this](const auth::Session& s) -> yuzu::server::DispatchCaller {
                     return derive_dispatch_caller(s);
-                });
+                },
+                // #4029: backs list_product_packs/get_product_pack.
+                product_pack_store_.get());
         }
 
         // -- Listen -----------------------------------------------------------
