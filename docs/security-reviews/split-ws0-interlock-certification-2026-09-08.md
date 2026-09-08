@@ -43,15 +43,32 @@ check *reports*, it does not block. So WS-0 arms **two layers**:
    engine principal is an engine-path ballot with **zero** new interlock symbols — caught by human
    review, not by the grep.
 
-**The two marker classes (why the tripwire does not deadlock the interlock).** Three interlock
-substrate symbols — `use_case_run_id` (the D12 audit column, cell c), the release-log store (cell d)
-and `evaluate_as_operator` (cell b's seam) — are the very things WS-A6/#2675 must **land** to turn
-the gate green. Blocking their first occurrence would deadlock the interlock against itself. So they
-are **substrate markers**: their appearance *flips a ledger cell*, routed to reviewers under normal
-derivation, never blocked. Only **engine-path markers** — the run-row store, the invocation/
-result-scoped grants, the finalisation receipt, the reaper metric family — block, and only while the
-gate is red. `plan_hash` is **excluded**: its 45 code hits are the pre-existing dispatch-tag grammar
-(`compute_plan_hash`), not the ADR-0032 Execution-Plan hash.
+**The two marker classes (why the tripwire does not deadlock the interlock).** Substrate symbols —
+`use_case_run_id` (the D12 audit column, cell c), the release-log store (cell d), `evaluate_as_operator`
+(cell b's seam), and the runtime capability-registry symbol (cell h) — are the very things WS-A6/#2675
+must **land** to turn the gate green. Blocking their first occurrence would deadlock the interlock
+against itself. So they are **substrate markers**: their appearance *flips a ledger cell*, routed to
+reviewers under normal derivation, never blocked (cells a and m carry substrate markers too —
+`engine_principal_store` and `class PrincipalQuota` — and are the two the false-certification guard
+actually exercises today, since they are the only non-red cells). Only **engine-path markers** — the
+run-row store (`use_case_runs`), the invocation/result-scoped grants (`invocation_grant` /
+`release_authorization`), the finalisation receipt, `served_from_run_id`, `released_input_digest`, and
+the reaper metric family — block, and only while the gate is red. `plan_hash` is **excluded**: its hits
+are the pre-existing dispatch-tag grammar (`compute_plan_hash`), not the ADR-0032 Execution-Plan hash.
+
+**Tamper-evidence, and the acknowledged grep limit.** The ledger is a repo file editable in the very
+PR the gate polices, so the tripwire alone is tamper-*evident*, not tamper-*proof*. Its load-bearing
+constants — `gate_set`, `search_paths`/`exclude_paths`, the engine-path marker key set, and "every gate
+cell has a substrate marker" — are **pinned against frozen values in
+`tests/test_split_interlock_tripwire_selftest.py`**, so opening the gate requires editing those test
+constants too: a loud, CI-failing, reviewable change the routed-concern row routes to security review,
+not one silent JSON edit. The remaining limit is inherent to grep: a marker proves **string-presence,
+not semantic existence** (a cell can be flipped green off an incidental match or a comment; a
+renamed/synonym symbol or a gitignored generated file evades RULE 1; and the `nvd_*`/`vuln_finding`
+disclosure path has no mechanical marker at all). The routed-concern **human review is the
+compensating control** for substrate quality and those un-mechanizable cases — and (b)'s #2665
+deny-precedence, being a semantic change to existing code with no symbol, **requires a human
+attestation** to flip green, never RULE 2 alone.
 
 Today the gate is **CLOSED** — cells (b), (c), (d), (h) are red — and the tripwire confirms no
 engine-path marker has breached it.
@@ -60,8 +77,10 @@ engine-path marker has breached it.
 
 ## 2. The interlock ledger (a)–(n)
 
-Command shape for a substrate symbol: `git grep -n '<sym>' origin/dev -- server/ agents/ common/
-proto/ sdk/ tests/` (code) vs `git grep -n '<sym>' origin/dev` (whole-tree).
+Command shape for a marker: `git grep -nE '<regex>' origin/dev -- . :(exclude)docs/ :(exclude).claude/
+:(exclude)tests/split_interlock_ledger.json :(exclude)tests/test_split_interlock_tripwire*.py` — the
+whole tree minus the self-naming files (matching the tripwire's `search_paths`/`exclude_paths`), so a
+future engine binary directory (`server/engine/`, `gateway/`, …) cannot be silently uncovered.
 
 | # | Prerequisite | Status | Tree evidence (re-runnable) |
 |---|---|---|---|
@@ -77,11 +96,12 @@ proto/ sdk/ tests/` (code) vs `git grep -n '<sym>' origin/dev` (whole-tree).
 | **(j)** | capability projection (generated OpenAPI + `tools/list`) | RED | `tools/list` iterates a compile-time array; OpenAPI a hand-typed literal. INV-31-4 test cannot exist until this lands. |
 | **(k)** | operational readiness (new stores in readyz + reaper liveness) | RED | Six new stores, none in `/readyz`; reaper has no liveness metric. |
 | **(l)** | intra-module cross-run isolation | RED | Nothing exists; the first module (vuln-mgmt) serves many operators from one deployment. |
-| **(m)** | per-principal quota caps | **GREEN** (ADR-0032 cell STALE) | `PrincipalQuota` (`principal_quota.{hpp,cpp}`, `max_concurrency=16`, `rate_per_second=20`) SHIPPED (PR 4.4, **#1973 CLOSED**), wired into `agent_service_impl.cpp` / `mcp_server.cpp` / `mcp_stream.cpp`. |
+| **(m)** | per-principal quota caps | **RED — PARTIAL** (not in gate set) | The **#1973 base cap** ships: `PrincipalQuota` (`principal_quota.{hpp,cpp}`, `max_concurrency=16`, `rate_per_second=20`), wired into `agent_service_impl.cpp` / `mcp_server.cpp` / `mcp_stream.cpp`. But ADR-0032 (m) **also** requires the 2b §5 invocation-grant outstanding-count + issuance-rate caps + dual-side debit (engine-path, **0-in-code**). So ADR-0032's "none enforced" **overstates** the gap (the base cap ships) but is **not wholesale stale**. |
 | **(n)** | credential predecessor/successor relation + terminal-reason classification | RED | Unbuilt; 2b must be amended. |
 
-**Unconditional merge-gate set (a)–(d)+(h): a=green, m=green (informational), b/c/d/h=RED → gate
-CLOSED.** No engine-path code may merge.
+**Unconditional merge-gate set (a)–(d)+(h): a=green, b/c/d/h=RED → gate CLOSED.** No engine-path code
+may merge. (m) is informational — not in the gate set — and is **partial** (base cap only), so it does
+not read green.
 
 ---
 
@@ -106,9 +126,20 @@ The `/auth-and-authz` skill carries **no** §1c/split content and is therefore *
   evaluated as the admitting operator while the engine is the authenticated caller). Absent in code.
 
 **Stale ADR-0032 cells for #4124** (markdown correction is #4124's scope, not WS-0's — appended here
-as verified input): cell **(a)** says Phase-4 "is not [shipped]" (stale — RBAC-only enforcement
-ships); cell **(m)** says "none is enforced" (stale — `PrincipalQuota` ships, #1973 CLOSED). Both are
-outside #4124's original (b)-only scope; recommend appending them to #4124 rather than widening WS-0.
+as verified input, each with the nuance the correction must preserve so #4124 does not itself overclaim):
+- cell **(a)** says Phase-4 "is not [shipped]" — **stale**: RBAC-only enforcement ships (`auth_routes.cpp`).
+- cell **(m)** says "none is enforced" — **overstated, NOT wholesale stale**: the #1973 base per-principal
+  cap ships, but the 2b §5 invocation-grant caps + dual-side debit remain genuinely unbuilt (engine-path).
+  The #4124 correction must say "base cap shipped; invocation-grant caps unbuilt", **not** flip (m) to
+  fully-shipped.
+- cell **(h)** cites the securables array as `rbac_store.cpp:217-244, 21 entries`; the **locator is stale**
+  (actual `:559`, 27 entries). Status (red) is unaffected — only the line/count reference drifted.
+
+**#4124 should carry a remediation deadline.** A stale authoritative ADR sitting open indefinitely is a
+contradictory-record risk (an auditor sampling ADR-0032 directly reads a false "not shipped" for a live
+control); recommend #4124 be given an explicit due date rather than left "deferred with no target". The
+machine-enforced ledger + this certification are the authoritative interim record (the ledger + tree
+win over any prose, stated at the top of this document), which bounds the risk but does not remove it.
 
 **Forward reference to unbuilt substrate (governance rule 3 — a truth finding WS-A6 owns):**
 `server/core/src/authz_model.hpp:205–206` comments that `data_class`/`audit_verb` are *"emitted with
@@ -135,10 +166,12 @@ in-flight engine-path ballot threatens the merge-gate as of this ref.
 - [x] Interlock ledger (a)–(n) certified against the tree with per-cell grep provenance (§2); machine
   half `tests/split_interlock_ledger.json`.
 - [x] Merge-gate armed: two marker classes + CI tripwire (`test_split_interlock_tripwire.py` in
-  `docs-lint.yml`) + routed-concern row with symbol **and** NVD-path triggers; `plan_hash` excluded.
-- [x] §1c ratification confirmed landed (#4125), three matrices cite Dave Rae (§3).
+  `docs-lint.yml`) + a self-test (`test_split_interlock_tripwire_selftest.py`) pinning the ledger's
+  load-bearing constants so the gate is tamper-evident + routed-concern row with symbol **and** NVD-path
+  triggers; `plan_hash` excluded.
+- [x] §1c ratification confirmed landed (#4125), cited at four sites (two matrices, two skills) (§3).
 - [x] #2665 named the single engine-gate open question; #2675 named the seam; both OPEN (§4).
 - [x] In-flight engine-path ballot sweep clean (§5).
-- [ ] (a)/(m) staleness + `authz_model.hpp:206` forward-reference appended to #4124 (external action —
-  pending operator go-ahead to comment).
+- [ ] (a)/(m)/(h) ADR-0032 staleness (scoped per §4) + `authz_model.hpp:206` forward-reference appended
+  to #4124, with a remediation deadline (external action — pending operator go-ahead to comment).
 - [x] Matrix WS-0 row flipped planned→done + Verified line re-stamped in this PR.

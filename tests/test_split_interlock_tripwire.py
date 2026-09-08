@@ -40,7 +40,25 @@ very things WS-A6 must land to turn the gate green. Blocking their first
 occurrence would deadlock the interlock against itself. Only engine-path markers
 block, and only while the gate is red.
 
+TAMPER-EVIDENCE, NOT TAMPER-PROOFNESS. The ledger is a repo file editable in the
+very PR it gates, so this test alone cannot be un-defeatable. Its load-bearing
+constants (gate_set, search_paths/exclude_paths, the engine-path marker key set,
+"every gate cell has a substrate marker") are PINNED against frozen values in
+tests/test_split_interlock_tripwire_selftest.py, so neutering the gate requires
+editing those frozen test constants too — a loud, CI-failing, reviewable act the
+routed-concern row routes to security review — instead of one silent JSON edit.
+
+GREP LIMIT (acknowledged, documented in the ledger _comment): a marker proves
+STRING-PRESENCE, not semantic existence — a cell can be flipped green off an
+incidental match or a comment, and a renamed/synonym symbol or a gitignored
+generated file evades RULE 1. git grep also sees TRACKED files only, so a local
+untracked file is invisible (CI checks out the merged PR with files tracked, so
+this is a local-dev blind spot, not a CI one). The routed-concern human review is
+the compensating control for substrate quality and the un-mechanizable
+nvd_*/vuln_finding disclosure path.
+
 Zero dependencies (stdlib only), like the other tests/test_*.py doc-lint gates.
+Pass an alternate ledger path as argv[1] (used by the self-test).
 """
 from __future__ import annotations
 
@@ -74,8 +92,8 @@ def _git_grep_hits(regex: str, search_paths: list[str], exclude_paths: list[str]
     return [ln for ln in proc.stdout.splitlines() if ln.strip()]
 
 
-def main() -> int:
-    with open(LEDGER, encoding="utf-8") as fh:
+def main(ledger_path: str = LEDGER) -> int:
+    with open(ledger_path, encoding="utf-8") as fh:
         ledger = json.load(fh)
 
     gate_set: list[str] = ledger["gate_set"]
@@ -87,6 +105,17 @@ def main() -> int:
     excluded: dict = ledger.get("excluded", {})
 
     failures = 0
+
+    # A status typo (e.g. "greeen") reads as not-green, which is fail-closed for
+    # gate-open but SILENTLY skips a cell's RULE 2 absence check. Reject any status
+    # that is not the exact enum so a typo fails loudly instead.
+    for cell_id, spec in cells.items():
+        if spec.get("status") not in ("green", "red"):
+            failures += 1
+            _fail(
+                f"cell ({cell_id}) has invalid status {spec.get('status')!r} — "
+                f"must be exactly 'green' or 'red'."
+            )
 
     # Is the unconditional merge-gate open? Every cell in the gate set must be green.
     red_gate_cells = [c for c in gate_set if cells.get(c, {}).get("status") != "green"]
@@ -119,17 +148,18 @@ def main() -> int:
                     f"code tree. Flip the cell back to red or land the substrate."
                 )
 
-    # GUARD — excluded symbols must carry a recorded rationale and never appear as markers.
-    marker_regexes = {s["regex"] for s in substrate.values()} | {
-        e["regex"] for e in engine_path.values()
-    }
+    # GUARD — excluded symbols must carry a recorded rationale and never collide
+    # with a marker. Compare against the marker KEYS (the namespace excluded entries
+    # share), not the marker REGEX strings — the two namespaces never intersect, so
+    # the old regex comparison was a no-op that could not catch a dual registration.
+    marker_keys = set(substrate) | set(engine_path)
     for name, rationale in excluded.items():
         if not rationale or not str(rationale).strip():
             failures += 1
             _fail(f"EXCLUDED symbol '{name}' has no recorded rationale.")
-        if name in marker_regexes:
+        if name in marker_keys:
             failures += 1
-            _fail(f"EXCLUDED symbol '{name}' is also registered as a marker.")
+            _fail(f"EXCLUDED symbol '{name}' is also registered as a marker key.")
 
     if failures:
         print(
@@ -146,4 +176,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1] if len(sys.argv) > 1 else LEDGER))

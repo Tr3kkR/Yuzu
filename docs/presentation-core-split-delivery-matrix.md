@@ -7,7 +7,7 @@ tracks *what ships, in what order, who reviews it, and how we know it's done*. *
 with the ADRs, the ADR wins; on delivery status, this matrix is the source of truth.** The `/split`
 skill is a pointer to both and loses to both.
 
-**Verified against the tree 2026-09-08** (`origin/dev` @ `d2e89ffaa`; WS-0 certification landed). Re-stamp
+**Verified against the tree 2026-09-08** (`origin/dev` @ `d2e89ffaa`; WS-0 certification in this change). Re-stamp
 this line whenever the table is revised — a matrix from a stale checkout is worse than none, and the
 current-state claims below were wrong in the first draft because they were copied from stale ADR status
 columns. Grep the tree, don't trust a doc.
