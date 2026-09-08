@@ -55,13 +55,12 @@ struct DenyCall {
 /// into this struct's other members, so those members must outlive it.
 ///
 /// Also: `bus`/`budget` (owned OUTSIDE this struct by the test, passed in
-/// as pointers) must outlive `sink` too — the advisory note on this
-/// module's SSE extraction: TestRouteSink's synthesized `httplib::Response`
-/// fires the resource releaser in its OWN destructor (the handler's body
-/// comment: "`lease` dies here"), which calls back into `*deps.event_bus`
-/// to unsubscribe. Each TEST_CASE below keeps `bus`/`budget` as locals
-/// declared BEFORE the harness, so they outlive every `Response` the sink
-/// hands back.
+/// as pointers) must outlive `sink` too. TestRouteSink's synthesized
+/// `httplib::Response` fires the resource releaser in its OWN destructor
+/// (the handler's body comment: "`lease` dies here"), which calls back into
+/// `*deps.event_bus` to unsubscribe. Each TEST_CASE below keeps `bus`/
+/// `budget` as locals declared BEFORE the harness, so they outlive every
+/// `Response` the sink hands back.
 struct Harness {
     EventBus* bus;
     StreamBudget* budget{nullptr};

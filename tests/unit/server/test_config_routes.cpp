@@ -11,12 +11,15 @@
  *     (the degraded case uses an intentionally-invalid `PgPool` — the
  *     `test_runtime_config_store.cpp` "no Postgres required" trick: an
  *     invalid conninfo fails `PgPool`'s own parse step, so the store never
- *     opens and never attempts a network connection), and PUT's body-shape
- *     validation (missing 'value', invalid JSON, non-numeric integer key).
+ *     opens and never attempts a network connection). PUT's body-shape
+ *     validation is NOT covered here: the null-store gate runs BEFORE body
+ *     parsing, so the invalid-conninfo trick 503s before ever reaching it.
  *   - `[pg]` cases (real `RuntimeConfigStore`): the GET effective-config +
- *     overrides round trip, and PUT's write-then-read-back + audit shape,
+ *     overrides round trip; PUT's write-then-read-back + audit shape,
  *     including the secret-key redaction (never the raw value in the audit
- *     detail).
+ *     detail); and PUT's body-shape validation (missing 'value', invalid
+ *     JSON, non-numeric integer key) — these need a real-but-open store to
+ *     reach the parsing logic at all.
  */
 
 #include "config_routes.hpp"
