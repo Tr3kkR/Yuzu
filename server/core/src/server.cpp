@@ -16053,16 +16053,20 @@ private:
                     // so a single bad policy must not take the process (or silently
                     // kill compliance evaluation). Catch, log, and keep ticking.
                     try {
-                        YUZU_ASSERT_BACKGROUND_JOB("policy_evaluator.tick"); // WS-10 FencedLeaderOnly
-                        // WS-3 3.2: run the remediation-dispatch tick only on the
-                        // fenced leader. Due-ness is already fleet-safe via ADR-0056
-                        // claim_due_policies, so this is defense-in-depth that also
-                        // stops non-leaders churning; the OPERATOR remediate()/
-                        // evaluate_now() REST paths run on any replica and are NOT
-                        // gated (two-dispatch-planes rule).
-                        if (leader_gate_permits<background_job_class("policy_evaluator.tick")>(
-                                leader_elector_.get()))
-                            policy_evaluator_->tick();
+                        // WS-3 3.2 (PR #4134 review): tick() SPLITS into two passes.
+                        // collect_ready() runs on EVERY replica — it is the completion
+                        // path for the operator-synchronous evaluate_now()/remediate()
+                        // plane (both accepted on any replica and NOT gated), so a
+                        // non-leader must still mature their in-flight records to a
+                        // terminal verdict (two-dispatch-planes rule). Only dispatch_due()
+                        // — the leader-owned durable due-policy scheduling (ADR-0056) — is
+                        // fenced. Gating the whole tick() would strand an operator
+                        // remediation as `fixing` forever on any non-leader.
+                        YUZU_ASSERT_BACKGROUND_JOB("policy_evaluator.collect_ready"); // WS-10 ReplicaSafe
+                        YUZU_ASSERT_BACKGROUND_JOB("policy_evaluator.dispatch_due");  // WS-10 FencedLeaderOnly
+                        policy_evaluator_->tick(
+                            leader_gate_permits<background_job_class("policy_evaluator.dispatch_due")>(
+                                leader_elector_.get()));
                     } catch (const std::exception& e) {
                         spdlog::error("policy_eval: tick threw ({}) — thread continuing", e.what());
                     } catch (...) {

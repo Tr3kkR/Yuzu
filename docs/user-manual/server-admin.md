@@ -242,8 +242,12 @@ election cycle (so a transient blip self-heals within seconds), but while the
 message persists the four dispatching loops above do not run. This is fail-closed
 by design — a paused loop never double-dispatches — and a persistent occurrence
 is a Postgres-reachability problem to investigate, not a server bug. (The
-operator-triggered paths — a manual policy remediation, an operator CRL revoke —
-are unaffected; they run on whichever replica received the request.)
+operator-triggered paths are unaffected: a manual policy remediation or evaluation,
+and an operator CRL revoke, run on whichever replica received the request — and a
+remediation/evaluation is also *completed* on that same replica, so it still reaches
+a terminal verdict even while that replica is not the leader. Only the leader-owned
+*scheduling* half — the automatic due-policy dispatch and the periodic CRL freshness
+re-publish — pauses.)
 
 ### vNEXT — gateway management plane now pins its peer (#1422, breaking for custom gateway configs)
 

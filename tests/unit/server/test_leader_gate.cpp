@@ -38,7 +38,12 @@ TEST_CASE("background_pass_may_run: only FencedLeaderOnly requires leadership",
 // and the gate follows. A mis-typed pass name would fail to compile
 // (background_job_class throws in constant evaluation) — that is the point.
 static_assert(background_job_class("schedule_runner.tick") == BackgroundJobClass::FencedLeaderOnly);
-static_assert(background_job_class("policy_evaluator.tick") == BackgroundJobClass::FencedLeaderOnly);
+// PR #4134: tick() split — only the leader-owned scheduling half is fenced; the
+// operator-plane completion half (collect_ready) MUST run per-replica.
+static_assert(background_job_class("policy_evaluator.dispatch_due") ==
+              BackgroundJobClass::FencedLeaderOnly);
+static_assert(background_job_class("policy_evaluator.collect_ready") ==
+              BackgroundJobClass::ReplicaSafe);
 static_assert(background_job_class("quarantine_reconciler.tick") ==
               BackgroundJobClass::FencedLeaderOnly);
 static_assert(background_job_class("ca.publish_crl") == BackgroundJobClass::FencedLeaderOnly);

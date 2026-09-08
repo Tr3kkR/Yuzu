@@ -48,7 +48,7 @@ TEST_CASE("background-job table classifies every audited pass correctly",
     // Count tripwire — forces a conscious table update when a pass is added or
     // removed (a silent count change is exactly what WS-10 exists to prevent).
     // Update this number ONLY alongside a real classification change.
-    CHECK(kBackgroundJobs.size() == 40);
+    CHECK(kBackgroundJobs.size() == 41);
 
     // The load-bearing per-pass calls — a regression here is the WS-10 hazard.
     SECTION("MUST-run-per-replica passes are ReplicaSafe, never leader-gated") {
@@ -56,6 +56,11 @@ TEST_CASE("background-job table classifies every audited pass correctly",
         auto* poll = find("execution_tracker.poll_event_outbox_once");
         REQUIRE(poll != nullptr);
         CHECK(poll->cls == BackgroundJobClass::ReplicaSafe);
+        // PR #4134: collect_ready() is the operator-plane completion path — gating it
+        // strands an evaluate_now()/remediate() accepted on a non-leader forever.
+        auto* collect = find("policy_evaluator.collect_ready");
+        REQUIRE(collect != nullptr);
+        CHECK(collect->cls == BackgroundJobClass::ReplicaSafe);
     }
     SECTION("the three #2508 clock-guard prune targets are ReplicaSafe (single-writer via guard)") {
         for (std::string_view p : {"app_perf_fleet_store.run_retention_prune",
@@ -83,7 +88,7 @@ TEST_CASE("background-job table classifies every audited pass correctly",
         }
     }
     SECTION("side-effecting singletons are FencedLeaderOnly") {
-        for (std::string_view p : {"schedule_runner.tick", "policy_evaluator.tick",
+        for (std::string_view p : {"schedule_runner.tick", "policy_evaluator.dispatch_due",
                                    "quarantine_reconciler.tick", "ca.publish_crl"}) {
             auto* j = find(p);
             INFO("missing/misclassified: " << p);
