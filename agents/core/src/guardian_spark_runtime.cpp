@@ -435,6 +435,32 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
     bool firewalled = false;
     bool published = false;
     std::shared_ptr<KeyClaim> refill;
+    // The compensating disarm, shared by (2) and (2b): a bounded run() on this worker
+    // (class quota held for the call, single-flight key, deadline accounting); a
+    // non-timeout refusal - Stopped at shutdown, or refused/threw at admission - falls
+    // back to a direct call on this (detached, role-marked) worker so the watcher is
+    // never left live. Contains every exception; always called OFF registry_mu_.
+    const auto run_compensating_disarm = [&](std::uint64_t sub) noexcept {
+        std::expected<int, IoFailure> d{std::unexpect, IoFailure::LaunchFailed};
+        try {
+            d = io_executor_.run(claim->io_class, key, cfg_.backend_op_deadline,
+                                 [backend = backend_, sub]() -> int {
+                                     backend->disarm(sub);
+                                     return 0;
+                                 });
+        } catch (...) {
+        }
+        if (!d) {
+            if (d.error() == IoFailure::Timeout) {
+                backend_op_timeouts_.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                try {
+                    backend_->disarm(sub);
+                } catch (...) {
+                }
+            }
+        }
+    };
 
     // registry_mu_ held. PUBLISH the staged verdicts, then pop every claim this drain
     // finished (they are a prefix of the fifo; new claims that queued behind the head
@@ -691,50 +717,32 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
             // the head claim is still the key's marker, so a rearm that arrives meanwhile
             // queues behind it. Direct only when the executor is stopping (R5.5: a late
             // success is disarmed rather than left live; nothing else can run it then).
-            std::expected<int, IoFailure> d{std::unexpect, IoFailure::LaunchFailed};
-            try {
-                d = io_executor_.run(claim->io_class, key, cfg_.backend_op_deadline,
-                                     [backend = backend_, sub = *compensating]() -> int {
-                                         backend->disarm(sub);
-                                         return 0;
-                                     });
-            } catch (...) {
-            }
-            if (!d) {
-                if (d.error() == IoFailure::Timeout) {
-                    backend_op_timeouts_.fetch_add(1, std::memory_order_relaxed);
-                } else {
-                    // Stopped, or refused/threw at admission: the watcher must not be
-                    // left live. Direct call on this (detached, role-marked) worker.
-                    try {
-                        backend_->disarm(*compensating);
-                    } catch (...) {
-                    }
-                }
-            }
+            run_compensating_disarm(*compensating);
             compensating.reset();
         }
     } catch (...) {
         firewalled = true;
     }
 
+    // (2b) Firewall compensation, OFF the lock (adversarial re-review r2 C3): a throw
+    // inside (1) or (2) can leave `compensating` still owning a live subscription. It
+    // gets the SAME bounded disarm as (2), here, before the deferred publish - never
+    // under registry_mu_, where a wedged OS unwatch would block every rule operation
+    // and begin_stop() until the shutdown deadline guard hard-exits the agent.
+    if (firewalled && compensating) {
+        run_compensating_disarm(*compensating); // never leak it
+        compensating.reset();
+    }
+
     // (3) Deferred PUBLISH and pop - the compensating path, and the firewall. Reached
     // whenever (1b) did not publish: a claim left in the fifo with no outcome would be
     // a Dispatched head nobody pops - #3831's orphaned marker in the new shape, wedging
-    // the key until restart.
+    // the key until restart. No backend call runs under this lock.
     if (!published) {
         try {
             std::lock_guard<std::mutex> lk{registry_mu_};
-            if (firewalled) {
+            if (firewalled)
                 claim_drain_failures_.fetch_add(1, std::memory_order_relaxed);
-                if (compensating) {
-                    try {
-                        backend_->disarm(*compensating); // last resort; never leak it
-                    } catch (...) {
-                    }
-                    compensating.reset();
-                }
-            }
             publish_locked(firewalled);
         } catch (...) {
             // A lock failure here leaves the entry as-is; the waiters' own deadlines still

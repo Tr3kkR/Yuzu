@@ -5178,3 +5178,53 @@ TEST_CASE("rung 9c R5.2 (adversarial re-review r2 C2): a throw inside the index 
     CHECK(b->disarmed_ids()[0] == b->armed_ids()[0]);
     CHECK(rt->claim_queue_depth_for_test(spark_key(file_spec("/a"))) == 0);
 }
+
+// rung 9c R5.2 - adversarial re-review r2 (C3 / Kimi K5): the drain's firewall
+// compensation runs OFF registry_mu_, so a wedged backend unwatch on that path can
+// never block the runtime's other operations (or begin_stop) behind the lock.
+TEST_CASE("rung 9c R5.2 (adversarial re-review r2 C3): the firewall's last-resort disarm runs "
+          "off registry_mu_ - a parked unwatch on that path does not block other rule operations",
+          "[spark][runtime][liveness]") {
+    // Mutation (the pre-fix shape): call backend_->disarm(*compensating) inside step
+    // (3)'s lock_guard{registry_mu_} -> the probe below cannot take the lock while the
+    // disarm is parked and times out.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() {
+            backend->release_hang();
+            backend->release_disarm_hang();
+        }
+    } cleanup{b.get()};
+    const auto key = spark_key(file_spec("/a"));
+
+    QueuedAttach a1;
+    a1.t = std::thread{[&] { a1.gen = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); }};
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    // Firewall path: bad_alloc before the fifo snapshot with a SUCCESSFUL arm, and the
+    // compensating disarm it owes parks inside the backend.
+    rt->set_drain_fault_point_for_test(1);
+    b->hang_next_disarm.store(true);
+    b->release_hang();
+    REQUIRE(b->wait_entered_disarm_hang(std::chrono::seconds(30)));
+
+    // While the unwatch is parked, an unrelated registry_mu_ acquisition must go through.
+    auto probe = std::async(std::launch::async, [&] { return rt->claim_queue_depth_for_test(key); });
+    const bool lock_free = probe.wait_for(std::chrono::seconds(3)) == std::future_status::ready;
+    CHECK(lock_free);
+    b->release_disarm_hang();
+    (void)probe.get();
+    a1.t.join();
+
+    REQUIRE_FALSE(a1.gen.has_value());
+    CHECK(a1.gen.error() == "arm drain failed");
+    CHECK(rt->claim_drain_failures() == 1);
+    REQUIRE(b->armed_ids().size() == 1);
+    REQUIRE(b->disarmed_ids().size() == 1); // compensated exactly once, before the verdict
+    CHECK(b->disarmed_ids()[0] == b->armed_ids()[0]);
+    CHECK(rt->armed_key_count() == 0);
+    CHECK(rt->claim_queue_depth_for_test(key) == 0);
+}
