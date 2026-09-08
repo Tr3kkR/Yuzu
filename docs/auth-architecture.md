@@ -2651,7 +2651,7 @@ Out of scope for this migration, flagged not fixed (none newly reachable by this
 
 **Third migration (#1634, this ADR-0017 continuation).** Closes the systemic gap #1634 tracked since 2026-06-23: the legacy REST `/api/responses/{id}/aggregate`/`/export`/catch-all-list routes (`server.cpp`), MCP `query_responses`/`aggregate_responses`, and REST `GET /api/v1/executions/{id}/visualization` all carried a per-row post-filter (`response_agent_in_scope`/`response_scope_fn`) that sat BEHIND a still-flat global gate — the exact "inert filter" shape #1711/#1550 shipped and this ADR names as the systemic defect. All five migrated onto `require_fleet_read`/`fleet_read_fn_` as their sole gate; the response list/export routes and `query_responses` additionally push the resolved visible-agent set into `ResponseStore::query`/`query_by_execution` as SQL `agent_id = ANY(...)` **before** `LIMIT`/`OFFSET` (a new optional scope parameter, ADR-0017 INV-3) rather than post-filtering a capped/paginated read — the INV-3-compliant fix an adversarial review (Kimi + Codex) found the first migration pass had missed. `GET /api/v1/executions/{id}` (REST final-state lookup), `GET /api/v1/events` (REST SSE), `GET /sse/executions/{id}` (dashboard SSE — closing the #3699 gap above), and MCP `get_execution_status`/`list_executions` also migrated: all four collapse an invisible execution to the same 404/not-found shape a genuinely nonexistent one gets (no existence oracle), and a confined non-dispatcher's view is a redacted projection (recomputed per-agent counts from only the visible agent-status rows, `scope_expression`/`parameter_values` replaced with a fixed placeholder) — dispatcher ownership admits VISIBILITY only (avoids a false 404 on a just-dispatched execution with zero responses yet) and never bypasses this projection, a distinction the same adversarial-review round caught the first attempt getting wrong. `list_executions` has a weaker mechanism than the others — execution rows carry no single `agent_id` to filter by, so a confined caller is restricted to `dispatched_by = session->username` (`ExecutionQuery::dispatched_by`) rather than a real visible-agent intersection. As of the PR #3793 review round, `agents_targeted`/`agents_responded` on this route ARE now projected (a batched, non-N+1 `get_agent_statuses_for_executions` call) the same way `get_execution_status` projects them, closing that specific gap; the confinement AXIS itself remains own-dispatches-only, not a real visible-agent intersection. **Disclosure gap (found in the same review round, not fixed):** `dispatched_by = session->username` is scoped to the minting principal, not intersected against a service-scoped token's own service-tag scope — an admitted service token sees its minting user's full dispatch-history metadata (status/timing/lineage, no agent identities), not narrowed to its own service. Recorded here as disclosed, not fixed. The two SSE routes share one event projector (`execution_event_scope.hpp`): `agent-transition` events are filtered by `agent_id`, `execution-progress` is dropped for confined subscribers (execution-wide counts, no `agent_id`), and `execution-completed` is sanitized (real `status` field preserved, counts stripped) rather than dropped, so the client still closes its stream. `query_responses`/`aggregate_responses`/`get_execution_status`/`list_executions` are reclassified `ServiceScopeClass::confined` (`kToolSecurityRows`), matching the real `fleet_read_fn_` mechanism they now have.
 
-**Fourth migration (#3789, this ADR-0017 continuation).** Closes the gap #1634's own Gate 2 review found and deliberately deferred: the legacy pre-v1 `/api/executions` (list), `/{id}` (detail), `/{id}/summary`, `/{id}/agents`, `/{id}/children`, `POST /{id}/rerun`, and `POST /{id}/cancel` routes (`server.cpp`) carried NO management-group confinement at all — a bare `require_permission(Execution, Read/Execute)`, unlike every other execution-reading surface migrated above. All five GET routes now gate on `require_fleet_read(..., "Read")`, mirroring the `GET /api/v1/executions/{id}` shape: an invisible or nonexistent execution collapses to one 404 (no oracle) for EVERY caller — but the audit row is written only when the caller's scope was actually engaged (`gate.scope`). A confined caller failing this check writes `execution.read`/`denied`; an unconfined caller's genuinely-nonexistent id is ordinary "not found", not a confinement decision, and writes no row at all — auditing it as `denied` would have inflated the CC7.2 denial-rate metric with routine 404 traffic (compliance-officer, #3789 Gate 6 finding F2, corrected before merge). The caller-visible 404 response is identical either way; only the server-side audit trail distinguishes the two. A confined view redacts `scope_expression`/`parameter_values` and recomputes the four agent counts from only the in-scope, terminal-status rows. `/agents` — the worst pre-migration leak, returning raw agent identities and `error_detail` fleet-wide — filters its row list to `authz::in_scope`. `/children` does NOT inherit the detail route's "keep lineage truthful" precedent: a visible parent does not authorize enumerating separate child execution records, so each child is checked against the same visibility predicate independently. The LIST route goes further than every sibling migrated above (including `list_executions`, next paragraph): rather than a post-fetch drop or an own-dispatches-only filter, the confinement predicate is pushed into the `WHERE` clause itself, before `LIMIT` (ADR-0017 INV-3) — `dispatched_by = $owner OR EXISTS (SELECT 1 FROM agent_exec_status WHERE agent_id = ANY($visible))`, one statement, no N+1 (`ExecutionTracker::query_executions_checked`'s new `ExecutionScope` parameter). The owner disjunct is load-bearing, not cosmetic: `agent_exec_status` rows are written only on response arrival, so an agent-membership-only predicate would make a caller's own just-dispatched execution invisible to them until the first agent replies.
+**Fourth migration (#3789, this ADR-0017 continuation).** Closes the gap #1634's own Gate 2 review found and deliberately deferred: the legacy pre-v1 `/api/executions` (list), `/{id}` (detail), `/{id}/summary`, `/{id}/agents`, `/{id}/children`, `POST /{id}/rerun`, and `POST /{id}/cancel` routes (`execution_routes.cpp` as of #2542 PR-7, extracted from `server.cpp`) carried NO management-group confinement at all — a bare `require_permission(Execution, Read/Execute)`, unlike every other execution-reading surface migrated above. All five GET routes now gate on `require_fleet_read(..., "Read")`, mirroring the `GET /api/v1/executions/{id}` shape: an invisible or nonexistent execution collapses to one 404 (no oracle) for EVERY caller — but the audit row is written only when the caller's scope was actually engaged (`gate.scope`). A confined caller failing this check writes `execution.read`/`denied`; an unconfined caller's genuinely-nonexistent id is ordinary "not found", not a confinement decision, and writes no row at all — auditing it as `denied` would have inflated the CC7.2 denial-rate metric with routine 404 traffic (compliance-officer, #3789 Gate 6 finding F2, corrected before merge). The caller-visible 404 response is identical either way; only the server-side audit trail distinguishes the two. A confined view redacts `scope_expression`/`parameter_values` and recomputes the four agent counts from only the in-scope, terminal-status rows. `/agents` — the worst pre-migration leak, returning raw agent identities and `error_detail` fleet-wide — filters its row list to `authz::in_scope`. `/children` does NOT inherit the detail route's "keep lineage truthful" precedent: a visible parent does not authorize enumerating separate child execution records, so each child is checked against the same visibility predicate independently. The LIST route goes further than every sibling migrated above (including `list_executions`, next paragraph): rather than a post-fetch drop or an own-dispatches-only filter, the confinement predicate is pushed into the `WHERE` clause itself, before `LIMIT` (ADR-0017 INV-3) — `dispatched_by = $owner OR EXISTS (SELECT 1 FROM agent_exec_status WHERE agent_id = ANY($visible))`, one statement, no N+1 (`ExecutionTracker::query_executions_checked`'s new `ExecutionScope` parameter). The owner disjunct is load-bearing, not cosmetic: `agent_exec_status` rows are written only on response arrival, so an agent-membership-only predicate would make a caller's own just-dispatched execution invisible to them until the first agent replies.
 
 The two mutating routes (`rerun`/`cancel`) keep `require_permission(Execution, Execute)` ahead of the fleet gate — `require_fleet_read` structurally rejects any operation but `Read` (its legacy-open `AdmitAll` branch has no MCP approval-ticket check, so a mutation must never reach it) — then additionally take `require_fleet_read(..., "Read")` purely for scope. Mutation admission is stricter than read visibility: an adversarial review (external model, Sol/gpt-5.6-sol) found that "every EXISTING agent-status row is in scope" is a false-admission path, because those rows are response-arrival-seeded — an execution targeting agents A and B can have only A's row while B, still pending, might be out of scope. The rule implemented instead: zero status rows (the just-dispatched window) admits ONLY the dispatcher; one or more rows requires the row count to equal `agents_targeted` (a complete ledger) AND every row's agent to be in scope — dispatcher ownership is not a bypass once rows exist. Nonexistent, zero-visible, partial-visibility, and incomplete-ledger all collapse to the identical 404 + non-distinguishing audit detail (a distinct status for "partial visibility" would itself be a hidden-cohort disclosure). `mark_cancelled`'s pre-existing false-success-on-nonexistent-id behavior (an `UPDATE` matching zero rows still reports `PGRES_COMMAND_OK`) is fixed as a side effect: an explicit existence check now runs before every cancel attempt, for confined and unconfined callers alike.
 
@@ -3657,6 +3657,80 @@ database outage is Postgres high availability (the `/ha` workstream), not a
 local bypass that would itself weaken the fail-closed guarantee.
 `--postgres-pool-size` is the operator lever for reducing acquire contention
 on the live server (the login path runs on the shared server pool).
+
+### Role recheck at login — row-lock plus post-mint recheck (#4107)
+
+Local-auth credential checks (`authenticate()`/`verify_password()`) re-verify
+role against AuthDB *after* the password check, rather than trusting the
+in-process cache: `AuthManager::recheck_role_after_credential_check` calls
+`AuthDB::recheck_role_locked`, which takes a `SELECT ... FOR UPDATE` row lock
+on the user's row and holds it across the in-process cache write — the same
+technique `mfa_verify_login_code` already uses to close its own replay race.
+This closes the same-process AND cross-replica divergence residual an
+earlier, now-retired in-memory version counter could only narrow (a version
+counter can tell you something changed since you looked; it cannot make your
+look happen atomically with the change) — Postgres row locks serialize at the
+database-engine level, not per-process, so a racing `update_role()`/
+`reactivate_user()` from a different replica sharing the same Postgres
+primary is serialized against this read exactly like a same-process writer.
+
+**What the row lock alone does NOT close: the check-then-mint gap.** A role
+this call observes under the row lock is provably fresh at the moment of the
+read — but `persist_new_session` (the actual session mint) is a separate,
+later step, outside the row lock (external adversarial review, fjarvis, PR
+#4076 — "an inherent check-then-mint gap no non-serialized recheck can
+close"). A demotion committing in the window between this function returning
+and the mint completing would otherwise mint a session at the pre-demote
+role, surviving that demotion's own session sweep (`update_role`'s
+`std::erase_if(sessions_, ...)`, which already ran before the new session
+existed).
+
+Closing that gap by holding AuthDB's row lock across the mint was considered
+and rejected — `persist_new_session` calls `SessionStore::create` in durable
+mode, and holding one store's pool lease while calling another is exactly
+the cross-store-lock deadlock hazard §3 above names for the structurally
+identical OIDC/SAML deprovision race (`SessionStore`'s shared write-
+generation row is the concrete instance: this row lock could end up waiting
+on that row while some other path holds the gen row and needs this row
+lock). Closed instead via the SAME pattern already used for OIDC/SAML: mint
+normally, then a **post-mint re-check** (`AuthManager::post_mint_role_recheck`)
+immediately re-verifies the just-minted role against a fresh AuthDB read and,
+on divergence, a store error, or the account having no active AuthDB row at
+all (never provisioned, or removed - the same `UserNotFound` branch
+`recheck_role_after_credential_check` uses), revokes the session
+(`invalidate_user_sessions`) and denies. Wired into both `authenticate()` and `create_local_session()` —
+the latter also closes the same gap for the MFA login-challenge (TOTP/
+recovery verify at `/login/mfa`) and enrollment-confirm routes, whose
+caller-supplied role can be stale across an entire TOTP round trip, a
+wider window than `authenticate()`'s own — NOT `/login/mfa/stepup`, which
+re-proves MFA on an existing session and never calls `create_local_session`.
+
+**The honest guarantee.** For the SAME-PROCESS/single-primary-Postgres case
+this is airtight, not merely narrowed: a racing `update_role()` commits its
+AuthDB `UPDATE` before taking `mu_` to sweep `sessions_`, and the mint's own
+`mu_` write is mutually ordered against that sweep, so either the sweep
+(running after the mint) removes the just-minted session, or the post-mint
+recheck (running after the demote's already-committed write) catches the
+divergence directly — one of the two always fires. Ordinary READ COMMITTED
+visibility extends the same guarantee across replicas sharing one primary,
+with no per-replica coordination needed. **Not closed:** a demote landing
+strictly between the post-mint recheck's own read and the response/
+`Set-Cookie` actually reaching the client is invisible to this mechanism —
+closing that would mean holding the mint's transaction open all the way to
+the HTTP response, a larger change than a role recheck (the same residual
+OIDC/SAML's own post-mint recheck discloses, `docs/adr/2001-scim-oidc-identity-linkage.md`
+"Known residuals").
+
+A denied mint is audited via `auth.login` `result=failure`,
+`detail=reason=session_mint_failed;cause=undifferentiated[;method=...]`
+(`auth_routes.cpp`) and counted in `yuzu_auth_login_session_mint_denied_total`
+— undifferentiated not just between a genuine role divergence and a
+post-mint store error, but also against a plain `SessionStore` persist
+failure (an ordinary availability event, unrelated to the role recheck at
+all), since `create_local_session`'s caller-facing contract (an empty
+string) collapses all three into one sentinel. Unlike the OIDC/SAML
+counters' genuine-vs-store-unavailable split, this counter is not a
+role-recheck-specific signal and must not be alerted on as one.
 
 ## RbacStore — the authorization substrate (Postgres, ADR-0041 — SQLite `rbac.db` retired)
 

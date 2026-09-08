@@ -177,6 +177,12 @@ struct SparkEngineStats {
     std::uint64_t mech_watch_rejected_total{0};
     std::uint64_t mech_quarantined_total{0};
     std::uint64_t mech_slow_op_total{0};
+    /// #2818: Lost notifications actually DELIVERED (i.e. the drop_key_locked call site
+    /// found >=1 live subscriber to notify before erasing the key). Distinct from
+    /// watch_faults_total/armed_faulted, which already cover the Faulted/Recovered edge
+    /// at the key level — this counts the previously-invisible hard-kill case
+    /// specifically. Monotonic.
+    std::uint64_t subscription_lost_total{0};
 };
 
 class YUZU_EXPORT SparkEngine {
@@ -286,6 +292,11 @@ public:
     [[nodiscard]] bool is_running() const noexcept;
 
     [[nodiscard]] SparkEngineStats stats() const;
+
+    /// #2818: cheap, lock-only (mu_), no I/O — safe to call from any context, including
+    /// a periodic backstop sweep (GuardianSparkRuntime::revalidate_subscriptions). See
+    /// SubscriptionHealth's own doc comment for why this needs no incarnation counter.
+    [[nodiscard]] SubscriptionHealth subscription_health(SubscriptionId id) const;
 
     /// Per-mechanism-type snapshot of the mechanism-owned counters (#2011 rung 1).
     /// Keyed by the registered SparkType — the KEY that stats() sums away — so the
@@ -646,6 +657,7 @@ private:
     std::atomic<std::uint64_t> arm_race_unwatch_failures_{0}; ///< monotonic; teardown_arm_race ONLY (#2270)
     std::atomic<std::uint64_t> disarm_unwatch_failures_{0};   ///< monotonic; disarm() ONLY (#2270)
     std::atomic<std::uint64_t> teardown_join_timeouts_{0};    ///< monotonic; stop()'s lease wait expired (#2815)
+    std::atomic<std::uint64_t> subscription_lost_{0}; ///< monotonic; #2818 Lost notifications delivered
 
     /// #2815 TEARDOWN LEASE. Callers currently inside one of the FOUR windows that
     /// resolve a raw `ISparkMechanism*` (and this engine's mech_ops_mu_by_type_ entry)
