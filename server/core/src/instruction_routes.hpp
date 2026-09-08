@@ -23,19 +23,21 @@
 /// PROMOTED, NOT DUPLICATED — `validate_yaml_source` and `log_safe`. Both
 /// were `static ServerImpl` members with call sites BOTH inside this
 /// extraction (the YAML save/validate routes below) AND outside it
-/// (`/fragments/instructions/yaml-preview` for `validate_yaml_source`; the
-/// `/api/approvals/:id/{approve,reject}` routes for `log_safe`, all staying
-/// inline in server.cpp). Copying either into this file would have split a
-/// single-contract helper into two independently-driftable copies —
-/// `validate_yaml_source`'s own doc comment names exactly this risk
-/// ("#1993: validate and save can never diverge on what a complete
-/// definition is"). Both are promoted to free functions instead — see
-/// `instruction_store.hpp`'s `validate_yaml_source` doc comment and
-/// `web_utils.hpp`'s `log_safe` doc comment — mirroring the #2557
-/// `json_extract.hpp` precedent for a call-site-straddling helper. Neither
-/// server.cpp call site needed to change (ordinary unqualified-lookup
-/// resolution from a `yuzu::server`-namespaced class to a `yuzu::server`
-/// free function).
+/// (`/fragments/instructions/yaml-preview` for `validate_yaml_source`,
+/// staying inline in server.cpp; the `/api/approvals/:id/{approve,reject}`
+/// routes for `log_safe`, which #2542 PR-9 later extracted into
+/// `approval_routes.cpp` — reconciled at merge time onto this same
+/// promotion rather than PR-9's own independently-promoted `log_safe.hpp`).
+/// Copying either into this file would have split a single-contract helper
+/// into two independently-driftable copies — `validate_yaml_source`'s own
+/// doc comment names exactly this risk ("#1993: validate and save can never
+/// diverge on what a complete definition is"). Both are promoted to free
+/// functions instead — see `instruction_store.hpp`'s `validate_yaml_source`
+/// doc comment and `web_utils.hpp`'s `log_safe` doc comment — mirroring the
+/// #2557 `json_extract.hpp` precedent for a call-site-straddling helper. No
+/// call site needed to change its calling syntax, wherever it now lives
+/// (ordinary unqualified-lookup resolution from a `yuzu::server`-namespaced
+/// class or nested namespace to a `yuzu::server` free function).
 ///
 /// `kInstructionEditorHtml`/`kInstructionEditorDeniedHtml` are `extern
 /// const char* const` globals defined in `instruction_ui.cpp` (a separate

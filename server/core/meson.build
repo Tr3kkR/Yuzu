@@ -508,6 +508,7 @@ yuzu_server_core_lib = static_library(
     'src/page_routes.cpp',
     'src/dashboard_api_routes.cpp',
     'src/nvd_routes.cpp',
+    'src/approval_routes.cpp',
     'src/webhook_routes.cpp',
     'src/offload_routes.cpp',
     'src/discovery_routes.cpp',
