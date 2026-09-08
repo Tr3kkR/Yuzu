@@ -31,7 +31,7 @@ Each capability is rated on two axes:
 > outside its own domain, and each entry counts once against its `T1`/`T2`/`T3` tier label.
 > Reproduce with:
 > `awk '/^### [0-9]+\.[0-9]+/ { if ($0 ~ /:white_check_mark:/) d++; else if ($0 ~ /:large_orange_diamond:/) p++; else if ($0 ~ /:x:/) n++ } END { print d, p, n, d+p+n }' docs/capability-map.md`
-> → `197 22 46 265`. Tier tallies (`Foundation`=T1, `Advanced`=T2, `Future`=T3) add the same
+> → `195 23 47 265`. Tier tallies (`Foundation`=T1, `Advanced`=T2, `Future`=T3) add the same
 > awk pattern filtered on `` `T1` ``/`` `T2` ``/`` `T3` ``. The former "New (Ph 8-16)" interim
 > row is retired — those phases are now ordinary domains 25-31, and 2026 additions land as
 > domains 32-39 rather than an undifferentiated bucket. **Domains 32-39 were verified for
@@ -42,11 +42,11 @@ Each capability is rated on two axes:
 > carry their own inline evidence citation and verification date. **Rows regraded or added on
 > 2026-09-07 carry the marker `*(verified 2026-09-07)*`; all other rows carry their v3.0
 > (2026-03-30) grade unchanged and were NOT re-verified in this pass** — reproduce with
-> `grep -c '\*(verified 2026-09-07)\*' docs/capability-map.md` → `69` (67 `###` rows across
-> §5, §7, §10, §12-14, §18, §20-22, §24, §26-28, §30-31, all of §32-39, plus one Appendix A
+> `grep -c '\*(verified 2026-09-07)\*' docs/capability-map.md` → `73` (71 `###` rows across
+> §5, §7, §10, §12-14, §17-18, §20-22, §24, §26-28, §30-31, all of §32-39, plus one Appendix A
 > caption note, plus this sentence's own citation of the literal marker string). Of the 265
-> total rows, 198 (265 - 67) are un-regraded v3.0 carry-overs — this document does NOT
-> represent whole-document verification against dev @ d295db964, only the 67 marked rows do.
+> total rows, 194 (265 - 71) are un-regraded v3.0 carry-overs — this document does NOT
+> represent whole-document verification against dev @ d295db964, only the 71 marked rows do.
 > Four hand-maintained views
 > must be updated together whenever a row's icon or tier changes: the headline/tier bars below,
 > the per-domain summary table, Appendix A's plugin count, and Appendix B's Foundation tally —
@@ -54,10 +54,10 @@ Each capability is rated on two axes:
 
 ```
 Foundation   [==============================--]  55/59 done  (93%) (1 partial)
-Advanced     [=========================-------]  133/172 done (77%) (18 partial)
+Advanced     [========================--------]  131/172 done (76%) (19 partial)
 Future       [========------------------------]  9/34 done   (26%) (3 partial)
 ─────────────────────────────────────────────────────────────────
-Overall      [========================--------]  197/265 done (74%) (22 partial)
+Overall      [========================--------]  195/265 done (74%) (23 partial)
 ```
 
 | Domain | Total | Done | Partial | Not Started |
@@ -78,7 +78,7 @@ Overall      [========================--------]  197/265 done (74%) (22 partial)
 | 14. User Interaction | 6 | 5 | 0 | 1 |
 | 15. Inventory and Data Collection | 5 | 4 | 0 | 1 |
 | 16. Policy and Compliance Engine | 8 | 8 | 0 | 0 |
-| 17. Triggers and Event-Driven Automation | 7 | 7 | 0 | 0 |
+| 17. Triggers and Event-Driven Automation | 7 | 5 | 1 | 1 |
 | 18. Server: Authentication and Authorization | 10 | 9 | 1 | 0 |
 | 19. Server: Device and Group Management | 7 | 7 | 0 | 0 |
 | 20. Server: Response Collection and Reporting | 8 | 8 | 0 | 0 |
@@ -101,7 +101,7 @@ Overall      [========================--------]  197/265 done (74%) (22 partial)
 | 37. Internal PKI / Certificate Authority | 5 | 5 | 0 | 0 |
 | 38. Server Storage Substrate — PostgreSQL | 4 | 4 | 0 | 0 |
 | 39. Headless Platform — Engine Principals & On-Behalf-Of (ADR-1005) | 3 | 3 | 0 | 0 |
-| **TOTAL** | **265** | **197** | **22** | **46** |
+| **TOTAL** | **265** | **195** | **23** | **47** |
 
 > **Scaffolded vs production-quality.** The percentages above measure feature presence, not enterprise hardening. "Done" means "implemented and functional" — not "hardened, observable, and proven at large-fleet scale" on every domain. Known gaps at the §-level (e.g. configurable heartbeat in §1.2, unified diagnostics bundle in §1.3, runtime plugin install in §1.5) remain even where a domain is marked Done. The `docs/capability-agentic-audit-2026-05.md` audit (figures as of 2026-05 — its counts predate this v4.0 tally) is the source for the production-quality dimension; subsequent reviews should keep it current.
 
@@ -770,7 +770,7 @@ Not implemented. Agent-side cache with delta sync.
 
 ## 16. Policy and Compliance Engine (Server-Side Guaranteed State)
 
-*Define desired-state policies, evaluate compliance on a poll-based schedule, and auto-remediate. This domain covers the **server-side** half of guaranteed state — definition, fleet-wide compliance evaluation, history, drill-down. Real-time **agent-side** enforcement (kernel-event-driven, millisecond-level, pre-login, offline-capable) lives in §31 (System Guardian) and is the operational primitive that makes "this setting must never be in a non-compliant state" actually true on disk. A complete guaranteed-state implementation requires both halves — §16 alone has a 5-minute poll cycle that is unacceptable for security-sensitive settings (firewall, registry, EDR process running, SSH config).*
+*Define desired-state policies and evaluate compliance on a server-side periodic schedule. **Corrected 2026-09-08 (external audit, Codex Astra residual sweep):** the previous framing here said "auto-remediate" — that overstates the mechanism. `PolicyEvaluator` (`server/core/src/policy_evaluator.hpp`) runs a background `tick()` every **10 seconds**, waits a **15-second grace window** for in-flight check responses, and re-evaluates each policy no more often than its own interval (**3600-second default**, `default_interval_seconds{3600}` at `policy_evaluator.hpp:107`). **Remediation is operator-gated, never automatic** — the operator manual states this explicitly: "Remediation is never automatic. Detection runs on the schedule above" (`docs/user-manual/policy-engine.md:220`). Do not conflate this domain with §31 System Guardian: this domain covers the **server-side** half of guaranteed state — definition, fleet-wide compliance evaluation, history, drill-down, with detection on the cadence above and remediation requiring an explicit operator action. Real-time **agent-side** *enforcement* (kernel-event-driven, near-real-time, pre-login, offline-capable, and — for the two live guards — genuinely autonomous remediation) lives entirely in §31 (System Guardian) and is the operational primitive that makes "this setting must never be in a non-compliant state" actually true on disk without an operator in the loop. *(Evidence: `policy_evaluator.hpp:107`; `docs/user-manual/policy-engine.md:220`; verified 2026-09-07.)*
 
 ### 16.1 Policy Rules Definition :white_check_mark: `T2`
 
@@ -814,17 +814,17 @@ Policies support enable/disable toggle for staged deployment. REST endpoints: `P
 
 Trigger engine with `interval` type. Timer-based execution with configurable seconds/minutes/hours.
 
-### 17.2 File / Directory Change Trigger :white_check_mark: `T2`
+### 17.2 File / Directory Change Trigger :large_orange_diamond: `T2` *(verified 2026-09-07)*
 
-Trigger engine with `file_change` and `directory_change` types. Filesystem watcher using inotify (Linux), FSEvents (macOS), ReadDirectoryChangesW (Windows).
+**Corrected 2026-09-08 (external audit, Codex Astra residual sweep):** this is a **5-second `last_write_time` poll, not a kernel-backed filesystem watcher.** `TriggerEngine::file_watch_loop()` wakes every 5 seconds and re-checks each watched path's mtime (`agents/core/src/trigger_engine.cpp:313-318`: "Poll every 5 seconds — but wake at once on stop()"). There is zero use of `inotify`, `FSEvents`, or `ReadDirectoryChangesW` anywhere in `trigger_engine.cpp` (confirmed by grep). The real `TriggerType` enum value is `FileChange` (wire string `"filesystem"`, `trigger_engine.hpp:22-28`) — there is no separate `directory_change` type. Detection latency is therefore up to 5 seconds, not near-instant kernel notification — contrast with Guardian's genuinely kernel-backed `guard_file.cpp` (§31.2, Windows only, detect-only). *(Evidence: `trigger_engine.cpp:313-318`; `trigger_engine.hpp:22-28`; previously mis-graded Done — claimed a mechanism the code does not use.)*
 
-### 17.3 Service Status Change Trigger :white_check_mark: `T2`
+### 17.3 Service Status Change Trigger :white_check_mark: `T2` *(verified 2026-09-07)*
 
-Trigger engine with `service_status_change` type. React to service start/stop/crash via Windows SCM or systemd on Linux.
+**Note added 2026-09-08 (external audit, Codex Astra residual sweep):** also a poll, not an SCM/systemd event subscription — `TriggerEngine::service_watch_loop()` wakes every **30 seconds** and re-checks each watched service's state (`agents/core/src/trigger_engine.cpp:376-381`: "Poll every 30 seconds — but wake at once on stop()"). The real `TriggerType` enum value is `ServiceStatus` (wire string `"service"`). Kept at Done because the capability genuinely works end-to-end (a service-state change is reliably detected and fires within 30 seconds), it just isn't the event-driven SCM/systemd-notification mechanism the original prose implied. *(Evidence: `trigger_engine.cpp:376-381`.)*
 
-### 17.4 Windows Event Log Trigger :white_check_mark: `T2`
+### 17.4 Windows Event Log Trigger :x: `T2` *(verified 2026-09-07)*
 
-Trigger engine with `event_log` type. React to Windows Event Log entries matching XPath filters.
+**Corrected 2026-09-08 (external audit, Codex Astra residual sweep):** there is no Event Log trigger type. The closed `TriggerType` enum (`agents/core/include/yuzu/agent/trigger_engine.hpp:22-28`) has exactly five values — `Interval`, `FileChange`, `ServiceStatus`, `AgentStartup`, `RegistryChange` — none of them Event Log. An unrecognized trigger-type string silently falls back to `Interval` (`trigger_type_from_string`, `:47`), so a YAML author who writes `event_log` gets an interval poll, not an error and not Event Log filtering. Zero `EvtSubscribe` (or any Windows Event Log API) call sites anywhere in `trigger_engine.cpp`. The `event_logs` *plugin* (§9.5) genuinely **collects** Windows/Linux/macOS event logs on demand — that is a real, working, unrelated capability — but no *trigger* type watches the event log for a matching entry and fires. *(Evidence: `trigger_engine.hpp:22-28,47`; previously mis-graded Done — the row described a trigger type that does not exist in the closed enum.)*
 
 ### 17.5 Registry Change Trigger :white_check_mark: `T3`
 
@@ -868,9 +868,9 @@ Session-cookie auth with PBKDF2-hashed passwords.
 
 `DirectorySync` (ADR-0063: migrated to PostgreSQL, schema `directory_sync`). Entra ID sync via Microsoft Graph API (OAuth2 client credentials flow). Fetches `/users` and `/groups`, stores in Postgres (fail-closed construction; FK + `ON DELETE CASCADE` on memberships, new in this migration). Group-to-role mapping (`configure_group_role_mapping`) maps directory groups to RBAC roles. LDAP sync stub for on-prem AD (full LDAP support planned). REST API endpoints for sync trigger, status, and mapping CRUD. Settings UI section active.
 
-### 18.7 Token-Based API Authentication :white_check_mark: `T2`
+### 18.7 Token-Based API Authentication :white_check_mark: `T2` *(verified 2026-09-07)*
 
-`ApiTokenStore` with SQLite backend. Tokens generated via `POST /api/v1/tokens` with optional expiry. Auth via `Authorization: Bearer` header or `X-Yuzu-Token` header. RBAC permissions: `ApiToken:Read`, `ApiToken:Write`, `ApiToken:Delete`. Tokens support optional `mcp_tier` field for MCP integration (readonly/operator/supervised). Settings UI token management with create/revoke.
+`ApiTokenStore` with **PostgreSQL backend** (`server/core/src/api_token_store.hpp:4`, ADR-0030 — corrected 2026-09-08, external audit Codex Astra residual sweep; the store's own header names its schema `api_token_store` and takes a `pg::PgPool&`, not a SQLite handle; previous row text stale-claimed SQLite). Tokens generated via `POST /api/v1/tokens` with optional expiry. Auth via `Authorization: Bearer` header or `X-Yuzu-Token` header. RBAC permissions: `ApiToken:Read`, `ApiToken:Write`, `ApiToken:Delete`. Tokens support optional `mcp_tier` field for MCP integration (readonly/operator/supervised). Settings UI token management with create/revoke.
 
 ### 18.8 Device Authorization Tokens :large_orange_diamond: `T2` *(verified 2026-09-07)*
 
@@ -1337,11 +1337,11 @@ Ruleless observation catalogue (`agents/core/src/dex_signal_catalog.cpp`, engine
 
 ### 32.2 Continuous Device Performance Telemetry :white_check_mark: `T2` *(verified 2026-09-07)*
 
-TAR `perf` capture source feeding device-level performance rollups; per-app top-N process telemetry; fleet rollup gauges + `/dex` device sparklines. *(Evidence: `server/core/src/dex_perf_ui.cpp`, `dex_perf_rules.hpp`, `dex_perf_model.{hpp,cpp}`.)*
+TAR `perf` capture source feeding device-level performance rollups; per-app top-N process telemetry; fleet rollup gauges + `/dex` device sparklines. **macOS caveat added 2026-09-08 (external audit, Codex Astra residual sweep):** the per-process counter collector (`agents/plugins/tar/src/tar_proc_perf.cpp`) is Windows/Linux-only — its macOS branch (`:647`, the `!_WIN32 && !__linux__` arm) returns a snapshot with `valid=false` and the source comment states plainly "collect_perf records nothing on this platform yet"; there is also no per-process version-resolution source on macOS (`resolve_proc_versions` is a documented no-op there). So per-app top-N process telemetry is a Windows/Linux capability today — macOS devices get device-level TAR `perf` rollups but no per-app process breakdown. *(Evidence: `server/core/src/dex_perf_ui.cpp`, `dex_perf_rules.hpp`, `dex_perf_model.{hpp,cpp}`, `agents/plugins/tar/src/tar_proc_perf.cpp:647`.)*
 
 ### 32.3 App Performance Over Time :white_check_mark: `T2` *(verified 2026-09-07)*
 
-Per-device daily rollups (`server/core/src/app_perf_daily_store.{hpp,cpp}`) feeding fleet aggregates (`app_perf_fleet_store.{hpp,cpp}`) via a shared read model surfaced through REST `/api/v1/dex/perf/*`, MCP twins, and `/fragments/dex/perf/*` (`dex_app_perf_ui.{hpp,cpp}`, `dex_app_perf_model.{hpp,cpp}`, `dex_routes.{hpp,cpp}`).
+Per-device daily rollups (`server/core/src/app_perf_daily_store.{hpp,cpp}`) feeding fleet aggregates (`app_perf_fleet_store.{hpp,cpp}`) via a shared read model surfaced through REST `/api/v1/dex/perf/*`, MCP twins, and `/fragments/dex/perf/*` (`dex_app_perf_ui.{hpp,cpp}`, `dex_app_perf_model.{hpp,cpp}`, `dex_routes.{hpp,cpp}`). **Inherits the §32.2 macOS gap:** with no per-process telemetry source on macOS (`tar_proc_perf.cpp:647`), macOS devices have no app-perf history to roll up — this row's daily/fleet aggregation is only as complete as its Windows/Linux-only input.
 
 ### 32.4 Fleet Blast-Radius Alerting and Signal Routing :white_check_mark: `T2` *(verified 2026-09-07)*
 
