@@ -2,8 +2,8 @@
   "_comment": [
     "WS-0 machine-readable interlock ledger — the data half of the split merge-gate.",
     "Read by tests/test_split_interlock_tripwire.py (wired into .github/workflows/docs-lint.yml).",
-    "Its LOAD-BEARING CONSTANTS (gate_set, search_paths, exclude_paths, the engine_path_markers key",
-    "set, and 'every gate cell has a substrate marker') are PINNED against frozen values in",
+    "Its LOAD-BEARING CONSTANTS (gate_set, search_paths, exclude_paths, the engine-path + substrate",
+    "marker dicts incl. regexes, and 'every gate cell has a substrate marker') are PINNED against frozen values in",
     "tests/test_split_interlock_tripwire_selftest.py — so a PR that edits this file to neuter the gate",
     "(drop a gate cell, widen an exclude, delete a marker) must ALSO edit those frozen test constants,",
     "which fails CI loudly and is a reviewable change (the ledger cannot silently disarm its own gate).",

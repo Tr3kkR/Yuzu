@@ -59,7 +59,7 @@ are the pre-existing dispatch-tag grammar (`compute_plan_hash`), not the ADR-003
 
 **Tamper-evidence, and the acknowledged grep limit.** The ledger is a repo file editable in the very
 PR the gate polices, so the tripwire alone is tamper-*evident*, not tamper-*proof*. Its load-bearing
-constants — `gate_set`, `search_paths`/`exclude_paths`, the engine-path marker key set, and "every gate
+constants — `gate_set`, `search_paths`/`exclude_paths`, the engine-path and substrate marker dicts (keys + regexes), and "every gate
 cell has a substrate marker" — are **pinned against frozen values in
 `tests/test_split_interlock_tripwire_selftest.py`**, so opening the gate requires editing those test
 constants too: a loud, CI-failing, reviewable change the routed-concern row routes to security review,
