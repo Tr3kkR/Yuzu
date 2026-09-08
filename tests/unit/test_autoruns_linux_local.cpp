@@ -380,6 +380,47 @@ TEST_CASE("autoruns Linux leg: list_dir reports truncated for exactly one real e
     }
 }
 
+TEST_CASE("autoruns Linux leg: timer_scan_status combines truncation and per-file "
+          "constraints into one status/reason pair",
+          "[autoruns][actions][linux]") {
+    using yuzu::autoruns::TimerScan;
+    using yuzu::autoruns::timer_scan_status;
+
+    SECTION("neither flag set -> supported, dash reason") {
+        TimerScan scan;
+        const auto [support, reason] = timer_scan_status(scan);
+        CHECK(support == YUZU_SUPPORT_SUPPORTED);
+        CHECK(reason == "-");
+    }
+
+    SECTION("truncated only -> constrained, row_cap") {
+        TimerScan scan;
+        scan.any_truncated = true;
+        const auto [support, reason] = timer_scan_status(scan);
+        CHECK(support == YUZU_SUPPORT_CONSTRAINED);
+        CHECK(reason == "row_cap");
+    }
+
+    SECTION("file-constrained only -> constrained, the file's reason") {
+        TimerScan scan;
+        scan.any_file_constrained = true;
+        scan.file_constrained_reason = "permission_denied";
+        const auto [support, reason] = timer_scan_status(scan);
+        CHECK(support == YUZU_SUPPORT_CONSTRAINED);
+        CHECK(reason == "permission_denied");
+    }
+
+    SECTION("both -> constrained, comma-joined reason") {
+        TimerScan scan;
+        scan.any_truncated = true;
+        scan.any_file_constrained = true;
+        scan.file_constrained_reason = "permission_denied";
+        const auto [support, reason] = timer_scan_status(scan);
+        CHECK(support == YUZU_SUPPORT_CONSTRAINED);
+        CHECK(reason == "permission_denied,row_cap");
+    }
+}
+
 #endif // defined(__linux__)
 
 TEST_CASE("autoruns Linux leg: an unknown action is refused, not silently ignored",
