@@ -57,6 +57,7 @@
 #include "pg/pg_raii.hpp"
 #include "pg/pg_session_advisory_lock.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <optional>
@@ -100,9 +101,19 @@ public:
 
     /// True iff we currently believe we hold the lock (last liveness check OK).
     /// NEVER the sole basis for a side effect — see the fencing model above.
+    ///
+    /// LOCK-FREE (slice 3.2, #4013): reads a published atomic, NOT `mu_`. The
+    /// election loop (the sole writer) holds `mu_` across its blocking libpq
+    /// probe; if this reader also took `mu_`, a half-open backend would stall
+    /// every worker tick asking "may I run?" for the OS TCP timeout. The loop
+    /// publishes leadership through the atomic so a stalled probe can never block
+    /// a reader. A momentarily-stale `true` here is acceptable BY DESIGN — this is
+    /// the attempt gate, and the epoch fence in the claim WRITE (slices 3.3/3.4)
+    /// is the correctness guarantee that rejects a stale ex-leader.
     [[nodiscard]] bool is_leader() const;
 
     /// The epoch stamped at our last successful acquire; `nullopt` if not leader.
+    /// LOCK-FREE, same published-atomic channel and rationale as `is_leader()`.
     [[nodiscard]] std::optional<std::int64_t> epoch() const;
 
     /// Liveness heartbeat on the owned connection. On failure, drops leadership
@@ -177,8 +188,17 @@ private:
     mutable std::mutex mu_;
     pg::PgConn conn_;                          ///< Dedicated, never-recycled (declared BEFORE the guard).
     std::optional<pg::PgSessionAdvisoryLockGuard> lock_guard_; ///< Held only while leader.
-    std::optional<std::int64_t> epoch_;        ///< Epoch of the current leadership, if any.
+    std::optional<std::int64_t> epoch_;        ///< Epoch of the current leadership, if any (writer state, under mu_).
     bool open_ = false;
+
+    /// Lock-free publish channel for `is_leader()`/`epoch()` (slice 3.2, #4013):
+    /// `0` = not leader; `>= 1` = leader at that epoch (minted epochs start at 1,
+    /// so `0` is an unambiguous sentinel). The election loop stores this under
+    /// `mu_` whenever `epoch_` changes (acquire → the minted epoch; drop → 0),
+    /// release-ordered; readers load it with acquire and never touch `mu_`, so a
+    /// libpq probe stalled under `mu_` cannot block a worker tick's leadership
+    /// read. `epoch_` above stays the writer's authoritative state under `mu_`.
+    std::atomic<std::int64_t> live_epoch_{0};
 };
 
 } // namespace yuzu::server
