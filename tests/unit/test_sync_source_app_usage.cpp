@@ -20,19 +20,25 @@
 
 #include "local_dispatcher.hpp"
 #include "sync_canonical.hpp" // sha256_hex
+#include "sync_scheduler.hpp" // SyncScheduler composition test
 #include "sync_source_app_usage.hpp"
 
 #include <yuzu/plugin.h>
 
+#include <algorithm>
 #include <cstddef>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 using yuzu::agent::AppUsageParse;
 using yuzu::agent::AppUsageRow;
 using yuzu::agent::make_app_usage_source;
 using yuzu::agent::parse_app_usage_last_used_output;
+using yuzu::agent::SyncScheduler;
 using yuzu::agent::render_app_usage_blob;
 using yuzu::agent::sha256_hex;
 using yuzu::agent::SyncSource;
@@ -235,4 +241,61 @@ TEST_CASE("make_app_usage_source: a nonzero plugin rc skips the cycle",
     SyncSource src = make_app_usage_source(&kFakeDescriptor);
     CHECK_FALSE(src.collect().has_value());
     g_rc = 0; // restore for any later test ordering
+}
+
+// ── Composition: make_app_usage_source wired into a REAL SyncScheduler ──────
+//
+// The four tests above prove make_app_usage_source's own collect() behavior
+// in isolation. Nothing previously proved the source actually PARTICIPATES
+// in a daily-sync pass once composed into a `SyncScheduler` the way
+// `agent.cpp`'s daily-sync thread wires it (`scheduler.add_source(make_app_
+// usage_source(app_usage_descriptor))`, alongside installed_software/
+// app_perf/device_ci/software_licensing) — i.e. that its name reaches
+// `ReportInventory`'s content_hashes on a due tick, not merely that its
+// `collect()` function returns something when called directly.
+//
+// `agent.cpp`'s own composition has no test seam (it is wired inline inside
+// the daily-sync thread's lambda body, same as every OTHER ADR-0016 source —
+// no source's scheduling is currently unit-tested at that literal call
+// site), so this reproduces the identical `SyncScheduler` + `SyncSource`
+// composition `agent.cpp` performs, using the REAL `make_app_usage_source`
+// production function, rather than driving `agent.cpp`'s private thread
+// directly. A future extraction of agent.cpp's source list into a testable
+// free function would let this test (and its four ADR-0016 siblings, none of
+// which have one today either) drive the literal startup path instead.
+TEST_CASE("make_app_usage_source composed into SyncScheduler: a due tick reports "
+          "app_usage's hash via the sender callback",
+          "[app_usage_sync][source][composition]") {
+    g_output = "last_used|chrome.exe|1700000500|1699000000|12|43200\n";
+    g_rc = 0;
+
+    std::unordered_map<std::string, std::string> kv;
+    auto kv_get = [&](const std::string& key) -> std::string {
+        auto it = kv.find(key);
+        return it == kv.end() ? std::string{} : it->second;
+    };
+    auto kv_set = [&](const std::string& key, const std::string& value) { kv[key] = value; };
+
+    std::vector<std::string> sent_hash_keys;
+    auto sender = [&](const std::vector<std::pair<std::string, std::string>>& hashes,
+                      const std::vector<std::pair<std::string, std::string>>&)
+        -> std::optional<std::vector<std::string>> {
+        for (const auto& [name, hash] : hashes)
+            sent_hash_keys.push_back(name);
+        return std::vector<std::string>{}; // need_full: none
+    };
+
+    yuzu::agent::SyncScheduler scheduler("test-agent", kv_get, kv_set, sender);
+    scheduler.add_source(make_app_usage_source(&kFakeDescriptor));
+    // A never-before-seen source schedules its first fire jittered into
+    // [now, now + kStartupJitterWindow) (10 minutes, mass-enroll herd
+    // avoidance) rather than firing on the very first tick — so this drives
+    // two ticks: one to establish the jittered next_fire, a second past the
+    // full jitter window to guarantee the source is due.
+    constexpr std::int64_t kStartupJitterWindowSecs = 10 * 60;
+    scheduler.tick(/*now_secs=*/1700000000);
+    scheduler.tick(/*now_secs=*/1700000000 + kStartupJitterWindowSecs + 1);
+
+    CHECK(std::find(sent_hash_keys.begin(), sent_hash_keys.end(), "app_usage") !=
+          sent_hash_keys.end());
 }
