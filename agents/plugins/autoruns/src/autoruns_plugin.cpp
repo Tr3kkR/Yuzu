@@ -79,7 +79,11 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "never folded into `absent`. lnx_init_d lists /etc/init.d script names only (no "
          "runlevel/systemctl wiring cross-check) -- CONSTRAINED by design, per-user reads report "
          "owning uid numerically (no NSS/getpwuid_r lookup, no directory-service deadline risk "
-         "on this read-only path)."},
+         "on this read-only path). lnx_systemd_timers_user is likewise always CONSTRAINED "
+         "(narrow_search_path_coverage) when reportable -- the scanned search-path set omits "
+         "several standard `systemd --user` unit roots (~/.local/share/systemd/user, "
+         "/run/systemd/user, /usr/local/{lib,share}/systemd/user, /usr/share/systemd/user), a "
+         "permanent gap, not a transient failure."},
         /* .macos_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 1,
          "CFPropertyListCreateWithData over launchd plists; file reads of /etc/periodic, "

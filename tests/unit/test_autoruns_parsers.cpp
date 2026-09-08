@@ -391,6 +391,22 @@ TEST_CASE("autoruns: parse_task_xml does not confuse <Actions> with a longer tag
     CHECK(info.actions.empty());
 }
 
+TEST_CASE("autoruns: parse_task_xml decodes the 5 predefined XML entities in "
+          "Command/Arguments (RECONSTRUCTION: pins round 5's minor finding -- get_Xml's "
+          "raw markup escapes reserved characters, and leaving them un-decoded breaks "
+          "exact IOC/command-string matching against the real argv)",
+          "[autoruns][parsers]") {
+    const std::string xml =
+        "<Task><Actions Context=\"Author\">"
+        "<Exec><Command>C:\\tools\\a&amp;b.exe</Command>"
+        "<Arguments>--filter=\"x&lt;y&gt;z\" --tag=&apos;a&amp;b&apos;</Arguments></Exec>"
+        "</Actions></Task>";
+    const auto info = parse_task_xml(xml);
+    REQUIRE(info.actions.size() == 1);
+    CHECK(info.actions[0].command == "C:\\tools\\a&b.exe");
+    CHECK(info.actions[0].arguments == "--filter=\"x<y>z\" --tag='a&b'");
+}
+
 TEST_CASE("autoruns: parse_task_xml's has_triggers consults each trigger's own "
           "<Enabled> value, not just bare presence of a trigger element "
           "(RECONSTRUCTION: pins round 3's should-fix -- a task with only "
@@ -448,6 +464,61 @@ TEST_CASE("autoruns: parse_task_xml's has_triggers consults each trigger's own "
         const std::string xml = "<Task><Triggers>\n   \t\n</Triggers></Task>";
         CHECK_FALSE(parse_task_xml(xml).has_triggers);
     }
+
+    SECTION("a self-closed trigger -> true (RECONSTRUCTION: pins round 5's blocker -- "
+            "LogonTrigger/BootTrigger/etc. have no required children, so a bare "
+            "<LogonTrigger/> is schema-valid and live; the round-4 exact-open-tag "
+            "matcher missed this shape entirely)") {
+        const std::string xml = "<Task><Triggers><LogonTrigger/></Triggers></Task>";
+        CHECK(parse_task_xml(xml).has_triggers);
+    }
+
+    SECTION("a self-closed trigger with a space before the slash -> true") {
+        const std::string xml = "<Task><Triggers><LogonTrigger /></Triggers></Task>";
+        CHECK(parse_task_xml(xml).has_triggers);
+    }
+
+    SECTION("a trigger carrying the schema's optional Id attribute -> true "
+            "(RECONSTRUCTION: pins round 5's blocker -- Task Scheduler's trigger "
+            "base type defines an optional Id attribute; the round-4 exact "
+            "'<Tag>' match required a bare tag with no attributes)") {
+        const std::string xml =
+            "<Task><Triggers><BootTrigger Id=\"boot\"><Enabled>true</Enabled>"
+            "</BootTrigger></Triggers></Task>";
+        CHECK(parse_task_xml(xml).has_triggers);
+    }
+
+    SECTION("<Enabled>0</Enabled> (xsd:boolean lexical form) disables a trigger "
+            "(RECONSTRUCTION: pins round 5's should-fix -- a bare =='false' string "
+            "compare treated '0' as live)") {
+        const std::string xml =
+            "<Task><Triggers><CalendarTrigger><Enabled>0</Enabled></CalendarTrigger>"
+            "</Triggers></Task>";
+        CHECK_FALSE(parse_task_xml(xml).has_triggers);
+    }
+
+    SECTION("whitespace-padded <Enabled> false form still disables") {
+        const std::string xml =
+            "<Task><Triggers><CalendarTrigger><Enabled> false </Enabled></CalendarTrigger>"
+            "</Triggers></Task>";
+        CHECK_FALSE(parse_task_xml(xml).has_triggers);
+    }
+}
+
+TEST_CASE("autoruns: parse_task_xml reads an Exec action carrying the schema's optional "
+          "lowercase id attribute "
+          "(RECONSTRUCTION: pins round 5's blocker -- pre-existing since round 1: "
+          "<Exec id=\"...\"> was invisible to the exact '<Exec>' match, so the row's "
+          "target/args came back empty even though the task has a real command)",
+          "[autoruns][parsers]") {
+    const std::string xml =
+        "<Task><Actions Context=\"Author\">"
+        "<Exec id=\"run\"><Command>C:\\real.exe</Command><Arguments>-x</Arguments></Exec>"
+        "</Actions></Task>";
+    const auto info = parse_task_xml(xml);
+    REQUIRE(info.actions.size() == 1);
+    CHECK(info.actions[0].command == "C:\\real.exe");
+    CHECK(info.actions[0].arguments == "-x");
 }
 
 // ── 8. parse_wmi_subscription_triple ─────────────────────────────────────

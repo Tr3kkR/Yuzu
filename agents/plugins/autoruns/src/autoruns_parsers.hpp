@@ -538,6 +538,45 @@ struct TaskInfo {
 
 namespace detail {
 
+/// Task Scheduler's `Enabled` element is typed `xsd:boolean`, whose valid
+/// lexical space is `"true"`/`"false"`/`"1"`/`"0"`, optionally
+/// whitespace-padded (`" false "`) -- a bare `== "false"` string compare
+/// (this function's predecessor) treats `"0"` and any padded form as live,
+/// which is the false-positive direction (an inert trigger read as firing).
+/// Decodes the 5 predefined XML entities (&amp; &lt; &gt; &quot; &apos;) --
+/// `get_Xml`'s raw markup carries these for a Command/Arguments value
+/// containing a reserved character (e.g. a path with a literal `&`), and
+/// leaving them un-decoded breaks exact IOC/command-string matching against
+/// the real argv. No numeric character references (&#NN;/&#xHH;) or DTD
+/// entities -- Task Scheduler's own XML never emits those for this field,
+/// and decoding them would need a bigger validator than this lightweight
+/// scanner is meant to be.
+inline std::string decode_xml_entities(std::string_view v) {
+    std::string out;
+    out.reserve(v.size());
+    std::size_t i = 0;
+    while (i < v.size()) {
+        if (v[i] == '&') {
+            if (v.compare(i, 5, "&amp;") == 0) { out += '&'; i += 5; continue; }
+            if (v.compare(i, 4, "&lt;") == 0) { out += '<'; i += 4; continue; }
+            if (v.compare(i, 4, "&gt;") == 0) { out += '>'; i += 4; continue; }
+            if (v.compare(i, 6, "&quot;") == 0) { out += '"'; i += 6; continue; }
+            if (v.compare(i, 6, "&apos;") == 0) { out += '\''; i += 6; continue; }
+        }
+        out += v[i];
+        ++i;
+    }
+    return out;
+}
+
+inline bool xsd_boolean_is_false(std::string_view v) {
+    const std::size_t b = v.find_first_not_of(" \t\r\n");
+    if (b == std::string_view::npos) return false; // empty/whitespace-only: not a recognized false
+    const std::size_t e = v.find_last_not_of(" \t\r\n");
+    const std::string_view trimmed = v.substr(b, e - b + 1);
+    return trimmed == "false" || trimmed == "0";
+}
+
 inline std::optional<std::string> extract_tag(std::string_view xml, std::string_view tag) {
     std::string open = "<" + std::string{tag} + ">";
     std::size_t start = xml.find(open);
@@ -577,20 +616,44 @@ inline std::optional<std::string_view> extract_tagged_block(std::string_view xml
     return xml.substr(gt + 1, end - (gt + 1));
 }
 
-/// Every occurrence of `<tag>...</tag>` (no attributes -- Task Scheduler's
-/// schema never puts them on `<Exec>`) within `xml`, in document order. A
+/// Every occurrence of `<tag ...>...</tag>` OR self-closed `<tag .../>`
+/// within `xml`, in document order -- an empty content span for a
+/// self-closed match. Task Scheduler's trigger and action base types both
+/// define an optional `Id`/`id` attribute, and a trigger with no required
+/// children (e.g. `<LogonTrigger/>`) is schema-valid self-closed, so a
+/// strict no-attributes exact-open-tag match (this function's pre-round-5
+/// form) silently drops both shapes -- confirmed against real captures
+/// twice (round 5: this function's own trigger callers; pre-existing since
+/// round 1: `<Exec id="...">`). Uses the SAME open-tag-prefix + trailing-
+/// delimiter-character logic as extract_tagged_block (this file's other,
+/// already-correct handler for both shapes) so the two stay consistent. A
 /// tag opened but never closed stops the scan there, keeping whatever
 /// complete blocks were already found rather than discarding all of them.
 inline std::vector<std::string_view> find_all_tagged_blocks(std::string_view xml,
                                                              std::string_view tag) {
     std::vector<std::string_view> out;
-    const std::string open = "<" + std::string{tag} + ">";
+    const std::string open_prefix = "<" + std::string{tag};
     const std::string close = "</" + std::string{tag} + ">";
     std::size_t pos = 0;
     while (true) {
-        const std::size_t start = xml.find(open, pos);
+        std::size_t start = xml.find(open_prefix, pos);
+        while (start != std::string_view::npos) {
+            const std::size_t after = start + open_prefix.size();
+            const char next = after < xml.size() ? xml[after] : '\0';
+            if (next == '>' || next == ' ' || next == '/' || next == '\t' || next == '\n' ||
+                next == '\r')
+                break; // genuinely this tag, not a longer one sharing the prefix
+            start = xml.find(open_prefix, start + 1);
+        }
         if (start == std::string_view::npos) break;
-        const std::size_t content_start = start + open.size();
+        const std::size_t gt = xml.find('>', start);
+        if (gt == std::string_view::npos) break; // truncated: stop, keep what's already found
+        if (gt > 0 && xml[gt - 1] == '/') {
+            out.push_back(std::string_view{}); // self-closed: empty content
+            pos = gt + 1;
+            continue;
+        }
+        const std::size_t content_start = gt + 1;
         const std::size_t end = xml.find(close, content_start);
         if (end == std::string_view::npos) break; // truncated: stop, keep what's already found
         out.push_back(xml.substr(content_start, end - content_start));
@@ -616,8 +679,10 @@ inline TaskInfo parse_task_xml(std::string_view xml) {
     if (auto actions_block = detail::extract_tagged_block(xml, "Actions")) {
         for (auto exec : detail::find_all_tagged_blocks(*actions_block, "Exec")) {
             TaskAction action;
-            if (auto v = detail::extract_tag(exec, "Command")) action.command = *v;
-            if (auto v = detail::extract_tag(exec, "Arguments")) action.arguments = *v;
+            if (auto v = detail::extract_tag(exec, "Command"))
+                action.command = detail::decode_xml_entities(*v);
+            if (auto v = detail::extract_tag(exec, "Arguments"))
+                action.arguments = detail::decode_xml_entities(*v);
             out.actions.push_back(std::move(action));
         }
         // A sibling action element this scanner doesn't decode -- ComHandler
@@ -634,21 +699,23 @@ inline TaskInfo parse_task_xml(std::string_view xml) {
 
     if (auto triggers_block = detail::extract_tagged_block(xml, "Triggers")) {
         // Every trigger element type ITriggerCollection can hold (Task
-        // Scheduler's fixed schema) -- checked individually via the SAME
-        // exact-tag, no-attributes helper find_all_tagged_blocks uses for
-        // <Exec>, since these elements never carry attributes either. Each
-        // trigger's OWN direct <Enabled> child decides that trigger alone
-        // (absent -> schema-default enabled, "false" -> disabled) -- never
-        // aggregated document-wide, or one disabled sibling would cancel
-        // out an unrelated enabled (or untagged) trigger with no
-        // relationship to it.
+        // Scheduler's fixed schema) -- checked individually via
+        // find_all_tagged_blocks, which (as of round 5) handles both a
+        // self-closed trigger (schema-valid for a type with no required
+        // children, e.g. <LogonTrigger/>) and an Id-attributed one
+        // (<BootTrigger Id="...">). Each trigger's OWN direct <Enabled>
+        // child decides that trigger alone (absent -> schema-default
+        // enabled, false-per-xsd:boolean -> disabled) -- never aggregated
+        // document-wide, or one disabled sibling would cancel out an
+        // unrelated enabled (or untagged) trigger with no relationship to
+        // it.
         for (const char* trigger_tag :
             {"BootTrigger", "IdleTrigger", "LogonTrigger", "TimeTrigger", "EventTrigger",
              "SessionStateChangeTrigger", "CalendarTrigger", "RegistrationTrigger",
              "WnfStateChangeTrigger"}) {
             for (auto trigger : detail::find_all_tagged_blocks(*triggers_block, trigger_tag)) {
                 auto enabled_val = detail::extract_tag(trigger, "Enabled");
-                if (!enabled_val || *enabled_val != "false") {
+                if (!enabled_val || !detail::xsd_boolean_is_false(*enabled_val)) {
                     out.has_triggers = true;
                     break;
                 }
@@ -669,8 +736,13 @@ inline TaskInfo parse_task_xml(std::string_view xml) {
 // record into two. escape_wmi_value/format_wmi_block are the producer half
 // of that round trip, kept in this portable seam (not autoruns_win.cpp,
 // their only real caller) specifically so a test here can assert
-// parse(format(original)) == original rather than only exercising the
-// decoder against a hand-escaped literal.
+// parse(format(original)) recovers the INTERIOR content and every embedded
+// \\/\n/\r byte-for-byte, rather than only exercising the decoder against a
+// hand-escaped literal. NOT a full identity round trip: the parser's own
+// detail::trim strips leading/trailing whitespace from every "Key : Value"
+// line before this function's unescaping ever runs, so a value with
+// leading/trailing whitespace loses it -- forensic-fidelity loss only, the
+// row and its interior content stay visible.
 inline std::string escape_wmi_value(std::string_view v) {
     std::string out;
     out.reserve(v.size());

@@ -1033,12 +1033,22 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                     ctx.write_output(format_source_status(SourceId::lnx_systemd_timers_user, support,
                                                           scan.rows.size(), reason));
                 } else if (home_listing.permission_denied) {
-                    ctx.write_output(format_source_status(SourceId::lnx_systemd_timers_user,
-                                                          YUZU_SUPPORT_CONSTRAINED, std::size_t{0},
-                                                          "permission_denied"));
+                    const auto [support, reason] = apply_narrow_search_path_coverage(
+                        YUZU_SUPPORT_CONSTRAINED, "permission_denied");
+                    ctx.write_output(
+                        format_source_status(SourceId::lnx_systemd_timers_user, support,
+                                            std::size_t{0}, reason));
                 } else {
-                    ctx.write_output(format_source_status(SourceId::lnx_systemd_timers_user,
-                                                          YUZU_SUPPORT_SUPPORTED, std::size_t{0}, "absent"));
+                    // Every present-systemd result routes through the same
+                    // helper -- including this terminal "no readable
+                    // user-unit directory and /home itself is absent" case,
+                    // which used to emit a bare Supported that contradicted
+                    // this source's own catalog declaration.
+                    const auto [support, reason] =
+                        apply_narrow_search_path_coverage(YUZU_SUPPORT_SUPPORTED, "-");
+                    ctx.write_output(
+                        format_source_status(SourceId::lnx_systemd_timers_user, support,
+                                            std::size_t{0}, reason));
                 }
             }
         }

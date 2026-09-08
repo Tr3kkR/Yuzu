@@ -62,7 +62,7 @@ source|lnx_user_crontabs|supported|-|declared
 source|lnx_anacrontab|supported|-|declared
 source|lnx_at_spool|supported|-|declared
 source|lnx_systemd_timers_system|supported|-|declared
-source|lnx_systemd_timers_user|supported|-|declared
+source|lnx_systemd_timers_user|constrained|-|declared
 source|lnx_xdg_autostart_system|supported|-|declared
 source|lnx_xdg_autostart_user|supported|-|declared
 source|lnx_rc_local|supported|-|declared

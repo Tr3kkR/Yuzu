@@ -590,6 +590,29 @@ TEST_CASE("autoruns Linux leg: trim_possibly_truncated_tail drops a partial "
     CHECK(trim_possibly_truncated_tail("", false).empty());
 }
 
+TEST_CASE("autoruns Linux leg: list_dir reports permission_denied, not absent, for a "
+          "genuinely unreadable existing directory "
+          "(RECONSTRUCTION: pins round 5's should-fix -- the round-4 XDG-denial fix "
+          "had no regression test; this follows the same try-then-verify pattern "
+          "already established in this repo (test_guardian_state_reader.cpp's "
+          "read_file permission test) rather than a geteuid()==0 precheck, since "
+          "even a non-root but capability-elevated runner can bypass the check)",
+          "[autoruns][actions][linux]") {
+    yuzu::test::TempDir dir("yuzu_test_autoruns_denied_");
+    std::filesystem::create_directories(dir.path);
+    std::error_code ec;
+    std::filesystem::permissions(dir.path, std::filesystem::perms::none, ec);
+    if (ec) SKIP("could not remove directory permissions");
+
+    const auto listing = list_dir(dir.path.string());
+
+    std::filesystem::permissions(dir.path, std::filesystem::perms::owner_all, ec); // restore for cleanup
+    if (listing.opened) SKIP("running as root (or CAP_DAC_OVERRIDE): permission bits bypassed");
+
+    CHECK_FALSE(listing.absent);        // the directory demonstrably EXISTS...
+    CHECK(listing.permission_denied);   // ...so this is a real denial, never folded into "absent"
+}
+
 #endif // defined(__linux__)
 
 TEST_CASE("autoruns Linux leg: an unknown action is refused, not silently ignored",
