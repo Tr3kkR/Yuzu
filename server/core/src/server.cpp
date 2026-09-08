@@ -64,6 +64,7 @@
 #include "grpc_on_behalf_interceptor.hpp"
 #include "guardian_health_fleet_tags.hpp" // Guardian M1 health-stream fleet gauge names + HELP (#2298 item 6d)
 #include "guardian_journal_fleet_tags.hpp" // Guardian journal fleet gauge names + HELP (#2298)
+#include "instruction_definition_model.hpp" // #4029: shared row/detail/export builders
 #include "instruction_store.hpp"
 #include "on_behalf_guard.hpp"
 #include "principal_class.hpp"
@@ -14058,7 +14059,17 @@ private:
             })
                              : SettingsRoutes::GatewaySessionCountFn{},
             [this]() -> std::string { return registry_.to_json(); }, oidc_mu_, oidc_provider_,
-            /*metrics_registry=*/&metrics_, step_up_fn);
+            /*metrics_registry=*/&metrics_, step_up_fn,
+            // #4028 — bool-returning audit hook for the fail-closed REST
+            // settings read-twins (SettingsRoutes::AuditReadFn); same
+            // underlying audit_log() the void-returning audit_fn_ lambda
+            // above already wraps, just with the persisted-or-not bool
+            // preserved instead of discarded.
+            [this](const httplib::Request& req, const std::string& action,
+                   const std::string& result, const std::string& target_type,
+                   const std::string& target_id, const std::string& detail) -> bool {
+                return audit_log(req, action, result, target_type, target_id, detail);
+            });
         // F1: live-apply hook for the DEX alerts settings (wired before the
         // listener starts, so no request races the set).
         settings_routes_->set_dex_alert_apply_fn([this]() { apply_dex_alert_config(); });
@@ -18015,7 +18026,9 @@ private:
                 // /api/command's visible-set half uses, now carrying identity too.
                 [this](const auth::Session& s) -> yuzu::server::DispatchCaller {
                     return derive_dispatch_caller(s);
-                });
+                },
+                // #4029: backs list_product_packs/get_product_pack.
+                product_pack_store_.get());
         }
 
         // -- Listen -----------------------------------------------------------
