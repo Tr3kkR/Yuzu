@@ -3912,7 +3912,18 @@ void CALLBACK establish_null_wait_cb(PTP_CALLBACK_INSTANCE, PVOID, PTP_WAIT, TP_
 /// named-function convention spark_registry.cpp's own OnWait uses, rather
 /// than relying on a lambda-to-function-pointer conversion across the
 /// CALLBACK/__stdcall decoration.
-void CALLBACK establish_r5_inflight_cb(PTP_CALLBACK_INSTANCE, PVOID, PTP_WAIT, TP_WAIT_RESULT) {
+/// `ctx` is a started-handshake `std::atomic<bool>*` (adversarial-review
+/// finding, PR-A round 2): set TRUE the instant this callback actually
+/// begins running, BEFORE the 50ms sleep, so the caller can wait for real
+/// execution to have started before timing the drain - without this,
+/// WaitForThreadpoolWaitCallbacks(TRUE) can legitimately CANCEL a callback
+/// that hasn't started yet (Microsoft's own documented behavior), and the
+/// resulting near-zero elapsed time would be measuring cancellation, not
+/// the 50ms in-flight drain this case is named for.
+void CALLBACK establish_r5_inflight_cb(PTP_CALLBACK_INSTANCE, PVOID ctx, PTP_WAIT,
+                                       TP_WAIT_RESULT) {
+    if (ctx)
+        static_cast<std::atomic<bool>*>(ctx)->store(true, std::memory_order_release);
     std::this_thread::sleep_for(50ms);
 }
 
@@ -4324,23 +4335,44 @@ TEST_CASE("Watch establishment (Registry): WaitForThreadpoolWaitCallbacks drain,
     // In-flight drain: the callback is already running (sleeping 50ms) when
     // unwatch() calls the drain - this is the case that stalls a lane if the
     // callback is parked inside an inline consumer (the whole reason this
-    // restructuring exists). Smaller n: each sample costs >= 50ms.
+    // restructuring exists). n matches the plan's n>=200 (adversarial-review
+    // finding, PR-A round 2 - previously 20, deliberately smaller since each
+    // sample costs >=50ms, but that read as a plan-contract deviation
+    // without ever stating so; 200 samples costs ~10s+, acceptable for a
+    // by-hand DGRHP-only, env-gated case).
     std::vector<std::int64_t> t_inflight;
-    constexpr int kInflightSamples = 20;
+    int inflight_not_started = 0; // adversarial-review finding, PR-A round 2: a sample
+                                  // where the callback never started before the drain
+                                  // ran is measuring cancellation, not the in-flight
+                                  // drain this case is named for - now DETECTED via
+                                  // the started-handshake below, not just theorized
+    constexpr int kInflightSamples = kEstablishSamples;
     for (int i = 0; i < kInflightSamples; ++i) {
+        std::atomic<bool> started{false};
         HANDLE ev = ::CreateEventW(nullptr, TRUE /*manual-reset*/, FALSE, nullptr);
         REQUIRE(ev != nullptr);
-        PTP_WAIT wait = ::CreateThreadpoolWait(&establish_r5_inflight_cb, nullptr, nullptr);
+        PTP_WAIT wait = ::CreateThreadpoolWait(&establish_r5_inflight_cb, &started, nullptr);
         REQUIRE(wait != nullptr);
         ::SetThreadpoolWait(wait, ev, nullptr);
         ::SetEvent(ev); // fire it - the callback is now (about to be) running
-        std::this_thread::sleep_for(5ms); // give the pool a moment to pick it up
+        // Wait for the callback to actually announce it started (bounded -
+        // if the pool never picks it up within 1s, this sample is genuinely
+        // measuring cancellation; still time it, but count it separately so
+        // the reported series is honest about what it contains) rather than
+        // a flat 5ms sleep that assumed, without proving, that the pool had
+        // already dispatched the callback by then.
+        if (!eventually([&] { return started.load(std::memory_order_acquire); }, 1000ms))
+            ++inflight_not_started;
         time_call(t_inflight, [&] { ::WaitForThreadpoolWaitCallbacks(wait, TRUE); });
         ::CloseThreadpoolWait(wait);
         ::CloseHandle(ev);
     }
     warn_establish("R5 drain in-flight (50ms callback)", "WaitForThreadpoolWaitCallbacks",
                    t_inflight);
+    WARN("R5 drain in-flight: " << inflight_not_started << " of " << kInflightSamples
+         << " samples never observed the callback start within 1s (those samples' "
+            "elapsed time characterizes TP_WAIT cancellation, not the 50ms in-flight "
+            "drain - expect them at 0)");
 }
 
 TEST_CASE("Watch establishment (Registry): THREAD_AGNOSTIC correctness control (R6)",
