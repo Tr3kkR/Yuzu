@@ -9,7 +9,7 @@
 | **Platforms** | Windows ✅ · macOS ✅ · Linux 🟡 constrained |
 | **Actions** | `battery` (definition `crossplatform.power.battery`) · `power_plan` (definition `crossplatform.power.power_plan`) · `set_power_plan` (definition `crossplatform.power.set_power_plan`) · `thermal` (definition `crossplatform.power.thermal`) |
 | **Security** | `battery`: securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `thermal`: securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `power_plan`: securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `set_power_plan`: securable `PowerManagement` · operation Write · risk Medium · dispatch Destructive · approval gate AdminOrApproval |
-| **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
+| **Roles** | execute: `battery`: endpoint-admin, endpoint-operator; `thermal`: endpoint-admin, endpoint-operator; `power_plan`: endpoint-admin, endpoint-operator; `set_power_plan`: endpoint-admin · author: content-author |
 <!-- END GENERATED -->
 
 ## How it works
@@ -166,7 +166,7 @@ set_power_plan|error|missing_param|-|-
 [rc] 1
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 082db96f6e05
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 082db96f6e05
 
 ```
 == action=battery

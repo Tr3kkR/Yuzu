@@ -178,7 +178,7 @@
       "if_refused": "n/a",
       "measured": "2026-09-07, bare-metal, euid 501",
       "os": "macOS",
-      "runs_as": "not documented; the capture ran unprivileged at euid 501 (alex)"
+      "runs_as": "not documented; the capture ran unprivileged at euid 501 (jsmith)"
     },
     {
       "grant": "None",
@@ -264,7 +264,7 @@
         "leg_hash": "5789eff1c673",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
-        "privilege": "euid 501 (alex)"
+        "privilege": "euid 501 (jsmith)"
       }
     },
     "windows": {

@@ -523,7 +523,7 @@
     {
       "grant": "None",
       "if_refused": "Same as Windows",
-      "measured": "2026-09-07 on bare metal at euid 501 (alex) — unprivileged, not the production root daemon",
+      "measured": "2026-09-07 on bare metal at euid 501 (jsmith) — unprivileged, not the production root daemon",
       "os": "macOS",
       "runs_as": "agent daemon, root — the shipped LaunchDaemon has no `UserName` key (`docs/agent-privilege-model.md:14`)"
     },
@@ -683,7 +683,7 @@
         "leg_hash": "d276d67e9d65",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
-        "privilege": "euid 501 (alex)"
+        "privilege": "euid 501 (jsmith)"
       }
     },
     "windows": {

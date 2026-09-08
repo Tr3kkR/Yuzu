@@ -106,7 +106,7 @@ spec:
       - name: hostname
         type: string
         description: "Agent host's configured hostname (gethostname(3) on Linux/macOS, GetComputerNameA on Windows); the row is simply not emitted if the call fails. Values: free text."
-        example: "braga.local"
+        example: "workstation1.local"
         platforms: [windows, linux, darwin]
 
   readablePayload: "Get agent platform info"

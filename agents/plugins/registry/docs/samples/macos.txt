@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 6255117edeb8
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 6255117edeb8
 == action=get_value hive=HKLM key="SOFTWARE\Microsoft\Windows NT\CurrentVersion" name=ProductName
 registry|unsupported|Windows registry has no macOS equivalent; use defaults/plists
 [result_status] UNDECLARED / UNKNOWN / 
@@ -30,7 +30,7 @@ registry|unsupported|Windows registry has no macOS equivalent; use defaults/plis
 registry|unsupported|Windows registry has no macOS equivalent; use defaults/plists
 [result_status] UNDECLARED / UNKNOWN / 
 
-== action=get_user_value username=alex key=Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced name=Hidden
+== action=get_user_value username=jsmith key=Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced name=Hidden
 registry|unsupported|Windows registry has no macOS equivalent; use defaults/plists
 [result_status] UNDECLARED / UNKNOWN / 
 

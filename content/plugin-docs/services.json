@@ -350,7 +350,7 @@
     {
       "grant": "`list`/`running`: none. `set_start_mode`: sudoers grant `/bin/launchctl enable system/*`, `/bin/launchctl disable system/*` (the installed grant also covers `bootstrap`/`bootout`, which this plugin does not use).",
       "if_refused": "`list`/`running`: a failed `launchctl list` or `launchctl print-disabled` forwards `UNAVAILABLE`/`CONSTRAINED` via `forward_runner_failure` (`services_plugin.cpp:743-745`). `set_start_mode`: a `sudo -n` denial is captured (`merge_stderr=true`, `services_plugin.cpp:375-379`) and threaded into the `error|...` message by `decide_set_start_mode_outcome`.",
-      "measured": "2026-09-07, bare-metal, captured **unprivileged** at `euid 501 (alex)` — not the root identity the daemon actually runs under",
+      "measured": "2026-09-07, bare-metal, captured **unprivileged** at `euid 501 (jsmith)` — not the root identity the daemon actually runs under",
       "os": "macOS",
       "runs_as": "agent daemon — root (shipped LaunchDaemon has no `UserName` key)"
     },
@@ -529,7 +529,7 @@
         "leg_hash": "e724207e0989",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
-        "privilege": "euid 501 (alex)"
+        "privilege": "euid 501 (jsmith)"
       }
     },
     "windows": {

@@ -9,7 +9,7 @@
 | **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
 | **Actions** | `append` (definition `device.filesystem.append`) · `create_temp` (definition `device.filesystem.create_temp`) · `create_temp_dir` (definition `device.filesystem.create_temp_dir`) · `delete_lines` (definition `device.filesystem.delete_lines`) · `exists` (definition `device.filesystem.exists`) · `file_hash` (definition `device.filesystem.file_hash`) · `find_by_hash` (definition `device.filesystem.find_by_hash`) · `get_acl` (definition `device.filesystem.get_acl`) · `get_signature` (definition `device.filesystem.get_signature`) · `get_version_info` (definition `device.filesystem.get_version_info`, `workflow.version_compliance_check`) · `list_dir` (definition `device.filesystem.list_dir`) · `read` (definition `device.filesystem.read`) · `replace` (definition `device.filesystem.replace`, `workflow.config_search_and_replace`) · `search` (definition `device.filesystem.search`) · `search_dir` (definition `device.filesystem.search_dir`) · `write_content` (definition `device.filesystem.write_content`) |
 | **Security** | `exists`: securable `FileRetrieval` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `list_dir`: securable `FileRetrieval` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `file_hash`: securable `FileRetrieval` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `create_temp`: securable `FileRetrieval` · operation Write · risk Medium · dispatch Mutating · approval gate AdminOrApproval; `create_temp_dir`: securable `FileRetrieval` · operation Write · risk Medium · dispatch Mutating · approval gate AdminOrApproval; `read`: securable `FileRetrieval` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `get_acl`: securable `FileRetrieval` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `get_signature`: securable `FileRetrieval` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `find_by_hash`: securable `FileRetrieval` · operation Read · risk Low · dispatch ReadOnly · approval gate AdminOrApproval; `search_dir`: securable `FileRetrieval` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `get_version_info`: securable `FileRetrieval` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `search`: securable `FileRetrieval` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `replace`: securable `FileRetrieval` · operation Write · risk Medium · dispatch Mutating · approval gate AdminOrApproval; `write_content`: securable `FileRetrieval` · operation Write · risk Medium · dispatch Mutating · approval gate AdminOrApproval; `append`: securable `FileRetrieval` · operation Write · risk Medium · dispatch Mutating · approval gate AdminOrApproval; `delete_lines`: securable `FileRetrieval` · operation Delete · risk High · dispatch Destructive · approval gate AdminOrApproval |
-| **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
+| **Roles** | execute: `exists`: endpoint-admin, endpoint-operator; `list_dir`: endpoint-admin, endpoint-operator; `file_hash`: endpoint-admin, endpoint-operator; `read`: endpoint-admin, endpoint-operator; `create_temp`: endpoint-admin; `create_temp_dir`: endpoint-admin; `get_acl`: endpoint-admin, endpoint-operator; `get_signature`: endpoint-admin, endpoint-operator; `find_by_hash`: endpoint-admin; `get_version_info`: endpoint-admin, endpoint-operator; `search_dir`: endpoint-admin, endpoint-operator; `search`: endpoint-admin, endpoint-operator; `replace`: endpoint-admin; `write_content`: endpoint-admin; `append`: endpoint-admin; `delete_lines`: endpoint-admin; `replace`: endpoint-admin; `get_version_info`: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
 
 ## How it works
@@ -64,7 +64,7 @@ flowchart LR
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
 | Windows | **LocalSystem today** (`docs/agent-privilege-model.md:70`, tracked #1442; target is the virtual service account `NT SERVICE\YuzuAgent`) | None for any read action. `write_content`/`replace`/`append`/`delete_lines` against a path the running account cannot already write need that account to be an `Administrators` member; default install grants nothing (`docs/agent-privilege-model.md:118`) | 2026-09-07, bare metal, as `SYSTEM` (`docs/samples/windows.txt:1`) | a single `error\|<message>` line + return code 1 (e.g. `error\|GetNamedSecurityInfo failed (error N)`) — no typed status is set |
-| macOS | **root** — the shipped LaunchDaemon has no `UserName` key (`docs/agent-privilege-model.md:14`) | None for any read action. Write actions against a path with no operator-authored per-path sudo entry are refused by the OS itself at `open()`/`rename()`; default install grants nothing (`docs/agent-privilege-model.md:118`) | 2026-09-07, bare metal, **unprivileged** at euid 501 (alex) — the capture ran through `LocalDispatcher`/`PluginHandle::load`, not the real root daemon (`docs/samples/macos.txt:1`) | same `error\|<message>` + rc 1 shape |
+| macOS | **root** — the shipped LaunchDaemon has no `UserName` key (`docs/agent-privilege-model.md:14`) | None for any read action. Write actions against a path with no operator-authored per-path sudo entry are refused by the OS itself at `open()`/`rename()`; default install grants nothing (`docs/agent-privilege-model.md:118`) | 2026-09-07, bare metal, **unprivileged** at euid 501 (jsmith) — the capture ran through `LocalDispatcher`/`PluginHandle::load`, not the real root daemon (`docs/samples/macos.txt:1`) | same `error\|<message>` + rc 1 shape |
 | Linux | `yuzu` unprivileged system account (`docs/agent-privilege-model.md:12,52`) | None for any read action. Write actions against system paths need an operator-authored per-path sudo entry; default install grants nothing (`docs/agent-privilege-model.md:118`) | 2026-09-07, container, as euid 0 (root) (`docs/samples/linux.txt:1`) — also not the least-privilege `yuzu` account | same `error\|<message>` + rc 1 shape |
 
 Subprocesses: `shasum` (macOS) / `sha256sum`, `sha1sum` (Linux) for `file_hash`/`find_by_hash` (`filesystem_plugin.cpp:265-294`); `/usr/bin/codesign` for macOS `get_signature` (`filesystem_plugin.cpp:1232-1234`); `/usr/bin/plutil` for macOS `get_version_info` (`filesystem_plugin.cpp:1487-1496`) — every one invoked by absolute path with no shell, through `yuzu::agent::run_bounded_subprocess`. No network access on any OS.
@@ -329,11 +329,11 @@ This plugin does not set a typed result status — no `set_result_status`/`yuzu_
 == action=exists path=C:\Windows\System32\drivers\etc\hosts
 exists|true
 type|file
-size|1405
+size|1432
 [result_status] UNDECLARED / UNKNOWN
 
 == action=list_dir path=C:\Windows\System32\drivers\etc
-entry|hosts|file|1405
+entry|hosts|file|1432
 entry|hosts.ics|file|444
 entry|lmhosts.sam|file|3683
 entry|networks|file|407
@@ -342,9 +342,9 @@ entry|services|file|17635
 [result_status] UNDECLARED / UNKNOWN
 
 == action=file_hash path=C:\Windows\System32\drivers\etc\hosts
-hash|9321feab332edbba521c7ea3eb978d9844cb4f62a4730dab9cf60fb79649037d
+hash|904287aa347ca8218ad8b694c173b038ff2faf684e94deeb6094ce4b43e40d35
 algorithm|sha256
-size|1405
+size|1432
 [result_status] UNDECLARED / UNKNOWN
 
 == action=create_temp
@@ -387,8 +387,8 @@ ace|allow|APPLICATION PACKAGE AUTHORITY\ALL RESTRICTED APP PACKAGES|0x001200a9
 signature_status|unsigned
 [result_status] UNDECLARED / UNKNOWN
 
-== action=find_by_hash directory=C:\Windows\System32\drivers\etc sha256=9321feab332edbba521c7ea3eb978d9844cb4f62a4730dab9cf60fb79649037d
-match|C:\Windows\System32\drivers\etc\hosts|1405
+== action=find_by_hash directory=C:\Windows\System32\drivers\etc sha256=904287aa347ca8218ad8b694c173b038ff2faf684e94deeb6094ce4b43e40d35
+match|C:\Windows\System32\drivers\etc\hosts|1432
 matches_found|1
 [result_status] UNDECLARED / UNKNOWN
 
@@ -439,7 +439,7 @@ total_lines_after|1
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 4db605b6c689
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 4db605b6c689
 
 ```
 == action=exists path=/etc/hosts

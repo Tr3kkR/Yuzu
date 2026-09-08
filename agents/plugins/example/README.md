@@ -9,7 +9,7 @@
 | **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
 | **Actions** | `echo` · `ping` |
 | **Security** | securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
-| **Roles** | execute: - · author: - |
+| **Roles** | execute:  · author: - |
 <!-- END GENERATED -->
 
 ## How it works
@@ -40,7 +40,7 @@ flowchart LR
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
 | Windows | no `docs/agent-privilege-model.md` row; sample captured as `SYSTEM` | None — no OS call is made (`example_plugin.cpp:63-77`) | 2026-09-07, bare-metal, Windows NT 10.0.26200.0 x64 (`docs/samples/windows.txt:1`) | n/a — no external resource is read; both actions return rc 0 for a known action name |
-| macOS | no privilege-model row; sample captured at euid 501 (alex), unprivileged | None | 2026-09-07, bare-metal, macOS 26.6.2 arm64 (`docs/samples/macos.txt:1`) | n/a |
+| macOS | no privilege-model row; sample captured at euid 501 (jsmith), unprivileged | None | 2026-09-07, bare-metal, macOS 26.6.2 arm64 (`docs/samples/macos.txt:1`) | n/a |
 | Linux | no privilege-model row; sample captured at euid 0, container | None | 2026-09-06, container, Debian GNU/Linux 13 aarch64 (`docs/samples/linux.txt:1`) | n/a |
 
 No external binaries, no subprocesses, no network access — `example_plugin.cpp` (81 lines, read in full) contains no process spawn, socket, or file I/O call.
@@ -87,7 +87,7 @@ echo: (no message)
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 23dda8161132
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 23dda8161132
 
 ```
 == action=ping

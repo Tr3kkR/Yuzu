@@ -382,7 +382,7 @@
     {
       "grant": "None — `os_info.*` row is `default`",
       "if_refused": "same fallback-to-literal behavior",
-      "measured": "2026-09-07, bare-metal, euid 501 (alex) — the capture ran **unprivileged**, not as the deployed root daemon (macos.txt sample stamp)",
+      "measured": "2026-09-07, bare-metal, euid 501 (jsmith) — the capture ran **unprivileged**, not as the deployed root daemon (macos.txt sample stamp)",
       "os": "macOS",
       "runs_as": "agent LaunchDaemon — runs as **root** today (no `UserName` key; `docs/agent-privilege-model.md` TL;DR)"
     },
@@ -581,7 +581,7 @@
         "leg_hash": "45e627d9dfa2",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
-        "privilege": "euid 501 (alex)"
+        "privilege": "euid 501 (jsmith)"
       }
     },
     "windows": {

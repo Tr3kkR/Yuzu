@@ -230,7 +230,7 @@
     {
       "grant": "n/a",
       "if_refused": "always `rdp_control|unsupported|...`, rc=1 (`set_state`) / rc=0 (`status`)",
-      "measured": "2026-09-07, bare metal, at euid 501 (alex)",
+      "measured": "2026-09-07, bare metal, at euid 501 (jsmith)",
       "os": "macOS",
       "runs_as": "n/a — leg not implemented; the honest-sentinel path needs no privilege"
     },
@@ -330,7 +330,7 @@
         "leg_hash": "e17062cd8474",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
-        "privilege": "euid 501 (alex)"
+        "privilege": "euid 501 (jsmith)"
       }
     },
     "windows": {

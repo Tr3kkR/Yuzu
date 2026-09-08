@@ -1962,7 +1962,7 @@
     {
       "grant": "Endpoint Security process capture needs root **and** the `com.apple.developer.endpoint-security.client` entitlement; without both, `es_new_client`/`es_subscribe` fails and the process/tcp legs self-heal to the `KERN_PROC_ALL`/`proc_pidfdinfo` poll (`tar_proc_es.cpp:118-121,327-328`).",
       "if_refused": "A missing entitlement/privilege never blocks the leg outright — it logs a warning and falls back to the poll (`tar_proc_es.cpp:327-328`).",
-      "measured": "2026-09-07, bare-metal, captured at **euid 501 (alex)** — unprivileged; the root LaunchDaemon path was not exercised by this capture.",
+      "measured": "2026-09-07, bare-metal, captured at **euid 501 (jsmith)** — unprivileged; the root LaunchDaemon path was not exercised by this capture.",
       "os": "macOS",
       "runs_as": "**root** (LaunchDaemon, no `UserName` — `docs/agent-privilege-model.md:94`)"
     },
@@ -2435,7 +2435,7 @@
         "leg_hash": "3094b2651318",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
-        "privilege": "euid 501 (alex)"
+        "privilege": "euid 501 (jsmith)"
       }
     },
     "windows": {

@@ -140,7 +140,7 @@
     {
       "grant": "None observed unprivileged — `proc_listpids`/`proc_pidpath` resolved paths and hashes for processes owned by root and other users in the sample (e.g. `postgres`, `XprotectService`) without elevation.",
       "if_refused": "`proc_pidpath` failing falls back to `proc_name()` for a short name only, leaving `path` and `sha1` empty (`procfetch_plugin.cpp:216-223`) — not observed in this capture",
-      "measured": "2026-09-07, macOS 26.6.2, euid 501 (alex)",
+      "measured": "2026-09-07, macOS 26.6.2, euid 501 (jsmith)",
       "os": "macOS",
       "runs_as": "unprivileged (agent daemon)"
     },
@@ -198,7 +198,7 @@
           },
           "row_count": 818,
           "rows": [
-            "10151|plugin_capture|/private/tmp/claude-501/-Users-alex-yuzu-dev/8d89cd79-001b-4ea8-8930-0c9affb3265e/scratchpad/d2/plugin_capture|87ea43e2b7d3dd2eb6e7db6a20041b1f77d20272",
+            "10151|plugin_capture|/private/tmp/claude-501/-Users-jsmith-yuzu-dev/00000000-0000-0000-0000-000000000000/scratchpad/d2/plugin_capture|87ea43e2b7d3dd2eb6e7db6a20041b1f77d20272",
             "10143|mdworker_shared|/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared|19ca6c856d80cfc6b83800c821b3129f40b135c7",
             "10125|Code Helper (Plugin)|/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Plugin).app/Contents/MacOS/Code Helper (Plugin)|0478d377b6ffa6659d823d3c72d25dc9b8816bd6",
             "10121|mdworker_shared|/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared|19ca6c856d80cfc6b83800c821b3129f40b135c7",
@@ -213,7 +213,7 @@
         "leg_hash": "514b81c2df7e",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
-        "privilege": "euid 501 (alex)"
+        "privilege": "euid 501 (jsmith)"
       }
     },
     "windows": {
@@ -278,7 +278,7 @@
   "where_the_data_goes": [
     "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. The classic dashboard also reaches this action through the legacy `POST /api/procfetch/fetch` route (`server.cpp:14943`), which forwards into the same dispatch chokepoint as the DSL path (`changelog.d/1.9-dispatch-chokepoint.security.md`) rather than a separate mechanism.",
     "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — grepping the server for `procfetch` finds only the dashboard route, the legacy REST forwarder, the capability declaration, and the static result-table column list (`result_parsing.hpp:49`).",
-    "**Sensitivity.** `name` rows name installed applications on the host (process/executable names — an installed-software inventory by another route, e.g. `XprotectService`, `Code Helper (Plugin)`); `path` frequently embeds the owning account's home directory on macOS/Linux (e.g. `/Users/alex/...` in the macOS sample), identifying a specific person, while `sha1` alone identifies neither a device nor a person.",
+    "**Sensitivity.** `name` rows name installed applications on the host (process/executable names — an installed-software inventory by another route, e.g. `XprotectService`, `Code Helper (Plugin)`); `path` frequently embeds the owning account's home directory on macOS/Linux (e.g. `/Users/jsmith/...` in the macOS sample), identifying a specific person, while `sha1` alone identifies neither a device nor a person.",
     "**Siblings:** `crossplatform.process.list` / `crossplatform.process.query` (the `processes` plugin) — PID and name only, no path or hash, cheaper to run.",
     "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"crossplatform.process.fetch\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."
   ]

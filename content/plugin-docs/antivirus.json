@@ -84,7 +84,7 @@
     "**The Windows `productState` decode is a reverse-engineered convention, not a documented API.** `decode_wsc_product_state` (`antivirus_parsers.hpp:217`) formats a widely-corroborated community convention going back to Vista — Microsoft has never published this layout, so the decode is MEDIUM confidence, not the HIGH confidence a header-published struct would carry.",
     "**No content definition targets the Linux `status` leg.** `list_status_linux` is real, and the descriptor declares `status` supported on Linux at rung 2 (`antivirus_plugin.cpp:490-492`), but `security.antivirus.defender_status` is `platforms: [windows]` and `security.antivirus.xprotect_status` is `platforms: [darwin]` (`content/definitions/antivirus.yaml:104`, `:178`) — no definition in this file targets Linux for the `status` action.",
     "**A single ACL'd exclusion subkey degrades the whole `av_exclusions` run.** The worst-of-six aggregation (`antivirus_plugin.cpp:211-247`) means one policy-hive key denied to the reading account reports `PERMISSION_DENIED` for the entire action, even if the other five subkey reads succeeded and returned real exclusions.",
-    "**`docs/agent-privilege-model.md`'s Windows cell is stale.** It still describes \"PowerShell SecurityCenter2 / `Get-MpComputerStatus` CIM queries\" (`docs/agent-privilege-model.md:97`); the plugin has read both namespaces in-process via WMI, with no PowerShell spawn, since PR #3369 (2026-08-23).",
+    "**`docs/agent-privilege-model.md`'s Windows cell now matches the code.** It describes in-process WMI/COM queries against `root\\SecurityCenter2` and `root\\Microsoft\\Windows\\Defender`, no PowerShell subprocess (`docs/agent-privilege-model.md:97`) — matching the plugin's actual mechanism since PR #3369 (2026-08-23). Earlier revisions of that row described a PowerShell `Get-MpComputerStatus` CIM query; treat any remaining reference to it elsewhere as stale.",
     "**CrowdStrike and Sophos are presence-only outside Windows.** Linux and macOS report `detected`/`not_detected` or `installed`/`running` for these vendors with no definitions-freshness data — this plugin has no rung-1 or rung-2 mechanism to read their own signature state on those platforms (`antivirus_plugin.cpp:327-329`)."
   ],
   "definitions": [
@@ -388,7 +388,7 @@
     {
       "grant": "None — `PlistBuddy`, `systemextensionsctl list`, and `pgrep` are all unprivileged reads.",
       "if_refused": "An unreadable XProtect bundle renders `av|XProtect|unknown` (`products`) or `status|unknown` (`status`) — never assumed active/healthy.",
-      "measured": "2026-09-07, bare-metal, euid 501 (alex)",
+      "measured": "2026-09-07, bare-metal, euid 501 (jsmith)",
       "os": "macOS",
       "runs_as": "agent daemon (docs describe default/unprivileged; sample was captured as an interactive user, euid 501, not the daemon identity)"
     },
@@ -599,7 +599,7 @@
         "leg_hash": "a4abf06e398d",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
-        "privilege": "euid 501 (alex)"
+        "privilege": "euid 501 (jsmith)"
       }
     },
     "windows": {

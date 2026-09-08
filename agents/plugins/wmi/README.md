@@ -120,7 +120,7 @@ property|DataExecutionPrevention_Available|true
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash a8a6121c1219
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash a8a6121c1219
 
 ```
 == action=query wql="SELECT Caption FROM Win32_OperatingSystem"

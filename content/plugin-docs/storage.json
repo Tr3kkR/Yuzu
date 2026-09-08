@@ -463,7 +463,7 @@
     {
       "grant": "None",
       "if_refused": "same as above",
-      "measured": "2026-09-07, bare-metal, euid 501 (alex) — **unprivileged**, i.e. this capture was taken at a weaker identity than the shipped root daemon",
+      "measured": "2026-09-07, bare-metal, euid 501 (jsmith) — **unprivileged**, i.e. this capture was taken at a weaker identity than the shipped root daemon",
       "os": "macOS",
       "runs_as": "agent daemon; ships root today per `docs/agent-privilege-model.md` (narrowing tracked in #1455)"
     },
@@ -649,7 +649,7 @@
         "leg_hash": "cc5994a9097a",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
-        "privilege": "euid 501 (alex)"
+        "privilege": "euid 501 (jsmith)"
       }
     },
     "windows": {

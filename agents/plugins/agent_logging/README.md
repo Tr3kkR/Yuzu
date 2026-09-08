@@ -44,7 +44,7 @@ flowchart LR
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
 | Windows | agent service account, registered as LocalSystem in practice today (docs/agent-privilege-model.md:12, #1442) | None — both actions are plain Win32 calls (`GetModuleFileNameA`, `std::filesystem`) with no elevated handle opened | 2026-09-07, bare-metal, SYSTEM (windows.txt sample stamp) | the file is silently omitted from the row set — `emit_file_info` returns early on a failed `fs::exists` |
-| macOS | agent daemon, root today (LaunchDaemon plist carries no `UserName` key) (docs/agent-privilege-model.md:14) | None — ordinary filesystem/config reads under the daemon's own permissions | 2026-09-07, bare-metal, euid 501 (alex) (macos.txt sample stamp — unprivileged, not the production root daemon) | same silent omission |
+| macOS | agent daemon, root today (LaunchDaemon plist carries no `UserName` key) (docs/agent-privilege-model.md:14) | None — ordinary filesystem/config reads under the daemon's own permissions | 2026-09-07, bare-metal, euid 501 (jsmith) (macos.txt sample stamp — unprivileged, not the production root daemon) | same silent omission |
 | Linux | agent daemon, designed to run unprivileged as `yuzu` (docs/agent-privilege-model.md:12) | None declared | 2026-09-06, container, euid 0 (linux.txt sample stamp — root, not the designed `yuzu` account) | same silent omission |
 
 No external binaries, no subprocesses, no network access — both actions are native, in-process filesystem/config reads on every OS.
@@ -68,7 +68,7 @@ Output is a stream of pipe-delimited `key|value` lines via `write_output()`, not
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
-| `path` | string | - | Windows, Linux, macOS | `/private/tmp/claude-501/-Users-alex-yuzu-dev/8d89cd79-001b-4ea8-8930-0c9affb3265e/scratchpad/d2/plugin_capture` | Absolute path of a discovered agent file (executable, log file, config file, data store, plugin file, or TLS certificate/key). Values: absolute path. |
+| `path` | string | - | Windows, Linux, macOS | `/private/tmp/claude-501/-Users-jsmith-yuzu-dev/00000000-0000-0000-0000-000000000000/scratchpad/d2/plugin_capture` | Absolute path of a discovered agent file (executable, log file, config file, data store, plugin file, or TLS certificate/key). Values: absolute path. |
 | `size` | int64 | - | Windows, Linux, macOS | `142208` | File size in bytes; 0 if the size read failed. Values: non-negative integer (bytes). |
 | `modified` | int64 | - | Windows, Linux, macOS | `1788774907` | Last-write time as Unix epoch seconds; 0 if the mtime read failed. Values: non-negative integer (unix epoch seconds). |
 
@@ -111,7 +111,7 @@ file|D:\yuzu-dev\Yuzu-worktrees\docs-plugin-readme-sweep\build-windows\tools\plu
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 6e239e35ca05
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 6e239e35ca05
 
 ```
 == action=get_log
@@ -120,7 +120,7 @@ line_count|0
 [result_status] UNDECLARED / UNKNOWN
 
 == action=get_key_files
-file|/private/tmp/claude-501/-Users-alex-yuzu-dev/8d89cd79-001b-4ea8-8930-0c9affb3265e/scratchpad/d2/plugin_capture|142208|1788774907
+file|/private/tmp/claude-501/-Users-jsmith-yuzu-dev/00000000-0000-0000-0000-000000000000/scratchpad/d2/plugin_capture|142208|1788774907
 [result_status] UNDECLARED / UNKNOWN
 ```
 

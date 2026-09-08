@@ -9,7 +9,7 @@
 | **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
 | **Actions** | `list` (definition `crossplatform.service.list`) · `running` (definition `crossplatform.service.running`) · `set_start_mode` (definition `crossplatform.service.set_start_mode`) |
 | **Security** | `list`: securable `Infrastructure` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `running`: securable `Infrastructure` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `set_start_mode`: securable `Infrastructure` · operation Write · risk High · dispatch Mutating · approval gate AdminOrApproval |
-| **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
+| **Roles** | execute: `list`: endpoint-admin, endpoint-operator; `running`: endpoint-admin, endpoint-operator; `set_start_mode`: endpoint-admin · author: content-author |
 <!-- END GENERATED -->
 
 ## How it works
@@ -41,7 +41,7 @@ flowchart LR
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
 | Windows | agent service account — LocalSystem today (#1442) | `list`/`running`: none (default account). `set_start_mode`: `SeAssignPrimaryTokenPrivilege` (service control). | 2026-09-07, bare-metal, captured as `SYSTEM` | `list`/`running`: `OpenSCManagerW` failing returns an **empty** service list with no error and no result status set (`services_plugin.cpp:189-191`) — a permission failure reads identically to "this host has zero services". `set_start_mode`: `OpenServiceW`/`ChangeServiceConfigW` failure emits an explicit `error\|access denied changing service '<name>'` row (`services_plugin.cpp:426-429`). |
-| macOS | agent daemon — root (shipped LaunchDaemon has no `UserName` key) | `list`/`running`: none. `set_start_mode`: sudoers grant `/bin/launchctl enable system/*`, `/bin/launchctl disable system/*` (the installed grant also covers `bootstrap`/`bootout`, which this plugin does not use). | 2026-09-07, bare-metal, captured **unprivileged** at `euid 501 (alex)` — not the root identity the daemon actually runs under | `list`/`running`: a failed `launchctl list` or `launchctl print-disabled` forwards `UNAVAILABLE`/`CONSTRAINED` via `forward_runner_failure` (`services_plugin.cpp:743-745`). `set_start_mode`: a `sudo -n` denial is captured (`merge_stderr=true`, `services_plugin.cpp:375-379`) and threaded into the `error\|...` message by `decide_set_start_mode_outcome`. |
+| macOS | agent daemon — root (shipped LaunchDaemon has no `UserName` key) | `list`/`running`: none. `set_start_mode`: sudoers grant `/bin/launchctl enable system/*`, `/bin/launchctl disable system/*` (the installed grant also covers `bootstrap`/`bootout`, which this plugin does not use). | 2026-09-07, bare-metal, captured **unprivileged** at `euid 501 (jsmith)` — not the root identity the daemon actually runs under | `list`/`running`: a failed `launchctl list` or `launchctl print-disabled` forwards `UNAVAILABLE`/`CONSTRAINED` via `forward_runner_failure` (`services_plugin.cpp:743-745`). `set_start_mode`: a `sudo -n` denial is captured (`merge_stderr=true`, `services_plugin.cpp:375-379`) and threaded into the `error\|...` message by `decide_set_start_mode_outcome`. |
 | Linux | agent daemon — unprivileged `yuzu` account | `list`/`running`: none. `set_start_mode`: sudoers grant `/bin/systemctl enable\|disable\|mask\|unmask *` (also `/usr/bin/systemctl` on distros that mirror it). | 2026-09-06, container, captured at `euid 0` — root, not the deployed unprivileged identity | Same `forward_runner_failure` path as macOS; the captured Linux sample shows exactly this on both `list` and `running` (`UNAVAILABLE / PARTIAL / subprocess_runner:spawn_error`, `docs/samples/linux.txt:3,7`) — here caused by `systemctl` not being resolvable in the capture container, not by a privilege denial. `set_start_mode` mirrors macOS. |
 
 Binaries/subprocesses/network: Linux runs `systemctl` (list-units for reads; enable/disable/mask/unmask under `sudo -n --` for the mutation). macOS runs `launchctl` (list, print-disabled for reads; enable/disable under `sudo -n --` for the mutation). Windows uses the native Win32 Service Control Manager API only — no subprocess. No network access on any OS.
@@ -159,7 +159,7 @@ error|missing required parameter: name
 [rc] 1
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash e724207e0989
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash e724207e0989
 
 ```
 == action=list

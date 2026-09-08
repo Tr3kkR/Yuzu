@@ -94,7 +94,7 @@ disk|C:\|248158089216|20788936704|91
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 16f60d46b82f
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 16f60d46b82f
 
 ```
 == action=free

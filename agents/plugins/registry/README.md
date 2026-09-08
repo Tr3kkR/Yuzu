@@ -9,7 +9,7 @@
 | **Platforms** | Windows ✅ · macOS ⛔ unsupported · Linux ⛔ unsupported |
 | **Actions** | `delete_key` (definition `windows.registry.delete_key`) · `delete_value` (definition `windows.registry.delete_value`) · `enumerate_keys` (definition `windows.registry.enumerate_keys`) · `enumerate_values` (definition `windows.registry.enumerate_values`) · `get_user_value` (definition `windows.registry.get_user_value`) · `get_value` (definition `windows.registry.get_value`) · `key_exists` (definition `windows.registry.key_exists`) · `list_profiles` (definition `windows.registry.list_profiles`) · `set_value` (definition `windows.registry.set_value`) |
 | **Security** | `get_value`: securable `Infrastructure` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `set_value`: securable `Infrastructure` · operation Write · risk Medium · dispatch Mutating · approval gate AdminOrApproval; `delete_value`: securable `Infrastructure` · operation Delete · risk High · dispatch Destructive · approval gate AdminOrApproval; `delete_key`: securable `Infrastructure` · operation Delete · risk Critical · dispatch Destructive · approval gate AdminOrApproval; `key_exists`: securable `Infrastructure` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `enumerate_keys`: securable `Infrastructure` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `enumerate_values`: securable `Infrastructure` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `get_user_value`: securable `Infrastructure` · operation Read · risk Medium · dispatch ReadOnly · approval gate AdminOrApproval; `list_profiles`: securable `Infrastructure` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
-| **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
+| **Roles** | execute: `get_value`: endpoint-admin, endpoint-operator; `get_user_value`: endpoint-admin; `list_profiles`: endpoint-admin, endpoint-operator; `set_value`: endpoint-admin; `enumerate_keys`: endpoint-admin, endpoint-operator; `delete_value`: endpoint-admin; `delete_key`: endpoint-admin; `key_exists`: endpoint-admin, endpoint-operator; `enumerate_values`: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
 
 ## How it works
@@ -54,7 +54,7 @@ flowchart LR
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
 | Windows | agent service account (LocalSystem today, #1442) | `set_value`/`delete_value`/`delete_key` against `HKLM\*` need the service account in `Administrators`; `HKCU\*` needs no elevation. `get_user_value`'s offline-hive fallback needs `SeBackupPrivilege`+`SeRestorePrivilege`, already granted to the service account — no new grant; its live-hive path and `list_profiles` need no elevated privilege at all. | 2026-09-07, bare-metal, as `SYSTEM` | `error\|key not found` / `error\|value not found` (reads); `error\|failed to open/create key` / `error\|failed to delete key` (writes/deletes) — Win32 does not distinguish "access denied" from "does not exist" in these two messages |
-| macOS | n/a — plugin loads but every action is the honest `unsupported` leg | n/a | 2026-09-07, bare-metal, euid 501 (alex) | always `registry\|unsupported\|Windows registry has no macOS equivalent; use defaults/plists`, rc 0 (reads) / rc 1 (mutators) |
+| macOS | n/a — plugin loads but every action is the honest `unsupported` leg | n/a | 2026-09-07, bare-metal, euid 501 (jsmith) | always `registry\|unsupported\|Windows registry has no macOS equivalent; use defaults/plists`, rc 0 (reads) / rc 1 (mutators) |
 | Linux | n/a — plugin loads but every action is the honest `unsupported` leg | n/a | 2026-09-07, container, euid 0 | always `registry\|unsupported\|Windows registry is not available on this platform`, rc 0 (reads) / rc 1 (mutators) |
 
 No external binaries, no subprocesses, no network access — every call is an in-process Win32 `Reg*W`/`AdjustTokenPrivileges` call (`registry_plugin.cpp`, `agents/shared/win_profiles.hpp`, `agents/shared/win_reg_handle.hpp`).
@@ -231,8 +231,8 @@ value|CurrentType|REG_SZ
 … 12 of 32 rows shown
 [result_status] UNDECLARED / UNKNOWN
 
-== action=get_user_value username=alex key=Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced name=Hidden
-username|alex
+== action=get_user_value username=jsmith key=Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced name=Hidden
+username|jsmith
 value|1
 type|REG_DWORD
 [result_status] UNDECLARED / UNKNOWN
@@ -242,7 +242,7 @@ S-1-5-21-571721511-16201247-3531262703-1001|Alex|C:\Users\Alex|loaded
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 6255117edeb8
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 6255117edeb8
 
 ```
 == action=get_value hive=HKLM key="SOFTWARE\Microsoft\Windows NT\CurrentVersion" name=ProductName
@@ -276,7 +276,7 @@ registry|unsupported|Windows registry has no macOS equivalent; use defaults/plis
 registry|unsupported|Windows registry has no macOS equivalent; use defaults/plists
 [result_status] UNDECLARED / UNKNOWN
 
-== action=get_user_value username=alex key=Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced name=Hidden
+== action=get_user_value username=jsmith key=Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced name=Hidden
 registry|unsupported|Windows registry has no macOS equivalent; use defaults/plists
 [result_status] UNDECLARED / UNKNOWN
 
@@ -319,7 +319,7 @@ registry|unsupported|Windows registry is not available on this platform
 registry|unsupported|Windows registry is not available on this platform
 [result_status] UNDECLARED / UNKNOWN
 
-== action=get_user_value username=alex key=Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced name=Hidden
+== action=get_user_value username=jsmith key=Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced name=Hidden
 registry|unsupported|Windows registry is not available on this platform
 [result_status] UNDECLARED / UNKNOWN
 

@@ -95,7 +95,7 @@ distinguished from failure by the typed result status).
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
 | `name` | string | - | Windows, Linux, macOS | `en0` | Adapter's OS-reported display name (Windows friendly name; Linux/macOS kernel interface name). Values: free text. |
-| `mac` | string | - | Windows, Linux, macOS | `d0:11:e5:c0:a0:99` | Adapter's MAC address, colon-separated hex, or '-' when the leg could not resolve one (loopback, tunnel/utun interfaces). |
+| `mac` | string | - | Windows, Linux, macOS | `00:00:5e:00:53:04` | Adapter's MAC address, colon-separated hex, or '-' when the leg could not resolve one (loopback, tunnel/utun interfaces). |
 | `speed_mbps` | int64 | - | Windows, Linux, macOS | `1000` | Link speed reported by the OS, in megabits per second; 0 when unknown, inactive, or not applicable (loopback/tunnel). Values: integer Mbps, 0 for unknown/inactive (Linux/macOS); Windows emits the unclamped TransmitLinkSpeed sentinel (18446744073709) instead of 0 when the adapter reports no known speed — see Caveats. |
 | `status` | string | - | Windows, Linux, macOS | `up` | Adapter link state. Windows/Linux report the OS's OPERATIONAL state (IfOperStatus / IFLA_OPERSTATE); macOS reports the ADMINISTRATIVE IFF_UP flag instead, so a cable-unplugged Mac NIC can read 'up' where Windows/Linux would read 'down'. Values: up, down (Windows, macOS); up, down, unknown (Linux, when the kernel omits IFLA_OPERSTATE). |
 
@@ -104,8 +104,8 @@ distinguished from failure by the typed result status).
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
 | `interface` | string | - | Windows, Linux, macOS | `Ethernet` | Owning network interface name; always '-' on macOS, where the PF_ROUTE RTF_LLINFO dump carries no interface field. Values: interface name, or '-' (macOS, always). |
-| `ip_address` | string | - | Windows, Linux, macOS | `192.168.0.61` | Neighbour's IPv4 or IPv6 address. Values: IPv4 or IPv6 literal. |
-| `mac_address` | string | - | Windows, Linux, macOS | `1c:53:f9:73:22:6c` | Neighbour's MAC address, colon-separated hex; '-' for a Windows entry with no resolved hardware address yet (incomplete). Linux drops all-zero-MAC rows rather than emitting '-'. Values: colon-separated hex, or '-' (Windows incomplete entries only). |
+| `ip_address` | string | - | Windows, Linux, macOS | `203.0.113.61` | Neighbour's IPv4 or IPv6 address. Values: IPv4 or IPv6 literal. |
+| `mac_address` | string | - | Windows, Linux, macOS | `00:00:5e:00:53:0f` | Neighbour's MAC address, colon-separated hex; '-' for a Windows entry with no resolved hardware address yet (incomplete). Linux drops all-zero-MAC rows rather than emitting '-'. Values: colon-separated hex, or '-' (Windows incomplete entries only). |
 | `entry_type` | string | - | Windows, Linux, macOS | `dynamic` | Static/dynamic/incomplete classification; always '-' on macOS, where the PF_ROUTE RTF_LLINFO dump carries no such distinction. Values: static, dynamic, incomplete (Windows only); static, dynamic (Linux); '-' (macOS, always). |
 
 **`device.network_config.dns_cache` — `name|record_type|ttl`**
@@ -121,7 +121,7 @@ distinguished from failure by the typed result status).
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
 | `adapter` | string | - | Windows, Linux, macOS | `system` | Adapter owning this resolver on Windows; Linux and macOS report the system-wide resolver list under the literal value 'system' (resolv.conf and SCDynamicStore are not per-adapter). Values: adapter name (Windows), or the literal 'system' (Linux, macOS). |
-| `server` | string | - | Windows, Linux, macOS | `194.168.4.100` | Configured DNS server address. Values: IPv4 or IPv6 literal. |
+| `server` | string | - | Windows, Linux, macOS | `192.0.2.100` | Configured DNS server address. Values: IPv4 or IPv6 literal. |
 | `type` | string | - | Windows, Linux, macOS | `IPv4` | Address family of the server value. Values: IPv4, IPv6. |
 
 **`device.network_config.ip_addresses` — `adapter|address|prefix_length|gateway`**
@@ -129,9 +129,9 @@ distinguished from failure by the typed result status).
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
 | `adapter` | string | - | Windows, Linux, macOS | `en0` | Adapter name the address belongs to (same name as the adapters action's name field). Values: free text. |
-| `address` | string | - | Windows, Linux, macOS | `192.168.0.131` | IPv4 or IPv6 unicast address assigned to the adapter; an IPv6 link-local zone suffix ('%ifname') is stripped on macOS. Values: IPv4 or IPv6 literal. |
+| `address` | string | - | Windows, Linux, macOS | `203.0.113.131` | IPv4 or IPv6 unicast address assigned to the adapter; an IPv6 link-local zone suffix ('%ifname') is stripped on macOS. Values: IPv4 or IPv6 literal. |
 | `prefix_length` | int32 | - | Windows, Linux, macOS | `24` | CIDR prefix length of the address's subnet. Values: integer, 0-32 (IPv4) or 0-128 (IPv6). |
-| `gateway` | string | - | Windows, Linux, macOS | `192.168.0.1` | Default gateway address for this row. Windows resolves it per-adapter (FirstGatewayAddress); Linux/macOS resolve a single system-wide default gateway and repeat it on every row. Values: IPv4 literal, or '-' when none or unresolved. |
+| `gateway` | string | - | Windows, Linux, macOS | `203.0.113.1` | Default gateway address for this row. Windows resolves it per-adapter (FirstGatewayAddress); Linux/macOS resolve a single system-wide default gateway and repeat it on every row. Values: IPv4 literal, or '-' when none or unresolved. |
 
 **`device.network_config.proxy` — `proxy_type|proxy_address|bypass`**
 
@@ -255,9 +255,9 @@ ip|Ethernet 2|fe80::24d2:a5ae:f55b:9132|64|-
 ip|Ethernet 2|169.254.54.245|16|-
 ip|Tailscale|fd7a:115c:a1e0::1c32:357a|128|-
 ip|Tailscale|fe80::c5b0:bd45:79bc:bd97|64|-
-ip|Tailscale|100.123.53.121|32|-
-ip|Ethernet|fe80::d459:2883:492c:f3fc|64|192.168.0.1
-ip|Ethernet|192.168.0.131|24|192.168.0.1
+ip|Tailscale|198.51.100.121|32|-
+ip|Ethernet|fe80::d459:2883:492c:f3fc|64|203.0.113.1
+ip|Ethernet|203.0.113.131|24|203.0.113.1
 ip|OpenVPN Data Channel Offload for NordVPN|fe80::c5b0:bd45:79bc:bd97|64|-
 ip|OpenVPN Data Channel Offload for NordVPN|169.254.133.126|16|-
 ip|Local Area Connection|fe80::669f:e4fb:4130:c7de|64|-
@@ -267,13 +267,13 @@ ip|WiFi|fe80::72f7:7266:9da0:e23c|64|-
 [result_status] UNDECLARED / UNKNOWN
 
 == action=dns_servers
-dns|Ethernet 2|194.168.4.100|IPv4
-dns|Ethernet 2|194.168.8.100|IPv4
+dns|Ethernet 2|192.0.2.100|IPv4
+dns|Ethernet 2|192.0.2.101|IPv4
 dns|Tailscale|fec0:0:0:ffff::1|IPv6
 dns|Tailscale|fec0:0:0:ffff::2|IPv6
 dns|Tailscale|fec0:0:0:ffff::3|IPv6
-dns|Ethernet|194.168.4.100|IPv4
-dns|Ethernet|194.168.8.100|IPv4
+dns|Ethernet|192.0.2.100|IPv4
+dns|Ethernet|192.0.2.101|IPv4
 dns|OpenVPN Data Channel Offload for NordVPN|fec0:0:0:ffff::1|IPv6
 dns|OpenVPN Data Channel Offload for NordVPN|fec0:0:0:ffff::2|IPv6
 dns|OpenVPN Data Channel Offload for NordVPN|fec0:0:0:ffff::3|IPv6
@@ -297,8 +297,8 @@ cache_entry|77.177.109.100.in-addr.arpa|PTR|0|
 cache_entry|kubernetes.docker.internal|A|0|
 cache_entry|kubernetes.docker.internal|AAAA|0|
 cache_entry|ocsp.comodoca.com|A|0|
-cache_entry|the-rig.tail128eb2.ts.net|A|0|
-cache_entry|the-rig.tail128eb2.ts.net|AAAA|0|
+cache_entry|buildhost1.tail0a0a0a.ts.net|A|0|
+cache_entry|buildhost1.tail0a0a0a.ts.net|AAAA|0|
 … 12 of 52 rows shown
 [result_status] UNDECLARED / UNKNOWN
 
@@ -308,9 +308,9 @@ arp|Loopback Pseudo-Interface 1|239.255.255.250|-|static
 arp|OpenVPN Data Channel Offload for NordVPN|224.0.0.22|-|static
 arp|WiFi|224.0.0.22|01:00:5e:00:00:16|static
 arp|Local Area Connection|224.0.0.22|01:00:5e:00:00:16|static
-arp|Tailscale|100.75.167.98|-|incomplete
+arp|Tailscale|198.51.100.98|-|incomplete
 arp|Tailscale|100.100.100.100|-|incomplete
-arp|Tailscale|100.109.177.77|-|dynamic
+arp|Tailscale|198.51.100.77|-|dynamic
 arp|Tailscale|224.0.0.22|-|static
 arp|Tailscale|224.0.0.251|-|static
 arp|Tailscale|239.255.255.250|-|static
@@ -319,45 +319,45 @@ arp|Local Area Connection* 1|224.0.0.22|01:00:5e:00:00:16|static
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 3b5c27bfec23
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 3b5c27bfec23
 
 ```
 == action=adapters
 adapter|lo0|-|0|up
 adapter|gif0|-|0|down
 adapter|stf0|-|0|down
-adapter|anpi0|ca:36:a7:b0:f6:23|0|up
-adapter|anpi1|ca:36:a7:b0:f6:24|0|up
-adapter|anpi3|ca:36:a7:b0:f6:26|0|up
-adapter|en0|d0:11:e5:c0:a0:99|1000|up
-adapter|en5|ca:36:a7:b0:f6:03|0|up
-adapter|en6|ca:36:a7:b0:f6:04|0|up
-adapter|en7|ca:36:a7:b0:f6:06|0|up
-adapter|en2|36:d8:fb:d2:52:c0|0|up
-adapter|en3|36:d8:fb:d2:52:c4|0|up
+adapter|anpi0|00:00:5e:00:53:01|0|up
+adapter|anpi1|00:00:5e:00:53:02|0|up
+adapter|anpi3|00:00:5e:00:53:03|0|up
+adapter|en0|00:00:5e:00:53:04|1000|up
+adapter|en5|00:00:5e:00:53:05|0|up
+adapter|en6|00:00:5e:00:53:06|0|up
+adapter|en7|00:00:5e:00:53:07|0|up
+adapter|en2|00:00:5e:00:53:08|0|up
+adapter|en3|00:00:5e:00:53:09|0|up
 … 12 of 25 rows shown
 [result_status] UNDECLARED / UNKNOWN
 
 == action=ip_addresses
-ip|en0|fe80::9e:c46b:750c:b2eb|64|192.168.0.1
-ip|en0|192.168.0.66|24|192.168.0.1
-ip|llw0|fe80::58a0:84ff:fe32:a9a3|64|192.168.0.1
-ip|utun0|fe80::93eb:5451:9abf:3695|64|192.168.0.1
-ip|utun1|fe80::313e:505c:4e40:16c8|64|192.168.0.1
-ip|utun2|fe80::fa0e:b15e:9046:683d|64|192.168.0.1
-ip|utun3|fe80::ce81:b1c:bd2c:69e|64|192.168.0.1
-ip|utun4|fe80::d211:e5ff:fec0:a099|64|192.168.0.1
-ip|utun4|100.109.177.77|32|192.168.0.1
-ip|utun4|fd7a:115c:a1e0::e032:b14f|48|192.168.0.1
-ip|utun5|fe80::b145:6483:7c96:77fa|64|192.168.0.1
-ip|utun6|fe80::68ce:f640:7c7a:bb05|64|192.168.0.1
+ip|en0|fe80::9e:c46b:750c:b2eb|64|203.0.113.1
+ip|en0|203.0.113.66|24|203.0.113.1
+ip|llw0|fe80::58a0:84ff:fe32:a9a3|64|203.0.113.1
+ip|utun0|fe80::93eb:5451:9abf:3695|64|203.0.113.1
+ip|utun1|fe80::313e:505c:4e40:16c8|64|203.0.113.1
+ip|utun2|fe80::fa0e:b15e:9046:683d|64|203.0.113.1
+ip|utun3|fe80::ce81:b1c:bd2c:69e|64|203.0.113.1
+ip|utun4|fe80::d211:e5ff:fec0:a099|64|203.0.113.1
+ip|utun4|198.51.100.77|32|203.0.113.1
+ip|utun4|fd7a:115c:a1e0::1234:5678|48|203.0.113.1
+ip|utun5|fe80::b145:6483:7c96:77fa|64|203.0.113.1
+ip|utun6|fe80::68ce:f640:7c7a:bb05|64|203.0.113.1
 [result_status] UNDECLARED / UNKNOWN
 
 == action=dns_servers
 dns|system|100.100.100.100|IPv4
 dns|system|fd7a:115c:a1e0::53|IPv6
-dns|system|194.168.4.100|IPv4
-dns|system|194.168.8.100|IPv4
+dns|system|192.0.2.100|IPv4
+dns|system|192.0.2.101|IPv4
 [result_status] UNDECLARED / UNKNOWN
 
 == action=proxy
@@ -370,18 +370,18 @@ dns_cache|unsupported|macOS does not expose DNS resolver cache contents
 [result_status] UNDECLARED / UNKNOWN
 
 == action=arp
-arp|-|192.168.0.1|b0:5b:99:ee:d0:32|-
-arp|-|192.168.0.61|1c:53:f9:73:22:6c|-
-arp|-|192.168.0.71|00:17:88:a6:b2:13|-
-arp|-|192.168.0.131|fc:34:97:65:1e:0a|-
-arp|-|192.168.0.138|c2:4e:eb:d7:1f:62|-
-arp|-|192.168.0.140|ce:e1:48:d3:04:97|-
-arp|-|192.168.0.179|b6:08:a0:6a:2d:de|-
-arp|-|192.168.0.197|8e:6e:21:3a:d8:1f|-
-arp|-|192.168.0.210|5c:3e:1b:ef:97:02|-
-arp|-|192.168.0.222|de:75:77:1a:d2:d9|-
-arp|-|192.168.0.238|34:cd:b0:ad:8a:b4|-
-arp|-|192.168.0.246|d8:8c:79:47:1d:43|-
+arp|-|203.0.113.1|00:00:5e:00:53:0e|-
+arp|-|203.0.113.61|00:00:5e:00:53:0f|-
+arp|-|203.0.113.71|00:00:5e:00:53:10|-
+arp|-|203.0.113.131|00:00:5e:00:53:11|-
+arp|-|203.0.113.138|00:00:5e:00:53:12|-
+arp|-|203.0.113.140|00:00:5e:00:53:13|-
+arp|-|203.0.113.179|00:00:5e:00:53:14|-
+arp|-|203.0.113.197|00:00:5e:00:53:15|-
+arp|-|203.0.113.210|00:00:5e:00:53:16|-
+arp|-|203.0.113.222|00:00:5e:00:53:17|-
+arp|-|203.0.113.238|00:00:5e:00:53:18|-
+arp|-|203.0.113.246|00:00:5e:00:53:19|-
 … 12 of 15 rows shown
 [result_status] UNDECLARED / UNKNOWN
 ```

@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 0e82a6f385ea
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 0e82a6f385ea
 == action=version
 version|0.13.1+5871
 build_number|5871
@@ -8,7 +8,7 @@ git_commit|4c377398e
 == action=info
 os|Darwin
 arch|arm64
-hostname|braga.local
+hostname|workstation1.local
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=health

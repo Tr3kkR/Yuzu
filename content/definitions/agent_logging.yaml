@@ -115,7 +115,7 @@ spec:
         type: string
         description: >-
           Absolute path of a discovered agent file (executable, log file, config file, data store, plugin file, or TLS certificate/key). Values: absolute path.
-        example: "/private/tmp/claude-501/-Users-alex-yuzu-dev/8d89cd79-001b-4ea8-8930-0c9affb3265e/scratchpad/d2/plugin_capture"
+        example: "/private/tmp/claude-501/-Users-jsmith-yuzu-dev/00000000-0000-0000-0000-000000000000/scratchpad/d2/plugin_capture"
         platforms: [windows, linux, darwin]
       - name: size
         type: int64

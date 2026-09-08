@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 9139daeb45d2
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 9139daeb45d2
 == action=list
 proc|1|/sbin/launchd
 proc|399|/usr/libexec/logd
@@ -550,12 +550,12 @@ proc|1308|/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (
 proc|1309|/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper.app/Contents/MacOS/Code Helper
 proc|1310|/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper.app/Contents/MacOS/Code Helper
 proc|1320|/usr/libexec/icloudmailagent
-proc|1322|/Users/alex/.vscode/extensions/openai.chatgpt-26.901.22334-darwin-arm64/bin/macos-aarch64/codex
+proc|1322|/Users/jsmith/.vscode/extensions/openai.chatgpt-26.901.22334-darwin-arm64/bin/macos-aarch64/codex
 proc|1338|/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper.app/Contents/MacOS/Code Helper
 proc|1341|/System/Library/PrivateFrameworks/AppleNeuralEngine.framework/XPCServices/ANECompilerService.xpc/Contents/MacOS/ANECompilerService
 proc|1343|/Applications/Signal.app/Contents/Frameworks/Signal Helper (Renderer).app/Contents/MacOS/Signal Helper (Renderer)
-proc|1370|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
-proc|1390|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
+proc|1370|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
+proc|1390|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
 proc|1437|/System/Volumes/Preboot/Cryptexes/Incoming/OS/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.Networking.xpc/Contents/MacOS/com.apple.WebKit.Networking
 proc|1438|/System/Volumes/Preboot/Cryptexes/App/usr/libexec/SafariLaunchAgent
 proc|1440|/Applications/Spotify.app/Contents/MacOS/Spotify
@@ -607,7 +607,7 @@ proc|1519|/System/Library/Frameworks/Metal.framework/Versions/A/XPCServices/MTLC
 proc|1520|/System/Library/Frameworks/Metal.framework/Versions/A/XPCServices/MTLCompilerService.xpc/Contents/MacOS/MTLCompilerService
 proc|1522|/System/Library/PrivateFrameworks/HearingCore.framework/heard
 proc|1526|/System/Library/Image Capture/Support/icdd
-proc|1527|/Users/alex/Library/Caches/net.whatsapp.WhatsApp/org.sparkle-project.Sparkle/Launcher/LTxMS6mZK/Updater.app/Contents/MacOS/Updater
+proc|1527|/Users/jsmith/Library/Caches/net.whatsapp.WhatsApp/org.sparkle-project.Sparkle/Launcher/LTxMS6mZK/Updater.app/Contents/MacOS/Updater
 proc|1528|/System/Library/PrivateFrameworks/AskPermission.framework/Versions/A/Resources/askpermissiond
 proc|1530|/System/Library/CoreServices/AirPlayUIAgent.app/Contents/MacOS/AirPlayUIAgent
 proc|1533|/opt/homebrew/Cellar/postgresql@18/18.6/bin/postgres
@@ -795,9 +795,9 @@ proc|8966|/Applications/Signal.app/Contents/Frameworks/Signal Helper.app/Content
 proc|8967|/Applications/Signal.app/Contents/Frameworks/Signal Helper.app/Contents/MacOS/Signal Helper
 proc|8968|/System/Library/Frameworks/Metal.framework/Versions/A/XPCServices/MTLCompilerService.xpc/Contents/MacOS/MTLCompilerService
 proc|8969|/System/Library/Frameworks/Metal.framework/Versions/A/XPCServices/MTLCompilerService.xpc/Contents/MacOS/MTLCompilerService
-proc|8979|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
-proc|9001|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
-proc|9039|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
+proc|8979|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
+proc|9001|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
+proc|9039|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
 proc|9064|/System/Library/Frameworks/ApplicationServices.framework/Versions/A/Frameworks/SpeechSynthesis.framework/Versions/A/XPCServices/SpeechSynthesisServerXPC.xpc/Contents/MacOS/SpeechSynthesisServerXPC
 proc|9098|/usr/bin/ssh-agent
 proc|9100|/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Renderer).app/Contents/MacOS/Code Helper (Renderer)
@@ -816,7 +816,7 @@ proc|10119|/System/Library/Frameworks/CoreServices.framework/Versions/A/Framewor
 proc|10120|/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared
 proc|10121|/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared
 proc|10125|/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Plugin).app/Contents/MacOS/Code Helper (Plugin)
-proc|10141|/private/tmp/claude-501/-Users-alex-yuzu-dev/8d89cd79-001b-4ea8-8930-0c9affb3265e/scratchpad/d2/plugin_capture
+proc|10141|/private/tmp/claude-501/-Users-jsmith-yuzu-dev/00000000-0000-0000-0000-000000000000/scratchpad/d2/plugin_capture
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=list_hashed
@@ -1370,12 +1370,12 @@ proc|1308|/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (
 proc|1309|/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper.app/Contents/MacOS/Code Helper|dd1c3543f34c38b52f1cbbd532f7502f380e1b0a56b3583038b57cbc6dbfb362|/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper.app/Contents/MacOS/Code Helper
 proc|1310|/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper.app/Contents/MacOS/Code Helper|dd1c3543f34c38b52f1cbbd532f7502f380e1b0a56b3583038b57cbc6dbfb362|/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper.app/Contents/MacOS/Code Helper
 proc|1320|/usr/libexec/icloudmailagent|3a33b01789e543f71c6aab9a068ae966db8c0cb200408c8fe84e9cc8829217bc|/usr/libexec/icloudmailagent
-proc|1322|/Users/alex/.vscode/extensions/openai.chatgpt-26.901.22334-darwin-arm64/bin/macos-aarch64/codex|a29d9e86eef88cbbd69f97ce8c590b1d0a287c8f77424f5eef226b883d7eaa22|/Users/alex/.vscode/extensions/openai.chatgpt-26.901.22334-darwin-arm64/bin/macos-aarch64/codex
+proc|1322|/Users/jsmith/.vscode/extensions/openai.chatgpt-26.901.22334-darwin-arm64/bin/macos-aarch64/codex|a29d9e86eef88cbbd69f97ce8c590b1d0a287c8f77424f5eef226b883d7eaa22|/Users/jsmith/.vscode/extensions/openai.chatgpt-26.901.22334-darwin-arm64/bin/macos-aarch64/codex
 proc|1338|/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper.app/Contents/MacOS/Code Helper|dd1c3543f34c38b52f1cbbd532f7502f380e1b0a56b3583038b57cbc6dbfb362|/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper.app/Contents/MacOS/Code Helper
 proc|1341|/System/Library/PrivateFrameworks/AppleNeuralEngine.framework/XPCServices/ANECompilerService.xpc/Contents/MacOS/ANECompilerService|a15044361ce8821a450c170f6495cbc22f9eeefdb92d4228628c626df2822533|/System/Library/PrivateFrameworks/AppleNeuralEngine.framework/XPCServices/ANECompilerService.xpc/Contents/MacOS/ANECompilerService
 proc|1343|/Applications/Signal.app/Contents/Frameworks/Signal Helper (Renderer).app/Contents/MacOS/Signal Helper (Renderer)|d6a1327830dd685642bff6c107b611984f6ba13f42ecb3d93e239e84be07f5ec|/Applications/Signal.app/Contents/Frameworks/Signal Helper (Renderer).app/Contents/MacOS/Signal Helper (Renderer)
-proc|1370|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude|ef5d2909c8af49f31ab6d5487e90316777bc2fac170adfe8160716caa8aaf4f9|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
-proc|1390|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude|ef5d2909c8af49f31ab6d5487e90316777bc2fac170adfe8160716caa8aaf4f9|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
+proc|1370|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude|ef5d2909c8af49f31ab6d5487e90316777bc2fac170adfe8160716caa8aaf4f9|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
+proc|1390|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude|ef5d2909c8af49f31ab6d5487e90316777bc2fac170adfe8160716caa8aaf4f9|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
 proc|1437|/System/Volumes/Preboot/Cryptexes/Incoming/OS/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.Networking.xpc/Contents/MacOS/com.apple.WebKit.Networking|a3e995f7b13449608f643b851c6f972bb6cc7833fac687bb6a9a687a70dc9771|/System/Volumes/Preboot/Cryptexes/Incoming/OS/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.Networking.xpc/Contents/MacOS/com.apple.WebKit.Networking
 proc|1438|/System/Volumes/Preboot/Cryptexes/App/usr/libexec/SafariLaunchAgent|f74529811cb7b97d8628f8389fc24b089f4a722e430aab6664a1bd44431324e8|/System/Volumes/Preboot/Cryptexes/App/usr/libexec/SafariLaunchAgent
 proc|1440|/Applications/Spotify.app/Contents/MacOS/Spotify|e3e6e4e00c873ac21ae71dadaab74ebd902d452ac938ca2bf9bf4c74a8ed0512|/Applications/Spotify.app/Contents/MacOS/Spotify
@@ -1427,7 +1427,7 @@ proc|1519|/System/Library/Frameworks/Metal.framework/Versions/A/XPCServices/MTLC
 proc|1520|/System/Library/Frameworks/Metal.framework/Versions/A/XPCServices/MTLCompilerService.xpc/Contents/MacOS/MTLCompilerService|4262e71f2412adcd66ec052611bc76a8f8c5477f38bd21f8094cf2ec0ee66256|/System/Library/Frameworks/Metal.framework/Versions/A/XPCServices/MTLCompilerService.xpc/Contents/MacOS/MTLCompilerService
 proc|1522|/System/Library/PrivateFrameworks/HearingCore.framework/heard|1d4c7927006261b6babd1c1c84ad51181a3359f1e7b519b9870365910fd1bfcc|/System/Library/PrivateFrameworks/HearingCore.framework/heard
 proc|1526|/System/Library/Image Capture/Support/icdd|849a149dd191c6a531627041fa8c9abb7862b5b0d9590e76d6ed7c7e8739cecb|/System/Library/Image Capture/Support/icdd
-proc|1527|/Users/alex/Library/Caches/net.whatsapp.WhatsApp/org.sparkle-project.Sparkle/Launcher/LTxMS6mZK/Updater.app/Contents/MacOS/Updater|3e8fc9f344f4f60934f37b31568c7a23a09b86ad8924a042d8d51c36dd525e92|/Users/alex/Library/Caches/net.whatsapp.WhatsApp/org.sparkle-project.Sparkle/Launcher/LTxMS6mZK/Updater.app/Contents/MacOS/Updater
+proc|1527|/Users/jsmith/Library/Caches/net.whatsapp.WhatsApp/org.sparkle-project.Sparkle/Launcher/LTxMS6mZK/Updater.app/Contents/MacOS/Updater|3e8fc9f344f4f60934f37b31568c7a23a09b86ad8924a042d8d51c36dd525e92|/Users/jsmith/Library/Caches/net.whatsapp.WhatsApp/org.sparkle-project.Sparkle/Launcher/LTxMS6mZK/Updater.app/Contents/MacOS/Updater
 proc|1528|/System/Library/PrivateFrameworks/AskPermission.framework/Versions/A/Resources/askpermissiond|f2ceaa95a3f04644e352f1e9705b3c11af5569da1237d3987f848a6c28977e56|/System/Library/PrivateFrameworks/AskPermission.framework/Versions/A/Resources/askpermissiond
 proc|1530|/System/Library/CoreServices/AirPlayUIAgent.app/Contents/MacOS/AirPlayUIAgent|f17d304fea7da6203aeccc624714c81f0f55d8403ed08f7b7a1b3d1c2d923da4|/System/Library/CoreServices/AirPlayUIAgent.app/Contents/MacOS/AirPlayUIAgent
 proc|1533|/opt/homebrew/Cellar/postgresql@18/18.6/bin/postgres|db04623906717b3f12df02e2285e8f9990c8ebbb1c9be78a4b1f18afb2361425|/opt/homebrew/Cellar/postgresql@18/18.6/bin/postgres
@@ -1615,9 +1615,9 @@ proc|8966|/Applications/Signal.app/Contents/Frameworks/Signal Helper.app/Content
 proc|8967|/Applications/Signal.app/Contents/Frameworks/Signal Helper.app/Contents/MacOS/Signal Helper|0ecdda9802bea78f852022a673f37cbdc4f5310d5177956bdc2f271dfc147cc9|/Applications/Signal.app/Contents/Frameworks/Signal Helper.app/Contents/MacOS/Signal Helper
 proc|8968|/System/Library/Frameworks/Metal.framework/Versions/A/XPCServices/MTLCompilerService.xpc/Contents/MacOS/MTLCompilerService|4262e71f2412adcd66ec052611bc76a8f8c5477f38bd21f8094cf2ec0ee66256|/System/Library/Frameworks/Metal.framework/Versions/A/XPCServices/MTLCompilerService.xpc/Contents/MacOS/MTLCompilerService
 proc|8969|/System/Library/Frameworks/Metal.framework/Versions/A/XPCServices/MTLCompilerService.xpc/Contents/MacOS/MTLCompilerService|4262e71f2412adcd66ec052611bc76a8f8c5477f38bd21f8094cf2ec0ee66256|/System/Library/Frameworks/Metal.framework/Versions/A/XPCServices/MTLCompilerService.xpc/Contents/MacOS/MTLCompilerService
-proc|8979|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude|ef5d2909c8af49f31ab6d5487e90316777bc2fac170adfe8160716caa8aaf4f9|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
-proc|9001|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude|ef5d2909c8af49f31ab6d5487e90316777bc2fac170adfe8160716caa8aaf4f9|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
-proc|9039|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude|ef5d2909c8af49f31ab6d5487e90316777bc2fac170adfe8160716caa8aaf4f9|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
+proc|8979|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude|ef5d2909c8af49f31ab6d5487e90316777bc2fac170adfe8160716caa8aaf4f9|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
+proc|9001|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude|ef5d2909c8af49f31ab6d5487e90316777bc2fac170adfe8160716caa8aaf4f9|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
+proc|9039|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude|ef5d2909c8af49f31ab6d5487e90316777bc2fac170adfe8160716caa8aaf4f9|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
 proc|9064|/System/Library/Frameworks/ApplicationServices.framework/Versions/A/Frameworks/SpeechSynthesis.framework/Versions/A/XPCServices/SpeechSynthesisServerXPC.xpc/Contents/MacOS/SpeechSynthesisServerXPC|d5bf7f2d2780fad48956899480783ed96ae7d0b3696d13294bcb148f0027023a|/System/Library/Frameworks/ApplicationServices.framework/Versions/A/Frameworks/SpeechSynthesis.framework/Versions/A/XPCServices/SpeechSynthesisServerXPC.xpc/Contents/MacOS/SpeechSynthesisServerXPC
 proc|9098|/usr/bin/ssh-agent|66ec220a9beb1039c15f302693fa3da744ca941e6eb090e9aac8fa90aac35e75|/usr/bin/ssh-agent
 proc|9100|/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Renderer).app/Contents/MacOS/Code Helper (Renderer)|186978ccecf7a390a29e4357394360c72db51b762466b754e230dd8d5375c0f3|/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Renderer).app/Contents/MacOS/Code Helper (Renderer)
@@ -1636,7 +1636,7 @@ proc|10119|/System/Library/Frameworks/CoreServices.framework/Versions/A/Framewor
 proc|10120|/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared|136013efa46b151fb7910b6aa2cef99af168d7968764218b2d8e01ed63cd3935|/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared
 proc|10121|/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared|136013efa46b151fb7910b6aa2cef99af168d7968764218b2d8e01ed63cd3935|/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared
 proc|10125|/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Plugin).app/Contents/MacOS/Code Helper (Plugin)|87377df56928e053d824db72ae9084a0c63d9f27e46ba507ee5483957d03e2ac|/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Plugin).app/Contents/MacOS/Code Helper (Plugin)
-proc|10142|/private/tmp/claude-501/-Users-alex-yuzu-dev/8d89cd79-001b-4ea8-8930-0c9affb3265e/scratchpad/d2/plugin_capture|b1d5bf066d75c96c1bce63d38699369c5a61fc8335ed1ce960c2b44e4603b472|/private/tmp/claude-501/-Users-alex-yuzu-dev/8d89cd79-001b-4ea8-8930-0c9affb3265e/scratchpad/d2/plugin_capture
+proc|10142|/private/tmp/claude-501/-Users-jsmith-yuzu-dev/00000000-0000-0000-0000-000000000000/scratchpad/d2/plugin_capture|b1d5bf066d75c96c1bce63d38699369c5a61fc8335ed1ce960c2b44e4603b472|/private/tmp/claude-501/-Users-jsmith-yuzu-dev/00000000-0000-0000-0000-000000000000/scratchpad/d2/plugin_capture
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=list_tree
@@ -2190,12 +2190,12 @@ proc|1308|1170|/Applications/Visual Studio Code.app/Contents/Frameworks/Code Hel
 proc|1309|1170|/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper.app/Contents/MacOS/Code Helper|dd1c3543f34c38b52f1cbbd532f7502f380e1b0a56b3583038b57cbc6dbfb362|/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper.app/Contents/MacOS/Code Helper
 proc|1310|1170|/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper.app/Contents/MacOS/Code Helper|dd1c3543f34c38b52f1cbbd532f7502f380e1b0a56b3583038b57cbc6dbfb362|/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper.app/Contents/MacOS/Code Helper
 proc|1320|1|/usr/libexec/icloudmailagent|3a33b01789e543f71c6aab9a068ae966db8c0cb200408c8fe84e9cc8829217bc|/usr/libexec/icloudmailagent
-proc|1322|1302|/Users/alex/.vscode/extensions/openai.chatgpt-26.901.22334-darwin-arm64/bin/macos-aarch64/codex|a29d9e86eef88cbbd69f97ce8c590b1d0a287c8f77424f5eef226b883d7eaa22|/Users/alex/.vscode/extensions/openai.chatgpt-26.901.22334-darwin-arm64/bin/macos-aarch64/codex
+proc|1322|1302|/Users/jsmith/.vscode/extensions/openai.chatgpt-26.901.22334-darwin-arm64/bin/macos-aarch64/codex|a29d9e86eef88cbbd69f97ce8c590b1d0a287c8f77424f5eef226b883d7eaa22|/Users/jsmith/.vscode/extensions/openai.chatgpt-26.901.22334-darwin-arm64/bin/macos-aarch64/codex
 proc|1338|1301|/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper.app/Contents/MacOS/Code Helper|dd1c3543f34c38b52f1cbbd532f7502f380e1b0a56b3583038b57cbc6dbfb362|/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper.app/Contents/MacOS/Code Helper
 proc|1341|1|/System/Library/PrivateFrameworks/AppleNeuralEngine.framework/XPCServices/ANECompilerService.xpc/Contents/MacOS/ANECompilerService|a15044361ce8821a450c170f6495cbc22f9eeefdb92d4228628c626df2822533|/System/Library/PrivateFrameworks/AppleNeuralEngine.framework/XPCServices/ANECompilerService.xpc/Contents/MacOS/ANECompilerService
 proc|1343|1173|/Applications/Signal.app/Contents/Frameworks/Signal Helper (Renderer).app/Contents/MacOS/Signal Helper (Renderer)|d6a1327830dd685642bff6c107b611984f6ba13f42ecb3d93e239e84be07f5ec|/Applications/Signal.app/Contents/Frameworks/Signal Helper (Renderer).app/Contents/MacOS/Signal Helper (Renderer)
-proc|1370|1302|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude|ef5d2909c8af49f31ab6d5487e90316777bc2fac170adfe8160716caa8aaf4f9|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
-proc|1390|1302|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude|ef5d2909c8af49f31ab6d5487e90316777bc2fac170adfe8160716caa8aaf4f9|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
+proc|1370|1302|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude|ef5d2909c8af49f31ab6d5487e90316777bc2fac170adfe8160716caa8aaf4f9|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
+proc|1390|1302|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude|ef5d2909c8af49f31ab6d5487e90316777bc2fac170adfe8160716caa8aaf4f9|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
 proc|1437|1|/System/Volumes/Preboot/Cryptexes/Incoming/OS/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.Networking.xpc/Contents/MacOS/com.apple.WebKit.Networking|a3e995f7b13449608f643b851c6f972bb6cc7833fac687bb6a9a687a70dc9771|/System/Volumes/Preboot/Cryptexes/Incoming/OS/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.Networking.xpc/Contents/MacOS/com.apple.WebKit.Networking
 proc|1438|1|/System/Volumes/Preboot/Cryptexes/App/usr/libexec/SafariLaunchAgent|f74529811cb7b97d8628f8389fc24b089f4a722e430aab6664a1bd44431324e8|/System/Volumes/Preboot/Cryptexes/App/usr/libexec/SafariLaunchAgent
 proc|1440|1|/Applications/Spotify.app/Contents/MacOS/Spotify|e3e6e4e00c873ac21ae71dadaab74ebd902d452ac938ca2bf9bf4c74a8ed0512|/Applications/Spotify.app/Contents/MacOS/Spotify
@@ -2247,7 +2247,7 @@ proc|1519|1|/System/Library/Frameworks/Metal.framework/Versions/A/XPCServices/MT
 proc|1520|1|/System/Library/Frameworks/Metal.framework/Versions/A/XPCServices/MTLCompilerService.xpc/Contents/MacOS/MTLCompilerService|4262e71f2412adcd66ec052611bc76a8f8c5477f38bd21f8094cf2ec0ee66256|/System/Library/Frameworks/Metal.framework/Versions/A/XPCServices/MTLCompilerService.xpc/Contents/MacOS/MTLCompilerService
 proc|1522|1|/System/Library/PrivateFrameworks/HearingCore.framework/heard|1d4c7927006261b6babd1c1c84ad51181a3359f1e7b519b9870365910fd1bfcc|/System/Library/PrivateFrameworks/HearingCore.framework/heard
 proc|1526|1|/System/Library/Image Capture/Support/icdd|849a149dd191c6a531627041fa8c9abb7862b5b0d9590e76d6ed7c7e8739cecb|/System/Library/Image Capture/Support/icdd
-proc|1527|1|/Users/alex/Library/Caches/net.whatsapp.WhatsApp/org.sparkle-project.Sparkle/Launcher/LTxMS6mZK/Updater.app/Contents/MacOS/Updater|3e8fc9f344f4f60934f37b31568c7a23a09b86ad8924a042d8d51c36dd525e92|/Users/alex/Library/Caches/net.whatsapp.WhatsApp/org.sparkle-project.Sparkle/Launcher/LTxMS6mZK/Updater.app/Contents/MacOS/Updater
+proc|1527|1|/Users/jsmith/Library/Caches/net.whatsapp.WhatsApp/org.sparkle-project.Sparkle/Launcher/LTxMS6mZK/Updater.app/Contents/MacOS/Updater|3e8fc9f344f4f60934f37b31568c7a23a09b86ad8924a042d8d51c36dd525e92|/Users/jsmith/Library/Caches/net.whatsapp.WhatsApp/org.sparkle-project.Sparkle/Launcher/LTxMS6mZK/Updater.app/Contents/MacOS/Updater
 proc|1528|1|/System/Library/PrivateFrameworks/AskPermission.framework/Versions/A/Resources/askpermissiond|f2ceaa95a3f04644e352f1e9705b3c11af5569da1237d3987f848a6c28977e56|/System/Library/PrivateFrameworks/AskPermission.framework/Versions/A/Resources/askpermissiond
 proc|1530|1|/System/Library/CoreServices/AirPlayUIAgent.app/Contents/MacOS/AirPlayUIAgent|f17d304fea7da6203aeccc624714c81f0f55d8403ed08f7b7a1b3d1c2d923da4|/System/Library/CoreServices/AirPlayUIAgent.app/Contents/MacOS/AirPlayUIAgent
 proc|1533|1|/opt/homebrew/Cellar/postgresql@18/18.6/bin/postgres|db04623906717b3f12df02e2285e8f9990c8ebbb1c9be78a4b1f18afb2361425|/opt/homebrew/Cellar/postgresql@18/18.6/bin/postgres
@@ -2435,9 +2435,9 @@ proc|8966|1173|/Applications/Signal.app/Contents/Frameworks/Signal Helper.app/Co
 proc|8967|1173|/Applications/Signal.app/Contents/Frameworks/Signal Helper.app/Contents/MacOS/Signal Helper|0ecdda9802bea78f852022a673f37cbdc4f5310d5177956bdc2f271dfc147cc9|/Applications/Signal.app/Contents/Frameworks/Signal Helper.app/Contents/MacOS/Signal Helper
 proc|8968|1|/System/Library/Frameworks/Metal.framework/Versions/A/XPCServices/MTLCompilerService.xpc/Contents/MacOS/MTLCompilerService|4262e71f2412adcd66ec052611bc76a8f8c5477f38bd21f8094cf2ec0ee66256|/System/Library/Frameworks/Metal.framework/Versions/A/XPCServices/MTLCompilerService.xpc/Contents/MacOS/MTLCompilerService
 proc|8969|1|/System/Library/Frameworks/Metal.framework/Versions/A/XPCServices/MTLCompilerService.xpc/Contents/MacOS/MTLCompilerService|4262e71f2412adcd66ec052611bc76a8f8c5477f38bd21f8094cf2ec0ee66256|/System/Library/Frameworks/Metal.framework/Versions/A/XPCServices/MTLCompilerService.xpc/Contents/MacOS/MTLCompilerService
-proc|8979|1302|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude|ef5d2909c8af49f31ab6d5487e90316777bc2fac170adfe8160716caa8aaf4f9|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
-proc|9001|1302|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude|ef5d2909c8af49f31ab6d5487e90316777bc2fac170adfe8160716caa8aaf4f9|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
-proc|9039|1302|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude|ef5d2909c8af49f31ab6d5487e90316777bc2fac170adfe8160716caa8aaf4f9|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
+proc|8979|1302|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude|ef5d2909c8af49f31ab6d5487e90316777bc2fac170adfe8160716caa8aaf4f9|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
+proc|9001|1302|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude|ef5d2909c8af49f31ab6d5487e90316777bc2fac170adfe8160716caa8aaf4f9|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
+proc|9039|1302|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude|ef5d2909c8af49f31ab6d5487e90316777bc2fac170adfe8160716caa8aaf4f9|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
 proc|9064|1|/System/Library/Frameworks/ApplicationServices.framework/Versions/A/Frameworks/SpeechSynthesis.framework/Versions/A/XPCServices/SpeechSynthesisServerXPC.xpc/Contents/MacOS/SpeechSynthesisServerXPC|d5bf7f2d2780fad48956899480783ed96ae7d0b3696d13294bcb148f0027023a|/System/Library/Frameworks/ApplicationServices.framework/Versions/A/Frameworks/SpeechSynthesis.framework/Versions/A/XPCServices/SpeechSynthesisServerXPC.xpc/Contents/MacOS/SpeechSynthesisServerXPC
 proc|9098|1|/usr/bin/ssh-agent|66ec220a9beb1039c15f302693fa3da744ca941e6eb090e9aac8fa90aac35e75|/usr/bin/ssh-agent
 proc|9100|1170|/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Renderer).app/Contents/MacOS/Code Helper (Renderer)|186978ccecf7a390a29e4357394360c72db51b762466b754e230dd8d5375c0f3|/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Renderer).app/Contents/MacOS/Code Helper (Renderer)
@@ -2457,7 +2457,7 @@ proc|10120|1|/System/Library/Frameworks/CoreServices.framework/Versions/A/Framew
 proc|10121|1|/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared|136013efa46b151fb7910b6aa2cef99af168d7968764218b2d8e01ed63cd3935|/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared
 proc|10125|1302|/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Plugin).app/Contents/MacOS/Code Helper (Plugin)|87377df56928e053d824db72ae9084a0c63d9f27e46ba507ee5483957d03e2ac|/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Plugin).app/Contents/MacOS/Code Helper (Plugin)
 proc|10143|1|/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared|136013efa46b151fb7910b6aa2cef99af168d7968764218b2d8e01ed63cd3935|/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared
-proc|10144|9603|/private/tmp/claude-501/-Users-alex-yuzu-dev/8d89cd79-001b-4ea8-8930-0c9affb3265e/scratchpad/d2/plugin_capture|b1d5bf066d75c96c1bce63d38699369c5a61fc8335ed1ce960c2b44e4603b472|/private/tmp/claude-501/-Users-alex-yuzu-dev/8d89cd79-001b-4ea8-8930-0c9affb3265e/scratchpad/d2/plugin_capture
+proc|10144|9603|/private/tmp/claude-501/-Users-jsmith-yuzu-dev/00000000-0000-0000-0000-000000000000/scratchpad/d2/plugin_capture|b1d5bf066d75c96c1bce63d38699369c5a61fc8335ed1ce960c2b44e4603b472|/private/tmp/claude-501/-Users-jsmith-yuzu-dev/00000000-0000-0000-0000-000000000000/scratchpad/d2/plugin_capture
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=query name=launchd

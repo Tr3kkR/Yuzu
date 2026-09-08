@@ -204,7 +204,7 @@
     {
       "grant": "**`sudo -n` NOPASSWD grants** for `/usr/bin/dscacheutil -flushcache` and `/usr/bin/killall -HUP mDNSResponder`, installed by `install-agent-user.sh`; skipped only when the agent is already root.",
       "if_refused": "a missing/refused sudo grant reports `status|error` plus a `detail|dscacheutil: ...` / `detail|mDNSResponder: ...` line carrying the captured command output",
-      "measured": "2026-09-07, bare-metal macOS 26.6.2, euid 501 (alex)",
+      "measured": "2026-09-07, bare-metal macOS 26.6.2, euid 501 (jsmith)",
       "os": "macOS",
       "runs_as": "agent daemon (measured unprivileged)"
     },
@@ -319,7 +319,7 @@
         "leg_hash": "a44c8631e3c1",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
-        "privilege": "euid 501 (alex)"
+        "privilege": "euid 501 (jsmith)"
       }
     },
     "windows": {

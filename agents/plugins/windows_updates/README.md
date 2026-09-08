@@ -232,7 +232,7 @@ summary|targets_tested|3|targets_reachable|3|targets_failed|0
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 007b2e86015f
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 007b2e86015f
 
 ```
 == action=installed

@@ -45,7 +45,7 @@ flowchart LR
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
 | Windows | agent service account — registered as **LocalSystem** today (#1442; `docs/agent-privilege-model.md` Correction, 2026-07-03) | None — `os_info.*` row is `default` (`docs/agent-privilege-model.md:84`) | 2026-09-07, bare-metal, `SYSTEM` (windows.txt sample stamp) | the affected field falls back to its literal (`unknown`, or the bare `Windows`/`macOS` name); no dedicated denial path — result status stays `UNDECLARED` regardless |
-| macOS | agent LaunchDaemon — runs as **root** today (no `UserName` key; `docs/agent-privilege-model.md` TL;DR) | None — `os_info.*` row is `default` | 2026-09-07, bare-metal, euid 501 (alex) — the capture ran **unprivileged**, not as the deployed root daemon (macos.txt sample stamp) | same fallback-to-literal behavior |
+| macOS | agent LaunchDaemon — runs as **root** today (no `UserName` key; `docs/agent-privilege-model.md` TL;DR) | None — `os_info.*` row is `default` | 2026-09-07, bare-metal, euid 501 (jsmith) — the capture ran **unprivileged**, not as the deployed root daemon (macos.txt sample stamp) | same fallback-to-literal behavior |
 | Linux | agent daemon — unprivileged `yuzu` account by design (`docs/agent-privilege-model.md` TL;DR); `os_info.*` needs nothing beyond default | None | 2026-09-06, container, euid 0 — the capture ran as **root**, not the intended unprivileged account (linux.txt sample stamp) | same fallback-to-literal behavior |
 
 None — every leg reads native OS surfaces in-process (files, registry, sysctl, `uname`); zero subprocesses anywhere (`os_info_plugin.cpp:381-388`; confirmed by `changelog.d/20260819-wave3-pr31-syscall-promotion.changed.md`, which removed the last macOS `sw_vers` shell-out). No network access.
@@ -138,7 +138,7 @@ uptime_display|0d 19h 13m
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 45e627d9dfa2
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 45e627d9dfa2
 
 ```
 == action=os_name

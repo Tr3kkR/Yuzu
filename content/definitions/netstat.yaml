@@ -51,7 +51,7 @@ spec:
       - name: local_addr
         type: string
         description: "The connection's local IP address, in the address family matching proto. Values: free text (IPv4 or IPv6 address)."
-        example: "100.109.177.77"
+        example: "198.51.100.77"
         platforms: [windows, linux, darwin]
       - name: local_port
         type: int32
@@ -62,7 +62,7 @@ spec:
         type: string
         description: >-
           The connection's remote IP address. UDP sockets report the literal '*' on macOS and Windows (no fixed peer); Linux instead parses the real value from /proc/net/udp* (normally 0.0.0.0). Values: free text (IPv4 or IPv6 address) or "*".
-        example: "100.123.53.121"
+        example: "198.51.100.121"
         platforms: [windows, linux, darwin]
       - name: remote_port
         type: int32

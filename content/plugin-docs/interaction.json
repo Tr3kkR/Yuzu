@@ -631,7 +631,7 @@
     {
       "grant": "None — but no LaunchDaemon has a reachable Aqua/GUI session by design",
       "if_refused": "`status|unavailable|no reachable GUI session` (`notify`) or `status|not_reachable` (`message_box`/`input`/`survey`)",
-      "measured": "2026-09-07, bare-metal, as euid 501 (alex) — an interactive logged-in user, **not** the production root-daemon posture",
+      "measured": "2026-09-07, bare-metal, as euid 501 (jsmith) — an interactive logged-in user, **not** the production root-daemon posture",
       "os": "macOS",
       "runs_as": "root (shipped LaunchDaemon has no `UserName` key)"
     },
@@ -866,7 +866,7 @@
         "leg_hash": "dc6c8e5f72d5",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
-        "privilege": "euid 501 (alex)"
+        "privilege": "euid 501 (jsmith)"
       }
     },
     "windows": {

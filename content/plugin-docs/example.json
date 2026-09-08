@@ -88,7 +88,7 @@
       "if_refused": "n/a",
       "measured": "2026-09-07, bare-metal, macOS 26.6.2 arm64 (`docs/samples/macos.txt:1`)",
       "os": "macOS",
-      "runs_as": "no privilege-model row; sample captured at euid 501 (alex), unprivileged"
+      "runs_as": "no privilege-model row; sample captured at euid 501 (jsmith), unprivileged"
     },
     {
       "grant": "None",
@@ -186,7 +186,7 @@
         "leg_hash": "23dda8161132",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
-        "privilege": "euid 501 (alex)"
+        "privilege": "euid 501 (jsmith)"
       }
     },
     "windows": {

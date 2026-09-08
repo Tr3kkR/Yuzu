@@ -774,7 +774,7 @@
     {
       "grant": "**None.** Every leg is either an IOKit-free `dscl`/`who`/`w`/`last` argv call or the shared `SCDynamicStoreCopyConsoleUser` console-user read — no elevated open.",
       "if_refused": "a spawn/timeout is forwarded via `forward_runner_failure` as `UNAVAILABLE`/`CONSTRAINED`; the action falls back to its own \"unknown\"/error row text",
-      "measured": "2026-09-07, bare-metal, euid 501 (alex)",
+      "measured": "2026-09-07, bare-metal, euid 501 (jsmith)",
       "os": "macOS",
       "runs_as": "agent daemon, unprivileged"
     },
@@ -971,7 +971,7 @@
           },
           "row_count": 1,
           "rows": [
-            "user|alex|local|console|console"
+            "user|jsmith|local|console|console"
           ],
           "truncated": false
         },
@@ -987,7 +987,7 @@
           },
           "row_count": 1,
           "rows": [
-            "session|console|alex|Active|-|13:35"
+            "session|console|jsmith|Active|-|13:35"
           ],
           "truncated": false
         },
@@ -1003,7 +1003,7 @@
           },
           "row_count": 2,
           "rows": [
-            "local_user|alex|true|2026-09-06 21:20:00|Alex Young|true",
+            "local_user|jsmith|true|2026-09-06 21:20:00|Jordan Smith|true",
             "local_user|root|true|2026-09-06 21:15:00|System Administrator|false"
           ],
           "truncated": false
@@ -1021,7 +1021,7 @@
           "row_count": 3,
           "rows": [
             "admin|root|user|admin",
-            "admin|alex|user|admin",
+            "admin|jsmith|user|admin",
             "admin|_mbsetupuser|user|admin"
           ],
           "truncated": false
@@ -1039,7 +1039,7 @@
           "row_count": 3,
           "rows": [
             "group_member|root|admin|user",
-            "group_member|alex|admin|user",
+            "group_member|jsmith|admin|user",
             "group_member|_mbsetupuser|admin|user"
           ],
           "truncated": false
@@ -1056,7 +1056,7 @@
           },
           "row_count": 1,
           "rows": [
-            "primary_user|alex|35|last"
+            "primary_user|jsmith|35|last"
           ],
           "truncated": false
         },
@@ -1072,11 +1072,11 @@
           },
           "row_count": 50,
           "rows": [
-            "session_history|alex|console|Sun|console|active|Sep  6 21:20   still logged in",
+            "session_history|jsmith|console|Sun|console|active|Sep  6 21:20   still logged in",
             "session_history|reboot|time|Sun|system|completed|Sep  6 21:19",
             "session_history|shutdown|time|Sun|system|completed|Sep  6 21:15",
             "session_history|root|console|Sun|console|completed|Sep  6 21:15 - shutdown  (00:00)",
-            "session_history|alex|ttys000|Sun|remote|completed|Sep  6 18:53 - 18:53  (00:00)"
+            "session_history|jsmith|ttys000|Sun|remote|completed|Sep  6 18:53 - 18:53  (00:00)"
           ],
           "truncated": false
         }
@@ -1087,7 +1087,7 @@
         "leg_hash": "5734018da5be",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
-        "privilege": "euid 501 (alex)"
+        "privilege": "euid 501 (jsmith)"
       }
     },
     "windows": {

@@ -901,8 +901,13 @@ def render_header(doc: PluginDoc) -> str:
         r = doc.cap_rows[0]
         sec_cells = [f"securable `{r.securable}` · operation {r.operation} · risk {r.risk_tier}"
                      f" · dispatch {r.dispatch_class} · approval gate {r.execute_gate}"]
-    exec_roles = sorted({x for d in doc.definitions for x in d.execute_roles})
     auth_roles = sorted({x for d in doc.definitions for x in d.author_roles})
+    if len({tuple(sorted(d.execute_roles)) for d in doc.definitions}) == 1:
+        exec_roles_cell = ", ".join(sorted({x for d in doc.definitions for x in d.execute_roles})) or "-"
+    else:
+        exec_roles_cell = "; ".join(
+            f"`{d.action}`: {', '.join(sorted(d.execute_roles)) or '-'}" for d in doc.definitions
+        )
     rows = [
         ("**What it does**", doc.description),
         ("**Version**", doc.version),
@@ -910,7 +915,7 @@ def render_header(doc: PluginDoc) -> str:
         ("**Platforms**", platforms_line(doc.legs)),
         ("**Actions**", " · ".join(actions) or "-"),
         ("**Security**", "; ".join(sec_cells) or "no capability row (not dispatchable)"),
-        ("**Roles**", f"execute: {', '.join(exec_roles) or '-'} · author: {', '.join(auth_roles) or '-'}"),
+        ("**Roles**", f"execute: {exec_roles_cell} · author: {', '.join(auth_roles) or '-'}"),
     ]
     lines = ["| | |", "|---|---|"] + [f"| {k} | {_esc(v)} |" for k, v in rows]
     return "\n".join(lines)

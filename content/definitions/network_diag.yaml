@@ -134,7 +134,7 @@ spec:
         type: string
         description: >-
           The local endpoint address. Dotted IPv4 on all platforms; on Linux an IPv6 address is emitted as raw undecoded hex, not text. Values: free text.
-        example: "192.168.0.66"
+        example: "203.0.113.66"
         platforms: [windows, linux, darwin]
       - name: local_port
         type: int32

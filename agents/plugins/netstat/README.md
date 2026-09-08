@@ -46,8 +46,8 @@ flowchart LR
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | LocalSystem today (#1442); intended target is `NT SERVICE\YuzuAgent` | None — `GetExtendedTcpTable`/`GetExtendedUdpTable` and `QueryFullProcessImageNameW(PROCESS_QUERY_LIMITED_INFORMATION)` need no elevation | 2026-09-07, bare metal, as SYSTEM | No typed error path: a table-query failure (return code other than `NO_ERROR`/`ERROR_INSUFFICIENT_BUFFER`) or a failed `QueryFullProcessImageNameW` is swallowed — the call returns with whatever rows it already emitted, or an attribution row with empty `process_name`/`process_path` (see `tcp\|192.168.0.131\|139\|0.0.0.0\|0\|LISTEN\|4\|\|` in the Windows sample below, PID 4) |
-| macOS | root — the LaunchDaemon has no `UserName` key (#1455 tracks narrowing this) | None beyond the agent's actual (root) identity; libproc reads need no separate entitlement | 2026-09-07, bare metal, at euid 501 (alex) — captured unprivileged, not as the production root daemon | `walk_sockets`/`resolve_proc_name_path` silently skip a PID libproc can't inspect (`proc_pidinfo`/`proc_name`/`proc_pidpath` returning ≤0); the socket, or its process fields, is simply omitted — never a typed status |
+| Windows | LocalSystem today (#1442); intended target is `NT SERVICE\YuzuAgent` | None — `GetExtendedTcpTable`/`GetExtendedUdpTable` and `QueryFullProcessImageNameW(PROCESS_QUERY_LIMITED_INFORMATION)` need no elevation | 2026-09-07, bare metal, as SYSTEM | No typed error path: a table-query failure (return code other than `NO_ERROR`/`ERROR_INSUFFICIENT_BUFFER`) or a failed `QueryFullProcessImageNameW` is swallowed — the call returns with whatever rows it already emitted, or an attribution row with empty `process_name`/`process_path` (see `tcp\|203.0.113.131\|139\|0.0.0.0\|0\|LISTEN\|4\|\|` in the Windows sample below, PID 4) |
+| macOS | root — the LaunchDaemon has no `UserName` key (#1455 tracks narrowing this) | None beyond the agent's actual (root) identity; libproc reads need no separate entitlement | 2026-09-07, bare metal, at euid 501 (jsmith) — captured unprivileged, not as the production root daemon | `walk_sockets`/`resolve_proc_name_path` silently skip a PID libproc can't inspect (`proc_pidinfo`/`proc_name`/`proc_pidpath` returning ≤0); the socket, or its process fields, is simply omitted — never a typed status |
 | Linux | dedicated unprivileged `_yuzu`/`yuzu` account (`docs/agent-privilege-model.md:95`, `netstat.*` row: default/default/default) | None declared — but see Caveats: `/proc/[pid]/fd` on another user's process needs a matching uid or `CAP_SYS_PTRACE`, which the "default" grant does not include | 2026-09-06, container, at euid 0 (root) — captured privileged, not as the least-privilege agent | `opendir()`/`ifstream` failures return silently (`if (!fd_dir) continue;` / `if (!f) return;`, `netstat_plugin.cpp:164-165,197-198`); an unresolved socket's `pid` stays `-1` (netstat_list) or its `process_name`/`process_path` stay empty (attribution) — never a typed status |
 
 No external binaries, no subprocesses, no sockets of its own — every leg reads OS-supplied tables/files or calls native Win32/libproc APIs directly (`netstat_plugin.cpp` has no `popen`/`CreateProcess`/`system(`/`exec*` call).
@@ -70,9 +70,9 @@ Pipe-delimited rows, one per socket, written via `ctx.write_output()`. `netstat_
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
 | `proto` | string | `tcp` `tcp6` `udp` `udp6` | Windows, Linux, macOS | `tcp` | Transport protocol and IP version of the socket. |
-| `local_addr` | string | - | Windows, Linux, macOS | `100.109.177.77` | The connection's local IP address, in the address family matching proto. Values: free text (IPv4 or IPv6 address). |
+| `local_addr` | string | - | Windows, Linux, macOS | `198.51.100.77` | The connection's local IP address, in the address family matching proto. Values: free text (IPv4 or IPv6 address). |
 | `local_port` | int32 | - | Windows, Linux, macOS | `52882` | The connection's local TCP or UDP port number. Values: integer, 0-65535. |
-| `remote_addr` | string | - | Windows, Linux, macOS | `100.123.53.121` | The connection's remote IP address. UDP sockets report the literal '*' on macOS and Windows (no fixed peer); Linux instead parses the real value from /proc/net/udp* (normally 0.0.0.0). Values: free text (IPv4 or IPv6 address) or "*". |
+| `remote_addr` | string | - | Windows, Linux, macOS | `198.51.100.121` | The connection's remote IP address. UDP sockets report the literal '*' on macOS and Windows (no fixed peer); Linux instead parses the real value from /proc/net/udp* (normally 0.0.0.0). Values: free text (IPv4 or IPv6 address) or "*". |
 | `remote_port` | int32 | - | Windows, Linux, macOS | `22` | The connection's remote port; always 0 for UDP (no fixed peer). Values: integer, 0-65535. |
 | `state` | string | - | Windows, Linux, macOS | `ESTABLISHED` | TCP connection state name; always empty for UDP rows (never a fabricated LISTEN). The exact name set differs slightly per OS. Values: ESTABLISHED, SYN_SENT, SYN_RECV, FIN_WAIT1, FIN_WAIT2, TIME_WAIT, CLOSE_WAIT, LAST_ACK, LISTEN, CLOSING, UNKNOWN, CLOSE (Linux only), CLOSED/DELETE_TCB (Windows only), or empty (UDP). |
 | `pid` | int32 | - | Windows, Linux, macOS | `9653` | PID of the process holding the socket, or -1 (Linux only) when no matching /proc/[pid]/fd inode was found. Values: integer, or -1 on Linux. |
@@ -84,9 +84,9 @@ Pipe-delimited rows, one per socket, written via `ctx.write_output()`. `netstat_
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
 | `proto` | string | `tcp` `tcp6` `udp` `udp6` | Windows, Linux, macOS | `tcp` | Transport protocol and IP version of the socket. |
-| `local_addr` | string | - | Windows, Linux, macOS | `100.109.177.77` | The connection's local IP address, in the address family matching proto. Values: free text (IPv4 or IPv6 address). |
+| `local_addr` | string | - | Windows, Linux, macOS | `198.51.100.77` | The connection's local IP address, in the address family matching proto. Values: free text (IPv4 or IPv6 address). |
 | `local_port` | int32 | - | Windows, Linux, macOS | `52882` | The connection's local TCP or UDP port number. Values: integer, 0-65535. |
-| `remote_addr` | string | - | Windows, Linux, macOS | `100.123.53.121` | The connection's remote IP address. UDP sockets report the literal '*' on macOS and Windows (no fixed peer); Linux instead parses the real value from /proc/net/udp* (normally 0.0.0.0). Values: free text (IPv4 or IPv6 address) or "*". |
+| `remote_addr` | string | - | Windows, Linux, macOS | `198.51.100.121` | The connection's remote IP address. UDP sockets report the literal '*' on macOS and Windows (no fixed peer); Linux instead parses the real value from /proc/net/udp* (normally 0.0.0.0). Values: free text (IPv4 or IPv6 address) or "*". |
 | `remote_port` | int32 | - | Windows, Linux, macOS | `22` | The connection's remote port; always 0 for UDP (no fixed peer). Values: integer, 0-65535. |
 | `state` | string | - | Windows, Linux, macOS | `ESTABLISHED` | TCP connection state name; always empty for UDP rows (never a fabricated LISTEN). The exact name set differs slightly per OS. Values: ESTABLISHED, SYN_SENT, SYN_RECV, FIN_WAIT1, FIN_WAIT2, TIME_WAIT, CLOSE_WAIT, LAST_ACK, LISTEN, CLOSING, UNKNOWN, CLOSE (Linux only), CLOSED/DELETE_TCB (Windows only), or empty (UDP). |
 | `pid` | int32 | - | Windows, Linux, macOS | `9653` | PID of the process holding the socket, or -1 (Linux only) when no matching /proc/[pid]/fd inode was found. Values: integer, or -1 on Linux. |
@@ -100,7 +100,7 @@ This plugin does not set a typed result status; the agent records `UNDECLARED` a
 
 - **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (90-day default retention — `docs/yaml-dsl-spec.md:194`, `response_store.hpp:167`), queryable at `/api/responses/{id}` and dashboard-rendered: `netstat_list` uses a static 8-column schema (`result_parsing.hpp:56`), while `attribution`'s 9-column schema is resolved from the content-definition `result` schema instead of a static entry (`result_parsing.hpp:50-55`).
 - **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — grepping `server/` and `agents/plugins/tar/` for `netstat` finds only the dashboard-schema and command-catalogue sites above; nothing runs on a schedule.
-- **Sensitivity.** `netstat_list` rows carry local/remote IPs and a bare `pid` — enough to fingerprint the device's active network identity, but nothing else. `attribution` rows add `process_name`/`process_path`, which name installed software and, for a per-user-profile install, can embed a person's account name in the path (the macOS sample below shows a VS Code extension path under `/Users/alex/...`).
+- **Sensitivity.** `netstat_list` rows carry local/remote IPs and a bare `pid` — enough to fingerprint the device's active network identity, but nothing else. `attribution` rows add `process_name`/`process_path`, which name installed software and, for a per-user-profile install, can embed a person's account name in the path (the macOS sample below shows a VS Code extension path under `/Users/jsmith/...`).
 - **Siblings:** `network_diag` (connection/socket diagnostics), `netprobe` (active reachability probes), the retired `sockwho` (folded into `attribution`, #3403).
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("device.network.netstat_attribution")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 
@@ -112,9 +112,9 @@ This plugin does not set a typed result status; the agent records `UNDECLARED` a
 ```
 == action=netstat_list
 tcp|0.0.0.0|22|0.0.0.0|0|LISTEN|5148
-tcp|100.123.53.121|22|100.109.177.77|53137|ESTABLISHED|5148
+tcp|198.51.100.121|22|198.51.100.77|53137|ESTABLISHED|5148
 tcp|0.0.0.0|135|0.0.0.0|0|LISTEN|1008
-tcp|192.168.0.131|139|0.0.0.0|0|LISTEN|4
+tcp|203.0.113.131|139|0.0.0.0|0|LISTEN|4
 tcp|0.0.0.0|3389|0.0.0.0|0|LISTEN|9048
 tcp|0.0.0.0|5040|0.0.0.0|0|LISTEN|14216
 tcp|127.0.0.1|5432|0.0.0.0|0|LISTEN|6436
@@ -128,9 +128,9 @@ tcp|127.0.0.1|8080|127.0.0.1|49754|ESTABLISHED|13676
 
 == action=attribution
 tcp|0.0.0.0|22|0.0.0.0|0|LISTEN|5148|sshd.exe|C:\Windows\System32\OpenSSH\sshd.exe
-tcp|100.123.53.121|22|100.109.177.77|53137|ESTABLISHED|5148|sshd.exe|C:\Windows\System32\OpenSSH\sshd.exe
+tcp|198.51.100.121|22|198.51.100.77|53137|ESTABLISHED|5148|sshd.exe|C:\Windows\System32\OpenSSH\sshd.exe
 tcp|0.0.0.0|135|0.0.0.0|0|LISTEN|1008|svchost.exe|C:\Windows\System32\svchost.exe
-tcp|192.168.0.131|139|0.0.0.0|0|LISTEN|4||
+tcp|203.0.113.131|139|0.0.0.0|0|LISTEN|4||
 tcp|0.0.0.0|3389|0.0.0.0|0|LISTEN|9048|svchost.exe|C:\Windows\System32\svchost.exe
 tcp|0.0.0.0|5040|0.0.0.0|0|LISTEN|14216|svchost.exe|C:\Windows\System32\svchost.exe
 tcp|127.0.0.1|5432|0.0.0.0|0|LISTEN|6436|postgres.exe|C:\Program Files\PostgreSQL\18\bin\postgres.exe
@@ -143,38 +143,38 @@ tcp|127.0.0.1|8080|127.0.0.1|49754|ESTABLISHED|13676|yuzu-server.exe|C:\yuzu-rig
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash f31d206bb2ee
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash f31d206bb2ee
 
 ```
 == action=netstat_list
-tcp|100.109.177.77|52882|100.123.53.121|22|ESTABLISHED|9653
-tcp|192.168.0.66|52771|160.79.104.10|443|ESTABLISHED|9039
-tcp|192.168.0.66|52775|160.79.104.10|443|ESTABLISHED|9039
-tcp|192.168.0.66|52773|160.79.104.10|443|ESTABLISHED|9039
-tcp|192.168.0.66|52789|160.79.104.10|443|ESTABLISHED|9039
-tcp|192.168.0.66|52801|34.149.66.165|443|ESTABLISHED|9039
-tcp|192.168.0.66|52777|160.79.104.10|443|ESTABLISHED|9039
-tcp|192.168.0.66|52779|160.79.104.10|443|ESTABLISHED|9039
-tcp|192.168.0.66|52781|160.79.104.10|443|ESTABLISHED|9039
-tcp|192.168.0.66|52856|160.79.104.10|443|ESTABLISHED|9039
-tcp|192.168.0.66|52783|160.79.104.10|443|ESTABLISHED|9039
-tcp|192.168.0.66|52785|160.79.104.10|443|ESTABLISHED|9039
+tcp|198.51.100.77|52882|198.51.100.121|22|ESTABLISHED|9653
+tcp|203.0.113.66|52771|160.79.104.10|443|ESTABLISHED|9039
+tcp|203.0.113.66|52775|160.79.104.10|443|ESTABLISHED|9039
+tcp|203.0.113.66|52773|160.79.104.10|443|ESTABLISHED|9039
+tcp|203.0.113.66|52789|160.79.104.10|443|ESTABLISHED|9039
+tcp|203.0.113.66|52801|34.149.66.165|443|ESTABLISHED|9039
+tcp|203.0.113.66|52777|160.79.104.10|443|ESTABLISHED|9039
+tcp|203.0.113.66|52779|160.79.104.10|443|ESTABLISHED|9039
+tcp|203.0.113.66|52781|160.79.104.10|443|ESTABLISHED|9039
+tcp|203.0.113.66|52856|160.79.104.10|443|ESTABLISHED|9039
+tcp|203.0.113.66|52783|160.79.104.10|443|ESTABLISHED|9039
+tcp|203.0.113.66|52785|160.79.104.10|443|ESTABLISHED|9039
 … 12 of 105 rows shown
 [result_status] UNDECLARED / UNKNOWN
 
 == action=attribution
-tcp|100.109.177.77|52882|100.123.53.121|22|ESTABLISHED|9653|ssh|/usr/bin/ssh
-tcp|192.168.0.66|52771|160.79.104.10|443|ESTABLISHED|9039|claude|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
-tcp|192.168.0.66|52775|160.79.104.10|443|ESTABLISHED|9039|claude|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
-tcp|192.168.0.66|52773|160.79.104.10|443|ESTABLISHED|9039|claude|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
-tcp|192.168.0.66|52789|160.79.104.10|443|ESTABLISHED|9039|claude|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
-tcp|192.168.0.66|52801|34.149.66.165|443|ESTABLISHED|9039|claude|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
-tcp|192.168.0.66|52777|160.79.104.10|443|ESTABLISHED|9039|claude|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
-tcp|192.168.0.66|52779|160.79.104.10|443|ESTABLISHED|9039|claude|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
-tcp|192.168.0.66|52781|160.79.104.10|443|ESTABLISHED|9039|claude|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
-tcp|192.168.0.66|52856|160.79.104.10|443|ESTABLISHED|9039|claude|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
-tcp|192.168.0.66|52783|160.79.104.10|443|ESTABLISHED|9039|claude|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
-tcp|192.168.0.66|52785|160.79.104.10|443|ESTABLISHED|9039|claude|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
+tcp|198.51.100.77|52882|198.51.100.121|22|ESTABLISHED|9653|ssh|/usr/bin/ssh
+tcp|203.0.113.66|52771|160.79.104.10|443|ESTABLISHED|9039|claude|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
+tcp|203.0.113.66|52775|160.79.104.10|443|ESTABLISHED|9039|claude|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
+tcp|203.0.113.66|52773|160.79.104.10|443|ESTABLISHED|9039|claude|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
+tcp|203.0.113.66|52789|160.79.104.10|443|ESTABLISHED|9039|claude|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
+tcp|203.0.113.66|52801|34.149.66.165|443|ESTABLISHED|9039|claude|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
+tcp|203.0.113.66|52777|160.79.104.10|443|ESTABLISHED|9039|claude|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
+tcp|203.0.113.66|52779|160.79.104.10|443|ESTABLISHED|9039|claude|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
+tcp|203.0.113.66|52781|160.79.104.10|443|ESTABLISHED|9039|claude|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
+tcp|203.0.113.66|52856|160.79.104.10|443|ESTABLISHED|9039|claude|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
+tcp|203.0.113.66|52783|160.79.104.10|443|ESTABLISHED|9039|claude|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
+tcp|203.0.113.66|52785|160.79.104.10|443|ESTABLISHED|9039|claude|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude
 … 12 of 105 rows shown
 [result_status] UNDECLARED / UNKNOWN
 ```

@@ -690,7 +690,7 @@
         },
         {
           "description": "Agent host's configured hostname (gethostname(3) on Linux/macOS, GetComputerNameA on Windows); the row is simply not emitted if the call fails. Values: free text.",
-          "example": "braga.local",
+          "example": "workstation1.local",
           "name": "hostname",
           "platforms": [
             "windows",
@@ -933,7 +933,7 @@
     {
       "grant": "None — `uname`, `gethostname`, and `task_info(MACH_TASK_BASIC_INFO)` on the calling process require no entitlement.",
       "if_refused": "Same — no typed denial path",
-      "measured": "2026-09-07 at euid 501 (alex)",
+      "measured": "2026-09-07 at euid 501 (jsmith)",
       "os": "macOS",
       "runs_as": "agent daemon, unprivileged"
     },
@@ -1139,7 +1139,7 @@
           "rows": [
             "os|Darwin",
             "arch|arm64",
-            "hostname|braga.local"
+            "hostname|workstation1.local"
           ],
           "truncated": false
         },
@@ -1259,7 +1259,7 @@
         "leg_hash": "0e82a6f385ea",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
-        "privilege": "euid 501 (alex)"
+        "privilege": "euid 501 (jsmith)"
       }
     },
     "windows": {

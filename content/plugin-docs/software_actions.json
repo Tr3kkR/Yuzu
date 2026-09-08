@@ -194,7 +194,7 @@
       "if_refused": "`UNAVAILABLE`/PARTIAL/`software_actions:softwareupdate_not_present` or `:softwareupdate_failed`; `installed_count`: `:pkgutil_not_present` or `:pkgutil_query_failed`",
       "measured": "2026-09-07 on macOS 26.6.2, euid 501",
       "os": "macOS",
-      "runs_as": "agent daemon — sample captured at `euid 501 (alex)`, unprivileged"
+      "runs_as": "agent daemon — sample captured at `euid 501 (jsmith)`, unprivileged"
     },
     {
       "grant": "None measured; apt/yum/dpkg-query/rpm are read-only queries",
@@ -353,7 +353,7 @@
         "leg_hash": "c95c61957b6f",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
-        "privilege": "euid 501 (alex)"
+        "privilege": "euid 501 (jsmith)"
       }
     },
     "windows": {

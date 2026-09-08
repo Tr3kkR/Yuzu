@@ -108,8 +108,8 @@
   "caveats": [
     "**macOS release is not a genuine undo.** `macos_unquarantine` restores `/etc/pf.conf`, never the endpoint's actual prior ruleset — any runtime pf rules present before quarantine are permanently lost. This is why the capability catalogue classifies `quarantine` Irreversible on every platform (`capdecls.md`; `quarantine_plugin.cpp:28-45,1776-1785`).",
     "**`whitelist` can quarantine a clean macOS device.** `add`/`remove` on macOS always calls `macos_load_ruleset`, which writes `block all` and enables pf regardless of the device's current state — running `whitelist` against a device that is not yet quarantined isolates it (`quarantine_plugin.cpp:2409-2460`).",
-    "**No nftables path, despite the privilege doc.** `docs/agent-privilege-model.md`'s row for `quarantine.*` lists `/usr/sbin/nft` as a Linux grant, but the plugin only ever shells to `/usr/sbin/iptables` and `/usr/sbin/ip6tables` (`quarantine_plugin.cpp:142-145`) — the doc row is stale in the same way the old user-manual catalogue text was before it was corrected.",
-    "**The Windows privilege doc overstates the mechanism.** `docs/agent-privilege-model.md` describes the Windows grant as using the `Set-NetFirewallRule` cmdlet; the code shells directly to `netsh.exe` (`quarantine_plugin.cpp:271-288,357`) — no PowerShell cmdlet is invoked anywhere in this plugin.",
+    "**No nftables path — and the privilege doc agrees.** `docs/agent-privilege-model.md`'s row for `quarantine.*` lists only `/usr/sbin/iptables` and `/usr/sbin/ip6tables` as the Linux grant, matching the code: the plugin only ever shells to those two binaries (`quarantine_plugin.cpp:142-145`), never `nft`. Earlier revisions of that row listed `/usr/sbin/nft`; treat any remaining reference to it elsewhere as stale. Separately, the *installer* (`scripts/install-agent-user.sh`) still grants a bare `/usr/sbin/nft` sudoers entry the plugin never uses — an over-grant, not a doc defect (see `docs/agent-privilege-model.md`'s own note on that row).",
+    "**The Windows privilege doc already states the real mechanism.** `docs/agent-privilege-model.md` describes the Windows grant as `netsh.exe advfirewall` directly, explicitly noting \"no `Set-NetFirewallRule` cmdlet\" — matching the code, which shells directly to `netsh.exe` (`quarantine_plugin.cpp:271-288,357`) and never invokes a PowerShell cmdlet.",
     "**Two undeclared storage keys make release retry-safe, once.** The captured pre-quarantine Windows firewall policy (`win.prior_firewall_policy`) and the Linux \"ip6tables applied\" marker (`linux.v6_applied`) are write-once until a clean release clears them (`quarantine_plugin.cpp:1873-2017`) — a re-quarantine of an already-contained host deliberately never overwrites a good restore image, so only the very first capture is ever trusted."
   ],
   "definitions": [
@@ -383,7 +383,7 @@
   },
   "privileges": [
     {
-      "grant": "**None today** (LocalSystem already holds firewall-policy privilege). Under the intended least-privilege model (`NT SERVICE\\YuzuAgent`, not in `Administrators`) this needs Administrators-group membership or equivalent firewall-policy privilege (`docs/agent-privilege-model.md` row for `quarantine.*`) — see Caveat 4 for where that doc's own description of the mechanism is stale.",
+      "grant": "**None today** (LocalSystem already holds firewall-policy privilege). Under the intended least-privilege model (`NT SERVICE\\YuzuAgent`, not in `Administrators`) this needs Administrators-group membership or equivalent firewall-policy privilege (`docs/agent-privilege-model.md` row for `quarantine.*`) — see Caveat 4.",
       "if_refused": "`state|uncertain`, note \"firewall query failed — containment state could not be determined\", ABI4 `UNAVAILABLE`/`PARTIAL` (`quarantine_plugin.cpp:802-805`)",
       "measured": "2026-09-07, bare-metal, as `SYSTEM`",
       "os": "Windows",
@@ -392,7 +392,7 @@
     {
       "grant": "Sudoers entry for `/sbin/pfctl` at `/etc/sudoers.d/yuzu-agent`, verified with `scripts/install-agent-user.sh --check` (`quarantine_plugin.cpp:1541-1543`).",
       "if_refused": "Reproduced by this capture's own `status` run: `state|uncertain`, note \"pf state could not be read -- containment can be neither confirmed nor ruled out\", `[result_status] UNAVAILABLE / PARTIAL / quarantine:macos_is_quarantined pf status unreadable`, `[rc] 1` (`quarantine_plugin.cpp:1728-1746`; `docs/samples/macos.txt`).",
-      "measured": "2026-09-07, bare-metal, **unprivileged, euid 501 (alex)** — deliberately below the production grant.",
+      "measured": "2026-09-07, bare-metal, **unprivileged, euid 501 (jsmith)** — deliberately below the production grant.",
       "os": "macOS",
       "runs_as": "Agent daemon; production runs under a narrow sudoers NOPASSWD grant for `/sbin/pfctl` (`quarantine_plugin.cpp:139,1540-1543`)."
     },
@@ -653,7 +653,7 @@
         "leg_hash": "f4d514eecc28",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
-        "privilege": "euid 501 (alex)"
+        "privilege": "euid 501 (jsmith)"
       }
     },
     "windows": {

@@ -51,7 +51,7 @@ flowchart LR
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
 | Windows | agent service account (LocalSystem today, #1442) | **None** for the other six actions (WTS/NetAPI calls succeed under the daemon's own account). `session_history` (and `primary_user`'s Security-log path) needs an elevated token to read the Security channel — an unelevated read reports `PERMISSION_DENIED`/`CONSTRAINED`/`UNAVAILABLE` depending on the failure (`users_plugin.cpp:234-253`) and `primary_user` still answers via the ProfileList fallback. | 2026-09-07, bare-metal, SYSTEM | `session_history`/`primary_user` set a typed result status (see Result status below) and emit an `error`-prefixed row naming the cause |
-| macOS | agent daemon, unprivileged | **None.** Every leg is either an IOKit-free `dscl`/`who`/`w`/`last` argv call or the shared `SCDynamicStoreCopyConsoleUser` console-user read — no elevated open. | 2026-09-07, bare-metal, euid 501 (alex) | a spawn/timeout is forwarded via `forward_runner_failure` as `UNAVAILABLE`/`CONSTRAINED`; the action falls back to its own "unknown"/error row text |
+| macOS | agent daemon, unprivileged | **None.** Every leg is either an IOKit-free `dscl`/`who`/`w`/`last` argv call or the shared `SCDynamicStoreCopyConsoleUser` console-user read — no elevated open. | 2026-09-07, bare-metal, euid 501 (jsmith) | a spawn/timeout is forwarded via `forward_runner_failure` as `UNAVAILABLE`/`CONSTRAINED`; the action falls back to its own "unknown"/error row text |
 | Linux | agent daemon (no row in `docs/agent-privilege-model.md`) | **None** for the native legs (utmp, `getgrnam`, `getpwuid`). `local_users`/`primary_user`/`session_history` also shell out to `lastlog`/`last`, which need to be present on `$PATH` — the 2026-09-06 container capture had neither installed, and both actions degraded to `UNAVAILABLE`/`PARTIAL`. | 2026-09-06, container, euid 0 | a missing/failed tool is forwarded via `forward_runner_failure` as `UNAVAILABLE`/`CONSTRAINED`; native legs (`logged_on`, `local_admins`, `group_members`) are unaffected |
 
 Binaries/subprocesses: Linux — `w`, `lastlog`, `last` (probed via `probe_tool_path`, direct argv, no shell). macOS — `who`, `w`, `last`, `dscl`, and `/usr/bin/env` (used only to pin `LC_ALL=C` ahead of `last -y`, still a plain exec, not a shell). Windows — none; every leg is a native Win32/WTS/NetAPI/wevtapi call. No network access on any OS.
@@ -213,50 +213,50 @@ session_history|sshd_4452|logon|service|-|2026-09-07T10:08:05.8249284Z|4624
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 5734018da5be
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 5734018da5be
 
 ```
 == action=logged_on
-user|alex|local|console|console
+user|jsmith|local|console|console
 [result_status] UNDECLARED / UNKNOWN
 
 == action=sessions
-session|console|alex|Active|-|13:35
+session|console|jsmith|Active|-|13:35
 [result_status] UNDECLARED / UNKNOWN
 
 == action=local_users
-local_user|alex|true|2026-09-06 21:20:00|Alex Young|true
+local_user|jsmith|true|2026-09-06 21:20:00|Jordan Smith|true
 local_user|root|true|2026-09-06 21:15:00|System Administrator|false
 [result_status] UNDECLARED / UNKNOWN
 
 == action=local_admins
 admin|root|user|admin
-admin|alex|user|admin
+admin|jsmith|user|admin
 admin|_mbsetupuser|user|admin
 [result_status] UNDECLARED / UNKNOWN
 
 == action=group_members group=admin
 group_member|root|admin|user
-group_member|alex|admin|user
+group_member|jsmith|admin|user
 group_member|_mbsetupuser|admin|user
 [result_status] UNDECLARED / UNKNOWN
 
 == action=primary_user
-primary_user|alex|35|last
+primary_user|jsmith|35|last
 [result_status] UNDECLARED / UNKNOWN
 
 == action=session_history
-session_history|alex|console|Sun|console|active|Sep  6 21:20   still logged in
+session_history|jsmith|console|Sun|console|active|Sep  6 21:20   still logged in
 session_history|reboot|time|Sun|system|completed|Sep  6 21:19
 session_history|shutdown|time|Sun|system|completed|Sep  6 21:15
 session_history|root|console|Sun|console|completed|Sep  6 21:15 - shutdown  (00:00)
-session_history|alex|ttys000|Sun|remote|completed|Sep  6 18:53 - 18:53  (00:00)
-session_history|alex|ttys000|Sun|remote|completed|Sep  6 18:53 - 18:53  (00:00)
-session_history|alex|ttys000|Mon|remote|completed|Aug 31 09:30 - 09:30  (00:00)
-session_history|alex|console|Mon|console|completed|Aug 31 09:30 - 21:14 (6+11:44)
+session_history|jsmith|ttys000|Sun|remote|completed|Sep  6 18:53 - 18:53  (00:00)
+session_history|jsmith|ttys000|Sun|remote|completed|Sep  6 18:53 - 18:53  (00:00)
+session_history|jsmith|ttys000|Mon|remote|completed|Aug 31 09:30 - 09:30  (00:00)
+session_history|jsmith|console|Mon|console|completed|Aug 31 09:30 - 21:14 (6+11:44)
 session_history|reboot|time|Mon|system|completed|Aug 31 09:29
-session_history|alex|ttys000|Fri|remote|completed|Aug 28 09:51 - 09:51  (00:00)
-session_history|alex|console|Fri|console|completed|Aug 28 09:51 - 22:26  (12:35)
+session_history|jsmith|ttys000|Fri|remote|completed|Aug 28 09:51 - 09:51  (00:00)
+session_history|jsmith|console|Fri|console|completed|Aug 28 09:51 - 22:26  (12:35)
 session_history|reboot|time|Fri|system|completed|Aug 28 09:50
 … 12 of 50 rows shown
 [result_status] UNDECLARED / UNKNOWN

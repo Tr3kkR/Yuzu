@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 6094b93f5b9d
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 6094b93f5b9d
 == action=mounts
 mount|/|/dev/disk3s1s1|apfs|-|494384795648|313557540864|313557540864|ro
 mount|/dev|devfs|devfs|-|201728|0|0|rw

@@ -30,7 +30,7 @@ registry|unsupported|Windows registry is not available on this platform
 registry|unsupported|Windows registry is not available on this platform
 [result_status] UNDECLARED / UNKNOWN / 
 
-== action=get_user_value username=alex key=Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced name=Hidden
+== action=get_user_value username=jsmith key=Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced name=Hidden
 registry|unsupported|Windows registry is not available on this platform
 [result_status] UNDECLARED / UNKNOWN / 
 

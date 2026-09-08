@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 93534d76a8aa
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 93534d76a8aa
 == action=list
 lic|Pages Creator Studio|||retail||licensed||app_receipt|probable|||machine|
 lic|iMovie|||retail||licensed||app_receipt|probable|||machine|

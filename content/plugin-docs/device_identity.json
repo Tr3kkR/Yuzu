@@ -196,7 +196,7 @@
         },
         {
           "description": "Whether the device is currently joined to a domain or realm.",
-          "example": false,
+          "example": "false",
           "name": "joined",
           "platforms": [
             "windows",
@@ -244,7 +244,7 @@
     {
       "grant": "None. `dsconfigad -show` runs unprivileged (`docs/agent-spawn-sink-manifest.md:77-78`).",
       "if_refused": "falls through to the `gethostname()`+`getaddrinfo` fallback (`device_identity_plugin.cpp:390-401`); `ou` reports `N/A`",
-      "measured": "2026-09-07, bare-metal, euid 501 (alex) — i.e. captured unprivileged, not as the daemon's real root identity",
+      "measured": "2026-09-07, bare-metal, euid 501 (jsmith) — i.e. captured unprivileged, not as the daemon's real root identity",
       "os": "macOS",
       "runs_as": "agent daemon, root (no `UserName` key in the LaunchDaemon — `docs/agent-privilege-model.md:8`)"
     },
@@ -334,7 +334,7 @@
           },
           "row_count": 1,
           "rows": [
-            "device_name|braga.local"
+            "device_name|workstation1.local"
           ],
           "truncated": false
         },
@@ -378,7 +378,7 @@
         "leg_hash": "fdf67a9b8831",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
-        "privilege": "euid 501 (alex)"
+        "privilege": "euid 501 (jsmith)"
       }
     },
     "windows": {

@@ -264,7 +264,7 @@
     {
       "grant": "None for `connected` (CoreWLAN reads are unprivileged); `list_networks`' `system_profiler` fallback needs a Location Services grant a background daemon cannot obtain (docs/agent-privilege-model.md row 96)",
       "if_refused": "`list_networks`: `CONSTRAINED`/`PARTIAL`/`wifi:macos_scan_requires_location_services`, sentinel `wifi|info|...` (wifi_plugin.cpp:931-936). `connected`: SSID/BSSID silently become `<ssid-withheld>` on an otherwise-live connection, never a false \"Not connected\" (wifi_corewlan.hpp:14-22)",
-      "measured": "2026-09-07 on bare-metal at **euid 501 (alex)** — unprivileged, not the production root LaunchDaemon identity (macos.txt capture stamp)",
+      "measured": "2026-09-07 on bare-metal at **euid 501 (jsmith)** — unprivileged, not the production root LaunchDaemon identity (macos.txt capture stamp)",
       "os": "macOS",
       "runs_as": "agent LaunchDaemon, root by default (no `UserName` key — docs/agent-privilege-model.md \"macOS is the current exception\"); this plugin itself needs no elevation"
     },
@@ -437,7 +437,7 @@
         "leg_hash": "08531a51b9d2",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
-        "privilege": "euid 501 (alex)"
+        "privilege": "euid 501 (jsmith)"
       }
     },
     "windows": {

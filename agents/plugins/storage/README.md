@@ -9,7 +9,7 @@
 | **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
 | **Actions** | `clear` (definition `agent.storage.clear`) · `delete` (definition `agent.storage.delete`) · `get` (definition `agent.storage.get`) · `list` (definition `agent.storage.list`) · `set` (definition `agent.storage.set`) |
 | **Security** | `set`: securable `Infrastructure` · operation Write · risk Medium · dispatch Mutating · approval gate AdminOrApproval; `get`: securable `Infrastructure` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `delete`: securable `Infrastructure` · operation Delete · risk High · dispatch Mutating · approval gate AdminOrApproval; `list`: securable `Infrastructure` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `clear`: securable `Infrastructure` · operation Delete · risk High · dispatch Destructive · approval gate AdminOrApproval |
-| **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
+| **Roles** | execute: `set`: endpoint-admin; `get`: endpoint-admin, endpoint-operator; `delete`: endpoint-admin; `list`: endpoint-admin, endpoint-operator; `clear`: endpoint-admin · author: content-author |
 <!-- END GENERATED -->
 
 ## How it works
@@ -46,7 +46,7 @@ flowchart LR
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
 | Windows | agent service account (LocalSystem today, #1442) | None — pure in-process SQLite KV read/write inside the agent's own data directory; no privileged API is touched | 2026-09-07, bare-metal, `SYSTEM` | No permission gate exists in this plugin. A missing/uninitialized store takes the ABI's `!ctx` early-return path (`agent.cpp:577-627`), not a typed permission error |
-| macOS | agent daemon; ships root today per `docs/agent-privilege-model.md` (narrowing tracked in #1455) | None | 2026-09-07, bare-metal, euid 501 (alex) — **unprivileged**, i.e. this capture was taken at a weaker identity than the shipped root daemon | same as above |
+| macOS | agent daemon; ships root today per `docs/agent-privilege-model.md` (narrowing tracked in #1455) | None | 2026-09-07, bare-metal, euid 501 (jsmith) — **unprivileged**, i.e. this capture was taken at a weaker identity than the shipped root daemon | same as above |
 | Linux | agent service account `yuzu`, unprivileged, per `docs/agent-privilege-model.md` | None | 2026-09-06, container, euid 0 — this capture was taken as root, not the production `yuzu` identity | same as above |
 
 No external binaries, no subprocesses, no network access — every action stays in-process against the agent's own `kv_store.db` (`storage_plugin.cpp:27-29`; `agent.cpp:799-803`).
@@ -146,7 +146,7 @@ count|0
 [not captured] Destructive/Irreversible: not executed on a live host
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash cc5994a9097a
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash cc5994a9097a
 
 ```
 == action=set key=yuzu_capture_tmp value=1

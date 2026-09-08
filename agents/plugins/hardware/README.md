@@ -135,8 +135,8 @@ Pipe-delimited rows, one per record via `write_output()`. Scalar actions (`manuf
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
-| `serial` | string | - | Windows, Linux, macOS | `J6RYL9MKMJ` | Hardware serial number, or "unknown" when absent (e.g. a VM with no SMBIOS serial) or unreadable. Values: free text, or the sentinel "unknown". |
-| `system_uuid` | string | - | Windows, Linux, macOS | `EC27F833-3739-5416-A744-E97433A27C90` | SMBIOS/firmware system UUID, or "unknown" when absent or unreadable. Values: free text UUID, or the sentinel "unknown". |
+| `serial` | string | - | Windows, Linux, macOS | `EXAMPLE0001` | Hardware serial number, or "unknown" when absent (e.g. a VM with no SMBIOS serial) or unreadable. Values: free text, or the sentinel "unknown". |
+| `system_uuid` | string | - | Windows, Linux, macOS | `00000000-0000-0000-0000-000000000001` | SMBIOS/firmware system UUID, or "unknown" when absent or unreadable. Values: free text UUID, or the sentinel "unknown". |
 <!-- END GENERATED -->
 
 ### Result status
@@ -202,12 +202,12 @@ driver|11|WAN Miniport (PPPOE)|10.0.26100.1|2006-06-21|Microsoft|NET
 [result_status] UNDECLARED / UNKNOWN
 
 == action=system
-serial|2188270001
-system_uuid|DD8078E2-34FC-6597-1E0B-FC3497651E0A
+serial|1234567890
+system_uuid|00000000-0000-0000-0000-000000000002
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash fc050dca8530
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash fc050dca8530
 
 ```
 == action=manufacturer
@@ -241,8 +241,8 @@ driver|0|unknown||||
 [result_status] UNDECLARED / UNKNOWN
 
 == action=system
-serial|J6RYL9MKMJ
-system_uuid|EC27F833-3739-5416-A744-E97433A27C90
+serial|EXAMPLE0001
+system_uuid|00000000-0000-0000-0000-000000000001
 [result_status] UNDECLARED / UNKNOWN
 ```
 

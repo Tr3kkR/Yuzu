@@ -283,7 +283,7 @@ driver|251|Volume Manager|10.0.26100.9278|2006-06-21|Microsoft|SYSTEM
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=system
-serial|2188270001
-system_uuid|DD8078E2-34FC-6597-1E0B-FC3497651E0A
+serial|1234567890
+system_uuid|00000000-0000-0000-0000-000000000002
 [result_status] UNDECLARED / UNKNOWN / 
 

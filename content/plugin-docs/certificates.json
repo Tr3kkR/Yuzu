@@ -459,7 +459,7 @@
     {
       "grant": "System/root keychain reads: none (in-process `SecItemCopyMatching`, no subprocess). Login keychain read: root, via `launchctl asuser` + `sudo -u` — live today only because the daemon runs as root; needs a dormant sudoers grant once #1455 narrows the agent off root. `delete` (System/MY only): a sudoers grant for `/usr/bin/security delete-certificate -t /Library/Keychains/System.keychain *` under the future non-root account; moot today.",
       "if_refused": "System/root keychain failure emits `not_available|<keychain> read failed` + `CONSTRAINED`/`PARTIAL` (`certificates_plugin.cpp:1306,1333`); login-keychain failure emits `not_available|login keychain read failed` + `CONSTRAINED`/`PARTIAL` (`certificates_plugin.cpp:1394-1396`) — the macOS sample shows exactly this (`macos.txt:164-165`)",
-      "measured": "2026-09-07, bare-metal macOS 26.6.2 arm64, euid 501 (alex) — unprivileged, captured via the test harness (`PluginHandle::load` + `LocalDispatcher::run`, no `init()`), not the production root LaunchDaemon",
+      "measured": "2026-09-07, bare-metal macOS 26.6.2 arm64, euid 501 (jsmith) — unprivileged, captured via the test harness (`PluginHandle::load` + `LocalDispatcher::run`, no `init()`), not the production root LaunchDaemon",
       "os": "macOS",
       "runs_as": "agent daemon; the shipped LaunchDaemon has no `UserName` key, so it runs as root — but this sample was captured unprivileged (see Measured)"
     },
@@ -626,7 +626,7 @@
         "leg_hash": "dd4cae6837a4",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
-        "privilege": "euid 501 (alex)"
+        "privilege": "euid 501 (jsmith)"
       }
     },
     "windows": {

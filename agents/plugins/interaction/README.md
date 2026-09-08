@@ -9,7 +9,7 @@
 | **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
 | **Actions** | `input` (definition `device.interaction.input`) · `message_box` (definition `device.interaction.message_box`) · `notify` (definition `device.interaction.notify`) · `set_dnd` (definition `device.interaction.set_dnd`) · `survey` (definition `device.interaction.survey`) |
 | **Security** | securable `Infrastructure` · operation Write · risk Medium · dispatch Mutating · approval gate AdminOrApproval |
-| **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
+| **Roles** | execute: `notify`: endpoint-admin, endpoint-operator; `message_box`: endpoint-admin; `input`: endpoint-admin; `survey`: endpoint-admin; `set_dnd`: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
 
 ## How it works
@@ -54,7 +54,7 @@ flowchart LR
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
 | Windows | agent service account; registers and runs as LocalSystem today (#1442, not yet the intended virtual service account) | None — `Shell_NotifyIconW`/`MessageBoxW` are unprivileged, and PowerShell needs no elevation to run `InputBox`/`WinForms` | 2026-09-07, bare-metal, as `SYSTEM` | PowerShell dialogs (`input`/`survey`) report `status\|unavailable\|PowerShell dialog exited with an error` or `...timed out`; native `notify`/`message_box` have no refusal path — `MessageBoxW` always returns a button |
-| macOS | root (shipped LaunchDaemon has no `UserName` key) | None — but no LaunchDaemon has a reachable Aqua/GUI session by design | 2026-09-07, bare-metal, as euid 501 (alex) — an interactive logged-in user, **not** the production root-daemon posture | `status\|unavailable\|no reachable GUI session` (`notify`) or `status\|not_reachable` (`message_box`/`input`/`survey`) |
+| macOS | root (shipped LaunchDaemon has no `UserName` key) | None — but no LaunchDaemon has a reachable Aqua/GUI session by design | 2026-09-07, bare-metal, as euid 501 (jsmith) — an interactive logged-in user, **not** the production root-daemon posture | `status\|unavailable\|no reachable GUI session` (`notify`) or `status\|not_reachable` (`message_box`/`input`/`survey`) |
 | Linux | agent unprivileged account (`yuzu`) | None — the plugin checks `DISPLAY`/`WAYLAND_DISPLAY` before ever spawning | 2026-09-06, container, as euid 0 | `status\|unavailable\|no reachable GUI session`, checked upfront before spawning zenity/notify-send |
 
 Binaries/subprocesses: PowerShell (`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`, Windows `input`/`survey`) · osascript (`/usr/bin/osascript`, macOS all four dialog actions) · zenity and notify-send (`/usr/bin/zenity`, `/usr/local/bin/zenity`, `/usr/bin/notify-send`, `/usr/local/bin/notify-send`, Linux). No network access. `set_dnd` and Windows `notify`/`message_box` spawn nothing.
@@ -181,7 +181,7 @@ status|ok
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash dc6c8e5f72d5
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash dc6c8e5f72d5
 
 ```
 == action=notify

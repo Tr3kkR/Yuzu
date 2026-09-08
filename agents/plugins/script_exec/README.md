@@ -149,7 +149,7 @@ status|error
 [rc] 1
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash a6cac34c1781
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash a6cac34c1781
 
 ```
 == action=exec command=echo args=yuzu-capture

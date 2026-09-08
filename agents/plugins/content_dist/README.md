@@ -9,7 +9,7 @@
 | **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
 | **Actions** | `cleanup` (definition `agent.content_dist.cleanup`) · `execute_staged` (definition `agent.content_dist.execute_staged`) · `list_staged` (definition `agent.content_dist.list_staged`) · `stage` (definition `agent.content_dist.stage`) · `upload_file` (definition `agent.content_dist.upload_file`) |
 | **Security** | `stage`: securable `SoftwareDeployment` · operation Write · risk High · dispatch Destructive · approval gate AdminOrApproval; `execute_staged`: securable `Execution` · operation Execute · risk High · dispatch Destructive · approval gate AdminOrApproval; `list_staged`: securable `SoftwareDeployment` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `cleanup`: securable `SoftwareDeployment` · operation Delete · risk High · dispatch Destructive · approval gate AdminOrApproval; `upload_file`: securable `FileRetrieval` · operation Write · risk High · dispatch Destructive · approval gate AdminOrApproval |
-| **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
+| **Roles** | execute: `stage`: endpoint-admin; `execute_staged`: endpoint-admin; `list_staged`: endpoint-admin, endpoint-operator; `cleanup`: endpoint-admin; `upload_file`: endpoint-admin · author: content-author |
 <!-- END GENERATED -->
 
 ## How it works
@@ -173,7 +173,7 @@ error|missing required parameters: path, grant_id, grant_secret
 [rc] 1
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 590399d7174c
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 590399d7174c
 
 ```
 == action=stage

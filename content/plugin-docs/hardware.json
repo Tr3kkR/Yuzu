@@ -725,7 +725,7 @@
       "columns": [
         {
           "description": "Hardware serial number, or \"unknown\" when absent (e.g. a VM with no SMBIOS serial) or unreadable. Values: free text, or the sentinel \"unknown\".",
-          "example": "J6RYL9MKMJ",
+          "example": "EXAMPLE0001",
           "name": "serial",
           "platforms": [
             "windows",
@@ -737,7 +737,7 @@
         },
         {
           "description": "SMBIOS/firmware system UUID, or \"unknown\" when absent or unreadable. Values: free text UUID, or the sentinel \"unknown\".",
-          "example": "EC27F833-3739-5416-A744-E97433A27C90",
+          "example": "00000000-0000-0000-0000-000000000001",
           "name": "system_uuid",
           "platforms": [
             "windows",
@@ -1059,8 +1059,8 @@
           },
           "row_count": 2,
           "rows": [
-            "serial|J6RYL9MKMJ",
-            "system_uuid|EC27F833-3739-5416-A744-E97433A27C90"
+            "serial|EXAMPLE0001",
+            "system_uuid|00000000-0000-0000-0000-000000000001"
           ],
           "truncated": false
         }
@@ -1071,7 +1071,7 @@
         "leg_hash": "fc050dca8530",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
-        "privilege": "euid 501 (alex)"
+        "privilege": "euid 501 (jsmith)"
       }
     },
     "windows": {
@@ -1208,8 +1208,8 @@
           },
           "row_count": 2,
           "rows": [
-            "serial|2188270001",
-            "system_uuid|DD8078E2-34FC-6597-1E0B-FC3497651E0A"
+            "serial|1234567890",
+            "system_uuid|00000000-0000-0000-0000-000000000002"
           ],
           "truncated": false
         }

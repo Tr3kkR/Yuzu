@@ -36,7 +36,7 @@ spec:
         type: bool
         description: 'Whether the registry reports a ProductVersion for the SCCM client (Windows only; always false off-Windows). Values: true, false.'
         example: "false"
-        platforms: [windows, linux]
+        platforms: [windows]
       - name: version
         type: string
         description: 'The installed SCCM client version from HKLM\SOFTWARE\Microsoft\SMS\Mobile Client\ProductVersion, or "-" if not present. Values: free text or "-".'

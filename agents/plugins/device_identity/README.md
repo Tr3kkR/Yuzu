@@ -44,7 +44,7 @@ flowchart LR
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
 | Windows | agent service account (LocalSystem today, #1442 — `docs/agent-privilege-model.md:12`) | None. All three calls are unprivileged native APIs. | 2026-09-07, bare-metal, `SYSTEM` (sample stamp) | `domain`/`ou` silently report `N/A` / `joined=false` (`device_identity_plugin.cpp:418-421`) — no distinct "refused" signal |
-| macOS | agent daemon, root (no `UserName` key in the LaunchDaemon — `docs/agent-privilege-model.md:8`) | None. `dsconfigad -show` runs unprivileged (`docs/agent-spawn-sink-manifest.md:77-78`). | 2026-09-07, bare-metal, euid 501 (alex) — i.e. captured unprivileged, not as the daemon's real root identity | falls through to the `gethostname()`+`getaddrinfo` fallback (`device_identity_plugin.cpp:390-401`); `ou` reports `N/A` |
+| macOS | agent daemon, root (no `UserName` key in the LaunchDaemon — `docs/agent-privilege-model.md:8`) | None. `dsconfigad -show` runs unprivileged (`docs/agent-spawn-sink-manifest.md:77-78`). | 2026-09-07, bare-metal, euid 501 (jsmith) — i.e. captured unprivileged, not as the daemon's real root identity | falls through to the `gethostname()`+`getaddrinfo` fallback (`device_identity_plugin.cpp:390-401`); `ou` reports `N/A` |
 | Linux | unprivileged `yuzu` account (`docs/agent-privilege-model.md`, Linux account section) | None. The sd-bus call, `realm list`, and the `sssd.conf` read are all unprivileged (`docs/agent-spawn-sink-manifest.md:76,79`). | 2026-09-06, container, euid 0 (root) — captured privileged, not as the daemon's real unprivileged identity | can fail closed on a stock host: sssd's InfoPipe defaults to root-only and `/etc/sssd/sssd.conf` ships mode 0600, so a genuinely joined host can report `joined=false` (`device_identity_plugin.cpp:252-268`, BR-011) |
 
 Subprocesses: `realm list` (Linux, `domain`/`ou` fallback, path resolved via `probe_tool_path`) and `/usr/sbin/dsconfigad -show` (macOS, `domain` and `ou`, each its own call), both via the bounded runner with a 10s deadline. Local IPC: one sd-bus call to sssd's InfoPipe (Linux `domain`, only when built with `YUZU_HAVE_LIBSYSTEMD`). No outbound network.
@@ -73,7 +73,7 @@ Each action writes one or more `key|value` lines via `write_output()` (`device_i
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
 | `domain` | string | - | Windows, Linux, macOS | `WORKGROUP` | The DNS or Active Directory domain name the device reports, or "N/A" if none was found. Values: free text (or the literal "N/A"). |
-| `joined` | bool | - | Windows, Linux, macOS | `False` | Whether the device is currently joined to a domain or realm. |
+| `joined` | bool | - | Windows, Linux, macOS | `false` | Whether the device is currently joined to a domain or realm. |
 
 **`device.device_identity.ou` — `ou`**
 
@@ -114,11 +114,11 @@ ou|N/A
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash fdf67a9b8831
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash fdf67a9b8831
 
 ```
 == action=device_name
-device_name|braga.local
+device_name|workstation1.local
 [result_status] UNDECLARED / UNKNOWN
 
 == action=domain

@@ -42,7 +42,7 @@ flowchart LR
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
 | Windows | agent service account (LocalSystem today, #1442) | **None.** Registry reads use `KEY_READ`; the SCM query uses `SC_MANAGER_CONNECT` / `SERVICE_QUERY_STATUS`; the COM call opens no elevated interface. | 2026-09-07, bare-metal, SYSTEM | `client_version.version` reports `-`/`installed\|false`; `service_status` reports `unavailable`; `site.site_code` reports `not_configured` |
-| macOS | agent daemon, unprivileged | n/a — action returns the honest-unsupported sentinel unconditionally | 2026-09-07, bare-metal, euid 501 (alex) | n/a — no read is attempted |
+| macOS | agent daemon, unprivileged | n/a — action returns the honest-unsupported sentinel unconditionally | 2026-09-07, bare-metal, euid 501 (jsmith) | n/a — no read is attempted |
 | Linux | agent daemon, unprivileged | n/a — action returns the honest-unsupported sentinel unconditionally | 2026-09-06, container, euid 0 | n/a — no read is attempted |
 
 No subprocesses and no network access. `site` opens an in-process COM apartment (`CoInitializeEx`/`CoCreateInstance` against `Microsoft.SMS.Client`) as a fallback only when the registry lookup is empty; nothing is spawned. The plugin previously shelled out to `sc query ccmexec` and two PowerShell ComObject calls — all three sites were retired in Wave 3 PR33d (`docs/agent-spawn-sink-manifest.md:326`); zero spawn sites remain.
@@ -64,7 +64,7 @@ Pipe-delimited `key|value` rows, one per fact, written via `write_output()`. On 
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
-| `installed` | bool | - | Windows, Linux | `false` | Whether the registry reports a ProductVersion for the SCCM client (Windows only; always false off-Windows). Values: true, false. |
+| `installed` | bool | - | Windows | `false` | Whether the registry reports a ProductVersion for the SCCM client (Windows only; always false off-Windows). Values: true, false. |
 | `version` | string | - | Windows | `-` | The installed SCCM client version from HKLM\SOFTWARE\Microsoft\SMS\Mobile Client\ProductVersion, or "-" if not present. Values: free text or "-". |
 | `service_status` | string | - | Windows | `not_found` | The ccmexec Windows service state from a live SCM query (OpenSCManagerW/OpenServiceW/QueryServiceStatusEx). Values: running, stopped, exists, not_found, unavailable. |
 
@@ -106,7 +106,7 @@ management_point|unknown
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 820bfb5e0176
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 820bfb5e0176
 
 ```
 == action=client_version

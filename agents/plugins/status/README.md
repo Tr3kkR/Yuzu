@@ -9,7 +9,7 @@
 | **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
 | **Actions** | `config` (definition `device.status.config`) · `connection` (definition `device.status.connection`) · `health` (definition `device.status.health`) · `info` (definition `device.status.info`) · `modules` (definition `device.status.modules`) · `plugins` (definition `device.status.plugins`) · `switch` (definition `device.status.switch`) · `version` (definition `device.status.version`) |
 | **Security** | `version`: securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `info`: securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `health`: securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `plugins`: securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `modules`: securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `connection`: securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `switch`: securable `PluginSecret` · operation Read · risk Medium · dispatch ReadOnly · approval gate None; `config`: securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
-| **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
+| **Roles** | execute: `version`: endpoint-admin, endpoint-operator; `info`: endpoint-admin, endpoint-operator; `health`: endpoint-admin, endpoint-operator; `plugins`: endpoint-admin, endpoint-operator; `modules`: endpoint-admin, endpoint-operator; `connection`: endpoint-admin; `switch`: endpoint-admin; `config`: endpoint-admin · author: content-author |
 <!-- END GENERATED -->
 
 ## How it works
@@ -50,7 +50,7 @@ flowchart LR
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
 | Windows | agent service account (LocalSystem today, #1442) | None — every call (`GetNativeSystemInfo`, `GetComputerNameA`, `K32GetProcessMemoryInfo`) works for an unprivileged process on its own memory/host info. | 2026-09-07 on the-rig as `SYSTEM` | No typed denial path exists; a failed native call is simply not written (see `health` in Caveats) |
-| macOS | agent daemon, unprivileged | None — `uname`, `gethostname`, and `task_info(MACH_TASK_BASIC_INFO)` on the calling process require no entitlement. | 2026-09-07 at euid 501 (alex) | Same — no typed denial path |
+| macOS | agent daemon, unprivileged | None — `uname`, `gethostname`, and `task_info(MACH_TASK_BASIC_INFO)` on the calling process require no entitlement. | 2026-09-07 at euid 501 (jsmith) | Same — no typed denial path |
 | Linux | agent daemon, root today | None — `uname`, `gethostname`, and reading the process's own `/proc/self/status` require no capability. | 2026-09-06 in a container at euid 0 | Same — no typed denial path |
 
 No external binaries, no subprocesses, no network access. Every call in `status_plugin.cpp` is either an in-process constant, a config-map lookup, or a single native syscall.
@@ -110,7 +110,7 @@ Every field is written as its own pipe-delimited `key|value` row via `write_outp
 |---|---|---|---|---|---|
 | `os` | string | - | Windows, Linux, macOS | `Darwin` | OS family name. "Darwin"/"Linux" from uname(2) on macOS/Linux, or the literal "Windows" on Windows. Values: "Darwin", "Linux", "Windows". |
 | `arch` | string | - | Windows, Linux, macOS | `arm64` | CPU architecture. uname(2)'s machine field on Linux/macOS; mapped from GetNativeSystemInfo on Windows. Values: free text on Linux/macOS (whatever uname reports); on Windows one of "x86_64", "aarch64", "x86", "arm", "unknown". |
-| `hostname` | string | - | Windows, Linux, macOS | `braga.local` | Agent host's configured hostname (gethostname(3) on Linux/macOS, GetComputerNameA on Windows); the row is simply not emitted if the call fails. Values: free text. |
+| `hostname` | string | - | Windows, Linux, macOS | `workstation1.local` | Agent host's configured hostname (gethostname(3) on Linux/macOS, GetComputerNameA on Windows); the row is simply not emitted if the call fails. Values: free text. |
 
 **`device.status.modules` — `modules_count|module_name|module_version|module_status|module_description`**
 
@@ -225,7 +225,7 @@ verbose_logging|
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 0e82a6f385ea
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 0e82a6f385ea
 
 ```
 == action=version
@@ -237,7 +237,7 @@ git_commit|4c377398e
 == action=info
 os|Darwin
 arch|arm64
-hostname|braga.local
+hostname|workstation1.local
 [result_status] UNDECLARED / UNKNOWN
 
 == action=health

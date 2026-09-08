@@ -128,7 +128,7 @@
       "columns": [
         {
           "description": "Absolute path of a discovered agent file (executable, log file, config file, data store, plugin file, or TLS certificate/key). Values: absolute path.",
-          "example": "/private/tmp/claude-501/-Users-alex-yuzu-dev/8d89cd79-001b-4ea8-8930-0c9affb3265e/scratchpad/d2/plugin_capture",
+          "example": "/private/tmp/claude-501/-Users-jsmith-yuzu-dev/00000000-0000-0000-0000-000000000000/scratchpad/d2/plugin_capture",
           "name": "path",
           "platforms": [
             "windows",
@@ -224,7 +224,7 @@
     {
       "grant": "None — ordinary filesystem/config reads under the daemon's own permissions",
       "if_refused": "same silent omission",
-      "measured": "2026-09-07, bare-metal, euid 501 (alex) (macos.txt sample stamp — unprivileged, not the production root daemon)",
+      "measured": "2026-09-07, bare-metal, euid 501 (jsmith) (macos.txt sample stamp — unprivileged, not the production root daemon)",
       "os": "macOS",
       "runs_as": "agent daemon, root today (LaunchDaemon plist carries no `UserName` key) (docs/agent-privilege-model.md:14)"
     },
@@ -315,7 +315,7 @@
           },
           "row_count": 1,
           "rows": [
-            "file|/private/tmp/claude-501/-Users-alex-yuzu-dev/8d89cd79-001b-4ea8-8930-0c9affb3265e/scratchpad/d2/plugin_capture|142208|1788774907"
+            "file|/private/tmp/claude-501/-Users-jsmith-yuzu-dev/00000000-0000-0000-0000-000000000000/scratchpad/d2/plugin_capture|142208|1788774907"
           ],
           "truncated": false
         }
@@ -326,7 +326,7 @@
         "leg_hash": "6e239e35ca05",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
-        "privilege": "euid 501 (alex)"
+        "privilege": "euid 501 (jsmith)"
       }
     },
     "windows": {

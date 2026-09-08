@@ -148,7 +148,7 @@ dns|localhost|2.8|ok|2
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash e635d1fd4823
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash e635d1fd4823
 
 ```
 == action=icmp targets=127.0.0.1

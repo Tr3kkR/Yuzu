@@ -898,7 +898,7 @@
     {
       "grant": "n/a",
       "if_refused": "always `registry|unsupported|Windows registry has no macOS equivalent; use defaults/plists`, rc 0 (reads) / rc 1 (mutators)",
-      "measured": "2026-09-07, bare-metal, euid 501 (alex)",
+      "measured": "2026-09-07, bare-metal, euid 501 (jsmith)",
       "os": "macOS",
       "runs_as": "n/a — plugin loads but every action is the honest `unsupported` leg"
     },
@@ -1030,7 +1030,7 @@
         {
           "action": "get_user_value",
           "not_captured": null,
-          "params": "username=alex key=Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced name=Hidden",
+          "params": "username=jsmith key=Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced name=Hidden",
           "rc": 0,
           "result_status": {
             "completeness": "UNKNOWN",
@@ -1186,7 +1186,7 @@
         {
           "action": "get_user_value",
           "not_captured": null,
-          "params": "username=alex key=Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced name=Hidden",
+          "params": "username=jsmith key=Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced name=Hidden",
           "rc": 0,
           "result_status": {
             "completeness": "UNKNOWN",
@@ -1222,7 +1222,7 @@
         "leg_hash": "6255117edeb8",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
-        "privilege": "euid 501 (alex)"
+        "privilege": "euid 501 (jsmith)"
       }
     },
     "windows": {
@@ -1351,7 +1351,7 @@
         {
           "action": "get_user_value",
           "not_captured": null,
-          "params": "username=alex key=Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced name=Hidden",
+          "params": "username=jsmith key=Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced name=Hidden",
           "rc": 0,
           "result_status": {
             "completeness": "UNKNOWN",
@@ -1360,7 +1360,7 @@
           },
           "row_count": 3,
           "rows": [
-            "username|alex",
+            "username|jsmith",
             "value|1",
             "type|REG_DWORD"
           ],

@@ -91,7 +91,7 @@ This plugin does not set a typed result status; the agent records `UNDECLARED` a
 - **Instruction result (`list`/`query`).** Dispatched via `execute_instruction`/`/api/instructions/{id}/execute`, rows land in the ResponseStore (90-day default retention, `server/core/src/response_store.hpp:152`), queryable at `/api/responses/{id}`.
 - **Device "Get live info" (`list_hashed`/`list_tree`).** `POST /api/v1/dex/devices/{id}/live?kind=processes` dispatches `list_hashed` synchronously (`server/core/src/live_kinds.hpp:44`); the dashboard's Processes card dispatches `list_tree` (joined with `network_diag/connections` by PID) via `server/core/src/device_routes.cpp:77`. Both are usage-class behavioral-PII reads, audited under their own verbs (`device.live.processes`, `device.live.process_tree`) through the fail-closed `emit_behavioral_audit` chokepoint (`rest_audit.hpp`) *before* dispatch — a 503 `Sec-Audit-Failed` blocks the command if the audit row can't persist.
 - **Not consumed by** daily-sync inventory, TAR, or metrics. Nothing runs on a schedule.
-- **Sensitivity.** `name` rows name installed applications on the host (process/executable names — an installed-software inventory by another route, e.g. `Code Helper (Plugin)`, `svchost.exe`); `list_hashed`/`list_tree`'s `path` frequently embeds the owning account's home directory on macOS/Linux (e.g. `/Users/alex/.vscode/extensions/...` in the macOS sample), identifying a specific person, while `sha256` alone identifies neither a device nor a person.
+- **Sensitivity.** `name` rows name installed applications on the host (process/executable names — an installed-software inventory by another route, e.g. `Code Helper (Plugin)`, `svchost.exe`); `list_hashed`/`list_tree`'s `path` frequently embeds the owning account's home directory on macOS/Linux (e.g. `/Users/jsmith/.vscode/extensions/...` in the macOS sample), identifying a specific person, while `sha256` alone identifies neither a device nor a person.
 - **Siblings:** `procfetch` (the scheduled fleet-wide hash collector, SHA-1, distinct from this plugin's on-demand SHA-256).
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("crossplatform.process.list")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}` (list/query) or `/api/v1/dex/devices/{id}/live?kind=processes` (list_hashed via the live-read surface).
 
@@ -166,7 +166,7 @@ proc|2456|svchost.exe
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 9139daeb45d2
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 9139daeb45d2
 
 ```
 == action=list

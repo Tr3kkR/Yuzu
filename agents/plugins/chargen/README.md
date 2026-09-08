@@ -42,7 +42,7 @@ flowchart LR
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
 | Windows | not documented — no row in `docs/agent-privilege-model.md`; the capture ran as `SYSTEM` | None. The loop touches no OS resource — no file, registry, or network handle is opened. | 2026-09-07, bare-metal | n/a — the plugin performs no privileged operation; the `AdminOrApproval` gate on `chargen_start` is an authorization check enforced server-side before dispatch, not a host permission |
-| macOS | not documented; the capture ran unprivileged at euid 501 (alex) | None | 2026-09-07, bare-metal, euid 501 | n/a |
+| macOS | not documented; the capture ran unprivileged at euid 501 (jsmith) | None | 2026-09-07, bare-metal, euid 501 | n/a |
 | Linux | not documented; the capture ran as euid 0 in a container | None | 2026-09-06, container, euid 0 | n/a |
 
 No external binaries, no subprocesses, no network access. The generator is pure in-memory C++ (`generate_line`), and `stop_all()`/`shutdown()` only touch the plugin's own in-process session map.
@@ -102,7 +102,7 @@ chargen stopped
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 5789eff1c673
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 5789eff1c673
 
 ```
 == action=chargen_start

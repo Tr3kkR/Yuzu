@@ -132,7 +132,7 @@ product_code|{20C01991-CCD1-2C06-7A9A-B10A9B4AF807}|Windows App Certification Ki
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash ece0243d8d74
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash ece0243d8d74
 
 ```
 == action=list

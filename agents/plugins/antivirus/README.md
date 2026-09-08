@@ -56,7 +56,7 @@ flowchart LR
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
 | Windows | agent service account, captured as `SYSTEM` (LocalSystem today, #1442) | None observed. In-process WMI queries against SecurityCenter2/Defender and the Defender exclusion registry keys all succeeded under this identity. | 2026-09-07, bare-metal host, `SYSTEM` | `products`/`status`: `not_available\|<WMI error text>` row + `UNAVAILABLE`/`PARTIAL`. `av_exclusions`: a per-subkey `ERROR_ACCESS_DENIED` open renders `permission_denied\|exclusions <kind> access denied` and the action's status becomes `PERMISSION_DENIED`/`PARTIAL`. |
-| macOS | agent daemon (docs describe default/unprivileged; sample was captured as an interactive user, euid 501, not the daemon identity) | None — `PlistBuddy`, `systemextensionsctl list`, and `pgrep` are all unprivileged reads. | 2026-09-07, bare-metal, euid 501 (alex) | An unreadable XProtect bundle renders `av\|XProtect\|unknown` (`products`) or `status\|unknown` (`status`) — never assumed active/healthy. |
+| macOS | agent daemon (docs describe default/unprivileged; sample was captured as an interactive user, euid 501, not the daemon identity) | None — `PlistBuddy`, `systemextensionsctl list`, and `pgrep` are all unprivileged reads. | 2026-09-07, bare-metal, euid 501 (jsmith) | An unreadable XProtect bundle renders `av\|XProtect\|unknown` (`products`) or `status\|unknown` (`status`) — never assumed active/healthy. |
 | Linux | agent daemon (docs describe default/unprivileged; sample was captured as root in a container) | None — `pgrep` and the `/opt/*` existence checks need no capability. | 2026-09-06, container, euid 0 | A failed `pgrep` invocation is forwarded once via `forward_runner_failure`; the affected product renders as `not_running`/`not_detected` rather than crashing or fabricating a state. |
 
 Binaries/subprocesses: macOS — `/usr/libexec/PlistBuddy`, `/usr/bin/systemextensionsctl`, `/usr/bin/pgrep` (bounded subprocess, 5s deadline). Linux — `/usr/bin/pgrep` or `/bin/pgrep` (bounded subprocess, 5s deadline). Windows — none; WMI and registry access are in-process. No network access on any OS.
@@ -156,7 +156,7 @@ exclusion|path|local|D:\yuzu-dev
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash a4abf06e398d
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash a4abf06e398d
 
 ```
 == action=products
@@ -200,7 +200,7 @@ unsupported|av_exclusions is Windows-only
 1. **The Windows `productState` decode is a reverse-engineered convention, not a documented API.** `decode_wsc_product_state` (`antivirus_parsers.hpp:217`) formats a widely-corroborated community convention going back to Vista — Microsoft has never published this layout, so the decode is MEDIUM confidence, not the HIGH confidence a header-published struct would carry.
 2. **No content definition targets the Linux `status` leg.** `list_status_linux` is real, and the descriptor declares `status` supported on Linux at rung 2 (`antivirus_plugin.cpp:490-492`), but `security.antivirus.defender_status` is `platforms: [windows]` and `security.antivirus.xprotect_status` is `platforms: [darwin]` (`content/definitions/antivirus.yaml:104`, `:178`) — no definition in this file targets Linux for the `status` action.
 3. **A single ACL'd exclusion subkey degrades the whole `av_exclusions` run.** The worst-of-six aggregation (`antivirus_plugin.cpp:211-247`) means one policy-hive key denied to the reading account reports `PERMISSION_DENIED` for the entire action, even if the other five subkey reads succeeded and returned real exclusions.
-4. **`docs/agent-privilege-model.md`'s Windows cell is stale.** It still describes "PowerShell SecurityCenter2 / `Get-MpComputerStatus` CIM queries" (`docs/agent-privilege-model.md:97`); the plugin has read both namespaces in-process via WMI, with no PowerShell spawn, since PR #3369 (2026-08-23).
+4. **`docs/agent-privilege-model.md`'s Windows cell now matches the code.** It describes in-process WMI/COM queries against `root\SecurityCenter2` and `root\Microsoft\Windows\Defender`, no PowerShell subprocess (`docs/agent-privilege-model.md:97`) — matching the plugin's actual mechanism since PR #3369 (2026-08-23). Earlier revisions of that row described a PowerShell `Get-MpComputerStatus` CIM query; treat any remaining reference to it elsewhere as stale.
 5. **CrowdStrike and Sophos are presence-only outside Windows.** Linux and macOS report `detected`/`not_detected` or `installed`/`running` for these vendors with no definitions-freshness data — this plugin has no rung-1 or rung-2 mechanism to read their own signature state on those platforms (`antivirus_plugin.cpp:327-329`).
 
 ## Source and tests

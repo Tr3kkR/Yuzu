@@ -57,7 +57,7 @@ flowchart LR
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
 | Windows | agent daemon identity (captured as `SYSTEM`) | not established — no `docs/agent-privilege-model.md` row for this plugin | 2026-09-07, bare metal, as SYSTEM | not observed in this capture; a denied `RegOpenKeyExW`/`RegQueryValueExW` fails silently and the read helper returns an empty string, so a blocked registry read surfaces as the check's default branch, not an explicit error |
-| macOS | agent daemon (captured unprivileged, euid 501) | not established — no privilege-model row | 2026-09-07, bare metal, euid 501 (alex) | not observed; a failed `popen` command (`spctl`/`fdesetup`/`csrutil`/`socketfilterfw`) returns empty output, which every check parses as its negative/disabled branch |
+| macOS | agent daemon (captured unprivileged, euid 501) | not established — no privilege-model row | 2026-09-07, bare metal, euid 501 (jsmith) | not observed; a failed `popen` command (`spctl`/`fdesetup`/`csrutil`/`socketfilterfw`) returns empty output, which every check parses as its negative/disabled branch |
 | Linux | agent daemon (captured as root, euid 0, container) | not established — no privilege-model row | 2026-09-06, container, euid 0 | not observed; a failed `popen` call or unreadable file returns empty, parsed as the check's negative/default branch |
 
 No external binaries on Windows — both software enumeration and the Windows config checks are
@@ -230,7 +230,7 @@ Defraggler|2.22
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 20c66f1c0618
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 20c66f1c0618
 
 ```
 == action=scan

@@ -9,7 +9,7 @@
 | **Platforms** | Windows ✅ · macOS ⛔ unsupported · Linux ⛔ unsupported |
 | **Actions** | `set_state` (definition `windows.rdp.set_state`) · `status` (definition `windows.rdp.status`) |
 | **Security** | `set_state`: securable `Security` · operation Write · risk High · dispatch Mutating · approval gate AdminOrApproval; `status`: securable `Security` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
-| **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
+| **Roles** | execute: `set_state`: endpoint-admin; `status`: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
 
 ## How it works
@@ -40,7 +40,7 @@ flowchart LR
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
 | Windows | agent service account with an elevated token (LocalSystem today, #1442) | **Administrators** group membership (LocalSystem already has it). The intended least-privilege `NT SERVICE\YuzuAgent` account is **not** granted this by `scripts/install-agent-user.ps1`; must be added out of band (GPO Restricted Groups / Intune / `Add-LocalGroupMember`). | 2026-09-07, bare metal, as `SYSTEM` | `set_state`: per-step `error:<code>` rows and `overall\|error`; `status`: per-gate `error:<code>` rows and `rdp\|unknown` |
-| macOS | n/a — leg not implemented; the honest-sentinel path needs no privilege | n/a | 2026-09-07, bare metal, at euid 501 (alex) | always `rdp_control\|unsupported\|...`, rc=1 (`set_state`) / rc=0 (`status`) |
+| macOS | n/a — leg not implemented; the honest-sentinel path needs no privilege | n/a | 2026-09-07, bare metal, at euid 501 (jsmith) | always `rdp_control\|unsupported\|...`, rc=1 (`set_state`) / rc=0 (`status`) |
 | Linux | n/a — leg not implemented; the honest-sentinel path needs no privilege | n/a | 2026-09-06, container, at euid 0 | always `rdp_control\|unsupported\|...`, rc=1 (`set_state`) / rc=0 (`status`) |
 
 None. The Windows leg calls Win32 registry, COM, and Service Control Manager APIs in-process (`RegSetValueExW`/`RegGetValueW`, `INetFwPolicy2` COM, `StartServiceW`/`QueryServiceStatusEx`) — no subprocess, no network.
@@ -110,7 +110,7 @@ rdp|on
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash e17062cd8474
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash e17062cd8474
 
 ```
 == action=set_state

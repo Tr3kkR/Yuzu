@@ -50,7 +50,7 @@ flowchart LR
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
 | Windows | agent service account (captured as `SYSTEM`; no dedicated row in `docs/agent-privilege-model.md` for this plugin) | **None.** `GetIpNetTable2` and `IcmpSendEcho` (linked via `iphlpapi`/`ws2_32`) need no elevated handle open. | 2026-09-07, bare-metal, Windows 10.0.26200.0, `SYSTEM` | ARP failure → `UNAVAILABLE`/`PARTIAL` `arp:read_failed`; ICMP session unavailable → `UNAVAILABLE`/`PARTIAL` `icmp:socket_error` |
-| macOS | agent daemon (captured unprivileged, euid 501) | **None.** The routing-socket sysctl read and an unprivileged `SOCK_DGRAM` ICMP socket need no elevated privilege. | 2026-09-07, bare-metal, macOS 26.6.2, euid 501 (alex) | ARP failure → `UNAVAILABLE`/`PARTIAL` `arp:read_failed`; ICMP session unavailable → `UNAVAILABLE`/`PARTIAL` `icmp:socket_error` |
+| macOS | agent daemon (captured unprivileged, euid 501) | **None.** The routing-socket sysctl read and an unprivileged `SOCK_DGRAM` ICMP socket need no elevated privilege. | 2026-09-07, bare-metal, macOS 26.6.2, euid 501 (jsmith) | ARP failure → `UNAVAILABLE`/`PARTIAL` `arp:read_failed`; ICMP session unavailable → `UNAVAILABLE`/`PARTIAL` `icmp:socket_error` |
 | Linux | agent daemon (captured as euid 0 in a container; production identity not pinned by a row in `docs/agent-privilege-model.md`) | `net.ipv4.ping_group_range` must admit the agent's gid for the unprivileged ICMP socket, or the sweep falls back to ARP-only. | 2026-09-07, Debian GNU/Linux 13 (trixie) aarch64, container, euid 0 | ICMP denied → `CONSTRAINED`/`PARTIAL` `icmp:ping_group_range`; ICMP unavailable for any other reason → `UNAVAILABLE`/`PARTIAL` `icmp:socket_error`; `/proc/net/arp` unreadable → `UNAVAILABLE`/`PARTIAL` `arp:read_failed` |
 
 No external binaries or subprocesses on any leg (the last `popen()`/`ping` spawn was removed in Wave 2). Network: yes — sends ICMP echo probes to every host address in the requested subnet, plus a reverse-DNS (PTR) query for each host found alive.
@@ -120,7 +120,7 @@ scan_complete|2|2
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 77514adb726f
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 77514adb726f
 
 ```
 == action=scan_subnet subnet=127.0.0.0/30

@@ -55,7 +55,7 @@ flowchart LR
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
 | Windows | agent service account (LocalSystem today, #1442) | `mounts`, `quotas`: **none** (default `FindFirstVolumeW`/`GetVolumeInformationW`/`GetDiskFreeSpaceExW`; `IDiskQuotaControl` opened read-only, `bReadWrite=FALSE`). `snapshots`: **Administrative rights** — `CreateVssBackupComponents`/`IVssBackupComponents::Query`; the agent runs as LocalSystem today, so this succeeds with no extra grant | 2026-09-03 on the-rig: `NT AUTHORITY\SYSTEM` succeeds (3 shadow copies found); `NT AUTHORITY\LOCAL SERVICE` and `NT AUTHORITY\NETWORK SERVICE` both fail `E_ACCESSDENIED`; `NT SERVICE\YuzuAgent` not measured. Sample capture 2026-09-07, `SYSTEM`, bare-metal | `quotas`: per-volume result status `permission_denied` (HRESULT `E_ACCESSDENIED`); `snapshots`: whole-run `permission_denied` with a `none` row naming the HRESULT — never an empty snapshot set |
-| macOS | agent daemon, unprivileged | none — `getmntinfo`, `getattrlist`, `fs_snapshot_list` are all unprivileged reads | 2026-09-07 at euid 501 (alex), bare-metal | `quotas`: per-volume `permission_denied` (`getattrlist`/volume-root `open` returning `EPERM`/`EACCES`); `snapshots`: per-volume `permission_denied` when opening a volume root fails `EACCES`/`EPERM` |
+| macOS | agent daemon, unprivileged | none — `getmntinfo`, `getattrlist`, `fs_snapshot_list` are all unprivileged reads | 2026-09-07 at euid 501 (jsmith), bare-metal | `quotas`: per-volume `permission_denied` (`getattrlist`/volume-root `open` returning `EPERM`/`EACCES`); `snapshots`: per-volume `permission_denied` when opening a volume root fails `EACCES`/`EPERM` |
 | Linux | agent daemon (sample captured as euid 0 in a container) | none for `mounts`/`snapshots` (mountinfo read + `statvfs`); `quotas` needs `CAP_SYS_ADMIN` for a non-`EPERM` `quotactl` reply | 2026-09-06, Debian 13 aarch64, container, euid 0 | `quotas`: `permission_denied` when every probed device returns `EPERM`/`EACCES`; `mounts`/`snapshots` have no privileged call, so a read failure there degrades to `CONSTRAINED` rather than a denial |
 
 No external binaries, no subprocesses. No network access is initiated by this plugin; the Linux `mounts` leg deliberately skips `statvfs` on network filesystem types (`is_network_fstype`) specifically to avoid blocking on one.
@@ -159,7 +159,7 @@ snapshot|C:/|{21E68FE4-CB60-454D-A893-9420AD8EE750}|vss|//?/GLOBALROOT/Device/Ha
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 6094b93f5b9d
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 6094b93f5b9d
 
 ```
 == action=mounts

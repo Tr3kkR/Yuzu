@@ -9,7 +9,7 @@
 | **Platforms** | Windows ✅ · macOS 🟡 constrained · Linux 🟡 constrained |
 | **Actions** | `list` · `surfaces` |
 | **Security** | securable `SoftwareLicensing` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
-| **Roles** | execute: - · author: - |
+| **Roles** | execute:  · author: - |
 <!-- END GENERATED -->
 
 ## How it works
@@ -132,7 +132,7 @@ probe_status|open_source_classification|ok|3
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 93534d76a8aa
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 93534d76a8aa
 
 ```
 == action=list

@@ -9,7 +9,7 @@
 | **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
 | **Actions** | `check` (definition `device.wol.check`) · `wake` (definition `device.wol.wake`) |
 | **Security** | `wake`: securable `Infrastructure` · operation Write · risk Medium · dispatch Mutating · approval gate AdminOrApproval; `check`: securable `Infrastructure` · operation Read · risk Low · dispatch ReadOnly · approval gate AdminOrApproval |
-| **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
+| **Roles** | execute: `wake`: endpoint-admin; `check`: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
 
 ## How it works
@@ -44,7 +44,7 @@ flowchart LR
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
 | Windows | agent service account (LocalSystem today, #1442) | `wake`: none beyond default socket access — Winsock `SOCK_DGRAM` broadcast (`wol_plugin.cpp:215`), no PowerShell; `check`: none — `IcmpSendEcho` (iphlpapi) and the TCP connect are both unprivileged | 2026-09-07, bare metal, as `SYSTEM` | not observed in any sample; `wake`'s only failure path is a `sendto` error, reported as `wake\|error\|Failed to send magic packet to <mac>` |
-| macOS | agent daemon (`_yuzu`) | `wake`: none — `docs/agent-privilege-model.md:120` and `wol_plugin.cpp:215` agree: the plugin opens `SOCK_DGRAM`/`IPPROTO_UDP` (not `SOCK_RAW`), which needs no such capability — the doc's grant is over-stated for the current code, see Caveat 1. `check`: none — the unprivileged `SOCK_DGRAM` ICMP ping socket "works out of the box on macOS" (`icmp_probe.hpp:19-20`) | 2026-09-07, bare metal, at euid 501 (unprivileged) | not observed; no permission-denied path is exercised in code or samples |
+| macOS | agent daemon (`_yuzu`) | `wake`: none — `docs/agent-privilege-model.md:120` and `wol_plugin.cpp:215` agree: the plugin opens `SOCK_DGRAM`/`IPPROTO_UDP` (not `SOCK_RAW`), which needs no such capability — see Caveat 1. `check`: none — the unprivileged `SOCK_DGRAM` ICMP ping socket "works out of the box on macOS" (`icmp_probe.hpp:19-20`) | 2026-09-07, bare metal, at euid 501 (unprivileged) | not observed; no permission-denied path is exercised in code or samples |
 | Linux | agent daemon (`yuzu`) | `wake`: none — `docs/agent-privilege-model.md:120` and `wol_plugin.cpp:215` agree: the plugin opens `SOCK_DGRAM`/`IPPROTO_UDP` (not `SOCK_RAW`), which needs no such capability — see Caveat 1. `check`: no agent-side grant — the unprivileged ICMP ping socket needs the *host's* `net.ipv4.ping_group_range` sysctl to admit the process's group, else the leg falls back to the TCP-connect probe (`matrix.md`) | 2026-09-06, container, at euid 0 (root) — see Caveats: the capture never ran unprivileged | a denied ICMP socket open (`EACCES`/`EPERM`) sets `icmp_session_ok=false` (`icmp_probe.hpp:370`) and the action silently falls through to the TCP fallback rather than surfacing a distinct error |
 
 No subprocess is spawned by either action — the historic `ping`/`popen` shell-out was removed (`changelog.d/20260818-wave2-network-actions-wol-services-native-argv.changed.md`). `wake` opens a UDP datagram socket; `check` opens an unprivileged ICMP ping socket (POSIX) or calls `IcmpSendEcho` (Windows), plus a TCP connect socket on port 443 as fallback. Network only — no filesystem or registry access.
@@ -120,7 +120,7 @@ mechanism|icmp
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash dcc02549b1eb
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash dcc02549b1eb
 
 ```
 == action=wake

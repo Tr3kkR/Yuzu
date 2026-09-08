@@ -1,6 +1,6 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 514b81c2df7e
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 514b81c2df7e
 == action=procfetch_fetch
-10151|plugin_capture|/private/tmp/claude-501/-Users-alex-yuzu-dev/8d89cd79-001b-4ea8-8930-0c9affb3265e/scratchpad/d2/plugin_capture|87ea43e2b7d3dd2eb6e7db6a20041b1f77d20272
+10151|plugin_capture|/private/tmp/claude-501/-Users-jsmith-yuzu-dev/00000000-0000-0000-0000-000000000000/scratchpad/d2/plugin_capture|87ea43e2b7d3dd2eb6e7db6a20041b1f77d20272
 10143|mdworker_shared|/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared|19ca6c856d80cfc6b83800c821b3129f40b135c7
 10125|Code Helper (Plugin)|/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Plugin).app/Contents/MacOS/Code Helper (Plugin)|0478d377b6ffa6659d823d3c72d25dc9b8816bd6
 10121|mdworker_shared|/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared|19ca6c856d80cfc6b83800c821b3129f40b135c7
@@ -20,9 +20,9 @@ captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex
 9100|Code Helper (Renderer)|/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Renderer).app/Contents/MacOS/Code Helper (Renderer)|f2350a895f845b3abf58acee435aaf9f95cf9fa2
 9098|ssh-agent|/usr/bin/ssh-agent|409e33df7093b1556ca4ebf201346c749da658ce
 9064|SpeechSynthesisServerXPC|/System/Library/Frameworks/ApplicationServices.framework/Versions/A/Frameworks/SpeechSynthesis.framework/Versions/A/XPCServices/SpeechSynthesisServerXPC.xpc/Contents/MacOS/SpeechSynthesisServerXPC|26378695d295a43f5c4223e3944d1ec9a28ec2e7
-9039|claude|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude|da44323dee6bf9fbd3aafca303f25884f3e6675e
-9001|claude|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude|da44323dee6bf9fbd3aafca303f25884f3e6675e
-8979|claude|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude|da44323dee6bf9fbd3aafca303f25884f3e6675e
+9039|claude|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude|da44323dee6bf9fbd3aafca303f25884f3e6675e
+9001|claude|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude|da44323dee6bf9fbd3aafca303f25884f3e6675e
+8979|claude|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude|da44323dee6bf9fbd3aafca303f25884f3e6675e
 8969|MTLCompilerService|/System/Library/Frameworks/Metal.framework/Versions/A/XPCServices/MTLCompilerService.xpc/Contents/MacOS/MTLCompilerService|e6aa243d70c17f39af1dc9dc86cb364accbd5cdc
 8968|MTLCompilerService|/System/Library/Frameworks/Metal.framework/Versions/A/XPCServices/MTLCompilerService.xpc/Contents/MacOS/MTLCompilerService|e6aa243d70c17f39af1dc9dc86cb364accbd5cdc
 8967|Signal Helper|/Applications/Signal.app/Contents/Frameworks/Signal Helper.app/Contents/MacOS/Signal Helper|6e6f20528e7e11b8d1617f5a1ac3c99f7958a7f3
@@ -208,7 +208,7 @@ captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex
 1540|TextInputSwitcher|/System/Library/CoreServices/TextInputSwitcher.app/Contents/MacOS/TextInputSwitcher|871329835bfe856ad65e045c88c1a46b053afcee
 1539|FindMyMacd|/System/Library/PrivateFrameworks/FindMyMac.framework/Versions/A/Resources/FindMyMacd|4f5546b8aff36203be7b79e22b063ea682002fc4
 1533|postgres|/opt/homebrew/Cellar/postgresql@18/18.6/bin/postgres|31591fbd9e7b921fc91ee5020801526259a4ec5a
-1527|Updater|/Users/alex/Library/Caches/net.whatsapp.WhatsApp/org.sparkle-project.Sparkle/Launcher/LTxMS6mZK/Updater.app/Contents/MacOS/Updater|f0146c9bcbc870abf6affd147d7ddf9ebb71b029
+1527|Updater|/Users/jsmith/Library/Caches/net.whatsapp.WhatsApp/org.sparkle-project.Sparkle/Launcher/LTxMS6mZK/Updater.app/Contents/MacOS/Updater|f0146c9bcbc870abf6affd147d7ddf9ebb71b029
 1526|icdd|/System/Library/Image Capture/Support/icdd|4fd0a642c66ad6c0cbf6131841ebe70f3b68d28e
 1522|heard|/System/Library/PrivateFrameworks/HearingCore.framework/heard|126eec33713b7474986cfa884c1b2783514a0b01
 1530|AirPlayUIAgent|/System/Library/CoreServices/AirPlayUIAgent.app/Contents/MacOS/AirPlayUIAgent|098caa96690d7cd73f2446e538470b48bc08795f
@@ -263,12 +263,12 @@ captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex
 1440|Spotify|/Applications/Spotify.app/Contents/MacOS/Spotify|b8e3868cf16c2c3f6d0e103b9c9d7971d7d0c1df
 1438|SafariLaunchAgent|/System/Volumes/Preboot/Cryptexes/App/usr/libexec/SafariLaunchAgent|c5b3675afa1319ff0b3e643ae262615689cfc277
 1437|com.apple.WebKit.Networking|/System/Volumes/Preboot/Cryptexes/Incoming/OS/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.Networking.xpc/Contents/MacOS/com.apple.WebKit.Networking|2ece86501698939f7368474cb80bdcc752301303
-1390|claude|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude|da44323dee6bf9fbd3aafca303f25884f3e6675e
-1370|claude|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude|da44323dee6bf9fbd3aafca303f25884f3e6675e
+1390|claude|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude|da44323dee6bf9fbd3aafca303f25884f3e6675e
+1370|claude|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude|da44323dee6bf9fbd3aafca303f25884f3e6675e
 1343|Signal Helper (Renderer)|/Applications/Signal.app/Contents/Frameworks/Signal Helper (Renderer).app/Contents/MacOS/Signal Helper (Renderer)|539215e2ab67107742f6c2deaec7bb1888747c5b
 1341|ANECompilerService|/System/Library/PrivateFrameworks/AppleNeuralEngine.framework/XPCServices/ANECompilerService.xpc/Contents/MacOS/ANECompilerService|b2fa11f60e35328183100c1680b5619f96501f45
 1338|Code Helper|/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper.app/Contents/MacOS/Code Helper|336541fba1b214679a6af0fdd0269486eb73aa11
-1322|codex|/Users/alex/.vscode/extensions/openai.chatgpt-26.901.22334-darwin-arm64/bin/macos-aarch64/codex|7c63f6e134aed10a4da875c1c7dd4f60433ae75c
+1322|codex|/Users/jsmith/.vscode/extensions/openai.chatgpt-26.901.22334-darwin-arm64/bin/macos-aarch64/codex|7c63f6e134aed10a4da875c1c7dd4f60433ae75c
 1320|icloudmailagent|/usr/libexec/icloudmailagent|d9b7554a36fcf5e1ce46864358042fdb40b7ef37
 1310|Code Helper|/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper.app/Contents/MacOS/Code Helper|336541fba1b214679a6af0fdd0269486eb73aa11
 1309|Code Helper|/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper.app/Contents/MacOS/Code Helper|336541fba1b214679a6af0fdd0269486eb73aa11

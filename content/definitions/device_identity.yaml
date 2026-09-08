@@ -94,7 +94,7 @@ spec:
       - name: joined
         type: bool
         description: Whether the device is currently joined to a domain or realm.
-        example: false
+        example: "false"
         platforms: [windows, linux, darwin]
 
   readablePayload: "Get domain membership"

@@ -511,12 +511,12 @@ spec:
       - name: serial
         type: string
         description: 'Hardware serial number, or "unknown" when absent (e.g. a VM with no SMBIOS serial) or unreadable. Values: free text, or the sentinel "unknown".'
-        example: "J6RYL9MKMJ"
+        example: "EXAMPLE0001"
         platforms: [windows, linux, darwin]
       - name: system_uuid
         type: string
         description: 'SMBIOS/firmware system UUID, or "unknown" when absent or unreadable. Values: free text UUID, or the sentinel "unknown".'
-        example: "EC27F833-3739-5416-A744-E97433A27C90"
+        example: "00000000-0000-0000-0000-000000000001"
         platforms: [windows, linux, darwin]
 
   readablePayload: "Get the device serial number and system UUID"

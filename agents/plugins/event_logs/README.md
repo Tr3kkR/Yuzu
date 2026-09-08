@@ -134,7 +134,7 @@ event|none|-|-|-|No match within the newest events examined (count window full; 
 [result_status] CONSTRAINED / PARTIAL / event_logs_win:count_window_full
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 81838b2b5566
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 81838b2b5566
 
 ```
 == action=errors

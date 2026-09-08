@@ -137,7 +137,7 @@
         },
         {
           "description": "The connection's local IP address, in the address family matching proto. Values: free text (IPv4 or IPv6 address).",
-          "example": "100.109.177.77",
+          "example": "198.51.100.77",
           "name": "local_addr",
           "platforms": [
             "windows",
@@ -161,7 +161,7 @@
         },
         {
           "description": "The connection's remote IP address. UDP sockets report the literal '*' on macOS and Windows (no fixed peer); Linux instead parses the real value from /proc/net/udp* (normally 0.0.0.0). Values: free text (IPv4 or IPv6 address) or \"*\".",
-          "example": "100.123.53.121",
+          "example": "198.51.100.121",
           "name": "remote_addr",
           "platforms": [
             "windows",
@@ -255,7 +255,7 @@
         },
         {
           "description": "The connection's local IP address, in the address family matching proto. Values: free text (IPv4 or IPv6 address).",
-          "example": "100.109.177.77",
+          "example": "198.51.100.77",
           "name": "local_addr",
           "platforms": [
             "windows",
@@ -279,7 +279,7 @@
         },
         {
           "description": "The connection's remote IP address. UDP sockets report the literal '*' on macOS and Windows (no fixed peer); Linux instead parses the real value from /proc/net/udp* (normally 0.0.0.0). Values: free text (IPv4 or IPv6 address) or \"*\".",
-          "example": "100.123.53.121",
+          "example": "198.51.100.121",
           "name": "remote_addr",
           "platforms": [
             "windows",
@@ -338,7 +338,7 @@
   "privileges": [
     {
       "grant": "None — `GetExtendedTcpTable`/`GetExtendedUdpTable` and `QueryFullProcessImageNameW(PROCESS_QUERY_LIMITED_INFORMATION)` need no elevation",
-      "if_refused": "No typed error path: a table-query failure (return code other than `NO_ERROR`/`ERROR_INSUFFICIENT_BUFFER`) or a failed `QueryFullProcessImageNameW` is swallowed — the call returns with whatever rows it already emitted, or an attribution row with empty `process_name`/`process_path` (see `tcp|192.168.0.131|139|0.0.0.0|0|LISTEN|4||` in the Windows sample below, PID 4)",
+      "if_refused": "No typed error path: a table-query failure (return code other than `NO_ERROR`/`ERROR_INSUFFICIENT_BUFFER`) or a failed `QueryFullProcessImageNameW` is swallowed — the call returns with whatever rows it already emitted, or an attribution row with empty `process_name`/`process_path` (see `tcp|203.0.113.131|139|0.0.0.0|0|LISTEN|4||` in the Windows sample below, PID 4)",
       "measured": "2026-09-07, bare metal, as SYSTEM",
       "os": "Windows",
       "runs_as": "LocalSystem today (#1442); intended target is `NT SERVICE\\YuzuAgent`"
@@ -346,7 +346,7 @@
     {
       "grant": "None beyond the agent's actual (root) identity; libproc reads need no separate entitlement",
       "if_refused": "`walk_sockets`/`resolve_proc_name_path` silently skip a PID libproc can't inspect (`proc_pidinfo`/`proc_name`/`proc_pidpath` returning ≤0); the socket, or its process fields, is simply omitted — never a typed status",
-      "measured": "2026-09-07, bare metal, at euid 501 (alex) — captured unprivileged, not as the production root daemon",
+      "measured": "2026-09-07, bare metal, at euid 501 (jsmith) — captured unprivileged, not as the production root daemon",
       "os": "macOS",
       "runs_as": "root — the LaunchDaemon has no `UserName` key (#1455 tracks narrowing this)"
     },
@@ -415,11 +415,11 @@
           },
           "row_count": 105,
           "rows": [
-            "tcp|100.109.177.77|52882|100.123.53.121|22|ESTABLISHED|9653",
-            "tcp|192.168.0.66|52771|160.79.104.10|443|ESTABLISHED|9039",
-            "tcp|192.168.0.66|52775|160.79.104.10|443|ESTABLISHED|9039",
-            "tcp|192.168.0.66|52773|160.79.104.10|443|ESTABLISHED|9039",
-            "tcp|192.168.0.66|52789|160.79.104.10|443|ESTABLISHED|9039"
+            "tcp|198.51.100.77|52882|198.51.100.121|22|ESTABLISHED|9653",
+            "tcp|203.0.113.66|52771|160.79.104.10|443|ESTABLISHED|9039",
+            "tcp|203.0.113.66|52775|160.79.104.10|443|ESTABLISHED|9039",
+            "tcp|203.0.113.66|52773|160.79.104.10|443|ESTABLISHED|9039",
+            "tcp|203.0.113.66|52789|160.79.104.10|443|ESTABLISHED|9039"
           ],
           "truncated": false
         },
@@ -435,11 +435,11 @@
           },
           "row_count": 105,
           "rows": [
-            "tcp|100.109.177.77|52882|100.123.53.121|22|ESTABLISHED|9653|ssh|/usr/bin/ssh",
-            "tcp|192.168.0.66|52771|160.79.104.10|443|ESTABLISHED|9039|claude|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude",
-            "tcp|192.168.0.66|52775|160.79.104.10|443|ESTABLISHED|9039|claude|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude",
-            "tcp|192.168.0.66|52773|160.79.104.10|443|ESTABLISHED|9039|claude|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude",
-            "tcp|192.168.0.66|52789|160.79.104.10|443|ESTABLISHED|9039|claude|/Users/alex/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude"
+            "tcp|198.51.100.77|52882|198.51.100.121|22|ESTABLISHED|9653|ssh|/usr/bin/ssh",
+            "tcp|203.0.113.66|52771|160.79.104.10|443|ESTABLISHED|9039|claude|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude",
+            "tcp|203.0.113.66|52775|160.79.104.10|443|ESTABLISHED|9039|claude|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude",
+            "tcp|203.0.113.66|52773|160.79.104.10|443|ESTABLISHED|9039|claude|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude",
+            "tcp|203.0.113.66|52789|160.79.104.10|443|ESTABLISHED|9039|claude|/Users/jsmith/.vscode/extensions/anthropic.claude-code-2.1.263-darwin-arm64/resources/native-binary/claude"
           ],
           "truncated": false
         }
@@ -450,7 +450,7 @@
         "leg_hash": "f31d206bb2ee",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
-        "privilege": "euid 501 (alex)"
+        "privilege": "euid 501 (jsmith)"
       }
     },
     "windows": {
@@ -468,9 +468,9 @@
           "row_count": 97,
           "rows": [
             "tcp|0.0.0.0|22|0.0.0.0|0|LISTEN|5148",
-            "tcp|100.123.53.121|22|100.109.177.77|53137|ESTABLISHED|5148",
+            "tcp|198.51.100.121|22|198.51.100.77|53137|ESTABLISHED|5148",
             "tcp|0.0.0.0|135|0.0.0.0|0|LISTEN|1008",
-            "tcp|192.168.0.131|139|0.0.0.0|0|LISTEN|4",
+            "tcp|203.0.113.131|139|0.0.0.0|0|LISTEN|4",
             "tcp|0.0.0.0|3389|0.0.0.0|0|LISTEN|9048"
           ],
           "truncated": false
@@ -488,9 +488,9 @@
           "row_count": 97,
           "rows": [
             "tcp|0.0.0.0|22|0.0.0.0|0|LISTEN|5148|sshd.exe|C:\\Windows\\System32\\OpenSSH\\sshd.exe",
-            "tcp|100.123.53.121|22|100.109.177.77|53137|ESTABLISHED|5148|sshd.exe|C:\\Windows\\System32\\OpenSSH\\sshd.exe",
+            "tcp|198.51.100.121|22|198.51.100.77|53137|ESTABLISHED|5148|sshd.exe|C:\\Windows\\System32\\OpenSSH\\sshd.exe",
             "tcp|0.0.0.0|135|0.0.0.0|0|LISTEN|1008|svchost.exe|C:\\Windows\\System32\\svchost.exe",
-            "tcp|192.168.0.131|139|0.0.0.0|0|LISTEN|4||",
+            "tcp|203.0.113.131|139|0.0.0.0|0|LISTEN|4||",
             "tcp|0.0.0.0|3389|0.0.0.0|0|LISTEN|9048|svchost.exe|C:\\Windows\\System32\\svchost.exe"
           ],
           "truncated": false
@@ -551,7 +551,7 @@
   "where_the_data_goes": [
     "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (90-day default retention — `docs/yaml-dsl-spec.md:194`, `response_store.hpp:167`), queryable at `/api/responses/{id}` and dashboard-rendered: `netstat_list` uses a static 8-column schema (`result_parsing.hpp:56`), while `attribution`'s 9-column schema is resolved from the content-definition `result` schema instead of a static entry (`result_parsing.hpp:50-55`).",
     "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — grepping `server/` and `agents/plugins/tar/` for `netstat` finds only the dashboard-schema and command-catalogue sites above; nothing runs on a schedule.",
-    "**Sensitivity.** `netstat_list` rows carry local/remote IPs and a bare `pid` — enough to fingerprint the device's active network identity, but nothing else. `attribution` rows add `process_name`/`process_path`, which name installed software and, for a per-user-profile install, can embed a person's account name in the path (the macOS sample below shows a VS Code extension path under `/Users/alex/...`).",
+    "**Sensitivity.** `netstat_list` rows carry local/remote IPs and a bare `pid` — enough to fingerprint the device's active network identity, but nothing else. `attribution` rows add `process_name`/`process_path`, which name installed software and, for a per-user-profile install, can embed a person's account name in the path (the macOS sample below shows a VS Code extension path under `/Users/jsmith/...`).",
     "**Siblings:** `network_diag` (connection/socket diagnostics), `netprobe` (active reachability probes), the retired `sockwho` (folded into `attribution`, #3403).",
     "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"device.network.netstat_attribution\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."
   ]

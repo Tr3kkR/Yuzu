@@ -9,7 +9,7 @@
 | **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
 | **Actions** | `certificates` (definition `device.diagnostics.certificates`) · `connection_info` (definition `device.diagnostics.connection_info`) · `log_level` (definition `device.diagnostics.log_level`) |
 | **Security** | `log_level`: securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `certificates`: securable `Security` · operation Read · risk Medium · dispatch ReadOnly · approval gate None; `connection_info`: securable `PluginSecret` · operation Read · risk Medium · dispatch ReadOnly · approval gate None |
-| **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
+| **Roles** | execute: `log_level`: endpoint-admin, endpoint-operator; `certificates`: endpoint-admin; `connection_info`: endpoint-admin · author: content-author |
 <!-- END GENERATED -->
 
 ## How it works
@@ -129,7 +129,7 @@ connected_since|0
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash c768172a2281
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash c768172a2281
 
 ```
 == action=log_level

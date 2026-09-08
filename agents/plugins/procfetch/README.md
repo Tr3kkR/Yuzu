@@ -39,7 +39,7 @@ flowchart LR
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
 | Windows | SYSTEM (measured; no row in `docs/agent-privilege-model.md` for this plugin) | None observed at SYSTEM. Even as SYSTEM, `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, ...)` is refused for a handful of protected/system processes — the sample's `[System Process]`, `System`, `Secure System`, `Registry` rows carry no path or hash. | 2026-09-07, bare-metal, `SYSTEM` | that row's `path` and `sha1` fields are empty; no error is surfaced and enumeration continues (`procfetch_plugin.cpp:251-264`) |
-| macOS | unprivileged (agent daemon) | None observed unprivileged — `proc_listpids`/`proc_pidpath` resolved paths and hashes for processes owned by root and other users in the sample (e.g. `postgres`, `XprotectService`) without elevation. | 2026-09-07, macOS 26.6.2, euid 501 (alex) | `proc_pidpath` failing falls back to `proc_name()` for a short name only, leaving `path` and `sha1` empty (`procfetch_plugin.cpp:216-223`) — not observed in this capture |
+| macOS | unprivileged (agent daemon) | None observed unprivileged — `proc_listpids`/`proc_pidpath` resolved paths and hashes for processes owned by root and other users in the sample (e.g. `postgres`, `XprotectService`) without elevation. | 2026-09-07, macOS 26.6.2, euid 501 (jsmith) | `proc_pidpath` failing falls back to `proc_name()` for a short name only, leaving `path` and `sha1` empty (`procfetch_plugin.cpp:216-223`) — not observed in this capture |
 | Linux | root (captured in a container; not measured unprivileged) | `resolve_exe` reads the `/proc/<pid>/exe` symlink, which the kernel restricts to the same UID or a reader holding `CAP_SYS_PTRACE`; an unprivileged, non-matching-UID read is expected to fail | 2026-09-06, Debian 13 (trixie) aarch64 container, euid 0 | `std::filesystem::read_symlink` throws `filesystem_error`, caught and turned into an empty path, so `path` and `sha1` are empty and the row still emits (`procfetch_plugin.cpp:134-140`) |
 
 No external binaries, no subprocesses, no network access — every leg is a native OS call plus an in-process hash (`agents/plugins/procfetch/src/procfetch_plugin.cpp`, no `popen`/`CreateProcess`/socket use anywhere in the file).
@@ -75,7 +75,7 @@ This plugin does not set a typed result status; the agent records `UNDECLARED` a
 
 - **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. The classic dashboard also reaches this action through the legacy `POST /api/procfetch/fetch` route (`server.cpp:14943`), which forwards into the same dispatch chokepoint as the DSL path (`changelog.d/1.9-dispatch-chokepoint.security.md`) rather than a separate mechanism.
 - **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — grepping the server for `procfetch` finds only the dashboard route, the legacy REST forwarder, the capability declaration, and the static result-table column list (`result_parsing.hpp:49`).
-- **Sensitivity.** `name` rows name installed applications on the host (process/executable names — an installed-software inventory by another route, e.g. `XprotectService`, `Code Helper (Plugin)`); `path` frequently embeds the owning account's home directory on macOS/Linux (e.g. `/Users/alex/...` in the macOS sample), identifying a specific person, while `sha1` alone identifies neither a device nor a person.
+- **Sensitivity.** `name` rows name installed applications on the host (process/executable names — an installed-software inventory by another route, e.g. `XprotectService`, `Code Helper (Plugin)`); `path` frequently embeds the owning account's home directory on macOS/Linux (e.g. `/Users/jsmith/...` in the macOS sample), identifying a specific person, while `sha1` alone identifies neither a device nor a person.
 - **Siblings:** `crossplatform.process.list` / `crossplatform.process.query` (the `processes` plugin) — PID and name only, no path or hash, cheaper to run.
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("crossplatform.process.fetch")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 
@@ -102,11 +102,11 @@ This plugin does not set a typed result status; the agent records `UNDECLARED` a
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 514b81c2df7e
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 514b81c2df7e
 
 ```
 == action=procfetch_fetch
-10151|plugin_capture|/private/tmp/claude-501/-Users-alex-yuzu-dev/8d89cd79-001b-4ea8-8930-0c9affb3265e/scratchpad/d2/plugin_capture|87ea43e2b7d3dd2eb6e7db6a20041b1f77d20272
+10151|plugin_capture|/private/tmp/claude-501/-Users-jsmith-yuzu-dev/00000000-0000-0000-0000-000000000000/scratchpad/d2/plugin_capture|87ea43e2b7d3dd2eb6e7db6a20041b1f77d20272
 10143|mdworker_shared|/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared|19ca6c856d80cfc6b83800c821b3129f40b135c7
 10125|Code Helper (Plugin)|/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Plugin).app/Contents/MacOS/Code Helper (Plugin)|0478d377b6ffa6659d823d3c72d25dc9b8816bd6
 10121|mdworker_shared|/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared|19ca6c856d80cfc6b83800c821b3129f40b135c7

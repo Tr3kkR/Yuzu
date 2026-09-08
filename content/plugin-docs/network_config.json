@@ -320,7 +320,7 @@
         },
         {
           "description": "Adapter's MAC address, colon-separated hex, or '-' when the leg could not resolve one (loopback, tunnel/utun interfaces).",
-          "example": "d0:11:e5:c0:a0:99",
+          "example": "00:00:5e:00:53:04",
           "name": "mac",
           "platforms": [
             "windows",
@@ -373,7 +373,7 @@
         },
         {
           "description": "Neighbour's IPv4 or IPv6 address. Values: IPv4 or IPv6 literal.",
-          "example": "192.168.0.61",
+          "example": "203.0.113.61",
           "name": "ip_address",
           "platforms": [
             "windows",
@@ -385,7 +385,7 @@
         },
         {
           "description": "Neighbour's MAC address, colon-separated hex; '-' for a Windows entry with no resolved hardware address yet (incomplete). Linux drops all-zero-MAC rows rather than emitting '-'. Values: colon-separated hex, or '-' (Windows incomplete entries only).",
-          "example": "1c:53:f9:73:22:6c",
+          "example": "00:00:5e:00:53:0f",
           "name": "mac_address",
           "platforms": [
             "windows",
@@ -461,7 +461,7 @@
         },
         {
           "description": "Configured DNS server address. Values: IPv4 or IPv6 literal.",
-          "example": "194.168.4.100",
+          "example": "192.0.2.100",
           "name": "server",
           "platforms": [
             "windows",
@@ -502,7 +502,7 @@
         },
         {
           "description": "IPv4 or IPv6 unicast address assigned to the adapter; an IPv6 link-local zone suffix ('%ifname') is stripped on macOS. Values: IPv4 or IPv6 literal.",
-          "example": "192.168.0.131",
+          "example": "203.0.113.131",
           "name": "address",
           "platforms": [
             "windows",
@@ -526,7 +526,7 @@
         },
         {
           "description": "Default gateway address for this row. Windows resolves it per-adapter (FirstGatewayAddress); Linux/macOS resolve a single system-wide default gateway and repeat it on every row. Values: IPv4 literal, or '-' when none or unresolved.",
-          "example": "192.168.0.1",
+          "example": "203.0.113.1",
           "name": "gateway",
           "platforms": [
             "windows",
@@ -849,8 +849,8 @@
             "adapter|lo0|-|0|up",
             "adapter|gif0|-|0|down",
             "adapter|stf0|-|0|down",
-            "adapter|anpi0|ca:36:a7:b0:f6:23|0|up",
-            "adapter|anpi1|ca:36:a7:b0:f6:24|0|up"
+            "adapter|anpi0|00:00:5e:00:53:01|0|up",
+            "adapter|anpi1|00:00:5e:00:53:02|0|up"
           ],
           "truncated": false
         },
@@ -866,11 +866,11 @@
           },
           "row_count": 12,
           "rows": [
-            "ip|en0|fe80::9e:c46b:750c:b2eb|64|192.168.0.1",
-            "ip|en0|192.168.0.66|24|192.168.0.1",
-            "ip|llw0|fe80::58a0:84ff:fe32:a9a3|64|192.168.0.1",
-            "ip|utun0|fe80::93eb:5451:9abf:3695|64|192.168.0.1",
-            "ip|utun1|fe80::313e:505c:4e40:16c8|64|192.168.0.1"
+            "ip|en0|fe80::9e:c46b:750c:b2eb|64|203.0.113.1",
+            "ip|en0|203.0.113.66|24|203.0.113.1",
+            "ip|llw0|fe80::58a0:84ff:fe32:a9a3|64|203.0.113.1",
+            "ip|utun0|fe80::93eb:5451:9abf:3695|64|203.0.113.1",
+            "ip|utun1|fe80::313e:505c:4e40:16c8|64|203.0.113.1"
           ],
           "truncated": false
         },
@@ -888,8 +888,8 @@
           "rows": [
             "dns|system|100.100.100.100|IPv4",
             "dns|system|fd7a:115c:a1e0::53|IPv6",
-            "dns|system|194.168.4.100|IPv4",
-            "dns|system|194.168.8.100|IPv4"
+            "dns|system|192.0.2.100|IPv4",
+            "dns|system|192.0.2.101|IPv4"
           ],
           "truncated": false
         },
@@ -938,11 +938,11 @@
           },
           "row_count": 15,
           "rows": [
-            "arp|-|192.168.0.1|b0:5b:99:ee:d0:32|-",
-            "arp|-|192.168.0.61|1c:53:f9:73:22:6c|-",
-            "arp|-|192.168.0.71|00:17:88:a6:b2:13|-",
-            "arp|-|192.168.0.131|fc:34:97:65:1e:0a|-",
-            "arp|-|192.168.0.138|c2:4e:eb:d7:1f:62|-"
+            "arp|-|203.0.113.1|00:00:5e:00:53:0e|-",
+            "arp|-|203.0.113.61|00:00:5e:00:53:0f|-",
+            "arp|-|203.0.113.71|00:00:5e:00:53:10|-",
+            "arp|-|203.0.113.131|00:00:5e:00:53:11|-",
+            "arp|-|203.0.113.138|00:00:5e:00:53:12|-"
           ],
           "truncated": false
         }
@@ -953,7 +953,7 @@
         "leg_hash": "3b5c27bfec23",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
-        "privilege": "euid 501 (alex)"
+        "privilege": "euid 501 (jsmith)"
       }
     },
     "windows": {
@@ -994,7 +994,7 @@
             "ip|Ethernet 2|169.254.54.245|16|-",
             "ip|Tailscale|fd7a:115c:a1e0::1c32:357a|128|-",
             "ip|Tailscale|fe80::c5b0:bd45:79bc:bd97|64|-",
-            "ip|Tailscale|100.123.53.121|32|-"
+            "ip|Tailscale|198.51.100.121|32|-"
           ],
           "truncated": false
         },
@@ -1010,8 +1010,8 @@
           },
           "row_count": 24,
           "rows": [
-            "dns|Ethernet 2|194.168.4.100|IPv4",
-            "dns|Ethernet 2|194.168.8.100|IPv4",
+            "dns|Ethernet 2|192.0.2.100|IPv4",
+            "dns|Ethernet 2|192.0.2.101|IPv4",
             "dns|Tailscale|fec0:0:0:ffff::1|IPv6",
             "dns|Tailscale|fec0:0:0:ffff::2|IPv6",
             "dns|Tailscale|fec0:0:0:ffff::3|IPv6"

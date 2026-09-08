@@ -43,7 +43,7 @@ flowchart LR
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
 | Windows | no `docs/agent-privilege-model.md` row; sample captured as `SYSTEM` | None observed — `GetExtendedTcpTable`/`GetExtendedUdpTable`, `DnsGetCacheDataTable`, and `GetFileAttributesEx`-family calls read attributes only (`ioc_plugin.cpp:141-242,393-425,436-446`) | 2026-09-07, bare-metal, Windows NT 10.0.26200.0 x64 (`docs/samples/windows.txt:1`) | Silent degradation, not an error: a failed `GetExtendedTcpTable`/`UdpTable` call is skipped with no rows added (`ioc_plugin.cpp:141-179,222-242`), so an IP/port check that can't read the connection table reports "not found" rather than a typed failure — the plugin never calls a result-status API |
-| macOS | no privilege-model row; sample captured at euid 501 (alex), unprivileged | None observed — the shared `libproc` walk and `/etc/hosts`/`stat()` checks ran successfully unprivileged in the sample | 2026-09-07, bare-metal, macOS 26.6.2 arm64 (`docs/samples/macos.txt:1`) | Same silent-degradation pattern as Windows; no typed failure status exists to distinguish it |
+| macOS | no privilege-model row; sample captured at euid 501 (jsmith), unprivileged | None observed — the shared `libproc` walk and `/etc/hosts`/`stat()` checks ran successfully unprivileged in the sample | 2026-09-07, bare-metal, macOS 26.6.2 arm64 (`docs/samples/macos.txt:1`) | Same silent-degradation pattern as Windows; no typed failure status exists to distinguish it |
 | Linux | no privilege-model row; sample captured at euid 0, container | None observed — `/proc/net/tcp[6]`, `/etc/hosts`, and `stat()` are world-readable | 2026-09-07, container, Debian GNU/Linux 13 aarch64 (`docs/samples/linux.txt:1`) | Same silent-degradation pattern; additionally, PID is never available from `/proc/net/tcp` parsing on Linux (`ioc_plugin.cpp:341`), so IP/port match details there never name a process |
 
 No external binaries or subprocesses on any OS — all three legs read OS-native tables/files directly (`ioc_plugin.cpp:21-25`). No outbound network access; the Windows DNS check reads the local resolver cache, it does not resolve or query anything.
@@ -103,7 +103,7 @@ port|22|true|Listening (pid 5148)
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 4c1360bf4eef
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 4c1360bf4eef
 
 ```
 == action=check ip_addresses=127.0.0.1 domains=localhost ports=22

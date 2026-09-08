@@ -51,7 +51,7 @@ spec:
       - name: mac
         type: string
         description: "Adapter's MAC address, colon-separated hex, or '-' when the leg could not resolve one (loopback, tunnel/utun interfaces)."
-        example: "d0:11:e5:c0:a0:99"
+        example: "00:00:5e:00:53:04"
         platforms: [windows, linux, darwin]
       - name: speed_mbps
         type: int64
@@ -129,7 +129,7 @@ spec:
       - name: address
         type: string
         description: "IPv4 or IPv6 unicast address assigned to the adapter; an IPv6 link-local zone suffix ('%ifname') is stripped on macOS. Values: IPv4 or IPv6 literal."
-        example: "192.168.0.131"
+        example: "203.0.113.131"
         platforms: [windows, linux, darwin]
       - name: prefix_length
         type: int32
@@ -139,7 +139,7 @@ spec:
       - name: gateway
         type: string
         description: "Default gateway address for this row. Windows resolves it per-adapter (FirstGatewayAddress); Linux/macOS resolve a single system-wide default gateway and repeat it on every row. Values: IPv4 literal, or '-' when none or unresolved."
-        example: "192.168.0.1"
+        example: "203.0.113.1"
         platforms: [windows, linux, darwin]
     aggregation:
       groupBy:
@@ -206,7 +206,7 @@ spec:
       - name: server
         type: string
         description: "Configured DNS server address. Values: IPv4 or IPv6 literal."
-        example: "194.168.4.100"
+        example: "192.0.2.100"
         platforms: [windows, linux, darwin]
       - name: type
         type: string
@@ -433,12 +433,12 @@ spec:
       - name: ip_address
         type: string
         description: "Neighbour's IPv4 or IPv6 address. Values: IPv4 or IPv6 literal."
-        example: "192.168.0.61"
+        example: "203.0.113.61"
         platforms: [windows, linux, darwin]
       - name: mac_address
         type: string
         description: "Neighbour's MAC address, colon-separated hex; '-' for a Windows entry with no resolved hardware address yet (incomplete). Linux drops all-zero-MAC rows rather than emitting '-'. Values: colon-separated hex, or '-' (Windows incomplete entries only)."
-        example: "1c:53:f9:73:22:6c"
+        example: "00:00:5e:00:53:0f"
         platforms: [windows, linux, darwin]
       - name: entry_type
         type: string

@@ -9,7 +9,7 @@
 | **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
 | **Actions** | `flush_dns` (definition `device.network_actions.flush_dns`) · `ping` (definition `device.network_actions.ping`) |
 | **Security** | `flush_dns`: securable `Infrastructure` · operation Write · risk Medium · dispatch Mutating · approval gate AdminOrApproval; `ping`: securable `Infrastructure` · operation Read · risk Low · dispatch ReadOnly · approval gate AdminOrApproval |
-| **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
+| **Roles** | execute: `flush_dns`: endpoint-admin; `ping`: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
 
 ## How it works
@@ -44,7 +44,7 @@ flowchart LR
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
 | Windows | agent service account (LocalSystem today, #1442) | **None.** `ipconfig.exe` and `PING.EXE` are probed at their fixed `System32` paths and run unprivileged; no elevated cmdlet is used. | 2026-09-07, bare-metal Windows 10.0.26200, SYSTEM | a spawn/deadline/signal failure reports `CONSTRAINED`/`UNAVAILABLE` via `forward_runner_failure`; a nonzero exit reports `status\|error` |
-| macOS | agent daemon (measured unprivileged) | **`sudo -n` NOPASSWD grants** for `/usr/bin/dscacheutil -flushcache` and `/usr/bin/killall -HUP mDNSResponder`, installed by `install-agent-user.sh`; skipped only when the agent is already root. | 2026-09-07, bare-metal macOS 26.6.2, euid 501 (alex) | a missing/refused sudo grant reports `status\|error` plus a `detail\|dscacheutil: ...` / `detail\|mDNSResponder: ...` line carrying the captured command output |
+| macOS | agent daemon (measured unprivileged) | **`sudo -n` NOPASSWD grants** for `/usr/bin/dscacheutil -flushcache` and `/usr/bin/killall -HUP mDNSResponder`, installed by `install-agent-user.sh`; skipped only when the agent is already root. | 2026-09-07, bare-metal macOS 26.6.2, euid 501 (jsmith) | a missing/refused sudo grant reports `status\|error` plus a `detail\|dscacheutil: ...` / `detail\|mDNSResponder: ...` line carrying the captured command output |
 | Linux | agent daemon | **`sudo -n` NOPASSWD grants** for `/usr/bin/systemd-resolve --flush-caches` and `/usr/bin/resolvectl flush-caches`, installed by `install-agent-user.sh`; skipped only when the agent is already root. | 2026-09-06, container Debian GNU/Linux 13 (trixie), euid 0 | neither tool found, or both found and fail: `status\|error`, `output\|neither resolvectl nor systemd-resolve found` |
 
 Subprocesses: `ipconfig.exe` / `PING.EXE` (Windows), `dscacheutil` / `killall` / `ping` (macOS), `resolvectl` / `systemd-resolve` / `ping` (Linux) — all spawned through the shared bounded argv runner (`run_bounded_subprocess`). Network: `ping` / `ping.exe` sends ICMP echo requests to the operator-supplied `host`. No direct socket or file-store access.
@@ -120,7 +120,7 @@ output|    Minimum = 0ms, Maximum = 0ms, Average = 0ms
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash a44c8631e3c1
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash a44c8631e3c1
 
 ```
 == action=flush_dns

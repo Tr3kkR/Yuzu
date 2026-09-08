@@ -158,7 +158,7 @@
   },
   "privileges": [
     {
-      "grant": "The WMI namespace `root\\CIMV2\\Security\\MicrosoftVolumeEncryption` is admin-only per Microsoft's docs (`bitlocker_plugin.cpp:97-99`). `docs/agent-privilege-model.md` carries two different characterizations of the specific grant for `bitlocker.state` — `SeBackupPrivilege` (line 99) vs. plain `Administrators` group membership (line 122) — a doc inconsistency, moot in practice today since LocalSystem already holds both",
+      "grant": "The WMI namespace `root\\CIMV2\\Security\\MicrosoftVolumeEncryption` is admin-only per Microsoft's docs (`bitlocker_plugin.cpp:97-99`); `docs/agent-privilege-model.md` names the `Administrators` group at both its rows for `bitlocker.state` (lines 99 and 122), matching that ACL — see Caveat 4",
       "if_refused": "typed sentinel row `error|permission_denied: administrator privilege required to read BitLocker status` (`bitlocker_plugin.cpp:114-115`); `execute()` returns 1",
       "measured": "2026-09-07, bare-metal, `SYSTEM` (`docs/samples/windows.txt:1`)",
       "os": "Windows",
@@ -167,7 +167,7 @@
     {
       "grant": "none observed in this plugin's code — both `fdesetup` and `diskutil` calls are unprivileged reads",
       "if_refused": "no distinct denial path: a timed-out or failed tool call still returns whatever text it produced, logged via `spdlog::warn` (`bitlocker_plugin.cpp:78-83`); the parser reports `filevault|unknown|<diagnostic>` rather than a typed permission error",
-      "measured": "2026-09-07, bare-metal, euid 501 (alex) — unprivileged (`docs/samples/macos.txt:1`)",
+      "measured": "2026-09-07, bare-metal, euid 501 (jsmith) — unprivileged (`docs/samples/macos.txt:1`)",
       "os": "macOS",
       "runs_as": "root — the shipped LaunchDaemon has no `UserName` key (`docs/agent-privilege-model.md:15`)"
     },
@@ -242,7 +242,7 @@
         "leg_hash": "ba3cbe6a5b56",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
-        "privilege": "euid 501 (alex)"
+        "privilege": "euid 501 (jsmith)"
       }
     },
     "windows": {

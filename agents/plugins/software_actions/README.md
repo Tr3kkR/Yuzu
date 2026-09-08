@@ -47,7 +47,7 @@ flowchart LR
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
 | Windows | agent service identity — sample captured under `SYSTEM` (no row in `docs/agent-privilege-model.md` for this plugin) | `list_upgradable` needs a resolvable `%LOCALAPPDATA%` and a user-session context for the winget alias to exist; `installed_count`'s registry read needs no extra grant | 2026-09-07 on bare metal, `SYSTEM` | `list_upgradable`: `UNAVAILABLE`/PARTIAL, e.g. `subprocess_runner:spawn_error` or `software_actions:localappdata_unset`; `installed_count`: `UNAVAILABLE`/PARTIAL/`software_actions:registry_query_failed` |
-| macOS | agent daemon — sample captured at `euid 501 (alex)`, unprivileged | None measured; both tools run unprivileged | 2026-09-07 on macOS 26.6.2, euid 501 | `UNAVAILABLE`/PARTIAL/`software_actions:softwareupdate_not_present` or `:softwareupdate_failed`; `installed_count`: `:pkgutil_not_present` or `:pkgutil_query_failed` |
+| macOS | agent daemon — sample captured at `euid 501 (jsmith)`, unprivileged | None measured; both tools run unprivileged | 2026-09-07 on macOS 26.6.2, euid 501 | `UNAVAILABLE`/PARTIAL/`software_actions:softwareupdate_not_present` or `:softwareupdate_failed`; `installed_count`: `:pkgutil_not_present` or `:pkgutil_query_failed` |
 | Linux | agent daemon — sample captured at `euid 0` (container) | None measured; apt/yum/dpkg-query/rpm are read-only queries | 2026-09-06 in a container, euid 0 | `list_upgradable`: `UNAVAILABLE`/PARTIAL/`software_actions:no_supported_package_manager`, `:apt_list_upgradable_failed`, or `:yum_check_update_failed`; `installed_count`: `:dpkg_query_failed`, `:rpm_query_failed`, or `:no_supported_package_manager` |
 
 Subprocesses: `winget.exe` (Windows, `list_upgradable` only), `apt`/`yum`/`dnf` (Linux, `list_upgradable`), `dpkg-query`/`rpm` (Linux, `installed_count`), `softwareupdate` (macOS, `list_upgradable`), `pkgutil` (macOS, `installed_count`) — all via the bounded argv runner, no shell. `installed_count` on Windows spawns nothing (native `RegOpenKeyExW`/`RegQueryInfoKeyW`). Network: `winget upgrade` and `softwareupdate -l` reach their configured update source/catalog over the network; every other leg is a local read.
@@ -120,7 +120,7 @@ count|124
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash c95c61957b6f
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash c95c61957b6f
 
 ```
 == action=list_upgradable

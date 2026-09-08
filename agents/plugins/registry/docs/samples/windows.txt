@@ -157,8 +157,8 @@ value|RegisteredOwner|REG_SZ
 value|InstallTime|REG_QWORD
 [result_status] UNDECLARED / UNKNOWN / 
 
-== action=get_user_value username=alex key=Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced name=Hidden
-username|alex
+== action=get_user_value username=jsmith key=Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced name=Hidden
+username|jsmith
 value|1
 type|REG_DWORD
 [result_status] UNDECLARED / UNKNOWN / 

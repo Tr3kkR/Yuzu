@@ -274,7 +274,7 @@
       "runs_as": "agent service account (LocalSystem today, #1442)"
     },
     {
-      "grant": "`wake`: none — `docs/agent-privilege-model.md:120` and `wol_plugin.cpp:215` agree: the plugin opens `SOCK_DGRAM`/`IPPROTO_UDP` (not `SOCK_RAW`), which needs no such capability — the doc's grant is over-stated for the current code, see Caveat 1. `check`: none — the unprivileged `SOCK_DGRAM` ICMP ping socket \"works out of the box on macOS\" (`icmp_probe.hpp:19-20`)",
+      "grant": "`wake`: none — `docs/agent-privilege-model.md:120` and `wol_plugin.cpp:215` agree: the plugin opens `SOCK_DGRAM`/`IPPROTO_UDP` (not `SOCK_RAW`), which needs no such capability — see Caveat 1. `check`: none — the unprivileged `SOCK_DGRAM` ICMP ping socket \"works out of the box on macOS\" (`icmp_probe.hpp:19-20`)",
       "if_refused": "not observed; no permission-denied path is exercised in code or samples",
       "measured": "2026-09-07, bare metal, at euid 501 (unprivileged)",
       "os": "macOS",
@@ -385,7 +385,7 @@
         "leg_hash": "dcc02549b1eb",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
-        "privilege": "euid 501 (alex)"
+        "privilege": "euid 501 (jsmith)"
       }
     },
     "windows": {

@@ -121,8 +121,7 @@
           "example": "false",
           "name": "installed",
           "platforms": [
-            "windows",
-            "linux"
+            "windows"
           ],
           "type": "bool",
           "values": null
@@ -193,7 +192,7 @@
     {
       "grant": "n/a — action returns the honest-unsupported sentinel unconditionally",
       "if_refused": "n/a — no read is attempted",
-      "measured": "2026-09-07, bare-metal, euid 501 (alex)",
+      "measured": "2026-09-07, bare-metal, euid 501 (jsmith)",
       "os": "macOS",
       "runs_as": "agent daemon, unprivileged"
     },
@@ -294,7 +293,7 @@
         "leg_hash": "820bfb5e0176",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
-        "privilege": "euid 501 (alex)"
+        "privilege": "euid 501 (jsmith)"
       }
     },
     "windows": {

@@ -9,7 +9,7 @@
 | **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
 | **Actions** | `info` (definition `device.agent_actions.info`) · `set_log_level` (definition `device.agent_actions.set_log_level`) |
 | **Security** | `set_log_level`: securable `Infrastructure` · operation Write · risk Medium · dispatch Mutating · approval gate None; `info`: securable `Infrastructure` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
-| **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
+| **Roles** | execute: `set_log_level`: endpoint-admin; `info`: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
 
 ## How it works
@@ -40,7 +40,7 @@ flowchart LR
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
 | Windows | not documented for this plugin (no row in `docs/agent-privilege-model.md`); captured as `SYSTEM` | None — both actions are in-process calls, no subprocess on either leg | 2026-09-07, bare-metal, `SYSTEM` (`docs/samples/windows.txt:1`) | N/A — no OS permission check exists |
-| macOS | not documented; captured unprivileged, `euid 501 (alex)` | None | 2026-09-07, bare-metal, euid 501 (`docs/samples/macos.txt:1`) | N/A — same as above |
+| macOS | not documented; captured unprivileged, `euid 501 (jsmith)` | None | 2026-09-07, bare-metal, euid 501 (`docs/samples/macos.txt:1`) | N/A — same as above |
 | Linux | not documented; captured as root, `euid 0`, container | None | 2026-09-06, container, euid 0 (`docs/samples/linux.txt:1`) | N/A — same as above |
 
 None. Both actions execute in-process — no subprocess and no network call on any OS (agent_actions_plugin.cpp:27-29 states "no subprocess on any OS -- rung 1 on all three legs").
@@ -110,7 +110,7 @@ agent.plugins.count|(not set)
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash 2688724a5dd5
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 2688724a5dd5
 
 ```
 == action=set_log_level level=info

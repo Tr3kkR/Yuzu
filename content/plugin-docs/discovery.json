@@ -195,7 +195,7 @@
     {
       "grant": "**None.** The routing-socket sysctl read and an unprivileged `SOCK_DGRAM` ICMP socket need no elevated privilege.",
       "if_refused": "ARP failure → `UNAVAILABLE`/`PARTIAL` `arp:read_failed`; ICMP session unavailable → `UNAVAILABLE`/`PARTIAL` `icmp:socket_error`",
-      "measured": "2026-09-07, bare-metal, macOS 26.6.2, euid 501 (alex)",
+      "measured": "2026-09-07, bare-metal, macOS 26.6.2, euid 501 (jsmith)",
       "os": "macOS",
       "runs_as": "agent daemon (captured unprivileged, euid 501)"
     },
@@ -315,7 +315,7 @@
         "leg_hash": "77514adb726f",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
-        "privilege": "euid 501 (alex)"
+        "privilege": "euid 501 (jsmith)"
       }
     },
     "windows": {

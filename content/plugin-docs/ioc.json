@@ -196,7 +196,7 @@
       "if_refused": "Same silent-degradation pattern as Windows; no typed failure status exists to distinguish it",
       "measured": "2026-09-07, bare-metal, macOS 26.6.2 arm64 (`docs/samples/macos.txt:1`)",
       "os": "macOS",
-      "runs_as": "no privilege-model row; sample captured at euid 501 (alex), unprivileged"
+      "runs_as": "no privilege-model row; sample captured at euid 501 (jsmith), unprivileged"
     },
     {
       "grant": "None observed — `/proc/net/tcp[6]`, `/etc/hosts`, and `stat()` are world-readable",
@@ -268,7 +268,7 @@
         "leg_hash": "4c1360bf4eef",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
-        "privilege": "euid 501 (alex)"
+        "privilege": "euid 501 (jsmith)"
       }
     },
     "windows": {

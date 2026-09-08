@@ -408,7 +408,7 @@
     {
       "grant": "none — `getmntinfo`, `getattrlist`, `fs_snapshot_list` are all unprivileged reads",
       "if_refused": "`quotas`: per-volume `permission_denied` (`getattrlist`/volume-root `open` returning `EPERM`/`EACCES`); `snapshots`: per-volume `permission_denied` when opening a volume root fails `EACCES`/`EPERM`",
-      "measured": "2026-09-07 at euid 501 (alex), bare-metal",
+      "measured": "2026-09-07 at euid 501 (jsmith), bare-metal",
       "os": "macOS",
       "runs_as": "agent daemon, unprivileged"
     },
@@ -580,7 +580,7 @@
         "leg_hash": "6094b93f5b9d",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
-        "privilege": "euid 501 (alex)"
+        "privilege": "euid 501 (jsmith)"
       }
     },
     "windows": {

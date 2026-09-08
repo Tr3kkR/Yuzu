@@ -70,7 +70,7 @@ Pipe-delimited rows, one per socket. Field 0 is a literal discriminator (`listen
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
 | `proto` | string | - | Windows, Linux, macOS | `tcp` | The socket's transport protocol. Always the literal "tcp" today — the plugin never distinguishes an IPv6 socket with "tcp6", even though Linux and macOS both source rows from IPv6-capable tables. |
-| `local_addr` | string | - | Windows, Linux, macOS | `192.168.0.66` | The local endpoint address. Dotted IPv4 on all platforms; on Linux an IPv6 address is emitted as raw undecoded hex, not text. Values: free text. |
+| `local_addr` | string | - | Windows, Linux, macOS | `203.0.113.66` | The local endpoint address. Dotted IPv4 on all platforms; on Linux an IPv6 address is emitted as raw undecoded hex, not text. Values: free text. |
 | `local_port` | int32 | - | Windows, Linux, macOS | `52882` | The local TCP port number. Values: integer. |
 | `remote_addr` | string | - | Windows, Linux, macOS | `160.79.104.10` | The remote endpoint address. Dotted IPv4 on all platforms; on Linux an IPv6 address is emitted as raw undecoded hex, not text. Values: free text. |
 | `remote_port` | int32 | - | Windows, Linux, macOS | `443` | The remote TCP port number. Values: integer. |
@@ -107,7 +107,7 @@ This plugin does not set a typed result status; the agent records `UNDECLARED` a
 == action=listening
 listen|tcp|0.0.0.0|22|5148
 listen|tcp|0.0.0.0|135|1008
-listen|tcp|192.168.0.131|139|4
+listen|tcp|203.0.113.131|139|4
 listen|tcp|0.0.0.0|3389|9048
 listen|tcp|0.0.0.0|5040|14216
 listen|tcp|127.0.0.1|5432|6436
@@ -121,13 +121,13 @@ listen|tcp|0.0.0.0|49667|3352
 [result_status] UNDECLARED / UNKNOWN
 
 == action=connections
-conn|tcp|100.123.53.121|22|100.109.177.77|53137|5148
+conn|tcp|198.51.100.121|22|198.51.100.77|53137|5148
 conn|tcp|127.0.0.1|5432|127.0.0.1|49748|6436
 conn|tcp|127.0.0.1|5432|127.0.0.1|49749|6436
 conn|tcp|127.0.0.1|5432|127.0.0.1|50169|6436
 conn|tcp|127.0.0.1|8080|127.0.0.1|49754|13676
-conn|tcp|192.168.0.131|49673|34.141.96.57|7500|5036
-conn|tcp|192.168.0.131|49708|199.165.136.100|443|5808
+conn|tcp|203.0.113.131|49673|34.141.96.57|7500|5036
+conn|tcp|203.0.113.131|49708|199.165.136.100|443|5808
 conn|tcp|127.0.0.1|49748|127.0.0.1|5432|13676
 conn|tcp|127.0.0.1|49749|127.0.0.1|5432|13676
 conn|tcp|127.0.0.1|49750|127.0.0.1|49751|13800
@@ -137,7 +137,7 @@ conn|tcp|127.0.0.1|49754|127.0.0.1|8080|13800
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (alex) · leg-hash f5009a752233
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash f5009a752233
 
 ```
 == action=listening
@@ -157,18 +157,18 @@ listen|tcp|*|3283|898
 [result_status] UNDECLARED / UNKNOWN
 
 == action=connections
-conn|tcp|100.109.177.77|52882|100.123.53.121|22|9653
-conn|tcp|192.168.0.66|52771|160.79.104.10|443|9039
-conn|tcp|192.168.0.66|52775|160.79.104.10|443|9039
-conn|tcp|192.168.0.66|52773|160.79.104.10|443|9039
-conn|tcp|192.168.0.66|52789|160.79.104.10|443|9039
-conn|tcp|192.168.0.66|52801|34.149.66.165|443|9039
-conn|tcp|192.168.0.66|52777|160.79.104.10|443|9039
-conn|tcp|192.168.0.66|52779|160.79.104.10|443|9039
-conn|tcp|192.168.0.66|52781|160.79.104.10|443|9039
-conn|tcp|192.168.0.66|52856|160.79.104.10|443|9039
-conn|tcp|192.168.0.66|52783|160.79.104.10|443|9039
-conn|tcp|192.168.0.66|52785|160.79.104.10|443|9039
+conn|tcp|198.51.100.77|52882|198.51.100.121|22|9653
+conn|tcp|203.0.113.66|52771|160.79.104.10|443|9039
+conn|tcp|203.0.113.66|52775|160.79.104.10|443|9039
+conn|tcp|203.0.113.66|52773|160.79.104.10|443|9039
+conn|tcp|203.0.113.66|52789|160.79.104.10|443|9039
+conn|tcp|203.0.113.66|52801|34.149.66.165|443|9039
+conn|tcp|203.0.113.66|52777|160.79.104.10|443|9039
+conn|tcp|203.0.113.66|52779|160.79.104.10|443|9039
+conn|tcp|203.0.113.66|52781|160.79.104.10|443|9039
+conn|tcp|203.0.113.66|52856|160.79.104.10|443|9039
+conn|tcp|203.0.113.66|52783|160.79.104.10|443|9039
+conn|tcp|203.0.113.66|52785|160.79.104.10|443|9039
 … 12 of 68 rows shown
 [result_status] UNDECLARED / UNKNOWN
 ```

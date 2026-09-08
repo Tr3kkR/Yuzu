@@ -2457,7 +2457,7 @@
     {
       "grant": "None for any read action. Write actions against a path with no operator-authored per-path sudo entry are refused by the OS itself at `open()`/`rename()`; default install grants nothing (`docs/agent-privilege-model.md:118`)",
       "if_refused": "same `error|<message>` + rc 1 shape",
-      "measured": "2026-09-07, bare metal, **unprivileged** at euid 501 (alex) — the capture ran through `LocalDispatcher`/`PluginHandle::load`, not the real root daemon (`docs/samples/macos.txt:1`)",
+      "measured": "2026-09-07, bare metal, **unprivileged** at euid 501 (jsmith) — the capture ran through `LocalDispatcher`/`PluginHandle::load`, not the real root daemon (`docs/samples/macos.txt:1`)",
       "os": "macOS",
       "runs_as": "**root** — the shipped LaunchDaemon has no `UserName` key (`docs/agent-privilege-model.md:14`)"
     },
@@ -3061,7 +3061,7 @@
         "leg_hash": "4db605b6c689",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
-        "privilege": "euid 501 (alex)"
+        "privilege": "euid 501 (jsmith)"
       }
     },
     "windows": {
@@ -3080,7 +3080,7 @@
           "rows": [
             "exists|true",
             "type|file",
-            "size|1405"
+            "size|1432"
           ],
           "truncated": false
         },
@@ -3096,7 +3096,7 @@
           },
           "row_count": 6,
           "rows": [
-            "entry|hosts|file|1405",
+            "entry|hosts|file|1432",
             "entry|hosts.ics|file|444",
             "entry|lmhosts.sam|file|3683",
             "entry|networks|file|407",
@@ -3116,9 +3116,9 @@
           },
           "row_count": 3,
           "rows": [
-            "hash|9321feab332edbba521c7ea3eb978d9844cb4f62a4730dab9cf60fb79649037d",
+            "hash|904287aa347ca8218ad8b694c173b038ff2faf684e94deeb6094ce4b43e40d35",
             "algorithm|sha256",
-            "size|1405"
+            "size|1432"
           ],
           "truncated": false
         },
@@ -3215,7 +3215,7 @@
         {
           "action": "find_by_hash",
           "not_captured": null,
-          "params": "directory=C:\\Windows\\System32\\drivers\\etc sha256=9321feab332edbba521c7ea3eb978d9844cb4f62a4730dab9cf60fb79649037d",
+          "params": "directory=C:\\Windows\\System32\\drivers\\etc sha256=904287aa347ca8218ad8b694c173b038ff2faf684e94deeb6094ce4b43e40d35",
           "rc": 0,
           "result_status": {
             "completeness": "UNKNOWN",
@@ -3224,7 +3224,7 @@
           },
           "row_count": 2,
           "rows": [
-            "match|C:\\Windows\\System32\\drivers\\etc\\hosts|1405",
+            "match|C:\\Windows\\System32\\drivers\\etc\\hosts|1432",
             "matches_found|1"
           ],
           "truncated": false

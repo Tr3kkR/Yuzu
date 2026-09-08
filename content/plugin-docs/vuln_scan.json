@@ -532,7 +532,7 @@
     {
       "grant": "not established — no privilege-model row",
       "if_refused": "not observed; a failed `popen` command (`spctl`/`fdesetup`/`csrutil`/`socketfilterfw`) returns empty output, which every check parses as its negative/disabled branch",
-      "measured": "2026-09-07, bare metal, euid 501 (alex)",
+      "measured": "2026-09-07, bare metal, euid 501 (jsmith)",
       "os": "macOS",
       "runs_as": "agent daemon (captured unprivileged, euid 501)"
     },
@@ -764,7 +764,7 @@
         "leg_hash": "20c66f1c0618",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
-        "privilege": "euid 501 (alex)"
+        "privilege": "euid 501 (jsmith)"
       }
     },
     "windows": {
