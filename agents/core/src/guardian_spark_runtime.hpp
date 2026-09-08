@@ -606,6 +606,11 @@ public:
     /// detach_rule_locked that builds a DISARM claim - throws std::bad_alloc at the
     /// claim allocation, i.e. before the durable index_/rules_/keys_ mutation.
     void set_detach_fault_for_test(bool on) noexcept;
+    /// R5.2 index-release fault seam (adversarial re-review r2 C2): consumed once by
+    /// the next release_claim_index_locked - throws std::bad_alloc where
+    /// index_->remove_rule's own key-copy allocation would, BEFORE the mapping or the
+    /// claim's index_held flag is touched.
+    void set_index_remove_fault_for_test(bool on) noexcept;
     /// R5.2: detach_rule_locked found itself unable to hand the subscription to a
     /// disarm claim (a throw inside index_->remove_rule after the claim was pushed,
     /// or the cannot-happen prediction mismatch) and took the counted rollback / last
@@ -1042,6 +1047,12 @@ private:
     std::function<void()> drain_gap_hook_for_test_; ///< registry_mu_-guarded; see the setter
     std::atomic<int> drain_fault_point_for_test_{0};  ///< see the setter
     std::atomic<bool> detach_fault_for_test_{false};  ///< see the setter
+    std::atomic<bool> index_remove_fault_for_test_{false}; ///< see the setter
+    /// Seam body for set_index_remove_fault_for_test; consumed once.
+    void index_remove_fault_here_for_test() {
+        if (index_remove_fault_for_test_.exchange(false))
+            throw std::bad_alloc{};
+    }
     /// Seam body for set_detach_fault_for_test; consumed once.
     void detach_fault_here_for_test() {
         if (detach_fault_for_test_.exchange(false))

@@ -5116,3 +5116,65 @@ TEST_CASE("rung 9c R5.2 (adversarial re-review r2 C1): a bad_alloc building the 
     CHECK(b->arms.load() == 2);
     CHECK(rt->armed_key_count() == 1);
 }
+
+// rung 9c R5.2 - adversarial re-review r2 (C2, found by both reviewers): a claim's
+// index ownership flag is cleared only AFTER index_->remove_rule succeeded, so a throw
+// from the removal leaves both the mapping and the flag for the next release to retry.
+TEST_CASE("rung 9c R5.2 (adversarial re-review r2 C2): a throw inside the index removal keeps "
+          "the claim's index ownership - the drain's retry cleans the mapping and the real "
+          "owner's detach is still the ->0 edge",
+          "[spark][runtime][liveness]") {
+    // Mutation (the pre-fix order): clear index_held BEFORE remove_rule -> the throw
+    // leaves a stale (key, r2) mapping nothing retries; the key's refcount never
+    // reaches zero again, so detaching r1 (the real owner) is NOT the ->0 edge:
+    // disarms stays 0, armed_key_count() stays 1 - a leaked subscription.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+    std::expected<std::uint64_t, std::string> gen_r1;
+    std::thread a_thread{[&] {
+        gen_r1 = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    }};
+    struct Cleanup {
+        FakeBackend* backend;
+        std::thread* t;
+        ~Cleanup() {
+            backend->release_hang();
+            if (t->joinable())
+                t->join();
+        }
+    } cleanup{b.get(), &a_thread};
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+
+    // r2 queues behind r1's parked arm on the same key (a queued sibling with its own
+    // index mapping), then is detached while remove_rule "fails to allocate".
+    std::expected<std::uint64_t, std::string> gen_r2;
+    std::thread r2_thread{[&] {
+        gen_r2 = rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true);
+    }};
+    REQUIRE(yuzu::test::spin_until([&] { return rt->backend_op_queued() == 1; },
+                                   std::chrono::seconds(10)));
+    rt->set_index_remove_fault_for_test(true);
+    REQUIRE_THROWS_AS(rt->detach_rule("r2"), std::bad_alloc);
+
+    // r1's arm lands: the drain commits r1 and, sweeping the withdrawn sibling, RETRIES
+    // r2's index release - which now succeeds because the flag was never cleared.
+    b->release_hang();
+    a_thread.join();
+    r2_thread.join();
+    REQUIRE(gen_r1.has_value());
+    REQUIRE_FALSE(gen_r2.has_value());
+    CHECK(gen_r2.error() == "withdrawn");
+    CHECK(rt->rule_count() == 1);
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(b->arms.load() == 1);
+
+    // The real owner's detach is the ->0 edge ONLY if r2's stale mapping is gone.
+    rt->detach_rule("r1");
+    CHECK(rt->rule_count() == 0);
+    CHECK(rt->armed_key_count() == 0);
+    REQUIRE(b->disarmed_ids().size() == 1);
+    CHECK(b->disarmed_ids()[0] == b->armed_ids()[0]);
+    CHECK(rt->claim_queue_depth_for_test(spark_key(file_spec("/a"))) == 0);
+}

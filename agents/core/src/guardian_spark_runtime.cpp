@@ -106,9 +106,18 @@ GuardianSparkRuntime::make_handler(std::shared_ptr<GuardianSparkRuntime> rt) {
 void GuardianSparkRuntime::release_claim_index_locked(KeyClaim& claim) {
     if (!claim.index_held)
         return;
-    claim.index_held = false;
+    // Adversarial re-review r2 C2: remove FIRST, clear the ownership flag AFTER.
+    // remove_rule's one allocation (its key copy) precedes its mutation, so a throw
+    // leaves both the index mapping and index_held intact - the next release for this
+    // claim (the drain's finished sweep, a later detach) retries and succeeds. The
+    // old order cleared the flag first, so a throw left a stale mapping that nothing
+    // could ever remove: the key's refcount never reached zero again (no disarm on
+    // the real owner's detach - a leaked subscription) and a same-key re-attach of
+    // the rule could hit a ghost entry.
+    index_remove_fault_here_for_test(); // seam: "remove_rule's allocation threw"
     index_->remove_rule(claim.rule_id); // idempotent; guarded by index_held so a stale
                                         // claim never removes a replacement's mapping
+    claim.index_held = false;
 }
 
 std::shared_ptr<GuardianSparkRuntime::KeyClaim>
@@ -2316,6 +2325,10 @@ std::vector<std::string> GuardianSparkRuntime::keys_with_pending_initial() const
 
 void GuardianSparkRuntime::set_drain_fault_point_for_test(int point) noexcept {
     drain_fault_point_for_test_.store(point);
+}
+
+void GuardianSparkRuntime::set_index_remove_fault_for_test(bool on) noexcept {
+    index_remove_fault_for_test_.store(on);
 }
 
 void GuardianSparkRuntime::set_detach_fault_for_test(bool on) noexcept {
