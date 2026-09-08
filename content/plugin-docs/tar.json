@@ -2869,6 +2869,8 @@
       "agents/plugins/tar/src/tar_sql_executor.cpp",
       "agents/plugins/tar/src/tar_sql_executor.hpp",
       "agents/plugins/tar/src/tar_status_format.hpp",
+      "agents/plugins/tar/src/tar_usage.cpp",
+      "agents/plugins/tar/src/tar_usage.hpp",
       "agents/plugins/tar/src/tar_user_collector.cpp",
       "agents/plugins/tar/src/tar_version.hpp",
       "agents/plugins/tar/src/tar_win_raii_guards.hpp"
@@ -2898,6 +2900,7 @@
       "tests/unit/test_tar_service.cpp",
       "tests/unit/test_tar_software.cpp",
       "tests/unit/test_tar_store.cpp",
+      "tests/unit/test_tar_usage.cpp",
       "tests/unit/test_tar_warehouse.cpp",
       "tests/unit/test_tar_win_raii_guards.cpp"
     ]
