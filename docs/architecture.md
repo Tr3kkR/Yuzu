@@ -317,11 +317,11 @@ API — `GET/POST /api/instructions`, `GET/PUT/DELETE /api/instructions/:id`,
 `POST /api/instructions/validate-yaml` — is `instruction_routes.{hpp,cpp}` (#2542 PR-7); the
 7-route legacy pre-v1 Executions API — `GET /api/executions`, `GET /api/executions/:id`,
 `GET /api/executions/:id/{summary,agents,children}`, `POST /api/executions/:id/{rerun,cancel}` —
-is `execution_routes.{hpp,cpp}` (#2542 PR-7); the 4-route Approval API — `GET /api/approvals`,
-`GET /api/approvals/pending/count`, `POST /api/approvals/:id/{approve,reject}` — is
-`approval_routes.{hpp,cpp}` (#2542 PR-9); and the 4-route Schedules API —
+is `execution_routes.{hpp,cpp}` (#2542 PR-7); the 4-route Schedules API —
 `GET/POST /api/schedules`, `DELETE /api/schedules/:id`, `POST /api/schedules/:id/enable` — is
-`schedule_routes.{hpp,cpp}` (#2542 PR-8). All nine owner files register against the same
+`schedule_routes.{hpp,cpp}` (#2542 PR-8); and the 4-route Approval API — `GET /api/approvals`,
+`GET /api/approvals/pending/count`, `POST /api/approvals/:id/{approve,reject}` — is
+`approval_routes.{hpp,cpp}` (#2542 PR-9). All nine owner files register against the same
 stack-local `inline_sink`, constructed in `start_web_server()`.)
 
 Counting the surface therefore needs a receiver-agnostic pattern, not a search for one variable
@@ -371,9 +371,9 @@ matching every other owning-class route module (`DeviceRoutes`, `ComplianceRoute
 use — `server.cpp` still calls `mcp_server_->register_routes(*web_server_, ...)` unchanged, exactly
 as it does for every other owning-class module), the Instruction Definitions + Instruction Sets /
 legacy pre-v1 Executions extraction (`instruction_routes.{hpp,cpp}` +
-`execution_routes.{hpp,cpp}`, PR-7, 13 + 7 = 20 routes, also against `inline_sink`), the Approval
-API extraction (`approval_routes.{hpp,cpp}`, PR-9, 4 routes, also against `inline_sink`), and the
-Schedules API extraction (`schedule_routes.{hpp,cpp}`, PR-8, 4 routes, also against `inline_sink`)
+`execution_routes.{hpp,cpp}`, PR-7, 13 + 7 = 20 routes, also against `inline_sink`), the Schedules
+API extraction (`schedule_routes.{hpp,cpp}`, PR-8, 4 routes, also against `inline_sink`), and the
+Approval API extraction (`approval_routes.{hpp,cpp}`, PR-9, 4 routes, also against `inline_sink`)
 — `server.cpp`'s own 30 inline routes are the only registrations left outside the sink, and they
 are not a route-owner class. Whether a further campaign PR touches them is #2542's own call, not
 this paragraph's to predict — an earlier version of this sentence claimed "no further PR touches
@@ -391,8 +391,8 @@ registrations in `mcp_server.cpp` (verify with
 `grep -cE '\bsvr\.(Get|Post|Put|Delete|Patch|Options)\(' server/core/src/mcp_server.cpp`, now 0),
 which were never counted by the `web_server_->` pattern above in the first place since they were
 never inline in `server.cpp` — dropped to 38 once the Instruction Definitions + Instruction Sets /
-legacy pre-v1 Executions extraction (-20, PR-7) landed, 34 once the Approval API extraction (-4,
-PR-9) also landed, and is 30 now that the Schedules API extraction (-4, PR-8) has also landed. 30
+legacy pre-v1 Executions extraction (-20, PR-7) landed, 34 once the Schedules API extraction (-4,
+PR-8) also landed, and is 30 now that the Approval API extraction (-4, PR-9) has also landed. 30
 registrations remain outside the sink in total.
 
 ## Storage Architecture

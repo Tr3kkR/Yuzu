@@ -13283,7 +13283,7 @@ private:
 
         // NON-BLOCKING session resolve (never writes to `res` on failure) —
         // distinct from `auth_fn` above, which wraps `require_auth` and DOES
-        // write a 401. Shared by three #2542 modules' post-gate "who is
+        // write a 401. Shared by four #2542 modules' post-gate "who is
         // calling" lookups: PR-7's `instruction_routes.cpp` (POST
         // /api/instructions's best-effort `created_by`) and every
         // `execution_routes.cpp` route under an engaged fleet-read scope,
@@ -13299,8 +13299,9 @@ private:
         };
 
         // #2542 PR-7: wraps ServerImpl::emit_event's 4-argument shape (no
-        // caller in any of the three modules below passes a non-default
-        // Severity).
+        // caller in the three modules below that take it — instruction,
+        // execution, approval; schedule_routes does not — passes a
+        // non-default Severity).
         auto emit_event_fn = [this](const std::string& event_type, const httplib::Request& req,
                                     const nlohmann::json& attrs,
                                     const nlohmann::json& payload_data) {
@@ -13338,9 +13339,10 @@ private:
         // /api/approvals/pending/count, /api/approvals/:id/{approve,reject}),
         // extracted onto the same inline_sink seam. Placed here rather than
         // alongside page_routes's call above (like PR-4/PR-5's siblings)
-        // because this module needs resolve_session_fn (defined just above,
-        // its first extracted caller) + audit_fn + emit_event_fn, none of
-        // which is in scope yet at that earlier point.
+        // because this module needs resolve_session_fn (defined just above;
+        // instruction_routes.cpp, PR-7, was its first extracted caller) +
+        // audit_fn + emit_event_fn, none of which is in scope yet at that
+        // earlier point.
         yuzu::server::approval::register_approval_routes(
             inline_sink, yuzu::server::approval::Deps{
                              .perm_fn = perm_fn,
