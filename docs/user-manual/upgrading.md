@@ -3159,9 +3159,11 @@ on its next call — **the three old grants no longer suffice**, because the rou
 them at all. Audit your custom roles before upgrading:
 
 ```sql
-SELECT DISTINCT principal_id FROM role_permissions
-  WHERE securable_type IN ('SoftwareLicensing', 'Inventory', 'GuaranteedState')
-    AND operation = 'Delete';
+SELECT DISTINCT pr.principal_type, pr.principal_id, pr.role_name
+  FROM principal_roles pr
+  JOIN role_permissions rp ON rp.role_name = pr.role_name
+  WHERE rp.securable_type IN ('SoftwareLicensing', 'Inventory', 'GuaranteedState')
+    AND rp.operation = 'Delete';
 ```
 
 Grant `Decommission:Delete` to any custom role in that list that must retain the ability to erase a
