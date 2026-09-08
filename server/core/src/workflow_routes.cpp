@@ -7,6 +7,7 @@
 #include "execution_event_scope.hpp"
 #include "http_route_sink.hpp"
 #include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (UP-1)
+#include "product_pack_model.hpp" // #4029: shared row/detail builders + error classifiers
 #include "rest_a4_envelope.hpp"     // detail::error_json_a4, make_correlation_id
 #include "rest_a4_envelope_http.hpp" // detail::a4_denial (deny_service_scoped_scope_estimate) —
                                      // mints/reuses X-Correlation-Id so header and body agree
@@ -31,35 +32,12 @@
 
 namespace yuzu::server {
 
-// Mirrors rest_api_v1.cpp's license_error_status/sw_deploy_error_status shape: ProductPackStore
-// widened list()/get() to std::expected and uninstall() now returns a machine-checkable
-// "not_found: " prefix (product_pack_store.hpp) as part of its PG migration — this classifier
-// keeps the REST surface's status codes correct instead of collapsing every failure to the
-// pre-migration 400/503-by-is_open()-only split. `kProductPackDbErrorPrefix` (a genuine DB/lease
-// failure) -> 503; `"not_found:"` -> 404 (a REST contract change for DELETE — the pre-migration
-// route always returned 400 for a missing id); anything else (signature rejection, validation,
-// business-rule error) -> 400.
-static int product_pack_error_status(const std::string& err) {
-    if (err.starts_with("not_found:"))
-        return 404;
-    if (err.starts_with(yuzu::server::kProductPackDbErrorPrefix))
-        return 503;
-    return 400;
-}
-
-// Mirrors rest_api_v1.cpp's sw_deploy_client_message/device_token_client_message: a
-// kProductPackDbErrorPrefix error carries a raw PQerrorMessage() fragment (connection string
-// detail, occasionally host:port) that is internal implementation detail, not caller-actionable
-// feedback (gov Gate 2 security-guardian). Logs the real error server-side and returns a generic
-// constant instead. A not_found/validation error (never carries the prefix) is safe to echo
-// verbatim — it's operator-authored request feedback, not database internals.
-static std::string product_pack_client_message(const char* op, const std::string& err) {
-    if (err.starts_with(yuzu::server::kProductPackDbErrorPrefix)) {
-        spdlog::error("{}: {}", op, err);
-        return "service unavailable";
-    }
-    return err;
-}
+// #4029: `product_pack_error_status`/`product_pack_client_message` moved to
+// product_pack_model.hpp — the new GET /api/v1/product-packs* routes and the
+// MCP list_product_packs/get_product_pack tools need the same classifiers,
+// and a second file-local copy is exactly the duplication
+// docs/api-twin-recipe.md's Rule 1 exists to prevent. See that header for the
+// (unchanged) behavior/rationale.
 
 // F031/#3481: the same per-kind delete dispatch is needed in two places now — DELETE
 // /api/product-packs/:id's uninstall_fn, and POST /api/product-packs's new compensate_fn
@@ -2639,22 +2617,12 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         auto& packs = *packs_result;
+        // #4029: shared builder (product_pack_model.hpp) — the same function
+        // GET /api/v1/product-packs and MCP list_product_packs call, so this
+        // route's shape cannot silently drift from theirs.
         nlohmann::json arr = nlohmann::json::array();
-        for (const auto& p : packs) {
-            nlohmann::json items_arr = nlohmann::json::array();
-            for (const auto& item : p.items) {
-                items_arr.push_back(
-                    {{"kind", item.kind}, {"item_id", item.item_id}, {"name", item.name}});
-            }
-            arr.push_back({{"id", p.id},
-                           {"name", p.name},
-                           {"version", p.version},
-                           {"description", p.description},
-                           {"item_count", p.items.size()},
-                           {"items", items_arr},
-                           {"installed_at", p.installed_at},
-                           {"verified", p.verified}});
-        }
+        for (const auto& p : packs)
+            arr.push_back(product_pack_row_json(p));
         res.set_content(nlohmann::json({{"product_packs", arr}, {"count", arr.size()}}).dump(),
                         "application/json");
     });
@@ -2870,24 +2838,9 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
         auto& pack = *pack_result;
 
-        nlohmann::json items_arr = nlohmann::json::array();
-        for (const auto& item : pack->items) {
-            items_arr.push_back({{"kind", item.kind},
-                                 {"item_id", item.item_id},
-                                 {"name", item.name},
-                                 {"yaml_source", item.yaml_source}});
-        }
-
-        res.set_content(nlohmann::json({{"id", pack->id},
-                                        {"name", pack->name},
-                                        {"version", pack->version},
-                                        {"description", pack->description},
-                                        {"yaml_source", pack->yaml_source},
-                                        {"items", items_arr},
-                                        {"installed_at", pack->installed_at},
-                                        {"verified", pack->verified}})
-                            .dump(),
-                        "application/json");
+        // #4029: shared builder (product_pack_model.hpp) — the same function
+        // GET /api/v1/product-packs/{id} and MCP get_product_pack call.
+        res.set_content(product_pack_detail_json(*pack).dump(), "application/json");
     });
 
     // DELETE /api/product-packs/:id -- uninstall product pack

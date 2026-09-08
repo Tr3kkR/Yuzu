@@ -170,9 +170,13 @@ TEST_CASE("RbacStore: seed data — securable types", "[rbac_store][pg]") {
     auto types = store.list_securable_types();
     // +SoftwareLicensing (ADR-0024) +AccessReview (SOC 2 CC6.2) +EnginePrincipal
     // (#2376, cut away from Security:Read) +PluginConfig +PluginSecret
-    // +UploadGrant (PR1.9a, peer finding PLAN-001) = 26. +PowerManagement (Wave 6
-    // W1B) = 27. +Workflow (#4030/#4032 — previously gated but never seeded) = 28.
-    REQUIRE(types.size() == 28);
+    // +UploadGrant (PR1.9a, peer finding PLAN-001) +PowerManagement (Wave 6 W1B) = 27,
+    // +Workflow (#4030/#4032 — previously gated but never seeded) = 28,
+    // +ProductPack (#4029 prerequisite fix — was used as an RBAC securable string by
+    // the shipped /api/product-packs* routes but never seeded) = 29,
+    // +TlsConfig +PluginSigning +ServerConfig +AnalyticsConfig (#4028
+    // Settings read-twins) = 33.
+    REQUIRE(types.size() == 33);
 
     auto has = [&](const std::string& t) {
         return std::find(types.begin(), types.end(), t) != types.end();
@@ -199,6 +203,12 @@ TEST_CASE("RbacStore: seed data — securable types", "[rbac_store][pg]") {
     CHECK(has("EnginePrincipal")); // Engine-principal inventory + grant-graph reads (#2376),
                                    // cut away from the over-broad Security:Read
     CHECK(has("Workflow")); // #4030/#4032: previously gated but never seeded
+    CHECK(has("ProductPack")); // #4029 prerequisite fix
+    CHECK(has("PowerManagement")); // Wave 6 W1B: power_health's set_power_plan
+    CHECK(has("TlsConfig"));       // #4028: tls/https Settings fragments
+    CHECK(has("PluginSigning"));   // #4028: plugin-signing fragment + GET /agent/plugin-policy (v2)
+    CHECK(has("ServerConfig"));    // #4028: gateway/server-config/mcp/data-retention fragments
+    CHECK(has("AnalyticsConfig")); // #4028: analytics fragment
 }
 
 TEST_CASE("RbacStore: seed data — operations", "[rbac_store][pg]") {
@@ -233,18 +243,20 @@ TEST_CASE("RbacStore: seeded catalogues match the MCP C8 validator mirrors",
 TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_store][pg]") {
     RBAC_STORE(store);
     auto perms = store.get_role_permissions("Administrator");
-    // 28 types * 5 CRUD ops = 140 permissions, plus a single targeted Push
-    // grant on GuaranteedState (= 141), plus a single AccessReview:Attest grant
-    // (Periodic Access Reviews, CC6.2, = 142), plus a single ApiToken:Rotate
-    // grant (P2 #11, SOC 2 CC6.3) = 143 permissions total. Push, Attest, and
+    // 33 types * 5 CRUD ops = 165 permissions, plus a single targeted Push
+    // grant on GuaranteedState (= 166), plus a single AccessReview:Attest grant
+    // (Periodic Access Reviews, CC6.2, = 167), plus a single ApiToken:Rotate
+    // grant (P2 #11, SOC 2 CC6.3) = 168 permissions total. Push, Attest, and
     // Rotate are deliberately NOT cross-seeded on other securables — see the
-    // rationale in rbac_store.cpp seed_defaults(). (28th: Workflow, #4030/#4032
+    // rationale in rbac_store.cpp seed_defaults(). (33rd-30th: TlsConfig/
+    // PluginSigning/ServerConfig/AnalyticsConfig, #4028 Settings read-twins;
+    // 29th: ProductPack, #4029 prerequisite fix; 28th: Workflow, #4030/#4032
     // — previously gated but never seeded; 27th: PowerManagement, Wave 6
-    // power_health set_power_plan; 26th-24th: UploadGrant/
-    // PluginSecret/PluginConfig, PR1.9a peer finding PLAN-001; 23rd:
-    // EnginePrincipal, #2376; 22nd: AccessReview, SOC 2 CC6.2; 21st:
-    // SoftwareLicensing, ADR-0024.)
-    CHECK(perms.size() == 143);
+    // power_health set_power_plan; 26th-24th: UploadGrant/PluginSecret/
+    // PluginConfig, PR1.9a peer finding PLAN-001; 23rd: EnginePrincipal,
+    // #2376; 22nd: AccessReview, SOC 2 CC6.2; 21st: SoftwareLicensing,
+    // ADR-0024.)
+    CHECK(perms.size() == 168);
     for (auto& p : perms)
         CHECK(p.effect == "allow");
 
@@ -274,10 +286,10 @@ TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_s
 TEST_CASE("RbacStore: seed data — Viewer has read-only", "[rbac_store][pg]") {
     RBAC_STORE(store);
     auto perms = store.get_role_permissions("Viewer");
-    // 22 types * Read only (everything except Infrastructure; incl. Inventory +
+    // 23 types * Read only (everything except Infrastructure; incl. Inventory +
     // SoftwareLicensing, ADR-0024, + EnginePrincipal, #2376, + Workflow,
-    // #4030/#4032)
-    CHECK(perms.size() == 22);
+    // #4030/#4032, + ProductPack, #4029)
+    CHECK(perms.size() == 23);
     for (auto& p : perms) {
         CHECK(p.operation == "Read");
         CHECK(p.effect == "allow");
@@ -342,6 +354,30 @@ TEST_CASE("RbacStore: seed data — Operator has Read on PluginConfig and Upload
     CHECK_FALSE(has_grant(perms, "PluginConfig", "Delete"));
     CHECK_FALSE(has_grant(perms, "UploadGrant", "Write"));
     CHECK_FALSE(has_grant(perms, "UploadGrant", "Delete"));
+}
+
+// ── #4029: ProductPack prerequisite fix ────────────────────────────────────
+
+TEST_CASE("RbacStore: seed data — Administrator has full CRUD on ProductPack",
+          "[rbac_store][4029][pg]") {
+    RBAC_STORE(store);
+    auto perms = store.get_role_permissions("Administrator");
+    for (const char* op : {"Read", "Write", "Execute", "Delete", "Approve"}) {
+        CHECK(has_grant(perms, "ProductPack", op));
+    }
+}
+
+TEST_CASE("RbacStore: seed data — Operator/PlatformEngineer/Viewer have ProductPack:Read, "
+          "never Write/Delete",
+          "[rbac_store][4029][pg]") {
+    RBAC_STORE(store);
+    for (const char* role : {"Operator", "PlatformEngineer", "Viewer"}) {
+        INFO("role=" << role);
+        auto perms = store.get_role_permissions(role);
+        CHECK(has_grant(perms, "ProductPack", "Read"));
+        CHECK_FALSE(has_grant(perms, "ProductPack", "Write"));
+        CHECK_FALSE(has_grant(perms, "ProductPack", "Delete"));
+    }
 }
 
 // ── RBAC toggle ──────────────────────────────────────────────────────────────

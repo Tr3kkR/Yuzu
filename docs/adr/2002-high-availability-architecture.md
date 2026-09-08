@@ -284,6 +284,11 @@ claim-commit and the external send is unavoidable:
 - Already-correct guards (Deployment CAS, retention/rotation advisory locks) stay as
   defense-in-depth; idempotent/read-only loops run leader-only with no claim.
 
+**Status (WS-3): NOT WIRED (2026-09-07).** `leader_elector.{hpp,cpp}` exists (the fenced-lock
+primitive) but has zero includers outside itself (`grep -rln leader_elector.hpp server/core/src` →
+itself only) — no singleton-loop refactor, transactional outbox, or `PolicyEvaluator` remediation
+redesign has landed.
+
 ### 7. Gateway cluster topology + routing (Q7)
 **Independent gateway clusters, one per trust zone / region** (internal-vs-external is a trust
 boundary; Erlang distribution's shared-cookie mesh must not span a DMZ or WAN). Zone/region is the

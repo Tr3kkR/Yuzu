@@ -208,6 +208,47 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
+### vNEXT — the server now elects a background-work leader at startup (HA WS-3; NOT breaking)
+
+New, non-breaking, and inert on a single-server deployment. As one step toward
+making a second server replica safe, the singleton background loops that
+*dispatch* — scheduled instructions, policy remediation, quarantine containment
+reconciliation, and the CRL freshness re-publish — now run only on a fenced
+leader elected over a dedicated Postgres coordination connection (ADR-2002 §3).
+On a single server the sole replica is always the leader, so behaviour is
+unchanged.
+
+> **This is the *attempt-gate* half only — do NOT run a second server replica on
+> the strength of this change alone.** It ensures only the leader *attempts* the
+> dispatching loops; the correctness guarantee that a paused ex-leader cannot
+> still commit a dispatch (the epoch fence in the claim write) lands in a
+> follow-on slice, and a supported active-active deployment additionally needs
+> gateway-fronted routing, shared agent presence, and PKI HA. Running a second
+> replica against this slice alone can double-dispatch destructive singleton work
+> (quarantine, deployment, policy remediation). Single-server is the only
+> supported topology today.
+
+What you will see, on **every** deployment including single-server, are new
+startup log lines — these are routine, not a fault:
+
+- `leader_elector: coordination connection established (host=… port=… dbname=…; dedicated, never-recycled)`
+- `leader_elector: election loop started (poll=5s)`
+- `leader_elector: acquired leadership 'server_background_leader' at epoch N`
+
+If instead you see `[HA] leader_elector could not open its coordination
+connection; FencedLeaderOnly background loops are PAUSED …`, the server could not
+reach its Postgres coordination connection: it keeps serving and re-tries every
+election cycle (so a transient blip self-heals within seconds), but while the
+message persists the four dispatching loops above do not run. This is fail-closed
+by design — a paused loop never double-dispatches — and a persistent occurrence
+is a Postgres-reachability problem to investigate, not a server bug. (The
+operator-triggered paths are unaffected: a manual policy remediation or evaluation,
+and an operator CRL revoke, run on whichever replica received the request — and a
+remediation/evaluation is also *completed* on that same replica, so it still reaches
+a terminal verdict even while that replica is not the leader. Only the leader-owned
+*scheduling* half — the automatic due-policy dispatch and the periodic CRL freshness
+re-publish — pauses.)
+
 ### vNEXT — gateway management plane now pins its peer (#1422, breaking for custom gateway configs)
 
 The gateway's `:50063` command plane requires, on any network-reachable
@@ -1664,7 +1705,7 @@ Plugin signature verification ships in two parts: an agent-side CMS verifier and
 
 **New audit actions.** `plugin_signing.bundle.uploaded`, `plugin_signing.bundle.cleared`, `plugin_signing.require.changed` — see `audit-log.md` for the result and detail conventions. SIEM rules already filtering on `success`/`failure`/`denied` will pick these up unchanged; no new vocabulary tokens.
 
-**Operator distribution.** The server hosts the bundle at `GET /api/v1/agent/plugin-policy` (admin-only). Agents are pointed at a local copy via `--plugin-trust-bundle <path>`; the manual workflow today is `curl` + `jq` + write the JSON's `trust_bundle_pem` field to disk on each agent host. Automatic agent-side fetch is a forthcoming change.
+**Operator distribution.** The server hosts the bundle at `GET /api/v2/agent/plugin-policy` (`PluginSigning:Read`, Administrator-only; unreachable by any MCP token at any tier as of #4028). Agents are pointed at a local copy via `--plugin-trust-bundle <path>`; the manual workflow today is `curl` + `jq` + write the JSON's `data.trust_bundle_pem` field to disk on each agent host. The old `GET /api/v1/agent/plugin-policy` (flat top-level body, no `data` envelope) is **deprecated** — see the vNEXT note below for the migration and removal window. Automatic agent-side fetch is a forthcoming change.
 
 **Fleet-suicide caveat.** The Yuzu release pipeline does not yet sign the 44 in-tree plugins under `agents/plugins/`. **Do NOT enable "Require signed plugins" until you have signed every plugin your fleet uses, including the in-tree ones.** Use the transitional mode (bundle uploaded, Require off) during rollout. The Settings card surfaces this warning inline.
 
@@ -1774,6 +1815,23 @@ dpkg-query -W -f='${db:Status-Abbrev}\n' | grep -c '^hi'
 ```
 
 A nonzero result means that host's `installed_count` will report a higher number after upgrading, by exactly that many. If your automation only compares the count to a rough threshold or trend, no action is needed; if it asserts an exact expected value, re-baseline it after upgrading.
+
+### vNEXT — `GET /api/v1/agent/plugin-policy` is DEPRECATED; use `GET /api/v2/agent/plugin-policy` (#4028, #4144)
+
+**What changed, and why there are now two versions.** This route already existed pre-#4028 (documented here as the trust-bundle-PEM distribution path for agent config management) but was off the REST-v1 API-parity ledger. #4028 originally hardened it onto the same conventions every other `/api/v1/*` route in this manual uses — but did so **in place**, reshaping `GET /api/v1/agent/plugin-policy`'s response envelope without a version bump. An external review (#4144) caught that this violates `docs/api-versioning-policy.md`'s own rule ("changing an error envelope's shape" requires a `/api/v2/` sibling and a deprecation cycle). Corrected: the hardened behavior now lives at `GET /api/v2/agent/plugin-policy`; `GET /api/v1/agent/plugin-policy` is restored to its exact pre-#4028 shape and formally deprecated.
+
+**`GET /api/v2/agent/plugin-policy` (the hardened route — migrate to this):**
+
+- **Success body is enveloped, under `data`.** `{"data": {"enabled":..., "required":..., "cert_count":..., "sha256":..., "subjects": [...], "bundle_unreadable": <bool>, "bundle_error"?: <string>, "trust_bundle_pem":...}, "meta": {"api_version": "v1"}}`. `subjects` and `bundle_unreadable`/`bundle_error` are new fields versus the v1 shape below.
+- **Error body is the standard A4 envelope** — `error.code`/`error.message`/`error.correlation_id`/`error.retry_after_ms`.
+- **Authorization is the `PluginSigning:Read` RBAC permission** (seeded Administrator-only). An MCP-tier token is denied this route regardless, at the tier chokepoint, before the permission check runs.
+- **Two `503` (retry) responses** where v1 answers `200` with a value it cannot stand behind: a `runtime_config_store` outage backing the `required` flag (v1 silently reports `required:false`), and a concurrent trust-bundle upload/clear racing this request's PEM re-read (v1 can pair a stale `sha256` with the newly-uploaded `trust_bundle_pem` on this exact race — #4144 also closed this integrity gap by deriving every field from a single read of the bundle).
+
+**`GET /api/v1/agent/plugin-policy` (DEPRECATED — unchanged since before #4028):** flat top-level body (`{"enabled":..., "required":..., "trust_bundle_pem":..., "cert_count":..., "sha256":...}`), `require_admin` gate (not RBAC), the old bespoke error shape, no audit row, and the pre-existing runtime_config_store/PEM-race behavior described above. Kept exactly as it always was — no new hardening is being back-ported to it.
+
+**Deprecation window (per `docs/api-versioning-policy.md`).** Announced 2026-09-08. `GET /api/v1/agent/plugin-policy` keeps working for at least 90 days **and** at least one intervening feature release, whichever is longer (so no earlier than 2026-12-07, and not before the next feature release ships) — removal will carry its own `CHANGELOG.md` **Breaking/Removed** entry per the cycle's Step 3, never a silent drop.
+
+**Who this affects, and what to do.** Any script, admin tool, or manual `curl` pipeline reading this route directly. Point it at `/api/v2/agent/plugin-policy` and read `response["data"]["trust_bundle_pem"]` (was `response["trust_bundle_pem"]`) — no CLI flag or configuration change is needed, this is a URL and response-shape change only. No action is required before the removal window closes, but migrating now also picks up the TOCTOU integrity fix.
 
 ---
 
@@ -2713,6 +2771,8 @@ For containerized deployments (Docker Compose), ensure the host volume backing `
 The server's storage substrate is **PostgreSQL** (ADR-0006/0007; the agent stays SQLite). As of the cut-over (#1320 PR 3) the server **requires a reachable database at boot and fails closed without one** — it constructs a shared connection pool at startup and, if `--postgres-dsn` / `YUZU_POSTGRES_DSN` is unset or the database is unreachable, **refuses to start and exits non-zero** (no SQLite fallback for the server). There is a distinct `[PG] Refusing to start` log line so the cause is unambiguous in `systemd` / `kubectl` logs.
 
 > **Upgrade action (BREAKING):** before upgrading to this release, provision PostgreSQL and set `YUZU_POSTGRES_DSN`. Docker Compose deployments already bundle the `postgres` service and wire the DSN (no action beyond pulling the new images). Native installs must run the provisioning helper below (or point the DSN at a managed PostgreSQL 16+) **first** — otherwise the upgraded server will not boot. Restore pairing (ADR-0010): a database restore must be paired with the matching `--ca-dir` / key-directory restore.
+
+**Dedicated coordination connection (HA WS-3, ADR-2002 §10).** Beyond the pool, each server holds **one** additional, never-recycled Postgres connection for background-work leader election — so budget `N_servers × 1` connections against Postgres `max_connections` on top of the pool size below. Per §10 it is deliberately outside the pool and must reach the primary directly (an HAProxy-to-primary front is fine; a *transaction-mode* pooler is not, as it breaks the session advisory lock leadership rests on).
 
 **Connection-pool sizing.** The server opens up to `--postgres-pool-size` / `YUZU_POSTGRES_POOL_SIZE` connections (default **16**). Each heartbeat persists last-seen with one short-lived lease (≈33/s at 1 000 agents on a 30 s heartbeat — well within 16), and `/viz/fleet` draws one. Raise the size for large fleets (rule of thumb: +1 per ~1 000 agents beyond 5 000, plus headroom per additional Postgres-backed store as they migrate) or for a slow managed-PG link. Tune against the `yuzu_pg_pool_{in_use,open,size}` gauges, the `yuzu_pg_acquire_wait_seconds` histogram (the leading saturation signal), and the `yuzu_pg_{connect_failed,acquire_timeout,unhealthy_discard}_total` counters (`unhealthy_discard` counts pooled connections dropped on a failed health probe); the bundled alert rules (`YuzuPgPoolSaturated`, `YuzuPgAcquireWaitHigh`, `YuzuPgConnectFailing` in `docs/prometheus/yuzu-alerts.yml`) fire before `/readyz` is affected. The heartbeat upsert is best-effort with a 250 ms acquire deadline, so a saturated pool degrades the stale-host display, never the live fleet.
 
