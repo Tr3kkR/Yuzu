@@ -11,8 +11,7 @@
 // host with N>1 bindings silently reported only 1 row. This header restores
 // one row per binding by matching each binding's Filter/Consumer CIM
 // reference to the row it names.
-#ifndef YUZU_AUTORUNS_WIN_WMI_JOIN_HPP
-#define YUZU_AUTORUNS_WIN_WMI_JOIN_HPP
+#pragma once
 
 #include <map>
 #include <string>
@@ -97,5 +96,3 @@ inline std::vector<WmiJoinedBinding> join_wmi_bindings(const std::vector<WmiJoin
 }
 
 } // namespace yuzu::autoruns
-
-#endif // YUZU_AUTORUNS_WIN_WMI_JOIN_HPP
