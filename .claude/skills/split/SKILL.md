@@ -139,9 +139,13 @@ Delivery phases (dependency-ordered):
    retirement → WS-B10, WS-X3.
 4. **Phase C — Extract engine:** WS-B9 behind the engine gate → WS-B11(engine half) → finalize.
 
-**Highest-leverage first slices after WS-0:** WS-A4 (seam + INV-31-4 test) and WS-B1
+**Highest-leverage first slices after WS-0:** WS-A4's *remaining* work and WS-B1
 (Drogon canary) — both monolith-buildable and parallel; WS-B11 is a third early start.
 None waits on an external programme now that WS-A3 is THIS-owned per-family.
+**⚠️ WS-A4's GLOBAL INV-31-4 drift test already shipped** (out-of-band, #842/#3991/#3992 —
+`scripts/ci/check-api-parity.py` + `test_openapi_spec_completeness.cpp`; `/api/v1` drift-zero).
+Do NOT rebuild it. WS-A4's remaining slices are the **per-family** seam+contract enforcement (gates
+WS-B2), the handler→API seam refactor, and the PII-audit relocation — grep the tree before scoping.
 
 ## 4. Landing a WS slice (workflow)
 

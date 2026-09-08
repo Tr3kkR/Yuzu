@@ -397,7 +397,8 @@ none of them today:
    registrations under them) and fail the build on any not present in the published OpenAPI —
    **does not exist**. It is a deliverable of migration step 3. *(Update 2026-09-08: it landed — see
    the INV-31-4 update note above; `scripts/ci/check-api-parity.py` + `test_openapi_spec_completeness.cpp`,
-   #842/#3991/#3992. This gap is closed for `/api/v1/*`; the per-family + seam-refactor halves of WS-A4 remain.)*
+   #842/#3991/#3992. This gap is closed for `/api/v1/*`; the per-family enforcement, the handler→API seam
+   refactor, and the PII-audit relocation halves of WS-A4 remain.)*
 2. **A REST route with no MCP twin.** Structurally invisible to the build.
 3. **A database grant handed to presentation or the engine.** Prevented by Postgres role
    configuration (2c D1), not by the compiler.
@@ -406,6 +407,11 @@ So: **the `consistency-auditor`'s standing question still carries the rule.** It
 this ADR — it is retired by the contract test, and until that test exists, saying "the build answers
 it" would delete a governance control on the strength of a property the build does not have. The
 deployment flexibility is a bonus; the parity guarantee is *work*.
+
+> **Update (2026-09-08): that global contract test now exists** (#842/#3991/#3992 — see the INV-31-4
+> update note above), so for `/api/v1/*` the build *does* now answer it and the standing question is
+> backed by an enforced gate rather than review alone. The `consistency-auditor`'s question still
+> carries the *per-family* and MCP-twin halves it was written for.
 
 ### F-10 is void, and the agentic gap closes as a side-effect
 
