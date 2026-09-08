@@ -2567,7 +2567,25 @@ MCP twins).
    MCP tier outright (`mcp_policy.hpp`'s `tier_allows()`), so an admin-owned
    MCP token cannot reach them even though it would otherwise satisfy this
    same floor check. (`Directory` deliberately has no floor entry, since it
-   was never `admin_fn_`-gated to begin with.) It is consulted **only**
+   was never `admin_fn_`-gated to begin with — `list_directory_users` and
+   most of `get_directory_status`'s payload stay reachable at Viewer role
+   and readonly MCP tier. **One field is the exception:**
+   `groups[].mapped_role` on `get_directory_status` — the AD-group ->
+   Yuzu-role authorization map, the same data class as the floored
+   `OidcConfig` `admin_group` field (colleague review on #4176 caught this
+   inconsistency: `mapped_role` was newly MCP-reachable at readonly tier and
+   newly Viewer-reachable under RBAC-on with no floor treatment at all,
+   despite the sibling `OidcConfig` field being floored in this same PR).
+   Flooring all of `Directory:Read` was rejected — it would also demote
+   `list_directory_users` (lower-sensitivity PII, not authorization
+   topology) to admin-only under RBAC-off. Instead
+   `directory_status_json`'s `reveal_mapped_role` parameter redacts just
+   that field to the empty string for a non-admin caller, checked via the
+   same `auth::effective_role(session) == auth::Role::admin` test the
+   topology floor itself uses — REST v1, the legacy route, and the MCP tool
+   all compute it independently at their own call site, since the floor
+   mechanism only gates whole-route `(securable, operation)` pairs, not
+   individual response fields.) It is consulted **only**
    inside the legacy (RBAC-off) fallback of
    `require_permission`/`require_scoped_permission`
    — never ahead of, or instead of, the live-RBAC branch. That ordering is

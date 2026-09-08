@@ -25,7 +25,9 @@
  */
 
 #include "authz_gates.hpp" // authz::FleetReadGate — the pending-agents ADR-0017 fake gate
+#include "enrollment_directory_model.hpp" // directory_status_json — direct builder test
 #include "enrollment_directory_routes.hpp"
+#include "pg/pg_exec.hpp"
 #include "test_directory_sync_pg_helper.hpp"
 #include "test_route_sink.hpp"
 
@@ -641,4 +643,108 @@ TEST_CASE("REST enrollment/directory[pg]: directory/status returns provider/stat
     CHECK(j["data"].contains("group_count"));
     CHECK(j["data"]["groups"].is_array());
     CHECK(audit_calls == 0); // no PII — deliberately unaudited, matches the legacy route
+}
+
+// ── mapped_role redaction (colleague-review finding on #4176) ──────────────
+//
+// groups[].mapped_role is the AD/Entra group -> Yuzu-role authorization map —
+// the same data class as the floored OidcConfig:admin_group field. Reachable
+// at Viewer role / readonly MCP tier by design (list_directory_users and the
+// rest of get_directory_status stay at that level), but mapped_role itself
+// must be admin-only. directory_status_json's `reveal_mapped_role` parameter
+// is the mechanism; this pins the builder directly (no store needed — a
+// DirectoryGroup is a plain struct) plus one route-level round trip proving
+// the wiring (auth_fn -> effective_role -> the builder call) actually holds.
+
+TEST_CASE("directory_status_json: redacts mapped_role when reveal_mapped_role is false, reveals "
+          "it when true",
+          "[enrollment_directory][model]") {
+    SyncStatus status{.provider = "entra", .status = "completed"};
+    std::vector<DirectoryGroup> groups{
+        {.id = "g1", .display_name = "Eng", .description = "", .mapped_role = "Administrator",
+         .synced_at = 100}};
+
+    auto redacted = directory_status_json(status, groups, /*reveal_mapped_role=*/false);
+    REQUIRE(redacted["groups"].size() == 1);
+    CHECK(redacted["groups"][0]["mapped_role"] == "");
+    // Every other field is untouched by the redaction — only mapped_role is cut.
+    CHECK(redacted["groups"][0]["id"] == "g1");
+    CHECK(redacted["groups"][0]["display_name"] == "Eng");
+
+    auto revealed = directory_status_json(status, groups, /*reveal_mapped_role=*/true);
+    REQUIRE(revealed["groups"].size() == 1);
+    CHECK(revealed["groups"][0]["mapped_role"] == "Administrator");
+}
+
+TEST_CASE("REST enrollment/directory[pg]: directory/status redacts mapped_role for a non-admin "
+          "caller and reveals it for an admin caller",
+          "[rest][enrollment_directory][pg]") {
+    yuzu::test::DirectorySyncPg ds;
+
+    // Seed one group + its role mapping. directory_groups has no public
+    // writer (store_group is private, apply_entra_sync's friend-struct seam
+    // is file-local to test_directory_sync.cpp — see this file's header
+    // note) so the group row itself goes in via a raw statement on the
+    // pool DirectorySyncPg exposes for exactly this ("asserting ... with a
+    // raw statement", test_directory_sync_pg_helper.hpp); the mapping goes
+    // in via the real public configure_group_role_mapping, so the LEFT JOIN
+    // read path this test actually cares about is exercised for real.
+    {
+        auto lease = ds.pool().acquire();
+        REQUIRE(lease);
+        auto ins = pg::exec_params(
+            lease.get(),
+            "INSERT INTO directory_sync.directory_groups (id, display_name, description, "
+            "synced_at) VALUES ($1, $2, $3, $4)",
+            std::vector<std::string>{"g1", "Engineering", "", "100"});
+        REQUIRE(ins.ok());
+    }
+    ds->configure_group_role_mapping("g1", "Administrator");
+    REQUIRE(ds->get_synced_groups().size() == 1);
+    REQUIRE(ds->get_synced_groups()[0].mapped_role == "Administrator");
+
+    EnrollmentDirectoryRouteHarness h;
+    auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                      const std::string&) { return true; };
+    auto audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
+                       const std::string&, const std::string&, const std::string&) {
+        return true;
+    };
+
+    yuzu::server::test::TestRouteSink admin_sink;
+    EnrollmentDirectoryRoutes admin_routes;
+    auto admin_auth_fn = [](const httplib::Request&, httplib::Response&)
+        -> std::optional<auth::Session> {
+        auth::Session s;
+        s.username = "admin-tester";
+        s.role = auth::Role::admin;
+        return s;
+    };
+    admin_routes.register_routes(admin_sink, admin_auth_fn, perm_fn, audit_fn, ds.get(),
+                                 &h.auto_approve, &h.auth_mgr, &h.cfg, h.oidc_mu);
+    auto admin_res = admin_sink.Get("/api/v1/directory/status");
+    REQUIRE(admin_res);
+    auto admin_json = nlohmann::json::parse(admin_res->body);
+    REQUIRE(admin_json["data"]["groups"].size() == 1);
+    CHECK(admin_json["data"]["groups"][0]["mapped_role"] == "Administrator");
+
+    yuzu::server::test::TestRouteSink viewer_sink;
+    EnrollmentDirectoryRoutes viewer_routes;
+    auto viewer_auth_fn = [](const httplib::Request&, httplib::Response&)
+        -> std::optional<auth::Session> {
+        auth::Session s;
+        s.username = "viewer-tester";
+        s.role = auth::Role::user; // Viewer holds Directory:Read via RBAC, but role != admin
+        return s;
+    };
+    viewer_routes.register_routes(viewer_sink, viewer_auth_fn, perm_fn, audit_fn, ds.get(),
+                                  &h.auto_approve, &h.auth_mgr, &h.cfg, h.oidc_mu);
+    auto viewer_res = viewer_sink.Get("/api/v1/directory/status");
+    REQUIRE(viewer_res);
+    auto viewer_json = nlohmann::json::parse(viewer_res->body);
+    REQUIRE(viewer_json["data"]["groups"].size() == 1);
+    CHECK(viewer_json["data"]["groups"][0]["mapped_role"] == "");
+    // Everything else stays reachable — the redaction is narrow.
+    CHECK(viewer_json["data"]["groups"][0]["id"] == "g1");
+    CHECK(viewer_json["data"]["groups"][0]["display_name"] == "Engineering");
 }

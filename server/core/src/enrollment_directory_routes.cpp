@@ -51,7 +51,7 @@ void EnrollmentDirectoryRoutes::register_routes(httplib::Server& svr, AuthFn aut
                     std::move(fleet_read_fn));
 }
 
-void EnrollmentDirectoryRoutes::register_routes(HttpRouteSink& sink, AuthFn /*auth_fn*/,
+void EnrollmentDirectoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn,
                                                 PermFn perm_fn, AuditFn audit_fn,
                                                 DirectorySync* directory_sync,
                                                 auth::AutoApproveEngine* auto_approve,
@@ -94,18 +94,25 @@ void EnrollmentDirectoryRoutes::register_routes(HttpRouteSink& sink, AuthFn /*au
     // Provider/status/counts + group-role-mapping metadata — no per-person
     // PII, so no audit call (matches list_software_deployments' "metadata,
     // not behavioural PII" precedent in docs/api-twin-recipe.md §8).
+    // `mapped_role` (the AD-group -> Yuzu-role authorization map, same data
+    // class as the floored OidcConfig:admin_group) is redacted for non-admin
+    // callers — see directory_status_json's own doc comment.
     sink.Get("/api/v1/directory/status",
-            [perm_fn, directory_sync](const httplib::Request& req, httplib::Response& res) {
+            [auth_fn, perm_fn, directory_sync](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Directory", "Read"))
                     return;
                 if (!directory_sync || !directory_sync->is_open()) {
                     respond_service_unavailable(res, "directory sync");
                     return;
                 }
+                auto session = auth_fn(req, res);
+                const bool reveal_mapped_role =
+                    session && auth::effective_role(*session) == auth::Role::admin;
                 auto status = directory_sync->get_status();
                 auto groups = directory_sync->get_synced_groups();
-                res.set_content(ok_json(directory_status_json(status, groups)),
-                                "application/json");
+                res.set_content(
+                    ok_json(directory_status_json(status, groups, reveal_mapped_role)),
+                    "application/json");
             });
 
     // ── GET /api/v1/enrollment/auto-approve-rules — Enrollment:Read ─────

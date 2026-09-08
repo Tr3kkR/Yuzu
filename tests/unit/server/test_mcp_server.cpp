@@ -11487,6 +11487,46 @@ TEST_CASE("MCP #4031: get_directory_status dispatches, returns the shared builde
     CHECK(ts.audit_log.empty());
 }
 
+// Colleague-review finding on #4176: groups[].mapped_role (the AD-group ->
+// Yuzu-role authorization map, same data class as the floored
+// OidcConfig:admin_group) must stay admin-only even at readonly MCP tier —
+// see enrollment_directory_model.hpp's directory_status_json doc comment.
+TEST_CASE("MCP #4031/#4176: get_directory_status redacts mapped_role for a non-admin caller at "
+          "readonly tier, reveals it for admin",
+          "[pg][mcp][integration][security]") {
+    yuzu::test::DirectorySyncPg ds;
+    {
+        auto lease = ds.pool().acquire();
+        REQUIRE(lease);
+        auto ins = pg::exec_params(
+            lease.get(),
+            "INSERT INTO directory_sync.directory_groups (id, display_name, description, "
+            "synced_at) VALUES ($1, $2, $3, $4)",
+            std::vector<std::string>{"g1", "Engineering", "", "100"});
+        REQUIRE(ins.ok());
+    }
+    ds->configure_group_role_mapping("g1", "Administrator");
+    REQUIRE(ds->get_synced_groups().size() == 1);
+
+    McpTestServer ts;
+    ts.directory_sync_for_test = ds.get();
+    ts.start("readonly");
+    ts.mock_role = yuzu::server::auth::Role::user;
+
+    auto call = R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":)"
+               R"("get_directory_status","arguments":{}}})";
+    auto denied_payload = operator_surface_payload(ts.call(call));
+    REQUIRE(denied_payload["groups"].size() == 1);
+    CHECK(denied_payload["groups"][0]["mapped_role"] == "");
+
+    // Admin session, same readonly MCP tier — the field is role-gated, not
+    // tier-gated, so an admin sees it even at readonly.
+    ts.mock_role = yuzu::server::auth::Role::admin;
+    auto revealed_payload = operator_surface_payload(ts.call(call));
+    REQUIRE(revealed_payload["groups"].size() == 1);
+    CHECK(revealed_payload["groups"][0]["mapped_role"] == "Administrator");
+}
+
 TEST_CASE("MCP #4031: list_directory_users respects perm_fn denial on Directory:Read",
           "[pg][mcp][integration]") {
     yuzu::test::DirectorySyncPg ds;

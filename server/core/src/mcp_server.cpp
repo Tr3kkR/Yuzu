@@ -660,7 +660,9 @@ static const ToolDef kTools[] = {
     {"get_directory_status",
      "Get AD/Entra directory-sync status: provider, last sync time/error, user/group counts, "
      "and the synced group catalog. Requires Directory:Read. No PII (counts + group metadata "
-     "only).",
+     "only). groups[].mapped_role (the AD-group -> Yuzu-role authorization map) is the empty "
+     "string for a non-admin caller, regardless of tier — admin-only, same posture as "
+     "OidcConfig's admin_group field.",
      R"({"type":"object","properties":{}})",
      R"j({"type":"object","properties":{"provider":{"type":"string"},"status":{"type":"string"},"last_sync_at":{"type":"integer"},"user_count":{"type":"integer"},"group_count":{"type":"integer"},"last_error":{"type":"string"},"groups":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"display_name":{"type":"string"},"description":{"type":"string"},"mapped_role":{"type":"string"},"synced_at":{"type":"integer"}},"required":["id","display_name","description","mapped_role","synced_at"]}}},"required":["provider","status","last_sync_at","user_count","group_count","last_error","groups"]})j"},
 
@@ -7995,10 +7997,16 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto status = directory_sync->get_status();
                 auto groups = directory_sync->get_synced_groups();
                 // No audit call — no per-person PII (counts + group metadata
-                // only), matching the REST twin's same decision.
+                // only), matching the REST twin's same decision. mapped_role
+                // (the AD-group -> Yuzu-role authorization map) is redacted
+                // for non-admin callers, incl. every readonly-tier MCP
+                // token — see directory_status_json's own doc comment.
+                const bool reveal_mapped_role =
+                    session && auth::effective_role(*session) == auth::Role::admin;
                 res.set_content(
                     success_response(
-                        id, tool_result(directory_status_json(status, groups).dump(),
+                        id, tool_result(directory_status_json(status, groups, reveal_mapped_role)
+                                            .dump(),
                                         kObjectOutputSchema)),
                     "application/json");
                 return;

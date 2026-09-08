@@ -59,8 +59,24 @@ nlohmann::json directory_user_row_json(const DirectoryUser& u);
 /// `GET /api/(v1/)directory/status` — provider/status/counts/last_error plus
 /// the full synced-groups array (id, display_name, description, mapped_role,
 /// synced_at). Mirrors the legacy handler's shape exactly.
+///
+/// `reveal_mapped_role` gates ONLY the `mapped_role` field — the AD/Entra
+/// group -> Yuzu-role authorization mapping, the same data class as
+/// `oidc_config_json`'s `admin_group` (which is floored in
+/// `authz_topology_floor.hpp`). Every other field (provider/status/counts/
+/// last_error/group id+display_name+description+synced_at) stays reachable
+/// at Viewer role and readonly MCP tier regardless — this is a narrower cut
+/// than flooring the whole `Directory:Read` securable, which would also
+/// gate `directory_user_row_json`'s listing (a different, lower-sensitivity
+/// capability). When `false`, `mapped_role` is the empty string, never
+/// omitted — every caller (REST v1, legacy, MCP) checks
+/// `auth::effective_role(session) == auth::Role::admin`, the same admin-role
+/// test `topology_floor_applies()` uses, so the redaction holds under both
+/// RBAC-off (the legacy fallback would otherwise admit any authenticated
+/// Read) and RBAC-on (Viewer holds `Directory:Read` but not this field).
 nlohmann::json directory_status_json(const SyncStatus& status,
-                                     const std::vector<DirectoryGroup>& groups);
+                                     const std::vector<DirectoryGroup>& groups,
+                                     bool reveal_mapped_role);
 
 // ── Enrollment (auto-approve rules + pending agents) — Enrollment:Read ────
 

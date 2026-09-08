@@ -206,8 +206,10 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
     // REST v1 twin + MCP get_directory_status) — Rule 1. No PII (counts +
     // group metadata only), so no audit call, matching this route's
     // pre-existing unaudited posture and the REST v1 twin's same decision.
+    // `mapped_role` is redacted for non-admin callers — see
+    // directory_status_json's own doc comment.
     sink.Get("/api/directory/status",
-            [perm_fn, directory_sync](const httplib::Request& req, httplib::Response& res) {
+            [auth_fn, perm_fn, directory_sync](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Directory", "Read"))
                     return;
                 if (!directory_sync || !directory_sync->is_open()) {
@@ -218,10 +220,13 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                     return;
                 }
 
+                auto session = auth_fn(req, res);
+                const bool reveal_mapped_role =
+                    session && auth::effective_role(*session) == auth::Role::admin;
                 auto status = directory_sync->get_status();
                 auto groups = directory_sync->get_synced_groups();
 
-                res.set_content(directory_status_json(status, groups).dump(),
+                res.set_content(directory_status_json(status, groups, reveal_mapped_role).dump(),
                                 "application/json");
             });
 

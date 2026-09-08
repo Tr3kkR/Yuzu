@@ -49,13 +49,14 @@ nlohmann::json directory_user_row_json(const DirectoryUser& u) {
 }
 
 nlohmann::json directory_status_json(const SyncStatus& status,
-                                     const std::vector<DirectoryGroup>& groups) {
+                                     const std::vector<DirectoryGroup>& groups,
+                                     bool reveal_mapped_role) {
     nlohmann::json groups_arr = nlohmann::json::array();
     for (const auto& g : groups) {
         groups_arr.push_back({{"id", g.id},
                               {"display_name", g.display_name},
                               {"description", g.description},
-                              {"mapped_role", g.mapped_role},
+                              {"mapped_role", reveal_mapped_role ? g.mapped_role : std::string{}},
                               {"synced_at", g.synced_at}});
     }
     return {{"provider", status.provider},
