@@ -88,6 +88,7 @@ A separate, narrower shape applies to ordinary mutation routes that audit a chan
   - [Inventory](#inventory)
   - [Result Sets](#result-sets)
   - [Software Licensing (SLE)](#software-licensing-sle)
+  - [App Usage](#app-usage)
   - [Execution Statistics](#execution-statistics)
   - [Live-Query Bundles](#live-query-bundles)
   - [Device Tokens](#device-tokens)
@@ -5087,6 +5088,47 @@ Per-store outcomes: `deleted` (the DELETE **committed**), `skipped` (store not c
 | 503 | Scope gate or cascade not configured (A4 envelope) |
 
 A `200` with `decommissioned: true` is confirmed erasure across every configured store; deleting an unknown `agent_id` is a no-op `200` (nothing to erase). Erasure does not unenroll the agent — a still-enrolled device re-syncs on its next daily cycle, so decommission the device first. This guarantee is scoped to the stores the cascade actually fans across — a leftover legacy `inventory.db` on disk (only possible outside ADR-0009's "no fleet ever ran pre-Postgres" assumption) was never part of it: `InventoryStore::delete_agent()` stopped scrubbing that file when its one-time backfill was retired (#3623), since the erasure branch existed only to serve the backfill.
+
+---
+
+### App Usage
+
+Read-only per-agent app-usage projection (Wave 7 PR7.2), sourced from the agent's `app_usage` plugin over TAR's derived `usage_daily` fold — see [App Usage](app-usage.md) for what is collected. No pid, command line, or user names ever leave the agent; `run_count_30d`/`total_seconds_30d` are a trailing 30-day window. This store is also the sixth and last in the `DELETE /api/v1/sle/agents/{agent_id}` decommission cascade (see [Software Licensing (SLE)](#software-licensing-sle) above).
+
+#### `GET /api/v1/forensics/agents/{agent_id}/app-usage`
+
+One device's app-usage projection — the per-agent drill, mirroring the SLE per-agent drill's shape. Behavioural data (what ran, when, how often), so every open is **audited fail-closed**: the store read is confirmed first, then a `app_usage.agent.view` `success` audit row is written — if that row cannot persist, the request is refused (`503` + `Sec-Audit-Failed`) and no data is served (reading before auditing avoids a durable false-positive "success" row on a read that then degrades).
+
+**Permission:** `Forensics:Read` — **per-device scoped** (management-group confinement; `403` for an in-fleet device outside your scope).
+
+**Response (200):**
+
+```json
+{
+  "data": {
+    "agent_id": "agent-001",
+    "apps": [
+      {"exe_key": "chrome.exe", "first_seen": 1751000000, "last_seen": 1751600000,
+       "run_count_30d": 42, "total_seconds_30d": 118800}
+    ],
+    "collected_at": 1751600000
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`collected_at` is the agent-batch collection time shared by every row in the last daily sync (hoisted to the top level rather than repeated per-app); `0` when the agent has never synced. An empty `apps` array with a non-zero `collected_at` is a genuine "nothing observed in the window" reading, not a degrade.
+
+**Error responses:**
+
+| Status | Condition |
+|---|---|
+| 401 | Unauthenticated |
+| 403 | Caller lacks per-device-scoped `Forensics:Read` for this agent |
+| 503 + `Sec-Audit-Failed` | The per-open audit row could not persist — fail-closed, no data served |
+| 503 | Store unavailable or degraded (A4 envelope with `correlation_id`, `retry_after_ms: 5000`) — **never an empty 200** |
+
+A device that has never synced app-usage (or synced zero rows) is `200` with `apps: []`; a `503` means the store could not be read — do **not** treat it as "no apps observed".
 
 ---
 
