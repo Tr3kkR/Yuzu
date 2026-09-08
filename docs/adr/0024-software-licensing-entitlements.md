@@ -9,7 +9,7 @@ context-refs: capability §27 issues #264–#267; #266 (entitlement-register rev
 
 # 0024 — Software Licensing & Entitlements (SLE: agent-discovered licences + multi-source entitlements)
 
-> **Implementation status (2026-09-08 ADR reconciliation):** Implemented — discovery plane shipped (PR #1950, merged 2026-07-13): `software_licensing_store.cpp`, `product_registry_store.cpp`, `sle_routes.cpp`, `license_scan` plugin. **Ratification pending**: the two maintainer sign-offs required at §Ratification (:49) are not recorded; flip to Accepted when they are. Not to be confused with `license_store.cpp` (ADR-0048 product licensing).
+> **Implementation status (2026-09-08 ADR reconciliation):** Implemented — discovery plane shipped (PR #1950, merged 2026-07-13): `software_licensing_store.cpp`, `product_registry_store.cpp`, `sle_routes.cpp`, `license_scan` plugin. **Ratification pending**: the two maintainer sign-offs required under "Maintainer sign-off required (Ratification)" below are not recorded; flip to Accepted when they are. Not to be confused with `license_store.cpp` (ADR-0048 product licensing).
 
 ## Summary
 
