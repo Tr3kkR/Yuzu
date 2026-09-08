@@ -94,7 +94,7 @@ struct SlowDtor {
     }
     ~SlowDtor() {
         if (!started)
-            return; // moved-from — nothing to record, nothing to hold
+            return; // moved-from - nothing to record, nothing to hold
         started->store(true, std::memory_order_relaxed);
         if (thread_id)
             thread_id->store(std::this_thread::get_id(), std::memory_order_relaxed);
@@ -105,7 +105,7 @@ struct SlowDtor {
 
 // A move-only, non-invokable-until-called-once marker used to prove a
 // closure handed back on Rejected/LaunchFailed is genuinely the SAME,
-// never-consumed object — not a fresh default-constructed stand-in and not
+// never-consumed object - not a fresh default-constructed stand-in and not
 // a moved-from husk.
 struct Marker {
     int tag{0};
@@ -152,7 +152,7 @@ TEST_CASE("launch: a gated fn times out on wait_take, then a later take delivers
     CHECK(f3->load() == 1);
 
     auto early = res.call->wait_take(std::chrono::steady_clock::now() + 50ms);
-    CHECK_FALSE(early.has_value()); // Timeout — still gated, NOT abandoned
+    CHECK_FALSE(early.has_value()); // Timeout - still gated, NOT abandoned
 
     gate.release();
     auto late = res.call->wait_take(std::chrono::steady_clock::now() + 5s);
@@ -160,10 +160,10 @@ TEST_CASE("launch: a gated fn times out on wait_take, then a later take delivers
     REQUIRE(late->has_value());
     CHECK(**late == 99);
 
-    // Exactly once — a further take after the late one is empty.
+    // Exactly once - a further take after the late one is empty.
     CHECK_FALSE(res.call->try_take().has_value());
 
-    // The lane/F3 counter reaches 0 once the worker is done — no ordering
+    // The lane/F3 counter reaches 0 once the worker is done - no ordering
     // claim is made here relative to the late take itself (F3 protects a
     // LIVE WORKER THREAD, not an inert parked value already delivered to
     // the owner; see spark_detached_call.hpp's own header comment).
@@ -184,7 +184,7 @@ TEST_CASE("launch: cap rejection returns Fn unconsumed", "[spark][detachedcall]"
     CHECK(f3->load() == 0);
     CHECK(lane.rejected_total() == 1);
 
-    // fn is genuinely the original, unconsumed closure — invoking it now
+    // fn is genuinely the original, unconsumed closure - invoking it now
     // returns the original captured value, not a moved-from husk's garbage.
     CHECK((*res.fn)() == 11);
 }
@@ -204,7 +204,7 @@ TEST_CASE("launch: OS launch failure returns Fn unconsumed", "[spark][detachedca
     CHECK(lane.launch_failed_total() == 1);
     CHECK((*res.fn)() == 23);
 
-    // The lane recovers once the test seam is cleared — a real launch after
+    // The lane recovers once the test seam is cleared - a real launch after
     // a simulated failure succeeds normally.
     lane.set_fail_launch_for_test(false);
     auto res2 = lane.launch([]() -> int { return 1; });
@@ -233,7 +233,7 @@ TEST_CASE("launch: a throwing fn maps to WorkerThrew and the process stays alive
     CHECK(lane.worker_threw_total() == 1);
 }
 
-TEST_CASE("launch: owner handle destroyed while parked — no UAF, disposal happens on the "
+TEST_CASE("launch: owner handle destroyed while parked - no UAF, disposal happens on the "
           "WORKER thread",
           "[spark][detachedcall]") {
     auto f3 = std::make_shared<std::atomic<std::size_t>>(0);
@@ -250,14 +250,14 @@ TEST_CASE("launch: owner handle destroyed while parked — no UAF, disposal happ
 
     {
         // Destroying the handle WHILE the call is still parked (fn is
-        // blocked on the gate) — this is the implicit-abandon path: the
+        // blocked on the gate) - this is the implicit-abandon path: the
         // worker discovers `abandoned` under cell.mu once it finally
         // completes, and self-disposes the SlowDtor LOCALLY (never
         // publishing it into the cell).
         [[maybe_unused]] auto dropped = std::move(*res.call);
     }
     // `res.call` (the optional) is still engaged but now holds a
-    // moved-from, cell_==nullptr handle — deliberately not touched again.
+    // moved-from, cell_==nullptr handle - deliberately not touched again.
 
     gate.release();
     REQUIRE(spin_until([&] { return dtor_ran.load(); }, 5s));
@@ -289,15 +289,15 @@ TEST_CASE("launch: abandon() after publish returns the result exactly once",
 }
 
 TEST_CASE("launch: an abandoned-before-publish result's disposal keeps the lane/F3 counter "
-          "nonzero until the captured object's OWN destructor completes — not merely until "
+          "nonzero until the captured object's OWN destructor completes - not merely until "
           "the worker decides not to publish",
           "[spark][detachedcall]") {
     // This is the tightened F3-timing regression test (plan's "Ownership
     // fix" section, Astra table-12): a buggy implementation that decrements
     // the counters as soon as the worker records `abandoned` (i.e., right
-    // when it would have published, had the owner not given up first) —
+    // when it would have published, had the owner not given up first) -
     // rather than only once the self-disposed value's OWN destructor has
-    // fully finished running — would fail this test.
+    // fully finished running - would fail this test.
     auto f3 = std::make_shared<std::atomic<std::size_t>>(0);
     SparkDetachedLane lane(f3, /*cap=*/4);
     Gate gate;
@@ -313,7 +313,7 @@ TEST_CASE("launch: an abandoned-before-publish result's disposal keeps the lane/
     CHECK(lane.active_workers() == 1);
     CHECK(f3->load() == 1);
 
-    // Abandon BEFORE the worker has even called fn() (still gated) — a
+    // Abandon BEFORE the worker has even called fn() (still gated) - a
     // not-yet-published call, per this file's own contract, so the worker
     // self-disposes when it eventually completes.
     auto pre_abandon = res.call->abandon();
@@ -322,7 +322,7 @@ TEST_CASE("launch: an abandoned-before-publish result's disposal keeps the lane/
     gate.release();
 
     REQUIRE(spin_until([&] { return dtor_started.load(); }, 5s));
-    // The destructor has STARTED (and is now sleeping for kHold) — poll for
+    // The destructor has STARTED (and is now sleeping for kHold) - poll for
     // a window comfortably inside that sleep and assert the counters never
     // read 0 during it. A premature-decrement bug would show 0 almost
     // immediately after dtor_started flips, well inside this window.
@@ -347,13 +347,13 @@ TEST_CASE("launch: fn's OWN captured RAII state outlives fn() returning, and the
           "[spark][detachedcall]") {
     // Pins the Payload<T,DFn> member-declaration-order fix directly (this
     // file's header comment, "Ticketing"): `held` is captured by the
-    // closure and is unrelated to the returned T (an int) — it is only
+    // closure and is unrelated to the returned T (an int) - it is only
     // destroyed when the closure itself (Payload's `fn` member) is
     // destroyed, which happens as part of Payload's own teardown AFTER
     // operator()() has already returned and the result has already been
     // published/taken. An implementation that captured the count-guard
     // ticket alongside fn in a lambda-capture list (UNSPECIFIED destruction
-    // order — the shape this file's header comment says not to copy)
+    // order - the shape this file's header comment says not to copy)
     // could destroy `held` AFTER the counters had already reached 0.
     auto f3 = std::make_shared<std::atomic<std::size_t>>(0);
     SparkDetachedLane lane(f3, /*cap=*/4);
@@ -369,7 +369,7 @@ TEST_CASE("launch: fn's OWN captured RAII state outlives fn() returning, and the
     REQUIRE(v.has_value());
     REQUIRE(v->has_value());
     CHECK(**v == 2);
-    // fn() has returned and the result has been taken — `held` (fn's own
+    // fn() has returned and the result has been taken - `held` (fn's own
     // capture) is NOT destroyed yet; it lives inside Payload's `fn` member
     // until Payload itself is torn down, which happens strictly after this.
 
@@ -410,34 +410,34 @@ TEST_CASE("spark_deadline_below_guardian_backend_op: tripwire matches the mirror
 //    while a worker is still parked (agent.cpp accounting) ─────────────────
 //
 // This is the direct regression test for the round-3 F3 finding (plan's "F3
-// orphan-exit accounting — Route A (corrected)" section): Astra found that
+// orphan-exit accounting - Route A (corrected)" section): Astra found that
 // summing F3 through GuardianEngine's wired SparkEngine pointer (an earlier
 // "Route B" design) misses a detached worker in the window between the
 // worker's own launch and whatever later, separate step wires or frees
-// that pointer — agent.cpp's real spark boot block resets spark_engine_ on
+// that pointer - agent.cpp's real spark boot block resets spark_engine_ on
 // an exception AFTER a mechanism (and thus a lane) may already have spawned
 // workers. Route A's fix is a counter that is summed directly in AgentImpl
 // (agent.cpp's guardian_active_io_workers(), verified by compile + code
-// inspection in this session — not exercised by a source-grepping test or
+// inspection in this session - not exercised by a source-grepping test or
 // a new test seam on the exported Agent interface, deliberately, per the
 // same "don't test the mechanism, test the property" spirit as the rest of
 // this file) and is NEVER read through spark_engine_/spark_boot_done_.
 //
 // PR-A has no real mechanism yet to reproduce agent.cpp's exact
-// SparkEngine→mechanism→lane ownership chain (that is PR-B's job) — this
+// SparkEngine→mechanism→lane ownership chain (that is PR-B's job) - this
 // test reproduces the SHAPE of the hazard directly against the primitive
 // itself: construct a lane with a shared F3 counter (standing in for
 // agent.cpp's spark_detached_workers_, which a real mechanism's
 // SparkDetachedLane will be constructed with in PR-B), launch a gated
-// (still in-flight) worker, then destroy the LANE OBJECT ITSELF — standing
+// (still in-flight) worker, then destroy the LANE OBJECT ITSELF - standing
 // in for a mechanism, and thus SparkEngine, being torn down (agent.cpp's
 // exception-reset path resets spark_engine_ while a mechanism's own
-// threads may still be running) — while the worker is still parked. The
+// threads may still be running) - while the worker is still parked. The
 // counter must stay nonzero throughout, readable via the SAME independent
 // shared_ptr<atomic<size_t>> the whole time, without going through
 // anything the destroyed lane owned.
 TEST_CASE("F3: the shared counter survives its lane's destruction while a worker is still "
-          "parked — the exact shape of agent.cpp's SparkEngine-exception-reset hazard",
+          "parked - the exact shape of agent.cpp's SparkEngine-exception-reset hazard",
           "[spark][detachedcall][f3]") {
     auto f3 = std::make_shared<std::atomic<std::size_t>>(0);
     Gate gate;
@@ -450,11 +450,11 @@ TEST_CASE("F3: the shared counter survives its lane's destruction while a worker
         });
         REQUIRE(res.status == DetachedLaunch::Launched);
         CHECK(f3->load() == 1);
-        [[maybe_unused]] auto call = std::move(*res.call); // drop the handle too — the
+        [[maybe_unused]] auto call = std::move(*res.call); // drop the handle too - the
                                                             // hazard is about the WORKER
                                                             // staying counted, not about
                                                             // any owner-side handle
-        // `lane` (and `call`) go out of scope HERE — the worker is still
+        // `lane` (and `call`) go out of scope HERE - the worker is still
         // gated/in-flight. This is the moment agent.cpp's exception-reset
         // path (spark_engine_.reset() in the boot block's catch clauses)
         // stands in for: whatever owned the lane is gone, but the counter
@@ -462,7 +462,7 @@ TEST_CASE("F3: the shared counter survives its lane's destruction while a worker
         // running worker.
     }
 
-    // The lane object no longer exists at all — read the counter through
+    // The lane object no longer exists at all - read the counter through
     // ONLY the independent shared_ptr the test itself still holds, exactly
     // as AgentImpl::guardian_active_io_workers() reads spark_detached_workers_
     // without ever touching spark_engine_.

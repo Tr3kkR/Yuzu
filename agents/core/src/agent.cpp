@@ -1205,10 +1205,10 @@ public:
         // to start (see the DISABLED branch in the heartbeat emit block below).
         // The flag selects exactly one detection path at instantiation, establishing
         // the "old and new never both drive enforce" property the rung-2/3 cutover
-        // leans on (moot at rung 1 — spark has no consumer — but pinned here).
+        // leans on (moot at rung 1 - spark has no consumer - but pinned here).
         //
         // spark_detached_workers_ (F3, #2012/#3840 plan "Route A corrected")
-        // needs no construction step here — it is already live via its own
+        // needs no construction step here - it is already live via its own
         // default member initializer, unconditionally before this line runs
         // on every path (including --spark-disable, and including a run()
         // that is never reached at all). See its member declaration's own
@@ -3390,7 +3390,7 @@ public:
         // Route A (corrected), #2012/#3840 plan: additive sum of Guardian's
         // own bounded-I/O workers and every Spark mechanism's detached probe
         // workers (spark_detached_workers_, see its own doc comment on why
-        // this NEVER dereferences spark_engine_/spark_boot_done_ — that is
+        // this NEVER dereferences spark_engine_/spark_boot_done_ - that is
         // the whole point of Route A, which fixed a real gap Route B (an
         // earlier design summing only through guardian_'s wired pointer)
         // had: a window where a mechanism's detached worker could exist
@@ -4005,30 +4005,30 @@ private:
     std::unique_ptr<ISignalObserver> dex_observer_;
     std::unique_ptr<ThreadPool> thread_pool_;
     // F3 orphan-exit accounting for mechanism-internal detached workers
-    // (#2012/#3840 plan, "F3 orphan-exit accounting — Route A (corrected)").
+    // (#2012/#3840 plan, "F3 orphan-exit accounting - Route A (corrected)").
     // A SparkDetachedLane (agents/core/src/spark_detached_call.hpp) inside a
     // future Spark mechanism (PR-B; no mechanism uses this yet) increments
     // this counter at admission and decrements it only once a detached
-    // worker's own closure is fully torn down — see that header's own doc
+    // worker's own closure is fully torn down - see that header's own doc
     // comment ("Ticketing"). Summed into guardian_active_io_workers() below,
     // additively with guardian_'s own count.
     //
-    // DEFAULT MEMBER INITIALIZER, DELIBERATELY — NOT declaration-order-
+    // DEFAULT MEMBER INITIALIZER, DELIBERATELY - NOT declaration-order-
     // coupled to spark_engine_/guardian_ the way THEY are coupled to each
     // other (see spark_engine_'s own comment just below for that unrelated,
     // real dependency). This member's shared_ptr target must be constructed
     // before spark_engine_'s run()-time `= std::make_unique<SparkEngine>()`
-    // (agent.cpp's spark boot block) — a default member initializer trivially
+    // (agent.cpp's spark boot block) - a default member initializer trivially
     // satisfies that: it exists from the moment AgentImpl itself finishes
     // constructing, which is unconditionally before run() is ever invoked,
     // covering every window the F3 sum must be correct in (pre-boot, mid-
-    // boot, post-exception-reset, post-sticky-stop-skip-wiring — Astra's
-    // round-3 finding, "F3 orphan-exit accounting — Route A (corrected)").
+    // boot, post-exception-reset, post-sticky-stop-skip-wiring - Astra's
+    // round-3 finding, "F3 orphan-exit accounting - Route A (corrected)").
     // Never read through spark_engine_ or spark_boot_done_ (that IS the
-    // point of Route A — see guardian_active_io_workers() below); its own
+    // point of Route A - see guardian_active_io_workers() below); its own
     // shared_ptr semantics keep the underlying atomic alive independent of
     // AgentImpl's member-destruction order, since any worker still holding a
-    // copy (via CountGuard) keeps it alive regardless — so its declaration
+    // copy (via CountGuard) keeps it alive regardless - so its declaration
     // POSITION here is for locality of reference (next to what it's summed
     // alongside), not because destruction order matters for it the way it
     // does for spark_engine_/guardian_ just below.

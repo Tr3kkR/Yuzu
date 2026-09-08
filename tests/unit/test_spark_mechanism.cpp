@@ -13,7 +13,7 @@
 #include "spark_engine.hpp"
 #include "spark_heartbeat.hpp" // emit_spark_heartbeat_tags — the #2833 egress pin
 #include "spark_mechanism.hpp"
-#include "test_helpers.hpp" // process_random_salt — the PR-A watch-establishment harness'
+#include "test_helpers.hpp" // process_random_salt - the PR-A watch-establishment harness'
                             // scratch registry keys (#2012/#3840 D-value measurement)
 
 #include <catch2/catch_test_macros.hpp>
@@ -3825,31 +3825,31 @@ TEST_CASE("Service spark (real mechanism): live service transition + inline disp
 
 // ── Watch-establishment LATENCY CHARACTERIZATION harness (PR-A; #2012/#3840) ─
 //
-// Measures the RAW Win32 call sequences DIRECTLY — CreateEventW /
+// Measures the RAW Win32 call sequences DIRECTLY - CreateEventW /
 // CreateThreadpoolWait / RegOpenKeyExW / RegNotifyChangeKeyValue /
 // SetThreadpoolWait for Registry; OpenSCManagerW / OpenServiceW /
 // NotifyServiceStatusChangeW for Service; is_directory / CreateFileW for
-// File — NOT through the mechanism classes (spark_file.cpp /
+// File - NOT through the mechanism classes (spark_file.cpp /
 // spark_registry.cpp / spark_service.cpp), which do not yet have the
 // off-lock restructuring this measurement feeds (that is PR-B). Deliberate:
 // D must be chosen from TODAY's raw call cost, before a mechanism hides it
-// behind a bounded worker — measuring through the mechanism is only possible
+// behind a bounded worker - measuring through the mechanism is only possible
 // once PR-B lands, by which point D would already be baked in.
 //
-// REPORT ONLY — never assert on these numbers on the shared Wee Tam CI pool.
+// REPORT ONLY - never assert on these numbers on the shared Wee Tam CI pool.
 // Treat a 200-sample p99 here as DEADLINE-CALIBRATION input, not evidence
 // about cold boot / a dead network share / true worst-case latency (Astra,
 // plan round 3, "#2012 + #3840" plan doc). Any downstream doc/PR body citing
 // these numbers must say so explicitly.
 //
 // Env-gated (YUZU_SPARK_ESTABLISH_BENCH=1), same shape as the
-// YUZU_SPARK_LIVE_SERVICE case above — every other [windows] case in this
+// YUZU_SPARK_LIVE_SERVICE case above - every other [windows] case in this
 // file runs by default on the shared Wee Tam CI box, and this is a
 // measurement run, not a gate; it must never fire there un-asked.
 //
 // NOT RUN IN THIS SESSION. No Windows toolchain/host was available when this
 // harness was authored (PR-A, docs/spark-rebuild-baselines/stage2-watch-
-// establish-latency.md records the pending-DGRHP-run status) — every Win32
+// establish-latency.md records the pending-DGRHP-run status) - every Win32
 // call shape below is modeled directly on the existing, already-shipped
 // usage in spark_registry.cpp / spark_service.cpp / spark_file.cpp (cited
 // per case), not invented, but this file has NOT been compiled or executed
@@ -3879,7 +3879,7 @@ void warn_establish(const char* case_label, const char* call_label, std::vector<
          << " max=" << s.max_us << " us");
 }
 
-/// ASCII-only widen — every path/name this harness constructs is a
+/// ASCII-only widen - every path/name this harness constructs is a
 /// PID/salt-suffixed ASCII literal, so a naive char->wchar_t widen is exact
 /// (no MultiByteToWideChar needed).
 std::wstring establish_widen(const std::string& s) { return std::wstring(s.begin(), s.end()); }
@@ -3889,7 +3889,7 @@ void CALLBACK establish_null_wait_cb(PTP_CALLBACK_INSTANCE, PVOID, PTP_WAIT, TP_
 /// R5 in-flight-drain callback: sleeps 50ms to simulate a callback parked
 /// inside a slow inline consumer, so WaitForThreadpoolWaitCallbacks(TRUE) has
 /// something real to drain. A named CALLBACK function, not a captureless
-/// lambda passed where a raw PTP_WAIT_CALLBACK is expected — matches the
+/// lambda passed where a raw PTP_WAIT_CALLBACK is expected - matches the
 /// named-function convention spark_registry.cpp's own OnWait uses, rather
 /// than relying on a lambda-to-function-pointer conversion across the
 /// CALLBACK/__stdcall decoration.
@@ -3903,9 +3903,9 @@ void CALLBACK establish_r6_fired_cb(PTP_CALLBACK_INSTANCE, PVOID ctx, PTP_WAIT, 
     static_cast<std::atomic<bool>*>(ctx)->store(true, std::memory_order_relaxed);
 }
 
-/// S2's SERVICE_NOTIFYW::pfnNotifyCallback — PFN_SC_NOTIFY_CALLBACK takes a
+/// S2's SERVICE_NOTIFYW::pfnNotifyCallback - PFN_SC_NOTIFY_CALLBACK takes a
 /// single PVOID (spark_service.cpp's own notify_cb, spark_service.cpp:968,
-/// matches this exact signature), NOT a SERVICE_NOTIFYW* — establishment
+/// matches this exact signature), NOT a SERVICE_NOTIFYW* - establishment
 /// only, this harness never reads the delivered status.
 void CALLBACK establish_s2_notify_cb(PVOID) {}
 
@@ -3913,7 +3913,7 @@ void CALLBACK establish_s2_notify_cb(PVOID) {}
 /// RegNotifyChangeKeyValue + SetThreadpoolWait sample, timed per call and
 /// appended to the five out-vectors (same order as the plan's R1/R2 call
 /// list). `open` performs the RegOpenKeyExW step itself (R1: a single open of
-/// the target; R2: an ancestor walk — see establish_open_ancestor_walk below)
+/// the target; R2: an ancestor walk - see establish_open_ancestor_walk below)
 /// so both cases can share this shell. `env` is null for the default process
 /// pool (R1/R2) or a private pool's environment (R3/R4, under hive load).
 template <class OpenFn>
@@ -3942,7 +3942,7 @@ void establish_registry_sample(PTP_CALLBACK_ENVIRON* env, DWORD notify_filter, O
 
     time_call(t_wait_set, [&] { ::SetThreadpoolWait(wait, ev, nullptr); });
 
-    // Teardown — not itself measured; mirrors spark_registry.cpp's own
+    // Teardown - not itself measured; mirrors spark_registry.cpp's own
     // teardown() shape (cancel-new, drain in-flight, then close).
     ::SetThreadpoolWait(wait, nullptr, nullptr);
     ::WaitForThreadpoolWaitCallbacks(wait, TRUE);
@@ -3952,7 +3952,7 @@ void establish_registry_sample(PTP_CALLBACK_ENVIRON* env, DWORD notify_filter, O
 }
 
 /// A private TP wait-group (min=2/max=4) matching spark_registry.cpp's own
-/// pool sizing (spark_registry.cpp:173-176) — used ONLY by the "under hive
+/// pool sizing (spark_registry.cpp:173-176) - used ONLY by the "under hive
 /// load" cases (R3/R4) so the measured contention is realistic private-pool
 /// saturation, not the effectively-unbounded default process pool.
 struct EstablishPrivatePool {
@@ -3976,7 +3976,7 @@ struct EstablishPrivatePool {
     EstablishPrivatePool& operator=(const EstablishPrivatePool&) = delete;
 };
 
-/// One self-re-arming registry watch used purely as CHURN LOAD for R3/R4 —
+/// One self-re-arming registry watch used purely as CHURN LOAD for R3/R4 -
 /// arm-before-process (mirrors spark_registry.cpp's reconcile() ordering) so
 /// it keeps firing/re-arming for the whole measurement window without
 /// growing unbounded. All churn watches point at the SAME shared key; a
@@ -4003,7 +4003,7 @@ struct EstablishChurnWatch {
 TEST_CASE("Watch establishment (Registry): target-present raw call sequence (R1)",
           "[spark][mechanism][windows][latency][establish]") {
     if (!spark_establish_bench_enabled()) {
-        SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset — skipping establishment latency harness");
+        SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset - skipping establishment latency harness");
         return;
     }
     const std::string base =
@@ -4040,7 +4040,7 @@ TEST_CASE("Watch establishment (Registry): target-present raw call sequence (R1)
 TEST_CASE("Watch establishment (Registry): target-absent, ancestor walk depth 6 (R2)",
           "[spark][mechanism][windows][latency][establish]") {
     if (!spark_establish_bench_enabled()) {
-        SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset — skipping establishment latency harness");
+        SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset - skipping establishment latency harness");
         return;
     }
     const std::string base =
@@ -4050,7 +4050,7 @@ TEST_CASE("Watch establishment (Registry): target-absent, ancestor walk depth 6 
     REQUIRE(::RegCreateKeyExA(HKEY_CURRENT_USER, base.c_str(), 0, nullptr, 0, KEY_ALL_ACCESS,
                               nullptr, &base_h, nullptr) == ERROR_SUCCESS);
     ::RegCloseKey(base_h);
-    // 6 absent levels under `base`, which exists — matches the plan's
+    // 6 absent levels under `base`, which exists - matches the plan's
     // "ancestor walk depth 6". None of a\b\c\d\e\f is ever created.
     const std::string target = base + "\\a\\b\\c\\d\\e\\f";
 
@@ -4062,7 +4062,7 @@ TEST_CASE("Watch establishment (Registry): target-absent, ancestor walk depth 6 
             /*env=*/nullptr, REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_THREAD_AGNOSTIC,
             [&](std::vector<std::int64_t>& t_open_inner) -> HKEY {
                 // Walk up from `target`, stripping one path component at a
-                // time, until RegOpenKeyExW succeeds — the same shape as
+                // time, until RegOpenKeyExW succeeds - the same shape as
                 // spark_registry.cpp's private open_nearest_ancestor(), not
                 // reused directly (it is a private member of
                 // WindowsRegistryMechanism, not exported) but replicated
@@ -4081,7 +4081,7 @@ TEST_CASE("Watch establishment (Registry): target-absent, ancestor walk depth 6 
                         return h;
                     const auto pos = path.find_last_of('\\');
                     if (pos == std::string::npos)
-                        return nullptr; // exhausted — should not happen, base_h exists
+                        return nullptr; // exhausted - should not happen, base_h exists
                     path = path.substr(0, pos);
                 }
             },
@@ -4166,7 +4166,7 @@ struct EstablishHiveLoad {
 TEST_CASE("Watch establishment (Registry): target-present under hive load (R3)",
           "[spark][mechanism][windows][latency][establish]") {
     if (!spark_establish_bench_enabled()) {
-        SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset — skipping establishment latency harness");
+        SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset - skipping establishment latency harness");
         return;
     }
     const std::string base =
@@ -4208,7 +4208,7 @@ TEST_CASE("Watch establishment (Registry): target-present under hive load (R3)",
 TEST_CASE("Watch establishment (Registry): target-absent depth6 under hive load (R4)",
           "[spark][mechanism][windows][latency][establish]") {
     if (!spark_establish_bench_enabled()) {
-        SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset — skipping establishment latency harness");
+        SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset - skipping establishment latency harness");
         return;
     }
     const std::string base =
@@ -4262,10 +4262,10 @@ TEST_CASE("Watch establishment (Registry): target-absent depth6 under hive load 
 TEST_CASE("Watch establishment (Registry): WaitForThreadpoolWaitCallbacks drain, idle vs in-flight (R5)",
           "[spark][mechanism][windows][latency][establish]") {
     if (!spark_establish_bench_enabled()) {
-        SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset — skipping establishment latency harness");
+        SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset - skipping establishment latency harness");
         return;
     }
-    // Idle drain: a wait that was never signaled, disarmed then drained —
+    // Idle drain: a wait that was never signaled, disarmed then drained -
     // this is unwatch()'s common case (spark_registry.cpp:304's
     // WaitForThreadpoolWaitCallbacks(TRUE)).
     std::vector<std::int64_t> t_idle;
@@ -4283,7 +4283,7 @@ TEST_CASE("Watch establishment (Registry): WaitForThreadpoolWaitCallbacks drain,
     warn_establish("R5 drain idle", "WaitForThreadpoolWaitCallbacks", t_idle);
 
     // In-flight drain: the callback is already running (sleeping 50ms) when
-    // unwatch() calls the drain — this is the case that stalls a lane if the
+    // unwatch() calls the drain - this is the case that stalls a lane if the
     // callback is parked inside an inline consumer (the whole reason this
     // restructuring exists). Smaller n: each sample costs >= 50ms.
     std::vector<std::int64_t> t_inflight;
@@ -4294,7 +4294,7 @@ TEST_CASE("Watch establishment (Registry): WaitForThreadpoolWaitCallbacks drain,
         PTP_WAIT wait = ::CreateThreadpoolWait(&establish_r5_inflight_cb, nullptr, nullptr);
         REQUIRE(wait != nullptr);
         ::SetThreadpoolWait(wait, ev, nullptr);
-        ::SetEvent(ev); // fire it — the callback is now (about to be) running
+        ::SetEvent(ev); // fire it - the callback is now (about to be) running
         std::this_thread::sleep_for(5ms); // give the pool a moment to pick it up
         time_call(t_inflight, [&] { ::WaitForThreadpoolWaitCallbacks(wait, TRUE); });
         ::CloseThreadpoolWait(wait);
@@ -4307,12 +4307,12 @@ TEST_CASE("Watch establishment (Registry): WaitForThreadpoolWaitCallbacks drain,
 TEST_CASE("Watch establishment (Registry): THREAD_AGNOSTIC correctness control (R6)",
           "[spark][mechanism][windows][latency][establish]") {
     if (!spark_establish_bench_enabled()) {
-        SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset — skipping establishment latency harness");
+        SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset - skipping establishment latency harness");
         return;
     }
     // Real risk this control exists for (Astra, plan round 3): without
     // REG_NOTIFY_THREAD_AGNOSTIC, a notification registered on a thread that
-    // then exits is indistinguishable — by symptom alone — from a real
+    // then exits is indistinguishable - by symptom alone - from a real
     // registry change, because the registering thread's OWN EXIT can signal
     // the event. This case proves the flag is what makes the notification
     // survive; the negative control demonstrates (does not hard-assert,
@@ -4341,7 +4341,7 @@ TEST_CASE("Watch establishment (Registry): THREAD_AGNOSTIC correctness control (
                                  (thread_agnostic ? REG_NOTIFY_THREAD_AGNOSTIC : 0);
             ::RegNotifyChangeKeyValue(*key_holder, FALSE, filter, *ev_holder, TRUE);
             ::SetThreadpoolWait(*wait_holder, *ev_holder, nullptr);
-            // Thread exits HERE, immediately after arming — the whole point
+            // Thread exits HERE, immediately after arming - the whole point
             // of the control.
         });
         registrant.join();
@@ -4374,7 +4374,7 @@ TEST_CASE("Watch establishment (Registry): THREAD_AGNOSTIC correctness control (
     const bool without_flag = run_one(/*thread_agnostic=*/false);
     WARN("R6 THREAD_AGNOSTIC control: with-flag fired=" << with_flag
          << " without-flag fired=" << without_flag
-         << " (without-flag NOT hard-asserted — this control characterizes, "
+         << " (without-flag NOT hard-asserted - this control characterizes, "
             "rather than assumes, the failure mode; a false 'fired' there "
             "would itself be the documented risk: the registering thread's "
             "own exit signaling the event, indistinguishable from a real "
@@ -4386,7 +4386,7 @@ TEST_CASE("Watch establishment (Registry): THREAD_AGNOSTIC correctness control (
 TEST_CASE("Watch establishment (Service): OpenSCManagerW connect+close (S1)",
           "[spark][mechanism][windows][latency][establish]") {
     if (!spark_establish_bench_enabled()) {
-        SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset — skipping establishment latency harness");
+        SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset - skipping establishment latency harness");
         return;
     }
     std::vector<std::int64_t> t_open, t_close;
@@ -4405,10 +4405,10 @@ TEST_CASE("Watch establishment (Service): OpenServiceW+NotifyServiceStatusChange
           "service list (S2)",
           "[spark][mechanism][windows][latency][establish]") {
     if (!spark_establish_bench_enabled()) {
-        SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset — skipping establishment latency harness");
+        SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset - skipping establishment latency harness");
         return;
     }
-    // Same mask spark_service.cpp uses (spark_service.cpp:888-892) — copied
+    // Same mask spark_service.cpp uses (spark_service.cpp:888-892) - copied
     // here rather than shared since it is a private constexpr in that TU.
     constexpr DWORD kEstablishNotifyMask =
         SERVICE_NOTIFY_RUNNING | SERVICE_NOTIFY_STOPPED | SERVICE_NOTIFY_START_PENDING |
@@ -4419,7 +4419,7 @@ TEST_CASE("Watch establishment (Service): OpenServiceW+NotifyServiceStatusChange
     REQUIRE(scm != nullptr);
 
     // EnumServicesStatusExW two-call pattern (MSDN): size probe, then fetch.
-    // resume reset to 0 before the real call — the probe call is expected to
+    // resume reset to 0 before the real call - the probe call is expected to
     // fail (ERROR_MORE_DATA) and must not leave a stale resume handle for
     // the real enumeration to (incorrectly) start from.
     DWORD needed = 0, count = 0, resume = 0;
@@ -4438,7 +4438,7 @@ TEST_CASE("Watch establishment (Service): OpenServiceW+NotifyServiceStatusChange
     int sampled = 0;
     for (int cycle = 0; sampled < kEstablishSamples; ++cycle) {
         // Cycle the real service list (EnumServicesStatusExW "cycled to
-        // n >= 200" per the plan) — re-use the enumeration round-robin until
+        // n >= 200" per the plan) - re-use the enumeration round-robin until
         // kEstablishSamples opens have been attempted.
         const auto& svc = entries[static_cast<DWORD>(cycle) % count];
 
@@ -4463,7 +4463,7 @@ TEST_CASE("Watch establishment (Service): OpenServiceW+NotifyServiceStatusChange
         time_call(t_notify,
                   [&] { rc = ::NotifyServiceStatusChangeW(h, kEstablishNotifyMask, &notify); });
         (void)rc; // report-only; a real service under active management may
-                 // legitimately refuse a second concurrent notify — not a
+                 // legitimately refuse a second concurrent notify - not a
                  // harness failure either way.
         ::CloseServiceHandle(h);
     }
@@ -4479,11 +4479,11 @@ TEST_CASE("Watch establishment (Service): OpenServiceW+NotifyServiceStatusChange
 TEST_CASE("Watch establishment (Service): S2 sequence under SCM load (S3)",
           "[spark][mechanism][windows][latency][establish]") {
     if (!spark_establish_bench_enabled()) {
-        SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset — skipping establishment latency harness");
+        SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset - skipping establishment latency harness");
         return;
     }
     // SCM load: two background threads hammering OpenSCManagerW+Close in a
-    // tight loop for the duration of the measurement — a proxy for
+    // tight loop for the duration of the measurement - a proxy for
     // contention on the SCM RPC connection itself (no toggling of any real
     // service; read-only, safe on any host).
     std::atomic<bool> stop{false};
@@ -4529,7 +4529,7 @@ TEST_CASE("Watch establishment (Service): S2 sequence under SCM load (S3)",
 TEST_CASE("Watch establishment (File): is_directory + CreateFileW sanity (F1)",
           "[spark][mechanism][windows][latency][establish]") {
     if (!spark_establish_bench_enabled()) {
-        SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset — skipping establishment latency harness");
+        SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset - skipping establishment latency harness");
         return;
     }
     namespace fs = std::filesystem;
@@ -4558,17 +4558,17 @@ TEST_CASE("Watch establishment (File): is_directory + CreateFileW sanity (F1)",
 
 TEST_CASE("Watch establishment: post-fix fast-path cost, bulk engine.arm() (N=200/mechanism)",
           "[spark][mechanism][windows][latency][establish]") {
-    // NOT env-gated on YUZU_SPARK_ESTABLISH_BENCH alone in spirit — this
+    // NOT env-gated on YUZU_SPARK_ESTABLISH_BENCH alone in spirit - this
     // case exercises the REAL mechanisms (through SparkEngine::arm(), not
     // raw Win32 calls), so it is meaningful TODAY (the "before" figure) and
-    // must be re-run VERBATIM once PR-B lands (the "after" figure) — see
+    // must be re-run VERBATIM once PR-B lands (the "after" figure) - see
     // the plan's "Post-fix fast-path cost" note: the restructuring adds one
     // _beginthreadex spawn per arm/re-arm, and this measurement is what
     // states that cost honestly against CH-5-UAT's spark_p99 <= 15s gate.
     // Gated the same way as every other case here regardless, since it is
     // still a measurement, not a gate.
     if (!spark_establish_bench_enabled()) {
-        SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset — skipping establishment latency harness");
+        SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset - skipping establishment latency harness");
         return;
     }
     constexpr int kBulkKeys = 200;
@@ -4601,7 +4601,7 @@ TEST_CASE("Watch establishment: post-fix fast-path cost, bulk engine.arm() (N=20
         });
     }
     const auto bulk_t1 = std::chrono::steady_clock::now();
-    warn_establish("post-fix-cost bulk arm (TODAY's baseline — re-run on PR-B build)",
+    warn_establish("post-fix-cost bulk arm (TODAY's baseline - re-run on PR-B build)",
                    "SparkEngine::arm (Registry)", t_arm);
     WARN("post-fix-cost bulk arm: " << kBulkKeys << " arms, wall clock total = "
          << std::chrono::duration_cast<std::chrono::milliseconds>(bulk_t1 - bulk_t0).count()
