@@ -1387,3 +1387,31 @@ paragraph's rung 2/3/5 numbering is left as originally written (it's internally 
 within that paragraph, and rewriting every occurrence risked introducing a new drift); a
 single italic note now precedes it, mapping "rung 2" to impl-rung-7 and "rung 3"/"rung 5" to
 P3/P5 in the current ladder, and pointing at this document for the live gate state.
+
+### #4153 note (2026-09-08): two of row 9's three `[tsan-heavy]` checkpoints redesigned off SQLite
+
+Dated addendum only - the row 9 / §5 evidence above (the local TSan build against real
+`KvStore` I/O, the `1010s`/`never finished in 1200s` #4018 measurements, and the QE-1
+discussion elsewhere in this document) describes what those tests WERE at the time it was
+written and is left as historical record, not rewritten as if it had always used a fake store.
+
+`test/4153-tsan-heavy-fake-store` (branch, not yet merged as of this note) introduces a
+narrow `IJournalStore` interface (`kv_store.hpp`, implemented by `KvStore`) so
+`GuardianLifecycleJournal` can be constructed against an in-memory `FakeJournalStore` test
+double instead of a real on-disk `KvStore`. Two of the three `[tsan-heavy]` cases this row's
+own text names - `"concurrent pagers + a drainer do not race (TSan checkpoint)"` and QE-1
+`"concurrent persist + page + prune + drain do not race (TSan checkpoint, QE-1)"` - are
+rewritten against that fake, with fixed per-thread iteration counts (`std::jthread`, blocking
+`std::latch`/`std::atomic::wait` handshakes) replacing the unbounded `while(!stop)` worker
+loops whose termination depended on the main thread winning lock races against contended real
+SQLite access - the mechanism row 9's own text and #2373/#2345/#4018 document as the cause of
+the CI stalls. Both are retagged `[tsan]` and now run in every build, not only sanitizer
+builds. The third case (`"...TSan checkpoint, #3848)"`, #3848's own liveness soak) is
+UNCHANGED and remains the sole test still tagged `[tsan-heavy]` - row 9's characterisation of
+it (SQLite-free, genuinely contention-dominated via a real backend deadline/watchdogs/releaser
+pulse, a local-TSan-only signal) is still accurate and this note does not restate it.
+
+This closes the test-infra half of #2373 (the CAUSE, not merely the symptom PR #4082's split
+addressed) via #4153. It does not change anything about the PREFER_SPARK flip gate itself -
+row 9's own criterion (a fresh rerun of the full TSan+shutdown+fault-injection matrix on the
+flip tree) is still owed by PR-6, unaffected by which store backs these two checkpoints.
