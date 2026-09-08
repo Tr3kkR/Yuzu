@@ -175,9 +175,11 @@ Columns: **WS · Delivers · Axis · Owner · Depends · Gates cutover? · Revie
 - **Phase C — Extract engine:** **WS-B9** behind the engine gate (needs WS-B8 done + interlock (a)–(d)+(h)
   closed + #2665 resolved) → WS-B11(engine half) → finalize supervision/readyz.
 
-**Highest-leverage first slices after WS-0:** **WS-A4** (seam + INV-31-4 test — the widest Axis-A
-dependency and the presentation gate) and **WS-B1** (Drogon canary — gates presentation extraction, fully
-parallel); **WS-B11** (DB decomposition) is a third independent early start. None waits on an external
+**Highest-leverage first slices after WS-0:** **WS-A4's remaining work** — its GLOBAL INV-31-4 drift test
+already shipped (#842/#3991/#3992; do NOT rebuild it — see the current-state bullet), so what's left is the
+*per-family* seam+contract enforcement, the handler→API seam refactor, and the PII-audit relocation — plus
+**WS-B1** (Drogon canary — gates presentation extraction, fully parallel); **WS-B11** (DB decomposition) is
+a third independent early start. None waits on an external
 programme now that WS-A3 is THIS-owned per-family.
 
 ## Relationship to HA (the split *consumes* HA, does not gate it)
