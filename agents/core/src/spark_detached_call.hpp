@@ -87,7 +87,14 @@
  * the worker (via Payload) and the owner (via DetachedCall<T>) by
  * shared_ptr; every state transition is decided under cell.mu, so the
  * atomic done flag is never load-bearing for correctness, only for a
- * lock-free done() poll.
+ * lock-free done() poll. DISPOSAL of the delivered value (running T's own
+ * destructor) always happens OUTSIDE cell.mu, on whichever thread ends up
+ * owning it - the worker's self-dispose path (Payload::operator()()'s own
+ * local scope, after releasing the lock) and the owner's abandon()/handle-
+ * destruction path (DetachedCall<T>::dispose_or_abandon() moves the boxed
+ * result out of the cell under the lock, then lets it destruct after the
+ * lock scope ends) both hold to this; only the CELL STATE TRANSITION itself
+ * (publish/take/abandon) is ever decided under the lock, never T's teardown.
  *
  * Versus GuardianIoExecutor::run - deliberately omitted (that class solves
  * a related but different problem: a bounded, single-flight, keyed,
@@ -314,11 +321,19 @@ private:
     /// not even box a WorkerThrew error - see Payload::operator()'s own
     /// second catch) is a real, reachable state, not a defect: `done` is
     /// still true (Cell<T>'s doc comment), so take_locked() must not assume
-    /// `result` is engaged just because `done` is. Mirrors
-    /// GuardianIoExecutor's equivalent null-check (guardian_io_executor.hpp,
-    /// its ResultCell take path) - found by inspection here, not by a live
-    /// failure, but the shape (and the fact that it is untestable without an
-    /// operator-new hook) is the same in both files.
+    /// `result` is engaged just because `done` is. Mirrors the SHAPE of
+    /// GuardianIoExecutor::run's own null-check (guardian_io_executor.hpp,
+    /// its `if (cell->result) ... return IoResult<T>{...WorkerThrew};` -
+    /// confirmed by reading that file directly, not from memory) - the
+    /// MAPPING differs deliberately: that file folds an alloc-starved
+    /// worker into its existing WorkerThrew, since its IoFailure enum has
+    /// no separate case for it; this file's DetachedCallError does, so it
+    /// maps here to ResultAllocFailed instead. Neither is independently
+    /// tested against a real allocation failure (no portable operator-new
+    /// hook); this file adds a dedicated test seam
+    /// (LaneState::fail_result_alloc_for_test) to reach the same
+    /// null-`result` STATE deterministically, which GuardianIoExecutor's
+    /// own test suite does not have an equivalent for.
     std::optional<DetachedResult<T>> take_locked() {
         if (!cell_->done || cell_->taken)
             return std::nullopt;
@@ -629,8 +644,11 @@ public:
             // the plan's own enum comment already documents: `LaunchFailed
             // /* OS refused | bad_alloc */`. Not exercised by a live test
             // (there is no portable, non-global way to force this specific
-            // allocation to fail) - GuardianIoExecutor's own equivalent
-            // call site has the same gap.
+            // allocation to fail) - GuardianIoExecutor::run wraps its own
+            // spawn_detached call the same way (guardian_io_executor.hpp,
+            // one try/catch(...) spanning its whole admission block,
+            // confirmed by reading it directly) and has no dedicated test
+            // forcing that specific allocation to fail either.
             launched = false;
         }
         if (!launched) {

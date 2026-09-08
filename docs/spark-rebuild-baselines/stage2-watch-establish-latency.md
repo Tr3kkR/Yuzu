@@ -7,10 +7,10 @@ Companion doc structure: `f11-flood-measurement-run.md` (same baselines director
 
 ## Status: PENDING - no DGRHP run has been performed yet
 
-This branch (PR-A, `feat/2012-3840-detached-call-f3`) adds the harness itself —
+This branch (PR-A, `feat/2012-3840-detached-call-f3`) adds the harness itself -
 `tests/unit/test_spark_mechanism.cpp`, cases tagged
 `[spark][mechanism][windows][latency][establish]`, env-gated on
-`YUZU_SPARK_ESTABLISH_BENCH=1` — but was authored in a session with **no Windows
+`YUZU_SPARK_ESTABLISH_BENCH=1` - but was authored in a session with **no Windows
 toolchain or host available**. No case in this harness has been compiled or run on a
 real Windows box. Every table below is a placeholder awaiting the first DGRHP pass;
 do not treat any number that might later appear here as final until this note is
@@ -22,10 +22,10 @@ Nothing in this document today is a measurement.
 
 ## What the harness measures, and why raw calls (not the mechanism)
 
-The harness measures the RAW Win32 call sequences directly — CreateEventW /
+The harness measures the RAW Win32 call sequences directly - CreateEventW /
 CreateThreadpoolWait / RegOpenKeyExW / RegNotifyChangeKeyValue / SetThreadpoolWait
 for Registry; OpenSCManagerW / OpenServiceW / NotifyServiceStatusChangeW for
-Service; `std::filesystem::is_directory` / CreateFileW for File — NOT through
+Service; `std::filesystem::is_directory` / CreateFileW for File - NOT through
 `spark_file.cpp` / `spark_registry.cpp` / `spark_service.cpp`, which do not yet have
 the off-lock restructuring PR-B will add. This is deliberate, not a shortcut: D must
 be chosen from TODAY's raw call cost, before a mechanism hides it behind a bounded
@@ -34,7 +34,7 @@ point D would already be baked into the code the measurement was supposed to inf
 
 Every Win32 call shape in the harness is modeled directly on the already-shipped
 usage in the three mechanism files (cited per case in the test file itself), not
-invented — but "modeled on real usage" is not the same as "verified to compile and
+invented - but "modeled on real usage" is not the same as "verified to compile and
 run on Windows." That verification is exactly what the pending DGRHP pass is for.
 
 ## Cases (see the test file for the authoritative list; summarized here)

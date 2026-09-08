@@ -241,11 +241,14 @@ TEST_CASE("launch: a result-alloc failure maps to ResultAllocFailed, not a null 
     // error box could not be allocated). There is no portable way to force
     // the real allocation to fail, so this uses the dedicated test seam
     // (set_fail_result_alloc_for_test) to reach the same state
-    // deterministically. Before the take_locked()/dispose_or_abandon() null
-    // check, this test dereferenced a null unique_ptr - UB caught by ASan
-    // as a null-pointer read, not a crash-on-sight, which is why the
-    // regression is worth pinning explicitly rather than trusting "it would
-    // have crashed".
+    // deterministically. MUTATION-TESTED: with the take_locked() null check
+    // temporarily removed, this test actually failed - not a hypothetical -
+    // via libstdc++'s debug unique_ptr guard ("Assertion 'get() !=
+    // pointer()' failed", SIGABRT), not a silent crash-on-sight; the
+    // sibling abandon() test below hit the same assertion first and aborted
+    // the whole binary before this case even ran. Restoring the null check
+    // returns both to green. Not re-verified under ASan specifically (the
+    // libstdc++ assertion already gave a clear, reproducible red).
     auto f3 = std::make_shared<std::atomic<std::size_t>>(0);
     SparkDetachedLane lane(f3, /*cap=*/4);
     lane.set_fail_result_alloc_for_test(true);
@@ -257,7 +260,16 @@ TEST_CASE("launch: a result-alloc failure maps to ResultAllocFailed, not a null 
     CHECK_FALSE(v->has_value()); // but the boxed DetachedResult<T> itself is the error
     CHECK(v->error() == DetachedCallError::ResultAllocFailed);
 
-    // Not WorkerThrew - fn() itself succeeded; only the box failed.
+    // Not WorkerThrew here - but only because this seam discards the box
+    // AFTER Payload::operator()()'s try/catch already ran (boxed.reset()
+    // sits outside it). A REAL result-alloc failure can only happen INSIDE
+    // that try/catch (the inner catch's own "even the error box didn't
+    // fit" branch, itself only reachable once fn() has already thrown and
+    // set `threw = true`) - so a genuine ResultAllocFailed in production
+    // always coincides with worker_threw_total also being bumped. This
+    // CHECK is a property of the injection method, not of production
+    // semantics; do not read it as "ResultAllocFailed and WorkerThrew are
+    // mutually exclusive in general".
     CHECK(lane.worker_threw_total() == 0);
 
     CHECK(spin_until([&] { return lane.active_workers() == 0; }));
