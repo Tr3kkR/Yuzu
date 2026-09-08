@@ -51,21 +51,29 @@
  * active_workers() count is a separate, lane-scoped mirror of the same
  * lifetime, incremented/decremented in lockstep with the shared F3 counter.
  *
- * TICKETING (mirrors GuardianIoExecutor's AliveTicket rule,
+ * TICKETING (mirrors GuardianIoExecutor's AliveTicket rule in SPIRIT,
  * guardian_io_executor.hpp:586-597 — read-only reference, this file does
- * not include or modify that class): CountGuard (below) decrements the
- * lane's active count + the shared F3 counter when it is destroyed, at
- * true OS-thread-exit time (i.e. when the worker's Payload is destroyed by
- * spawn_detached's trampoline, after the worker's own operator()() has
- * fully returned — same "OS-thread-exit" wording GuardianIoExecutor already
- * uses for the equivalent case). CountGuard is deliberately the FIRST-
- * declared member of Payload<T, DFn> (cell and fn follow it) — struct
- * members destroy in REVERSE declaration order (specified by the standard,
- * unlike lambda-capture destruction order, which is UNSPECIFIED — an
- * earlier draft of this file captured {cell, ticket, fn} directly in a
- * worker lambda and relied on compiler behavior for the ordering; do not
- * copy that shape elsewhere), so `fn` (which may still hold live RAII state
- * of its own, separate from whatever T it returned) is ALWAYS destroyed
+ * not include or modify that class, and does NOT copy its shared_ptr-based
+ * ownership shape; see launch()'s own "Payload is a std::unique_ptr, NOT a
+ * shared_ptr" comment for why that specific difference is load-bearing,
+ * found via a real TSan failure during this file's own development, not by
+ * inspection): CountGuard (below) decrements the lane's active count + the
+ * shared F3 counter when it is destroyed, at true OS-thread-exit time —
+ * Payload<T, DFn> is owned via a raw-pointer handoff into a unique_ptr
+ * reclaimed INSIDE the worker's own closure (launch()'s Phase 3), so
+ * Payload is destroyed exactly once, unconditionally on the worker thread,
+ * when that closure's own `owned` unique_ptr goes out of scope after the
+ * worker's operator()() has fully returned (same "OS-thread-exit" wording
+ * GuardianIoExecutor already uses for the equivalent case, now genuinely
+ * true by construction rather than by which side of a shared_ptr race
+ * happens to run last). CountGuard is deliberately the FIRST-declared
+ * member of Payload<T, DFn> (cell and fn follow it) — struct members
+ * destroy in REVERSE declaration order (specified by the standard, unlike
+ * lambda-capture destruction order, which is UNSPECIFIED — an earlier
+ * draft of this file captured {cell, ticket, fn} directly in a worker
+ * lambda and relied on compiler behavior for the ordering; do not copy
+ * that shape elsewhere), so `fn` (which may still hold live RAII state of
+ * its own, separate from whatever T it returned) is ALWAYS destroyed
  * BEFORE CountGuard's destructor runs and decrements the counters. A
  * self-disposed T (the abandoned-before-publish path) is disposed even
  * earlier still — inside Payload::operator()()'s own local scope, before
@@ -190,7 +198,7 @@ struct LaneState {
 /// position as Payload's FIRST-declared member (destroyed LAST) is
 /// load-bearing, not cosmetic. Move-only (needed so a temporary can be
 /// forwarded into Payload's constructor — see launch()'s "Ownership fix"
-/// comments for why this specific shape lets a failed make_shared leave the
+/// comments for why this specific shape lets a failed make_unique leave the
 /// caller's Fn provably untouched).
 struct CountGuard {
     std::shared_ptr<LaneState> lane;
@@ -330,7 +338,7 @@ namespace detached_detail {
 /// decrements the lane/F3 counters. See this file's header comment
 /// ("Ticketing") for the full argument. The templated constructor exists
 /// (rather than a plain by-value `DFn fn` parameter) so launch() can pass
-/// `std::forward<Fn>(fn_in)` all the way through to `make_shared`, which
+/// `std::forward<Fn>(fn_in)` all the way through to `make_unique`, which
 /// only performs the actual move INSIDE the placement-new it runs strictly
 /// after its own allocation succeeds — the property launch()'s "Ownership
 /// fix" comments rely on to guarantee Fn is untouched on every allocation-
@@ -496,17 +504,42 @@ public:
         // Phase 2: construct the Cell + Payload. If EITHER allocation
         // throws (bad_alloc), fn_in is guaranteed untouched: Cell's
         // allocation never involves fn at all, and Payload's constructor
-        // only moves fn from within the placement-new make_shared performs
-        // STRICTLY AFTER its own control-block allocation succeeds — see
-        // Payload's own doc comment. The temporary CountGuard{state_}
-        // constructed as make_shared's first argument is, if the
-        // allocation fails, destroyed by ordinary exception-unwind of the
-        // failed full-expression — which itself performs exactly the
-        // rollback roll_back_admission() would, so this catch block does
-        // NOT call roll_back_admission() a second time on this path either
-        // (see the comment at the catch site).
+        // only moves fn from within the placement-new make_unique performs
+        // STRICTLY AFTER its own allocation succeeds — see Payload's own
+        // doc comment. The temporary CountGuard{state_} constructed as
+        // make_unique's first argument is, if the allocation fails,
+        // destroyed by ordinary exception-unwind of the failed full-
+        // expression — which itself performs exactly the rollback
+        // roll_back_admission() would, so this catch block does NOT call
+        // roll_back_admission() a second time on this path either (see the
+        // comment at the catch site).
+        //
+        // Payload is a std::unique_ptr, NOT a shared_ptr — this is
+        // LOAD-BEARING, not a style choice (round-3-of-implementation
+        // correction, found via a real TSan failure, not by inspection: an
+        // earlier draft used shared_ptr here, mirroring GuardianIoExecutor's
+        // `ticket` idiom below in spirit, keeping a copy alive in `launch()`
+        // across spawn_detached and dropping it via `payload.reset()` on
+        // success. shared_ptr's destroy-on-last-reference semantics do not
+        // care WHICH side drops the last reference — under TSan's different
+        // scheduling (and, more rarely, on a fast unsanitized run too), the
+        // worker could finish and drop ITS copy BEFORE `launch()` reached
+        // its own `.reset()`, making `launch()`'s `.reset()` — running on
+        // the CALLING thread — the one that hits refcount-zero and
+        // therefore runs Payload's ENTIRE destructor chain, including fn's
+        // arbitrary user-supplied teardown, SYNCHRONOUSLY INSIDE launch().
+        // That is exactly the "blocking close under a lock" hazard class
+        // this whole primitive exists to avoid — launch() must never be
+        // able to block on a completed worker's cleanup. unique_ptr fixes
+        // this structurally: ownership is handed off via a RAW POINTER
+        // (spawn_detached's own DetachedPayload<Fn> does the identical
+        // thing internally), reclaimed into a FRESH unique_ptr INSIDE the
+        // worker's own closure body — so the worker is the sole,
+        // unambiguous owner from the moment its closure starts running, and
+        // `launch()`'s own `.release()` on the success path (see below)
+        // NEVER dereferences or deletes anything, so it can never race.
         std::shared_ptr<detached_detail::Cell<T>> cell;
-        std::shared_ptr<P> payload;
+        std::unique_ptr<P> payload;
         bool countguard_temporary_may_have_rolled_back = false;
         try {
             cell = std::make_shared<detached_detail::Cell<T>>();
@@ -514,7 +547,7 @@ public:
                                                                // unwinds a constructed
                                                                // CountGuard temporary
             payload =
-                std::make_shared<P>(detached_detail::CountGuard{state_}, cell, std::forward<Fn>(fn_in));
+                std::make_unique<P>(detached_detail::CountGuard{state_}, cell, std::forward<Fn>(fn_in));
         } catch (...) {
             if (!countguard_temporary_may_have_rolled_back)
                 roll_back_admission(); // threw before the CountGuard temporary
@@ -527,39 +560,42 @@ public:
             return r;
         }
 
-        // Phase 3: spawn. `payload` (this call's own shared_ptr copy) stays
-        // alive across spawn_detached, mirroring GuardianIoExecutor's
-        // `ticket` idiom — on success the worker's own copy (captured in
-        // the small trampoline closure below) becomes the reservation's
-        // sole owner once we drop ours below; on failure our copy is what
-        // lets us recover `fn` from the still-alive Payload, since
-        // spawn_detached's OWN internal failure path destroys only ITS
-        // copy of the trampoline closure, never Payload itself while we
-        // still hold a reference.
-        const bool launched =
-            io_detail::spawn_detached([payload]() mutable noexcept { (*payload)(); });
+        // Phase 3: spawn. Hand off via a RAW pointer — the closure below
+        // reclaims sole ownership into ITS OWN unique_ptr the moment it
+        // starts running (on the worker thread), so there is exactly one
+        // owner at every instant after this point, never two racing to be
+        // "last". `payload` (still held here, in launch()) is untouched by
+        // whatever the worker does with the raw pointer — see below.
+        P* raw = payload.get();
+        const bool launched = io_detail::spawn_detached([raw]() noexcept {
+            std::unique_ptr<P> owned{raw}; // sole ownership from HERE, on the worker thread
+            (*owned)();
+            // `owned` destructs at the end of THIS scope, on the WORKER
+            // thread, unconditionally — fn's teardown and CountGuard's
+            // decrement both happen here, never on any other thread.
+        });
         if (!launched) {
+            // spawn_detached returned false ONLY if the OS never created the
+            // thread at all (its own doc comment) — the closure above never
+            // ran, so `raw` was never reclaimed by anyone; `payload` (still
+            // ours, untouched) is the sole owner. Recover fn, then let
+            // `payload` destruct normally below (guard rolls the admission
+            // back via its own destructor, single-threaded, no race
+            // possible here since no worker thread ever existed).
             state_->launch_failed_total.fetch_add(1, std::memory_order_relaxed);
             Result r;
             r.status = DetachedLaunch::LaunchFailed;
             r.fn.emplace(std::move(payload->fn));
-            // Deliberately NOT calling roll_back_admission() here: `payload`
-            // (our last live reference — spawn_detached's own internal
-            // failure path already destroyed ITS copy before returning
-            // false) is about to go out of scope, which destroys Payload,
-            // whose LAST-destroyed member is `guard` — its destructor
-            // performs exactly this rollback. Calling roll_back_admission()
-            // here too would double-decrement.
             return r;
         }
 
-        // Success: drop OUR copy explicitly (mirrors GuardianIoExecutor's
-        // `ticket.reset(); // success: drop the caller copy`) — the
-        // worker's own copy, captured in the trampoline closure
-        // spawn_detached just launched, is now the reservation's sole
-        // owner; CountGuard's destructor runs when THAT copy is destroyed,
-        // at true worker-thread-exit time.
-        payload.reset();
+        // Success: RELEASE (not reset/delete) — the closure spawn_detached
+        // just launched has already reclaimed (or will reclaim, or already
+        // has fully finished with) sole ownership via its own unique_ptr;
+        // release() only forgets the pointer here, it never dereferences or
+        // deletes it, so this is safe regardless of how far the worker has
+        // already gotten.
+        payload.release();
         Result r;
         r.status = DetachedLaunch::Launched;
         r.call.emplace(std::move(cell));
