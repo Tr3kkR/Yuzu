@@ -339,7 +339,16 @@ TEST_CASE("peripherals plugin: thunderbolt reports a real row or is explicitly S
 // result_status, so every mark_result_read call could be deleted and the
 // suite would stay green on the row-shape checks alone. LocalDispatcher's
 // Result exposes the seam precisely so a test can prove it fires.
-TEST_CASE("peripherals: wave-1's placeholder legs report through the typed status seam",
+//
+// P91-6-02 (Architect ruling, ws91): this case originally pinned the wave-1
+// truth (every leg is the not_implemented placeholder -> every action
+// reports CONSTRAINED/PARTIAL). Wave 2 replaces all three legs' bodies with
+// real bus walks, so that blanket assertion is now false on every OS the
+// moment I91-2 wires this suite in -- a healthy walk (this Mac's 8 IOPCIDevice
+// nodes, say) reports OK/FULL, not CONSTRAINED/PARTIAL. Retargeted to the
+// invariant that survives once no leg is a placeholder: the seam fired, and
+// it paired status with completeness correctly, on either branch.
+TEST_CASE("peripherals: every leg reports through the typed status seam",
           "[peripherals][status]") {
     auto plugin = load_peripherals_plugin();
     if (!plugin) {
@@ -351,15 +360,20 @@ TEST_CASE("peripherals: wave-1's placeholder legs report through the typed statu
         INFO("action: " << a.action);
         auto result = dispatcher.run(plugin->descriptor, a.action);
         CHECK(result.rc == 0);
-        // Every wave-1 leg is the not_implemented placeholder, so every
-        // action reports CONSTRAINED/PARTIAL with a provenance ending in
-        // ":leg:not_implemented" today. This is deliberately NOT pinned as
-        // an equality against one OS's literal token (that is what P91-6's
-        // completeness case pins the ABSENCE of) -- only that the seam fired
-        // with a real, non-empty provenance.
-        CHECK(result.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
-        CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
-        CHECK_FALSE(result.result_provenance.empty());
+        // mark_result_read can only produce one of these two pairings --
+        // never a third status, and never a mismatched pairing.
+        bool is_ok = result.result_status == YUZU_RESULT_STATUS_OK;
+        bool is_constrained = result.result_status == YUZU_RESULT_STATUS_CONSTRAINED;
+        CHECK((is_ok || is_constrained));
+        if (is_ok) {
+            CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_FULL);
+        } else if (is_constrained) {
+            CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+            // Only the degraded branch carries a failure token; mark_result_read
+            // passes an empty reason on the OK branch, so asserting non-empty
+            // provenance unconditionally would itself be a false assertion.
+            CHECK_FALSE(result.result_provenance.empty());
+        }
     }
 }
 
@@ -373,4 +387,35 @@ TEST_CASE("peripherals plugin: an unknown action is refused, not silently ignore
     yuzu::agent::LocalDispatcher dispatcher;
     auto result = dispatcher.run(plugin->descriptor, "no_such_action");
     CHECK(result.rc != 0);
+}
+
+// BUILD-COMPLETENESS CASE (P91-6, wave 2). All three legs (Windows/Linux/
+// macOS) replace their wave-1 `<os>:leg:not_implemented` placeholder in this
+// same wave, so this case is host-agnostic and carries no platform #ifdef --
+// it is GREEN on every CI OS once wave 2 integrates, and RED only if a real
+// leg placeholder survives past this wave. It does not assert row shape or
+// count (those are the cases above); it asserts only the one thing every
+// leg's placeholder body shares regardless of OS: the `:leg:not_implemented`
+// suffix on the unavailable token's provenance string. Host-specific counts
+// (usb/pci/thunderbolt node totals on this Mac) are report-only, per the
+// package spec -- never committed as an assertion here, since CI runs this
+// suite on a shared, unknown-hardware runner (yuzu-bigmags-macos).
+TEST_CASE("peripherals plugin: no leg reports its wave-1 not_implemented placeholder",
+          "[peripherals][actions]") {
+    auto plugin = load_peripherals_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    yuzu::agent::LocalDispatcher dispatcher;
+    for (const auto& a : kActions) {
+        INFO("action: " << a.action);
+        auto result = dispatcher.run(plugin->descriptor, a.action);
+        const auto rows = captured_rows(result.captured);
+        REQUIRE_FALSE(rows.empty());
+        for (const auto& r : rows) {
+            INFO("row: " << r);
+            CHECK(r.find(":leg:not_implemented") == std::string::npos);
+        }
+    }
 }
