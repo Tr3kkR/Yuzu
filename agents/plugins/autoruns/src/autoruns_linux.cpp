@@ -814,24 +814,32 @@ WantsListing build_wants_listing(const std::string& wants_dir) {
 /// GLOBAL-directory timer whose enabling user's wants dir was missed by the
 /// incomplete `/home` scan could read as a confident `disabled`.
 ///
-/// `wants_open_failure_out` (default nullptr) is set true when a consulted
-/// wants dir failed to open for a real (non-ENOENT) reason -- i.e. any
-/// `build_wants_listing(...).open_error`. This row-level Enabled::unknown
-/// return already correctly reflects that locally, but the signal itself
-/// used to go no further: TimerScan (and therefore the SOURCE-level status
-/// line built from it) never learned a real wants-dir acquisition failure
-/// happened at all, so a genuine EIO-class failure was indistinguishable
-/// from every candidate wants dir being cleanly absent at the source-status
-/// level (adversarial review finding, PR #4154 fix-round). Deliberately
-/// narrower than `any_incomplete` above: `enumeration_error`/`truncated`/
-/// the caller's own `user_wants_bases_incomplete` are a different signal
-/// (or already surfaced elsewhere at the source level), so only the real
-/// open failure is threaded out here.
+/// `wants_scan_incomplete_out` (default nullptr) is set true when a
+/// consulted wants dir's `build_wants_listing(...)` result was itself
+/// incomplete for a real reason -- `open_error` (opendir() failed for a
+/// real, non-ENOENT reason), `enumeration_error` (a real readdir() I/O
+/// error stopped the scan partway through), or `truncated` (the entry cap
+/// was hit with a real entry still unread). This row-level Enabled::unknown
+/// return already correctly reflects all three locally, but the signal
+/// itself used to go no further: TimerScan (and therefore the SOURCE-level
+/// status line built from it) never learned a real wants-dir acquisition
+/// failure happened at all, so a genuine EIO-class failure, mid-scan I/O
+/// error, or capped scan was indistinguishable from every candidate wants
+/// dir being cleanly absent at the source-status level (adversarial review
+/// finding, PR #4154 fix-round; originally shipped covering only
+/// `open_error`, then widened in the very next round to close that same
+/// gap for `enumeration_error`/`truncated`). Deliberately still excludes
+/// the caller's own `user_wants_bases_incomplete`: that is a different
+/// signal the caller (collect_linux) already folds into TimerScan directly
+/// at the `/home`-listing call site (`scan.any_truncated` /
+/// `scan.any_dir_open_failure`), independently of anything this function
+/// returns, so only a real per-listing scan failure on a directory this
+/// function itself consulted is threaded out here.
 Enabled timer_enabled(const std::string& unit_dir, const std::string& timer_filename,
                       const std::string& wanted_by, Scope scope,
                       const std::vector<std::string>& user_wants_bases = {},
                       bool user_wants_bases_incomplete = false,
-                      bool* wants_open_failure_out = nullptr) {
+                      bool* wants_scan_incomplete_out = nullptr) {
     const std::string_view wants_root =
         scope == Scope::system ? "/etc/systemd/system" : "/etc/systemd/user";
     std::vector<std::string> wants_base_dirs = {unit_dir};
@@ -857,14 +865,16 @@ Enabled timer_enabled(const std::string& unit_dir, const std::string& timer_file
     for (const auto& base : wants_base_dirs) {
         auto w1 = build_wants_listing(base + "/timers.target.wants");
         any_opened |= w1.opened;
-        any_incomplete |= w1.enumeration_error || w1.truncated || w1.open_error;
-        if (w1.open_error && wants_open_failure_out != nullptr) *wants_open_failure_out = true;
+        const bool w1_incomplete = w1.enumeration_error || w1.truncated || w1.open_error;
+        any_incomplete |= w1_incomplete;
+        if (w1_incomplete && wants_scan_incomplete_out != nullptr) *wants_scan_incomplete_out = true;
         if (w1.opened && timer_enabled_from_wants(w1.text, timer_filename)) return Enabled::enabled;
         if (!wanted_by.empty()) {
             auto w2 = build_wants_listing(base + "/" + wanted_by + ".wants");
             any_opened |= w2.opened;
-            any_incomplete |= w2.enumeration_error || w2.truncated || w2.open_error;
-            if (w2.open_error && wants_open_failure_out != nullptr) *wants_open_failure_out = true;
+            const bool w2_incomplete = w2.enumeration_error || w2.truncated || w2.open_error;
+            any_incomplete |= w2_incomplete;
+            if (w2_incomplete && wants_scan_incomplete_out != nullptr) *wants_scan_incomplete_out = true;
             if (w2.opened && timer_enabled_from_wants(w2.text, timer_filename)) return Enabled::enabled;
         }
     }
@@ -988,19 +998,20 @@ void scan_systemd_timer_dir(const std::string& dir, Scope scope, const std::stri
                 row.args += triggers[i];
             }
         }
-        bool wants_open_failure = false;
+        bool wants_scan_incomplete = false;
         row.enabled = timer_enabled(dir, name, fields.wanted_by, scope, user_wants_bases,
-                                    user_wants_bases_incomplete, &wants_open_failure);
-        // A real (non-ENOENT) wants-dir open failure doesn't just make THIS
-        // row's own Enabled::unknown correct (unchanged above) -- it also
-        // means the source as a whole couldn't fully verify enablement, so
-        // it folds into the SAME any_dir_open_failure/dir_open_failure_reason
-        // signal this scan's own unit-listing-directory open failures use,
-        // letting timer_scan_status's source-level status line name it too
-        // instead of reading as a plain, misleadingly-clean `supported|-`.
-        if (wants_open_failure)
+                                    user_wants_bases_incomplete, &wants_scan_incomplete);
+        // A real wants-dir scan failure -- open_error, enumeration_error, or
+        // truncated -- doesn't just make THIS row's own Enabled::unknown
+        // correct (unchanged above) -- it also means the source as a whole
+        // couldn't fully verify enablement, so it folds into the SAME
+        // any_dir_open_failure/dir_open_failure_reason signal this scan's
+        // own unit-listing-directory open failures use, letting
+        // timer_scan_status's source-level status line name it too instead
+        // of reading as a plain, misleadingly-clean `supported|-`.
+        if (wants_scan_incomplete)
             note_file_constraint(out.any_dir_open_failure, out.dir_open_failure_reason,
-                                 "wants_open_error");
+                                 "wants_scan_incomplete");
         row.scope = scope;
         row.user = user;
         row.signed_state = Signed::not_checked;

@@ -1077,7 +1077,7 @@ TEST_CASE("autoruns Linux leg: timer_enabled treats a real (non-ENOENT) open fai
                         /*user_wants_bases_incomplete=*/false) == Enabled::unknown);
 }
 
-TEST_CASE("autoruns Linux leg: timer_enabled's wants_open_failure_out out-parameter "
+TEST_CASE("autoruns Linux leg: timer_enabled's wants_scan_incomplete_out out-parameter "
           "surfaces a real (non-ENOENT) wants-dir open failure to its caller "
           "(RECONSTRUCTION: pins the adversarial-review should-fix -- "
           "timer_enabled's own row-level Enabled::unknown for this exact case was "
@@ -1105,12 +1105,12 @@ TEST_CASE("autoruns Linux leg: timer_enabled's wants_open_failure_out out-parame
         REQUIRE_FALSE(ec);
         { std::ofstream(bad_base.path / "timers.target.wants") << "not a directory"; }
 
-        bool wants_open_failure = false;
+        bool wants_scan_incomplete = false;
         CHECK(timer_enabled(vendor_dir.path.string(), "backup.timer", "", Scope::user,
                             {bad_base.path.string()},
                             /*user_wants_bases_incomplete=*/false,
-                            &wants_open_failure) == Enabled::unknown);
-        CHECK(wants_open_failure);
+                            &wants_scan_incomplete) == Enabled::unknown);
+        CHECK(wants_scan_incomplete);
     }
 
     SECTION("no open failure anywhere -- ordinary absence -- leaves the "
@@ -1119,12 +1119,12 @@ TEST_CASE("autoruns Linux leg: timer_enabled's wants_open_failure_out out-parame
         std::filesystem::create_directories(good_base.path, ec); // no timers.target.wants at all: ENOENT
         REQUIRE_FALSE(ec);
 
-        bool wants_open_failure = false;
+        bool wants_scan_incomplete = false;
         CHECK(timer_enabled(vendor_dir.path.string(), "backup.timer", "", Scope::user,
                             {good_base.path.string()},
                             /*user_wants_bases_incomplete=*/false,
-                            &wants_open_failure) == Enabled::disabled);
-        CHECK_FALSE(wants_open_failure);
+                            &wants_scan_incomplete) == Enabled::disabled);
+        CHECK_FALSE(wants_scan_incomplete);
     }
 }
 
@@ -1167,7 +1167,66 @@ TEST_CASE("autoruns Linux leg: a real wants-dir open failure constrains "
 
     const auto [support, reason] = timer_scan_status(scan);
     CHECK(support == YUZU_SUPPORT_CONSTRAINED); // source-level: now also constrained
-    CHECK(reason.find("wants_open_error") != std::string::npos);
+    CHECK(reason.find("wants_scan_incomplete") != std::string::npos);
+}
+
+TEST_CASE("autoruns Linux leg: a wants-dir scan that hits its entry cap (truncated, "
+          "no real open failure) ALSO constrains timer_scan_status's SOURCE-level "
+          "status via the SAME wants_scan_incomplete reason, not just the affected "
+          "row's own enabled=unknown "
+          "(RECONSTRUCTION: pins the governance-run top finding -- Gate 4 unhappy-"
+          "path, Gate 5 chaos-injector, and Gate 6 sre independently converged on "
+          "this gap: timer_enabled's any_incomplete already forced the row to "
+          "Enabled::unknown for a capped/mid-scan-failed .wants directory, but "
+          "wants_open_failure_out/wants_scan_incomplete_out only ever fired on "
+          "open_error, so the SOURCE-level status line stayed a plain, misleadingly-"
+          "clean `supported|-` for exactly the acquisition-failure case this "
+          "plugin's whole reason for existing is to surface)",
+          "[autoruns][actions][linux]") {
+    using yuzu::autoruns::Enabled;
+    using yuzu::autoruns::Row;
+    using yuzu::autoruns::scan_systemd_timer_dir_unique;
+    using yuzu::autoruns::Scope;
+    using yuzu::autoruns::TimerScan;
+    using yuzu::autoruns::timer_scan_status;
+
+    yuzu::test::TempDir unit_dir("yuzu_test_autoruns_scanwants_cap_unit_");
+    yuzu::test::TempDir capped_base("yuzu_test_autoruns_scanwants_cap_base_");
+    std::error_code ec;
+    std::filesystem::create_directories(unit_dir.path, ec);
+    REQUIRE_FALSE(ec);
+    { std::ofstream f(unit_dir.path / "backup.timer"); f << "[Timer]\nOnCalendar=daily\n"; }
+
+    // capped_base's wants dir opens fine but is packed with more entries
+    // (kMaxDirEntries + 1, matching the sibling cap test above) than the
+    // 4096 cap, none of which is the "backup.timer" symlink this timer
+    // would need to read as enabled -- a real cap-truncation, not an open
+    // failure, so the pre-fix code left both the out-param and the
+    // source-level status untouched. Symlinks (not real files) to keep the
+    // fixture cheap, matching the existing cap test's own approach.
+    const auto wants_dir = capped_base.path / "timers.target.wants";
+    std::filesystem::create_directories(wants_dir, ec);
+    REQUIRE_FALSE(ec);
+    for (int i = 0; i < 4097; ++i) {
+        const auto decoy = wants_dir / ("aaa-decoy-" + std::to_string(i) + ".timer");
+        std::filesystem::create_symlink(unit_dir.path / "backup.timer", decoy);
+    }
+
+    TimerScan scan;
+    std::vector<std::pair<dev_t, ino_t>> seen_dirs;
+    scan_systemd_timer_dir_unique(unit_dir.path.string(), Scope::user, "dave", scan, seen_dirs,
+                                  {capped_base.path.string()});
+
+    REQUIRE(scan.rows.size() == 1);
+    // Row-level: unaffected, already correct pre-fix (any_incomplete already
+    // covered truncated).
+    CHECK(scan.rows[0].enabled == Enabled::unknown);
+
+    const auto [support, reason] = timer_scan_status(scan);
+    // Source-level: THIS is the fix -- a capped .wants scan must constrain
+    // the source status too, not just the row.
+    CHECK(support == YUZU_SUPPORT_CONSTRAINED);
+    CHECK(reason.find("wants_scan_incomplete") != std::string::npos);
 }
 
 TEST_CASE("autoruns Linux leg: scan_cron_d wires a rejected crontab line into a "
