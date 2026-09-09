@@ -340,8 +340,12 @@ public:
     [[nodiscard]] std::optional<DetachedResult<T>> try_take() {
         if (!cell_)
             return std::nullopt;
-        std::lock_guard<std::mutex> lk(cell_->mu);
-        return take_locked();
+        std::optional<std::unique_ptr<DetachedResult<T>>> boxed;
+        {
+            std::lock_guard<std::mutex> lk(cell_->mu);
+            boxed = take_locked();
+        }
+        return unbox(std::move(boxed));
     }
 
     /// Blocks until `deadline` or the result is published, whichever comes
@@ -353,32 +357,35 @@ public:
     wait_take(std::chrono::steady_clock::time_point deadline) {
         if (!cell_)
             return std::nullopt;
-        std::unique_lock<std::mutex> lk(cell_->mu);
-        cell_->cv.wait_until(lk, deadline, [this] { return cell_->done; });
-        return take_locked();
+        std::optional<std::unique_ptr<DetachedResult<T>>> boxed;
+        {
+            std::unique_lock<std::mutex> lk(cell_->mu);
+            cell_->cv.wait_until(lk, deadline, [this] { return cell_->done; });
+            boxed = take_locked();
+        }
+        return unbox(std::move(boxed));
     }
 
     /// Give up on this call. Published-but-untaken -> the result is
     /// returned to the caller here (for disposal); not-yet-published -> the
     /// worker is told to self-dispose when it eventually completes, and
     /// nullopt is returned. Exactly once - a second abandon() (or a
-    /// try_take/wait_take after one) always returns nullopt. noexcept: on
-    /// the published-but-untaken path this runs take_locked(), which MOVE-
-    /// CONSTRUCTS T out of the boxed result (never destroys it here - see
-    /// take_locked()'s own comment on why the moved-from remnant is left
-    /// engaged); that move is not merely assumed not to throw, it is
-    /// COMPILE-TIME ENFORCED by launch()'s own
-    /// static_assert(is_nothrow_move_constructible_v<T>) (Gate 4
-    /// consistency-auditor finding, PR-A round 5: this comment previously
-    /// named T's destructor as the operation running here and called its
-    /// nothrow-ness an assumption - neither is accurate).
+    /// try_take/wait_take after one) always returns nullopt. noexcept:
+    /// take_locked() only pointer-moves the boxed result (see its own
+    /// comment) and unbox() only runs after cell_->mu is released, so no
+    /// exception-under-lock path exists here; unbox()'s own T-move is
+    /// COMPILE-TIME ENFORCED nothrow by launch()'s own
+    /// static_assert(is_nothrow_move_constructible_v<T>).
     [[nodiscard]] std::optional<DetachedResult<T>> abandon() noexcept {
         if (!cell_)
             return std::nullopt;
-        std::lock_guard<std::mutex> lk(cell_->mu);
-        auto out = take_locked();
-        cell_->abandoned = true;
-        return out;
+        std::optional<std::unique_ptr<DetachedResult<T>>> boxed;
+        {
+            std::lock_guard<std::mutex> lk(cell_->mu);
+            boxed = take_locked();
+            cell_->abandoned = true;
+        }
+        return unbox(std::move(boxed));
     }
 
     /// Constructs a handle directly over an existing cell. PUBLIC (not
@@ -397,45 +404,79 @@ public:
         : cell_(std::move(cell)) {}
 
 private:
-    /// Caller must hold cell_->mu. A null cell_->result (the worker could
-    /// not box a result - EITHER of Payload::operator()'s two catch blocks,
-    /// see DetachedCallError::ResultAllocFailed's own comment for both
-    /// causes - Gate 4 consistency-auditor finding, PR-A round 5: this
-    /// comment previously named only the second/outer catch) is a real,
-    /// reachable state, not a defect: `done` is still true (Cell<T>'s doc
-    /// comment), so take_locked() must not assume `result` is engaged just
-    /// because `done` is. Mirrors the SHAPE of
-    /// GuardianIoExecutor::run's own null-check (guardian_io_executor.hpp,
-    /// its `if (cell->result) ... return IoResult<T>{...WorkerThrew};` -
-    /// confirmed by reading that file directly, not from memory) - the
-    /// MAPPING differs deliberately: that file folds an alloc-starved
-    /// worker into its existing WorkerThrew, since its IoFailure enum has
-    /// no separate case for it; this file's DetachedCallError does, so it
-    /// maps here to ResultAllocFailed instead. Neither is independently
-    /// tested against a real allocation failure (no portable operator-new
-    /// hook); this file adds a dedicated test seam
+    /// Caller must hold cell_->mu. Returns nullopt if not yet done or
+    /// already taken. Otherwise sets `taken` and hands back OWNERSHIP OF
+    /// THE BOX ITSELF (a pointer move only - T is never touched, moved, or
+    /// destroyed here), which may itself be null: a null cell_->result (the
+    /// worker could not box a result - EITHER of Payload::operator()'s two
+    /// catch blocks, see DetachedCallError::ResultAllocFailed's own comment
+    /// for both causes - Gate 4 consistency-auditor finding, PR-A round 5:
+    /// this comment previously named only the second/outer catch) is a
+    /// real, reachable state, not a defect: `done` is still true (Cell<T>'s
+    /// doc comment), so take_locked() must not assume `result` is engaged
+    /// just because `done` is. Mirrors the SHAPE of GuardianIoExecutor::
+    /// run's own null-check (guardian_io_executor.hpp, its `if (cell->
+    /// result) ... return IoResult<T>{...WorkerThrew};` - confirmed by
+    /// reading that file directly, not from memory) - the MAPPING differs
+    /// deliberately: that file folds an alloc-starved worker into its
+    /// existing WorkerThrew, since its IoFailure enum has no separate case
+    /// for it; this file's DetachedCallError does, so it maps to
+    /// ResultAllocFailed instead, decided by unbox() (below) once the box
+    /// this function returns is examined OUTSIDE the lock. Neither is
+    /// independently tested against a real allocation failure (no portable
+    /// operator-new hook); this file adds a dedicated test seam
     /// (LaneState::fail_result_alloc_for_test) to reach the same
     /// null-`result` STATE deterministically, which GuardianIoExecutor's
     /// own test suite does not have an equivalent for.
-    std::optional<DetachedResult<T>> take_locked() {
+    ///
+    /// MUST NOT touch T: an earlier version of this function moved T out of
+    /// the box itself (`auto out = std::move(*cell_->result); return out;`)
+    /// and returned `std::optional<DetachedResult<T>>` directly. That is a
+    /// genuine bug, not a style choice - colleague review on PR #4190 (the
+    /// finding this rewrite fixes) traced it precisely: the return
+    /// statement's type (optional<DetachedResult<T>>) differs from `out`'s
+    /// type (DetachedResult<T>), so NRVO cannot apply; `out` is move-
+    /// constructed into the returned optional, and the MOVED-FROM `out`
+    /// (a std::expected, which - unlike optional/unique_ptr - does NOT
+    /// reset itself to an empty/no-value state on move; see the old
+    /// comment this replaced) is then destroyed at this function's own
+    /// scope exit, running ~T() on a moved-from T - and that destruction
+    /// happens BEFORE the caller's lock_guard releases cell_->mu, since
+    /// this function's stack frame unwinds strictly before try_take()/
+    /// wait_take()/abandon() return to release it. For a T whose moved-from
+    /// destructor does blocking or lock-taking work, that violates this
+    /// file's own "DISPOSAL ... always happens OUTSIDE cell.mu" contract
+    /// (see the file header comment). This function now only pointer-moves
+    /// the box (a nothrow, non-blocking unique_ptr move, same as
+    /// dispose_or_abandon()'s already-correct `to_dispose = std::move(
+    /// cell_->result)` below) - T is moved out of the box, and the box's
+    /// own moved-from remnant destroyed, only inside unbox(), which every
+    /// caller runs strictly after releasing cell_->mu.
+    std::optional<std::unique_ptr<DetachedResult<T>>> take_locked() {
         if (!cell_->done || cell_->taken)
             return std::nullopt;
         cell_->taken = true;
-        if (!cell_->result)
+        return std::move(cell_->result); // pointer move only; may itself be
+                                          // null (ResultAllocFailed state) -
+                                          // unbox() resolves both cases.
+    }
+
+    /// Converts a take_locked() box into the public DetachedResult<T>
+    /// optional. MUST be called with cell_->mu already released - this is
+    /// where T is actually moved out of the box (if present) and where the
+    /// box's own moved-from remnant is destroyed, at this function's own
+    /// return. noexcept: T's move is compile-time enforced nothrow by
+    /// launch()'s static_assert(is_nothrow_move_constructible_v<T>), and
+    /// DetachedCallError is a trivially-movable enum, so DetachedResult<T>'s
+    /// (std::expected's) move ctor is itself noexcept, as is optional's
+    /// converting constructor from it.
+    static std::optional<DetachedResult<T>>
+    unbox(std::optional<std::unique_ptr<DetachedResult<T>>> boxed) noexcept {
+        if (!boxed)
+            return std::nullopt; // not yet done, or already taken
+        if (!*boxed)
             return DetachedResult<T>{std::unexpect, DetachedCallError::ResultAllocFailed};
-        auto out = std::move(*cell_->result);
-        // Deliberately NOT cell_->result.reset() here (governance finding,
-        // PR-A round 2): a std::expected move leaves the source ENGAGED (T's
-        // move ctor runs, the moved-from T remains a live object), so an
-        // explicit reset() here would run ~T() on that moved-from remnant
-        // while cell_->mu is STILL HELD - exactly the "disposal under the
-        // lock" mistake dispose_or_abandon()'s own comment (above) already
-        // names and avoids. `taken` alone gates re-entry (checked at the top
-        // of this function), so a stale, moved-from unique_ptr in
-        // cell_->result is harmless and inert; it is destroyed later, outside
-        // any lock, whenever Cell<T> itself is (the shared_ptr's last
-        // reference dropping - by then nothing can be holding cell_->mu).
-        return out;
+        return std::move(**boxed);
     }
 
     /// Disposes a published-but-untaken result OUTSIDE cell_->mu - matching
@@ -596,10 +637,22 @@ public:
         state_->cap.store(cap, std::memory_order_relaxed);
     }
 
+    // Deliberately non-movable, not just non-copyable (colleague review,
+    // PR #4190): a lane is a bulkhead identity for one mechanism concern
+    // (the file header's "Versus GuardianIoExecutor::run" section), not a
+    // value - and the defaulted move this used to have left the moved-from
+    // lane's state_ null while every other method (launch(), active_
+    // workers(), etc.) derefs state_ unconditionally, so a moved-from lane
+    // was a live use-after-move footgun with no production caller today to
+    // catch it. No caller in this file, PR-B's plan, or any test moves a
+    // SparkDetachedLane - it is always constructed once, in place, and
+    // owned for the lifetime of the mechanism/lane owner - so deleting the
+    // move ops removes the footgun rather than defending against a need
+    // that does not exist.
     SparkDetachedLane(const SparkDetachedLane&) = delete;
     SparkDetachedLane& operator=(const SparkDetachedLane&) = delete;
-    SparkDetachedLane(SparkDetachedLane&&) noexcept = default;
-    SparkDetachedLane& operator=(SparkDetachedLane&&) noexcept = default;
+    SparkDetachedLane(SparkDetachedLane&&) = delete;
+    SparkDetachedLane& operator=(SparkDetachedLane&&) = delete;
 
     /// Launches `fn` (a nullary callable) on a detached worker if the lane
     /// has capacity. `fn`'s return type T becomes the call's result type.
@@ -630,6 +683,18 @@ public:
             "rejected or failed launch hands Fn back to the caller by a move, and a "
             "throwing move there would leave that handoff in an indeterminate state (see "
             "this file's header comment, 'Ownership fix').");
+        static_assert(
+            std::is_rvalue_reference_v<Fn&&>,
+            "SparkDetachedLane::launch: fn must be passed as an rvalue (a temporary, or an "
+            "lvalue wrapped in std::move()) - colleague review, PR #4190: an lvalue Fn "
+            "deduces Fn = DFn&, and the Rejected/LaunchFailed hand-back path "
+            "(r.fn.emplace(std::forward<Fn>(fn_in))) would then COPY-construct DFn instead "
+            "of moving it. Only DFn's MOVE constructor is required nothrow above - its copy "
+            "constructor is unconstrained and may throw, which would make launch() itself "
+            "throw on the Rejected/LaunchFailed path, contradicting this function's "
+            "documented {status, fn} contract (see 'Ownership fix' in the file header "
+            "comment). Every caller in this file's own tests already passes a prvalue "
+            "lambda, so this closes a hazard with no current caller, not a live defect.");
 
         using Result = DetachedLaunchResult<T, DFn>;
         using P = detached_detail::Payload<T, DFn>;

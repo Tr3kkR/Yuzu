@@ -27,6 +27,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -104,6 +105,52 @@ struct SlowDtor {
         started->store(true, std::memory_order_relaxed);
         if (thread_id)
             thread_id->store(std::this_thread::get_id(), std::memory_order_relaxed);
+        if (hold_for.count() > 0)
+            std::this_thread::sleep_for(hold_for);
+    }
+};
+
+// A move-only result type whose MOVED-FROM remnant ALSO performs slow,
+// observable destructor work - unlike SlowDtor above, which nulls itself on
+// move so its moved-from copy's destructor is an inert no-op (see SlowDtor's
+// own comment). Regresses the colleague-review finding on PR #4190:
+// take_locked() used to move T out of the box into a named local `out` and
+// `return out;` - and because the enclosing function's return type
+// (optional<DetachedResult<T>>) differs from `out`'s type, NRVO couldn't
+// apply, so `out` itself became a SECOND moved-from remnant, destroyed at
+// take_locked()'s own scope exit, still inside the caller's lock_guard on
+// cell_->mu. The fix (spark_detached_call.hpp's take_locked()/unbox() split)
+// moves only the BOX (a unique_ptr pointer move) under the lock, and defers
+// the actual T-move - and the moved-from remnant's destructor - to unbox(),
+// which every caller runs strictly AFTER releasing cell_->mu.
+//
+// This type makes that difference OBSERVABLE: its moved-from destructor
+// sleeps for `hold_for`. The regression test below races a second,
+// concurrent try/wait_take() against the one that "wins" (takes the real
+// value and thus runs this slow destructor inside its own call) - the LOSER
+// must see cell_->mu released almost immediately (an uncontended lock,
+// already-taken -> nullopt) rather than blocking for the winner's entire
+// slow-destructor duration, which is exactly what the pre-fix code would
+// have done (mutation-tested: reverting take_locked()/unbox() to the
+// pre-fix shape makes this test's loser_elapsed assertion fail).
+struct SlowMoveObservableDtor {
+    std::chrono::milliseconds hold_for{0};
+    bool moved_from{false};
+
+    SlowMoveObservableDtor() = default;
+    explicit SlowMoveObservableDtor(std::chrono::milliseconds hold) : hold_for(hold) {}
+    SlowMoveObservableDtor(const SlowMoveObservableDtor&) = delete;
+    SlowMoveObservableDtor& operator=(const SlowMoveObservableDtor&) = delete;
+    SlowMoveObservableDtor(SlowMoveObservableDtor&& o) noexcept : hold_for(o.hold_for) {
+        o.moved_from = true; // o (the SOURCE) becomes the probed remnant;
+                              // `this` (the destination) is the live value
+                              // and stays moved_from == false (its own
+                              // default), so ITS eventual teardown is fast
+    }
+    SlowMoveObservableDtor& operator=(SlowMoveObservableDtor&&) = delete;
+    ~SlowMoveObservableDtor() {
+        if (!moved_from)
+            return; // the live (moved-to) value's teardown isn't probed
         if (hold_for.count() > 0)
             std::this_thread::sleep_for(hold_for);
     }
@@ -407,19 +454,39 @@ TEST_CASE("launch: abandon() after publish returns the result exactly once",
     CHECK(f3->load() == 0);
 }
 
-TEST_CASE("take_locked: a taken result's unique_ptr is left engaged (moved-from), never "
-          "reset, under the cell's own lock",
+TEST_CASE("take_locked: the box itself is moved out of the cell (pointer-only) under the "
+          "lock - T is never touched there",
           "[spark][detachedcall]") {
-    // White-box regression for the Gate 8 fix (spark_detached_call.hpp's
-    // take_locked()): an earlier version called cell_->result.reset() while
+    // White-box regression, twice over now. Originally (Gate 8 fix,
+    // pre-PR-4190): an earlier version called cell_->result.reset() while
     // still holding cell_->mu, running ~T() on the moved-from remnant UNDER
-    // THE LOCK - contradicting this class's own "disposal never runs under
-    // the lock" contract. Constructs a Cell<T> directly (DetachedCall's
-    // cell-wrapping constructor is deliberately public - see its own doc
-    // comment) rather than going through a real launch(), so the take can
-    // be observed synchronously with no worker thread involved at all.
-    // MUTATION-TESTED: reinstating the removed `cell_->result.reset();`
-    // line turns CHECK(cell->result != nullptr) below red.
+    // THE LOCK; the fix at the time left cell_->result deliberately engaged
+    // (moved-from, non-null) so no reset ran under the lock at all.
+    //
+    // Colleague review on PR #4190 found a SECOND, subtler way the same
+    // contract broke: take_locked() itself moved T out of the box into a
+    // named local `out` and `return`ed it - and because the enclosing
+    // function's return type didn't match `out`'s type, NRVO couldn't
+    // apply, so `out` became a fresh moved-from remnant destroyed at
+    // take_locked()'s own scope exit, STILL under the caller's lock_guard.
+    // The real fix (this test now pins) is to never touch T under the lock
+    // at all: take_locked() moves the BOX ITSELF (the unique_ptr) out of
+    // the cell - a pointer move, T untouched - leaving cell_->result null
+    // immediately, and the actual T-move (plus the moved-from box's own
+    // teardown) happens in unbox(), which every caller runs strictly after
+    // releasing cell_->mu. See spark_detached_call.hpp's take_locked()/
+    // unbox() comments for the full argument, and the "take_locked()/
+    // unbox(): a concurrent second take is not blocked..." test in this
+    // file for the threaded proof this doesn't merely LOOK right on one
+    // thread.
+    //
+    // Constructs a Cell<T> directly (DetachedCall's cell-wrapping
+    // constructor is deliberately public - see its own doc comment) rather
+    // than going through a real launch(), so the take can be observed
+    // synchronously with no worker thread involved at all.
+    // MUTATION-TESTED: reinstating the pre-#4190 take_locked() shape (move
+    // T into a local `out` and return it directly, cell_->result left
+    // engaged) turns CHECK(cell->result == nullptr) below red.
     auto cell = std::make_shared<detached_detail::Cell<int>>();
     cell->done = true;
     cell->done_hint.store(true, std::memory_order_relaxed);
@@ -431,10 +498,9 @@ TEST_CASE("take_locked: a taken result's unique_ptr is left engaged (moved-from)
     REQUIRE(out->has_value());
     CHECK(**out == 42);
     CHECK(cell->taken); // exactly-once gate - this, not result's nullness, is authoritative
-    CHECK(cell->result != nullptr); // the fix: left engaged (moved-from), not reset to null
+    CHECK(cell->result == nullptr); // the box itself was moved out whole, not reset in place
 
-    // A second take on the same handle is still correctly exactly-once,
-    // regardless of result's non-null state - `taken` is what gates it.
+    // A second take on the same handle is still correctly exactly-once.
     CHECK_FALSE(handle.try_take().has_value());
 }
 
@@ -695,4 +761,102 @@ TEST_CASE("F3: the shared counter survives its lane's destruction while a worker
 
     gate.release();
     REQUIRE(spin_until([&] { return f3->load() == 0; }, 5s));
+}
+
+// ── Regression: take_locked() must not touch T - a concurrent take is not
+//    blocked by a slow moved-from destructor (colleague review, PR #4190) ──
+TEST_CASE("take_locked()/unbox(): a concurrent second take is not blocked by the winner's "
+          "own slow moved-from-T destructor",
+          "[spark][detachedcall]") {
+    auto f3 = std::make_shared<std::atomic<std::size_t>>(0);
+    SparkDetachedLane lane(f3, /*cap=*/4);
+    constexpr auto kHold = 400ms;
+
+    auto res = lane.launch([kHold]() -> SlowMoveObservableDtor {
+        return SlowMoveObservableDtor(kHold);
+    });
+    REQUIRE(res.status == DetachedLaunch::Launched);
+
+    // Wait for the worker to publish. The worker's OWN local `value` (see
+    // Payload::operator()()) is itself a moved-from remnant of the move
+    // into the box - its slow destructor runs here too, but on the WORKER
+    // thread, before `done` is even set, and has nothing to do with
+    // cell_->mu (the worker never holds it during this phase) - this just
+    // means `done` may take a little over kHold to become true.
+    REQUIRE(spin_until([&] { return res.call->done(); }, 5s));
+
+    // Race two takers. Whichever wins runs the box's real moved-from T
+    // destructor (this type's slow path) inside unbox() - AFTER the fix,
+    // strictly outside cell_->mu; before the fix, still inside it (see the
+    // type's own comment above). The LOSER must see an uncontended lock and
+    // return promptly regardless of which side wins the race.
+    std::array<std::chrono::steady_clock::duration, 2> elapsed{};
+    std::array<bool, 2> got_value{false, false};
+    auto racer = [&](std::size_t idx) {
+        auto start = std::chrono::steady_clock::now();
+        auto v = res.call->wait_take(std::chrono::steady_clock::now() + 5s);
+        elapsed[idx] = std::chrono::steady_clock::now() - start;
+        got_value[idx] = v.has_value();
+    };
+    std::thread t0([&] { racer(0); });
+    std::thread t1([&] { racer(1); });
+    t0.join();
+    t1.join();
+
+    // Exactly one racer took the value; the other saw nullopt.
+    REQUIRE(got_value[0] != got_value[1]);
+    const auto loser_elapsed = got_value[0] ? elapsed[1] : elapsed[0];
+    // The loser must not have blocked anywhere near the winner's slow
+    // destructor duration - a generous margin (kHold/3) well clear of
+    // ordinary scheduling jitter, but far enough under kHold that this
+    // assertion FAILS if cell_->mu is held across the slow destructor
+    // (verified: reverting the take_locked()/unbox() fix makes this fail,
+    // with loser_elapsed landing close to kHold instead).
+    CHECK(loser_elapsed < kHold / 3);
+}
+
+// ── Regression: two lanes sharing one F3 counter add/subtract correctly and
+//    independently (§24 sum-integrity - no test previously composed two
+//    lanes over one counter; every prior F3 case is single-lane) ──────────
+TEST_CASE("F3: two independent lanes sharing one counter add and subtract correctly, "
+          "including across independent teardown",
+          "[spark][detachedcall][f3]") {
+    auto f3 = std::make_shared<std::atomic<std::size_t>>(0);
+    Gate gate_a, gate_b;
+
+    auto lane_a = std::make_unique<SparkDetachedLane>(f3, /*cap=*/4);
+    auto lane_b = std::make_unique<SparkDetachedLane>(f3, /*cap=*/4);
+
+    auto res_a = lane_a->launch([&gate_a]() -> int {
+        gate_a.wait();
+        return 1;
+    });
+    REQUIRE(res_a.status == DetachedLaunch::Launched);
+    CHECK(f3->load() == 1);
+
+    auto res_b = lane_b->launch([&gate_b]() -> int {
+        gate_b.wait();
+        return 2;
+    });
+    REQUIRE(res_b.status == DetachedLaunch::Launched);
+    CHECK(f3->load() == 2); // additive across lanes, not per-lane-scoped
+
+    // Release + retire lane A's worker; lane B's stays parked throughout.
+    gate_a.release();
+    REQUIRE(spin_until([&] { return res_a.call->done(); }, 5s));
+    auto va = res_a.call->wait_take(std::chrono::steady_clock::now() + 5s);
+    REQUIRE(va.has_value());
+    REQUIRE(va->has_value());
+    CHECK(**va == 1);
+    REQUIRE(spin_until([&] { return f3->load() == 1; }, 5s)); // A's exit only
+
+    // Destroying lane A entirely must not disturb lane B's still-parked
+    // worker's contribution to the SHARED counter.
+    lane_a.reset();
+    CHECK(f3->load() == 1);
+    CHECK(lane_b->active_workers() == 1);
+
+    gate_b.release();
+    REQUIRE(spin_until([&] { return f3->load() == 0; }, 5s));
+    CHECK(lane_b->active_workers() == 0);
 }
