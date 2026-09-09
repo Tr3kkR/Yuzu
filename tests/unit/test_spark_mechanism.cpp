@@ -24,11 +24,13 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio> // std::fputs - the T6 child process reports its own deadlock detection
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -3562,6 +3564,495 @@ TEST_CASE("Registry spark: same-type disarm() does not deadlock against an in-fl
                                           << code << " (0=completed, 3=child saw the deadlock)");
     CHECK(wr == WAIT_OBJECT_0);
     CHECK(code == 0);
+}
+
+// ── #2012/#3840 PR-B1: Registry establishment off the per-type lock ──────────
+//
+// These cases drive the real Windows mechanism through its test seams
+// (spark_mechanism.hpp: set_registry_test_controls_for_test /
+// registry_debug_counters_for_test). The probe hook runs on the DETACHED probe
+// worker, so a hook that parks models a hung hive without needing one; every
+// case that parks a probe releases it before returning (a parked worker that
+// outlived the test would be a real orphan at process exit).
+namespace {
+
+struct ScratchRegKey {
+    std::string sub;
+    HKEY h{nullptr};
+    explicit ScratchRegKey(const char* tag) {
+        static std::atomic<int> n{0};
+        sub = std::string("Software\\Yuzu\\SparkB1_") + tag + "_" +
+              std::to_string(::GetCurrentProcessId()) + "_" +
+              std::to_string(yuzu::test::process_random_salt() % 1000000000) + "_" +
+              std::to_string(n.fetch_add(1));
+        ::RegCreateKeyExA(HKEY_CURRENT_USER, sub.c_str(), 0, nullptr, 0, KEY_SET_VALUE, nullptr, &h,
+                          nullptr);
+    }
+    ~ScratchRegKey() {
+        if (h)
+            ::RegCloseKey(h);
+        ::RegDeleteKeyA(HKEY_CURRENT_USER, sub.c_str());
+    }
+    ScratchRegKey(const ScratchRegKey&) = delete;
+    ScratchRegKey& operator=(const ScratchRegKey&) = delete;
+    void write(DWORD v) const {
+        ::RegSetValueExA(h, "V", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&v), sizeof(v));
+    }
+};
+
+/// Parks every probe of one subkey until release(); counts what it saw.
+struct ProbeGate {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool open{false};
+    std::atomic<int> parked{0};
+    std::atomic<int> seen{0};
+    std::function<void(std::string_view)> hook_for(std::string match) {
+        return [this, match](std::string_view sub) {
+            seen.fetch_add(1, std::memory_order_relaxed);
+            if (sub != match)
+                return;
+            parked.fetch_add(1, std::memory_order_acq_rel);
+            std::unique_lock lk(mu);
+            cv.wait(lk, [&] { return open; });
+        };
+    }
+    void release() {
+        {
+            std::lock_guard lk(mu);
+            open = true;
+        }
+        cv.notify_all();
+    }
+    ~ProbeGate() { release(); } // never leave a worker parked past the test
+};
+
+std::size_t count_kind(Collector& got, const std::string& key, SparkEventKind kind) {
+    std::lock_guard lk(got.mu);
+    std::size_t n = 0;
+    for (const auto& ev : got.events)
+        if (ev.key == key && ev.kind == kind)
+            ++n;
+    return n;
+}
+
+} // namespace
+
+TEST_CASE("Registry spark (real mechanism): a parked probe on key A neither stalls arm(B) nor "
+          "holds arm(A) past its caller budget (#2012 PR-B1)",
+          "[spark][mechanism][windows][walkoff]") {
+    ScratchRegKey a("iso_a"), b("iso_b");
+    SparkEngine engine;
+    auto mech = make_registry_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::Registry, std::move(mech)).has_value());
+    ProbeGate gate;
+    RegistryMechanismTestControls ctl;
+    ctl.probe_hook = gate.hook_for(a.sub);
+    REQUIRE(set_registry_test_controls_for_test(*raw, std::move(ctl)));
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    // arm(A): its probe parks on the worker. The caller must still get an answer
+    // within the budget (50 ms) plus scheduling slack - before PR-B1 this call
+    // did not return until the probe did.
+    const auto spec_a = registry_spec("HKCU", a.sub);
+    const auto t0 = std::chrono::steady_clock::now();
+    auto sa = engine.arm(*c, spec_a);
+    const auto arm_a_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
+            .count();
+    CHECK(sa.has_value()); // success-with-pending
+    INFO("arm(A) returned after " << arm_a_ms << " ms with A's probe parked");
+    CHECK(arm_a_ms < 2000);
+    CHECK(eventually([&] { return gate.parked.load() == 1; }, 2000ms));
+
+    // arm(B) while A's probe is still parked: same type, must not queue behind A.
+    const auto spec_b = registry_spec("HKCU", b.sub);
+    const auto t1 = std::chrono::steady_clock::now();
+    auto sb = engine.arm(*c, spec_b);
+    const auto arm_b_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t1)
+            .count();
+    CHECK(sb.has_value());
+    INFO("arm(B) returned after " << arm_b_ms << " ms while A's probe was parked");
+    CHECK(arm_b_ms < 2000);
+    // ...and B is genuinely watching: a write fires it.
+    std::this_thread::sleep_for(100ms);
+    b.write(1);
+    CHECK(eventually([&] { return count_kind(got, spark_key(spec_b), SparkEventKind::Fired) >= 1; },
+                     8000ms));
+
+    // A missed its health grace while parked: Faulted, counted once as slow_op.
+    CHECK(eventually([&] { return engine.stats().armed_faulted == 1; }, 3000ms));
+    CHECK(raw->stats().slow_op_total == 1);
+    CHECK(count_kind(got, spark_key(spec_a), SparkEventKind::Fired) == 0); // nothing synthetic yet
+
+    // Release the probe: the late result is committed (not dropped), the watch
+    // recovers, and the observation gap is closed by exactly one synthetic fire.
+    gate.release();
+    CHECK(eventually([&] { return engine.stats().armed_faulted == 0; }, 5000ms));
+    CHECK(eventually([&] { return count_kind(got, spark_key(spec_a), SparkEventKind::Fired) >= 1; },
+                     5000ms));
+    // Health edges arrived in order: Faulted strictly before Recovered.
+    {
+        std::lock_guard lk(got.mu);
+        std::ptrdiff_t i_f = -1, i_r = -1;
+        for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(got.events.size()); ++i) {
+            const auto& ev = got.events[static_cast<std::size_t>(i)];
+            if (ev.key != spark_key(spec_a))
+                continue;
+            if (ev.kind == SparkEventKind::Faulted && i_f < 0)
+                i_f = i;
+            if (ev.kind == SparkEventKind::Recovered)
+                i_r = i;
+        }
+        CHECK(i_f >= 0);
+        CHECK(i_r > i_f);
+    }
+    // A is really watching now: a real write fires it again.
+    const auto before = count_kind(got, spark_key(spec_a), SparkEventKind::Fired);
+    a.write(7);
+    CHECK(eventually([&] { return count_kind(got, spark_key(spec_a), SparkEventKind::Fired) > before; },
+                     8000ms));
+    auto dc = registry_debug_counters_for_test(*raw);
+    REQUIRE(dc.has_value());
+    CHECK(dc->synthetic_fires >= 1);
+    CHECK(dc->probe_discarded == 0);
+    engine.stop();
+    CHECK(eventually([&] { return registry_debug_counters_for_test(*raw)->probe_workers_active == 0; },
+                     5000ms));
+}
+
+TEST_CASE("Registry spark (real mechanism): disarm while the initial probe is still parked "
+          "discards the late result and frees the worker (#2012 PR-B1)",
+          "[spark][mechanism][windows][walkoff]") {
+    ScratchRegKey a("late_discard");
+    SparkEngine engine;
+    auto mech = make_registry_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::Registry, std::move(mech)).has_value());
+    ProbeGate gate;
+    RegistryMechanismTestControls ctl;
+    ctl.probe_hook = gate.hook_for(a.sub);
+    REQUIRE(set_registry_test_controls_for_test(*raw, std::move(ctl)));
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    const auto spec_a = registry_spec("HKCU", a.sub);
+    auto sa = engine.arm(*c, spec_a);
+    REQUIRE(sa.has_value());
+    REQUIRE(eventually([&] { return gate.parked.load() == 1; }, 2000ms));
+
+    // Disarm while pending: must return promptly (the retirement is a detached
+    // drain, and this watch never armed a wait, so that drain is trivial).
+    const auto t0 = std::chrono::steady_clock::now();
+    engine.disarm(*sa);
+    const auto disarm_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
+            .count();
+    INFO("disarm(A) returned after " << disarm_ms << " ms with A's probe parked");
+    CHECK(disarm_ms < 2000);
+    CHECK(engine.stats().armed_sparks == 0);
+
+    // Release the probe: its result belongs to a retired watch - self-disposed by
+    // the worker, never committed, never emitted.
+    gate.release();
+    CHECK(eventually(
+        [&] {
+            auto d = registry_debug_counters_for_test(*raw);
+            return d && d->probe_workers_active == 0 && d->retiring == 0 && d->live_watches == 0;
+        },
+        5000ms));
+    std::this_thread::sleep_for(200ms);
+    CHECK(count_kind(got, spark_key(spec_a), SparkEventKind::Fired) == 0);
+    CHECK(engine.stats().armed_faulted == 0);
+    engine.stop();
+}
+
+TEST_CASE("Registry spark (real mechanism): a failed re-arm is retried on the backend schedule "
+          "and recovers - never deaf forever (#2012 PR-B1)",
+          "[spark][mechanism][windows][walkoff]") {
+    ScratchRegKey a("rearm_retry");
+    SparkEngine engine;
+    auto mech = make_registry_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::Registry, std::move(mech)).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+    const auto spec_a = registry_spec("HKCU", a.sub);
+    REQUIRE(engine.arm(*c, spec_a).has_value()); // healthy initial establishment
+    std::this_thread::sleep_for(150ms);
+
+    // From here every probe of A throws inside the worker (WorkerThrew -> a
+    // backend failure), and the backend retry base is shortened so the test can
+    // observe the schedule.
+    {
+        RegistryMechanismTestControls ctl;
+        ctl.probe_hook = [sub = a.sub](std::string_view s) {
+            if (s == sub)
+                throw std::runtime_error("simulated re-arm failure");
+        };
+        ctl.backend_retry_base = 150ms;
+        REQUIRE(set_registry_test_controls_for_test(*raw, std::move(ctl)));
+    }
+    a.write(1); // fires: immediate emit, then the re-arm probe fails
+    CHECK(eventually([&] { return count_kind(got, spark_key(spec_a), SparkEventKind::Fired) >= 1; },
+                     8000ms));
+    CHECK(eventually([&] { return engine.stats().armed_faulted == 1; }, 5000ms));
+    {
+        auto d = registry_debug_counters_for_test(*raw);
+        REQUIRE(d.has_value());
+        CHECK(d->probe_backend_failed >= 1);
+    }
+    // Let at least one scheduled retry fail too (proves the retry is timed, not a
+    // one-shot), then clear the hook: the next retry recovers the watch.
+    CHECK(eventually([&] { return registry_debug_counters_for_test(*raw)->probe_backend_failed >= 2; },
+                     5000ms));
+    {
+        RegistryMechanismTestControls ctl; // null hook clears it; timings unchanged
+        REQUIRE(set_registry_test_controls_for_test(*raw, std::move(ctl)));
+    }
+    CHECK(eventually([&] { return engine.stats().armed_faulted == 0; }, 10000ms));
+    // The recovery closed the gap with a synthetic fire, and the watch is live:
+    // a fresh write fires again.
+    const auto after_recover = count_kind(got, spark_key(spec_a), SparkEventKind::Fired);
+    CHECK(after_recover >= 2);
+    a.write(2);
+    CHECK(eventually(
+        [&] { return count_kind(got, spark_key(spec_a), SparkEventKind::Fired) > after_recover; },
+        8000ms));
+    engine.stop();
+}
+
+TEST_CASE("Registry spark (real mechanism): stop() drains a callback-bearing retirement instead of "
+          "leaking it (#2012 PR-B1)",
+          "[spark][mechanism][windows][walkoff]") {
+    ScratchRegKey a("stop_drain");
+    SparkEngine engine;
+    auto mech = make_registry_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::Registry, std::move(mech)).has_value());
+    std::atomic<bool> in_handler{false};
+    std::mutex go_mu;
+    std::condition_variable go_cv;
+    bool go = false;
+    auto release_handler = [&] {
+        {
+            std::lock_guard lk(go_mu);
+            go = true;
+        }
+        go_cv.notify_all();
+    };
+    std::atomic<int> fires{0};
+    auto sub = engine.arm_inline(registry_spec("HKCU", a.sub), [&](const SparkEvent&) {
+        if (fires.fetch_add(1, std::memory_order_acq_rel) != 0)
+            return;
+        in_handler.store(true, std::memory_order_release);
+        std::unique_lock lk(go_mu);
+        go_cv.wait(lk, [&] { return go; }); // the TP_WAIT callback is now parked
+    });
+    REQUIRE(sub.has_value());
+    engine.start();
+    std::this_thread::sleep_for(150ms);
+    a.write(1);
+    REQUIRE(eventually([&] { return in_handler.load(std::memory_order_acquire); }, 8000ms));
+
+    // Disarm with the callback parked: control path returns, the drain is now a
+    // detached worker blocked in WaitForThreadpoolWaitCallbacks.
+    std::atomic<bool> disarm_done{false};
+    std::thread disarmer([&] {
+        engine.disarm(*sub);
+        disarm_done.store(true, std::memory_order_release);
+    });
+    CHECK(eventually([&] { return disarm_done.load(std::memory_order_acquire); }, 3000ms));
+    {
+        auto d = registry_debug_counters_for_test(*raw);
+        REQUIRE(d.has_value());
+        CHECK(d->retiring == 1);
+        CHECK(d->drains_launched == 1);
+        CHECK(d->drains_completed == 0);
+        CHECK(d->drain_workers_active == 1);
+    }
+    // stop() must WAIT for that drain (its context still points at the
+    // mechanism) - it may not complete while the callback is parked...
+    std::atomic<bool> stop_done{false};
+    std::thread stopper([&] {
+        engine.stop();
+        stop_done.store(true, std::memory_order_release);
+    });
+    CHECK_FALSE(eventually([&] { return stop_done.load(std::memory_order_acquire); }, 700ms));
+    // ...and completes once the callback returns.
+    release_handler();
+    CHECK(eventually([&] { return stop_done.load(std::memory_order_acquire); }, 10000ms));
+    if (!stop_done.load(std::memory_order_acquire))
+        release_handler(); // belt and braces before the joins below
+    disarmer.join();
+    stopper.join();
+    auto d = registry_debug_counters_for_test(*raw);
+    REQUIRE(d.has_value());
+    CHECK(d->drains_completed == 1);
+    CHECK(d->retiring == 0);
+    CHECK(eventually([&] { return registry_debug_counters_for_test(*raw)->drain_workers_active == 0; },
+                     5000ms));
+}
+
+TEST_CASE("Registry spark (real mechanism): retiring cap under a blocked drain refuses new watches "
+          "and clears once the drain completes (#2012 PR-B1)",
+          "[spark][mechanism][windows][walkoff]") {
+    ScratchRegKey a("cap_a"), k1("cap_1"), k2("cap_2"), k3("cap_3"), k4("cap_4");
+    SparkEngine engine;
+    auto mech = make_registry_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::Registry, std::move(mech)).has_value());
+    {
+        RegistryMechanismTestControls ctl;
+        ctl.retiring_cap = 4;
+        ctl.drain_lane_cap = 1; // one blocked drain occupies the whole lane
+        REQUIRE(set_registry_test_controls_for_test(*raw, std::move(ctl)));
+    }
+    std::mutex go_mu;
+    std::condition_variable go_cv;
+    bool go = false;
+    auto release_handler = [&] {
+        {
+            std::lock_guard lk(go_mu);
+            go = true;
+        }
+        go_cv.notify_all();
+    };
+    std::atomic<bool> in_handler{false};
+    std::atomic<int> fires{0};
+    auto sub_a = engine.arm_inline(registry_spec("HKCU", a.sub), [&](const SparkEvent&) {
+        if (fires.fetch_add(1, std::memory_order_acq_rel) != 0)
+            return;
+        in_handler.store(true, std::memory_order_release);
+        std::unique_lock lk(go_mu);
+        go_cv.wait(lk, [&] { return go; });
+    });
+    REQUIRE(sub_a.has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+    std::this_thread::sleep_for(150ms);
+    a.write(1);
+    REQUIRE(eventually([&] { return in_handler.load(std::memory_order_acquire); }, 8000ms));
+    engine.disarm(*sub_a); // retirement #1: its drain is parked behind the callback
+    CHECK(eventually([&] { return registry_debug_counters_for_test(*raw)->drain_workers_active == 1; },
+                     2000ms));
+
+    // Churn: each arm+disarm adds a retirement that cannot get a drain worker
+    // (lane cap 1 is busy), so it backlogs. cap=4 => the 4th further arm is refused.
+    for (ScratchRegKey* k : {&k1, &k2, &k3}) {
+        auto s = engine.arm(*c, registry_spec("HKCU", k->sub));
+        REQUIRE(s.has_value());
+        engine.disarm(*s);
+    }
+    {
+        auto d = registry_debug_counters_for_test(*raw);
+        REQUIRE(d.has_value());
+        CHECK(d->retiring == 4);
+        CHECK(d->drains_admission_rejected >= 1);
+    }
+    auto refused = engine.arm(*c, registry_spec("HKCU", k4.sub));
+    CHECK_FALSE(refused.has_value());
+    CHECK(raw->stats().watch_rejected_total == 1);
+    CHECK(raw->stats().retiring_cap == 4);
+
+    // Release the parked callback: drain #1 completes, the backlog drains, the
+    // gauge returns to zero and the refused key now arms.
+    release_handler();
+    CHECK(eventually([&] { return registry_debug_counters_for_test(*raw)->retiring == 0; }, 10000ms));
+    auto ok = engine.arm(*c, registry_spec("HKCU", k4.sub));
+    CHECK(ok.has_value());
+    engine.stop();
+    CHECK(eventually([&] { return registry_debug_counters_for_test(*raw)->drain_workers_active == 0; },
+                     5000ms));
+}
+
+TEST_CASE("Registry spark (real mechanism): a probe parked across stop() is counted on the shared "
+          "F3 counter until its worker exits (#2012 PR-B1)",
+          "[spark][mechanism][windows][walkoff]") {
+    ScratchRegKey a("f3_orphan");
+    auto f3 = std::make_shared<std::atomic<std::size_t>>(0);
+    SparkEngine engine;
+    auto mech = make_registry_mechanism(f3);
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::Registry, std::move(mech)).has_value());
+    ProbeGate gate;
+    {
+        RegistryMechanismTestControls ctl;
+        ctl.probe_hook = gate.hook_for(a.sub);
+        REQUIRE(set_registry_test_controls_for_test(*raw, std::move(ctl)));
+    }
+    auto c = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(c.has_value());
+    engine.start();
+    REQUIRE(engine.arm(*c, registry_spec("HKCU", a.sub)).has_value()); // pending, parked
+    REQUIRE(eventually([&] { return gate.parked.load() == 1; }, 2000ms));
+    CHECK(f3->load() == 1); // admitted against the SHARED counter, not just the lane
+
+    // stop() with the probe still parked: the watch is retired, its uncommitted
+    // probe is leaked-and-counted, and stop() does NOT wait for it.
+    const auto t0 = std::chrono::steady_clock::now();
+    engine.stop();
+    const auto stop_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
+            .count();
+    INFO("engine.stop() took " << stop_ms << " ms with one probe parked");
+    CHECK(stop_ms < 5000);
+    CHECK(raw->stats().quarantined_total == 1);
+    CHECK(f3->load() == 1); // still parked => still counted (F3 / §24)
+
+    gate.release();
+    CHECK(eventually([&] { return f3->load() == 0; }, 5000ms)); // worker exited => counter released
+    CHECK(eventually([&] { return registry_debug_counters_for_test(*raw)->probe_workers_active == 0; },
+                     5000ms));
+}
+
+TEST_CASE("Registry mechanism (direct): stop() during watch()'s bounded wait cancels the "
+          "reservation - the late result is discarded, never committed (#2012 PR-B1)",
+          "[spark][mechanism][windows][walkoff]") {
+    // Mechanism-direct (no engine) so the interleaving is under the test's control:
+    // watch() is inside its caller wait when stop() retires the reservation.
+    ScratchRegKey a("gen_race");
+    auto mech = make_registry_mechanism();
+    REQUIRE(mech != nullptr);
+    ProbeGate gate;
+    {
+        RegistryMechanismTestControls ctl;
+        ctl.probe_hook = gate.hook_for(a.sub);
+        ctl.caller_wait_budget = 3000ms; // long enough for stop() to land inside it
+        REQUIRE(set_registry_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    std::atomic<int> emits{0};
+    std::atomic<int> faults{0};
+    mech->start([&](const std::string&, SparkData) { emits.fetch_add(1); },
+                [&](const std::string&, bool, std::string_view) { faults.fetch_add(1); });
+    const auto spec = registry_spec("HKCU", a.sub);
+    std::expected<void, std::string> result;
+    std::thread watcher([&] { result = mech->watch(spark_key(spec), spec.params); });
+    REQUIRE(eventually([&] { return gate.parked.load() == 1; }, 2000ms));
+    std::this_thread::sleep_for(100ms); // the watcher is now inside wait_take()
+    mech->stop();                        // retires the reservation underneath it
+    gate.release();                      // the probe completes AFTER the retirement
+    watcher.join();
+    CHECK_FALSE(result.has_value()); // the caller observed the cancellation
+    auto d = registry_debug_counters_for_test(*mech);
+    REQUIRE(d.has_value());
+    CHECK(d->probe_discarded == 1);
+    CHECK(d->live_watches == 0);
+    CHECK(emits.load() == 0);
+    CHECK(faults.load() == 0);
+    CHECK(eventually([&] { return registry_debug_counters_for_test(*mech)->probe_workers_active == 0; },
+                     5000ms));
 }
 
 // ── Inline-tier dispatch latency (the ADR-0021 §3 µs claim) ──────────────────
