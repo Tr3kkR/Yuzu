@@ -122,9 +122,10 @@ learns of a real acquisition failure:
   `filtered`), which counts toward this aggregate the same as an unfiltered
   read would, so excluding them from `sources=` never produces a clean
   result. macOS is the same via `mac_login_items`, which isn't even
-  filter-gated at all -- it always performs its one constrained read.
-  Windows has no permanently-constrained source, so whether a given run
-  degrades depends on live host state.
+  filter-gated at all -- it always emits its one constrained status line
+  (there is no real read to skip; see below). Windows has no
+  permanently-constrained source, so whether a given run degrades depends
+  on live host state.
 - **`UNAVAILABLE` / `PARTIAL` / `autoruns:exception`** -- an exception
   escaped a leg (`execute()`'s catch clauses); the command itself aborted,
   `rc=1`.
