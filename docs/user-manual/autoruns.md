@@ -66,18 +66,25 @@ versus one that could not be read at all:
   `RegUnLoadKeyW` fails on the way out -- this is orthogonal to the
   per-source `source|` line and never folded into it.
 - **`constrained|<n>|malformed`** (launchd plist walk, `mac_emond`,
-  `lnx_etc_crontab`, `lnx_cron_d`, `lnx_user_crontabs`, `win_scheduled_tasks`)
-  -- a file was read but could not be fully parsed. On macOS a plist could
-  not be parsed (corrupt, or a valid plist truncated by `kMaxPlistBytes`).
-  On the three Linux crontab-family sources, a crontab file had at least one
-  rejected line (`parse_crontab`'s `rejected_lines > 0`) while every other
-  valid entry in that file is still kept, never dropping the whole file. On
-  `win_scheduled_tasks`, a task's XML was read successfully but
-  `parse_task_xml` could not make sense of it (truncated/corrupt XML, a
-  rejected DTD, an unexpected root) -- distinct from `get_Xml()` itself
-  failing, which carries its own, more specific token. Never silently folded
-  into a `supported` status. `mac_emond` combines this with any
-  directory-level constraint via a comma-joined reason.
+  `lnx_etc_crontab`, `lnx_cron_d`, `lnx_user_crontabs`, `win_scheduled_tasks`,
+  and any Windows registry-value source -- `win_run_hklm`/`_hkcu`,
+  `win_runonce*`, `win_startup_approved`, `win_winlogon_shell`/`_userinit`,
+  `win_appinit_dlls` -- when a value's data fails `ReadValueStatus` decoding)
+  -- a file or registry value was read but could not be fully parsed. On
+  macOS a plist could not be parsed (corrupt, or a valid plist truncated by
+  `kMaxPlistBytes`). On the three Linux crontab-family sources, a crontab
+  file had at least one rejected line (`parse_crontab`'s `rejected_lines > 0`)
+  while every other valid entry in that file is still kept, never dropping
+  the whole file. On `win_scheduled_tasks`, a task's XML was read
+  successfully but `parse_task_xml` could not make sense of it
+  (truncated/corrupt XML, a rejected DTD, an unexpected root) -- distinct
+  from `get_Xml()` itself failing, which carries its own, more specific
+  token. On the Windows registry-value sources, a value existed with a
+  declared numeric type but a size too small to hold it (`win_profiles.hpp`'s
+  `ReadValueStatus::malformed`) -- distinct from the key/value simply not
+  existing. Never silently folded into a `supported` status. `mac_emond`
+  combines this with any directory-level constraint via a comma-joined
+  reason.
 - **`constrained|<n>|narrow_search_path_coverage`** (`lnx_systemd_timers_user`
   only) -- a permanent, catalog-declared exception (`autoruns_catalog.hpp`'s
   third documented exception, alongside `mac_login_items`/`lnx_init_d`):

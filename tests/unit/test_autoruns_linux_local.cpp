@@ -261,6 +261,8 @@ TEST_CASE("autoruns Linux leg: on a non-Linux build every lnx_* source reports "
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <yuzu/agent/scoped_fd.hpp>
+
 TEST_CASE("autoruns Linux leg: real collect_linux never reports foreign_os for a lnx_* source",
           "[autoruns][actions][linux]") {
     auto plugin = load_autoruns_plugin();
@@ -390,13 +392,12 @@ TEST_CASE("autoruns Linux leg: lnx_rc_local's real collect_linux status/row is "
         return;
     }
 
-    int fd = ::open("/etc/rc.local", O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    yuzu::agent::ScopedFd fd{::open("/etc/rc.local", O_RDONLY | O_NOFOLLOW | O_CLOEXEC)};
     const int open_errno = errno;
     struct stat fst{};
-    const bool opened = fd >= 0;
+    const bool opened = fd.valid();
     if (opened) {
-        REQUIRE(::fstat(fd, &fst) == 0);
-        ::close(fd);
+        REQUIRE(::fstat(fd.get(), &fst) == 0);
     }
 
     yuzu::agent::LocalDispatcher dispatcher;
