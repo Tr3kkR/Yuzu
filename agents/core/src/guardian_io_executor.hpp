@@ -568,7 +568,8 @@ public:
                 // Destroy the user callables inside the marked scope (R5.1).
                 on_abandoned.reset();
                 fn.reset();
-                // `ticket` copy destroyed at worker scope end -> releases the counts
+                // `ticket` copy destroyed when the trampoline destroys the payload (the
+                // captures), after this lambda returns -> releases the physical counts
                 // (and, on the abandoned branch, the key too - see above)
             };
 
