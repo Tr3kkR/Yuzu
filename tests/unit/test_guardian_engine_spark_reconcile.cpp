@@ -1458,9 +1458,13 @@ TEST_CASE("a worker-thread mtx_ acquisition aborts the process (death test)",
         return;
     }
 
-    // fork() WITHOUT exec. Safe here because Catch2 runs test cases sequentially and this one
-    // starts no threads before forking, so no other thread can hold a libc lock at fork time.
+    // fork() WITHOUT exec. Catch2 runs test cases sequentially and this one starts no threads
+    // before forking - but an EARLIER case's detached executor worker can still be in its
+    // exit tail here (its active_worker_count()==0 is the last self-observable point, not
+    // OS-thread exit), and under TSan that makes the child die at its first thread start
+    // (die_after_fork; seen 2 of 6 runs on rung 9c PR-1). Wait for quiescence first, loudly.
     // The child is short-lived and aborts; it never returns to the harness.
+    REQUIRE(yuzu::test::wait_until_quiescent());
     const pid_t pid = ::fork();
     REQUIRE(pid >= 0);
 
@@ -1550,7 +1554,10 @@ TEST_CASE("a GuardianIoExecutor::submit() completion callback taking mtx_ aborts
     // bounds but does not prove it). Only the forking thread is duplicated, and the
     // child does nothing but open a KvStore, start an engine, spawn ONE worker and touch
     // mtx_, so a libc lock held by a stray thread at fork time is the residual risk;
-    // an isolated child executable would remove it and is noted as the follow-up.
+    // an isolated child executable would remove it and is noted as the follow-up. Until
+    // then, wait for thread quiescence (governance pass-3 qe-2/cp-1/cs-4) so the fork is
+    // never taken with a stray worker alive - TSan kills such a child at its first thread.
+    REQUIRE(yuzu::test::wait_until_quiescent());
     const pid_t pid = ::fork();
     REQUIRE(pid >= 0);
 
@@ -2569,3 +2576,29 @@ TEST_CASE("#2233 item 3: a timed-out arm holds policy_generation for retry, not 
     // finish before the fixture tears down SparkEngine/GuardianEngine.
     f.mechanism->release_hang();
 }
+
+#ifndef _WIN32
+// The quiescence gate the fork()-without-exec death tests above rely on. Mutation: make
+// wait_until_quiescent return true unconditionally -> the "false while a thread lives"
+// branch fails; make it never return true -> the "true once it exits" branch times out.
+TEST_CASE("test helper: wait_until_quiescent returns false while another thread lives and true once "
+          "it has exited (fork death-test gate, governance pass-3 qe-2/cp-1/cs-4)",
+          "[spark][guardian][reconcile][helpers]") {
+#if !defined(__linux__)
+    SUCCEED("wait_until_quiescent is a no-op off Linux; nothing to prove");
+    return;
+#else
+    std::atomic<bool> release{false};
+    std::thread t([&] {
+        while (!release.load(std::memory_order_acquire))
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    });
+    // A live second thread: the gate must NOT open (bounded: 150 ms, scaled).
+    CHECK_FALSE(yuzu::test::wait_until_quiescent(std::chrono::milliseconds(150)));
+    release.store(true, std::memory_order_release);
+    t.join();
+    // Joined -> quiescent (TSan's background thread is excluded by the helper's threshold).
+    CHECK(yuzu::test::wait_until_quiescent(std::chrono::seconds(5)));
+#endif
+}
+#endif

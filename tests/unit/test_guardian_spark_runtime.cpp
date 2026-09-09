@@ -5345,6 +5345,7 @@ TEST_CASE("rung 9c R5.2 (adversarial re-review r3 C2): a throwing index release 
     // leaves fail_all_claims_locked -> dispatch_arm_off_lock -> on_arm_complete()
     // noexcept -> std::terminate: the child dies by SIGABRT (WIFSIGNALED), exit code
     // never reached.
+    REQUIRE(yuzu::test::wait_until_quiescent()); // no stray worker at fork (pass-3 qe-2/cp-1/cs-4)
     const pid_t pid = ::fork();
     REQUIRE(pid >= 0);
     if (pid == 0) {
