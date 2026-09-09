@@ -813,10 +813,25 @@ WantsListing build_wants_listing(const std::string& wants_dir) {
 /// uncertainty propagated into this decision at all, so a genuinely-enabled
 /// GLOBAL-directory timer whose enabling user's wants dir was missed by the
 /// incomplete `/home` scan could read as a confident `disabled`.
+///
+/// `wants_open_failure_out` (default nullptr) is set true when a consulted
+/// wants dir failed to open for a real (non-ENOENT) reason -- i.e. any
+/// `build_wants_listing(...).open_error`. This row-level Enabled::unknown
+/// return already correctly reflects that locally, but the signal itself
+/// used to go no further: TimerScan (and therefore the SOURCE-level status
+/// line built from it) never learned a real wants-dir acquisition failure
+/// happened at all, so a genuine EIO-class failure was indistinguishable
+/// from every candidate wants dir being cleanly absent at the source-status
+/// level (adversarial review finding, PR #4154 fix-round). Deliberately
+/// narrower than `any_incomplete` above: `enumeration_error`/`truncated`/
+/// the caller's own `user_wants_bases_incomplete` are a different signal
+/// (or already surfaced elsewhere at the source level), so only the real
+/// open failure is threaded out here.
 Enabled timer_enabled(const std::string& unit_dir, const std::string& timer_filename,
                       const std::string& wanted_by, Scope scope,
                       const std::vector<std::string>& user_wants_bases = {},
-                      bool user_wants_bases_incomplete = false) {
+                      bool user_wants_bases_incomplete = false,
+                      bool* wants_open_failure_out = nullptr) {
     const std::string_view wants_root =
         scope == Scope::system ? "/etc/systemd/system" : "/etc/systemd/user";
     std::vector<std::string> wants_base_dirs = {unit_dir};
@@ -843,11 +858,13 @@ Enabled timer_enabled(const std::string& unit_dir, const std::string& timer_file
         auto w1 = build_wants_listing(base + "/timers.target.wants");
         any_opened |= w1.opened;
         any_incomplete |= w1.enumeration_error || w1.truncated || w1.open_error;
+        if (w1.open_error && wants_open_failure_out != nullptr) *wants_open_failure_out = true;
         if (w1.opened && timer_enabled_from_wants(w1.text, timer_filename)) return Enabled::enabled;
         if (!wanted_by.empty()) {
             auto w2 = build_wants_listing(base + "/" + wanted_by + ".wants");
             any_opened |= w2.opened;
             any_incomplete |= w2.enumeration_error || w2.truncated || w2.open_error;
+            if (w2.open_error && wants_open_failure_out != nullptr) *wants_open_failure_out = true;
             if (w2.opened && timer_enabled_from_wants(w2.text, timer_filename)) return Enabled::enabled;
         }
     }
@@ -971,8 +988,19 @@ void scan_systemd_timer_dir(const std::string& dir, Scope scope, const std::stri
                 row.args += triggers[i];
             }
         }
+        bool wants_open_failure = false;
         row.enabled = timer_enabled(dir, name, fields.wanted_by, scope, user_wants_bases,
-                                    user_wants_bases_incomplete);
+                                    user_wants_bases_incomplete, &wants_open_failure);
+        // A real (non-ENOENT) wants-dir open failure doesn't just make THIS
+        // row's own Enabled::unknown correct (unchanged above) -- it also
+        // means the source as a whole couldn't fully verify enablement, so
+        // it folds into the SAME any_dir_open_failure/dir_open_failure_reason
+        // signal this scan's own unit-listing-directory open failures use,
+        // letting timer_scan_status's source-level status line name it too
+        // instead of reading as a plain, misleadingly-clean `supported|-`.
+        if (wants_open_failure)
+            note_file_constraint(out.any_dir_open_failure, out.dir_open_failure_reason,
+                                 "wants_open_error");
         row.scope = scope;
         row.user = user;
         row.signed_state = Signed::not_checked;

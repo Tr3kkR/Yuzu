@@ -247,6 +247,16 @@ finding does not apply to this leg's `RegLoadKeyW`, which does.
   exist to close. `unknown` here is a genuine "cannot tell", same meaning as
   the rung-2 case above, just a different cause.
 
+  A genuine (non-`ENOENT`) wants-directory open failure also constrains the
+  **source-level** status line for `lnx_systemd_timers_system` /
+  `lnx_systemd_timers_user`, not just the affected row: it composes into the
+  same `constrained` status (reason `wants_open_error`, alongside any other
+  applicable reason such as `partial_permission_denied` or `row_cap`) that
+  the source's own unit-listing-directory open failures already use, so an
+  acquisition failure of this kind never reads as the plain, misleadingly-
+  clean `supported|-` a cleanly-absent set of wants directories would
+  produce.
+
 ## macOS: Login Items is constrained, `osascript` is rejected
 
 `mac_login_items` always emits one constrained status line

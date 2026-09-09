@@ -1077,6 +1077,99 @@ TEST_CASE("autoruns Linux leg: timer_enabled treats a real (non-ENOENT) open fai
                         /*user_wants_bases_incomplete=*/false) == Enabled::unknown);
 }
 
+TEST_CASE("autoruns Linux leg: timer_enabled's wants_open_failure_out out-parameter "
+          "surfaces a real (non-ENOENT) wants-dir open failure to its caller "
+          "(RECONSTRUCTION: pins the adversarial-review should-fix -- "
+          "timer_enabled's own row-level Enabled::unknown for this exact case was "
+          "already correct, but the failure signal never reached TimerScan/"
+          "timer_scan_status, so a genuine wants-dir acquisition failure was "
+          "indistinguishable from every candidate wants dir being cleanly absent "
+          "at the SOURCE-level status line)",
+          "[autoruns][actions][linux]") {
+    using yuzu::autoruns::Enabled;
+    using yuzu::autoruns::Scope;
+    using yuzu::autoruns::timer_enabled;
+
+    yuzu::test::TempDir vendor_dir("yuzu_test_autoruns_wantsoutp_vendor_");
+    yuzu::test::TempDir bad_base("yuzu_test_autoruns_wantsoutp_bad_");
+    std::error_code ec;
+    std::filesystem::create_directories(vendor_dir.path, ec);
+    REQUIRE_FALSE(ec);
+    const auto unit_file = vendor_dir.path / "backup.timer";
+    { std::ofstream f(unit_file); f << "[Timer]\nOnCalendar=daily\n"; }
+
+    SECTION("a real open failure on a candidate wants dir sets the out-param true") {
+        // Same ENOTDIR-via-regular-file trick as the sibling TEST_CASE above:
+        // a real, non-ENOENT opendir() failure, not plain absence.
+        std::filesystem::create_directories(bad_base.path, ec);
+        REQUIRE_FALSE(ec);
+        { std::ofstream(bad_base.path / "timers.target.wants") << "not a directory"; }
+
+        bool wants_open_failure = false;
+        CHECK(timer_enabled(vendor_dir.path.string(), "backup.timer", "", Scope::user,
+                            {bad_base.path.string()},
+                            /*user_wants_bases_incomplete=*/false,
+                            &wants_open_failure) == Enabled::unknown);
+        CHECK(wants_open_failure);
+    }
+
+    SECTION("no open failure anywhere -- ordinary absence -- leaves the "
+            "out-param false, never a false positive") {
+        yuzu::test::TempDir good_base("yuzu_test_autoruns_wantsoutp_good_");
+        std::filesystem::create_directories(good_base.path, ec); // no timers.target.wants at all: ENOENT
+        REQUIRE_FALSE(ec);
+
+        bool wants_open_failure = false;
+        CHECK(timer_enabled(vendor_dir.path.string(), "backup.timer", "", Scope::user,
+                            {good_base.path.string()},
+                            /*user_wants_bases_incomplete=*/false,
+                            &wants_open_failure) == Enabled::disabled);
+        CHECK_FALSE(wants_open_failure);
+    }
+}
+
+TEST_CASE("autoruns Linux leg: a real wants-dir open failure constrains "
+          "timer_scan_status's SOURCE-level status, composing with (not "
+          "replacing) the affected row's own enabled=unknown "
+          "(RECONSTRUCTION: pins the adversarial-review should-fix end to end -- "
+          "asserts BOTH the row-level and the newly-threaded source-level effect "
+          "of the same real wants-dir open failure via the actual "
+          "scan_systemd_timer_dir_unique -> TimerScan -> timer_scan_status path, "
+          "not just the timer_enabled unit above)",
+          "[autoruns][actions][linux]") {
+    using yuzu::autoruns::Enabled;
+    using yuzu::autoruns::Row;
+    using yuzu::autoruns::scan_systemd_timer_dir_unique;
+    using yuzu::autoruns::Scope;
+    using yuzu::autoruns::TimerScan;
+    using yuzu::autoruns::timer_scan_status;
+
+    yuzu::test::TempDir unit_dir("yuzu_test_autoruns_scanwants_unit_");
+    yuzu::test::TempDir bad_base("yuzu_test_autoruns_scanwants_bad_");
+    std::error_code ec;
+    std::filesystem::create_directories(unit_dir.path, ec);
+    REQUIRE_FALSE(ec);
+    { std::ofstream f(unit_dir.path / "backup.timer"); f << "[Timer]\nOnCalendar=daily\n"; }
+
+    // bad_base's wants dir is a regular file, not a directory: opendir()
+    // fails ENOTDIR, a real (non-ENOENT) open failure.
+    std::filesystem::create_directories(bad_base.path, ec);
+    REQUIRE_FALSE(ec);
+    { std::ofstream(bad_base.path / "timers.target.wants") << "not a directory"; }
+
+    TimerScan scan;
+    std::vector<std::pair<dev_t, ino_t>> seen_dirs;
+    scan_systemd_timer_dir_unique(unit_dir.path.string(), Scope::user, "carol", scan, seen_dirs,
+                                  {bad_base.path.string()});
+
+    REQUIRE(scan.rows.size() == 1);
+    CHECK(scan.rows[0].enabled == Enabled::unknown); // row-level: unaffected, already correct
+
+    const auto [support, reason] = timer_scan_status(scan);
+    CHECK(support == YUZU_SUPPORT_CONSTRAINED); // source-level: now also constrained
+    CHECK(reason.find("wants_open_error") != std::string::npos);
+}
+
 TEST_CASE("autoruns Linux leg: scan_cron_d wires a rejected crontab line into a "
           "'malformed' constraint while still emitting the file's other valid entries "
           "(RECONSTRUCTION: pins PR #4154 round 9's should-fix -- rejected_lines was "
