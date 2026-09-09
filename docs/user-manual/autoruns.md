@@ -65,11 +65,19 @@ versus one that could not be read at all:
   `warning|hive_unload_failed|...` line is emitted if the trailing
   `RegUnLoadKeyW` fails on the way out -- this is orthogonal to the
   per-source `source|` line and never folded into it.
-- **`constrained|<n>|malformed`** (launchd plist walk, `mac_emond`) -- the
-  file was read but its plist could not be parsed (corrupt, or a valid
-  plist truncated by `kMaxPlistBytes`); never silently folded into a
-  `supported` status. `mac_emond` combines this with any directory-level
-  constraint via a comma-joined reason.
+- **`constrained|<n>|malformed`** (launchd plist walk, `mac_emond`,
+  `lnx_etc_crontab`, `lnx_cron_d`, `lnx_user_crontabs`, `win_scheduled_tasks`)
+  -- a file was read but could not be fully parsed. On macOS a plist could
+  not be parsed (corrupt, or a valid plist truncated by `kMaxPlistBytes`).
+  On the three Linux crontab-family sources, a crontab file had at least one
+  rejected line (`parse_crontab`'s `rejected_lines > 0`) while every other
+  valid entry in that file is still kept, never dropping the whole file. On
+  `win_scheduled_tasks`, a task's XML was read successfully but
+  `parse_task_xml` could not make sense of it (truncated/corrupt XML, a
+  rejected DTD, an unexpected root) -- distinct from `get_Xml()` itself
+  failing, which carries its own, more specific token. Never silently folded
+  into a `supported` status. `mac_emond` combines this with any
+  directory-level constraint via a comma-joined reason.
 - **`constrained|<n>|narrow_search_path_coverage`** (`lnx_systemd_timers_user`
   only) -- a permanent, catalog-declared exception (`autoruns_catalog.hpp`'s
   third documented exception, alongside `mac_login_items`/`lnx_init_d`):
@@ -108,13 +116,24 @@ learns of a real acquisition failure:
   always-`rc=0` contract -- `rc` answers "did the command abort", not "did
   every source read cleanly". On Linux, `lnx_init_d` and
   `lnx_systemd_timers_user` are catalog-declared permanently `constrained`
-  (see above), so an unfiltered Linux `list` run always reports
-  `CONSTRAINED` here; macOS is the same via `mac_login_items`. Windows has
-  no permanently-constrained source, so whether a given run degrades depends
-  on live host state.
+  (see above), so every Linux `list` run always reports `CONSTRAINED` here
+  regardless of any `sources=` filter -- both sources' filtered-out branches
+  still emit their own catalog-declared `CONSTRAINED` status (reason
+  `filtered`), which counts toward this aggregate the same as an unfiltered
+  read would, so excluding them from `sources=` never produces a clean
+  result. macOS is the same via `mac_login_items`, which isn't even
+  filter-gated at all -- it always performs its one constrained read.
+  Windows has no permanently-constrained source, so whether a given run
+  degrades depends on live host state.
 - **`UNAVAILABLE` / `PARTIAL` / `autoruns:exception`** -- an exception
   escaped a leg (`execute()`'s catch clauses); the command itself aborted,
   `rc=1`.
+
+Because this field is effectively constant on Linux and macOS (always
+`CONSTRAINED`/`PARTIAL`), it cannot by itself signal a *new* degradation on
+those platforms -- a fleet-scale consumer still needs to read the per-source
+`source|` text lines to detect a genuinely new failure there. Only
+Windows's typed field varies with live host state today.
 
 ## Versioned source catalog
 
@@ -271,6 +290,12 @@ finding does not apply to this leg's `RegLoadKeyW`, which does.
   mechanism read as inert" defect this leg's directory-enumeration fixes
   exist to close. `unknown` here is a genuine "cannot tell", same meaning as
   the rung-2 case above, just a different cause.
+
+  A timer row can also carry `enabled=unknown` for a third reason, with no
+  failed read among the wants directories it actually checked at all: when
+  `/home` itself couldn't be fully enumerated, the very SET of user wants
+  directories to search is itself incomplete, not just an individual
+  directory that was checked.
 
   A genuine wants-directory scan failure -- a non-`ENOENT` open failure, a
   real I/O error partway through the scan, or a capped scan with a real
