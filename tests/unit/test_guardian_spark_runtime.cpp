@@ -35,6 +35,8 @@
 #include <unordered_map>
 #include <string>
 #include <thread>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 using namespace yuzu::agent;
@@ -483,6 +485,59 @@ struct FakeStoreRig {
                                         serialize_journal_batch(ts_ms, entries)) ==
                KvInsert::Inserted);
     }
+};
+
+// Portable std::jthread/std::stop_token replacement (adversarial-review finding,
+// #4153): Apple Clang's libc++, at Yuzu's declared Apple Clang 15+ floor
+// (docs/cpp-conventions.md), does not provide std::jthread or std::stop_token -
+// this exact break already took down the macOS leg once (#2530/#2580,
+// test_secret_codec.cpp:1103-1121), and every OTHER std::jthread use in the tree
+// feature-gates it (`#ifdef __cpp_lib_jthread`, e.g. auth_db.cpp:440-445). Rather
+// than duplicate every worker body below behind that macro, this hand-rolled RAII
+// thread + shared atomic-flag pair sidesteps the feature-detection question
+// entirely: it is unconditionally portable across every supported compiler and
+// reproduces exactly the two properties the two checkpoints below actually need -
+// stop_requested() as a poll predicate, and an implicit request-then-join on
+// destruction so a REQUIRE-throw unwind can never leave a worker joinable (the
+// same std::terminate hazard test_secret_codec.cpp's JoinGuard exists for).
+class PortableStopToken {
+public:
+    explicit PortableStopToken(std::shared_ptr<std::atomic<bool>> flag) : flag_(std::move(flag)) {}
+    bool stop_requested() const { return flag_->load(std::memory_order_acquire); }
+
+private:
+    std::shared_ptr<std::atomic<bool>> flag_;
+};
+
+class PortableJThread {
+public:
+    // Mirrors std::jthread's own overload selection: a callable taking one
+    // PortableStopToken gets one constructed from this instance's shared flag;
+    // anything else (a plain `[&]{...}` capture) is invoked with no arguments.
+    template <typename F>
+    explicit PortableJThread(F&& f) : flag_(std::make_shared<std::atomic<bool>>(false)) {
+        if constexpr (std::is_invocable_v<std::decay_t<F>, PortableStopToken>) {
+            thread_ = std::thread(
+                [f = std::forward<F>(f), tok = PortableStopToken(flag_)]() mutable { f(tok); });
+        } else {
+            thread_ = std::thread(std::forward<F>(f));
+        }
+    }
+    PortableJThread(PortableJThread&&) = default;
+    PortableJThread& operator=(PortableJThread&&) = default;
+    // Matches std::jthread::join(): joins only, does NOT request_stop() first (that
+    // combination is exclusive to the destructor, both here and on the real type).
+    void join() { thread_.join(); }
+    ~PortableJThread() {
+        if (thread_.joinable()) {
+            flag_->store(true, std::memory_order_release);
+            thread_.join();
+        }
+    }
+
+private:
+    std::shared_ptr<std::atomic<bool>> flag_;
+    std::thread thread_;
 };
 } // namespace
 
@@ -3841,11 +3896,13 @@ TEST_CASE("concurrent pagers + a drainer do not race (TSan checkpoint)",
     // below used to sit in an unbounded `first_pass.wait()` even after main's own
     // bounded_wait (further below) already FAILed and started tearing down; `workers`'
     // destructor then hung forever trying to join it. `stoppable_wait` gives the pruner
-    // a std::stop_token (jthread supplies one automatically to a callable that accepts
-    // it) so `~jthread`'s implicit request_stop() actually releases it - false only for
-    // a real production hang inside page_into_window, which stays fundamentally
-    // untestable this way.
-    const auto stoppable_wait = [](auto&& ready, std::stop_token stoken) {
+    // a PortableStopToken (this file's own portable std::jthread/std::stop_token
+    // replacement, defined above FakeStoreRig - Apple Clang's libc++ lacks the real
+    // ones, see that definition's comment) supplied automatically to a callable that
+    // accepts it, so ~PortableJThread's implicit request-then-join actually releases
+    // it - false only for a real production hang inside page_into_window, which stays
+    // fundamentally untestable this way.
+    const auto stoppable_wait = [](auto&& ready, PortableStopToken stoken) {
         while (!ready()) {
             if (stoken.stop_requested())
                 return false;
@@ -3854,7 +3911,7 @@ TEST_CASE("concurrent pagers + a drainer do not race (TSan checkpoint)",
         return true;
     };
 
-    std::vector<std::jthread> workers;
+    std::vector<PortableJThread> workers;
     for (int p = 0; p < 3; ++p)
         workers.emplace_back([&, p] {
             std::int64_t t = kBaseTs + p * 1000;
@@ -3896,7 +3953,7 @@ TEST_CASE("concurrent pagers + a drainer do not race (TSan checkpoint)",
     // additionally blocks on `prune_evicted` before calling request_stop() (also #4153
     // round 2), which is what actually makes this deterministic; the step size here
     // only keeps that wait short.
-    workers.emplace_back([&](std::stop_token stoken) {
+    workers.emplace_back([&](PortableStopToken stoken) {
         if (!stoppable_wait([&] { return first_pass.try_wait(); }, stoken))
             return; // request_stop() fired before first_pass ever released - nothing to prune
         std::int64_t t = kBaseTs;
@@ -3917,7 +3974,7 @@ TEST_CASE("concurrent pagers + a drainer do not race (TSan checkpoint)",
     // never requested before the join loop, so this loop's own try_wait() condition is
     // what ends it - exactly as before - and it is never cut off while pagers may still
     // have unpaged work in flight.
-    workers.emplace_back([&](std::stop_token stoken) {
+    workers.emplace_back([&](PortableStopToken stoken) {
         while (!pagers_done.try_wait() && !stoken.stop_requested())
             rig.rt->drain_bounded(send, {.max_entries = 64});
         rig.rt->drain_bounded(send, {}); // final drain: whatever the last pass paged
@@ -4197,9 +4254,10 @@ TEST_CASE("concurrent persist + page + prune + drain do not race (TSan checkpoin
           "[spark][runtime][journal][tsan]") {
     // #4153: same redesign as the pagers+drainer checkpoint above - see its header
     // comment for the full rationale (real KvStore -> FakeJournalStore, unbounded
-    // stop-flag loops -> fixed per-thread iteration counts, std::jthread for RAII join
-    // safety, `workers` declared after the rig/latches/atomics for unwind safety). This
-    // test additionally exercises persist() - a REAL write path serialised only by the
+    // stop-flag loops -> fixed per-thread iteration counts, PortableJThread (this
+    // file's portable std::jthread replacement, defined above FakeStoreRig) for RAII
+    // join safety, `workers` declared after the rig/latches/atomics for unwind
+    // safety). This test additionally exercises persist() - a REAL write path serialised only by the
     // store's own lock, no paging_mutex_ - racing page/prune's paging_mutex_-guarded
     // path: the FR5 prune-vs-paging serialization under genuinely concurrent I/O.
     FakeStoreRig rig;
@@ -4258,7 +4316,7 @@ TEST_CASE("concurrent persist + page + prune + drain do not race (TSan checkpoin
     // mechanism here; this overload takes an explicit interval so the persister can use
     // one far finer than the pagers test's one-shot 5ms default, since a coarse interval
     // here would blur the persist/prune interleaving this test exists to exercise.
-    const auto stoppable_wait = [](auto&& ready, std::stop_token stoken,
+    const auto stoppable_wait = [](auto&& ready, PortableStopToken stoken,
                                    std::chrono::microseconds poll = std::chrono::milliseconds{5}) {
         while (!ready()) {
             if (stoken.stop_requested())
@@ -4268,7 +4326,7 @@ TEST_CASE("concurrent persist + page + prune + drain do not race (TSan checkpoin
         return true;
     };
 
-    std::vector<std::jthread> workers;
+    std::vector<PortableJThread> workers;
     // Pagers: page_into_window (paging_mutex_ -> the fake store's own mutex).
     for (int p = 0; p < 2; ++p)
         workers.emplace_back([&, p] {
@@ -4308,7 +4366,7 @@ TEST_CASE("concurrent persist + page + prune + drain do not race (TSan checkpoin
     // bounded_wait FAIL(), needing an external kill). A poll is the only mechanism here
     // that is both genuinely stoppable and doesn't require mutating pruner_passes with
     // an artificial sentinel value.
-    workers.emplace_back([&](std::stop_token stoken) {
+    workers.emplace_back([&](PortableStopToken stoken) {
         int n = 0;
         const auto persist_one = [&] {
             std::vector<std::shared_ptr<const JournalRecord>> pending{
@@ -4341,7 +4399,7 @@ TEST_CASE("concurrent persist + page + prune + drain do not race (TSan checkpoin
     });
     // Drainer. Stoppable for the same reason and under the same success-path guarantee
     // as the pagers test's drainer above.
-    workers.emplace_back([&](std::stop_token stoken) {
+    workers.emplace_back([&](PortableStopToken stoken) {
         while (!producers_done.try_wait() && !stoken.stop_requested())
             rig.rt->drain(send);
         rig.rt->drain(send); // final drain

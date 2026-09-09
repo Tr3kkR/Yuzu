@@ -623,10 +623,12 @@ agent_test_exe = executable(
 # out the whole agent suite (#2345), and the same mechanism recurred on Wee Tam/Windows under
 # ASan (#4018, one run took 1010s, the other never finished in 1200s). #4153 redesigned both
 # off SQLite entirely (an in-memory FakeJournalStore, IJournalStore seam) and off the
-# stop-flag race (fixed per-thread iteration counts, std::jthread, blocking latch/atomic
-# handshakes instead of a spin) - termination now depends on nothing but each worker's own
-# bounded loop, so they moved to [tsan] (below with the other cheap cases) and run in EVERY
-# build, not only sanitizer ones.
+# stop-flag race (fixed per-thread iteration counts; a portable jthread-alike with fixed
+# producer loops, latches, and bounded/stop-token-aware polling waits for the drainer and
+# persister, replacing a spin) - termination now depends on fixed iteration counts and
+# 30s-bounded main-thread waits, never on the main thread winning a lock race, so they
+# moved to [tsan] (below with the other cheap cases) and run in EVERY build, not only
+# sanitizer ones.
 # #2373 (the split that first isolated [tsan-heavy] into its own budgeted entry, keeping a
 # stall here from timing out the fast suite) is superseded for those two tests by #4153's
 # redesign above; it remains the reason the sole survivor still gets its own entry. A

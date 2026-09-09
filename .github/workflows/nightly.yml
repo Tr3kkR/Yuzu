@@ -869,10 +869,12 @@ jobs:
           path: build-linux-coverage/coverage-html/
 
       - name: Upload meson testlog (on failure or cancel)
-        # New step (#4153 round 4) - this leg had no testlog upload at all before now,
-        # only the HTML coverage report above, which gcovr only writes on a passing
-        # Test step. `|| cancelled()`: see the same line's comment on the asan leg -
-        # a stall here rides the JOB's own timeout, reported as CANCELLED not FAILED.
+        # Supersedes the leg's prior bare `if: failure()` testlog upload (adversarial-
+        # review finding, #4153): that step had no progress.log and, on a duplicate
+        # `meson-testlog-coverage` name, would have collided with this one and failed
+        # on every red run - deleted rather than kept alongside this one. `|| cancelled()`:
+        # see the same line's comment on the asan leg - a stall here rides the JOB's own
+        # timeout, reported as CANCELLED not FAILED, which the deleted step never covered.
         if: failure() || cancelled()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -887,17 +889,6 @@ jobs:
       - name: ccache stats
         if: always()
         run: ccache -s
-
-      - name: Upload meson testlog (on failure)
-        if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: meson-testlog-coverage
-          path: |
-            build-linux-coverage/meson-logs/testlog.txt
-            build-linux-coverage/meson-logs/testlog.junit.xml
-          retention-days: 14
-          if-no-files-found: warn
 
   # ── Alert on nightly failure ───────────────────────────────────────────
   # Opens or comments on the `nightly-broken` issue if any of the four

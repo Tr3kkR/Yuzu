@@ -1401,11 +1401,16 @@ narrow `IJournalStore` interface (`kv_store.hpp`, implemented by `KvStore`) so
 double instead of a real on-disk `KvStore`. Two of the three `[tsan-heavy]` cases this row's
 own text names - `"concurrent pagers + a drainer do not race (TSan checkpoint)"` and QE-1
 `"concurrent persist + page + prune + drain do not race (TSan checkpoint, QE-1)"` - are
-rewritten against that fake, with fixed per-thread iteration counts (`std::jthread`, blocking
-`std::latch`/`std::atomic::wait` handshakes) replacing the unbounded `while(!stop)` worker
-loops whose termination depended on the main thread winning lock races against contended real
-SQLite access - the mechanism row 9's own text and #2373/#2345/#4018 document as the cause of
-the CI stalls. One worker per test remains a poll loop rather than a fixed iteration count -
+rewritten against that fake, with fixed per-thread iteration counts (a portable jthread-alike
+- Apple Clang's libc++ lacks `std::jthread`/`std::stop_token`, so the tests use a hand-rolled
+RAII thread + shared atomic-flag pair with the same join/cancel-on-unwind contract - and
+`std::latch`-gated handshakes, plus bounded/stop-token-aware POLLING waits, not blocking
+`std::atomic::wait`: an earlier attempt at a blocking wait/notify bridge was tried and
+reverted, since `std::atomic<T>::wait(old)` re-blocks on a notify that doesn't change the
+value) replacing the unbounded `while(!stop)` worker loops whose termination depended on the
+main thread winning lock races against contended real SQLite access - the mechanism row 9's
+own text and #2373/#2345/#4018 document as the cause of the CI stalls. One worker per test
+remains a poll loop rather than a fixed iteration count -
 the drainer loops `while (!<producers-done latch>.try_wait())` calling a bounded drain per
 pass - because draining WHILE paging/pruning/persisting proceed is the concurrency property
 these two tests are named for; a drainer that blocked until the latch released would remove
