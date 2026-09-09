@@ -905,8 +905,10 @@ public:
             sweep_hook_.reset();
         if (c.probe_lane_cap)
             probe_lane_.set_cap_for_test(c.probe_lane_cap);
-        if (c.drain_lane_cap)
+        if (c.drain_lane_cap) {
             drain_lane_.set_cap_for_test(c.drain_lane_cap);
+            drain_lane_cap_.store(c.drain_lane_cap, std::memory_order_relaxed);
+        }
         if (c.retiring_cap)
             retiring_cap_.store(c.retiring_cap, std::memory_order_relaxed);
         if (c.caller_wait_budget.count() > 0)
@@ -1270,7 +1272,7 @@ private:
         work.old_keys.reserve(cap);
         work.dead_results.reserve(cap);
         work.stale_calls.reserve(cap + kDrainLaneCap);
-        work.drain_launches.reserve(kDrainLaneCap);
+        work.drain_launches.reserve(drain_lane_cap_.load(std::memory_order_relaxed));
         if (sweep_hook_ && *sweep_hook_)
             (*sweep_hook_)(); // test seam: a throw here models an allocation failure
 
@@ -1286,10 +1288,14 @@ private:
             }
         }
         if (lost_head_ && Clock::now() >= drain_retry_at_) {
+            // Batch size is the lane's OWN cap (overridable for tests), never the
+            // compile-time constant: relaunching more than the lane can actually
+            // admit wastes a launch()/reject()/re-park round trip per excess item.
+            const std::size_t lane_cap = drain_lane_cap_.load(std::memory_order_relaxed);
             // Tracking capacity BEFORE unlinking: a throw here leaves the list intact.
-            if (drains_in_flight_.size() + kDrainLaneCap > drains_in_flight_.capacity())
-                drains_in_flight_.reserve(drains_in_flight_.size() + 2 * kDrainLaneCap);
-            while (lost_head_ && work.drain_launches.size() < kDrainLaneCap) {
+            if (drains_in_flight_.size() + lane_cap > drains_in_flight_.capacity())
+                drains_in_flight_.reserve(drains_in_flight_.size() + 2 * lane_cap);
+            while (lost_head_ && work.drain_launches.size() < lane_cap) {
                 RegWatch* w = lost_head_;
                 lost_head_ = w->lost_next;
                 w->lost_next = nullptr;
@@ -1702,6 +1708,7 @@ private:
     std::size_t lost_count_{0};
     unsigned drain_refusals_{0}; ///< consecutive refusals; drives the relaunch backoff
     Clock::time_point drain_retry_at_{};
+    std::atomic<std::size_t> drain_lane_cap_{kDrainLaneCap}; ///< mirrors drain_lane_'s cap (test-overridable)
     std::size_t retiring_count_{0};
     /// Mechanism-global (never per-watch, so a stale pointer cannot alias a fresh
     /// watch): bumped at every probe reservation and every retirement.
