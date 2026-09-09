@@ -228,7 +228,15 @@ bool apply_source_enabled_transition(TarDatabase& db, std::string_view source,
     // pause. Placed after the flag write above (mirrors every other leg here)
     // so a re-baseline never runs while the config still reads disabled.
     if (source == "usage" && new_value == "true" && prev_canon != "true") {
-        yuzu::tar::usage::usage_rebaseline(db, now_epoch);
+        // A failure here is not fatal on this edge: run_usage_fold() itself
+        // (tar_usage.cpp, Blocker 3 fix) checks usage_coverage_since on
+        // every fast tick and retries the rebaseline there, so this
+        // enable-edge attempt does not need its own retry loop.
+        if (auto rb = yuzu::tar::usage::usage_rebaseline(db, now_epoch); !rb.has_value()) {
+            spdlog::warn("TAR: usage rebaseline on enable failed ({}); the fast-tick fold will "
+                        "retry it",
+                        rb.error());
+        }
     }
     return true;
 }
@@ -851,6 +859,33 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
                                              "ORDER BY {} ASC, id ASC LIMIT {})",
                                              table_name, table_name, ts_col, cutoff, ts_col,
                                              kMaxTarDeletesPerTablePerPass)});
+
+            // usage_daily_user (Wave 7 PR7.2 adversarial review, Blocker 2)
+            // carries no tier of its own in the schema registry -- its shape
+            // (PRIMARY KEY(day_ts, exe_key, user), no `id` column; see
+            // tar_db.cpp's v6 migration) does not fit the generic per-tier
+            // layout every registered warehouse table above shares, so it
+            // cannot reuse the id-keyed DELETE just queued or receive its
+            // own independent clock-guard verdict from this loop. Its
+            // retention window is documented (tar_usage.cpp) to MIRROR
+            // usage_daily's own window byte-for-byte, so rather than
+            // re-derive a second, divergence-prone Facts/classify verdict
+            // for it, it is queued in the SAME transaction under
+            // usage_daily's ALREADY-ACCEPTED verdict computed just above:
+            // whatever usage_daily's guard just decided (decline, accept,
+            // capped) is what usage_daily_user gets too -- this whole block
+            // is unreachable when that verdict declined (the guard `continue`s
+            // above before reaching here). Deliberate ADOPTION-by-inheritance
+            // of the guarded shape, not a second implementation -- see
+            // docs/clock-guarded-retention.md's usage_daily_user entry.
+            if (src.name == "usage" && g.suffix == "daily") {
+                plans.push_back(Plan{
+                    "usage_daily_user",
+                    std::format("DELETE FROM usage_daily_user WHERE (day_ts, exe_key, user) IN ("
+                                "SELECT day_ts, exe_key, user FROM usage_daily_user "
+                                "WHERE day_ts < {} ORDER BY day_ts ASC LIMIT {})",
+                                cutoff, kMaxTarDeletesPerTablePerPass)});
+            }
         }
     }
 

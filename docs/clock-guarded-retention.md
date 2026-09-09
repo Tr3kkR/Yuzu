@@ -177,6 +177,30 @@ of already-consumed mappings is an acceptable worst case.
 Satisfies parts **1/3/4/5 ONLY** — its reading is in-process and deliberately NOT persisted, so **do
 not copy it for part (2)**.
 
+### `usage_daily_user` (TAR agent warehouse, Wave 7 PR7.2)
+
+**ADOPTS by INHERITANCE, not by a second implementation.** This table (the `usage` derived fold's
+per-day/per-executable username membership, `tar_usage.cpp`) has no tier of its own in the schema
+registry — its shape is `PRIMARY KEY(day_ts, exe_key, user)` with no `id` column, which does not fit
+the generic per-tier layout `tar_aggregator.cpp::run_retention`'s registry walk assumes for every
+other warehouse table. Rather than hand-write a second, divergence-prone `Facts`/`classify` verdict
+for it, `run_retention` queues its capped delete in the SAME transaction as `usage_daily`'s —
+immediately after `usage_daily`'s own guarded verdict is computed and ACCEPTED (decline, big-step,
+no-anchor, and the cap-will-bind bookkeeping all apply to `usage_daily_user` exactly as they applied
+to `usage_daily`, because they are the same computation; the block is unreachable when that verdict
+declines). This is deliberate: `usage_daily_user`'s retention window is documented (`tar_usage.cpp`)
+to MIRROR `usage_daily`'s own window byte-for-byte, so the two tables sharing one verdict is a
+correctness property, not a shortcut — a second independent verdict computed from the same inputs
+could only ever agree with or drift from the first, never usefully differ. All seven parts are
+satisfied THROUGH `usage_daily`'s own compliance (this file's "Reference implementations" section);
+none is re-derived here. SINGLE-WRITER: same agent-side SQLite connection as every other TAR table,
+serialised under `execute_atomic_batch`'s held `mu_`.
+
+`tar.purge_source usage` additionally purges `usage_daily_user` explicitly in `TarDatabase::
+purge_source` (`tar_db.cpp`), in the SAME transaction as the source's registered tiers — the
+granularity walk that function otherwise uses cannot reach a table with no registry entry, and
+without this the erasure path would silently leave every username behind.
+
 ## Reference implementations
 
 **Decision rule:** `common/include/yuzu/audit_retention_rules.hpp::classify` (extracted to a shared

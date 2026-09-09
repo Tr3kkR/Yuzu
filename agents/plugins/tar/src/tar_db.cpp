@@ -1454,6 +1454,26 @@ std::expected<int, std::string> TarDatabase::purge_source(const std::string& sou
         total += sqlite3_changes(db_);
     }
 
+    // usage_daily_user (Wave 7 PR7.2 adversarial review, Blocker 2) has no
+    // tier of its own in the schema registry -- its shape (PRIMARY
+    // KEY(day_ts, exe_key, user), no `id` column; see this file's v6
+    // migration) does not fit the generic per-tier layout the loop above
+    // walks, so the granularity walk above never reaches it and an operator-
+    // initiated tar.purge_source usage would otherwise leave every username
+    // behind (docs/tar-dashboard.md §3.4's purge promise). Purge it here, in
+    // the SAME transaction as the registered "usage" tiers above, so it
+    // erases atomically with everything else.
+    if (source == "usage") {
+        if (sqlite3_exec(db_, "DELETE FROM usage_daily_user", nullptr, nullptr, &err_msg) !=
+            SQLITE_OK) {
+            std::string e = err_msg ? err_msg : "unknown";
+            sqlite3_free(err_msg);
+            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+            return std::unexpected("purge failed on usage_daily_user: " + e);
+        }
+        total += sqlite3_changes(db_);
+    }
+
     if (sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &err_msg) != SQLITE_OK) {
         std::string e = err_msg ? err_msg : "unknown";
         sqlite3_free(err_msg);
