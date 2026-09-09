@@ -959,10 +959,21 @@ inline bool is_comment_or_blank_or_assignment(std::string_view line) {
     std::size_t nb = line.find_first_not_of(" \t");
     if (nb == std::string_view::npos) return true;
     if (line[nb] == '#') return true;
-    // VAR=VALUE: an identifier followed by '=' before any whitespace.
-    std::size_t sp = line.find_first_of(" \t", nb);
-    std::string_view first = sp == std::string_view::npos ? line.substr(nb) : line.substr(nb, sp - nb);
-    return first.find('=') != std::string_view::npos;
+    // VAR = VALUE (crontab(5) environment-variable assignment): an
+    // identifier ([A-Za-z_][A-Za-z0-9_]*), optional surrounding
+    // whitespace, then '='. crontab(5) permits whitespace on either side
+    // of the '=' -- "MAILTO=root", "MAILTO = root", "MAILTO= root", and
+    // "MAILTO =root" are ALL valid assignments and must be skipped here,
+    // never misparsed as a malformed cron command line just because the
+    // no-space form was the only one this used to recognize.
+    std::size_t p = nb;
+    if (!(std::isalpha(static_cast<unsigned char>(line[p])) != 0 || line[p] == '_')) return false;
+    ++p;
+    while (p < line.size() &&
+          (std::isalnum(static_cast<unsigned char>(line[p])) != 0 || line[p] == '_'))
+        ++p;
+    while (p < line.size() && (line[p] == ' ' || line[p] == '\t')) ++p;
+    return p < line.size() && line[p] == '=';
 }
 
 // crontab(5) nickname shortcuts -- each replaces the 5 schedule fields with

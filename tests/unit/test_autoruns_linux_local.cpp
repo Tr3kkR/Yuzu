@@ -1198,6 +1198,39 @@ TEST_CASE("autoruns Linux leg: scan_cron_d wires a rejected crontab line into a 
     CHECK(scan.reason.find("malformed") != std::string::npos);
 }
 
+TEST_CASE("autoruns Linux leg: scan_cron_d does NOT flag a crontab as malformed "
+          "for spaced environment-variable assignments end to end "
+          "(RECONSTRUCTION: pins the adversarial-review should-fix -- "
+          "'MAILTO = root' (and the other spaced variants) used to be misparsed "
+          "as a malformed cron command, wiring a constrained|...|malformed "
+          "status onto an otherwise entirely valid crontab file via this exact "
+          "collector)",
+          "[autoruns][actions][linux]") {
+    using yuzu::autoruns::scan_cron_d;
+    using yuzu::autoruns::SourceId;
+
+    yuzu::test::TempDir dir("yuzu_test_autoruns_crond_spaced_assign_");
+    std::error_code ec;
+    std::filesystem::create_directories(dir.path, ec);
+    REQUIRE_FALSE(ec);
+
+    {
+        std::ofstream f(dir.path / "myjob");
+        f << "MAILTO = root\n";       // spaces both sides
+        f << "PATH= /usr/bin:/bin\n"; // space after '=' only
+        f << "HOME =/root\n";         // space before '=' only
+        f << "SHELL=/bin/sh\n";       // tight form -- no regression
+        f << "*/5 * * * * root /usr/bin/true\n"; // one real, valid entry
+    }
+
+    auto scan = scan_cron_d(dir.path.string(), SourceId::lnx_cron_d);
+
+    REQUIRE(scan.rows.size() == 1);
+    CHECK(scan.rows[0].target == "/usr/bin/true");
+    CHECK(scan.support == YUZU_SUPPORT_SUPPORTED);
+    CHECK(scan.reason.find("malformed") == std::string::npos);
+}
+
 TEST_CASE("autoruns Linux leg: scan_xdg_autostart_user distinguishes a real "
           "(non-ENOENT) home-root open failure from genuine confirmed absence "
           "(RECONSTRUCTION: pins PR #4154 round 9's sharpest blocker -- this "

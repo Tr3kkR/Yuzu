@@ -861,6 +861,67 @@ TEST_CASE("autoruns: parse_crontab rejects a nickname line missing its command",
     CHECK(result.rejected_lines == 1);
 }
 
+TEST_CASE("autoruns: parse_crontab recognizes a spaced environment-variable "
+          "assignment (crontab(5) permits whitespace on either side of '=') "
+          "(RECONSTRUCTION: pins the adversarial-review should-fix -- the "
+          "recognizer previously only matched the tight NAME=value form, so "
+          "'MAILTO = root' was misparsed as a malformed cron command line and "
+          "counted into rejected_lines on an otherwise entirely valid crontab)",
+          "[autoruns][parsers]") {
+    SECTION("spaces on both sides of '='") {
+        const auto result = parse_crontab("MAILTO = root\n", /*system_format=*/true);
+        CHECK(result.entries.empty());
+        CHECK(result.rejected_lines == 0);
+    }
+
+    SECTION("space only after '='") {
+        const auto result = parse_crontab("MAILTO= root\n", /*system_format=*/true);
+        CHECK(result.entries.empty());
+        CHECK(result.rejected_lines == 0);
+    }
+
+    SECTION("space only before '='") {
+        const auto result = parse_crontab("MAILTO =root\n", /*system_format=*/true);
+        CHECK(result.entries.empty());
+        CHECK(result.rejected_lines == 0);
+    }
+
+    SECTION("no space either side -- still valid, no regression") {
+        const auto result = parse_crontab("MAILTO=root\n", /*system_format=*/true);
+        CHECK(result.entries.empty());
+        CHECK(result.rejected_lines == 0);
+    }
+}
+
+TEST_CASE("autoruns: parse_crontab treats every spaced-assignment variant "
+          "identically to the tight form across a whole file, alongside real "
+          "cron entries, with zero rejected lines",
+          "[autoruns][parsers]") {
+    const std::string text =
+        "SHELL=/bin/sh\n"
+        "MAILTO = root\n"
+        "PATH= /usr/bin:/bin\n"
+        "HOME =/root\n"
+        "17 *\t* * *\troot\tcd / && run-parts --report /etc/cron.hourly\n"
+        "25 6\t* * *\troot\ttest -x /usr/sbin/anacron\n";
+    const auto result = parse_crontab(text, /*system_format=*/true);
+    REQUIRE(result.entries.size() == 2);
+    CHECK(result.entries[0].command.rfind("cd / &&", 0) == 0);
+    CHECK(result.entries[1].command.rfind("test -x", 0) == 0);
+    CHECK(result.rejected_lines == 0);
+}
+
+TEST_CASE("autoruns: parse_crontab still rejects a bare identifier with no "
+          "'=' anywhere on the line, spaced assignment recognition does not "
+          "loosen this into a false positive",
+          "[autoruns][parsers]") {
+    // A lone token with no '=' at all is neither a valid assignment nor a
+    // well-formed cron line -- must still be counted as rejected.
+    const auto result = parse_crontab("MAILTO\n", /*system_format=*/true);
+    CHECK(result.entries.empty());
+    CHECK(result.rejected_lines == 1);
+}
+
 // ── 10. parse_anacrontab ──────────────────────────────────────────────────
 
 TEST_CASE("autoruns: parse_anacrontab parses period/delay/job/command "
