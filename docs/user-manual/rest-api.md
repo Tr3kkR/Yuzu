@@ -3959,12 +3959,19 @@ the store's unfiltered fleet-wide aggregate. MCP twin: `get_policy_agent_statuse
 }
 ```
 
-**Audit:** `compliance.agent_statuses.view` — set-and-proceed (not
-fail-closed): compliance/policy status is not per-device behavioural PII the
-way DEX/device-live data is, but the per-agent list does name `agent_id`s
-fleet-wide, so this route records a proportionate trail (`Sec-Audit-Failed:
-true` on a persist miss, never a 503) rather than staying silent like the
-five sibling routes above it.
+**Audit:** `compliance.agent_statuses.view` — **fail-closed** (`503` +
+`Sec-Audit-Failed: true`, never a `2xx` on an audit-persist miss), matching
+this API's general behavioural-PII posture (see [`Sec-Audit-Failed` and the
+behavioural-PII audit posture](#sec-audit-failed-and-the-behavioural-pii-audit-posture)
+above). Unlike the five sibling routes above it, this route's `check_result`
+field carries the raw, unrestricted output of whatever instruction the
+bound fragment's `check_instruction` names — free-form and
+operator-authored at fragment-creation time, not a fixed machine-scope
+shape — so it cannot make the same "not behavioural PII" claim
+`GET /api/v1/inventory/software` genuinely can. The MCP twin
+(`get_policy_agent_statuses`) is unaffected: it follows MCP's own
+convention of surfacing the same gap via an `audit_persisted:false` body
+field rather than a header/status code.
 
 ---
 

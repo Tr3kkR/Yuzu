@@ -598,7 +598,7 @@ static const ToolDef kTools[] = {
      "confined caller's summary counts only its own visible agents, never the fleet-wide "
      "total. REST v1 twin: GET /api/v1/compliance/{id} (same shape).",
      R"({"type":"object","properties":{"policy_id":{"type":"string","minLength":1,"description":"Policy ID"}},"required":["policy_id"]})",
-     R"j({"type":"object","properties":{"policy_id":{"type":"string"},"summary":{"type":"object","properties":{"compliant":{"type":"integer"},"non_compliant":{"type":"integer"},"unknown":{"type":"integer"},"fixing":{"type":"integer"},"error":{"type":"integer"},"total":{"type":"integer"}}},"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"status":{"type":"string"},"last_check_at":{"type":"integer"},"last_fix_at":{"type":"integer"},"check_result":{"type":"string"}},"required":["agent_id","status"]}}},"required":["policy_id","summary","agents"]})j"},
+     R"j({"type":"object","properties":{"policy_id":{"type":"string"},"summary":{"type":"object","properties":{"compliant":{"type":"integer"},"non_compliant":{"type":"integer"},"unknown":{"type":"integer"},"fixing":{"type":"integer"},"error":{"type":"integer"},"total":{"type":"integer"}}},"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"status":{"type":"string"},"last_check_at":{"type":"integer"},"last_fix_at":{"type":"integer"},"check_result":{"type":"string"}},"required":["agent_id","status"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["policy_id","summary","agents"]})j"},
 
     {"list_management_groups", "List management groups (hierarchical device grouping).",
      R"({"type":"object","properties":{}})",
@@ -7416,10 +7416,17 @@ McpServer::HandlerFn McpServer::build_handler(
                 JArr arr;
                 for (const auto& s : confined.visible)
                     arr.add_raw(policy_agent_status_json(s).dump());
-                // Same "not behavioural PII, but names agent_ids fleet-wide"
-                // proportionate audit posture as the REST twin — set-and-
-                // proceed (audit_persisted:false on failure), never a 503;
-                // reuses the REST route's own domain verb (recipe §4).
+                // Set-and-proceed (audit_persisted:false on failure), never
+                // a 503 — this is the MCP-specific convention for surfacing
+                // an audit-persist gap (rest_audit.hpp: "MCP wraps the
+                // kernel itself and surfaces the gap through its own body
+                // field"), NOT the REST twin's posture: GET
+                // /api/v1/compliance/{id} was reclassified to fail-closed
+                // (503) because check_result can carry raw, unrestricted
+                // agent-instruction output — see that route's own comment
+                // (compliance_routes.cpp) for why "not behavioural PII"
+                // does NOT hold for this data. Reuses the REST route's own
+                // domain verb (recipe §4).
                 const bool audit_ok = yuzu::server::detail::try_persist_audit(
                     audit_fn, req, "compliance.agent_statuses.view", "success", "Policy",
                     policy_id, "agents=" + std::to_string(confined.visible.size()));
