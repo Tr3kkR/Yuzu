@@ -355,6 +355,77 @@ TEST_CASE("autoruns Linux leg: read_file_bounded/classify_read_error distinguish
     }
 }
 
+TEST_CASE("autoruns Linux leg: read_file_bounded's optional out_st out-parameter "
+          "carries the SAME fstat() metadata the read itself already verified "
+          "(RECONSTRUCTION: pins the /etc/rc.local BLOCKER fix -- the eligibility "
+          "check used to redo a second, separately racy path-based ::stat() after "
+          "a successful read, which folded a genuine acquisition failure -- EIO "
+          "from a real filesystem fault, not just a raced-removal ENOENT -- into "
+          "the exact same confident not_executable status as an ordinary "
+          "non-executable file. Threading the descriptor-based fstat() the "
+          "function already performs internally out to the caller removes the "
+          "second lookup entirely, so there is no longer a distinct stat-failure "
+          "branch to misclassify. These cases confirm the refactor is "
+          "behavior-preserving for the success path: an executable file's mode "
+          "bits are visible via out_st exactly as they would have been via a "
+          "second stat() call, and likewise for a non-executable one)",
+          "[autoruns][actions][linux]") {
+    namespace fsx = std::filesystem;
+    yuzu::test::TempDir tmp("yuzu_test_autoruns_outst_");
+    fsx::create_directories(tmp.path);
+    const fsx::path& dir = tmp.path;
+    std::error_code ec;
+
+    SECTION("out_st is populated on a successful read, matching the file's real size") {
+        fsx::path f = dir / "plain.txt";
+        { std::ofstream(f) << "hello world\n"; }
+
+        struct stat st{};
+        auto result = yuzu::autoruns::read_file_bounded(f.string(), yuzu::autoruns::kDefaultMaxReadBytes, &st);
+        REQUIRE(result.has_value());
+        CHECK(static_cast<std::size_t>(st.st_size) == result->size());
+    }
+
+    SECTION("an executable rc.local-shaped file: out_st's mode bits make "
+            "is_root_executable(st) true directly, no second stat() needed") {
+        fsx::path f = dir / "rc.local";
+        { std::ofstream(f) << "#!/bin/sh\nexit 0\n"; }
+        fsx::permissions(f, fsx::perms::owner_all, ec);
+        REQUIRE_FALSE(ec);
+
+        struct stat st{};
+        auto result = yuzu::autoruns::read_file_bounded(f.string(), yuzu::autoruns::kDefaultMaxReadBytes, &st);
+        REQUIRE(result.has_value());
+        CHECK(yuzu::autoruns::is_root_executable(st));
+    }
+
+    SECTION("a non-executable (0644) rc.local-shaped file: out_st's mode bits "
+            "correctly evaluate not_executable via the same metadata path") {
+        fsx::path f = dir / "rc.local";
+        { std::ofstream(f) << "#!/bin/sh\nexit 0\n"; }
+        fsx::permissions(f,
+                         fsx::perms::owner_read | fsx::perms::owner_write |
+                             fsx::perms::group_read | fsx::perms::others_read,
+                         ec);
+        REQUIRE_FALSE(ec);
+
+        struct stat st{};
+        auto result = yuzu::autoruns::read_file_bounded(f.string(), yuzu::autoruns::kDefaultMaxReadBytes, &st);
+        REQUIRE(result.has_value());
+        CHECK_FALSE(yuzu::autoruns::is_root_executable(st));
+    }
+
+    SECTION("out_st defaults to nullptr and is safely skipped -- every other "
+            "call site's unchanged two-argument call form still compiles and reads") {
+        fsx::path f = dir / "no_out_param.txt";
+        { std::ofstream(f) << "unaffected call sites\n"; }
+
+        auto result = yuzu::autoruns::read_file_bounded(f.string());
+        REQUIRE(result.has_value());
+        CHECK(*result == "unaffected call sites\n");
+    }
+}
+
 TEST_CASE("autoruns Linux leg: list_dir reports truncated for exactly one real entry "
           "beyond the cap (RECONSTRUCTION: pins the fix for an adversarial-review "
           "falsifier -- an earlier version discarded the over-cap entry itself while "

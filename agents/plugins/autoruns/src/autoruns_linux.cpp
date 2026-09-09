@@ -113,7 +113,8 @@ struct ReadError {
 /// returns an empty success for a failed acquisition -- every failure path
 /// below is a std::unexpected.
 std::expected<std::string, ReadError> read_file_bounded(const std::string& path,
-                                                         std::size_t max_bytes = kDefaultMaxReadBytes) {
+                                                         std::size_t max_bytes = kDefaultMaxReadBytes,
+                                                         struct stat* out_st = nullptr) {
     int fd = ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) {
         return std::unexpected(ReadError{errno_token_for(errno)});
@@ -148,6 +149,7 @@ std::expected<std::string, ReadError> read_file_bounded(const std::string& path,
         total += static_cast<std::size_t>(n);
     }
     buf.resize(total);
+    if (out_st != nullptr) *out_st = st;
     return buf;
 }
 
@@ -1487,18 +1489,20 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                                               std::nullopt, "filtered"));
     } else {
         const SourceId id = SourceId::lnx_rc_local;
-        auto content = read_file_bounded("/etc/rc.local");
+        struct stat st{};
+        auto content = read_file_bounded("/etc/rc.local", kDefaultMaxReadBytes, &st);
         if (!content) {
             auto cls = classify_read_error(content.error(), /*required_by_catalog=*/false);
             ctx.write_output(format_source_status(id, cls.support, std::size_t{0}, cls.reason));
         } else {
-            struct stat st{};
             // is_root_executable, not access(X_OK): init runs this as root,
             // not as this agent's own unprivileged account -- see the
-            // predicate's banner. A stat() failure here (e.g. a raced
-            // removal between the read above and this call) falls into the
-            // same not_executable bucket access() failing here always did.
-            if (::stat("/etc/rc.local", &st) != 0 || !is_root_executable(st)) {
+            // predicate's banner. `st` is the metadata read_file_bounded
+            // already fetched via fstat() on the same open descriptor that
+            // produced `content` -- no second, separately racy path-based
+            // stat() call, so there is no "stat failure" branch to handle
+            // here: the read already succeeded against this exact metadata.
+            if (!is_root_executable(st)) {
                 ctx.write_output(format_source_status(id, YUZU_SUPPORT_SUPPORTED, std::size_t{0},
                                                       "not_executable"));
             } else {
