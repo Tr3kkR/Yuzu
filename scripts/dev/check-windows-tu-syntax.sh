@@ -54,6 +54,7 @@ SHIM
 tus=(
     agents/plugins/disk_actions/src/disk_actions_win.cpp
     agents/plugins/power_health/src/power_health_plugin.cpp
+    agents/plugins/autoruns/src/autoruns_win.cpp
     agents/plugins/tar/src/tar_removable_collector.cpp
 )
 [ "$#" -gt 0 ] && tus+=("$@")
@@ -92,7 +93,7 @@ for tu in "${tus[@]}"; do
     fi
     if "$CXX" -std=c++23 -fsyntax-only -fno-elide-constructors \
         -DWIN32_LEAN_AND_MEAN -DNOMINMAX \
-        -I "$shim" -I "$src_dir" -I agents/shared -I sdk/include -I agents/core/include \
+        -I "$shim" -I "$src_dir" -I agents/shared -I agents/core/include -I sdk/include \
         "${extra_inc[@]}" "$tu" 2>"$shim/err.log"; then
         echo "  ok    $tu"
     else
