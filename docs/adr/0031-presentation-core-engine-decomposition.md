@@ -340,9 +340,12 @@ rule it replaces.
 > `<recv>.<Verb>("/path", …)` registrations, and there are **three** cases, not one: (1) a literal verb
 > call is checked and fails the build on a gap; (2) a non-literal **direct** verb call
 > (`<recv>.<Verb>(runtime_expr, …)`) emits a CI `::warning::` and exits 0 — a loud escape; (3) a
-> registration reached through a **helper** whose call site carries no `<recv>.<Verb>(` token, or defined
-> **in a header** (e.g. an `HttpRouteSink`-style wrapper), is **invisible — no warning, no failure**, a
-> SILENT escape. So the escape is not always loud. The type-aware (clang-based) successor that closes all
+> registration reached through a **helper** whose call site carries no `<recv>.<Verb>(` token (e.g. a
+> `register_*(sink, "/path", …)` helper whose body makes the verb call), or defined **in a header**, is
+> **invisible to the lexical gate — no warning, no failure**, a SILENT escape (the in-process
+> `test_openapi_spec_completeness.cpp` backstops only the unconditional subset of
+> `RestApiV1::register_routes`, not the `*_routes.cpp` mounts). So the escape is not always loud. The
+> type-aware (clang-based) successor that closes all
 > three indirection gaps is tracked at **#2572**. Today's tree is verified drift-zero, so this invariant is
 > now enforced by a lexical test for literal registrations — stronger than review alone but short of
 > INV-31-4's full "every registered route," and not a compensating control against a silent (3) escape.
