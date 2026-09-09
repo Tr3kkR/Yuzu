@@ -256,5 +256,5 @@ source|win_startup_folder_common|unsupported|-|declared
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_autoruns.hpp`
 - Tests: `tests/unit/test_autoruns_linux_local.cpp` · `tests/unit/test_autoruns_local_dispatcher.cpp` · `tests/unit/test_autoruns_macos_local.cpp` · `tests/unit/test_autoruns_parsers.cpp` · `tests/unit/test_autoruns_win_local.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/4154-autoruns-libxml2-rootcause.fixed.md` · `changelog.d/7.1-autoruns.added.md`
+- Changelog: `changelog.d/20260909-autoruns-plugin.added.md`
 <!-- END GENERATED -->
