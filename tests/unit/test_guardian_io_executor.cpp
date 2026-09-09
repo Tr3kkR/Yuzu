@@ -719,14 +719,21 @@ struct Completion {
     std::atomic<int> error{-1};
     std::atomic<bool> on_test_thread{true}; // default true so a missed write fails loudly
     std::thread::id test_thread{std::this_thread::get_id()};
+    // governance qe-1 (policy floor: a flaky test leg introduced by this change):
+    // `calls` is the terminal atomic every case polls on, so the result fields MUST
+    // be published BEFORE it. The original order (++calls first) let a poller observe
+    // calls==1 and read value==-1 under --order rand (seed 1, :979 `-1 == 4`,
+    // reproduced on the TSan binary). The release increment pairs with the pollers'
+    // (seq_cst, hence acquire) loads of `calls`, so every field written above it is
+    // visible once calls reads 1.
     void record(IoResult<int>&& r) {
-        ++calls;
         had_value.store(r.has_value());
         if (r)
             value.store(*r);
         else
             error.store(static_cast<int>(r.error()));
         on_test_thread.store(std::this_thread::get_id() == test_thread);
+        calls.fetch_add(1, std::memory_order_release); // publish LAST
     }
 };
 } // namespace
