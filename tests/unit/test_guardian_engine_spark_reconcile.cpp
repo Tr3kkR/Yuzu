@@ -2600,16 +2600,21 @@ TEST_CASE("test helper: wait_until_quiescent returns false while another thread 
     // has it (loops on its own stop_token: a jthread destructor calls request_stop() and
     // would never set a hand-rolled release flag, so looping on such a flag would hang the
     // unwind path); a scope-exit join guard over std::thread on any toolchain that does not
-    // define __cpp_lib_jthread. NOT every shipped toolchain defines it - Apple Clang 15's
-    // libc++ (the macOS floor, docs/darwin-compat.md) does not - the fallback exists for
-    // exactly that case (the #2580 lesson: an untested portability arm bit on Apple Clang).
+    // define __cpp_lib_jthread. __cpp_lib_jthread is not guaranteed across every C++23
+    // toolchain this project's own Prerequisites list (CLAUDE.md: "GCC 13+, Clang 18+,
+    // MSVC 19.38+, or Apple Clang 15+") - the fallback exists to stay safe across that
+    // stated floor, not because a specific currently-tested compiler is known to lack the
+    // macro (governance pass-7 xp-401/xp-402: no in-tree doc states an Apple Clang
+    // compiler-version floor, and this project's macOS runner is not established to lack
+    // it either - do not cite a specific toolchain here without verifying against the
+    // actual runner/toolchain-manifest first).
     // NOTE (governance pass-6 xp-201/dw-304): no CI leg compiles the fallback arm today for a
     // STRUCTURAL reason, not toolchain ubiquity - this whole test is `#ifndef _WIN32` (Windows
     // excluded above) and returns via SUCCEED() before reaching this #if on any non-Linux
     // platform (see the `#if !defined(__linux__)` branch just above), so only Linux ever
     // reaches this selection, and every Linux CI leg builds against libstdc++, which does
-    // define __cpp_lib_jthread. A macOS leg would be the first to actually compile the
-    // fallback arm; treat it as review-only code and keep it trivially simple regardless.
+    // define __cpp_lib_jthread. Treat this fallback as review-only code (no CI leg compiles
+    // it today) and keep it trivially simple regardless.
 #if defined(__cpp_lib_jthread)
     std::jthread t([](std::stop_token st) {
         while (!st.stop_requested())
