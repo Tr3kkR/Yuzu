@@ -609,6 +609,12 @@ PolicyEvaluator::remediate(const std::string& policy_id,
     if (!claim_result) {
         out.error = "policy store degraded — could not claim remediation targets";
         out.degraded = true;
+        if (d_.metrics)
+            // Distinct from dispatch_due's "claim" phase (line ~415, the leader-driven
+            // claim_due_policies degrade): this is the operator-synchronous remediation
+            // claim, a different failure site — keep them separately countable.
+            d_.metrics->counter("yuzu_server_policy_eval_errors_total", {{"phase", "remediate_claim"}})
+                .increment();
         return out;
     }
     const std::vector<std::string>& claimed = *claim_result;

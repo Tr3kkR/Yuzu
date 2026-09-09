@@ -1422,6 +1422,27 @@ TEST_CASE("claim_remediation claims a fresh target with no pre-existing policy_s
     CHECK((*s)->status == "unknown");
 }
 
+TEST_CASE("claim_remediation dedups a duplicate agent id in the input list",
+          "[policy_store][pg][claim]") {
+    // Regression test: a caller-supplied duplicate agent id used to make the
+    // INSERT...SELECT...ON CONFLICT DO UPDATE raise cardinality_violation
+    // (21000) -- "ON CONFLICT DO UPDATE command cannot affect row a second
+    // time" -- and fail the whole claim (fixed via SELECT DISTINCT).
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+    auto pol = store.create_policy(make_policy_yaml(frag.value()));
+    REQUIRE(pol.has_value());
+
+    auto claimed = store.claim_remediation(pol.value(), {"agentX", "agentX"}, 1000, 1800);
+    REQUIRE(claimed.has_value());
+    REQUIRE(claimed->size() == 1);
+    CHECK((*claimed)[0] == "agentX");
+}
+
 TEST_CASE("claim_remediation refuses a second concurrent claim of the same target",
           "[policy_store][pg][claim]") {
     YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);

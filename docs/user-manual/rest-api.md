@@ -2962,7 +2962,7 @@ row fails to persist, the response carries a `Sec-Audit-Failed: true` header
 | `bundle.collate` | Live-query bundle collated via `GET /api/v1/bundles/{id}`. `target_type=Execution`, `target_id=<correlation id>`. `result=success` (detail `complete=0\|1`), `result=denied` (`not found or not owned` — the 404 covers both an unknown id and a non-owner, so the audit row is where the real reason is recorded), or `result=failure` (`response store degraded` — a 503, distinct from `denied`: the bundle WAS found and owned, the read just could not be served; retryable, `retry_after_ms:5000`). |
 | `policy_fragment.create` | Policy fragment created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_name` (409, fragment with the same `name` already exists). |
 | `policy.evaluate` | Compliance evaluation forced for a policy via `POST /api/policies/{id}/evaluate`. `result` ∈ {`success`, `error`}. Success detail format `execution_id=<id>`. Note: the `409` rejection (no check instruction / no matching agents) returns without emitting an audit row; the `503` degraded-evaluation case (`policy_evaluator_->evaluate_now` returning an error, e.g. an InstructionStore DB/lease failure per ADR-0058) DOES audit, `result=error` detail `degraded` — matches `policy.remediate`'s own `error`-vs-`denied` convention: an infra degrade is not an operator denial. |
-| `policy.remediate` | Manual remediation triggered via `POST /api/policies/{id}/remediate`. `result` ∈ {`success`, `denied`, `error`}. Success detail `execution_id=<id> agents=<n>`; denied detail carries the reason (e.g. fragment defines no `fix` instruction, no non-compliant agents, a remediation for this policy is already in flight); `error` is a genuine store/evaluator degrade, distinct from `denied`. |
+| `policy.remediate` | Manual remediation triggered via `POST /api/policies/{id}/remediate`. `result` ∈ {`success`, `denied`, `error`}. Success detail `execution_id=<id> agents=<n>` (`agents` = delivered count, see the route doc); denied detail carries the reason (e.g. fragment defines no `fix` instruction, no non-compliant agents, a target is already claimed for remediation, or a target has reached its fix-retry cap for this policy); `error` is a genuine store/evaluator degrade, distinct from `denied`. |
 | `quarantine.enable` | Device quarantined |
 | `quarantine.disable` | Device released from quarantine |
 | `ca.cert.issued` | Internal CA signed a per-agent client certificate at enrollment. `target_type=AgentCertificate`, `target_id=<serial>`, `result=success`. |
@@ -3599,11 +3599,19 @@ is remediated.
 }
 ```
 
+The `agents` field counts targets the fix was actually **dispatched to**
+(delivered). A claimed-but-undelivered target (offline / quarantined / plugin
+absent) releases its claim without consuming a retry attempt and is excluded
+from the count, so `agents` may be smaller than the number of `agent_ids`
+requested.
+
 **Response (404):** policy not found. **Response (409):** the fragment defines no
-`fix` instruction, there are no non-compliant agents to remediate, or a
-remediation for this policy is already in flight (dispatched but not yet past
-its `postCheck` — same-process dedup only, see the ADR-0056 Follow-ups for the
-cross-replica gap).
+`fix` instruction, there are no non-compliant agents to remediate, or a target
+could not be claimed — either it is already claimed for remediation (a durable
+per-`(policy, agent)` claim in `PolicyStore`, safe across replicas, HA WS-3
+3.4) or it has exhausted its fix-retry cap for this policy. The response body
+message is `"remediation already in flight or retry cap reached for this
+policy"`.
 **Response (503):** either the policy evaluator isn't wired ("policy evaluation
 not available"), or a genuine internal store failure occurred while resolving
 the policy or its remediation targets, including (ADR-0058) InstructionStore

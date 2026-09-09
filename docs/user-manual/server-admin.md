@@ -293,6 +293,42 @@ a narrow window, and no data corruption (the row stays durable in Postgres
 and delivers as soon as a 3.3-or-later binary is running and holds
 leadership).
 
+### vNEXT — manual policy remediation is now claimed durably, cross-replica (HA WS-3 3.4; breaking for automation asserting `agents == len(agent_ids)`)
+
+`POST /api/policies/{id}/remediate` now arbitrates its per-target claim
+through a durable per-`(policy, agent)` row in `PolicyStore`
+(`policy_status.remediation_claim_at`), instead of an in-process-only guard.
+This closes the cross-replica gap noted in the ADR-0056 Follow-ups: two
+replicas racing a remediate call for the same policy/agent can no longer both
+dispatch a fix.
+
+**Behaviour changes you will see:**
+
+- **A new 409 cause.** `POST /api/policies/{id}/remediate` can now refuse
+  with `409` and body message `"remediation already in flight or retry cap
+  reached for this policy"` when a target is already claimed for remediation
+  (by this replica or a sibling) or has exhausted its fix-retry cap for this
+  policy — in addition to the existing no-fix-instruction and
+  no-non-compliant-agents 409 causes.
+- **`agents` in the `202` response is now the delivered count, not the
+  attempted count (breaking).** A claimed-but-undelivered target (offline,
+  quarantined, plugin absent) releases its claim without consuming a retry
+  attempt and is excluded from `agents`. Automation asserting `agents ==
+  len(agent_ids)` (or `== number of non-compliant agents` for an omitted
+  `agent_ids`) must be updated to tolerate `agents` being smaller than the
+  number of targets requested.
+
+**Migration note:** schema migration v2 adds
+`policy_status.remediation_claim_at` (`BIGINT NOT NULL DEFAULT 0`). It runs
+automatically on upgrade, is metadata-only, and requires no operator action
+and no downtime.
+
+**Post-restart note:** after a restart, a durable claim left behind by the
+previous process may briefly block re-remediation of the agents it was
+mid-flight for. This self-heals once the claim ages past the staleness
+window (`fixing_stale_seconds`, default 1800s) — the same window
+`claim_due_policies`'s own stranded-`fixing` sweep uses.
+
 ### vNEXT — gateway management plane now pins its peer (#1422, breaking for custom gateway configs)
 
 The gateway's `:50063` command plane requires, on any network-reachable

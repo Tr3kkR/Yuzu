@@ -1409,11 +1409,14 @@ PolicyStore::claim_remediation(const std::string& policy_id,
     // AND the retry cap has not already been hit — mirrors
     // update_agent_status's own kMaxFixAttempts guard so a capped agent
     // cannot be claimed at all, not just refused later at the status write.
+    // DISTINCT: a caller may pass a duplicate agent id; without it the
+    // ON CONFLICT DO UPDATE raises cardinality_violation (21000) and fails
+    // the whole claim.
     const std::string sql =
         "INSERT INTO policy_store.policy_status "
         "(policy_id, agent_id, status, last_check_at, last_fix_at, check_result, "
         " fix_attempt_count, remediation_claim_at) "
-        "SELECT $1, x, 'unknown', 0, 0, '', 0, $3::bigint FROM unnest($2::text[]) AS x "
+        "SELECT DISTINCT $1, x, 'unknown', 0, 0, '', 0, $3::bigint FROM unnest($2::text[]) AS x "
         "ON CONFLICT (policy_id, agent_id) DO UPDATE SET "
         "  remediation_claim_at = EXCLUDED.remediation_claim_at "
         "  WHERE (policy_status.remediation_claim_at = 0 "

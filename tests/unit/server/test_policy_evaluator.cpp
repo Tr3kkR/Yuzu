@@ -613,8 +613,8 @@ TEST_CASE("policy evaluator: two PolicyEvaluator instances sharing one store rem
     CHECK(h.dispatch_calls == calls_before_cap); // refused at claim time — no dispatch
 }
 
-TEST_CASE("policy evaluator: remediate releases the claim (without burning a retry attempt) "
-          "when the fix send fails, and a re-remediate re-claims it",
+TEST_CASE("policy evaluator: remediate releases the claim without burning a retry attempt "
+          "when the fix send fails and re-remediate re-claims it",
           "[pg][policy][evaluator][claim]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};

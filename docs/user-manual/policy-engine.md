@@ -227,7 +227,8 @@ use-after-free guard any shutdown refactor must preserve.
 > is claimed durably before the fix is dispatched, so two replicas cannot independently remediate
 > the same agent. If a target has already exhausted its fix-retry cap for the policy, the
 > remediation request is refused with HTTP 409 and the message "remediation already in flight or
-> retry cap reached for this policy".
+> retry cap reached for this policy". The remediate response's `agents` count reflects **delivered**
+> targets (the fix was actually dispatched to them), not attempted targets.
 
 ### Forcing an immediate evaluation
 
