@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <functional>
 #include <map>
@@ -167,6 +168,11 @@ private:
     // Query service status (platform-specific)
     static std::string query_service_status(const std::string& service_name);
 
+    // Block for up to `dur`, waking immediately if stop() is called instead of
+    // riding out the full duration. Returns true if a stop was observed
+    // (either already stopped, or signalled during the wait).
+    bool wait_or_stopping(std::chrono::milliseconds dur);
+
     // State
     std::vector<TriggerConfig> triggers_;
     mutable std::mutex mu_;
@@ -174,6 +180,11 @@ private:
     std::vector<std::thread> workers_;
     DispatchFn dispatch_;
     size_t max_triggers_ = kDefaultMaxTriggers;
+
+    // Wakes worker loops blocked in wait_or_stopping()/registry_watch_loop()'s
+    // no-op wait as soon as stop() runs.
+    std::mutex stop_mu_;
+    std::condition_variable stop_cv_;
 
     // File watch state: trigger_id -> last known mtime
     std::map<std::string, std::filesystem::file_time_type> file_mtimes_;
