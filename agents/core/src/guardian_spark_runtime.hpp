@@ -618,6 +618,14 @@ public:
     [[nodiscard]] std::uint64_t detach_claim_failures() const noexcept {
         return detach_claim_failures_.load(std::memory_order_relaxed);
     }
+    /// R5.2 (adversarial re-review r3 C2/C3): a claim's index release threw inside
+    /// index_->remove_rule (its key-copy allocation) and was CONTAINED instead of
+    /// crossing a noexcept boundary (the drain, a refill's admission-failure cleanup,
+    /// begin_stop from the destructor); the claim keeps its index ownership for the
+    /// next release to retry. Expected 0. Lock-free.
+    [[nodiscard]] std::uint64_t claim_index_release_failures() const noexcept {
+        return claim_index_release_failures_.load(std::memory_order_relaxed);
+    }
 
     /// Phase 1 of shutdown: set the stopping flag and mark every generation
     /// inactive under the registry lock, so no in-flight or late eval commits.
@@ -916,10 +924,15 @@ private:
     void on_arm_complete(const std::string& key, const std::shared_ptr<KeyClaim>& claim,
                          IoResult<std::expected<std::uint64_t, std::string>>&& r) noexcept;
     /// registry_mu_ held. Publish `reason` on every claim in `key`'s fifo, release their
-    /// index entries, and erase the entry.
+    /// index entries, and erase the entry. Reached from on_arm_complete() (noexcept):
+    /// every allocating step is contained per claim (r3 C2).
     void fail_all_claims_locked(const std::string& key, const std::string& reason, ClaimEnd end);
     /// registry_mu_ held. Release the claim's index_ mapping iff it still owns one.
-    void release_claim_index_locked(KeyClaim& claim);
+    /// Never throws (r3 C2/C3): a throw inside index_->remove_rule is counted
+    /// (claim_index_release_failures_) and reported as false, with index_held left
+    /// true so the next release retries.
+    /// Callers may ignore the result: retry is implicit in the retained ownership.
+    bool release_claim_index_locked(KeyClaim& claim) noexcept;
     /// registry_mu_ held. The waiter gave up on `claim` (deadline or stop): a Queued
     /// claim is erased outright, a dispatched one is marked waiter_abandoned for its
     /// completion to finish. Returns the string outcome for the caller.
@@ -1046,6 +1059,7 @@ private:
     std::atomic<std::uint64_t> claims_dropped_at_stop_{0}; ///< R5.2: queued claims dropped by begin_stop / Stopped
     std::atomic<std::uint64_t> claim_drain_failures_{0};  ///< R5.2: on_arm_complete firewall fired
     std::atomic<std::uint64_t> detach_claim_failures_{0}; ///< R5.2: detach_rule_locked rollback / last resort fired
+    std::atomic<std::uint64_t> claim_index_release_failures_{0}; ///< r3 C2/C3: contained remove_rule throw
     std::function<void()> drain_gap_hook_for_test_; ///< registry_mu_-guarded; see the setter
     std::atomic<int> drain_fault_point_for_test_{0};  ///< see the setter
     std::atomic<bool> detach_fault_for_test_{false};  ///< see the setter

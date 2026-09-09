@@ -103,9 +103,9 @@ GuardianSparkRuntime::make_handler(std::shared_ptr<GuardianSparkRuntime> rt) {
     return [rt = std::move(rt)](const SparkEvent& ev) { rt->on_event(ev); };
 }
 
-void GuardianSparkRuntime::release_claim_index_locked(KeyClaim& claim) {
+bool GuardianSparkRuntime::release_claim_index_locked(KeyClaim& claim) noexcept {
     if (!claim.index_held)
-        return;
+        return true;
     // Adversarial re-review r2 C2: remove FIRST, clear the ownership flag AFTER.
     // remove_rule's one allocation (its key copy) precedes its mutation, so a throw
     // leaves both the index mapping and index_held intact - the next release for this
@@ -114,10 +114,28 @@ void GuardianSparkRuntime::release_claim_index_locked(KeyClaim& claim) {
     // could ever remove: the key's refcount never reached zero again (no disarm on
     // the real owner's detach - a leaked subscription) and a same-key re-attach of
     // the rule could hit a ghost entry.
-    index_remove_fault_here_for_test(); // seam: "remove_rule's allocation threw"
-    index_->remove_rule(claim.rule_id); // idempotent; guarded by index_held so a stale
-                                        // claim never removes a replacement's mapping
+    //
+    // Adversarial re-review r3 C2/C3: noexcept BY CONSTRUCTION. Callers reach this
+    // from on_arm_complete() (noexcept: the finished sweep, publish_locked's fill-in,
+    // the refill's fail_all_claims_locked) and from begin_stop() (which runs from the
+    // destructor); before this round remove_rule's one allocation - the key copy it
+    // RETURNS, which this caller never needed - could cross those noexcept boundaries
+    // into std::terminate. SparkKeyRuleIndex::erase_rule is the same walk without that
+    // copy: finds on stored strings and erases by iterator, nothing that can throw.
+    // The try/catch below exists for the test seam (which throws to prove the
+    // containment shape) and as defence in depth: a failure is counted, reported as
+    // `false`, and index_held stays true so the next release retries.
+    try {
+        index_remove_fault_here_for_test(); // seam: "the index removal threw"
+        index_->erase_rule(claim.rule_id);  // noexcept; idempotent; guarded by index_held
+                                            // so a stale claim never removes a
+                                            // replacement's mapping
+    } catch (...) {
+        claim_index_release_failures_.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
     claim.index_held = false;
+    return true;
 }
 
 std::shared_ptr<GuardianSparkRuntime::KeyClaim>
@@ -137,14 +155,42 @@ void GuardianSparkRuntime::fail_all_claims_locked(const std::string& key, const 
     const auto eit = claims_.find(key);
     if (eit == claims_.end())
         return;
-    for (auto& c : eit->second.fifo) {
-        release_claim_index_locked(*c);
-        if (!c->outcome)
-            c->outcome = std::unexpected(reason);
+    auto& fifo = eit->second.fifo;
+    bool all_released = true;
+    for (auto& c : fifo) {
+        // noexcept; a failure (test seam / defence in depth - erase_rule cannot throw)
+        // is counted and the claim keeps its index ownership for a retry.
+        if (!release_claim_index_locked(*c)) {
+            all_released = false;
+            c->withdrawn = true; // tombstone: the drain that next runs on this key sweeps
+                                 // it (retrying the release) and never commits it
+        }
+        if (!c->outcome) {
+            // Adversarial re-review r3 C2: this copy of `reason` allocates, and this
+            // function is reached from on_arm_complete() (noexcept) via the refill's
+            // admission-failure branch. Contained per claim: a waiter left without an
+            // outcome is still bounded by its own deadline (its abandon path finds no
+            // entry and returns "arm timed out"); never a std::terminate.
+            try {
+                c->outcome = std::unexpected(reason);
+            } catch (...) {
+                claim_drain_failures_.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         if (c->end == ClaimEnd::None)
             c->end = end;
     }
-    claims_.erase(eit);
+    if (all_released) {
+        claims_.erase(eit); // noexcept: the key is free for the next same-key event
+        return;
+    }
+    // Keep only the tombstones (Queued, withdrawn, index still held): the next
+    // same-key attach queues behind them and its dispatch drives the head; the drain
+    // then sweeps the tombstones, retrying their index release, and adopts the arm for
+    // the live claim. Erase-by-iterator only: nothing here can throw.
+    std::erase_if(fifo, [](const std::shared_ptr<KeyClaim>& c) { return !c->index_held; });
+    for (auto& c : fifo)
+        c->dispatch = ClaimDispatch::Queued;
 }
 
 std::string GuardianSparkRuntime::abandon_claim_locked(const std::string& key,
@@ -346,19 +392,32 @@ void GuardianSparkRuntime::dispatch_arm_off_lock(const std::string& key,
                 claim->dispatch = ClaimDispatch::Dispatched;
             return;
         }
-        std::string reason;
-        switch (adm.error()) {
-        case IoFailure::Timeout:            reason = "arm timed out"; break; // unreachable: submit() has no deadline
-        case IoFailure::Stopped:            reason = "stopping"; break;
-        case IoFailure::CapacityExhausted:  reason = "arm capacity exhausted"; break;
-        case IoFailure::AlreadyRunning:     reason = "arm already in progress for this key"; break;
-        case IoFailure::LaunchFailed:       reason = "arm worker launch failed"; break;
-        case IoFailure::WorkerThrew:        reason = "arm worker threw"; break; // unreachable at admission
-        case IoFailure::CeilingExhausted:   reason = "arm rejected at alive-worker ceiling"; break;
+        // Adversarial re-review r3 C2: this branch is reached from on_arm_complete()
+        // (noexcept) when a refill's admission is refused, and the reason string
+        // allocates. Contained: on a throw the head is handed back to Queued (a
+        // nothrow enum write) so the next same-key event - an attach, a detach,
+        // begin_stop - re-drives or drops it, the failure is counted, and the
+        // claims' waiters stay bounded by their own deadlines. Nothing crosses the
+        // noexcept boundary. fail_all_claims_locked itself is contained per claim.
+        try {
+            std::string reason;
+            switch (adm.error()) {
+            case IoFailure::Timeout:            reason = "arm timed out"; break; // unreachable: submit() has no deadline
+            case IoFailure::Stopped:            reason = "stopping"; break;
+            case IoFailure::CapacityExhausted:  reason = "arm capacity exhausted"; break;
+            case IoFailure::AlreadyRunning:     reason = "arm already in progress for this key"; break;
+            case IoFailure::LaunchFailed:       reason = "arm worker launch failed"; break;
+            case IoFailure::WorkerThrew:        reason = "arm worker threw"; break; // unreachable at admission
+            case IoFailure::CeilingExhausted:   reason = "arm rejected at alive-worker ceiling"; break;
+            }
+            fail_all_claims_locked(key, reason,
+                                   adm.error() == IoFailure::Stopped ? ClaimEnd::Stopped
+                                                                     : ClaimEnd::AdmissionRejected);
+        } catch (...) {
+            claim_drain_failures_.fetch_add(1, std::memory_order_relaxed);
+            if (claim->dispatch == ClaimDispatch::Dispatching)
+                claim->dispatch = ClaimDispatch::Queued; // recoverable: re-driven by the next event
         }
-        fail_all_claims_locked(key, reason,
-                               adm.error() == IoFailure::Stopped ? ClaimEnd::Stopped
-                                                                 : ClaimEnd::AdmissionRejected);
     }
     claim_cv_.notify_all();
 }
@@ -743,9 +802,24 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                 claim_drain_failures_.fetch_add(1, std::memory_order_relaxed);
             publish_locked(firewalled);
         } catch (...) {
-            // A lock failure here leaves the entry as-is; the waiters' own deadlines still
-            // bound them, and the count records that this path fired.
+            // A throw here (the lock, or publish_locked's own fill-in allocations,
+            // now the only throwing steps left on this path since the index release
+            // became noexcept - r3 C2) leaves the entry as-is; the waiters' own
+            // deadlines still bound them, and the count records that this path fired.
+            // Best-effort recovery so the key is not wedged until restart: if the head
+            // is still this claim, hand it back to Queued so the next same-key event
+            // re-drives it (its old result was already disarmed or committed above;
+            // a re-arm on a committed key fails at the keys_.emplace hard error and
+            // is compensated, never leaked). Double-fault only; contained again.
             claim_drain_failures_.fetch_add(1, std::memory_order_relaxed);
+            try {
+                std::lock_guard<std::mutex> lk{registry_mu_};
+                const auto eit = claims_.find(key);
+                if (eit != claims_.end() && !eit->second.fifo.empty() &&
+                    eit->second.fifo.front() == claim && !claim->outcome)
+                    claim->dispatch = ClaimDispatch::Queued;
+            } catch (...) {
+            }
         }
     }
     // (4) Wake + notify. Waiters were unreachable until now.
@@ -963,6 +1037,16 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
                 if (entry.fifo.front() != c && entry.fifo.front()->kind == ClaimKind::Disarm &&
                     entry.fifo.front()->dispatch == ClaimDispatch::Queued)
                     head_to_drive = entry.fifo.front();
+                // Adversarial re-review r3 C2: a Queued ARM head that is not this call's
+                // own claim is one a contained failure handed back (a refill whose
+                // admission-failure cleanup threw, a drain whose publish threw) or a
+                // withdrawn tombstone still holding its index mapping. Nothing else
+                // drives it, so THIS call does, exactly as it would its own head: the
+                // drain then adopts the arm for the live claims behind it and sweeps
+                // the tombstone (retrying its index release).
+                else if (entry.fifo.front() != c && entry.fifo.front()->kind == ClaimKind::Arm &&
+                         entry.fifo.front()->dispatch == ClaimDispatch::Queued)
+                    to_dispatch = try_dispatch_head_locked(key);
                 assert(entry.fifo.front()->kind == ClaimKind::Disarm ||
                        entry.fifo.front()->kind == ClaimKind::Arm);
             } else {
@@ -1144,15 +1228,19 @@ GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id, std::string
                     c->end == ClaimEnd::Committed)
                     continue; // a committed claim is a rules_ entry now, never "pending"
                 c->withdrawn = true;
-                release_claim_index_locked(*c);
+                const bool released = release_claim_index_locked(*c); // noexcept
                 // The waiter returns "withdrawn" NOW in either state - the rule is no
                 // longer wanted, so there is nothing for its caller to wait for. A
                 // dispatched claim keeps its place as the key's marker and the drain
                 // skips it by the `withdrawn` flag (a live sibling adopts the result, or
-                // it is disarmed); a queued one is erased outright.
+                // it is disarmed); a queued one is erased outright - UNLESS its index
+                // release failed (r3 C2/C3 containment; only the test seam can make
+                // erase_rule fail): then it stays as a withdrawn tombstone so the next
+                // drain on this key sweeps it and retries the release, exactly as the
+                // pre-containment code left it in the fifo by throwing before the erase.
                 c->outcome = std::unexpected(std::string{"withdrawn"});
                 c->end = ClaimEnd::Withdrawn;
-                if (c->dispatch == ClaimDispatch::Queued) {
+                if (c->dispatch == ClaimDispatch::Queued && released) {
                     fifo.erase(it);
                     if (fifo.empty())
                         claims_.erase(eit);
@@ -2195,9 +2283,19 @@ void GuardianSparkRuntime::begin_stop() {
             for (auto it = fifo.begin(); it != fifo.end();) {
                 auto& c = *it;
                 if (c->dispatch == ClaimDispatch::Queued) {
+                    // Adversarial re-review r3 C3: begin_stop() runs from the destructor
+                    // (implicitly noexcept) and from GuardianEngine::stop() AHEAD of the
+                    // executor/scheduler/worker shutdown, so nothing in this walk may
+                    // propagate. The index release is noexcept (counted on failure,
+                    // ownership kept - moot after stop); the outcome copy is contained,
+                    // and a waiter that never sees one still wakes on stopping_
+                    // (wait_for_claim's predicate) and returns "stopping".
                     release_claim_index_locked(*c);
-                    if (!c->outcome)
-                        c->outcome = std::unexpected(std::string{"stopping"});
+                    try {
+                        if (!c->outcome)
+                            c->outcome = std::unexpected(std::string{"stopping"});
+                    } catch (...) {
+                    }
                     if (c->end == ClaimEnd::None)
                         c->end = ClaimEnd::Stopped;
                     claims_dropped_at_stop_.fetch_add(1, std::memory_order_relaxed);

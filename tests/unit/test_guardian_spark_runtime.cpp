@@ -36,6 +36,12 @@
 #include <thread>
 #include <vector>
 
+#ifndef _WIN32
+#  include <csignal>   // SIGABRT (fork-based containment test, rung 9c r3 C2)
+#  include <sys/wait.h> // waitpid
+#  include <unistd.h>   // fork, _exit
+#endif
+
 using namespace yuzu::agent;
 
 namespace {
@@ -5156,7 +5162,11 @@ TEST_CASE("rung 9c R5.2 (adversarial re-review r2 C2): a throw inside the index 
     REQUIRE(yuzu::test::spin_until([&] { return rt->backend_op_queued() == 1; },
                                    std::chrono::seconds(10)));
     rt->set_index_remove_fault_for_test(true);
-    REQUIRE_THROWS_AS(rt->detach_rule("r2"), std::bad_alloc);
+    // Adversarial re-review r3 C2/C3: the release is CONTAINED now (it never propagates,
+    // since it also runs on noexcept and destructor paths), so the detach returns
+    // normally with the failure counted; the ownership flag is still kept for the retry.
+    REQUIRE_NOTHROW(rt->detach_rule("r2"));
+    CHECK(rt->claim_index_release_failures() == 1);
 
     // r1's arm lands: the drain commits r1 and, sweeping the withdrawn sibling, RETRIES
     // r2's index release - which now succeeds because the flag was never cleared.
@@ -5228,3 +5238,166 @@ TEST_CASE("rung 9c R5.2 (adversarial re-review r2 C3): the firewall's last-resor
     CHECK(rt->armed_key_count() == 0);
     CHECK(rt->claim_queue_depth_for_test(key) == 0);
 }
+
+// rung 9c R5.2 - adversarial re-review r3 (C3): begin_stop() runs from the destructor
+// (implicitly noexcept) and from GuardianEngine::stop() ahead of the executor/scheduler/
+// worker shutdown, so its queued-claim walk must never propagate a throw from the index
+// release. The release is noexcept by construction now (SparkKeyRuleIndex::erase_rule
+// has no allocation); the seam throws to prove the containment shape.
+TEST_CASE("rung 9c R5.2 (adversarial re-review r3 C3): begin_stop() survives a throwing index "
+          "release on a queued claim - counted, the claim dropped, the executor still stopped",
+          "[spark][runtime][liveness]") {
+    // Mutation (the pre-fix shape): release_claim_index_locked propagates the throw ->
+    // begin_stop() throws out of its walk before io_executor_.stop() runs
+    // (REQUIRE_NOTHROW fails); from ~GuardianSparkRuntime that is std::terminate.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); }
+    } cleanup{b.get()};
+
+    QueuedAttach a1;
+    a1.t = std::thread{[&] { a1.gen = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); }};
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    QueuedAttach a2; // queues behind r1's parked arm: a Queued claim holding an index mapping
+    a2.t = std::thread{[&] { a2.gen = rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true); }};
+    REQUIRE(yuzu::test::spin_until([&] { return rt->backend_op_queued() == 1; },
+                                   std::chrono::seconds(10)));
+
+    rt->set_index_remove_fault_for_test(true); // r2's release in the stop walk "throws"
+    REQUIRE_NOTHROW(rt->begin_stop());
+    CHECK(rt->claim_index_release_failures() == 1);
+    CHECK(rt->claims_dropped_at_stop() == 1);
+    CHECK(rt->io_executor_stats_for_test().stopping); // the walk continued to the executor stop
+
+    b->release_hang(); // r1's late success is disarmed by the drain (R5.5)
+    a1.t.join();
+    a2.t.join();
+    REQUIRE_FALSE(a2.gen.has_value());
+    CHECK(a2.gen.error() == "stopping");
+    REQUIRE_FALSE(a1.gen.has_value());
+    CHECK(a1.gen.error() == "stopping");
+    REQUIRE(yuzu::test::spin_until([&] { return b->disarmed_ids().size() == 1; },
+                                   std::chrono::seconds(10)));
+    CHECK(b->disarmed_ids()[0] == b->armed_ids()[0]);
+    CHECK(rt->claim_queue_depth_for_test(spark_key(file_spec("/a"))) == 0);
+}
+
+#ifndef _WIN32
+// rung 9c R5.2 - adversarial re-review r3 (C2, the real half): a refill whose admission is
+// refused is cleaned up INSIDE on_arm_complete() (noexcept). Before this round a throw
+// from the index release in that cleanup crossed the noexcept boundary: std::terminate,
+// the agent gone. Inverted death test: the child must exit 0, never die by SIGABRT.
+// fork() WITHOUT exec, as the reconcile death tests do; Catch2 runs cases sequentially
+// and this case starts no threads before forking (every thread below is created in the
+// child). A detached executor worker from an EARLIER case may still be alive at fork
+// time; the child's only libc-lock-sensitive work is allocation, and the existing death
+// tests carry the same exposure - noted, not new.
+TEST_CASE("rung 9c R5.2 (adversarial re-review r3 C2): a throwing index release inside the "
+          "refill's admission-failure cleanup is contained on the noexcept drain (inverted "
+          "death test: the child must not abort)",
+          "[spark][runtime][liveness][death]") {
+    // Mutation (the pre-fix shape): release_claim_index_locked propagates -> the throw
+    // leaves fail_all_claims_locked -> dispatch_arm_off_lock -> on_arm_complete()
+    // noexcept -> std::terminate: the child dies by SIGABRT (WIFSIGNALED), exit code
+    // never reached.
+    const pid_t pid = ::fork();
+    REQUIRE(pid >= 0);
+    if (pid == 0) {
+        // ---- child ----
+        ::signal(SIGABRT, SIG_DFL); // die silently on a regression; the parent reads the signal
+        auto r = std::make_shared<FakeReader>();
+        auto b = std::make_shared<FakeBackend>();
+        b->hang_next_arm.store(true);
+        auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+        const auto key = spark_key(file_spec("/a"));
+
+        std::expected<std::uint64_t, std::string> gen_r1;
+        std::thread t1{[&] { gen_r1 = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); }};
+        if (!b->wait_entered_hang(std::chrono::seconds(30)))
+            ::_exit(90);
+        rt->detach_rule("r1"); // Case-0 withdraw: the dispatched head stays as the key's marker
+        t1.join();
+        if (gen_r1.has_value() || gen_r1.error() != "withdrawn")
+            ::_exit(91);
+
+        // In the drain's compensating gap (nobody adopts the withdrawn head's result):
+        // queue r2 behind the head, then make the REFILL's admission fail and r2's
+        // index release throw inside that failure's cleanup.
+        std::expected<std::uint64_t, std::string> gen_r2;
+        std::thread t2;
+        std::atomic<bool> r2_done{false};
+        rt->set_drain_gap_hook_for_test([&] {
+            t2 = std::thread{[&] {
+                gen_r2 = rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true);
+                r2_done.store(true);
+            }};
+            (void)yuzu::test::spin_until([&] { return rt->backend_op_queued() == 1; },
+                                         std::chrono::seconds(10));
+            rt->set_io_executor_fail_launch_for_test(true); // the refill's submit() is refused
+            rt->set_index_remove_fault_for_test(true);      // ...and its cleanup's release throws
+        });
+        b->release_hang(); // r1's arm lands: drain -> gap hook -> compensation -> pop -> refill r2
+        if (!yuzu::test::spin_until([&] { return r2_done.load(); }, std::chrono::seconds(30)))
+            ::_exit(92);
+        t2.join();
+        rt->set_io_executor_fail_launch_for_test(false);
+        if (gen_r2.has_value())
+            ::_exit(93);
+        if (gen_r2.error() != "arm worker launch failed")
+            ::_exit(94); // the cleanup published its verdict despite the contained throw
+        if (rt->claim_index_release_failures() != 1)
+            ::_exit(95);
+        if (rt->claim_queue_depth_for_test(key) != 1)
+            ::_exit(96); // r2 stays as a withdrawn TOMBSTONE: its index mapping is still
+                         // held (the release "failed"), parked for the next drain to retry
+        // Recovery on the SAME key (the state a later same-key event must be able to
+        // recover from): r4 queues behind the tombstone, its dispatch drives the head,
+        // the drain adopts the arm for r4 and sweeps the tombstone - retrying and now
+        // completing r2's index release. Then r4 is the sole owner: its detach is the
+        // ->0 edge and disarms exactly the subscription r4 adopted.
+        const auto gen_r4 = rt->attach_rule("r4", file_spec("/a"), file_exists_rule("r4"), true);
+        if (!gen_r4.has_value())
+            ::_exit(97);
+        if (rt->claim_queue_depth_for_test(key) != 0 || rt->rule_count() != 1)
+            ::_exit(98); // the tombstone was swept, the mapping cleaned
+        rt->detach_rule("r4");
+        if (rt->rule_count() != 0 || rt->armed_key_count() != 0)
+            ::_exit(99);
+        // Two disarms overall: r1's compensation (its withdrawn head) and r4's own.
+        if (b->disarmed_ids().size() != 2 || b->armed_ids().size() != 2 ||
+            b->disarmed_ids()[1] != b->armed_ids()[1])
+            ::_exit(100);
+        rt->begin_stop();
+        ::_exit(0);
+    }
+
+    // ---- parent ---- poll, never block: a regression that hangs must fail, not stall the suite.
+    int status = 0;
+    bool reaped = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    while (std::chrono::steady_clock::now() < deadline) {
+        const pid_t w = ::waitpid(pid, &status, WNOHANG);
+        if (w == pid) {
+            reaped = true;
+            break;
+        }
+        REQUIRE(w == 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    if (!reaped) {
+        ::kill(pid, SIGKILL);
+        ::waitpid(pid, &status, 0);
+        FAIL("child never exited within 60 s");
+    }
+    INFO("child status: exited=" << WIFEXITED(status) << " code=" << (WIFEXITED(status) ? WEXITSTATUS(status) : -1)
+                                 << " signaled=" << WIFSIGNALED(status)
+                                 << " sig=" << (WIFSIGNALED(status) ? WTERMSIG(status) : 0));
+    CHECK_FALSE(WIFSIGNALED(status)); // the pre-fix shape: SIGABRT from std::terminate
+    REQUIRE(WIFEXITED(status));
+    CHECK(WEXITSTATUS(status) == 0);
+}
+#endif
