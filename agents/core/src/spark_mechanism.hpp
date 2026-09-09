@@ -39,6 +39,8 @@
 
 #include <yuzu/agent/spark.hpp>
 
+#include <atomic>
+#include <cstddef>
 #include <expected>
 #include <functional>
 #include <memory>
@@ -179,8 +181,23 @@ public:
 [[nodiscard]] YUZU_EXPORT std::unique_ptr<ISparkMechanism> make_file_mechanism();
 
 /// Platform factory: a real TP_WAIT + RegNotifyChangeKeyValue registry-change
-/// mechanism on Windows, `nullptr` on every other platform.
+/// mechanism on Windows, `nullptr` on every other platform. This zero-argument
+/// form constructs the mechanism with NO shared F3 counter (its detached probe
+/// and drain workers are then counted only lane-locally) - it exists for tests
+/// and for the platform-capability cross-check; production wiring uses the
+/// counter-taking overload below.
 [[nodiscard]] YUZU_EXPORT std::unique_ptr<ISparkMechanism> make_registry_mechanism();
+
+/// Production factory (#2012/#3840 PR-B1): the same mechanism, with every
+/// SparkDetachedLane it owns constructed over `f3_counter` - the agent-lifetime
+/// orphan-exit counter (AgentImpl::spark_detached_workers_) that
+/// guardian_active_io_workers() sums, so a probe or drain worker still parked at
+/// shutdown is visible to the F3 hard-exit decision (spark_detached_call.hpp,
+/// "F3 / §24"). Same platform contract as the zero-argument form: real on
+/// Windows, `nullptr` elsewhere (the argument is ignored off Windows). A null
+/// counter is accepted and behaves like the zero-argument form.
+[[nodiscard]] YUZU_EXPORT std::unique_ptr<ISparkMechanism>
+make_registry_mechanism(std::shared_ptr<std::atomic<std::size_t>> f3_counter);
 
 /// Platform factory: a real multiplexed service/unit run-state mechanism — one
 /// sd-bus connection servicing N `PropertiesChanged` matches on Linux built

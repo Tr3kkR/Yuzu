@@ -145,6 +145,12 @@ struct RegWatch {
 
 class WindowsRegistryMechanism final : public ISparkMechanism {
 public:
+    /// `f3_counter` (may be null) is the agent-lifetime orphan-exit counter every
+    /// detached worker this mechanism launches must be admitted against (#2012/
+    /// #3840 PR-B1, F3). Held here from construction so the lanes built over it
+    /// share one identity for the mechanism's whole life.
+    explicit WindowsRegistryMechanism(std::shared_ptr<std::atomic<std::size_t>> f3_counter)
+        : f3_counter_(std::move(f3_counter)) {}
     ~WindowsRegistryMechanism() override { stop(); }
 
     void start(SparkEmitFn emit, SparkFaultFn fault) override {
@@ -356,6 +362,7 @@ private:
     std::mutex mu_;
     SparkEmitFn emit_;
     SparkFaultFn fault_;
+    std::shared_ptr<std::atomic<std::size_t>> f3_counter_; ///< see the constructor
     PTP_POOL pool_{nullptr};
     TP_CALLBACK_ENVIRON env_{};
     bool started_{false};
@@ -373,7 +380,12 @@ public:
 } // namespace
 
 std::unique_ptr<ISparkMechanism> make_registry_mechanism() {
-    return std::make_unique<WindowsRegistryMechanism>();
+    return std::make_unique<WindowsRegistryMechanism>(nullptr); // no shared F3 counter (tests)
+}
+
+std::unique_ptr<ISparkMechanism>
+make_registry_mechanism(std::shared_ptr<std::atomic<std::size_t>> f3_counter) {
+    return std::make_unique<WindowsRegistryMechanism>(std::move(f3_counter));
 }
 
 } // namespace yuzu::agent
@@ -384,6 +396,11 @@ namespace yuzu::agent {
 
 std::unique_ptr<ISparkMechanism> make_registry_mechanism() {
     return nullptr; // no mechanism → SparkEngine rejects arm(Registry) off Windows
+}
+
+std::unique_ptr<ISparkMechanism>
+make_registry_mechanism(std::shared_ptr<std::atomic<std::size_t>> /*f3_counter*/) {
+    return nullptr; // same platform contract as the zero-argument form
 }
 
 } // namespace yuzu::agent
