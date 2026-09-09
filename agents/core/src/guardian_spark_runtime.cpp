@@ -493,13 +493,15 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
     if (r && r->has_value())
         compensating = **r;
     // Test seam: consumed once; 1 = bad_alloc before the fifo snapshot (the window
-    // C2 found), 2 = a throw right after the first commit adopted the subscription.
+    // C2 found), 2 = a throw right after the first commit adopted the subscription,
+    // 3 = a throw after the verdicts are staged and before the pop (governance pass-3
+    // sg-3/ar-4/cs-5: the terminal-tombstone sweep).
     const auto fault_here = [this](int point) {
         int expected = point;
         if (drain_fault_point_for_test_.compare_exchange_strong(expected, 0)) {
             if (point == 1)
                 throw std::bad_alloc{};
-            throw std::runtime_error("drain fault point 2 (test seam)");
+            throw std::runtime_error("drain fault point " + std::to_string(point) + " (test seam)");
         }
     };
     std::vector<std::shared_ptr<KeyClaim>> finished;

@@ -416,7 +416,7 @@ makes "a key's disarm completes before its own rearm dispatches" true by constru
 rather than by a separately-maintained ordering rule. Each claim also records a
 facts-only `ClaimEnd` (how it ended: committed, backend refused, worker threw, admission
 rejected, withdrawn, waiter timed out while queued or while dispatched, stopped, commit
-threw, disarm done) as the plug point PR-5's quarantine / K-bound / `arm_failed`
+threw, disarm done, or dead subscription: a Disarm whose subscription id was already reported dead, completed without a backend call, rung 9c PR-1) as the plug point PR-5's quarantine / K-bound / `arm_failed`
 classification reads; PR-1 carries no classification logic on it - the only reads are
 bookkeeping guards (a committed claim is a `rules_` entry, never a pending one).
 
@@ -790,7 +790,7 @@ on the sole production `attach_rule` hardcoding `emit_compliant_edge=true` - do 
    sends compliance first) so a rule's "armed" audit entry never arrives after its first
    drift event.
 5. **Two-count executor + physical-orphan ceiling (Fable M4).** Today inflight counters
-   free at OS-thread-exit (`guardian_io_executor.hpp:338`), so `kMaxProcessIoWorkers=10`
+   free when the worker payload is destroyed inside the thread trampoline (`~TicketCore`, `guardian_io_executor.hpp`), so `kMaxProcessIoWorkers=10`
    is a real physical bound. Freeing the *logical* admission slot on the run() deadline
    requires a **separate physical-orphan ceiling strictly > sum(quotas)** (else 10 wedged
    orphans re-create the exact cross-class starvation R3 eliminated) + same-key

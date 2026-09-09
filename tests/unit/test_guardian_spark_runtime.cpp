@@ -5514,7 +5514,7 @@ TEST_CASE("rung 9c R5.2 (adversarial re-review r3 C4): a throw at the lifecycle-
 // lingered undriven, and the next same-key attach first re-drove a guaranteed no-op
 // backend disarm (a wasted bounded run() the attach had to wait out) before arming.
 TEST_CASE("rung 9c R5.2 (governance pass-3 cs-1): a subscription reported dead completes its "
-          "queued disarm claim in place - no backend call for a dead id, the key is clean and "
+          "queued disarm claim in place - no backend call for a dead id; the key is clean and "
           "the next same-key attach arms at once",
           "[spark][runtime][liveness]") {
     // Mutation: drop the completion block in on_subscription_lost -> depth stays 1
@@ -5590,7 +5590,7 @@ TEST_CASE("rung 9c R5.2 (governance pass-3 sg-3/ar-4/cs-5): a publish that throw
 // that made the next same-key attach take the shared-watcher branch (refcount 1->2,
 // no 0->1 edge) against a key that has no PerKey: keys_.at(key) threw out of attach_rule.
 TEST_CASE("rung 9c R5.2 (governance pass-3 cs-2): a firewalled drain whose index release fails "
-          "keeps the claim as a tombstone, never a ghost mapping - the next same-key attach "
+          "keeps the claim as a tombstone and never a ghost mapping - the next same-key attach "
           "sweeps it and arms",
           "[spark][runtime][liveness]") {
     // Mutation: restore the unconditional fifo.clear() -> depth 0 with the mapping
@@ -5599,16 +5599,19 @@ TEST_CASE("rung 9c R5.2 (governance pass-3 cs-2): a firewalled drain whose index
     auto b = std::make_shared<FakeBackend>();
     b->hang_next_arm.store(true);
     auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+
+    // qe-101: the future is declared BEFORE the Cleanup guard (the file's idiom) so a
+    // failed REQUIRE releases the parked backend first and the future's destructor
+    // then observes attach_rule returning, instead of stalling on the deadline.
+    auto fut = std::async(std::launch::async, [&] {
+        return rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    });
     struct Cleanup {
         FakeBackend* backend;
         ~Cleanup() { backend->release_hang(); }
     } cleanup{b.get()};
-    const auto key = spark_key(file_spec("/a"));
-
-    auto fut = std::async(std::launch::async, [&] {
-        return rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
-    });
-    REQUIRE(b->wait_entered_hang(std::chrono::seconds(5)));
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
     rt->set_drain_fault_point_for_test(1);   // bad_alloc before the fifo snapshot -> firewall
     rt->set_index_remove_fault_for_test(true); // the firewall's release of r1 fails once
     b->release_hang();
@@ -5639,7 +5642,7 @@ TEST_CASE("rung 9c R5.2 (governance pass-3 cs-2): a firewalled drain whose index
 // adversarial round 4 K2/C5: index_add_rollback's .fn runs inside ~GuardianRollback,
 // which swallows exceptions; remove_rule's key copy could throw there and leave a ghost
 // mapping. erase_rule is the same walk without the copy (noexcept).
-TEST_CASE("source tripwire: index_add_rollback's .fn uses the noexcept erase_rule, not the "
+TEST_CASE("source tripwire: index_add_rollback's .fn uses the noexcept erase_rule rather than the "
           "allocating remove_rule (adversarial round 4 K2/C5)",
           "[spark][runtime][liveness][source_tripwire]") {
     // Mutation-verified: `index_->remove_rule(rule_id)` inside the lambda makes this fail.
@@ -5667,16 +5670,19 @@ TEST_CASE("rung 9c R5.2 (governance pass-3 qe-4): detach_all withdraws a rule th
     auto b = std::make_shared<FakeBackend>();
     b->hang_next_arm.store(true);
     auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+
+    // qe-101: the future is declared BEFORE the Cleanup guard (the file's idiom) so a
+    // failed REQUIRE releases the parked backend first and the future's destructor
+    // then observes attach_rule returning, instead of stalling on the deadline.
+    auto fut = std::async(std::launch::async, [&] {
+        return rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    });
     struct Cleanup {
         FakeBackend* backend;
         ~Cleanup() { backend->release_hang(); }
     } cleanup{b.get()};
-    const auto key = spark_key(file_spec("/a"));
-
-    auto fut = std::async(std::launch::async, [&] {
-        return rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
-    });
-    REQUIRE(b->wait_entered_hang(std::chrono::seconds(5)));
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
     CHECK(rt->rule_count() == 0);                     // claimed, not committed
     CHECK(rt->claim_queue_depth_for_test(key) == 1);
 

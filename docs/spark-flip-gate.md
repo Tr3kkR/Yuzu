@@ -352,8 +352,9 @@ flip, with a red-first test each:
   (`on_arm_complete` step (3) and its catch): PR-1 pops a terminal head in the catch
   (governance pass-3 sg-3/ar-4/cs-5 fold); criterion: a deadline sweep also clears any head a
   double fault still leaves, so no key wedges until restart.
-- **ch-1, step-(3) publish allocation seam**: PR-1 added fault point 3 (`set_drain_fault_point_for_test(3)`);
-  criterion: PR-5's quarantine tests exercise it.
+- **ch-1, step-(3) publish allocation seam**: PR-1 added fault point 3 (`set_drain_fault_point_for_test(3)`,
+  post-verdict and pre-pop), which sits UPSTREAM of the fill-in allocation ch-1 named; that seam is still
+  absent. Criterion: PR-5 adds the fill-in-allocation seam and exercises CH-3 through it.
 - **up-5** as recorded in the pass-3 ledger (`governance.d/`, PR-1).
 
 ## 4. #2340 scenario contract
@@ -1022,14 +1023,15 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   #3840 (filed 2026-09-02, `spark_engine.hpp:536–548`) is the identical "walk-off-`mu_`"
   hazard shape for Registry's `TP_WAIT` / Service's Windows SCM query - folded into this same
   mechanism-hardening package.
-- Owner: the mechanism-hardening package (File + Registry + Service together, one restructure,
-  reviewed once) - no individual named in source.
+- Owner: for the remaining #2011/#2014 piece, the mechanism-hardening package (File + Registry +
+  Service together, one restructure, reviewed once) - no individual named in source; the pulled-forward
+  #2012/#3840 piece is owned by its rung 9c kickoff (Milestone below).
 - Milestone: **split by ruling 14(c) (2026-09-08)** - the #2012/#3840 same-type-serialization piece is
   pulled forward into rung 9c's own ladder, between its PR-1 and PR-2, landing as two PRs (kickoff:
-  `~/.claude/plans/spark-2012-3840-mechanism-walkoffmu-KICKOFF.md`, session "SPARK 3840 Decouple");
+  `~/.claude/plans/spark-2012-3840-mechanism-walkoffmu-KICKOFF.md`, operator-local, session "SPARK 3840 Decouple");
   #2011 (lock granularity) and #2014 stay early post-flip in the named package.
-- Revisit trigger: **escalate to flip-gating if a production fleet materializes before this
-  lands.**
+- Revisit trigger: for the remaining #2011/#2014 piece, **escalate to flip-gating if a production
+  fleet materializes before it lands**; the #2012/#3840 piece is already pre-flip by ruling 14(c).
 
 **#2570 + #2578** (macOS spark-test flakes)
 - Detection signal: CI red on the macOS leg for these two specific named tests.

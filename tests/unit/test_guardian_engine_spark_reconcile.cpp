@@ -2583,7 +2583,7 @@ TEST_CASE("#2233 item 3: a timed-out arm holds policy_generation for retry, not 
 // wait_until_quiescent return true unconditionally -> the "false while a thread lives"
 // branch fails; make it never return true -> the "true once it exits" branch times out.
 TEST_CASE("test helper: wait_until_quiescent returns false while another thread lives and true once "
-          "it has exited (fork death-test gate, governance pass-3 qe-2/cp-1/cs-4)",
+          "it has exited (fork death-test gate; governance pass-3 qe-2/cp-1/cs-4)",
           "[spark][guardian][reconcile][helpers]") {
 #if !defined(__linux__)
     SUCCEED("wait_until_quiescent is a no-op off Linux; nothing to prove");
