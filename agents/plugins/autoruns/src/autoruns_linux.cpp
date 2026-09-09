@@ -234,6 +234,24 @@ bool run_parts_valid_name(std::string_view name) {
     return name.find('.') == std::string_view::npos && name.find('~') == std::string_view::npos;
 }
 
+/// Whether `st` describes a regular file ROOT'S OWN scheduler would execute
+/// -- i.e. any owner/group/other execute bit set. This is deliberately NOT
+/// `::access(path, X_OK)`: that call answers whether the CALLING process
+/// (this agent daemon, which runs as the unprivileged `yuzu` account per
+/// docs/agent-privilege-model.md) could execute the file, which is the
+/// wrong question for /etc/cron.{hourly,daily,weekly,monthly} (executed by
+/// run-parts(8) as root) and /etc/rc.local (executed by init as root). A
+/// root-owned mode-0700 or 0744 script passes root's own scheduler but
+/// fails `access(X_OK)` under the unprivileged agent's uid/gid -- silently
+/// dropping it from the collector's rows while the source still reports
+/// Supported is a false-negative persistence-mechanism miss, not a benign
+/// absence (PR #4154 round 9 blocker). Testing the raw mode bits instead
+/// matches what will actually run, independent of which account this
+/// process happens to hold.
+bool is_root_executable(const struct stat& st) {
+    return S_ISREG(st.st_mode) && (st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) != 0;
+}
+
 std::string owner_uid_string(const std::string& path) {
     struct stat st{};
     if (::stat(path.c_str(), &st) != 0) return "-";
@@ -730,9 +748,10 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
             for (const auto& name : listing.names) {
                 if (!run_parts_valid_name(name)) continue;
                 std::string full = dir + "/" + name;
-                if (::access(full.c_str(), X_OK) != 0) continue; // run-parts only executes +x files
                 struct stat st{};
-                if (::stat(full.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) continue;
+                // is_root_executable, not access(X_OK): run-parts(8) executes
+                // this as root, not as this agent's own unprivileged account.
+                if (::stat(full.c_str(), &st) != 0 || !is_root_executable(st)) continue;
                 Row row;
                 row.source_id = id;
                 row.catalog_version = kAutorunSourceCatalogVersion;
@@ -1233,23 +1252,31 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
         if (!content) {
             auto cls = classify_read_error(content.error(), /*required_by_catalog=*/false);
             ctx.write_output(format_source_status(id, cls.support, std::size_t{0}, cls.reason));
-        } else if (::access("/etc/rc.local", X_OK) != 0) {
-            ctx.write_output(
-                format_source_status(id, YUZU_SUPPORT_SUPPORTED, std::size_t{0}, "not_executable"));
         } else {
-            Row row;
-            row.source_id = id;
-            row.catalog_version = kAutorunSourceCatalogVersion;
-            row.location = "/etc/rc.local";
-            row.entry = "rc.local";
-            row.target = "/etc/rc.local";
-            row.enabled = Enabled::enabled;
-            row.scope = Scope::system;
-            row.user = "-";
-            row.signed_state = Signed::not_checked;
-            row.mtime = mtime_of("/etc/rc.local");
-            ctx.write_output(format_row(row));
-            ctx.write_output(format_source_status(id, YUZU_SUPPORT_SUPPORTED, std::size_t{1}, "-"));
+            struct stat st{};
+            // is_root_executable, not access(X_OK): init runs this as root,
+            // not as this agent's own unprivileged account -- see the
+            // predicate's banner. A stat() failure here (e.g. a raced
+            // removal between the read above and this call) falls into the
+            // same not_executable bucket access() failing here always did.
+            if (::stat("/etc/rc.local", &st) != 0 || !is_root_executable(st)) {
+                ctx.write_output(format_source_status(id, YUZU_SUPPORT_SUPPORTED, std::size_t{0},
+                                                      "not_executable"));
+            } else {
+                Row row;
+                row.source_id = id;
+                row.catalog_version = kAutorunSourceCatalogVersion;
+                row.location = "/etc/rc.local";
+                row.entry = "rc.local";
+                row.target = "/etc/rc.local";
+                row.enabled = Enabled::enabled;
+                row.scope = Scope::system;
+                row.user = "-";
+                row.signed_state = Signed::not_checked;
+                row.mtime = static_cast<std::int64_t>(st.st_mtime);
+                ctx.write_output(format_row(row));
+                ctx.write_output(format_source_status(id, YUZU_SUPPORT_SUPPORTED, std::size_t{1}, "-"));
+            }
         }
     }
 

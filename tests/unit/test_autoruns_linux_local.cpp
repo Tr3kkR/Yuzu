@@ -662,6 +662,71 @@ TEST_CASE("autoruns Linux leg: list_dir reports permission_denied, not absent, f
     CHECK(listing.permission_denied);   // ...so this is a real denial, never folded into "absent"
 }
 
+TEST_CASE("autoruns Linux leg: is_root_executable tests raw execute-mode bits, not "
+          "this process's own effective uid/gid "
+          "(RECONSTRUCTION: pins PR #4154 round 9's blocker -- ::access(path, X_OK) "
+          "answers whether the UNPRIVILEGED yuzu agent account could execute the "
+          "file, not whether root's own scheduler (run-parts(8) for "
+          "cron.{hourly,daily,weekly,monthly}, init for /etc/rc.local) will -- a "
+          "root-owned mode-0700/0744 script was silently dropped from those two "
+          "collectors' rows even though root's scheduler runs it)",
+          "[autoruns][actions][linux]") {
+    using yuzu::autoruns::is_root_executable;
+
+    yuzu::test::TempDir tmp("yuzu_test_autoruns_rootexec_");
+    std::error_code ec;
+    std::filesystem::create_directories(tmp.path, ec);
+    REQUIRE_FALSE(ec);
+
+    auto stat_of = [](const std::filesystem::path& p) {
+        struct stat st{};
+        REQUIRE(::stat(p.c_str(), &st) == 0);
+        return st;
+    };
+
+    SECTION("0700 (owner-only execute) is eligible -- the shape a root-only "
+            "persistence script actually has on disk") {
+        std::filesystem::path f = tmp.path / "owner_only.sh";
+        { std::ofstream(f) << "#!/bin/sh\n"; }
+        std::filesystem::permissions(f, std::filesystem::perms::owner_all, ec);
+        REQUIRE_FALSE(ec);
+        CHECK(is_root_executable(stat_of(f)));
+    }
+
+    SECTION("0744 (owner all, group/other read-only) is eligible") {
+        std::filesystem::path f = tmp.path / "owner_all_rest_read.sh";
+        { std::ofstream(f) << "#!/bin/sh\n"; }
+        std::filesystem::permissions(f,
+                                     std::filesystem::perms::owner_all |
+                                         std::filesystem::perms::group_read |
+                                         std::filesystem::perms::others_read,
+                                     ec);
+        REQUIRE_FALSE(ec);
+        CHECK(is_root_executable(stat_of(f)));
+    }
+
+    SECTION("no execute bit set anywhere is excluded") {
+        std::filesystem::path f = tmp.path / "no_exec.sh";
+        { std::ofstream(f) << "#!/bin/sh\n"; }
+        std::filesystem::permissions(f,
+                                     std::filesystem::perms::owner_read |
+                                         std::filesystem::perms::owner_write,
+                                     ec);
+        REQUIRE_FALSE(ec);
+        CHECK_FALSE(is_root_executable(stat_of(f)));
+    }
+
+    SECTION("a non-regular entry (a directory) is excluded even though it carries "
+            "the search/execute bit") {
+        std::filesystem::path d = tmp.path / "a_directory";
+        std::filesystem::create_directory(d, ec);
+        REQUIRE_FALSE(ec);
+        std::filesystem::permissions(d, std::filesystem::perms::owner_all, ec);
+        REQUIRE_FALSE(ec);
+        CHECK_FALSE(is_root_executable(stat_of(d)));
+    }
+}
+
 #endif // defined(__linux__)
 
 TEST_CASE("autoruns Linux leg: an unknown action is refused, not silently ignored",
