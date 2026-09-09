@@ -222,6 +222,12 @@ use-after-free guard any shutdown refactor must preserve.
 > `POST /api/policies/{id}/remediate` below). On a server restart, any agent
 > left mid-remediation (`fixing`) is reset to `unknown` and re-evaluated, since
 > the in-flight fix/verify state does not survive the restart.
+>
+> **High Availability (HA): manual remediation is now safe on multi-replica servers.** Each target
+> is claimed durably before the fix is dispatched, so two replicas cannot independently remediate
+> the same agent. If a target has already exhausted its fix-retry cap for the policy, the
+> remediation request is refused with HTTP 409 and the message "remediation already in flight or
+> retry cap reached for this policy".
 
 ### Forcing an immediate evaluation
 

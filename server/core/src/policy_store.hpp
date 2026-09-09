@@ -254,6 +254,42 @@ public:
     [[nodiscard]] std::expected<void, std::string> record_dispatch(const std::string& policy_id,
                                                                     int64_t now);
 
+    // ── Durable per-(policy,agent) remediation claim (HA WS-3 3.4) ──────────
+    /// UPSERT CAS: claims the subset of `agent_ids` whose `policy_status` row
+    /// is either absent (fresh-INSERT branch — `resolve_targets()`'s scope
+    /// list can name an agent never checked before), unclaimed
+    /// (`remediation_claim_at == 0`), or claimed stale (older than
+    /// `now - stale_seconds` — mirrors `claim_due_policies`'s own
+    /// fixing_stale_seconds window; callers MUST pass the SAME value so the
+    /// two never fight over the same row), AND whose `fix_attempt_count` has
+    /// not already hit the cap. Returns exactly the ids actually claimed —
+    /// NEVER the full `agent_ids` echoed back unconditionally, or two
+    /// concurrent callers (same process or a sibling replica) would both
+    /// believe they own the same agent. An UPDATE-only claim would silently
+    /// never remediate an agent with no existing row — this is why the claim
+    /// is an UPSERT, not a plain UPDATE. Deliberately does NOT check
+    /// `open_`/acquire failure any differently from every other mutator here
+    /// — `try_acquire_for` returning no lease or the UPSERT itself erroring
+    /// both surface as `unexpected`, never collapsed into "claimed nothing"
+    /// (PolicyEvaluator::remediate must not read a degraded claim read as
+    /// "already in flight").
+    [[nodiscard]] std::expected<std::vector<std::string>, std::string>
+    claim_remediation(const std::string& policy_id, const std::vector<std::string>& agent_ids,
+                      int64_t now, int64_t stale_seconds);
+
+    /// Releases a durable claim WITHOUT touching `fix_attempt_count` or
+    /// `status` — the caller (PolicyEvaluator::remediate) uses this for a
+    /// claimed-but-not-DELIVERED target (offline / quarantined / plugin
+    /// absent / a systemic containment-gate failure), which must never burn
+    /// a capped retry attempt (ADR-2002 §6 finding 6a(ii)). Also called by
+    /// `collect_ready()` when a dispatched FixWait entry matures — the
+    /// dispatching replica is the only holder of that in-memory entry, so
+    /// this release is itself replica-local with nothing to coordinate,
+    /// exactly like `update_agent_status`'s own per-replica FixWait writes.
+    [[nodiscard]] std::expected<void, std::string>
+    release_remediation_claim(const std::string& policy_id,
+                              const std::vector<std::string>& agent_ids);
+
 private:
     pg::PgPool& pool_;
     bool open_{false};

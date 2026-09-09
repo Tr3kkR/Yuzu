@@ -1389,3 +1389,146 @@ TEST_CASE("claim_due_policies sweeps a stale 'fixing' row back to 'unknown'",
     REQUIRE(s2->has_value());
     CHECK((*s2)->status == "unknown");
 }
+
+// ============================================================================
+// claim_remediation / release_remediation_claim (HA WS-3 3.4)
+// ============================================================================
+
+TEST_CASE("claim_remediation claims a fresh target with no pre-existing policy_status row "
+          "(the UPSERT branch)",
+          "[policy_store][pg][claim]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+    auto pol = store.create_policy(make_policy_yaml(frag.value()));
+    REQUIRE(pol.has_value());
+
+    // "agent-1" has never been checked/fixed for this policy -- no
+    // policy_status row exists yet. An UPDATE-only claim would silently
+    // claim nothing here; this is the regression test for that.
+    auto claimed = store.claim_remediation(pol.value(), {"agent-1"}, 1000, 1800);
+    REQUIRE(claimed.has_value());
+    REQUIRE(claimed->size() == 1);
+    CHECK((*claimed)[0] == "agent-1");
+
+    auto s = store.get_agent_status(pol.value(), "agent-1");
+    REQUIRE(s.has_value());
+    REQUIRE(s->has_value());
+    // The fresh-INSERT branch seeds an 'unknown' status row purely to carry
+    // the claim -- it must not fabricate a compliance verdict.
+    CHECK((*s)->status == "unknown");
+}
+
+TEST_CASE("claim_remediation refuses a second concurrent claim of the same target",
+          "[policy_store][pg][claim]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+    auto pol = store.create_policy(make_policy_yaml(frag.value()));
+    REQUIRE(pol.has_value());
+
+    auto claimed1 = store.claim_remediation(pol.value(), {"agent-1"}, 1000, 1800);
+    REQUIRE(claimed1.has_value());
+    REQUIRE(claimed1->size() == 1);
+
+    // Still within the staleness window: a second claim attempt (a sibling
+    // replica, or the same replica's own retry) gets nothing back.
+    auto claimed2 = store.claim_remediation(pol.value(), {"agent-1"}, 1010, 1800);
+    REQUIRE(claimed2.has_value());
+    CHECK(claimed2->empty());
+}
+
+TEST_CASE("claim_remediation refuses a target that has already exhausted the fix retry cap",
+          "[policy_store][pg][claim]") {
+    // kMaxFixAttempts=3 (policy_store.cpp) -- mirrors the "fix retry cap
+    // forces error after 3 fixing transitions" test's own hardcoded 3.
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+    auto pol = store.create_policy(make_policy_yaml(frag.value()));
+    REQUIRE(pol.has_value());
+
+    REQUIRE(store.update_agent_status(pol.value(), "agent-1", "non_compliant").has_value());
+    for (int i = 0; i < 4; ++i)
+        REQUIRE(store.update_agent_status(pol.value(), "agent-1", "fixing").has_value());
+    auto s = store.get_agent_status(pol.value(), "agent-1");
+    REQUIRE(s.has_value());
+    REQUIRE(s->has_value());
+    REQUIRE((*s)->status == "error"); // cap tripped -- confirms the setup
+
+    // Even fully unclaimed (remediation_claim_at is still its default 0),
+    // the retry-cap guard in claim_remediation's own WHERE clause refuses
+    // this target -- there is nothing left to remediate it with.
+    auto claimed = store.claim_remediation(pol.value(), {"agent-1"}, 2000, 1800);
+    REQUIRE(claimed.has_value());
+    CHECK(claimed->empty());
+}
+
+TEST_CASE("claim_remediation re-claims a stale claim past the staleness window",
+          "[policy_store][pg][claim]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+    auto pol = store.create_policy(make_policy_yaml(frag.value()));
+    REQUIRE(pol.has_value());
+
+    auto claimed1 = store.claim_remediation(pol.value(), {"agent-1"}, 1000, 1800);
+    REQUIRE(claimed1.has_value());
+    REQUIRE(claimed1->size() == 1);
+
+    // Just short of the staleness window: still refused.
+    auto claimed_early = store.claim_remediation(pol.value(), {"agent-1"}, 1000 + 1799, 1800);
+    REQUIRE(claimed_early.has_value());
+    CHECK(claimed_early->empty());
+
+    // Past the staleness window (the claiming replica presumably died): a
+    // fresh claim succeeds, same as `claim_due_policies`'s own stranded-
+    // 'fixing' staleness sweep.
+    auto claimed2 = store.claim_remediation(pol.value(), {"agent-1"}, 1000 + 1801, 1800);
+    REQUIRE(claimed2.has_value());
+    REQUIRE(claimed2->size() == 1);
+    CHECK((*claimed2)[0] == "agent-1");
+}
+
+TEST_CASE("release_remediation_claim frees a claim so it can be re-claimed immediately",
+          "[policy_store][pg][claim]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+    auto pol = store.create_policy(make_policy_yaml(frag.value()));
+    REQUIRE(pol.has_value());
+
+    auto claimed1 = store.claim_remediation(pol.value(), {"agent-1"}, 1000, 1800);
+    REQUIRE(claimed1.has_value());
+    REQUIRE(claimed1->size() == 1);
+
+    // Still well within the staleness window -- without an explicit
+    // release, a re-claim here would be refused (see the "second concurrent
+    // claim" test above).
+    REQUIRE(store.release_remediation_claim(pol.value(), {"agent-1"}).has_value());
+
+    auto claimed2 = store.claim_remediation(pol.value(), {"agent-1"}, 1005, 1800);
+    REQUIRE(claimed2.has_value());
+    REQUIRE(claimed2->size() == 1);
+    CHECK((*claimed2)[0] == "agent-1");
+
+    // Releasing an already-unclaimed / never-claimed target is a benign
+    // no-op, not an error.
+    REQUIRE(store.release_remediation_claim(pol.value(), {"agent-1"}).has_value());
+    REQUIRE(store.release_remediation_claim("nonexistent-policy", {"agent-99"}).has_value());
+}

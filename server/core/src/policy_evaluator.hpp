@@ -28,32 +28,36 @@
 ///     — `update_agent_status`'s UPSERT is naturally idempotent against a
 ///     racing manual evaluate_now()/remediate() call on another replica FOR
 ///     THE STATUS VALUE (each write converges to a consistent final row).
-///     This does NOT extend to remediate()'s retry-attempt counter (governance
-///     UP-3, 2026-08-24): two concurrent remediate() calls for the same
-///     policy — same-process, guarded by `remediating_`; cross-replica,
-///     still open — each independently increment it, which is a real double
-///     count, not an idempotent no-op.
 ///
 /// Remediation is MANUAL and opt-in (operator-gated) and only available when
 /// the fragment defines a fix_instruction: `remediate()` marks targets
 /// `fixing`, dispatches the fix, then (on a later tick) dispatches the
 /// post-check / check instruction and writes the true post-fix verdict. There
-/// is no automatic non_compliant -> fix loop. A concurrent `remediate()` call
-/// for the same policy while one is already dispatching is rejected (error,
-/// same-process only via `remediating_`/`ReservationGuard` below — a
-/// cross-replica race is still possible, see the Multi-replica note above).
+/// is no automatic non_compliant -> fix loop.
 ///
-/// Multi-replica note (ADR-0056): a stranded `fixing` row (the dispatching
-/// replica died mid-FixWait) is swept back to `unknown` by
-/// `claim_due_policies`'s per-tick staleness check, not by this class's
-/// constructor — the old unconditional every-restart reset would stomp
-/// another replica's still-live remediation under N replicas.
+/// HA WS-3 3.4 (ADR-2002 §6 finding 6a): a concurrent `remediate()` call for
+/// the same policy is arbitrated by a DURABLE, per-(policy,agent) CAS in
+/// `PolicyStore` (`claim_remediation`/`release_remediation_claim`) — CLAIM,
+/// then DISPATCH, then mark 'fixing' only for the subset the dispatch
+/// actually DELIVERED to. This closes what the pre-HA in-process
+/// `remediating_` guard never covered: a sibling replica's independent
+/// remediate() call for the same policy had no shared state to see it and
+/// would double-dispatch the fix, double-incrementing
+/// `update_agent_status`'s `fix_attempt_count` on a fix instruction that may
+/// not be idempotent. The claim is released (a) for a claimed-but-NOT-
+/// delivered target (offline / quarantined / plugin-absent / a systemic
+/// containment-gate failure) immediately, WITHOUT burning a retry attempt;
+/// (b) for a delivered target once its FixWait entry matures in
+/// `collect_ready()`; (c) by `claim_due_policies`'s own stranded-`fixing`
+/// staleness sweep, using the SAME `fixing_stale_seconds` window, if the
+/// claiming replica dies mid-flight (superseding the old unconditional
+/// every-restart reset this class's constructor used to do, which would
+/// stomp another replica's still-live remediation under N replicas).
 
 #include <cstdint>
 #include <expected>
 #include <functional>
 #include <mutex>
-#include <set>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -178,7 +182,11 @@ public:
         // business rejection" shape to every caller.
         bool degraded{false};
         std::string execution_id; // fix-dispatch execution id when ok
-        int agents{0};            // agents the fix was dispatched to
+        // Agents the fix was actually DELIVERED to (HA WS-3 3.4) — a
+        // claimed-but-not-delivered target (offline/not_sent, quarantined,
+        // plugin-absent) is excluded; it was never marked 'fixing' and its
+        // claim was released without burning a retry attempt.
+        int agents{0};
     };
 
     /// Manually remediate a policy. Requires the fragment to define a
@@ -206,19 +214,27 @@ private:
     };
 
     Deps d_;
-    std::mutex mu_;                                   // guards in_flight_, remediating_
+    std::mutex mu_; // guards in_flight_
     std::vector<InFlight> in_flight_;
-    // Governance UP-3 (2026-08-24): reserved policy_ids between remediate()'s
-    // dedupe check and the FixWait entry landing in in_flight_ — the window
-    // kickoff_check doesn't have (it dispatches, THEN registers, all under a
-    // single caller). remediate() burns the attempt-counter retry budget on
-    // its own dispatch, so a second concurrent call in that window is a
-    // stronger hazard than kickoff_check's equivalent gap, not just a
-    // duplicate-check nuisance. See remediate()'s RAII guard.
-    std::set<std::string> remediating_;
+    // HA WS-3 3.4: the process-local `remediating_`/`ReservationGuard` guard
+    // that used to live here (governance UP-3, 2026-08-24) is DELETED, not
+    // demoted — the durable per-(policy,agent) claim in PolicyStore
+    // (`claim_remediation`) is strictly finer-grained (per agent, not per
+    // policy) and cross-replica-visible, so it fully subsumes the
+    // same-process case this guard covered. See this file's header doc.
 
     void dispatch_due();
     void collect_ready();
+
+    // HA WS-3 3.4: dispatch_instruction() must hand its ConfinedDispatchOutcome
+    // back to remediate() (fold-in #4 -- `.sent` is a COUNT, not a set, so the
+    // DELIVERED subset can only be recovered from the outcome's per-id
+    // fields). kickoff_check() and collect_ready()'s verify-dispatch call
+    // site keep ignoring `.outcome`, same as before this struct existed.
+    struct DispatchInstructionResult {
+        std::string execution_id;
+        yuzu::server::ConfinedDispatchOutcome outcome;
+    };
 
     // Resolve scope/groups -> unique agent ids. Must be called WITHOUT mu_
     // held (it does store/registry I/O that must not run under the evaluator
@@ -233,14 +249,16 @@ private:
     // forwarding, so it must run lock-free. Caller must NOT hold mu_.
     std::expected<std::string, std::string> kickoff_check(const Policy& p);
 
-    // Dispatch `instruction_id` to `targets`; returns a fresh execution_id, or
-    // "" on a legitimate no-op (unknown definition / empty targets — same as
-    // pre-migration). `unexpected` when InstructionStore::get_definition itself
-    // errors (ADR-0058: a genuine DB/lease failure must never collapse into the
-    // same "" a not-found id returns — every caller propagates this the same
-    // way it propagates its own other degrade paths). Must be called WITHOUT
-    // mu_ held (invokes the blocking dispatch_fn).
-    std::expected<std::string, std::string>
+    // Dispatch `instruction_id` to `targets`; returns a fresh execution_id
+    // (plus the raw ConfinedDispatchOutcome from dispatch_fn — HA WS-3 3.4,
+    // only remediate() consumes it), or an empty execution_id on a legitimate
+    // no-op (unknown definition / empty targets — same as pre-migration).
+    // `unexpected` when InstructionStore::get_definition itself errors
+    // (ADR-0058: a genuine DB/lease failure must never collapse into the same
+    // "" a not-found id returns — every caller propagates this the same way
+    // it propagates its own other degrade paths). Must be called WITHOUT mu_
+    // held (invokes the blocking dispatch_fn).
+    std::expected<DispatchInstructionResult, std::string>
     dispatch_instruction(const std::string& instruction_id,
                          const std::unordered_map<std::string, std::string>& parameters,
                          const std::vector<std::string>& targets);

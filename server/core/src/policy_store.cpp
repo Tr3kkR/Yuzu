@@ -2,6 +2,7 @@
 
 #include "cel_eval.hpp"
 #include "compliance_eval.hpp"
+#include "pg/pg_array.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_raii.hpp"
@@ -52,6 +53,27 @@ std::string text_col(PGresult* res, int row, int col) {
     if (PQgetisnull(res, row, col))
         return {};
     return std::string(PQgetvalue(res, row, col));
+}
+
+// Mirrors DeploymentRunStore's identically-named helpers — bind a
+// vector<string> as a text[] literal (pg::to_text_array wants string_views),
+// and collect a RETURNING-column result back into a vector<string>.
+std::vector<std::string_view> as_views(const std::vector<std::string>& v) {
+    std::vector<std::string_view> out;
+    out.reserve(v.size());
+    for (const auto& s : v)
+        out.emplace_back(s);
+    return out;
+}
+
+std::vector<std::string> returned_ids(const pg::PgResult& res) {
+    std::vector<std::string> out;
+    if (res.status() != PGRES_TUPLES_OK)
+        return out;
+    out.reserve(static_cast<size_t>(PQntuples(res.get())));
+    for (int i = 0; i < PQntuples(res.get()); ++i)
+        out.push_back(text_col(res.get(), i, 0));
+    return out;
 }
 
 bool is_fk_violation(const pg::PgResult& res) {
@@ -300,6 +322,15 @@ const std::vector<pg::PgMigration>& migrations() {
          "  policy_id          TEXT PRIMARY KEY REFERENCES policies(id) ON DELETE CASCADE,"
          "  last_dispatched_at BIGINT NOT NULL DEFAULT 0"
          ");"},
+        // HA WS-3 3.4: durable per-(policy,agent) remediation claim, closing
+        // the gap left by the evaluator's old process-local `remediating_`
+        // guard under active-active HA (two replicas each independently
+        // dispatching the same fix and each incrementing fix_attempt_count —
+        // a real double-fire, not an idempotent race). 0 = unclaimed; a
+        // non-zero value is the claiming replica's epoch-seconds `now()` at
+        // claim time, aged out by `claim_remediation`'s own WHERE guard
+        // (never a separate reaper — see that method's doc comment).
+        {2, "ALTER TABLE policy_status ADD COLUMN remediation_claim_at BIGINT NOT NULL DEFAULT 0;"},
     };
     return kMigrations;
 }
@@ -1228,9 +1259,18 @@ PolicyStore::claim_due_policies(int64_t now, int64_t default_interval_seconds,
         // very next real check, and a wrongly-swept row just costs one
         // extra dispatch cycle — none of the irrecoverable-on-clock-skew
         // stakes that rule exists for.
+        // HA WS-3 3.4: also frees a stranded remediation claim in the SAME
+        // UPDATE — this is the graceful-shutdown drop path's release (the
+        // dispatching replica died before collect_ready() could mature the
+        // FixWait and release it itself, policy_evaluator.cpp's grace-window
+        // comment). Uses the SAME `fixing_stale_seconds` window
+        // claim_remediation's own staleness guard is passed — the two
+        // windows are one and the same value from every production caller
+        // (PolicyEvaluator::Deps::fixing_stale_seconds), so they can never
+        // disagree about when a row is stale.
         pg::PgResult sweep = pg::exec_params(
             conn,
-            "UPDATE policy_store.policy_status SET status = 'unknown' "
+            "UPDATE policy_store.policy_status SET status = 'unknown', remediation_claim_at = 0 "
             "WHERE status = 'fixing' AND last_fix_at < $1",
             std::vector<std::string>{std::to_string(now - fixing_stale_seconds)});
         if (sweep.status() != PGRES_COMMAND_OK) {
@@ -1339,6 +1379,88 @@ std::expected<void, std::string> PolicyStore::record_dispatch(const std::string&
         spdlog::error("PolicyStore: record_dispatch failed for policy {}: {}", policy_id,
                      PQerrorMessage(lease.get()));
         return std::unexpected(std::string(kPolicyDbErrorPrefix) + "failed to record dispatch");
+    }
+    return {};
+}
+
+// ── Durable per-(policy,agent) remediation claim (HA WS-3 3.4) ──────────────
+
+std::expected<std::vector<std::string>, std::string>
+PolicyStore::claim_remediation(const std::string& policy_id,
+                               const std::vector<std::string>& agent_ids, int64_t now,
+                               int64_t stale_seconds) {
+    if (!open_)
+        return std::unexpected(std::string(kPolicyDbErrorPrefix) + "database not open");
+    if (policy_id.empty() || agent_ids.empty())
+        return std::vector<std::string>{};
+
+    auto lease = pool_.try_acquire_for(kAcquireTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kPolicyDbErrorPrefix) +
+                               "database unavailable — try again");
+
+    // UPSERT CAS, not a plain UPDATE: `unnest($2::text[])` seeds the
+    // fresh-INSERT branch for an agent with no `policy_status` row yet (an
+    // UPDATE-only claim would silently claim nothing for it — see the
+    // header doc). ON CONFLICT wins iff the existing row is unclaimed
+    // (remediation_claim_at = 0), claimed stale (older than
+    // `now - stale_seconds` — the SAME window claim_due_policies' own
+    // stranded-fixing sweep uses, so the two never disagree about a row),
+    // AND the retry cap has not already been hit — mirrors
+    // update_agent_status's own kMaxFixAttempts guard so a capped agent
+    // cannot be claimed at all, not just refused later at the status write.
+    const std::string sql =
+        "INSERT INTO policy_store.policy_status "
+        "(policy_id, agent_id, status, last_check_at, last_fix_at, check_result, "
+        " fix_attempt_count, remediation_claim_at) "
+        "SELECT $1, x, 'unknown', 0, 0, '', 0, $3::bigint FROM unnest($2::text[]) AS x "
+        "ON CONFLICT (policy_id, agent_id) DO UPDATE SET "
+        "  remediation_claim_at = EXCLUDED.remediation_claim_at "
+        "  WHERE (policy_status.remediation_claim_at = 0 "
+        "         OR policy_status.remediation_claim_at <= $3::bigint - $4::bigint) "
+        "    AND policy_status.fix_attempt_count < " +
+        std::to_string(kMaxFixAttempts) +
+        " "
+        "RETURNING agent_id";
+    pg::PgResult res = pg::exec_params(
+        lease.get(), sql.c_str(),
+        std::vector<std::string>{policy_id, pg::to_text_array(as_views(agent_ids)),
+                                 std::to_string(now), std::to_string(stale_seconds)});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("PolicyStore: claim_remediation failed for policy {}: {}", policy_id,
+                     PQerrorMessage(lease.get()));
+        return std::unexpected(std::string(kPolicyDbErrorPrefix) +
+                               "failed to claim remediation targets");
+    }
+    return returned_ids(res);
+}
+
+std::expected<void, std::string>
+PolicyStore::release_remediation_claim(const std::string& policy_id,
+                                       const std::vector<std::string>& agent_ids) {
+    if (!open_)
+        return std::unexpected(std::string(kPolicyDbErrorPrefix) + "database not open");
+    if (policy_id.empty() || agent_ids.empty())
+        return {};
+
+    auto lease = pool_.try_acquire_for(kAcquireTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kPolicyDbErrorPrefix) +
+                               "database unavailable — try again");
+
+    // No RETURNING check on row count: releasing a claim that was already
+    // released (or never taken — e.g. this policy/agent pair had no
+    // policy_status row at all) is a benign no-op, not an error.
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "UPDATE policy_store.policy_status SET remediation_claim_at = 0 "
+        "WHERE policy_id = $1 AND agent_id = ANY($2::text[])",
+        std::vector<std::string>{policy_id, pg::to_text_array(as_views(agent_ids))});
+    if (res.status() != PGRES_COMMAND_OK) {
+        spdlog::error("PolicyStore: release_remediation_claim failed for policy {}: {}", policy_id,
+                     PQerrorMessage(lease.get()));
+        return std::unexpected(std::string(kPolicyDbErrorPrefix) +
+                               "failed to release remediation claim");
     }
     return {};
 }

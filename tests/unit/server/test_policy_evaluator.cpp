@@ -139,11 +139,25 @@ struct Harness {
                                const std::string& execid) -> yuzu::server::ConfinedDispatchOutcome {
             ++dispatch_calls;
             dispatched_plugins.push_back(plugin);
-            int sent = 0;
+            yuzu::server::ConfinedDispatchOutcome outcome;
+            outcome.command_id = "cmd-" + execid;
             for (const auto& a : agents) {
                 auto it = canned.find(a + "|" + plugin);
-                if (it == canned.end())
-                    continue; // non-responder
+                if (it == canned.end()) {
+                    // HA WS-3 3.4 (mandatory test-harness fix): a canned-absent
+                    // agent now simulates an offline/unreachable device -- the
+                    // DELIVERY itself failed (ArmDispatchResult::not_sent), not
+                    // merely "dispatched but never responded". Previously this
+                    // fake left `.not_sent` permanently empty, so any
+                    // release-on-offline assertion against `remediate()`'s
+                    // delivered-set logic would have passed vacuously (nothing
+                    // ever landed in not_sent to exercise it). Check/verify
+                    // phases discard `.outcome` entirely (only remediate()
+                    // reads it), so this has no effect on their "non-responder
+                    // -> unknown" behaviour.
+                    outcome.not_sent.push_back(a);
+                    continue;
+                }
                 StoredResponse r;
                 r.instruction_id = "test";
                 r.agent_id = a;
@@ -153,9 +167,9 @@ struct Harness {
                 r.execution_id = execid;
                 r.timestamp = fake_now;
                 rs.store(r);
-                ++sent;
+                ++outcome.sent;
             }
-            return {.sent = sent, .command_id = "cmd-" + execid};
+            return outcome;
         };
         return d;
     }
@@ -444,7 +458,8 @@ TEST_CASE("policy evaluator: empty compliance CEL -> error (no false compliant)"
     CHECK(h.status_of(pid, "agentA") == "error");
 }
 
-TEST_CASE("policy evaluator: remediation attempt cap -> error after 3 fixing transitions",
+TEST_CASE("policy evaluator: remediate refuses a 4th call once the fix retry cap is "
+          "exhausted (HA WS-3 3.4 — refused at claim time, not dispatched-then-error)",
           "[pg][policy][evaluator]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -459,33 +474,43 @@ TEST_CASE("policy evaluator: remediation attempt cap -> error after 3 fixing tra
     ev.tick(true);
     REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
 
-    // Drive remediation with an explicit (in-scope) agent list. Each call marks
-    // the agent 'fixing'; PolicyStore caps fix attempts at 3 and forces 'error'
-    // on the transition that would exceed it. Verify the cap is reached.
+    // Drive remediation with an explicit (in-scope) agent list to the cap:
+    // three successful, DELIVERED remediate() calls each mark the agent
+    // 'fixing', and PolicyStore.claim_remediation's own WHERE guard
+    // (kMaxFixAttempts=3) now refuses a 4th attempt at CLAIM time, before
+    // any dispatch — see below.
     //
-    // Governance UP-3 (2026-08-24): remediate() now refuses a second call
-    // while the prior attempt's FixWait is still outstanding (closes a
+    // Governance UP-3 (2026-08-24): remediate() refuses a second call while
+    // the prior attempt's FixWait is still outstanding (closes a
     // double-dispatch / double-attempt-count hazard), so each attempt must
     // mature — advance time past grace, tick() — before the next call. This
     // is the realistic shape anyway: an operator waits for one fix attempt to
     // resolve before retrying.
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 3; ++i) {
         auto rr = ev.remediate(pid, {"agentA"});
-        // The first three dispatch the fix; the 4th still dispatches but the
-        // status write trips the cap. remediate reports dispatch success either way.
         REQUIRE(rr.ok);
-        if (i < 3) {
-            // Mature this attempt's FixWait (clearing it from in_flight_) so the
-            // NEXT remediate() call isn't refused as already-in-flight. Skip
-            // this on the 4th/final call — collect_ready()'s own verify-phase
-            // write (no canned "agentA|verifyp" response here -> non-responder
-            // -> "unknown") would otherwise overwrite the cap's "error" write
-            // this assertion is checking for.
-            h.fake_now += 20;
-            ev.tick(true);
-        }
+        // Mature this attempt's FixWait (clearing it from in_flight_ AND
+        // releasing the durable claim — HA WS-3 3.4) so the NEXT remediate()
+        // call isn't refused as already-in-flight.
+        h.fake_now += 20;
+        ev.tick(true);
     }
-    CHECK(h.status_of(pid, "agentA") == "error");
+
+    // HA WS-3 3.4: claim_remediation's own WHERE guard now refuses a target
+    // whose fix_attempt_count has already hit the cap BEFORE any dispatch is
+    // attempted — a behavioural change from the pre-CAS design, where a 4th
+    // remediate() call dispatched the fix a wasted 4th time and only THEN
+    // got its status forced to 'error' by update_agent_status's own cap
+    // CASE (see this change's changelog.d fragment). The fix is never even
+    // sent now, so there is no forced-to-'error' write to observe here —
+    // the cap having tripped is instead proven by the claim refusal itself
+    // and the absence of a 4th dispatch.
+    const int calls_before_4th = h.dispatch_calls;
+    auto rr4 = ev.remediate(pid, {"agentA"});
+    CHECK_FALSE(rr4.ok);
+    CHECK_FALSE(rr4.degraded); // a business rejection (cap exhausted), not a store degrade
+    CHECK(rr4.error.find("already in flight") != std::string::npos);
+    CHECK(h.dispatch_calls == calls_before_4th); // refused at claim time — no 4th dispatch
 }
 
 TEST_CASE("policy evaluator: remediate refuses a second call while a FixWait is already "
@@ -508,8 +533,9 @@ TEST_CASE("policy evaluator: remediate refuses a second call while a FixWait is 
     REQUIRE(rr1.ok);
     const int calls_after_first = h.dispatch_calls;
 
-    // NO tick() here — the first call's FixWait entry is still in in_flight_
-    // (collect_ready() is the only thing that clears it, and its grace
+    // NO tick() here — the first call's durable PolicyStore claim
+    // (HA WS-3 3.4, `claim_remediation`) is still live (collect_ready()'s
+    // FixWait maturation is the only thing that releases it, and its grace
     // window hasn't elapsed). A second call for the SAME policy must be
     // refused rather than dispatching another fix and burning a second
     // attempt against the retry cap on top of the first.
@@ -518,6 +544,120 @@ TEST_CASE("policy evaluator: remediate refuses a second call while a FixWait is 
     CHECK_FALSE(rr2.degraded); // this is a business rejection, not a store degrade
     CHECK(rr2.error.find("already in flight") != std::string::npos);
     CHECK(h.dispatch_calls == calls_after_first); // no second dispatch happened
+}
+
+TEST_CASE("policy evaluator: two PolicyEvaluator instances sharing one store remediate a "
+          "target exactly once (HA WS-3 3.4 durable claim)",
+          "[pg][policy][evaluator][claim]") {
+    // Regression for the double-dispatch/double-attempt-count hazard the
+    // durable claim closes: `remediating_`/`ReservationGuard` (governance
+    // UP-3, 2026-08-24) was a PER-INSTANCE in-memory guard — two independent
+    // PolicyEvaluator instances (simulating two HA replicas) shared no state
+    // at all, so a second instance targeting the SAME agent explicitly
+    // (bypassing the non_compliant status filter, which the first call's own
+    // 'fixing' write would otherwise narrow away before the second instance
+    // ever ran) would previously double-dispatch the fix and
+    // double-increment fix_attempt_count. Explicit `{"agentA"}` on BOTH
+    // calls is required to exercise this: with an empty agent_ids list the
+    // pre-existing non_compliant filter alone (get_policy_agent_statuses)
+    // already excludes agentA once the first call's synchronous dispatch
+    // marks it 'fixing' — sequential single-threaded execution means that
+    // would pass even under the OLD, pre-claim code, so it would not be a
+    // real regression test for the CAS.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 8}};
+    Harness h(pool);
+    h.canned["agentA|checkp"] = {1, out_json("hostname", "")}; // non_compliant
+    h.canned["agentA|fixp"] = {1, "ok"};
+    auto pid = h.author("result.hostname != ''", /*with_fix=*/true);
+
+    PolicyEvaluator evA(h.deps());
+    PolicyEvaluator evB(h.deps());
+    REQUIRE_FALSE(evA.evaluate_now(pid).value_or("").empty());
+    h.fake_now += 20;
+    evA.tick(true);
+    REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
+
+    const int calls_before = h.dispatch_calls;
+    auto rrA = evA.remediate(pid, {"agentA"});
+    auto rrB = evB.remediate(pid, {"agentA"});
+
+    REQUIRE(rrA.ok);
+    CHECK_FALSE(rrB.ok);
+    CHECK_FALSE(rrB.degraded); // a business rejection (already claimed), not a store degrade
+    CHECK(rrB.error.find("already in flight") != std::string::npos);
+    CHECK(h.dispatch_calls == calls_before + 1); // exactly one fix dispatch, not two
+
+    // fix_attempt_count must be exactly 1 after the race above (not 2): TWO
+    // more successful 'fixing' writes (matching the single-instance cap
+    // test's total of three) bring it to kMaxFixAttempts=3, and a THIRD
+    // attempt at that point must be refused AT CLAIM TIME (HA WS-3 3.4 —
+    // claim_remediation's own WHERE guard, not update_agent_status's
+    // dispatched-then-forced-to-'error' CASE). If the race above had
+    // double-incremented (count already 2, not 1), only ONE more successful
+    // write would be needed to reach the cap and this refusal would land
+    // one iteration early with a dispatch still recorded for it.
+    for (int i = 0; i < 2; ++i) {
+        h.fake_now += 20;
+        evA.tick(true); // mature the previous round's FixWait, releasing its claim
+        auto rr = evA.remediate(pid, {"agentA"});
+        REQUIRE(rr.ok);
+    }
+    h.fake_now += 20;
+    evA.tick(true); // mature the 3rd round's FixWait, releasing its claim
+    const int calls_before_cap = h.dispatch_calls;
+    auto rr_capped = evA.remediate(pid, {"agentA"});
+    CHECK_FALSE(rr_capped.ok);
+    CHECK_FALSE(rr_capped.degraded);
+    CHECK(rr_capped.error.find("already in flight") != std::string::npos);
+    CHECK(h.dispatch_calls == calls_before_cap); // refused at claim time — no dispatch
+}
+
+TEST_CASE("policy evaluator: remediate releases the claim (without burning a retry attempt) "
+          "when the fix send fails, and a re-remediate re-claims it",
+          "[pg][policy][evaluator][claim]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.canned["agentA|checkp"] = {1, out_json("hostname", "")}; // non_compliant
+    auto pid = h.author("result.hostname != ''", /*with_fix=*/true);
+    // agentA is deliberately NOT canned for "fixp" -- the fake dispatch_fn
+    // (fixed above) records it in outcome.not_sent, simulating an
+    // offline/unreachable device at delivery time.
+
+    PolicyEvaluator ev(h.deps());
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    h.fake_now += 20;
+    ev.tick(true);
+    REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
+
+    // Three remediate() attempts, each claiming then failing to deliver.
+    // None of these may ever reach update_agent_status("fixing") -- if the
+    // claim were released WITH an attempt burned, the fix_attempt_count cap
+    // (kMaxFixAttempts=3) would already have tripped by the third of these.
+    for (int i = 0; i < 3; ++i) {
+        auto rr = ev.remediate(pid, {"agentA"});
+        REQUIRE(rr.ok); // dispatch itself succeeded -- a valid execution_id was minted
+        // Honest count (HA WS-3 3.4): nothing was DELIVERED (agentA landed in
+        // outcome.not_sent), so agents == 0 even though ok == true and a
+        // real dispatch call was made.
+        CHECK(rr.agents == 0);
+        // Nothing was delivered -- no FixWait entry queued, no status write.
+        CHECK(h.status_of(pid, "agentA") == "non_compliant");
+    }
+
+    // Each of the three releases above must have cleared the claim (else
+    // this call would be refused as "already in flight"). Wire up a real
+    // delivery and confirm the claim is re-claimable and the fix actually
+    // dispatches.
+    h.canned["agentA|fixp"] = {1, "ok"};
+    auto rr = ev.remediate(pid, {"agentA"});
+    REQUIRE(rr.ok);
+    CHECK(rr.agents == 1);
+    // fix_attempt_count is still 0 going into this write (none of the three
+    // not_sent releases incremented it) -- 'fixing', not the capped 'error'
+    // three real increments would have produced.
+    CHECK(h.status_of(pid, "agentA") == "fixing");
 }
 
 TEST_CASE("policy evaluator: verify dispatch failure -> error", "[pg][policy][evaluator]") {
