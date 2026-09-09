@@ -104,14 +104,14 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # see check-capability-matrix.sh's CDX-P2-006 comment for why an un-adjusted
 # baseline is not a real ratchet.
 #
-# #4031 (enrollment/directory/pending read twins, Batch A of #2146) flips
-# the enrollment domain's five GET rows from "planned:#2146" to "twinned"
-# (two directory-sync REST+MCP twins, three REST-only twins with the MCP gap
-# a reviewed #520 exception — see docs/mcp-server.md), on top of origin/dev's
-# own already-merged #4027/#4028/#4029/#4030 twins (251) -- reconciled
-# post-merge against the actual measured count below, not hand-added from
-# either side's stale pre-merge value.
-BASELINE_UNTWINNED = 246
+# #4034 (compliance/policy read-twin batch, #2146 API-parity Batch A) flips
+# the compliance-policy domain rows from "planned:#2146" to "twinned" (more
+# than the 3 net-new tools alone -- the underlying compliance-policy.json
+# ledger file combined additional REST-only twin flips too), on top of
+# origin/dev's own already-merged #4027/#4028/#4029/#4030/#4031/#4033
+# twins (242) -- reconciled post-merge against the actual measured count
+# below, not hand-added from either side's stale pre-merge value.
+BASELINE_UNTWINNED = 237
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.

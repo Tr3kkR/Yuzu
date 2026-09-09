@@ -60,6 +60,7 @@ A separate, narrower shape applies to ordinary mutation routes that audit a chan
 - [Pre-Auth Request Body Caps](#pre-auth-request-body-caps-2407)
 - [REST API v1 Endpoints](#rest-api-v1-endpoints)
   - [Current User](#current-user)
+  - [Devices](#devices)
   - [Management Groups](#management-groups)
   - [API Tokens](#api-tokens)
   - [Engine Principals](#engine-principals)
@@ -330,6 +331,84 @@ Returns the authenticated user's identity and role.
   "meta": { "api_version": "v1" }
 }
 ```
+
+---
+
+### Devices
+
+The fleet device list and single-device identity read (#4033, #2146 API-parity Batch A) — the
+REST twins of the `/devices` dashboard's `list_agents`/`get_agent_details`-shaped MCP tools.
+Both routes are gated via `AuthRoutes::require_fleet_read` (the admit-then-filter chokepoint),
+not a bare permission check — a management-group-confined operator and a correctly-confined
+service-scoped token both see a real, filtered subset of the fleet rather than either the whole
+fleet or an outright denial. Neither route is audited on a successful read: device identity
+(hostname/OS/arch/version) is machine metadata, not behavioural PII — matching the
+`/fragments/devices/list`, `/fragments/device/page`, and `/fragments/device/info` dashboard
+fragments' own unaudited posture.
+
+#### `GET /api/v1/devices`
+
+List every device visible to the caller.
+
+**Permission:** `Infrastructure:Read`, via `require_fleet_read`.
+
+**Response:**
+
+```json
+{
+  "data": {
+    "devices": [
+      {
+        "agent_id": "a1b2c3d4e5f6",
+        "hostname": "web-01",
+        "os": "linux",
+        "arch": "x86_64",
+        "agent_version": "0.13.1"
+      }
+    ],
+    "count": 1,
+    "devices_omitted": 0
+  },
+  "pagination": { "total": 1, "start": 0, "page_size": 50 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`devices_omitted` counts agents dropped by the caller's management-group/service-scope
+confinement (0 when unfiltered or nothing was dropped) — the same "out of my scope" vs. "not
+present" signal `GET /api/v1/inventory/software`'s `devices_omitted` field carries.
+
+---
+
+#### `GET /api/v1/devices/{id}`
+
+Fetch one device's identity.
+
+**Permission:** `Infrastructure:Read`, via `require_fleet_read`.
+
+**Response:**
+
+```json
+{
+  "data": {
+    "agent_id": "a1b2c3d4e5f6",
+    "hostname": "web-01",
+    "os": "linux",
+    "arch": "x86_64",
+    "agent_version": "0.13.1",
+    "tags": [
+      { "key": "environment", "value": "production", "source": "server" }
+    ]
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`tags` is present only when a TagStore is configured; it is omitted entirely (never an empty
+array) when it is not. A device outside the caller's fleet-read scope returns the SAME 404 as a
+genuinely nonexistent `agent_id` — an out-of-scope match is never distinguishable from "does not
+exist" in the response body (matches the pre-existing MCP `get_agent_details` tool's
+existence-oracle closure exactly).
 
 ---
 
@@ -723,6 +802,43 @@ Remove a role assignment from this management group.
 ```json
 {
   "data": { "unassigned": true },
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+#### `GET /api/v1/management-groups/agent-count-preview`
+
+Preview the number of currently-visible agents that would match a would-be management group's
+filter criteria, before creating it (#4033, #2146 API-parity Batch A). REST/MCP/dashboard-fragment
+twin of `/fragments/create-group-form`'s own live count. This route and its MCP twin call the same
+shared builder (`group_agent_count_preview.hpp`), so those two cannot drift from each other; the
+dashboard fragment keeps its own separate, behaviourally-equivalent inline implementation
+(`DashboardRoutes::parse_filters`), unchanged by this PR — the number it shows and this route's
+`agent_count` are expected to agree today, but are not structurally guaranteed to. MCP twin:
+`preview_management_group_agent_count`.
+
+**Permission:** `ManagementGroup:Write` — matching the fragment's own gate exactly (only an
+operator who could create the group may preview it), **not** `ManagementGroup:Read`, even though
+this route performs no mutation.
+
+**Query parameters:**
+
+| Parameter | Description |
+|---|---|
+| `command_id` | The response set's instruction/command id to count against. |
+| `plugin` | Plugin name whose response columns the filter keys are matched against. |
+| `<filter keys>` | Any other query param is treated as a filter, keyed by the SAME mangling the dashboard fragment's `f_<column>` params apply to a column name — lowercase, spaces/dashes replaced with underscores (e.g. `Local Addr` → `local_addr`). Unlike the fragment, this route's keys carry **no** `f_` prefix — supply `local_addr`, not `f_local_addr`. An unrecognised key is silently ignored. |
+
+An empty filter set (no recognised filter keys supplied) returns a genuine `0` — no scoped count
+to report, and no store read is made.
+
+**Response:**
+
+```json
+{
+  "data": { "agent_count": 42 },
   "meta": { "api_version": "v1" }
 }
 ```
@@ -3331,6 +3447,39 @@ Delete a policy fragment.
 
 ---
 
+#### `GET /api/v1/policy-fragments`
+
+REST v1 twin of `GET /api/policy-fragments` above (api-parity #4034) — same query
+parameters, same row shape, A4-enveloped. MCP twin: `list_policy_fragments`.
+
+**Permission:** `Policy:Read`
+
+**Response:**
+
+```json
+{
+  "data": [
+    {
+      "id": "frag-abc123",
+      "name": "ensure-defender-enabled",
+      "description": "Verify Windows Defender is active",
+      "check_instruction": "security.defender-status",
+      "check_compliance": "result.enabled == true",
+      "fix_instruction": "security.enable-defender",
+      "post_check_instruction": "",
+      "created_at": 1710849600,
+      "updated_at": 1710849600
+    }
+  ],
+  "pagination": { "total": 1, "start": 0, "page_size": 50 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Response (503):** `{"error":{"code":503,"message":"policy store not available"},"meta":{"api_version":"v1"}}`
+
+---
+
 ### Policies
 
 Policies bind fragments to devices via scope expressions, triggers, and management group bindings.
@@ -3618,6 +3767,64 @@ is a store degrade, never a business rejection).
 
 ---
 
+#### `GET /api/v1/policies`
+
+REST v1 twin of `GET /api/policies` above (api-parity #4034) — same query
+parameters, same row shape, A4-enveloped. MCP twin: `list_policies` (a narrower
+5-field subset of this row shape — id/name/description/enabled/scope_expression
+only).
+
+**Permission:** `Policy:Read`
+
+**Response:** same `data`/`pagination`/`meta` envelope shape as
+`GET /api/v1/policy-fragments` above, wrapping the same per-policy row
+`GET /api/policies` documents.
+
+---
+
+#### `GET /api/v1/policies/{id}`
+
+REST v1 twin of `GET /api/policies/{id}` above (api-parity #4034) — flat
+top-level fields (not nested under a `"policy"` key), A4-enveloped. MCP twin:
+`get_policy`.
+
+**Permission:** `Policy:Read`
+
+**Response:**
+
+```json
+{
+  "data": {
+    "id": "pol-xyz789",
+    "name": "baseline-security",
+    "description": "",
+    "yaml_source": "apiVersion: yuzu.io/v1alpha1\nkind: Policy\n...",
+    "fragment_id": "frag-abc123",
+    "scope_expression": "tag:environment = 'production'",
+    "enabled": true,
+    "remediation_available": true,
+    "inputs": { "severity": "high" },
+    "triggers": [{ "id": 1, "type": "interval", "config": { "interval_seconds": 300 } }],
+    "management_groups": ["eu-production"],
+    "created_at": 1710849600,
+    "updated_at": 1710849600,
+    "compliance": {
+      "compliant": 42,
+      "non_compliant": 3,
+      "unknown": 5,
+      "fixing": 1,
+      "error": 0,
+      "total": 51
+    }
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Response (404):** `{"error":{"code":404,"message":"policy not found"},"meta":{"api_version":"v1"}}`
+
+---
+
 ### Compliance
 
 Fleet and per-policy compliance status endpoints.
@@ -3680,6 +3887,91 @@ Per-policy compliance detail with per-agent statuses.
 
 **Response (503):** `policy store degraded`, on either the summary or the
 per-agent-status read.
+
+---
+
+#### `GET /api/v1/compliance`
+
+REST v1 twin of `GET /api/compliance` above (api-parity #4034), A4-enveloped.
+MCP twin: `get_fleet_compliance`.
+
+**Permission:** `Policy:Read`
+
+**Response:**
+
+```json
+{
+  "data": {
+    "compliance_pct": 92.5,
+    "total_checks": 200,
+    "compliant": 185,
+    "non_compliant": 8,
+    "unknown": 5,
+    "fixing": 2,
+    "error": 0
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+#### `GET /api/v1/compliance/{policy_id}`
+
+REST v1 twin of `GET /api/compliance/{policy_id}` above (api-parity #4034),
+A4-enveloped, plus a `policy_id` sibling field the legacy route also returns
+(the legacy route's own doc example above omits it — pre-existing doc drift,
+not introduced by this route). **Authorization is `require_fleet_read`
+(`Policy:Read`), not a bare permission check** — the per-agent `agents` array
+is a fan-out read of per-agent data (routed-concerns RBAC row), so a
+management-group- or service-scope-confined caller sees only the agents
+visible to it, and `summary` is tallied from exactly that filtered set, never
+the store's unfiltered fleet-wide aggregate. MCP twin: `get_policy_agent_statuses`
+(same shape) — `get_compliance_summary` covers the `summary`-only half.
+
+**Permission:** `Policy:Read` (fleet-read gate)
+
+**Response:**
+
+```json
+{
+  "data": {
+    "policy_id": "pol-xyz789",
+    "summary": {
+      "compliant": 42,
+      "non_compliant": 3,
+      "unknown": 5,
+      "fixing": 1,
+      "error": 0,
+      "total": 51
+    },
+    "agents": [
+      {
+        "agent_id": "agent-01",
+        "status": "compliant",
+        "last_check_at": 1710936000,
+        "last_fix_at": 0,
+        "check_result": "{\"realtime_protection\": true}"
+      }
+    ]
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Audit:** `compliance.agent_statuses.view` — **fail-closed** (`503` +
+`Sec-Audit-Failed: true`, never a `2xx` on an audit-persist miss), matching
+this API's general behavioural-PII posture (see [`Sec-Audit-Failed` and the
+behavioural-PII audit posture](#sec-audit-failed-and-the-behavioural-pii-audit-posture)
+above). Unlike the five sibling routes above it, this route's `check_result`
+field carries the raw, unrestricted output of whatever instruction the
+bound fragment's `check_instruction` names — free-form and
+operator-authored at fragment-creation time, not a fixed machine-scope
+shape — so it cannot make the same "not behavioural PII" claim
+`GET /api/v1/inventory/software` genuinely can. The MCP twin
+(`get_policy_agent_statuses`) is unaffected: it follows MCP's own
+convention of surfacing the same gap via an `audit_persisted:false` body
+field rather than a header/status code.
 
 ---
 

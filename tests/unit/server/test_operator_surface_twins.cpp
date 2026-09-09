@@ -458,6 +458,15 @@ constexpr TwinRow kExpectedTwins[] = {
     // is what proves get_directory_status's own table entries are
     // consistent, and test_mcp_server.cpp exercises its dispatch directly).
     {"list_directory_users", "Directory", "Read", true},
+    // #4033 (#2146 Batch A) — pinned against
+    // /fragments/create-group-form's own ManagementGroup:Write gate
+    // (dashboard_routes.cpp) and its REST twin GET /api/v1/management-groups/
+    // agent-count-preview (rest_api_v1.cpp).
+    {"preview_management_group_agent_count", "ManagementGroup", "Write", false},
+    // #4034 — compliance/policy REST v1 read twins.
+    {"get_policy", "Policy", "Read", true},
+    {"list_policy_fragments", "Policy", "Read", true},
+    {"get_policy_agent_statuses", "Policy", "Read", true},
 };
 
 } // namespace
