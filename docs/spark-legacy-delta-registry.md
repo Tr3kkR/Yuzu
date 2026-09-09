@@ -328,6 +328,17 @@ here.
 
 ---
 
+### D12 — Registry: a consumed Target-mode notification is two Fired submissions; appearance is emitted at commit; an establishment past its 50 ms grace is a Faulted/Recovered pair (#2012/#3840 PR-B1)
+
+| | |
+|---|---|
+| **Legacy** | `guard_registry`'s dedicated per-guard thread re-arms `RegNotifyChangeKeyValue` inline before evaluating: one notification is one evaluation, a key that (re)appears under an ancestor watch is evaluated inline, and there is no health edge tied to how long the re-arm took. |
+| **Spark** | Since PR-B1 the Registry mechanism's re-arm is a detached probe committed later by the mechanism's sweeper. A consumed Target-mode notification therefore produces the known-good fire immediately AND one synthetic fire when the re-arm commits (two `Fired` submissions, both invalidation hints - Guardian re-reads on each and its `decide_emit` debounce governs the wire; N writes before the re-arm still coalesce into one notification). An Ancestor->Target appearance is emitted when the re-arm commits (one fire, delayed by at most one sweep cadence). An establishment or re-arm still outstanding past `kRegHealthGrace` (50 ms; `accepted_at` is stamped at reservation, before the caller's own 50 ms budget starts) is reported `Faulted` and `Recovered` on commit, so a slow hive yields health-edge pairs at its change rate. |
+| **Why deliberate** | Plan amendment 5/6/8 (ownership protocol, resync epoch, launch-and-poll re-arm) and Dave's ruling on option A (2026-09-09, Astra + Fable concurring): reporting an already-received notification must not depend on the next watch establishing; Recovered never re-evaluates, so the gap needs a real fire. |
+| **Operator symptom** | In steady drift the synthetic fire lands inside the default 1000 ms event debounce and inflates the next `drift.detected` row's `collapsed_count` by one (a rule debounced below ~200 ms shows a second uncollapsed drift row instead); on the queued tier a noisy key's synthetic fire can evict a quiet key's only fire from the per-consumer drop-oldest queue; `guard.unhealthy`/`guard.healthy` pairs appear for Registry rules on slow hives where legacy showed nothing. F14's D1 ceiling sizing must include these pairs. |
+| **Verify at** | `agents/core/src/spark_registry.cpp` (`on_fire`, `commit_locked`, `grace_check_locked`, header "Ownership / dispatch protocol" point 6); `agents/core/src/guardian_emit_decider.hpp` (`decide_emit`); `changelog.d/2012-3840-spark-regkey-watch-off-per-type-lock.changed.md`. |
+| **Epistemic** | reasoned from the PR-B1 code and its governance run; the collapsed_count and eviction effects are not yet measured on a rig (pre-flip measurement item, see `docs/spark-flip-gate.md` F14). |
+
 ## E. Cadence / resource
 
 ### E1 — Spark runs a scheduled convergence sweep across every rule; legacy is mostly notification-driven

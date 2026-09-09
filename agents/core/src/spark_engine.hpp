@@ -596,7 +596,7 @@ private:
     /// blocking callback drain to a detached worker and returns in
     /// microseconds - which also closes the #4181 same-type reentrant deadlock
     /// (this lock held across that drain while the drained callback's Inline
-    /// consumer needed it). Cost: a consumed Registry notification is now TWO
+    /// consumer needed it). Cost: a consumed Target-mode Registry notification is now TWO
     /// emit submissions (the immediate fire, then a synthetic fire when the
     /// asynchronous re-arm commits) - a queued consumer's per-consumer,
     /// drop-oldest queue (deliver()) can therefore be pushed by a noisy key's
