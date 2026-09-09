@@ -455,6 +455,14 @@ struct RegWatch {
     bool grace_counted{false};
     bool needs_resync{false};
     std::uint64_t resync_epoch{0};
+    /// The outstanding re-arm was fire-triggered while in Ancestor mode. If it
+    /// commits in Target mode the key APPEARED, which the base mechanism emitted
+    /// (`old_mode == Target || w.mode == Target`) and this one must too. Kept as
+    /// its own bit, NOT derived from `armed` (on_fire clears `armed` before the
+    /// probe is even launched, so `armed` cannot tell a fire-triggered commit
+    /// from an initial establishment). Survives a failed probe; cleared only by
+    /// a successful commit.
+    bool rearm_from_ancestor{false};
     WindowsRegistryMechanism* owner{nullptr};
 
     ~RegWatch(); // drain_watch() safety net - see below
@@ -856,9 +864,10 @@ public:
             const WatchMode old_mode = w.mode;
             w.armed = false; // this notification is consumed; the watch must re-establish
             // Emit when the key existed before this fire (it changed / was deleted).
-            // The (re)appearance case - Ancestor mode resolving to Target - is
-            // detected at commit and emitted there. Pure-ancestor noise (a sibling
-            // changed while our target stays absent) emits nowhere.
+            // The (re)appearance case - Ancestor mode resolving to Target - is only
+            // knowable at commit: `rearm_from_ancestor` carries it there. Pure-
+            // ancestor noise (a sibling changed while our target stays absent)
+            // emits nowhere.
             do_emit = (old_mode == WatchMode::Target);
             emit = emit_;
             if (old_mode == WatchMode::Target) {
@@ -866,6 +875,8 @@ public:
                 // the key is not observed - the commit's synthetic fire covers it.
                 w.needs_resync = true;
                 w.resync_epoch = ++resync_epoch_;
+            } else {
+                w.rearm_from_ancestor = true;
             }
             if (w.probe == ProbeState::Idle) {
                 w.probe = ProbeState::Pending;
@@ -995,8 +1006,6 @@ private:
     void commit_locked(RegWatch& w, ProbeResult res, SweepWork& work) {
         w.probe = ProbeState::Idle;
         w.call.reset();
-        const bool was_armed = w.armed;
-        const WatchMode prev = w.mode;
         if (!w.wait)
             w.wait = res.wait.release(); // initial establishment brought its own wait
         if (!w.wait) {
@@ -1022,9 +1031,16 @@ private:
             w.faulted_now = false;
             w.fault_reason = "recovered";
         }
-        const bool appeared =
-            was_armed && prev == WatchMode::Ancestor && w.mode == WatchMode::Target;
-        if (w.needs_resync || appeared) {
+        // Appearance: a fire-triggered re-arm that left Ancestor mode and landed on
+        // the target. Folded into the resync obligation (fresh epoch) so it takes
+        // the one Emit staging path below - and its restore-on-throw handling.
+        // An initial establishment never sets the bit, so it never emits here.
+        if (w.rearm_from_ancestor && w.mode == WatchMode::Target) {
+            w.needs_resync = true;
+            w.resync_epoch = ++resync_epoch_;
+        }
+        w.rearm_from_ancestor = false;
+        if (w.needs_resync) {
             work.actions.push_back(
                 {SweepWork::Action::Kind::Emit, w.spark_key, false, "", w.resync_epoch});
             w.needs_resync = false; // submitted below; restored only if the submit throws
