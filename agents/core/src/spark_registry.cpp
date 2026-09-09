@@ -1,5 +1,6 @@
 /**
- * spark_registry.cpp — the Registry spark mechanism (ADR-0021 Stage 1 PR 1b).
+ * spark_registry.cpp — the Registry spark mechanism (ADR-0021 Stage 1 PR 1b;
+ * watch establishment moved off the engine's per-type lock in #2012/#3840 PR-B1).
  *
  * Windows: one PRIVATE threadpool wait-group (TP_WAIT, min=2/max=4) servicing
  * RegNotifyChangeKeyValue across every watched key — O(mechanism), never
@@ -10,16 +11,81 @@
  *   - REG_NOTIFY_THREAD_AGNOSTIC on every RegNotifyChangeKeyValue: TP_WAIT
  *     recycles pool threads, and a notification registered without the flag is
  *     bound to the (transient) registering thread and dies when the pool
- *     recycles it. Present-in-code; necessity is a documented Win32 property.
- *   - Re-arm BEFORE processing (spike condition 4, rearm_failures=0): the
- *     RegNotify + SetThreadpoolWait are re-issued before the emit, so no change
- *     falls in the arm→process gap.
+ *     recycles it. Since PR-B1 the registration is issued from a detached probe
+ *     worker that EXITS right after, so the flag is now what keeps every
+ *     notification alive at all, not only across pool recycling.
+ *   - Re-arm before processing (spike condition 4) is now split: the known-good
+ *     Target-mode fire is delivered immediately from the callback, the re-arm is
+ *     a detached probe committed later by the sweeper, and the window between
+ *     the two is covered by a synthetic fire on commit (`needs_resync`) — see
+ *     "Ownership / dispatch protocol" below.
  *
  * PORTS THE WATCH, NOT THE ASSERTION: no expected-value compare, no write-back,
  * no ResilienceStrategy retry — a fired spark is a raw "this key changed" fact
  * (the old TriggerEngine RegistryChange shape). Compare + enforce are
  * Guardian's, Stage 2. It DOES port guard_registry's nearest-ancestor resilience
  * (survive a deleted+recreated key) and arm-before-check ordering.
+ *
+ * WHY THE PR-B1 SHAPE (issues #2012/#3840, T6 = #4181). The engine serialises
+ * every watch()/unwatch() of one SparkType under SparkEngine::mech_ops_mu_by_type_
+ * [type]. Before PR-B1, watch() ran five OS calls (open, notify, the unbounded
+ * nearest-ancestor walk) under that lock and unwatch() blocked in
+ * WaitForThreadpoolWaitCallbacks(TRUE) under it - so one slow hive stalled every
+ * other Registry arm/disarm, and (#4181) a disarm racing an in-flight callback
+ * whose Inline consumer re-entered the same type deadlocked outright: the
+ * disarmer held the per-type lock waiting for the callback, the callback waited
+ * for the per-type lock. Now:
+ *   - watch(): reserve under mu_ -> release -> launch the probe on a detached,
+ *     F3-counted worker (`probe_lane_`) -> wait at most kRegCallerWaitBudget ->
+ *     relock, re-validate, commit; a probe still outstanding is PUBLISHED to the
+ *     sweeper and watch() returns success-with-pending. Per-type lock hold is
+ *     <= budget + microseconds, never an OS-call duration.
+ *   - unwatch(): mark inactive, disarm the wait, hand the whole RegWatch to a
+ *     detached drain worker (`drain_lane_`) that performs the blocking callback
+ *     drain and closes the handles. O(microseconds) on the control path.
+ *   - on_fire(): emits the known-good fire immediately, then launch-and-poll
+ *     re-arm (never a bounded wait on the pool thread - amendment 8) with a
+ *     timed retry backstop where the old code went deaf forever.
+ *   - a joined `sweeper_` thread polls outstanding probes/drains, commits late
+ *     results, retries on a schedule, and is the SINGLE producer of fault()
+ *     edges and synthetic fires (dispatched with mu_ released).
+ *
+ * OWNERSHIP / DISPATCH PROTOCOL (plan amendment 5 - the same rules PR-B2/B3
+ * apply to File/Service):
+ *   1. Reserve the obligation under mu_ (probe state + a mechanism-global
+ *      generation stamped on the watch), release, launch off-lock.
+ *   2. Only the initiating control-path caller (watch()) performs a bounded
+ *      wait; the sweeper and on_fire only poll (try_take), never block for D.
+ *   3. Reacquire mu_, re-validate key + generation + lifecycle, then commit,
+ *      hand off (publish as Pending) or discard - the discard's handle closes
+ *      run after mu_ is released.
+ *   4. Neither watch() nor unwatch() calls emit()/fault() synchronously on ANY
+ *      path, immediate success included: the engine's per-type lock is still on
+ *      that call stack even though our own mu_ is not.
+ *   5. Caller and sweeper never touch the same DetachedCall concurrently: the
+ *      launching thread owns the handle until it commits or publishes it under
+ *      mu_; a retirement racing that window cancels the reservation and the
+ *      launcher observes cancellation (generation/active mismatch), not a
+ *      stolen value.
+ *   6. `needs_resync` carries an epoch: set (epoch bumped) whenever an accepted
+ *      watch has an observation gap (a Target-mode fire consumed, or an initial
+ *      probe published past the caller budget); cleared by the sweeper when the
+ *      synthetic fire is SUBMITTED through emit (SparkEmitFn returns void - there
+ *      is no delivery acknowledgement to wait for), restored only if that submit
+ *      threw and the epoch is unchanged.
+ *
+ * LIFETIME INVARIANT that makes the raw `RegWatch*` TP_WAIT context safe: a
+ * RegWatch whose wait was ever armed is destroyed ONLY after that wait has been
+ * disarmed and drained (drain_watch), on a thread that is not the callback
+ * itself - so on_fire(w) always runs against a live object. A wait created by a
+ * probe but never committed is never armed, so its (possibly dangling) context
+ * is never dereferenced; it is simply closed.
+ *
+ * D (50 ms) is PR-B's chosen initial policy value, not a proven statistical
+ * bound - the measured inputs (docs/spark-rebuild-baselines/stage2-watch-
+ * establish-latency.md: Registry direct-target summed per-call p99 82 us, R2
+ * ancestor-walk total p99 1264 us, R4 unmeasured) sit far below it. Its five
+ * meanings are separate named constants below so they can be tuned apart.
  *
  * Off Windows the factory returns nullptr → SparkEngine rejects arm(Registry).
  */
@@ -36,46 +102,152 @@
 #endif
 
 #include "guard_win_handle.hpp" // detail::EventHandle
+#include "spark_detached_call.hpp"
 
 #include <spdlog/spdlog.h>
 
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <deque>
+#include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
-#include <unordered_map>
+#include <string_view>
+#include <thread>
+#include <utility>
 #include <variant>
+#include <vector>
 
 #pragma comment(lib, "advapi32.lib")
 
 namespace yuzu::agent {
 namespace {
 
+using namespace std::chrono_literals;
+using Clock = std::chrono::steady_clock;
+
 constexpr DWORD kNotifyFilter = REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET;
 #ifndef REG_NOTIFY_THREAD_AGNOSTIC
 #define REG_NOTIFY_THREAD_AGNOSTIC 0x10000000L // Win8+; define for older SDK headers
 #endif
 
+// ── D and its five meanings (PR-B1 initial policy: all 50 ms, tuned apart) ──
+/// How long watch() waits for its own probe before publishing it to the
+/// sweeper and returning success-with-pending. The per-type lock hold bound.
+constexpr std::chrono::milliseconds kRegCallerWaitBudget{50};
+/// How long an accepted obligation (initial establishment or re-arm) may stay
+/// unestablished before the watch is reported Faulted and slow_op_total bumps.
+constexpr std::chrono::milliseconds kRegHealthGrace{50};
+/// Sweeper poll cadence while any probe or drain is outstanding.
+constexpr std::chrono::milliseconds kRegSweepCadence{50};
+/// First delay after an admission refusal (lane cap / launch failure): D, 2D,
+/// 4D, ... capped at kRegAdmissionBackoffCap, never counted as a backend attempt.
+constexpr std::chrono::milliseconds kRegAdmissionBackoffSeed{50};
+/// Elapsed budget for the nearest-ancestor walk once the target open failed:
+/// a dead hive costs ~one OS timeout plus this, not depth x timeout.
+constexpr std::chrono::milliseconds kRegProbeTraversalBudget{50};
+
+constexpr std::chrono::milliseconds kRegAdmissionBackoffCap{30'000};
+/// Genuine backend failure (open/notify refused, probe threw): 30 s doubling to
+/// a 300 s cap, attempts reset on a successful establishment.
+constexpr std::chrono::milliseconds kRegBackendRetryBase{30'000};
+constexpr std::chrono::milliseconds kRegBackendRetryCap{300'000};
+
+constexpr std::size_t kProbeLaneCap = 16; ///< concurrent detached probe workers
+constexpr std::size_t kDrainLaneCap = 8;  ///< concurrent detached drain workers
+/// Retirements (drains launched or backlogged, not yet completed) past which
+/// watch() refuses new watches - the same bound spark_file.cpp places on its
+/// retiring_ (#1979); teardown itself is never gated.
+constexpr std::size_t kRetiringCap = 256;
+/// Per-sweep budget under mu_: items visited / wall time before the sweeper
+/// yields and re-nudges itself (not N x D per pass - Astra correction).
+constexpr std::size_t kSweepMaxItems = 256;
+constexpr std::chrono::milliseconds kSweepTimeBudget{5};
+
+// The caller wait budget is the only one of the five that a Guardian control-path
+// caller can be made to wait through under the per-type lock; it must sit inside
+// Guardian's backend_op deadline. This is a configuration check, not a proof that
+// an arbitrary same-type caller completes inside that deadline (lock waiters are
+// not bounded by the lane cap).
+static_assert(spark_deadline_below_guardian_backend_op(kRegCallerWaitBudget),
+              "kRegCallerWaitBudget must be strictly below Guardian's backend_op deadline");
+
 /// Hand-rolled HKEY owner (the ScopedWinHandle template is HANDLE-typed;
-/// mirrors guard_registry.cpp's RegKeyHandle).
+/// mirrors guard_registry.cpp's RegKeyHandle). Movable + release() since PR-B1
+/// so a probe result can carry an opened key across threads.
 class RegKeyHandle {
 public:
     RegKeyHandle() = default;
     ~RegKeyHandle() { reset(); }
     RegKeyHandle(const RegKeyHandle&) = delete;
     RegKeyHandle& operator=(const RegKeyHandle&) = delete;
+    RegKeyHandle(RegKeyHandle&& o) noexcept : h_(o.h_) { o.h_ = nullptr; }
+    RegKeyHandle& operator=(RegKeyHandle&& o) noexcept {
+        if (this != &o) {
+            reset();
+            h_ = o.h_;
+            o.h_ = nullptr;
+        }
+        return *this;
+    }
     void reset(HKEY h = nullptr) {
         if (h_ && h_ != h)
             ::RegCloseKey(h_);
         h_ = h;
+    }
+    [[nodiscard]] HKEY release() noexcept {
+        HKEY h = h_;
+        h_ = nullptr;
+        return h;
     }
     [[nodiscard]] HKEY get() const { return h_; }
     explicit operator bool() const { return h_ != nullptr; }
 
 private:
     HKEY h_ = nullptr;
+};
+
+/// Owner of a TP_WAIT that has NEVER been armed (SetThreadpoolWait never called
+/// with a handle) - closing it needs no drain. An armed wait lives as a raw
+/// PTP_WAIT inside RegWatch and is closed only by drain_watch().
+class TpWaitHandle {
+public:
+    TpWaitHandle() = default;
+    ~TpWaitHandle() { reset(); }
+    TpWaitHandle(const TpWaitHandle&) = delete;
+    TpWaitHandle& operator=(const TpWaitHandle&) = delete;
+    TpWaitHandle(TpWaitHandle&& o) noexcept : w_(o.w_) { o.w_ = nullptr; }
+    TpWaitHandle& operator=(TpWaitHandle&& o) noexcept {
+        if (this != &o) {
+            reset();
+            w_ = o.w_;
+            o.w_ = nullptr;
+        }
+        return *this;
+    }
+    void reset(PTP_WAIT w = nullptr) {
+        if (w_ && w_ != w)
+            ::CloseThreadpoolWait(w_);
+        w_ = w;
+    }
+    [[nodiscard]] PTP_WAIT release() noexcept {
+        PTP_WAIT w = w_;
+        w_ = nullptr;
+        return w;
+    }
+    [[nodiscard]] PTP_WAIT get() const { return w_; }
+    explicit operator bool() const { return w_ != nullptr; }
+
+private:
+    PTP_WAIT w_ = nullptr;
 };
 
 std::wstring to_wide(const std::string& s) {
@@ -104,63 +276,279 @@ std::string parent_path(const std::string& key) {
     return pos == std::string::npos ? std::string{} : key.substr(0, pos);
 }
 
-/// Walk up from the key's parent until a subkey opens with KEY_NOTIFY (the hive
-/// root always opens). Sets `out`; returns false only if even the root fails.
-bool open_nearest_ancestor(HKEY root, const std::string& key, RegKeyHandle& out) {
-    std::string p = parent_path(key);
-    for (;;) {
-        HKEY h = nullptr;
-        const std::wstring wp = to_wide(p);
-        const LONG rc = ::RegOpenKeyExW(root, p.empty() ? nullptr : wp.c_str(), 0, KEY_NOTIFY, &h);
-        if (rc == ERROR_SUCCESS) {
-            out.reset(h);
-            return true;
+/// The private pool + its callback environment, shared by lease: the mechanism
+/// holds one reference for its started lifetime, every probe worker that must
+/// call CreateThreadpoolWait(&env) holds another for the duration of its call
+/// and of the (unarmed) wait it produced. The pool is therefore closed by
+/// whichever holder is last - normally stop(), otherwise a probe worker that was
+/// still parked when the mechanism stopped (the F3-counted orphan case).
+struct PoolCore {
+    PTP_POOL pool{nullptr};
+    TP_CALLBACK_ENVIRON env{};
+    PoolCore() = default;
+    PoolCore(const PoolCore&) = delete;
+    PoolCore& operator=(const PoolCore&) = delete;
+    ~PoolCore() {
+        if (pool) {
+            ::DestroyThreadpoolEnvironment(&env);
+            ::CloseThreadpool(pool);
         }
-        if (p.empty())
-            return false;
-        p = parent_path(p);
     }
-}
+};
 
 enum class WatchMode { Target, Ancestor };
 
-class WindowsRegistryMechanism; // OnWait dispatches back through the watch's owner
+/// Pending-operation state of one watch - INDEPENDENT of its health (a watch
+/// can be Faulted with a retry in flight, or healthy with a re-arm pending).
+enum class ProbeState : std::uint8_t {
+    Idle,     ///< nothing outstanding; `armed` says whether a notify is live
+    Pending,  ///< a probe is reserved or in flight (call engaged once published)
+    Deferred, ///< a probe will be relaunched at next_retry_at
+};
 
-/// One watched registry key: its notify event, the TP_WAIT that services it, the
-/// currently-open key (target or nearest ancestor), and the emit key. `active`
-/// (under the mechanism mu_) gates re-arm against teardown. `owner` lets the
-/// context-only TP_WAIT callback re-enter the mechanism.
+/// What one detached probe produced. Every OS resource it opened is owned here
+/// (RAII), so a discarded result closes itself on whichever thread drops it -
+/// never under mu_ by construction of the call sites. `core` is declared FIRST
+/// so it is destroyed LAST, after `wait` (a TP_WAIT must be closed before its
+/// pool). nothrow-move by construction (launch() static_asserts it).
+struct ProbeResult {
+    std::shared_ptr<PoolCore> core;
+    TpWaitHandle wait; ///< created (never armed) only for an initial establishment
+    detail::EventHandle event; ///< the per-probe auto-reset event the notify is bound to
+    RegKeyHandle key;          ///< target (Target mode) or nearest ancestor (Ancestor mode)
+    WatchMode mode{WatchMode::Target};
+    bool ok{false};
+    DWORD err{0};
+    const char* stage{""}; ///< which step failed, for the log / fault reason
+};
+static_assert(std::is_nothrow_move_constructible_v<ProbeResult>);
+
+class WindowsRegistryMechanism;
+struct RegWatch;
+void CALLBACK reg_on_wait_cb(PTP_CALLBACK_INSTANCE, PVOID ctx, PTP_WAIT, TP_WAIT_RESULT);
+
+using ProbeHook = std::function<void(std::string_view subkey)>;
+
+/// The detached probe: reconcile()'s old body minus the final SetThreadpoolWait,
+/// run on a counted worker off every lock. Owns its own auto-reset event, and
+/// for an initial establishment also creates the (unarmed) TP_WAIT - so nothing
+/// that can block, and no allocation of a pool object, happens on the control
+/// path. `wait_ctx` is an opaque RegWatch* handed to CreateThreadpoolWait and
+/// NEVER dereferenced here (the watch may already be retired by the time this
+/// runs; an uncommitted wait is never armed, so that context is never used).
+struct ProbeJob {
+    HKEY root{nullptr};
+    std::wstring subkey_w; ///< pre-widened on the launching thread
+    std::string subkey;
+    std::shared_ptr<PoolCore> core;
+    void* wait_ctx{nullptr};
+    bool create_wait{false};
+    std::shared_ptr<const ProbeHook> hook; ///< test seam; may be null
+    std::chrono::milliseconds traversal_budget{kRegProbeTraversalBudget};
+
+    ProbeResult operator()() {
+        ProbeResult r;
+        r.core = core;
+        if (hook && *hook)
+            (*hook)(subkey); // test seam: may park (a "hung hive") or throw
+        r.event.reset(::CreateEventW(nullptr, FALSE, FALSE, nullptr)); // auto-reset
+        if (!r.event) {
+            r.err = ::GetLastError();
+            r.stage = "CreateEventW";
+            return r;
+        }
+        if (create_wait) {
+            r.wait.reset(::CreateThreadpoolWait(&reg_on_wait_cb, wait_ctx, &core->env));
+            if (!r.wait) {
+                r.err = ::GetLastError();
+                r.stage = "CreateThreadpoolWait";
+                return r;
+            }
+        }
+        const auto t0 = Clock::now();
+        // Prefer the target key. REG_NOTIFY_THREAD_AGNOSTIC is a dwNotifyFilter
+        // bit (3rd arg), NOT the fAsynchronous flag (5th) — it must be OR'd into
+        // the filter or it is silently dropped and the notification dies with
+        // this very worker thread, which exits as soon as it returns.
+        HKEY h = nullptr;
+        if (::RegOpenKeyExW(root, subkey_w.c_str(), 0, KEY_NOTIFY | KEY_READ, &h) ==
+            ERROR_SUCCESS) {
+            r.key.reset(h);
+            if (::RegNotifyChangeKeyValue(r.key.get(), FALSE,
+                                          kNotifyFilter | REG_NOTIFY_THREAD_AGNOSTIC, r.event.get(),
+                                          TRUE /*async*/) == ERROR_SUCCESS) {
+                r.mode = WatchMode::Target;
+                r.ok = true;
+                return r;
+            }
+            r.key.reset();
+        }
+        // Target absent (or refused notify): watch the nearest existing ancestor
+        // for its (re)creation. The hive root always opens, so this walk ends;
+        // the elapsed budget bounds how long a dead hive can hold this lane slot.
+        std::string p = parent_path(subkey);
+        for (;;) {
+            if (Clock::now() - t0 > traversal_budget) {
+                r.err = ERROR_TIMEOUT;
+                r.stage = "ancestor walk exceeded its traversal budget";
+                return r;
+            }
+            HKEY a = nullptr;
+            const std::wstring wp = to_wide(p);
+            const LONG rc =
+                ::RegOpenKeyExW(root, p.empty() ? nullptr : wp.c_str(), 0, KEY_NOTIFY, &a);
+            if (rc == ERROR_SUCCESS) {
+                r.key.reset(a);
+                const LONG nrc = ::RegNotifyChangeKeyValue(
+                    r.key.get(), FALSE, REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_THREAD_AGNOSTIC,
+                    r.event.get(), TRUE /*async*/);
+                if (nrc == ERROR_SUCCESS) {
+                    r.mode = WatchMode::Ancestor;
+                    r.ok = true;
+                    return r;
+                }
+                r.key.reset();
+                r.err = static_cast<DWORD>(nrc);
+                r.stage = "RegNotifyChangeKeyValue(ancestor)";
+                return r;
+            }
+            if (p.empty()) {
+                r.err = static_cast<DWORD>(rc);
+                r.stage = "RegOpenKeyExW(hive root, KEY_NOTIFY)";
+                return r;
+            }
+            p = parent_path(p);
+        }
+    }
+};
+static_assert(std::is_nothrow_move_constructible_v<ProbeJob>);
+
+/// One watched registry key. Every field is guarded by the mechanism's mu_
+/// EXCEPT that a retired watch (active=false, moved into a DrainJob) is owned
+/// by its drain worker, which touches only the OS handles - and only after the
+/// callback that could be reading the other fields has been drained.
 struct RegWatch {
     std::string spark_key;
     HKEY root{nullptr};
     std::string subkey;
-    detail::EventHandle event; ///< auto-reset; the TP_WAIT object
+    std::wstring subkey_w;
+    // committed live resources
+    detail::EventHandle event; ///< auto-reset; the TP_WAIT object of the live notify
     RegKeyHandle open_key;      ///< target in Target mode, ancestor in Ancestor mode
-    PTP_WAIT wait{nullptr};
+    PTP_WAIT wait{nullptr};     ///< armed at least once => drain before destroy
     WatchMode mode{WatchMode::Target};
-    bool active{true};
-    bool faulted{false}; ///< last-reported health, so fault_ fires only on transitions
+    bool armed{false}; ///< a notify + wait is currently established
+    bool active{true}; ///< false once retired (unwatch / stop)
+    // health (single producer: the sweeper dispatches the edges)
+    bool faulted_now{false};
+    bool faulted_reported{false};
+    const char* fault_reason{""};
+    // pending operation
+    ProbeState probe{ProbeState::Idle};
+    std::uint64_t probe_gen{0}; ///< mechanism-global gen stamped at reservation
+    std::optional<DetachedCall<ProbeResult>> call; ///< engaged once a launch is PUBLISHED
+    /// Obligation acceptance - grace runs from here and a retry never resets it.
+    Clock::time_point accepted_at{};
+    Clock::time_point next_retry_at{};
+    unsigned backend_attempts{0};
+    unsigned admission_attempts{0};
+    bool grace_counted{false};
+    bool needs_resync{false};
+    std::uint64_t resync_epoch{0};
     WindowsRegistryMechanism* owner{nullptr};
+
+    ~RegWatch(); // drain_watch() safety net - see below
+};
+
+/// Disarm + drain + close a watch's wait, then close its handles. Blocking
+/// (WaitForThreadpoolWaitCallbacks waits for a running callback), so it runs
+/// only on a drain worker, or inline in stop(), never under mu_. Idempotent.
+/// A pending probe call inside the watch is destroyed with the watch: that is
+/// an abandon(), so its worker self-disposes whatever it eventually produced.
+void drain_watch(RegWatch& w) noexcept {
+    if (w.wait) {
+        ::SetThreadpoolWait(w.wait, nullptr, nullptr);
+        ::WaitForThreadpoolWaitCallbacks(w.wait, TRUE);
+        ::CloseThreadpoolWait(w.wait);
+        w.wait = nullptr;
+    }
+    w.open_key.reset();
+    w.event.reset();
+}
+
+RegWatch::~RegWatch() {
+    // Safety net only: every designed destruction path (DrainJob, stop()) has
+    // already drained. Kept so a future path that forgets cannot leave an
+    // armed wait pointing at freed memory.
+    drain_watch(*this);
+}
+
+/// The detached retirement: owns the RegWatch, drains it, frees it. The result
+/// is a unit value - the sweeper only needs to learn "done" to shrink retiring_.
+struct DrainJob {
+    std::unique_ptr<RegWatch> w;
+    std::monostate operator()() noexcept {
+        if (w)
+            drain_watch(*w);
+        w.reset();
+        return {};
+    }
+};
+static_assert(std::is_nothrow_move_constructible_v<DrainJob>);
+
+/// Everything one sweep pass wants to do OUTSIDE mu_: launches, dispatch, and
+/// the disposal of anything whose destructor closes an OS handle or abandons a
+/// call. Destroyed only with mu_ released.
+struct SweepWork {
+    struct ProbeLaunch {
+        std::string key;
+        std::uint64_t gen{0};
+        std::optional<ProbeJob> job;
+        DetachedLaunch status{DetachedLaunch::LaunchFailed};
+        std::optional<DetachedCall<ProbeResult>> call;
+    };
+    struct Action {
+        enum class Kind : std::uint8_t { Fault, Emit } kind{Kind::Emit};
+        std::string key;
+        bool faulted{false};
+        const char* reason{""};
+        std::uint64_t epoch{0};
+    };
+    std::vector<ProbeLaunch> probe_launches;
+    std::vector<DrainJob> drain_launches;
+    std::vector<Action> actions; ///< in recorded order - per-watch ordering matters
+    SparkEmitFn emit;
+    SparkFaultFn fault;
+    // discards (destroyed off-lock)
+    std::vector<detail::EventHandle> old_events;
+    std::vector<RegKeyHandle> old_keys;
+    std::vector<ProbeResult> dead_results;
+    std::vector<DetachedCall<ProbeResult>> stale_calls;
+    std::vector<std::unique_ptr<RegWatch>> dead_watches;
+    std::vector<DrainJob> inline_drains; ///< could not even be queued - drained inline off-lock
+    std::vector<std::pair<std::string, std::uint64_t>> failed_emits; ///< restore needs_resync
 };
 
 class WindowsRegistryMechanism final : public ISparkMechanism {
 public:
     /// `f3_counter` (may be null) is the agent-lifetime orphan-exit counter every
-    /// detached worker this mechanism launches must be admitted against (#2012/
-    /// #3840 PR-B1, F3). Held here from construction so the lanes built over it
-    /// share one identity for the mechanism's whole life.
+    /// detached worker this mechanism launches is admitted against (#2012/#3840
+    /// PR-B1, F3). Both lanes are constructed here, once - SparkDetachedLane is
+    /// non-movable - and keep their identity across start()/stop().
     explicit WindowsRegistryMechanism(std::shared_ptr<std::atomic<std::size_t>> f3_counter)
-        : f3_counter_(std::move(f3_counter)) {}
+        : probe_lane_(f3_counter, kProbeLaneCap),
+          drain_lane_(std::move(f3_counter), kDrainLaneCap) {}
     ~WindowsRegistryMechanism() override { stop(); }
 
     void start(SparkEmitFn emit, SparkFaultFn fault) override {
         std::lock_guard lk(mu_);
-        if (pool_)
+        if (core_)
             return; // idempotent
         emit_ = std::move(emit);
         fault_ = std::move(fault);
-        pool_ = ::CreateThreadpool(nullptr);
-        if (!pool_) {
+        auto core = std::make_shared<PoolCore>();
+        core->pool = ::CreateThreadpool(nullptr);
+        if (!core->pool) {
             spdlog::error("spark_registry: CreateThreadpool failed (err={}) — registry sparks inert",
                           ::GetLastError());
             // Publish the inertness: without this the mechanism stays REGISTERED and
@@ -176,10 +564,24 @@ public:
         // failed-then-successful start() would report a working mechanism as inert forever
         // and silently drop it from the capability CSV (governance Gate-3 cpp-expert).
         inert_.store(false, std::memory_order_release);
-        ::SetThreadpoolThreadMinimum(pool_, 2);
-        ::SetThreadpoolThreadMaximum(pool_, 4);
-        ::InitializeThreadpoolEnvironment(&env_);
-        ::SetThreadpoolCallbackPool(&env_, pool_);
+        ::SetThreadpoolThreadMinimum(core->pool, 2);
+        ::SetThreadpoolThreadMaximum(core->pool, 4);
+        ::InitializeThreadpoolEnvironment(&core->env);
+        ::SetThreadpoolCallbackPool(&core->env, core->pool);
+        core_ = std::move(core);
+        stopping_ = false;
+        sweeper_stop_ = false;
+        nudged_ = false;
+        drains_in_flight_.reserve(2 * kDrainLaneCap + 16);
+        try {
+            sweeper_ = std::thread([this] { sweeper_main(); });
+        } catch (...) {
+            // No sweeper => no late commits, no retries, no health edges: refuse to
+            // run half-alive. The caller (agent boot) treats a throw here as
+            // "spark unavailable", which is the honest posture.
+            core_.reset();
+            throw;
+        }
         started_ = true;
     }
 
@@ -191,34 +593,108 @@ public:
         HKEY root = root_for(rp->hive);
         if (!root)
             return std::unexpected("registry mechanism: unknown hive '" + rp->hive + "'");
+        std::wstring subkey_w = to_wide(rp->key); // allocation off mu_
 
-        std::lock_guard lk(mu_);
-        if (!started_)
-            return std::unexpected("registry mechanism not started");
-        if (watches_.contains(key))
-            return {}; // idempotent (engine dedups, but stay safe)
-        auto w = std::make_unique<RegWatch>();
-        w->spark_key = key;
-        w->root = root;
-        w->subkey = rp->key;
-        w->owner = this;
-        w->event.reset(::CreateEventW(nullptr, FALSE, FALSE, nullptr)); // auto-reset
-        if (!w->event)
-            return std::unexpected("registry mechanism: CreateEventW failed");
-        w->wait = ::CreateThreadpoolWait(&OnWait, w.get(), &env_);
-        if (!w->wait)
-            return std::unexpected("registry mechanism: CreateThreadpoolWait failed");
-        // Arm-before-check: establish the notify + TP_WAIT before returning. A
-        // registry change spark fires on a CHANGE, so there is no initial emit.
-        if (!reconcile(*w)) {
-            // F1: reconcile failed after CreateThreadpoolWait succeeded — release
-            // the TP_WAIT before the unique_ptr drops it, or it leaks on every
-            // failed arm. SetThreadpoolWait was never called on this path, so
-            // teardown()'s CloseThreadpoolWait is the operative cleanup.
-            teardown(*w);
-            return std::unexpected("registry mechanism: could not arm any watch for the key");
+        // 1) Reserve under mu_: the watch exists (so stop() can retire it) but
+        //    owns no OS resource yet.
+        RegWatch* w = nullptr;
+        std::uint64_t gen = 0;
+        std::optional<ProbeJob> job;
+        {
+            std::lock_guard lk(mu_);
+            if (!started_ || stopping_)
+                return std::unexpected("registry mechanism not started");
+            if (watches_.contains(key))
+                return {}; // idempotent (engine dedups, but stay safe)
+            if (retiring_count_ >= retiring_cap()) {
+                watch_rejected_.fetch_add(1, std::memory_order_relaxed);
+                return std::unexpected(std::string("registry mechanism: ") +
+                                       std::to_string(retiring_count_) +
+                                       " watch(es) awaiting callback drain (cap " +
+                                       std::to_string(retiring_cap()) +
+                                       ") - refusing new watches until the backlog clears");
+            }
+            auto uw = std::make_unique<RegWatch>();
+            uw->spark_key = key;
+            uw->root = root;
+            uw->subkey = rp->key;
+            uw->subkey_w = subkey_w;
+            uw->owner = this;
+            uw->accepted_at = Clock::now();
+            uw->probe = ProbeState::Pending;
+            uw->probe_gen = ++gen_;
+            gen = uw->probe_gen;
+            w = uw.get();
+            job.emplace(ProbeJob{root, std::move(subkey_w), rp->key, core_, w, /*create_wait=*/true,
+                                 probe_hook_, traversal_budget()});
+            watches_.emplace(key, std::move(uw));
         }
-        watches_.emplace(key, std::move(w));
+
+        // 2) Launch off-lock; the deadline is computed BEFORE launch so launch
+        //    overhead cannot silently extend the wait.
+        const auto deadline = Clock::now() + caller_wait_budget();
+        auto lr = probe_lane_.launch(std::move(*job));
+        std::optional<DetachedCall<ProbeResult>> call;
+        std::optional<DetachedResult<ProbeResult>> taken;
+        if (lr.status == DetachedLaunch::Launched) {
+            probe_launched_.fetch_add(1, std::memory_order_relaxed);
+            call = std::move(lr.call);
+            taken = call->wait_take(deadline); // the ONE bounded wait - control-path caller only
+        }
+
+        // 3) Relock, re-validate, commit / publish / retire.
+        std::optional<std::string> error;
+        SweepWork discards;
+        {
+            std::lock_guard lk(mu_);
+            auto it = watches_.find(key);
+            const bool live = it != watches_.end() && it->second.get() == w &&
+                              w->probe_gen == gen && w->active && !stopping_;
+            if (!live) {
+                // Reservation cancelled underneath us (stop()). Whatever we hold is
+                // ours to discard - off-lock, below.
+                if (call)
+                    discards.stale_calls.push_back(std::move(*call));
+                if (taken && taken->has_value())
+                    discards.dead_results.push_back(std::move(**taken));
+                probe_discarded_.fetch_add(1, std::memory_order_relaxed);
+                error = "registry mechanism stopped during watch establishment";
+            } else if (lr.status != DetachedLaunch::Launched) {
+                // Admission refused: keep the obligation, retry on the admission
+                // schedule (never an inline probe under the per-type lock - that
+                // would reinstate the unbounded stall on exactly the contended path).
+                defer_admission_locked(*w, lr.status);
+                w->needs_resync = true;
+                w->resync_epoch = ++resync_epoch_;
+                nudge_locked();
+            } else if (taken) {
+                if (taken->has_value() && (*taken)->ok) {
+                    commit_locked(*w, std::move(**taken), discards);
+                } else {
+                    // Definite failure while the caller is still here: retire the
+                    // insertion and report it - the engine rolls the arm back.
+                    error = describe_failure(*taken);
+                    if (taken->has_value())
+                        discards.dead_results.push_back(std::move(**taken));
+                    probe_backend_failed_.fetch_add(1, std::memory_order_relaxed);
+                    // No wait was ever armed on it: a plain destroy, off-lock.
+                    discards.dead_watches.push_back(std::move(it->second));
+                    watches_.erase(it);
+                }
+            } else {
+                // Still outstanding past the caller budget: publish to the sweeper.
+                // From here the watch is armed-from-the-engine's-view but not yet
+                // watching; a change in this window is caught by the synthetic fire
+                // the sweeper emits on commit.
+                w->call = std::move(call);
+                w->needs_resync = true;
+                w->resync_epoch = ++resync_epoch_;
+                nudge_locked();
+            }
+        }
+        // `discards` destroyed here, with mu_ released.
+        if (error)
+            return std::unexpected(std::move(*error));
         return {};
     }
 
@@ -229,153 +705,657 @@ public:
             auto it = watches_.find(key);
             if (it == watches_.end())
                 return;
-            it->second->active = false; // no further re-arm from an in-flight callback
             victim = std::move(it->second);
             watches_.erase(it);
+            victim->active = false; // no re-arm, no commit, no dispatch from here on
+            ++gen_;
+            ++retiring_count_;
+            retiring_gauge_.fetch_add(1, std::memory_order_relaxed);
         }
-        // Disarm + drain OUTSIDE mu_: WaitForThreadpoolWaitCallbacks(TRUE) blocks
-        // on a running callback, which itself takes mu_ — holding mu_ here would
-        // deadlock. `active=false` (set above) guarantees the drained callback
-        // will not re-arm.
-        teardown(*victim);
+        // Disarm OUTSIDE mu_ (cheap, non-blocking; a callback already running keeps
+        // running and observes active=false). The blocking drain is the worker's.
+        if (victim->wait)
+            ::SetThreadpoolWait(victim->wait, nullptr, nullptr);
+        retire(std::move(victim));
     }
 
     void stop() override {
         {
             std::lock_guard lk(mu_);
-            if (!pool_)
+            if (!core_ && !sweeper_.joinable())
                 return;
+            stopping_ = true;
+            sweeper_stop_ = true;
+            nudged_ = true;
         }
-        // Drop every watch first (each teardown drains its callback), then
-        // release the pool. teardown() runs OUTSIDE mu_ — a draining callback
-        // takes mu_, so holding it here would deadlock.
-        std::unordered_map<std::string, std::unique_ptr<RegWatch>> victims;
+        cv_.notify_all();
+        if (sweeper_.joinable())
+            sweeper_.join(); // outside mu_: the sweeper may be mid-dispatch into the engine
+
+        std::map<std::string, std::unique_ptr<RegWatch>> victims;
+        std::vector<DetachedCall<std::monostate>> drains;
+        std::deque<DrainJob> backlog;
         {
             std::lock_guard lk(mu_);
             for (auto& [k, w] : watches_)
                 w->active = false;
             victims.swap(watches_);
+            drains.swap(drains_in_flight_);
+            backlog.swap(drain_backlog_);
+            ++gen_;
         }
+        // Drain every callback-bearing watch OUTSIDE mu_ - an UNBOUNDED drain, on
+        // purpose (parity with spark_file; the #3737 shutdown watchdog is the
+        // backstop). These contexts hold `owner`, so they must be gone before the
+        // mechanism is. Only an UNCOMMITTED probe - whose captures are independent
+        // of this object - may outlive stop(): it is leaked-and-counted.
         for (auto& [k, w] : victims)
-            teardown(*w);
-        std::lock_guard lk(mu_);
-        ::DestroyThreadpoolEnvironment(&env_);
-        if (pool_) {
-            ::CloseThreadpool(pool_);
-            pool_ = nullptr;
+            if (w->wait)
+                ::SetThreadpoolWait(w->wait, nullptr, nullptr);
+        std::uint64_t orphaned = 0;
+        for (auto& [k, w] : victims) {
+            if (w->call && !w->call->done())
+                ++orphaned;
+            w.reset(); // ~RegWatch: drain + close; a pending call is abandoned
         }
+        for (auto& job : backlog)
+            job(); // retirements that never got a worker: drain them here
+        for (auto& d : drains) {
+            for (;;) { // wait for the drain worker (unbounded - see above)
+                if (d.wait_take(Clock::now() + 1s) || d.done())
+                    break;
+            }
+        }
+        if (orphaned)
+            quarantined_.fetch_add(orphaned, std::memory_order_relaxed);
+        std::lock_guard lk(mu_);
+        retiring_count_ = 0;
+        retiring_gauge_.store(0, std::memory_order_relaxed);
+        core_.reset(); // closes the pool now, or when the last leased worker finishes
         started_ = false;
         emit_ = nullptr;
         fault_ = nullptr;
+        stopping_ = false;
+        sweeper_stop_ = false;
+        nudged_ = false;
+        sweep_cursor_.clear();
+    }
+
+    [[nodiscard]] SparkMechanismStats stats() const override {
+        return {
+            .retiring = retiring_gauge_.load(std::memory_order_relaxed),
+            .retiring_cap = retiring_cap(),
+            .watch_rejected_total = watch_rejected_.load(std::memory_order_relaxed),
+            .quarantined_total = quarantined_.load(std::memory_order_relaxed),
+            .slow_op_total = slow_op_.load(std::memory_order_relaxed),
+            .inert = inert_.load(std::memory_order_acquire),
+        };
+    }
+
+    // ── test seams (spark_mechanism.hpp free functions forward here) ─────────
+    void apply_test_controls(RegistryMechanismTestControls c) {
+        std::lock_guard lk(mu_);
+        if (c.probe_hook)
+            probe_hook_ = std::make_shared<const ProbeHook>(std::move(c.probe_hook));
+        else
+            probe_hook_.reset();
+        if (c.probe_lane_cap)
+            probe_lane_.set_cap_for_test(c.probe_lane_cap);
+        if (c.drain_lane_cap)
+            drain_lane_.set_cap_for_test(c.drain_lane_cap);
+        if (c.retiring_cap)
+            retiring_cap_.store(c.retiring_cap, std::memory_order_relaxed);
+        if (c.caller_wait_budget.count() > 0)
+            caller_wait_ms_.store(c.caller_wait_budget.count(), std::memory_order_relaxed);
+        if (c.health_grace.count() > 0)
+            health_grace_ms_.store(c.health_grace.count(), std::memory_order_relaxed);
+        if (c.backend_retry_base.count() > 0)
+            backend_retry_base_ms_.store(c.backend_retry_base.count(), std::memory_order_relaxed);
+        if (c.admission_backoff_seed.count() > 0)
+            admission_seed_ms_.store(c.admission_backoff_seed.count(), std::memory_order_relaxed);
+        if (c.sweep_cadence.count() > 0)
+            sweep_cadence_ms_.store(c.sweep_cadence.count(), std::memory_order_relaxed);
+        nudge_locked();
+    }
+
+    [[nodiscard]] RegistryMechanismDebugCounters debug_counters() const {
+        RegistryMechanismDebugCounters d;
+        d.probe_launched = probe_launched_.load(std::memory_order_relaxed);
+        d.probe_admission_rejected = probe_admission_rejected_.load(std::memory_order_relaxed);
+        d.probe_launch_failed = probe_launch_failed_.load(std::memory_order_relaxed);
+        d.probe_backend_failed = probe_backend_failed_.load(std::memory_order_relaxed);
+        d.probe_discarded = probe_discarded_.load(std::memory_order_relaxed);
+        d.drains_launched = drains_launched_.load(std::memory_order_relaxed);
+        d.drains_completed = drains_completed_.load(std::memory_order_relaxed);
+        d.drains_admission_rejected = drains_admission_rejected_.load(std::memory_order_relaxed);
+        d.synthetic_fires = synthetic_fires_.load(std::memory_order_relaxed);
+        d.health_edges = health_edges_.load(std::memory_order_relaxed);
+        d.probe_workers_active = probe_lane_.active_workers();
+        d.drain_workers_active = drain_lane_.active_workers();
+        std::lock_guard lk(mu_);
+        d.live_watches = watches_.size();
+        d.retiring = retiring_count_;
+        d.drain_backlog = drain_backlog_.size();
+        return d;
+    }
+
+    // Called from the TP_WAIT callback (reg_on_wait_cb) with `w` guaranteed live.
+    void on_fire(RegWatch& w) {
+        SparkEmitFn emit;
+        bool do_emit = false;
+        std::optional<ProbeJob> job;
+        std::uint64_t gen = 0;
+        {
+            std::lock_guard lk(mu_);
+            if (!w.active || stopping_)
+                return; // being torn down — no re-arm, no dispatch
+            const WatchMode old_mode = w.mode;
+            w.armed = false; // this notification is consumed; the watch must re-establish
+            // Emit when the key existed before this fire (it changed / was deleted).
+            // The (re)appearance case - Ancestor mode resolving to Target - is
+            // detected at commit and emitted there. Pure-ancestor noise (a sibling
+            // changed while our target stays absent) emits nowhere.
+            do_emit = (old_mode == WatchMode::Target);
+            emit = emit_;
+            if (old_mode == WatchMode::Target) {
+                // Observation gap: from now until the re-arm commits, a change on
+                // the key is not observed - the commit's synthetic fire covers it.
+                w.needs_resync = true;
+                w.resync_epoch = ++resync_epoch_;
+            }
+            if (w.probe == ProbeState::Idle) {
+                w.probe = ProbeState::Pending;
+                w.probe_gen = ++gen_;
+                gen = w.probe_gen;
+                w.accepted_at = Clock::now();
+                w.grace_counted = false;
+                job.emplace(ProbeJob{w.root, w.subkey_w, w.subkey, core_, &w,
+                                     /*create_wait=*/w.wait == nullptr, probe_hook_,
+                                     traversal_budget()});
+            }
+            // else: a probe is already outstanding (Pending/Deferred) - it will
+            // re-establish; launching a second one would duplicate the obligation.
+        }
+        std::optional<DetachedCall<ProbeResult>> stale;
+        if (job) {
+            // Launch-and-poll (amendment 8): never park one of the four pool
+            // threads waiting on a probe. The sweeper commits the result.
+            auto lr = probe_lane_.launch(std::move(*job));
+            std::lock_guard lk(mu_);
+            if (w.active && !stopping_ && w.probe == ProbeState::Pending && w.probe_gen == gen &&
+                !w.call) {
+                if (lr.status == DetachedLaunch::Launched) {
+                    probe_launched_.fetch_add(1, std::memory_order_relaxed);
+                    w.call = std::move(lr.call);
+                } else {
+                    defer_admission_locked(w, lr.status);
+                }
+                nudge_locked();
+            } else if (lr.call) {
+                stale = std::move(lr.call); // reservation cancelled (retired) - abandon off-lock
+                probe_discarded_.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        // Fire with mu_ RELEASED: emit re-enters the engine under its own lock, and
+        // an inline consumer re-arming would take our mu_ → deadlock if held.
+        if (do_emit && emit)
+            emit(w.spark_key, SparkData{std::monostate{}});
+        // `stale` (if any) destroyed here: an abandon, the worker self-disposes.
     }
 
 private:
-    /// (Re)establish the notify + TP_WAIT for `w`, preferring the target key and
-    /// falling back to the nearest existing ancestor (recreate resilience). Sets
-    /// w.mode. Called under mu_. Returns false only if nothing could be armed.
-    bool reconcile(RegWatch& w) {
-        // Prefer the target key.
-        HKEY h = nullptr;
-        const std::wstring wsub = to_wide(w.subkey);
-        // REG_NOTIFY_THREAD_AGNOSTIC is a dwNotifyFilter bit (3rd arg), NOT the
-        // fAsynchronous flag (5th) — it must be OR'd into the filter or it is
-        // silently dropped and the notification dies when TP_WAIT recycles the
-        // registering thread (the whole reason the flag is here).
-        if (::RegOpenKeyExW(w.root, wsub.c_str(), 0, KEY_NOTIFY | KEY_READ, &h) == ERROR_SUCCESS) {
-            w.open_key.reset(h);
-            if (::RegNotifyChangeKeyValue(w.open_key.get(), FALSE,
-                                          kNotifyFilter | REG_NOTIFY_THREAD_AGNOSTIC, w.event.get(),
-                                          TRUE /*async*/) == ERROR_SUCCESS) {
-                w.mode = WatchMode::Target;
-                ::SetThreadpoolWait(w.wait, w.event.get(), nullptr);
-                return true;
+    // ── tunables (atomics so the test seam can override without a rebuild) ──
+    [[nodiscard]] std::chrono::milliseconds caller_wait_budget() const {
+        return std::chrono::milliseconds(caller_wait_ms_.load(std::memory_order_relaxed));
+    }
+    [[nodiscard]] std::chrono::milliseconds health_grace() const {
+        return std::chrono::milliseconds(health_grace_ms_.load(std::memory_order_relaxed));
+    }
+    [[nodiscard]] std::chrono::milliseconds sweep_cadence() const {
+        return std::chrono::milliseconds(sweep_cadence_ms_.load(std::memory_order_relaxed));
+    }
+    [[nodiscard]] std::chrono::milliseconds backend_retry_base() const {
+        return std::chrono::milliseconds(backend_retry_base_ms_.load(std::memory_order_relaxed));
+    }
+    [[nodiscard]] std::chrono::milliseconds admission_seed() const {
+        return std::chrono::milliseconds(admission_seed_ms_.load(std::memory_order_relaxed));
+    }
+    [[nodiscard]] std::chrono::milliseconds traversal_budget() const {
+        return kRegProbeTraversalBudget;
+    }
+    [[nodiscard]] std::size_t retiring_cap() const {
+        return retiring_cap_.load(std::memory_order_relaxed);
+    }
+
+    void nudge_locked() {
+        nudged_ = true;
+        cv_.notify_one();
+    }
+
+    static std::string describe_failure(const DetachedResult<ProbeResult>& r) {
+        if (!r.has_value()) {
+            switch (r.error()) {
+            case DetachedCallError::WorkerThrew:
+                return "registry mechanism: probe threw";
+            case DetachedCallError::ResultAllocFailed:
+                return "registry mechanism: probe result could not be boxed";
             }
-            w.open_key.reset();
+            return "registry mechanism: probe failed";
         }
-        // Target absent: watch the nearest ancestor for its (re)creation.
-        if (open_nearest_ancestor(w.root, w.subkey, w.open_key) &&
-            ::RegNotifyChangeKeyValue(w.open_key.get(), FALSE,
-                                      REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_THREAD_AGNOSTIC,
-                                      w.event.get(), TRUE /*async*/) == ERROR_SUCCESS) {
-            w.mode = WatchMode::Ancestor;
-            ::SetThreadpoolWait(w.wait, w.event.get(), nullptr);
-            return true;
-        }
-        return false;
+        return std::string("registry mechanism: could not arm any watch for the key (") + r->stage +
+               ", err=" + std::to_string(r->err) + ")";
     }
 
-    void teardown(RegWatch& w) {
-        if (w.wait) {
-            ::SetThreadpoolWait(w.wait, nullptr, nullptr);            // disarm
-            ::WaitForThreadpoolWaitCallbacks(w.wait, TRUE);          // cancel pending + drain running
-            ::CloseThreadpoolWait(w.wait);
-            w.wait = nullptr;
+    static std::chrono::milliseconds doubled(std::chrono::milliseconds base, unsigned attempts,
+                                             std::chrono::milliseconds cap) {
+        // base * 2^(attempts-1), saturating at cap (attempts >= 1).
+        std::chrono::milliseconds d = base;
+        for (unsigned i = 1; i < attempts && d < cap; ++i)
+            d *= 2;
+        return std::min(d, cap);
+    }
+
+    /// Admission refused (lane cap / launch failure): keep the obligation, retry
+    /// on the admission schedule. Never counts as a backend attempt. Under mu_.
+    void defer_admission_locked(RegWatch& w, DetachedLaunch status) {
+        if (status == DetachedLaunch::Rejected)
+            probe_admission_rejected_.fetch_add(1, std::memory_order_relaxed);
+        else
+            probe_launch_failed_.fetch_add(1, std::memory_order_relaxed);
+        w.probe = ProbeState::Deferred;
+        w.call.reset(); // nothing published (a launched call is never handed here)
+        ++w.admission_attempts;
+        w.next_retry_at = Clock::now() + doubled(admission_seed(), w.admission_attempts,
+                                                 kRegAdmissionBackoffCap);
+    }
+
+    /// Genuine backend failure: retry on the 30 s doubling schedule, report the
+    /// watch Faulted (the sweeper dispatches the edge). Under mu_.
+    void fail_backend_locked(RegWatch& w, const char* reason) {
+        probe_backend_failed_.fetch_add(1, std::memory_order_relaxed);
+        w.probe = ProbeState::Deferred;
+        w.call.reset();
+        ++w.backend_attempts;
+        w.next_retry_at = Clock::now() + doubled(backend_retry_base(), w.backend_attempts,
+                                                 kRegBackendRetryCap);
+        if (!w.faulted_now) {
+            w.faulted_now = true;
+            w.fault_reason = reason;
         }
-        w.open_key.reset();
-        w.event.reset();
+        spdlog::warn("spark_registry: establishing '{}' failed ({}) — watch is deaf until the retry",
+                     w.spark_key, reason);
     }
 
-    static void CALLBACK OnWait(PTP_CALLBACK_INSTANCE, PVOID ctx, PTP_WAIT, TP_WAIT_RESULT) {
-        auto* w = static_cast<RegWatch*>(ctx);
-        w->owner->on_fire(*w);
+    /// A probe result for a LIVE watch, matched by generation. Under mu_; every
+    /// handle it supersedes goes into `work` for off-lock disposal.
+    void commit_locked(RegWatch& w, ProbeResult res, SweepWork& work) {
+        w.probe = ProbeState::Idle;
+        w.call.reset();
+        const bool was_armed = w.armed;
+        const WatchMode prev = w.mode;
+        if (!w.wait)
+            w.wait = res.wait.release(); // initial establishment brought its own wait
+        if (!w.wait) {
+            work.dead_results.push_back(std::move(res));
+            fail_backend_locked(w, "no TP_WAIT to arm");
+            return;
+        }
+        // Retire the superseded key/event (closing the old key signals the OLD
+        // event, which is exactly why each probe brings its own) - off-lock.
+        if (w.event)
+            work.old_events.push_back(std::move(w.event));
+        if (w.open_key)
+            work.old_keys.push_back(std::move(w.open_key));
+        w.event = std::move(res.event);
+        w.open_key = std::move(res.key);
+        w.mode = res.mode;
+        ::SetThreadpoolWait(w.wait, w.event.get(), nullptr); // the ONLY place a wait is armed
+        w.armed = true;
+        w.backend_attempts = 0;
+        w.admission_attempts = 0;
+        w.grace_counted = false;
+        if (w.faulted_now) {
+            w.faulted_now = false;
+            w.fault_reason = "recovered";
+        }
+        const bool appeared =
+            was_armed && prev == WatchMode::Ancestor && w.mode == WatchMode::Target;
+        if (w.needs_resync || appeared) {
+            work.actions.push_back(
+                {SweepWork::Action::Kind::Emit, w.spark_key, false, "", w.resync_epoch});
+            w.needs_resync = false; // submitted below; restored only if the submit throws
+            synthetic_fires_.fetch_add(1, std::memory_order_relaxed);
+        }
+        // `res` (now holding only the pool lease) drops here - not the last ref.
     }
 
-    void on_fire(RegWatch& w) {
-        SparkEmitFn emit;
-        SparkFaultFn fault;
-        bool do_emit = false;
-        bool fault_changed = false;
-        bool now_faulted = false;
+    void resolve_probe_locked(RegWatch& w, DetachedResult<ProbeResult> r, SweepWork& work) {
+        if (r.has_value() && r->ok) {
+            commit_locked(w, std::move(*r), work);
+            return;
+        }
+        if (r.has_value())
+            work.dead_results.push_back(std::move(*r));
+        // Static text only (fault_reason is a const char*): the specific stage is
+        // in the log line, the fault channel carries the class.
+        const char* reason = !r.has_value() ? (r.error() == DetachedCallError::WorkerThrew
+                                                   ? "registry probe threw"
+                                                   : "registry probe result could not be boxed")
+                                            : "registry re-arm failed";
+        fail_backend_locked(w, reason);
+    }
+
+    void grace_check_locked(RegWatch& w, Clock::time_point now) {
+        if (w.grace_counted || now - w.accepted_at <= health_grace())
+            return;
+        w.grace_counted = true;
+        // slow_op_total has exactly one meaning here: an obligation missed its grace.
+        slow_op_.fetch_add(1, std::memory_order_relaxed);
+        if (!w.faulted_now) {
+            w.faulted_now = true;
+            w.fault_reason = "registry watch establishment pending past grace";
+        }
+    }
+
+    [[nodiscard]] Clock::time_point next_wake_locked(Clock::time_point now) const {
+        auto wake = now + std::chrono::hours(1);
+        const auto cadence = sweep_cadence();
+        const auto grace = health_grace();
+        for (const auto& [k, w] : watches_) {
+            switch (w->probe) {
+            case ProbeState::Pending:
+                wake = std::min(wake, now + cadence);
+                break;
+            case ProbeState::Deferred:
+                wake = std::min(wake, w->next_retry_at);
+                break;
+            case ProbeState::Idle:
+                continue;
+            }
+            if (!w->grace_counted)
+                wake = std::min(wake, w->accepted_at + grace);
+        }
+        if (!drains_in_flight_.empty() || !drain_backlog_.empty())
+            wake = std::min(wake, now + cadence);
+        return wake;
+    }
+
+    /// One pass under mu_: reap finished drains, pick backlog drains to relaunch,
+    /// visit watches under an item/time budget (rotating cursor), record health
+    /// edges. Everything blocking or dispatching is deferred into `work`.
+    void sweep_locked(SweepWork& work) {
+        const auto t_start = Clock::now();
+        work.emit = emit_;
+        work.fault = fault_;
+
+        for (auto it = drains_in_flight_.begin(); it != drains_in_flight_.end();) {
+            if (it->try_take()) {
+                it = drains_in_flight_.erase(it);
+                if (retiring_count_)
+                    --retiring_count_;
+                retiring_gauge_.fetch_sub(1, std::memory_order_relaxed);
+                drains_completed_.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                ++it;
+            }
+        }
+        while (!drain_backlog_.empty() && work.drain_launches.size() < kDrainLaneCap) {
+            work.drain_launches.push_back(std::move(drain_backlog_.front()));
+            drain_backlog_.pop_front();
+        }
+
+        if (watches_.empty())
+            return;
+        auto it = sweep_cursor_.empty() ? watches_.begin() : watches_.upper_bound(sweep_cursor_);
+        std::size_t visited = 0;
+        for (std::size_t n = 0; n < watches_.size(); ++n) {
+            if (it == watches_.end())
+                it = watches_.begin();
+            RegWatch& w = *it->second;
+            sweep_cursor_ = it->first;
+            ++it;
+            if (++visited > kSweepMaxItems || Clock::now() - t_start > kSweepTimeBudget) {
+                nudged_ = true; // resume from the cursor without sleeping
+                break;
+            }
+            const auto now = Clock::now();
+            switch (w.probe) {
+            case ProbeState::Pending:
+                if (w.call) {
+                    if (auto r = w.call->try_take()) {
+                        w.call.reset(); // taken: dispose_or_abandon is a no-op now
+                        resolve_probe_locked(w, std::move(*r), work);
+                    } else {
+                        grace_check_locked(w, now);
+                    }
+                }
+                // Pending with no call: a launch is in progress on another thread.
+                break;
+            case ProbeState::Deferred:
+                if (now >= w.next_retry_at) {
+                    w.probe = ProbeState::Pending;
+                    w.probe_gen = ++gen_;
+                    work.probe_launches.push_back(
+                        {w.spark_key, w.probe_gen,
+                         ProbeJob{w.root, w.subkey_w, w.subkey, core_, &w,
+                                  /*create_wait=*/w.wait == nullptr, probe_hook_,
+                                  traversal_budget()},
+                         DetachedLaunch::LaunchFailed, std::nullopt});
+                } else {
+                    grace_check_locked(w, now);
+                }
+                break;
+            case ProbeState::Idle:
+                break;
+            }
+            if (w.faulted_now != w.faulted_reported) {
+                w.faulted_reported = w.faulted_now;
+                health_edges_.fetch_add(1, std::memory_order_relaxed);
+                work.actions.push_back({SweepWork::Action::Kind::Fault, w.spark_key, w.faulted_now,
+                                        w.fault_reason, 0});
+            }
+        }
+    }
+
+    /// Off-lock half of a pass: launches, then dispatch in recorded order.
+    void run_off_lock(SweepWork& work) {
+        for (auto& pl : work.probe_launches) {
+            auto lr = probe_lane_.launch(std::move(*pl.job));
+            pl.job.reset();
+            pl.status = lr.status;
+            pl.call = std::move(lr.call);
+        }
+        std::vector<std::pair<DetachedLaunch, std::variant<DetachedCall<std::monostate>, DrainJob>>>
+            drain_outcomes;
+        drain_outcomes.reserve(work.drain_launches.size());
+        for (auto& dj : work.drain_launches) {
+            auto lr = drain_lane_.launch(std::move(dj));
+            if (lr.status == DetachedLaunch::Launched)
+                drain_outcomes.emplace_back(lr.status, std::move(*lr.call));
+            else
+                drain_outcomes.emplace_back(lr.status, std::move(*lr.fn));
+        }
+        work.drain_launches.clear();
+        drain_outcomes_ = std::move(drain_outcomes); // consumed by publish_locked (sweeper-private)
+
+        for (const auto& a : work.actions) {
+            try {
+                if (a.kind == SweepWork::Action::Kind::Fault) {
+                    if (work.fault)
+                        work.fault(a.key, a.faulted, a.reason);
+                } else if (work.emit) {
+                    work.emit(a.key, SparkData{std::monostate{}});
+                }
+            } catch (...) {
+                if (a.kind == SweepWork::Action::Kind::Emit)
+                    work.failed_emits.emplace_back(a.key, a.epoch);
+            }
+        }
+    }
+
+    /// Relock half: publish launched probes with re-validation; file drain
+    /// outcomes; restore any resync obligation whose submit threw.
+    void publish_locked(SweepWork& work) {
+        for (auto& pl : work.probe_launches) {
+            auto it = watches_.find(pl.key);
+            RegWatch* w = it != watches_.end() ? it->second.get() : nullptr;
+            const bool live = w && w->active && !stopping_ && w->probe == ProbeState::Pending &&
+                              w->probe_gen == pl.gen && !w->call;
+            if (!live) {
+                if (pl.call)
+                    work.stale_calls.push_back(std::move(*pl.call));
+                probe_discarded_.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            if (pl.status == DetachedLaunch::Launched) {
+                probe_launched_.fetch_add(1, std::memory_order_relaxed);
+                w->call = std::move(pl.call);
+            } else {
+                defer_admission_locked(*w, pl.status);
+            }
+        }
+        work.probe_launches.clear();
+        for (auto& [status, payload] : drain_outcomes_) {
+            if (status == DetachedLaunch::Launched) {
+                drains_launched_.fetch_add(1, std::memory_order_relaxed);
+                try {
+                    drains_in_flight_.push_back(
+                        std::move(std::get<DetachedCall<std::monostate>>(payload)));
+                } catch (...) {
+                    // Tracking lost, not the watch: the worker still drains and frees
+                    // it. Correct the gauge now rather than never.
+                    if (retiring_count_)
+                        --retiring_count_;
+                    retiring_gauge_.fetch_sub(1, std::memory_order_relaxed);
+                }
+            } else {
+                drains_admission_rejected_.fetch_add(1, std::memory_order_relaxed);
+                try {
+                    drain_backlog_.push_front(std::move(std::get<DrainJob>(payload)));
+                } catch (...) {
+                    work.inline_drains.push_back(std::move(std::get<DrainJob>(payload)));
+                }
+            }
+        }
+        drain_outcomes_.clear();
+        for (const auto& [key, epoch] : work.failed_emits) {
+            auto it = watches_.find(key);
+            if (it != watches_.end() && it->second->active && it->second->resync_epoch == epoch)
+                it->second->needs_resync = true;
+        }
+        work.failed_emits.clear();
+    }
+
+    void sweeper_main() {
+        std::unique_lock lk(mu_);
+        for (;;) {
+            const auto wake = next_wake_locked(Clock::now());
+            cv_.wait_until(lk, wake, [&] { return sweeper_stop_ || nudged_; });
+            if (sweeper_stop_)
+                return;
+            nudged_ = false;
+            SweepWork work;
+            sweep_locked(work);
+            lk.unlock();
+            run_off_lock(work);
+            lk.lock();
+            publish_locked(work);
+            lk.unlock();
+            for (auto& dj : work.inline_drains)
+                dj(); // last resort: nothing could hold the retirement, drain it here
+            {
+                SweepWork dead = std::move(work); // handle closes + abandons run off-lock
+            }
+            lk.lock();
+        }
+    }
+
+    /// Retire an already-inactive watch onto the drain lane (off-lock), then
+    /// record the outcome. Called from unwatch() with no lock held.
+    void retire(std::unique_ptr<RegWatch> victim) {
+        auto lr = drain_lane_.launch(DrainJob{std::move(victim)});
+        std::optional<DrainJob> inline_drain;
         {
             std::lock_guard lk(mu_);
-            if (!w.active)
-                return; // being torn down — do not re-arm
-            const WatchMode old_mode = w.mode;
-            // Re-arm BEFORE processing (condition 4): reconcile re-issues the
-            // RegNotify + SetThreadpoolWait for the next change. A failure here
-            // (neither target nor even the hive root armable) leaves the watch
-            // deaf — now reported through the fault channel (B1) instead of only
-            // a log, so a deaf watch is observable in SparkEngineStats.
-            now_faulted = !reconcile(w);
-            if (w.faulted != now_faulted) {
-                w.faulted = now_faulted; // report the fault edge only, not every fire
-                fault_changed = true;
+            if (lr.status == DetachedLaunch::Launched) {
+                drains_launched_.fetch_add(1, std::memory_order_relaxed);
+                try {
+                    drains_in_flight_.push_back(std::move(*lr.call));
+                } catch (...) {
+                    if (retiring_count_)
+                        --retiring_count_;
+                    retiring_gauge_.fetch_sub(1, std::memory_order_relaxed);
+                }
+            } else {
+                drains_admission_rejected_.fetch_add(1, std::memory_order_relaxed);
+                try {
+                    drain_backlog_.push_back(std::move(*lr.fn));
+                } catch (...) {
+                    inline_drain = std::move(*lr.fn);
+                }
             }
-            if (now_faulted)
-                spdlog::warn("spark_registry: re-arm failed for '{}' — watch is now deaf",
-                             w.spark_key);
-            // Emit when the key existed before this fire (it changed/was deleted)
-            // OR exists now (it (re)appeared). Pure-ancestor noise (a sibling key
-            // changed while our target stays absent) does not emit.
-            do_emit = (old_mode == WatchMode::Target) || (w.mode == WatchMode::Target);
-            emit = emit_;
-            fault = fault_;
+            nudge_locked();
         }
-        // Fire emit + fault with mu_ RELEASED: both re-enter the engine under its
-        // own lock, and an inline re-arm would take our mu_ → deadlock if held.
-        if (do_emit && emit)
-            emit(w.spark_key, SparkData{std::monostate{}});
-        if (fault_changed && fault)
-            fault(w.spark_key, now_faulted, now_faulted ? "registry re-arm failed" : "recovered");
+        if (inline_drain)
+            (*inline_drain)(); // allocation failure on the queue: drain inline, off-lock
     }
 
-    std::mutex mu_;
+    mutable std::mutex mu_;
+    std::condition_variable cv_;
     SparkEmitFn emit_;
     SparkFaultFn fault_;
-    std::shared_ptr<std::atomic<std::size_t>> f3_counter_; ///< see the constructor
-    PTP_POOL pool_{nullptr};
-    TP_CALLBACK_ENVIRON env_{};
+    std::shared_ptr<PoolCore> core_;
     bool started_{false};
+    bool stopping_{false};
+    bool sweeper_stop_{false};
+    bool nudged_{false};
+    std::thread sweeper_;
+    /// Ordered (not unordered_) so the sweep cursor can rotate over it by key.
+    std::map<std::string, std::unique_ptr<RegWatch>> watches_;
+    std::vector<DetachedCall<std::monostate>> drains_in_flight_;
+    std::deque<DrainJob> drain_backlog_;
+    std::size_t retiring_count_{0};
+    /// Mechanism-global (never per-watch, so a stale pointer cannot alias a fresh
+    /// watch): bumped at every probe reservation and every retirement.
+    std::uint64_t gen_{0};
+    /// Mechanism-global: bumped whenever an observation gap is recorded.
+    std::uint64_t resync_epoch_{0};
+    std::string sweep_cursor_;
+    std::vector<std::pair<DetachedLaunch, std::variant<DetachedCall<std::monostate>, DrainJob>>>
+        drain_outcomes_; ///< sweeper-thread private scratch between run_off_lock and publish_locked
+    std::shared_ptr<const ProbeHook> probe_hook_; ///< test seam
+    SparkDetachedLane probe_lane_;
+    SparkDetachedLane drain_lane_;
+
     /// Started, but CreateThreadpool failed — every watch() will be refused. Atomic so
     /// stats() (const, called from the heartbeat thread) reads it without mu_.
     std::atomic<bool> inert_{false};
-    std::unordered_map<std::string, std::unique_ptr<RegWatch>> watches_;
-
-public:
-    [[nodiscard]] SparkMechanismStats stats() const override {
-        return {.inert = inert_.load(std::memory_order_acquire)};
-    }
+    std::atomic<std::uint64_t> retiring_gauge_{0};
+    std::atomic<std::uint64_t> watch_rejected_{0};
+    std::atomic<std::uint64_t> quarantined_{0};
+    std::atomic<std::uint64_t> slow_op_{0};
+    std::atomic<std::uint64_t> probe_launched_{0};
+    std::atomic<std::uint64_t> probe_admission_rejected_{0};
+    std::atomic<std::uint64_t> probe_launch_failed_{0};
+    std::atomic<std::uint64_t> probe_backend_failed_{0};
+    std::atomic<std::uint64_t> probe_discarded_{0};
+    std::atomic<std::uint64_t> drains_launched_{0};
+    std::atomic<std::uint64_t> drains_completed_{0};
+    std::atomic<std::uint64_t> drains_admission_rejected_{0};
+    std::atomic<std::uint64_t> synthetic_fires_{0};
+    std::atomic<std::uint64_t> health_edges_{0};
+    std::atomic<std::size_t> retiring_cap_{kRetiringCap};
+    std::atomic<std::int64_t> caller_wait_ms_{kRegCallerWaitBudget.count()};
+    std::atomic<std::int64_t> health_grace_ms_{kRegHealthGrace.count()};
+    std::atomic<std::int64_t> sweep_cadence_ms_{kRegSweepCadence.count()};
+    std::atomic<std::int64_t> backend_retry_base_ms_{kRegBackendRetryBase.count()};
+    std::atomic<std::int64_t> admission_seed_ms_{kRegAdmissionBackoffSeed.count()};
 };
+
+void CALLBACK reg_on_wait_cb(PTP_CALLBACK_INSTANCE, PVOID ctx, PTP_WAIT, TP_WAIT_RESULT) {
+    auto* w = static_cast<RegWatch*>(ctx);
+    w->owner->on_fire(*w);
+}
 
 } // namespace
 
@@ -386,6 +1366,23 @@ std::unique_ptr<ISparkMechanism> make_registry_mechanism() {
 std::unique_ptr<ISparkMechanism>
 make_registry_mechanism(std::shared_ptr<std::atomic<std::size_t>> f3_counter) {
     return std::make_unique<WindowsRegistryMechanism>(std::move(f3_counter));
+}
+
+bool set_registry_test_controls_for_test(ISparkMechanism& mech,
+                                         RegistryMechanismTestControls controls) {
+    auto* real = dynamic_cast<WindowsRegistryMechanism*>(&mech);
+    if (!real)
+        return false;
+    real->apply_test_controls(std::move(controls));
+    return true;
+}
+
+std::optional<RegistryMechanismDebugCounters>
+registry_debug_counters_for_test(const ISparkMechanism& mech) {
+    const auto* real = dynamic_cast<const WindowsRegistryMechanism*>(&mech);
+    if (!real)
+        return std::nullopt;
+    return real->debug_counters();
 }
 
 } // namespace yuzu::agent
@@ -401,6 +1398,15 @@ std::unique_ptr<ISparkMechanism> make_registry_mechanism() {
 std::unique_ptr<ISparkMechanism>
 make_registry_mechanism(std::shared_ptr<std::atomic<std::size_t>> /*f3_counter*/) {
     return nullptr; // same platform contract as the zero-argument form
+}
+
+bool set_registry_test_controls_for_test(ISparkMechanism&, RegistryMechanismTestControls) {
+    return false; // nothing to control off Windows
+}
+
+std::optional<RegistryMechanismDebugCounters>
+registry_debug_counters_for_test(const ISparkMechanism&) {
+    return std::nullopt;
 }
 
 } // namespace yuzu::agent

@@ -583,16 +583,26 @@ private:
     /// RESOLVED cross-mechanism coupling (#2011): a slow watch() on one
     /// mechanism no longer blocks a concurrent arm/disarm on a DIFFERENT
     /// mechanism (e.g. File no longer blocks Registry/Service) — the HARD GATE
-    /// closed before Stage 2 wires the second live mechanism under load. STILL
-    /// OPEN (distinct follow-up, NOT closed by #2011): a slow watch() still
-    /// stalls its OWN type's arm/disarm queue for the full duration, and that
-    /// duration is unbounded — spark_file's arm_ancestor deadline (#1980) bounds
-    /// the NUMBER of slow probes to ~one, not the wall-clock of any one probe
-    /// (fs::is_directory is uninterruptible, so a hung probe on a dead UNC path
-    /// holds File's lock for the full OS network timeout); Registry (TP_WAIT)
-    /// and Service (SCM query) watch latencies are entirely UNCHARACTERISED.
-    /// Truly bounding the per-type stall needs the walk-off-mu_ (probe on a
-    /// separate thread) restructure — a deferred follow-up, unscheduled.
+    /// closed before Stage 2 wires the second live mechanism under load.
+    /// SAME-TYPE stall (#2012/#3840, the walk-off-mu_ restructure), per
+    /// mechanism: a slow watch() stalls its OWN type's arm/disarm queue for as
+    /// long as the mechanism lets it. REGISTRY is bounded since PR-B1
+    /// (spark_registry.cpp): watch() reserves under the mechanism's own lock,
+    /// runs the probe on a detached F3-counted worker, waits at most
+    /// kRegCallerWaitBudget (50 ms - PR-B's chosen initial policy value, not a
+    /// measured bound; the measured inputs in docs/spark-rebuild-baselines/
+    /// stage2-watch-establish-latency.md sit at 82 us / 1264 us p99) and
+    /// otherwise publishes the probe to its sweeper; unwatch() hands the
+    /// blocking callback drain to a detached worker and returns in
+    /// microseconds - which also closes the #4181 same-type reentrant deadlock
+    /// (this lock held across that drain while the drained callback's Inline
+    /// consumer needed it). STILL OPEN for FILE and SERVICE (PR-B2/PR-B3): a
+    /// File watch() still blocks for the OS-call duration - spark_file's
+    /// arm_ancestor deadline (#1980) bounds the NUMBER of slow probes to ~one,
+    /// not the wall-clock of any one probe (fs::is_directory is uninterruptible,
+    /// so a hung probe on a dead UNC path holds File's lock for the full OS
+    /// network timeout); Service's queue-push watch()/unwatch() are already
+    /// O(1) but its SCM open/notify run head-of-line on its worker.
     /// Populated in register_mechanism() under mu_, in lockstep with
     /// mechanisms_, and — like mechanisms_ — never erased thereafter, so a
     /// std::mutex& obtained via .at(type) is safe to hold across the blocking

@@ -40,11 +40,15 @@
 #include <yuzu/agent/spark.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
 
 namespace yuzu::agent {
 
@@ -125,8 +129,25 @@ struct SparkMechanismStats {
 /// One watch mechanism for one event-driven SparkType. Lifecycle mirrors the
 /// engine: register (pre-start) → start(emit, fault) → watch/unwatch as sparks
 /// arm/disarm while running → stop(). The engine calls start / watch / unwatch
-/// / stop with NO engine lock held — a mechanism method may block on OS handle
-/// setup without stalling every other arm/disarm/emit.
+/// / stop with its own `mu_` released — but NOT lock-free: every watch() and
+/// unwatch() runs under `SparkEngine::mech_ops_mu_by_type_[type]`, the per-TYPE
+/// serialiser (#1994 M2 / #2011), so a mechanism method that blocks on an OS
+/// call stalls every other arm/disarm of the SAME type for exactly that long
+/// (#2012/#3840). Two contract points follow (corrected in PR-B1; the previous
+/// wording here claimed watch() "may block on OS handle setup without stalling
+/// every other arm/disarm", which was true only across TYPES):
+///   1. A mechanism is responsible for BOUNDING its own watch()/unwatch(): run
+///      the blocking OS call on a worker it owns, wait at most a short budget
+///      on the control path, and commit or hand the result off later. Registry
+///      does this since PR-B1 (spark_registry.cpp, "Ownership / dispatch
+///      protocol"); File and Service still block for the OS-call duration
+///      (PR-B2/PR-B3).
+///   2. A mechanism must NEVER call emit()/fault() synchronously from inside
+///      watch()/unwatch() - not even on an immediate-success path. The engine's
+///      per-type lock is on that call stack, and an Inline consumer reacting by
+///      re-arming the same type would self-deadlock the non-recursive lock.
+///      Deliver from a mechanism-owned thread, with the mechanism's own lock
+///      released.
 class ISparkMechanism {
 public:
     virtual ~ISparkMechanism() = default;
@@ -227,5 +248,58 @@ make_registry_mechanism(std::shared_ptr<std::atomic<std::size_t>> f3_counter);
 /// set-then-use contract as the engine's seams — no concurrent-access support.
 [[nodiscard]] YUZU_EXPORT bool
 set_file_retire_fault_hook_for_test(ISparkMechanism& mech, std::function<void()> hook);
+
+/// Test controls for the Windows Registry mechanism (#2012/#3840 PR-B1). Same
+/// TU-boundary free-function shape as set_file_retire_fault_hook_for_test above,
+/// for the same reason (the class lives in spark_registry.cpp's anonymous
+/// namespace). Zero / empty means "leave unchanged"; a null `probe_hook` clears
+/// any installed hook. Set-then-use: no concurrent-access support.
+struct RegistryMechanismTestControls {
+    /// Runs on the detached probe worker, BEFORE its OS calls, with the subkey
+    /// being probed. Parking here models a hung hive; throwing models a probe
+    /// that failed inside the worker (surfaces as a WorkerThrew backend failure).
+    std::function<void(std::string_view subkey)> probe_hook;
+    std::size_t probe_lane_cap{0};
+    std::size_t drain_lane_cap{0};
+    std::size_t retiring_cap{0};
+    std::chrono::milliseconds caller_wait_budget{0};
+    std::chrono::milliseconds health_grace{0};
+    std::chrono::milliseconds backend_retry_base{0};
+    std::chrono::milliseconds admission_backoff_seed{0};
+    std::chrono::milliseconds sweep_cadence{0};
+};
+
+/// Mechanism-internal counters the public SparkMechanismStats does not carry
+/// (admission refusals, backend failures, discards, drains, synthetic fires).
+/// Point-in-time skew like SparkMechanismStats - never derive an invariant
+/// across two fields. Exposure on the heartbeat is a separate decision; this is
+/// the test-visible surface only.
+struct RegistryMechanismDebugCounters {
+    std::uint64_t probe_launched{0};
+    std::uint64_t probe_admission_rejected{0};
+    std::uint64_t probe_launch_failed{0};
+    std::uint64_t probe_backend_failed{0};
+    std::uint64_t probe_discarded{0};
+    std::uint64_t drains_launched{0};
+    std::uint64_t drains_completed{0};
+    std::uint64_t drains_admission_rejected{0};
+    std::uint64_t synthetic_fires{0};
+    std::uint64_t health_edges{0};
+    std::size_t probe_workers_active{0};
+    std::size_t drain_workers_active{0};
+    std::size_t live_watches{0};
+    std::size_t retiring{0};
+    std::size_t drain_backlog{0};
+};
+
+/// Returns true if `mech` is the Windows Registry mechanism and the controls
+/// were applied; false on every non-Windows platform and for any other
+/// mechanism type (a caller that forgets to check gets a visible false).
+[[nodiscard]] YUZU_EXPORT bool
+set_registry_test_controls_for_test(ISparkMechanism& mech, RegistryMechanismTestControls controls);
+
+/// nullopt on every non-Windows platform and for any other mechanism type.
+[[nodiscard]] YUZU_EXPORT std::optional<RegistryMechanismDebugCounters>
+registry_debug_counters_for_test(const ISparkMechanism& mech);
 
 } // namespace yuzu::agent
