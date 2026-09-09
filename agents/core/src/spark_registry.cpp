@@ -899,6 +899,10 @@ public:
             probe_hook_ = std::make_shared<const ProbeHook>(std::move(c.probe_hook));
         else
             probe_hook_.reset();
+        if (c.sweep_hook)
+            sweep_hook_ = std::make_shared<const std::function<void()>>(std::move(c.sweep_hook));
+        else
+            sweep_hook_.reset();
         if (c.probe_lane_cap)
             probe_lane_.set_cap_for_test(c.probe_lane_cap);
         if (c.drain_lane_cap)
@@ -1267,6 +1271,8 @@ private:
         work.dead_results.reserve(cap);
         work.stale_calls.reserve(cap + kDrainLaneCap);
         work.drain_launches.reserve(kDrainLaneCap);
+        if (sweep_hook_ && *sweep_hook_)
+            (*sweep_hook_)(); // test seam: a throw here models an allocation failure
 
         for (auto it = drains_in_flight_.begin(); it != drains_in_flight_.end();) {
             if (it->try_take()) {
@@ -1705,7 +1711,8 @@ private:
     std::string sweep_cursor_;
     std::vector<std::pair<DetachedLaunch, std::variant<DetachedCall<std::monostate>, DrainJob>>>
         drain_outcomes_; ///< sweeper-thread private scratch between run_off_lock and publish_locked
-    std::shared_ptr<const ProbeHook> probe_hook_; ///< test seam
+    std::shared_ptr<const ProbeHook> probe_hook_;                ///< test seam
+    std::shared_ptr<const std::function<void()>> sweep_hook_; ///< test seam (sre6-1 coverage)
     SparkDetachedLane probe_lane_;
     SparkDetachedLane drain_lane_;
 

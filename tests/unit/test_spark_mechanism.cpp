@@ -2575,6 +2575,8 @@ TEST_CASE("Service spark (real mechanism): live unit transition fires Running th
 
 #include <win_str.hpp> // yuzu::win::from_wide (real service-name widen/narrow, PR-A round 2)
 
+#include <sddl.h> // ConvertSidToStringSidW / ConvertStringSecurityDescriptorToSecurityDescriptorW (UP-2 closure test)
+
 #include <condition_variable>
 #include <filesystem>
 #include <fstream>
@@ -3454,6 +3456,49 @@ TEST_CASE("Registry spark (real mechanism): survives key delete + recreate",
 // observed the disarm not completing and force-exited (TerminateProcess, since
 // a deadlocked thread cannot be joined); a parent-side kill = a hard hang.
 namespace {
+/// Test-side owners for the Win32 handles these cases open by hand (governance
+/// sg-5/cs-6: new test C++ carries no manual cleanup). Closed on every exit path,
+/// including a failed REQUIRE.
+struct UniqueHandle {
+    HANDLE h{nullptr};
+    UniqueHandle() = default;
+    explicit UniqueHandle(HANDLE handle) : h(handle) {}
+    ~UniqueHandle() { reset(); }
+    UniqueHandle(const UniqueHandle&) = delete;
+    UniqueHandle& operator=(const UniqueHandle&) = delete;
+    void reset(HANDLE handle = nullptr) {
+        if (h && h != INVALID_HANDLE_VALUE && h != handle)
+            ::CloseHandle(h);
+        h = handle;
+    }
+    [[nodiscard]] bool valid() const { return h && h != INVALID_HANDLE_VALUE; }
+};
+
+/// Creates (or opens) a NAMED HKCU key for the test's lifetime; deletes it on
+/// destruction. `h` is null when creation failed - callers REQUIRE it.
+struct OwnedRegKey {
+    std::string sub;
+    HKEY h{nullptr};
+    OwnedRegKey(std::string subkey, REGSAM sam) : sub(std::move(subkey)) {
+        if (::RegCreateKeyExA(HKEY_CURRENT_USER, sub.c_str(), 0, nullptr, 0, sam, nullptr, &h,
+                              nullptr) != ERROR_SUCCESS)
+            h = nullptr;
+    }
+    ~OwnedRegKey() {
+        if (h)
+            ::RegCloseKey(h);
+        ::RegDeleteKeyA(HKEY_CURRENT_USER, sub.c_str());
+    }
+    OwnedRegKey(const OwnedRegKey&) = delete;
+    OwnedRegKey& operator=(const OwnedRegKey&) = delete;
+};
+
+/// The T6 child's own exit code for "I observed the deadlock". Deliberately not
+/// 3: Catch2 exits 3 itself when the command line matched no test case
+/// (UnmatchedTestSpecExitCode), which would make a name drift between the
+/// parent's macro and the child case read as a reproduced deadlock (qe-1).
+constexpr DWORD kT6DeadlockExitCode = 100;
+
 std::string t6_child_key() {
     char buf[512]{};
     const DWORD n = ::GetEnvironmentVariableA("YUZU_SPARK_T6_KEY", buf, sizeof(buf));
@@ -3470,9 +3515,9 @@ std::string t6_child_key() {
 TEST_CASE(YUZU_SPARK_T6_CHILD_CASE_NAME, "[.][t6-child]") {
     const std::string sub = t6_child_key();
     const std::string sub2 = sub + "\\Second";
-    HKEY h = nullptr;
-    REQUIRE(::RegCreateKeyExA(HKEY_CURRENT_USER, sub.c_str(), 0, nullptr, 0, KEY_SET_VALUE, nullptr,
-                              &h, nullptr) == ERROR_SUCCESS);
+    OwnedRegKey key(sub, KEY_SET_VALUE);
+    REQUIRE(key.h != nullptr);
+    HKEY h = key.h; // borrowed for the writes below; owned (and deleted) by `key`
 
     SparkEngine engine;
     REQUIRE(engine.register_mechanism(SparkType::Registry, make_registry_mechanism()).has_value());
@@ -3526,7 +3571,7 @@ TEST_CASE(YUZU_SPARK_T6_CHILD_CASE_NAME, "[.][t6-child]") {
                    "the same type - deadlock observed\n",
                    stderr);
         std::fflush(stderr);
-        ::TerminateProcess(::GetCurrentProcess(), 3);
+        ::TerminateProcess(::GetCurrentProcess(), kT6DeadlockExitCode);
     }
     CHECK(completed);
     disarmer.join();
@@ -3545,16 +3590,16 @@ TEST_CASE(YUZU_SPARK_T6_CHILD_CASE_NAME, "[.][t6-child]") {
         CHECK(rearmed.load(std::memory_order_acquire));
     }
     engine.stop();
-    ::RegCloseKey(h);
-    ::RegDeleteKeyA(HKEY_CURRENT_USER, sub2.c_str());
-    ::RegDeleteKeyA(HKEY_CURRENT_USER, sub.c_str());
+    ::RegDeleteKeyA(HKEY_CURRENT_USER, sub2.c_str()); // never created; belt and braces
+    // `key` deletes `sub` on scope exit, after the engine is gone.
 }
 
 TEST_CASE("Registry spark: same-type disarm() does not deadlock against an in-flight Inline "
           "callback (T6, subprocess boundary)",
           "[spark][mechanism][windows][t6]") {
     wchar_t exe[MAX_PATH]{};
-    REQUIRE(::GetModuleFileNameW(nullptr, exe, MAX_PATH) > 0);
+    const DWORD exe_len = ::GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    REQUIRE((exe_len > 0 && exe_len < MAX_PATH)); // == MAX_PATH means truncated (xp-6)
     // The child reads its scratch key from the environment so the parent can clean
     // it up even when the child had to be killed mid-scenario.
     const std::string key = "Software\\Yuzu\\SparkT6_" + std::to_string(::GetCurrentProcessId());
@@ -3578,30 +3623,32 @@ TEST_CASE("Registry spark: same-type disarm() does not deadlock against an in-fl
     SECURITY_ATTRIBUTES sa{};
     sa.nLength = sizeof(sa);
     sa.bInheritHandle = TRUE;
-    HANDLE hlog = ::CreateFileW(child_log.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &sa, CREATE_ALWAYS,
-                                FILE_ATTRIBUTE_NORMAL, nullptr);
-    REQUIRE(hlog != INVALID_HANDLE_VALUE);
+    UniqueHandle hlog(::CreateFileW(child_log.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &sa,
+                                    CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
+    REQUIRE(hlog.valid());
     STARTUPINFOW si{};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdInput = nullptr;
-    si.hStdOutput = hlog;
-    si.hStdError = hlog;
+    si.hStdOutput = hlog.h;
+    si.hStdError = hlog.h;
     PROCESS_INFORMATION pi{};
     // cmd.data() is writable (CreateProcessW may modify lpCommandLine).
     const BOOL created = ::CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE /*inherit*/,
                                           CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
-    ::CloseHandle(hlog); // the child holds its own inherited copy
+    UniqueHandle hthread(pi.hThread); // both null if the create failed
+    UniqueHandle hprocess(pi.hProcess);
+    hlog.reset(); // the child holds its own inherited copy
     REQUIRE(created);
-    ::CloseHandle(pi.hThread);
-    const DWORD wr = ::WaitForSingleObject(pi.hProcess, 30000);
+    hthread.reset();
+    const DWORD wr = ::WaitForSingleObject(hprocess.h, 30000);
     if (wr == WAIT_TIMEOUT) {
-        ::TerminateProcess(pi.hProcess, 9);
-        ::WaitForSingleObject(pi.hProcess, 5000);
+        ::TerminateProcess(hprocess.h, 9);
+        ::WaitForSingleObject(hprocess.h, 5000);
     }
     DWORD code = 0xFFFFFFFFu;
-    ::GetExitCodeProcess(pi.hProcess, &code);
-    ::CloseHandle(pi.hProcess);
+    ::GetExitCodeProcess(hprocess.h, &code);
+    hprocess.reset();
     ::SetEnvironmentVariableA("YUZU_SPARK_T6_KEY", nullptr);
     ::RegDeleteKeyA(HKEY_CURRENT_USER, (key + "\\Second").c_str());
     ::RegDeleteKeyA(HKEY_CURRENT_USER, key.c_str());
@@ -3614,7 +3661,8 @@ TEST_CASE("Registry spark: same-type disarm() does not deadlock against an in-fl
     std::filesystem::remove(child_log, ec);
 
     INFO("T6 child: WaitForSingleObject=" << wr << " (0=exited, 258=timeout->killed) exit code="
-                                          << code << " (0=completed, 3=child saw the deadlock)");
+                                          << code << " (0=completed, " << kT6DeadlockExitCode
+                                          << "=child saw the deadlock, 3=Catch2 matched no case)");
     INFO("T6 child output:\n" << child_out);
     CHECK(wr == WAIT_OBJECT_0);
     CHECK(code == 0);
@@ -4150,17 +4198,15 @@ TEST_CASE("Registry spark (real mechanism): a target that appears under an ances
     // Create the target key - NO value write. The parent's NAME notification is
     // the only thing that fires; the re-arm resolves to Target, and that
     // appearance must reach the consumer as a Fired event.
-    HKEY h = nullptr;
-    REQUIRE(::RegCreateKeyExA(HKEY_CURRENT_USER, target.c_str(), 0, nullptr, 0, KEY_READ, nullptr, &h,
-                              nullptr) == ERROR_SUCCESS);
-    ::RegCloseKey(h);
+    OwnedRegKey created(target, KEY_READ); // deleted on scope exit
+    REQUIRE(created.h != nullptr);
     CHECK(eventually([&] { return count_kind(got, spark_key(spec), SparkEventKind::Fired) > baseline; },
                      5000ms));
     auto d = registry_debug_counters_for_test(*raw);
     REQUIRE(d.has_value());
     CHECK(d->synthetic_fires >= 1);
     engine.stop();
-    ::RegDeleteKeyA(HKEY_CURRENT_USER, target.c_str());
+    // `created` deletes the target on scope exit.
 }
 
 TEST_CASE("Registry mechanism (direct): a throwing emit is contained on the fire callback and the "
@@ -4263,6 +4309,238 @@ LatencyStats summarize_us(std::vector<std::int64_t> v) {
     return s;
 }
 } // namespace
+
+namespace {
+/// The current process token's user SID as a string (for a test DACL).
+std::wstring current_user_sid() {
+    HANDLE raw = nullptr;
+    if (!::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY, &raw))
+        return {};
+    UniqueHandle tok(raw);
+    DWORD n = 0;
+    ::GetTokenInformation(tok.h, TokenUser, nullptr, 0, &n);
+    std::vector<BYTE> buf(n);
+    if (n == 0 || !::GetTokenInformation(tok.h, TokenUser, buf.data(), n, &n))
+        return {};
+    LPWSTR str = nullptr;
+    if (!::ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(buf.data())->User.Sid, &str))
+        return {};
+    std::wstring out(str);
+    ::LocalFree(str);
+    return out;
+}
+
+/// Replace a key's DACL from SDDL. Needs a handle opened with WRITE_DAC.
+bool apply_sddl(HKEY h, const std::wstring& sddl) {
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    if (!::ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &sd,
+                                                                nullptr))
+        return false;
+    const LONG rc = ::RegSetKeySecurity(h, DACL_SECURITY_INFORMATION, sd);
+    ::LocalFree(sd);
+    return rc == ERROR_SUCCESS;
+}
+
+/// Denies the current user KEY_NOTIFY (0x0010) on `sub` while allowing all else,
+/// and restores full access on destruction - BEFORE the key is deleted (a deny
+/// of DELETE would leave an undeletable key behind on a shared runner box).
+struct DenyNotifyScope {
+    std::string sub;
+    std::wstring sid;
+    bool applied{false};
+    explicit DenyNotifyScope(std::string subkey) : sub(std::move(subkey)), sid(current_user_sid()) {
+        if (sid.empty())
+            return;
+        HKEY raw = nullptr;
+        if (::RegOpenKeyExA(HKEY_CURRENT_USER, sub.c_str(), 0, WRITE_DAC | READ_CONTROL, &raw) !=
+            ERROR_SUCCESS)
+            return;
+        applied = apply_sddl(raw, L"D:(D;;0x0010;;;" + sid + L")(A;;KA;;;" + sid + L")");
+        ::RegCloseKey(raw);
+    }
+    void restore() {
+        if (!applied)
+            return;
+        HKEY raw = nullptr;
+        if (::RegOpenKeyExA(HKEY_CURRENT_USER, sub.c_str(), 0, WRITE_DAC | READ_CONTROL, &raw) ==
+            ERROR_SUCCESS) {
+            apply_sddl(raw, L"D:(A;;KA;;;" + sid + L")");
+            ::RegCloseKey(raw);
+        }
+        applied = false;
+    }
+    ~DenyNotifyScope() { restore(); }
+    DenyNotifyScope(const DenyNotifyScope&) = delete;
+    DenyNotifyScope& operator=(const DenyNotifyScope&) = delete;
+};
+} // namespace
+
+TEST_CASE("Registry spark (real mechanism): a health edge staged for one watch is never delivered "
+          "to the same-key re-arm that replaced it (#2012 PR-B1 UP-1)",
+          "[spark][mechanism][windows][walkoff]") {
+    ScratchRegKey a("up1_churn");
+    SparkEngine engine;
+    auto mech = make_registry_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::Registry, std::move(mech)).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    {
+        // Every establishment misses a 1 ms grace (a Faulted edge is staged for it),
+        // and a fast sweep cadence keeps staging and dispatch close together.
+        RegistryMechanismTestControls ctl;
+        ctl.health_grace = 1ms;
+        ctl.sweep_cadence = 5ms;
+        ctl.probe_hook = [sub = a.sub](std::string_view s) {
+            if (s == sub)
+                std::this_thread::sleep_for(3ms);
+        };
+        REQUIRE(set_registry_test_controls_for_test(*raw, std::move(ctl)));
+    }
+    engine.start();
+    const auto spec = registry_spec("HKCU", a.sub);
+    // Churn: arm / disarm the SAME key every ~10 ms for a while. Before the fix a
+    // Faulted edge staged for a replaced watch could land on its successor and stick.
+    int cycles = 0;
+    const auto until = std::chrono::steady_clock::now() + 3s;
+    while (std::chrono::steady_clock::now() < until) {
+        auto s = engine.arm(*c, spec);
+        REQUIRE(s.has_value());
+        std::this_thread::sleep_for(10ms);
+        engine.disarm(*s);
+        ++cycles;
+    }
+    INFO("churn cycles: " << cycles);
+    auto last = engine.arm(*c, spec);
+    REQUIRE(last.has_value());
+    // The engine's per-key health must settle to healthy: no stale Faulted stuck on
+    // the surviving watch, and every Faulted this key delivered has its Recovered.
+    CHECK(eventually([&] { return engine.stats().armed_faulted == 0; }, 5000ms));
+    CHECK(eventually(
+        [&] {
+            return count_kind(got, spark_key(spec), SparkEventKind::Faulted) ==
+                   count_kind(got, spark_key(spec), SparkEventKind::Recovered);
+        },
+        5000ms));
+    const auto before = count_kind(got, spark_key(spec), SparkEventKind::Fired);
+    a.write(1);
+    CHECK(eventually([&] { return count_kind(got, spark_key(spec), SparkEventKind::Fired) > before; },
+                     8000ms));
+    engine.stop();
+}
+
+TEST_CASE("Registry spark (real mechanism): an existing key that refuses KEY_NOTIFY is an arm "
+          "failure, never a silent ancestor watch (#2012 PR-B1 UP-2)",
+          "[spark][mechanism][windows][walkoff]") {
+    ScratchRegKey a("up2_acl");
+    DenyNotifyScope deny(a.sub);
+    if (!deny.applied)
+        WARN("could not apply the test DACL (no SID or no WRITE_DAC) - the denied half is skipped");
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::Registry, make_registry_mechanism()).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+    const auto spec = registry_spec("HKCU", a.sub);
+    if (deny.applied) {
+        // The key EXISTS; only its notify is refused. Before the fix the probe fell
+        // through to the parent's NAME watch and arm() succeeded: armed, healthy,
+        // and deaf to every value change on the key. Now the fast definite failure
+        // is reported to the caller.
+        auto denied = engine.arm(*c, spec);
+        CHECK_FALSE(denied.has_value());
+        if (denied.has_value())
+            engine.disarm(*denied);
+        deny.restore();
+    }
+    auto ok = engine.arm(*c, spec);
+    REQUIRE(ok.has_value());
+    std::this_thread::sleep_for(150ms);
+    const auto before = count_kind(got, spark_key(spec), SparkEventKind::Fired);
+    a.write(1);
+    CHECK(eventually([&] { return count_kind(got, spark_key(spec), SparkEventKind::Fired) > before; },
+                     8000ms));
+    engine.stop();
+}
+
+TEST_CASE("Registry mechanism (direct): a sweeper whose passes keep failing reports the mechanism "
+          "inert and clears it when a pass succeeds (#2012 PR-B1 sre6-1)",
+          "[spark][mechanism][windows][walkoff]") {
+    ScratchRegKey a("sweep_fail");
+    auto mech = make_registry_mechanism();
+    REQUIRE(mech != nullptr);
+    std::atomic<bool> failing{true};
+    std::atomic<int> throws{0};
+    {
+        RegistryMechanismTestControls ctl;
+        ctl.sweep_cadence = 5ms;
+        ctl.sweep_hook = [&] {
+            if (failing.load(std::memory_order_acquire)) {
+                throws.fetch_add(1, std::memory_order_relaxed);
+                throw std::bad_alloc{};
+            }
+        };
+        REQUIRE(set_registry_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    std::atomic<int> fired{0};
+    mech->start([&](const std::string&, SparkData) { fired.fetch_add(1, std::memory_order_relaxed); },
+                [](const std::string&, bool, std::string_view) {});
+    const auto spec = registry_spec("HKCU", a.sub);
+    REQUIRE(mech->watch(spark_key(spec), spec.params).has_value()); // control-path establishment
+    CHECK_FALSE(mech->stats().inert);
+    a.write(1); // consumed notification -> re-arm published to the sweeper -> passes run and throw
+    CHECK(eventually([&] { return throws.load(std::memory_order_relaxed) >= 3; }, 8000ms));
+    CHECK(eventually([&] { return mech->stats().inert; }, 8000ms)); // the dark sweeper is visible
+    {
+        auto d = registry_debug_counters_for_test(*mech);
+        REQUIRE(d.has_value());
+        CHECK(d->sweep_pass_failed >= 3);
+    }
+    failing.store(false, std::memory_order_release);
+    CHECK(eventually([&] { return !mech->stats().inert; }, 8000ms)); // first good pass clears it
+    // The re-arm the failing passes held back has now committed: the watch is live.
+    const int before = fired.load(std::memory_order_relaxed);
+    a.write(2);
+    CHECK(eventually([&] { return fired.load(std::memory_order_relaxed) > before; }, 8000ms));
+    mech->stop();
+}
+
+TEST_CASE("Registry spark (real mechanism): disarm() returns in bounded time while its drain runs "
+          "detached (#2012 PR-B1 sre6-4)",
+          "[spark][mechanism][windows][walkoff]") {
+    constexpr int kKeys = 8;
+    std::vector<std::unique_ptr<ScratchRegKey>> keys;
+    for (int i = 0; i < kKeys; ++i)
+        keys.push_back(std::make_unique<ScratchRegKey>("unwatch_bound"));
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::Registry, make_registry_mechanism()).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+    std::vector<SparkEngine::SubscriptionId> subs;
+    for (auto& k : keys) {
+        auto s = engine.arm(*c, registry_spec("HKCU", k->sub));
+        REQUIRE(s.has_value());
+        subs.push_back(*s);
+    }
+    std::this_thread::sleep_for(150ms);
+    // unwatch() holds the mechanism lock across a thread CREATION (not an OS wait);
+    // 50 ms is a generous ceiling for that on a loaded CI box and still an order
+    // of magnitude under any callback-drain duration.
+    std::chrono::microseconds worst{0};
+    for (auto s : subs) {
+        const auto t0 = std::chrono::steady_clock::now();
+        engine.disarm(s);
+        worst = std::max(worst, std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now() - t0));
+    }
+    INFO("worst disarm(): " << worst.count() << " us");
+    CHECK(worst < 50ms);
+    engine.stop();
+}
 
 TEST_CASE("Registry spark (real mechanism): inline dispatch is microsecond-scale",
           "[spark][mechanism][windows][latency]") {

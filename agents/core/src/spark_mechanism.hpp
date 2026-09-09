@@ -277,6 +277,12 @@ struct RegistryMechanismTestControls {
     /// being probed. Parking here models a hung hive; throwing models a probe
     /// that failed inside the worker (surfaces as a WorkerThrew backend failure).
     std::function<void(std::string_view subkey)> probe_hook;
+    /// Runs on the sweeper thread at the top of every pass, under the
+    /// mechanism's lock, AFTER the pass has reserved its containers and BEFORE
+    /// it mutates any watch. Throwing here models a pass that failed on
+    /// allocation (the pass is unwound, counted and retried on a backoff;
+    /// persistent failure reports the mechanism inert). Null clears it.
+    std::function<void()> sweep_hook;
     std::size_t probe_lane_cap{0};
     std::size_t drain_lane_cap{0};
     std::size_t retiring_cap{0};
