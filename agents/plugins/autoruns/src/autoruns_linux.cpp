@@ -912,16 +912,23 @@ struct TimerScan {
                                         // open -- distinct from "absent",
                                         // matching lnx_cron_periodic's
                                         // partial_permission_denied treatment
-    bool any_dir_open_failure = false; // a candidate dir failed to open for a
+    bool any_dir_open_failure = false; // set by three distinct causes, not
+                                       // just an open failure: (1) a
+                                       // candidate dir failed to open for a
                                        // real reason OTHER than permission-
-                                       // denied or plain absence (e.g. EIO) --
-                                       // PR #4154 round 9 blocker: previously
-                                       // dropped entirely, both for this
-                                       // scan's own candidate dirs and for a
-                                       // failed /home enumeration feeding
-                                       // lnx_systemd_timers_user's global-
-                                       // scope scans (collect_linux folds
-                                       // that failure in here too)
+                                       // denied or plain absence (e.g. EIO);
+                                       // (2) a failed /home enumeration
+                                       // feeding lnx_systemd_timers_user's
+                                       // global-scope scans (collect_linux
+                                       // folds that failure in here too);
+                                       // (3) timer_enabled's own
+                                       // wants_scan_incomplete signal for a
+                                       // consulted .wants dir -- open_error,
+                                       // enumeration_error, or truncated --
+                                       // PR #4154 round 9 blocker (dir open
+                                       // failures dropped entirely), widened
+                                       // the next round to also cover (3)'s
+                                       // enumeration_error/truncated cases
     std::string dir_open_failure_reason;
 };
 
