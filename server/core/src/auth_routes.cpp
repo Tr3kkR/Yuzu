@@ -2131,9 +2131,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 // other failure branches (no oracle on which credential/
                 // state step failed).
                 res.status = 401;
-                res.set_content(
-                    R"({"error":{"code":401,"message":"Invalid username or password"},"meta":{"api_version":"v1"}})",
-                    "application/json");
+                res.set_content(detail::a4_error(res, "Invalid username or password"),
+                                "application/json");
                 audit_log_for_principal(req, "auth.login", "failure", username,
                                         auth::role_to_string(*role_opt), "User", username,
                                         "reason=session_mint_failed;cause=undifferentiated");
@@ -2427,7 +2426,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             // covers why the audit reason below doesn't assert
             // post_mint_recheck=true - cpp-expert Gate 8).
             res.status = 401;
-            res.set_content(kFailureBody, "application/json");
+            res.set_content(kFailureBody(res), "application/json");
             audit_log_for_principal(req, "auth.login", "failure", entry.username,
                                     auth::role_to_string(entry.role), "User", entry.username,
                                     "reason=session_mint_failed;cause=undifferentiated;method=" +
@@ -2691,7 +2690,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             // out regardless of enrollment status. The recovery-codes
             // one-time reveal is correctly withheld on this path too.
             res.status = 401;
-            res.set_content(kFailureBody, "application/json");
+            res.set_content(kFailureBody(res), "application/json");
             audit_log_for_principal(req, "auth.login", "failure", entry.username,
                                     auth::role_to_string(entry.role), "User", entry.username,
                                     "reason=session_mint_failed;cause=undifferentiated;"

@@ -1776,9 +1776,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // time (security-guardian Gate 2 finding #2).
         if (!fleet_read_fn) {
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
         auto gate = fleet_read_fn(req, res, "Workflow", "Read");
@@ -1811,13 +1809,14 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // which audits every fetch) and none is added here; adding a
         // first-ever audit call to this route is a separate, unrelated
         // decision, out of scope for this fix. Denial 404-collapses
-        // identically to the not-found body above (byte-identical -- same
-        // literal string, anti-enumeration).
+        // identically to the not-found body above (#1552: same
+        // detail::a4_error call, same message -- correlation_id is the
+        // only per-request-varying field and is minted identically on
+        // every failure path regardless of which check caught it, so it
+        // is not an oracle; anti-enumeration is preserved).
         if (!workflow_execution_visible(exec, gate.scope)) {
             res.status = 404;
-            res.set_content(
-                R"({"error":{"code":404,"message":"execution not found"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "execution not found"), "application/json");
             return;
         }
 

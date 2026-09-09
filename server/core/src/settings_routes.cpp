@@ -3721,7 +3721,7 @@ void SettingsRoutes::register_routes(
             res.set_header(
                 "HX-Trigger",
                 R"({"showToast":{"message":"Failed to save thresholds","level":"error"}})");
-            res.set_content(detail::a4_error(res, "Failed to persist thresholds"),
+            res.set_content(detail::a4_error(res, "Failed to save thresholds"),
                             "application/json");
             return;
         }
