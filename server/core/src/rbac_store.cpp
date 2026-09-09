@@ -874,12 +874,25 @@ void RbacStore::seed_defaults() {
     // suppressing a FUTURE reseed of a row an operator explicitly removed;
     // it does not care about the marker's age, so it stays correct with the
     // DELETE gone.
+    // Governance round 6: the marker-presence probe below used to conflate a
+    // query FAILURE (transient PG connection/timeout error) with genuine
+    // ABSENCE — both left `decommission_marker_present == false`, silently
+    // re-entering the insert+DELETE branch on a boot that merely hit a PG
+    // hiccup, which reopens round 5's exact bug on a narrower trigger. A
+    // failed probe must SKIP this migration attempt for the current boot
+    // (logged, like every other statement in this function), never be
+    // read as "not yet migrated, do the migration."
     pg::PgResult decommission_marker = pg::exec_params(c,
         "SELECT 1 FROM rbac_store.revoked_seed_defaults WHERE role_name = 'ITServiceOwner' AND "
         "securable_type = 'Decommission' AND operation = 'Delete'", std::vector<std::string>{});
+    if (decommission_marker.status() != PGRES_TUPLES_OK) {
+        spdlog::error("RbacStore: seed_defaults Decommission carry-forward probe failed: {}",
+                      PQerrorMessage(c));
+    }
+    const bool decommission_marker_probe_ok = decommission_marker.status() == PGRES_TUPLES_OK;
     const bool decommission_marker_present =
-        decommission_marker.status() == PGRES_TUPLES_OK && PQntuples(decommission_marker.get()) > 0;
-    if (!decommission_marker_present) {
+        decommission_marker_probe_ok && PQntuples(decommission_marker.get()) > 0;
+    if (decommission_marker_probe_ok && !decommission_marker_present) {
         exec("INSERT INTO rbac_store.revoked_seed_defaults (role_name, securable_type, operation) "
             "SELECT 'ITServiceOwner', 'Decommission', 'Delete' WHERE EXISTS ("
             "  SELECT 1 FROM rbac_store.revoked_seed_defaults WHERE role_name = 'ITServiceOwner' AND "
