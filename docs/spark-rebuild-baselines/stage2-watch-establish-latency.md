@@ -18,7 +18,7 @@ This branch (PR-A, `feat/2012-3840-detached-call-f3`) adds the harness itself -
 `[spark][mechanism][windows][latency][establish]`, env-gated on
 `YUZU_SPARK_ESTABLISH_BENCH=1`. It was authored in a session with no Windows
 toolchain or host available, and stayed uncompiled through 6 governance passes; that
-gap is now closed. **DGRHP** (`daver@100.65.232.53`, Win11 Pro, MSVC 19.44.35227.0 /
+gap is now closed. **DGRHP** (the standing Windows dev rig, Win11 Pro, MSVC 19.44.35227.0 /
 BuildTools 2022): worktree at commit `acd9fd3df` + a T6-comment-only follow-up patch
 (#4181 citation), `meson setup -Dcmake_prefix_path=<abs path>/vcpkg_installed/x64-windows
 -Dbuild_tests=true`, `meson compile -C build-windows yuzu_agent_tests` - clean, zero
@@ -122,9 +122,15 @@ against, using the real numbers derived below.
 
 All times microseconds unless stated. `p99` below is the WORST of the 3 runs per
 metric (conservative - the "never clamp silently" posture applies to which run we
-trust, not only to the formula). The per-run raw `WARN` output isn't separately
-committed anywhere - the tables below are its full summary, not an excerpt of a
-larger record.
+trust, not only to the formula). The per-run raw `WARN` output is committed
+alongside this doc at `raw/establish-run{1,2,3}.txt` (unhappy-path Gate 4 finding
+- an earlier draft of this doc discarded the raw artifact and relied on the
+tables below as the sole record, which meant nothing could re-validate a
+transcription against source). Each `raw/` file is every `ESTABLISH ...` line
+extracted verbatim from that run's Catch2 `--out` file, with only the console-
+wrap line breaks Catch2's own writer inserted mid-message rejoined - no values
+altered; the full `--out` file also has ~33k lines of ordinary passing-assertion
+output not worth committing.
 
 **Registry, direct-target path (R1 idle / R3 under hive load) - per-call p99, worst of 3 runs:**
 
@@ -150,12 +156,25 @@ this scale. Real, not assumed: stated here because it is the opposite of what
 | 2 | 447 | 504 |
 | 3 | 1264 | 1284 |
 
-R2's worst-of-3 p99 = **1264us**. R4 (the under-load counterpart) has no comparable
-number - the harness gap above. R3-vs-R1 showed hive load did not measurably worsen
-the direct-target path; whether that generalizes to the ancestor-walk path is an
-open question, not an assumption - R4 would need roughly a 10x jump over R2's
-1264us before it could move Registry's D off the 50ms floor computed in the D
-derivation section below (see "Why Registry's D above doesn't wait on R4").
+R2's worst-of-3 p99 = **1264us**, with real run-to-run spread worth noting on its
+own (1200 / 447 / 1264 - a 2.8x swing between run 2 and run 3, unremarked until
+this pass; not explained here, flagged for whoever next touches this harness).
+
+R2's own per-call series (unhappy-path Gate 4 finding - previously measured but
+never surfaced in this doc) puts this spread in context. Worst-of-3 p99 per call:
+CreateEventW 4us, CreateThreadpoolWait 6us, RegNotifyChangeKeyValue 25us,
+RegOpenKeyExW (per level, up to 7 calls/sample) 13us, SetThreadpoolWait 2us -
+summing to **50us**, roughly **4% of the 1264us TOTAL**. The other ~96% is
+whatever the TOTAL bracket captures that no per-call metric does - per its own
+in-code comment, this bracket is establishment PLUS the unmeasured
+teardown/drain step, so that step is the leading suspect, not the walk itself.
+This matters for R4: R1-vs-R3's "hive load didn't worsen it" finding was measured
+on the direct-target path's per-call components only, never on a teardown/drain
+bracket - so it's weaker evidence for R4's TOTAL (which needs the SAME
+teardown-dominated bracket R2 has) than it looks at first read. R4 would still
+need roughly a 10x jump over R2's 1264us before it could move Registry's D off
+the 50ms floor computed in the D derivation section below (see "Why Registry's D
+above doesn't wait on R4") - genuinely an open question, not a settled one.
 **Forward action item, added here:** give R4 the same `t_walk_total` bracket R2
 already has.
 
@@ -228,8 +247,14 @@ behavior, not a gap in this measurement.
 `4 x p99 > 50ms`, i.e. `p99 > 12.5ms`. R4 would need to be roughly 10x R2's
 measured 1264us worst-case to move the number - and R3-vs-R1 showed hive load did
 not measurably worsen the direct-target path on this hardware. That is a reason to
-expect R4 stays under the threshold, not proof of it - R4 is genuinely unmeasured,
-stated as such, and the forward action item above (give R4 its own `t_walk_total`)
+expect R4 stays under the threshold, not proof of it. **A stronger, direct check
+(happy-path Gate 4 finding):** even using R2's own measured 1264us worst-case
+DIRECTLY as if it were Registry's `p99_worst` (skipping the R4-inference
+argument entirely), `4 x 1264us = 5056us` still rounds up to only `50ms` - the
+same floor. R4 would have to land far outside anything R1-vs-R3's no-load-effect
+finding makes plausible before it could change the derived D. R4 is still
+genuinely unmeasured, stated as such, and the forward action item above (give it
+its own `t_walk_total`)
 should be done before this is treated as settled.
 
 ## Run protocol (as executed 2026-09-09)
@@ -246,9 +271,10 @@ bolded `sum`/`p99_worst` rows are already arithmetic, carried into that section
 only because they're the direct input to the D derivation that follows.
 
 **Treat a 200-sample p99 as deadline-calibration input, not evidence about cold
-boot, a dead network share, or true worst-case latency** (round-3 finding in the
-plan above) - any PR-B body or changelog fragment citing a number from this
-document must repeat that caveat, not just this document.
+boot, a dead network share, or true worst-case latency** (a round-3 governance
+finding, recorded in the authoring plan file noted under Authority above) - any
+PR-B body or changelog fragment citing a number from this document must repeat
+that caveat, not just this document.
 
 ## Forward action items
 

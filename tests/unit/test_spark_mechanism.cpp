@@ -4059,6 +4059,12 @@ struct EstablishChurnWatch {
     HANDLE event{nullptr};
     PTP_WAIT wait{nullptr};
     const std::atomic<bool>* stop{nullptr};
+    // Guards on_fire's check-then-rearm against ~EstablishHiveLoad's
+    // stop-latch, below - see on_fire's comment for why a bare atomic
+    // wasn't enough. Owned by EstablishHiveLoad, outlives every watch
+    // (declared ahead of `watches` there so member-destruction order keeps
+    // it alive through every EstablishChurnWatch destructor).
+    std::mutex* mu{nullptr};
 
     EstablishChurnWatch() = default;
     EstablishChurnWatch(const EstablishChurnWatch&) = delete;
@@ -4075,7 +4081,7 @@ struct EstablishChurnWatch {
     // CreateThreadpoolWait, so no element is ever moved after its address
     // is registered with the OS.
     EstablishChurnWatch(EstablishChurnWatch&& o) noexcept
-        : hkey(o.hkey), event(o.event), wait(o.wait), stop(o.stop) {
+        : hkey(o.hkey), event(o.event), wait(o.wait), stop(o.stop), mu(o.mu) {
         o.event = nullptr;
         o.wait = nullptr;
     }
@@ -4098,54 +4104,52 @@ struct EstablishChurnWatch {
             ::CloseHandle(event);
     }
 
-    // KNOWN, UNFIXED RACE (governance finding, PR-A round 2, deliberately
-    // left as-is rather than guessed-at): this check-then-rearm is NOT
-    // synchronized against ~EstablishHiveLoad()'s teardown - `stop` is a
-    // bare atomic with no mutex, so a pool thread already past the check
-    // below can still be calling SetThreadpoolWait on `wait` at the exact
-    // moment the destructor's own SetThreadpoolWait(nullptr,nullptr)/
-    // WaitForThreadpoolWaitCallbacks/CloseThreadpoolWait sequence runs on
-    // it. Worst case (governance Gate 8 sharpening): CloseThreadpoolWait
-    // running while another pool thread is mid-SetThreadpoolWait on the
-    // SAME object - a genuine use-after-close, not merely a benign
-    // duplicate notification. This harness's own comment elsewhere claims
-    // it "mirrors spark_registry.cpp's reconcile() ordering," but
-    // production's equivalent race-freedom rests on a real mutex-guarded
-    // active flag (spark_registry.cpp's mu_, confirmed gating re-arm at
-    // unwatch()/stop() - not independently re-verified end-to-end on
-    // Windows in this session), not on cancel+drain alone; this harness
-    // has no equivalent flag, so mechanically copying production's
-    // cancel+drain shape does not by itself establish safety here. Fixing
-    // this needs real Windows hardware to verify against, not a guess
-    // from a Linux session with no compiler for this file - recorded here
-    // for whoever runs this harness on DGRHP, not silently hidden. This
-    // harness-local instance does not yet have its own tracked issue, and
-    // is a DIFFERENT concern from "T6" - a production DEADLOCK shape
-    // (unwatch() holding the per-type lock, mech_ops_mu_by_type_, waiting
-    // on a callback drain, while that callback is itself parked inside an
-    // inline consumer trying to re-arm and hitting the same per-type lock),
-    // now filed as issue #4181 (2026-09-09) with the exact code-verified
-    // thread cycle: SparkEngine::disarm (spark_engine.cpp:1256, holds
-    // mech_ops_mu_by_type_) blocks in WindowsRegistryMechanism::unwatch's
+    // FIXED (consistency-auditor Gate 4 finding, DGRHP re-verification pass,
+    // 2026-09-09): this check-then-rearm was NOT synchronized against
+    // ~EstablishHiveLoad()'s teardown - `stop` was a bare atomic with no
+    // mutex, so a pool thread already past the check below could still be
+    // calling SetThreadpoolWait on `wait` at the exact moment the
+    // destructor's own SetThreadpoolWait(nullptr,nullptr) disarm call ran
+    // on it. SetThreadpoolWait is explicitly NOT thread-safe (MSDN) when
+    // two threads call it concurrently on the same PTP_WAIT - a genuine
+    // data race on the OS object's internal state, not merely a benign
+    // duplicate notification. This is now fixed the same way production
+    // avoids it: `mu` below (owned by EstablishHiveLoad) is held around
+    // BOTH this whole check-then-rearm AND ~EstablishHiveLoad()'s
+    // stop.store() (both call sites, ctor-catch and dtor) - mirroring
+    // spark_registry.cpp's `mu_`-guarded `active` flag (confirmed by
+    // reading unwatch()/on_fire() there: `active` is set false under
+    // `mu_`, `mu_` released, THEN the unlocked SetThreadpoolWait(nullptr)
+    // runs - safe because on_fire's own SetThreadpoolWait re-arm call only
+    // ever happens INSIDE its own `mu_`-held section, so by the time
+    // unwatch's locked section completes, no in-flight on_fire can still
+    // be mid-rearm, and no future one will attempt it once the flag is
+    // visible). The lock is released before any blocking Win32 call in
+    // both places (WaitForThreadpoolWaitCallbacks in the per-watch
+    // destructor, writer.join() in ~EstablishHiveLoad) - on_fire could
+    // otherwise deadlock trying to acquire `mu` while the destructor holds
+    // it across a wait for on_fire itself to finish.
+    //
+    // Unrelated to the T6/#4181 production deadlock shape (unwatch()
+    // holding SparkEngine's per-type lock, mech_ops_mu_by_type_, while
+    // blocked draining a callback that reaches an Inline-tier consumer
+    // re-entering the same lock) - filed as issue #4181 (2026-09-09) with
+    // the code-verified thread cycle: SparkEngine::disarm
+    // (spark_engine.cpp:1256) blocks in WindowsRegistryMechanism::unwatch's
     // WaitForThreadpoolWaitCallbacks (spark_registry.cpp:304) waiting on an
     // in-flight on_fire; that on_fire's emit() (spark_registry.cpp:351)
-    // reaches an Inline-tier subscriber synchronously (spark_engine.cpp's
-    // deliver(), :1778) which, if it re-enters the engine for the same
-    // type, needs the same mech_ops_mu_by_type_ entry the disarm thread
-    // already holds. #3840 as filed covers the general "a hung call starves other
-    // arm/disarm on the same type" stall, not this specific cyclic-deadlock
-    // scenario - #4181 is the correct tracked reference, #3840 is not. This
-    // harness has no per-type lock at all, so neither #3840 nor #4181
-    // covers the check-then-rearm race described above; named here only so
-    // a reader chasing "what else is unverified in this delivery" has a
-    // correct entry point. (Gate 6 compliance finding, PR-A round 5,
-    // corrected at round 6 after advisor caught a prior round citing #3840
-    // as T6's actual source without checking the issue's own text first;
-    // filed as #4181 and this comment updated at the DGRHP verification
-    // pass, closing the "should be filed before merge" item this comment
-    // used to carry.)
+    // reaches deliver()'s Inline-tier dispatch (spark_engine.cpp:1779 - the
+    // sub.inline_fn(out) call itself, inside the try block opened at :1778;
+    // four reviewers cited :1778 without re-deriving it against source, one
+    // caught the off-by-one, re-verified here directly)
+    // synchronously, which, if it re-enters the engine for the same type,
+    // needs the same mech_ops_mu_by_type_ entry the disarm thread already
+    // holds. This harness has no per-type lock at all - `mu` above guards
+    // only the local check-then-rearm race just fixed, a different
+    // mechanism from #4181's cross-lock cycle.
     static void CALLBACK on_fire(PTP_CALLBACK_INSTANCE, void* ctx, PTP_WAIT, TP_WAIT_RESULT) {
         auto* self = static_cast<EstablishChurnWatch*>(ctx);
+        std::lock_guard lk(*self->mu);
         if (self->stop->load(std::memory_order_relaxed))
             return;
         ::RegNotifyChangeKeyValue(self->hkey, FALSE,
@@ -4278,6 +4282,10 @@ struct EstablishHiveLoad {
     EstablishPrivatePool pool;
     HKEY churn_key{nullptr};
     std::atomic<bool> stop{false};
+    // Declared ahead of `watches`: members destruct in REVERSE declaration
+    // order, so this stays alive through every EstablishChurnWatch
+    // destructor below - see on_fire's comment for what it guards.
+    std::mutex mu;
     std::vector<EstablishChurnWatch> watches;
     std::thread writer;
 
@@ -4299,6 +4307,7 @@ struct EstablishHiveLoad {
             for (auto& w : watches) {
                 w.hkey = churn_key;
                 w.stop = &stop;
+                w.mu = &mu;
                 w.event = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
                 REQUIRE(w.event != nullptr);
                 w.wait = ::CreateThreadpoolWait(&EstablishChurnWatch::on_fire, &w, &pool.env);
@@ -4332,23 +4341,26 @@ struct EstablishHiveLoad {
             // - the exact mechanism (not flag-ordering) that makes the
             // normal, non-throwing destructor below actually safe: no
             // watch can still be armed by the time churn_key closes there,
-            // and now none can be here either. stop.store() is kept as a
-            // cheap, harmless belt-and-suspenders for the window before
-            // any given watch's own cancel+drain completes; it is not
-            // doing the load-bearing work by itself. The residual
-            // check-then-act race inside on_fire itself (not proven atomic
-            // against WaitForThreadpoolWaitCallbacks) is the SAME
-            // pre-existing "KNOWN, UNFIXED RACE" already disclosed above
-            // on_fire - unrelated to this catch path, not reintroduced or
-            // worsened by it.
-            stop.store(true, std::memory_order_relaxed);
+            // and now none can be here either. The stop.store() below is
+            // now ALSO mutex-guarded (on_fire's comment, DGRHP
+            // re-verification pass, closes the check-then-rearm race
+            // formerly disclosed here as unfixed) - a partially-armed
+            // watch's on_fire hitting this exception path gets the same
+            // protection as the normal destructor below.
+            {
+                std::lock_guard lk(mu);
+                stop.store(true, std::memory_order_relaxed);
+            }
             watches.clear();
             ::RegCloseKey(churn_key);
             throw;
         }
     }
     ~EstablishHiveLoad() {
-        stop.store(true, std::memory_order_relaxed);
+        {
+            std::lock_guard lk(mu);
+            stop.store(true, std::memory_order_relaxed);
+        }
         if (writer.joinable())
             writer.join();
         // Per-watch teardown (disarm, drain, close) now lives in
