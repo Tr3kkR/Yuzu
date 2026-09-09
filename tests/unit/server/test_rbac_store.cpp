@@ -175,14 +175,12 @@ TEST_CASE("RbacStore: seed data — securable types", "[rbac_store][pg]") {
     // +ProductPack (#4029 prerequisite fix — was used as an RBAC securable string by
     // the shipped /api/product-packs* routes but never seeded) = 29,
     // +TlsConfig +PluginSigning +ServerConfig +AnalyticsConfig (#4028
-    // Settings read-twins) = 33, +Forensics (34th) +Decommission (35th, Wave 7
-    // PR7.2) = 35.
-    REQUIRE(types.size() == 35);
     // Settings read-twins) = 33,
     // +Directory +Enrollment +OidcConfig (#4031 prerequisite fix — Directory was
     // referenced by discovery_routes.cpp but never seeded; Enrollment/OidcConfig
-    // are the two new #4031 route securables) = 36.
-    REQUIRE(types.size() == 36);
+    // are the two new #4031 route securables) = 36,
+    // +Forensics (37th) +Decommission (38th, Wave 7 PR7.2) = 38.
+    REQUIRE(types.size() == 38);
 
     auto has = [&](const std::string& t) {
         return std::find(types.begin(), types.end(), t) != types.end();
@@ -254,22 +252,13 @@ TEST_CASE("RbacStore: seeded catalogues match the MCP C8 validator mirrors",
 TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_store][pg]") {
     RBAC_STORE(store);
     auto perms = store.get_role_permissions("Administrator");
-    // 35 types * 5 CRUD ops = 175 permissions, plus a single targeted Push
-    // grant on GuaranteedState (= 176), plus a single AccessReview:Attest grant
-    // (Periodic Access Reviews, CC6.2, = 177), plus a single ApiToken:Rotate
-    // grant (P2 #11, SOC 2 CC6.3) = 178 permissions total. Push, Attest, and
+    // 38 types * 5 CRUD ops = 190 permissions, plus a single targeted Push
+    // grant on GuaranteedState (= 191), plus a single AccessReview:Attest grant
+    // (Periodic Access Reviews, CC6.2, = 192), plus a single ApiToken:Rotate
+    // grant (P2 #11, SOC 2 CC6.3) = 193 permissions total. Push, Attest, and
     // Rotate are deliberately NOT cross-seeded on other securables — see the
-    // rationale in rbac_store.cpp seed_defaults(). (35th: Decommission, Wave 7
-    // PR7.2; 34th: Forensics, Wave 7 forensics class; 33rd-30th: TlsConfig/
-    // PluginSigning/ServerConfig/AnalyticsConfig, #4028 Settings read-twins;
-    // 29th: ProductPack, #4029 prerequisite fix; 28th: Workflow, #4030/#4032
-    // — previously gated but never seeded; 27th: PowerManagement, Wave 6
-    // 36 types * 5 CRUD ops = 180 permissions, plus a single targeted Push
-    // grant on GuaranteedState (= 181), plus a single AccessReview:Attest grant
-    // (Periodic Access Reviews, CC6.2, = 182), plus a single ApiToken:Rotate
-    // grant (P2 #11, SOC 2 CC6.3) = 183 permissions total. Push, Attest, and
-    // Rotate are deliberately NOT cross-seeded on other securables — see the
-    // rationale in rbac_store.cpp seed_defaults(). (36th-34th: Directory/
+    // rationale in rbac_store.cpp seed_defaults(). (38th: Decommission, Wave 7
+    // PR7.2; 37th: Forensics, Wave 7 forensics class; 36th-34th: Directory/
     // Enrollment/OidcConfig, #4031; 33rd-30th: TlsConfig/PluginSigning/
     // ServerConfig/AnalyticsConfig, #4028 Settings read-twins; 29th:
     // ProductPack, #4029 prerequisite fix; 28th: Workflow, #4030/#4032 —
@@ -278,8 +267,7 @@ TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_s
     // PluginConfig, PR1.9a peer finding PLAN-001; 23rd: EnginePrincipal,
     // #2376; 22nd: AccessReview, SOC 2 CC6.2; 21st: SoftwareLicensing,
     // ADR-0024.)
-    CHECK(perms.size() == 178);
-    CHECK(perms.size() == 183);
+    CHECK(perms.size() == 193);
     for (auto& p : perms)
         CHECK(p.effect == "allow");
 

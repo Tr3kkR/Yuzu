@@ -1808,10 +1808,9 @@ TEST_CASE("MCP 2383: RBAC catalogue mirrors have the expected cardinality", "[mc
     // + 1 (#4029: ProductPack prerequisite fix) = 29,
     // + 4 #4028 additions (TlsConfig, PluginSigning, ServerConfig,
     // AnalyticsConfig — Settings read-twins) = 33,
-    // + 2 Wave 7 (Forensics, Decommission — PR7.2) = 35.
-    CHECK(rbac_securables_for_test().size() == 35);
-    // + 3 #4031 additions (Directory, Enrollment, OidcConfig) = 36.
-    CHECK(rbac_securables_for_test().size() == 36);
+    // + 3 #4031 additions (Directory, Enrollment, OidcConfig) = 36,
+    // + 2 Wave 7 (Forensics, Decommission — PR7.2) = 38.
+    CHECK(rbac_securables_for_test().size() == 38);
 }
 
 TEST_CASE("MCP 2383: three-way dispatch classifier — knownness decides first", "[mcp][2g]") {

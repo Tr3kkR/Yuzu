@@ -556,8 +556,7 @@ void RbacStore::seed_defaults() {
          "ON CONFLICT (key) DO NOTHING");
 
     // Securable types.
-    const std::array<std::string_view, 35> types = {
-    const std::array<std::string_view, 36> types = {
+    const std::array<std::string_view, 38> types = {
         "Infrastructure",  "UserManagement",  "InstructionDefinition",
         "InstructionSet",  "Execution",       "Schedule",
         "Approval",        "Tag",             "AuditLog",
@@ -628,19 +627,6 @@ void RbacStore::seed_defaults() {
                            // kill-switch config — a different domain)
         "ServerConfig",    // gateway/server-config/mcp/data-retention fragments
         "AnalyticsConfig", // analytics fragment (ClickHouse integration)
-        // Wave 7 forensics class: execution_artifacts, app_usage, later
-        // shell_history/yara_scan. Administrator CRUD via the loop below;
-        // deliberately ABSENT from the Viewer read-list.
-        "Forensics",
-        // Wave 7 PR7.2: the device-level securable ADR-0024 Decision 9
-        // promoted when the erasure gate's conjunction reached a fourth
-        // securable (app_usage_store, Forensics). `Decommission:Delete` is
-        // the ONLY consumed operation (the DELETE /sle/agents/{id} cascade,
-        // sle_routes.cpp); Administrator gets CRUD via the loop (the
-        // PowerManagement/PluginConfig precedent — unused ops are harmless
-        // and keep the loop uniform); ITServiceOwner gets a TARGETED
-        // Decommission:Delete grant below (see that grant's comment).
-        "Decommission"};
         // #4031 prerequisite 1: "Directory" is called at discovery_routes.cpp
         // (perm_fn(..., "Directory", "Read"/"Write")) but was NEVER seeded
         // here — role_permissions.securable_type has a hard FK to
@@ -668,7 +654,20 @@ void RbacStore::seed_defaults() {
         // a wholly unrelated capability (the naming trap the issue calls out).
         // Read granted to Administrator ONLY, same admin-only-gate parity and
         // same topology-floor requirement as Enrollment above.
-        "OidcConfig"
+        "OidcConfig",
+        // Wave 7 forensics class: execution_artifacts, app_usage, later
+        // shell_history/yara_scan. Administrator CRUD via the loop below;
+        // deliberately ABSENT from the Viewer read-list.
+        "Forensics",
+        // Wave 7 PR7.2: the device-level securable ADR-0024 Decision 9
+        // promoted when the erasure gate's conjunction reached a fourth
+        // securable (app_usage_store, Forensics). `Decommission:Delete` is
+        // the ONLY consumed operation (the DELETE /sle/agents/{id} cascade,
+        // sle_routes.cpp); Administrator gets CRUD via the loop (the
+        // PowerManagement/PluginConfig precedent — unused ops are harmless
+        // and keep the loop uniform); ITServiceOwner gets a TARGETED
+        // Decommission:Delete grant below (see that grant's comment).
+        "Decommission"
     };
     for (auto t : types)
         exec("INSERT INTO rbac_store.securable_types (name, is_system) VALUES ($1, TRUE) "
