@@ -69,10 +69,17 @@
  *
  *    ~TicketCore runs when the LAST holder dies - the worker's own captured copy,
  *    destroyed by the trampoline after the worker lambda has fully returned: the
- *    latest point the detached thread can self-observe before it exits (the tail
- *    after it - State release, notify, trampoline epilogue, CRT thread exit - runs
- *    no library code, and F3's orphan grace absorbs it; a self-decremented count
- *    cannot certify its own thread's exit). A timed-out run() submitter does NOT release
+ *    latest point the detached thread can self-observe before it exits. The tail
+ *    after that decrement - the State handle release, cv.notify_all, payload
+ *    deallocation, the trampoline epilogue and the CRT thread exit - runs only
+ *    process-lifetime runtime code (libstdc++/libc/pthread or the CRT), never the
+ *    Guardian, OpenSSL, libsystemd or Win32-RPC code F3 exists to keep out of DSO
+ *    teardown. NO grace covers that tail: wait_for_workers_to_drain() returns on
+ *    the first zero it reads and main.cpp/service_win.cpp skip the wait outright
+ *    when the initial sample is zero (hard_exit.hpp). The exposure is identical for
+ *    every run() worker since rung 7 and is accepted; a self-decremented count
+ *    cannot certify its own thread's exit (adversarial review rounds 1-3, C3/C1).
+ *    A timed-out run() submitter does NOT release
  *    anything - the worker does, on its own schedule. Exactly-once decrement
  *    handshake: `quota_released` flips under the same State::mu acquisition as the
  *    quota decrement, and the destructor decrements quota only if it is still

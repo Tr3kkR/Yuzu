@@ -364,10 +364,15 @@ quota). `GuardianIoExecutor::active_worker_count()` reports the PHYSICAL count, 
 in `TicketCore`'s destructor when the trampoline destroys the worker's payload
 (`guardian_io_executor.hpp`): the latest point a detached worker can self-observe before
 its OS thread exits. The uncounted tail after that release is the `State` handle release,
-a notify, the trampoline epilogue and the CRT thread exit; none of it runs library code
-through DSO teardown, which is the hazard F3 guards, and the existing orphan grace is
-what absorbs it. A self-decremented count cannot certify its own thread's exit, so the
-release point is stated as what it is rather than as "OS-thread exit". That count is
+a `notify_all`, the payload deallocation, the trampoline epilogue and the CRT thread
+exit: it runs only process-lifetime runtime code (the C++ standard library, libc /
+pthread or the CRT), never the Guardian, OpenSSL, libsystemd or Win32-RPC code F3
+exists to keep out of DSO teardown. No grace covers that tail (`wait_for_workers_to_drain`
+returns on the first zero it reads, and `main.cpp` / `service_win.cpp` skip the wait when
+the initial sample is zero, `hard_exit.hpp`); the exposure is identical for every `run()`
+worker since rung 7 and is accepted as such. A self-decremented count cannot certify its
+own thread's exit, so the release point is stated as what it is rather than as
+"OS-thread exit" (adversarial review rounds 1-3). That count is
 the count `GuardianEngine::active_io_workers()` (`guardian_engine.cpp`) sums for the
 F3 orphan-exit grace; F3 never binds to the early-releasing quota count.
 `GuardianDetachedWorkerRole` workers are in that sum by construction, callback phase
@@ -598,8 +603,9 @@ accounting the state-read and existing arm/disarm executors already use, and tha
 accounting is the PHYSICAL alive-worker count (R5.1, #4147):
 `GuardianEngine::active_io_workers()` sums each
 `GuardianIoExecutor::active_worker_count()`, released when the worker's payload is
-destroyed in the trampoline (the latest self-observable point before OS-thread exit,
-see R5.1), never the early-releasing quota count, so a worker that has returned from `fn()` and is still
+destroyed in the trampoline (the latest self-observable point before OS-thread exit; the
+uncounted tail after it and why no grace covers it are stated in R5.1), never the
+early-releasing quota count, so a worker that has returned from `fn()` and is still
 inside its completion callback holds the process open exactly as a worker still inside
 the OS call does.
 
