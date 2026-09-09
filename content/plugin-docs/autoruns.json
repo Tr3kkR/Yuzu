@@ -306,7 +306,7 @@
       "completeness": "—",
       "provenance": "—",
       "status": "`UNDECLARED` (agent default)",
-      "when": "No `set_result_status` call fires on this path — the overwhelming majority of `list`/`catalog` runs. Every per-source outcome, including a degraded one, is carried in that source's own `source|` row instead of this command-level status."
+      "when": "No `set_result_status` call fires on this path — `catalog` runs, and a `list` run where every source came back `SUPPORTED`/`UNSUPPORTED`. Every per-source outcome, including a degraded one, is also carried in that source's own `source|` row."
     },
     {
       "completeness": "`PARTIAL`",
@@ -343,6 +343,12 @@
       "provenance": "`subprocess_runner:line_limit`",
       "status": "`OK`",
       "when": "The same rung-2 fallback hit the runner's output line cap — a deliberate bounded stop, not a failure; `trim_possibly_truncated_tail` additionally drops a possibly-partial trailing line before parsing (`autoruns_linux.cpp:511-515`)."
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`autoruns:degraded`",
+      "status": "`CONSTRAINED`",
+      "when": "`do_list` ORs `collect_windows`/`collect_linux`/`collect_macos`'s return values and sets this whenever any source across the three legs emitted `CONSTRAINED` (`autoruns_plugin.cpp:259-266`). On Linux and macOS, three catalog-permanent sources (`lnx_init_d`, `lnx_systemd_timers_user`, `mac_login_items`) are always `CONSTRAINED`, so this status fires on every `list` run on those two platforms regardless of host health — it is NOT by itself evidence of a new degradation there; only Windows's signal varies with live host state. Consult the per-source `source|` rows for the specific cause on any platform."
     }
   ],
   "samples": {

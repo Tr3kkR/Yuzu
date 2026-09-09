@@ -105,17 +105,18 @@ Two row shapes share one stream, discriminated by field 0 (`row_kind`): a `sourc
 
 ### Result status
 
-Surfaced as `plugin_result_status` on the command response, set via `ctx.set_result_status` or forwarded from a runner failure via `yuzu::agent::forward_runner_failure`. A per-source degraded read (permission denied, a malformed plist, an unreachable hive) is reported entirely inside that source's own `source|` row — see Outputs above — and never escalated to this command-level status; the rows below are the only paths that set it.
+Surfaced as `plugin_result_status` on the command response, set via `ctx.set_result_status` or forwarded from a runner failure via `yuzu::agent::forward_runner_failure`. A per-source degraded read (permission denied, a malformed plist, an unreachable hive) is always reported inside that source's own `source|` row first — see Outputs above — and, on `list`, ALSO aggregated into this command-level status via `autoruns:degraded` whenever any source came back `CONSTRAINED`; the rows below are the only paths that set it.
 
 | Status | Completeness | Provenance | When |
 |---|---|---|---|
-| `UNDECLARED` (agent default) | — | — | No `set_result_status` call fires on this path — the overwhelming majority of `list`/`catalog` runs. Every per-source outcome, including a degraded one, is carried in that source's own `source\|` row instead of this command-level status. |
+| `UNDECLARED` (agent default) | — | — | No `set_result_status` call fires on this path — `catalog` runs, and a `list` run where every source came back `SUPPORTED`/`UNSUPPORTED`. Every per-source outcome, including a degraded one, is also carried in that source's own `source\|` row. |
 | `UNAVAILABLE` | `PARTIAL` | `autoruns:exception` | `execute()`'s top-level `catch` — either `catch (const std::exception&)` or `catch (...)` — caught an exception escaping `do_catalog`/`do_list` before any OS-ABI boundary crossing (`autoruns_plugin.cpp:210-219`). No exception may cross the plugin's `extern "C"` boundary, so this is the last-resort backstop, not an expected per-source outcome. |
 | `UNAVAILABLE` | `PARTIAL` | `subprocess_runner:spawn_error` | The rung-2 Linux fallback (`systemctl list-timers`, `collect_linux`'s `lnx_systemd_timers_system` branch) could not spawn the child at all, forwarded via `forward_runner_failure` (`autoruns_linux.cpp:941`). |
 | `CONSTRAINED` | `PARTIAL` | `subprocess_runner:deadline` | The same rung-2 fallback's 20s deadline elapsed and the still-running `systemctl` was killed. |
 | `CONSTRAINED` | `PARTIAL` | `subprocess_runner:cancelled` | The same rung-2 fallback's run was cancelled before it finished. |
 | `CONSTRAINED` | `PARTIAL` | `subprocess_runner:signaled` | The same rung-2 fallback's `systemctl` child was killed by a signal rather than exiting cleanly. |
 | `OK` | `PARTIAL` | `subprocess_runner:line_limit` | The same rung-2 fallback hit the runner's output line cap — a deliberate bounded stop, not a failure; `trim_possibly_truncated_tail` additionally drops a possibly-partial trailing line before parsing (`autoruns_linux.cpp:511-515`). |
+| `CONSTRAINED` | `PARTIAL` | `autoruns:degraded` | `do_list` ORs `collect_windows`/`collect_linux`/`collect_macos`'s return values and sets this whenever any source across the three legs emitted `CONSTRAINED` (`autoruns_plugin.cpp:259-266`). On Linux and macOS, three catalog-permanent sources (`lnx_init_d`, `lnx_systemd_timers_user`, `mac_login_items`) are always `CONSTRAINED`, so this status fires on every `list` run on those two platforms regardless of host health — it is NOT by itself evidence of a new degradation there; only Windows's signal varies with live host state. Consult the per-source `source\|` rows for the specific cause on any platform. |
 
 `subprocess_runner:*` is the only subprocess this plugin ever runs anywhere on any OS — the Windows and macOS legs never call `forward_runner_failure` because they never spawn a child process at all.
 
