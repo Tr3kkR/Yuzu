@@ -161,13 +161,32 @@ bool GuardianSparkRuntime::release_claim_index_locked(KeyClaim& claim) noexcept 
 std::shared_ptr<GuardianSparkRuntime::KeyClaim>
 GuardianSparkRuntime::try_dispatch_head_locked(const std::string& key) {
     const auto eit = claims_.find(key);
-    if (eit == claims_.end() || eit->second.fifo.empty())
+    if (eit == claims_.end())
         return nullptr;
+    sweep_terminal_queued_locked(eit->second); // never dispatch a tombstone (pass-3 sg-3)
+    if (eit->second.fifo.empty()) {
+        claims_.erase(eit);
+        return nullptr;
+    }
     auto& head = eit->second.fifo.front();
     if (head->dispatch != ClaimDispatch::Queued)
         return nullptr;
     head->dispatch = ClaimDispatch::Dispatching;
     return head;
+}
+
+void GuardianSparkRuntime::sweep_terminal_queued_locked(KeyClaimQueue& entry) noexcept {
+    auto& fifo = entry.fifo;
+    while (!fifo.empty()) {
+        auto& c = fifo.front();
+        // A Dispatching/Dispatched head belongs to its drain (which pops it); only a
+        // claim that was never dispatched and is already terminal is a tombstone.
+        if (c->dispatch != ClaimDispatch::Queued || (!c->outcome && !c->commit_exception))
+            return;
+        if (!release_claim_index_locked(*c))
+            return; // release still failing (seam): keep the tombstone for the next retry
+        fifo.pop_front();
+    }
 }
 
 void GuardianSparkRuntime::fail_all_claims_locked(const std::string& key, const std::string& reason,
@@ -558,6 +577,7 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
             if (c->end == ClaimEnd::None)
                 c->end = v.end;
         }
+        fault_here(3); // seam: "the publish threw after the outcomes were written, before the pop"
         for (const auto& c : finished) {
             if (!c->outcome && !c->commit_exception) {
                 // No verdict was staged for this claim: the drain threw before it got
@@ -583,13 +603,21 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
         if (firewall && !fifo.empty() && fifo.front() == claim) {
             // finished was never filled: the head is still here. Drop the entry.
             for (auto& c : fifo) {
-                release_claim_index_locked(*c);
+                // Governance pass-3 cs-2: a claim whose index release fails (seam /
+                // defence in depth) is KEPT as a Queued tombstone holding its mapping,
+                // never dropped - dropping it would leave a ghost (key, rule) mapping
+                // that makes the next same-key attach take the shared-watcher branch
+                // for a key that has no PerKey. The next same-key event sweeps it.
+                if (!release_claim_index_locked(*c)) {
+                    c->withdrawn = true;
+                    c->dispatch = ClaimDispatch::Queued;
+                }
                 if (!c->outcome)
                     c->outcome = std::unexpected(std::string{"arm drain failed"});
                 if (c->end == ClaimEnd::None)
                     c->end = ClaimEnd::CommitThrew;
             }
-            fifo.clear();
+            std::erase_if(fifo, [](const std::shared_ptr<KeyClaim>& c) { return !c->index_held; });
         }
         if (fifo.empty())
             claims_.erase(eit);
@@ -630,7 +658,12 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                 for (const auto& c : fifo)
                     finished.push_back(c);
                 for (const auto& c : finished)
-                    if (!c->withdrawn && !c->waiter_abandoned)
+                    // Live = an Arm still wanted AND not yet terminal AND still owning
+                    // its index mapping. The last two guards (governance pass-3
+                    // sg-3/ar-4/cs-5) keep a tombstone or an already-published claim
+                    // that survived a double fault from ever being committed twice.
+                    if (c->kind == ClaimKind::Arm && !c->withdrawn && !c->waiter_abandoned &&
+                        !c->outcome && !c->commit_exception && c->index_held)
                         live.push_back(c);
 
                 if (stopping_ || live.empty()) {
@@ -821,8 +854,22 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                 std::lock_guard<std::mutex> lk{registry_mu_};
                 const auto eit = claims_.find(key);
                 if (eit != claims_.end() && !eit->second.fifo.empty() &&
-                    eit->second.fifo.front() == claim && !claim->outcome)
-                    claim->dispatch = ClaimDispatch::Queued;
+                    eit->second.fifo.front() == claim) {
+                    if (claim->outcome || claim->commit_exception) {
+                        // Its verdict IS published (the throw came after the write):
+                        // the head is terminal, so pop it rather than leave a Dispatched
+                        // tombstone nothing pops - a detach would then queue a Disarm
+                        // behind it that nothing drives (governance pass-3 sg-3/ar-4/cs-5).
+                        release_claim_index_locked(*claim); // noexcept; no-op once committed
+                        eit->second.fifo.pop_front();
+                        if (eit->second.fifo.empty())
+                            claims_.erase(eit);
+                        else
+                            refill = try_dispatch_head_locked(key); // sweeps finished siblings
+                    } else {
+                        claim->dispatch = ClaimDispatch::Queued;
+                    }
+                }
             } catch (...) {
             }
         }
@@ -999,7 +1046,9 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
         GuardianRollback index_add_rollback;
         index_add_rollback.fn = [this, rule_id, &index_added] {
             if (index_added)
-                index_->remove_rule(rule_id);
+                index_->erase_rule(rule_id); // noexcept (adversarial r4 K2/C5): remove_rule's
+                                            // key copy could throw inside ~GuardianRollback,
+                                            // which swallows it and leaves a ghost mapping
         };
 
         // rung 9c R5.2: a key that already has a claim entry (an arm in flight with
@@ -1311,8 +1360,11 @@ GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id, std::string
                 c->io_class = *ioc;
                 c->subscription = kit->second->subscription;
                 const auto [eit, inserted] = claims_.try_emplace(*key_opt);
-                // A disarm is only ever created on a key with no live claim (an arm
-                // never writes keys_ until it commits, and commit erases the entry).
+                // A disarm is only ever created on a key with no LIVE claim (an arm
+                // never writes keys_ until it commits, and commit erases the entry);
+                // a never-dispatched terminal tombstone may still sit here after a
+                // double fault, and is swept first (governance pass-3 sg-3/ar-4/cs-5).
+                sweep_terminal_queued_locked(eit->second);
                 assert(eit->second.fifo.empty());
                 try {
                     eit->second.fifo.push_back(c);
@@ -1449,10 +1501,25 @@ void GuardianSparkRuntime::on_subscription_lost(const std::string& key,
         } catch (...) {
         }
         for (const auto& rid : rule_ids)
-            detach_rule_locked(rid, "errored"); // DisarmWork discarded: the guard above
-                                                 // already proves this id is dead, so any
-                                                 // resulting disarm() is a guaranteed,
-                                                 // already-idempotent no-op
+            (void)detach_rule_locked(rid, "errored");
+        // The last detach above queued a Disarm claim for the dead id at the key's
+        // head (rung 9c R5.2). The guard above already proves that id dead, so driving
+        // it would be a guaranteed no-op backend call that the next same-key attach
+        // would have to wait out first (governance pass-3 cs-1). Complete it HERE, in
+        // the same critical section, and count it: no undriven claim lingers, the key
+        // is clean, and the next attach arms straight away.
+        if (const auto eit = claims_.find(key); eit != claims_.end() && !eit->second.fifo.empty()) {
+            auto& head = eit->second.fifo.front();
+            if (head->kind == ClaimKind::Disarm && head->dispatch == ClaimDispatch::Queued &&
+                head->subscription == subscription_id) {
+                head->outcome = std::uint64_t{0};
+                head->end = ClaimEnd::DeadSubscription;
+                eit->second.fifo.pop_front();
+                if (eit->second.fifo.empty())
+                    claims_.erase(eit);
+                dead_subscription_disarms_skipped_.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         outbox_waker = outbox_enqueue_waker_;
     }
     if (outbox_waker)

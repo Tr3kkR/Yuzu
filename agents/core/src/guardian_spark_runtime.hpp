@@ -600,7 +600,9 @@ public:
     /// R5.2 drain fault seam (C2/K5): consumed once by the next on_arm_complete.
     /// 1 = std::bad_alloc before the fifo snapshot (after `compensating` took ownership
     /// of a successful arm); 2 = a throw right after the first commit adopted the
-    /// subscription (before its verdict is staged). 0 = off.
+    /// subscription (before its verdict is staged); 3 = a throw inside the publish
+    /// after the verdicts were written into the claims but before the pop (governance
+    /// pass-3 ch-1 seam: exercises step (3)'s catch and the terminal-head pop). 0 = off.
     void set_drain_fault_point_for_test(int point) noexcept;
     /// R5.2 detach fault seam (adversarial re-review r2 C1): consumed once by the next
     /// detach_rule_locked that builds a DISARM claim - throws std::bad_alloc at the
@@ -628,6 +630,14 @@ public:
     /// disarm claim (a throw inside index_->remove_rule after the claim was pushed,
     /// or the cannot-happen prediction mismatch) and took the counted rollback / last
     /// resort. Expected 0. Lock-free.
+    /// Disarm claims completed WITHOUT a backend call because on_subscription_lost had
+    /// already proven their subscription id dead (governance pass-3 cs-1): the claim a
+    /// dead key's last detach queues is popped in the same critical section, so no
+    /// undriven claim for a dead id lingers at the key's head and the next same-key
+    /// attach arms without first redriving a no-op disarm.
+    [[nodiscard]] std::uint64_t dead_subscription_disarms_skipped() const noexcept {
+        return dead_subscription_disarms_skipped_.load(std::memory_order_relaxed);
+    }
     [[nodiscard]] std::uint64_t detach_claim_failures() const noexcept {
         return detach_claim_failures_.load(std::memory_order_relaxed);
     }
@@ -844,7 +854,9 @@ private:
     enum class ClaimDispatch { Queued, Dispatching, Dispatched };
     enum class ClaimEnd {
         None, Committed, BackendRefused, WorkerThrew, AdmissionRejected, Withdrawn,
-        WaiterTimedOutQueued, WaiterTimedOutDispatched, Stopped, CommitThrew, DisarmDone
+        WaiterTimedOutQueued, WaiterTimedOutDispatched, Stopped, CommitThrew, DisarmDone,
+        DeadSubscription ///< Disarm: its subscription id was already reported dead (Lost);
+                         ///< completed without a backend call (governance pass-3 cs-1)
     };
     struct KeyClaim {
         ClaimKind kind{ClaimKind::Arm};
@@ -920,6 +932,14 @@ private:
     /// registry_mu_ held. If `key`'s fifo has a Queued head, flip it to Dispatching and
     /// return it for the caller to dispatch off-lock; else nullptr.
     std::shared_ptr<KeyClaim> try_dispatch_head_locked(const std::string& key);
+    /// Pop every TERMINAL, never-dispatched claim at the front of `entry` (a Queued
+    /// claim that already carries an outcome or a commit exception: a withdrawn or
+    /// release-failed tombstone), retrying its index release. Governance pass-3
+    /// sg-3/ar-4/cs-5: such a tombstone must never be re-dispatched as an arm, never
+    /// re-committed by the live sweep, and never sit ahead of a Disarm claim. Called
+    /// by try_dispatch_head_locked (refill) and detach_rule_locked (before it queues a
+    /// Disarm). noexcept by construction (iterator erases + a noexcept release).
+    void sweep_terminal_queued_locked(KeyClaimQueue& entry) noexcept;
     /// Off-lock. Dispatch an ARM claim (already the Dispatching head) through
     /// io_executor_.submit(); on a synchronous admission refusal (or a throw building
     /// the call) fail the head and every arm queued behind it with today's strings.
@@ -1072,6 +1092,7 @@ private:
     std::atomic<std::uint64_t> claims_dropped_at_stop_{0}; ///< R5.2: queued claims dropped by begin_stop / Stopped
     std::atomic<std::uint64_t> claim_drain_failures_{0};  ///< R5.2: on_arm_complete firewall fired
     std::atomic<std::uint64_t> detach_claim_failures_{0}; ///< R5.2: detach_rule_locked rollback / last resort fired
+    std::atomic<std::uint64_t> dead_subscription_disarms_skipped_{0}; ///< cs-1: Disarm claims completed for an id already reported dead
     std::atomic<std::uint64_t> claim_index_release_failures_{0}; ///< r3 C2/C3: contained remove_rule throw
     std::function<void()> drain_gap_hook_for_test_; ///< registry_mu_-guarded; see the setter
     std::atomic<int> drain_fault_point_for_test_{0};  ///< see the setter
