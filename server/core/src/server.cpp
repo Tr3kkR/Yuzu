@@ -14916,7 +14916,8 @@ private:
                 emit_event(event_type, req, attrs, payload_data);
             },
             policy_store_.get(), [this]() -> std::string { return registry_.to_json(); },
-            policy_evaluator_.get(), &metrics_); // #2500 targeting-refusal counter
+            policy_evaluator_.get(), &metrics_, // #2500 targeting-refusal counter
+            fleet_read_fn); // #4034 — GET /api/v1/compliance/{id}'s sole gate
 
         // GuardianRoutes — /guardian + /fragments/guardian/* (Guaranteed State
         // dashboard; docs/guardian-mvp-contract.md §8). Fragment renderers are
@@ -16056,7 +16057,12 @@ private:
                 }
                 return {"", ""};
             },
-            &metrics_, instruction_store_.get(), std::move(response_visible_set_fn));
+            // #4033: NOT moved — RestApiV1's GET /api/v1/management-groups/
+            // agent-count-preview registration below reuses this SAME
+            // resolver (byte-identical D3 Response:Read scope, REST and the
+            // dashboard fragment cannot observe a different admit decision
+            // for the same caller).
+            &metrics_, instruction_store_.get(), response_visible_set_fn);
 
         // WorkflowRoutes — /fragments/executions, /fragments/schedules, /api/workflows/*,
         //                   /api/workflow-executions/*, /api/product-packs/*, /api/scope/estimate
@@ -17294,7 +17300,20 @@ private:
             // #3290 Phase 2: GET /api/v1/inventory/software's SOLE
             // authorization gate — see rest_api_v1.cpp's route comment for
             // why it must never be stacked with perm_fn.
-            fleet_read_fn);
+            fleet_read_fn,
+            // #4033: GET /api/v1/devices[/{id}]'s raw registry snapshot — the
+            // SAME underlying call as the MCP AgentsJsonFn wired into
+            // McpServer below (registry_.to_json_obj()), so the two
+            // transports read from the identical unfiltered source and can
+            // only diverge on the scope filter each applies on top.
+            [this]() { return registry_.to_json_obj(); },
+            // #4033: GET /api/v1/management-groups/agent-count-preview's D3
+            // Response:Read scope resolver — the SAME instance passed to
+            // DashboardRoutes::register_routes above (not moved there
+            // anymore; see that call site's comment), so REST and the
+            // /fragments/create-group-form fragment cannot disagree on scope
+            // for the same caller.
+            response_visible_set_fn);
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -17464,6 +17483,11 @@ private:
                 return out;
             });
             mcp_server_->set_dashboard_routes(dashboard_routes_.get());
+            // #4033 — the SAME D3 Response:Read scope resolver wired into
+            // RestApiV1 and DashboardRoutes above, so
+            // preview_management_group_agent_count cannot disagree with its
+            // REST/fragment siblings for the same caller.
+            mcp_server_->set_response_visible_set_fn(response_visible_set_fn);
             // PR1.5c/1.6c (p14) — ADR-0031 operator surface MCP twins,
             // wired UNCONDITIONALLY exactly like kek_ops above (never
             // gated behind an unrelated conditional — see the KEK comment

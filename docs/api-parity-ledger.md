@@ -101,7 +101,7 @@ plus `$ref` validity) - the #842 companion to this whole-tree script.
 
 | Domain | Rows | Twinned | Untwinned |
 |---|---:|---:|---:|
-| devices | 10 | 3 | 7 |
+| devices | 10 | 7 | 3 |
 | inventory | 6 | 1 | 5 |
 | dex | 25 | 1 | 24 |
 | guardian | 16 | 0 | 16 |
@@ -114,7 +114,7 @@ plus `$ref` validity) - the #842 companion to this whole-tree script.
 | executions | 6 | 1 | 5 |
 | scope-result-sets | 1 | 0 | 1 |
 | instructions | 24 | 11 | 13 |
-| compliance-policy | 19 | 1 | 18 |
+| compliance-policy | 19 | 6 | 13 |
 | settings | 15 | 0 | 15 |
 | rbac | 8 | 0 | 8 |
 | auth-mfa | 7 | 0 | 7 |
@@ -124,11 +124,11 @@ plus `$ref` validity) - the #842 companion to this whole-tree script.
 | ota | 15 | 0 | 15 |
 | enrollment | 19 | 5 | 14 |
 | other | 74 | 0 | 74 |
-| **Total** | **278** | **32** | **246** |
+| **Total** | **278** | **41** | **237** |
 
-Registered `/api/vN/*` routes: 201. OpenAPI `paths` entries: 200. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 102.
+Registered `/api/vN/*` routes: 209. OpenAPI `paths` entries: 208. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 106.
 
-Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 246.
+Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 237.
 
 <!-- END GENERATED -->
 
