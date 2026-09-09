@@ -34,11 +34,12 @@
  * before it ever reaches this function -- this function does not itself
  * truncate, so two Linux binaries whose names collide in the first 15 bytes
  * alias to the same exe_key; that is a kernel-imposed limit, not a defect
- * here. THIS FUNCTION IS THE SOURCE OF TRUTH for the rule: app_usage_parsers
- * .hpp (agents/plugins/app_usage/src/) duplicates it byte-for-byte because
- * that plugin cannot depend on tar's internal headers, and its own parity
- * test pins the duplication -- any change here must be mirrored there by
- * hand.
+ * here. THIS FUNCTION IS THE SOURCE OF TRUTH for the rule: the forthcoming
+ * `app_usage` plugin's app_usage_parsers.hpp (agents/plugins/app_usage/src/,
+ * not yet landed) is planned to duplicate it byte-for-byte, since that
+ * plugin cannot depend on tar's internal headers -- when it lands, its own
+ * parity test should pin the duplication, and any change here must be
+ * mirrored there by hand.
  */
 
 #include "tar_db.hpp" // yuzu::tar::ProcessEvent
@@ -46,6 +47,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <expected>
+#include <limits>
 #include <map>
 #include <optional>
 #include <string>
@@ -57,8 +60,9 @@ namespace yuzu::tar::usage {
 
 /// Lowercase, basename after the last '/' or '\\', trimmed, empty ->
 /// "(unknown)". See the file banner for the Windows/.exe and Linux/comm
-/// notes. Mirrored byte-for-byte in agents/plugins/app_usage/src/
-/// app_usage_parsers.hpp -- this is the source of truth for the rule.
+/// notes. Planned to be mirrored byte-for-byte in the forthcoming
+/// agents/plugins/app_usage/src/app_usage_parsers.hpp (not yet landed) --
+/// this is the source of truth for the rule.
 [[nodiscard]] inline std::string normalise_exe_key(std::string_view raw) {
     std::string s{raw};
     if (const auto pos = s.find_last_of("/\\"); pos != std::string::npos)
@@ -115,6 +119,47 @@ struct FoldState {
 constexpr int64_t kDefaultMaxAgeSeconds = 604800; // 7 days
 constexpr size_t kMaxOpenRuns = 20000;
 
+/// `a - b`, saturating at the int64 range boundary instead of invoking UB on
+/// overflow. Adversarial review (Wave 7 PR7.2): `now - start_ts` in
+/// expire_open_runs overflows when `start_ts` is an extreme value (e.g.
+/// INT64_MIN from a corrupt/adversarial process_live row) and `now` is a
+/// plausible epoch second -- reproduced under UBSan. Every caller here only
+/// ever compares the result against a small positive `max_age`, so
+/// saturating (rather than, say, throwing) is the right degrade: a
+/// saturated-to-max result still correctly reads as "older than max_age".
+[[nodiscard]] constexpr int64_t saturating_sub(int64_t a, int64_t b) noexcept {
+    if (b > 0 && a < std::numeric_limits<int64_t>::min() + b)
+        return std::numeric_limits<int64_t>::min();
+    if (b < 0 && a > std::numeric_limits<int64_t>::max() + b)
+        return std::numeric_limits<int64_t>::max();
+    return a - b;
+}
+
+/// Floor-toward-negative-infinity bucketing of `ts` into a UTC day boundary,
+/// without ever negating `ts` directly -- negating INT64_MIN overflows
+/// (adversarial review, Wave 7 PR7.2), which the previous
+/// `-(((-ts) + 86399) / 86400) * 86400` formula did for exactly that input.
+/// Shared by fold_daily() below and tar_usage.cpp's usage_daily_user
+/// bucketing so both use the SAME, overflow-safe rule.
+[[nodiscard]] constexpr int64_t day_ts_for(int64_t ts) noexcept {
+    constexpr int64_t kDay = 86400;
+    if (ts >= 0)
+        return (ts / kDay) * kDay;
+    // Guard the one region where the floor-adjusted bucket boundary would
+    // itself be mathematically below INT64_MIN: INT64_MIN is not a multiple
+    // of kDay, so its TRUE floor boundary is one day further negative than
+    // int64 can represent. `ts` within one day-width of INT64_MIN hits
+    // this; saturate to the smallest representable day-aligned bucket
+    // rather than compute an unrepresentable value. An input this extreme
+    // is already corrupt/adversarial, not a real epoch second.
+    constexpr int64_t kMin = std::numeric_limits<int64_t>::min();
+    if (ts <= kMin + kDay)
+        return (kMin / kDay) * kDay;
+    const int64_t q = ts / kDay; // truncates toward zero
+    const int64_t r = ts % kDay;
+    return (r == 0) ? q * kDay : (q - 1) * kDay;
+}
+
 /**
  * Apply one process event to the fold.
  *
@@ -146,7 +191,18 @@ constexpr size_t kMaxOpenRuns = 20000;
             closed.exe_key = it->second.exe_key;
             closed.user = it->second.user;
             closed.start_ts = it->second.start_ts;
-            closed.end_ts = ev.ts;
+            // Same clamp the "stopped" path below applies (adversarial
+            // review, Wave 7 PR7.2): a backward clock step between this
+            // run's start and the new "started" that supersedes it must not
+            // produce a negative duration -- reproduced with
+            // duration=-1000 and clock_anomalies never incremented before
+            // this fix.
+            if (ev.ts < closed.start_ts) {
+                closed.end_ts = closed.start_ts; // clamp to 0s duration
+                ++state.clock_anomalies;
+            } else {
+                closed.end_ts = ev.ts;
+            }
             closed.kind = ClosedRun::Kind::superseded;
             superseded = closed;
             state.open.erase(it);
@@ -192,7 +248,7 @@ constexpr size_t kMaxOpenRuns = 20000;
 expire_open_runs(FoldState& state, int64_t now, int64_t max_age = kDefaultMaxAgeSeconds) {
     std::vector<ClosedRun> closed;
     for (auto it = state.open.begin(); it != state.open.end();) {
-        if (now - it->second.start_ts > max_age) {
+        if (saturating_sub(now, it->second.start_ts) > max_age) {
             ClosedRun c;
             c.pid = it->second.pid;
             c.exe_key = it->second.exe_key;
@@ -257,8 +313,7 @@ struct DailyDelta {
 [[nodiscard]] inline std::vector<DailyDelta> fold_daily(const std::vector<ClosedRun>& runs) {
     std::map<std::pair<int64_t, std::string>, DailyDelta> acc;
     for (const auto& r : runs) {
-        const int64_t day_ts = (r.start_ts >= 0) ? (r.start_ts / 86400) * 86400
-                                                 : -(((-r.start_ts) + 86399) / 86400) * 86400;
+        const int64_t day_ts = day_ts_for(r.start_ts);
         auto key = std::make_pair(day_ts, r.exe_key);
         auto [it, inserted] = acc.try_emplace(key);
         DailyDelta& d = it->second;
@@ -317,10 +372,20 @@ struct UsageFoldResult {
  * usage_hwm_id = MAX(id) over process_live, clears every open run in
  * usage_live, and stamps usage_coverage_since = now. Called on the `usage`
  * source's false->true enable edge (tar_aggregator.cpp
- * apply_source_enabled_transition) and once at plugin init when
- * usage_coverage_since is absent (first run after upgrade) -- never a
- * retrospective fold over history the fold never covered.
+ * apply_source_enabled_transition), once at plugin init when
+ * usage_coverage_since is absent (first run after upgrade), and by
+ * run_usage_fold() itself as a self-healing retry when the coverage marker
+ * is still absent at fold time -- never a retrospective fold over history
+ * the fold never covered.
+ *
+ * Returns a checked outcome (Wave 7 PR7.2 adversarial review, Blocker 3):
+ * the previous `void` signature let a failed MAX(id) probe silently persist
+ * hwm=0 alongside a FRESH usage_coverage_since marker, which disarms the one
+ * retry path that gates on the marker's ABSENCE -- permanently defeating the
+ * forward-only guarantee on a transient DB fault. On failure, NOTHING is
+ * written (no hwm, no coverage marker, no usage_live clear): the caller must
+ * retry, and the missing marker keeps the retry path armed.
  */
-void usage_rebaseline(TarDatabase& db, int64_t now);
+[[nodiscard]] std::expected<void, std::string> usage_rebaseline(TarDatabase& db, int64_t now);
 
 } // namespace yuzu::tar::usage
