@@ -4120,18 +4120,27 @@ struct EstablishChurnWatch {
     // from a Linux session with no compiler for this file - recorded here
     // for whoever runs this harness on DGRHP, not silently hidden. This
     // harness-local instance does not yet have its own tracked issue, and
-    // is a DIFFERENT concern from "T6" - a production deadlock tracked
-    // under issue #3840 (Windows watch establishment): unwatch() holding
-    // the per-type lock (mech_ops_mu_by_type_) waiting on a callback
-    // drain, while that callback is itself parked inside an inline
-    // consumer trying to re-arm and hitting the same per-type lock. This
-    // harness has no per-type lock at all, so T6 does not cover this race;
-    // it's named here only so a reader chasing "what else is unverified in
-    // this delivery" lands on the right tracked concern. (Gate 6
-    // compliance finding, PR-A round 5: an earlier version of this comment
-    // cited a session-local, uncommitted plan file as T6's source - not
-    // durable evidence for a reader who isn't the authoring operator. #3840
-    // is the durable, resolvable reference.)
+    // is a DIFFERENT concern from "T6" - a production DEADLOCK shape
+    // (unwatch() holding the per-type lock, mech_ops_mu_by_type_, waiting
+    // on a callback drain, while that callback is itself parked inside an
+    // inline consumer trying to re-arm and hitting the same per-type lock)
+    // surfaced during issue #3840's design exploration but NOT itself
+    // separately filed - #3840 as filed covers the general "a hung call
+    // starves other arm/disarm on the same type" stall, not this specific
+    // cyclic-deadlock scenario (verified by reading #3840's body: it
+    // describes mech_ops_mu_by_type_ being held for a call's "full,
+    // unbounded duration," never a lock-plus-wait cycle). This harness has
+    // no per-type lock at all, so neither #3840 nor T6 covers this race;
+    // named here only so a reader chasing "what else is unverified in this
+    // delivery" has SOME tracked entry point, even an imperfect one. (Gate
+    // 6 compliance finding, PR-A round 5, corrected again at round 6 after
+    // advisor caught the correction citing #3840 as T6's actual source
+    // without checking the issue's own text first: rounds 1-3 of this
+    // comment's history all cited or mischaracterized T6 without a durable,
+    // verified reference - this is the fourth attempt, and the fix is
+    // stating plainly what's actually tracked vs. not, rather than a fifth
+    // guess. T6 should be filed as its own issue before this branch merges,
+    // not left as a comment-only reference indefinitely.)
     static void CALLBACK on_fire(PTP_CALLBACK_INSTANCE, void* ctx, PTP_WAIT, TP_WAIT_RESULT) {
         auto* self = static_cast<EstablishChurnWatch*>(ctx);
         if (self->stop->load(std::memory_order_relaxed))
@@ -4307,6 +4316,20 @@ struct EstablishHiveLoad {
                 }
             });
         } catch (...) {
+            // stop MUST be set before RegCloseKey (advisor-caught defect,
+            // PR-A round 6, before this fix shipped into review): closing a
+            // key with armed RegNotifyChangeKeyValue registrations SIGNALS
+            // every one of their events (this file's own establish_
+            // registry_sample() doc comment states the same fact for a
+            // single watch) - up to 200 already-armed on_fire callbacks
+            // would otherwise fire concurrently with stop still false, each
+            // reading it as "keep going" and calling RegNotifyChangeKeyValue
+            // on the handle this catch is in the middle of closing. The
+            // normal destructor below sets stop=true FIRST for exactly this
+            // reason; a first draft of this catch inverted that order and
+            // made the already-disclosed on_fire race strictly worse rather
+            // than merely failing to fix it.
+            stop.store(true, std::memory_order_relaxed);
             ::RegCloseKey(churn_key);
             throw;
         }
