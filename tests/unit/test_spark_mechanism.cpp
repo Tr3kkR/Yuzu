@@ -4130,7 +4130,8 @@ struct EstablishChurnWatch {
     // cyclic-deadlock scenario (verified by reading #3840's body: it
     // describes mech_ops_mu_by_type_ being held for a call's "full,
     // unbounded duration," never a lock-plus-wait cycle). This harness has
-    // no per-type lock at all, so neither #3840 nor T6 covers this race;
+    // no per-type lock at all, so neither #3840 nor T6 covers the
+    // check-then-rearm race described above;
     // named here only so a reader chasing "what else is unverified in this
     // delivery" has SOME tracked entry point, even an imperfect one. (Gate
     // 6 compliance finding, PR-A round 5, corrected again at round 6 after
@@ -4316,20 +4317,30 @@ struct EstablishHiveLoad {
                 }
             });
         } catch (...) {
-            // stop MUST be set before RegCloseKey (advisor-caught defect,
-            // PR-A round 6, before this fix shipped into review): closing a
-            // key with armed RegNotifyChangeKeyValue registrations SIGNALS
-            // every one of their events (this file's own establish_
-            // registry_sample() doc comment states the same fact for a
-            // single watch) - up to 200 already-armed on_fire callbacks
-            // would otherwise fire concurrently with stop still false, each
-            // reading it as "keep going" and calling RegNotifyChangeKeyValue
-            // on the handle this catch is in the middle of closing. The
-            // normal destructor below sets stop=true FIRST for exactly this
-            // reason; a first draft of this catch inverted that order and
-            // made the already-disclosed on_fire race strictly worse rather
-            // than merely failing to fix it.
+            // Quiesce every already-armed watch BEFORE touching the key
+            // they're rooted in (Gate 8 pass-5 finding, cpp-safety: a first
+            // fix here only reordered stop=true ahead of RegCloseKey, which
+            // is weaker than the destructor's actual protection below).
+            // Closing a registry key with armed RegNotifyChangeKeyValue
+            // registrations SIGNALS every one of them, so up to 200
+            // already-armed on_fire callbacks could otherwise fire
+            // concurrently with the close. watches.clear() runs every
+            // already-constructed EstablishChurnWatch's own destructor
+            // (cancel + WaitForThreadpoolWaitCallbacks drain + close) FIRST
+            // - the exact mechanism (not flag-ordering) that makes the
+            // normal, non-throwing destructor below actually safe: no
+            // watch can still be armed by the time churn_key closes there,
+            // and now none can be here either. stop.store() is kept as a
+            // cheap, harmless belt-and-suspenders for the window before
+            // any given watch's own cancel+drain completes; it is not
+            // doing the load-bearing work by itself. The residual
+            // check-then-act race inside on_fire itself (not proven atomic
+            // against WaitForThreadpoolWaitCallbacks) is the SAME
+            // pre-existing "KNOWN, UNFIXED RACE" already disclosed above
+            // on_fire - unrelated to this catch path, not reintroduced or
+            // worsened by it.
             stop.store(true, std::memory_order_relaxed);
+            watches.clear();
             ::RegCloseKey(churn_key);
             throw;
         }
@@ -4365,6 +4376,16 @@ TEST_CASE("Watch establishment (Registry): target-present under hive load (R3)",
     REQUIRE(::RegCreateKeyExA(HKEY_CURRENT_USER, base.c_str(), 0, nullptr, 0, KEY_ALL_ACCESS,
                               nullptr, &base_h, nullptr) == ERROR_SUCCESS);
     ::RegCloseKey(base_h);
+    // Declared BEFORE the nested block below, not after it (Gate 8 pass-5
+    // finding - security-guardian/cross-platform/cpp-expert independently
+    // converged on this same gap): tree_guard's destructor runs at THIS
+    // function's scope exit, which - because `load` lives inside the
+    // nested block below - is always strictly after load's own destructor,
+    // on the normal-completion path AND on a REQUIRE-throw path alike
+    // (nested-scope objects always unwind before their enclosing scope's).
+    // The previous bare trailing establish_cleanup_tree(base) call
+    // preserved this ordering only when nothing threw.
+    EstablishTreeGuard tree_guard{base};
     const std::wstring base_w = establish_widen(base);
 
     {
@@ -4397,8 +4418,7 @@ TEST_CASE("Watch establishment (Registry): target-present under hive load (R3)",
         warn_establish("R3 registry target-present UNDER HIVE LOAD", "SetThreadpoolWait",
                        t_wait_set);
     } // load destroyed here - base\churn's handle is closed before cleanup
-
-    establish_cleanup_tree(base);
+    // tree_guard's destructor cleans up base\... here, unconditionally.
 }
 
 TEST_CASE("Watch establishment (Registry): target-absent depth6 under hive load (R4)",
@@ -4414,6 +4434,9 @@ TEST_CASE("Watch establishment (Registry): target-absent depth6 under hive load 
     REQUIRE(::RegCreateKeyExA(HKEY_CURRENT_USER, base.c_str(), 0, nullptr, 0, KEY_ALL_ACCESS,
                               nullptr, &base_h, nullptr) == ERROR_SUCCESS);
     ::RegCloseKey(base_h);
+    // Same ordering argument as R3's identical declaration - see that
+    // comment (Gate 8 pass-5 finding).
+    EstablishTreeGuard tree_guard{base};
     const std::string target = base + "\\a\\b\\c\\d\\e\\f";
 
     {
@@ -4456,8 +4479,7 @@ TEST_CASE("Watch establishment (Registry): target-absent depth6 under hive load 
         warn_establish("R4 registry target-absent depth6 UNDER HIVE LOAD", "SetThreadpoolWait",
                        t_wait_set);
     } // load destroyed here
-
-    establish_cleanup_tree(base);
+    // tree_guard's destructor cleans up base\... here, unconditionally.
 }
 
 TEST_CASE("Watch establishment (Registry): WaitForThreadpoolWaitCallbacks drain, idle vs in-flight (R5)",
@@ -4912,7 +4934,7 @@ TEST_CASE("Watch establishment: post-fix fast-path cost, bulk engine.arm() (N=20
         // finding, PR-A round 5): the REQUIRE(count > 0) below used to
         // leak `scm` on failure.
         struct ScGuard {
-            SC_HANDLE h;
+            SC_HANDLE h{nullptr}; // NSDMI, matching every sibling guard's pattern
             ~ScGuard() {
                 if (h)
                     ::CloseServiceHandle(h);

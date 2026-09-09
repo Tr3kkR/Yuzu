@@ -226,10 +226,12 @@ struct LaneState {
     // seams that exercise take_locked()'s null-result branch (the other is
     // fail_first_box_alloc_for_test below, which reaches the SAME branch by
     // a different route - the fn()-succeeded path's inner catch, not this
-    // seam's post-hoc discard on the WorkerThrew-adjacent path; Gate 4
-    // consistency-auditor finding, PR-A round 5: this comment previously
-    // claimed to be the ONLY way, which fail_first_box_alloc_for_test's own
-    // later addition made false).
+    // seam's post-hoc discard, which runs unconditionally after both catch
+    // blocks resolve, regardless of which outcome occurred; Gate 4
+    // consistency-auditor finding, PR-A round 5, wording tightened at pass
+    // 5: this comment previously claimed to be the ONLY way, which
+    // fail_first_box_alloc_for_test's own later addition made false, and
+    // then briefly mischaracterized this seam as gated to one branch).
     // NOTE: this seam's discard happens OUTSIDE operator()()'s try/catch, so
     // it never itself SETS worker_threw_total (whether the counter ends up
     // 0 depends only on whether fn() threw, same as without this seam

@@ -74,12 +74,18 @@ unmeasured teardown/drain per its own in-code comment). R1/R3/S2/S3 emit only
 PER-CALL series (t_event, t_wait_create, t_open, t_notify, t_wait_set for
 R1/R3; t_open, t_notify for S2/S3) - there is no per-sample sequence total to
 take a clean p99 of. Until the harness itself is extended with one (a
-before/after bracket per sample, mirroring R2/R4's shape), compute
-`p99_worst` for these four cases as the SUM of each call's own p99 - this is
-statistically conservative (an upper bound on the true sequence p99, not an
-exact one) and matches this document's existing "never clamp silently, stop
-and re-think" posture: an inflated p99_worst can only make the STOP check
-fire more readily, never less.
+before/after bracket per sample, mirroring R2/R4's shape), apply this
+substitute two-step process wherever the D-derivation formula above calls
+for one of these four cases' sequence p99 (docs-writer finding, pass 5 -
+tightened to avoid reading as a one-step shortcut that skips the idle-vs-
+load max entirely): first, compute EACH of R1/R3/S2/S3's own sequence p99
+as the SUM of its per-call p99s; `p99_worst` is then the max of that summed
+figure across the idle/under-load pair (R1 vs R3, S1/S2 vs S3), per the
+rule above - not the sum used in place of that max. The sum-as-substitute-
+for-a-real-sequence-total is statistically conservative (an upper bound,
+not an exact one) and matches this document's existing "never clamp
+silently, stop and re-think" posture: an inflated per-case figure can only
+make the STOP check fire more readily, never less.
 
 A later commit on this same branch (PR-A's `spark_detached_call.hpp`) ships a
 `kGuardianBackendOpDeadlineMirror` constant + a `spark_deadline_below_guardian_

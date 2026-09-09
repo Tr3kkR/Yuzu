@@ -2486,18 +2486,22 @@ Guardian ladder must check these.
   the use-after-free the joined-thread rule used to prevent by a different
   mechanism.
   **Extended for Spark (PR-A, #2012/#3840; dormant until a mechanism uses it —
-  Gate 6 compliance finding, PR-A round 5, folded in here):** a second,
-  independent additive source feeds the SAME chokepoint one level up.
+  Gate 6 compliance finding, PR-A round 5, folded in here; reworded at pass 5
+  per an architect finding — the clause below previously read as modifying
+  the primitive rather than the counter):** a second, independent additive
+  source feeds the SAME chokepoint one level up.
   `AgentImpl::guardian_active_io_workers()` (`agent.cpp`) sums
   `GuardianEngine::active_io_workers()` (above) with a separate
-  `spark_detached_workers_` counter fed by `agents/core/src/
-  spark_detached_call.hpp`'s `SparkDetachedLane`/`DetachedCall<T>` primitive —
-  constructed before any `SparkEngine`/mechanism and never read through
-  `spark_engine_`/`spark_boot_done_`, so it stays correct across a boot-time
-  exception that resets `spark_engine_`. `main.cpp`/`service_win.cpp` poll the
-  SUM at this `AgentImpl` level, not `GuardianEngine::active_io_workers()`
-  alone; a future third additive source must feed this same chokepoint, never
-  a parallel counter.
+  `spark_detached_workers_` counter — constructed via a default member
+  initializer before any `SparkEngine`/mechanism exists, and never read
+  through `spark_engine_`/`spark_boot_done_` — fed by `agents/core/src/
+  spark_detached_call.hpp`'s `SparkDetachedLane`/`DetachedCall<T>` primitive,
+  so it stays correct across a boot-time exception that resets
+  `spark_engine_`. `main.cpp`/`service_win.cpp` poll the SUM at this
+  `AgentImpl` level, not `GuardianEngine::active_io_workers()` alone; a
+  future third additive source must add a term to that same sum inside
+  `AgentImpl::guardian_active_io_workers()`, never a parallel counter read
+  elsewhere.
 - **Journal maintenance is paced by TIME, never by wake count.** The drain
   worker wakes on every outbox enqueue, and a paging pass is a full
   `list_entries` + parse + `validate_record` sweep of the journal.
