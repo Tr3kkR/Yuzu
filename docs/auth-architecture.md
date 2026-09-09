@@ -566,7 +566,9 @@ account policy)"* — this ships **both** halves.
 
 - **`--auth-mode <standard|sso-only>`** (`YUZU_AUTH_MODE`, default `standard`).
   Under `sso-only` the local-password login path is disabled fleet-wide — only
-  OIDC SSO (`/auth/callback`, untouched) mints a session. The rejection at
+  an SSO provider mints a session: OIDC (`/auth/callback`) or SAML (`/saml/acs`),
+  both untouched by the gate (the `POST /login` gate keys on `auth_mode` alone,
+  never on which provider is wired). The rejection at
   `POST /login` returns the **same generic 401** as a bad password (no
   "disabled"/"sso-only" wording, no `Retry-After`) so the response BODY carries
   no enumeration/mode/arm-state oracle, and `verify_password` (PBKDF2) is
@@ -577,13 +579,31 @@ account policy)"* — this ships **both** halves.
   the lockout *blocked* path avoids; the CC6.3 evidence is the boot-posture
   banner + this counter (the `{target}` label, cardinality 2, flags probing of
   the break-glass account itself for SIEM alerting).
-- **Boot guard (fail-closed).** `sso-only` **refuses to start** when OIDC is not
-  **fully** configured — the guard requires both `--oidc-issuer` **and**
-  `--oidc-client-id` (the same predicate the OIDC provider's `is_enabled()` uses;
-  issuer-without-client-id leaves SSO silently non-functional). Otherwise every
-  operator is locked out. The break-glass account is for an IdP **outage**, not
-  for never wiring SSO. The active posture is logged once at boot for CC6.3
-  evidence.
+- **Boot guard (fail-closed).** `sso-only` **refuses to start** unless at least
+  one SSO provider is configured well enough to actually mint a session —
+  otherwise every operator is locked out (the break-glass account is for an IdP
+  **outage**, not for never wiring SSO). The testable core is
+  `sso_only_boot_guard_ok` (`sso_boot_guard.{hpp,cpp}`), mirroring the SCIM boot
+  guard; it accepts **either**:
+  - **OIDC** — both `--oidc-issuer` **and** `--oidc-client-id` (the same
+    predicate the OIDC provider's `is_enabled()` uses; issuer-without-client-id
+    leaves SSO silently non-functional, review #1735 HIGH-1); **or**
+  - **SAML** (non-Windows) — all five SP fields (`--saml-idp-sso-url`,
+    `--saml-idp-cert`, `--saml-sp-entity-id`, `--saml-sp-acs-url`,
+    `--saml-idp-entity-id`) **and HTTPS enabled**. HTTPS is part of the gate, not
+    deferred to runtime: `server.cpp` leaves the SAML provider disabled under
+    `--no-https` (its Secure browser-binding cookie is dropped over plain HTTP,
+    so `/auth/saml/start` would 404), so a SAML-only `--no-https` deployment would
+    otherwise pass a presence-only gate and boot straight into a fleet-wide
+    lockout. SAML is excluded on Windows because the provider is a compile-time
+    stub there (it can never mint a session; running the *server* on Windows is
+    out of scope regardless).
+
+  The gate checks config **presence**, not runtime validity: a SAML config whose
+  IdP cert / SP key is unreadable, oversized, or non-RSA still passes the boot
+  guard and is then disabled **loudly** by `server.cpp` — exactly as OIDC
+  issuer/JWKS runtime validity is not gate-checked either. The active SSO
+  path(s) are named in the boot banner for CC6.3 evidence.
 - **Break-glass account.** `--break-glass-user <name>` (`YUZU_BREAK_GLASS_USER`)
   designates the single local account exempt from `sso-only`, exempt **only
   while armed**. "Armed" is `users.break_glass_armed_until` (migration v4) — a
@@ -632,10 +652,13 @@ account policy)"* — this ships **both** halves.
 Implementation: gate at `auth_routes.cpp` `POST /login` (between the lockout
 pre-check and `verify_password`); accessors `AuthDB::break_glass_status` /
 `arm_break_glass` (single `UPDATE ... RETURNING`, no `sqlite3_changes()` —
-#1033); flags + boot guard + arm one-shot in `main.cpp`; `Config::auth_mode` /
-`break_glass_user` / `break_glass_window_secs` in `server.hpp`. Tests:
-`tests/unit/server/test_auth_break_glass.cpp` (DB accessors) +
-`test_auth_routes_hardened.cpp` (wire path).
+#1033); the boot guard's testable core is `sso_only_boot_guard_ok`
+(`sso_boot_guard.{hpp,cpp}`, shared with `server.cpp` via `saml_config_complete`),
+called from a thin wrapper in `main.cpp` alongside the flags + arm one-shot;
+`Config::auth_mode` / `break_glass_user` / `break_glass_window_secs` in
+`server.hpp`. Tests: `tests/unit/server/test_auth_break_glass.cpp` (DB
+accessors) + `test_auth_routes_hardened.cpp` (login-gate wire path) +
+`test_sso_boot_guard.cpp` (boot-guard predicate — OIDC/SAML/HTTPS/platform).
 
 ## RBAC group provisioning (#1832)
 
@@ -1264,12 +1287,29 @@ when SAML is in use, and configure your IdP to enforce MFA at login time. Avoid
 gates. The recommended pattern for a SAML deployment is `optional` with IdP-side
 MFA enforcement.
 
-### `--auth-mode=sso-only` is OIDC-only in this release
+### `--auth-mode=sso-only` covers SAML (SOC 2 CC6.3)
 
-`--auth-mode=sso-only` requires OIDC configuration (`--oidc-issuer` +
-`--oidc-client-id`); a SAML-only deployment cannot disable local-password login
-in this release. The boot guard explicitly requires OIDC — SAML configuration
-alone does not satisfy it and the server refuses to start.
+A SAML-only deployment **can** run under `--auth-mode=sso-only`: the boot guard
+accepts a complete SAML SP config (all five `--saml-*` fields) **with HTTPS
+enabled** as an SSO path, exactly as it accepts a complete OIDC config — see the
+Hardened-mode boot-guard bullet above for the full predicate. A dual OIDC+SAML
+deployment satisfies it via either provider. On Windows the SAML provider is a
+stub, so a Windows *server* still needs OIDC for `sso-only` (running the server
+on Windows is out of scope regardless).
+
+Two limitations a SAML-only `sso-only` operator should know (neither is new to
+this change; both are pre-existing SAML properties that simply become more
+visible without a local-password fallback):
+
+- **No privilege elevation for SAML operators.** A SAML session cannot perform a
+  local TOTP step-up and has no OIDC `amr` proof, so JIT admin elevation
+  (`POST /api/v1/elevate`) is unavailable to it. A SAML-only deployment that
+  needs elevation should grant standing admin via the group→role mapping
+  (`--saml-admin-group`) rather than rely on JIT.
+- **No SAML button on the login page.** `/login` still renders a password form
+  (which always returns the generic 401 under `sso-only`) and, if OIDC is also
+  configured, its SSO button; SAML operators navigate to `GET /auth/saml/start`
+  directly.
 
 ### HA / multi-replica
 
@@ -1320,9 +1360,6 @@ key. Design:
 
 - **Login-page SSO button.** There is no "Sign in with SAML" button on the
   login page; users must navigate directly to `GET /auth/saml/start`.
-- **`--auth-mode=sso-only` for SAML.** A SAML-only deployment cannot disable
-  local-password login. Compliance impact: CC6.3 (local-password fallback
-  remains active). OIDC is the path to `sso-only`.
 - **AttributeStatement parsing beyond group/name/email.** Group→role mapping
   (`--saml-group-attribute`) plus the display-name/email session-enrichment
   attributes (`--saml-name-attribute`/`--saml-email-attribute`, see
@@ -2517,19 +2554,40 @@ MCP twins).
 2. **The topology floor itself**: `{AccessReview:Read, UserManagement:Read,
    EnginePrincipal:Read}` — plus, as of #4028, `{TlsConfig:Read,
    PluginSigning:Read, ServerConfig:Read, AnalyticsConfig:Read}` (see
-   "Settings read-twins" below) — require the `admin` session role
-   regardless of the RBAC on/off toggle, via `authz_topology_floor.hpp`'s
-   `topology_floor_applies()`. The two groups are different categories that
-   happen to share this one mechanism: the original three are
+   "Settings read-twins" below), and as of #4031, `{Enrollment:Read,
+   OidcConfig:Read}` — require the `admin` session role regardless of the
+   RBAC on/off toggle, via `authz_topology_floor.hpp`'s
+   `topology_floor_applies()`. The three groups are different categories
+   that happen to share this one mechanism: the original three are
    authorization-topology reads (the RBAC role graph, the engine-principal
    grant graph, the access-review export) that intentionally stay reachable
    by an admin-owned session on ANY transport, MCP tokens included, per the
-   legacy-role-fallback note below; the #4028 four are
+   legacy-role-fallback note below; the #4028 four and #4031 two are
    server-administration reads that #520 additionally excludes from every
    MCP tier outright (`mcp_policy.hpp`'s `tier_allows()`), so an admin-owned
    MCP token cannot reach them even though it would otherwise satisfy this
-   same floor check. It is consulted **only** inside the legacy
-   (RBAC-off) fallback of `require_permission`/`require_scoped_permission`
+   same floor check. (`Directory` deliberately has no floor entry, since it
+   was never `admin_fn_`-gated to begin with — `list_directory_users` and
+   most of `get_directory_status`'s payload stay reachable at Viewer role
+   and readonly MCP tier. **One field is the exception:**
+   `groups[].mapped_role` on `get_directory_status` — the AD-group ->
+   Yuzu-role authorization map, the same data class as the floored
+   `OidcConfig` `admin_group` field (colleague review on #4176 caught this
+   inconsistency: `mapped_role` was newly MCP-reachable at readonly tier and
+   newly Viewer-reachable under RBAC-on with no floor treatment at all,
+   despite the sibling `OidcConfig` field being floored in this same PR).
+   Flooring all of `Directory:Read` was rejected — it would also demote
+   `list_directory_users` (lower-sensitivity PII, not authorization
+   topology) to admin-only under RBAC-off. Instead
+   `directory_status_json`'s `reveal_mapped_role` parameter redacts just
+   that field to the empty string for a non-admin caller, checked via the
+   same `auth::effective_role(session) == auth::Role::admin` test the
+   topology floor itself uses — REST v1, the legacy route, and the MCP tool
+   all compute it independently at their own call site, since the floor
+   mechanism only gates whole-route `(securable, operation)` pairs, not
+   individual response fields.) It is consulted **only**
+   inside the legacy (RBAC-off) fallback of
+   `require_permission`/`require_scoped_permission`
    — never ahead of, or instead of, the live-RBAC branch. That ordering is
    load-bearing, not incidental: #2324 cut the dedicated `AccessReview`
    securable specifically so a non-admin `Reviewer` role could be seeded
@@ -2809,6 +2867,10 @@ Deferred, not fixed here (flagged for a follow-up, not swept into #3789): MCP `l
 Still open after this migration (unrelated files, tracked separately, not swept into #1634): REST `GET /api/v1/execution-statistics/agents` + the workflow executions LIST fragment (#3526); three reliability gaps on the workflow detail route — legacy-fallback starvation, untested store-degrade banner, `get_execution` error-vs-absent ambiguity (#3527); `/fragments/results` has no audit trail at all (#3528); no `[pg]` end-to-end test proves the real `require_fleet_read`/`RbacStore`/`ManagementGroupStore` composition for the #1712 call sites (#3529). **Staleness of an already-open SSE stream (compliance/sre finding, this round):** `require_fleet_read`/`fleet_read_fn` is evaluated once, at subscribe time — neither `/sse/executions/{id}` nor `/api/v1/events` re-checks the caller's management-group scope for the life of the connection, so a scope narrowed (or a session revoked) mid-stream via `invalidate_session` does not disconnect an already-open subscriber; `invalidate_session` (`auth.cpp`) only erases the session record, it never reaches an open httplib connection, and no lever exists today to force-disconnect one live stream short of a full server restart. This is the same one-time-admission shape `require_fleet_read`'s non-streaming callers already have (a scope change doesn't retroactively alter an in-flight response either), but a held-open stream widens the exposure window from one request to as long as the tab/worker stays connected. Accepted for this migration (real-time revocation is a separate, larger change to the SSE subsystem, not a #1634 scope-pushdown fix); worth a security runbook line if this becomes an operational concern before it is addressed.
 
 `GET`/`PUT`/`DELETE /api/agents/:id/properties[/:key]` — found in this same governance re-review, bare `require_permission(Infrastructure,Read/Write)` with no per-agent scope filter at all (including a WRITE path) — is now **fixed** (#3700): all three routes migrated to `require_scoped_permission("Infrastructure", "Read"/"Write", agent_id)`, the same per-target gate the Tag routes (`/api/tags/set`, `/api/tags/delete`) use. RBAC-off behavior is unchanged, since `Infrastructure` is not in `kTopologyFloor`. Coverage: `tests/unit/server/test_agent_properties_scope_authz.cpp`.
+
+**Fifth migration (#4031 hardening round, adversarial review of the branch before push).** `GET /api/v1/enrollment/pending-agents` — a new REST v1 route, not a legacy one — was gated on bare `require_permission(Enrollment, Read)` (`perm_fn`) in an earlier revision of this branch, the exact anti-pattern this ADR's Consequences section names as forbidden for a new list/fan-out read of per-agent data: `pending_agent_row_json` rows carry a genuine `agent_id` plus hostname/os/arch/agent_version (`auth::PendingAgent`). Migrated onto `require_fleet_read("Enrollment", "Read")` as the route's sole gate, filtering with `authz::in_scope(gate.scope, agent.agent_id)` — the same idiom `GET /api/v1/inventory/software` uses. The defect this closed was **under-admission, not disclosure**: `require_permission`'s ordinary RBAC branch resolves authority via `RbacStore::collect_roles` (direct/group-role grants only) and never consults `ManagementGroupStore`, so a caller holding *only* a management-group-scoped `Enrollment:Read` grant — a combination the product's own docs (`docs/user-manual/rbac.md`) instruct operators to configure — was denied outright (403) rather than admitted with a real, correctly confined result. That result is typically empty under the intended enrollment workflow (a pending/not-yet-approved agent normally has no management-group membership yet — group assignment follows approval), but this is **not enforced by the data model**: `management_group_members.agent_id` carries no enrollment/agent-registry foreign key, and `POST /api/v1/management-groups/{id}/members` accepts any non-empty caller-supplied id with no existence check, so a pre-assigned membership row yields a non-empty, correctly-confined result via the same filter — never a widening. No live exploit path existed under the default seed (`Enrollment:Read` grants to Administrator only, resolved via `check_permission`'s global-grant branch regardless of which primitive gates the route), which is why this passed the branch's 7-pass, multi-agent governance run before an adversarial review of the branch caught it.
+
+This migration also closed a **second, load-bearing gap it exposed**: `Enrollment:Read` is the first `kTopologyFloor`-floored securable ever routed through `require_fleet_read`. Unlike `require_permission`'s legacy (RBAC-off) branch, `require_fleet_read`'s subordinate primitive, `RbacStore::authorize_list_read`, has no floor concept of its own by design (a data-layer primitive must not depend on `Session`) — its own legacy-open branch returns `AdmitAll` unconditionally once RBAC enforcement is off, with no way to distinguish an admin session from any other authenticated one. Every prior `require_fleet_read` caller (`Inventory`/`Execution`/`Response`/`Schedule:Read`) is unfloored, so this gap was latent, not exercised, until now — and `require_list_read`'s own doc comment (`auth_routes.hpp`) had already named the identical risk as something "a FUTURE floored securable... must re-apply explicitly." Fixed inside `require_fleet_read` itself (`authz_gates.cpp`), not as a route-level bolt-on: a pre-check mirroring `require_permission`'s own legacy-branch floor logic (same audit-reason prefix `"topology floor: "`, same `yuzu_auth_topology_floor_denied_total` counter) now runs before the management-group axis whenever RBAC enforcement is off, denying a non-admin session on any floored pair. Coverage: `tests/unit/server/test_authz_gates.cpp` (RBAC-off + floored securable, non-admin-denied and admin-admitted); `tests/unit/server/test_enrollment_directory_routes.cpp` (route-level scope-filtering, including the admitted-empty-not-403 case that is the whole point of the fix).
 
 **Consequences accepted for v1 (recorded, not oversights):** fleet-wide aggregates with no per-agent identity (e.g. `get_dex_perf_fleet`, `get_network_fleet`) stay `denied` at C8 — a `confined` label with no real downstream mechanism would be an unenforced claim; re-admission is a Phase 2 `kServiceScopeGlobalSafe` entry with security-guardian sign-off, not an inferred-safe classification during a routine change. Service-tag writes (whoever sets an agent's `service` tag moves scope) are hardened as of #3289 — a service-scoped session is denied, value-blind, before writing/deleting the `service` key at every REST/legacy-dashboard/MCP tag-mutation site, and the agent's own gRPC `Register` sync path no longer accepts an agent-claimed `service` value at all; plain `Tag:Write`/`Tag:Delete` remains sufficient for non-service-scoped (already fleet-scoped) holders. A related but distinct gap — a live agent's in-memory self-reported tags shadowing the store during scope-DSL evaluation — was tracked separately as #3295 and is now closed: `evaluate_scope`'s `tag:<key>` resolver is store-first (a TagStore row of any source wins over a connected agent's live claim; the session value answers only when the store has no row at all), and `register_agent` drops an agent-claimed `service` key from the session at ingest. No cached derived confinement sets. Dispatch's supersede→intersect migration (§3d, four `authorize_list_read` callers) is deferred, not part of this PR. **Bootstrap note:** an empty-cohort service token cannot bootstrap its own scope via any route — and since #3289, neither can an agent via its own Register sync; onboarding a brand-new service still needs an interactive/unscoped path; see `docs/user-manual/authentication.md`.
 

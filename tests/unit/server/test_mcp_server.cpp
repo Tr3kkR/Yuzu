@@ -29,6 +29,7 @@
 #include "test_analytics_pg_helper.hpp" // AnalyticsEventStorePg — ADR-0049 PG port
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "test_approval_manager_pg_helper.hpp" // ApprovalManagerPg — ADR-0065 PG port
+#include "test_directory_sync_pg_helper.hpp" // DirectorySyncPg — #4031 list_directory_users/get_directory_status
 #include "test_execution_tracker_pg_helper.hpp" // ExecutionTrackerPg — ADR-0065 PG port
 #include "test_response_execution_authz_pg_helper.hpp"
 #include "test_tag_store_pg_helper.hpp"  // TagStorePg — ADR-0050 PG port
@@ -52,6 +53,7 @@
 #include "response_store.hpp"
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
+#include "workflow_engine.hpp" // #4030 Gate 8 fix: mcp_workflow_tpl / get_workflow_execution tests
 // M5 remediation (ADR-0031 operator-surface functional coverage): mcp_server.hpp
 // only forward-declares PluginConfigStore (its .cpp includes the real header) —
 // the store's live-state assertions below need the full definition + its
@@ -111,6 +113,14 @@ yuzu::test::PgTestTemplate mcp_instr_tpl{"mcpinstr", [](const std::string& dsn) 
     yuzu::server::InstructionStore store{pool};
     if (!store.is_open())
         throw std::runtime_error("mcpinstr template: store failed to migrate");
+}};
+// #4030 Gate 8 fix: WorkflowEngine is Postgres-backed (ADR-0064) -- no MCP
+// test wired one before this fix (get_workflow_execution had zero coverage).
+yuzu::test::PgTestTemplate mcp_workflow_tpl{"mcpworkflow", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    yuzu::server::WorkflowEngine store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("mcpworkflow template: store failed to migrate");
 }};
 } // namespace
 
@@ -303,7 +313,9 @@ TEST_CASE("MCP Policy: operator tier DOES allow the distinct ApiToken:Rotate "
     CHECK(tier_allows("operator", "ApiToken", "Rotate"));
 }
 
-TEST_CASE("MCP Policy: supervised tier allows everything", "[mcp][policy]") {
+TEST_CASE("MCP Policy: supervised tier allows everything except server "
+          "self-administration (Enrollment/OidcConfig)",
+          "[mcp][policy]") {
     CHECK(tier_allows("supervised", "Infrastructure", "Read"));
     CHECK(tier_allows("supervised", "Execution", "Execute"));
     CHECK(tier_allows("supervised", "Policy", "Write"));
@@ -318,6 +330,37 @@ TEST_CASE("MCP Policy: supervised tier allows everything", "[mcp][policy]") {
 TEST_CASE("MCP Policy: unknown tier denies everything", "[mcp][policy]") {
     CHECK(!tier_allows("bogus", "Infrastructure", "Read"));
     CHECK(!tier_allows("bogus", "Tag", "Write"));
+}
+
+TEST_CASE("MCP Policy: #4031/#520 Enrollment and OidcConfig are denied at "
+          "EVERY tier, including supervised — MCP tokens must never "
+          "administer the server itself (settings, users, TLS, OIDC)",
+          "[mcp][policy][security]") {
+    // The bug this pins: tier_allows() checked only the OPERATION
+    // ("Read"), never the SECURABLE, so a readonly-tier MCP token could
+    // reach the #4031 REST v1 enrollment/auto-approve-rules,
+    // enrollment/pending-agents, and settings/oidc routes purely because
+    // those routes' perm_fn asks "is this Read?" — the same question a
+    // readonly token answers yes to for every OTHER securable too.
+    CHECK_FALSE(tier_allows("readonly", "Enrollment", "Read"));
+    CHECK_FALSE(tier_allows("readonly", "OidcConfig", "Read"));
+    CHECK_FALSE(tier_allows("operator", "Enrollment", "Read"));
+    CHECK_FALSE(tier_allows("operator", "OidcConfig", "Read"));
+    // supervised tier allows everything else (see "MCP Policy: supervised
+    // tier allows everything except server self-administration" above) —
+    // this is the one carve-out, matching require_admin()'s unconditional
+    // posture for the equivalent admin_fn_-gated dashboard surface.
+    CHECK_FALSE(tier_allows("supervised", "Enrollment", "Read"));
+    CHECK_FALSE(tier_allows("supervised", "OidcConfig", "Read"));
+    CHECK_FALSE(tier_allows("supervised", "Enrollment", "Write"));
+    CHECK_FALSE(tier_allows("supervised", "OidcConfig", "Write"));
+
+    // Directory is deliberately NOT in this deny set — it has real MCP twins
+    // (list_directory_users/get_directory_status) by design, so it must stay
+    // reachable at readonly tier, unlike Enrollment/OidcConfig which have
+    // none.
+    CHECK(tier_allows("readonly", "Directory", "Read"));
+    CHECK(tier_allows("supervised", "Directory", "Read"));
 }
 
 // #4028/#520 security regression guard: server-administration securables
@@ -873,6 +916,14 @@ struct McpTestServer {
     /// MCP test that needs the lifecycle to be a no-op.
     yuzu::server::ExecutionTracker* execution_tracker_for_test{nullptr};
 
+    /// #4030 Gate 8 fix: optionally wire a real WorkflowEngine so
+    /// list_workflows/get_workflow/get_workflow_execution can be exercised
+    /// end-to-end -- until this fix, no MCP test wired one at all (every
+    /// existing test hit the "Workflow engine unavailable" internal-error
+    /// path unconditionally). Default nullptr preserves that prior
+    /// behaviour for tests that don't opt in.
+    yuzu::server::WorkflowEngine* workflow_engine_for_test{nullptr};
+
     /// Slice 1 (agentic fan-out scale-hardening): optionally wire a real
     /// ResponseStore so query_responses can be exercised end-to-end, including
     /// the new execution_id exact-correlation collect path. Default nullptr
@@ -987,6 +1038,9 @@ struct McpTestServer {
     yuzu::server::TagStore* tag_store_for_test{nullptr};
     yuzu::server::ApprovalManager* approval_manager_for_test{nullptr};
     yuzu::server::QuarantineStore* quarantine_store_for_test{nullptr};
+    /// #4031: list_directory_users / get_directory_status. Default nullptr
+    /// keeps every pre-existing test on the store-unavailable path.
+    yuzu::server::DirectorySync* directory_sync_for_test{nullptr};
     /// Records (agent_id,key) pairs pushed via the tag-push closure (D4), so a
     /// set_tag test can assert the agent push fired.
     std::vector<std::pair<std::string, std::string>> tag_pushes;
@@ -1285,7 +1339,7 @@ private:
             /*engine_principal_store=*/nullptr,
             /*access_review_store=*/nullptr,
             /*auth_db=*/nullptr,
-            /*directory_sync=*/nullptr,
+            /*directory_sync=*/directory_sync_for_test,
             /*caller_fn=*/caller_fn_for_test,
             // 2f PR 3b: the POST handler leases from the SAME budget as GET.
             // Default nullptr keeps every pre-3b test on the plain path - a test
@@ -1293,7 +1347,8 @@ private:
             /*stream_budget=*/stream_budget_for_test,
             /*revalidate_fn=*/revalidate_fn_for_test,
             /*principal_audit_fn=*/principal_audit_fn_for_test,
-            /*product_pack_store=*/product_pack_store_for_test);
+            /*product_pack_store=*/product_pack_store_for_test,
+            /*workflow_engine=*/workflow_engine_for_test);
     }
 };
 
@@ -1749,10 +1804,12 @@ TEST_CASE("MCP 2383: RBAC catalogue mirrors have the expected cardinality", "[mc
     CHECK(rbac_ops_for_test().size() == 8);
     // 23 + 3 PR1.9a additions (PluginConfig, PluginSecret, UploadGrant)
     // + 1 Wave 6 (PowerManagement, power_health's set_power_plan) = 27,
-    // + 1 (#4029: ProductPack prerequisite fix) = 28,
+    // + 1 (#4030/#4032: Workflow, previously gated but never seeded) = 28,
+    // + 1 (#4029: ProductPack prerequisite fix) = 29,
     // + 4 #4028 additions (TlsConfig, PluginSigning, ServerConfig,
-    // AnalyticsConfig — Settings read-twins) = 32.
-    CHECK(rbac_securables_for_test().size() == 32);
+    // AnalyticsConfig — Settings read-twins) = 33,
+    // + 3 #4031 additions (Directory, Enrollment, OidcConfig) = 36.
+    CHECK(rbac_securables_for_test().size() == 36);
 }
 
 TEST_CASE("MCP 2383: three-way dispatch classifier — knownness decides first", "[mcp][2g]") {
@@ -6135,6 +6192,139 @@ TEST_CASE("MCP get_execution_status: invisible execution collapses to the same "
     CHECK(missing_json["error"]["message"].get<std::string>().starts_with("Execution not found:"));
 }
 
+// #4030 Gate 8 fix: get_workflow_execution had ZERO prior MCP-level test
+// coverage (quality-engineer + cpp-safety, Gate 3) -- the confinement fix
+// (security-guardian, Gate 2 HIGH: workflow_execution_detail_json had no
+// record-level confinement gate, only `agent_ids` was field-filtered; a
+// caller with zero visibility into an execution's target agents still got
+// the full status/steps/results) is verified here on the MCP surface,
+// mirroring get_execution_status's own #1634 zero-overlap test above.
+// PRE-fix this call returned 200 with the full unfiltered record.
+TEST_CASE("MCP get_workflow_execution: zero-overlap confined caller gets the "
+          "same not-found error as a nonexistent id (#4030 Gate 8 fix)",
+          "[pg][mcp][integration][workflow][scope][notfound]") {
+    YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ResponseExecutionAuthzPgRig authz{authz_db.dsn()};
+    // The shared rig grants bob Response:Read/Execution:Read via his
+    // management group -- "Workflow" is a brand-new securable this PR
+    // introduces (rbac_store.cpp seeding), so it is not part of the rig's
+    // own fixed setup. Grant it the same way (management-group-scoped),
+    // mirroring the rig's own ResponseReader1634/ExecutionReader1634 shape.
+    REQUIRE(authz.rbac.create_role({"WorkflowReader4030", "", false, 0}).has_value());
+    REQUIRE(
+        authz.rbac.set_permission({"WorkflowReader4030", "Workflow", "Read", "allow"}).has_value());
+    REQUIRE(authz.mgmt.assign_role({authz.bob_group, "user", "bob", "WorkflowReader4030"})
+                .has_value());
+
+    YUZU_REQUIRE_PG_DB_TPL(wf_db, mcp_workflow_tpl);
+    yuzu::server::pg::PgPool wf_pool{{.conninfo = wf_db.dsn(), .size = 4}};
+    yuzu::server::WorkflowEngine workflows{wf_pool};
+    REQUIRE(workflows.is_open());
+
+    const std::string yaml = "kind: Workflow\n"
+                             "metadata:\n"
+                             "  displayName: mcp-wf-scope\n"
+                             "spec:\n"
+                             "  steps:\n"
+                             "    - instruction: def-mcp-wf\n";
+    auto wf_id = workflows.create_workflow(yaml);
+    REQUIRE(wf_id.has_value());
+
+    auto dispatch_fn = [](const std::string&, const std::string&,
+                          const std::string&) -> std::expected<std::string, std::string> {
+        return std::string(
+            R"({"status":"dispatched","command_id":"cmd-mcp-wf","agents_reached":1})");
+    };
+    // Target agent-A only -- bob's confined scope below (mint_bob) is
+    // disjoint from it (mirrors get_execution_status's own bob/alice-agent
+    // disjoint setup above).
+    auto exec_id = workflows.execute(*wf_id, {"agent-A"}, dispatch_fn);
+    REQUIRE(exec_id.has_value());
+
+    McpTestServer ts;
+    ts.workflow_engine_for_test = &workflows;
+    ts.fleet_read_fn_for_test = authz.fleet_read_fn();
+    ts.mock_username = "bob";
+    ts.start("operator");
+
+    const auto token = authz.mint_bob();
+    auto call = [&](const std::string& id) {
+        return ts.call_raw(
+            "POST",
+            std::string(
+                R"({"jsonrpc":"2.0","method":"tools/call","id":740,)"
+                R"("params":{"name":"get_workflow_execution","arguments":{"execution_id":")") +
+                id + R"("}}})",
+            {{"Authorization", "Bearer " + token}});
+    };
+    auto invisible = call(*exec_id);
+    auto missing = call("wfexec-does-not-exist-at-all");
+    REQUIRE(invisible);
+    REQUIRE(missing);
+    auto invisible_json = nlohmann::json::parse(invisible->body);
+    auto missing_json = nlohmann::json::parse(missing->body);
+    REQUIRE(invisible_json.contains("error"));
+    REQUIRE(missing_json.contains("error"));
+    CHECK(invisible_json["error"]["code"] == missing_json["error"]["code"]);
+    CHECK(invisible_json["error"]["message"].get<std::string>().starts_with(
+        "Workflow execution not found:"));
+    CHECK(missing_json["error"]["message"].get<std::string>().starts_with(
+        "Workflow execution not found:"));
+    // PRE-fix regression proof: the error response has no "result" key at
+    // all -- the record (status/steps/results) genuinely was not returned,
+    // not merely field-filtered.
+    CHECK_FALSE(invisible_json.contains("result"));
+}
+
+// Regression guard for the fix above: an UNCONFINED caller must still see
+// the full record, including the raw `agents_reached` count in each step's
+// result (the confined-only redaction the fix's count-disclosure guard
+// applies must not fire for a caller with no scope at all).
+TEST_CASE("MCP get_workflow_execution: unconfined caller still sees the full "
+          "record including agents_reached (#4030 Gate 8 fix regression guard)",
+          "[pg][mcp][integration][workflow][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(wf_db, mcp_workflow_tpl);
+    yuzu::server::pg::PgPool wf_pool{{.conninfo = wf_db.dsn(), .size = 4}};
+    yuzu::server::WorkflowEngine workflows{wf_pool};
+    REQUIRE(workflows.is_open());
+
+    const std::string yaml = "kind: Workflow\n"
+                             "metadata:\n"
+                             "  displayName: mcp-wf-unconfined\n"
+                             "spec:\n"
+                             "  steps:\n"
+                             "    - instruction: def-mcp-wf2\n";
+    auto wf_id = workflows.create_workflow(yaml);
+    REQUIRE(wf_id.has_value());
+    auto dispatch_fn = [](const std::string&, const std::string&,
+                          const std::string&) -> std::expected<std::string, std::string> {
+        return std::string(
+            R"({"status":"dispatched","command_id":"cmd-mcp-wf2","agents_reached":2})");
+    };
+    auto exec_id = workflows.execute(*wf_id, {"agent-X", "agent-Y"}, dispatch_fn);
+    REQUIRE(exec_id.has_value());
+
+    McpTestServer ts;
+    ts.workflow_engine_for_test = &workflows;
+    // fleet_read_fn_for_test's own default (checked above) admits
+    // unconfined -- no authz rig wired for this direction.
+    ts.start("operator");
+
+    auto res = ts.call(
+        std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":741,)"
+                    R"("params":{"name":"get_workflow_execution","arguments":{"execution_id":")") +
+        *exec_id + R"("}}})");
+    REQUIRE(res);
+    auto sc = nlohmann::json::parse(res->body)["result"]["structuredContent"];
+    CHECK(sc["status"] == "completed");
+    REQUIRE(sc["agent_ids"].is_array());
+    CHECK(sc["agent_ids"].size() == 2);
+    REQUIRE(sc["steps"].is_array());
+    REQUIRE(sc["steps"].size() == 1);
+    REQUIRE(sc["steps"][0]["result"].contains("agents_reached"));
+    CHECK(sc["steps"][0]["result"]["agents_reached"] == 2);
+}
+
 // #1634: execution rows carry no single agent_id, so a confined caller is
 // restricted to their own dispatches (ExecutionQuery::dispatched_by) rather than
 // a full per-row visible-agent check — never another operator's execution.
@@ -6228,6 +6418,42 @@ TEST_CASE("MCP list_executions: confined caller's counts reflect only in-scope, 
     // never 2 (alice-agent's out-of-scope success must not leak in either).
     CHECK(sc[0]["agents_targeted"] == 1);
     CHECK(sc[0]["agents_responded"] == 0);
+}
+
+// #4030 review finding (blocking, HIGH): list_executions used to call the
+// unchecked query_executions()/get_agent_statuses_for_executions(), which
+// silently collapsed a degraded tracker (not-open / pool-exhausted /
+// query-failed) into an empty executions list -- indistinguishable from a
+// genuinely empty fleet, and the exact defect class already fixed for
+// list_schedules (5686776fe) two commits earlier in this same PR. Mirrors
+// "create_execution failure degrades..." above: an ExecutionTracker bound to
+// an unreachable pool fails its own connect attempt deterministically
+// (ADR-0065, test_engine_principal_store.cpp's #2456 precedent) -- no live
+// database needed, so this carries no [pg] tag.
+TEST_CASE("MCP list_executions: a degraded tracker surfaces a store-fault "
+          "error, never a false empty-success list (#4030 fix regression)",
+          "[mcp][integration][execution]") {
+    pg::PgPool unreachable{{.conninfo = "host=127.0.0.1 port=1 dbname=yuzu connect_timeout=1",
+                            .size = 1,
+                            .connect_timeout_s = 1}};
+    REQUIRE(unreachable.valid()); // conninfo parses; the host is just unreachable
+    ExecutionTracker broken(unreachable);
+    REQUIRE(!broken.is_open());
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &broken;
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":733,"params":{"name":"list_executions"}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInternalError);
+    // Never the pre-fix shape: a "success" result with an empty executions
+    // array, indistinguishable from a genuinely-empty fleet.
+    CHECK_FALSE(body.contains("result"));
 }
 
 TEST_CASE("MCP Agentic demo: ceo_demo prompt is live-only and ignores injected args (ADR-0016)",
@@ -11183,6 +11409,140 @@ TEST_CASE("MCP operator surface: list_upload_grants is confined to what's actual
     REQUIRE(ts.audit_log.size() == 2);
     CHECK(ts.audit_log[0] == "mcp.list_upload_grants|success");
     CHECK(ts.audit_log[1] == "mcp.list_upload_grants|success");
+}
+
+// ── #4031: list_directory_users / get_directory_status ──────────────────
+//
+// Round-trip dispatch tests proving the shared-builder claim (docs/
+// api-twin-recipe.md §1) actually holds for these two tools: both call the
+// SAME directory_user_row_json / directory_status_json functions the REST
+// v1 twins (enrollment_directory_routes.cpp) and the legacy
+// /api/directory/* routes (discovery_routes.cpp) use. Deliberately does NOT
+// seed data via sync_entra/apply_entra_sync — see
+// test_enrollment_directory_routes.cpp's identical note (sync_entra makes a
+// real outbound Graph call; apply_entra_sync's test seam is a file-local
+// friend struct in test_directory_sync.cpp, not safely duplicable here
+// without an ODR risk). A freshly-opened, empty store already proves the
+// tool's registration, gating, and response-shape wiring.
+
+TEST_CASE("MCP #4031: list_directory_users dispatches, returns the shared builder's shape, and "
+          "uses the REST-domain audit verb (not mcp.list_directory_users)",
+          "[pg][mcp][integration]") {
+    yuzu::test::DirectorySyncPg ds;
+
+    McpTestServer ts;
+    ts.directory_sync_for_test = ds.get();
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"list_directory_users",)"
+        R"("arguments":{}}})");
+    REQUIRE(res);
+    auto payload = operator_surface_payload(res);
+    REQUIRE(payload["users"].is_array());
+    CHECK(payload["users"].empty());
+    CHECK(payload["count"] == 0);
+
+    // Prefers the REST-established domain verb over the generic
+    // mcp.<tool_name> action (docs/api-twin-recipe.md §4).
+    REQUIRE(ts.audit_log.size() == 1);
+    CHECK(ts.audit_log[0] == "directory.users.view|success");
+}
+
+TEST_CASE("MCP #4031: list_directory_users answers store-unavailable when directory_sync is "
+          "unwired",
+          "[mcp][integration]") {
+    McpTestServer ts;
+    // directory_sync_for_test stays nullptr — default.
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"list_directory_users",)"
+        R"("arguments":{}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+}
+
+TEST_CASE("MCP #4031: get_directory_status dispatches, returns the shared builder's shape, and "
+          "is NOT audited (no per-person PII)",
+          "[pg][mcp][integration]") {
+    yuzu::test::DirectorySyncPg ds;
+
+    McpTestServer ts;
+    ts.directory_sync_for_test = ds.get();
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"get_directory_status",)"
+        R"("arguments":{}}})");
+    REQUIRE(res);
+    auto payload = operator_surface_payload(res);
+    CHECK(payload.contains("provider"));
+    CHECK(payload.contains("status"));
+    CHECK(payload.contains("user_count"));
+    CHECK(payload.contains("group_count"));
+    REQUIRE(payload["groups"].is_array());
+
+    CHECK(ts.audit_log.empty());
+}
+
+// Colleague-review finding on #4176: groups[].mapped_role (the AD-group ->
+// Yuzu-role authorization map, same data class as the floored
+// OidcConfig:admin_group) must stay admin-only even at readonly MCP tier —
+// see enrollment_directory_model.hpp's directory_status_json doc comment.
+TEST_CASE("MCP #4031/#4176: get_directory_status redacts mapped_role for a non-admin caller at "
+          "readonly tier, reveals it for admin",
+          "[pg][mcp][integration][security]") {
+    yuzu::test::DirectorySyncPg ds;
+    {
+        auto lease = ds.pool().acquire();
+        REQUIRE(lease);
+        auto ins = pg::exec_params(
+            lease.get(),
+            "INSERT INTO directory_sync.directory_groups (id, display_name, description, "
+            "synced_at) VALUES ($1, $2, $3, $4)",
+            std::vector<std::string>{"g1", "Engineering", "", "100"});
+        REQUIRE(ins.ok());
+    }
+    ds->configure_group_role_mapping("g1", "Administrator");
+    REQUIRE(ds->get_synced_groups().size() == 1);
+
+    McpTestServer ts;
+    ts.directory_sync_for_test = ds.get();
+    ts.start("readonly");
+    ts.mock_role = yuzu::server::auth::Role::user;
+
+    auto call = R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":)"
+               R"("get_directory_status","arguments":{}}})";
+    auto denied_payload = operator_surface_payload(ts.call(call));
+    REQUIRE(denied_payload["groups"].size() == 1);
+    CHECK(denied_payload["groups"][0]["mapped_role"] == "");
+
+    // Admin session, same readonly MCP tier — the field is role-gated, not
+    // tier-gated, so an admin sees it even at readonly.
+    ts.mock_role = yuzu::server::auth::Role::admin;
+    auto revealed_payload = operator_surface_payload(ts.call(call));
+    REQUIRE(revealed_payload["groups"].size() == 1);
+    CHECK(revealed_payload["groups"][0]["mapped_role"] == "Administrator");
+}
+
+TEST_CASE("MCP #4031: list_directory_users respects perm_fn denial on Directory:Read",
+          "[pg][mcp][integration]") {
+    yuzu::test::DirectorySyncPg ds;
+
+    McpTestServer ts;
+    ts.directory_sync_for_test = ds.get();
+    ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+        return !(securable == "Directory" && op == "Read");
+    };
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"list_directory_users",)"
+        R"("arguments":{}}})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
 }
 
 TEST_CASE("MCP operator surface: revoke_upload_grant flips the REAL store row to revoked and "

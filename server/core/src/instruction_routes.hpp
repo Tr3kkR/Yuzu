@@ -12,19 +12,26 @@
 /// -> `deps.store->`), and the audit/event calls (`audit_log(...)` ->
 /// `deps.audit_fn(...)`, `emit_event(...)` -> `deps.emit_event_fn(...)`).
 ///
-/// NOT in this module (deliberately — outside #2542's route list for this
-/// extraction): `GET /fragments/instructions` (the definitions-list
+/// NOT in this module (deliberately — outside #2542 PR-7's route list for
+/// this extraction): `GET /fragments/instructions` (the definitions-list
 /// fragment) and its row-rendering helper, and `POST /fragments/
-/// instructions/yaml-preview` — both stay inline in server.cpp. The latter
-/// shares `validate_yaml_source`/`highlight_yaml` with this module's two
-/// YAML endpoints; see the "PROMOTED, NOT DUPLICATED" note below for why
-/// that sharing is preserved rather than forked.
+/// instructions/yaml-preview` — both stayed inline in server.cpp at PR-7
+/// time and were extracted later, into their own
+/// `instruction_fragment_routes.{hpp,cpp}` module (#2542 PR-12's Infra/Misc
+/// bundle — see that module's header for why: on inspection at PR-12 time,
+/// only `validate_yaml_source` was actually shared with this module's two
+/// YAML endpoints; `highlight_yaml` had exactly one caller, the yaml-preview
+/// route, and moved there rather than being promoted). See the "PROMOTED,
+/// NOT DUPLICATED" note below for `validate_yaml_source`'s own sharing
+/// story, which this module still participates in.
 ///
 /// PROMOTED, NOT DUPLICATED — `validate_yaml_source` and `log_safe`. Both
 /// were `static ServerImpl` members with call sites BOTH inside this
 /// extraction (the YAML save/validate routes below) AND outside it
-/// (`/fragments/instructions/yaml-preview` for `validate_yaml_source`,
-/// staying inline in server.cpp; the `/api/approvals/:id/{approve,reject}`
+/// (`/fragments/instructions/yaml-preview` for `validate_yaml_source` — that
+/// route itself later moved to `instruction_fragment_routes.cpp`, #2542
+/// PR-12, but the promotion made here at PR-7 time is what let it keep
+/// calling the free function unchanged; the `/api/approvals/:id/{approve,reject}`
 /// routes for `log_safe`, which #2542 PR-9 later extracted into
 /// `approval_routes.cpp` — reconciled at merge time onto this same
 /// promotion rather than PR-9's own independently-promoted `log_safe.hpp`).

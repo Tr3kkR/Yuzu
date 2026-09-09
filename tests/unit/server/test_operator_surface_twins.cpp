@@ -271,21 +271,16 @@ struct Harness {
               .instruction_store = &is,
               .execution_tracker = &tracker,
               .approval_manager = &approvals,
-              .dispatch_fn =
-                  [this](const std::string& plugin, const std::string& action,
-                         const std::vector<std::string>&, const std::string&,
-                         const std::unordered_map<std::string, std::string>&,
-                         const std::string&,
-                         const DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
-                      dispatched_actions.push_back(plugin + "." + action);
-                      return {.sent = 1, .command_id = "cmd-" + std::to_string(dispatched_actions.size())};
-                  },
-              // #3133 review fix: resolve_caller re-resolves a real caller
-              // from the schedule's creator at fire time — see
-              // test_schedule_runner.cpp's identical wiring.
-              .resolve_caller =
-                  [](const std::string& username) {
-                      return DispatchCaller{.principal = username, .system = false};
+              // WS-3 3.3: scheduled fires enqueue a durable outbox occurrence
+              // instead of dispatching inline (the delivery loop sends). The
+              // arming gate still runs at fire time BEFORE the enqueue, so a
+              // denied fire records nothing here exactly as a denied dispatch did
+              // — which is what these operator-surface-twin cases assert.
+              .enqueue_fn =
+                  [this](const yuzu::server::OutboxEnqueueRequest& req)
+                      -> yuzu::server::OutboxEnqueueOutcome {
+                      dispatched_actions.push_back(req.plugin + "." + req.action);
+                      return yuzu::server::OutboxEnqueueOutcome::Enqueued;
                   },
               .arming_check =
                   [this](const std::string& principal, const std::string& plugin,
@@ -426,6 +421,10 @@ constexpr TwinRow kExpectedTwins[] = {
     {"mint_upload_grant", "UploadGrant", "Write", false},
     {"list_upload_grants", "UploadGrant", "Read", true},
     {"revoke_upload_grant", "UploadGrant", "Delete", false},
+    // #4030: executions/workflows/schedules read-twin programme.
+    {"list_workflows", "Workflow", "Read", true},
+    {"get_workflow", "Workflow", "Read", true},
+    {"get_workflow_execution", "Workflow", "Read", true},
     // #4029 (api-parity Batch A content/catalog half): instruction-definition
     // read twins, pinned against instruction_definition_model.hpp / the new
     // GET /api/v1/instructions* routes (rest_api_v1.cpp).
@@ -443,6 +442,22 @@ constexpr TwinRow kExpectedTwins[] = {
     {"list_tar_process_tree_devices", "Infrastructure", "Read", true},
     {"list_tar_capture_sources_devices", "Infrastructure", "Read", true},
     {"list_tar_retention_paused", "Infrastructure", "Read", true},
+    // #4031: directory-sync (AD/Entra) read twin — parity with GET
+    // /api/v1/directory/users. The OIDC-config, auto-approve-rules, and
+    // pending-agents read twins are REST-only per #520 (see
+    // docs/mcp-server.md) and so carry no MCP tool, no row here.
+    //
+    // get_directory_status (the /directory/status twin) is deliberately NOT
+    // listed here even though it shares Directory:Read: it takes no input
+    // parameters, so its schema is the honest, bounded
+    // {"type":"object","properties":{}} shape — same precedent as
+    // get_guardian_schemas above, also absent from this array for the same
+    // reason (the A5 sweep below asserts every LISTED tool's schema differs
+    // from that literal, which is correct for this curated list but not a
+    // universal rule; validate_tool_security_registration's boot-time check
+    // is what proves get_directory_status's own table entries are
+    // consistent, and test_mcp_server.cpp exercises its dispatch directly).
+    {"list_directory_users", "Directory", "Read", true},
 };
 
 } // namespace

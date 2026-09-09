@@ -17,6 +17,9 @@
 #include "event_bus.hpp"
 #include "execution_event_bus.hpp"
 #include "execution_event_scope.hpp"
+#include "execution_model.hpp" // #4030: shared execution list/agent/kpi/response row builders
+#include "execution_scope_rules.hpp" // #4030: execution_visible/confined_projection — reused from
+                                     // the #3789 GET /api/executions precedent, not re-derived
 #include "guardian_rule_spec.hpp"
 #include "guardian_schema_registry.hpp"
 #include "http_route_sink.hpp"
@@ -1068,8 +1071,32 @@ const std::string& openapi_spec() {
     "/events": {
       "get": {"summary": "Subscribe to per-execution live events (JSON SSE)", "tags": ["Events"], "description": "Authenticated agentic-first JSON Server-Sent Events channel (sprint W5.1). Gated by the ADR-0017 admit-then-filter fleet-read primitive (Execution:Read) — an execution with no agent visible to the caller 404s identically to a nonexistent one; a confined subscriber's agent-transition events are filtered to their in-scope agents, execution-progress is withheld, and execution-completed carries only the real terminal status (no fleet-wide counts). Reuses the per-execution ExecutionEventBus that backs the dashboard /sse/executions/{id} route. Each SSE frame carries an `id:`, `event:` (one of `agent-transition`, `execution-progress`, `execution-completed`, plus the synthetic `replay-gap` / `events-dropped` / `heartbeat`), and a JSON `data:` payload conforming to ExecutionSseEvent. Reconnect via `Last-Event-ID` request header OR `?since=<event_id>` query (query wins). Non-integer `?since` values silently degrade to 0 (no replay). On reconnect after the per-execution ring buffer has evicted older events (FIFO, ~1000 events / ~30s window), a synthetic `replay-gap` frame is emitted as the first event so the worker knows state may be inconsistent. A slow consumer that lets the per-connection queue fill receives a synthetic `events-dropped` envelope summarising the drop count rather than silent OOM growth. Errors use the A4 envelope (ErrorEnvelope schema). Response headers always include X-Correlation-Id; Sec-Audit-Failed: true is set when audit persistence fails (CC6.6 contract).", "parameters": [{"name": "execution_id", "in": "query", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}, "description": "Execution to subscribe to. Unfiltered subscription is reserved for sprint W5.2."}, {"name": "since", "in": "query", "schema": {"type": "integer", "minimum": 0}, "description": "Replay events with id > since. Overrides Last-Event-ID header. Non-integer values silently degrade to 0."}, {"name": "Last-Event-ID", "in": "header", "schema": {"type": "string"}, "description": "Browser EventSource auto-reconnect header. Ignored when `since` is set."}], "responses": {"200": {"description": "SSE stream. Content-Type: text/event-stream. Each `data:` line is an ExecutionSseEvent.", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}, "Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when audit row persistence failed; subscription still proceeds (CC6.6 evidence chain)."}}, "content": {"text/event-stream": {"schema": {"$ref": "#/components/schemas/ExecutionSseEvent"}}}}, "400": {"description": "Missing or malformed execution_id", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "404": {"description": "Execution not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "410": {"description": "Execution already terminal — subscribe-time stream is no longer available", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Tracker or event bus not initialised; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     },
+    "/executions": {
+      "get": {"summary": "List executions, fleet-confined (#4030)", "tags": ["Events"], "description": "REST v1 twin of the dashboard /fragments/executions list fragment and the widened MCP list_executions tool (docs/api-twin-recipe.md Rule 1 — all three call the same execution_list_row_json builder). Gated on the ADR-0017 fleet-read primitive (Execution:Read via fleet_read_fn) — NOT the fragment's plain permission check, closing a real confinement gap rather than copying it into new surface. Rows carry the definition name (resolved + memoized per request) and a truncated last_error_detail preview alongside the existing agents_targeted/responded/success/failure split.", "parameters": [{"name": "definition_id", "in": "query", "required": false, "schema": {"type": "string"}}, {"name": "status", "in": "query", "required": false, "schema": {"type": "string"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 100, "maximum": 500}}], "responses": {"200": {"description": "Execution list", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}}, "400": {"description": "Invalid numeric query parameter"}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "503": {"description": "Execution tracker not initialised or degraded; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+    },
     "/executions/{id}": {
-      "get": {"summary": "Fetch the final state of a single execution (#1088)", "tags": ["Events"], "description": "Companion to GET /api/v1/events: when the SSE subscribe returns 410 (execution already terminal), the worker calls this endpoint to fetch the final state in one round-trip. Mirrors the dashboard /fragments/executions/{id}/detail data but JSON-shaped. Gated by the ADR-0017 admit-then-filter fleet-read primitive (Execution:Read) — an execution with no agent visible to the caller 404s identically to a nonexistent one; a confined caller's counts/last_error_detail are recomputed from only their visible agents, and scope_expression/parameter_values are redacted — the execution's dispatcher is admitted to VIEW it (avoids a false 404 on a just-dispatched execution with no responses yet) but gets the same redacted projection as any other confined caller.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}}], "responses": {"200": {"description": "Final execution state", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "404": {"description": "Execution not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Execution tracker not initialised; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+      "get": {"summary": "Fetch the final state of a single execution (#1088), optional per-agent expansion (#4030)", "tags": ["Events"], "description": "Companion to GET /api/v1/events: when the SSE subscribe returns 410 (execution already terminal), the worker calls this endpoint to fetch the final state in one round-trip. Mirrors the dashboard /fragments/executions/{id}/detail data but JSON-shaped. Gated by the ADR-0017 admit-then-filter fleet-read primitive (Execution:Read) — an execution with no agent visible to the caller 404s identically to a nonexistent one; a confined caller's counts/last_error_detail are recomputed from only their visible agents, and scope_expression/parameter_values are redacted — the execution's dispatcher is admitted to VIEW it (avoids a false 404 on a just-dispatched execution with no responses yet) but gets the same redacted projection as any other confined caller. #4030: ?include=agents adds a confined per-agent status/duration array (agent_id/status/dispatched_at/first_response_at/completed_at/exit_code/error_detail) plus a kpi object (total/succeeded/failed/p50_ms/p95_ms) to the response — a deliberate query-param widening of this SAME route rather than a new one, so the fragment's aggregate+per-agent capability stays one genuine twin; this expansion IS audited (execution.detail.fetch, REST fail-closed) because it discloses raw agent identities, unlike the bare request. Response bodies are a SEPARATE route (GET .../responses) on a different securable (Response:Read), not part of this expansion.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}}, {"name": "include", "in": "query", "required": false, "schema": {"type": "string", "enum": ["agents"]}, "description": "When \"agents\", adds the per-agent array + kpi object described above."}], "responses": {"200": {"description": "Final execution state, optionally with agents[]/kpi", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "404": {"description": "Execution not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Execution tracker not initialised/degraded, or (when include=agents) the execution.detail.fetch audit row could not persist; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+    },
+    "/executions/{id}/responses": {
+      "get": {"summary": "Responses for one execution (#4030)", "tags": ["Events"], "description": "REST v1 twin of MCP query_responses' execution_id-scoped filter (no new MCP tool: query_responses already covers this shape). A DISTINCT route from GET /executions/{id}, not a query param on it — response bodies are gated on Response:Read, a different securable than the detail route's Execution:Read. Scope pushdown mirrors query_responses exactly: distinct_agent_ids_by_execution -> in_scope filter -> pushed into the store query BEFORE limit (ADR-0017 INV-3). No offset parameter, matching query_responses exactly: the result set orders by a non-unique, actively-growing timestamp while an execution is non-terminal, so offset-based paging would silently skip or duplicate rows -- a caller-supplied offset is rejected with 400, not silently ignored (#4030 Gate 8 fix). Audited as execution.detail.fetch, REST fail-closed.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}}, {"name": "agent_id", "in": "query", "required": false, "schema": {"type": "string"}}, {"name": "status", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "since", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "until", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "Response rows for this execution", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}}, "400": {"description": "Invalid numeric query parameter, or offset supplied (not supported on this route)"}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Response:Read)"}, "503": {"description": "Response store not initialised/degraded, or the execution.detail.fetch audit row could not persist; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+    })json"
+        // Split here (MSVC C2026 ~16,380-byte per-literal cap): the
+        // Executions/Workflows/Schedules read-twin routes (#4030) grew this
+        // segment past the cap. Adjacent string literals are concatenated
+        // at compile time, so the emitted OpenAPI JSON is byte-identical to
+        // the unsplit form.
+        R"json(,
+    "/workflows": {
+      "get": {"summary": "List workflows (#4030)", "tags": ["Workflows"], "description": "REST v1 twin of the legacy GET /api/workflows and MCP list_workflows (new). Requires Workflow:Read (RBAC seeding prerequisite fixed by #4030/#4032 — Workflow was gated but never seeded, so no role could hold this grant before this change). Shared builder workflow_row_json (workflow_model.hpp) — REST/MCP cannot drift on field set.", "parameters": [{"name": "name", "in": "query", "required": false, "schema": {"type": "string"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 100, "maximum": 500}}], "responses": {"200": {"description": "Workflow list"}, "400": {"description": "Invalid limit or numeric query parameter"}, "403": {"description": "Insufficient permission (Workflow:Read)"}, "503": {"description": "Workflow engine not available"}}}
+    },
+    "/workflows/{id}": {
+      "get": {"summary": "Fetch one workflow (#4030)", "tags": ["Workflows"], "description": "REST v1 twin of the legacy GET /api/workflows/{id} and MCP get_workflow (new). Requires Workflow:Read. Full step list plus yaml_source. Shared builder workflow_detail_json.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Workflow detail"}, "403": {"description": "Insufficient permission (Workflow:Read)"}, "404": {"description": "Workflow not found"}, "503": {"description": "Workflow engine not available"}}}
+    },
+    "/workflow-executions/{id}": {
+      "get": {"summary": "Fetch one workflow execution (#4030)", "tags": ["Workflows"], "description": "REST v1 twin of the legacy GET /api/workflow-executions/{id} and MCP get_workflow_execution (new) — WorkflowEngine's own per-step execution record, a DIFFERENT data model from ExecutionTracker's fan-out Execution (GET /executions/{id}). Both this route and the legacy twin gate on fleet_read_fn (Workflow:Read) with record-level confinement (#4030 Gate 8 fix): a caller with no agent visible in agent_ids_json 404s identically to a nonexistent execution, never a narrower-but-present record; an admitted confined caller's agent_ids is narrowed to their visible agents and each step's result.agents_reached is stripped. Audited as workflow_execution.detail.fetch (set-and-proceed) on both the success path and the confinement-denied path — a genuinely nonexistent id writes no audit row (the denied row alone therefore distinguishes 'exists, out of scope' from 'never existed' for a caller who also holds AuditLog:Read; tracked open). Shared builder workflow_execution_detail_json.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Workflow execution detail"}, "403": {"description": "Insufficient permission (Workflow:Read)"}, "404": {"description": "Execution not found"}, "503": {"description": "Workflow engine not available"}}}
+    },
+    "/schedules": {
+      "get": {"summary": "List schedules (#4030)", "tags": ["Workflows"], "description": "REST v1 twin of the dashboard GET /fragments/schedules fragment and the widened MCP list_schedules tool (now includes execution_count). NOT the separate legacy unversioned GET /api/schedules (a distinct, untouched capability). Same two-stage gate as the fragment: a service-scoped token is denied the fleet-wide list outright, then Schedule:Read. Shared builder schedule_row_json. Gated on query_schedules_checked (#4030 review finding): a store/pool failure returns 503 with retry_after_ms rather than a false empty list. The underlying query is hard-capped at 100 rows (no caller-visible limit/cursor); when the fleet has more schedules than that, `pagination.result_truncated_by_cap: true` is added so `pagination.total` is never presented as the fleet's true count.", "responses": {"200": {"description": "Schedule list. pagination.result_truncated_by_cap is present (true) when the 100-row cap dropped rows."}, "403": {"description": "Insufficient permission (Schedule:Read), or a service-scoped token denied the fleet-wide list"}, "503": {"description": "Schedule engine not available, or the store query itself failed (retry_after_ms in the A4 envelope)"}}}
     })json"
         // Fresh literal split (MSVC C2026 ~16 KB per-literal cap) before the A4 approvals row.
         R"json(,
@@ -1378,6 +1405,24 @@ const std::string& openapi_spec() {
     },
     "/license/alerts": {
       "get": {"summary": "List license alerts (expiration warnings, seat-limit approaching)", "tags": ["License Management"], "description": "Only available when LicenseStore is wired — the server does not construct it today (licensing deliberately shelved, ADR-0048); documented for when a future change re-wires it. Requires License:Read.", "parameters": [{"name": "unacknowledged", "in": "query", "required": false, "schema": {"type": "boolean"}, "description": "When present/true, return only unacknowledged alerts"}], "responses": {"200": {"description": "{data: [{id, alert_type, message, triggered_at, acknowledged}]}"}, "503": {"description": "A genuine database read failure"}}}
+    })json"
+        // Fresh literal split (MSVC C2026 16,380-byte cap) — #4031 directory/
+        // enrollment/OIDC-config read twins.
+        R"json(,
+    "/directory/users": {
+      "get": {"summary": "List AD/Entra-synced directory users", "tags": ["Directory Sync"], "description": "#4031 REST v1 twin of legacy GET /api/directory/users and MCP tool list_directory_users — all three call the same directory_user_row_json builder. Requires Directory:Read. Genuinely PII (email/UPN/group membership); every call is audited (directory.users.view) and the route FAILS CLOSED (503) if the audit row cannot be persisted (docs/api-twin-recipe.md §4). Plain cache read of the Postgres-backed directory_sync schema — no live LDAP/Entra call (that is the separate POST /api/directory/sync).", "parameters": [{"name": "group_id", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Filter to users in this directory group"}], "responses": {"200": {"description": "{data: [{id, display_name, email, upn, enabled, groups, synced_at}], pagination: {total}}"}, "403": {"description": "Directory:Read denied"}, "503": {"description": "Directory sync not available, or the audit subsystem is unavailable (refuses to serve PII without durable evidence)", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Set when the audit row failed to persist; the 503 body itself is returned in that case, not partial data."}}}}}
+    },
+    "/directory/status": {
+      "get": {"summary": "Get AD/Entra directory-sync status", "tags": ["Directory Sync"], "description": "#4031 REST v1 twin of legacy GET /api/directory/status and MCP tool get_directory_status — all three call the same directory_status_json builder. Requires Directory:Read. No per-person PII (counts + synced-group metadata only), so unaudited, matching the legacy route's own posture. groups[].mapped_role (the AD-group -> Yuzu-role authorization map) is the empty string for a non-admin caller — admin-only, same posture as OidcConfig's admin_group field.", "responses": {"200": {"description": "{data: {provider, status, last_sync_at, user_count, group_count, last_error, groups: [{id, display_name, description, mapped_role, synced_at}]}}"}, "403": {"description": "Directory:Read denied"}, "503": {"description": "Directory sync not available"}}}
+    },
+    "/enrollment/auto-approve-rules": {
+      "get": {"summary": "List auto-approve enrollment rules", "tags": ["Enrollment"], "description": "#4031 REST v1 twin of GET /fragments/settings/auto-approve. Requires Enrollment:Read — REST-only, no MCP twin (reviewed exception to #520: auto_approve_engine, like settings, is not a fleet-query surface MCP tokens are meant to reach; see docs/mcp-server.md and the sibling settings issue #4028's identical decision). Administrator-only today (matching the previous admin_fn_ gate); the (Enrollment, Read) pair is in authz_topology_floor.hpp's kTopologyFloor so an RBAC-off deployment cannot silently widen this to any authenticated user. Audited (enrollment.auto_approve.view, non-blocking — rule set is auto-enrollment bypass criteria, reconnaissance-valuable but not per-person PII).", "responses": {"200": {"description": "{data: {rules: [{index, type, value, label, enabled}], require_all}}"}, "403": {"description": "Enrollment:Read denied"}, "503": {"description": "Auto-approve engine not available"}}}
+    },
+    "/enrollment/pending-agents": {
+      "get": {"summary": "List pending/denied agent-enrollment requests", "tags": ["Enrollment"], "description": "#4031 REST v1 twin of GET /fragments/settings/pending. Requires Enrollment:Read — REST-only, no MCP twin, same #520 exception as auto-approve-rules above; do NOT conflate with the unrelated existing MCP tool list_pending_approvals (ApprovalManager's maker-checker action-approval queue, a different domain). Administrator-only in the default seed, floored in authz_topology_floor.hpp for RBAC-off. Rows carry genuine per-agent identity (agent_id/hostname/os/arch/agent_version), so unlike this file's other Enrollment/OidcConfig/Directory routes this one gates on the ADR-0017 admit-then-filter chokepoint (require_fleet_read), not a bare permission check — a management-group-scoped Enrollment:Read grant is admitted and gets the real visible-agent intersection, typically empty for pending (not-yet-approved) agents since they normally hold no group membership yet (not a data-model guarantee — a pre-assigned membership row yields a non-empty, correctly-confined result), rather than being denied outright. Audited (enrollment.pending_agents.view, non-blocking — device-identity fingerprint data, a lighter version of the device_ci GDPR-personal-data-adjacent class).", "responses": {"200": {"description": "{data: [{agent_id, hostname, os, arch, agent_version, requested_at, status}], pagination: {total}} — data is the caller's confined slice: unfiltered for a global grant, the real (typically empty, but not data-model-guaranteed) intersection for a management-group-scoped one"}, "403": {"description": "Enrollment:Read denied"}, "503": {"description": "Auth manager not available, or the ADR-0017 authorization gate is unavailable"}}}
+    },
+    "/settings/oidc": {
+      "get": {"summary": "Get OIDC SSO configuration", "tags": ["Settings"], "description": "#4031 REST v1 twin of GET /fragments/settings/directory — despite that legacy path, this is pure OIDC SSO config (Issuer/Client ID/Redirect URI/Admin Group/Skip-TLS-Verify), NOT the AD/Entra directory-sync feature (see /directory/users, /directory/status above); deliberately gated on the freshly-minted OidcConfig securable, never Directory, to avoid colliding with that unrelated capability. Requires OidcConfig:Read — REST-only, no MCP twin, same #520 exception as the enrollment routes above. Administrator-only today, floored in authz_topology_floor.hpp. Audited (settings.oidc.view, non-blocking — IdP/admin-group recon value). The client secret is never disclosed, masked/placeholder-only, only client_secret_configured (bool) is returned.", "responses": {"200": {"description": "{data: {configured, issuer, client_id, client_secret_configured, redirect_uri, admin_group, skip_tls_verify}}"}, "403": {"description": "OidcConfig:Read denied"}, "503": {"description": "Server config not available"}}}
     }
   }
 })json";
@@ -7342,6 +7387,315 @@ void RestApiV1::register_routes(
                                  "application/json");
              });
 
+    // ── GET /api/v1/executions — confined list twin of GET /fragments/executions
+    // (workflow_routes.cpp) + widened MCP `list_executions` (#4030). MUST use
+    // fleet_read_fn/require_fleet_read (ADR-0017), NOT the fragment's plain
+    // perm_fn -- the fragment's own gate is a real, documented confinement
+    // gap this new route must not inherit (out of scope to fix the fragment
+    // itself, per the recipe's twin-PR guidance). Confinement mirrors the
+    // already-shipped, SQL-pushdown `GET /api/executions` (server.cpp
+    // #3789) via execution_scope_rules.hpp's shared
+    // execution_visible/confined_projection -- not re-derived here.
+    //
+    // Auth: Execution:Read via fleet_read_fn. No audit call: matches the
+    // fragment's own unaudited posture and the recipe's
+    // `list_software_deployments` precedent -- metadata about executions,
+    // not itself the per-agent behavioural PII the detail route's per-agent
+    // expansion carries.
+    sink.Get(
+        "/api/v1/executions",
+        [fleet_read_fn, auth_fn, execution_tracker, instruction_store](
+            const httplib::Request& req, httplib::Response& res) {
+            const auto cid = detail::make_correlation_id();
+            res.set_header("X-Correlation-Id", cid);
+            if (!fleet_read_fn) {
+                spdlog::error("GET /api/v1/executions: fleet_read_fn unwired; cid={}", cid);
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                "application/json");
+                return;
+            }
+            auto gate = fleet_read_fn(req, res, "Execution", "Read");
+            if (!gate.admitted)
+                return; // gate already wrote the response.
+            if (!execution_tracker) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "execution tracker unavailable",
+                                     {.retry_after_ms = 5000}),
+                    "application/json");
+                return;
+            }
+
+            ExecutionQuery q;
+            q.include_error_detail = true; // #4030: list twin surfaces an error preview
+            if (req.has_param("definition_id"))
+                q.definition_id = req.get_param_value("definition_id");
+            if (req.has_param("status"))
+                q.status = req.get_param_value("status");
+            try {
+                if (req.has_param("limit"))
+                    q.limit = std::stoi(req.get_param_value("limit"));
+            } catch (const std::exception&) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
+                                "application/json");
+                return;
+            }
+            if (q.limit < 1)
+                q.limit = 1;
+            if (q.limit > 500)
+                q.limit = 500;
+
+            yuzu::server::ExecutionScope scope_arg; // nullopt = unrestricted
+            std::string username;
+            if (gate.scope) {
+                auto session = auth_fn(req, res);
+                if (!session)
+                    return;
+                username = session->username;
+                // #1634/#3789 precedent: an empty username under an engaged
+                // scope must never silently widen the owner disjunct to "no
+                // owner filter" for a confined caller.
+                if (username.empty()) {
+                    res.status = 503;
+                    res.set_content(
+                        detail::a4_error(res,
+                                         "unable to resolve caller identity for a confined read",
+                                         {.retry_after_ms = 5000}),
+                        "application/json");
+                    return;
+                }
+                yuzu::server::ExecutionListScope s;
+                s.owner = username;
+                s.visible_agents.assign(gate.scope->begin(), gate.scope->end());
+                scope_arg = std::move(s);
+            }
+
+            auto execs_opt = execution_tracker->query_executions_checked(q, scope_arg);
+            if (!execs_opt) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "execution tracker degraded", {.retry_after_ms = 5000}),
+                    "application/json");
+                return;
+            }
+            const auto& execs = *execs_opt;
+
+            // Memoized per request -- the fragment's own per-row get_definition
+            // lookup is accepted at its LIMIT 50; this route caps at 500, so an
+            // unmemoized per-row lookup would be a real N+1.
+            std::unordered_map<std::string, std::string> definition_names;
+            auto resolve_definition_name = [&](const std::string& definition_id) -> std::string {
+                if (definition_id.empty())
+                    return {};
+                auto it = definition_names.find(definition_id);
+                if (it != definition_names.end())
+                    return it->second;
+                std::string name;
+                if (instruction_store) {
+                    auto def = instruction_store->get_definition(definition_id);
+                    if (def && *def)
+                        name = (*def)->name;
+                }
+                definition_names.emplace(definition_id, name);
+                return name;
+            };
+
+            JArr arr;
+            if (gate.scope) {
+                std::vector<std::string> ids;
+                ids.reserve(execs.size());
+                for (const auto& e : execs)
+                    ids.push_back(e.id);
+                auto statuses_opt =
+                    execution_tracker->get_agent_statuses_for_executions_checked(ids);
+                if (!statuses_opt) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "execution tracker degraded",
+                                                     {.retry_after_ms = 5000}),
+                                    "application/json");
+                    return;
+                }
+                static const std::vector<AgentExecStatus> kEmptyStatuses;
+                for (const auto& e : execs) {
+                    auto it = statuses_opt->find(e.id);
+                    const auto& statuses =
+                        it != statuses_opt->end() ? it->second : kEmptyStatuses;
+                    if (!execution_visible(e, statuses, gate.scope, username))
+                        continue;
+                    auto counts = confined_projection(statuses, gate.scope);
+                    ExecutionListRow row;
+                    row.id = e.id;
+                    row.definition_id = e.definition_id;
+                    row.definition_name = resolve_definition_name(e.definition_id);
+                    row.status = e.status;
+                    row.dispatched_by = e.dispatched_by;
+                    row.dispatched_at = e.dispatched_at;
+                    row.agents_targeted = counts.agents_targeted;
+                    row.agents_responded = counts.agents_responded;
+                    row.agents_success = counts.agents_success;
+                    row.agents_failure = counts.agents_failure;
+                    row.completed_at = e.completed_at;
+                    row.rerun_of = e.rerun_of;
+                    row.error_preview = truncate_utf8(counts.last_error_detail, 80);
+                    arr.add_raw(execution_list_row_json(row).dump());
+                }
+            } else {
+                for (const auto& e : execs) {
+                    ExecutionListRow row;
+                    row.id = e.id;
+                    row.definition_id = e.definition_id;
+                    row.definition_name = resolve_definition_name(e.definition_id);
+                    row.status = e.status;
+                    row.dispatched_by = e.dispatched_by;
+                    row.dispatched_at = e.dispatched_at;
+                    row.agents_targeted = e.agents_targeted;
+                    row.agents_responded = e.agents_responded;
+                    row.agents_success = e.agents_success;
+                    row.agents_failure = e.agents_failure;
+                    row.completed_at = e.completed_at;
+                    row.rerun_of = e.rerun_of;
+                    row.error_preview = truncate_utf8(e.last_error_detail, 80);
+                    arr.add_raw(execution_list_row_json(row).dump());
+                }
+            }
+            res.set_content(list_json(arr.str(), arr.size()), "application/json");
+        });
+
+    // ── GET /api/v1/executions/{id}/responses — execution-scoped responses
+    // (#4030), mirroring MCP `query_responses`'s `execution_id` filter (no
+    // new MCP tool needed: `query_responses` already covers this shape --
+    // this route is ITS REST v1 twin). A DISTINCT route from the detail
+    // route below, not a query param on it: response bodies are gated on
+    // `Response:Read`, a different securable than the detail route's
+    // `Execution:Read` -- folding them into the same route+gate would leak
+    // response bodies to any Execution:Read holder lacking Response:Read.
+    sink.Get(
+        R"(/api/v1/executions/([A-Za-z0-9_-]{1,128})/responses)",
+        [fleet_read_fn, audit_fn, response_store](const httplib::Request& req,
+                                                   httplib::Response& res) {
+            const auto cid = detail::make_correlation_id();
+            res.set_header("X-Correlation-Id", cid);
+            if (!fleet_read_fn) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                "application/json");
+                return;
+            }
+            auto gate = fleet_read_fn(req, res, "Response", "Read");
+            if (!gate.admitted)
+                return; // gate already wrote the response.
+            if (!response_store || !response_store->is_open()) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "response store unavailable", {.retry_after_ms = 5000}),
+                    "application/json");
+                return;
+            }
+            auto execution_id = req.matches[1].str();
+
+            ResponseQuery q;
+            if (req.has_param("agent_id"))
+                q.agent_id = req.get_param_value("agent_id");
+            try {
+                if (req.has_param("status"))
+                    q.status = std::stoi(req.get_param_value("status"));
+                if (req.has_param("since"))
+                    q.since = std::stoll(req.get_param_value("since"));
+                if (req.has_param("until"))
+                    q.until = std::stoll(req.get_param_value("until"));
+                if (req.has_param("limit"))
+                    q.limit = std::stoi(req.get_param_value("limit"));
+            } catch (const std::exception&) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
+                                "application/json");
+                return;
+            }
+            // #4030 Gate 8 fix (sre, Gate 6): was floor-only via
+            // ResponseStore's own sanitize_limit() -- no ceiling reached
+            // Postgres, unlike its declared MCP twin query_responses
+            // (clamped [1,1000]) and every other limit-accepting route in
+            // this file.
+            q.limit = std::min(q.limit, 1000);
+            // #4030 Gate 8 fix: `offset` is deliberately NOT accepted here,
+            // matching its declared MCP twin `query_responses`, which
+            // omits it for the same reason (mcp_server.cpp's own comment
+            // on that tool): the result set orders by non-unique
+            // `timestamp DESC` (response_store.cpp's
+            // `query_by_execution`) and actively grows while an execution
+            // is non-terminal, so offset-based paging silently skips or
+            // duplicates rows with zero signal to the caller (Gate 4
+            // happy-path finding 1, I3/HIGH). Reject rather than
+            // silently ignore a caller-supplied `offset` -- honest under
+            // A4 (a caller relying on it to page deserves an error, not a
+            // response that quietly served page 1 again).
+            if (req.has_param("offset")) {
+                res.status = 400;
+                res.set_content(
+                    detail::a4_error(res,
+                                     "offset is not supported on this route -- the result set "
+                                     "orders by a non-unique, actively-growing timestamp and "
+                                     "offset-based paging would silently skip or duplicate rows "
+                                     "while the execution is non-terminal; use the limit/since "
+                                     "cursor shape instead, matching MCP query_responses"),
+                    "application/json");
+                return;
+            }
+
+            // #1634/ADR-0017 INV-3: resolve the in-scope agent set and push it
+            // into the store query BEFORE LIMIT/OFFSET -- mirrors MCP
+            // query_responses' execution_id path exactly (mcp_server.cpp).
+            AggregateScope scope_arg; // nullopt = unrestricted
+            if (gate.scope) {
+                auto distinct = response_store->distinct_agent_ids_by_execution(execution_id);
+                if (!distinct) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "response store degraded",
+                                                     {.retry_after_ms = 5000}),
+                                    "application/json");
+                    return;
+                }
+                std::vector<std::string> in_scope;
+                in_scope.reserve(distinct->size());
+                for (auto& aid : *distinct) {
+                    if (authz::in_scope(gate.scope, aid))
+                        in_scope.push_back(std::move(aid));
+                }
+                scope_arg = std::move(in_scope); // engaged-empty means no rows
+            }
+
+            auto responses_opt =
+                response_store->query_by_execution(execution_id, q, scope_arg);
+            if (!responses_opt) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "response store degraded", {.retry_after_ms = 5000}),
+                    "application/json");
+                return;
+            }
+
+            if (!detail::emit_behavioral_audit(audit_fn, req, res, "execution.detail.fetch",
+                                               "success", "Execution", execution_id,
+                                               "REST execution-scoped responses read cid=" +
+                                                   cid)) {
+                res.status = 503;
+                res.set_content(
+                    detail::error_json_a4(503,
+                                          "audit subsystem unavailable; refusing to serve "
+                                          "response data without durable evidence",
+                                          cid, 5000, "retry the request"),
+                    "application/json");
+                return;
+            }
+
+            JArr arr;
+            for (const auto& r : *responses_opt)
+                arr.add_raw(execution_response_row_json(r).dump());
+            res.set_content(list_json(arr.str(), arr.size()), "application/json");
+        });
+
     // ── GET /api/v1/executions/{id} — final-state lookup (#1088 UAT-found gap)
     //
     // The W5.1 `GET /api/v1/events` 410 envelope's remediation hint
@@ -7390,17 +7744,31 @@ void RestApiV1::register_routes(
             }
             auto exec_id = req.matches[1].str();
             auto exec_opt = execution_tracker->get_execution(exec_id);
+            // #4030: optional per-agent status/duration expansion --
+            // `?include=agents` adds a per-agent array + KPI summary to this
+            // SAME route (the issue's query-param decision, not a distinct
+            // route: keeps one canonical detail endpoint, and lets the
+            // ledger record a genuine single REST+MCP twin for the
+            // fragment's aggregate+per-agent capability). Response BODIES
+            // stay a separate route (GET .../responses, above) gated on the
+            // distinct Response:Read securable -- folding them in here would
+            // leak response bodies to any Execution:Read holder lacking
+            // Response:Read.
+            bool include_agents = false;
+            if (req.has_param("include"))
+                include_agents = req.get_param_value("include").find("agents") != std::string::npos;
             // #1634 perf (governance Gate 3 finding): only fetch/scan agent
-            // statuses when confined — an unrestricted caller (gate.scope ==
-            // nullopt, the common RBAC-off/global-permission case) is always
-            // visible regardless, so this indexed lookup would be pure waste
-            // on every single-execution read. Fetch and scan the same status
-            // set for a missing id and an invisible id when confined. Do not
-            // stop on the first visible row: #1634 collapses both cases to
-            // one 404 without a scan-length existence oracle.
+            // statuses when confined OR the caller asked for the per-agent
+            // expansion — an unrestricted caller with no `include=agents` is
+            // always visible regardless, so this indexed lookup would be
+            // pure waste on every single-execution read. Fetch and scan the
+            // same status set for a missing id and an invisible id when
+            // confined. Do not stop on the first visible row: #1634
+            // collapses both cases to one 404 without a scan-length
+            // existence oracle.
             std::vector<AgentExecStatus> agents;
             bool has_visible_agent = false;
-            if (gate.scope) {
+            if (gate.scope || include_agents) {
                 // #1634 (Doomgoose review finding, important): a plain
                 // vector cannot distinguish "genuinely zero agent rows"
                 // from "a transient PG pool/query degrade" — the old
@@ -7499,24 +7867,62 @@ void RestApiV1::register_routes(
             }
             // Deliberately keep status, completion time, dispatcher, and lineage
             // truthful for this narrower #1634 slice; none directly names another agent.
-            auto data = JObj()
-                            .add("id", e.id)
-                            .add("definition_id", e.definition_id)
-                            .add("status", e.status)
-                            .add("scope_expression", scope_expression)
-                            .add("parameter_values", parameter_values)
-                            .add("dispatched_by", e.dispatched_by)
-                            .add("dispatched_at", static_cast<int64_t>(e.dispatched_at))
-                            .add("agents_targeted", agents_targeted)
-                            .add("agents_responded", agents_responded)
-                            .add("agents_success", agents_success)
-                            .add("agents_failure", agents_failure)
-                            .add("completed_at", static_cast<int64_t>(e.completed_at))
-                            .add("parent_id", e.parent_id)
-                            .add("rerun_of", e.rerun_of)
-                            .add("last_error_detail", last_error_detail)
-                            .str();
-            res.set_content(ok_json(data), "application/json");
+            JObj data_obj;
+            data_obj.add("id", e.id)
+                .add("definition_id", e.definition_id)
+                .add("status", e.status)
+                .add("scope_expression", scope_expression)
+                .add("parameter_values", parameter_values)
+                .add("dispatched_by", e.dispatched_by)
+                .add("dispatched_at", static_cast<int64_t>(e.dispatched_at))
+                .add("agents_targeted", agents_targeted)
+                .add("agents_responded", agents_responded)
+                .add("agents_success", agents_success)
+                .add("agents_failure", agents_failure)
+                .add("completed_at", static_cast<int64_t>(e.completed_at))
+                .add("parent_id", e.parent_id)
+                .add("rerun_of", e.rerun_of)
+                .add("last_error_detail", last_error_detail);
+            if (include_agents) {
+                // #4030: per-agent status/duration array + KPI summary,
+                // confined to the same visible set as the aggregate counts
+                // above (never the unredacted `agents` vector directly).
+                JArr agent_rows;
+                std::vector<AgentExecStatus> kpi_source;
+                kpi_source.reserve(agents.size());
+                for (const auto& a : agents) {
+                    if (gate.scope && !authz::in_scope(gate.scope, a.agent_id))
+                        continue;
+                    agent_rows.add_raw(execution_agent_status_json(a).dump());
+                    kpi_source.push_back(a);
+                }
+                auto kpi = compute_execution_kpi(kpi_source);
+                data_obj.raw("agents", agent_rows.str())
+                    .raw("kpi", execution_kpi_json(kpi).dump());
+                // #4030 audit decision: the per-agent expansion carries raw
+                // agent identities/durations, worth the same behavioural-PII
+                // posture as the fragment's own `execution.detail.view` —
+                // reuse THIS route's existing verb (`execution.detail.fetch`,
+                // the aggregate-fetch verb) rather than mint a new one, per
+                // the recipe's domain-verb-over-generic-name preference. REST
+                // fail-closed (503) on a persist failure; the bare (no
+                // `include`) request above is intentionally left unaudited,
+                // matching this route's pre-#4030 posture — only the new,
+                // wider disclosure gets the new audit call.
+                if (!detail::emit_behavioral_audit(audit_fn, req, res, "execution.detail.fetch",
+                                                   "success", "Execution", e.id,
+                                                   "REST per-agent expansion cid=" + cid)) {
+                    res.status = 503;
+                    res.set_content(
+                        detail::error_json_a4(503,
+                                              "audit subsystem unavailable; refusing to "
+                                              "serve agent data without durable evidence",
+                                              cid, 5000, "retry the request"),
+                        "application/json");
+                    return;
+                }
+            }
+            res.set_content(ok_json(data_obj.str()), "application/json");
         });
 
     // ── GET /api/v1/approvals/{id} — single approval status (A4 status_url) ──

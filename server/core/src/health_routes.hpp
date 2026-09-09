@@ -154,6 +154,7 @@ class DirectorySync;
 class WorkflowEngine;
 class ScheduleEngine;
 class ExecutionTracker;    // + fragment summary
+class CommandOutboxStore;  // WS-3 3.3: /readyz + /healthz + /metrics backlog gauge
 class ManagementGroupStore; // + /metrics
 
 // Stores checked by /readyz ONLY.
@@ -257,6 +258,7 @@ struct Deps {
     WorkflowEngine* workflow_engine{nullptr};
     ScheduleEngine* schedule_engine{nullptr};
     ExecutionTracker* execution_tracker{nullptr};
+    CommandOutboxStore* command_outbox_store{nullptr}; // WS-3 3.3
 
     // ---- stores checked by /readyz ONLY ----
     ApiTokenStore* api_token_store{nullptr};

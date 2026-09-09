@@ -394,10 +394,12 @@ yuzu_server_core_lib = static_library(
     'src/ota_signature_sidecar.cpp',
     'src/update_registry.cpp',
     'src/response_store.cpp',
+    'src/response_routes.cpp',
     'src/bundle_service.cpp',
     'src/bundle_orchestrator.cpp',
     'src/audit_store.cpp',
     'src/tag_store.cpp',
+    'src/tag_routes.cpp',
     'src/scope_engine.cpp',
     'src/yaml_scan.cpp',
     'src/scope_yaml.cpp',
@@ -409,9 +411,12 @@ yuzu_server_core_lib = static_library(
     'src/instruction_definition_model.cpp', # #4029: shared REST v1 + MCP builder
     'src/instruction_routes.cpp',
     'src/execution_tracker.cpp',
+    'src/execution_model.cpp',
     'src/execution_routes.cpp',
     'src/health_routes.cpp',
     'src/leader_elector.cpp',
+    'src/command_outbox_store.cpp',
+    'src/command_outbox_delivery.cpp',
     'src/execution_event_bus.cpp',
     'src/fleet_topology_store.cpp',
     'src/heartbeat_ingestion.cpp',
@@ -445,6 +450,7 @@ yuzu_server_core_lib = static_library(
     'src/scim_store.cpp',
     'src/scim_json.cpp',
     'src/scim_routes.cpp',
+    'src/sso_boot_guard.cpp',
     'src/deprovision_revoke.cpp',
     'src/quarantine_store.cpp',
     'src/quarantine_reapply.cpp',
@@ -512,10 +518,18 @@ yuzu_server_core_lib = static_library(
     'src/dashboard_api_routes.cpp',
     'src/nvd_routes.cpp',
     'src/approval_routes.cpp',
+    'src/config_routes.cpp', # #2542 PR-12: the 2-route Runtime Configuration API (7.3), extracted onto the HttpRouteSink seam
+    'src/diagnostics_routes.cpp', # #2542 PR-12: the 5-route Chargen + Procfetch diagnostic API, extracted onto the HttpRouteSink seam
+    'src/legacy_events_routes.cpp', # #2542 PR-12: the legacy GET /events SSE stream, extracted onto the HttpRouteSink seam
+    'src/instruction_fragment_routes.cpp', # #2542 PR-12: the 2-route Instructions HTMX fragment pair, extracted onto the HttpRouteSink seam
+    'src/approvals_fragment_routes.cpp', # #2542 PR-12: the Approvals HTMX fragment, extracted onto the HttpRouteSink seam
+    'src/mcp_disabled_routes.cpp', # #2542 PR-12: the 3-route MCP-disabled stub triple, extracted onto the HttpRouteSink seam
     'src/webhook_routes.cpp',
     'src/offload_routes.cpp',
     'src/discovery_routes.cpp',
     'src/discover_routes.cpp', # A2 discovery surface: /api/v1/discover/* (Issue 17.1)
+    'src/enrollment_directory_model.cpp', # #4031: shared row builders — directory/enrollment/OIDC-config read twins
+    'src/enrollment_directory_routes.cpp', # #4031: REST v1 read twins — /api/v1/{directory,enrollment,settings/oidc}
     'src/viz_routes.cpp',
     'src/viz_page_ui.cpp',
     'src/viz_host_page_ui.cpp',
@@ -525,6 +539,7 @@ yuzu_server_core_lib = static_library(
     'src/cel_eval.cpp',
     'src/compliance_eval.cpp',
     'src/workflow_engine.cpp',
+    'src/workflow_model.cpp',
     'src/product_pack_store.cpp',
     'src/product_pack_model.cpp', # #4029: shared REST v1 + MCP builder
     'src/app_perf_daily_store.cpp',
@@ -536,6 +551,7 @@ yuzu_server_core_lib = static_library(
     'src/app_perf_rollup.cpp',
     'src/inventory_ingestion.cpp',
     'src/inventory_store.cpp',
+    'src/data_inventory_routes.cpp',
     'src/software_inventory_store.cpp',
     'src/vuln_finding_store.cpp',
     'src/product_normalize.cpp',

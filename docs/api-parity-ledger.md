@@ -113,7 +113,7 @@ plus `$ref` validity) - the #842 companion to this whole-tree script.
 | viz | 2 | 2 | 0 |
 | executions | 6 | 1 | 5 |
 | scope-result-sets | 1 | 0 | 1 |
-| instructions | 24 | 5 | 19 |
+| instructions | 24 | 11 | 13 |
 | compliance-policy | 19 | 1 | 18 |
 | settings | 15 | 0 | 15 |
 | rbac | 8 | 0 | 8 |
@@ -122,13 +122,13 @@ plus `$ref` validity) - the #842 companion to this whole-tree script.
 | access-reviews | 2 | 0 | 2 |
 | ca-pki | 3 | 2 | 1 |
 | ota | 15 | 0 | 15 |
-| enrollment | 19 | 0 | 19 |
+| enrollment | 19 | 5 | 14 |
 | other | 74 | 0 | 74 |
-| **Total** | **278** | **21** | **257** |
+| **Total** | **278** | **32** | **246** |
 
-Registered `/api/vN/*` routes: 190. OpenAPI `paths` entries: 189. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 97.
+Registered `/api/vN/*` routes: 201. OpenAPI `paths` entries: 200. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 102.
 
-Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 257.
+Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 246.
 
 <!-- END GENERATED -->
 

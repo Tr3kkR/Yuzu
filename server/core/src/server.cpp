@@ -34,6 +34,7 @@
 #include "ca_routes.hpp"
 #include "ca_store.hpp"
 #include "default_certs.hpp"
+#include "sso_boot_guard.hpp" // saml_config_complete — shared with the sso-only boot guard
 #include "kek_op_lock.hpp"
 #include "kek_rotate_control.hpp"
 #include "kek_routes.hpp"
@@ -130,6 +131,15 @@
 #include "schedule_routes.hpp" // #2542 PR-8: the 4-route Schedules API, extracted onto the HttpRouteSink seam
 #include "approval_routes.hpp" // #2542 PR-9: the 4-route Approval API, extracted onto the HttpRouteSink seam
 #include "health_routes.hpp" // #2542 PR-10: the 6-route Health/Infra cluster, extracted onto the HttpRouteSink seam
+#include "response_routes.hpp" // #2542 PR-11: the 3-route legacy pre-v1 Responses API, extracted onto the HttpRouteSink seam
+#include "tag_routes.hpp" // #2542 PR-11: the 4-route Tags API, extracted onto the HttpRouteSink seam
+#include "data_inventory_routes.hpp" // #2542 PR-11: the 3-route generic plugin-data Inventory API, extracted onto the HttpRouteSink seam
+#include "config_routes.hpp" // #2542 PR-12: the 2-route Runtime Configuration API (7.3), extracted onto the HttpRouteSink seam
+#include "diagnostics_routes.hpp" // #2542 PR-12: the 5-route Chargen + Procfetch diagnostic API, extracted onto the HttpRouteSink seam
+#include "legacy_events_routes.hpp" // #2542 PR-12: the legacy GET /events SSE stream, extracted onto the HttpRouteSink seam
+#include "instruction_fragment_routes.hpp" // #2542 PR-12: the 2-route Instructions HTMX fragment pair, extracted onto the HttpRouteSink seam
+#include "approvals_fragment_routes.hpp" // #2542 PR-12: the Approvals HTMX fragment, extracted onto the HttpRouteSink seam
+#include "mcp_disabled_routes.hpp" // #2542 PR-12: the 3-route MCP-disabled stub triple, extracted onto the HttpRouteSink seam
 #include "command_capability.hpp" // PR1.9c: CommandCapabilityRegistry — the dispatch classification vocabulary
 #include "command_capability_parsers.hpp" // PR1.9c: encode_dispatch_tag / compute_plan_hash
 // PR1.9c: the seven capability spans build_classified_command's registry composes over —
@@ -178,9 +188,12 @@
 #include "leader_gate.hpp"     // WS-3 3.2: runtime FencedLeaderOnly loop gate over kBackgroundJobs
 #include "policy_evaluator.hpp"
 #include "schedule_arming_check.hpp"
+#include "command_outbox_delivery.hpp" // WS-3 3.3: leader-gated outbox delivery loop
+#include "command_outbox_store.hpp"    // WS-3 3.3: durable command outbox store
 #include "schedule_runner.hpp"
 #include "dashboard_routes.hpp"
 #include "discovery_routes.hpp"
+#include "enrollment_directory_routes.hpp" // #4031: REST v1 read twins
 #include "fleet_topology_store.hpp"
 #include "heartbeat_ingestion.hpp"
 #include "fleet_topology_types.hpp"
@@ -196,7 +209,6 @@
 #include "webhook_routes.hpp"
 #include "workflow_routes.hpp"
 #include "runtime_config_store.hpp"
-#include "runtime_config_view.hpp"
 #include "secure_buffer.hpp"
 #include "schedule_engine.hpp"
 #include "scope_engine.hpp"
@@ -3769,12 +3781,12 @@ public:
                              cfg_.saml_group_attribute, cfg_.saml_admin_group);
             }
 
-            const bool saml_config_complete = !cfg_.saml_idp_sso_url.empty() &&
-                                              !cfg_.saml_idp_cert.empty() &&
-                                              !cfg_.saml_sp_entity_id.empty() &&
-                                              !cfg_.saml_sp_acs_url.empty() &&
-                                              !cfg_.saml_idp_entity_id.empty();
-            if (saml_config_complete) {
+            // Single source of truth for "SAML SP config is complete" — shared
+            // with the --auth-mode=sso-only boot guard (sso_boot_guard.hpp) so the
+            // two predicates can never drift. The bare 5-field check stays here
+            // (HTTPS is handled by the explicit gate just below) so a complete-
+            // but-plaintext config still reaches the HTTPS-disabled error path.
+            if (yuzu::server::saml_config_complete(cfg_)) {
                 // HTTPS gate: SAML ACS is delivered over the browser's back-channel
                 // POST.  The __Host-yuzu_saml_bind binding cookie requires Secure
                 // attribute (baked into the cookie string) which browsers only send
@@ -3904,6 +3916,10 @@ public:
                        !cfg_.saml_sp_entity_id.empty() || !cfg_.saml_sp_acs_url.empty() ||
                        !cfg_.saml_idp_entity_id.empty()) {
                 // Partial config — warn so the operator knows which flags are missing.
+                // NB: this OR-list is the COMPLEMENT of saml_config_complete()
+                // (some-but-not-all set), so it cannot call that predicate; if a
+                // sixth required SAML field is ever added there, add it here too —
+                // the two field lists are coupled by construction.
                 spdlog::warn("SAML: incomplete configuration (need --saml-idp-sso-url, "
                              "--saml-idp-cert, --saml-sp-entity-id, --saml-sp-acs-url, "
                              "--saml-idp-entity-id) — SAML login disabled");
@@ -5526,6 +5542,21 @@ public:
             } else {
                 legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "instructions.db",
                                                          "ScheduleEngine", {"schedules"});
+            }
+        }
+
+        // CommandOutboxStore — born-on-PG durable command outbox (HA WS-3 3.3,
+        // ADR-2002 §6). Backs the ScheduleRunner enqueue seam + the
+        // CommandOutboxDelivery loop wired much later. Construction fail-CLOSED
+        // (ADR-0012 §1), same posture as its ScheduleEngine sibling above.
+        if (pg_pool_ && !startup_failed_) {
+            command_outbox_store_ = std::make_unique<CommandOutboxStore>(*pg_pool_);
+            command_outbox_store_->set_metrics(&metrics_);
+            if (!command_outbox_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: command outbox migration/open failed "
+                              "(database reachable but the command_outbox_store schema could not "
+                              "be created/opened)");
+                startup_failed_ = true;
             }
         }
 
@@ -8931,6 +8962,11 @@ public:
             schedule_tick_thread_.join();
         }
         schedule_runner_.reset();
+        // WS-3 3.3: the delivery loop ticks in the schedule thread just joined and
+        // borrows execution_tracker_/audit_store_/command_outbox_store_/
+        // leader_elector_ — drop it here so it can't be ticked again before those
+        // are torn down.
+        command_outbox_delivery_.reset();
 
         // WS-3 (ADR-2002 §3): stop the election loop and resign leadership. Joined
         // here, AFTER every FencedLeaderOnly worker thread that reads is_leader()
@@ -9146,6 +9182,13 @@ public:
         execution_event_bus_.reset();
         approval_manager_.reset();
         schedule_engine_.reset();
+        // WS-3 3.3 (CDX-P1-03): command_outbox_store_ borrows pg_pool_ and MUST be
+        // reset before pg_pool_.reset() below — the member-declaration order is not
+        // enough on its own, because stop() resets the pool explicitly here rather
+        // than at member-destruction time. Its delivery-loop borrower
+        // (command_outbox_delivery_) was already dropped above, after the schedule
+        // thread was joined.
+        command_outbox_store_.reset();
 
         // PostgreSQL substrate teardown (ADR-0007). The gRPC drain above has
         // quiesced every handler thread that could hold a pool lease through a
@@ -10572,107 +10615,21 @@ private:
         return out;
     }
 
-    // -- Server-side YAML syntax highlighter ----------------------------------
-    // Used by instruction editor routes. YAML helpers are also duplicated in
-    // settings_routes.cpp (anonymous namespace) for the settings YAML preview.
-
-    static std::string highlight_yaml_value(const std::string& val, const std::string& key = {}) {
-        if (val.empty())
-            return {};
-        auto trimmed = val;
-        auto sp = trimmed.find_first_not_of(' ');
-        if (sp == std::string::npos)
-            return html_escape(val);
-        trimmed = trimmed.substr(sp);
-        // Semantic highlighting: color specific key:value pairs to match the legend.
-        if (key == "type" && (trimmed == "question" || trimmed == "\"question\""))
-            return "<span class=\"yq\">" + html_escape(val) + "</span>";
-        if (key == "type" && (trimmed == "action" || trimmed == "\"action\""))
-            return "<span class=\"yact\">" + html_escape(val) + "</span>";
-        if (key == "approval" && (trimmed == "required" || trimmed == "\"required\""))
-            return "<span class=\"yar\">" + html_escape(val) + "</span>";
-        if (key == "concurrency" && (trimmed == "single" || trimmed == "serial" ||
-                                     trimmed == "\"single\"" || trimmed == "\"serial\""))
-            return "<span class=\"ycc\">" + html_escape(val) + "</span>";
-        if (trimmed == "true" || trimmed == "false" || trimmed == "True" || trimmed == "False")
-            return "<span class=\"yb\">" + html_escape(val) + "</span>";
-        bool is_number = !trimmed.empty();
-        for (char c : trimmed) {
-            if (c != '-' && c != '.' && (c < '0' || c > '9')) {
-                is_number = false;
-                break;
-            }
-        }
-        if (is_number && !trimmed.empty())
-            return "<span class=\"yn\">" + html_escape(val) + "</span>";
-        return "<span class=\"yv\">" + html_escape(val) + "</span>";
-    }
-
-    static std::string highlight_yaml_kv(const std::string& line) {
-        std::size_t i = 0;
-        while (i < line.size() && line[i] == ' ')
-            ++i;
-        auto key_start = i;
-        while (i < line.size() && (std::isalnum(static_cast<unsigned char>(line[i])) ||
-                                   line[i] == '_' || line[i] == '-' || line[i] == '.'))
-            ++i;
-        if (i >= line.size() || line[i] != ':' || i == key_start)
-            return html_escape(line);
-        auto indent = line.substr(0, key_start);
-        auto key = line.substr(key_start, i - key_start);
-        auto rest = line.substr(i + 1);
-        bool is_schema = (key == "apiVersion" || key == "kind");
-        std::string key_cls = is_schema ? "ya" : "yk";
-        return html_escape(indent) + "<span class=\"" + key_cls + "\">" + html_escape(key) +
-               "</span>:" + highlight_yaml_value(rest, key);
-    }
-
-    static std::string highlight_yaml(std::string_view source) {
-        std::string result;
-        result.reserve(source.size() * 2);
-        int line_num = 1;
-        std::size_t pos = 0;
-        while (pos <= source.size()) {
-            auto nl = source.find('\n', pos);
-            std::string line;
-            if (nl == std::string_view::npos) {
-                line = std::string(source.substr(pos));
-                pos = source.size() + 1;
-            } else {
-                line = std::string(source.substr(pos, nl - pos));
-                pos = nl + 1;
-            }
-            result +=
-                "<div class=\"yl\"><span class=\"ln\">" + std::to_string(line_num++) + "</span>";
-            auto trimmed_start = line.find_first_not_of(' ');
-            if (trimmed_start == std::string::npos) {
-                result += "&nbsp;";
-            } else if (line[trimmed_start] == '#') {
-                result += "<span class=\"yc\">" + html_escape(line) + "</span>";
-            } else if (line == "---" || line == "...") {
-                result += "<span class=\"yd\">" + html_escape(line) + "</span>";
-            } else if (line[trimmed_start] == '-' && trimmed_start + 1 < line.size() &&
-                       line[trimmed_start + 1] == ' ') {
-                auto indent2 = line.substr(0, trimmed_start);
-                auto after_dash = line.substr(trimmed_start + 2);
-                result += html_escape(indent2) + "<span class=\"yd\">-</span> ";
-                if (after_dash.find(':') != std::string::npos)
-                    result += highlight_yaml_kv(after_dash);
-                else
-                    result += highlight_yaml_value(after_dash);
-            } else if (line.find(':') != std::string::npos) {
-                result += highlight_yaml_kv(line);
-            } else {
-                result += html_escape(line);
-            }
-            result += "</div>";
-        }
-        return result;
-    }
+    // highlight_yaml / highlight_yaml_value / highlight_yaml_kv moved to
+    // instruction_fragment_routes.cpp (#2542 PR-12, anonymous namespace) —
+    // their one external call site (POST /fragments/instructions/
+    // yaml-preview) moved there in the same change. Unlike
+    // validate_yaml_source below, these three had no second caller to keep
+    // in sync with, so they were MOVED rather than promoted to a shared
+    // header — see instruction_fragment_routes.hpp's file header for the
+    // full rationale. A SEPARATE, independent copy still lives in
+    // settings_routes.cpp (anonymous namespace) for the unrelated Settings
+    // YAML preview feature — untouched by this move.
 
     // validate_yaml_source moved to instruction_store.{hpp,cpp} (#2542
-    // PR-7) — promoted, not duplicated, because /fragments/instructions/
-    // yaml-preview (stays inline below) shares it with the two now-extracted
+    // PR-7) — promoted, not duplicated, because POST /fragments/
+    // instructions/yaml-preview (now extracted to
+    // instruction_fragment_routes.cpp, #2542 PR-12) shares it with the two
     // instruction_routes.cpp callers (#2557 json_extract.hpp precedent).
     // Unqualified call sites in this class resolve to yuzu::server::
     // validate_yaml_source via ordinary lookup.
@@ -11313,7 +11270,17 @@ private:
         // `ScheduleRunner`. Every OTHER caller (background pushes, raw
         // plugin/action dispatch with no definition concept) passes neither
         // and gets no gate, unchanged from today.
-        const std::string& definition_id = {}, const std::string& concurrency_mode = {}) {
+        const std::string& definition_id = {}, const std::string& concurrency_mode = {},
+        // WS-3 3.3 (ADR-2002 §6): a caller-supplied STABLE command_id for the
+        // command-outbox delivery path — trailing, defaulted-empty so every
+        // existing caller keeps minting its own. When non-empty (only
+        // CommandOutboxDelivery passes it) the dispatch reuses it verbatim, so a
+        // re-drive of the same occurrence carries the same command_id and the
+        // agent dedups (WS-0) — the effectively-once guarantee. NEVER combine
+        // with `definition_id`/`concurrency_mode`: the delivery path is R1 (no
+        // ADR-1007 concurrency claim), and a supplied id must not enter the
+        // per-device claim's `(command_id, agent_id)` uniqueness.
+        const std::string& supplied_command_id = {}) {
         // Normalize action to lowercase — agent plugins register actions in
         // lowercase and match case-sensitively (was implicit on the MCP path
         // via upstream lowercasing; a safe superset here).
@@ -11331,8 +11298,18 @@ private:
         // probabilistically unlikely, not DB-enforced. See the new
         // `ux_concurrency_claims_command` unique index
         // (execution_tracker.cpp) for the enforcement half of this fix.
-        auto command_id = plugin + "-" +
-                          auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(16));
+        // R1 (arch-F3): a supplied command_id is ONLY the outbox-delivery path,
+        // which must NOT take the ADR-1007 per-device concurrency claim — so it
+        // must never be combined with definition_id/concurrency_mode. Enforce the
+        // invariant the "NEVER combine" comment states, so a future caller cannot
+        // silently violate it and re-enter the (command_id, agent_id) claim.
+        assert(supplied_command_id.empty() ||
+               (definition_id.empty() && concurrency_mode.empty()));
+        auto command_id =
+            supplied_command_id.empty()
+                ? plugin + "-" +
+                      auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(16))
+                : supplied_command_id;
 
         // Same classifier as the /api/command handler (#2500): an explicit
         // agent_ids list ALWAYS wins over a broadcast request; `__all__` is
@@ -13359,7 +13336,11 @@ private:
 
         // Per-device tier + management-group scope gate (wraps
         // require_scoped_permission). Used by DeviceRoutes' per-device routes so an
-        // operator can only open / read / live-query a device inside their scope.
+        // operator can only open / read / live-query a device inside their scope,
+        // and by several #2542 extracted modules that need the same per-agent
+        // confinement (custom_properties_routes.cpp, tag_routes.cpp) — grep
+        // `scoped_perm_fn` for the current full consumer list rather than trusting
+        // an enumerated one here, since it grows as more modules extract.
         auto scoped_perm_fn = [this](const httplib::Request& req, httplib::Response& res,
                                      const std::string& type, const std::string& op,
                                      const std::string& agent_id) -> bool {
@@ -13377,8 +13358,11 @@ private:
         // require_fleet_read). GET /api/v1/inventory/software's SOLE
         // authorization gate — never stacked with perm_fn (see
         // rest_api_v1.cpp's route comment; same BLOCKING rule as list_read_fn
-        // above). Shared, byte-identical, with the MCP query_installed_software
-        // twin's set_fleet_read_fn wiring below — one conversion, two surfaces.
+        // above). Shared, byte-identical, across several surfaces now
+        // (the MCP query_installed_software twin's set_fleet_read_fn wiring
+        // below, execution_routes.cpp, response_routes.cpp, and workflow
+        // routes) — grep `fleet_read_fn` for the current full consumer list
+        // rather than trusting an enumerated count here.
         auto fleet_read_fn = [this](const httplib::Request& req, httplib::Response& res,
                                     const std::string& type,
                                     const std::string& op) -> yuzu::server::authz::FleetReadGate {
@@ -13576,6 +13560,7 @@ private:
                              .workflow_engine = workflow_engine_.get(),
                              .schedule_engine = schedule_engine_.get(),
                              .execution_tracker = execution_tracker_.get(),
+                             .command_outbox_store = command_outbox_store_.get(), // WS-3 3.3
                              .api_token_store = api_token_store_.get(),
                              .engine_principal_store = engine_principal_store_.get(),
                              .custom_properties_store = custom_properties_store_.get(),
@@ -13652,6 +13637,146 @@ private:
                              .schedule_engine = schedule_engine_.get(),
                          });
 
+        // #2542 PR-11: the 3-route legacy pre-v1 Responses API
+        // (/api/responses/:id/{aggregate,export}, /api/responses/(.+)),
+        // extracted onto the same inline_sink seam. Needs `fleet_read_fn`
+        // (defined above, shared with the execution_routes/rest_api_v1/mcp
+        // callers) + `audit_fn`. REGISTRATION ORDER PRESERVED: aggregate,
+        // then export, then the catch-all — see response_routes.hpp's file
+        // header for why this order is load-bearing.
+        yuzu::server::response::register_response_routes(
+            inline_sink, yuzu::server::response::Deps{
+                             .fleet_read_fn = fleet_read_fn,
+                             .audit_fn = audit_fn,
+                             .store = response_store_.get(),
+                         });
+
+        // #2542 PR-11: wraps AuthRoutes::deny_service_scoped_service_tag_mutation
+        // (#3289) — the Tags API's TOCTOU guard against a service-scoped
+        // token rewriting/deleting its own cohort's `service` tag. Only
+        // tag_routes.cpp calls this today.
+        auto deny_service_scoped_tag_mutation_fn =
+            [this](const httplib::Request& req, httplib::Response& res,
+                   const std::string& action, const std::string& agent_id,
+                   const std::string& key) -> bool {
+            return auth_routes_->deny_service_scoped_service_tag_mutation(req, res, action,
+                                                                           agent_id, key);
+        };
+        // #2542 PR-11: wraps ServerImpl::ensure_service_management_group —
+        // POST /api/tags/set's side effect when the `service` tag changes.
+        // Only tag_routes.cpp calls this today.
+        auto ensure_service_management_group_fn = [this](const std::string& service_value) {
+            ensure_service_management_group(service_value);
+        };
+        // #2542 PR-11: wraps ServerImpl::push_asset_tags_to_agent — POST
+        // /api/tags/set's side effect when a structured category tag
+        // changes. Only tag_routes.cpp calls this today.
+        auto push_asset_tags_to_agent_fn = [this](const std::string& agent_id) {
+            push_asset_tags_to_agent(agent_id);
+        };
+
+        // #2542 PR-11: the 4-route Tags API (/api/tags[/set|/delete|/query]),
+        // extracted onto the same inline_sink seam. Needs
+        // scoped_perm_fn/auth_fn (defined above) plus the three
+        // just-defined closures.
+        yuzu::server::tag::register_tag_routes(
+            inline_sink, yuzu::server::tag::Deps{
+                             .auth_fn = auth_fn,
+                             .perm_fn = perm_fn,
+                             .scoped_perm_fn = scoped_perm_fn,
+                             .deny_service_scoped_tag_mutation_fn =
+                                 deny_service_scoped_tag_mutation_fn,
+                             .audit_fn = audit_fn,
+                             .ensure_service_management_group_fn =
+                                 ensure_service_management_group_fn,
+                             .push_asset_tags_to_agent_fn = push_asset_tags_to_agent_fn,
+                             .store = tag_store_.get(),
+                         });
+
+        // #2542 PR-11: the 3-route generic plugin-data Inventory API
+        // (Issue 7.17: /api/inventory/{tables,query,:agent_id/:plugin}),
+        // extracted onto the same inline_sink seam. Only needs perm_fn.
+        yuzu::server::data_inventory::register_data_inventory_routes(
+            inline_sink, yuzu::server::data_inventory::Deps{
+                             .perm_fn = perm_fn,
+                             .store = inventory_store_.get(),
+                         });
+
+        // #2542 PR-12 (Infra/Misc bundle): six small, heterogeneous route
+        // modules with no single owning store of their own — the
+        // dashboard_api_routes/nvd_routes bundling precedent, matching
+        // PR-10's Health/Infra cluster. Placed here (after the PR-11 Data
+        // APIs block, like every other #2542 module below page_routes's own
+        // call) since every closure each needs (auth_fn/perm_fn/audit_fn/
+        // deny_service_scoped_fn/resolve_session_fn) is already in scope.
+
+        // #2542 PR-12: the 2-route Runtime Configuration API (7.3).
+        yuzu::server::config::register_config_routes(
+            inline_sink, yuzu::server::config::Deps{
+                             .auth_fn = auth_fn,
+                             .perm_fn = perm_fn,
+                             .audit_fn = audit_fn,
+                             .cfg = &cfg_,
+                             .auto_approve = &auto_approve_,
+                             .runtime_config_store = runtime_config_store_.get(),
+                         });
+
+        // #2542 PR-12: the 5-route Chargen + Procfetch diagnostic API.
+        // `forward_legacy_command_fn` wraps the ServerImpl-private
+        // `forward_legacy_command` member — see diagnostics_routes.hpp's
+        // header comment for why that helper itself stays in server.cpp.
+        yuzu::server::diagnostics::register_diagnostics_routes(
+            inline_sink,
+            yuzu::server::diagnostics::Deps{
+                .perm_fn = perm_fn,
+                .forward_legacy_command_fn =
+                    [this](const httplib::Request& req, const std::string& plugin,
+                           const std::string& action, httplib::Response& res) {
+                    forward_legacy_command(req, plugin, action, res);
+                },
+                .registry = &registry_,
+            });
+
+        // #2542 PR-12: the legacy GET /events SSE stream. Reuses the
+        // already-hoisted `deny_service_scoped_fn` (first shared by PR-5's
+        // result_set_routes.cpp) rather than a module-local closure — see
+        // legacy_events_routes.hpp's header comment for the SSE-extraction
+        // safety note (checked against the /api/v1/events precedent).
+        yuzu::server::legacy_events::register_legacy_events_routes(
+            inline_sink, yuzu::server::legacy_events::Deps{
+                             .deny_service_scoped_fn = deny_service_scoped_fn,
+                             .resolve_session_fn = resolve_session_fn,
+                             .event_bus = &event_bus_,
+                             .stream_budget = stream_budget_.get(),
+                         });
+
+        // #2542 PR-12: the 2-route Instructions HTMX fragment pair,
+        // deliberately NOT part of PR-7's instruction_routes.cpp (see that
+        // module's own header comment, and instruction_fragment_routes.hpp's).
+        yuzu::server::instruction_fragment::register_instruction_fragment_routes(
+            inline_sink, yuzu::server::instruction_fragment::Deps{
+                             .auth_fn = auth_fn,
+                             .perm_fn = perm_fn,
+                             .deny_service_scoped_fn = deny_service_scoped_fn,
+                             .store = instruction_store_.get(),
+                         });
+
+        // #2542 PR-12: the Approvals HTMX fragment, deliberately NOT part
+        // of PR-9's approval_routes.cpp (the JSON API) — see
+        // approvals_fragment_routes.hpp's header comment.
+        yuzu::server::approvals_fragment::register_approvals_fragment_routes(
+            inline_sink, yuzu::server::approvals_fragment::Deps{
+                             .auth_fn = auth_fn,
+                             .perm_fn = perm_fn,
+                             .approval_manager = approval_manager_.get(),
+                         });
+
+        // NOTE: the 3-route MCP-disabled stub module
+        // (yuzu::server::mcp_disabled::register_mcp_disabled_routes) is
+        // registered later, inside the `if (cfg_.mcp_disable)` branch near
+        // the MCP server setup — it stays conditional on that flag, not
+        // unconditional here, matching the original inline code exactly.
+
         // Shared command-dispatch closure — sends a CommandRequest to agents via
         // gRPC. Hoisted here (was inline in the WorkflowRoutes block) so every
         // background consumer drives the EXACT same dispatch path.
@@ -13725,180 +13850,29 @@ private:
                                      definition_id, concurrency_mode);
         };
 
-        // -- Runtime Configuration API (7.3) ------------------------------------
-        web_server_->Get("/api/config", [this](const httplib::Request& req,
-                                               httplib::Response& res) {
-            if (!require_permission(req, res, "Infrastructure", "Read"))
-                return;
+        // WS-3 3.3 (ADR-2002 §6) — the command-outbox DELIVERY dispatch: the R1
+        // path. PLAIN confined dispatch (empty definition_id/concurrency_mode →
+        // NO ADR-1007 per-device concurrency claim) with the occurrence's
+        // caller-SUPPLIED stable command_id, so a re-drive reuses it and the
+        // agent dedups (WS-0). A concurrency claim here would fail-closed-exclude
+        // an already-delivered device on a same-command_id re-drive and misread
+        // it as "reached nobody" — see command_outbox_delivery.hpp's R1 note.
+        auto command_outbox_deliver_dispatch_fn =
+            [this](const std::string& plugin, const std::string& action,
+                   const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+                   const std::unordered_map<std::string, std::string>& parameters,
+                   const std::string& execution_id, const yuzu::server::DispatchCaller& caller,
+                   const std::string& command_id) -> yuzu::server::ConfinedDispatchOutcome {
+            return dispatch_confined(plugin, action, agent_ids, scope_expr, parameters,
+                                     execution_id, caller, /*broadcast_on_none=*/false,
+                                     /*definition_id=*/{}, /*concurrency_mode=*/{},
+                                     /*supplied_command_id=*/command_id);
+        };
 
-            nlohmann::json config_obj;
-            // Current effective values (from cfg_ + overrides)
-            config_obj["heartbeat_timeout"] = cfg_.session_timeout.count();
-            config_obj["response_retention_days"] = cfg_.response_retention_days;
-            config_obj["audit_retention_days"] = cfg_.audit_retention_days;
-            config_obj["guardian_event_retention_days"] = cfg_.guardian_event_retention_days;
-            config_obj["auto_approve_enabled"] = !auto_approve_.list_rules().empty();
-            config_obj["log_level"] =
-                spdlog::level::to_string_view(spdlog::default_logger()->level()).data();
-
-            // Overrides from store. The omission rule lives in
-            // build_overrides_json (runtime_config_view.hpp) so it is unit-testable -- this
-            // route is not TestRouteSink-registered, and it is one of the sites the
-            // secret leaked from twice.
-            // A degraded store must NOT read as "nothing is configured". This route no
-            // longer returns a secret's value, so the PRESENCE of the key and its
-            // `is_set` are the only way to answer "is the OIDC secret set here?" -- and
-            // security-hardening.md tells operators to answer exactly that before
-            // deciding whether to rotate a disclosed credential. Returning 200 with an
-            // empty `overrides` would answer "never set, nothing to rotate". The PUT twin
-            // below already 503s on this condition; this matches it.
-            if (!runtime_config_store_ || !runtime_config_store_->is_open()) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"runtime config store unavailable"},)"
-                    R"("meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            auto overrides_result = runtime_config_store_->get_all();
-            if (!overrides_result.has_value()) {
-                spdlog::error("GET /api/config: read failed: {}", overrides_result.error());
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"runtime config store unavailable"},)"
-                    R"("meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            nlohmann::json overrides = build_overrides_json(*overrides_result);
-
-            nlohmann::json allowed = nlohmann::json::array();
-            for (const auto& k : RuntimeConfigStore::allowed_keys())
-                allowed.push_back(k);
-
-            res.set_content(
-                nlohmann::json(
-                    {{"config", config_obj}, {"overrides", overrides}, {"allowed_keys", allowed}})
-                    .dump(),
-                "application/json");
-        });
-
-        web_server_->Put(R"(/api/config/([a-z_]+))", [this](const httplib::Request& req,
-                                                            httplib::Response& res) {
-            if (!require_permission(req, res, "Infrastructure", "Write"))
-                return;
-            if (!runtime_config_store_ || !runtime_config_store_->is_open()) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"runtime config store unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            auto key = req.matches[1].str();
-            std::string value;
-            try {
-                auto j = nlohmann::json::parse(req.body);
-                if (j.contains("value"))
-                    value =
-                        j["value"].is_string() ? j["value"].get<std::string>() : j["value"].dump();
-                else {
-                    res.status = 400;
-                    res.set_content(
-                        R"({"error":{"code":400,"message":"missing 'value' in request body"},"meta":{"api_version":"v1"}})",
-                        "application/json");
-                    return;
-                }
-            } catch (...) {
-                res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"invalid JSON body"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            // Validate integer-typed keys BEFORE persisting so a
-            // non-numeric or negative value does not silently land
-            // in RuntimeConfigStore while leaving cfg_ at the old
-            // value (the prior `try { stoi } catch (...) {}` path
-            // was a ghost-write: store persists, cfg ignores,
-            // operator sees 200 with no effect). UP-R5 from the
-            // Guardian PR 2 governance re-run.
-            const bool is_int_key =
-                key == "heartbeat_timeout" || key == "response_retention_days" ||
-                key == "audit_retention_days" || key == "guardian_event_retention_days";
-            int parsed_int = 0;
-            if (is_int_key) {
-                auto first = value.data();
-                auto last = value.data() + value.size();
-                auto [ptr, ec] = std::from_chars(first, last, parsed_int);
-                if (ec != std::errc{} || ptr != last || parsed_int < 0) {
-                    res.status = 400;
-                    res.set_content(
-                        R"({"error":{"code":400,"message":"value must be a non-negative integer"},"meta":{"api_version":"v1"}})",
-                        "application/json");
-                    return;
-                }
-            }
-
-            // Get username from session
-            auto session = require_auth(req, res);
-            if (!session)
-                return;
-
-            auto result = runtime_config_store_->set(key, value, session->username);
-            if (!result) {
-                // A genuine DB/crypto failure (kRuntimeConfigDbErrorPrefix) is a
-                // 503 with a generic message -- never echo the internal detail
-                // to the caller; caller-input validation (unknown key, bad
-                // value shape, the redaction-placeholder guard) is a 400 with
-                // the store's own message, which is written for an operator.
-                if (result.error().starts_with(kRuntimeConfigDbErrorPrefix)) {
-                    spdlog::error("PUT /api/config/{}: write failed: {}", key, result.error());
-                    res.status = 503;
-                    res.set_content(
-                        R"({"error":{"code":503,"message":"runtime config store unavailable"},)"
-                        R"("meta":{"api_version":"v1"}})",
-                        "application/json");
-                } else {
-                    res.status = 400;
-                    res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
-                                    "application/json");
-                }
-                return;
-            }
-
-            // Apply the change to in-memory config. Integer keys
-            // parsed above; direct assignment here means no
-            // second `try { stoi }` that could swallow errors.
-            if (key == "heartbeat_timeout") {
-                cfg_.session_timeout = std::chrono::seconds(parsed_int);
-            } else if (key == "response_retention_days") {
-                cfg_.response_retention_days = parsed_int;
-            } else if (key == "audit_retention_days") {
-                cfg_.audit_retention_days = parsed_int;
-            } else if (key == "guardian_event_retention_days") {
-                cfg_.guardian_event_retention_days = parsed_int;
-            }
-            // log_level is applied inside RuntimeConfigStore::set()
-
-            // NOT the raw value. An audit detail is durable, retained by policy, and
-            // readable by every role seeded AuditLog:Read (Operator among them) -- so
-            // writing a credential here is a worse sink than the log and the API this
-            // branch already fixed, and it is not rotatable away afterwards.
-            (void)audit_log(req, "config.update", "success", "RuntimeConfig", key,
-                            "value=" + (RuntimeConfigStore::is_secret_key(key)
-                                            ? std::string(RuntimeConfigStore::redacted_placeholder())
-                                            : value));
-
-            res.set_content(
-                nlohmann::json(RuntimeConfigStore::is_secret_key(key)
-                                   ? nlohmann::json{{"key", key}, {"applied", true}}
-                                   : nlohmann::json{{"key", key}, {"value", value},
-                                                    {"applied", true}})
-                    .dump(),
-                "application/json");
-        });
+        // #2542 PR-12: the 2-route Runtime Configuration API (7.3),
+        // extracted onto the HttpRouteSink seam (config_routes.cpp) — see
+        // config_routes.hpp's header comment for the route table and audit
+        // asymmetry.
 
         // Issue #253 fragment route lives in dashboard_routes.cpp now (#589).
 
@@ -13999,94 +13973,10 @@ private:
         // listener starts, so no request races the set).
         settings_routes_->set_dex_alert_apply_fn([this]() { apply_dex_alert_config(); });
 
-        // SSE endpoint
-        web_server_->Get("/events", [this](const httplib::Request& req, httplib::Response& res) {
-            // ADMISSION CONTROL (ADR-0034). Every connection holds an httplib worker for
-            // its whole life, so it takes a lease like every other streaming surface.
-            // This route IS session-gated: `/events` is not in `is_login_exempt_path`,
-            // and the pre-routing chokepoint 401s a caller with no session by name
-            // (alongside `/api/` and `/mcp/`), so the handler only ever runs for an
-            // authenticated operator. What the lease bounds here is therefore an
-            // AUTHENTICATED thread-pinning path, not a pre-auth one.
-            // The anonymous branch below is unreachable today and kept only as
-            // defence-in-depth against a future change to the exempt list — it must not
-            // be read as evidence that this surface is open. The residual defect on this
-            // route is the missing per-connection queue cap (`/api/v1/events` opts into
-            // `kPerConnectionQueueCapDefault`; this one does not), which the lease does
-            // NOT address — see ADR-0034 Decision 1.
-            // guardian-confinement-2298 PR3 §3e: this legacy stream has NO
-            // in-handler auth at all beyond the pre-routing 401 (see the
-            // block comment above) — `event_bus_.subscribe` below fans out
-            // raw agent ids, pending-agent ids, live command result rows,
-            // and command status/timing with no per-agent scoping. Deny a
-            // service-scoped session BEFORE the admission-control lease and
-            // BEFORE subscribe, so a denied caller never pins a worker or a
-            // bus subscription slot.
-            if (auth_routes_->deny_service_scoped_session(
-                    req, res, "events.stream.access_denied",
-                    "service-scoped tokens may not open the fleet-wide legacy event stream"))
-                return;
-
-            std::string principal = "anonymous";
-            std::size_t per_principal = detail::kPerPrincipalAnonymous;
-            if (auth_routes_) {
-                if (auto sess = auth_routes_->resolve_session(req)) {
-                    principal = sess->username;
-                    per_principal = detail::kPerPrincipalDashboard;
-                }
-            }
-            auto lease = std::make_shared<detail::StreamBudget::Lease>();
-            if (stream_budget_) {
-                auto admitted = stream_budget_->try_acquire(detail::SseSurface::kLegacyEvents,
-                                                            principal, per_principal);
-                if (!admitted.lease) {
-                    res.status = 429;
-                    res.set_header("Retry-After", "5");
-                    res.set_content("too many live streams open", "text/plain; charset=utf-8");
-                    return;
-                }
-                *lease = std::move(admitted.lease);
-            }
-
-            res.set_header("Cache-Control", "no-cache");
-            res.set_header("X-Accel-Buffering", "no");
-
-            auto sink_state = std::make_shared<detail::SseSinkState>();
-            sink_state->sub_id = event_bus_.subscribe([sink_state](const detail::SseEvent& ev) {
-                {
-                    std::lock_guard<std::mutex> lk(sink_state->mu);
-                    sink_state->queue.push_back(ev);
-                }
-                sink_state->cv.notify_one();
-            });
-
-            detail::EventBus* bus = &event_bus_;
-            // Use chunked content provider so httplib sends each sink.write()
-            // as a complete HTTP chunk in a single send() call.  The browser
-            // processes each chunk eagerly (no buffering of raw streams).
-            // Note: httplib's chunked loop sets data_available = (l > 0) on
-            // every write.  Our provider never writes 0 bytes (always at
-            // least a 14-byte keepalive), so the loop runs indefinitely.
-            // UP-1: adopt any pending engine QuotaSlot into this stream's
-            // resource-releaser (see is_streaming_path/adopt_quota_slot_
-            // into_stream in principal_quota_gate.hpp) so the concurrency
-            // reservation survives for the stream's actual lifetime instead
-            // of releasing early at post-routing.
-            res.set_chunked_content_provider(
-                "text/event-stream",
-                [sink_state, budget = stream_budget_.get()](size_t offset,
-                                                            httplib::DataSink& sink) -> bool {
-                    return detail::sse_content_provider(sink_state, offset, sink, budget);
-                },
-                detail::adopt_quota_slot_into_stream(
-                    [sink_state, bus, lease](bool success) noexcept {
-                        // noexcept for parity with the three sibling releasers: this runs
-                        // from ~Response, and sse_resource_release is now noexcept at source
-                        // (event_bus.hpp), so the whole chain is terminate-safe.
-                        detail::sse_resource_release(sink_state, *bus, success);
-                        // `lease` dies here — the worker returns to the one shared budget.
-                    }));
-        });
+        // #2542 PR-12: the legacy GET /events SSE stream, extracted onto
+        // the HttpRouteSink seam (legacy_events_routes.cpp) — see that
+        // file's header comment for the SSE-extraction-safety note (checked
+        // against the /api/v1/events precedent, not assumed).
 
         // /fragments/scope-list — moved to DashboardRoutes (with groups support)
 
@@ -14210,1020 +14100,6 @@ private:
                     },
                 });
         }
-
-        // -- Legacy API endpoints (still functional, delegate to generic path) --
-
-        web_server_->Post("/api/chargen/start",
-                          [this](const httplib::Request& req, httplib::Response& res) {
-                              if (!require_permission(req, res, "Execution", "Execute"))
-                                  return;
-                              forward_legacy_command(req, "chargen", "chargen_start", res);
-                          });
-
-        web_server_->Post("/api/chargen/stop",
-                          [this](const httplib::Request& req, httplib::Response& res) {
-                              if (!require_permission(req, res, "Execution", "Execute"))
-                                  return;
-                              forward_legacy_command(req, "chargen", "chargen_stop", res);
-                          });
-
-        web_server_->Post("/api/procfetch/fetch",
-                          [this](const httplib::Request& req, httplib::Response& res) {
-                              if (!require_permission(req, res, "Execution", "Execute"))
-                                  return;
-                              forward_legacy_command(req, "procfetch", "procfetch_fetch", res);
-                          });
-
-        web_server_->Get(
-            "/api/chargen/status", [this](const httplib::Request& req, httplib::Response& res) {
-                if (!require_permission(req, res, "Infrastructure", "Read"))
-                    return;
-                res.set_content(nlohmann::json({{"agent_connected", registry_.has_any()}}).dump(),
-                                "application/json");
-            });
-
-        web_server_->Get(
-            "/api/procfetch/status", [this](const httplib::Request& req, httplib::Response& res) {
-                if (!require_permission(req, res, "Infrastructure", "Read"))
-                    return;
-                res.set_content(nlohmann::json({{"agent_connected", registry_.has_any()}}).dump(),
-                                "application/json");
-            });
-
-        // -- Response API ---------------------------------------------------------
-
-        // Aggregate endpoint — must be registered before the catch-all responses route
-        web_server_->Get(R"(/api/responses/([^/]+)/aggregate)", [this](const httplib::Request& req,
-                                                                       httplib::Response& res) {
-            auto gate = require_fleet_read(req, res, "Response", "Read");
-            if (!gate.admitted)
-                return; // gate already wrote the response.
-
-            auto instruction_id = req.matches[1].str();
-            if (!response_store_ || !response_store_->is_open()) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"response store not available"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            auto group_by = req.get_param_value("group_by");
-            if (group_by.empty())
-                group_by = "status";
-
-            AggregateOp op = AggregateOp::Count;
-            auto op_str = req.get_param_value("op");
-            if (op_str == "sum")
-                op = AggregateOp::Sum;
-            else if (op_str == "avg")
-                op = AggregateOp::Avg;
-            else if (op_str == "min")
-                op = AggregateOp::Min;
-            else if (op_str == "max")
-                op = AggregateOp::Max;
-
-            // Validate CLIENT input against ResponseStore::aggregate()'s own
-            // allow-lists BEFORE calling in (#2691, Doomgoose finding #2): an
-            // allow-list miss inside aggregate() itself returns nullopt,
-            // which this handler otherwise maps unconditionally to 503 "store
-            // degraded" below — a typo'd group_by/op_column would page the
-            // degrade alert for a healthy database. Bad TARGETED client input
-            // is a 400, not a 503.
-            if (std::find(ResponseStore::allowed_group_by().begin(),
-                          ResponseStore::allowed_group_by().end(),
-                          group_by) == ResponseStore::allowed_group_by().end()) {
-                res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"invalid group_by"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            auto op_column_param = req.get_param_value("op_column");
-            const std::string effective_op_column = op_column_param.empty() ? "id" : op_column_param;
-            if (std::find(ResponseStore::allowed_op_column().begin(),
-                          ResponseStore::allowed_op_column().end(),
-                          effective_op_column) == ResponseStore::allowed_op_column().end()) {
-                res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"invalid op_column"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            AggregationQuery aq;
-            aq.group_by = group_by;
-            aq.op = op;
-            aq.op_column = op_column_param;
-
-            ResponseQuery filter;
-            if (req.has_param("agent_id"))
-                filter.agent_id = req.get_param_value("agent_id");
-            try {
-                if (req.has_param("status"))
-                    filter.status = std::stoi(req.get_param_value("status"));
-                if (req.has_param("since"))
-                    filter.since = std::stoll(req.get_param_value("since"));
-                if (req.has_param("until"))
-                    filter.until = std::stoll(req.get_param_value("until"));
-            } catch (const std::exception&) {
-                res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            // #1634 management-group scope. Resolve the responding agents only to
-            // retain the existing distinct-drop audit; the gate's VisibleSet is the
-            // authority and the engaged AggregateScope is applied before folding.
-            AggregateScope agg_scope; // nullopt = no restriction
-            std::size_t agg_dropped = 0;
-            if (gate.scope) {
-                auto distinct = response_store_->distinct_agent_ids(instruction_id);
-                if (!distinct) {
-                    res.status = 503;
-                    res.set_content(
-                        R"({"error":{"code":503,"message":"response store unavailable"},"meta":{"api_version":"v1"}})",
-                        "application/json");
-                    return;
-                }
-                std::vector<std::string> in_scope;
-                in_scope.reserve(distinct->size());
-                for (auto& aid : *distinct) {
-                    if (authz::in_scope(gate.scope, aid))
-                        in_scope.push_back(std::move(aid));
-                    else
-                        ++agg_dropped;
-                }
-                agg_scope = std::move(in_scope); // engaged-empty means no rows
-            }
-            // CC7.2 evidence: a scope-drop is a security-relevant filtering event — record
-            // it so a cross-operator access attempt that was suppressed is auditable on this
-            // surface too (#1634 compliance review; parity with the MCP denied row / the
-            // visualization scope_dropped detail).
-            if (agg_dropped > 0)
-                (void)audit_log(req, "response.read", "denied", "Execution", instruction_id,
-                                "scope_dropped=" + std::to_string(agg_dropped) + " surface=aggregate");
-
-            auto results_opt = response_store_->aggregate(instruction_id, aq, filter, agg_scope);
-            if (!results_opt) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"response store degraded"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            const auto& results = *results_opt;
-
-            int64_t total_rows = 0;
-            nlohmann::json groups = nlohmann::json::array();
-            for (const auto& r : results) {
-                total_rows += r.count;
-                groups.push_back({{"group_value", r.group_value},
-                                  {"count", r.count},
-                                  {"aggregate_value", r.aggregate_value}});
-            }
-
-            res.set_content(nlohmann::json({{"instruction_id", instruction_id},
-                                            {"groups", groups},
-                                            {"total_groups", results.size()},
-                                            {"total_rows", total_rows}})
-                                .dump(),
-                            "application/json");
-        });
-
-        // Export endpoint — must be registered before the catch-all responses route
-        web_server_->Get(R"(/api/responses/([^/]+)/export)", [this](const httplib::Request& req,
-                                                                    httplib::Response& res) {
-            auto gate = require_fleet_read(req, res, "Response", "Read");
-            if (!gate.admitted)
-                return; // gate already wrote the response.
-
-            auto instruction_id = req.matches[1].str();
-            if (!response_store_ || !response_store_->is_open()) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"response store not available"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            ResponseQuery q;
-            if (req.has_param("agent_id"))
-                q.agent_id = req.get_param_value("agent_id");
-            try {
-                if (req.has_param("status"))
-                    q.status = std::stoi(req.get_param_value("status"));
-                if (req.has_param("since"))
-                    q.since = std::stoll(req.get_param_value("since"));
-                if (req.has_param("until"))
-                    q.until = std::stoll(req.get_param_value("until"));
-                if (req.has_param("limit"))
-                    q.limit = std::stoi(req.get_param_value("limit"));
-                else
-                    q.limit = 10000; // higher default for exports
-            } catch (const std::exception&) {
-                res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            // #1634 / ADR-0017 INV-3 (CRITICAL): resolve the in-scope agent set and push it
-            // into the SQL WHERE clause BEFORE LIMIT/OFFSET, not as a post-fetch filter — a
-            // post-fetch filter on a paginated read can hand a confined caller a short or
-            // empty page even though visible rows exist past the hidden ones LIMIT already
-            // truncated. Mirrors the /aggregate sibling's resolve-then-scope pattern above.
-            AggregateScope scope_arg; // nullopt = unrestricted
-            std::size_t export_dropped = 0;
-            if (gate.scope) {
-                auto distinct = response_store_->distinct_agent_ids(instruction_id);
-                if (!distinct) {
-                    res.status = 503;
-                    res.set_content(
-                        R"({"error":{"code":503,"message":"response store degraded"},"meta":{"api_version":"v1"}})",
-                        "application/json");
-                    return;
-                }
-                std::vector<std::string> in_scope;
-                in_scope.reserve(distinct->size());
-                for (auto& aid : *distinct) {
-                    if (authz::in_scope(gate.scope, aid))
-                        in_scope.push_back(std::move(aid));
-                    else
-                        ++export_dropped;
-                }
-                scope_arg = std::move(in_scope); // engaged-empty means no rows
-            }
-
-            auto results_opt = response_store_->query(instruction_id, q, scope_arg);
-            if (!results_opt) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"response store degraded"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            auto results = std::move(*results_opt);
-
-            // CC7.2 evidence: record the scope-drop on this surface (#1634 compliance review).
-            if (export_dropped > 0)
-                (void)audit_log(req, "response.read", "denied", "Execution", instruction_id,
-                                "scope_dropped=" + std::to_string(export_dropped) + " surface=export");
-
-            auto format = req.get_param_value("format");
-
-            if (format == "csv") {
-                std::string csv =
-                    "id,instruction_id,agent_id,timestamp,status,output,error_detail\r\n";
-                for (const auto& r : results) {
-                    csv += std::to_string(r.id) + ",";
-                    csv += data_export::csv_escape(r.instruction_id) + ",";
-                    csv += data_export::csv_escape(r.agent_id) + ",";
-                    csv += std::to_string(r.timestamp) + ",";
-                    csv += std::to_string(r.status) + ",";
-                    csv += data_export::csv_escape(r.output) + ",";
-                    csv += data_export::csv_escape(r.error_detail) + "\r\n";
-                }
-                res.set_header("Content-Disposition",
-                               "attachment; filename=\"responses-" + instruction_id + ".csv\"");
-                res.set_content(csv, "text/csv; charset=utf-8");
-            } else {
-                nlohmann::json arr = nlohmann::json::array();
-                for (const auto& r : results) {
-                    arr.push_back({{"id", r.id},
-                                   {"instruction_id", r.instruction_id},
-                                   {"agent_id", r.agent_id},
-                                   {"timestamp", r.timestamp},
-                                   {"status", r.status},
-                                   {"output", r.output},
-                                   {"error_detail", r.error_detail}});
-                }
-                nlohmann::json envelope = {{"instruction_id", instruction_id},
-                                           {"count", results.size()},
-                                           {"responses", arr}};
-                res.set_header("Content-Disposition",
-                               "attachment; filename=\"responses-" + instruction_id + ".json\"");
-                res.set_content(envelope.dump(2), "application/json; charset=utf-8");
-            }
-        });
-
-        web_server_->Get(R"(/api/responses/(.+))", [this](const httplib::Request& req,
-                                                          httplib::Response& res) {
-            auto gate = require_fleet_read(req, res, "Response", "Read");
-            if (!gate.admitted)
-                return; // gate already wrote the response.
-
-            auto instruction_id = req.matches[1].str();
-            if (instruction_id.empty()) {
-                res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"instruction_id required"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            if (!response_store_ || !response_store_->is_open()) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"response store not available"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            ResponseQuery q;
-            if (req.has_param("agent_id"))
-                q.agent_id = req.get_param_value("agent_id");
-            try {
-                if (req.has_param("status"))
-                    q.status = std::stoi(req.get_param_value("status"));
-                if (req.has_param("since"))
-                    q.since = std::stoll(req.get_param_value("since"));
-                if (req.has_param("until"))
-                    q.until = std::stoll(req.get_param_value("until"));
-                if (req.has_param("limit"))
-                    q.limit = std::stoi(req.get_param_value("limit"));
-                if (req.has_param("offset"))
-                    q.offset = std::stoi(req.get_param_value("offset"));
-            } catch (const std::exception&) {
-                res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            // #1634 / ADR-0017 INV-3 (CRITICAL): resolve the in-scope agent set and push it
-            // into the SQL WHERE clause BEFORE LIMIT/OFFSET — see the /export sibling above
-            // for the full rationale (post-fetch filtering a paginated read can hand a
-            // confined caller a short or empty page).
-            AggregateScope scope_arg; // nullopt = unrestricted
-            std::size_t get_dropped = 0;
-            if (gate.scope) {
-                auto distinct = response_store_->distinct_agent_ids(instruction_id);
-                if (!distinct) {
-                    res.status = 503;
-                    res.set_content(
-                        R"({"error":{"code":503,"message":"response store degraded"},"meta":{"api_version":"v1"}})",
-                        "application/json");
-                    return;
-                }
-                std::vector<std::string> in_scope;
-                in_scope.reserve(distinct->size());
-                for (auto& aid : *distinct) {
-                    if (authz::in_scope(gate.scope, aid))
-                        in_scope.push_back(std::move(aid));
-                    else
-                        ++get_dropped;
-                }
-                scope_arg = std::move(in_scope); // engaged-empty means no rows
-            }
-
-            auto results_opt = response_store_->query(instruction_id, q, scope_arg);
-            if (!results_opt) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"response store degraded"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            auto results = std::move(*results_opt);
-
-            // CC7.2 evidence: record the scope-drop on this surface (#1634 compliance review).
-            if (get_dropped > 0)
-                (void)audit_log(req, "response.read", "denied", "Execution", instruction_id,
-                                "scope_dropped=" + std::to_string(get_dropped) + " surface=get");
-
-            nlohmann::json arr = nlohmann::json::array();
-            for (const auto& r : results) {
-                arr.push_back({{"id", r.id},
-                               {"instruction_id", r.instruction_id},
-                               {"agent_id", r.agent_id},
-                               {"timestamp", r.timestamp},
-                               {"status", r.status},
-                               {"output", r.output},
-                               {"error_detail", r.error_detail}});
-            }
-            res.set_content(nlohmann::json({{"responses", arr}, {"count", arr.size()}}).dump(),
-                            "application/json");
-        });
-
-        // -- Tags API ---------------------------------------------------------
-        web_server_->Get("/api/tags", [this](const httplib::Request& req, httplib::Response& res) {
-            if (!require_permission(req, res, "Tag", "Read"))
-                return;
-
-            if (!tag_store_ || !tag_store_->is_open()) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"tag store not available"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            auto agent_id = req.get_param_value("agent_id");
-            if (agent_id.empty()) {
-                res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"agent_id parameter required"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            auto tags = tag_store_->get_all_tags(agent_id);
-            if (!tags) {
-                // Degrade → 503, never an empty list (#3097 classification).
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"tag store unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            nlohmann::json arr = nlohmann::json::array();
-            for (const auto& t : *tags) {
-                arr.push_back({{"key", t.key},
-                               {"value", t.value},
-                               {"source", t.source},
-                               {"updated_at", t.updated_at}});
-            }
-            res.set_content(nlohmann::json({{"agent_id", agent_id}, {"tags", arr}}).dump(),
-                            "application/json");
-        });
-
-        web_server_->Post("/api/tags/set", [this](const httplib::Request& req,
-                                                  httplib::Response& res) {
-            // CDX-R4-02: authenticate BEFORE any store/body work (401 first).
-            if (!require_auth(req, res))
-                return;
-            if (!tag_store_) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"tag store not available"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            auto agent_id = extract_json_string(req.body, "agent_id");
-            auto key = extract_json_string(req.body, "key");
-            auto value = extract_json_string(req.body, "value");
-
-            if (agent_id.empty() || key.empty()) {
-                res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"agent_id and key required"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            if (!TagStore::validate_key(key)) {
-                res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"invalid tag key"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            // #3289 hardening-round follow-up: normalize category keys to
-            // lowercase BEFORE anything downstream compares against them —
-            // mirrors the REST v1 twin (rest_api_v1.cpp), which already did
-            // this. Without it, a caller writing `key="Service"` (capital)
-            // stored the tag under the wrong case and silently skipped the
-            // `ensure_service_management_group` side effect below (a
-            // case-sensitive literal comparison), even though it isn't a
-            // security issue — the #3289 guard's own key check is already
-            // case-insensitive regardless of this normalization. Uses
-            // `kCategoryKeys` (the same constant the tag-push block 40 lines
-            // below already reads) rather than a second hardcoded literal
-            // list.
-            {
-                std::string lower_key = key;
-                std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(),
-                               [](unsigned char c) { return std::tolower(c); });
-                for (auto cat_key : kCategoryKeys) {
-                    if (cat_key == lower_key) {
-                        key = lower_key;
-                        break;
-                    }
-                }
-            }
-
-            // #3289: a service-scoped token authorizing this write via
-            // require_scoped_permission below reads the PRE-WRITE `service`
-            // tag to decide admission — so without this guard it could
-            // authorize the very write that changes that tag out from under
-            // its own confinement. Value-blind, checked before the scoped
-            // gate. See deny_service_scoped_service_tag_mutation's doc
-            // comment (auth_routes.hpp).
-            if (auth_routes_->deny_service_scoped_service_tag_mutation(req, res, "tag.set",
-                                                                       agent_id, key))
-                return;
-
-            // K-04/CDX-R4-08: per-TARGET authorization -- NOT a global Tag:Write
-            // gate. The old require_permission("Tag","Write") admitted a
-            // service-scoped token on its ITServiceOwner grant with no target
-            // check, so a service-A token could rewrite the `service` tag on a
-            // service-B agent and escape its own #1788 dispatch confinement (and
-            // it 403'd management-group-scoped operators). require_scoped_permission
-            // enforces Tag:Write scoped to agent_id, the same gate the REST v1
-            // twin (rest_api_v1.cpp) and MCP set_tag (mcp_server.cpp) use.
-            if (!require_scoped_permission(req, res, "Tag", "Write", agent_id))
-                return;
-
-            // Surface the write result (#3097 classification): db_error →
-            // 503, caller/validation error → 400 — a swallowed failed write
-            // used to report "Tag updated" over nothing written.
-            if (auto set_res = tag_store_->set_tag(agent_id, key, value, "api"); !set_res) {
-                const bool db_error = set_res.error().starts_with(kTagDbErrorPrefix);
-                (void)audit_log(req, "tag.set", "failure", "tag", agent_id + ":" + key,
-                                set_res.error());
-                res.status = db_error ? 503 : 400;
-                res.set_content(nlohmann::json{{"error",
-                                                {{"code", res.status},
-                                                 {"message", db_error ? "tag store unavailable"
-                                                                      : set_res.error()}}},
-                                               {"meta", {{"api_version", "v1"}}}}
-                                    .dump(),
-                                "application/json");
-                return;
-            }
-            if (key == "service")
-                ensure_service_management_group(value);
-            // Push updated tags to agent if a structured category changed
-            // Case-insensitive: API may receive "Role" but kCategoryKeys are lowercase
-            {
-                std::string lower_key = key;
-                std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(),
-                               [](unsigned char c) { return std::tolower(c); });
-                for (auto cat_key : kCategoryKeys) {
-                    if (cat_key == lower_key) {
-                        push_asset_tags_to_agent(agent_id);
-                        break;
-                    }
-                }
-            }
-            (void)audit_log(req, "tag.set", "success", "tag", agent_id + ":" + key, value);
-            res.set_header("HX-Trigger",
-                           R"({"showToast":{"message":"Tag updated","level":"success"}})");
-            res.set_content(R"({"status":"ok"})", "application/json");
-        });
-
-        web_server_->Post("/api/tags/delete", [this](const httplib::Request& req,
-                                                     httplib::Response& res) {
-            // CDX-R4-02: authenticate BEFORE any store/body work (401 first).
-            if (!require_auth(req, res))
-                return;
-            if (!tag_store_) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"tag store not available"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            auto agent_id = extract_json_string(req.body, "agent_id");
-            auto key = extract_json_string(req.body, "key");
-
-            if (agent_id.empty() || key.empty()) {
-                res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"agent_id and key required"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            // Gate 4/#3289 hardening round: normalize category keys to
-            // lowercase, matching the /api/tags/set twin above — without
-            // this, deleting a key by the same case a caller just set it
-            // with (e.g. "Service") silently no-ops (TagStore::delete_tag
-            // finds no row stored under that exact case) instead of removing
-            // the tag, since /api/tags/set now stores the normalized form.
-            {
-                std::string lower_key = key;
-                std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(),
-                               [](unsigned char c) { return std::tolower(c); });
-                for (auto cat_key : kCategoryKeys) {
-                    if (cat_key == lower_key) {
-                        key = lower_key;
-                        break;
-                    }
-                }
-            }
-
-            // #3289: same TOCTOU guard as /api/tags/set — a service-scoped
-            // token must not delete its own confinement key. See
-            // deny_service_scoped_service_tag_mutation's doc comment.
-            if (auth_routes_->deny_service_scoped_service_tag_mutation(req, res, "tag.delete",
-                                                                       agent_id, key))
-                return;
-
-            // K-04/CDX-R4-08: per-TARGET authorization (see /api/tags/set) --
-            // a service-scoped token must not delete a tag on an out-of-scope
-            // agent, and a group-scoped operator must be admitted on in-scope
-            // targets. Same gate as the REST v1 twin and MCP delete_tag.
-            if (!require_scoped_permission(req, res, "Tag", "Delete", agent_id))
-                return;
-
-            auto deleted = tag_store_->delete_tag(agent_id, key);
-            if (!deleted) {
-                // Degrade → 503, never "not deleted" (#3097 classification;
-                // the pre-migration bool conflated failure with not-found).
-                (void)audit_log(req, "tag.delete", "failure", "tag", agent_id + ":" + key);
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"tag store unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            (void)audit_log(req, "tag.delete", *deleted ? "success" : "not_found", "tag",
-                            agent_id + ":" + key);
-            if (*deleted) {
-                res.set_header("HX-Trigger",
-                               R"({"showToast":{"message":"Tag deleted","level":"success"}})");
-            }
-            res.set_content(nlohmann::json({{"deleted", *deleted}}).dump(), "application/json");
-        });
-
-        web_server_->Post("/api/tags/query", [this](const httplib::Request& req,
-                                                    httplib::Response& res) {
-            if (!require_permission(req, res, "Tag", "Read"))
-                return;
-            if (!tag_store_) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"tag store not available"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            auto key = extract_json_string(req.body, "key");
-            auto value = extract_json_string(req.body, "value");
-
-            if (key.empty()) {
-                res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"key required"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-
-            auto agents = tag_store_->agents_with_tag(key, value);
-            if (!agents) {
-                // Degrade → 503, never an empty agent list — this result
-                // feeds operator targeting decisions (#3097 classification).
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"tag store unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            nlohmann::json arr = nlohmann::json::array();
-            for (const auto& a : *agents)
-                arr.push_back(a);
-            res.set_content(nlohmann::json({{"agents", arr}, {"count", arr.size()}}).dump(),
-                            "application/json");
-        });
-
-        // -- HTMX Fragment Routes for Instructions UI -------------------------
-
-        web_server_->Get(
-            "/fragments/instructions", [this](const httplib::Request& req, httplib::Response& res) {
-                // guardian-confinement-2298 PR3 §3e: require_auth-only; the
-                // role check below (`can_author`) gates only the New/Edit
-                // buttons, not the definitions list itself.
-                if (auth_routes_->deny_service_scoped_session(
-                        req, res, "instructions.fragment.access_denied",
-                        "service-scoped tokens may not read the fleet-wide instruction "
-                        "definitions list"))
-                    return;
-                auto session = require_auth(req, res);
-                if (!session)
-                    return;
-                if (!instruction_store_) {
-                    res.set_content("<div class=\"empty-state\">Not available</div>", "text/html");
-                    return;
-                }
-
-                // ADR-0058: query_definitions now returns std::expected — a genuine DB
-                // error degrades to the same "Not available" fragment as a null store.
-                auto defs_result = instruction_store_->query_definitions();
-                if (!defs_result) {
-                    res.set_content("<div class=\"empty-state\">Not available</div>", "text/html");
-                    return;
-                }
-                const auto& defs = *defs_result;
-
-                // Check if user has PlatformEngineer or Administrator role
-                // PlatformEngineer or Administrator can author definitions.
-                // When RBAC enforcement is fully wired, this will check the
-                // PlatformEngineer role via RbacStore::check_permission().
-                // effective_role so an active JIT elevation also reveals the
-                // authoring UI (the POST already gates on effective_role).
-                bool can_author = (auth::effective_role(*session) == auth::Role::admin);
-
-                std::string html;
-                // Toolbar with New button for Platform Engineers
-                html += "<div class=\"toolbar\"><div>";
-                html += "<strong>" + std::to_string(defs.size()) + "</strong> definitions";
-                html += "</div><div>";
-                if (can_author) {
-                    html += "<button class=\"btn btn-primary\" onclick=\"openEditor()\">"
-                            "New Definition</button>";
-                }
-                html += "</div></div>";
-
-                if (defs.empty()) {
-                    html += "<div class=\"empty-state\">No instruction definitions yet.";
-                    if (can_author)
-                        html += " Click <strong>New Definition</strong> to create one.";
-                    html += "</div>";
-                } else {
-                    html += "<table><thead><tr><th>Name</th><th>Plugin:Action</th><th>Type</"
-                            "th><th>Enabled</th><th>Set</th><th></th></tr></thead><tbody>";
-                    for (const auto& d : defs) {
-                        auto type_cls = d.type == "question" ? "status-running" : "status-pending";
-                        bool is_legacy = d.id.starts_with("legacy.");
-                        html += "<tr><td><strong>" + html_escape(d.name) + "</strong>";
-                        if (is_legacy)
-                            html += " <span class=\"legacy-badge\">legacy</span>";
-                        html += "<br><span style=\"font-size:0.65rem;color:#8b949e\">" +
-                                html_escape(d.id.substr(0, 12)) +
-                                "</span></td>"
-                                "<td><code>" +
-                                html_escape(d.plugin) + ":" + html_escape(d.action) +
-                                "</code></td>"
-                                "<td><span class=\"status-badge " +
-                                type_cls + "\">" + html_escape(d.type) +
-                                "</span></td>"
-                                "<td>" +
-                                std::string(d.enabled ? "Yes" : "No") +
-                                "</td>"
-                                "<td>" +
-                                html_escape(d.instruction_set_id.empty()
-                                                ? "-"
-                                                : d.instruction_set_id.substr(0, 8)) +
-                                "</td>"
-                                "<td>";
-                        // d.id is operator-chosen since #402 (JSON create) /
-                        // #1993 (YAML metadata.id). The store now bounds NEW
-                        // ids to [A-Za-z0-9._-]{1,128}, but a row that predates
-                        // that gate may hold arbitrary text — so encode it for
-                        // the DOM at every interpolation (governance sec-M1).
-                        // The Edit control carries the id in a data-attribute
-                        // (html_escape makes it a safe attribute value) and
-                        // reads it back via this.dataset.defId, NOT string-
-                        // interpolated into the onclick JS: the browser
-                        // entity-decodes an attribute BEFORE the JS parser runs,
-                        // so a bare html_escape inside onclick="openEditor('…')"
-                        // would still let a legacy id break out of the string
-                        // and execute in the admin's session (Gate 8 SEC-1).
-                        if (can_author) {
-                            html += "<button class=\"btn btn-secondary btn-sm\" "
-                                    "data-def-id=\"" +
-                                    html_escape(d.id) +
-                                    "\" onclick=\"openEditor(this.dataset.defId)\">Edit</button> ";
-                        }
-                        html += "<button class=\"btn btn-danger btn-sm\" "
-                                "hx-delete=\"/api/instructions/" +
-                                html_escape(d.id) +
-                                "\" hx-target=\"#tab-definitions\" hx-swap=\"innerHTML\" "
-                                "hx-confirm=\"Delete definition '" +
-                                html_escape(d.name) + "'?\">Delete</button></td></tr>";
-                    }
-                    html += "</tbody></table>";
-                }
-                res.set_content(html, "text/html; charset=utf-8");
-            });
-
-        // -- YAML preview endpoint (server-side highlighting + validation) --
-        web_server_->Post(
-            "/fragments/instructions/yaml-preview",
-            [this](const httplib::Request& req, httplib::Response& res) {
-                if (!require_permission(req, res, "InstructionDefinition", "Read"))
-                    return;
-
-                auto yaml_source = req.get_param_value("yaml_source");
-                auto highlighted = highlight_yaml(yaml_source);
-                auto errors = validate_yaml_source(yaml_source);
-
-                std::string html = highlighted;
-                if (!errors.empty()) {
-                    html += R"(<div id="yaml-errors" hx-swap-oob="innerHTML:#yaml-errors">)";
-                    for (const auto& e : errors)
-                        html += "<div class='err'>" + html_escape(e) + "</div>";
-                    html += "</div>";
-                } else {
-                    html += R"(<div id="yaml-errors" hx-swap-oob="innerHTML:#yaml-errors"></div>)";
-                }
-                res.set_content(html, "text/html");
-            });
-
-        web_server_->Get(
-            "/fragments/approvals", [this](const httplib::Request& req, httplib::Response& res) {
-                auto session = require_auth(req, res);
-                if (!session)
-                    return;
-                // Gate on Approval:Read, mirroring the REST sibling GET /api/approvals
-                // (#3040): this fragment renders the full approvals population
-                // (submitted_by / status / scope_expression) and must not disclose it
-                // to any authenticated session, only to Approval:Read holders (seeded
-                // to Viewer). Approvals are workflow rows, not per-agent fleet data, so
-                // a bare require_permission is correct here (not authorize_list_read).
-                if (!require_permission(req, res, "Approval", "Read"))
-                    return;
-                if (!approval_manager_) {
-                    res.set_content("<div class=\"empty-state\">Not available</div>", "text/html");
-                    return;
-                }
-
-                auto approvals = approval_manager_->query();
-                std::string html;
-                if (approvals.empty()) {
-                    html = "<div class=\"empty-state\">No approval requests.</div>";
-                } else {
-                    html = "<table><thead><tr><th>ID</th><th>Status</th><th>Submitted "
-                           "By</th><th>Scope</th><th></th></tr></thead><tbody>";
-                    for (const auto& a : approvals) {
-                        auto status_cls = "status-" + a.status;
-                        html += "<tr><td><code style=\"font-size:0.7rem\">" +
-                                html_escape(a.id.substr(0, 12)) +
-                                "</code></td>"
-                                "<td><span class=\"status-badge " +
-                                status_cls + "\">" + html_escape(a.status) +
-                                "</span></td>"
-                                "<td>" +
-                                html_escape(a.submitted_by) +
-                                "</td>"
-                                "<td><code style=\"font-size:0.7rem\">" +
-                                html_escape(a.scope_expression) +
-                                "</code></td>"
-                                "<td>";
-                        if (a.status == "pending") {
-                            if (a.submitted_by == session->username) {
-                                // Self-review is denied server-side
-                                // (ApprovalManager: "reviewer cannot be the
-                                // same as the submitter") — don't render
-                                // buttons that can only silently fail (#1821).
-                                html += "<span style=\"font-size:0.65rem;color:var(--muted)\">"
-                                        "You submitted this — another reviewer must "
-                                        "approve</span>";
-                            } else {
-                                html += "<button class=\"btn btn-primary\" "
-                                        "style=\"font-size:0.65rem;padding:0.15rem "
-                                        "0.5rem;margin-right:0.3rem\" "
-                                        "hx-post=\"/api/approvals/" +
-                                        a.id +
-                                        "/approve\" hx-target=\"#tab-approvals\" "
-                                        "hx-swap=\"innerHTML\">Approve</button>"
-                                        "<button class=\"btn btn-danger\" "
-                                        "style=\"font-size:0.65rem;padding:0.15rem 0.5rem\" "
-                                        "hx-post=\"/api/approvals/" +
-                                        a.id +
-                                        "/reject\" hx-target=\"#tab-approvals\" "
-                                        "hx-swap=\"innerHTML\">Reject</button>";
-                            }
-                        }
-                        html += "</td></tr>";
-                    }
-                    html += "</tbody></table>";
-                }
-                res.set_content(html, "text/html; charset=utf-8");
-            });
-
-        // -- Inventory REST endpoints (Issue 7.17) --------------------------------
-
-        // GET /api/inventory/tables — list available inventory data types
-        web_server_->Get("/api/inventory/tables", [this](const httplib::Request& req,
-                                                         httplib::Response& res) {
-            if (!require_permission(req, res, "Inventory", "Read"))
-                return;
-            if (!inventory_store_ || !inventory_store_->is_open()) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"inventory store not available"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            auto tables = inventory_store_->list_tables();
-            if (!tables) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"inventory store degraded"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            nlohmann::json arr = nlohmann::json::array();
-            for (const auto& t : *tables) {
-                arr.push_back({{"plugin", t.plugin},
-                               {"agent_count", t.agent_count},
-                               {"last_collected", t.last_collected}});
-            }
-            res.set_content(nlohmann::json({{"tables", arr}, {"count", arr.size()}}).dump(),
-                            "application/json");
-        });
-
-        // GET /api/inventory/:agent_id/:plugin — get inventory for agent+plugin
-        web_server_->Get(R"(/api/inventory/([^/]+)/([^/]+))", [this](const httplib::Request& req,
-                                                                     httplib::Response& res) {
-            if (!require_permission(req, res, "Inventory", "Read"))
-                return;
-            if (!inventory_store_ || !inventory_store_->is_open()) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"inventory store not available"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            auto agent_id = req.matches[1].str();
-            auto plugin = req.matches[2].str();
-            auto record = inventory_store_->get(agent_id, plugin);
-            if (!record.has_value()) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"inventory store degraded"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            if (!record->has_value()) {
-                res.status = 404;
-                res.set_content(
-                    R"({"error":{"code":404,"message":"no inventory data found"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            const InventoryRecord& rec = **record;
-            nlohmann::json data_obj;
-            try {
-                data_obj = nlohmann::json::parse(rec.data_json);
-            } catch (...) {
-                data_obj = rec.data_json;
-            }
-            res.set_content(nlohmann::json({{"agent_id", rec.agent_id},
-                                            {"plugin", rec.plugin},
-                                            {"data", data_obj},
-                                            {"collected_at", rec.collected_at}})
-                                .dump(),
-                            "application/json");
-        });
-
-        // POST /api/inventory/query — query inventory across agents
-        web_server_->Post("/api/inventory/query", [this](const httplib::Request& req,
-                                                         httplib::Response& res) {
-            if (!require_permission(req, res, "Inventory", "Read"))
-                return;
-            if (!inventory_store_ || !inventory_store_->is_open()) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"inventory store not available"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            auto body = nlohmann::json::parse(req.body, nullptr, false);
-            if (body.is_discarded()) {
-                res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"invalid JSON"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            InventoryQuery q;
-            q.agent_id = body.value("agent_id", "");
-            q.plugin = body.value("plugin", "");
-            q.since = body.value("since", int64_t{0});
-            q.until = body.value("until", int64_t{0});
-            q.limit = body.value("limit", 100);
-            if (q.limit > 1000)
-                q.limit = 1000;
-
-            bool inventory_truncated = false;
-            auto records = inventory_store_->query(q, &inventory_truncated);
-            if (!records) {
-                res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"inventory store degraded"},"meta":{"api_version":"v1"}})",
-                    "application/json");
-                return;
-            }
-            nlohmann::json arr = nlohmann::json::array();
-            for (const auto& r : *records) {
-                nlohmann::json data_obj;
-                try {
-                    data_obj = nlohmann::json::parse(r.data_json);
-                } catch (...) {
-                    data_obj = r.data_json;
-                }
-                arr.push_back({{"agent_id", r.agent_id},
-                               {"plugin", r.plugin},
-                               {"data", data_obj},
-                               {"collected_at", r.collected_at}});
-            }
-            res.set_content(nlohmann::json({{"results", arr},
-                                            {"count", arr.size()},
-                                            {"result_truncated_by_cap", inventory_truncated}})
-                                .dump(),
-                            "application/json");
-        });
 
         // PolicyEvaluator — drives the compliance check -> verdict pipeline.
         // A background thread ticks it: dispatch due policies' check
@@ -15536,19 +14412,30 @@ private:
             .approval_manager = approval_manager_.get(),
             .audit_store = audit_store_.get(),
             .metrics = &metrics_,
-            // Review finding (#3133, merged): was command_dispatch_fn
-            // (hardcoded system=true, unfiltered) — every scheduled fire
-            // bypassed the classify+authorize chokepoint's per-action check
-            // regardless of the creator's actual permissions. Now carries the
-            // caller resolve_caller derives, exactly like every other operator
-            // dispatch surface. NOTE for future rebases: this must stay
-            // `command_dispatch_caller_fn` — reverting it to the system
-            // closure silently reopens that bypass.
-            .dispatch_fn = command_dispatch_caller_fn,
-            .dispatch_fn_concurrency = command_dispatch_concurrency_fn,
-            .resolve_caller =
-                [this](const std::string& username) {
-                return derive_dispatch_caller_for_username(username);
+            // WS-3 3.3 (ADR-2002 §6): scheduled fires no longer dispatch inline —
+            // they commit a durable `pending` outbox occurrence, and the
+            // CommandOutboxDelivery loop below performs the actual send (and the
+            // send-time re-authorization / caller resolution that the former
+            // inline `resolve_caller` + `dispatch_fn` did). This seam mints the
+            // occurrence's stable command_id and reads the current leader epoch
+            // for the fenced claim. FencedOut (leadership moved mid-tick) or a
+            // degraded store leaves the schedule due to retry — the stable
+            // occurrence key makes the retry idempotent.
+            .enqueue_fn =
+                [this](const yuzu::server::OutboxEnqueueRequest& req_in)
+                -> yuzu::server::OutboxEnqueueOutcome {
+                if (!command_outbox_store_ || !leader_elector_)
+                    return yuzu::server::OutboxEnqueueOutcome::Degraded;
+                const auto epoch = leader_elector_->epoch();
+                if (!epoch)
+                    return yuzu::server::OutboxEnqueueOutcome::FencedOut; // not leader — defer
+                yuzu::server::OutboxEnqueueRequest req = req_in;
+                if (req.command_id.empty())
+                    req.command_id =
+                        req.plugin + "-" +
+                        auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(16));
+                return command_outbox_store_->claim_and_enqueue(
+                    req, yuzu::server::kServerBackgroundLeaderLock, *epoch);
             },
             // D7/PLAN-003 (p14) — re-verify the arming principal's CURRENT
             // authority for this plugin.action before every fire (both the
@@ -15586,11 +14473,62 @@ private:
             // wiring as QuarantineContainmentReconciler::Deps above.
             .should_stop = [this] { return stop_requested_.load(std::memory_order_acquire); },
         });
+        // WS-3 3.3 (ADR-2002 §6): the leader-gated delivery loop that drains the
+        // command outbox ScheduleRunner now enqueues into, and performs the
+        // actual wire dispatch (R1: plain confined path with the stable supplied
+        // command_id) + the send-time re-authorization / caller resolution.
+        // Runs in the schedule thread's 5s sub-tick below, not a new thread.
+        command_outbox_delivery_ =
+            std::make_unique<CommandOutboxDelivery>(CommandOutboxDelivery::Deps{
+                .outbox = command_outbox_store_.get(),
+                .leader = leader_elector_.get(),
+                .execution_tracker = execution_tracker_.get(),
+                .audit_store = audit_store_.get(),
+                .metrics = &metrics_,
+                .dispatch_fn = command_outbox_deliver_dispatch_fn,
+                .resolve_caller =
+                    [this](const std::string& username) {
+                    return derive_dispatch_caller_for_username(username);
+                },
+                // Same arming seam as ScheduleRunner (schedule_arming_check.hpp) —
+                // re-verified AGAIN here at send time (authority may have changed
+                // between enqueue and delivery), the load-bearing re-authorization.
+                .arming_check = [this](const std::string& principal, const std::string& plugin,
+                                       const std::string& action) -> bool {
+                    return yuzu::server::schedule_arming_permitted(capability_registry_,
+                                                                   rbac_store_.get(), principal,
+                                                                   plugin, action);
+                },
+                .should_stop = [this] { return stop_requested_.load(std::memory_order_acquire); },
+            });
         schedule_tick_thread_ = std::thread([this]() {
-            spdlog::info("Schedule runner thread started (cadence=30s)");
+            spdlog::info("Schedule runner thread started (schedule eval 30s, outbox delivery 5s)");
             while (!stop_requested_.load(std::memory_order_acquire)) {
-                for (int i = 0; i < 6 && !stop_requested_.load(std::memory_order_acquire); ++i)
+                for (int i = 0; i < 6 && !stop_requested_.load(std::memory_order_acquire); ++i) {
                     std::this_thread::sleep_for(std::chrono::seconds{5});
+                    // WS-3 3.3: drive the command-outbox delivery every 5s
+                    // (leader-gated), independent of the 30s schedule-evaluation
+                    // cadence, so a queued fire dispatches within ~5s. Same
+                    // FencedLeaderOnly gate + catch-and-continue posture as the
+                    // schedule tick below.
+                    if (!stop_requested_.load(std::memory_order_acquire) &&
+                        command_outbox_delivery_) {
+                        try {
+                            YUZU_ASSERT_BACKGROUND_JOB("command_outbox.deliver"); // WS-10 FencedLeaderOnly
+                            if (leader_gate_permits<background_job_class("command_outbox.deliver")>(
+                                    leader_elector_.get()))
+                                command_outbox_delivery_->tick();
+                        } catch (const std::exception& e) {
+                            metrics_.counter("yuzu_schedule_tick_errors_total").increment();
+                            spdlog::error("command_outbox_delivery: tick threw ({}) — continuing",
+                                          e.what());
+                        } catch (...) {
+                            metrics_.counter("yuzu_schedule_tick_errors_total").increment();
+                            spdlog::error(
+                                "command_outbox_delivery: tick threw unknown exception — continuing");
+                        }
+                    }
+                }
                 if (stop_requested_.load(std::memory_order_acquire))
                     break;
                 if (schedule_runner_) {
@@ -17218,6 +16156,19 @@ private:
                                            directory_sync_.get(), patch_manager_.get(),
                                            deployment_store_.get(), discovery_store_.get());
 
+        // EnrollmentDirectoryRoutes — #4031 REST v1 read twins:
+        // /api/v1/directory/{users,status}, /api/v1/enrollment/{auto-approve-rules,
+        // pending-agents}, /api/v1/settings/oidc. `fleet_read_fn` (constructed
+        // above, already wired into RestApiV1/dashboard_routes_) is the
+        // ADR-0017 admit-then-filter gate for pending-agents alone — see this
+        // class's own header comment for why the other four routes stay on
+        // `perm_fn`.
+        enrollment_directory_routes_ = std::make_unique<EnrollmentDirectoryRoutes>();
+        enrollment_directory_routes_->register_routes(*web_server_, auth_fn, perm_fn, audit_fn,
+                                                       directory_sync_.get(), &auto_approve_,
+                                                       &auth_mgr_, &cfg_, oidc_mu_,
+                                                       fleet_read_fn);
+
         // -- PKI PR4: internal-CA REST surface (/api/v1/ca/*) ---------------------
         // The publish-CRL callback captures `this`; like the agent-cert signer it
         // relies on the gRPC/web drain in stop() running before members destruct.
@@ -18348,18 +17299,13 @@ private:
         // -- Register MCP server routes ----------------------------------------
 
         if (cfg_.mcp_disable) {
-            // C8: Return a proper JSON-RPC error instead of a generic 404.
-            // CH-7(c): the disabled stub must ANSWER GET/DELETE too (not a bare
-            // 404), so Streamable HTTP probes get the same honest disabled error.
-            auto mcp_disabled_stub = [](const httplib::Request&, httplib::Response& res) {
-                res.set_header("Content-Type", "application/json");
-                res.set_content(
-                    mcp::error_response_null(mcp::kMcpDisabled, "MCP is disabled on this server"),
-                    "application/json");
-            };
-            web_server_->Post("/mcp/v1/", mcp_disabled_stub);
-            web_server_->Get("/mcp/v1/", mcp_disabled_stub);
-            web_server_->Delete("/mcp/v1/", mcp_disabled_stub);
+            // #2542 PR-12: the 3-route MCP-disabled stub triple, extracted
+            // onto the HttpRouteSink seam (mcp_disabled_routes.cpp) — a
+            // local sink, same pattern as command_routes's registration
+            // above, since `inline_sink` (defined ~5,000 lines earlier) is
+            // not assumed still in scope here.
+            HttplibRouteSink mcp_disabled_sink{*web_server_};
+            yuzu::server::mcp_disabled::register_mcp_disabled_routes(mcp_disabled_sink);
         } else {
             mcp_server_ = std::make_unique<mcp::McpServer>();
             // In-memory session registry for Streamable HTTP (2f). Bounded,
@@ -18722,7 +17668,9 @@ private:
                     return derive_dispatch_caller(s);
                 },
                 // #4029: backs list_product_packs/get_product_pack.
-                product_pack_store_.get());
+                product_pack_store_.get(),
+                // #4030: backs list_workflows/get_workflow/get_workflow_execution.
+                workflow_engine_.get());
         }
 
         // -- Listen -----------------------------------------------------------
@@ -19123,6 +18071,11 @@ private:
     // [BUS-BEFORE-TRACKER] before approving any change to this block.
     std::unique_ptr<ApprovalManager> approval_manager_;
     std::unique_ptr<ScheduleEngine> schedule_engine_;
+    // WS-3 3.3 (ADR-2002 §6): the durable command outbox (borrows pg_pool_, so
+    // declared after it — destroyed before it) + its leader-gated delivery loop
+    // (borrows the outbox/elector/tracker/audit — reset in stop() before those).
+    std::unique_ptr<CommandOutboxStore> command_outbox_store_;
+    std::unique_ptr<CommandOutboxDelivery> command_outbox_delivery_;
 
     // Phase 3: Security & RBAC
     // ORDER IS LOAD-BEARING (#1453): rbac_store_ MUST be declared before
@@ -19320,6 +18273,7 @@ private:
     std::unique_ptr<WebhookRoutes> webhook_routes_;
     std::unique_ptr<OffloadRoutes> offload_routes_;
     std::unique_ptr<DiscoveryRoutes> discovery_routes_;
+    std::unique_ptr<EnrollmentDirectoryRoutes> enrollment_directory_routes_; // #4031
     std::unique_ptr<CaRoutes> ca_routes_; // PKI PR4: /api/v1/ca/*
     std::unique_ptr<KekRoutes> kek_routes_; // #2395: /api/v1/secrets/kek/*
     // The three KEK operations, shared by the REST routes above and the MCP
