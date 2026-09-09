@@ -463,6 +463,10 @@ constexpr TwinRow kExpectedTwins[] = {
     // (dashboard_routes.cpp) and its REST twin GET /api/v1/management-groups/
     // agent-count-preview (rest_api_v1.cpp).
     {"preview_management_group_agent_count", "ManagementGroup", "Write", false},
+    // #4034 — compliance/policy REST v1 read twins.
+    {"get_policy", "Policy", "Read", true},
+    {"list_policy_fragments", "Policy", "Read", true},
+    {"get_policy_agent_statuses", "Policy", "Read", true},
 };
 
 } // namespace

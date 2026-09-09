@@ -21,6 +21,7 @@
 #include "token_rotation_lookup.hpp" // shared REST/MCP human-token rotation successor lookup (P2 #11)
 
 #include "agent_registry.hpp"           // AgentRegistry (discover_plugins tool)
+#include "compliance_model.hpp"         // shared REST/MCP/fragment builders (#4034)
 #include "dashboard_routes.hpp"         // DashboardRoutes::gather_tar_retention_paused (#4027)
 #include "discover_routes.hpp"          // A2 discovery builders shared with REST /discover/*
 #include "instruction_definition_model.hpp" // #4029: shared row/detail/export builders
@@ -559,9 +560,45 @@ static const ToolDef kTools[] = {
      R"({"type":"object","properties":{"policy_id":{"type":"string","description":"Policy ID"}},"required":["policy_id"]})",
      R"j({"type":"object","properties":{"policy_id":{"type":"string"},"compliant":{"type":"integer"},"non_compliant":{"type":"integer"},"unknown":{"type":"integer"},"fixing":{"type":"integer"},"error":{"type":"integer"},"total":{"type":"integer"}},"required":["policy_id","compliant","non_compliant","unknown","fixing","error","total"]})j"},
 
+    // #4034: output widened to carry `fixing`/`error` (previously silently
+    // dropped — a real shape mismatch against this tool's REST siblings,
+    // GET /api/compliance and the new GET /api/v1/compliance, found while
+    // verifying this ledger claim per the recipe's Rule 1). Purely additive
+    // (new required fields, no field removed/renamed) — a caller reading
+    // only the five pre-existing fields is unaffected.
     {"get_fleet_compliance", "Get fleet-wide compliance percentages across all policies.",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"total_checks":{"type":"integer"},"compliant":{"type":"integer"},"non_compliant":{"type":"integer"},"unknown":{"type":"integer"},"compliance_pct":{"type":"number"}},"required":["total_checks","compliant","non_compliant","unknown","compliance_pct"]})j"},
+     R"j({"type":"object","properties":{"total_checks":{"type":"integer"},"compliant":{"type":"integer"},"non_compliant":{"type":"integer"},"unknown":{"type":"integer"},"fixing":{"type":"integer"},"error":{"type":"integer"},"compliance_pct":{"type":"number"}},"required":["total_checks","compliant","non_compliant","unknown","fixing","error","compliance_pct"]})j"},
+
+    {"get_policy", "Get a single policy's full detail, including its compliance summary. "
+     "REST v1 twin: GET /api/v1/policies/{id}.",
+     R"({"type":"object","properties":{"policy_id":{"type":"string","minLength":1,"description":"Policy ID"}},"required":["policy_id"]})",
+     R"j({"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"description":{"type":"string"},"yaml_source":{"type":"string"},"fragment_id":{"type":"string"},"scope_expression":{"type":"string"},"enabled":{"type":"boolean"},"remediation_available":{"type":"boolean"},"inputs":{"type":"object"},"triggers":{"type":"array"},"management_groups":{"type":"array","items":{"type":"string"}},"created_at":{"type":"integer"},"updated_at":{"type":"integer"},"compliance":{"type":"object","properties":{"compliant":{"type":"integer"},"non_compliant":{"type":"integer"},"unknown":{"type":"integer"},"fixing":{"type":"integer"},"error":{"type":"integer"},"total":{"type":"integer"}}}},"required":["id","name","enabled","scope_expression"]})j"},
+
+    {"list_policy_fragments", "List reusable check/fix/postCheck policy fragments. "
+     "REST v1 twin: GET /api/v1/policy-fragments.",
+     R"({"type":"object","properties":{"name":{"type":"string","description":"Optional name filter, substring match"},"limit":{"type":"integer","minimum":1,"maximum":1000,"description":"Maximum results, default 100"}}})",
+     R"j({"type":"object","properties":{"fragments":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"description":{"type":"string"},"check_instruction":{"type":"string"},"check_compliance":{"type":"string"},"fix_instruction":{"type":"string"},"post_check_instruction":{"type":"string"},"created_at":{"type":"integer"},"updated_at":{"type":"integer"}},"required":["id","name","check_instruction"]}}},"required":["fragments"]})j"},
+
+    // #4034: the per-agent-status fan-out half of GET /api/v1/compliance/{id}
+    // — get_compliance_summary above covers the aggregate-only half.
+    // Confined via fleet_read_fn_ (ServiceScopeClass::confined below): a
+    // management-group/service-scoped caller sees only the agents it can
+    // itself list, and `summary` is tallied from exactly that filtered set,
+    // never the store's unfiltered aggregate (see compliance_model.hpp's
+    // confined_policy_compliance doc comment). Chosen as a DISTINCT tool
+    // rather than widening get_compliance_summary's own output: the
+    // per-agent list can grow with fleet size (unlike the fixed-shape
+    // aggregate) and is the one row the #4034 issue calls "worth a second
+    // look" for confinement, so it gets its own gate + tool rather than
+    // silently riding along on every aggregate-only call.
+    {"get_policy_agent_statuses",
+     "Get one policy's per-agent compliance statuses (fan-out list) plus a summary tallied "
+     "from exactly the agents returned. Confined by management group / service scope: a "
+     "confined caller's summary counts only its own visible agents, never the fleet-wide "
+     "total. REST v1 twin: GET /api/v1/compliance/{id} (same shape).",
+     R"({"type":"object","properties":{"policy_id":{"type":"string","minLength":1,"description":"Policy ID"}},"required":["policy_id"]})",
+     R"j({"type":"object","properties":{"policy_id":{"type":"string"},"summary":{"type":"object","properties":{"compliant":{"type":"integer"},"non_compliant":{"type":"integer"},"unknown":{"type":"integer"},"fixing":{"type":"integer"},"error":{"type":"integer"},"total":{"type":"integer"}}},"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"status":{"type":"string"},"last_check_at":{"type":"integer"},"last_fix_at":{"type":"integer"},"check_result":{"type":"string"}},"required":["agent_id","status"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["policy_id","summary","agents"]})j"},
 
     {"list_management_groups", "List management groups (hierarchical device grouping).",
      R"({"type":"object","properties":{}})",
@@ -2071,6 +2108,12 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"list_policies", {"Policy", "Read"}},
     {"get_compliance_summary", {"Policy", "Read"}},
     {"get_fleet_compliance", {"Policy", "Read"}},
+    {"get_policy", {"Policy", "Read"}},
+    {"list_policy_fragments", {"Policy", "Read"}},
+    // #4034 — fleet_read_fn_-gated (like query_installed_software/
+    // get_agent_details above): a REAL confinement mechanism, so `confined`
+    // rather than the default `denied`.
+    {"get_policy_agent_statuses", {"Policy", "Read", ServiceScopeClass::confined}},
     {"list_management_groups", {"ManagementGroup", "Read"}},
     // #4033 — matches /fragments/create-group-form's own gate exactly
     // (Write, not Read); see the kTools[] entry's comment for why.
@@ -2589,6 +2632,9 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"list_policies", {ToolEffect::ReadOnly, true, "List policies"}},
     {"get_compliance_summary", {ToolEffect::ReadOnly, true, "Get compliance summary"}},
     {"get_fleet_compliance", {ToolEffect::ReadOnly, true, "Get fleet compliance"}},
+    {"get_policy", {ToolEffect::ReadOnly, true, "Get policy"}},
+    {"list_policy_fragments", {ToolEffect::ReadOnly, true, "List policy fragments"}},
+    {"get_policy_agent_statuses", {ToolEffect::ReadOnly, true, "Get policy agent statuses"}},
     {"list_management_groups", {ToolEffect::ReadOnly, true, "List management groups"}},
     // #4033 — NOT ToolEffect::ReadOnly: test_mcp_server.cpp's 2g PR2 cross-check
     // mechanically requires readOnlyHint == (operation == "Read"), and this
@@ -7174,17 +7220,13 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // #4034 Rule 1: same compliance_summary_json builder REST's
+                // GET /api/v1/compliance/{id} and GET /api/v1/policies/{id} call.
                 const auto& cs = *cs_res;
-                auto obj = JObj()
-                               .add("policy_id", cs.policy_id)
-                               .add("compliant", cs.compliant)
-                               .add("non_compliant", cs.non_compliant)
-                               .add("unknown", cs.unknown)
-                               .add("fixing", cs.fixing)
-                               .add("error", cs.error)
-                               .add("total", cs.total);
+                nlohmann::json obj = compliance_summary_json(cs);
+                obj["policy_id"] = cs.policy_id;
                 mcp_audit("success", policy_id);
-                res.set_content(success_response(id, tool_result(obj.str(), kObjectOutputSchema)),
+                res.set_content(success_response(id, tool_result(obj.dump(), kObjectOutputSchema)),
                                 "application/json");
                 return;
             }
@@ -7213,15 +7255,188 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // #4034 Rule 1: same fleet_compliance_json builder REST's
+                // GET /api/compliance and GET /api/v1/compliance call — this
+                // is also the fix for the shape mismatch this ledger claim
+                // surfaced (fixing/error were previously dropped here).
                 const auto& fc = *fc_res;
-                auto obj = JObj()
-                               .add("total_checks", fc.total_checks)
-                               .add("compliant", fc.compliant)
-                               .add("non_compliant", fc.non_compliant)
-                               .add("unknown", fc.unknown)
-                               .add("compliance_pct", fc.compliance_pct);
+                nlohmann::json obj = fleet_compliance_json(fc);
                 mcp_audit("success");
-                res.set_content(success_response(id, tool_result(obj.str(), kObjectOutputSchema)),
+                res.set_content(success_response(id, tool_result(obj.dump(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            // ── get_policy ─────────────────────────────────────────────────
+            // #4034 — MCP twin of GET /api/v1/policies/{id}. Plain perm_fn
+            // gate (not a fan-out list, so require_fleet_read does not apply).
+            if (tool_name == "get_policy") {
+                if (!tier_allows(tier, "Policy", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Policy", "Read"))
+                    return;
+                if (!policy_store) {
+                    res.set_content(error_response(id, kInternalError, "Policy store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto policy_id = param_str(args, "policy_id");
+                auto policy_res = policy_store->get_policy(policy_id);
+                if (!policy_res) {
+                    mcp_audit("failure", "store degraded; " + policy_id);
+                    res.set_content(
+                        a4_error(kInternalError, "Policy store degraded — query failed", {},
+                                 /*retry_after_ms=*/5000),
+                        "application/json");
+                    return;
+                }
+                if (!*policy_res) {
+                    mcp_audit("failure", "not found; " + policy_id);
+                    // Matches the wider codebase convention for a not-found
+                    // id ("bundle not found" / "tag not found" / "token not
+                    // found" above) — kInvalidParams via the plain
+                    // error_response, not the a4_error data envelope this
+                    // domain's degraded-store branches use.
+                    res.set_content(error_response(id, kInvalidParams, "policy not found"),
+                                    "application/json");
+                    return;
+                }
+                const Policy& policy = **policy_res;
+                auto cs_res = policy_store->get_compliance_summary(policy_id);
+                if (!cs_res) {
+                    mcp_audit("failure", "store degraded (compliance); " + policy_id);
+                    res.set_content(
+                        a4_error(kInternalError, "Policy store degraded — query failed", {},
+                                 /*retry_after_ms=*/5000),
+                        "application/json");
+                    return;
+                }
+                // Same fail-soft posture as the REST twin: a degraded
+                // fragment read means "not offered", not a distinct error —
+                // this only gates a UI/agentic affordance, not a grant.
+                bool remediation_available = false;
+                auto frag_res = policy_store->get_fragment(policy.fragment_id);
+                if (frag_res && *frag_res)
+                    remediation_available = !(*frag_res)->fix_instruction.empty();
+                nlohmann::json obj =
+                    single_policy_detail_json(policy, *cs_res, remediation_available);
+                mcp_audit("success", policy_id);
+                res.set_content(success_response(id, tool_result(obj.dump(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            // ── list_policy_fragments ──────────────────────────────────────
+            // #4034 — MCP twin of GET /api/v1/policy-fragments.
+            if (tool_name == "list_policy_fragments") {
+                if (!tier_allows(tier, "Policy", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Policy", "Read"))
+                    return;
+                if (!policy_store) {
+                    res.set_content(error_response(id, kInternalError, "Policy store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                FragmentQuery q;
+                auto name_filter = param_str(args, "name");
+                if (!name_filter.empty())
+                    q.name_filter = name_filter;
+                // Clamped like query_installed_software's own "limit" arg —
+                // bounds a caller-supplied 0/negative/huge value rather than
+                // passing it straight to the store (the legacy REST route
+                // has no such floor; this is deliberate MCP-side hardening).
+                q.limit = static_cast<int>(
+                    std::clamp<std::int64_t>(param_int(args, "limit", 100), 1, 1000));
+                auto frags_res = policy_store->query_fragments(q);
+                if (!frags_res) {
+                    mcp_audit("failure", "store degraded; list_policy_fragments");
+                    res.set_content(
+                        a4_error(kInternalError, "Policy store degraded — query failed", {},
+                                 /*retry_after_ms=*/5000),
+                        "application/json");
+                    return;
+                }
+                JArr arr;
+                for (const auto& f : *frags_res)
+                    arr.add_raw(policy_fragment_list_row_json(f).dump());
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id, tool_result(JObj().raw("fragments", arr.str()).str(),
+                                                     kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // ── get_policy_agent_statuses ───────────────────────────────────
+            // #4034 — the per-agent-status fan-out half of GET
+            // /api/v1/compliance/{id} (get_compliance_summary above covers
+            // the aggregate-only half). fleet_read_fn_ is the SOLE
+            // authorization gate — routed-concerns RBAC row: never stacked
+            // with perm_fn/tier_allows (same BLOCKING rule
+            // query_installed_software documents above).
+            if (tool_name == "get_policy_agent_statuses") {
+                if (!fleet_read_fn_) {
+                    spdlog::error("get_policy_agent_statuses: fleet_read_fn_ unwired — "
+                                  "misconfigured call site; failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto gate = fleet_read_fn_(req, res, "Policy", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the A4 error body + status.
+                if (!policy_store) {
+                    res.set_content(error_response(id, kInternalError, "Policy store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto policy_id = param_str(args, "policy_id");
+                auto statuses_res = policy_store->get_policy_agent_statuses(policy_id);
+                if (!statuses_res) {
+                    mcp_audit("failure", "store degraded; " + policy_id);
+                    res.set_content(
+                        a4_error(kInternalError, "Policy store degraded — query failed", {},
+                                 /*retry_after_ms=*/5000),
+                        "application/json");
+                    return;
+                }
+                // The confined tally (never the store's own unfiltered
+                // aggregate) — see compliance_model.hpp's
+                // confined_policy_compliance doc comment.
+                auto confined = confined_policy_compliance(*statuses_res, gate.scope, policy_id);
+                JArr arr;
+                for (const auto& s : confined.visible)
+                    arr.add_raw(policy_agent_status_json(s).dump());
+                // Set-and-proceed (audit_persisted:false on failure), never
+                // a 503 — this is the MCP-specific convention for surfacing
+                // an audit-persist gap (rest_audit.hpp: "MCP wraps the
+                // kernel itself and surfaces the gap through its own body
+                // field"), NOT the REST twin's posture: GET
+                // /api/v1/compliance/{id} was reclassified to fail-closed
+                // (503) because check_result can carry raw, unrestricted
+                // agent-instruction output — see that route's own comment
+                // (compliance_routes.cpp) for why "not behavioural PII"
+                // does NOT hold for this data. Reuses the REST route's own
+                // domain verb (recipe §4).
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "compliance.agent_statuses.view", "success", "Policy",
+                    policy_id, "agents=" + std::to_string(confined.visible.size()));
+                JObj payload;
+                payload.add("policy_id", policy_id);
+                payload.raw("summary", compliance_summary_json(confined.summary).dump());
+                payload.raw("agents", arr.str());
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");
                 return;
             }
