@@ -1289,6 +1289,55 @@ TEST_CASE("RbacStore: a decommission-ability revocation via an old conjunct gran
     CHECK(reopened.check_role_has_permission("ITServiceOwner", "GuaranteedState", "Delete"));
 }
 
+// Governance round 5 (Blocker 1): the carry-forward marker+DELETE pair above
+// must fire ONCE, at the moment the marker is first created — not on every
+// boot. Prior code re-ran the unconditional DELETE on every seed_defaults()
+// call gated only on "does the marker exist" (which is permanent), so an
+// operator's later EXPLICIT re-grant of Decommission:Delete via
+// set_permission() (which never touches revoked_seed_defaults) was silently
+// wiped out again on the very next restart. Sequence under test: revoke an
+// old conjunct grant -> first reopen carries the marker forward and deletes
+// the seeded Decommission:Delete row (matches the existing preservation test
+// above) -> operator explicitly RE-GRANTS Decommission:Delete -> second
+// reopen must NOT delete it again.
+TEST_CASE("RbacStore: an operator's explicit re-grant of Decommission:Delete survives "
+          "a later seed_defaults() reboot",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    REQUIRE(store.check_role_has_permission("ITServiceOwner", "Decommission", "Delete"));
+
+    // Pre-migration operator action: revoke one of the three old conjunct
+    // grants specifically to strip decommission ability.
+    auto removed = store.remove_permission("ITServiceOwner", "SoftwareLicensing", "Delete");
+    REQUIRE(removed.has_value());
+
+    // First reboot: the real seed_defaults() carries the revocation forward
+    // onto Decommission:Delete and deletes the row (the marker is created
+    // here for the first time).
+    {
+        RbacStore first_reopen{rbac_pool_fx_};
+        REQUIRE(first_reopen.is_open());
+        REQUIRE_FALSE(
+            first_reopen.check_role_has_permission("ITServiceOwner", "Decommission", "Delete"));
+
+        // Operator explicitly re-grants Decommission:Delete via the RBAC
+        // editor's own path — set_permission() writes role_permissions
+        // directly and never touches revoked_seed_defaults.
+        auto regranted =
+            first_reopen.set_permission({"ITServiceOwner", "Decommission", "Delete", "allow"});
+        REQUIRE(regranted.has_value());
+        REQUIRE(
+            first_reopen.check_role_has_permission("ITServiceOwner", "Decommission", "Delete"));
+    }
+
+    // Second reboot: the marker from the first reopen is still present, but
+    // the carry-forward DELETE must not fire again — the re-grant must
+    // survive.
+    RbacStore second_reopen{rbac_pool_fx_};
+    REQUIRE(second_reopen.is_open());
+    CHECK(second_reopen.check_role_has_permission("ITServiceOwner", "Decommission", "Delete"));
+}
+
 // ── check_scoped_permission ──────────────────────────────────────────────────
 
 namespace {

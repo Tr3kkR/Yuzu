@@ -851,18 +851,48 @@ void RbacStore::seed_defaults() {
     // pair exactly (same rationale: a hard DELETE with a separate bookkeeping
     // marker, never a fabricated 'deny' row — see remove_permission()'s own
     // comment for why) rather than relying on grant()'s guard alone.
-    exec("INSERT INTO rbac_store.revoked_seed_defaults (role_name, securable_type, operation) "
-        "SELECT 'ITServiceOwner', 'Decommission', 'Delete' WHERE EXISTS ("
-        "  SELECT 1 FROM rbac_store.revoked_seed_defaults WHERE role_name = 'ITServiceOwner' AND "
-        "  ((securable_type = 'SoftwareLicensing' AND operation = 'Delete') OR "
-        "   (securable_type = 'Inventory' AND operation = 'Delete') OR "
-        "   (securable_type = 'GuaranteedState' AND operation = 'Delete'))"
-        ") ON CONFLICT DO NOTHING");
-    exec("DELETE FROM rbac_store.role_permissions WHERE role_name = 'ITServiceOwner' AND "
-        "securable_type = 'Decommission' AND operation = 'Delete' AND EXISTS ("
-        "  SELECT 1 FROM rbac_store.revoked_seed_defaults WHERE role_name = 'ITServiceOwner' AND "
-        "  securable_type = 'Decommission' AND operation = 'Delete'"
-        ")");
+    //
+    // Governance round 5 (Blocker 1): the marker-insert + DELETE pair above
+    // used to run unconditionally on EVERY seed_defaults() call (every server
+    // boot), gated only on the marker's presence — never on whether the row
+    // had since been explicitly RE-GRANTED by an operator via set_permission()
+    // (which writes role_permissions directly and never touches
+    // revoked_seed_defaults). Reproduced: revoke an old grant -> first boot
+    // carries the marker forward and deletes the row (correct, one-time
+    // migration) -> operator explicitly re-grants Decommission:Delete ->
+    // next restart's seed_defaults() deleted the just-re-granted row again,
+    // because the DELETE's only gate was "does the marker exist", and the
+    // marker is permanent bookkeeping, not a one-shot flag.
+    //
+    // The carry-forward is a MIGRATION, not a standing invariant: it should
+    // fire exactly once, at the moment the marker itself is first created for
+    // this triple. Detect "already migrated" the same way the rest of this
+    // file treats one-time state (schema_meta-style: presence of the marker
+    // row IS the completion flag) — probe for the marker BEFORE inserting it,
+    // and only run the insert+DELETE pair when it is not yet present. Once
+    // the marker exists, grant()'s own `WHERE NOT EXISTS` guard is what keeps
+    // suppressing a FUTURE reseed of a row an operator explicitly removed;
+    // it does not care about the marker's age, so it stays correct with the
+    // DELETE gone.
+    pg::PgResult decommission_marker = pg::exec_params(c,
+        "SELECT 1 FROM rbac_store.revoked_seed_defaults WHERE role_name = 'ITServiceOwner' AND "
+        "securable_type = 'Decommission' AND operation = 'Delete'", std::vector<std::string>{});
+    const bool decommission_marker_present =
+        decommission_marker.status() == PGRES_TUPLES_OK && PQntuples(decommission_marker.get()) > 0;
+    if (!decommission_marker_present) {
+        exec("INSERT INTO rbac_store.revoked_seed_defaults (role_name, securable_type, operation) "
+            "SELECT 'ITServiceOwner', 'Decommission', 'Delete' WHERE EXISTS ("
+            "  SELECT 1 FROM rbac_store.revoked_seed_defaults WHERE role_name = 'ITServiceOwner' AND "
+            "  ((securable_type = 'SoftwareLicensing' AND operation = 'Delete') OR "
+            "   (securable_type = 'Inventory' AND operation = 'Delete') OR "
+            "   (securable_type = 'GuaranteedState' AND operation = 'Delete'))"
+            ") ON CONFLICT DO NOTHING");
+        exec("DELETE FROM rbac_store.role_permissions WHERE role_name = 'ITServiceOwner' AND "
+            "securable_type = 'Decommission' AND operation = 'Delete' AND EXISTS ("
+            "  SELECT 1 FROM rbac_store.revoked_seed_defaults WHERE role_name = 'ITServiceOwner' AND "
+            "  securable_type = 'Decommission' AND operation = 'Delete'"
+            ")");
+    }
     grant("ITServiceOwner", "Decommission", "Delete");
 
     // Viewer: read on all except Infrastructure.
