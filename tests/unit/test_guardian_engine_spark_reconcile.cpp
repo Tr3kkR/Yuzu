@@ -2600,10 +2600,16 @@ TEST_CASE("test helper: wait_until_quiescent returns false while another thread 
     // has it (loops on its own stop_token: a jthread destructor calls request_stop() and
     // would never set a hand-rolled release flag, so looping on such a flag would hang the
     // unwind path); a scope-exit join guard over std::thread on any toolchain that does not
-    // define __cpp_lib_jthread. NOTE (governance pass-5 xp-201): no CI leg compiles that
-    // fallback arm today (every shipped toolchain defines __cpp_lib_jthread); it exists
-    // because of the #2580 lesson (an untested portability arm bit on Apple Clang), so treat
-    // it as review-only code and keep it trivially simple.
+    // define __cpp_lib_jthread. NOT every shipped toolchain defines it - Apple Clang 15's
+    // libc++ (the macOS floor, docs/darwin-compat.md) does not - the fallback exists for
+    // exactly that case (the #2580 lesson: an untested portability arm bit on Apple Clang).
+    // NOTE (governance pass-6 xp-201/dw-304): no CI leg compiles the fallback arm today for a
+    // STRUCTURAL reason, not toolchain ubiquity - this whole test is `#ifndef _WIN32` (Windows
+    // excluded above) and returns via SUCCEED() before reaching this #if on any non-Linux
+    // platform (see the `#if !defined(__linux__)` branch just above), so only Linux ever
+    // reaches this selection, and every Linux CI leg builds against libstdc++, which does
+    // define __cpp_lib_jthread. A macOS leg would be the first to actually compile the
+    // fallback arm; treat it as review-only code and keep it trivially simple regardless.
 #if defined(__cpp_lib_jthread)
     std::jthread t([](std::stop_token st) {
         while (!st.stop_requested())
