@@ -1,9 +1,15 @@
 # Stage 2 - watch-establishment latency (PR-A harness, DGRHP run PENDING)
 
-Authority: `~/.claude/plans/let-s-deliver-this-claude-plans-spark-20-shiny-jellyfish.md`
-("#2012 + #3840 - bound File/Registry/Service watch establishment off the per-type
-lock"), "Latency characterization harness (PR-A; produces PR-B's constants)" section.
-Companion doc structure: `f11-flood-measurement-run.md` (same baselines directory).
+Authority: issues #2012 + #3840 ("bound File/Registry/Service watch establishment
+off the per-type lock"). Companion doc structure: `f11-flood-measurement-run.md`
+(same baselines directory). (Gate 6 compliance finding, PR-A round 5: this line
+previously cited a session-local, uncommitted plan file
+(`~/.claude/plans/let-s-deliver-this-claude-plans-spark-20-shiny-jellyfish.md`,
+"Latency characterization harness (PR-A; produces PR-B's constants)" section) as
+sole authority - unresolvable for any reader who isn't the authoring operator,
+unlike this sibling doc's own ADR/ruling citation. The plan file still holds the
+full design rationale if it's needed and still exists on the authoring machine,
+but the tracked issues are the durable reference.)
 
 ## Status: PENDING - no DGRHP run has been performed yet
 
@@ -61,6 +67,19 @@ Per the plan: `D = max(round_up_50ms(4 x p99_worst), floor)`, ceiling 500ms (Fil
 **If 4 x p99 exceeds the ceiling for any mechanism, STOP and re-think - never clamp
 silently.** `p99_worst` means the worst of the idle and under-load runs (R1 vs R3,
 R2 vs R4, S1/S2 vs S3), not just the idle baseline.
+
+**Aggregation convention (Gate 4 happy-path finding, PR-A round 5):** only R2/R4
+emit a per-sample sequence total (`t_walk_total`, itself contaminated by
+unmeasured teardown/drain per its own in-code comment). R1/R3/S2/S3 emit only
+PER-CALL series (t_event, t_wait_create, t_open, t_notify, t_wait_set for
+R1/R3; t_open, t_notify for S2/S3) - there is no per-sample sequence total to
+take a clean p99 of. Until the harness itself is extended with one (a
+before/after bracket per sample, mirroring R2/R4's shape), compute
+`p99_worst` for these four cases as the SUM of each call's own p99 - this is
+statistically conservative (an upper bound on the true sequence p99, not an
+exact one) and matches this document's existing "never clamp silently, stop
+and re-think" posture: an inflated p99_worst can only make the STOP check
+fire more readily, never less.
 
 A later commit on this same branch (PR-A's `spark_detached_call.hpp`) ships a
 `kGuardianBackendOpDeadlineMirror` constant + a `spark_deadline_below_guardian_

@@ -3905,6 +3905,16 @@ void establish_cleanup_tree(const std::string& base) {
              << " - a scratch key under HKCU\\" << base << " may be leaked");
 }
 
+/// RAII wrapper for establish_cleanup_tree(): calls it unconditionally at
+/// scope exit, including on a REQUIRE throw mid-loop (Gate 4 unhappy-path
+/// finding, PR-A round 5) - R1/R2's own trailing cleanup call was reached
+/// only if none of that case's kEstablishSamples-iteration loop's REQUIREs
+/// ever threw, leaking base\... on the first failure.
+struct EstablishTreeGuard {
+    std::string base;
+    ~EstablishTreeGuard() { establish_cleanup_tree(base); }
+};
+
 void CALLBACK establish_null_wait_cb(PTP_CALLBACK_INSTANCE, PVOID, PTP_WAIT, TP_WAIT_RESULT) {}
 
 /// R5 in-flight-drain callback: sleeps 50ms to simulate a callback parked
@@ -3962,32 +3972,46 @@ void establish_registry_sample(PTP_CALLBACK_ENVIRON env, DWORD notify_filter, Op
                                std::vector<std::int64_t>& t_open,
                                std::vector<std::int64_t>& t_notify,
                                std::vector<std::int64_t>& t_wait_set) {
-    HANDLE ev = nullptr;
-    time_call(t_event, [&] { ev = ::CreateEventW(nullptr, FALSE, FALSE, nullptr); });
-    REQUIRE(ev != nullptr);
+    // RAII, not three unconditional closes after the last REQUIRE (Gate 4
+    // unhappy-path finding, PR-A round 5): a REQUIRE throwing between two
+    // resource acquisitions used to leak whichever of ev/wait/h had already
+    // succeeded - the same defect class EstablishChurnWatch was fixed for
+    // in round 2, never generalized to this function. Teardown order
+    // (cancel-new, drain in-flight, then close) is unchanged; it now runs
+    // at scope exit unconditionally instead of only on the success path.
+    struct SampleGuard {
+        HANDLE ev{nullptr};
+        PTP_WAIT wait{nullptr};
+        HKEY h{nullptr};
+        ~SampleGuard() {
+            if (wait) {
+                ::SetThreadpoolWait(wait, nullptr, nullptr);
+                ::WaitForThreadpoolWaitCallbacks(wait, TRUE);
+                ::CloseThreadpoolWait(wait);
+            }
+            if (h)
+                ::RegCloseKey(h);
+            if (ev)
+                ::CloseHandle(ev);
+        }
+    } guard;
 
-    PTP_WAIT wait = nullptr;
+    time_call(t_event, [&] { guard.ev = ::CreateEventW(nullptr, FALSE, FALSE, nullptr); });
+    REQUIRE(guard.ev != nullptr);
+
     time_call(t_wait_create,
-              [&] { wait = ::CreateThreadpoolWait(&establish_null_wait_cb, nullptr, env); });
-    REQUIRE(wait != nullptr);
+              [&] { guard.wait = ::CreateThreadpoolWait(&establish_null_wait_cb, nullptr, env); });
+    REQUIRE(guard.wait != nullptr);
 
-    HKEY h = open(t_open);
-    REQUIRE(h != nullptr);
+    guard.h = open(t_open);
+    REQUIRE(guard.h != nullptr);
 
     LONG rc = 0;
     time_call(t_notify,
-              [&] { rc = ::RegNotifyChangeKeyValue(h, FALSE, notify_filter, ev, TRUE); });
+              [&] { rc = ::RegNotifyChangeKeyValue(guard.h, FALSE, notify_filter, guard.ev, TRUE); });
     CHECK(rc == ERROR_SUCCESS);
 
-    time_call(t_wait_set, [&] { ::SetThreadpoolWait(wait, ev, nullptr); });
-
-    // Teardown - not itself measured; mirrors spark_registry.cpp's own
-    // teardown() shape (cancel-new, drain in-flight, then close).
-    ::SetThreadpoolWait(wait, nullptr, nullptr);
-    ::WaitForThreadpoolWaitCallbacks(wait, TRUE);
-    ::CloseThreadpoolWait(wait);
-    ::RegCloseKey(h);
-    ::CloseHandle(ev);
+    time_call(t_wait_set, [&] { ::SetThreadpoolWait(guard.wait, guard.ev, nullptr); });
 }
 
 /// A private TP wait-group (min=2/max=4) matching spark_registry.cpp's own
@@ -4096,17 +4120,18 @@ struct EstablishChurnWatch {
     // from a Linux session with no compiler for this file - recorded here
     // for whoever runs this harness on DGRHP, not silently hidden. This
     // harness-local instance does not yet have its own tracked issue, and
-    // is a DIFFERENT concern from "T6" in `~/.claude/plans/let-s-deliver-
-    // this-claude-plans-spark-20-shiny-jellyfish.md` (this PR's own
-    // delivery-plan authority, also cited at the top of docs/spark-
-    // rebuild-baselines/stage2-watch-establish-latency.md): T6 names a
-    // production deadlock - unwatch() holding the per-type lock
-    // (mech_ops_mu_by_type_) waiting on a callback drain, while that
-    // callback is itself parked inside an inline consumer trying to
-    // re-arm and hitting the same per-type lock. This harness has no
-    // per-type lock at all, so T6 does not cover this race; it's named
-    // here only so a reader chasing "what else is unverified in this
-    // delivery" lands on the right document and the right concern.
+    // is a DIFFERENT concern from "T6" - a production deadlock tracked
+    // under issue #3840 (Windows watch establishment): unwatch() holding
+    // the per-type lock (mech_ops_mu_by_type_) waiting on a callback
+    // drain, while that callback is itself parked inside an inline
+    // consumer trying to re-arm and hitting the same per-type lock. This
+    // harness has no per-type lock at all, so T6 does not cover this race;
+    // it's named here only so a reader chasing "what else is unverified in
+    // this delivery" lands on the right tracked concern. (Gate 6
+    // compliance finding, PR-A round 5: an earlier version of this comment
+    // cited a session-local, uncommitted plan file as T6's source - not
+    // durable evidence for a reader who isn't the authoring operator. #3840
+    // is the durable, resolvable reference.)
     static void CALLBACK on_fire(PTP_CALLBACK_INSTANCE, void* ctx, PTP_WAIT, TP_WAIT_RESULT) {
         auto* self = static_cast<EstablishChurnWatch*>(ctx);
         if (self->stop->load(std::memory_order_relaxed))
@@ -4132,6 +4157,9 @@ TEST_CASE("Watch establishment (Registry): target-present raw call sequence (R1)
     REQUIRE(::RegCreateKeyExA(HKEY_CURRENT_USER, base.c_str(), 0, nullptr, 0, KEY_ALL_ACCESS,
                               nullptr, &base_h, nullptr) == ERROR_SUCCESS);
     ::RegCloseKey(base_h);
+    EstablishTreeGuard tree_guard{base}; // Gate 4 unhappy-path finding, PR-A round 5:
+                                         // the old trailing RegDeleteKeyA was reached
+                                         // only if none of the loop's REQUIREs threw
     const std::wstring base_w = establish_widen(base);
 
     std::vector<std::int64_t> t_event, t_wait_create, t_open, t_notify, t_wait_set;
@@ -4153,8 +4181,6 @@ TEST_CASE("Watch establishment (Registry): target-present raw call sequence (R1)
     warn_establish("R1 registry target-present", "RegOpenKeyExW", t_open);
     warn_establish("R1 registry target-present", "RegNotifyChangeKeyValue", t_notify);
     warn_establish("R1 registry target-present", "SetThreadpoolWait", t_wait_set);
-
-    ::RegDeleteKeyA(HKEY_CURRENT_USER, base.c_str());
 }
 
 TEST_CASE("Watch establishment (Registry): target-absent, ancestor walk depth 6 (R2)",
@@ -4170,6 +4196,9 @@ TEST_CASE("Watch establishment (Registry): target-absent, ancestor walk depth 6 
     REQUIRE(::RegCreateKeyExA(HKEY_CURRENT_USER, base.c_str(), 0, nullptr, 0, KEY_ALL_ACCESS,
                               nullptr, &base_h, nullptr) == ERROR_SUCCESS);
     ::RegCloseKey(base_h);
+    EstablishTreeGuard tree_guard{base}; // Gate 4 unhappy-path finding, PR-A round 5:
+                                         // the old trailing RegDeleteKeyA was reached
+                                         // only if none of the loop's REQUIREs threw
     // 6 absent levels under `base`, which exists - matches the plan's
     // "ancestor walk depth 6". None of a\b\c\d\e\f is ever created.
     const std::string target = base + "\\a\\b\\c\\d\\e\\f";
@@ -4226,8 +4255,6 @@ TEST_CASE("Watch establishment (Registry): target-absent, ancestor walk depth 6 
     warn_establish("R2 registry target-absent depth6",
                    "TOTAL (event+waitcreate+walk+notify+set, INCL. TEARDOWN/DRAIN)",
                    t_walk_total);
-
-    ::RegDeleteKeyA(HKEY_CURRENT_USER, base.c_str());
 }
 
 namespace {
@@ -4246,29 +4273,43 @@ struct EstablishHiveLoad {
         const std::string churn_key_path = base + "\\churn";
         REQUIRE(::RegCreateKeyExA(HKEY_CURRENT_USER, churn_key_path.c_str(), 0, nullptr, 0,
                                   KEY_ALL_ACCESS, nullptr, &churn_key, nullptr) == ERROR_SUCCESS);
-        constexpr int kChurnWatches = 200; // plan: "200 pre-armed watches on the private pool"
-        watches.resize(kChurnWatches);
-        for (auto& w : watches) {
-            w.hkey = churn_key;
-            w.stop = &stop;
-            w.event = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
-            REQUIRE(w.event != nullptr);
-            w.wait = ::CreateThreadpoolWait(&EstablishChurnWatch::on_fire, &w, &pool.env);
-            REQUIRE(w.wait != nullptr);
-            REQUIRE(::RegNotifyChangeKeyValue(
-                        churn_key, FALSE, REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_THREAD_AGNOSTIC,
-                        w.event, TRUE) == ERROR_SUCCESS);
-            ::SetThreadpoolWait(w.wait, w.event, nullptr);
-        }
-        writer = std::thread([this] {
-            DWORD v = 0;
-            while (!stop.load(std::memory_order_relaxed)) {
-                ::RegSetValueExA(churn_key, "v", 0, REG_DWORD,
-                                 reinterpret_cast<const BYTE*>(&v), sizeof(v));
-                ++v;
-                std::this_thread::sleep_for(2ms);
+        // Everything from here on can REQUIRE-throw before the constructor
+        // completes, and a not-fully-constructed object's destructor never
+        // runs (Gate 4 unhappy-path finding, PR-A round 5) - churn_key is
+        // this object's own resource, acquired above, so only THIS catch
+        // block can close it on that path; `watches`' own elements still
+        // unwind correctly via their own destructors regardless (subobject
+        // cleanup runs even when the enclosing object's ctor doesn't
+        // finish), so they need no equivalent handling here.
+        try {
+            constexpr int kChurnWatches = 200; // plan: "200 pre-armed watches on the private pool"
+            watches.resize(kChurnWatches);
+            for (auto& w : watches) {
+                w.hkey = churn_key;
+                w.stop = &stop;
+                w.event = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                REQUIRE(w.event != nullptr);
+                w.wait = ::CreateThreadpoolWait(&EstablishChurnWatch::on_fire, &w, &pool.env);
+                REQUIRE(w.wait != nullptr);
+                REQUIRE(::RegNotifyChangeKeyValue(
+                            churn_key, FALSE,
+                            REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_THREAD_AGNOSTIC, w.event,
+                            TRUE) == ERROR_SUCCESS);
+                ::SetThreadpoolWait(w.wait, w.event, nullptr);
             }
-        });
+            writer = std::thread([this] {
+                DWORD v = 0;
+                while (!stop.load(std::memory_order_relaxed)) {
+                    ::RegSetValueExA(churn_key, "v", 0, REG_DWORD,
+                                     reinterpret_cast<const BYTE*>(&v), sizeof(v));
+                    ++v;
+                    std::this_thread::sleep_for(2ms);
+                }
+            });
+        } catch (...) {
+            ::RegCloseKey(churn_key);
+            throw;
+        }
     }
     ~EstablishHiveLoad() {
         stop.store(true, std::memory_order_relaxed);
@@ -4402,20 +4443,33 @@ TEST_CASE("Watch establishment (Registry): WaitForThreadpoolWaitCallbacks drain,
         SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset - skipping establishment latency harness");
         return;
     }
+    // RAII, not two unconditional closes at loop-bottom (Gate 4 unhappy-path
+    // finding, PR-A round 5): a REQUIRE throwing between the two creates
+    // below used to leak whichever of ev/wait had already succeeded.
+    struct EventWaitGuard {
+        HANDLE ev{nullptr};
+        PTP_WAIT wait{nullptr};
+        ~EventWaitGuard() {
+            if (wait)
+                ::CloseThreadpoolWait(wait);
+            if (ev)
+                ::CloseHandle(ev);
+        }
+    };
+
     // Idle drain: a wait that was never signaled, disarmed then drained -
     // this is unwatch()'s common case (spark_registry.cpp:304's
     // WaitForThreadpoolWaitCallbacks(TRUE)).
     std::vector<std::int64_t> t_idle;
     for (int i = 0; i < kEstablishSamples; ++i) {
-        HANDLE ev = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        REQUIRE(ev != nullptr);
-        PTP_WAIT wait = ::CreateThreadpoolWait(&establish_null_wait_cb, nullptr, nullptr);
-        REQUIRE(wait != nullptr);
-        ::SetThreadpoolWait(wait, ev, nullptr);
-        ::SetThreadpoolWait(wait, nullptr, nullptr); // cancel before it ever fires
-        time_call(t_idle, [&] { ::WaitForThreadpoolWaitCallbacks(wait, TRUE); });
-        ::CloseThreadpoolWait(wait);
-        ::CloseHandle(ev);
+        EventWaitGuard g;
+        g.ev = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        REQUIRE(g.ev != nullptr);
+        g.wait = ::CreateThreadpoolWait(&establish_null_wait_cb, nullptr, nullptr);
+        REQUIRE(g.wait != nullptr);
+        ::SetThreadpoolWait(g.wait, g.ev, nullptr);
+        ::SetThreadpoolWait(g.wait, nullptr, nullptr); // cancel before it ever fires
+        time_call(t_idle, [&] { ::WaitForThreadpoolWaitCallbacks(g.wait, TRUE); });
     }
     warn_establish("R5 drain idle", "WaitForThreadpoolWaitCallbacks", t_idle);
 
@@ -4436,12 +4490,13 @@ TEST_CASE("Watch establishment (Registry): WaitForThreadpoolWaitCallbacks drain,
     constexpr int kInflightSamples = kEstablishSamples;
     for (int i = 0; i < kInflightSamples; ++i) {
         std::atomic<bool> started{false};
-        HANDLE ev = ::CreateEventW(nullptr, TRUE /*manual-reset*/, FALSE, nullptr);
-        REQUIRE(ev != nullptr);
-        PTP_WAIT wait = ::CreateThreadpoolWait(&establish_r5_inflight_cb, &started, nullptr);
-        REQUIRE(wait != nullptr);
-        ::SetThreadpoolWait(wait, ev, nullptr);
-        ::SetEvent(ev); // fire it - the callback is now (about to be) running
+        EventWaitGuard g;
+        g.ev = ::CreateEventW(nullptr, TRUE /*manual-reset*/, FALSE, nullptr);
+        REQUIRE(g.ev != nullptr);
+        g.wait = ::CreateThreadpoolWait(&establish_r5_inflight_cb, &started, nullptr);
+        REQUIRE(g.wait != nullptr);
+        ::SetThreadpoolWait(g.wait, g.ev, nullptr);
+        ::SetEvent(g.ev); // fire it - the callback is now (about to be) running
         // Wait for the callback to actually announce it started (bounded -
         // if the pool never picks it up within 1s, this sample is genuinely
         // measuring cancellation; still time it, but count it separately so
@@ -4450,9 +4505,7 @@ TEST_CASE("Watch establishment (Registry): WaitForThreadpoolWaitCallbacks drain,
         // already dispatched the callback by then.
         if (!eventually([&] { return started.load(std::memory_order_acquire); }, 1000ms))
             ++inflight_not_started;
-        time_call(t_inflight, [&] { ::WaitForThreadpoolWaitCallbacks(wait, TRUE); });
-        ::CloseThreadpoolWait(wait);
-        ::CloseHandle(ev);
+        time_call(t_inflight, [&] { ::WaitForThreadpoolWaitCallbacks(g.wait, TRUE); });
     }
     warn_establish("R5 drain in-flight (50ms callback)", "WaitForThreadpoolWaitCallbacks",
                    t_inflight);
@@ -4629,6 +4682,15 @@ TEST_CASE("Watch establishment (Service): OpenServiceW+NotifyServiceStatusChange
         });
         ++sampled;
         if (!h) {
+            // Gate 4 happy-path finding, PR-A round 5: time_call above ran
+            // unconditionally, so a failed open's (likely fast) timing was
+            // silently mixed into t_open - the exact same series the WARN
+            // below reports as "OpenServiceW" latency, contradicting its own
+            // "not timed as a separate latency series" wording. pop_back()
+            // it out, matching the bulk-arm Service series' existing
+            // convention (t_svc_arm.pop_back() on failure) - the failure is
+            // still visible via t_open_failed's GetLastError codes.
+            t_open.pop_back();
             t_open_failed.push_back(static_cast<std::int64_t>(last_err));
             continue;
         }
@@ -4649,8 +4711,8 @@ TEST_CASE("Watch establishment (Service): OpenServiceW+NotifyServiceStatusChange
     warn_establish("S2 service list open+notify", "OpenServiceW", t_open);
     warn_establish("S2 service list open+notify", "NotifyServiceStatusChangeW", t_notify);
     WARN("S2 service list open+notify: " << t_open_failed.size() << " of " << sampled
-         << " OpenServiceW attempts failed (GetLastError values reported, not timed as a"
-            " separate latency series)");
+         << " OpenServiceW attempts failed and are excluded from the t_open series above"
+            " (GetLastError values reported, not timed as a separate latency series)");
 }
 
 TEST_CASE("Watch establishment (Service): S2 sequence under SCM load (S3)",
@@ -4725,6 +4787,10 @@ TEST_CASE("Watch establishment (Service): S2 sequence under SCM load (S3)",
         });
         ++sampled;
         if (!h) {
+            // Gate 4 happy-path finding, PR-A round 5: see S2's identical
+            // comment - pop_back() keeps a failed open's timing out of the
+            // t_open series it would otherwise silently contaminate.
+            t_open.pop_back();
             t_open_failed.push_back(static_cast<std::int64_t>(last_err));
             continue;
         }
@@ -4748,8 +4814,8 @@ TEST_CASE("Watch establishment (Service): S2 sequence under SCM load (S3)",
     warn_establish("S3 NotifyServiceStatusChangeW UNDER SCM LOAD", "NotifyServiceStatusChangeW",
                    t_notify);
     WARN("S3 UNDER SCM LOAD: " << t_open_failed.size() << " of " << sampled
-         << " OpenServiceW attempts failed (GetLastError values reported, not timed as a"
-            " separate latency series)");
+         << " OpenServiceW attempts failed and are excluded from the t_open series above"
+            " (GetLastError values reported, not timed as a separate latency series)");
 }
 
 TEST_CASE("Watch establishment (File): is_directory + CreateFileW sanity (F1)",
@@ -4819,6 +4885,16 @@ TEST_CASE("Watch establishment: post-fix fast-path cost, bulk engine.arm() (N=20
         SC_HANDLE scm =
             ::OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT | SC_MANAGER_ENUMERATE_SERVICE);
         REQUIRE(scm != nullptr);
+        // RAII, not a trailing CloseServiceHandle (Gate 4 unhappy-path
+        // finding, PR-A round 5): the REQUIRE(count > 0) below used to
+        // leak `scm` on failure.
+        struct ScGuard {
+            SC_HANDLE h;
+            ~ScGuard() {
+                if (h)
+                    ::CloseServiceHandle(h);
+            }
+        } scm_guard{scm};
         DWORD needed = 0, count = 0, resume = 0;
         ::EnumServicesStatusExW(scm, SC_ENUM_PROCESS_INFO, SERVICE_WIN32, SERVICE_STATE_ALL,
                                 nullptr, 0, &needed, &count, &resume, nullptr);
@@ -4832,7 +4908,6 @@ TEST_CASE("Watch establishment: post-fix fast-path cost, bulk engine.arm() (N=20
         const auto* entries = reinterpret_cast<const ENUM_SERVICE_STATUS_PROCESSW*>(buf.data());
         for (DWORD i = 0; i < count; ++i)
             service_names.emplace_back(entries[i].lpServiceName);
-        ::CloseServiceHandle(scm);
     }
 
     yuzu::test::TempDir file_base("yuzu_test_spark_est_bulk_file_");
@@ -4850,6 +4925,22 @@ TEST_CASE("Watch establishment: post-fix fast-path cost, bulk engine.arm() (N=20
     auto c = engine.register_consumer("c", got.handler());
     REQUIRE(c.has_value());
     engine.start();
+    // RAII, not trailing engine.stop()/establish_cleanup_tree calls at the
+    // end of this function (Gate 4 unhappy-path finding, PR-A round 5): any
+    // of the many REQUIREs in the Registry/File/Service arm loops below
+    // used to leave the engine's background threads running AND leak
+    // base\k0..k199 on the first failure, since both trailing calls were
+    // reached only on full completion.
+    struct BulkGuard {
+        SparkEngine& engine;
+        const std::string& base;
+        ~BulkGuard() {
+            engine.stop();
+            establish_cleanup_tree(base); // base\k0..k199 - RegDeleteKeyA
+                                          // would silently fail here (200
+                                          // children still present)
+        }
+    } bulk_guard{engine, base};
 
     // --- Registry: initial arm, then re-arm (value-write triggers each
     // key's TP_WAIT callback -> on_fire() -> reconcile()) ---
@@ -4967,10 +5058,8 @@ TEST_CASE("Watch establishment: post-fix fast-path cost, bulk engine.arm() (N=20
             "excluded from the timing series above), wall clock total = "
          << std::chrono::duration_cast<std::chrono::milliseconds>(svc_t1 - svc_t0).count()
          << "ms");
-
-    engine.stop();
-    establish_cleanup_tree(base); // base\k0..k199 - RegDeleteKeyA would silently
-                                  // fail here (200 children still present)
+    // bulk_guard's destructor stops the engine and cleans up the registry
+    // tree here, unconditionally.
 }
 
 #endif // _WIN32

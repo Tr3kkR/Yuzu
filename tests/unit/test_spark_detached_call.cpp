@@ -22,7 +22,8 @@
 
 #include "spark_detached_call.hpp"
 
-#include "test_helpers.hpp" // yuzu::test::spin_until
+#include "guardian_spark_runtime.hpp" // GuardianSparkRuntime::Config, for the deadline-mirror pinning test
+#include "test_helpers.hpp"           // yuzu::test::spin_until
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -614,6 +615,20 @@ TEST_CASE("spark_deadline_below_guardian_backend_op: tripwire matches the mirror
     CHECK(spark_deadline_below_guardian_backend_op(std::chrono::milliseconds(4999)));
     CHECK_FALSE(spark_deadline_below_guardian_backend_op(std::chrono::milliseconds(5000)));
     CHECK_FALSE(spark_deadline_below_guardian_backend_op(std::chrono::milliseconds(5001)));
+}
+
+TEST_CASE("kGuardianBackendOpDeadlineMirror: pinned against the REAL, live-constructed "
+          "GuardianSparkRuntime::Config default, not just the literal it happens to equal",
+          "[spark][detachedcall]") {
+    // Gate 6 sre finding, PR-A round 5: kGuardianBackendOpDeadlineMirror's own
+    // header comment calls itself "a documentation tripwire, not a functional
+    // coupling" - nothing previously cross-checked it against the config it
+    // claims to mirror, only against a second literal (the test above, and
+    // the static_asserts before it) that could drift in lockstep with it and
+    // never be caught. Default-constructing the real config here is what
+    // makes this test capable of failing if Guardian's own default ever
+    // changes without a matching update to the mirror.
+    CHECK(kGuardianBackendOpDeadlineMirror == GuardianSparkRuntime::Config{}.backend_op_deadline);
 }
 
 // ── F3 regression: the counter survives its OWNING OBJECT's destruction

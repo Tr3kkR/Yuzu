@@ -2485,6 +2485,19 @@ Guardian ladder must check these.
   after a bounded grace. A source left out of that sum would silently reinstate
   the use-after-free the joined-thread rule used to prevent by a different
   mechanism.
+  **Extended for Spark (PR-A, #2012/#3840; dormant until a mechanism uses it —
+  Gate 6 compliance finding, PR-A round 5, folded in here):** a second,
+  independent additive source feeds the SAME chokepoint one level up.
+  `AgentImpl::guardian_active_io_workers()` (`agent.cpp`) sums
+  `GuardianEngine::active_io_workers()` (above) with a separate
+  `spark_detached_workers_` counter fed by `agents/core/src/
+  spark_detached_call.hpp`'s `SparkDetachedLane`/`DetachedCall<T>` primitive —
+  constructed before any `SparkEngine`/mechanism and never read through
+  `spark_engine_`/`spark_boot_done_`, so it stays correct across a boot-time
+  exception that resets `spark_engine_`. `main.cpp`/`service_win.cpp` poll the
+  SUM at this `AgentImpl` level, not `GuardianEngine::active_io_workers()`
+  alone; a future third additive source must feed this same chokepoint, never
+  a parallel counter.
 - **Journal maintenance is paced by TIME, never by wake count.** The drain
   worker wakes on every outbox enqueue, and a paging pass is a full
   `list_entries` + parse + `validate_record` sweep of the journal.

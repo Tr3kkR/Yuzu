@@ -160,8 +160,14 @@ enum class DetachedLaunch : std::uint8_t {
 /// Why a launched call's result is not a plain T.
 enum class DetachedCallError : std::uint8_t {
     WorkerThrew,       ///< fn() threw; contained, the worker never terminates
-    ResultAllocFailed, ///< the worker could not even box the WorkerThrew error
-                       ///< (allocation-starved worker) - done() is still true
+    ResultAllocFailed, ///< the worker could not box a result - EITHER fn()
+                       ///< succeeded and only its result's own box allocation
+                       ///< failed (the more likely real-world cause, no
+                       ///< antecedent exception needed), OR fn() threw and
+                       ///< the WorkerThrew error box itself then also failed
+                       ///< to allocate (Gate 4 consistency-auditor finding,
+                       ///< PR-A round 5: this comment named only the second
+                       ///< cause) - done() is still true either way
 };
 
 template <class T>
@@ -216,8 +222,14 @@ struct LaneState {
     // successfully-boxed result immediately after computing it, so a test
     // can reach the ResultAllocFailed path deterministically. There is no
     // portable way to make std::make_unique<DetachedResult<T>> itself fail
-    // (it would need a global operator-new hook), so this is the only
-    // reachable way to exercise take_locked()'s null-result branch at all.
+    // (it would need a global operator-new hook), so this is one of two
+    // seams that exercise take_locked()'s null-result branch (the other is
+    // fail_first_box_alloc_for_test below, which reaches the SAME branch by
+    // a different route - the fn()-succeeded path's inner catch, not this
+    // seam's post-hoc discard on the WorkerThrew-adjacent path; Gate 4
+    // consistency-auditor finding, PR-A round 5: this comment previously
+    // claimed to be the ONLY way, which fail_first_box_alloc_for_test's own
+    // later addition made false).
     // NOTE: this seam's discard happens OUTSIDE operator()()'s try/catch, so
     // it never itself SETS worker_threw_total (whether the counter ends up
     // 0 depends only on whether fn() threw, same as without this seam
@@ -348,9 +360,16 @@ public:
     /// returned to the caller here (for disposal); not-yet-published -> the
     /// worker is told to self-dispose when it eventually completes, and
     /// nullopt is returned. Exactly once - a second abandon() (or a
-    /// try_take/wait_take after one) always returns nullopt. noexcept: T's
-    /// destructor (the only thing that can run here besides lock
-    /// acquisition) is assumed not to throw, per ordinary RAII convention.
+    /// try_take/wait_take after one) always returns nullopt. noexcept: on
+    /// the published-but-untaken path this runs take_locked(), which MOVE-
+    /// CONSTRUCTS T out of the boxed result (never destroys it here - see
+    /// take_locked()'s own comment on why the moved-from remnant is left
+    /// engaged); that move is not merely assumed not to throw, it is
+    /// COMPILE-TIME ENFORCED by launch()'s own
+    /// static_assert(is_nothrow_move_constructible_v<T>) (Gate 4
+    /// consistency-auditor finding, PR-A round 5: this comment previously
+    /// named T's destructor as the operation running here and called its
+    /// nothrow-ness an assumption - neither is accurate).
     [[nodiscard]] std::optional<DetachedResult<T>> abandon() noexcept {
         if (!cell_)
             return std::nullopt;
@@ -377,10 +396,13 @@ public:
 
 private:
     /// Caller must hold cell_->mu. A null cell_->result (the worker could
-    /// not even box a WorkerThrew error - see Payload::operator()'s own
-    /// second catch) is a real, reachable state, not a defect: `done` is
-    /// still true (Cell<T>'s doc comment), so take_locked() must not assume
-    /// `result` is engaged just because `done` is. Mirrors the SHAPE of
+    /// not box a result - EITHER of Payload::operator()'s two catch blocks,
+    /// see DetachedCallError::ResultAllocFailed's own comment for both
+    /// causes - Gate 4 consistency-auditor finding, PR-A round 5: this
+    /// comment previously named only the second/outer catch) is a real,
+    /// reachable state, not a defect: `done` is still true (Cell<T>'s doc
+    /// comment), so take_locked() must not assume `result` is engaged just
+    /// because `done` is. Mirrors the SHAPE of
     /// GuardianIoExecutor::run's own null-check (guardian_io_executor.hpp,
     /// its `if (cell->result) ... return IoResult<T>{...WorkerThrew};` -
     /// confirmed by reading that file directly, not from memory) - the
