@@ -516,7 +516,7 @@ TEST_CASE("launch: an abandoned-before-publish result's disposal keeps the lane/
     std::atomic<std::thread::id> dtor_thread{};
     constexpr auto kHold = 300ms;
 
-    auto res = lane.launch([&gate, &dtor_started, &dtor_thread]() -> SlowDtor {
+    auto res = lane.launch([&gate, &dtor_started, &dtor_thread, kHold]() -> SlowDtor {
         gate.wait();
         return SlowDtor(&dtor_started, &dtor_thread, kHold, 1);
     });
