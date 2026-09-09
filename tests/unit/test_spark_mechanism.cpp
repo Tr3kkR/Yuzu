@@ -3473,6 +3473,7 @@ TEST_CASE(YUZU_SPARK_T6_CHILD_CASE_NAME, "[.][t6-child]") {
     std::atomic<bool> in_handler{false};
     std::atomic<bool> go{false};
     std::atomic<bool> rearmed{false};
+    std::atomic<bool> rearm_done{false}; // the in-handler arm_inline() has RETURNED
     std::atomic<int> fires{0};
     std::mutex rearm_err_mu;
     std::string rearm_err; // written on the callback thread, read after the joins below
@@ -3490,6 +3491,7 @@ TEST_CASE(YUZU_SPARK_T6_CHILD_CASE_NAME, "[.][t6-child]") {
             rearm_err = s2.error();
         }
         rearmed.store(s2.has_value(), std::memory_order_release);
+        rearm_done.store(true, std::memory_order_release);
     });
     REQUIRE(sub_k.has_value());
     engine.start();
@@ -3522,9 +3524,18 @@ TEST_CASE(YUZU_SPARK_T6_CHILD_CASE_NAME, "[.][t6-child]") {
     }
     CHECK(completed);
     disarmer.join();
+    // disarm() completing is the deadlock half of the scenario; the re-entry half
+    // is the handler's own arm_inline() RETURNING (with success). It runs on the
+    // callback thread and is only ordered after disarm() by the old deadlock, so
+    // wait for it explicitly rather than reading `rearmed` while it may still be
+    // inside watch()'s bounded wait.
+    CHECK(eventually([&] { return rearm_done.load(std::memory_order_acquire); }, 5000ms));
     {
         std::lock_guard lk(rearm_err_mu);
-        INFO("same-type arm_inline from inside the Inline handler: " << (rearm_err.empty() ? "ok" : rearm_err));
+        INFO("same-type arm_inline from inside the Inline handler: "
+             << (rearm_done.load(std::memory_order_acquire)
+                     ? (rearm_err.empty() ? "returned ok" : rearm_err)
+                     : "did not return within 5s"));
         CHECK(rearmed.load(std::memory_order_acquire));
     }
     engine.stop();
