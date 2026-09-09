@@ -3079,7 +3079,13 @@ TEST_CASE("the outbox-enqueue waker fires on a compliance commit and on attach/d
 
     r->file = read_known(FileSnapshot{.exists = true});
     rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
-    CHECK(wakes.load() >= 1); // the "armed" lifecycle enqueue
+    // The "armed" lifecycle enqueue. Since rung 9c R5.2 the commit (and this waker)
+    // runs on the executor worker, whose drain notifies the attach waiter BEFORE it
+    // fires the wakers (a pinned ordering: "a parked completion callback keeps ...
+    // the waiter returns before the waker parks", below), so attach_rule() can
+    // return a scheduler tick ahead of the wake. Liveness, not a synchronous count
+    // (governance qe-201 - reproduced under CPU starvation as `0 >= 1`).
+    CHECK(yuzu::test::spin_until([&] { return wakes.load() >= 1; }));
 
     const int before_eval = wakes.load();
     rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Initial);
