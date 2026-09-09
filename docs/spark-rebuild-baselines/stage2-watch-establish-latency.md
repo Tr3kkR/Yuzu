@@ -1,4 +1,4 @@
-# Stage 2 - watch-establishment latency (PR-A harness, DGRHP run PENDING)
+# Stage 2 - watch-establishment latency (PR-A harness, DGRHP run CAPTURED 2026-09-09)
 
 Authority: issues #2012 + #3840 ("bound File/Registry/Service watch establishment
 off the per-type lock"). Companion doc structure: `f11-flood-measurement-run.md`
@@ -11,20 +11,31 @@ unlike this sibling doc's own ADR/ruling citation. The plan file still holds the
 full design rationale if it's needed and still exists on the authoring machine,
 but the tracked issues are the durable reference.)
 
-## Status: PENDING - no DGRHP run has been performed yet
+## Status: CAPTURED 2026-09-09 - DGRHP, first real run
 
 This branch (PR-A, `feat/2012-3840-detached-call-f3`) adds the harness itself -
 `tests/unit/test_spark_mechanism.cpp`, cases tagged
 `[spark][mechanism][windows][latency][establish]`, env-gated on
-`YUZU_SPARK_ESTABLISH_BENCH=1` - but was authored in a session with **no Windows
-toolchain or host available**. No case in this harness has been compiled or run on a
-real Windows box. Every table below is a placeholder awaiting the first DGRHP pass;
-do not treat any number that might later appear here as final until this note is
-removed and replaced with a real run's output (same discipline as
-`f11-flood-measurement-run.md`'s "Captured <date>" header).
+`YUZU_SPARK_ESTABLISH_BENCH=1`. It was authored in a session with no Windows
+toolchain or host available, and stayed uncompiled through 6 governance passes; that
+gap is now closed. **DGRHP** (`daver@100.65.232.53`, Win11 Pro, MSVC 19.44.35227.0 /
+BuildTools 2022): worktree at commit `acd9fd3df` + a T6-comment-only follow-up patch
+(#4181 citation), `meson setup -Dcmake_prefix_path=<abs path>/vcpkg_installed/x64-windows
+-Dbuild_tests=true`, `meson compile -C build-windows yuzu_agent_tests` - clean, zero
+warnings on this file, zero errors anywhere. `meson test` on the full `[spark][mechanism]`
+tag: **83 test cases, 3843 assertions, 0 failures**. The `[establish]` subset alone, run
+3 times with `YUZU_SPARK_ESTABLISH_BENCH=1` via Catch2's own `--out` file write (piping
+through the nested ssh/bash session truncated Catch2's wrapped WARN lines mid-message -
+`--out` bypasses that): **11 test cases, 6625 assertions, 0 failures, all 3 runs.**
 
-**Do not derive PR-B's D constants from anything but a real run of this harness.**
-Nothing in this document today is a measurement.
+This closes forward action item 3 from the original PENDING version of this doc
+(compile-verify on real Windows hardware) and forward item 1 (the actual DGRHP run).
+Item 2 (re-run `post-fix-cost` once PR-B lands, for the "after" figure) remains open.
+
+**Still true, and still binding for anyone citing a number below:** treat every p99
+here as deadline-calibration input for the *establishment path's own* healthy-case
+cost, not as evidence about cold boot, a dead network share, or a hung call's
+worst-case duration - see the caveat restated after the results below.
 
 ## What the harness measures, and why raw calls (not the mechanism)
 
@@ -68,13 +79,21 @@ Per the plan: `D = max(round_up_50ms(4 x p99_worst), floor)`, ceiling 500ms (Fil
 silently.** `p99_worst` means the worst of the idle and under-load runs (R1 vs R3,
 R2 vs R4, S1/S2 vs S3), not just the idle baseline.
 
-**Aggregation convention (Gate 4 happy-path finding, PR-A round 5):** only R2/R4
-emit a per-sample sequence total (`t_walk_total`, itself contaminated by
-unmeasured teardown/drain per its own in-code comment). R1/R3/S2/S3 emit only
-PER-CALL series (t_event, t_wait_create, t_open, t_notify, t_wait_set for
-R1/R3; t_open, t_notify for S2/S3) - there is no per-sample sequence total to
-take a clean p99 of. Until the harness itself is extended with one (a
-before/after bracket per sample, mirroring R2/R4's shape), apply this
+**Aggregation convention (Gate 4 happy-path finding, PR-A round 5; CORRECTED at
+the DGRHP pass, 2026-09-09):** this paragraph previously claimed "only R2/R4 emit
+a per-sample sequence total." That is only half true. Reading the harness source
+(`test_spark_mechanism.cpp:4267-4269`) shows the `t_walk_total` emission
+(`warn_establish("R2 registry target-absent depth6", "TOTAL ...", t_walk_total)`)
+is a **single call site inside R2's own `TEST_CASE`** - R4 (R2's under-hive-load
+counterpart) has no equivalent bracket and never emits a TOTAL. This is a real,
+previously-undocumented gap in the harness, not a documentation typo alone - see
+the Results section below for what it costs us.
+
+R1/R3/S2/S3 emit only PER-CALL series (t_event, t_wait_create, t_open, t_notify,
+t_wait_set for R1/R3; t_open, t_notify for S2/S3) - there is no per-sample
+sequence total to take a clean p99 of. Until the harness is extended with one (a
+before/after bracket per sample, mirroring R2's own shape - and, separately, R4
+needs the SAME bracket added, which it currently lacks entirely), apply this
 substitute two-step process wherever the D-derivation formula above calls
 for one of these four cases' sequence p99 (docs-writer finding, pass 5 -
 tightened to avoid reading as a one-step shortcut that skips the idle-vs-
@@ -83,14 +102,131 @@ as the SUM of its per-call p99s; `p99_worst` is then the max of that summed
 figure across the idle/under-load pair (R1 vs R3, S1/S2 vs S3), per the
 rule above - not the sum used in place of that max. The sum-as-substitute-
 for-a-real-sequence-total is statistically conservative (an upper bound,
-not an exact one) and matches this document's existing "never clamp
-silently, stop and re-think" posture: an inflated per-case figure can only
-make the STOP check fire more readily, never less.
+not an exact one) **only when each summed metric is called once per sample**,
+which holds for R1/R3/S2/S3 (a direct open, no walk) but does NOT hold for
+R2/R4's `RegOpenKeyExW (per level)` metric (called once per ancestor-walk
+level - up to 7 times per sample at depth 6, `n=1400` for `n=200` samples).
+Applying the same per-call-sum substitute to R4 would UNDERSTATE its real
+per-sample cost, not overstate it - the opposite of this substitute's usual
+conservative direction. **Do not apply the substitute to R2 or R4.** R2's
+real `t_walk_total` is used directly below; R4's is unmeasured and flagged,
+not estimated.
 
 A later commit on this same branch (PR-A's `spark_detached_call.hpp`) ships a
 `kGuardianBackendOpDeadlineMirror` constant + a `spark_deadline_below_guardian_
 backend_op()` predicate for PR-B to `static_assert` each derived D constant
 against, once these are real numbers.
+
+## Results (3 runs, DGRHP, 2026-09-09)
+
+All times microseconds unless stated. `p99` below is the WORST of the 3 runs per
+metric (conservative - the "never clamp silently" posture applies to which run we
+trust, not only to the formula). Full per-run WARN output: see this branch's
+DGRHP session notes; summarized here.
+
+**Registry, direct-target path (R1 idle / R3 under hive load) - per-call p99, worst of 3 runs:**
+
+| metric | R1 (idle) p99 | R3 (hive load) p99 |
+|---|---|---|
+| CreateEventW | 4 | 5 |
+| CreateThreadpoolWait | 5 | 4 |
+| RegOpenKeyExW | 53 | 43 |
+| RegNotifyChangeKeyValue | 18 | 17 |
+| SetThreadpoolWait | 2 | 3 |
+| **sum (substitute sequence-p99)** | **82** | **72** |
+
+`p99_worst` (R1 vs R3) = **82us**. Hive load did **not** inflate direct-target
+establishment - R3's sum is slightly lower than R1's, within measurement noise at
+this scale. Real, not assumed: stated here because it is the opposite of what
+"under load" cases are usually expected to show, and is worth a reader's notice.
+
+**Registry, ancestor-walk path (R2 idle, real `t_walk_total`; R4 under hive load, UNMEASURED):**
+
+| run | R2 TOTAL p99 (INCL. teardown/drain) | R2 TOTAL max |
+|---|---|---|
+| 1 | 1200 | 1221 |
+| 2 | 447 | 504 |
+| 3 | 1264 | 1284 |
+
+R2's worst-of-3 p99 = **1264us**. R4 (the under-load counterpart) has no comparable
+number - the harness gap above. R3-vs-R1 showed hive load did not measurably worsen
+the direct-target path; whether that generalizes to the ancestor-walk path is an
+open question, not an assumption - R4 would need roughly a 10x jump over R2's
+1264us before it could move Registry's D off the 50ms floor computed below (see
+"why R4's absence doesn't block a decision" underneath the formula). **Forward
+action item, added here:** give R4 the same `t_walk_total` bracket R2 already has.
+
+**File (F1 - no under-load counterpart in this harness):**
+
+| metric | p99 (worst of 3) |
+|---|---|
+| is_directory | 67 |
+| CreateFileW(BACKUP\|OVERLAPPED) | 47 |
+| **sum** | **114** |
+
+**Service, per-key path (S2 idle-ish / S3 under SCM load) - per-call p99, worst of 3:**
+
+| metric | S2 p99 | S3 p99 |
+|---|---|---|
+| OpenServiceW | 47 | 91 |
+| NotifyServiceStatusChangeW | 36 | 99 |
+| **sum** | **83** | **190** |
+
+`p99_worst` (S2 vs S3) = **190us**. Unlike Registry, SCM load roughly **doubled**
+Service's cost (83 -> 190) - a real asymmetry between the two mechanisms, not
+noise at this scale.
+
+**Service, `start()`-path cost (S1 - OpenSCManagerW connect, separate from per-key
+establishment, not folded into Service's D below):**
+
+| metric | p99 (worst of 3) |
+|---|---|
+| OpenSCManagerW | 79 |
+| CloseServiceHandle | 45 |
+
+**R5 (drain characterization, not a D input):** idle drain p99=0us (no in-flight
+callback to wait on). In-flight drain (a deliberately-parked 50ms callback) p99
+across the 3 runs: 48826 / 48872 / 48837us - i.e. **the drain waits essentially the
+full callback duration**, as designed. This is the direct, measured cost of the
+#2819/#4181 mechanism's *stall* case (an unwatch draining a slow-but-not-cyclic
+callback) - useful context for both issues, not a D input itself.
+
+**post-fix-cost (today's pre-PR-B baseline - bulk `SparkEngine::arm()`, N=200/mechanism, worst-of-3 p99):**
+
+| mechanism | p99 | max | n |
+|---|---|---|---|
+| File | 559 | 825 | 200 |
+| Registry | 618 | 623 | 200 |
+| Service | 155 | 204 | **199** (one arm excluded/skipped this run - real service list, not a harness defect) |
+
+Re-run verbatim once PR-B lands, per forward item 2.
+
+## D derivation, applied to the results above
+
+`D = max(round_up_50ms(4 x p99_worst), floor)` (floor's numeric value is not
+stated in the source plan - PR-B's decision, not asserted here):
+
+- File: `4 x 114us = 456us` -> `round_up_50ms = 50ms`.
+- Registry (direct-target path only): `4 x 82us = 328us` -> `round_up_50ms = 50ms`.
+  Registry's ancestor-walk path is not included in this number - see below.
+- Service: `4 x 190us = 760us` -> `round_up_50ms = 50ms`.
+
+All three land on the 50ms quantum, nowhere near their ceilings (500ms general /
+250ms File). **This is a meaningful result, not a null one:** it says healthy-case
+establishment is microsecond-scale on this hardware, so 4x p99 buys over 50x
+headroom before a HEALTHY call would ever be mistaken for a stalled one - which is
+what D is actually for (`wait_take(now+D)` deciding "commit now" vs "go Pending and
+let the sweeper retry"), not a bound on how long a genuinely hung call can run.
+A hung call trivially exceeds any D chosen this way; that is the intended
+behavior, not a gap in this measurement.
+
+**Why Registry's D above doesn't wait on R4:** D only leaves the 50ms floor if
+`4 x p99 > 50ms`, i.e. `p99 > 12.5ms`. R4 would need to be roughly 10x R2's
+measured 1264us worst-case to move the number - and R3-vs-R1 showed hive load did
+not measurably worsen the direct-target path on this hardware. That is a reason to
+expect R4 stays under the threshold, not proof of it - R4 is genuinely unmeasured,
+stated as such, and the forward action item above (give R4 its own `t_walk_total`)
+should be done before this is treated as settled.
 
 ## Run protocol (once DGRHP is available)
 
@@ -108,10 +244,18 @@ document must repeat that caveat, not just this document.
 
 ## Forward action items
 
-1. Run the harness on DGRHP (idle x3, under load x3); replace this document's
-   PENDING status with the real output and derived D values.
+1. ~~Run the harness on DGRHP (idle x3, under load x3)~~ - DONE 2026-09-09, see
+   Results above.
 2. Re-run the `post-fix-cost` case verbatim once PR-B lands, to get the "after"
    figure the plan's "post-fix fast-path cost" note asks for (today's run here is
-   the "before" baseline only).
-3. Compile-verify the harness itself on a real Windows toolchain before relying on
-   any number it produces - this session could not do so.
+   the "before" baseline only). Still open.
+3. ~~Compile-verify the harness itself on a real Windows toolchain~~ - DONE
+   2026-09-09: MSVC 19.44, zero warnings on this file, 83 `[spark][mechanism]`
+   cases / 3843 assertions and 11 `[establish]` cases / 6625 assertions, all
+   passing across 3 independent runs.
+4. **NEW:** give R4 (Registry ancestor-walk under hive load) its own
+   `t_walk_total` bracket, mirroring R2's (`test_spark_mechanism.cpp:4267-4269`).
+   Without it, Registry's ancestor-walk D contribution rests on an inference from
+   R2's idle number plus R1-vs-R3's no-load-effect finding, not a direct
+   measurement - see the D-derivation section above for exactly what this gap
+   costs and why it likely (not certainly) doesn't change the derived number.
