@@ -750,6 +750,31 @@ inline TaskInfo parse_task_xml(std::string_view xml) {
     return out;
 }
 
+/// The Enabled decision for a `win_scheduled_tasks` row -- pulled out of
+/// the win.cpp COM call site as a pure function so it stays testable on
+/// every build host (the COM code itself only compiles on Windows).
+///
+/// The `ITaskFolder`/`IRegisteredTask::get_Enabled` COM property alone
+/// overstates reach: a task with an empty `<Triggers/>` block is
+/// `Enabled==true` yet Task Scheduler will never invoke it on its own --
+/// only a manual Run counts, which is not persistence. Both the COM
+/// property AND a genuine parsed trigger must hold for `enabled`. If
+/// either COM accessor needed for that decision failed (`enabled_hr_ok`/
+/// `xml_hr_ok` false), OR the XML that WAS retrieved didn't genuinely
+/// parse (`info.parsed_ok` false -- a real parse failure, never conflated
+/// with "well-formed but boring": see TaskInfo::parsed_ok), the state is
+/// `unknown`, never a fabricated definite answer -- `get_Enabled` failing
+/// leaves the caller's own `enabled_b` at its `VARIANT_TRUE` initializer
+/// (would silently read as "enabled"), and a parse failure leaves
+/// `info.has_triggers` at its default `false` (would silently read as
+/// "disabled" for a task whose real trigger state was never actually
+/// determined).
+inline Enabled scheduled_task_enabled_state(bool enabled_hr_ok, bool xml_hr_ok, bool com_enabled,
+                                            const TaskInfo& info) {
+    if (!enabled_hr_ok || !xml_hr_ok || !info.parsed_ok) return Enabled::unknown;
+    return (com_enabled && info.has_triggers) ? Enabled::enabled : Enabled::disabled;
+}
+
 // ── 8. parse_wmi_subscription_triple ─────────────────────────────────────
 
 // The highest-value payload this plugin can produce

@@ -656,6 +656,63 @@ TEST_CASE("autoruns: parse_task_xml reads an Exec action carrying the schema's o
     CHECK(info.actions[0].arguments == "-x");
 }
 
+TEST_CASE("autoruns: scheduled_task_enabled_state requires both a live COM Enabled "
+          "property AND a genuine parsed trigger, and reports unknown (never a "
+          "fabricated definite answer) on any COM accessor failure or parse failure "
+          "(RECONSTRUCTION: pins PR #4154 round 9's blocker -- extracted from the "
+          "win.cpp COM call site specifically so this decision is testable on every "
+          "build host, not just Windows)",
+          "[autoruns][parsers]") {
+    TaskInfo info_no_triggers; // parsed_ok=false, has_triggers=false (defaults)
+    TaskInfo info_with_triggers;
+    info_with_triggers.parsed_ok = true;
+    info_with_triggers.has_triggers = true;
+    TaskInfo info_no_triggers_ok; // well-formed, genuinely no triggers
+    info_no_triggers_ok.parsed_ok = true;
+    info_no_triggers_ok.has_triggers = false;
+
+    SECTION("get_Enabled accessor failed -> unknown, even if the XML parsed fine "
+            "with live triggers") {
+        CHECK(scheduled_task_enabled_state(/*enabled_hr_ok=*/false, /*xml_hr_ok=*/true,
+                                           /*com_enabled=*/true,
+                                           info_with_triggers) == Enabled::unknown);
+    }
+
+    SECTION("get_Xml accessor failed -> unknown") {
+        CHECK(scheduled_task_enabled_state(/*enabled_hr_ok=*/true, /*xml_hr_ok=*/false,
+                                           /*com_enabled=*/true,
+                                           info_with_triggers) == Enabled::unknown);
+    }
+
+    SECTION("both COM accessors succeeded but the XML genuinely failed to parse -> "
+            "unknown, never fabricated as disabled from the default has_triggers=false") {
+        CHECK(scheduled_task_enabled_state(/*enabled_hr_ok=*/true, /*xml_hr_ok=*/true,
+                                           /*com_enabled=*/true,
+                                           info_no_triggers) == Enabled::unknown);
+    }
+
+    SECTION("both COM accessors ok, XML parsed fine, task genuinely has no triggers "
+            "-> disabled (a real answer, distinct from the malformed case above)") {
+        CHECK(scheduled_task_enabled_state(/*enabled_hr_ok=*/true, /*xml_hr_ok=*/true,
+                                           /*com_enabled=*/true,
+                                           info_no_triggers_ok) == Enabled::disabled);
+    }
+
+    SECTION("both COM accessors ok, XML parsed fine, live triggers, but COM reports "
+            "disabled -> disabled") {
+        CHECK(scheduled_task_enabled_state(/*enabled_hr_ok=*/true, /*xml_hr_ok=*/true,
+                                           /*com_enabled=*/false,
+                                           info_with_triggers) == Enabled::disabled);
+    }
+
+    SECTION("both COM accessors ok, XML parsed fine, live triggers, COM reports "
+            "enabled -> enabled") {
+        CHECK(scheduled_task_enabled_state(/*enabled_hr_ok=*/true, /*xml_hr_ok=*/true,
+                                           /*com_enabled=*/true,
+                                           info_with_triggers) == Enabled::enabled);
+    }
+}
+
 // ── 8. parse_wmi_subscription_triple ─────────────────────────────────────
 
 TEST_CASE("autoruns: parse_wmi_subscription_triple joins filter/consumer/binding blocks "

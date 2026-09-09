@@ -914,23 +914,12 @@ void walk_task_folder(ITaskFolder* folder, SourceOutcome& outcome, std::size_t c
             const std::string entry_base = wstring_to_utf8(last_path_component(path_w));
             const std::string location = wstring_to_utf8(path_w);
             const std::string user = info.user_id.empty() ? "-" : info.user_id;
-            // The Enabled COM property alone overstates reach: a task with
-            // <Triggers/> empty (no triggers defined) is Enabled==true yet
-            // Task Scheduler will never invoke it on its own -- only a
-            // manual Run counts, which is not persistence. Both must hold.
-            // If either accessor needed for that decision failed, OR the XML
-            // that was retrieved didn't genuinely parse, the state is
-            // unknown, never a fabricated definite answer: get_Enabled
-            // failing leaves enabled_b at its VARIANT_TRUE initializer
-            // (would silently read as "enabled"), and a parse failure
-            // leaves info.has_triggers at its default false (would silently
-            // read as "disabled" for a task whose real trigger state this
-            // function never actually determined).
-            const Enabled enabled_state = (FAILED(enabled_hr) || FAILED(xml_hr) || !info.parsed_ok)
-                                              ? Enabled::unknown
-                                          : (enabled_b == VARIANT_TRUE && info.has_triggers)
-                                              ? Enabled::enabled
-                                              : Enabled::disabled;
+            // scheduled_task_enabled_state (autoruns_parsers.hpp) is a pure
+            // function specifically so this decision stays testable on
+            // every build host -- this COM call site itself only compiles
+            // on Windows. See its own banner for the full reasoning.
+            const Enabled enabled_state = scheduled_task_enabled_state(
+                !FAILED(enabled_hr), !FAILED(xml_hr), enabled_b == VARIANT_TRUE, info);
 
             // Task Scheduler executes every <Exec> action in sequence -- one
             // row per action (index-suffixed once there's more than one) so
