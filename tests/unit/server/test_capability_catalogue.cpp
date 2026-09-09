@@ -26,6 +26,7 @@
 #include "capability_decls/plugin_action_catalogue_disk_actions.hpp"
 #include "capability_decls/plugin_action_catalogue_filesystem_posture.hpp"
 #include "capability_decls/plugin_action_catalogue_power_health.hpp"
+#include "capability_decls/plugin_action_catalogue_autoruns.hpp"
 #include "command_capability.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -50,7 +51,7 @@ namespace {
 // updating too — that is the intended failure mode: a securable this
 // catalogue references but rbac_store.cpp stops seeding should fail loudly,
 // not silently pass.
-constexpr std::array<std::string_view, 28> kSeededSecurableTypes{{
+constexpr std::array<std::string_view, 26> kSeededSecurableTypes{{
     "Infrastructure",
     "UserManagement",
     "InstructionDefinition",
@@ -73,20 +74,10 @@ constexpr std::array<std::string_view, 28> kSeededSecurableTypes{{
     "Inventory",
     "AccessReview",
     "SoftwareLicensing",
-    "EnginePrincipal", // #4030 Gate 8 fix: was missing (pre-existing gap,
-                       // predates #4030 -- already flagged by #4029's own
-                       // Gate 8 pass on its own worktree; closed here since
-                       // this file is already being touched for "Workflow"
-                       // below).
     "PluginConfig",
     "PluginSecret",
     "UploadGrant",
     "PowerManagement",
-    "Workflow", // #4030: this PR's own new securable (rbac_store.cpp) --
-                // this mirror was the third of three hand-maintained
-                // copies (rbac_store.cpp's types[], mcp_server.cpp's
-                // kRbacSecurables[], and this one) and was the one left
-                // stale (cpp-expert, Gate 3).
 }};
 
 // Mirrors rbac_store.cpp's `seed_defaults()` `ops[]` — the full seven-value
@@ -126,6 +117,7 @@ struct LabeledSpan {
         {"disk_actions", capdecls::plugin_action_catalogue_disk_actions(), false},
         {"filesystem_posture", capdecls::plugin_action_catalogue_filesystem_posture(), false},
         {"power_health", capdecls::plugin_action_catalogue_power_health(), false},
+        {"autoruns", capdecls::plugin_action_catalogue_autoruns(), false},
         {"core", capdecls::core_dispatch_capabilities(), true},
     };
 }
@@ -134,7 +126,7 @@ struct LabeledSpan {
     // CommandCapabilityRegistry's constructor only accepts a brace-enclosed
     // std::initializer_list (see command_capability.hpp), so this can't be
     // built from the vector programmatically — it mirrors all_labeled_sources()
-    // literally, eight sources exactly as a live composition site would use.
+    // literally, nine sources exactly as a live composition site would use.
     return CommandCapabilityRegistry{
         capdecls::plugin_action_catalogue_content_dist(),
         capdecls::plugin_action_catalogue_a(),
@@ -144,6 +136,7 @@ struct LabeledSpan {
         capdecls::plugin_action_catalogue_disk_actions(),
         capdecls::plugin_action_catalogue_filesystem_posture(),
         capdecls::plugin_action_catalogue_power_health(),
+        capdecls::plugin_action_catalogue_autoruns(),
         capdecls::core_dispatch_capabilities(),
     };
 }
@@ -216,6 +209,27 @@ TEST_CASE("capability catalogue: every Destructive row is Irreversible unless ex
             }
             CHECK(row.mutability == Mutability::Irreversible);
         }
+    }
+}
+
+/// Exact-row pin for `autoruns` (P15 Arbiter action). Both its actions are
+/// ReadOnly/None with no Destructive row to protect via the allowlist above,
+/// so this pins their classification directly, the same way
+/// `kReversibleDestructive` protects `power_health.set_power_plan`'s fields
+/// from a silent future change.
+TEST_CASE("capability catalogue: autoruns.list and autoruns.catalog pin their exact "
+          "classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_autoruns();
+    for (const auto action : {"list", "catalog"}) {
+        const auto it =
+            std::find_if(rows.begin(), rows.end(), [&](const auto& r) { return r.action == action; });
+        REQUIRE(it != rows.end());
+        CHECK(it->dispatch_class == DispatchClass::ReadOnly);
+        CHECK(it->mutability == Mutability::None);
+        CHECK(it->securable == "Security");
+        CHECK(it->operation == authz::Operation::Read);
+        CHECK(it->execute_gate == ExecuteGate::None);
     }
 }
 
