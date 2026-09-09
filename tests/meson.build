@@ -276,6 +276,7 @@ agent_test_exe = executable(
     'unit/test_shutdown_pipe.cpp',
     'unit/test_hard_exit.cpp',
     'unit/test_shutdown_deadline_guard.cpp',
+    'unit/test_spark_detached_call.cpp',
     'unit/test_spark_disk.cpp',
     'unit/test_spark_engine.cpp',
     'unit/test_spark_key_rule_index.cpp',
