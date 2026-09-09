@@ -3909,8 +3909,16 @@ TEST_CASE("concurrent pagers + a drainer do not race (TSan checkpoint)",
             t += 30'000'000;
         }
     });
-    workers.emplace_back([&] {
-        while (!pagers_done.try_wait())
+    // Governance follow-up (#4153 round 4, redesigned per external review after an
+    // earlier attempt here was found unsafe and reverted): stop_token-aware, but ONLY
+    // ever meaningfully cancelled on the FAILURE path below (main's own bounded_wait on
+    // pagers_done times out and throws, unwinding through `workers`' destructor, which
+    // calls request_stop() on every element). On the SUCCESS path this stop_token is
+    // never requested before the join loop, so this loop's own try_wait() condition is
+    // what ends it - exactly as before - and it is never cut off while pagers may still
+    // have unpaged work in flight.
+    workers.emplace_back([&](std::stop_token stoken) {
+        while (!pagers_done.try_wait() && !stoken.stop_requested())
             rig.rt->drain_bounded(send, {.max_entries = 64});
         rig.rt->drain_bounded(send, {}); // final drain: whatever the last pass paged
     });
@@ -3955,6 +3963,16 @@ TEST_CASE("concurrent pagers + a drainer do not race (TSan checkpoint)",
                  "prune_evicted (the pruner never evicted a batch for age)");
 
     rig.journal->request_stop();
+    // Placed AFTER request_stop(), not before: this still exercises journal shutdown
+    // while pagers may be mid-loop (the property the comment above names), and only
+    // adds a bound on how long main then waits for them to genuinely finish - it does
+    // NOT gate their own completion on anything main does. If this never releases (a
+    // future regression dropping a pagers_done.count_down() call), the FAIL() below
+    // unwinds through `workers`' destructor, which cancels the drainer (and, via the
+    // same mechanism, the already-stoppable pruner) before joining - see both workers'
+    // own comments. On the success path nothing here requests any worker's stop_token.
+    bounded_wait([&] { return pagers_done.try_wait(); },
+                 "pagers_done (a pager never finished all its iterations)");
     for (auto& w : workers)
         w.join();
 
@@ -4207,6 +4225,32 @@ TEST_CASE("concurrent persist + page + prune + drain do not race (TSan checkpoin
         return SendResult::Sent;
     };
 
+    // Governance follow-up (#4153 round 4, same shape as the pagers+drainer test above -
+    // see its comments for the full rationale and the empirical two-sided proof this
+    // design is safe: a suppressed producers_done count-down fails fast and attributed
+    // instead of hanging, and a genuinely slow-but-healthy producer still completes
+    // normally instead of being cut off early). `bounded_wait` gates only MAIN's own
+    // wait for producers_done before the join below; `stoppable_wait` lets the persister
+    // and drainer be cancelled, but ONLY via the failure path (bounded_wait's FAIL()
+    // unwinding through `workers`' destructor) - never on the success path, since
+    // nothing here requests any worker's stop_token before producers_done is confirmed.
+    const auto bounded_wait = [](auto&& ready, const char* what) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
+        while (!ready()) {
+            if (std::chrono::steady_clock::now() >= deadline)
+                FAIL("timed out after 30s waiting for " << what);
+            std::this_thread::sleep_for(std::chrono::milliseconds{5});
+        }
+    };
+    const auto stoppable_wait = [](auto&& ready, std::stop_token stoken) {
+        while (!ready()) {
+            if (stoken.stop_requested())
+                return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds{5});
+        }
+        return true;
+    };
+
     std::vector<std::jthread> workers;
     // Pagers: page_into_window (paging_mutex_ -> the fake store's own mutex).
     for (int p = 0; p < 2; ++p)
@@ -4235,9 +4279,12 @@ TEST_CASE("concurrent persist + page + prune + drain do not race (TSan checkpoin
     // Persister: persist() (the store only, no paging_mutex_) - a single writer, as in
     // production (always under the engine mtx_); it races page/prune only on the
     // shared store + atomics. Three tranches gated on the pruner's OWN pass count (a
-    // blocking std::atomic::wait on a finite worker, never a spin) so count-eviction
-    // genuinely interleaves with writes rather than one finishing before the other starts.
-    workers.emplace_back([&] {
+    // bounded poll on a finite worker, never a spin - stoppable_wait, not the raw
+    // atomic::wait this used before #4153 round 4, since a plain wait/notify pair can't
+    // be interrupted by a stop_token: notifying pruner_passes on cancellation wouldn't
+    // wake a waiter blocked on a DIFFERENT value) so count-eviction genuinely interleaves
+    // with writes rather than one finishing before the other starts.
+    workers.emplace_back([&](std::stop_token stoken) {
         int n = 0;
         const auto persist_one = [&] {
             std::vector<std::shared_ptr<const JournalRecord>> pending{
@@ -4252,25 +4299,26 @@ TEST_CASE("concurrent persist + page + prune + drain do not race (TSan checkpoin
             ++n;
         };
         const auto wait_for_pass = [&](int target) {
-            int cur = pruner_passes.load(std::memory_order_acquire);
-            while (cur < target) {
-                pruner_passes.wait(cur, std::memory_order_acquire);
-                cur = pruner_passes.load(std::memory_order_acquire);
-            }
+            return stoppable_wait(
+                [&] { return pruner_passes.load(std::memory_order_acquire) >= target; },
+                stoken);
         };
         for (int i = 0; i < kPersistTotal / 3; ++i)
             persist_one();
-        wait_for_pass(1);
+        if (!wait_for_pass(1))
+            return; // request_stop() fired before the pruner reached pass 1
         for (int i = 0; i < kPersistTotal / 3; ++i)
             persist_one();
-        wait_for_pass(2);
+        if (!wait_for_pass(2))
+            return;
         while (n < kPersistTotal)
             persist_one();
         producers_done.count_down();
     });
-    // Drainer.
-    workers.emplace_back([&] {
-        while (!producers_done.try_wait())
+    // Drainer. Stoppable for the same reason and under the same success-path guarantee
+    // as the pagers test's drainer above.
+    workers.emplace_back([&](std::stop_token stoken) {
+        while (!producers_done.try_wait() && !stoken.stop_requested())
             rig.rt->drain(send);
         rig.rt->drain(send); // final drain
     });
@@ -4278,6 +4326,14 @@ TEST_CASE("concurrent persist + page + prune + drain do not race (TSan checkpoin
     for (int i = 0; i < 60; ++i)
         rig.journal->page_into_window(*rig.rt, kBaseTs + 500'000 + i * 1000);
 
+    // Bounds how long main then waits for all four producers to genuinely finish - it
+    // does NOT gate their own completion on anything main does, and nothing here
+    // requests any worker's stop_token on this (the success) path. If it never
+    // releases (a future regression dropping a producers_done.count_down() call), the
+    // FAIL() below unwinds through `workers`' destructor, which cancels the stoppable
+    // persister and drainer before joining.
+    bounded_wait([&] { return producers_done.try_wait(); },
+                 "producers_done (a pager, the pruner, or the persister never completed)");
     for (auto& w : workers)
         w.join();
 
