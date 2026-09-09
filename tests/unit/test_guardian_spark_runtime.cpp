@@ -3161,8 +3161,16 @@ TEST_CASE("lifecycle_backpressure_drops counts a full audit log without blocking
     // reliably crossing that shared-library boundary).
     CHECK(rt->lifecycle_backpressure_log_fires_for_test() == 1);
     // The arm itself still succeeded throughout - the audit trail never blocks
-    // the real detection-capability change.
-    CHECK(rt->rule_count() == 1);
+    // the real detection-capability change. rung 9c R5.2 (governance qe-304): the 5
+    // attach_rule() calls above are unchecked and same-key ("r1"), each one
+    // superseding the prior generation's claim; under CPU contention a caller can
+    // hit its own waiter deadline (waiter_abandoned) and return before the
+    // completion callback commits the LAST generation into rules_/keys_ - a
+    // transient race between this synchronous check and the async commit, not a
+    // permanent retention (unlike qe-303's detach_all - a further same-key event
+    // isn't needed here, the in-flight claim's own completion lands on its own).
+    // A bounded wait is valid and sufficient.
+    CHECK(yuzu::test::spin_until([&] { return rt->rule_count() == 1; }));
     CHECK(b->arms.load() >= 1);
 }
 
