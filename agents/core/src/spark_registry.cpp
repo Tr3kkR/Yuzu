@@ -152,7 +152,10 @@ constexpr std::chrono::milliseconds kRegCallerWaitBudget{50};
 /// How long an accepted obligation (initial establishment or re-arm) may stay
 /// unestablished before the watch is reported Faulted and slow_op_total bumps.
 constexpr std::chrono::milliseconds kRegHealthGrace{50};
-/// Sweeper poll cadence while any probe or drain is outstanding.
+/// Sweeper poll cadence while any probe or drain is outstanding - a CEILING on
+/// how long a completed probe waits to be committed, not an added latency:
+/// every launch and state change nudges the sweeper, so the common case is
+/// committed on the next pass.
 constexpr std::chrono::milliseconds kRegSweepCadence{50};
 /// First delay after an admission refusal (lane cap / launch failure): D, 2D,
 /// 4D, ... capped at kRegAdmissionBackoffCap, never counted as a backend attempt.

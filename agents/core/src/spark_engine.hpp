@@ -596,7 +596,14 @@ private:
     /// blocking callback drain to a detached worker and returns in
     /// microseconds - which also closes the #4181 same-type reentrant deadlock
     /// (this lock held across that drain while the drained callback's Inline
-    /// consumer needed it). STILL OPEN for FILE and SERVICE (PR-B2/PR-B3): a
+    /// consumer needed it). Cost: a consumed Registry notification is now TWO
+    /// emit submissions (the immediate fire, then a synthetic fire when the
+    /// asynchronous re-arm commits) - a queued consumer's per-consumer,
+    /// drop-oldest queue (deliver()) can therefore be pushed by a noisy key's
+    /// synthetic fire into evicting a quiet key's only fire, a detection-
+    /// latency/fairness cost, and nothing here dedups on the wire (Guardian's
+    /// decide_emit re-emits Drift past debounce_ms regardless). STILL OPEN for
+    /// FILE and SERVICE (PR-B2/PR-B3): a
     /// File watch() still blocks for the OS-call duration - spark_file's
     /// arm_ancestor deadline (#1980) bounds the NUMBER of slow probes to ~one,
     /// not the wall-clock of any one probe (fs::is_directory is uninterruptible,
