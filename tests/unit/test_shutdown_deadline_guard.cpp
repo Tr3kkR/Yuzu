@@ -142,6 +142,11 @@ TEST_CASE("cancel racing the deadline is race-free under repeat",
 // process" death test.
 TEST_CASE("an un-cancelled guard's real default action hard_exit()s with the documented code",
           "[shutdown_deadline_guard][death]") {
+    // Governance pass-4 sg-105: the fourth fork()-without-exec site in yuzu_agent_tests.
+    // Under whole-suite TSan another test's detached worker can still be alive here, and
+    // TSan kills the child the moment it starts a thread (die_after_fork; reproduced 1/3
+    // on rung 9c PR-1). Same gate as the three Guardian death tests.
+    REQUIRE(yuzu::test::wait_until_quiescent()); // no stray worker at fork
     const pid_t pid = ::fork();
     REQUIRE(pid >= 0);
 
