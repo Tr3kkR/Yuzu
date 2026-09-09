@@ -17,6 +17,7 @@
 
 #include <yuzu/server/auth_db.hpp>
 
+#include "background_jobs.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "acquire_retry.hpp"
@@ -308,6 +309,15 @@ constexpr int kRecoveryCodePbkdfIters = 100'000;
 // CALLER already holds inside an open transaction (mirrors the SQLite-era
 // `regenerate_recovery_codes_locked`, ported from `TxnGuard` to
 // `pool.with_txn_for`'s callback connection).
+//
+// CONTRACT: the caller MUST already hold the `auth.users` row lock for
+// `username` (a `SELECT … FOR UPDATE` or a guarded row `UPDATE`) for the life
+// of this call. DELETE-all + INSERT is NOT self-serializing — two concurrent
+// callers without that lock each persist 10 rows (20 total under READ
+// COMMITTED, since neither DELETE sees the other's uncommitted INSERTs) and
+// each receive a code set that does not match storage (#3779).
+// `mfa_verify_enrollment` holds it via its guarded `UPDATE`;
+// `mfa_regenerate_recovery_codes` via a `SELECT … FOR UPDATE`.
 [[nodiscard]] std::expected<std::vector<std::string>, AuthDBError>
 regenerate_recovery_codes_locked(PGconn* conn, const std::string& username) {
     pg::PgResult del = pg::exec_params(conn, "DELETE FROM auth.mfa_recovery_codes WHERE username = $1",
@@ -499,6 +509,7 @@ AuthDB::AuthDB(pg::PgPool& pool, pg::SecretCodec& secret_codec, int cleanup_inte
         return;
     }
 
+    YUZU_ASSERT_BACKGROUND_JOB("auth_db.cleanup_provisional_mfa"); // WS-10 ReplicaSafe (idempotent)
 #ifdef __cpp_lib_jthread
     impl_->cleanup_thread = std::jthread([this, interval = impl_->cleanup_interval_secs](
                                              std::stop_token stop) {
@@ -671,6 +682,47 @@ std::expected<void, AuthDBError> AuthDB::upsert_sso_identity(const std::string& 
 }
 
 std::expected<auth::UserEntry, AuthDBError> AuthDB::get_user(const std::string& username) {
+    // Gate 4 governance BLOCKING finding (unhappy-path): unlike ~20 sibling
+    // AuthDB methods, this READ path never validated `username` at all before
+    // handing it to PQexecParams. PQexecParams is called with paramLengths=
+    // nullptr (pg_exec.hpp), so libpq reads every text-format parameter as a
+    // NUL-terminated C string — an embedded NUL in `username` (trivially
+    // produced by URL-decoding a request body's "username=admin%00<garbage>")
+    // makes the SQL query match the TRUNCATED prefix ("admin") while the
+    // FULL raw C++ string (NUL and garbage suffix included) is what callers
+    // use as an in-memory map/session key. #4020 made this function newly
+    // reachable, unauthenticated, from POST /login's raw form field (via
+    // find_user_or_hydrate -> verify_password/authenticate), where the
+    // returned row was then try_emplace'd into AuthManager::users_ keyed by
+    // the FULL mangled string — every distinct garbage suffix an attacker
+    // sends for the SAME real username creates a new, permanent, unevictable
+    // cache entry (unauthenticated, unbounded memory growth) and, if the
+    // attacker also holds the real password, mints a session whose
+    // `Session::username` (the same mangled string) never matches the
+    // canonical name compared during remove_user()/update_role()'s session
+    // sweep — surviving a demotion or removal. Both closed at the source:
+    // reject here, before any query or any caller ever sees a successful
+    // result to cache.
+    //
+    // `is_valid_principal`, NOT `is_valid_username`: `auth.users.username`
+    // legitimately holds SSO principal strings too (upsert_sso_identity
+    // stores an "oidc:"/"saml:"/"ad:"-prefixed principal directly as this
+    // column, validated there via this SAME wider function) — and this
+    // function IS called with such a principal today, via
+    // get_user_role(api_token.principal_id) at auth_routes.cpp's legacy
+    // API-token session synthesis for an SSO-authenticated human's token.
+    // is_valid_username() would reject the ':' every SSO-prefixed principal
+    // contains, silently demoting every such token to Role::user
+    // (auth_routes.cpp's own .value_or(Role::user)) — a regression nearly as
+    // bad as the vulnerability this fixes. is_valid_principal() still closes
+    // the NUL-byte attack: its non-prefixed branch delegates to
+    // is_valid_username's own alnum/./_/- allowlist (NUL is none of those),
+    // and its reserved-prefix branch explicitly rejects every byte < 0x20
+    // (NUL included) plus a control/shell-metacharacter set.
+    if (!is_valid_principal(username)) {
+        spdlog::warn("get_user rejected invalid username/principal: '{}'", username);
+        return std::unexpected(AuthDBError::InvalidUsername);
+    }
     auto lease = impl_->pool.try_acquire_for(kReadTimeout);
     if (!lease)
         return std::unexpected(AuthDBError::QueryFailed);
@@ -862,6 +914,94 @@ std::expected<void, AuthDBError> AuthDB::update_role(const std::string& username
         return std::unexpected(AuthDBError::UserNotFound);
     }
     spdlog::info("User role updated: {} -> {}", username, role_str);
+    return {};
+}
+
+std::expected<void, AuthDBError>
+AuthDB::recheck_role_locked(const std::string& username,
+                            const std::function<void(auth::Role)>& under_row_lock) {
+    // is_valid_principal, NOT is_valid_username: this is called on the exact
+    // same path as get_user() (via AuthManager::recheck_role_after_credential_
+    // check, reachable with an SSO-prefixed principal) - see get_user()'s own
+    // header comment for the full rationale.
+    if (!is_valid_principal(username))
+        return std::unexpected(AuthDBError::InvalidUsername);
+
+    // #4107: SELECT ... FOR UPDATE serializes this read against any
+    // concurrent update_role()/reactivate_user() write - same technique as
+    // mfa_verify_login_code's replay guard above. kWriteTimeout (not
+    // kReadTimeout) because FOR UPDATE takes a write-class lock, matching
+    // that precedent. with_txn_for does a SINGLE bounded try_acquire_for (no
+    // #2396 retry loop), matching the acquire-shape discipline this file's
+    // stripe-held call sites already use.
+    //
+    // Safety argument (security-guardian Gate 8 re-review correction: an
+    // earlier draft of this comment leaned on the /login stripe mutex -
+    // auth_routes.cpp's login_lock_for - as if it universally guarded this
+    // call; it doesn't, since the stripe is only taken when
+    // `auth_lockout_threshold > 0`, an operator-configurable setting that
+    // can be 0). The actual safety argument doesn't need the stripe: this
+    // critical section (one SELECT, one fast/uncontended mu_ map write, one
+    // COMMIT) is microseconds, not anywhere near kWriteTimeout's ceiling, so
+    // N concurrent same-username rechecks drain in roughly N x low-single-
+    // digit-ms regardless of whether the stripe happens to be serializing
+    // them too - the row lock's own bounded hold time is what keeps this
+    // safe on the shared connection pool, with or without the stripe.
+    //
+    // authdb Gate 8 finding: kWriteTimeout only bounds the connection
+    // ACQUIRE (with_txn_for's try_acquire_for). Once inside the txn, the
+    // FOR UPDATE's own row-lock WAIT is bounded by PgPool::connect_one's
+    // per-connection `lock_timeout` (10000ms default, pg_pool.hpp) unless
+    // overridden - a contended lock could otherwise block ~5x longer than
+    // this call's own acquire bound. The set_config() call below closes
+    // that: it scopes to this transaction only (no leak back to the pooled
+    // connection) and matches the wait bound to kWriteTimeout itself, so a
+    // genuinely stuck writer fails this call closed (QueryFailed, via the
+    // SQLSTATE 55P03 lock_timeout error surfacing as a non-PGRES_COMMAND_OK/
+    // TUPLES_OK status) well inside the caller's own expectations.
+    std::optional<AuthDBError> err;
+    const bool committed = impl_->pool.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        // Bound parameter, not string interpolation (authdb review contract,
+        // .claude/agents/authdb.md: "zero string interpolation", SQL string
+        // interpolation grades HIGH/block-merge - fjarvis PR #4076 re-review
+        // caught the prior version building this via std::to_string +
+        // concatenation, even though the value was a trusted compile-time
+        // constant). set_config('lock_timeout', $1, true) is the
+        // parameterized equivalent of `SET LOCAL lock_timeout = $1` - the
+        // third argument (is_local=true) scopes it to this transaction only,
+        // identically to SET LOCAL.
+        pg::PgResult set_lt = pg::exec_params(
+            conn, "SELECT set_config('lock_timeout', $1, true)",
+            std::vector<std::string>{std::to_string(kWriteTimeout.count()) + "ms"});
+        if (set_lt.status() != PGRES_TUPLES_OK) {
+            err = AuthDBError::QueryFailed;
+            return false;
+        }
+        pg::PgResult sel = pg::exec_params(
+            conn, "SELECT role FROM auth.users WHERE username = $1 AND is_active = TRUE FOR UPDATE",
+            std::vector<std::string>{username});
+        if (sel.status() != PGRES_TUPLES_OK) {
+            err = AuthDBError::QueryFailed;
+            return false;
+        }
+        if (PQntuples(sel.get()) == 0) {
+            // No active row - either never existed, or a concurrent
+            // remove_user() already committed its soft-delete UPDATE (which
+            // took this SAME row lock for its own transaction, so this
+            // SELECT either saw it directly or waited for it) before this
+            // SELECT ran.
+            err = AuthDBError::UserNotFound;
+            return false;
+        }
+        // under_row_lock runs here, still holding the row lock - see the
+        // header doc: fast, local, in-process work only, no further DB I/O.
+        under_row_lock(auth::string_to_role(col_str(sel.get(), 0, 0)));
+        return true; // commit - releases the row lock; no DB mutation to persist
+    });
+    if (err)
+        return std::unexpected(*err);
+    if (!committed)
+        return std::unexpected(AuthDBError::QueryFailed);
     return {};
 }
 
@@ -1691,6 +1831,49 @@ AuthDB::mfa_regenerate_recovery_codes(const std::string& username) {
     std::vector<std::string> raw_codes;
     AuthDBError txn_error = AuthDBError::WriteFailed;
     const bool ok = impl_->pool.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        // Serialize on the auth.users row BEFORE the DELETE-all + INSERT-10 in
+        // regenerate_recovery_codes_locked (#3779). That helper is not
+        // self-serializing: without a row lock two concurrent regenerates each
+        // DELETE the committed rows and INSERT 10 → 20 persist, and each caller
+        // is handed a set that no longer matches storage. This FOR UPDATE joins
+        // regenerate to the same per-user serialization group every other MFA
+        // writer already takes (mfa_verify_enrollment / mfa_verify_login_code /
+        // mfa_disable / remove_user all lock this row), so the loser blocks then
+        // re-runs against the winner's committed state → returned == persisted for
+        // each caller in turn (clean sequential last-writer-wins).
+        //
+        // `is_active = TRUE` is load-bearing, not cosmetic: it cross-serializes
+        // against remove_user (UPDATE+DELETE on this row). Without it a regen
+        // racing a deactivation could DELETE, block behind remove_user, then
+        // INSERT 10 fresh codes onto a now-deactivated account — live recovery
+        // codes on a dead login, the stale-code hazard docs/auth-mfa-design.md
+        // warns of. Post-lock the loser re-reads is_active = FALSE → 0 rows →
+        // UserNotFound.
+        //
+        // Lock_timeout: this deliberately does NOT scope lock_timeout to
+        // kWriteTimeout the way the #4107 sibling (mfa_verify_login_code /
+        // recheck_role_locked, ~line 969) does. That sibling narrows it to 2000ms
+        // because its critical section is microsecond-scale; here the row is held
+        // across 10x PBKDF2 (100k iters, ~0.3-0.6s), so a 2s bound would surface a
+        // legitimate loser's wait as a false QueryFailed. The pool's inherited
+        // per-connection lock_timeout (10000ms, pg_pool.hpp) still bounds a
+        // wedged-connection hang; a loser that genuinely waits >10s (≈20 piled
+        // same-user regenerates) gets SQLSTATE 55P03 → QueryFailed → 503, which is
+        // acceptable graceful degradation for a self-service action. The real fix —
+        // shrinking the hold to microseconds by minting+hashing BEFORE the lock —
+        // is a shared-helper refactor (it touches the enrollment path too) tracked
+        // as a follow-up, not folded here.
+        pg::PgResult lock = pg::exec_params(
+            conn, "SELECT id FROM auth.users WHERE username = $1 AND is_active = TRUE FOR UPDATE",
+            std::vector<std::string>{username});
+        if (lock.status() != PGRES_TUPLES_OK) {
+            txn_error = AuthDBError::QueryFailed; // read outage → fail closed (503)
+            return false;
+        }
+        if (PQntuples(lock.get()) == 0) {
+            txn_error = AuthDBError::UserNotFound; // no active user → never issue codes
+            return false;
+        }
         auto codes = regenerate_recovery_codes_locked(conn, username);
         if (!codes) {
             txn_error = codes.error();

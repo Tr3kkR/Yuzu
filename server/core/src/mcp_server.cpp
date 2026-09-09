@@ -1,5 +1,6 @@
 #include "mcp_server.hpp"
 
+#include "http_route_sink.hpp" // HttpRouteSink / HttplibRouteSink — #2542 PR-6 seam migration
 #include "mcp_server_testonly.hpp" // decls for the tool_*_for_test() defs below
 #include "engine_store_error_class.hpp" // shared REST/MCP store-error classifier
 #include "mcp_agentic_catalog.hpp" // agentic demo catalog: incident playbooks
@@ -20,7 +21,10 @@
 #include "token_rotation_lookup.hpp" // shared REST/MCP human-token rotation successor lookup (P2 #11)
 
 #include "agent_registry.hpp"           // AgentRegistry (discover_plugins tool)
+#include "dashboard_routes.hpp"         // DashboardRoutes::gather_tar_retention_paused (#4027)
 #include "discover_routes.hpp"          // A2 discovery builders shared with REST /discover/*
+#include "instruction_definition_model.hpp" // #4029: shared row/detail/export builders
+#include "product_pack_model.hpp" // #4029: ProductPackStore (fwd-declared only in mcp_server.hpp) + shared builders
 #include "engine_principal_store.hpp"   // EnginePrincipalStore (fwd-declared only in mcp_server.hpp)
 #include "openapi_spec_access.hpp"      // openapi_spec_json() (discover_routes tool)
 #include "guardian_schema_registry.hpp" // guardian_schema_catalog (Guardian discovery surface)
@@ -44,10 +48,13 @@
 #include "bundle_service.hpp"           // validate_bundle_steps / aggregate_to_json
 #include "dispatch_destructive_gate.hpp" // #3685: evaluate_destructive_targeting — shared with /api/command
 #include "dispatch_target_shape.hpp" // kBroadcastScope (#2500)
+#include "execution_model.hpp" // #4030: shared execution list/agent/kpi/response row builders
+#include "workflow_model.hpp"  // #4030: shared workflow/workflow-execution/schedule row builders
 #include "mcp_input_bounds.hpp"        // kExecInstr* / check_exec_instruction_shape (#2437)
 #include "access_review_model.hpp"      // Periodic Access Reviews (SOC 2 CC6.2) — read-model
 #include "access_review_store.hpp"      // Periodic Access Reviews — campaign persistence
 #include "directory_sync.hpp"           // access-review read-model optional email enrichment
+#include "enrollment_directory_model.hpp" // #4031: shared row builders — REST/MCP parity (Rule 1)
 // ADR-0031 operator surface (PR1.5c/1.6c, p14) — MCP twins of p5's plugin
 // config/secret/kill-switch surface and p6's upload-grant mint/list/revoke.
 // The *_parsers.hpp headers are the SAME pure validation grammar the REST
@@ -368,6 +375,52 @@ static const ToolDef kTools[] = {
      R"({"type":"object","properties":{}})",
      R"j({"type":"object","properties":{"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"}},"required":["agent_id","hostname","os","arch","agent_version"]}}},"required":["agents"]})j"},
 
+    // ── #4027 API-parity read twins: TAR process-tree / capture-sources device
+    // pickers + retention-paused source list. Requires Infrastructure:Read,
+    // enforced via fleet_read_fn_ (#4027 fix round, CDX-P1-01/K4 — the ADR-0017
+    // admit-then-filter chokepoint; SAME gate their REST twins use, NOT the two
+    // pre-existing HTML fragment siblings, which stay on the legacy bare
+    // require_permission gate this round — see tar_tree_routes.cpp's
+    // recorded-exception comments at their registration). #4143 review fix:
+    // all three now read from an UNFILTERED source (all_devices_fn_ /
+    // DashboardRoutes::gather_tar_retention_paused with
+    // extra_scope_is_authoritative=true) exactly like list_agents' own
+    // agents_fn, with fleet_read_fn_'s gate.scope as the SOLE filter — no
+    // longer intersected with a separate per-operator-scoped provider. See
+    // set_all_devices_fn's doc comment (mcp_server.hpp) for the full
+    // rationale.
+    // GET /fragments/tar/process-tree/result and .../detail are DELIBERATELY NOT
+    // twinned by #4027 (see tar_tree_routes.hpp's file comment) — no REST/MCP-only
+    // path exists to mint their required pcmd/tcmd/token inputs today.
+    {"list_tar_process_tree_devices",
+     "List the operator-scoped device picker for the TAR process-tree viewer. "
+     "Each row carries `online`, which is always true today — the sole wired "
+     "provider sources this list from the live-session registry, so a "
+     "disconnected enrolled device is not included (#4027 fix round, "
+     "CDX-P1-02/K1). Requires Infrastructure:Read. Read-only twin of GET "
+     "/fragments/tar/process-tree's device picker / GET /api/v1/tar/process-tree.",
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{"devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"},"online":{"type":"boolean"}},"required":["agent_id","hostname","os","arch","agent_version","online"]}}},"required":["devices"]})j"},
+
+    {"list_tar_capture_sources_devices",
+     "List the operator-scoped device picker for the TAR capture-sources (ADR-0015 "
+     "enable/disable) frame. Same row shape as list_tar_process_tree_devices — "
+     "`online` is always true today, same reason. Requires Infrastructure:Read. "
+     "Read-only twin of GET /fragments/tar/capture-sources's device picker / "
+     "GET /api/v1/tar/capture-sources.",
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{"devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"},"online":{"type":"boolean"}},"required":["agent_id","hostname","os","arch","agent_version","online"]}}},"required":["devices"]})j"},
+
+    {"list_tar_retention_paused",
+     "List the calling operator's most recent TAR retention-paused source scan "
+     "(per-username state; filtered to the operator's visible agents), one row per "
+     "(agent, paused source). Requires Infrastructure:Read. Read-only twin of GET "
+     "/fragments/tar/retention-paused / GET /api/v1/tar/retention-paused. Returns "
+     "scan_id=\"\" when the operator has not dispatched a scan yet (call "
+     "POST /fragments/tar/retention-paused/scan first, dashboard-only today).",
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{"scan_id":{"type":"string"},"scan_count":{"type":"integer"},"scan_at":{"type":"integer"},"agents_responded":{"type":"integer"},"agents_with_no_paused_sources":{"type":"integer"},"agents_filtered_out_of_scope":{"type":"integer"},"store_degraded":{"type":"boolean"},"rows":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"agent_display":{"type":"string"},"source":{"type":"string"},"paused_at":{"type":"integer"},"live_rows":{"type":"integer"},"oldest_ts":{"type":"integer"},"value_error":{"type":"boolean"},"enabled_raw":{"type":"string"}},"required":["agent_id","agent_display","source","paused_at","live_rows","oldest_ts","value_error","enabled_raw"]}}},"required":["scan_id","scan_count","scan_at","agents_responded","agents_with_no_paused_sources","agents_filtered_out_of_scope","store_degraded","rows"]})j"},
+
     {"get_agent_details",
      "Get detailed info for a single agent including tags and inventory. "
      "An \"Agent not found\" error means either the agent does not exist or "
@@ -382,13 +435,45 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{"entries":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"timestamp":{"type":"integer"},"principal":{"type":"string"},"action":{"type":"string"},"target_type":{"type":"string"},"target_id":{"type":"string"},"detail":{"type":"string"},"result":{"type":"string"}},"required":["id","timestamp","principal","action","target_type","target_id","detail","result"]}}},"required":["entries"]})j"},
 
     {"list_definitions",
-     "List available instruction definitions (commands that can be dispatched to agents).",
-     R"({"type":"object","properties":{"plugin":{"type":"string"},"type":{"type":"string","enum":["question","action"]},"enabled":{"type":"boolean"}}})",
-     R"j({"type":"object","properties":{"definitions":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"version":{"type":"string"},"type":{"type":"string"},"plugin":{"type":"string"},"action":{"type":"string"},"description":{"type":"string"},"enabled":{"type":"boolean"}},"required":["id","name","version","type","plugin","action","description","enabled"]}}},"required":["definitions"]})j"},
+     // #4029: full filter set (was plugin/type only) — mirrors GET /api/v1/instructions.
+     // `enabled` (never honored by the dispatch code) is replaced by `enabled_only`,
+     // matching the REST fragment's own field name.
+     "List available instruction definitions (commands that can be dispatched to agents). "
+     "Mirrors GET /api/v1/instructions.",
+     R"({"type":"object","properties":{"name":{"type":"string","description":"Name filter"},"plugin":{"type":"string"},"type":{"type":"string","enum":["question","action"]},"set_id":{"type":"string","description":"Filter to definitions in this instruction set"},"enabled_only":{"type":"boolean","description":"Only return enabled definitions"},"limit":{"type":"integer","minimum":1,"maximum":1000,"default":100}}})",
+     // #4029: row shape widened to the reconciled superset (instruction_set_id/
+     // created_at/updated_at were REST-fragment-only before this PR — see
+     // instruction_definition_model.hpp).
+     R"j({"type":"object","properties":{"definitions":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"version":{"type":"string"},"type":{"type":"string"},"plugin":{"type":"string"},"action":{"type":"string"},"description":{"type":"string"},"enabled":{"type":"boolean"},"instruction_set_id":{"type":"string"},"created_at":{"type":"integer"},"updated_at":{"type":"integer"}},"required":["id","name","version","type","plugin","action","description","enabled","instruction_set_id","created_at","updated_at"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["definitions"]})j"},
 
-    {"get_definition", "Get a single instruction definition with its parameter and result schemas.",
+    {"get_definition",
+     "Get a single instruction definition with its parameter and result schemas. Mirrors "
+     "GET /api/v1/instructions/{id}.",
      R"({"type":"object","properties":{"id":{"type":"string","description":"Definition ID"}},"required":["id"]})",
-     R"j({"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"version":{"type":"string"},"type":{"type":"string"},"plugin":{"type":"string"},"action":{"type":"string"},"description":{"type":"string"},"approval_mode":{"type":"string"},"parameter_schema":{"type":"string","description":"Serialized JSON Schema for the definition's parameters"},"result_schema":{"type":"string","description":"Serialized JSON Schema for the definition's result"},"yaml_source":{"type":"string"}},"required":["id","name","version","type","plugin","action","description","approval_mode","parameter_schema","result_schema","yaml_source"]})j"},
+     // #4029: reconciled superset — was missing gather_ttl_seconds/response_ttl_days/
+     // created_by/instruction_set_id/created_at/updated_at (the REST fragment's fields)
+     // before this PR — see instruction_definition_model.hpp.
+     R"j({"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"version":{"type":"string"},"type":{"type":"string"},"plugin":{"type":"string"},"action":{"type":"string"},"description":{"type":"string"},"enabled":{"type":"boolean"},"instruction_set_id":{"type":"string"},"created_at":{"type":"integer"},"updated_at":{"type":"integer"},"gather_ttl_seconds":{"type":"integer"},"response_ttl_days":{"type":"integer"},"created_by":{"type":"string"},"approval_mode":{"type":"string"},"parameter_schema":{"type":"string","description":"Serialized JSON Schema for the definition's parameters"},"result_schema":{"type":"string","description":"Serialized JSON Schema for the definition's result"},"yaml_source":{"type":"string"},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["id","name","version","type","plugin","action","description","enabled","instruction_set_id","created_at","updated_at","gather_ttl_seconds","response_ttl_days","created_by","approval_mode","parameter_schema","result_schema","yaml_source"]})j"},
+
+    {"export_definition",
+     "Export a single instruction definition as its full JSON document (every field, including "
+     "yaml_source and the operator-facing metadata list/get omit). Mirrors GET "
+     "/api/v1/instructions/{id}/export. Requires InstructionDefinition:Read.",
+     R"({"type":"object","properties":{"id":{"type":"string","minLength":1,"description":"Definition ID"}},"required":["id"]})",
+     R"j({"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"version":{"type":"string"},"type":{"type":"string"},"plugin":{"type":"string"},"action":{"type":"string"},"description":{"type":"string"},"enabled":{"type":"boolean"},"instruction_set_id":{"type":"string"},"created_at":{"type":"integer"},"updated_at":{"type":"integer"},"gather_ttl_seconds":{"type":"integer"},"response_ttl_days":{"type":"integer"},"created_by":{"type":"string"},"approval_mode":{"type":"string"},"parameter_schema":{"type":"string"},"result_schema":{"type":"string"},"yaml_source":{"type":"string"},"concurrency_mode":{"type":"string"},"platforms":{"type":"string"},"min_agent_version":{"type":"string"},"required_plugins":{"type":"string"},"readable_payload":{"type":"string"},"visualization_spec":{"type":"string"},"response_templates_spec":{"type":"string"},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["id","name","version","type","plugin","action","description"]})j"},
+
+    {"list_product_packs",
+     "List installed product packs (bundles of InstructionDefinition/PolicyFragment/Policy/"
+     "Workflow documents installed together). Mirrors GET /api/v1/product-packs. Requires "
+     "ProductPack:Read.",
+     R"({"type":"object","properties":{"name":{"type":"string","description":"Name filter"},"limit":{"type":"integer","minimum":1,"maximum":1000,"default":100}}})",
+     R"j({"type":"object","properties":{"product_packs":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"version":{"type":"string"},"description":{"type":"string"},"item_count":{"type":"integer"},"items":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"item_id":{"type":"string"},"name":{"type":"string"}},"required":["kind","item_id","name"]}},"installed_at":{"type":"integer"},"verified":{"type":"boolean"}},"required":["id","name","version","description","item_count","items","installed_at","verified"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["product_packs"]})j"},
+
+    {"get_product_pack",
+     "Get a single installed product pack's detail, including each item's own yaml_source. "
+     "Mirrors GET /api/v1/product-packs/{id}. Requires ProductPack:Read.",
+     R"({"type":"object","properties":{"id":{"type":"string","minLength":1,"description":"Product pack ID"}},"required":["id"]})",
+     R"j({"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"version":{"type":"string"},"description":{"type":"string"},"yaml_source":{"type":"string"},"items":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"item_id":{"type":"string"},"name":{"type":"string"},"yaml_source":{"type":"string"}},"required":["kind","item_id","name","yaml_source"]}},"installed_at":{"type":"integer"},"verified":{"type":"boolean"},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["id","name","version","description","yaml_source","items","installed_at","verified"]})j"},
 
     {"query_responses",
      "Query command response data. Provide execution_id to collect exactly the "
@@ -527,21 +612,52 @@ static const ToolDef kTools[] = {
      "from only their visible agents and scope_expression is redacted — the "
      "execution's dispatcher is admitted to VIEW the execution (avoids a false "
      "not-found on a just-dispatched execution with no responses yet) but gets "
-     "the SAME redacted counts/scope_expression as any other confined caller.",
-     R"({"type":"object","properties":{"execution_id":{"type":"string","description":"Execution ID"}},"required":["execution_id"]})",
-     R"j({"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"status":{"type":"string"},"scope_expression":{"type":"string"},"dispatched_by":{"type":"string"},"dispatched_at":{"type":"integer"},"agents_targeted":{"type":"integer"},"agents_responded":{"type":"integer"},"agents_success":{"type":"integer"},"agents_failure":{"type":"integer"},"progress_pct":{"type":"integer"},"retry_after_ms":{"type":"integer","description":"Present only while status is non-terminal — minimum ms before polling again"}},"required":["id","definition_id","status","scope_expression","dispatched_by","dispatched_at","agents_targeted","agents_responded","agents_success","agents_failure","progress_pct"]})j"},
+     "the SAME redacted counts/scope_expression as any other confined caller. "
+     "#4030: include:[\"agents\"] adds a confined per-agent status/duration array "
+     "plus a kpi summary (total/succeeded/failed/p50_ms/p95_ms) — audited "
+     "separately from the bare call because it discloses raw agent identities.",
+     R"({"type":"object","properties":{"execution_id":{"type":"string","description":"Execution ID"},"include":{"type":"array","items":{"type":"string","enum":["agents"]},"description":"Optional; \"agents\" adds a confined per-agent array + kpi summary"}},"required":["execution_id"]})",
+     R"j({"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"status":{"type":"string"},"scope_expression":{"type":"string"},"dispatched_by":{"type":"string"},"dispatched_at":{"type":"integer"},"agents_targeted":{"type":"integer"},"agents_responded":{"type":"integer"},"agents_success":{"type":"integer"},"agents_failure":{"type":"integer"},"progress_pct":{"type":"integer"},"retry_after_ms":{"type":"integer","description":"Present only while status is non-terminal — minimum ms before polling again"},"agents":{"type":"array","description":"Present only when include contains \"agents\"","items":{"type":"object","properties":{"agent_id":{"type":"string"},"status":{"type":"string"},"dispatched_at":{"type":"integer"},"first_response_at":{"type":"integer"},"completed_at":{"type":"integer"},"exit_code":{"type":"integer"},"error_detail":{"type":"string"}}}},"kpi":{"type":"object","description":"Present only when include contains \"agents\"","properties":{"total":{"type":"integer"},"succeeded":{"type":"integer"},"failed":{"type":"integer"},"p50_ms":{"type":["number","null"]},"p95_ms":{"type":["number","null"]}}},"audit_persisted":{"type":"boolean","description":"Present and false only when the per-agent expansion's audit row failed to persist"}},"required":["id","definition_id","status","scope_expression","dispatched_by","dispatched_at","agents_targeted","agents_responded","agents_success","agents_failure","progress_pct"]})j"},
 
     {"list_executions", "List recent command executions. Confined by management group: a "
      "caller admitted through a management-group grant (rather than a global permission) "
      "sees only executions they themselves dispatched — a narrower interim mechanism than "
      "the visible-agent filtering other read tools apply, since execution rows carry no "
-     "single agent_id to filter by.",
-     R"({"type":"object","properties":{"definition_id":{"type":"string"},"status":{"type":"string"},"limit":{"type":"integer","default":50}}})",
-     R"j({"type":"object","properties":{"executions":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"status":{"type":"string"},"dispatched_by":{"type":"string"},"dispatched_at":{"type":"integer"},"agents_targeted":{"type":"integer"},"agents_responded":{"type":"integer"}},"required":["id","definition_id","status","dispatched_by","dispatched_at","agents_targeted","agents_responded"]}}},"required":["executions"]})j"},
+     "single agent_id to filter by. #4030: rows now also carry the resolved definition "
+     "name, the agents_success/agents_failure split, and a truncated error preview — "
+     "reconciled onto the dashboard fragment's fuller field set.",
+     R"({"type":"object","properties":{"definition_id":{"type":"string","maxLength":256},"status":{"type":"string","maxLength":64},"limit":{"type":"integer","default":50,"minimum":1,"maximum":500}}})",
+     R"j({"type":"object","properties":{"executions":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"definition_name":{"type":"string"},"status":{"type":"string"},"dispatched_by":{"type":"string"},"dispatched_at":{"type":"integer"},"agents_targeted":{"type":"integer"},"agents_responded":{"type":"integer"},"agents_success":{"type":"integer"},"agents_failure":{"type":"integer"},"completed_at":{"type":"integer"},"rerun_of":{"type":"string"},"error_preview":{"type":"string"}},"required":["id","definition_id","status","dispatched_by","dispatched_at","agents_targeted","agents_responded"]}}},"required":["executions"]})j"},
 
-    {"list_schedules", "List scheduled (recurring) instructions.",
+    {"list_schedules", "List scheduled (recurring) instructions. #4030: rows now also "
+     "carry execution_count, matching the dashboard fragment's field set. The query is "
+     "hard-capped at 100 rows with no limit/cursor parameter; a result hitting that cap "
+     "sets result_truncated_by_cap:true rather than presenting a partial list as complete.",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"schedules":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"definition_id":{"type":"string"},"frequency_type":{"type":"string"},"enabled":{"type":"boolean"},"next_execution_at":{"type":"integer"}},"required":["id","name","definition_id","frequency_type","enabled","next_execution_at"]}}},"required":["schedules"]})j"},
+     R"j({"type":"object","properties":{"schedules":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"definition_id":{"type":"string"},"frequency_type":{"type":"string"},"enabled":{"type":"boolean"},"next_execution_at":{"type":"integer"},"execution_count":{"type":"integer"}},"required":["id","name","definition_id","frequency_type","enabled","next_execution_at","execution_count"]}},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when the 100-row cap dropped rows; absent otherwise."}},"required":["schedules"]})j"},
+
+    {"list_workflows", "List multi-step workflows (WorkflowEngine — a different data model "
+     "from a single-instruction Execution; see get_workflow_execution). Requires "
+     "Workflow:Read.",
+     R"({"type":"object","properties":{"name":{"type":"string","description":"Optional name filter","maxLength":256},"limit":{"type":"integer","default":100,"minimum":1,"maximum":500}}})",
+     R"j({"type":"object","properties":{"workflows":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"description":{"type":"string"},"steps":{"type":"array","items":{"type":"object","properties":{"index":{"type":"integer"},"instruction_id":{"type":"string"},"condition":{"type":"string"},"retry_count":{"type":"integer"},"retry_delay_seconds":{"type":"integer"},"foreach":{"type":"string"},"label":{"type":"string"},"on_failure":{"type":"string"}},"required":["index","instruction_id"]}},"step_count":{"type":"integer"},"created_at":{"type":"integer"},"updated_at":{"type":"integer"}},"required":["id","name","steps","step_count","created_at","updated_at"]}}},"required":["workflows"]})j"},
+
+    {"get_workflow", "Fetch a single multi-step workflow's full definition, including its "
+     "source YAML. Requires Workflow:Read.",
+     R"({"type":"object","properties":{"workflow_id":{"type":"string","minLength":1}},"required":["workflow_id"]})",
+     R"j({"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"description":{"type":"string"},"yaml_source":{"type":"string"},"steps":{"type":"array","items":{"type":"object","properties":{"index":{"type":"integer"},"instruction_id":{"type":"string"},"condition":{"type":"string"},"retry_count":{"type":"integer"},"retry_delay_seconds":{"type":"integer"},"foreach":{"type":"string"},"label":{"type":"string"},"on_failure":{"type":"string"}},"required":["index","instruction_id"]}},"step_count":{"type":"integer"},"created_at":{"type":"integer"},"updated_at":{"type":"integer"}},"required":["id","name","yaml_source","steps","step_count","created_at","updated_at"]})j"},
+
+    {"get_workflow_execution", "Fetch one workflow execution's status and per-step results "
+     "— WorkflowEngine's own multi-step run record, a DIFFERENT data model from "
+     "get_execution_status's single-instruction fan-out Execution. Requires Workflow:Read. "
+     "Record-level confined (#4030 Gate 8 fix): a caller with no agent visible in the "
+     "execution's agent_ids gets the same not-found error as a nonexistent id, not a "
+     "narrower-but-still-present record; an admitted confined caller's agent_ids is narrowed "
+     "to their visible agents and each step's result.agents_reached is stripped. Audited as "
+     "workflow_execution.detail.fetch (set-and-proceed, audit_persisted:false on an admitted "
+     "read whose audit row was dropped) — a genuinely nonexistent id writes no audit row.",
+     R"({"type":"object","properties":{"execution_id":{"type":"string","minLength":1}},"required":["execution_id"]})",
+     R"j({"type":"object","properties":{"id":{"type":"string"},"workflow_id":{"type":"string"},"status":{"type":"string"},"agent_ids":{"type":"array","items":{"type":"string"}},"current_step":{"type":"integer"},"started_at":{"type":"integer"},"completed_at":{"type":"integer"},"steps":{"type":"array","items":{"type":"object","properties":{"step_index":{"type":"integer"},"instruction_id":{"type":"string"},"status":{"type":"string"},"result":{},"started_at":{"type":"integer"},"completed_at":{"type":"integer"},"attempt":{"type":"integer"}},"required":["step_index","instruction_id","status"]}},"audit_persisted":{"type":"boolean","description":"Present and false only when the confinement-denied or success audit row failed to persist (set-and-proceed — the read still succeeds)."}},"required":["id","workflow_id","status","agent_ids","current_step","started_at","completed_at","steps"]})j"},
 
     {"validate_scope",
      "Validate a scope expression without executing it. Returns parse errors if invalid.",
@@ -564,6 +680,26 @@ static const ToolDef kTools[] = {
     {"list_pending_approvals", "List pending approval requests.",
      R"({"type":"object","properties":{"status":{"type":"string","enum":["pending","approved","rejected"]},"submitted_by":{"type":"string"}}})",
      R"j({"type":"object","properties":{"approvals":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"status":{"type":"string"},"submitted_by":{"type":"string"},"submitted_at":{"type":"integer"},"scope_expression":{"type":"string"}},"required":["id","definition_id","status","submitted_by","submitted_at","scope_expression"]}}},"required":["approvals"]})j"},
+
+    // ── #4031: AD/Entra directory-sync read twins — parity with GET
+    // /api/v1/directory/users and /directory/status. NOT the OIDC SSO config
+    // route (that stays REST-only per #520, see docs/mcp-server.md) — the
+    // naming trap this comment exists to head off.
+    {"list_directory_users",
+     "List AD/Entra-synced directory users, optionally filtered by group. Requires "
+     "Directory:Read. Returns email/UPN/group-membership PII — every call is audited "
+     "(directory.users.view).",
+     R"({"type":"object","properties":{"group_id":{"type":"string","description":"Optional directory group id to filter by"}}})",
+     R"j({"type":"object","properties":{"users":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"display_name":{"type":"string"},"email":{"type":"string"},"upn":{"type":"string"},"enabled":{"type":"boolean"},"groups":{"type":"array","items":{"type":"string"}},"synced_at":{"type":"integer"}},"required":["id","display_name","email","upn","enabled","groups","synced_at"]}},"count":{"type":"integer"}},"required":["users","count"]})j"},
+
+    {"get_directory_status",
+     "Get AD/Entra directory-sync status: provider, last sync time/error, user/group counts, "
+     "and the synced group catalog. Requires Directory:Read. No PII (counts + group metadata "
+     "only). groups[].mapped_role (the AD-group -> Yuzu-role authorization map) is the empty "
+     "string for a non-admin caller, regardless of tier — admin-only, same posture as "
+     "OidcConfig's admin_group field.",
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{"provider":{"type":"string"},"status":{"type":"string"},"last_sync_at":{"type":"integer"},"user_count":{"type":"integer"},"group_count":{"type":"integer"},"last_error":{"type":"string"},"groups":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"display_name":{"type":"string"},"description":{"type":"string"},"mapped_role":{"type":"string"},"synced_at":{"type":"integer"}},"required":["id","display_name","description","mapped_role","synced_at"]}}},"required":["provider","status","last_sync_at","user_count","group_count","last_error","groups"]})j"},
 
     {"get_guardian_schemas",
      "Get the Guardian (Guaranteed State) Guard authoring schema catalog — the "
@@ -1475,8 +1611,11 @@ static const ToolDef kTools[] = {
      "Plugin/action catalog observed across currently-connected agents. Each action carries an "
      "inline parameter_schema when it has a published InstructionDefinition (so you learn HOW to "
      "call it, not just that it exists); actions without one are name+description only — "
-     "discover_instructions is the full schema-bearing catalog. NOT a build-time manifest. New to "
-     "the fleet? Read the yuzu://operating-model and yuzu://capabilities resources first to orient "
+     "discover_instructions is the full schema-bearing catalog. NOT a build-time manifest. Each "
+     "plugin carries docs — {summary, kind, platforms, readme, resource} when its README has adopted the "
+     "plugin documentation standard, else null; read the yuzu://plugin-docs resource for the full "
+     "per-plugin manifest (how it works, privileges, output columns, sample rows). New to the "
+     "fleet? Read the yuzu://operating-model and yuzu://capabilities resources first to orient "
      "before acting. Read-only catalog.",
      R"({"type":"object","properties":{}})",
      // #2986: build_plugins_catalog's envelope + per-plugin/per-action keys
@@ -1484,7 +1623,7 @@ static const ToolDef kTools[] = {
      // and fixed; only actions[].parameter_schema is conditional (present
      // only when the action has a matching published InstructionDefinition),
      // typed generically for the same reason as discover_instructions above.
-     R"j({"type":"object","properties":{"version":{"type":"integer"},"description":{"type":"string"},"limitation":{"type":"string"},"actions_enriched_with_schema":{"type":"integer"},"plugins":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"version":{"type":"string"},"description":{"type":"string"},"actions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"description":{"type":"string"},"parameter_schema":{"type":"object","description":"Present only when the action has a matching published InstructionDefinition"}},"required":["name","description"]}}},"required":["name","version","description","actions"]}},"commands":{"type":"array","items":{"type":"string"}}},"required":["version","description","limitation","actions_enriched_with_schema","plugins","commands"]})j"},
+     R"j({"type":"object","properties":{"version":{"type":"integer"},"description":{"type":"string"},"limitation":{"type":"string"},"actions_enriched_with_schema":{"type":"integer"},"plugins":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"version":{"type":"string"},"description":{"type":"string"},"docs":{"type":["object","null"],"description":"Build-embedded documentation summary {summary, kind, platforms, readme, resource} when the plugin has adopted the README standard; null when it has not. kind says whether the plugin is a read-only collector or mutates state and whether it runs on a gather schedule. The full manifest is the yuzu://plugin-docs resource.","properties":{"summary":{"type":"string"},"kind":{"type":"object","properties":{"collector":{"type":"boolean"},"mutating":{"type":"boolean"},"gathered":{"type":"boolean"}},"required":["collector","mutating","gathered"]},"platforms":{"type":"object","properties":{"windows":{"type":"string","enum":["supported","constrained","planned","unsupported","undeclared"]},"macos":{"type":"string","enum":["supported","constrained","planned","unsupported","undeclared"]},"linux":{"type":"string","enum":["supported","constrained","planned","unsupported","undeclared"]}},"required":["windows","macos","linux"]},"readme":{"type":"string"},"resource":{"type":"string"}},"required":["summary","kind","platforms","readme","resource"]},"actions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"description":{"type":"string"},"parameter_schema":{"type":"object","description":"Present only when the action has a matching published InstructionDefinition"}},"required":["name","description"]}}},"required":["name","version","description","docs","actions"]}},"commands":{"type":"array","items":{"type":"string"}}},"required":["version","description","limitation","actions_enriched_with_schema","plugins","commands"]})j"},
     {"query_software_licenses",
      "Query a single agent's discovered software licences (ADR-0024 discovery plane) — the "
      "MCP twin of GET /api/v1/sle/agents/{id}. Returns each detected licence's product, "
@@ -1889,6 +2028,19 @@ struct ToolSecurityEntry {
 static const ToolSecurityEntry kToolSecurityRows[] = {
     // Phase 1 read-only tools
     {"list_agents", {"Infrastructure", "Read"}},
+    // #4027 — default (2-element) form, matching list_agents: service-scoped
+    // tokens are structurally denied at the generic C8 chokepoint. #4027 fix
+    // round (CDX-P1-01/K4): the handlers below migrated from tier_allows+
+    // perm_fn to fleet_read_fn_ for the RBAC/management-group axis, but this
+    // C8 classification is DELIBERATELY UNCHANGED — parity with the two
+    // device-picker REST twins' deny_fleet_wide_device_enumeration guard and
+    // the retention twin's own explicit service-scope 403
+    // (dashboard_routes.cpp) — none of the six #4027 surfaces admits a
+    // service-scoped caller; this fix round closes the management-group gap
+    // only, never widens the service-scope one.
+    {"list_tar_process_tree_devices", {"Infrastructure", "Read"}},
+    {"list_tar_capture_sources_devices", {"Infrastructure", "Read"}},
+    {"list_tar_retention_paused", {"Infrastructure", "Read"}},
     // #1700 / #3290 Phase 2: migrated onto require_fleet_read, which gives
     // this tool a REAL confinement mechanism (meet(management-group,
     // service-scope)) — reclassified from the default `denied` to
@@ -1900,6 +2052,9 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"query_audit_log", {"AuditLog", "Read"}},
     {"list_definitions", {"InstructionDefinition", "Read"}},
     {"get_definition", {"InstructionDefinition", "Read"}},
+    {"export_definition", {"InstructionDefinition", "Read"}},
+    {"list_product_packs", {"ProductPack", "Read"}},
+    {"get_product_pack", {"ProductPack", "Read"}},
     // #1634 (adversarial-review C3/D7) — migrated onto fleet_read_fn_, which
     // gives these a REAL confinement mechanism (meet(management-group,
     // service-scope)), same as get_agent_details above — reclassified from
@@ -1926,9 +2081,22 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"get_execution_status", {"Execution", "Read", ServiceScopeClass::confined}},
     {"list_executions", {"Execution", "Read", ServiceScopeClass::confined}},
     {"list_schedules", {"Schedule", "Read", ServiceScopeClass::confined}},
+    // #4030: Workflow (multi-step orchestration) — RBAC seeding prerequisite
+    // fixed by this same PR (see rbac_store.cpp's types[] comment). No per-
+    // agent confinement mechanism for list/get — a workflow is a YAML
+    // definition, same shape as InstructionDefinition's list_definitions/
+    // get_definition above, not a per-agent read.
+    {"list_workflows", {"Workflow", "Read"}},
+    {"get_workflow", {"Workflow", "Read"}},
+    // get_workflow_execution DOES carry per-agent data (agent_ids) and is
+    // gated on fleet_read_fn — a real confinement mechanism, so it earns the
+    // `confined` tag (same precedent as query_responses/get_agent_details).
+    {"get_workflow_execution", {"Workflow", "Read", ServiceScopeClass::confined}},
     {"validate_scope", {"Infrastructure", "Read"}},
     {"preview_scope_targets", {"Infrastructure", "Read"}},
     {"list_pending_approvals", {"Approval", "Read"}},
+    {"list_directory_users", {"Directory", "Read"}},
+    {"get_directory_status", {"Directory", "Read"}},
     {"get_guardian_schemas", {"GuaranteedState", "Read"}},
     {"list_dex_signals", {"GuaranteedState", "Read"}},
     {"get_dex_signal_scope", {"GuaranteedState", "Read"}},
@@ -2154,7 +2322,9 @@ constexpr std::string_view kRbacOps[] = {"Read",   "Write",  "Execute", "Delete"
 // Closed RBAC securable-type catalogue — mirrors rbac_store.cpp's seeded
 // `types[]` (MOVE TOGETHER; same binding test). A typo'd TYPE is the same
 // fail-open class as a typo'd op: supervised tier_allows() permits every
-// type and requires_approval() exact-matches type strings, so e.g.
+// type EXCEPT Enrollment/OidcConfig (#520/#4031's explicit server-
+// administration deny, applied before any tier branch) and
+// requires_approval() exact-matches type strings, so e.g.
 // {"quarantine_device", {"Securty", "Execute"}} would silently skip its
 // approval rule (governance UP-6).
 //
@@ -2162,6 +2332,11 @@ constexpr std::string_view kRbacOps[] = {"Read",   "Write",  "Execute", "Delete"
 // seeds them for the new plugin/upload securables, and letting this mirror drift would fail the
 // seeded-catalogues binding test in test_rbac_store.cpp or, for a typo'd entry, silently fail open
 // exactly as above.
+//
+// #4028 adds TlsConfig/PluginSigning/ServerConfig/AnalyticsConfig for the same reason — rbac_store.cpp's
+// `types[]` now seeds them for the Settings read-twins. None of the four is used by any MCP tool
+// today (#4028 ships those 8 routes REST-only per #520 — see docs/mcp-server.md); they are mirrored
+// here purely to keep this catalogue in lockstep with the seeded set, same as every other entry.
 constexpr std::string_view kRbacSecurables[] = {
     "Infrastructure", "UserManagement",     "InstructionDefinition", "InstructionSet",
     "Execution",      "Schedule",           "Approval",              "Tag",
@@ -2170,7 +2345,22 @@ constexpr std::string_view kRbacSecurables[] = {
     "License",        "FileRetrieval",      "GuaranteedState",       "Inventory",
     "AccessReview",   "SoftwareLicensing",  "EnginePrincipal",       "PluginConfig",
     "PluginSecret",   "UploadGrant",
-    "PowerManagement"};
+    "PowerManagement",
+    // #4030/#4032: mirrors rbac_store.cpp's types[] addition — see that
+    // array's comment for the full seeding-gap rationale.
+    "Workflow",
+    // #4029 prerequisite fix: mirrors rbac_store.cpp's seed_defaults() `types[]`
+    // addition — ProductPack was used as an RBAC securable string by the
+    // already-shipped /api/product-packs* routes but was never seeded on
+    // either side, so no role could ever be granted ProductPack:*.
+    "ProductPack",
+    "TlsConfig",      "PluginSigning",      "ServerConfig",          "AnalyticsConfig",
+    // #4031: mirrors rbac_store.cpp's types[] additions (MOVE TOGETHER; same
+    // binding test) — Directory (AD/Entra directory-sync, prerequisite 1 fix),
+    // Enrollment (auto-approve rules + pending-agent visibility), OidcConfig
+    // (OIDC SSO config read — deliberately NOT "Directory", see the naming
+    // trap called out in the issue and in discovery_routes.cpp).
+    "Directory", "Enrollment", "OidcConfig"};
 
 // Borrowed (name, input_schema_json) row for the registration validator's
 // 4th sequence (#2405). Views are valid only for the duration of the call.
@@ -2375,10 +2565,19 @@ struct ToolAnnotation {
 static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     // ── Read-only tools (effect ReadOnly, idempotent) ─────────────────────────
     {"list_agents", {ToolEffect::ReadOnly, true, "List agents"}},
+    {"list_tar_process_tree_devices",
+     {ToolEffect::ReadOnly, true, "List TAR process-tree device picker"}},
+    {"list_tar_capture_sources_devices",
+     {ToolEffect::ReadOnly, true, "List TAR capture-sources device picker"}},
+    {"list_tar_retention_paused",
+     {ToolEffect::ReadOnly, true, "List TAR retention-paused sources"}},
     {"get_agent_details", {ToolEffect::ReadOnly, true, "Get agent details"}},
     {"query_audit_log", {ToolEffect::ReadOnly, true, "Query audit log"}},
     {"list_definitions", {ToolEffect::ReadOnly, true, "List instruction definitions"}},
     {"get_definition", {ToolEffect::ReadOnly, true, "Get instruction definition"}},
+    {"export_definition", {ToolEffect::ReadOnly, true, "Export instruction definition"}},
+    {"list_product_packs", {ToolEffect::ReadOnly, true, "List product packs"}},
+    {"get_product_pack", {ToolEffect::ReadOnly, true, "Get product pack"}},
     {"query_responses", {ToolEffect::ReadOnly, true, "Query responses"}},
     {"aggregate_responses", {ToolEffect::ReadOnly, true, "Aggregate responses"}},
     {"query_inventory", {ToolEffect::ReadOnly, true, "Query inventory"}},
@@ -2404,9 +2603,14 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"get_execution_status", {ToolEffect::ReadOnly, true, "Get execution status"}},
     {"list_executions", {ToolEffect::ReadOnly, true, "List executions"}},
     {"list_schedules", {ToolEffect::ReadOnly, true, "List schedules"}},
+    {"list_workflows", {ToolEffect::ReadOnly, true, "List workflows"}},
+    {"get_workflow", {ToolEffect::ReadOnly, true, "Get workflow"}},
+    {"get_workflow_execution", {ToolEffect::ReadOnly, true, "Get workflow execution"}},
     {"validate_scope", {ToolEffect::ReadOnly, true, "Validate scope"}},
     {"preview_scope_targets", {ToolEffect::ReadOnly, true, "Preview scope targets"}},
     {"list_pending_approvals", {ToolEffect::ReadOnly, true, "List pending approvals"}},
+    {"list_directory_users", {ToolEffect::ReadOnly, true, "List directory users"}},
+    {"get_directory_status", {ToolEffect::ReadOnly, true, "Get directory sync status"}},
     {"get_guardian_schemas", {ToolEffect::ReadOnly, true, "Get Guardian schemas"}},
     {"list_dex_signals", {ToolEffect::ReadOnly, true, "List DEX signals"}},
     {"get_dex_signal_scope", {ToolEffect::ReadOnly, true, "Get DEX signal scope"}},
@@ -2601,6 +2805,12 @@ static const ResourceDef kResources[] = {
     {"yuzu://scope-dsl", "Scope DSL Reference",
      "Scope-kind and comparison-operator catalog — same builder as GET "
      "/api/v1/discover/scope-kinds and the discover_scope_kinds tool",
+     "application/json"},
+    {"yuzu://plugin-docs", "Plugin Documentation Manifests",
+     "Per-plugin documentation as data — how each agent plugin works, on which OS, "
+     "what it needs and what it emits (generated from agents/plugins/<name>/README.md) — "
+     "same builder as GET /api/v1/discover/plugin-docs; discover_plugins carries a "
+     "per-plugin summary that points here",
      "application/json"},
 };
 
@@ -3151,7 +3361,8 @@ McpServer::HandlerFn McpServer::build_handler(
     EnginePrincipalStore* engine_principal_store, AccessReviewStore* access_review_store,
     AuthDB* auth_db, DirectorySync* directory_sync, CallerFn caller_fn,
     yuzu::server::detail::StreamBudget* stream_budget, StreamRevalidateFn revalidate_fn,
-    StreamPrincipalAuditFn principal_audit_fn) {
+    StreamPrincipalAuditFn principal_audit_fn, ProductPackStore* product_pack_store,
+    WorkflowEngine* workflow_engine) {
 
     // Live reads via a pointer captured by value in the [=] handler below, so a
     // runtime settings-UI toggle of mcp_read_only / mcp_disable reaches this
@@ -3929,7 +4140,12 @@ McpServer::HandlerFn McpServer::build_handler(
             constexpr std::string_view kResourceTierRemediation =
                 "this MCP token's tier does not permit the operation; use a higher-tier "
                 "MCP token (operator or supervised), or the REST API / dashboard";
-            if (uri == "yuzu://openapi") {
+            // The compiled-in catalogs share ONE shape — tier gate, then perm gate,
+            // then the text as a single application/json content entry — kept as
+            // one local so a further static resource cannot drift from the
+            // tier-then-perm order. Each caller names its source; the bytes are
+            // whatever that builder serves to its REST twin.
+            auto serve_compiled_json_resource = [&](std::string_view text) {
                 if (!tier_allows(session->mcp_tier, "Infrastructure", "Read")) {
                     res.set_content(
                         error_response_a4(id, kTierDenied, "MCP tier does not allow this operation",
@@ -3940,37 +4156,29 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "Infrastructure", "Read"))
                     return;
-                // Compiled-in — no store dependency. Raw openapi_spec_json(): byte-identical
-                // to REST GET /api/v1/openapi.json, a different projection than
-                // discover_routes (see the block comment above).
                 JArr contents;
-                contents.add(JObj()
-                                 .add("uri", uri)
-                                 .add("mimeType", "application/json")
-                                 .add("text", yuzu::server::openapi_spec_json()));
+                contents.add(
+                    JObj().add("uri", uri).add("mimeType", "application/json").add("text", text));
                 res.set_content(success_response(id, JObj().raw("contents", contents.str()).str()),
                                 "application/json");
+            };
+            if (uri == "yuzu://openapi") {
+                // Raw openapi_spec_json(): byte-identical to REST GET /api/v1/openapi.json,
+                // a different projection than discover_routes (see the block comment above).
+                serve_compiled_json_resource(yuzu::server::openapi_spec_json());
                 return;
             }
             if (uri == "yuzu://scope-dsl") {
-                if (!tier_allows(session->mcp_tier, "Infrastructure", "Read")) {
-                    res.set_content(
-                        error_response_a4(id, kTierDenied, "MCP tier does not allow this operation",
-                                          yuzu::server::detail::make_correlation_id(),
-                                          kResourceTierRemediation),
-                        "application/json");
-                    return;
-                }
-                if (!perm_fn(req, res, "Infrastructure", "Read"))
-                    return;
-                // Compiled-in — no store dependency, same builder as REST
-                // /api/v1/discover/scope-kinds and discover_scope_kinds.
-                const auto& doc = yuzu::server::scope_kinds_catalog();
-                JArr contents;
-                contents.add(
-                    JObj().add("uri", uri).add("mimeType", "application/json").add("text", doc.json));
-                res.set_content(success_response(id, JObj().raw("contents", contents.str()).str()),
-                                "application/json");
+                // Same builder as REST /api/v1/discover/scope-kinds and discover_scope_kinds.
+                serve_compiled_json_resource(yuzu::server::scope_kinds_catalog().json);
+                return;
+            }
+            if (uri == "yuzu://plugin-docs") {
+                // Plugin README standard (docs/plugin-readme-standard.md rule 10): the
+                // build-embedded per-plugin manifests, byte-identical to REST
+                // GET /api/v1/discover/plugin-docs. Compiled-in content only, never
+                // fleet-derived.
+                serve_compiled_json_resource(yuzu::server::plugin_docs_catalog().json);
                 return;
             }
 
@@ -5471,6 +5679,140 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
+            // ── #4027 read twins: TAR process-tree / capture-sources device
+            // pickers + retention-paused source list. #4027 fix round
+            // (CDX-P1-01/K4): all three now gate SOLELY on fleet_read_fn_
+            // (require_fleet_read, the ADR-0017 admit-then-filter chokepoint),
+            // NOT the former tier_allows+perm_fn pair — fleet_read_fn_ already
+            // covers the MCP tier axis internally (authz_gates.cpp's
+            // mcp::tier_allows check precedes its RBAC branch), exactly mirroring
+            // query_installed_software's established migration a few hundred
+            // lines above ("fleet_read_fn_ is now the SOLE gate... no separate
+            // tier_allows/perm_fn call here"). Service-scoped tokens are
+            // unaffected by this migration — all three tools keep their default
+            // `ServiceScopeClass::denied` classification in kToolSecurityRows
+            // below, so the generic C8 chokepoint still denies them before this
+            // code is ever reached (parity with the REST retention twin's own
+            // explicit deny — see dashboard_routes.cpp). Unaudited-on-success
+            // posture for the two device pickers would match their REST
+            // siblings, but every other MCP tool in this file (including
+            // list_agents just above) calls mcp_audit("success") as baseline
+            // MCP-transport access logging regardless of the REST-side audit
+            // decision — followed here for consistency rather than introducing
+            // a fourth posture into an already-three-posture table
+            // (docs/api-twin-recipe.md §4).
+            //
+            // #4143 review fix (external colleague review, BLOCKING + SILENTFAIL-1,
+            // both confirmed by direct source inspection): the two device pickers
+            // now read the SAME shared builder their REST twin calls
+            // (api-twin-recipe.md Rule 1) from an UNFILTERED registry snapshot
+            // (all_devices_fn_ — same source list_agents' agents_fn and
+            // GET /api/v1/devices (#4033) use), with gate.scope as the SOLE
+            // filter — not an intersection with tar_devices_fn_'s direct-
+            // membership-only pre-filter (see set_all_devices_fn's doc comment
+            // above for why the old intersection design was an ADR-0017
+            // INV-4/INV-7 violation). And both now fail LOUD (503-equivalent
+            // kInternalError) when their provider is unwired, matching
+            // list_tar_retention_paused's existing posture below — the previous
+            // code silently answered "0 devices in your scope" on a misconfigured
+            // call site for these two tools only, indistinguishable from a
+            // genuinely-empty-scope caller (a false "closed" that reads as data,
+            // not an outage; the same class of bug the loud unwired-fleet_read_fn_
+            // branch just above already guards against). ──
+            if (tool_name == "list_tar_process_tree_devices") {
+                if (!fleet_read_fn_ || !all_devices_fn_) {
+                    spdlog::error("list_tar_process_tree_devices: fleet_read_fn_/"
+                                  "all_devices_fn_ unwired — misconfigured call site; "
+                                  "failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto gate = fleet_read_fn_(req, res, "Infrastructure", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the A4 error body + status
+                std::vector<DeviceRow> devices = all_devices_fn_();
+                if (gate.scope) {
+                    std::vector<DeviceRow> visible;
+                    visible.reserve(devices.size());
+                    for (auto& d : devices)
+                        if (authz::in_scope(gate.scope, d.agent_id))
+                            visible.push_back(std::move(d));
+                    devices.swap(visible);
+                }
+                const std::string devices_json = tar_process_tree_frame_json(devices);
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id,
+                                      tool_result_split(devices_json,
+                                                         JObj().raw("devices", devices_json).str(),
+                                                         kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "list_tar_capture_sources_devices") {
+                if (!fleet_read_fn_ || !all_devices_fn_) {
+                    spdlog::error("list_tar_capture_sources_devices: fleet_read_fn_/"
+                                  "all_devices_fn_ unwired — misconfigured call site; "
+                                  "failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto gate = fleet_read_fn_(req, res, "Infrastructure", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the A4 error body + status
+                std::vector<DeviceRow> devices = all_devices_fn_();
+                if (gate.scope) {
+                    std::vector<DeviceRow> visible;
+                    visible.reserve(devices.size());
+                    for (auto& d : devices)
+                        if (authz::in_scope(gate.scope, d.agent_id))
+                            visible.push_back(std::move(d));
+                    devices.swap(visible);
+                }
+                const std::string devices_json = tar_capture_sources_devices_json(devices);
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id,
+                                      tool_result_split(devices_json,
+                                                         JObj().raw("devices", devices_json).str(),
+                                                         kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "list_tar_retention_paused") {
+                if (!fleet_read_fn_) {
+                    spdlog::error("list_tar_retention_paused: fleet_read_fn_ unwired — "
+                                  "misconfigured call site; failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto gate = fleet_read_fn_(req, res, "Infrastructure", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the A4 error body + status
+                if (!dashboard_routes_) {
+                    res.set_content(
+                        a4_error(kInternalError, "TAR retention-paused surface unavailable",
+                                 "this is a server configuration/wiring fault, not a caller "
+                                 "error; contact an administrator"),
+                        "application/json");
+                    return;
+                }
+                // #4143 review fix: gate.scope is authoritative here — see
+                // gather_tar_retention_paused's doc comment.
+                const std::string payload =
+                    tar_retention_paused_json(dashboard_routes_->gather_tar_retention_paused(
+                        session->username, gate.scope, /*extra_scope_is_authoritative=*/true));
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(payload, kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
             // ── get_agent_details ─────────────────────────────────────────
             // #1700 / #3290 Phase 2 — migrated onto require_fleet_read
             // (fleet_read_fn_), mirroring query_installed_software exactly:
@@ -5661,6 +6003,10 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             // ── list_definitions ──────────────────────────────────────────
+            // #4029: full filter set (name/plugin/type/set_id/enabled_only/limit,
+            // mirrors GET /api/v1/instructions) and the reconciled row builder
+            // (instruction_definition_model.hpp) — was plugin/type-only with a
+            // narrower row shape before this PR.
             if (tool_name == "list_definitions") {
                 if (!tier_allows(tier, "InstructionDefinition", "Read")) {
                     res.set_content(
@@ -5677,8 +6023,20 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 InstructionQuery iq;
+                iq.name_filter = param_str(args, "name");
                 iq.plugin_filter = param_str(args, "plugin");
                 iq.type_filter = param_str(args, "type");
+                iq.set_id_filter = param_str(args, "set_id");
+                if (args.contains("enabled_only") && args["enabled_only"].is_boolean())
+                    iq.enabled_only = args["enabled_only"].get<bool>();
+                const auto limit_opt = param_int_strict(args, "limit", iq.limit);
+                if (!limit_opt) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "limit must be a JSON integer"),
+                        "application/json");
+                    return;
+                }
+                iq.limit = static_cast<int>(*limit_opt);
                 auto defs_result = instruction_store->query_definitions(iq);
                 if (!defs_result) {
                     res.set_content(
@@ -5687,28 +6045,29 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 JArr arr;
-                for (const auto& d : *defs_result) {
-                    arr.add(JObj()
-                                .add("id", d.id)
-                                .add("name", d.name)
-                                .add("version", d.version)
-                                .add("type", d.type)
-                                .add("plugin", d.plugin)
-                                .add("action", d.action)
-                                .add("description", d.description)
-                                .add("enabled", d.enabled));
-                }
-                mcp_audit("success");
+                for (const auto& d : *defs_result)
+                    arr.add_raw(instruction_definition_row_json(d).dump());
+                // #4029 audit posture (docs/api-twin-recipe.md §4): set-and-proceed,
+                // generic mcp.<tool_name> action (unchanged from before this PR) —
+                // check-and-surface the persist outcome rather than silently
+                // discarding it, matching the reconciled posture applied to every
+                // tool this PR touches.
+                const bool audit_ok = mcp_audit("success");
+                JObj structured;
+                structured.raw("definitions", arr.str());
+                if (!audit_ok)
+                    structured.add("audit_persisted", false);
                 res.set_content(
                     success_response(
-                        id, tool_result_split(arr.str(),
-                                              JObj().raw("definitions", arr.str()).str(),
-                                              kObjectOutputSchema)),
+                        id, tool_result_split(arr.str(), structured.str(), kObjectOutputSchema)),
                     "application/json");
                 return;
             }
 
             // ── get_definition ────────────────────────────────────────────
+            // #4029: reconciled superset builder (instruction_definition_model.hpp)
+            // — was the REST fragment's fields OR MCP's fields, never both, before
+            // this PR.
             if (tool_name == "get_definition") {
                 if (!tier_allows(tier, "InstructionDefinition", "Read")) {
                     res.set_content(
@@ -5738,22 +6097,155 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                const auto& def = **def_result;
-                auto obj = JObj()
-                               .add("id", def.id)
-                               .add("name", def.name)
-                               .add("version", def.version)
-                               .add("type", def.type)
-                               .add("plugin", def.plugin)
-                               .add("action", def.action)
-                               .add("description", def.description)
-                               .add("approval_mode", def.approval_mode)
-                               .add("parameter_schema", def.parameter_schema)
-                               .add("result_schema", def.result_schema)
-                               .add("yaml_source", def.yaml_source);
-                mcp_audit("success", def_id);
-                res.set_content(success_response(id, tool_result(obj.str(), kObjectOutputSchema)),
-                                "application/json");
+                const bool audit_ok = mcp_audit("success", def_id);
+                nlohmann::json obj = instruction_definition_detail_json(**def_result);
+                if (!audit_ok)
+                    obj["audit_persisted"] = false;
+                res.set_content(
+                    success_response(id, tool_result(obj.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // ── export_definition ─────────────────────────────────────────
+            // #4029: new tool, twin of GET /api/v1/instructions/{id}/export. Fetches
+            // via get_definition (not the store's own export_definition_json) so it
+            // can distinguish 404 (kInvalidParams) from a genuine store failure
+            // itself, and calls the SAME pure builder export_definition_json's own
+            // store method now delegates to (instruction_definition_model.hpp) — no
+            // second store round-trip, no independent field list.
+            if (tool_name == "export_definition") {
+                if (!tier_allows(tier, "InstructionDefinition", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "InstructionDefinition", "Read"))
+                    return;
+                if (!instruction_store) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Instruction store unavailable"),
+                        "application/json");
+                    return;
+                }
+                auto def_id = param_str(args, "id");
+                auto def_result = instruction_store->get_definition(def_id);
+                if (!def_result) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Instruction store unavailable"),
+                        "application/json");
+                    return;
+                }
+                if (!*def_result) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "Definition not found: " + def_id),
+                        "application/json");
+                    return;
+                }
+                const bool audit_ok = mcp_audit("success", def_id);
+                nlohmann::json obj = instruction_definition_export_json(**def_result);
+                if (!audit_ok)
+                    obj["audit_persisted"] = false;
+                res.set_content(
+                    success_response(id, tool_result(obj.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // ── list_product_packs ────────────────────────────────────────
+            // #4029: new tool, twin of GET /api/v1/product-packs. No pre-existing
+            // MCP shape to reconcile — calls the same builder the REST v1 route and
+            // the (now-refactored) legacy /api/product-packs route call.
+            if (tool_name == "list_product_packs") {
+                if (!tier_allows(tier, "ProductPack", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "ProductPack", "Read"))
+                    return;
+                if (!product_pack_store || !product_pack_store->is_open()) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Product pack store unavailable"),
+                        "application/json");
+                    return;
+                }
+                ProductPackQuery q;
+                q.name_filter = param_str(args, "name");
+                const auto limit_opt = param_int_strict(args, "limit", q.limit);
+                if (!limit_opt) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "limit must be a JSON integer"),
+                        "application/json");
+                    return;
+                }
+                q.limit = static_cast<int>(*limit_opt);
+                auto packs_result = product_pack_store->list(q);
+                if (!packs_result) {
+                    res.set_content(
+                        error_response(id, kInternalError,
+                                       product_pack_client_message("list_product_packs",
+                                                                   packs_result.error())),
+                        "application/json");
+                    return;
+                }
+                JArr arr;
+                for (const auto& p : *packs_result)
+                    arr.add_raw(product_pack_row_json(p).dump());
+                const bool audit_ok = mcp_audit("success");
+                JObj structured;
+                structured.raw("product_packs", arr.str());
+                if (!audit_ok)
+                    structured.add("audit_persisted", false);
+                res.set_content(
+                    success_response(
+                        id, tool_result_split(arr.str(), structured.str(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // ── get_product_pack ──────────────────────────────────────────
+            // #4029: new tool, twin of GET /api/v1/product-packs/{id}.
+            if (tool_name == "get_product_pack") {
+                if (!tier_allows(tier, "ProductPack", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "ProductPack", "Read"))
+                    return;
+                if (!product_pack_store || !product_pack_store->is_open()) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Product pack store unavailable"),
+                        "application/json");
+                    return;
+                }
+                auto pack_id = param_str(args, "id");
+                auto pack_result = product_pack_store->get(pack_id);
+                if (!pack_result) {
+                    res.set_content(
+                        error_response(id, kInternalError,
+                                       product_pack_client_message("get_product_pack",
+                                                                   pack_result.error())),
+                        "application/json");
+                    return;
+                }
+                if (!*pack_result) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "Product pack not found: " + pack_id),
+                        "application/json");
+                    return;
+                }
+                const bool audit_ok = mcp_audit("success", pack_id);
+                nlohmann::json obj = product_pack_detail_json(**pack_result);
+                if (!audit_ok)
+                    obj["audit_persisted"] = false;
+                res.set_content(
+                    success_response(id, tool_result(obj.dump(), kObjectOutputSchema)),
+                    "application/json");
                 return;
             }
 
@@ -6855,13 +7347,26 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 auto exec_id = param_str(args, "execution_id");
                 auto exec = execution_tracker->get_execution(exec_id);
+                // #4030: optional per-agent expansion, MCP twin of the REST
+                // `?include=agents` decision on GET /api/v1/executions/{id} —
+                // same param name/value, same route (this tool), not a new
+                // tool. Response bodies stay on `query_responses`
+                // (execution_id filter), never folded in here.
+                bool include_agents = false;
+                if (args.contains("include") && args["include"].is_array()) {
+                    for (const auto& v : args["include"]) {
+                        if (v.is_string() && v.get<std::string>() == "agents")
+                            include_agents = true;
+                    }
+                }
                 // #1634 perf (governance Gate 3 finding): only fetch/scan agent
-                // statuses when confined — an unrestricted caller is always
-                // visible regardless, so this indexed lookup would be pure
-                // waste on every poll.
+                // statuses when confined OR the caller asked for the per-agent
+                // expansion — an unrestricted caller with no `include` is
+                // always visible regardless, so this indexed lookup would be
+                // pure waste on every poll.
                 std::vector<AgentExecStatus> agents;
                 bool has_visible_agent = false;
-                if (gate.scope) {
+                if (gate.scope || include_agents) {
                     // #1634 (Doomgoose review finding, important): fail
                     // closed on a transient tracker degrade rather than
                     // silently treat it as "zero agents" — see
@@ -6946,6 +7451,33 @@ McpServer::HandlerFn McpServer::build_handler(
                     obj.add("retry_after_ms", mcp::kMcpResultPollRetryMs);
                 count_poll("get_execution_status", !terminal);
                 mcp_audit("success", exec_id);
+                if (include_agents) {
+                    // #4030: per-agent status/duration array + KPI summary,
+                    // confined to the same visible set as the aggregate
+                    // counts above. Audited separately (execution.detail.fetch
+                    // — the REST twin's verb, per the recipe's
+                    // domain-verb-over-generic-name preference) because it
+                    // discloses raw agent identities the bare call above does
+                    // not; MCP posture is set-and-proceed with
+                    // audit_persisted:false on a persist failure, never a
+                    // hard error (see docs/api-twin-recipe.md §4).
+                    JArr agent_rows;
+                    std::vector<AgentExecStatus> kpi_source;
+                    kpi_source.reserve(agents.size());
+                    for (const auto& a : agents) {
+                        if (gate.scope && !authz::in_scope(gate.scope, a.agent_id))
+                            continue;
+                        agent_rows.add_raw(execution_agent_status_json(a).dump());
+                        kpi_source.push_back(a);
+                    }
+                    auto kpi = compute_execution_kpi(kpi_source);
+                    obj.raw("agents", agent_rows.str()).raw("kpi", execution_kpi_json(kpi).dump());
+                    const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "execution.detail.fetch", "success", "Execution", exec_id,
+                        "MCP per-agent expansion");
+                    if (!audit_ok)
+                        obj.add("audit_persisted", false);
+                }
                 res.set_content(success_response(id, tool_result(obj.str(), kObjectOutputSchema)),
                                 "application/json");
                 return;
@@ -6999,7 +7531,26 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (gate.scope)
                     eq.dispatched_by = session->username;
                 eq.limit = std::min(param_int32(args, "limit", 50), 500);
-                auto execs = execution_tracker->query_executions(eq);
+                // #4030: reconciled onto the fragment's fuller field set —
+                // populate last_error_detail so the error preview below is
+                // non-empty (default false; most list_executions-style
+                // callers don't consume the field).
+                eq.include_error_detail = true;
+                // #4030 review finding (blocking): was the unchecked
+                // query_executions(), which collapsed a tracker-not-open,
+                // pool-exhaustion, or query-failure degrade into the same
+                // empty vector a genuinely empty table returns -- matches
+                // GET /api/v1/executions above (rest_api_v1.cpp), which
+                // already has this checked/error shape, and mirrors the
+                // list_schedules fix immediately below in this same file.
+                auto execs_opt = execution_tracker->query_executions_checked(eq);
+                if (!execs_opt) {
+                    res.set_content(
+                        error_response(id, kInternalError, "execution tracker degraded"),
+                        "application/json");
+                    return;
+                }
+                const auto& execs = *execs_opt;
                 // #1634 (Doomgoose review finding, important): get_execution_status
                 // projects agents_targeted/agents_responded to the caller's visible
                 // agents when confined; this LIST sibling served the raw fleet-wide
@@ -7012,36 +7563,87 @@ McpServer::HandlerFn McpServer::build_handler(
                     exec_ids.reserve(execs.size());
                     for (const auto& e : execs)
                         exec_ids.push_back(e.id);
-                    statuses_by_exec =
-                        execution_tracker->get_agent_statuses_for_executions(exec_ids);
+                    // #4030 review finding (blocking): same class as the
+                    // list-query fix immediately above -- was the unchecked
+                    // get_agent_statuses_for_executions(), which silently
+                    // zeroed every confined row's counts on a degrade
+                    // instead of surfacing it.
+                    auto statuses_opt =
+                        execution_tracker->get_agent_statuses_for_executions_checked(exec_ids);
+                    if (!statuses_opt) {
+                        res.set_content(
+                            error_response(id, kInternalError, "execution tracker degraded"),
+                            "application/json");
+                        return;
+                    }
+                    statuses_by_exec = std::move(*statuses_opt);
                 }
+                // #4030: reconciled field set (docs/api-twin-recipe.md Rule 1) —
+                // shared builder with GET /fragments/executions and the new
+                // GET /api/v1/executions: adds the agents_success/agents_failure
+                // split, the resolved definition name (memoized per call — up to
+                // `limit` distinct lookups otherwise), and a truncated error
+                // preview, none of which this tool emitted before #4030.
+                std::unordered_map<std::string, std::string> definition_names;
                 JArr arr;
                 for (const auto& e : execs) {
                     int64_t agents_targeted = e.agents_targeted;
                     int64_t agents_responded = e.agents_responded;
+                    int64_t agents_success = e.agents_success;
+                    int64_t agents_failure = e.agents_failure;
+                    std::string last_error_detail = e.last_error_detail;
                     if (gate.scope) {
-                        agents_targeted = 0;
-                        agents_responded = 0;
+                        agents_targeted = agents_responded = agents_success = agents_failure = 0;
+                        last_error_detail.clear();
+                        int64_t newest_error_at = 0;
                         auto it = statuses_by_exec.find(e.id);
                         if (it != statuses_by_exec.end()) {
                             for (const auto& a : it->second) {
                                 if (!authz::in_scope(gate.scope, a.agent_id))
                                     continue;
                                 ++agents_targeted;
-                                if (a.status == "success" || a.status == "failure" ||
-                                    a.status == "timeout" || a.status == "rejected")
+                                if (a.status == "success") {
                                     ++agents_responded;
+                                    ++agents_success;
+                                } else if (a.status == "failure" || a.status == "timeout" ||
+                                          a.status == "rejected") {
+                                    ++agents_responded;
+                                    ++agents_failure;
+                                }
+                                if (!a.error_detail.empty() && a.completed_at >= newest_error_at) {
+                                    newest_error_at = a.completed_at;
+                                    last_error_detail = a.error_detail;
+                                }
                             }
                         }
                     }
-                    arr.add(JObj()
-                                .add("id", e.id)
-                                .add("definition_id", e.definition_id)
-                                .add("status", e.status)
-                                .add("dispatched_by", e.dispatched_by)
-                                .add("dispatched_at", e.dispatched_at)
-                                .add("agents_targeted", agents_targeted)
-                                .add("agents_responded", agents_responded));
+                    std::string definition_name;
+                    if (!e.definition_id.empty()) {
+                        auto dn_it = definition_names.find(e.definition_id);
+                        if (dn_it != definition_names.end()) {
+                            definition_name = dn_it->second;
+                        } else if (instruction_store) {
+                            auto def = instruction_store->get_definition(e.definition_id);
+                            if (def && *def)
+                                definition_name = (*def)->name;
+                            definition_names.emplace(e.definition_id, definition_name);
+                        }
+                    }
+                    ExecutionListRow row;
+                    row.id = e.id;
+                    row.definition_id = e.definition_id;
+                    row.definition_name = definition_name;
+                    row.status = e.status;
+                    row.dispatched_by = e.dispatched_by;
+                    row.dispatched_at = e.dispatched_at;
+                    row.agents_targeted = static_cast<int>(agents_targeted);
+                    row.agents_responded = static_cast<int>(agents_responded);
+                    row.agents_success = static_cast<int>(agents_success);
+                    row.agents_failure = static_cast<int>(agents_failure);
+                    row.completed_at = e.completed_at;
+                    row.rerun_of = e.rerun_of;
+                    row.error_preview = truncate_utf8(last_error_detail, 80);
+                    arr.add_raw(execution_list_row_json(row).dump());
                 }
                 mcp_audit("success");
                 res.set_content(
@@ -7085,24 +7687,199 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // #4030 review finding (blocking): was the unchecked
+                // query_schedules(), which silently returned an empty list
+                // on pool exhaustion / a failed query, indistinguishable
+                // from a genuinely empty table -- mirrors the same-PR
+                // list_workflows MCP tool's checked/error_response shape
+                // immediately below.
                 ScheduleQuery sq;
-                auto schedules = schedule_engine->query_schedules(sq);
-                JArr arr;
-                for (const auto& s : schedules) {
-                    arr.add(JObj()
-                                .add("id", s.id)
-                                .add("name", s.name)
-                                .add("definition_id", s.definition_id)
-                                .add("frequency_type", s.frequency_type)
-                                .add("enabled", s.enabled)
-                                .add("next_execution_at", s.next_execution_at));
+                auto schedules_result = schedule_engine->query_schedules_checked(sq);
+                if (!schedules_result) {
+                    res.set_content(
+                        error_response(id, kInternalError,
+                                       yuzu::server::genericize_db_error(
+                                           "list_schedules", schedules_result.error())),
+                        "application/json");
+                    return;
                 }
+                // #4030: shared builder (schedule_row_json, workflow_model.hpp) —
+                // widens this tool's output with execution_count, the one field
+                // the dashboard fragment showed that this tool didn't. Same
+                // builder as GET /api/v1/schedules, so the two cannot drift.
+                JArr arr;
+                for (const auto& s : schedules_result->schedules)
+                    arr.add_raw(schedule_row_json(s).dump());
+                mcp_audit("success");
+                // #4030 review finding (blocking): the underlying query is
+                // hard-capped at 100 rows with no limit/cursor parameter on
+                // this tool; result_truncated_by_cap (declared in the output
+                // schema above, precedent: query_responses's identical flag)
+                // tells a caller when this response is a partial page rather
+                // than the complete schedule list. content[].text stays the
+                // bare `schedules` array unchanged for backward compat — the
+                // flag lives only in structuredContent, same split as
+                // query_responses.
+                JObj structured;
+                structured.raw("schedules", arr.str());
+                if (schedules_result->truncated)
+                    structured.add("result_truncated_by_cap", true);
+                res.set_content(
+                    success_response(
+                        id, tool_result_split(arr.str(), structured.str(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // ── list_workflows (#4030) ────────────────────────────────────
+            if (tool_name == "list_workflows") {
+                if (!tier_allows(tier, "Workflow", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Workflow", "Read"))
+                    return;
+                if (!workflow_engine || !workflow_engine->is_open()) {
+                    res.set_content(error_response(id, kInternalError, "Workflow engine unavailable"),
+                                    "application/json");
+                    return;
+                }
+                WorkflowQuery wq;
+                wq.name_filter = param_str(args, "name");
+                wq.limit = std::min(param_int32(args, "limit", 100), 500);
+                auto workflows_result = workflow_engine->list_workflows(wq);
+                if (!workflows_result) {
+                    res.set_content(
+                        error_response(id, kInternalError,
+                                       yuzu::server::genericize_db_error("list_workflows",
+                                                                         workflows_result.error())),
+                        "application/json");
+                    return;
+                }
+                JArr arr;
+                for (const auto& w : *workflows_result)
+                    arr.add_raw(workflow_row_json(w).dump());
                 mcp_audit("success");
                 res.set_content(
-                    success_response(id,
-                                      tool_result_split(arr.str(),
-                                                         JObj().raw("schedules", arr.str()).str(),
-                                                         kObjectOutputSchema)),
+                    success_response(
+                        id, tool_result_split(arr.str(), JObj().raw("workflows", arr.str()).str(),
+                                              kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // ── get_workflow (#4030) ──────────────────────────────────────
+            if (tool_name == "get_workflow") {
+                if (!tier_allows(tier, "Workflow", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Workflow", "Read"))
+                    return;
+                if (!workflow_engine) {
+                    res.set_content(error_response(id, kInternalError, "Workflow engine unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto workflow_id = param_str(args, "workflow_id");
+                auto workflow_result = workflow_engine->get_workflow(workflow_id);
+                if (!workflow_result) {
+                    res.set_content(
+                        error_response(id, kInternalError,
+                                       yuzu::server::genericize_db_error("get_workflow",
+                                                                         workflow_result.error())),
+                        "application/json");
+                    return;
+                }
+                if (!*workflow_result) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "Workflow not found: " + workflow_id),
+                        "application/json");
+                    return;
+                }
+                mcp_audit("success", workflow_id);
+                res.set_content(
+                    success_response(id, tool_result(workflow_detail_json(**workflow_result).dump(),
+                                                      kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // ── get_workflow_execution (#4030) ────────────────────────────
+            // WorkflowEngine's own multi-step run record — a DIFFERENT data
+            // model from get_execution_status's fan-out Execution. Confined:
+            // agent_ids_json names agents directly, so this gates on
+            // fleet_read_fn_ (not a plain perm_fn) and confines the emitted
+            // agent_ids to the caller's visible scope.
+            if (tool_name == "get_workflow_execution") {
+                if (!fleet_read_fn_) {
+                    spdlog::error(
+                        "get_workflow_execution: fleet_read_fn_ unwired; failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto gate = fleet_read_fn_(req, res, "Workflow", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the response.
+                if (!workflow_engine) {
+                    res.set_content(error_response(id, kInternalError, "Workflow engine unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto exec_id = param_str(args, "execution_id");
+                auto exec_result = workflow_engine->get_execution(exec_id);
+                if (!exec_result) {
+                    res.set_content(
+                        error_response(id, kInternalError,
+                                       yuzu::server::genericize_db_error("get_execution",
+                                                                         exec_result.error())),
+                        "application/json");
+                    return;
+                }
+                if (!*exec_result) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "Workflow execution not found: " + exec_id),
+                        "application/json");
+                    return;
+                }
+                // #4030 Gate 8 fix: record-level confinement gate (see v1
+                // REST twin's identical comment) -- denial collapses to
+                // the SAME not-found error as the branch above (identical
+                // kInvalidParams code + message template, no extra field
+                // such as audit_persisted attached -- byte-identical body,
+                // anti-enumeration, chaos_test 2) and is audited
+                // DISTINCTLY from a successful fetch, never folded into
+                // the "success" call below.
+                if (!workflow_execution_visible(**exec_result, gate.scope)) {
+                    (void)yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "workflow_execution.detail.fetch", "denied",
+                        "WorkflowExecution", exec_id,
+                        "not found or outside caller's fleet-read scope "
+                        "(management-group confinement)");
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "Workflow execution not found: " + exec_id),
+                        "application/json");
+                    return;
+                }
+                // #4030 audit decision: workflow-execution results carry
+                // operator-supplied step parameters/output — audited (see
+                // REST twin's identical reasoning), verb
+                // workflow_execution.detail.fetch, MCP set-and-proceed with
+                // audit_persisted:false on a persist failure.
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "workflow_execution.detail.fetch", "success",
+                    "WorkflowExecution", exec_id, "");
+                auto payload = workflow_execution_detail_json(**exec_result, gate.scope);
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                res.set_content(
+                    success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
                     "application/json");
                 return;
             }
@@ -7264,6 +8041,83 @@ McpServer::HandlerFn McpServer::build_handler(
                                       tool_result_split(arr.str(),
                                                          JObj().raw("approvals", arr.str()).str(),
                                                          kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // ── #4031: AD/Entra directory-sync read twins (REST/MCP parity
+            // for GET /api/v1/directory/users and /directory/status). Both
+            // call the SAME shared builders discovery_routes.cpp and
+            // enrollment_directory_routes.cpp use (docs/api-twin-recipe.md
+            // §1). The OIDC-config route stays REST-only per #520 — see
+            // docs/mcp-server.md.
+
+            if (tool_name == "list_directory_users") {
+                if (!tier_allows(tier, "Directory", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Directory", "Read"))
+                    return;
+                if (!directory_sync || !directory_sync->is_open()) {
+                    res.set_content(error_response(id, kInternalError, "directory sync unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto group_filter = param_str(args, "group_id");
+                auto users = directory_sync->get_synced_users(group_filter);
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& u : users)
+                    arr.push_back(directory_user_row_json(u));
+                nlohmann::json payload;
+                payload["users"] = arr;
+                payload["count"] = arr.size();
+                // Prefer the REST-established domain verb over the generic
+                // mcp.<tool_name> action (docs/api-twin-recipe.md §4) — set-
+                // and-proceed with audit_persisted:false on a persist
+                // failure, never a hard MCP error (this is a read, not a
+                // mutation, but MCP has no Sec-Audit-Failed header channel).
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "directory.users.view", "success", "Directory", group_filter,
+                    "MCP directory users read");
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                res.set_content(
+                    success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "get_directory_status") {
+                if (!tier_allows(tier, "Directory", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Directory", "Read"))
+                    return;
+                if (!directory_sync || !directory_sync->is_open()) {
+                    res.set_content(error_response(id, kInternalError, "directory sync unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto status = directory_sync->get_status();
+                auto groups = directory_sync->get_synced_groups();
+                // No audit call — no per-person PII (counts + group metadata
+                // only), matching the REST twin's same decision. mapped_role
+                // (the AD-group -> Yuzu-role authorization map) is redacted
+                // for non-admin callers, incl. every readonly-tier MCP
+                // token — see directory_status_json's own doc comment.
+                const bool reveal_mapped_role =
+                    session && auth::effective_role(*session) == auth::Role::admin;
+                res.set_content(
+                    success_response(
+                        id, tool_result(directory_status_json(status, groups, reveal_mapped_role)
+                                            .dump(),
+                                        kObjectOutputSchema)),
                     "application/json");
                 return;
             }
@@ -14184,8 +15038,17 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!perm_fn(req, res, "Infrastructure", "Read"))
                     return;
                 if (!agent_registry) {
-                    res.set_content(error_response(id, kInternalError, "Agent registry unavailable"),
-                                    "application/json");
+                    // A4-shaped (PR #4112 review, should-fix): this branch used to call the
+                    // bare error_response(), with no correlation_id/retry_after_ms/remediation
+                    // at all -- an inconsistency within this same function, since the
+                    // tier_allows denial three lines up already goes through a4_error.
+                    // Registry-unavailable is transient, so it gets the same named retry
+                    // floor as the comparable degraded-read path below (kMcpStoreFaultRetryMs).
+                    mcp_audit("failure", "agent registry unavailable");
+                    res.set_content(
+                        a4_error(kInternalError, "Agent registry unavailable", {},
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
                     return;
                 }
                 // Least-privilege (gov Gate 2 security-guardian MEDIUM / UP-7):
@@ -14434,38 +15297,88 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 StreamRevalidateFn revalidate_fn,
                                 std::size_t mcp_max_streams_per_principal,
                                 StreamPrincipalAuditFn principal_audit_fn,
-                                CallerFn caller_fn) {
+                                CallerFn caller_fn, ProductPackStore* product_pack_store,
+                                WorkflowEngine* workflow_engine) {
+    HttplibRouteSink sink(svr);
+    register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
+                    std::move(agents_fn), rbac_store, instruction_store, execution_tracker,
+                    response_store, audit_store, tag_store, inventory_store, policy_store,
+                    mgmt_store, approval_manager, schedule_engine, read_only_mode, mcp_disabled,
+                    std::move(dispatch_fn), ca_store, std::move(publish_crl_fn),
+                    guaranteed_state_store, std::move(dex_perf_fn), std::move(net_perf_fn),
+                    std::move(response_scope_fn), software_inventory_store, metrics,
+                    std::move(app_perf_providers), quarantine_store, std::move(tag_push_fn),
+                    agent_registry, std::move(scoped_perm_fn), sessions, mcp_streaming_disabled,
+                    mcp_streamed_post_enabled, std::move(allowed_origins),
+                    software_licensing_store, engine_principal_store, access_review_store,
+                    auth_db, directory_sync, stream_budget, std::move(revalidate_fn),
+                    mcp_max_streams_per_principal, std::move(principal_audit_fn),
+                    std::move(caller_fn), product_pack_store, workflow_engine);
+}
+
+void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
+                                AuditFn audit_fn, AgentsJsonFn agents_fn, RbacStore* rbac_store,
+                                InstructionStore* instruction_store,
+                                ExecutionTracker* execution_tracker, ResponseStore* response_store,
+                                AuditStore* audit_store, TagStore* tag_store,
+                                InventoryStore* inventory_store, PolicyStore* policy_store,
+                                ManagementGroupStore* mgmt_store, ApprovalManager* approval_manager,
+                                ScheduleEngine* schedule_engine, const bool& read_only_mode,
+                                const bool& mcp_disabled, DispatchFn dispatch_fn, CaStore* ca_store,
+                                PublishCrlFn publish_crl_fn,
+                                GuaranteedStateStore* guaranteed_state_store,
+                                DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn,
+                                ResponseScopeFn response_scope_fn,
+                                SoftwareInventoryStore* software_inventory_store,
+                                yuzu::MetricsRegistry* metrics,
+                                AppPerfProviders app_perf_providers,
+                                QuarantineStore* quarantine_store, TagPushFn tag_push_fn,
+                                yuzu::server::detail::AgentRegistry* agent_registry,
+                                ScopedPermFn scoped_perm_fn, McpSessionRegistry* sessions,
+                                const bool* mcp_streaming_disabled,
+                                const bool* mcp_streamed_post_enabled,
+                                std::vector<std::string> allowed_origins,
+                                SoftwareLicensingStore* software_licensing_store,
+                                EnginePrincipalStore* engine_principal_store,
+                                AccessReviewStore* access_review_store, AuthDB* auth_db,
+                                DirectorySync* directory_sync,
+                                yuzu::server::detail::StreamBudget* stream_budget,
+                                StreamRevalidateFn revalidate_fn,
+                                std::size_t mcp_max_streams_per_principal,
+                                StreamPrincipalAuditFn principal_audit_fn,
+                                CallerFn caller_fn, ProductPackStore* product_pack_store,
+                                WorkflowEngine* workflow_engine) {
     // GET + DELETE first: they COPY auth_fn / audit_fn / allowed_origins, which
     // build_handler std::move()s below. &mcp_disabled is a live pointer into the
     // cfg_ member (outlives the handlers).
-    svr.Get("/mcp/v1/", build_get_handler(auth_fn, audit_fn, &mcp_disabled, mcp_streaming_disabled,
-                                          sessions, allowed_origins, stream_budget, revalidate_fn,
-                                          metrics, mcp_max_streams_per_principal,
-                                          principal_audit_fn));
-    svr.Delete("/mcp/v1/", build_delete_handler(auth_fn, audit_fn, &mcp_disabled,
-                                                mcp_streaming_disabled, sessions, allowed_origins));
+    sink.Get("/mcp/v1/", build_get_handler(auth_fn, audit_fn, &mcp_disabled, mcp_streaming_disabled,
+                                           sessions, allowed_origins, stream_budget, revalidate_fn,
+                                           metrics, mcp_max_streams_per_principal,
+                                           principal_audit_fn));
+    sink.Delete("/mcp/v1/", build_delete_handler(auth_fn, audit_fn, &mcp_disabled,
+                                                 mcp_streaming_disabled, sessions, allowed_origins));
 
-    svr.Post("/mcp/v1/",
-             build_handler(std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
-                           std::move(agents_fn), rbac_store, instruction_store, execution_tracker,
-                           response_store, audit_store, tag_store, inventory_store, policy_store,
-                           mgmt_store, approval_manager, schedule_engine, read_only_mode,
-                           mcp_disabled, std::move(dispatch_fn), ca_store,
-                           std::move(publish_crl_fn), guaranteed_state_store,
-                           std::move(dex_perf_fn), std::move(net_perf_fn),
-                           std::move(response_scope_fn), software_inventory_store, metrics,
-                           std::move(app_perf_providers), quarantine_store,
-                           std::move(tag_push_fn), agent_registry, std::move(scoped_perm_fn),
-                           sessions, mcp_streaming_disabled, mcp_streamed_post_enabled,
-                           std::move(allowed_origins),
-                           software_licensing_store, engine_principal_store, access_review_store,
-                           auth_db, directory_sync, std::move(caller_fn),
-                           // 2f PR 3b: the streamed-POST arm leases from the SAME
-                           // budget as the GET channel above (which COPIED these, so
-                           // moving here is safe) - one arithmetic for every
-                           // held-open worker, whichever verb pinned it.
-                           stream_budget, std::move(revalidate_fn),
-                           std::move(principal_audit_fn)));
+    sink.Post("/mcp/v1/",
+              build_handler(std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
+                            std::move(agents_fn), rbac_store, instruction_store, execution_tracker,
+                            response_store, audit_store, tag_store, inventory_store, policy_store,
+                            mgmt_store, approval_manager, schedule_engine, read_only_mode,
+                            mcp_disabled, std::move(dispatch_fn), ca_store,
+                            std::move(publish_crl_fn), guaranteed_state_store,
+                            std::move(dex_perf_fn), std::move(net_perf_fn),
+                            std::move(response_scope_fn), software_inventory_store, metrics,
+                            std::move(app_perf_providers), quarantine_store,
+                            std::move(tag_push_fn), agent_registry, std::move(scoped_perm_fn),
+                            sessions, mcp_streaming_disabled, mcp_streamed_post_enabled,
+                            std::move(allowed_origins),
+                            software_licensing_store, engine_principal_store, access_review_store,
+                            auth_db, directory_sync, std::move(caller_fn),
+                            // 2f PR 3b: the streamed-POST arm leases from the SAME
+                            // budget as the GET channel above (which COPIED these, so
+                            // moving here is safe) - one arithmetic for every
+                            // held-open worker, whichever verb pinned it.
+                            stream_budget, std::move(revalidate_fn),
+                            std::move(principal_audit_fn), product_pack_store, workflow_engine));
 
     // Streaming is ON only when a registry is wired AND the kill switch is off —
     // report the true state, not just the kill-switch bit (governance arch/sre NICE).

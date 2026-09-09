@@ -1103,20 +1103,29 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
             }
             auto b = parse_journal_batch(**got);
             // Re-validate every record before replay (review M6): a corrupt/tampered v4 row on disk
-            // (enqueued_ns<=0, an oversized/non-UTF-8 field, or a kind other than armed/disarmed)
-            // would poison the server compare into a false Conflict every reconnect -- the exact
-            // failure the M6 MINT gate prevents. QUARANTINE the whole batch (the quarantine unit per
-            // section 2/9) so it is never replayed and the removal is COUNTED, not silently skipped.
+            // (enqueued_ns<=0, an oversized/non-UTF-8 field, or an unrecognized kind) would poison
+            // the server compare into a false Conflict every reconnect -- the exact failure the M6
+            // MINT gate prevents. QUARANTINE the whole batch (the quarantine unit per section 2/9)
+            // so it is never replayed and the removal is COUNTED, not silently skipped.
             //
             // An UNPARSEABLE value is quarantined here too. It used to be prune's job, but prune no
             // longer reads values at all, so the pass that does read a value is the pass that must
             // act on it. Bounded: at most one quarantine per considered candidate per pass, and
             // retention still bounds a corrupt journal by age, count and bytes meanwhile.
+            //
+            // #2818 (enterprise-readiness Gate 6): "errored" is a real, live-producible kind
+            // (GuardianSparkRuntime::on_subscription_lost) as of this PR, not a corruption
+            // signature - this allowlist must track guardian_outbox.hpp's documented lifecycle
+            // vocabulary ("armed" | "disarmed" | "errored"), not lag one kind behind it. Before
+            // this fix, an "errored" record surviving a crash/restart before it drained live would
+            // have been silently quarantined here as tampered - destroying the exact audit record
+            // #2818 exists to produce, in the exact scenario (durability across a restart) that
+            // record is meant to survive.
             bool replayable = b.has_value();
             if (replayable) {
                 for (const auto& r : b->entries) {
                     if (validate_record(r) != JournalReject::None ||
-                        (r.kind != "armed" && r.kind != "disarmed")) {
+                        (r.kind != "armed" && r.kind != "disarmed" && r.kind != "errored")) {
                         replayable = false;
                         break;
                     }

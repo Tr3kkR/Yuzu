@@ -1,8 +1,8 @@
 ---
-status: proposed
+status: accepted
 date: 2026-07-06
 owner: Dave Rae
-deciders: pending — acceptance requires at least one recorded independent review and a linked tracking issue (SOC 2 Workstream F change-management evidence; cf. ADR-0006's decision record)
+deciders: Nathan Dornbrook (project owner), 2026-09-07; independent review of record: enterprise-architect adjudication 2026-09-07 + the approving review on the ADR-reconciliation PR (docs/agents/domain.md ADR Acceptance Convention); tracking issue #4099
 scope: platform — consumer model, principal classes, UI/API boundary, use-case engine direction
 ---
 
@@ -106,6 +106,19 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      applies in full to that feature. Recorded class-level so each future
      gauge-family PR cites this entry instead of relitigating (governance
      Gate-3 architect, spark rung-1 re-land).
+
+   - **2026-09-07 — class-level entry: a compiled-in specification surfaced as
+     REST route + MCP resource, with no MCP tool, satisfies the twin.** The
+     plugin documentation manifests (`GET /api/v1/discover/plugin-docs` and
+     `yuzu://plugin-docs`, byte-identical, `docs/plugin-readme-standard.md`
+     rule 10) follow the 2g PR4 specs-as-resources shape: the resource is
+     enumerable through `resources/list`, gated tier-then-permission like
+     its REST twin, and the tool-level entry point is the `docs` summary
+     `discover_plugins` already carries. Decision 4 asks for REST and MCP;
+     a resource IS the MCP surface for static content. Recorded class-level
+     so the next compiled-in catalog cites this entry (governance Gate-3
+     architect + Gate-4 consistency-auditor, PR D.1 of the plugin docs
+     programme).
 
    - **2026-07-08 — SCIM v2 provisioning (`/scim/v2/*`, PR #2018).** REST-only,
      no MCP twin, and absent from route discovery (A2/A3) — a "no" on
@@ -264,6 +277,65 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        (#3789)"; wire reference: `docs/user-manual/rest-api.md`'s
        "Executions" section.
 
+   - **2026-09-07 — 8 Settings read-twins (`GET /api/v1/settings/{tls,https,
+     gateway,server-config,mcp,data-retention,analytics}` +
+     `GET /api/v2/agent/plugin-policy` — its predecessor `/api/v1/agent/
+     plugin-policy` deprecated by #4144 per `docs/api-versioning-policy.md`,
+     not covered by this exception, #4028).** REST-only, no MCP twin — a
+     "no" on Decision 1's both-surfaces requirement. Recorded rather than
+     fixed pre-merge because:
+     - **The gap is a deliberate, pre-existing security boundary, not a
+       build-order gap.** #520 (this issue's own scoping note, echoed in
+       `docs/mcp-server.md`'s MCP-tier reference) holds that MCP tokens are
+       for fleet management and must not be used to administer the server
+       itself — settings, users, TLS, OIDC. `mcp_policy.hpp`'s `tier_allows()`
+       hard-denies the four securables gating these eight routes
+       (`TlsConfig`/`PluginSigning`/`ServerConfig`/`AnalyticsConfig`) at
+       EVERY MCP tier, including `readonly` — an admin-owned MCP token
+       cannot read this data either. This PR's job was hardening the eight
+       sub-areas onto REST v1 + dedicated RBAC securables (previously an
+       undifferentiated `admin_fn_`-only gate on the dashboard fragment
+       route alone); it did not — and, per #520, should not casually — add
+       an MCP surface alongside that hardening.
+     - **This entry corrects a same-PR ledger error, not a fresh
+       classification call.** An earlier round of this PR flipped these 8
+       rows straight to `status: "twinned"` in
+       `scripts/ci/api-parity/settings.json` despite `mcp_twin: null`,
+       understating the untwinned ratchet by 8
+       (`scripts/ci/check-api-parity.py`'s `BASELINE_UNTWINNED` moved
+       265 → 257) and recording the #520 decision nowhere this ADR's own
+       exception-ledger mechanism could see it — an adversarial two-model
+       review (`/home/dgr/advrev-4028`) caught the mislabel independently of
+       the credential-leak finding on the same branch. The rows are now
+       `status: "exception:#520"`, `BASELINE_UNTWINNED` is restored to 265,
+       and this entry is the exception-ledger record ADR-1005's own
+       Decision 1 requires for it.
+     - **Not a tracked follow-up — revisit only if #520 itself is amended.**
+       Unlike the SCIM entry above, there is no scoped MCP-surface work
+       item to point at: adding an MCP twin here means amending #520's
+       fleet-management/server-administration boundary, which
+       `docs/mcp-server.md:21` already states explicitly requires "its own
+       security-guardian-reviewed amendment... not a side effect of a
+       routine REST-twin PR." This stands as a standing exception until
+       that amendment happens, not a numbered issue with a revisit date.
+     - **The exception relaxes no control.** Every route requires its
+       dedicated RBAC securable (`Read`) and is floored in
+       `authz_topology_floor.hpp` so an RBAC-off deployment stays
+       admin-gated rather than silently widening to any authenticated user.
+       Four of the eight (TLS, HTTPS, plugin-signing, analytics — the
+       higher-sensitivity sub-areas) are additionally audited fail-closed
+       (`settings.*.read` / `plugin_signing.*`, `settings_routes.hpp`'s
+       dedicated `AuditFn`); the other four (gateway, server-config,
+       data-retention, MCP) are deliberately unaudited, matching their
+       pre-existing dashboard-fragment posture and #4028's own Evidence
+       classification of that data as non-sensitive (each REST handler's
+       comment states this explicitly). The MCP deny-list changes nothing
+       about REST-side access control either way.
+     - Design record: `server/core/src/mcp_policy.hpp`'s `#4028/#520`
+       comment; `docs/auth-architecture.md`'s "Settings read-twins" section;
+       wire reference: `docs/user-manual/rest-api.md`'s Settings routes,
+       `docs/mcp-server.md`'s MCP-tier reference.
+
 ## Interim rules (until the named follow-ups ship)
 
 - **No engine principal class exists** until the auth-architecture follow-up lands. Until then, integrations authenticate as themselves via existing API tokens, and the server accepts **no** on-behalf-of assertion on any surface — any such header/field is rejected, not ignored.
@@ -292,3 +364,11 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
 - **Ship shape (eventual):** headless `yuzu-server` (with thin admin console) as a supported standalone deploy; first-party engine as a separate artifact customers may take, replace, or omit. The first-party engine declares a min/max supported server API version and refuses to start outside it.
 - **Data-processor status:** an engine holding a synced copy of fleet or behavioral data is a data processor in its own right; retention/deletion/DPA obligations for that copy fall to the engine operator and are not discharged by this ADR — SOC 2 Workstream E tracks this.
 - **Works-council / SOC 2 posture is designed to improve** — one audit chokepoint recording every server-mediated actor (human, agent daemon, engine, engine-for-operator) — **contingent on** the delegation follow-up shipping server-verifiable delegation and the Decision 5 audit-row fields. It is not a completed control, and engine-internal redistribution of synced data remains outside this chokepoint (see Decision 5's perimeter caveat). Engine-principal credential lifecycle lands in SOC 2 Workstream B.
+
+## Acceptance note (2026-09-07)
+
+Accepted (tracking issue #4099). Shipped in-server: `on_behalf_guard.hpp`, `grpc_on_behalf_interceptor.hpp` (registered via `SetInterceptorCreators`, `server.cpp:7157-7166`), `principal_class.hpp`, `engine_principal_store.{hpp,cpp}`, `principal_quota_gate.hpp`, and the `StreamBudget` admission cap give Decisions 1–4 a live substrate to bind against. Accepted children ADR-0031 (`engine_principal_store`, builds-on), ADR-0031 (`presentation-core-engine-decomposition`, amends Decision 6), ADR-0032 and ADR-0033 (both depends-on) already rest on this ADR; acceptance closes that inversion.
+
+Phase 7 (the vuln-management strangler re-home into a use-case engine under `engines/`, `docs/adr-1005-execution-plan.md`) has NOT started — no `engines/` directory exists. Grandfathered surface #2 is unchanged by this acceptance: it covers only the shipped NVD sync/matching and the absorbed ADR-0023 and ADR-4001 designed scopes, placement-only, outside-by-default beyond them (rider (b): ADR-4002 not absorbed). The remaining vuln ADRs (0001/0002/0005/0029/4002/4003/4004) are deferred into that future engine, not withdrawn, and are NOT grandfathered — each faces Decision 2 fresh at implementation. ADR-0028 (component inventory) is agent-side collection mechanism: deferred, but it stays core under Decision 2 and is not engine scope.
+
+Interim rules at acceptance: rule 1's "no engine principal class" clause is discharged by ADR-0031 (`engine_principal_store`) while its on-behalf-of ban remains live (`on_behalf_guard.hpp`, unamended by ADR-0032); rule 2 is discharged by `principal_quota_gate.hpp`; rule 3 is discharged by the published `docs/api-versioning-policy.md`; rule 4 (unverified-delegation audit marking) remains live and conditional on the delegation follow-up. Decisions 1–4 bind prospectively from 2026-09-07.

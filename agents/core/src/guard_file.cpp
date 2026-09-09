@@ -264,6 +264,8 @@ void FileGuard::run() try {
             baseline = cur; // baseline-on-arm: first present read establishes the good state
             baseline_set = true;
             spdlog::info("Guardian FileGuard[{}]: baselined {} = {}", cfg_.rule_id, cfg_.path, cur);
+            if (cfg_.on_baseline) // #4021: persist so a later full_sync/restart re-seeds this
+                cfg_.on_baseline(cur);
             report_compliant(); // armed at the known-good baseline → compliant edge
             return;             // no drift — we just captured the baseline
         }
