@@ -194,6 +194,11 @@ TEST_CASE("autoruns Linux leg: on a non-Linux build every lnx_* source reports "
 
 #else // defined(__linux__)
 
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 TEST_CASE("autoruns Linux leg: real collect_linux never reports foreign_os for a lnx_* source",
           "[autoruns][actions][linux]") {
     auto plugin = load_autoruns_plugin();
@@ -294,6 +299,101 @@ TEST_CASE("autoruns Linux leg: systemd sources are self-consistent with /run/sys
         // call sites would leave that test green while this one catches it).
         CHECK(usr_st->status == "constrained");
         CHECK(usr_st->reason.find("narrow_search_path_coverage") != std::string::npos);
+    }
+}
+
+TEST_CASE("autoruns Linux leg: lnx_rc_local's real collect_linux status/row is "
+          "self-consistent with this host's own /etc/rc.local",
+          "[autoruns][actions][linux]") {
+    // RECONSTRUCTION: the pre-existing rc.local coverage (below, "Direct
+    // source inclusion") only ever calls read_file_bounded/is_root_executable
+    // directly -- zero prior assertions anywhere touched the actual
+    // /etc/rc.local block inside collect_linux at dispatch level. Drives the
+    // ACTUAL collect_linux integration point via a live dispatch instead,
+    // and builds its own ground truth by opening /etc/rc.local with the SAME
+    // flags read_file_bounded uses (O_RDONLY|O_NOFOLLOW|O_CLOEXEC), so a
+    // symlinked leaf (refused, not followed) is classified the same way
+    // here as it is in production, independent of this host's actual
+    // /etc/rc.local state. NOTE this does NOT deterministically catch the
+    // specific "redundant second ::stat() call reinstated while out_st
+    // plumbing stays in place" partial-revert regression: on a quiescent
+    // host both the real fstat() and a fresh path-based ::stat() return the
+    // same answer, so that class of regression needs an injectable-path
+    // seam or fault injection to reproduce, not a real-filesystem read. What
+    // this DOES pin: the real branch decision (absent/not_executable/row)
+    // now has dispatch-level coverage at all, where before it had none.
+    auto plugin = load_autoruns_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+
+    int fd = ::open("/etc/rc.local", O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    const int open_errno = errno;
+    struct stat fst{};
+    const bool opened = fd >= 0;
+    if (opened) {
+        REQUIRE(::fstat(fd, &fst) == 0);
+        ::close(fd);
+    }
+
+    yuzu::agent::LocalDispatcher dispatcher;
+    auto result = dispatcher.run(plugin->descriptor, "list");
+    CHECK(result.rc == 0);
+    const auto rows = captured_rows(result.captured);
+
+    auto st = find_status(rows, "lnx_rc_local");
+    REQUIRE(st.has_value());
+
+    int autorun_count = 0;
+    std::vector<std::string> autorun_fields;
+    for (const auto& r : rows) {
+        auto f = fields_of(r);
+        if (f.size() == 12 && f[0] == "autorun" && f[1] == "lnx_rc_local") {
+            ++autorun_count;
+            autorun_fields = f;
+        }
+    }
+
+    if (!opened) {
+        if (open_errno == ENOENT) {
+            CHECK(st->status == "supported");
+            CHECK(st->row_count == "0");
+            CHECK(st->reason == "absent");
+        } else {
+            // A refused symlink leaf (ELOOP), permission_denied, or any
+            // other real open failure -- never a confident supported/absent.
+            CHECK(st->status == "constrained");
+        }
+        CHECK(autorun_count == 0);
+    } else if (!S_ISREG(fst.st_mode)) {
+        // open() itself can succeed against a non-regular leaf (a
+        // directory, fifo, device -- O_NOFOLLOW alone doesn't catch this);
+        // read_file_bounded's own S_ISREG check then fails the read as a
+        // real error (NOT_REGULAR), so the real call site reports
+        // constrained here too, never a confident supported/absent.
+        CHECK(st->status == "constrained");
+        CHECK(autorun_count == 0);
+    } else if ((fst.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) == 0) {
+        // A regular file that opened and read cleanly but isn't
+        // root-executable -- its own honest zero-row case, never folded
+        // into absent nor promoted to a fabricated row.
+        CHECK(st->status == "supported");
+        CHECK(st->row_count == "0");
+        CHECK(st->reason == "not_executable");
+        CHECK(autorun_count == 0);
+    } else {
+        // Present, regular, root-executable: a real persistence mechanism,
+        // exactly one row.
+        CHECK(st->status == "supported");
+        CHECK(st->row_count == "1");
+        CHECK(st->reason == "-");
+        REQUIRE(autorun_count == 1);
+        REQUIRE(autorun_fields.size() == 12);
+        CHECK(autorun_fields[3] == "/etc/rc.local"); // location
+        CHECK(autorun_fields[5] == "/etc/rc.local"); // target
+        CHECK(autorun_fields[7] == "enabled");       // enabled
+        CHECK(autorun_fields[8] == "system");        // scope
     }
 }
 
