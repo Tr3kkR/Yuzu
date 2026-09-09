@@ -3407,19 +3407,25 @@ TEST_CASE("Registry spark (real mechanism): survives key delete + recreate",
     std::this_thread::sleep_for(200ms); // let the target notify arm
 
     // Delete the watched key → the mechanism falls back to the ancestor NAME
-    // watch on the parent (Software\Yuzu).
+    // watch on the parent (Software\Yuzu). The deletion is itself a Target-mode
+    // notification, so it fires - wait for that fire, let any re-arm follow-up
+    // land, and take the baseline AFTER it: the assertion below must be met by
+    // a fire the RECREATE produced, not by the deletion's.
     ::RegDeleteKeyA(HKEY_CURRENT_USER, sub.c_str());
-    std::this_thread::sleep_for(300ms);
+    CHECK(eventually([&] { return got.count() >= 1; }, 8000ms));
+    std::this_thread::sleep_for(500ms);
+    const std::size_t after_delete = got.count();
 
     // Recreate it + write a value → the ancestor watch must re-resolve to the
-    // target key and fire.
+    // target key and fire (the reappearance itself, and/or the write).
     HKEY h2 = nullptr;
     REQUIRE(::RegCreateKeyExA(HKEY_CURRENT_USER, sub.c_str(), 0, nullptr, 0, KEY_SET_VALUE, nullptr,
                               &h2, nullptr) == ERROR_SUCCESS);
     const DWORD val = 7;
     ::RegSetValueExA(h2, "V", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&val), sizeof(val));
 
-    CHECK(eventually([&] { return got.count() >= 1; }, 10000ms));
+    INFO("fires after the deletion settled: " << after_delete);
+    CHECK(eventually([&] { return got.count() > after_delete; }, 10000ms));
     if (got.count() >= 1)
         CHECK(got.at(0).type == SparkType::Registry);
     engine.stop();
@@ -4101,6 +4107,46 @@ TEST_CASE("Registry mechanism (direct): stop() during watch()'s bounded wait can
     CHECK(faults.load() == 0);
     CHECK(eventually([&] { return registry_debug_counters_for_test(*mech)->probe_workers_active == 0; },
                      5000ms));
+}
+
+TEST_CASE("Registry spark (real mechanism): a target that appears under an ancestor watch fires "
+          "without any value write (#2012 PR-B1 appearance)",
+          "[spark][mechanism][windows][walkoff]") {
+    // Base behaviour (b9a389b9a: emit on `old_mode == Target || w.mode == Target`)
+    // fired on an Ancestor -> Target transition. With the re-arm now asynchronous,
+    // that transition is only visible at commit and must be emitted from there.
+    ScratchRegKey parent("appear_parent");
+    const std::string target = parent.sub + "\\Missing"; // absent at arm time
+    SparkEngine engine;
+    auto mech = make_registry_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::Registry, std::move(mech)).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    const auto spec = registry_spec("HKCU", target);
+    REQUIRE(engine.arm(*c, spec).has_value()); // establishes in Ancestor mode (on `parent`)
+    engine.start();
+    CHECK(eventually([&] { return engine.stats().armed_sparks == 1 && engine.stats().armed_faulted == 0; },
+                     3000ms));
+    std::this_thread::sleep_for(200ms);
+    const auto baseline = count_kind(got, spark_key(spec), SparkEventKind::Fired);
+    CHECK(baseline == 0); // an initial establishment never emits
+
+    // Create the target key - NO value write. The parent's NAME notification is
+    // the only thing that fires; the re-arm resolves to Target, and that
+    // appearance must reach the consumer as a Fired event.
+    HKEY h = nullptr;
+    REQUIRE(::RegCreateKeyExA(HKEY_CURRENT_USER, target.c_str(), 0, nullptr, 0, KEY_READ, nullptr, &h,
+                              nullptr) == ERROR_SUCCESS);
+    ::RegCloseKey(h);
+    CHECK(eventually([&] { return count_kind(got, spark_key(spec), SparkEventKind::Fired) > baseline; },
+                     5000ms));
+    auto d = registry_debug_counters_for_test(*raw);
+    REQUIRE(d.has_value());
+    CHECK(d->synthetic_fires >= 1);
+    engine.stop();
+    ::RegDeleteKeyA(HKEY_CURRENT_USER, target.c_str());
 }
 
 // ── Inline-tier dispatch latency (the ADR-0021 §3 µs claim) ──────────────────
