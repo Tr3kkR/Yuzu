@@ -702,6 +702,34 @@ spec:
           Requires agent v0.12.0+.
         validation:
           pattern: "^[0-9]+$"
+      usage_enabled:
+        type: string
+        displayName: App Usage Fold Enabled
+        description: >
+          Enable or disable the derived app-usage fold (usage → $Usage_Live /
+          $Usage_Daily), which pairs process start/stop events from the
+          process source into per-executable runs (run_usage_fold; no
+          collector of its own). **ON by default ("true")** — joining power
+          and removable as a works-council-class source that ships enabled.
+          This is NOT the product's first default-on source: process, tcp,
+          service, user and perf have always been on as machine-scope
+          operational telemetry.
+          The divergence is deliberate, but it does NOT mean the data is
+          low-sensitivity: the SOC 2 data inventory classifies $Usage_Live /
+          $Usage_Daily as usage-class / behavioral-adjacent, because WHAT a
+          device runs and WHEN is a presence and working-hours proxy, and the
+          fold additionally persists the owning pid/user per open run and a
+          raw username per (day, executable) in usage_daily_user. Treat it as
+          co-determination-relevant.
+          The fold ships LIVE with no retrospective backfill: coverage begins
+          at the first tick after enablement or upgrade
+          (usage_coverage_since, forward-only) — process history from before
+          that point is never folded.
+          Set to "false" to opt out; existing usage_daily/usage_live rows
+          stay queryable until they age out. Requires agent v0.12.0+; older
+          agents silently ignore. Valid: "true" | "false".
+        validation:
+          pattern: "^(true|false)$"
       network_capture_method:
         type: string
         displayName: Network Capture Method
