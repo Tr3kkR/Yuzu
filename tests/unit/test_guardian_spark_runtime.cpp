@@ -4630,6 +4630,47 @@ TEST_CASE("rung 9c R5.2: a disarm the executor refuses at admission is RETAINED 
     CHECK(rt->rule_count() == 1);
 }
 
+TEST_CASE("rung 9c R5.2 (governance Gate 4 hp-1): a rule re-pushed from one key onto ANOTHER "
+          "key that holds a RETAINED disarm drives BOTH its prior-key disarm and the target "
+          "key's retained disarm before its own arm",
+          "[spark][runtime][liveness]") {
+    // Mutation: attach_rule drives prior_disarm OR head_to_drive (an else-if) -> the
+    // target key's retained disarm is never re-driven by this call, the new arm claim
+    // waits behind it until the deadline and the push fails "arm timed out".
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::milliseconds(300)});
+    // Key /b: r1 armed, then its disarm refused at admission -> a RETAINED disarm head.
+    REQUIRE(rt->attach_rule("r1", file_spec("/b"), file_exists_rule("r1"), true));
+    rt->set_io_executor_fail_launch_for_test(true); // LaunchFailed at admission
+    rt->detach_rule("r1");
+    rt->set_io_executor_fail_launch_for_test(false);
+    REQUIRE(rt->disarm_retained() == 1);
+    REQUIRE(rt->claim_queue_depth_for_test(spark_key(file_spec("/b"))) == 1);
+    // Key /a: r2 armed.
+    REQUIRE(rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true));
+    REQUIRE(b->arms.load() == 2);
+    // r2 re-pushed onto /b: its prior generation on /a owes a disarm (prior_disarm)
+    // AND /b's head is the retained disarm (head_to_drive). Both must run before
+    // r2's arm on /b dispatches.
+    const auto gen = rt->attach_rule("r2", file_spec("/b"), file_exists_rule("r2"), true);
+    REQUIRE(gen);
+    CHECK(b->disarms.load() == 2);
+    CHECK(b->arms.load() == 3);
+    REQUIRE(b->armed_ids().size() == 3);
+    REQUIRE(b->disarmed_ids().size() == 2);
+    const auto disarmed = b->disarmed_ids();
+    const auto armed = b->armed_ids();
+    // Both stale watchers are gone (r1's on /b, r2's on /a); the new /b watcher is live.
+    CHECK(std::find(disarmed.begin(), disarmed.end(), armed[0]) != disarmed.end());
+    CHECK(std::find(disarmed.begin(), disarmed.end(), armed[1]) != disarmed.end());
+    CHECK(std::find(disarmed.begin(), disarmed.end(), armed[2]) == disarmed.end());
+    CHECK(rt->claim_queue_depth_for_test(spark_key(file_spec("/a"))) == 0);
+    CHECK(rt->claim_queue_depth_for_test(spark_key(file_spec("/b"))) == 0);
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(rt->rule_count() == 1);
+}
+
 TEST_CASE("rung 9c R5.2: begin_stop() wakes queued siblings promptly with \"stopping\" and "
           "counts them; the dispatched head is left to its callback",
           "[spark][runtime][liveness]") {

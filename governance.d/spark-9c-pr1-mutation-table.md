@@ -1,0 +1,97 @@
+# PR-1 mutation table (red-first evidence)
+
+Every new or rewritten test was made RED by the named mutation, then GREEN after the mutation
+was reverted. Columns: test, mutation, red output (first failing line), green output.
+Rows whose red column reads "rc=2 (no summary)" are Catch2 matching NO test (the test name
+contains a comma, which splits the spec) and are superseded by the wildcard re-run rows below
+them. The counts live in the legend directly above the table and are recomputed from the rows.
+column shows the racy assert that was then fixed; its re-run row is the valid pair).
+
+
+
+
+**Legend (computed from the rows below, 51 data rows):** 4 matched no test (Catch2 comma split; each superseded by its wildcard re-run row); 47 valid rows; 43 show a RED (FAILED / SIGABRT / unexpected exception) on the mutated run; 43 show GREEN after the revert; the remainder are re-run or death-test rows whose red is recorded differently (see each row). Regenerated after fix round 3.
+
+| # | test | mutation | red output | green |
+|---|---|---|---|---|
+| 1 | the detached-worker role marker is set on the marked thread and nowhere else | `GuardianDetachedWorkerRole` ctor sets the flag `false` | ../tests/unit/test_guardian_io_executor.cpp:699: FAILED:   CHECK( marked_true.load() ) test cases: 1 | 1 failed  | All tests passed (5 assertions in 1 test case) |
+| | submit: delivers fn's value to on_complete exactly once, on the worker thread | M1 double-invoke on_complete | rc=2: rc=2 (no summary; crashed?) | rc=2 (no summary; crashed?) |
+| | submit: a throwing fn is delivered as WorkerThrew through on_complete | M2 skip callback on throw | rc=42: ../tests/unit/test_guardian_io_executor.cpp:761: FAILED: | test cases: 1 | 1 failed | All tests passed (7 assertions in 1 test case) |
+| | submit: the quota slot and single-flight key release at fn() return, before on_complete runs | M3 release slot+key AFTER on_complete | rc=2: rc=2 (no summary; crashed?) | rc=2 (no summary; crashed?) |
+| | submit: a nested run() from inside on_complete on the same key is admitted (refill) | M3 release slot+key AFTER on_complete | rc=42: ../tests/unit/test_guardian_io_executor.cpp:1003: FAILED: | ../tests/unit/test_guardian_io_executor.cpp:1005: FAILED: | test cases: 1 | 1 failed | All tests passed (6 assertions in 1 test case) |
+| | submit: the physical alive-worker ceiling refuses admission while quota is free | M4 drop ceiling check | rc=42: ../tests/unit/test_guardian_io_executor.cpp:841: FAILED: | test cases:  1 |  0 passed | 1 failed | All tests passed (30 assertions in 1 test case) |
+| | submit: active_worker_count() stays nonzero across the completion-callback window after the quota slot released (#4147) | M5 active_worker_count reports quota_held | rc=42: ../tests/unit/test_guardian_io_executor.cpp:885: FAILED: | test cases: 1 | 1 failed | All tests passed (9 assertions in 1 test case) |
+| | submit: stop() snapshots the alive count, rejects new submits, and does not suppress a late completion (completed_after_stop) | M6 suppress callback after stop | rc=2: rc=2 (no summary; crashed?) | rc=2 (no summary; crashed?) |
+| | submit: a throwing on_complete is contained and counted; the slot and key were already released | M7 remove try/catch around on_complete | rc=-6: ../tests/unit/test_guardian_io_executor.cpp:946: FAILED: |   SIGABRT - Abort (abnormal termination) signal | test cases: 1 | 1 failed | All tests passed (6 assertions in 1 test case) |
+| | submit: a failed launch rolls admission back and never fires on_complete | M8 dtor skips quota decrement | rc=42: ../tests/unit/test_guardian_io_executor.cpp:972: FAILED: | ../tests/unit/test_guardian_io_executor.cpp:977: FAILED: | test cases: 1 | 1 failed | All tests passed (10 assertions in 1 test case) |
+| | the detached-worker role marker is worn by run() and submit() workers, fn and callbacks included | M11 drop role marker from both workers | rc=2: rc=2 (no summary; crashed?) | rc=2 (no summary; crashed?) |
+
+(re-run of the four comma-named cases with a wildcard spec, superseding the rc=2 rows above)
+| | submit: delivers fn's value to on_complete exactly once, on the worker thread | M1 double-invoke on_complete | rc=42: ../tests/unit/test_guardian_io_executor.cpp:742: FAILED: | test cases: 1 | 1 failed | All tests passed (8 assertions in 1 test case) |
+| | submit: the quota slot and single-flight key release at fn() return, before on_complete runs | M3 release slot+key AFTER on_complete | rc=42: ../tests/unit/test_guardian_io_executor.cpp:788: FAILED: | ../tests/unit/test_guardian_io_executor.cpp:789: FAILED: | ../tests/unit/test_guardian_io_executor.cpp:797: FAILED: | All tests passed (14 assertions in 1 test case) |
+| | submit: stop() snapshots the alive count, rejects new submits, and does not suppress a late completion (completed_after_stop) | M6 suppress callback after stop | rc=42: ../tests/unit/test_guardian_io_executor.cpp:927: FAILED: | test cases: 1 | 1 failed | All tests passed (11 assertions in 1 test case) |
+| | the detached-worker role marker is worn by run() and submit() workers, fn and callbacks included | M11 drop role marker from both workers | rc=42: ../tests/unit/test_guardian_io_executor.cpp:1032: FAILED: | ../tests/unit/test_guardian_io_executor.cpp:1033: FAILED: | ../tests/unit/test_guardian_io_executor.cpp:1056: FAILED: | All tests passed (12 assertions in 1 test case) |
+
+## Runtime (commit 4)
+
+| | rung 9c R5.2: a same-key attach while another is in flight QUEUES behind it, joins the one subscription, and never double-arms | R1 restore the busy reject | rc=42: ../tests/unit/test_guardian_spark_runtime.cpp:2586: FAILED: | test cases: 1 | 1 failed | All tests passed (17 assertions in 1 test case) |
+| | attach_rule: a same-key re-push that QUEUES behind an in-flight arm still disarms the re-pushed rule's OWN prior generation first (rung 9c R5.2) | R2 drop the prior-generation disarm before the wait | rc=42: ../tests/unit/test_guardian_spark_runtime.cpp:2370: FAILED: | ../tests/unit/test_guardian_spark_runtime.cpp:2378: FAILED: | test cases:  1 | 1 failed | ../tests/unit/test_guardian_spark_runtime.cpp:2370: FAILED: | test cases:  1 |  0 passed | 1 failed |
+| | source tripwire: claim_rollback's .fn is assigned before the arm claim is enqueued, not after (#3831, rung 9c R5.2 shape) | R3 enqueue text before claim_rollback.fn= (order swap, textual) | rc=42: ../tests/unit/test_guardian_spark_runtime.cpp:2308: FAILED: | test cases: 1 | 1 failed | All tests passed (7 assertions in 1 test case) |
+| | #2233 item 3 (security-guardian F2 / cpp-safety HIGH): a same-rule_id RETRY after a timeout arms cleanly, exercising the generation token | R4 drain ignores waiter_abandoned | rc=42: ../tests/unit/test_guardian_spark_runtime.cpp:2835: FAILED: | test cases:  1 |  0 passed | 1 failed | All tests passed (23 assertions in 1 test case) |
+| | rung 9c R5.2: three concurrent same-key attaches produce ONE backend arm and three distinct generations sharing it | R5 dispatch a backend arm per queued claim | rc=0: All tests passed (14 assertions in 1 test case) | All tests passed (14 assertions in 1 test case) |
+| | rung 9c R5.2: an arm that arrives while the key's DISARM is in flight queues behind it - the disarm completes before the rearm dispatches | R5 dispatch a backend arm per queued claim | rc=42: ../tests/unit/test_guardian_spark_runtime.cpp:4539: FAILED: | test cases: 1 | 1 failed | All tests passed (13 assertions in 1 test case) |
+| | rung 9c R5.2: the head's backend REFUSAL fails every queued sibling with it and leaves the key clean | R6 forget sibling index release on backend refusal | rc=0: All tests passed (13 assertions in 1 test case) | All tests passed (13 assertions in 1 test case) |
+| | rung 9c R5.2: the head's backend THROW fails every queued sibling with "arm worker threw" | R7 deliver only the head's WorkerThrew | rc=42: ../tests/unit/test_guardian_spark_runtime.cpp:4419: FAILED: | test cases: 1 | 1 failed | All tests passed (8 assertions in 1 test case) |
+| | rung 9c R5.2: detaching a QUEUED sibling before the head completes withdraws it promptly; the others commit | R8 keep a withdrawn Queued claim in the fifo | rc=42: ../tests/unit/test_guardian_spark_runtime.cpp:4452: FAILED: | test cases:  1 |  0 passed | 1 failed | All tests passed (13 assertions in 1 test case) |
+| | rung 9c R5.2: a withdrawn HEAD with a live sibling: the sibling adopts the subscription, nothing is disarmed | R9 always disarm when the head is withdrawn | rc=42: ../tests/unit/test_guardian_spark_runtime.cpp:4494: FAILED: | test cases: 1 | 1 failed | All tests passed (13 assertions in 1 test case) |
+| | rung 9c R5.2: a same-key REDEPLOY queues its own rearm behind its own disarm, and a third rule racing that gap queues behind both | R11 check claims_ BEFORE the prior-generation detach reserves its disarm | rc=-11: ../tests/unit/test_guardian_spark_runtime.cpp:4568: FAILED: | ../tests/unit/test_guardian_spark_runtime.cpp:4568: FAILED: | test cases: 1 | 1 failed | All tests passed (12 assertions in 1 test case) |
+| | rung 9c R5.2: a disarm the executor refuses at admission is RETAINED at the head and re-driven by the next same-key attach, before that attach's own arm | R12 drop a refused disarm instead of retaining it | rc=42: ../tests/unit/test_guardian_spark_runtime.cpp:4606: FAILED: | ../tests/unit/test_guardian_spark_runtime.cpp:4607: FAILED: | ../tests/unit/test_guardian_spark_runtime.cpp:4613: FAILED: | All tests passed (16 assertions in 1 test case) |
+| | rung 9c R5.2: begin_stop() wakes queued siblings promptly with "stopping" and counts them; the dispatched head is left to its callback | R13 begin_stop forgets claim_cv_.notify_all | rc=42: ../tests/unit/test_guardian_spark_runtime.cpp:4650: FAILED: | test cases:  1 |  0 passed | 1 failed | All tests passed (14 assertions in 1 test case) |
+| | rung 9c R5.2: a commit throw in the drain surfaces on the head's waiter, fails the sibling, disarms the subscription once, and leaves the key clean | R14 skip the compensating disarm after a commit throw | rc=42: ../tests/unit/test_guardian_spark_runtime.cpp:4714: FAILED: | test cases:  1 |  0 passed | 1 failed | All tests passed (14 assertions in 1 test case) |
+| | rung 9c R5.2: a rule re-pushed onto ANOTHER key while its old-key claim is in flight keeps its new mapping when the old claim finishes (index ownership) | R15 release_claim_index ignores index_held | rc=42: ../tests/unit/test_guardian_spark_runtime.cpp:4765: FAILED: | ../tests/unit/test_guardian_spark_runtime.cpp:4766: FAILED: | test cases:  1 |  0 passed | 1 failed | All tests passed (13 assertions in 1 test case) |
+| | rung 9c R5.2 / #4147: a parked completion callback keeps the F3 count (active_backend_op_workers) nonzero after the quota slot has released | R16 active_worker_count reports quota_held (header) | rc=42: ../tests/unit/test_guardian_spark_runtime.cpp:4792: FAILED: | test cases: 1 | 1 failed | All tests passed (6 assertions in 1 test case) |
+
+(re-runs after test fixes: R2, R6, R11, and the replacement R5b for the three-attach case)
+| | attach_rule: a same-key re-push that QUEUES behind an in-flight arm still disarms the re-pushed rule's OWN prior generation first (rung 9c R5.2) | R2 drop the prior-generation disarm before the wait | rc=-6: ../tests/unit/test_guardian_spark_runtime.cpp:2372: FAILED: | ../tests/unit/test_guardian_spark_runtime.cpp:2372: FAILED: | SIGABRT - Abort (abnormal termination) signal | All tests passed (11 assertions in 1 test case) |
+| | rung 9c R5.2: the head's backend REFUSAL fails every queued sibling with it and leaves the key clean | R6 forget sibling index release on backend refusal | rc=42: ../tests/unit/test_guardian_spark_runtime.cpp:4389: FAILED: | test cases:  1 |  0 passed | 1 failed | All tests passed (13 assertions in 1 test case) |
+| | rung 9c R5.2: a same-key REDEPLOY queues its own rearm behind its own disarm, and a third rule racing that gap queues behind both | R11 check claims_ BEFORE the prior-generation detach reserves its disarm | rc=-6: ../tests/unit/test_guardian_spark_runtime.cpp:4563: FAILED: | SIGABRT - Abort (abnormal termination) signal | test cases: 1 | 1 failed | All tests passed (12 assertions in 1 test case) |
+| | rung 9c R5.2: three concurrent same-key attaches produce ONE backend arm and three distinct generations sharing it | R5b drain commits only the head (siblings fail) | rc=42: ../tests/unit/test_guardian_spark_runtime.cpp:4340: FAILED: | test cases: 1 | 1 failed | All tests passed (14 assertions in 1 test case) |
+
+## Death test (commit 5)
+
+| | a GuardianIoExecutor::submit() completion callback taking mtx_ aborts the process* | tripwire predicate reverted to joined-only |  |  |
+
+## Death test (commit 5)
+
+| | a GuardianIoExecutor::submit() completion callback taking mtx_ aborts the process* | tripwire predicate reverted to joined-only | ../tests/unit/test_guardian_engine_spark_reconcile.cpp:1606: FAILED:   child exit code (if it exited normally): 94 test cases:   1 |   0 passed | 1 failed  | All tests passed (58 assertions in 1 test case)  |
+
+## Drain publish fix (commit 6)
+
+| | #2233 item 3 (C2/c2): the post-arm commit rollback disarm runs off registry_mu_ (pre-existing) | OBSERVED red: verdicts written in step 1 (before the compensating disarm) | full-suite run: test_guardian_spark_runtime.cpp:2911 FAILED CHECK(b->disarms.load() == 1) | 30/30 passes after the fix; [spark][runtime] 125/125 |
+
+## Fix round (adversarial review)
+
+| test | mutation | red | green |
+|---|---|---|---|
+| C1/K1' (a): a same-key attach right after an adopted commit JOINS the watcher | F1: skip the in-step-(1) publish (comment out `if (!compensating) publish_locked(false);`) | :4914 FAILED CHECK_FALSE(park->entered) (gap reached); :4915 CHECK(arm_entries == 1) got 2 (refill re-armed); :4916 CHECK_FALSE(a2_threw) (keys_.emplace hard error surfaced on r2); :4919 REQUIRE(armed_ids().size() == 1) got 2 | All tests passed (29 assertions in 2 test cases) |
+| C1/K1' (b): a detach right after the commit disarms the LIVE rule | F1 (same mutation) | SIGABRT: `assert(entry.fifo.empty())` in detach_rule_locked (the committed claim still sat in the fifo; Case-0's belt-and-braces skipped it, so the normal path tried to create a Disarm claim behind it) | All tests passed (29 assertions in 2 test cases) |
+| C2/K5 (c): bad_alloc before the fifo snapshot never leaks the arm | F2: take ownership only in the success branch, after the vectors (pre-fix order) | ../tests/unit/test_guardian_spark_runtime.cpp:5019: FAILED:   CHECK( b->disarms.load() == 1 ) ../tests/unit/test_guardian_spark_runtime.cpp:5020: FAILED:   REQUIRE( b->disarmed_ids().size() == 1 ) test cases: 1 | 1 failed  | All tests passed (29 assertions in 2 test cases) |
+| C2/K5 (d): a throw after adoption publishes the TRUE verdict | F3: drop the rules_-carries-this-generation check in publish (always "arm drain failed") | ../tests/unit/test_guardian_spark_runtime.cpp:5058: FAILED:   REQUIRE( a1.gen.has_value() ) test cases: 1 | 1 failed  | All tests passed (29 assertions in 2 test cases) |
+
+### Fix round 2 (adversarial re-review)
+
+| | rung 9c R5.2 (adversarial re-review r2 C1): a bad_alloc building the disarm claim leaves the rule consistent - a retried detach disarms once and a fresh attach arms cleanly | R2-1 pre-fix ordering: seam at the OLD post-erase claim-allocation site (HEAD 85102826f detach_rule_locked + seam) | rc=42: test_guardian_spark_runtime.cpp:5100 FAILED CHECK(rt->rule_count() == 1); :5109 CHECK(armed_key_count()==0); :5110 REQUIRE(disarmed_ids().size()==1) | test cases: 1 / 1 failed (11 assertions, 3 failed) | All tests passed (16 assertions in 1 test case) |
+| | rung 9c R5.2 (adversarial re-review r2 C2): a throw inside the index removal keeps the claim's index ownership - the drain's retry cleans the mapping and the real owner's detach is still the ->0 edge | R2-2 pre-fix order: clear index_held BEFORE index_->remove_rule | rc=42: test_guardian_spark_runtime.cpp:5176 FAILED CHECK(armed_key_count()==0); :5177 REQUIRE(disarmed_ids().size()==1) | test cases: 1 / 1 failed (12 assertions, 2 failed) | All tests passed (14 assertions in 1 test case) |
+| | rung 9c R5.2 (adversarial re-review r2 C3): the firewall's last-resort disarm runs off registry_mu_ - a parked unwatch on that path does not block other rule operations | R2-3 pre-fix shape: direct backend_->disarm(*compensating) inside step (3)'s lock_guard{registry_mu_}, (2b) removed | rc=42: test_guardian_spark_runtime.cpp:5217 FAILED CHECK(lock_free) | test cases: 1 / 1 failed (11 assertions, 1 failed) | All tests passed (11 assertions in 1 test case) |
+
+### Fix round 3 (adversarial re-review r3)
+
+| | rung 9c R5.2 (adversarial re-review r3 C2): a throwing index release inside the refill's admission-failure cleanup is contained on the noexcept drain (inverted death test: the child must not abort) | R3-1 release_claim_index_locked rethrows from its catch (the pre-fix propagation) | rc=42: ../tests/unit/test_guardian_spark_runtime.cpp:5399: FAILED: child status: exited=0 code=-1 signaled=1 sig=6 (the child died by SIGABRT = std::terminate through on_arm_complete noexcept) | All tests passed (1 test case) |
+| | rung 9c R5.2 (adversarial re-review r3 C3): begin_stop() survives a throwing index release on a queued claim - counted, the claim dropped, the executor still stopped | R3-1 (same mutation) | rc=134: ../tests/unit/test_guardian_spark_runtime.cpp:5267: FAILED: (REQUIRE_NOTHROW) then "due to a fatal error condition: SIGABRT" - the process itself died | All tests passed (1 test case) |
+| | rung 9c R5.2 (adversarial re-review r2 C2): a throw inside the index removal keeps the claim's index ownership (rewritten: the detach now returns normally, the failure is counted) | R3-1 (same mutation) | rc=42: ../tests/unit/test_guardian_spark_runtime.cpp:5162: FAILED: REQUIRE_NOTHROW( rt->detach_rule("r2") ) threw std::bad_alloc | All tests passed (1 test case) |
+| | rung 9c R5.2 (adversarial re-review r3 C4): a throw in the outbox purge after the durable detach is contained - the queued disarm is still driven and the audit staged | R3-2 drop_rule unwrapped (rethrow from its catch = the pre-fix shape) | rc=42: ../tests/unit/test_guardian_spark_runtime.cpp:5424: FAILED: due to unexpected exception with message: std::bad_alloc (detach_rule threw; disarm never driven) | All tests passed (2 test cases) |
+| | rung 9c R5.2 (adversarial re-review r3 C4): a throw at the lifecycle-kind copy fails the detach BEFORE any durable mutation - the rule stays confirmed and a retried detach disarms once | R3-3 the seam/copy placed after rules_.erase (the pre-fix placement) | rc=42: ../tests/unit/test_guardian_spark_runtime.cpp:5453: FAILED: CHECK( rt->rule_count() == 1 ) with expansion 0 == 1; :5455 claim_queue_depth 1 == 0 (durable state gone, disarm queued but undriven) | All tests passed (2 test cases) |
+
+## Governance Gate 8 fold (2026-09-09)
+
+| | rung 9c R5.2 (governance Gate 4 hp-1): a rule re-pushed from one key onto ANOTHER key that holds a RETAINED disarm drives BOTH its prior-key disarm and the target key's retained disarm before its own arm | G8-1 attach_rule drives prior_disarm OR head_to_drive (else-if), the pre-fix code | ../tests/unit/test_guardian_spark_runtime.cpp:4657: FAILED: REQUIRE( gen ) | test cases: 1 / 1 failed (6 assertions, 5 passed, 1 failed) | All tests passed (17 assertions in 1 test case) |

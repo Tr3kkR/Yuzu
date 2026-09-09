@@ -96,6 +96,26 @@ GuardianSparkRuntime::~GuardianSparkRuntime() {
     begin_stop();
 }
 
+namespace {
+/// The ONE arm-side map from an executor failure to the reason string a waiter
+/// receives (and GuardianEngine logs). Shared by dispatch_arm_off_lock's admission
+/// branch and on_arm_complete's worker-failure branch so the two cannot drift
+/// (governance consistency c-1); the reader keeps its own read-side strings
+/// (guardian_state_reader.cpp). Exhaustive: -Wswitch enforces a new IoFailure here.
+[[nodiscard]] const char* arm_failure_reason(IoFailure f) noexcept {
+    switch (f) {
+    case IoFailure::Timeout:           return "arm timed out";
+    case IoFailure::Stopped:           return "stopping";
+    case IoFailure::CapacityExhausted: return "arm capacity exhausted";
+    case IoFailure::AlreadyRunning:    return "arm already in progress for this key";
+    case IoFailure::LaunchFailed:      return "arm worker launch failed";
+    case IoFailure::WorkerThrew:       return "arm worker threw";
+    case IoFailure::CeilingExhausted:  return "arm rejected at alive-worker ceiling";
+    }
+    return "arm failed";
+}
+} // namespace
+
 std::function<void(const SparkEvent&)>
 GuardianSparkRuntime::make_handler(std::shared_ptr<GuardianSparkRuntime> rt) {
     // Capture ONLY the shared_ptr: detach-safe. A late/detached dispatch touches
@@ -400,16 +420,10 @@ void GuardianSparkRuntime::dispatch_arm_off_lock(const std::string& key,
         // claims' waiters stay bounded by their own deadlines. Nothing crosses the
         // noexcept boundary. fail_all_claims_locked itself is contained per claim.
         try {
-            std::string reason;
-            switch (adm.error()) {
-            case IoFailure::Timeout:            reason = "arm timed out"; break; // unreachable: submit() has no deadline
-            case IoFailure::Stopped:            reason = "stopping"; break;
-            case IoFailure::CapacityExhausted:  reason = "arm capacity exhausted"; break;
-            case IoFailure::AlreadyRunning:     reason = "arm already in progress for this key"; break;
-            case IoFailure::LaunchFailed:       reason = "arm worker launch failed"; break;
-            case IoFailure::WorkerThrew:        reason = "arm worker threw"; break; // unreachable at admission
-            case IoFailure::CeilingExhausted:   reason = "arm rejected at alive-worker ceiling"; break;
-            }
+            // Timeout/WorkerThrew are unreachable at admission (submit() has no
+            // deadline; a throw happens on the worker) - the shared map keeps them so
+            // the two sites can never drift (governance consistency c-1).
+            std::string reason{arm_failure_reason(adm.error())};
             fail_all_claims_locked(key, reason,
                                    adm.error() == IoFailure::Stopped ? ClaimEnd::Stopped
                                                                      : ClaimEnd::AdmissionRejected);
@@ -637,16 +651,7 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                     // The executor's own outer failure. Only WorkerThrew is reachable
                     // here (submit() has no deadline and admission refusals never reach
                     // a callback); the full map is kept for PR-5.
-                    std::string reason;
-                    switch (r.error()) {
-                    case IoFailure::Timeout:            reason = "arm timed out"; break;
-                    case IoFailure::Stopped:            reason = "stopping"; break;
-                    case IoFailure::CapacityExhausted:  reason = "arm capacity exhausted"; break;
-                    case IoFailure::AlreadyRunning:     reason = "arm already in progress for this key"; break;
-                    case IoFailure::LaunchFailed:       reason = "arm worker launch failed"; break;
-                    case IoFailure::WorkerThrew:        reason = "arm worker threw"; break;
-                    case IoFailure::CeilingExhausted:   reason = "arm rejected at alive-worker ceiling"; break;
-                    }
+                    std::string reason{arm_failure_reason(r.error())};
                     if (r.error() == IoFailure::Timeout)
                         backend_op_timeouts_.fetch_add(1, std::memory_order_relaxed);
                     for (const auto& c : finished) {
@@ -1113,8 +1118,13 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
     // before, so the two never race their own teardown against their own re-arm.
     if (prior_disarm)
         submit_disarm_off_lock(prior_disarm);
-    else if (head_to_drive)
-        submit_disarm_off_lock(head_to_drive); // a retained disarm from an earlier detach
+    if (head_to_drive && head_to_drive != prior_disarm)
+        submit_disarm_off_lock(head_to_drive); // a retained disarm from an earlier detach on the
+                                               // TARGET key. Governance Gate 4 hp-1: a rule moving
+                                               // from key A onto key B can owe BOTH (A's prior
+                                               // generation, B's retained head); an else-if left
+                                               // B's undriven and this call's own arm waited it
+                                               // out. Same object on a same-key redeploy -> once.
     if (to_dispatch)
         dispatch_arm_off_lock(key, to_dispatch);
 
@@ -1132,7 +1142,9 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
     // resolve, PLUS, if this rule_id had a prior generation on a bounded key, up to
     // another deadline for that generation's disarm above, since the two are
     // sequential, not concurrent - a same-key redeploy is therefore up to 2x this
-    // deadline, not 1x; PR-2 removes the wait). The deadline is real steady_clock
+    // deadline, not 1x, and a rule moving onto a key that holds a RETAINED disarm
+    // (Gate 4 hp-1) up to 3x: prior-key disarm, target-key disarm, own arm; PR-2
+    // removes the wait). The deadline is real steady_clock
     // time captured HERE, after the prior-disarm wait, never the injected clock_()
     // snapshot above (tests inject fake clocks) and never counted from entry. Every
     // OTHER rule's attach/detach and every evaluate_key proceed freely throughout,
