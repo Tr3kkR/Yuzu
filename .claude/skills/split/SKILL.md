@@ -144,8 +144,9 @@ Delivery phases (dependency-ordered):
 None waits on an external programme now that WS-A3 is THIS-owned per-family.
 **⚠️ WS-A4's GLOBAL INV-31-4 drift test already shipped** (out-of-band, #842/#3991/#3992 —
 `scripts/ci/check-api-parity.py` + `test_openapi_spec_completeness.cpp`; `/api/vN` drift-zero). It's a
-**lexical** tripwire, not a proof — a non-literal/helper-mediated registration warns but does NOT fail
-the build (type-aware successor #2572). Do NOT rebuild it. WS-A4's remaining slices are the **per-family** seam+contract enforcement (gates
+**lexical** tripwire, not a proof (scans `server/core/src/*.cpp` only) — a literal registration fails the
+build; a non-literal *direct* verb call warns (exit 0); a helper- or header-defined registration escapes
+SILENTLY (#2572). Do NOT rebuild it. WS-A4's remaining slices are the **per-family** seam+contract enforcement (gates
 WS-B2), the handler→API seam refactor, and the PII-audit relocation — grep the tree before scoping.
 
 ## 4. Landing a WS slice (workflow)

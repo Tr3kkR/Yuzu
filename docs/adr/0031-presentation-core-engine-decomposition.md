@@ -336,12 +336,16 @@ rule it replaces.
 > (registers `RestApiV1::register_routes()` into a `TestRouteSink` and diffs against `openapi_spec_json()`,
 > TSan-safe, no socket); #3992 backfilled 39 routes so the `/api/vN` baseline is drift-zero (1 allowlisted
 > CORS `OPTIONS` catch-all). **Important — this is a LEXICAL tripwire, not a proof** (the gate's own
-> docstring): it regex-extracts literal `sink.Get("/literal", …)` registrations, so a route registered via
-> a **non-literal or helper-mediated** call emits a CI `::warning::` and the gate still **exits 0** — it
-> does not fail the build. Today's tree is verified drift-zero, and the escape fails loud (never silent),
-> but the invariant is only *partially* mechanized; the type-aware (clang-based) successor that would close
-> the indirection gap is tracked at **#2572**. So this invariant is now enforced by a lexical test for
-> literal registrations, stronger than review alone but short of INV-31-4's full "every registered route."
+> docstring), and it scans `server/core/src/*.cpp` only (not headers). It matches literal
+> `<recv>.<Verb>("/path", …)` registrations, and there are **three** cases, not one: (1) a literal verb
+> call is checked and fails the build on a gap; (2) a non-literal **direct** verb call
+> (`<recv>.<Verb>(runtime_expr, …)`) emits a CI `::warning::` and exits 0 — a loud escape; (3) a
+> registration reached through a **helper** whose call site carries no `<recv>.<Verb>(` token, or defined
+> **in a header** (e.g. an `HttpRouteSink`-style wrapper), is **invisible — no warning, no failure**, a
+> SILENT escape. So the escape is not always loud. The type-aware (clang-based) successor that closes all
+> three indirection gaps is tracked at **#2572**. Today's tree is verified drift-zero, so this invariant is
+> now enforced by a lexical test for literal registrations — stronger than review alone but short of
+> INV-31-4's full "every registered route," and not a compensating control against a silent (3) escape.
 > **What remains for WS-A4** (split matrix): the *per-family* seam+contract enforcement that gates the
 > WS-B2 strangler cutover, the "handlers/renderers call the API, never a `Store*`" seam refactor, and the
 > behavioural-PII audit relocation — none of which #842 delivered.
@@ -402,9 +406,10 @@ none of them today:
    registrations under them) and fail the build on any not present in the published OpenAPI —
    **does not exist**. It is a deliverable of migration step 3. *(Update 2026-09-08: it landed — see
    the INV-31-4 update note above; `scripts/ci/check-api-parity.py` + `test_openapi_spec_completeness.cpp`,
-   #842/#3991/#3992. This gap is closed for `/api/vN/*` by a LEXICAL gate (non-literal/helper-mediated
-   registrations warn but don't fail — #2572); the per-family enforcement, the handler→API seam refactor,
-   and the PII-audit relocation halves of WS-A4 remain.)*
+   #842/#3991/#3992. This gap is closed for `/api/vN/*` only by a LEXICAL gate (literal registrations fail
+   the build; a non-literal *direct* verb call warns; a helper- or header-defined registration can escape
+   SILENTLY — see the INV-31-4 update note above; #2572); the per-family enforcement, the handler→API seam
+   refactor, and the PII-audit relocation halves of WS-A4 remain.)*
 2. **A REST route with no MCP twin.** Structurally invisible to the build.
 3. **A database grant handed to presentation or the engine.** Prevented by Postgres role
    configuration (2c D1), not by the compiler.
@@ -416,9 +421,10 @@ deployment flexibility is a bonus; the parity guarantee is *work*.
 
 > **Update (2026-09-08): that global contract test now exists** (#842/#3991/#3992 — see the INV-31-4
 > update note above), so for `/api/vN/*` the build *does* now answer it **for literal registrations** and
-> the standing question is backed by an enforced (lexical) gate rather than review alone — a
-> helper-mediated/non-literal route still escapes with only a CI warning (#2572). The
-> `consistency-auditor`'s question still carries the *per-family* and MCP-twin halves it was written for.
+> the standing question is backed by an enforced (lexical) gate rather than review alone — but a
+> non-literal *direct* verb call only warns, and a helper- or header-defined registration escapes it
+> **silently** (#2572). The `consistency-auditor`'s question still carries the *per-family* and MCP-twin
+> halves it was written for.
 
 ### F-10 is void, and the agentic gap closes as a side-effect
 
