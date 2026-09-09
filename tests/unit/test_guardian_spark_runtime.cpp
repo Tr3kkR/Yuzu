@@ -2458,6 +2458,20 @@ TEST_CASE("#2233 item 3: a bounded arm that never returns times out, leaves no s
     b->hang_next_arm.store(true);
     auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline =
                                                           std::chrono::milliseconds(50)});
+    // Release the still-parked detached worker on EVERY exit path, so a failing
+    // REQUIRE below can never leave a real OS thread parked for the rest of the
+    // binary (io_executor_'s shared_ptr<State> keeps it memory-safe regardless, but
+    // a parked worker trips every later fork gate and the quiescence self-test;
+    // governance cs-202). Declared after `rt` -> runs before it is destroyed.
+    const std::function<void()> release_parked_fn = [&] {
+        b->wait_entered_hang(std::chrono::seconds(30));
+        b->release_hang();
+    };
+    struct Cleanup {
+        const std::function<void()>& fn;
+        ~Cleanup() { fn(); }
+    };
+    Cleanup release_parked{release_parked_fn};
 
     const auto t0 = clk::now();
     auto gen = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
@@ -2474,12 +2488,7 @@ TEST_CASE("#2233 item 3: a bounded arm that never returns times out, leaves no s
     CHECK(rt->rule_count() == 0);
     CHECK(rt->backend_op_timeouts() == 1);
     CHECK(drain_lifecycle(*rt).empty()); // no phantom "armed" for a rule that never armed
-
-    // Cleanup: release the still-parked detached worker so it does not outlive the
-    // test (io_executor_'s own shared_ptr<State> keeps it memory-safe regardless,
-    // but leaving it parked would leak a real OS thread across tests).
-    b->wait_entered_hang(std::chrono::seconds(30));
-    b->release_hang();
+    // (the parked worker is released by `release_parked` above on every exit path)
 }
 
 TEST_CASE("#2233 item 3: a bounded disarm that never returns is counted too - "
@@ -2498,6 +2507,18 @@ TEST_CASE("#2233 item 3: a bounded disarm that never returns is counted too - "
     CHECK(rt->backend_op_timeouts() == 0); // arming cleanly does not touch this counter
 
     b->hang_next_disarm.store(true);
+    // Release the parked disarm worker on every exit path (governance cs-202; same
+    // shape as the arm-side case above). Nothing is parked before this line, so a
+    // failure above leaves nothing to release.
+    const std::function<void()> release_parked_fn = [&] {
+        b->wait_entered_disarm_hang(std::chrono::seconds(30));
+        b->release_disarm_hang();
+    };
+    struct Cleanup {
+        const std::function<void()>& fn;
+        ~Cleanup() { fn(); }
+    };
+    Cleanup release_parked{release_parked_fn};
     const auto t0 = clk::now();
     rt->detach_rule("r1"); // blocks up to backend_op_deadline waiting on the hung disarm
     const auto elapsed = clk::now() - t0;
@@ -2505,10 +2526,7 @@ TEST_CASE("#2233 item 3: a bounded disarm that never returns is counted too - "
     CHECK(elapsed >= std::chrono::milliseconds(50));
     CHECK(elapsed < std::chrono::seconds(10));
     CHECK(rt->backend_op_timeouts() == 1);
-
-    // Cleanup: release the still-parked detached worker.
-    b->wait_entered_disarm_hang(std::chrono::seconds(30));
-    b->release_disarm_hang();
+    // (the parked worker is released by `release_parked` above on every exit path)
 }
 
 TEST_CASE("#2233 item 3: a parked arm on one key does not block a DIFFERENT key's attach",

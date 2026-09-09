@@ -2556,6 +2556,15 @@ TEST_CASE("#2233 item 3: a timed-out arm holds policy_generation for retry, not 
           "[spark][guardian][reconcile][liveness]") {
     SparkReconcileFixture f;
     f.mechanism->hang_next_watch();
+    // Release the parked mechanism on EVERY exit path, declared after `f` so it runs
+    // BEFORE the fixture tears down SparkEngine/GuardianEngine: a failing REQUIRE
+    // below used to skip the end-of-body release and destroy spark_engine while the
+    // detached worker was still parked inside a mechanism it owns (governance cs-202).
+    struct ReleaseHangOnExit {
+        SparkReconcileFixture& fx;
+        ~ReleaseHangOnExit() { fx.mechanism->release_hang(); }
+    };
+    ReleaseHangOnExit release_parked{f};
     REQUIRE(f.engine->policy_generation() == 0);
 
     gpb::GuaranteedStatePush p;
@@ -2572,10 +2581,7 @@ TEST_CASE("#2233 item 3: a timed-out arm holds policy_generation for retry, not 
     CHECK(f.engine->policy_generation() == 0); // held, NOT advanced to 5
     CHECK(f.engine->rule_count() == 1);        // persisted (put_rule_locked ran)
     CHECK(f.engine->spark_armed_rule_count() == 0);
-
-    // Cleanup: release the still-parked mechanism so the detached worker can
-    // finish before the fixture tears down SparkEngine/GuardianEngine.
-    f.mechanism->release_hang();
+    // (the parked mechanism is released by `release_parked` above on every exit path)
 }
 
 #ifndef _WIN32
