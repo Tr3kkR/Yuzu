@@ -915,7 +915,7 @@ source|mac_user_launchagents|constrained|1|not_a_directory
 source|mac_login_items|constrained|0|btm_private_database_no_public_api
 source|mac_periodic|supported|0|periodic_dir_walk
 source|mac_emond|supported|0|emond_rule_plist_walk
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] CONSTRAINED / PARTIAL / autoruns:degraded
 
 == action=catalog
 catalog|1

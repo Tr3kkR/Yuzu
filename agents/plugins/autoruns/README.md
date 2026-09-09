@@ -184,7 +184,7 @@ source|win_ifeo_debugger|unsupported|0|foreign_os
 source|win_startup_folder_common|unsupported|0|foreign_os
 source|win_startup_folder_user|unsupported|0|foreign_os
 … 12 of 915 rows shown
-[result_status] UNDECLARED / UNKNOWN
+[result_status] CONSTRAINED / PARTIAL / autoruns:degraded
 
 == action=catalog
 catalog|1
@@ -203,9 +203,25 @@ source|win_startup_folder_common|unsupported|-|declared
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-08 · euid 0 · leg-hash d105f619923a
+**Linux** — captured: linux Ubuntu 26.04.1 LTS (x86_64) · bare-metal · 2026-09-10 · euid 1000 · leg-hash d105f619923a
 
 ```
+== action=catalog
+catalog|1
+source|win_run_hklm|unsupported|-|declared
+source|win_runonce_hklm|unsupported|-|declared
+source|win_runonceex_hklm|unsupported|-|declared
+source|win_run_hku|unsupported|-|declared
+source|win_runonce_hku|unsupported|-|declared
+source|win_startup_approved|unsupported|-|declared
+source|win_winlogon_shell|unsupported|-|declared
+source|win_winlogon_userinit|unsupported|-|declared
+source|win_appinit_dlls|unsupported|-|declared
+source|win_ifeo_debugger|unsupported|-|declared
+source|win_startup_folder_common|unsupported|-|declared
+… 12 of 35 rows shown
+[result_status] UNDECLARED / UNKNOWN
+
 == action=list
 source|win_run_hklm|unsupported|0|foreign_os
 source|win_runonce_hklm|unsupported|0|foreign_os
@@ -219,24 +235,8 @@ source|win_appinit_dlls|unsupported|0|foreign_os
 source|win_ifeo_debugger|unsupported|0|foreign_os
 source|win_startup_folder_common|unsupported|0|foreign_os
 source|win_startup_folder_user|unsupported|0|foreign_os
-… 12 of 37 rows shown
-[result_status] UNDECLARED / UNKNOWN
-
-== action=catalog
-catalog|1
-source|win_run_hklm|unsupported|-|declared
-source|win_runonce_hklm|unsupported|-|declared
-source|win_runonceex_hklm|unsupported|-|declared
-source|win_run_hku|unsupported|-|declared
-source|win_runonce_hku|unsupported|-|declared
-source|win_startup_approved|unsupported|-|declared
-source|win_winlogon_shell|unsupported|-|declared
-source|win_winlogon_userinit|unsupported|-|declared
-source|win_appinit_dlls|unsupported|-|declared
-source|win_ifeo_debugger|unsupported|-|declared
-source|win_startup_folder_common|unsupported|-|declared
-… 12 of 35 rows shown
-[result_status] UNDECLARED / UNKNOWN
+… 12 of 135 rows shown
+[result_status] CONSTRAINED / PARTIAL / autoruns:degraded
 ```
 <!-- END GENERATED -->
 

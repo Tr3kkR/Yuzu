@@ -355,26 +355,6 @@
     "linux": {
       "actions": [
         {
-          "action": "list",
-          "not_captured": null,
-          "params": "",
-          "rc": 0,
-          "result_status": {
-            "completeness": "UNKNOWN",
-            "provenance": "",
-            "status": "UNDECLARED"
-          },
-          "row_count": 37,
-          "rows": [
-            "source|win_run_hklm|unsupported|0|foreign_os",
-            "source|win_runonce_hklm|unsupported|0|foreign_os",
-            "source|win_runonceex_hklm|unsupported|0|foreign_os",
-            "source|win_run_hku|unsupported|0|foreign_os",
-            "source|win_runonce_hku|unsupported|0|foreign_os"
-          ],
-          "truncated": false
-        },
-        {
           "action": "catalog",
           "not_captured": null,
           "params": "",
@@ -393,15 +373,35 @@
             "source|win_run_hku|unsupported|-|declared"
           ],
           "truncated": false
+        },
+        {
+          "action": "list",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "PARTIAL",
+            "provenance": "autoruns:degraded",
+            "status": "CONSTRAINED"
+          },
+          "row_count": 135,
+          "rows": [
+            "source|win_run_hklm|unsupported|0|foreign_os",
+            "source|win_runonce_hklm|unsupported|0|foreign_os",
+            "source|win_runonceex_hklm|unsupported|0|foreign_os",
+            "source|win_run_hku|unsupported|0|foreign_os",
+            "source|win_runonce_hku|unsupported|0|foreign_os"
+          ],
+          "truncated": false
         }
       ],
       "stamp": {
-        "date": "2026-09-08",
-        "host_class": "container",
+        "date": "2026-09-10",
+        "host_class": "bare-metal",
         "leg_hash": "d105f619923a",
         "os": "linux",
-        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
-        "privilege": "euid 0"
+        "os_version": "Ubuntu 26.04.1 LTS (x86_64)",
+        "privilege": "euid 1000"
       }
     },
     "macos": {
@@ -412,9 +412,9 @@
           "params": "",
           "rc": 0,
           "result_status": {
-            "completeness": "UNKNOWN",
-            "provenance": "",
-            "status": "UNDECLARED"
+            "completeness": "PARTIAL",
+            "provenance": "autoruns:degraded",
+            "status": "CONSTRAINED"
           },
           "row_count": 915,
           "rows": [
