@@ -377,27 +377,50 @@ struct ProbeJob {
                 return r;
             }
         }
-        const auto t0 = Clock::now();
-        // Prefer the target key. REG_NOTIFY_THREAD_AGNOSTIC is a dwNotifyFilter
-        // bit (3rd arg), NOT the fAsynchronous flag (5th) - it must be OR'd into
-        // the filter or it is silently dropped and the notification dies with
-        // this very worker thread, which exits as soon as it returns.
+        // Prefer the target key. KEY_NOTIFY is all RegNotifyChangeKeyValue needs
+        // (the value read is Guardian's, on its own handle). REG_NOTIFY_THREAD_
+        // AGNOSTIC is a dwNotifyFilter bit (3rd arg), NOT the fAsynchronous flag
+        // (5th) - it must be OR'd into the filter or it is silently dropped and
+        // the notification dies with this very worker thread, which exits as soon
+        // as it returns.
         HKEY h = nullptr;
-        if (::RegOpenKeyExW(root, subkey_w.c_str(), 0, KEY_NOTIFY | KEY_READ, &h) ==
-            ERROR_SUCCESS) {
+        const LONG trc = ::RegOpenKeyExW(root, subkey_w.c_str(), 0, KEY_NOTIFY, &h);
+        if (trc == ERROR_SUCCESS) {
             r.key.reset(h);
-            if (::RegNotifyChangeKeyValue(r.key.get(), FALSE,
-                                          kNotifyFilter | REG_NOTIFY_THREAD_AGNOSTIC, r.event.get(),
-                                          TRUE /*async*/) == ERROR_SUCCESS) {
+            const LONG nrc = ::RegNotifyChangeKeyValue(r.key.get(), FALSE,
+                                                       kNotifyFilter | REG_NOTIFY_THREAD_AGNOSTIC,
+                                                       r.event.get(), TRUE /*async*/);
+            if (nrc == ERROR_SUCCESS) {
                 r.mode = WatchMode::Target;
                 r.ok = true;
                 return r;
             }
+            // The key EXISTS and refused a notify: that is a backend failure to be
+            // reported and retried, never a fall-back to the ancestor watch (which
+            // would leave an existing key silently unobserved - UP-2).
             r.key.reset();
+            r.err = static_cast<DWORD>(nrc);
+            r.stage = "RegNotifyChangeKeyValue(target)";
+            return r;
         }
-        // Target absent (or refused notify): watch the nearest existing ancestor
-        // for its (re)creation. The hive root always opens, so this walk ends;
-        // the elapsed budget bounds how long a dead hive can hold this lane slot.
+        if (trc != ERROR_FILE_NOT_FOUND && trc != ERROR_PATH_NOT_FOUND) {
+            // Same rule for the open: only ABSENCE means "watch the ancestor for its
+            // creation". Access denied, a locked hive, or any other refusal on an
+            // existing key is a Faulted watch on the backend ladder, so the operator
+            // sees a deaf key instead of a healthy one (UP-2; the pre-PR-B1 code
+            // fell through here too).
+            r.err = static_cast<DWORD>(trc);
+            r.stage = "RegOpenKeyExW(target, KEY_NOTIFY)";
+            return r;
+        }
+        // Target absent: watch the nearest existing ancestor for its (re)creation.
+        // The hive root opens for every caller that reached this far, so the walk
+        // ends. The elapsed budget bounds the WALK (started here, after the target
+        // open, so a slow-but-healthy hive is not pushed onto the backend ladder by
+        // its target open alone - UP-5); a single blocked OS call is not
+        // interruptible and holds its lane slot until it returns (UP-3, documented
+        // limit; the pre-PR-B1 code held the whole per-type lock for it instead).
+        const auto t0 = Clock::now();
         std::string p = parent_path(subkey);
         for (;;) {
             if (Clock::now() - t0 > traversal_budget) {
