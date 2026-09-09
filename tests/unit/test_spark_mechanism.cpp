@@ -3733,11 +3733,15 @@ TEST_CASE("Registry spark (real mechanism): a parked probe on key A neither stal
     CHECK(sb.has_value());
     INFO("arm(B) returned after " << arm_b_ms << " ms while A's probe was parked");
     CHECK(arm_b_ms < 2000);
-    // ...and B is genuinely watching: a write fires it.
+    // ...and B is genuinely watching: a write fires it (baseline first - an
+    // establishment never emits, but the assertion should prove THIS fire).
     std::this_thread::sleep_for(100ms);
+    const auto b_before = count_kind(got, spark_key(spec_b), SparkEventKind::Fired);
+    CHECK(b_before == 0);
     b.write(1);
-    CHECK(eventually([&] { return count_kind(got, spark_key(spec_b), SparkEventKind::Fired) >= 1; },
-                     8000ms));
+    CHECK(eventually(
+        [&] { return count_kind(got, spark_key(spec_b), SparkEventKind::Fired) > b_before; },
+        8000ms));
 
     // A missed its health grace while parked: Faulted, counted once as slow_op.
     CHECK(eventually([&] { return engine.stats().armed_faulted == 1; }, 3000ms));
@@ -3856,9 +3860,14 @@ TEST_CASE("Registry spark (real mechanism): a failed re-arm is retried on the ba
         ctl.backend_retry_base = 150ms;
         REQUIRE(set_registry_test_controls_for_test(*raw, std::move(ctl)));
     }
+    const auto fired_before_write = count_kind(got, spark_key(spec_a), SparkEventKind::Fired);
+    CHECK(fired_before_write == 0);
     a.write(1); // fires: immediate emit, then the re-arm probe fails
-    CHECK(eventually([&] { return count_kind(got, spark_key(spec_a), SparkEventKind::Fired) >= 1; },
-                     8000ms));
+    CHECK(eventually(
+        [&] {
+            return count_kind(got, spark_key(spec_a), SparkEventKind::Fired) > fired_before_write;
+        },
+        8000ms));
     CHECK(eventually([&] { return engine.stats().armed_faulted == 1; }, 5000ms));
     {
         auto d = registry_debug_counters_for_test(*raw);
@@ -3874,10 +3883,15 @@ TEST_CASE("Registry spark (real mechanism): a failed re-arm is retried on the ba
         REQUIRE(set_registry_test_controls_for_test(*raw, std::move(ctl)));
     }
     CHECK(eventually([&] { return engine.stats().armed_faulted == 0; }, 10000ms));
-    // The recovery closed the gap with a synthetic fire, and the watch is live:
-    // a fresh write fires again.
+    // The recovery closed the gap with a synthetic fire: exactly one more Fired
+    // than the immediate fire the write produced. Then the watch is live: a
+    // fresh write fires again.
+    CHECK(eventually(
+        [&] {
+            return count_kind(got, spark_key(spec_a), SparkEventKind::Fired) >= fired_before_write + 2;
+        },
+        5000ms));
     const auto after_recover = count_kind(got, spark_key(spec_a), SparkEventKind::Fired);
-    CHECK(after_recover >= 2);
     a.write(2);
     CHECK(eventually(
         [&] { return count_kind(got, spark_key(spec_a), SparkEventKind::Fired) > after_recover; },
