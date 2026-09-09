@@ -4149,6 +4149,61 @@ TEST_CASE("Registry spark (real mechanism): a target that appears under an ances
     ::RegDeleteKeyA(HKEY_CURRENT_USER, target.c_str());
 }
 
+TEST_CASE("Registry mechanism (direct): a throwing emit is contained on the fire callback and the "
+          "synthetic fire is retried on a backoff until it submits (#2012 PR-B1 hole 2)",
+          "[spark][mechanism][windows][walkoff]") {
+    // Mechanism-direct so the SparkEmitFn is ours: it throws for the first three
+    // submissions (the fire callback's immediate emit, the commit's synthetic
+    // fire, and the first restored retry) and counts from the fourth on. The
+    // engine's real emit can throw std::bad_alloc (see SparkEmitFn's doc); this
+    // models it without needing an allocation failure.
+    ScratchRegKey a("emit_throw");
+    auto mech = make_registry_mechanism();
+    REQUIRE(mech != nullptr);
+    {
+        RegistryMechanismTestControls ctl;
+        ctl.admission_backoff_seed = 50ms; // the resync retry schedule's seed (D)
+        REQUIRE(set_registry_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    std::atomic<int> submits{0};
+    std::atomic<int> delivered{0};
+    std::atomic<int> faults{0};
+    mech->start(
+        [&](const std::string&, SparkData) {
+            if (submits.fetch_add(1, std::memory_order_acq_rel) < 3)
+                throw std::runtime_error("injected emit failure");
+            delivered.fetch_add(1, std::memory_order_acq_rel);
+        },
+        [&](const std::string&, bool, std::string_view) { faults.fetch_add(1); });
+    const auto spec = registry_spec("HKCU", a.sub);
+    REQUIRE(mech->watch(spark_key(spec), spec.params).has_value());
+    std::this_thread::sleep_for(150ms);
+
+    a.write(1); // fire: immediate emit throws (contained), re-arm commits, synthetic throws...
+    // ...restored debt retries at 50 ms, 100 ms: the third retry is the fourth
+    // submission and lands.
+    CHECK(eventually([&] { return delivered.load(std::memory_order_acquire) >= 1; }, 5000ms));
+    {
+        auto d = registry_debug_counters_for_test(*mech);
+        REQUIRE(d.has_value());
+        INFO("submits=" << submits.load() << " delivered=" << delivered.load()
+                        << " emit_failed=" << d->emit_failed << " resync_retries=" << d->resync_retries);
+        CHECK(d->emit_failed == 3);
+        CHECK(d->resync_retries >= 2);
+        CHECK(delivered.load(std::memory_order_acquire) == 1); // one debt, one delivery
+    }
+    // The watch is still live and no debt lingers: a second write produces its
+    // immediate fire (now delivered) and one synthetic fire, nothing more.
+    std::this_thread::sleep_for(200ms);
+    const int before = delivered.load(std::memory_order_acquire);
+    a.write(2);
+    CHECK(eventually([&] { return delivered.load(std::memory_order_acquire) >= before + 2; }, 5000ms));
+    std::this_thread::sleep_for(300ms);
+    CHECK(delivered.load(std::memory_order_acquire) == before + 2);
+    CHECK(faults.load() == 0);
+    mech->stop();
+}
+
 // ── Inline-tier dispatch latency (the ADR-0021 §3 µs claim) ──────────────────
 //
 // SCOPE — read before trusting these numbers. This measures ONLY the
