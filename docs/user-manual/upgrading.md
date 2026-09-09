@@ -3154,6 +3154,15 @@ securable above runs on every boot, so `Administrator` (full CRUD via the generi
 loop) and `ITServiceOwner` (a targeted `Decommission:Delete` grant) pick up the new securable
 automatically on upgrade, with no operator action required.
 
+**A previously revoked decommission ability is NOT silently regained.** If you had used
+`remove_permission()` to revoke `ITServiceOwner`'s `SoftwareLicensing:Delete`,
+`Inventory:Delete`, or `GuaranteedState:Delete` specifically to strip its decommission ability
+under the old conjunction, the upgrade detects that revocation and carries it forward onto the new
+`Decommission:Delete` grant automatically — `ITServiceOwner` stays unable to decommission a device
+after upgrading, exactly as before. No operator action is needed for this case; it is the inverse
+of the custom-role gap above (a seeded role *losing* access it deliberately had revoked is checked
+for, not just a custom role *gaining* an unrelated 403).
+
 **This is breaking only for a custom role.** Any custom role an operator built by hand-assembling
 the old three-securable conjunction (`SoftwareLicensing:Delete` + `Inventory:Delete` +
 `GuaranteedState:Delete`) specifically to reach this endpoint will start getting `403 Decommission:Delete`
@@ -3162,8 +3171,8 @@ them at all. Audit your custom roles before upgrading:
 
 ```sql
 SELECT DISTINCT pr.principal_type, pr.principal_id, pr.role_name
-  FROM principal_roles pr
-  JOIN role_permissions rp ON rp.role_name = pr.role_name
+  FROM rbac_store.principal_roles pr
+  JOIN rbac_store.role_permissions rp ON rp.role_name = pr.role_name
   WHERE rp.securable_type IN ('SoftwareLicensing', 'Inventory', 'GuaranteedState')
     AND rp.operation = 'Delete';
 ```

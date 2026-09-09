@@ -830,6 +830,25 @@ void RbacStore::seed_defaults() {
     // by the route's gate as before. Deliberately NOT in the ITSO crud_ops
     // list above: Read/Write/Execute/Approve on Decommission are
     // meaningless — do not widen.
+    //
+    // Adversarial review finding: grant()'s revoked_seed_defaults check only
+    // matches the EXACT (role, securable, operation) triple, and
+    // Decommission:Delete never existed before this migration, so an
+    // operator who had revoked ANY of the three OLD conjunct grants
+    // specifically to strip ITServiceOwner's decommission ability would
+    // otherwise regain it silently the moment this seed runs. Carry that
+    // prior intent forward onto the new securable BEFORE calling grant():
+    // if any of the three old grants is recorded revoked for
+    // ITServiceOwner, record the SAME revocation against Decommission:Delete
+    // first (idempotent), so the standard suppression path in grant() itself
+    // applies uniformly rather than a second bespoke skip here.
+    exec("INSERT INTO rbac_store.revoked_seed_defaults (role_name, securable_type, operation) "
+        "SELECT 'ITServiceOwner', 'Decommission', 'Delete' WHERE EXISTS ("
+        "  SELECT 1 FROM rbac_store.revoked_seed_defaults WHERE role_name = 'ITServiceOwner' AND "
+        "  ((securable_type = 'SoftwareLicensing' AND operation = 'Delete') OR "
+        "   (securable_type = 'Inventory' AND operation = 'Delete') OR "
+        "   (securable_type = 'GuaranteedState' AND operation = 'Delete'))"
+        ") ON CONFLICT DO NOTHING");
     grant("ITServiceOwner", "Decommission", "Delete");
 
     // Viewer: read on all except Infrastructure.
