@@ -44,6 +44,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <thread>
+#include <version> // __cpp_lib_jthread
 #include <vector>
 
 #ifndef _WIN32
@@ -2588,16 +2589,43 @@ TEST_CASE("test helper: wait_until_quiescent returns false while another thread 
     SUCCEED("wait_until_quiescent is a no-op off Linux; nothing to prove");
     return;
 #else
+    // Governance pass-4 cs-101: the second thread is joined on scope exit by construction,
+    // never by a trailing manual join a throw could skip. std::jthread where the library
+    // has it (loops on its own stop_token: a jthread destructor calls request_stop() and
+    // would never set a hand-rolled release flag, so looping on such a flag would hang the
+    // unwind path); a scope-exit join guard over std::thread otherwise (Apple Clang 15's
+    // libc++ lacks <stop_token>, the #2580 lesson).
+#if defined(__cpp_lib_jthread)
+    std::jthread t([](std::stop_token st) {
+        while (!st.stop_requested())
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    });
+    // A live second thread: the gate must NOT open (bounded: 150 ms, scaled).
+    CHECK_FALSE(yuzu::test::wait_until_quiescent(std::chrono::milliseconds(150)));
+    t.request_stop();
+    t.join(); // explicit here so the next CHECK observes the exited thread; the
+              // destructor's join is the exception-path guarantee, not the happy path
+#else
     std::atomic<bool> release{false};
     std::thread t([&] {
         while (!release.load(std::memory_order_acquire))
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
     });
+    struct JoinOnExit {
+        std::atomic<bool>& release;
+        std::thread& t;
+        ~JoinOnExit() {
+            release.store(true, std::memory_order_release);
+            if (t.joinable())
+                t.join();
+        }
+    } join_guard{release, t};
     // A live second thread: the gate must NOT open (bounded: 150 ms, scaled).
     CHECK_FALSE(yuzu::test::wait_until_quiescent(std::chrono::milliseconds(150)));
     release.store(true, std::memory_order_release);
-    t.join();
-    // Joined -> quiescent (TSan's background thread is excluded by the helper's threshold).
+    t.join(); // explicit for the next CHECK; the guard is the exception-path join
+#endif
+    // Exited -> quiescent (TSan's background thread is excluded by the helper's threshold).
     CHECK(yuzu::test::wait_until_quiescent(std::chrono::seconds(5)));
 #endif
 }
