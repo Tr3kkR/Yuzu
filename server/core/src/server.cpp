@@ -13426,6 +13426,37 @@ private:
             if (!v) return std::set<std::string>{}; // degrade → fail-closed, never nullopt
             return std::set<std::string>(v->begin(), v->end());
         };
+        // #4035 review fix (colleague review, BLOCKING): get_dex_app's/
+        // get_dex_overview's REST v1 + MCP twins previously reused the
+        // pre-existing `visible_set_fn` below (Infrastructure:Read global
+        // bypass + ManagementGroupStore::get_visible_agents, which is
+        // PERMISSION-AGNOSTIC — see that lambda's own doc comment) as their
+        // ADR-0017 confinement belt. That resolver returns every agent
+        // visible via ANY management-group role the caller holds, not just
+        // GuaranteedState:Read — so a caller with GuaranteedState:Read on
+        // one group and any unrelated role on a second group would see the
+        // second group's device ids/crash data leak into these two DEX
+        // reads. Deliberately a NEW resolver rather than fixing
+        // `visible_set_fn` in place: that lambda is also shared by the
+        // pre-existing `/fragments/dex/app`+`/fragments/dex/overview`
+        // dashboard fragments and an unrelated inventory-devices resolver,
+        // so changing it has a wider blast radius than this fix should
+        // take on — same shape as `response_visible_set_fn` above (D3),
+        // just scoped to GuaranteedState:Read instead of Response:Read.
+        auto dex_visible_fn = [this](const std::string& username)
+            -> std::optional<std::set<std::string>> {
+            if (!rbac_enforcement_in_effect(rbac_store_.get())) return std::nullopt;
+            bool global_read = rbac_store_ && rbac_store_->is_open() &&
+                               rbac_store_->check_permission(username, "GuaranteedState", "Read");
+            if (global_read) return std::nullopt;
+            if (!rbac_store_ || !mgmt_group_store_) {
+                return std::set<std::string>{}; // fail-closed, no store to resolve against
+            }
+            auto v = rbac_store_->visible_agents_for_permission(username, "GuaranteedState", "Read",
+                                                                 mgmt_group_store_.get());
+            if (!v) return std::set<std::string>{}; // degrade → fail-closed, never nullopt
+            return std::set<std::string>(v->begin(), v->end());
+        };
         auto audit_fn = [this](const httplib::Request& req, const std::string& action,
                                const std::string& result, const std::string& target_type,
                                const std::string& target_id, const std::string& detail) -> bool {
@@ -17327,12 +17358,15 @@ private:
             // just above the DexRoutes registration) for why this must be
             // the identical lambda, not a second copy.
             dex_fleet_fn,
-            // #4035 hardening (governance): the SAME visible_set_fn
-            // DexRoutes::register_routes above already received (defined
-            // once, just above the DexRoutes registration) — GET
-            // /api/v1/dex/app and GET /api/v1/dex/overview confine their
-            // device lists the identical way the dashboard fragments do.
-            visible_set_fn);
+            // #4035 review fix (colleague review, BLOCKING): a DEDICATED
+            // GuaranteedState:Read-scoped resolver (defined above, see its
+            // own doc comment) — NOT the SAME visible_set_fn
+            // DexRoutes::register_routes above uses, despite this comment's
+            // own earlier (incorrect) claim that they should be identical.
+            // visible_set_fn's permission-agnostic join would leak a
+            // multi-role operator's OTHER groups' device ids into GET
+            // /api/v1/dex/app / GET /api/v1/dex/overview.
+            dex_visible_fn);
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -17512,11 +17546,13 @@ private:
             // the DexRoutes registration) for why this must be the identical
             // lambda, not a second copy.
             mcp_server_->set_dex_fleet_fn(dex_fleet_fn);
-            // #4035 hardening (governance): the SAME visible_set_fn wired into
-            // the REST registration's trailing dex_visible_fn param above, so
-            // get_dex_app/get_dex_overview confine their device lists the
-            // identical way their REST twins and the dashboard fragments do.
-            mcp_server_->set_dex_visible_fn(visible_set_fn);
+            // #4035 review fix (colleague review, BLOCKING): the SAME
+            // dedicated GuaranteedState:Read-scoped resolver wired into the
+            // REST registration's trailing dex_visible_fn param above (see
+            // that variable's doc comment) — NOT visible_set_fn, whose
+            // permission-agnostic join does not actually confine to this
+            // securable's grants.
+            mcp_server_->set_dex_visible_fn(dex_visible_fn);
             // PR1.5c/1.6c (p14) — ADR-0031 operator surface MCP twins,
             // wired UNCONDITIONALLY exactly like kek_ops above (never
             // gated behind an unrelated conditional — see the KEK comment
