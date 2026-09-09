@@ -1794,6 +1794,9 @@ void GuardianEngine::wire_spark_engine(SparkEngine* engine, bool spark_disabled_
         // IJournalStore*), not by anything at this call site - so if a future refactor
         // ever widens kv_'s type, this assert fires as a compile error right here, forcing
         // that change to be a conscious, reviewed decision rather than a silent widening.
+        // Scope, stated honestly: this only catches kv_'s TYPE being widened. It cannot
+        // catch a future refactor that leaves kv_'s type alone but substitutes a
+        // different pointer at the construction call site below.
         static_assert(std::is_same_v<decltype(kv_), KvStore*>,
                       "GuardianEngine::kv_ must stay KvStore*, not IJournalStore* - "
                       "production must never construct GuardianLifecycleJournal against "

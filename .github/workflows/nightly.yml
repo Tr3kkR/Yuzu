@@ -826,7 +826,16 @@ jobs:
       - name: Test
         # --timeout-multiplier 2: see the asan Test step (#2092 shard budgets;
         # coverage instrumentation is similarly slower than plain debug).
-        run: meson test -C build-linux-coverage --timeout-multiplier 2 --print-errorlogs
+        # YUZU_TEST_PROGRESS (governance follow-up, #4153 round 4): this leg runs the
+        # full unfiltered suite including agent, but had no per-test attribution on a
+        # hang - only the asan/tsan/windows-asan legs did. Same absolute-path reasoning
+        # as those: meson's default test workdir is the build directory itself.
+        run: |
+          export YUZU_TEST_PROGRESS=1
+          export YUZU_TEST_PROGRESS_FILE="$GITHUB_WORKSPACE/build-linux-coverage/meson-logs/progress.log"
+          mkdir -p "$(dirname "$YUZU_TEST_PROGRESS_FILE")"
+          rm -f "$YUZU_TEST_PROGRESS_FILE"
+          meson test -C build-linux-coverage --timeout-multiplier 2 --print-errorlogs
 
       - name: Generate coverage reports
         run: |
@@ -858,6 +867,22 @@ jobs:
         with:
           name: coverage-report
           path: build-linux-coverage/coverage-html/
+
+      - name: Upload meson testlog (on failure or cancel)
+        # New step (#4153 round 4) - this leg had no testlog upload at all before now,
+        # only the HTML coverage report above, which gcovr only writes on a passing
+        # Test step. `|| cancelled()`: see the same line's comment on the asan leg -
+        # a stall here rides the JOB's own timeout, reported as CANCELLED not FAILED.
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: meson-testlog-coverage
+          path: |
+            build-linux-coverage/meson-logs/testlog.txt
+            build-linux-coverage/meson-logs/testlog.junit.xml
+            build-linux-coverage/meson-logs/progress.log
+          retention-days: 14
+          if-no-files-found: warn
 
       - name: ccache stats
         if: always()

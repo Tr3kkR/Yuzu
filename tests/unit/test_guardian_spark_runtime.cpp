@@ -3932,7 +3932,8 @@ TEST_CASE("concurrent pagers + a drainer do not race (TSan checkpoint)",
     // be mid-loop - exactly the shape of the production drain-worker/reconnect race
     // this checkpoint exists to prove race-free.
     //
-    // Both waits below are bounded (governance Gate 4/5/6/8 finding, folded #4153
+    // All three of main's waits below (two here, plus `pagers_done` further down after
+    // request_stop()) are bounded (governance Gate 4/5/6/8 finding, folded #4153
     // round 3): every worker's own loop is fixed-iteration, so under normal operation
     // these release in well under a second - the 30s ceiling only ever fires on a
     // genuine stuck-thread regression, converting what would otherwise be a silent,
@@ -3968,9 +3969,12 @@ TEST_CASE("concurrent pagers + a drainer do not race (TSan checkpoint)",
     // adds a bound on how long main then waits for them to genuinely finish - it does
     // NOT gate their own completion on anything main does. If this never releases (a
     // future regression dropping a pagers_done.count_down() call), the FAIL() below
-    // unwinds through `workers`' destructor, which cancels the drainer (and, via the
-    // same mechanism, the already-stoppable pruner) before joining - see both workers'
-    // own comments. On the success path nothing here requests any worker's stop_token.
+    // unwinds through `workers`' destructor, which cancels the drainer before joining
+    // (see its own comment) - the pruner's stop_token has nothing left to interrupt by
+    // this point, since a pagers_done-stuck scenario implies first_pass/prune_evicted
+    // already succeeded, meaning the pruner is long past its own only interruptible
+    // point and just finishing its fixed, non-stop-checking loop. On the success path
+    // nothing here requests any worker's stop_token.
     bounded_wait([&] { return pagers_done.try_wait(); },
                  "pagers_done (a pager never finished all its iterations)");
     for (auto& w : workers)
@@ -4242,11 +4246,24 @@ TEST_CASE("concurrent persist + page + prune + drain do not race (TSan checkpoin
             std::this_thread::sleep_for(std::chrono::milliseconds{5});
         }
     };
-    const auto stoppable_wait = [](auto&& ready, std::stop_token stoken) {
+    // Governance follow-up (#4153 round 4 continued): unlike the pagers test's use of
+    // this same helper (a one-shot latch check, coarse interval is fine), the persister
+    // below uses this repeatedly as an interleaving GATE - a std::stop_callback bridging
+    // request_stop() to pruner_passes.notify_all() was tried and reverted here: it does
+    // NOT work, because std::atomic<T>::wait(old) is specified to re-compare against
+    // `old` on every wakeup and re-block if the value hasn't actually changed - a notify
+    // with no value change is silently absorbed and never returns control to the caller
+    // (empirically confirmed: the persister hung past its own bounded_wait's 30s FAIL,
+    // needing the external kill). A poll is therefore the only viable stoppable
+    // mechanism here; this overload takes an explicit interval so the persister can use
+    // one far finer than the pagers test's one-shot 5ms default, since a coarse interval
+    // here would blur the persist/prune interleaving this test exists to exercise.
+    const auto stoppable_wait = [](auto&& ready, std::stop_token stoken,
+                                   std::chrono::microseconds poll = std::chrono::milliseconds{5}) {
         while (!ready()) {
             if (stoken.stop_requested())
                 return false;
-            std::this_thread::sleep_for(std::chrono::milliseconds{5});
+            std::this_thread::sleep_for(poll);
         }
         return true;
     };
@@ -4264,26 +4281,33 @@ TEST_CASE("concurrent persist + page + prune + drain do not race (TSan checkpoin
         });
     // Pruner: prune() (paging_mutex_ -> the store) - the FR5 prune-vs-paging
     // serialization this test exists to exercise under TSan. Publishes its own pass
-    // count so the persister below can genuinely interleave with it via a BLOCKING
-    // wait, instead of racing to finish first.
+    // count so the persister below can genuinely interleave with it, instead of racing
+    // to finish first. NOT a blocking wait/notify pair as of #4153 round 4 - see the
+    // persister's own comment for why - so this fetch_add is the only reader that
+    // matters; the notify has no waiter to wake and is deliberately not sent.
     workers.emplace_back([&] {
         std::int64_t t = kBaseTs;
         for (int i = 0; i < kIters; ++i) {
             rig.journal->prune(t);
             t += 5'000;
             pruner_passes.fetch_add(1, std::memory_order_release);
-            pruner_passes.notify_all();
         }
         producers_done.count_down();
     });
     // Persister: persist() (the store only, no paging_mutex_) - a single writer, as in
     // production (always under the engine mtx_); it races page/prune only on the
-    // shared store + atomics. Three tranches gated on the pruner's OWN pass count (a
-    // bounded poll on a finite worker, never a spin - stoppable_wait, not the raw
-    // atomic::wait this used before #4153 round 4, since a plain wait/notify pair can't
-    // be interrupted by a stop_token: notifying pruner_passes on cancellation wouldn't
-    // wake a waiter blocked on a DIFFERENT value) so count-eviction genuinely interleaves
-    // with writes rather than one finishing before the other starts.
+    // shared store + atomics. Three tranches gated on the pruner's OWN pass count via a
+    // fine-grained stoppable_wait poll (50us, not this file's usual 5ms), so count-
+    // eviction interleaves with writes closely enough to still exercise the property
+    // under test, rather than one finishing before the other starts. NOT a blocking
+    // atomic::wait()/notify_all() pair: that shape was tried in this exact spot and
+    // empirically reverted - std::atomic<T>::wait(old) re-compares against `old` on
+    // every wakeup and re-blocks if the value hasn't actually changed, so a stop_token-
+    // triggered notify_all() with no real value change is silently absorbed and never
+    // returns control to the caller (confirmed: the persister hung past its own 30s
+    // bounded_wait FAIL(), needing an external kill). A poll is the only mechanism here
+    // that is both genuinely stoppable and doesn't require mutating pruner_passes with
+    // an artificial sentinel value.
     workers.emplace_back([&](std::stop_token stoken) {
         int n = 0;
         const auto persist_one = [&] {
@@ -4301,7 +4325,7 @@ TEST_CASE("concurrent persist + page + prune + drain do not race (TSan checkpoin
         const auto wait_for_pass = [&](int target) {
             return stoppable_wait(
                 [&] { return pruner_passes.load(std::memory_order_acquire) >= target; },
-                stoken);
+                stoken, std::chrono::microseconds{50});
         };
         for (int i = 0; i < kPersistTotal / 3; ++i)
             persist_one();
