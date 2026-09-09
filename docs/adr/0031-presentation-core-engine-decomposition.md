@@ -332,11 +332,16 @@ rule it replaces.
 
 > **Update (2026-09-08): the enumerate-every-route-vs-OpenAPI contract test LANDED** — out-of-band from
 > the split delivery matrix, under **#842 / #3991 / #3992**. `scripts/ci/check-api-parity.py` is the
-> whole-tree source-parse CI gate (fails on any registered `/api/v1/*` route absent from
-> `openapi_spec()`); `tests/unit/server/test_openapi_spec_completeness.cpp` is the in-process unit half
+> whole-tree CI gate; `tests/unit/server/test_openapi_spec_completeness.cpp` is the in-process unit half
 > (registers `RestApiV1::register_routes()` into a `TestRouteSink` and diffs against `openapi_spec_json()`,
-> TSan-safe, no socket); #3992 backfilled 39 routes so the `/api/v1` baseline is drift-zero (1 allowlisted
-> CORS `OPTIONS` catch-all). So this invariant is now enforced by a test, not only by review.
+> TSan-safe, no socket); #3992 backfilled 39 routes so the `/api/vN` baseline is drift-zero (1 allowlisted
+> CORS `OPTIONS` catch-all). **Important — this is a LEXICAL tripwire, not a proof** (the gate's own
+> docstring): it regex-extracts literal `sink.Get("/literal", …)` registrations, so a route registered via
+> a **non-literal or helper-mediated** call emits a CI `::warning::` and the gate still **exits 0** — it
+> does not fail the build. Today's tree is verified drift-zero, and the escape fails loud (never silent),
+> but the invariant is only *partially* mechanized; the type-aware (clang-based) successor that would close
+> the indirection gap is tracked at **#2572**. So this invariant is now enforced by a lexical test for
+> literal registrations, stronger than review alone but short of INV-31-4's full "every registered route."
 > **What remains for WS-A4** (split matrix): the *per-family* seam+contract enforcement that gates the
 > WS-B2 strangler cutover, the "handlers/renderers call the API, never a `Store*`" seam refactor, and the
 > behavioural-PII audit relocation — none of which #842 delivered.
