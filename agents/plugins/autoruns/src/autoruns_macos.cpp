@@ -197,9 +197,15 @@ bool source_in_filter(std::string_view filter, SourceId id) noexcept {
     return false;
 }
 
-void emit_status(yuzu::CommandContext& ctx, SourceId id, YuzuSupportLevel support,
+/// Returns true iff `support` is CONSTRAINED (never UNSUPPORTED -- a normal,
+/// expected outcome, not a degradation -- and never plain SUPPORTED), so
+/// every call site can accumulate the leg-wide degradation aggregate
+/// collect_macos returns to do_list (autoruns_plugin.cpp), which folds it
+/// into the plugin's typed CC-07 result status.
+bool emit_status(yuzu::CommandContext& ctx, SourceId id, YuzuSupportLevel support,
                  std::optional<std::size_t> rows, std::string_view reason) {
     ctx.write_output(format_source_status(id, support, rows, reason));
+    return support == YUZU_SUPPORT_CONSTRAINED;
 }
 
 /// Reads `name` inside the directory backing `dir_fd`, refusing a symlink
@@ -558,6 +564,14 @@ DirCollectOutcome collect_user_launchagents(yuzu::CommandContext& ctx) {
 } // namespace
 
 int collect_macos(yuzu::CommandContext& ctx, std::string_view filter) {
+    // Tracks whether ANY source this leg processed reported CONSTRAINED (not
+    // UNSUPPORTED, not plain SUPPORTED) -- ORed into every emit_status call's
+    // own return below -- so this leg's return value can surface a real
+    // acquisition degradation to do_list's aggregate CC-07 result-status
+    // (autoruns_plugin.cpp) instead of it being visible only in the
+    // individual `source|` text lines.
+    bool any_constrained = false;
+
     struct SystemDirSpec {
         SourceId id;
         const char* path;
@@ -571,38 +585,44 @@ int collect_macos(yuzu::CommandContext& ctx, std::string_view filter) {
 
     for (const auto& spec : kSystemDirs) {
         if (!source_in_filter(filter, spec.id)) {
-            emit_status(ctx, spec.id, YUZU_SUPPORT_SUPPORTED, std::nullopt, "filtered");
+            any_constrained |=
+                emit_status(ctx, spec.id, YUZU_SUPPORT_SUPPORTED, std::nullopt, "filtered");
             continue;
         }
         const auto outcome = collect_launchd_dir(ctx, spec.id, spec.path, Scope::system, {});
         if (outcome.constrained) {
-            emit_status(ctx, spec.id, YUZU_SUPPORT_CONSTRAINED, outcome.rows, outcome.reason);
+            any_constrained |=
+                emit_status(ctx, spec.id, YUZU_SUPPORT_CONSTRAINED, outcome.rows, outcome.reason);
         } else {
-            emit_status(ctx, spec.id, YUZU_SUPPORT_SUPPORTED, outcome.rows, "launchd_plist_walk");
+            any_constrained |=
+                emit_status(ctx, spec.id, YUZU_SUPPORT_SUPPORTED, outcome.rows,
+                           "launchd_plist_walk");
         }
     }
 
     if (!source_in_filter(filter, SourceId::mac_user_launchagents)) {
-        emit_status(ctx, SourceId::mac_user_launchagents, YUZU_SUPPORT_SUPPORTED, std::nullopt,
-                   "filtered");
+        any_constrained |= emit_status(ctx, SourceId::mac_user_launchagents, YUZU_SUPPORT_SUPPORTED,
+                                       std::nullopt, "filtered");
     } else {
         const auto outcome = collect_user_launchagents(ctx);
         if (outcome.constrained) {
-            emit_status(ctx, SourceId::mac_user_launchagents, YUZU_SUPPORT_CONSTRAINED, outcome.rows,
-                       outcome.reason);
+            any_constrained |= emit_status(ctx, SourceId::mac_user_launchagents,
+                                           YUZU_SUPPORT_CONSTRAINED, outcome.rows, outcome.reason);
         } else {
-            emit_status(ctx, SourceId::mac_user_launchagents, YUZU_SUPPORT_SUPPORTED, outcome.rows,
-                       "launchd_plist_walk");
+            any_constrained |= emit_status(ctx, SourceId::mac_user_launchagents,
+                                           YUZU_SUPPORT_SUPPORTED, outcome.rows,
+                                           "launchd_plist_walk");
         }
     }
 
     // Login Items: no file this leg can read, ever — always this exact
     // status line, unaffected by `sources=` (there is no real read to skip).
-    emit_status(ctx, SourceId::mac_login_items, YUZU_SUPPORT_CONSTRAINED, std::size_t{0},
-               "btm_private_database_no_public_api");
+    any_constrained |= emit_status(ctx, SourceId::mac_login_items, YUZU_SUPPORT_CONSTRAINED,
+                                   std::size_t{0}, "btm_private_database_no_public_api");
 
     if (!source_in_filter(filter, SourceId::mac_periodic)) {
-        emit_status(ctx, SourceId::mac_periodic, YUZU_SUPPORT_SUPPORTED, std::nullopt, "filtered");
+        any_constrained |= emit_status(ctx, SourceId::mac_periodic, YUZU_SUPPORT_SUPPORTED,
+                                       std::nullopt, "filtered");
     } else {
         std::size_t count = 0;
         DirCollectOutcome outcome;
@@ -632,14 +652,17 @@ int collect_macos(yuzu::CommandContext& ctx, std::string_view filter) {
             if (dir_outcome.constrained) note_dir_constraint(outcome, dir_outcome.reason);
         }
         if (outcome.constrained) {
-            emit_status(ctx, SourceId::mac_periodic, YUZU_SUPPORT_CONSTRAINED, count, outcome.reason);
+            any_constrained |= emit_status(ctx, SourceId::mac_periodic, YUZU_SUPPORT_CONSTRAINED,
+                                           count, outcome.reason);
         } else {
-            emit_status(ctx, SourceId::mac_periodic, YUZU_SUPPORT_SUPPORTED, count, "periodic_dir_walk");
+            any_constrained |= emit_status(ctx, SourceId::mac_periodic, YUZU_SUPPORT_SUPPORTED,
+                                           count, "periodic_dir_walk");
         }
     }
 
     if (!source_in_filter(filter, SourceId::mac_emond)) {
-        emit_status(ctx, SourceId::mac_emond, YUZU_SUPPORT_SUPPORTED, std::nullopt, "filtered");
+        any_constrained |=
+            emit_status(ctx, SourceId::mac_emond, YUZU_SUPPORT_SUPPORTED, std::nullopt, "filtered");
     } else {
         std::size_t count = 0;
         bool any_parse_failed = false;
@@ -682,13 +705,19 @@ int collect_macos(yuzu::CommandContext& ctx, std::string_view filter) {
         if (outcome.constrained) reason = std::string{outcome.reason};
         if (any_parse_failed) reason += (reason.empty() ? "" : ",") + std::string{"malformed"};
         if (!reason.empty()) {
-            emit_status(ctx, SourceId::mac_emond, YUZU_SUPPORT_CONSTRAINED, count, reason);
+            any_constrained |=
+                emit_status(ctx, SourceId::mac_emond, YUZU_SUPPORT_CONSTRAINED, count, reason);
         } else {
-            emit_status(ctx, SourceId::mac_emond, YUZU_SUPPORT_SUPPORTED, count, "emond_rule_plist_walk");
+            any_constrained |= emit_status(ctx, SourceId::mac_emond, YUZU_SUPPORT_SUPPORTED, count,
+                                           "emond_rule_plist_walk");
         }
     }
 
-    return 0; // a degraded per-source read is reported via source| lines, not this rc
+    // Non-zero signals "at least one source reported CONSTRAINED" to
+    // do_list's aggregate -- distinct from this function's own success/
+    // failure, which this leg has no way to report other than an escaping
+    // exception (caught in execute()).
+    return any_constrained ? 1 : 0;
 }
 
 } // namespace yuzu::autoruns

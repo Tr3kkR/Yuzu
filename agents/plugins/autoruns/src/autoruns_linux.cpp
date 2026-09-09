@@ -1169,10 +1169,25 @@ std::vector<FallbackTimer> parse_list_timers_fallback(std::string_view text) {
 #ifndef YUZU_AUTORUNS_LINUX_UNIT_TEST_INTERNALS_ONLY
 
 int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
+    // Tracks whether ANY source this leg processed reported CONSTRAINED (not
+    // UNSUPPORTED -- a normal outcome for a foreign-OS stub, and not plain
+    // SUPPORTED), so collect_linux's return value can surface a real
+    // acquisition degradation to do_list's aggregate CC-07 result-status
+    // (autoruns_plugin.cpp) instead of it being visible only in this leg's
+    // many individual `source|` text lines. One helper wraps every existing
+    // ctx.write_output(format_source_status(...)) call site so none of the
+    // dozens of call sites below has to track this by hand.
+    bool any_constrained = false;
+    auto emit_status = [&ctx, &any_constrained](SourceId id, YuzuSupportLevel support,
+                                                std::optional<std::size_t> rows,
+                                                std::string_view reason) {
+        ctx.write_output(format_source_status(id, support, rows, reason));
+        if (support == YUZU_SUPPORT_CONSTRAINED) any_constrained = true;
+    };
+
     // ── /etc/crontab (system format, required-by-catalog file) ──────────
     if (!source_wanted(filter, SourceId::lnx_etc_crontab)) {
-        ctx.write_output(format_source_status(SourceId::lnx_etc_crontab, YUZU_SUPPORT_SUPPORTED,
-                                              std::nullopt, "filtered"));
+        emit_status(SourceId::lnx_etc_crontab, YUZU_SUPPORT_SUPPORTED, std::nullopt, "filtered");
     } else {
         const SourceId id = SourceId::lnx_etc_crontab;
         auto content = read_file_bounded("/etc/crontab");
@@ -1200,53 +1215,49 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
             // bare Supported -- rejected_lines was already computed and
             // tested but never consumed by this call site until now.
             const bool malformed = parsed.rejected_lines > 0;
-            ctx.write_output(format_source_status(
+            emit_status(
                 id, malformed ? YUZU_SUPPORT_CONSTRAINED : YUZU_SUPPORT_SUPPORTED, n,
-                malformed ? "malformed" : "-"));
+                malformed ? "malformed" : "-");
         } else {
             auto cls = classify_read_error(content.error(), /*required_by_catalog=*/true);
-            ctx.write_output(format_source_status(id, cls.support, std::size_t{0}, cls.reason));
+            emit_status(id, cls.support, std::size_t{0}, cls.reason);
         }
     }
 
     // ── /etc/cron.d/* (system format, run-parts-valid names only) ───────
     if (!source_wanted(filter, SourceId::lnx_cron_d)) {
-        ctx.write_output(format_source_status(SourceId::lnx_cron_d, YUZU_SUPPORT_SUPPORTED,
-                                              std::nullopt, "filtered"));
+        emit_status(SourceId::lnx_cron_d, YUZU_SUPPORT_SUPPORTED, std::nullopt, "filtered");
     } else {
         const SourceId id = SourceId::lnx_cron_d;
         auto scan = scan_cron_d("/etc/cron.d", id);
         for (const auto& row : scan.rows) ctx.write_output(format_row(row));
-        ctx.write_output(format_source_status(id, scan.support, scan.rows.size(), scan.reason));
+        emit_status(id, scan.support, scan.rows.size(), scan.reason);
     }
 
     // ── /etc/cron.{hourly,daily,weekly,monthly}/* (listing only) ────────
     if (!source_wanted(filter, SourceId::lnx_cron_periodic)) {
-        ctx.write_output(format_source_status(SourceId::lnx_cron_periodic, YUZU_SUPPORT_SUPPORTED,
-                                              std::nullopt, "filtered"));
+        emit_status(SourceId::lnx_cron_periodic, YUZU_SUPPORT_SUPPORTED, std::nullopt, "filtered");
     } else {
         const SourceId id = SourceId::lnx_cron_periodic;
         auto scan = scan_run_parts_dirs(
             {"/etc/cron.hourly", "/etc/cron.daily", "/etc/cron.weekly", "/etc/cron.monthly"}, id);
         for (const auto& row : scan.rows) ctx.write_output(format_row(row));
-        ctx.write_output(format_source_status(id, scan.support, scan.rows.size(), scan.reason));
+        emit_status(id, scan.support, scan.rows.size(), scan.reason);
     }
 
     // ── per-user crontabs (/var/spool/cron/crontabs, /var/spool/cron) ───
     if (!source_wanted(filter, SourceId::lnx_user_crontabs)) {
-        ctx.write_output(format_source_status(SourceId::lnx_user_crontabs, YUZU_SUPPORT_SUPPORTED,
-                                              std::nullopt, "filtered"));
+        emit_status(SourceId::lnx_user_crontabs, YUZU_SUPPORT_SUPPORTED, std::nullopt, "filtered");
     } else {
         const SourceId id = SourceId::lnx_user_crontabs;
         auto scan = scan_user_crontabs({"/var/spool/cron/crontabs", "/var/spool/cron"}, id);
         for (const auto& row : scan.rows) ctx.write_output(format_row(row));
-        ctx.write_output(format_source_status(id, scan.support, scan.rows.size(), scan.reason));
+        emit_status(id, scan.support, scan.rows.size(), scan.reason);
     }
 
     // ── /etc/anacrontab (required-by-catalog file) ───────────────────────
     if (!source_wanted(filter, SourceId::lnx_anacrontab)) {
-        ctx.write_output(format_source_status(SourceId::lnx_anacrontab, YUZU_SUPPORT_SUPPORTED,
-                                              std::nullopt, "filtered"));
+        emit_status(SourceId::lnx_anacrontab, YUZU_SUPPORT_SUPPORTED, std::nullopt, "filtered");
     } else {
         const SourceId id = SourceId::lnx_anacrontab;
         auto content = read_file_bounded("/etc/anacrontab");
@@ -1268,54 +1279,55 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                 row.mtime = mtime;
                 ctx.write_output(format_row(row));
             }
-            ctx.write_output(format_source_status(id, YUZU_SUPPORT_SUPPORTED, entries.size(), "-"));
+            emit_status(id, YUZU_SUPPORT_SUPPORTED, entries.size(), "-");
         } else {
             auto cls = classify_read_error(content.error(), /*required_by_catalog=*/true);
-            ctx.write_output(format_source_status(id, cls.support, std::size_t{0}, cls.reason));
+            emit_status(id, cls.support, std::size_t{0}, cls.reason);
         }
     }
 
     // ── /var/spool/at/* (at(1) job files) ────────────────────────────────
     if (!source_wanted(filter, SourceId::lnx_at_spool)) {
-        ctx.write_output(format_source_status(SourceId::lnx_at_spool, YUZU_SUPPORT_SUPPORTED,
-                                              std::nullopt, "filtered"));
+        emit_status(SourceId::lnx_at_spool, YUZU_SUPPORT_SUPPORTED, std::nullopt, "filtered");
     } else {
         const SourceId id = SourceId::lnx_at_spool;
         auto scan = scan_at_spool("/var/spool/at", id);
         for (const auto& row : scan.rows) ctx.write_output(format_row(row));
-        ctx.write_output(format_source_status(id, scan.support, scan.rows.size(), scan.reason));
+        emit_status(id, scan.support, scan.rows.size(), scan.reason);
     }
 
     // ── systemd timers (system + user), tri-state on /run/systemd/system ─
     const bool want_sys_timers = source_wanted(filter, SourceId::lnx_systemd_timers_system);
     const bool want_user_timers = source_wanted(filter, SourceId::lnx_systemd_timers_user);
     if (!want_sys_timers)
-        ctx.write_output(format_source_status(SourceId::lnx_systemd_timers_system,
-                                              YUZU_SUPPORT_SUPPORTED, std::nullopt, "filtered"));
+        emit_status(
+            SourceId::lnx_systemd_timers_system, YUZU_SUPPORT_SUPPORTED, std::nullopt, "filtered");
     if (!want_user_timers)
         // CONSTRAINED even filtered-out -- matches this source's own
         // catalog-declared level (narrow_search_path_coverage, a permanent
         // gap), same principle as lnx_init_d's filtered branch above.
-        ctx.write_output(format_source_status(SourceId::lnx_systemd_timers_user,
-                                              YUZU_SUPPORT_CONSTRAINED, std::nullopt, "filtered"));
+        emit_status(
+            SourceId::lnx_systemd_timers_user, YUZU_SUPPORT_CONSTRAINED, std::nullopt, "filtered");
     if (want_sys_timers || want_user_timers) {
         const SystemdPresence presence = check_systemd_presence();
         if (presence == SystemdPresence::absent) {
             if (want_sys_timers)
-                ctx.write_output(format_source_status(SourceId::lnx_systemd_timers_system,
-                                                      YUZU_SUPPORT_UNSUPPORTED, std::size_t{0}, "no_systemd"));
+                emit_status(
+                    SourceId::lnx_systemd_timers_system, YUZU_SUPPORT_UNSUPPORTED, std::size_t{0},
+                    "no_systemd");
             if (want_user_timers)
-                ctx.write_output(format_source_status(SourceId::lnx_systemd_timers_user,
-                                                      YUZU_SUPPORT_UNSUPPORTED, std::size_t{0}, "no_systemd"));
+                emit_status(
+                    SourceId::lnx_systemd_timers_user, YUZU_SUPPORT_UNSUPPORTED, std::size_t{0},
+                    "no_systemd");
         } else if (presence == SystemdPresence::undetermined) {
             if (want_sys_timers)
-                ctx.write_output(format_source_status(SourceId::lnx_systemd_timers_system,
-                                                      YUZU_SUPPORT_CONSTRAINED, std::size_t{0},
-                                                      "systemd_state_undetermined"));
+                emit_status(
+                    SourceId::lnx_systemd_timers_system, YUZU_SUPPORT_CONSTRAINED, std::size_t{0},
+                    "systemd_state_undetermined");
             if (want_user_timers)
-                ctx.write_output(format_source_status(SourceId::lnx_systemd_timers_user,
-                                                      YUZU_SUPPORT_CONSTRAINED, std::size_t{0},
-                                                      "systemd_state_undetermined"));
+                emit_status(
+                    SourceId::lnx_systemd_timers_user, YUZU_SUPPORT_CONSTRAINED, std::size_t{0},
+                    "systemd_state_undetermined");
         } else {
             if (want_sys_timers) {
                 TimerScan scan;
@@ -1330,8 +1342,8 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                 if (scan.any_dir_readable) {
                     for (const auto& row : scan.rows) ctx.write_output(format_row(row));
                     const auto [support, reason] = timer_scan_status(scan);
-                    ctx.write_output(format_source_status(SourceId::lnx_systemd_timers_system,
-                                                          support, scan.rows.size(), reason));
+                    emit_status(
+                        SourceId::lnx_systemd_timers_system, support, scan.rows.size(), reason);
                 } else {
                     // Rung-2 fallback -- autoruns/collect_linux#1 (docs/wave7/
                     // integration-autoruns-linux.md). ONLY reached when none
@@ -1361,9 +1373,9 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                         row.mtime = 0;
                         ctx.write_output(format_row(row));
                     }
-                    ctx.write_output(format_source_status(SourceId::lnx_systemd_timers_system,
-                                                          YUZU_SUPPORT_CONSTRAINED, parsed.size(),
-                                                          "argv_fallback"));
+                    emit_status(
+                        SourceId::lnx_systemd_timers_system, YUZU_SUPPORT_CONSTRAINED,
+                        parsed.size(), "argv_fallback");
                 }
             }
 
@@ -1443,16 +1455,15 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                 for (const auto& row : scan.rows) ctx.write_output(format_row(row));
                 const auto [support, reason, row_count] = systemd_user_timer_status(
                     scan.any_dir_readable, home_listing.opened, home_listing.permission_denied, scan);
-                ctx.write_output(format_source_status(SourceId::lnx_systemd_timers_user, support,
-                                                      row_count, reason));
+                emit_status(SourceId::lnx_systemd_timers_user, support, row_count, reason);
             }
         }
     }
 
     // ── XDG autostart (system) ───────────────────────────────────────────
     if (!source_wanted(filter, SourceId::lnx_xdg_autostart_system)) {
-        ctx.write_output(format_source_status(SourceId::lnx_xdg_autostart_system,
-                                              YUZU_SUPPORT_SUPPORTED, std::nullopt, "filtered"));
+        emit_status(
+            SourceId::lnx_xdg_autostart_system, YUZU_SUPPORT_SUPPORTED, std::nullopt, "filtered");
     } else {
         const SourceId id = SourceId::lnx_xdg_autostart_system;
         auto listing = list_dir("/etc/xdg/autostart");
@@ -1460,7 +1471,7 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
             YuzuSupportLevel support = listing.absent ? YUZU_SUPPORT_SUPPORTED : YUZU_SUPPORT_CONSTRAINED;
             std::string reason =
                 listing.absent ? "absent" : (listing.permission_denied ? "permission_denied" : listing.other_token);
-            ctx.write_output(format_source_status(id, support, std::size_t{0}, reason));
+            emit_status(id, support, std::size_t{0}, reason);
         } else {
             std::size_t n = 0;
             bool any_file_constrained = false;
@@ -1496,21 +1507,21 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
             std::string reason;
             if (any_file_constrained) reason = file_constrained_reason;
             if (listing.truncated) reason += (reason.empty() ? "" : ",") + std::string{"row_cap"};
-            ctx.write_output(format_source_status(
+            emit_status(
                 id, reason.empty() ? YUZU_SUPPORT_SUPPORTED : YUZU_SUPPORT_CONSTRAINED, n,
-                reason.empty() ? "-" : reason));
+                reason.empty() ? "-" : reason);
         }
     }
 
     // ── XDG autostart (per-user, /home/*/.config/autostart only) ────────
     if (!source_wanted(filter, SourceId::lnx_xdg_autostart_user)) {
-        ctx.write_output(format_source_status(SourceId::lnx_xdg_autostart_user,
-                                              YUZU_SUPPORT_SUPPORTED, std::nullopt, "filtered"));
+        emit_status(
+            SourceId::lnx_xdg_autostart_user, YUZU_SUPPORT_SUPPORTED, std::nullopt, "filtered");
     } else {
         const SourceId id = SourceId::lnx_xdg_autostart_user;
         auto scan = scan_xdg_autostart_user(id, "/home");
         for (const auto& row : scan.rows) ctx.write_output(format_row(row));
-        ctx.write_output(format_source_status(id, scan.support, scan.rows.size(), scan.reason));
+        emit_status(id, scan.support, scan.rows.size(), scan.reason);
     }
 
     // ── /etc/rc.local (row only when present AND executable) ────────────
@@ -1524,15 +1535,14 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
     // declaration for this source, and the spec's own worked example of
     // an absent /etc/rc.local as supported|0|absent).
     if (!source_wanted(filter, SourceId::lnx_rc_local)) {
-        ctx.write_output(format_source_status(SourceId::lnx_rc_local, YUZU_SUPPORT_SUPPORTED,
-                                              std::nullopt, "filtered"));
+        emit_status(SourceId::lnx_rc_local, YUZU_SUPPORT_SUPPORTED, std::nullopt, "filtered");
     } else {
         const SourceId id = SourceId::lnx_rc_local;
         struct stat st{};
         auto content = read_file_bounded("/etc/rc.local", kDefaultMaxReadBytes, &st);
         if (!content) {
             auto cls = classify_read_error(content.error(), /*required_by_catalog=*/false);
-            ctx.write_output(format_source_status(id, cls.support, std::size_t{0}, cls.reason));
+            emit_status(id, cls.support, std::size_t{0}, cls.reason);
         } else {
             // is_root_executable, not access(X_OK): init runs this as root,
             // not as this agent's own unprivileged account -- see the
@@ -1542,8 +1552,7 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
             // stat() call, so there is no "stat failure" branch to handle
             // here: the read already succeeded against this exact metadata.
             if (!is_root_executable(st)) {
-                ctx.write_output(format_source_status(id, YUZU_SUPPORT_SUPPORTED, std::size_t{0},
-                                                      "not_executable"));
+                emit_status(id, YUZU_SUPPORT_SUPPORTED, std::size_t{0}, "not_executable");
             } else {
                 Row row;
                 row.source_id = id;
@@ -1557,7 +1566,7 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                 row.signed_state = Signed::not_checked;
                 row.mtime = static_cast<std::int64_t>(st.st_mtime);
                 ctx.write_output(format_row(row));
-                ctx.write_output(format_source_status(id, YUZU_SUPPORT_SUPPORTED, std::size_t{1}, "-"));
+                emit_status(id, YUZU_SUPPORT_SUPPORTED, std::size_t{1}, "-");
             }
         }
     }
@@ -1568,15 +1577,14 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
         // own intrinsic support level as CONSTRAINED (listing-only, no
         // runlevel-wiring read), and a filtered status must report that
         // source's own level, never a blanket SUPPORTED (autoruns_catalog.hpp).
-        ctx.write_output(format_source_status(SourceId::lnx_init_d, YUZU_SUPPORT_CONSTRAINED,
-                                              std::nullopt, "filtered"));
+        emit_status(SourceId::lnx_init_d, YUZU_SUPPORT_CONSTRAINED, std::nullopt, "filtered");
     } else {
         const SourceId id = SourceId::lnx_init_d;
         auto listing = list_dir("/etc/init.d");
         if (!listing.opened) {
             std::string reason =
                 listing.absent ? "absent" : (listing.permission_denied ? "permission_denied" : listing.other_token);
-            ctx.write_output(format_source_status(id, YUZU_SUPPORT_CONSTRAINED, std::size_t{0}, reason));
+            emit_status(id, YUZU_SUPPORT_CONSTRAINED, std::size_t{0}, reason);
         } else {
             std::size_t n = 0;
             for (const auto& name : listing.names) {
@@ -1597,13 +1605,17 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                 ctx.write_output(format_row(row));
                 ++n;
             }
-            ctx.write_output(format_source_status(
+            emit_status(
                 id, YUZU_SUPPORT_CONSTRAINED, n,
-                listing.truncated ? "listing_only,row_cap" : "listing_only"));
+                listing.truncated ? "listing_only,row_cap" : "listing_only");
         }
     }
 
-    return 0;
+    // Non-zero signals "at least one source reported CONSTRAINED" to
+    // do_list's aggregate -- distinct from this function's own success/
+    // failure, which this leg has no way to report other than an escaping
+    // exception (caught in execute()).
+    return any_constrained ? 1 : 0;
 }
 
 #endif // !YUZU_AUTORUNS_LINUX_UNIT_TEST_INTERNALS_ONLY

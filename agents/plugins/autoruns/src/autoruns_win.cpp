@@ -274,11 +274,15 @@ void note_constraint(SourceOutcome& outcome, std::string_view token) {
     outcome.reason += token;
 }
 
-void finish_source(yuzu::CommandContext& ctx, SourceId id, const SourceOutcome& outcome) {
+/// Returns true iff this source's own status resolved to CONSTRAINED -- lets
+/// callers accumulate a leg-wide degradation aggregate without duplicating
+/// the constrained/supported decision at every call site.
+bool finish_source(yuzu::CommandContext& ctx, SourceId id, const SourceOutcome& outcome) {
     for (const auto& r : outcome.rows) ctx.write_output(format_row(r));
     ctx.write_output(format_source_status(
         id, outcome.constrained ? YUZU_SUPPORT_CONSTRAINED : YUZU_SUPPORT_SUPPORTED,
         outcome.rows.size(), outcome.constrained ? std::string_view{outcome.reason} : "ok"));
+    return outcome.constrained;
 }
 
 /// A `sources=` filter excluding `id` must still report a status row for
@@ -286,14 +290,16 @@ void finish_source(yuzu::CommandContext& ctx, SourceId id, const SourceOutcome& 
 /// both guarantee every catalog source reports a status on every `list`
 /// capture, "never omitted" -- so this is the sole dispatch point for every
 /// Windows source's final status, matching the macOS leg's `filtered`
-/// convention rather than silently emitting nothing.
-void finish_source_or_filtered(yuzu::CommandContext& ctx, std::string_view filter, SourceId id,
+/// convention rather than silently emitting nothing. Returns true iff the
+/// dispatched status resolved to CONSTRAINED (a `filtered` status is always
+/// SUPPORTED, never counted) -- same aggregation contract as finish_source.
+bool finish_source_or_filtered(yuzu::CommandContext& ctx, std::string_view filter, SourceId id,
                                const SourceOutcome& outcome) {
     if (want(filter, id)) {
-        finish_source(ctx, id, outcome);
-    } else {
-        ctx.write_output(format_source_status(id, YUZU_SUPPORT_SUPPORTED, std::nullopt, "filtered"));
+        return finish_source(ctx, id, outcome);
     }
+    ctx.write_output(format_source_status(id, YUZU_SUPPORT_SUPPORTED, std::nullopt, "filtered"));
+    return false;
 }
 
 // ── 1. HKLM Run / RunOnce / RunOnceEx (native + WOW6432Node views) ───────
@@ -1307,23 +1313,43 @@ int collect_windows(yuzu::CommandContext& ctx, std::string_view filter) {
         }
     }
 
-    finish_source_or_filtered(ctx, filter, SourceId::win_run_hklm, run_hklm);
-    finish_source_or_filtered(ctx, filter, SourceId::win_runonce_hklm, runonce_hklm);
-    finish_source_or_filtered(ctx, filter, SourceId::win_runonceex_hklm, runonceex_hklm);
-    finish_source_or_filtered(ctx, filter, SourceId::win_run_hku, run_hku);
-    finish_source_or_filtered(ctx, filter, SourceId::win_runonce_hku, runonce_hku);
-    finish_source_or_filtered(ctx, filter, SourceId::win_startup_approved, startup_approved);
-    finish_source_or_filtered(ctx, filter, SourceId::win_winlogon_shell, winlogon_shell);
-    finish_source_or_filtered(ctx, filter, SourceId::win_winlogon_userinit, winlogon_userinit);
-    finish_source_or_filtered(ctx, filter, SourceId::win_appinit_dlls, appinit);
-    finish_source_or_filtered(ctx, filter, SourceId::win_ifeo_debugger, ifeo);
-    finish_source_or_filtered(ctx, filter, SourceId::win_startup_folder_common,
-                              startup_folder_common);
-    finish_source_or_filtered(ctx, filter, SourceId::win_startup_folder_user, startup_folder_user);
-    finish_source_or_filtered(ctx, filter, SourceId::win_scheduled_tasks, scheduled_tasks);
-    finish_source_or_filtered(ctx, filter, SourceId::win_wmi_subscriptions, wmi_subscriptions);
+    // Every source's own finish_source_or_filtered result is ORed together
+    // below -- true iff ANY source this leg processed resolved to
+    // CONSTRAINED -- so collect_windows's return value can surface a real
+    // acquisition degradation to do_list's aggregate CC-07 result-status
+    // (autoruns_plugin.cpp) instead of it being visible only in this leg's
+    // individual `source|` text lines.
+    bool any_constrained = false;
+    any_constrained |= finish_source_or_filtered(ctx, filter, SourceId::win_run_hklm, run_hklm);
+    any_constrained |=
+        finish_source_or_filtered(ctx, filter, SourceId::win_runonce_hklm, runonce_hklm);
+    any_constrained |=
+        finish_source_or_filtered(ctx, filter, SourceId::win_runonceex_hklm, runonceex_hklm);
+    any_constrained |= finish_source_or_filtered(ctx, filter, SourceId::win_run_hku, run_hku);
+    any_constrained |=
+        finish_source_or_filtered(ctx, filter, SourceId::win_runonce_hku, runonce_hku);
+    any_constrained |=
+        finish_source_or_filtered(ctx, filter, SourceId::win_startup_approved, startup_approved);
+    any_constrained |=
+        finish_source_or_filtered(ctx, filter, SourceId::win_winlogon_shell, winlogon_shell);
+    any_constrained |=
+        finish_source_or_filtered(ctx, filter, SourceId::win_winlogon_userinit, winlogon_userinit);
+    any_constrained |= finish_source_or_filtered(ctx, filter, SourceId::win_appinit_dlls, appinit);
+    any_constrained |= finish_source_or_filtered(ctx, filter, SourceId::win_ifeo_debugger, ifeo);
+    any_constrained |= finish_source_or_filtered(ctx, filter, SourceId::win_startup_folder_common,
+                                                 startup_folder_common);
+    any_constrained |= finish_source_or_filtered(ctx, filter, SourceId::win_startup_folder_user,
+                                                 startup_folder_user);
+    any_constrained |=
+        finish_source_or_filtered(ctx, filter, SourceId::win_scheduled_tasks, scheduled_tasks);
+    any_constrained |= finish_source_or_filtered(ctx, filter, SourceId::win_wmi_subscriptions,
+                                                 wmi_subscriptions);
 
-    return 0;
+    // Non-zero signals "at least one source reported CONSTRAINED" to
+    // do_list's aggregate -- distinct from this function's own success/
+    // failure, which this leg has no way to report other than an escaping
+    // exception (caught in execute()).
+    return any_constrained ? 1 : 0;
 }
 
 } // namespace yuzu::autoruns

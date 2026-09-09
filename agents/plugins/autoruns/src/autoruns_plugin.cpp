@@ -195,10 +195,15 @@ public:
         // No exception may escape this function: every leg below eventually
         // calls into untrusted-input parsers and third-party OS APIs, and an
         // uncaught exception crossing the extern "C" plugin-ABI boundary is
-        // undefined behaviour, not a clean failure. Every branch inside the
-        // try also agrees its int return with whatever it told
-        // set_result_status, so a caller reading either signal gets the same
-        // answer.
+        // undefined behaviour, not a clean failure. The int return reflects
+        // whether THIS COMMAND completed (0) or aborted (1 -- an exception,
+        // or an unknown action); it is NOT the same axis as set_result_status
+        // below, which carries whether the DATA this command produced is
+        // fully trustworthy. A `list` run that genuinely completes but had
+        // one or more sources report CONSTRAINED still returns 0 here --
+        // that degradation is set_result_status's job (do_list), not rc's.
+        // Only the exception paths below tie the two together (rc=1 always
+        // pairs with UNAVAILABLE there).
         try {
             if (action == "catalog") {
                 do_catalog(ctx);
@@ -240,10 +245,30 @@ private:
         // not this build's own OS resolve to autoruns_legs.hpp's foreign-OS
         // stub, so a `list` capture always names every source in the
         // catalog, the same completeness guarantee `catalog` gives.
-        yuzu::autoruns::collect_windows(ctx, filter);
-        yuzu::autoruns::collect_linux(ctx, filter);
-        yuzu::autoruns::collect_macos(ctx, filter);
-        return 0; // a degraded per-source read is reported via set_result_status, not this rc
+        //
+        // Each collect_* leg's own return value is non-zero iff it emitted
+        // at least one CONSTRAINED `source|` status (never for UNSUPPORTED
+        // -- a foreign-OS stub's normal, expected outcome -- and never for
+        // plain SUPPORTED); see each leg's own banner. ORing the three
+        // together and folding a true result into the typed CC-07 result
+        // status is what makes a real per-source acquisition failure
+        // visible to a fleet-scale consumer reading only that typed field,
+        // not just this leg's many individual `source|` text lines --
+        // previously the ONLY set_result_status call this plugin ever made
+        // was on the exception path, so a degraded-but-completed `list` run
+        // always left the typed result at UNDECLARED.
+        const int windows_rc = yuzu::autoruns::collect_windows(ctx, filter);
+        const int linux_rc = yuzu::autoruns::collect_linux(ctx, filter);
+        const int macos_rc = yuzu::autoruns::collect_macos(ctx, filter);
+        if (windows_rc != 0 || linux_rc != 0 || macos_rc != 0) {
+            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "autoruns:degraded");
+        }
+        // The list command itself always completes here -- a genuinely
+        // degraded-but-completed read is reported via set_result_status
+        // above, never by this rc (distinct from execute()'s exception
+        // path, the only case that reports autoruns:UNAVAILABLE/rc=1).
+        return 0;
     }
 };
 

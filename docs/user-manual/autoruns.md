@@ -91,6 +91,31 @@ versus one that could not be read at all:
   reason. Either way, a partial listing is never reported as a complete
   `supported` result.
 
+### Typed result status (CC-07)
+
+Every `source|` line above is text output -- a consumer must parse each one
+to notice a degradation. `list` also sets the plugin's typed ABI4 CC-07
+result status (`YuzuResultStatus`/`YuzuResultCompleteness`) so a fleet-scale
+consumer that only reads that typed field, never the text stream, still
+learns of a real acquisition failure:
+
+- **`UNDECLARED`** -- every source this run processed reported `supported`
+  (or `unsupported`, the normal outcome for a foreign-OS stub leg) with no
+  `constrained` status anywhere in the run.
+- **`CONSTRAINED` / `PARTIAL` / `autoruns:degraded`** -- at least one source
+  reported `constrained` (any reason). The `list` command itself still
+  completed normally: this run is still `rc=0`, matching `catalog`'s own
+  always-`rc=0` contract -- `rc` answers "did the command abort", not "did
+  every source read cleanly". On Linux, `lnx_init_d` and
+  `lnx_systemd_timers_user` are catalog-declared permanently `constrained`
+  (see above), so an unfiltered Linux `list` run always reports
+  `CONSTRAINED` here; macOS is the same via `mac_login_items`. Windows has
+  no permanently-constrained source, so whether a given run degrades depends
+  on live host state.
+- **`UNAVAILABLE` / `PARTIAL` / `autoruns:exception`** -- an exception
+  escaped a leg (`execute()`'s catch clauses); the command itself aborted,
+  `rc=1`.
+
 ## Versioned source catalog
 
 Support: **S**upported (rung 1, direct read), **C**onstrained (reads, but

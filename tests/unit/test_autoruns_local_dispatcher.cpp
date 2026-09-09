@@ -190,6 +190,59 @@ TEST_CASE("autoruns plugin: list emits a source status per catalog source, every
     CHECK(autorun_row_count > 0);
 }
 
+TEST_CASE("autoruns plugin: a genuinely constrained source surfaces through the typed "
+          "CC-07 result status, not just its own source| text line "
+          "(RECONSTRUCTION: pins the governance-run top finding -- Gate 4 unhappy-path, "
+          "Gate 5 chaos-injector, and Gate 6 sre independently converged on this gap: "
+          "execute()'s only set_result_status call was the exception path, so a "
+          "degraded-but-completed `list` run -- one where a real source reported "
+          "CONSTRAINED -- left the typed result at UNDECLARED, indistinguishable from a "
+          "fully clean run to any fleet-scale consumer reading only the typed field "
+          "rather than parsing every source| line)",
+          "[autoruns][actions]") {
+    auto plugin = load_autoruns_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+
+    yuzu::agent::LocalDispatcher dispatcher;
+    auto result = dispatcher.run(plugin->descriptor, "list");
+    // A degraded-but-completed list run is still a successful command
+    // execution -- rc=0 is reserved for "this command itself aborted"
+    // (exception/unknown action), a different axis from the typed
+    // result-status asserted below (autoruns_plugin.cpp's do_list banner).
+    CHECK(result.rc == 0);
+
+#if defined(__linux__)
+    // lnx_init_d and lnx_systemd_timers_user are catalog-declared
+    // permanently CONSTRAINED (autoruns_catalog.hpp) -- never SUPPORTED,
+    // regardless of host state (lnx_init_d: listing-only, no runlevel-
+    // wiring read; lnx_systemd_timers_user: narrow_search_path_coverage, a
+    // permanent search-path gap). An unfiltered `list` run on this host is
+    // therefore GUARANTEED to include at least one CONSTRAINED source line
+    // -- so the aggregate must surface too.
+    CHECK(result.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(result.result_provenance == "autoruns:degraded");
+#elif defined(__APPLE__)
+    // mac_login_items is likewise always CONSTRAINED -- the list lives in a
+    // private per-user BTM database with no public read API, so this leg
+    // never even attempts a real read for it (autoruns_macos.cpp banner).
+    CHECK(result.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(result.result_provenance == "autoruns:degraded");
+#else
+    // Windows has no catalog-declared permanently-CONSTRAINED source, so
+    // whether this run degrades depends on live host state -- not asserted
+    // here, but confirm the typed fields at least reach a real value
+    // (UNDECLARED is only correct pre-fix, on a run with zero CONSTRAINED
+    // sources; CONSTRAINED is correct whenever at least one source degrades).
+    CHECK((result.result_status == YUZU_RESULT_STATUS_UNDECLARED ||
+          result.result_status == YUZU_RESULT_STATUS_CONSTRAINED));
+#endif
+}
+
 TEST_CASE("autoruns plugin: a sources= filter still reports a status for every catalog "
           "source, never silently omitting the excluded ones",
           "[autoruns][actions]") {
