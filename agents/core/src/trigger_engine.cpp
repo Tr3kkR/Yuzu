@@ -160,6 +160,15 @@ void TriggerEngine::stop() {
 
     spdlog::info("TriggerEngine stopping...");
 
+    // Acquiring stop_mu_ here (even though running_ is already flipped) closes
+    // the lost-wakeup race against wait_or_stopping()/registry_watch_loop()'s
+    // cv.wait: it guarantees a worker can't be caught between checking the
+    // predicate and entering the wait when notify_all() fires below.
+    {
+        std::lock_guard<std::mutex> lock(stop_mu_);
+    }
+    stop_cv_.notify_all();
+
     for (auto& t : workers_) {
         if (t.joinable()) {
             t.join();
@@ -168,6 +177,12 @@ void TriggerEngine::stop() {
     workers_.clear();
 
     spdlog::info("TriggerEngine stopped");
+}
+
+bool TriggerEngine::wait_or_stopping(std::chrono::milliseconds dur) {
+    std::unique_lock<std::mutex> lock(stop_mu_);
+    return stop_cv_.wait_for(lock, dur,
+                             [this] { return !running_.load(std::memory_order_acquire); });
 }
 
 size_t TriggerEngine::trigger_count() const {
@@ -232,12 +247,9 @@ void TriggerEngine::interval_loop() {
     // Track last fire time per trigger for interval calculation
     std::map<std::string, std::chrono::steady_clock::time_point> last_fired;
 
-    while (running_.load(std::memory_order_acquire)) {
-        // Sleep in 1-second increments for responsive shutdown
-        std::this_thread::sleep_for(std::chrono::seconds{1});
-        if (!running_.load(std::memory_order_acquire))
-            break;
-
+    // Poll every second; wait_or_stopping wakes immediately on stop() instead
+    // of riding out the full second.
+    while (!wait_or_stopping(std::chrono::seconds{1})) {
         auto now = std::chrono::steady_clock::now();
 
         // Take a snapshot of interval triggers
@@ -292,14 +304,8 @@ void TriggerEngine::interval_loop() {
 void TriggerEngine::file_watch_loop() {
     spdlog::debug("TriggerEngine: file_watch_loop started");
 
-    while (running_.load(std::memory_order_acquire)) {
-        // Poll every 5 seconds
-        for (int i = 0; i < 5 && running_.load(std::memory_order_acquire); ++i) {
-            std::this_thread::sleep_for(std::chrono::seconds{1});
-        }
-        if (!running_.load(std::memory_order_acquire))
-            break;
-
+    // Poll every 5 seconds; wait_or_stopping wakes immediately on stop().
+    while (!wait_or_stopping(std::chrono::seconds{5})) {
         // Take a snapshot of file change triggers
         std::vector<TriggerConfig> snapshot;
         {
@@ -358,14 +364,8 @@ void TriggerEngine::file_watch_loop() {
 void TriggerEngine::service_watch_loop() {
     spdlog::debug("TriggerEngine: service_watch_loop started");
 
-    while (running_.load(std::memory_order_acquire)) {
-        // Poll every 30 seconds
-        for (int i = 0; i < 30 && running_.load(std::memory_order_acquire); ++i) {
-            std::this_thread::sleep_for(std::chrono::seconds{1});
-        }
-        if (!running_.load(std::memory_order_acquire))
-            break;
-
+    // Poll every 30 seconds; wait_or_stopping wakes immediately on stop().
+    while (!wait_or_stopping(std::chrono::seconds{30})) {
         // Take a snapshot of service status triggers
         std::vector<TriggerConfig> snapshot;
         {
@@ -552,9 +552,9 @@ void TriggerEngine::registry_watch_loop() {
             }
         }
 
-        // Sleep 2 seconds between polls
-        for (int i = 0; i < 2 && running_.load(std::memory_order_acquire); ++i) {
-            std::this_thread::sleep_for(std::chrono::seconds{1});
+        // Sleep 2 seconds between polls; wake immediately on stop().
+        if (wait_or_stopping(std::chrono::seconds{2})) {
+            break;
         }
     }
 
@@ -566,10 +566,11 @@ void TriggerEngine::registry_watch_loop() {
 
 void TriggerEngine::registry_watch_loop() {
     spdlog::debug("TriggerEngine: registry_watch_loop is a no-op on this platform");
-    // No registry on Linux/macOS — just wait for shutdown
-    while (running_.load(std::memory_order_acquire)) {
-        std::this_thread::sleep_for(std::chrono::seconds{5});
-    }
+    // No registry on Linux/macOS — block until stop() notifies rather than
+    // polling a fixed sleep, which used to leave stop()/~TriggerEngine()
+    // waiting up to 5s for this thread to wake up and notice running_ flipped.
+    std::unique_lock<std::mutex> lock(stop_mu_);
+    stop_cv_.wait(lock, [this] { return !running_.load(std::memory_order_acquire); });
 }
 
 #endif
