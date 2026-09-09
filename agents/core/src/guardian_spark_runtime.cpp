@@ -1279,6 +1279,12 @@ GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id, std::string
     // claim - and the next same-key attach then hit the keys_.emplace hard error.
     // The ->0 edge is PREDICTED from the refcount (same lock, nothing can change it
     // between here and remove_rule) instead of learned from remove_rule's return.
+    // Adversarial re-review r3 C4: the lifecycle kind is copied HERE, before the durable
+    // mutation, not at the enqueue call after it - that copy allocates, and a throw
+    // there used to unwind past the claim hand-off with rules_/index_/keys_ already
+    // erased (the queued disarm never driven, the audit record lost).
+    detach_post_fault_here_for_test(1); // seam: "the lifecycle-kind copy threw" (pre-mutation)
+    const std::string kind_str{lifecycle_kind};
     std::shared_ptr<KeyClaim> work;
     bool claim_pushed = false;
     std::optional<std::uint64_t> inline_disarm; // inline type: disarmed synchronously below
@@ -1331,14 +1337,27 @@ GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id, std::string
         detach_claim_failures_.fetch_add(1, std::memory_order_relaxed);
         throw;
     }
-    // From here to the claim hand-off nothing can throw: rules_.erase, keys_.erase and
-    // the shared_ptr copy are noexcept and the claim already sits at the head of its
-    // entry (mutation-site audit in the PR body).
+    // From here to the claim hand-off (`return work`) the function ALWAYS reaches the
+    // hand-off: rules_.erase, keys_.erase, pending_initial.erase and the shared_ptr copy
+    // are noexcept; the two remaining allocating steps are CONTAINED, not absent
+    // (adversarial re-review r3 C4, which found the earlier "nothing can throw" claim
+    // false): outbox_.drop_rule builds an owning Key string per matching entry
+    // (guardian_outbox.hpp) and is wrapped below - a throw there is counted and the
+    // teardown continues; enqueue_lifecycle_locked's disarm branch is firewalled
+    // inside itself (journal_stage_failures_) and its only caller-side allocation, the
+    // kind string, was moved ahead of the mutation above. The inline-type synchronous
+    // backend_->disarm is pre-existing and unchanged.
     if (known)
         rules_.erase(rule_id);
-    {
+    try {
+        detach_post_fault_here_for_test(2); // seam: "drop_rule's Key allocation threw"
         std::lock_guard<std::mutex> ob{outbox_mu_};
         outbox_.drop_rule(rule_id); // compliance/health only - Lifecycle lives in lifecycle_log_
+    } catch (...) {
+        // Compliance/health entries for a withdrawn rule may linger in the outbox until
+        // its generation-supersede purge or the drain's own staleness check; the
+        // durable state and the queued disarm are unaffected. Counted.
+        detach_post_commit_failures_.fetch_add(1, std::memory_order_relaxed);
     }
     assert(disarm_key.has_value() == last_on_key); // the prediction and the edge agree
     if (disarm_key) {
@@ -1363,7 +1382,8 @@ GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id, std::string
             kit->second->pending_initial.erase(rule_id);
     }
     if (known)
-        enqueue_lifecycle_locked(rule_id, gen, std::string(lifecycle_kind), guard_type, rule_name);
+        enqueue_lifecycle_locked(rule_id, gen, kind_str, guard_type, rule_name); // disarm
+                                                        // branch: firewalled inside
     return work;
 }
 
@@ -2429,6 +2449,10 @@ std::vector<std::string> GuardianSparkRuntime::keys_with_pending_initial() const
 
 void GuardianSparkRuntime::set_drain_fault_point_for_test(int point) noexcept {
     drain_fault_point_for_test_.store(point);
+}
+
+void GuardianSparkRuntime::set_detach_post_fault_point_for_test(int point) noexcept {
+    detach_post_fault_point_for_test_.store(point);
 }
 
 void GuardianSparkRuntime::set_index_remove_fault_for_test(bool on) noexcept {

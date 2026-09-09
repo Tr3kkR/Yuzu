@@ -5401,3 +5401,66 @@ TEST_CASE("rung 9c R5.2 (adversarial re-review r3 C2): a throwing index release 
     CHECK(WEXITSTATUS(status) == 0);
 }
 #endif
+
+// rung 9c R5.2 - adversarial re-review r3 (C4): after detach_rule_locked's durable
+// mutation, the compliance-outbox purge (outbox_.drop_rule builds an owning Key string
+// per match) can throw. It is CONTAINED: the teardown completes, the queued disarm is
+// still handed to the caller and driven, the "disarmed" audit is staged, the failure
+// counted.
+TEST_CASE("rung 9c R5.2 (adversarial re-review r3 C4): a throw in the outbox purge after the "
+          "durable detach is contained - the queued disarm is still driven and the audit staged",
+          "[spark][runtime][liveness]") {
+    // Mutation (the pre-fix shape): drop_rule unwrapped -> the throw unwinds past the
+    // claim hand-off: detach_rule throws, the disarm claim sits queued and undriven
+    // (disarms stays 0), no "disarmed" audit entry.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+    REQUIRE(b->armed_ids().size() == 1);
+    const auto key = spark_key(file_spec("/a"));
+
+    rt->set_detach_post_fault_point_for_test(2);
+    REQUIRE_NOTHROW(rt->detach_rule("r1"));
+    CHECK(rt->detach_post_commit_failures() == 1);
+    CHECK(rt->rule_count() == 0);
+    CHECK(rt->armed_key_count() == 0);
+    REQUIRE(b->disarmed_ids().size() == 1); // the queued disarm was driven
+    CHECK(b->disarmed_ids()[0] == b->armed_ids()[0]);
+    CHECK(rt->claim_queue_depth_for_test(key) == 0);
+    CHECK(drain_lifecycle(*rt).size() == 2); // "armed" at attach + "disarmed" at detach
+}
+
+// rung 9c R5.2 - adversarial re-review r3 (C4): the lifecycle-kind string copy, the
+// caller-side allocation that used to sit AFTER the durable mutation, now runs before
+// it, so a throw there fails the detach cleanly with the rule still confirmed.
+TEST_CASE("rung 9c R5.2 (adversarial re-review r3 C4): a throw at the lifecycle-kind copy fails "
+          "the detach BEFORE any durable mutation - the rule stays confirmed and a retried "
+          "detach disarms once",
+          "[spark][runtime][liveness]") {
+    // Mutation (the pre-fix placement): the copy (and the seam) after rules_.erase /
+    // keys_.erase -> the throw leaves rule_count() == 0 with the queued disarm undriven
+    // and the retry finds nothing to detach (disarms stays 0).
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+    REQUIRE(b->armed_ids().size() == 1);
+    const auto key = spark_key(file_spec("/a"));
+
+    rt->set_detach_post_fault_point_for_test(1);
+    REQUIRE_THROWS_AS(rt->detach_rule("r1"), std::bad_alloc);
+    CHECK(rt->rule_count() == 1);
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 0);
+    CHECK(b->disarms.load() == 0);
+    CHECK(rt->detach_claim_failures() == 0);
+    CHECK(rt->detach_post_commit_failures() == 0);
+
+    rt->detach_rule("r1"); // the retry: one disarm of exactly the armed subscription
+    CHECK(rt->rule_count() == 0);
+    CHECK(rt->armed_key_count() == 0);
+    REQUIRE(b->disarmed_ids().size() == 1);
+    CHECK(b->disarmed_ids()[0] == b->armed_ids()[0]);
+    CHECK(rt->claim_queue_depth_for_test(key) == 0);
+}

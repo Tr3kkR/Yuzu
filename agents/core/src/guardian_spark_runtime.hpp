@@ -611,6 +611,19 @@ public:
     /// index_->remove_rule's own key-copy allocation would, BEFORE the mapping or the
     /// claim's index_held flag is touched.
     void set_index_remove_fault_for_test(bool on) noexcept;
+    /// R5.2 detach post-mutation fault seam (adversarial re-review r3 C4): consumed
+    /// once by the next detach_rule_locked. 1 = std::bad_alloc where the lifecycle-kind
+    /// string copy allocates (now BEFORE the durable mutation: the detach fails cleanly
+    /// with the rule intact); 2 = std::bad_alloc where outbox_.drop_rule's Key
+    /// allocation would (AFTER the mutation: contained and counted, the queued disarm
+    /// is still handed to the caller). 0 = off.
+    void set_detach_post_fault_point_for_test(int point) noexcept;
+    /// R5.2 (r3 C4): a post-mutation, non-durable step of detach_rule_locked
+    /// (outbox_.drop_rule) threw and was contained; the teardown and the queued disarm
+    /// completed regardless. Expected 0. Lock-free.
+    [[nodiscard]] std::uint64_t detach_post_commit_failures() const noexcept {
+        return detach_post_commit_failures_.load(std::memory_order_relaxed);
+    }
     /// R5.2: detach_rule_locked found itself unable to hand the subscription to a
     /// disarm claim (a throw inside index_->remove_rule after the claim was pushed,
     /// or the cannot-happen prediction mismatch) and took the counted rollback / last
@@ -1064,6 +1077,14 @@ private:
     std::atomic<int> drain_fault_point_for_test_{0};  ///< see the setter
     std::atomic<bool> detach_fault_for_test_{false};  ///< see the setter
     std::atomic<bool> index_remove_fault_for_test_{false}; ///< see the setter
+    std::atomic<std::uint64_t> detach_post_commit_failures_{0}; ///< r3 C4: contained drop_rule throw
+    std::atomic<int> detach_post_fault_point_for_test_{0}; ///< see the setter
+    /// Seam body for set_detach_post_fault_point_for_test; consumed once at `point`.
+    void detach_post_fault_here_for_test(int point) {
+        int expected = point;
+        if (detach_post_fault_point_for_test_.compare_exchange_strong(expected, 0))
+            throw std::bad_alloc{};
+    }
     /// Seam body for set_index_remove_fault_for_test; consumed once.
     void index_remove_fault_here_for_test() {
         if (index_remove_fault_for_test_.exchange(false))
