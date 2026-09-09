@@ -302,6 +302,22 @@ This closes the cross-replica gap noted in the ADR-0056 Follow-ups: two
 replicas racing a remediate call for the same policy/agent can no longer both
 dispatch a fix.
 
+**Scope of the guarantee.** This holds between replicas running the **same
+schema version**. A rolling upgrade across the migration boundary can
+transiently run an old binary that predates the durable claim alongside a new
+one; that mixed-version window is gated today by issue #4014 (which blocks
+running a second production replica) pending a durable cluster-capability
+admission gate. The exposure is one-directional: a row written by an old
+binary carries claim-generation `0`, a value a new binary never mints.
+Separately, this is effectively-once, not exactly-once (consistent with
+ADR-2002): a replica that pauses for longer than `fixing_stale_seconds`
+between winning a claim and actually sending a command over gRPC — the fix,
+or the subsequent post-fix verify — can still
+dispatch that one send after a sibling has reclaimed the target — the wire
+send is not itself transactionally fenced. The durable claim prevents
+concurrent or duplicate *claims*; it bounds, but does not make impossible, a
+single late duplicate *dispatch* from a long-paused claim-holder.
+
 **Behaviour changes you will see:**
 
 - **A new 409 cause.** `POST /api/policies/{id}/remediate` can now refuse
@@ -318,9 +334,11 @@ dispatch a fix.
   `agent_ids`) must be updated to tolerate `agents` being smaller than the
   number of targets requested.
 
-**Migration note:** schema migration v2 adds
-`policy_status.remediation_claim_at` (`BIGINT NOT NULL DEFAULT 0`). It runs
-automatically on upgrade, is metadata-only, and requires no operator action
+**Migration note:** schema migrations v2–v4 add
+`policy_status.remediation_claim_at` (v2), `policy_status.remediation_claim_gen`
+(v3, the ABA claim-generation fence), and the `remediation_claim_seq` sequence
+(v4) — all `BIGINT NOT NULL DEFAULT 0` columns plus one sequence. They run
+automatically on upgrade, are metadata-only, and require no operator action
 and no downtime.
 
 **Post-restart note:** after a restart, a durable claim left behind by the

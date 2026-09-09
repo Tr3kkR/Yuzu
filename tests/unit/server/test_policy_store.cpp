@@ -21,6 +21,7 @@
 
 #include "policy_store.hpp"
 
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "store_errors.hpp"
@@ -1357,6 +1358,14 @@ TEST_CASE("claim_due_policies does not claim a disabled policy",
 
 TEST_CASE("claim_due_policies sweeps a stale 'fixing' row back to 'unknown'",
           "[policy_store][pg][claim]") {
+    // HA WS-3 3.4 review B2 follow-on: the stranded-'fixing' sweep's
+    // staleness cutoff is now authored from Postgres NOW() in-SQL (the SAME
+    // authority claim_remediation's own staleness guard uses), NOT the
+    // `now` param claim_due_policies otherwise uses for its due-policy
+    // interval check — passing a future fake `now` no longer ages this row
+    // for the sweep. Simulating staleness means backdating the stored
+    // `last_fix_at` directly, same technique as claim_remediation's own
+    // `backdate_claim` helper above.
     YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
@@ -1367,13 +1376,10 @@ TEST_CASE("claim_due_policies sweeps a stale 'fixing' row back to 'unknown'",
     REQUIRE(pol.has_value());
     REQUIRE(store.update_agent_status(pol.value(), "agent-1", "fixing").has_value());
 
-    // update_agent_status stamps last_fix_at from the REAL wall clock (it
-    // has no injectable NowFn, unlike claim_due_policies) — t0 must be
-    // real-clock-relative or the staleness comparison is meaningless.
-    int64_t t0 = std::chrono::duration_cast<std::chrono::seconds>(
-                     std::chrono::system_clock::now().time_since_epoch())
-                     .count();
-    // Within the staleness window: untouched.
+    int64_t t0 = 1000000; // the due-policy interval check still reads this param.
+
+    // Within the staleness window (last_fix_at is fresh, just stamped from
+    // real NOW() by update_agent_status above): untouched.
     auto claimed1 = store.claim_due_policies(t0, 3600, 1800);
     REQUIRE(claimed1.has_value());
     auto s1 = store.get_agent_status(pol.value(), "agent-1");
@@ -1381,8 +1387,20 @@ TEST_CASE("claim_due_policies sweeps a stale 'fixing' row back to 'unknown'",
     REQUIRE(s1->has_value());
     CHECK((*s1)->status == "fixing");
 
-    // Past the staleness window: swept to 'unknown'.
-    auto claimed2 = store.claim_due_policies(t0 + 1801, 3600, 1800);
+    // Past the staleness window: backdate last_fix_at (real Postgres NOW()
+    // minus 1801s), then the sweep's own NOW()-authored cutoff catches it.
+    {
+        auto lease = pool.try_acquire_for(std::chrono::milliseconds{2000});
+        REQUIRE(lease);
+        auto r = yuzu::server::pg::exec_params(
+            lease.get(),
+            "UPDATE policy_store.policy_status SET last_fix_at = "
+            "EXTRACT(EPOCH FROM NOW())::bigint - 1801 "
+            "WHERE policy_id = $1 AND agent_id = $2",
+            std::vector<std::string>{pol.value(), std::string("agent-1")});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    auto claimed2 = store.claim_due_policies(t0 + 1, 3600, 1800);
     REQUIRE(claimed2.has_value());
     auto s2 = store.get_agent_status(pol.value(), "agent-1");
     REQUIRE(s2.has_value());
@@ -1390,9 +1408,94 @@ TEST_CASE("claim_due_policies sweeps a stale 'fixing' row back to 'unknown'",
     CHECK((*s2)->status == "unknown");
 }
 
+TEST_CASE("claim_due_policies sweep does NOT erase a FRESH reclaim of a stranded row "
+          "(HA WS-3 3.4 adversarial review C3/K1 — Codex+Kimi)",
+          "[policy_store][pg][claim]") {
+    // Regression for the sweep-erases-a-live-reclaim race. A reclaim
+    // (claim_remediation's ON CONFLICT) refreshes remediation_claim_at + _gen
+    // but NOT last_fix_at/status; only the reclaimer's LATER mark-fixing write
+    // refreshes last_fix_at. So a row a sibling just reclaimed carries a FRESH
+    // claim_at but the dead ex-holder's OLD last_fix_at + status 'fixing'. A
+    // sweep gated on last_fix_at ALONE would zero that live claim, freeing the
+    // row for a third claimant → duplicate dispatch by two un-paused holders,
+    // OUTSIDE the effectively-once residual. The fix gates the sweep on
+    // remediation_claim_at freshness too.
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+    auto pol = store.create_policy(make_policy_yaml(frag.value()));
+    REQUIRE(pol.has_value());
+
+    // A claims agent-1 and marks it 'fixing' (stamps last_fix_at = NOW), then
+    // strands it: backdate BOTH last_fix_at AND remediation_claim_at to well
+    // past the window, simulating A dying mid-flight.
+    auto claimA = store.claim_remediation(pol.value(), {"agent-1"}, 1800);
+    REQUIRE(claimA.has_value());
+    REQUIRE(claimA->ids.size() == 1);
+    REQUIRE(store.update_agent_status(pol.value(), "agent-1", "fixing", "", claimA->generation)
+                .has_value());
+    {
+        auto lease = pool.try_acquire_for(std::chrono::milliseconds{2000});
+        REQUIRE(lease);
+        auto r = yuzu::server::pg::exec_params(
+            lease.get(),
+            "UPDATE policy_store.policy_status SET "
+            "  last_fix_at = EXTRACT(EPOCH FROM NOW())::bigint - 1801, "
+            "  remediation_claim_at = EXTRACT(EPOCH FROM NOW())::bigint - 1801 "
+            "WHERE policy_id = $1 AND agent_id = $2",
+            std::vector<std::string>{pol.value(), std::string("agent-1")});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+
+    // B reclaims the stranded row: claim_at is refreshed to NOW (FRESH), gen
+    // bumped — but status stays 'fixing' and last_fix_at stays 1801s old
+    // (claim_remediation touches neither). This is the exact race precondition.
+    auto claimB = store.claim_remediation(pol.value(), {"agent-1"}, 1800);
+    REQUIRE(claimB.has_value());
+    REQUIRE(claimB->ids.size() == 1);
+    CHECK(claimB->generation != claimA->generation);
+
+    // The leader sweep runs. Pre-fix it matched on the old last_fix_at and
+    // zeroed B's fresh claim; the fix's claim-age guard must now EXCLUDE it.
+    auto swept = store.claim_due_policies(1000000, 3600, 1800);
+    REQUIRE(swept.has_value());
+
+    // B's claim survived: status is still 'fixing' (not reset to 'unknown')...
+    auto s = store.get_agent_status(pol.value(), "agent-1");
+    REQUIRE(s.has_value());
+    REQUIRE(s->has_value());
+    CHECK((*s)->status == "fixing");
+    // ...and a third claimant C still gets NOTHING, because B's fresh claim_at
+    // was not zeroed. (Pre-fix the sweep zeroed it and C would win — the
+    // double-dispatch this test exists to prevent.)
+    auto claimC = store.claim_remediation(pol.value(), {"agent-1"}, 1800);
+    REQUIRE(claimC.has_value());
+    CHECK(claimC->ids.empty());
+}
+
 // ============================================================================
 // claim_remediation / release_remediation_claim (HA WS-3 3.4)
 // ============================================================================
+
+// Backdate an existing claim so the pg-NOW() staleness guard sees it as
+// aged. Staleness is authored AND adjudicated entirely from Postgres NOW()
+// (review B2) -- claim_remediation takes no `now` param -- so simulating a
+// stale claim in a test means rewriting the stored `remediation_claim_at`
+// directly, not passing a different fake clock value.
+static void backdate_claim(PgPool& pool, const std::string& pol, const std::string& agent,
+                           int64_t seconds_ago) {
+    auto lease = pool.try_acquire_for(std::chrono::milliseconds{2000});
+    REQUIRE(lease);
+    auto r = yuzu::server::pg::exec_params(
+        lease.get(),
+        "UPDATE policy_store.policy_status SET remediation_claim_at = EXTRACT(EPOCH FROM NOW())::bigint - $3::bigint "
+        "WHERE policy_id = $1 AND agent_id = $2",
+        std::vector<std::string>{pol, agent, std::to_string(seconds_ago)});
+    REQUIRE(r.status() == PGRES_COMMAND_OK);
+}
 
 TEST_CASE("claim_remediation claims a fresh target with no pre-existing policy_status row "
           "(the UPSERT branch)",
@@ -1409,10 +1512,10 @@ TEST_CASE("claim_remediation claims a fresh target with no pre-existing policy_s
     // "agent-1" has never been checked/fixed for this policy -- no
     // policy_status row exists yet. An UPDATE-only claim would silently
     // claim nothing here; this is the regression test for that.
-    auto claimed = store.claim_remediation(pol.value(), {"agent-1"}, 1000, 1800);
+    auto claimed = store.claim_remediation(pol.value(), {"agent-1"}, 1800);
     REQUIRE(claimed.has_value());
-    REQUIRE(claimed->size() == 1);
-    CHECK((*claimed)[0] == "agent-1");
+    REQUIRE(claimed->ids.size() == 1);
+    CHECK(claimed->ids[0] == "agent-1");
 
     auto s = store.get_agent_status(pol.value(), "agent-1");
     REQUIRE(s.has_value());
@@ -1437,10 +1540,10 @@ TEST_CASE("claim_remediation dedups a duplicate agent id in the input list",
     auto pol = store.create_policy(make_policy_yaml(frag.value()));
     REQUIRE(pol.has_value());
 
-    auto claimed = store.claim_remediation(pol.value(), {"agentX", "agentX"}, 1000, 1800);
+    auto claimed = store.claim_remediation(pol.value(), {"agentX", "agentX"}, 1800);
     REQUIRE(claimed.has_value());
-    REQUIRE(claimed->size() == 1);
-    CHECK((*claimed)[0] == "agentX");
+    REQUIRE(claimed->ids.size() == 1);
+    CHECK(claimed->ids[0] == "agentX");
 }
 
 TEST_CASE("claim_remediation refuses a second concurrent claim of the same target",
@@ -1454,15 +1557,15 @@ TEST_CASE("claim_remediation refuses a second concurrent claim of the same targe
     auto pol = store.create_policy(make_policy_yaml(frag.value()));
     REQUIRE(pol.has_value());
 
-    auto claimed1 = store.claim_remediation(pol.value(), {"agent-1"}, 1000, 1800);
+    auto claimed1 = store.claim_remediation(pol.value(), {"agent-1"}, 1800);
     REQUIRE(claimed1.has_value());
-    REQUIRE(claimed1->size() == 1);
+    REQUIRE(claimed1->ids.size() == 1);
 
-    // Still within the staleness window: a second claim attempt (a sibling
+    // Fresh claim, no backdating: a second claim attempt (a sibling
     // replica, or the same replica's own retry) gets nothing back.
-    auto claimed2 = store.claim_remediation(pol.value(), {"agent-1"}, 1010, 1800);
+    auto claimed2 = store.claim_remediation(pol.value(), {"agent-1"}, 1800);
     REQUIRE(claimed2.has_value());
-    CHECK(claimed2->empty());
+    CHECK(claimed2->ids.empty());
 }
 
 TEST_CASE("claim_remediation refuses a target that has already exhausted the fix retry cap",
@@ -1489,9 +1592,9 @@ TEST_CASE("claim_remediation refuses a target that has already exhausted the fix
     // Even fully unclaimed (remediation_claim_at is still its default 0),
     // the retry-cap guard in claim_remediation's own WHERE clause refuses
     // this target -- there is nothing left to remediate it with.
-    auto claimed = store.claim_remediation(pol.value(), {"agent-1"}, 2000, 1800);
+    auto claimed = store.claim_remediation(pol.value(), {"agent-1"}, 1800);
     REQUIRE(claimed.has_value());
-    CHECK(claimed->empty());
+    CHECK(claimed->ids.empty());
 }
 
 TEST_CASE("claim_remediation re-claims a stale claim past the staleness window",
@@ -1505,22 +1608,24 @@ TEST_CASE("claim_remediation re-claims a stale claim past the staleness window",
     auto pol = store.create_policy(make_policy_yaml(frag.value()));
     REQUIRE(pol.has_value());
 
-    auto claimed1 = store.claim_remediation(pol.value(), {"agent-1"}, 1000, 1800);
+    auto claimed1 = store.claim_remediation(pol.value(), {"agent-1"}, 1800);
     REQUIRE(claimed1.has_value());
-    REQUIRE(claimed1->size() == 1);
+    REQUIRE(claimed1->ids.size() == 1);
 
     // Just short of the staleness window: still refused.
-    auto claimed_early = store.claim_remediation(pol.value(), {"agent-1"}, 1000 + 1799, 1800);
+    backdate_claim(pool, pol.value(), "agent-1", 1799);
+    auto claimed_early = store.claim_remediation(pol.value(), {"agent-1"}, 1800);
     REQUIRE(claimed_early.has_value());
-    CHECK(claimed_early->empty());
+    CHECK(claimed_early->ids.empty());
 
     // Past the staleness window (the claiming replica presumably died): a
     // fresh claim succeeds, same as `claim_due_policies`'s own stranded-
     // 'fixing' staleness sweep.
-    auto claimed2 = store.claim_remediation(pol.value(), {"agent-1"}, 1000 + 1801, 1800);
+    backdate_claim(pool, pol.value(), "agent-1", 1801);
+    auto claimed2 = store.claim_remediation(pol.value(), {"agent-1"}, 1800);
     REQUIRE(claimed2.has_value());
-    REQUIRE(claimed2->size() == 1);
-    CHECK((*claimed2)[0] == "agent-1");
+    REQUIRE(claimed2->ids.size() == 1);
+    CHECK(claimed2->ids[0] == "agent-1");
 }
 
 TEST_CASE("release_remediation_claim frees a claim so it can be re-claimed immediately",
@@ -1534,22 +1639,122 @@ TEST_CASE("release_remediation_claim frees a claim so it can be re-claimed immed
     auto pol = store.create_policy(make_policy_yaml(frag.value()));
     REQUIRE(pol.has_value());
 
-    auto claimed1 = store.claim_remediation(pol.value(), {"agent-1"}, 1000, 1800);
+    auto claimed1 = store.claim_remediation(pol.value(), {"agent-1"}, 1800);
     REQUIRE(claimed1.has_value());
-    REQUIRE(claimed1->size() == 1);
+    REQUIRE(claimed1->ids.size() == 1);
+    const int64_t gen1 = claimed1->generation;
 
     // Still well within the staleness window -- without an explicit
     // release, a re-claim here would be refused (see the "second concurrent
     // claim" test above).
-    REQUIRE(store.release_remediation_claim(pol.value(), {"agent-1"}).has_value());
+    REQUIRE(store.release_remediation_claim(pol.value(), {"agent-1"}, gen1).has_value());
 
-    auto claimed2 = store.claim_remediation(pol.value(), {"agent-1"}, 1005, 1800);
+    auto claimed2 = store.claim_remediation(pol.value(), {"agent-1"}, 1800);
     REQUIRE(claimed2.has_value());
-    REQUIRE(claimed2->size() == 1);
-    CHECK((*claimed2)[0] == "agent-1");
+    REQUIRE(claimed2->ids.size() == 1);
+    CHECK(claimed2->ids[0] == "agent-1");
 
     // Releasing an already-unclaimed / never-claimed target is a benign
-    // no-op, not an error.
-    REQUIRE(store.release_remediation_claim(pol.value(), {"agent-1"}).has_value());
-    REQUIRE(store.release_remediation_claim("nonexistent-policy", {"agent-99"}).has_value());
+    // no-op, not an error -- any generation value is fine here, the point is
+    // that it returns Ok, not that it frees anything.
+    REQUIRE(store.release_remediation_claim(pol.value(), {"agent-1"}, claimed2->generation)
+                .has_value());
+    REQUIRE(store.release_remediation_claim("nonexistent-policy", {"agent-99"}, 0).has_value());
+}
+
+TEST_CASE("release_remediation_claim with a stale generation is a fenced no-op that cannot "
+          "erase a sibling's reclaim (HA WS-3 3.4 review B3 / ABA)",
+          "[policy_store][pg][claim]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+    auto pol = store.create_policy(make_policy_yaml(frag.value()));
+    REQUIRE(pol.has_value());
+
+    // A claims agent-1.
+    auto claimA = store.claim_remediation(pol.value(), {"agent-1"}, 1800);
+    REQUIRE(claimA.has_value());
+    REQUIRE(claimA->ids.size() == 1);
+    const int64_t gen_a = claimA->generation;
+
+    // A's claim ages past the staleness window (A "dies" mid-flight).
+    backdate_claim(pool, pol.value(), "agent-1", 1801);
+
+    // B reclaims the same target -- succeeds, with a NEW generation.
+    auto claimB = store.claim_remediation(pol.value(), {"agent-1"}, 1800);
+    REQUIRE(claimB.has_value());
+    REQUIRE(claimB->ids.size() == 1);
+    const int64_t gen_b = claimB->generation;
+    CHECK(gen_b != gen_a);
+
+    // A resumes and releases with its now-STALE generation. This must
+    // return Ok (a fenced no-op is benign, never an error) but must NOT
+    // free B's live claim.
+    REQUIRE(store.release_remediation_claim(pol.value(), {"agent-1"}, gen_a).has_value());
+
+    // Proof the fence held: a third claimant (C) attempting the same
+    // target right now still gets nothing back -- B's claim, stamped with
+    // gen_b, is still live because A's stale-gen release matched zero rows.
+    auto claimC = store.claim_remediation(pol.value(), {"agent-1"}, 1800);
+    REQUIRE(claimC.has_value());
+    CHECK(claimC->ids.empty());
+
+    // Only B, releasing with its OWN current generation, can actually free
+    // the row.
+    REQUIRE(store.release_remediation_claim(pol.value(), {"agent-1"}, gen_b).has_value());
+    auto claimD = store.claim_remediation(pol.value(), {"agent-1"}, 1800);
+    REQUIRE(claimD.has_value());
+    REQUIRE(claimD->ids.size() == 1);
+}
+
+TEST_CASE("update_agent_status with expected_gen is a fenced write: the owning generation "
+          "writes, a stale generation is a benign no-op that does not stomp the live status "
+          "(HA WS-3 3.4 review B3)",
+          "[policy_store][pg][claim]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+    auto pol = store.create_policy(make_policy_yaml(frag.value()));
+    REQUIRE(pol.has_value());
+
+    auto claimed = store.claim_remediation(pol.value(), {"agent-1"}, 1800);
+    REQUIRE(claimed.has_value());
+    REQUIRE(claimed->ids.size() == 1);
+    const int64_t gen = claimed->generation;
+
+    // The owning generation writes, and reports TRUE (a row was written).
+    auto r1 = store.update_agent_status(pol.value(), "agent-1", "fixing", "", gen);
+    REQUIRE(r1.has_value());
+    CHECK(*r1 == true);
+    auto s1 = store.get_agent_status(pol.value(), "agent-1");
+    REQUIRE(s1.has_value());
+    REQUIRE(s1->has_value());
+    CHECK((*s1)->status == "fixing");
+
+    // A wrong/stale generation is a benign fenced no-op: Ok(false), and the
+    // live 'fixing' status must be left untouched -- a stale holder must
+    // never stomp a row a sibling now owns.
+    auto r2 = store.update_agent_status(pol.value(), "agent-1", "error", "", gen + 999);
+    REQUIRE(r2.has_value());
+    CHECK(*r2 == false);
+    auto s2 = store.get_agent_status(pol.value(), "agent-1");
+    REQUIRE(s2.has_value());
+    REQUIRE(s2->has_value());
+    CHECK((*s2)->status == "fixing"); // unchanged by the fenced no-op
+
+    // An UNFENCED write (no expected_gen) is the ordinary detection path --
+    // unconditional, and DOES change status.
+    auto r3 = store.update_agent_status(pol.value(), "agent-1", "compliant");
+    REQUIRE(r3.has_value());
+    CHECK(*r3 == true);
+    auto s3 = store.get_agent_status(pol.value(), "agent-1");
+    REQUIRE(s3.has_value());
+    REQUIRE(s3->has_value());
+    CHECK((*s3)->status == "compliant");
 }

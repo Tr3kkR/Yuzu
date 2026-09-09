@@ -22,6 +22,7 @@
 
 #include <chrono>
 #include <format>
+#include <optional>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -605,7 +606,7 @@ PolicyEvaluator::remediate(const std::string& policy_id,
     // claiming replica dies mid-flight (see collect_ready()'s FixWait
     // maturation and the sweep itself for the two release paths).
     auto claim_result =
-        d_.policy_store->claim_remediation(policy_id, targets, now(), d_.fixing_stale_seconds);
+        d_.policy_store->claim_remediation(policy_id, targets, d_.fixing_stale_seconds);
     if (!claim_result) {
         out.error = "policy store degraded — could not claim remediation targets";
         out.degraded = true;
@@ -617,7 +618,8 @@ PolicyEvaluator::remediate(const std::string& policy_id,
                 .increment();
         return out;
     }
-    const std::vector<std::string>& claimed = *claim_result;
+    const std::vector<std::string>& claimed = claim_result->ids;
+    const int64_t claim_gen = claim_result->generation;
     if (claimed.empty()) {
         // Every requested target is either already mid-remediation (a live
         // claim — this replica or another) or has already exhausted its
@@ -649,7 +651,7 @@ PolicyEvaluator::remediate(const std::string& policy_id,
     if (!dispatch_result) {
         // Dispatch never happened — release every claim so it does not sit
         // orphaned until the stale window expires.
-        auto rel = d_.policy_store->release_remediation_claim(policy_id, claimed);
+        auto rel = d_.policy_store->release_remediation_claim(policy_id, claimed, claim_gen);
         if (!rel)
             spdlog::warn("policy_evaluator: remediate: failed to release claim for policy {} "
                         "after a dispatch error: {}",
@@ -664,7 +666,7 @@ PolicyEvaluator::remediate(const std::string& policy_id,
         return out;
     }
     if (dispatch_result->execution_id.empty()) {
-        auto rel = d_.policy_store->release_remediation_claim(policy_id, claimed);
+        auto rel = d_.policy_store->release_remediation_claim(policy_id, claimed, claim_gen);
         if (!rel)
             spdlog::warn("policy_evaluator: remediate: failed to release claim for policy {} "
                         "after an empty dispatch: {}",
@@ -687,7 +689,7 @@ PolicyEvaluator::remediate(const std::string& policy_id,
     if (!not_delivered.empty()) {
         // Release WITHOUT touching fix_attempt_count (ADR-2002 §6 finding
         // 6a(ii)): a failed DELIVERY must never burn a capped retry attempt.
-        auto rel = d_.policy_store->release_remediation_claim(policy_id, not_delivered);
+        auto rel = d_.policy_store->release_remediation_claim(policy_id, not_delivered, claim_gen);
         if (!rel)
             spdlog::warn("policy_evaluator: remediate: failed to release claim for {} "
                         "not-delivered target(s) of policy {}: {}",
@@ -697,10 +699,15 @@ PolicyEvaluator::remediate(const std::string& policy_id,
     // Now mark fixing (increments the attempt counter; >3 auto-transitions to
     // error) — DELIVERED targets only.
     for (const auto& tgt : delivered) {
-        auto r = d_.policy_store->update_agent_status(policy_id, tgt, "fixing");
+        auto r = d_.policy_store->update_agent_status(policy_id, tgt, "fixing", "", claim_gen);
         if (!r)
             spdlog::warn("policy_evaluator: remediate: failed to mark {} fixing for policy {}: {}",
                         tgt, policy_id, r.error());
+        else if (!*r && d_.metrics)
+            // fenced no-op — a sibling reclaimed this row between our claim and
+            // this write (see PolicyStore::update_agent_status); visible so a
+            // mis-threaded gen does not silently vanish every remediation.
+            d_.metrics->counter("yuzu_server_policy_remediation_fence_skip_total").increment();
     }
 
     if (!delivered.empty()) {
@@ -712,6 +719,7 @@ PolicyEvaluator::remediate(const std::string& policy_id,
                                       .compliance_expr = "",
                                       .targets = delivered,
                                       .dispatched_at = now(),
+                                      .claim_gen = claim_gen,
                                       .verify_instruction = std::move(verify_instr),
                                       .verify_compliance = std::move(verify_cel),
                                       .verify_parameters_json = map_to_json_obj(verify_params)});
@@ -787,9 +795,19 @@ void PolicyEvaluator::collect_ready() {
                     cr = make_check_result(it->second);
                 }
                 if (d_.policy_store) {
-                    auto r = d_.policy_store->update_agent_status(f.policy_id, tgt, status, cr);
+                    // Shared Check-phase write: a REMEDIATION verify entry
+                    // carries claim_gen != 0 and its verdict is fenced on it
+                    // (a sibling may have reclaimed while the verify was in
+                    // flight); an ordinary DETECTION entry carries 0 and writes
+                    // unconditionally.
+                    std::optional<int64_t> gen =
+                        f.claim_gen != 0 ? std::optional<int64_t>(f.claim_gen) : std::nullopt;
+                    auto r = d_.policy_store->update_agent_status(f.policy_id, tgt, status, cr, gen);
                     if (!r)
                         spdlog::warn("policy_evaluator: update_agent_status failed: {}", r.error());
+                    else if (!*r && d_.metrics)
+                        d_.metrics->counter("yuzu_server_policy_remediation_fence_skip_total")
+                            .increment();
                 }
                 if (d_.metrics)
                     d_.metrics->counter("yuzu_server_policy_verdicts_total", {{"status", status}})
@@ -810,7 +828,8 @@ void PolicyEvaluator::collect_ready() {
             // refused as "already in flight" by a claim this evaluator no
             // longer needs.
             if (d_.policy_store) {
-                auto rel = d_.policy_store->release_remediation_claim(f.policy_id, f.targets);
+                auto rel =
+                    d_.policy_store->release_remediation_claim(f.policy_id, f.targets, f.claim_gen);
                 if (!rel)
                     spdlog::warn("policy_evaluator: collect_ready: failed to release remediation "
                                 "claim for policy {}: {}",
@@ -822,11 +841,18 @@ void PolicyEvaluator::collect_ready() {
                 if (it != best.end() && is_terminal_failure(it->second.status)) {
                     if (d_.policy_store) {
                         auto r = d_.policy_store->update_agent_status(
-                            f.policy_id, tgt, "error", R"({"phase":"fix","result":"failed"})");
+                            f.policy_id, tgt, "error", R"({"phase":"fix","result":"failed"})",
+                            f.claim_gen);
                         if (!r)
                             spdlog::warn("policy_evaluator: fix-failure status write failed for "
                                         "{}/{}: {}",
                                         f.policy_id, tgt, r.error());
+                        else if (!*r && d_.metrics)
+                            // fenced no-op: a sibling reclaimed after our
+                            // release above — do not stomp its fresh 'fixing'.
+                            d_.metrics
+                                ->counter("yuzu_server_policy_remediation_fence_skip_total")
+                                .increment();
                     }
                     if (d_.metrics)
                         d_.metrics
@@ -848,6 +874,10 @@ void PolicyEvaluator::collect_ready() {
                                                   .compliance_expr = f.verify_compliance,
                                                   .targets = verify_targets,
                                                   .dispatched_at = now(),
+                                                  // propagate the claim gen so the
+                                                  // verify verdict write (:790) stays
+                                                  // fenced on it.
+                                                  .claim_gen = f.claim_gen,
                                                   .verify_instruction = "",
                                                   .verify_compliance = "",
                                                   .verify_parameters_json = ""});
@@ -859,11 +889,16 @@ void PolicyEvaluator::collect_ready() {
                     for (const auto& tgt : verify_targets) {
                         auto r = d_.policy_store->update_agent_status(
                             f.policy_id, tgt, "error",
-                            std::format(R"({{"phase":"verify","result":"{}"}})", result_tag));
+                            std::format(R"({{"phase":"verify","result":"{}"}})", result_tag),
+                            f.claim_gen);
                         if (!r)
                             spdlog::warn("policy_evaluator: verify-dispatch-failed status write "
                                         "failed for {}/{}: {}",
                                         f.policy_id, tgt, r.error());
+                        else if (!*r && d_.metrics)
+                            d_.metrics
+                                ->counter("yuzu_server_policy_remediation_fence_skip_total")
+                                .increment();
                         if (d_.metrics)
                             d_.metrics
                                 ->counter("yuzu_server_policy_eval_errors_total",

@@ -331,6 +331,14 @@ const std::vector<pg::PgMigration>& migrations() {
         // claim time, aged out by `claim_remediation`'s own WHERE guard
         // (never a separate reaper — see that method's doc comment).
         {2, "ALTER TABLE policy_status ADD COLUMN remediation_claim_at BIGINT NOT NULL DEFAULT 0;"},
+        // HA WS-3 3.4 (review B3): the per-(policy,agent) claim's owner/occurrence
+        // token. Minted per claim CALL from remediation_claim_seq; fences
+        // release and remediation-owned status writes against ABA (a stale
+        // holder releasing/overwriting a row a sibling has reclaimed). DEFAULT 0
+        // is the "no claim / pre-v3 row" sentinel — a value nextval never mints,
+        // so an old binary's rows are one-directionally distinguishable.
+        {3, "ALTER TABLE policy_status ADD COLUMN remediation_claim_gen BIGINT NOT NULL DEFAULT 0;"},
+        {4, "CREATE SEQUENCE IF NOT EXISTS remediation_claim_seq;"},
     };
     return kMigrations;
 }
@@ -920,9 +928,10 @@ bool PolicyStore::delete_policy(const std::string& id) {
 
 // ── Compliance tracking ──────────────────────────────────────────────────────
 
-std::expected<void, std::string>
+std::expected<bool, std::string>
 PolicyStore::update_agent_status(const std::string& policy_id, const std::string& agent_id,
-                                 const std::string& status, const std::string& check_result) {
+                                 const std::string& status, const std::string& check_result,
+                                 std::optional<int64_t> expected_gen) {
     if (!open_)
         return std::unexpected(std::string(kPolicyDbErrorPrefix) + "database not open");
     if (policy_id.empty() || agent_id.empty())
@@ -936,60 +945,103 @@ PolicyStore::update_agent_status(const std::string& policy_id, const std::string
         return std::unexpected(std::string(kPolicyDbErrorPrefix) +
                                "database unavailable — try again");
 
-    auto now = now_epoch();
-    // ADR-0056: the retry-cap check folds into the UPSERT itself (closing a
+    const std::string kMax = std::to_string(kMaxFixAttempts);
+    // ADR-0056: the retry-cap check folds into the write itself (closing a
     // TOCTOU the SQLite original only avoided by accident, via a process-wide
-    // mutex that no longer serializes calls arriving from different
-    // replicas). `policy_status.fix_attempt_count` on the RHS of each CASE is
-    // the row's value as of THIS UPDATE's lock acquisition — concurrent
-    // UPSERTs on the same key serialize, so the second one sees the first
-    // one's already-committed count, never a stale pre-fetched value.
-    // last_fix_at on the fresh-INSERT branch: CASE, not a bare 0 (found in
-    // testing — the ADR-0056 staleness sweep is the first consumer that ever
-    // relied on last_fix_at being meaningful for a 'fixing' row; the SQLite
-    // original always wrote 0 here unconditionally, harmless there since the
-    // old stranded-fixing reset was unconditional too). Without this, a
-    // 'fixing' status landing as the very FIRST-ever write for a
-    // (policy,agent) pair (reachable: an operator remediate() naming an
-    // agent never checked before) gets last_fix_at=0 — the very next
-    // claim_due_policies staleness sweep would immediately read that as
-    // ancient and un-fix it before the FixWait's own grace window ever runs.
-    const std::string sql =
-        "INSERT INTO policy_store.policy_status "
-        "(policy_id, agent_id, status, last_check_at, last_fix_at, check_result, "
-        " fix_attempt_count) "
-        "VALUES ($1,$2,$3,$4::bigint,CASE WHEN $3 = 'fixing' THEN $4::bigint ELSE 0::bigint END,"
-        "$5,0) "
-        "ON CONFLICT (policy_id, agent_id) DO UPDATE SET "
-        "  status = CASE WHEN EXCLUDED.status = 'fixing' "
-        "                  AND policy_status.fix_attempt_count >= " +
-        std::to_string(kMaxFixAttempts) +
-        " THEN 'error' ELSE EXCLUDED.status END, "
-        "  last_check_at = EXCLUDED.last_check_at, "
-        "  check_result = EXCLUDED.check_result, "
-        "  last_fix_at = CASE WHEN EXCLUDED.status = 'fixing' "
-        "                       AND policy_status.fix_attempt_count < " +
-        std::to_string(kMaxFixAttempts) +
-        " THEN EXCLUDED.last_check_at ELSE policy_status.last_fix_at END, "
-        "  fix_attempt_count = CASE "
-        "    WHEN EXCLUDED.status = 'fixing' AND policy_status.fix_attempt_count < " +
-        std::to_string(kMaxFixAttempts) +
-        "      THEN policy_status.fix_attempt_count + 1 "
-        "    WHEN EXCLUDED.status = 'compliant' THEN 0 "
-        "    ELSE policy_status.fix_attempt_count END "
-        "RETURNING policy_id";
-    pg::PgResult res = pg::exec_params(
-        lease.get(), sql.c_str(),
-        std::vector<std::string>{policy_id, agent_id, status, std::to_string(now),
-                                 sanitize_pg_text(check_result)});
-    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0) {
-        spdlog::error("PolicyStore: upsert failed in update_agent_status: {}",
+    // mutex that no longer serializes calls arriving from different replicas).
+    // `fix_attempt_count` on the RHS of each CASE is the row's value as of THIS
+    // write's lock acquisition — concurrent writes on the same key serialize,
+    // so the second sees the first's already-committed count.
+    //
+    // last_check_at / last_fix_at are authored from POSTGRES NOW() (review B2),
+    // never a replica clock: the stranded-fixing sweep compares last_fix_at
+    // against its own pg-NOW() cutoff, so a lagging replica can no longer
+    // author a last_fix_at the sweep misreads as already-stale and un-fix a
+    // live claim. NOW() is constant within one statement, so every EXTRACT
+    // here is the same instant. last_fix_at on a 'fixing' write is that instant
+    // (not 0), so a first-ever 'fixing' write for a never-checked pair is not
+    // immediately swept as ancient before its FixWait grace runs.
+    //
+    // Two shapes, chosen by `expected_gen` (review B3):
+    //  - FENCED (expected_gen set): a plain UPDATE guarded by
+    //    remediation_claim_gen = $5. A stale claim-holder whose row a sibling
+    //    reclaimed (bumping the gen) matches ZERO rows → benign no-op (returns
+    //    false, counted by the caller), never a stomp. It must be an UPDATE,
+    //    NOT the UPSERT — the UPSERT's INSERT branch is unconditional, so a
+    //    fenced call against a vanished row would silently create a gen-0 row
+    //    that bypasses the fence entirely.
+    //  - UNFENCED (expected_gen unset): the ordinary detection write, which may
+    //    be the FIRST-ever write for a pair, so it stays the UPSERT.
+    std::string sql;
+    if (expected_gen) {
+        sql = "UPDATE policy_store.policy_status SET "
+              "  status = CASE WHEN $3 = 'fixing' AND fix_attempt_count >= " + kMax +
+              "                  THEN 'error' ELSE $3 END, "
+              "  last_check_at = EXTRACT(EPOCH FROM NOW())::bigint, "
+              "  check_result = $4, "
+              "  last_fix_at = CASE WHEN $3 = 'fixing' AND fix_attempt_count < " + kMax +
+              "                       THEN EXTRACT(EPOCH FROM NOW())::bigint ELSE last_fix_at END, "
+              "  fix_attempt_count = CASE "
+              "    WHEN $3 = 'fixing' AND fix_attempt_count < " + kMax +
+              "      THEN fix_attempt_count + 1 "
+              "    WHEN $3 = 'compliant' THEN 0 "
+              "    ELSE fix_attempt_count END "
+              "WHERE policy_id = $1 AND agent_id = $2 AND remediation_claim_gen = $5::bigint "
+              "RETURNING policy_id";
+    } else {
+        sql = "INSERT INTO policy_store.policy_status "
+              "(policy_id, agent_id, status, last_check_at, last_fix_at, check_result, "
+              " fix_attempt_count) "
+              "VALUES ($1,$2,$3,EXTRACT(EPOCH FROM NOW())::bigint,"
+              "CASE WHEN $3 = 'fixing' THEN EXTRACT(EPOCH FROM NOW())::bigint ELSE 0::bigint END,"
+              "$4,0) "
+              "ON CONFLICT (policy_id, agent_id) DO UPDATE SET "
+              "  status = CASE WHEN EXCLUDED.status = 'fixing' "
+              "                  AND policy_status.fix_attempt_count >= " + kMax +
+              " THEN 'error' ELSE EXCLUDED.status END, "
+              "  last_check_at = EXCLUDED.last_check_at, "
+              "  check_result = EXCLUDED.check_result, "
+              "  last_fix_at = CASE WHEN EXCLUDED.status = 'fixing' "
+              "                       AND policy_status.fix_attempt_count < " + kMax +
+              " THEN EXCLUDED.last_check_at ELSE policy_status.last_fix_at END, "
+              "  fix_attempt_count = CASE "
+              "    WHEN EXCLUDED.status = 'fixing' AND policy_status.fix_attempt_count < " + kMax +
+              "      THEN policy_status.fix_attempt_count + 1 "
+              "    WHEN EXCLUDED.status = 'compliant' THEN 0 "
+              "    ELSE policy_status.fix_attempt_count END "
+              "RETURNING policy_id";
+    }
+    std::vector<std::string> params{policy_id, agent_id, status, sanitize_pg_text(check_result)};
+    if (expected_gen)
+        params.push_back(std::to_string(*expected_gen));
+
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("PolicyStore: write failed in update_agent_status: {}",
+                      PQerrorMessage(lease.get()));
+        return std::unexpected(std::string(kPolicyDbErrorPrefix) +
+                               "failed to update compliance status");
+    }
+    const bool wrote = PQntuples(res.get()) > 0;
+    if (expected_gen && !wrote) {
+        // Benign fenced no-op: the caller's claim generation no longer owns
+        // this row (a sibling reclaimed it, or it was released). Never an
+        // error; the caller counts it so a MIS-THREADED gen (which would make
+        // every remediation write silently vanish) is visible.
+        spdlog::warn("PolicyStore: fenced status write for {}/{} (gen {}) matched no row — "
+                     "the claim was reclaimed or released; skipped",
+                     policy_id, agent_id, *expected_gen);
+        return false;
+    }
+    if (!wrote) {
+        // Unfenced UPSERT must always write a row.
+        spdlog::error("PolicyStore: upsert wrote no row in update_agent_status: {}",
                       PQerrorMessage(lease.get()));
         return std::unexpected(std::string(kPolicyDbErrorPrefix) +
                                "failed to update compliance status");
     }
     invalidate_fleet_compliance_cache();
-    return {};
+    return true;
 }
 
 std::expected<std::optional<PolicyAgentStatus>, PolicyReadError>
@@ -1263,16 +1315,36 @@ PolicyStore::claim_due_policies(int64_t now, int64_t default_interval_seconds,
         // UPDATE — this is the graceful-shutdown drop path's release (the
         // dispatching replica died before collect_ready() could mature the
         // FixWait and release it itself, policy_evaluator.cpp's grace-window
-        // comment). Uses the SAME `fixing_stale_seconds` window
-        // claim_remediation's own staleness guard is passed — the two
-        // windows are one and the same value from every production caller
-        // (PolicyEvaluator::Deps::fixing_stale_seconds), so they can never
-        // disagree about when a row is stale.
+        // comment). AGE is the correct fence for the sweep (review B3 Q2): it
+        // has no claim owner to compare against, so it must NOT gen-fence, and
+        // it must NOT touch remediation_claim_gen (a later claim mints afresh).
+        //
+        // But the age signal MUST include remediation_claim_at, not last_fix_at
+        // alone (adversarial review C3/K1, Codex+Kimi both independently): a
+        // RECLAIM (claim_remediation's ON CONFLICT) refreshes remediation_claim_at
+        // and _gen but deliberately does NOT touch last_fix_at or status, and
+        // only the reclaimer's LATER mark-fixing write refreshes last_fix_at.
+        // So between a sibling's reclaim and its mark-fixing, the row carries a
+        // FRESH claim_at but the dead ex-holder's OLD last_fix_at + status
+        // 'fixing' — and a last_fix_at-only sweep would zero that live claim,
+        // freeing the row for a third claimant and producing a duplicate
+        // dispatch by two un-paused holders, OUTSIDE the effectively-once
+        // residual (which is bounded to a >stale-window-PAUSED holder). Gating
+        // on remediation_claim_at freshness — the real ownership signal, and
+        // the SAME `(=0 OR <= NOW()-stale)` shape claim_remediation's own
+        // reclaim guard uses — excludes a fresh reclaim while still sweeping a
+        // genuinely stranded row (claim_at stale) and a released-but-dangling
+        // one (claim_at 0). Both cutoffs are authored from POSTGRES NOW()
+        // (review B2), one clock. Still UPDATE-only (a wrongly-swept row costs
+        // one extra dispatch cycle), never a #2360 clock-guarded delete.
         pg::PgResult sweep = pg::exec_params(
             conn,
             "UPDATE policy_store.policy_status SET status = 'unknown', remediation_claim_at = 0 "
-            "WHERE status = 'fixing' AND last_fix_at < $1",
-            std::vector<std::string>{std::to_string(now - fixing_stale_seconds)});
+            "WHERE status = 'fixing' "
+            "  AND last_fix_at < EXTRACT(EPOCH FROM NOW())::bigint - $1::bigint "
+            "  AND (remediation_claim_at = 0 "
+            "       OR remediation_claim_at <= EXTRACT(EPOCH FROM NOW())::bigint - $1::bigint)",
+            std::vector<std::string>{std::to_string(fixing_stale_seconds)});
         if (sweep.status() != PGRES_COMMAND_OK) {
             failure = std::string("stranded-fixing sweep failed: ") + PQerrorMessage(conn);
             degraded = true;
@@ -1312,6 +1384,14 @@ PolicyStore::claim_due_policies(int64_t now, int64_t default_interval_seconds,
             // operator-supplied interval of 0/negative must not re-dispatch
             // to the whole fleet every tick.
             const int64_t clamped = std::max<int64_t>(interval, 60);
+            // DELIBERATELY on the replica `now` clock, NOT pg-NOW() (review B2):
+            // this is the check-CADENCE throttle, not the remediation-claim
+            // staleness guard. A skewed replica here only shifts WHEN a policy's
+            // next check fires by up to one interval — non-destructive, self-
+            // correcting on the next tick, never a double-DISPATCH of a
+            // non-idempotent fix. The remediation claim + the stranded-fixing
+            // sweep, which DO arbitrate a destructive double-dispatch, author
+            // from pg-NOW() precisely because a skew there is a safety bug.
             pg::PgResult claim = pg::exec_params(
                 conn,
                 "INSERT INTO policy_store.policy_dispatch_state (policy_id, last_dispatched_at) "
@@ -1385,42 +1465,70 @@ std::expected<void, std::string> PolicyStore::record_dispatch(const std::string&
 
 // ── Durable per-(policy,agent) remediation claim (HA WS-3 3.4) ──────────────
 
-std::expected<std::vector<std::string>, std::string>
+std::expected<PolicyStore::RemediationClaim, std::string>
 PolicyStore::claim_remediation(const std::string& policy_id,
-                               const std::vector<std::string>& agent_ids, int64_t now,
-                               int64_t stale_seconds) {
+                               const std::vector<std::string>& agent_ids, int64_t stale_seconds) {
     if (!open_)
         return std::unexpected(std::string(kPolicyDbErrorPrefix) + "database not open");
     if (policy_id.empty() || agent_ids.empty())
-        return std::vector<std::string>{};
+        return RemediationClaim{};
 
     auto lease = pool_.try_acquire_for(kAcquireTimeout);
     if (!lease)
         return std::unexpected(std::string(kPolicyDbErrorPrefix) +
                                "database unavailable — try again");
 
+    // Mint ONE generation token for this whole claim call up front, on the
+    // same lease, and bind it as a plain param — explicit and single-valued,
+    // rather than a `nextval()` scalar-subquery inside the INSERT (which a
+    // CTE-inlining planner could evaluate per output row, handing different
+    // rows different gens). The sequence is schema-qualified because the
+    // runner's migration-time search_path does not cover runtime statements.
+    pg::PgResult genres = pg::exec_params(
+        lease.get(), "SELECT nextval('policy_store.remediation_claim_seq')",
+        std::vector<std::string>{});
+    if (genres.status() != PGRES_TUPLES_OK || PQntuples(genres.get()) != 1 ||
+        PQgetisnull(genres.get(), 0, 0)) {
+        spdlog::error("PolicyStore: claim_remediation could not mint a generation for policy {}: {}",
+                      policy_id, PQerrorMessage(lease.get()));
+        return std::unexpected(std::string(kPolicyDbErrorPrefix) +
+                               "failed to claim remediation targets");
+    }
+    // nextval() on a bigint sequence is always a valid non-null integer literal
+    // in [1, 2^63-1]; the NULL guard above plus this makes the parse total
+    // rather than able to throw std::invalid_argument out of the store.
+    const int64_t generation = std::stoll(PQgetvalue(genres.get(), 0, 0));
+
     // UPSERT CAS, not a plain UPDATE: `unnest($2::text[])` seeds the
     // fresh-INSERT branch for an agent with no `policy_status` row yet (an
     // UPDATE-only claim would silently claim nothing for it — see the
     // header doc). ON CONFLICT wins iff the existing row is unclaimed
     // (remediation_claim_at = 0), claimed stale (older than
-    // `now - stale_seconds` — the SAME window claim_due_policies' own
-    // stranded-fixing sweep uses, so the two never disagree about a row),
-    // AND the retry cap has not already been hit — mirrors
-    // update_agent_status's own kMaxFixAttempts guard so a capped agent
-    // cannot be claimed at all, not just refused later at the status write.
-    // DISTINCT: a caller may pass a duplicate agent id; without it the
-    // ON CONFLICT DO UPDATE raises cardinality_violation (21000) and fails
-    // the whole claim.
+    // `NOW() - stale_seconds`, authored from POSTGRES NOW() so a replica
+    // clock cannot steal a live claim, review B2 — the SAME window
+    // claim_due_policies' own stranded-fixing sweep now uses, so the two
+    // never disagree about a row), AND the retry cap has not already been
+    // hit — mirrors update_agent_status's own kMaxFixAttempts guard so a
+    // capped agent cannot be claimed at all, not just refused later at the
+    // status write. Both the stored remediation_claim_at and the reclaim
+    // cutoff read NOW() within the one statement, so they are the same
+    // instant. remediation_claim_gen stamps the winner rows with this call's
+    // token (review B3) for the release/status fences. DISTINCT: a caller may
+    // pass a duplicate agent id; without it the ON CONFLICT DO UPDATE raises
+    // cardinality_violation (21000) and fails the whole claim.
     const std::string sql =
         "INSERT INTO policy_store.policy_status "
         "(policy_id, agent_id, status, last_check_at, last_fix_at, check_result, "
-        " fix_attempt_count, remediation_claim_at) "
-        "SELECT DISTINCT $1, x, 'unknown', 0, 0, '', 0, $3::bigint FROM unnest($2::text[]) AS x "
+        " fix_attempt_count, remediation_claim_at, remediation_claim_gen) "
+        "SELECT DISTINCT $1, x, 'unknown', 0, 0, '', 0, EXTRACT(EPOCH FROM NOW())::bigint, "
+        "                $4::bigint "
+        "FROM unnest($2::text[]) AS x "
         "ON CONFLICT (policy_id, agent_id) DO UPDATE SET "
-        "  remediation_claim_at = EXCLUDED.remediation_claim_at "
+        "  remediation_claim_at = EXCLUDED.remediation_claim_at, "
+        "  remediation_claim_gen = EXCLUDED.remediation_claim_gen "
         "  WHERE (policy_status.remediation_claim_at = 0 "
-        "         OR policy_status.remediation_claim_at <= $3::bigint - $4::bigint) "
+        "         OR policy_status.remediation_claim_at <= EXTRACT(EPOCH FROM NOW())::bigint "
+        "                                                  - $3::bigint) "
         "    AND policy_status.fix_attempt_count < " +
         std::to_string(kMaxFixAttempts) +
         " "
@@ -1428,19 +1536,20 @@ PolicyStore::claim_remediation(const std::string& policy_id,
     pg::PgResult res = pg::exec_params(
         lease.get(), sql.c_str(),
         std::vector<std::string>{policy_id, pg::to_text_array(as_views(agent_ids)),
-                                 std::to_string(now), std::to_string(stale_seconds)});
+                                 std::to_string(stale_seconds), std::to_string(generation)});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("PolicyStore: claim_remediation failed for policy {}: {}", policy_id,
                      PQerrorMessage(lease.get()));
         return std::unexpected(std::string(kPolicyDbErrorPrefix) +
                                "failed to claim remediation targets");
     }
-    return returned_ids(res);
+    return RemediationClaim{.ids = returned_ids(res), .generation = generation};
 }
 
 std::expected<void, std::string>
 PolicyStore::release_remediation_claim(const std::string& policy_id,
-                                       const std::vector<std::string>& agent_ids) {
+                                       const std::vector<std::string>& agent_ids,
+                                       int64_t generation) {
     if (!open_)
         return std::unexpected(std::string(kPolicyDbErrorPrefix) + "database not open");
     if (policy_id.empty() || agent_ids.empty())
@@ -1453,12 +1562,18 @@ PolicyStore::release_remediation_claim(const std::string& policy_id,
 
     // No RETURNING check on row count: releasing a claim that was already
     // released (or never taken — e.g. this policy/agent pair had no
-    // policy_status row at all) is a benign no-op, not an error.
+    // policy_status row at all) is a benign no-op, not an error. The
+    // `remediation_claim_gen = $3` fence (review B3) makes a THIRD case a
+    // benign no-op and that is the whole point: a stale holder whose row a
+    // sibling reclaimed (bumping the gen) matches zero rows here and so cannot
+    // erase the sibling's live claim.
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "UPDATE policy_store.policy_status SET remediation_claim_at = 0 "
-        "WHERE policy_id = $1 AND agent_id = ANY($2::text[])",
-        std::vector<std::string>{policy_id, pg::to_text_array(as_views(agent_ids))});
+        "WHERE policy_id = $1 AND agent_id = ANY($2::text[]) "
+        "  AND remediation_claim_gen = $3::bigint",
+        std::vector<std::string>{policy_id, pg::to_text_array(as_views(agent_ids)),
+                                 std::to_string(generation)});
     if (res.status() != PGRES_COMMAND_OK) {
         spdlog::error("PolicyStore: release_remediation_claim failed for policy {}: {}", policy_id,
                      PQerrorMessage(lease.get()));

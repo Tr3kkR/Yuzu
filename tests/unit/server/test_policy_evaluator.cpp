@@ -33,6 +33,7 @@
 #include <libpq-fe.h>
 
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -91,6 +92,11 @@ struct Harness {
     std::vector<std::string> dispatched_plugins;
     // canned[agent + "|" + plugin] -> (status, output)
     std::map<std::string, std::pair<int, std::string>> canned;
+    // HA WS-3 3.4 review B1 regression harness: agent ids the fake
+    // dispatch_fn treats as quarantine-denied (ConfinedDispatchOutcome::
+    // denied_quarantined) rather than delivered or not_sent -- a THIRD way a
+    // claimed target can fail to be delivered, distinct from both.
+    std::set<std::string> quarantined;
 
     std::string group_id;
 
@@ -142,6 +148,15 @@ struct Harness {
             yuzu::server::ConfinedDispatchOutcome outcome;
             outcome.command_id = "cmd-" + execid;
             for (const auto& a : agents) {
+                if (quarantined.count(a)) {
+                    // Mirrors dispatch_confined_arms.hpp's real quarantine-gate
+                    // denial: a claimed target the #881 gate refuses BEFORE the
+                    // per-id send attempt -- distinct from not_sent (delivery
+                    // attempted, failed) and from a canned-absent lookup below.
+                    outcome.denied_quarantined.push_back(a);
+                    ++outcome.denied_quarantined_count;
+                    continue;
+                }
                 auto it = canned.find(a + "|" + plugin);
                 if (it == canned.end()) {
                     // HA WS-3 3.4 (mandatory test-harness fix): a canned-absent
@@ -658,6 +673,60 @@ TEST_CASE("policy evaluator: remediate releases the claim without burning a retr
     // not_sent releases incremented it) -- 'fixing', not the capped 'error'
     // three real increments would have produced.
     CHECK(h.status_of(pid, "agentA") == "fixing");
+}
+
+TEST_CASE("policy evaluator: a mixed delivered+quarantined remediate batch marks only the "
+          "delivered target 'fixing' (HA WS-3 3.4 review B1)",
+          "[pg][policy][evaluator]") {
+    // Regression for review B1: compute_delivered's `not_delivered` set must
+    // fold in outcome.denied_quarantined alongside outcome.not_sent -- a
+    // claimed target the #881 quarantine gate refused must be released
+    // without burning a retry attempt (like an offline/not_sent target),
+    // never mistaken for delivered just because SOMETHING in the batch was
+    // sent (outcome.sent > 0). The underlying by-value-move defect the B1
+    // finding actually caught is now prevented at the type level (the audit
+    // sink in server.cpp takes the outcome by const reference rather than by
+    // value) -- this test locks the downstream compute_delivered() CONTRACT
+    // itself: a mixed sent>0 batch must still classify each id correctly.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    auto pid = h.author("result.hostname != ''", /*with_fix=*/true);
+
+    // agentA is a normal delivered target; agentB is quarantined -- claimed
+    // (it is a member of the policy's management group, so the
+    // confused-deputy scope intersection admits it), but the fake
+    // dispatch_fn denies it via denied_quarantined instead of sending or
+    // canned-absent-not_sent'ing it. No evaluate_now()/check needed: an
+    // explicit agent_ids list bypasses the non_compliant status filter
+    // entirely (same shape as the two-instances claim test above).
+    h.canned["agentA|fixp"] = {1, "ok"};
+    h.quarantined.insert("agentB");
+
+    PolicyEvaluator ev(h.deps());
+    auto rr = ev.remediate(pid, {"agentA", "agentB"});
+    REQUIRE(rr.ok);
+    // Honest count: only agentA was actually delivered.
+    CHECK(rr.agents == 1);
+
+    // Delivered target: marked 'fixing' by the synchronous update_agent_status
+    // call inside remediate() -- no tick() needed to observe it.
+    CHECK(h.status_of(pid, "agentA") == "fixing");
+    // Quarantined target: claimed (claim_remediation's fresh-INSERT branch
+    // seeds an 'unknown' row to carry the claim) then released WITHOUT a
+    // status write or a burned retry attempt -- it must NOT read 'fixing'.
+    CHECK(h.status_of(pid, "agentB") == "unknown");
+
+    // The quarantined target's claim must have been released (not left
+    // dangling): a fresh remediate() naming only agentB, now un-quarantined
+    // and wired up for delivery, re-claims and delivers it -- proving the
+    // release actually happened rather than merely not writing 'fixing'.
+    h.quarantined.erase("agentB");
+    h.canned["agentB|fixp"] = {1, "ok"};
+    auto rr2 = ev.remediate(pid, {"agentB"});
+    REQUIRE(rr2.ok);
+    CHECK(rr2.agents == 1);
+    CHECK(h.status_of(pid, "agentB") == "fixing");
 }
 
 TEST_CASE("policy evaluator: verify dispatch failure -> error", "[pg][policy][evaluator]") {

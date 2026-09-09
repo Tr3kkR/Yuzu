@@ -207,6 +207,13 @@ private:
         std::string compliance_expr;  // CEL evaluated in the Check phase
         std::vector<std::string> targets;
         int64_t dispatched_at{0};
+        // HA WS-3 3.4 (review B3): the remediation claim generation this entry
+        // owns. Threaded through to the fenced release + status writes at
+        // maturity so a stale holder cannot stomp a row a sibling reclaimed.
+        // 0 = NOT remediation-owned (an ordinary detection Check entry), which
+        // makes its status writes unconditional. Propagated from the FixWait
+        // entry onto the verify Check entry it spawns.
+        int64_t claim_gen{0};
         // FixWait -> verify hand-off (the post-check to run after the fix):
         std::string verify_instruction;
         std::string verify_compliance;
