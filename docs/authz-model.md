@@ -324,9 +324,9 @@ Administrator-only, unlike `PluginConfig`/`UploadGrant` where Operator gets read
 day-to-day triage. No other role (Viewer, ITServiceOwner, ApiTokenManager, Reviewer) is touched by
 this PR.
 
-## 4. Wave 7 PR7.2: `Forensics` and `Decommission` (28th/29th securables)
+## 4. Wave 7 PR7.2: `Forensics` and `Decommission` (34th/35th securables)
 
-Two more securables appended to `rbac_store.cpp`'s `types[]` (27→29) and its `mcp_server.cpp`
+Two more securables appended to `rbac_store.cpp`'s `types[]` (33→35) and its `mcp_server.cpp`
 mirror (`kRbacSecurables`):
 
 | Securable | Purpose | Consumed operations | Roles |
