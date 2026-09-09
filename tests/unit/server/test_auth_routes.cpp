@@ -591,6 +591,47 @@ TEST_CASE("AuthRoutes::require_permission — operator MCP tier IS allowed ApiTo
 }
 
 // ---------------------------------------------------------------------------
+// #4028/#520 security regression guard: an admin-owned MCP token (any tier)
+// must still be blocked from the new settings read-twins' securables, even
+// though those routes gate via require_permission (not require_admin) and
+// even though topology-floor's legacy-role fallback would otherwise admit
+// an admin-owned MCP session (see auth_routes.cpp's "an admin's MCP token
+// passes the floor here ... that is intended" note, and the AccessReview/
+// UserManagement/EnginePrincipal routes that deliberately rely on it). The
+// fix lives at the tier_allows() chokepoint (mcp_policy.hpp), not here —
+// this test exercises the real end-to-end require_permission() path so a
+// future change to either layer can't silently reopen it. Companion
+// tier_allows()-only tests: test_mcp_server.cpp "no tier admits the #4028
+// server-administration securables".
+// ---------------------------------------------------------------------------
+
+TEST_CASE("AuthRoutes::require_permission — no MCP tier (incl. readonly, admin-owned) "
+          "reaches the #4028 settings-administration securables",
+          "[pg][auth_routes][scope][mcp][security]") {
+    AuthRoutesFixture fix;
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+    for (const std::string_view securable :
+         {"TlsConfig", "PluginSigning", "ServerConfig", "AnalyticsConfig"}) {
+        CAPTURE(securable);
+        // test_user is admin and RBAC is disabled on this fixture — the exact
+        // combination that lets an admin-owned MCP token fall through the
+        // legacy topology-floor branch for securables that don't carry this
+        // tier-level deny.
+        auto raw = fix.api_tokens->create_token(
+            "mcp-settings-ro-" + std::string(securable), "test_user", now + 3600, "", "readonly");
+        REQUIRE(raw.has_value());
+        auto req = request_with_header("Authorization", "Bearer " + *raw);
+        httplib::Response res;
+
+        bool ok = fix.ar->require_permission(req, res, std::string(securable), "Read");
+        CHECK_FALSE(ok);
+        CHECK(res.status == 403);
+        CHECK(res.body.find("MCP token tier does not allow") != std::string::npos);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // require_scoped_permission MCP-tier enforcement tests (#520)
 // ---------------------------------------------------------------------------
 

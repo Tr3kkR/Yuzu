@@ -150,14 +150,14 @@ openssl cms -inform pem -text -noout -in chargen.so.sig
 
 **Configuration.** There are two paths — server-managed (recommended for fleets) and agent-local (for one-off hosts or air-gapped environments).
 
-**Server-managed (Settings → Plugin Code Signing).** An admin operator goes to the Settings page and uploads the PEM trust bundle through the **Plugin Code Signing** card. The server validates the PEM (counts certs, computes SHA-256, surfaces parse errors immediately), persists it atomically (temp file + rename) under the server's cert directory, and exposes it at `GET /api/v1/agent/plugin-policy` (admin-only, returns JSON containing the bundle PEM + the require flag). The card also has a "Require signed plugins" checkbox that flips the require flag and a "Remove trust bundle" button that disables signing for new agent starts. Every change emits an `audit_event` with action `plugin_signing.bundle.uploaded` / `plugin_signing.bundle.cleared` / `plugin_signing.require.changed`.
+**Server-managed (Settings → Plugin Code Signing).** An admin operator goes to the Settings page and uploads the PEM trust bundle through the **Plugin Code Signing** card. The server validates the PEM (counts certs, computes SHA-256, surfaces parse errors immediately), persists it atomically (temp file + rename) under the server's cert directory, and exposes it at `GET /api/v2/agent/plugin-policy` (`PluginSigning:Read`, Administrator-only and unreachable by any MCP token at any tier — see `docs/user-manual/rest-api.md` "Settings"; returns JSON containing the bundle PEM + the require flag, nested under a `data` envelope). The deprecated `GET /api/v1/agent/plugin-policy` (flat body, `require_admin` gate) still works during its announced removal window — see `server-admin.md`'s vNEXT note. The card also has a "Require signed plugins" checkbox that flips the require flag and a "Remove trust bundle" button that disables signing for new agent starts. Every change emits an `audit_event` with action `plugin_signing.bundle.uploaded` / `plugin_signing.bundle.cleared` / `plugin_signing.require.changed`.
 
 In this mode, agents are configured by curling the policy endpoint (with an admin token) into a local file at startup:
 
 ```bash
 curl -fsSL -H "Authorization: Bearer $YUZU_ADMIN_TOKEN" \
-  https://server.example.com:8443/api/v1/agent/plugin-policy \
-  | jq -r .trust_bundle_pem > /etc/yuzu/plugin-trust-bundle.pem
+  https://server.example.com:8443/api/v2/agent/plugin-policy \
+  | jq -r .data.trust_bundle_pem > /etc/yuzu/plugin-trust-bundle.pem
 
 yuzu-agent --plugin-trust-bundle /etc/yuzu/plugin-trust-bundle.pem \
            --plugin-require-signature

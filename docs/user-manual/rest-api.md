@@ -71,6 +71,7 @@ A separate, narrower shape applies to ordinary mutation routes that audit a chan
   - [RBAC](#rbac)
   - [Tags](#tags)
   - [Definitions](#definitions)
+  - [Product Packs](#product-packs)
   - [Response Templates](#response-templates)
   - [Audit Log](#audit-log)
   - [Access Reviews](#access-reviews)
@@ -78,11 +79,13 @@ A separate, narrower shape applies to ordinary mutation routes that audit a chan
   - [Policies](#policies)
   - [Compliance](#compliance)
   - [Runtime Configuration](#runtime-configuration)
+  - [Settings](#settings)
   - [Custom Properties](#custom-properties)
   - [Webhooks](#webhooks)
   - [Offload Targets](#offload-targets)
   - [Network Discovery](#network-discovery)
   - [Workflows](#workflows)
+  - [Workflows, Executions & Schedules — v1 read twins (#4030)](#workflows-executions--schedules--v1-read-twins-4030)
   - [OpenAPI Spec](#openapi-spec)
   - [Discovery (A2)](#discovery-a2)
   - [Inventory](#inventory)
@@ -2516,6 +2519,162 @@ List all instruction definitions.
 
 ---
 
+#### `GET /api/v1/instructions`
+
+(#4029, api-parity Batch A) Twin of the legacy `GET /api/instructions` — the full filter set (`name`/`plugin`/`type`/`set_id`/`enabled_only`/`limit`), reconciled onto the same shared builder MCP's `list_definitions` tool calls (`instruction_definition_row_json`, `instruction_definition_model.hpp`) so REST and MCP cannot drift from each other by construction. A distinct route from `GET /api/v1/definitions` above (that route predates this issue and is unaffected by it).
+
+**Permission:** `InstructionDefinition:Read`
+
+**Query parameters:** `name`, `plugin`, `type` (`question`|`action`), `set_id`, `enabled_only` (bool), `limit` (default 100).
+
+**Response:**
+
+```json
+{
+  "data": [
+    {
+      "id": "def-abc123",
+      "name": "hardware.cpu-info",
+      "version": "1.0.0",
+      "type": "question",
+      "plugin": "hardware",
+      "action": "cpu-info",
+      "description": "Retrieve CPU model, core count, and architecture",
+      "enabled": true,
+      "instruction_set_id": "",
+      "created_at": 1742385600,
+      "updated_at": 1742385600
+    }
+  ],
+  "pagination": { "total": 1, "start": 0, "page_size": 50 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+#### `GET /api/v1/instructions/{id}`
+
+(#4029) Single-definition detail — the RECONCILED SUPERSET of the legacy `GET /api/instructions/{id}` fragment's fields (`gather_ttl_seconds`/`response_ttl_days`/`created_by`/timestamps) and MCP `get_definition`'s pre-existing fields (`approval_mode`/`parameter_schema`/`result_schema`/`yaml_source`) — both surfaces call the same builder (`instruction_definition_detail_json`) now, closing the field-set drift that existed between them before this issue.
+
+**Permission:** `InstructionDefinition:Read`
+
+**Response:**
+
+```json
+{
+  "data": {
+    "id": "def-abc123",
+    "name": "hardware.cpu-info",
+    "version": "1.0.0",
+    "type": "question",
+    "plugin": "hardware",
+    "action": "cpu-info",
+    "description": "Retrieve CPU model, core count, and architecture",
+    "enabled": true,
+    "instruction_set_id": "",
+    "created_at": 1742385600,
+    "updated_at": 1742385600,
+    "gather_ttl_seconds": 300,
+    "response_ttl_days": 90,
+    "created_by": "operator@example.com",
+    "approval_mode": "auto",
+    "parameter_schema": "{}",
+    "result_schema": "{}",
+    "yaml_source": "apiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\n..."
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**404** if no definition has that id.
+
+---
+
+#### `GET /api/v1/instructions/{id}/export`
+
+(#4029) Export a single instruction definition as its full JSON document (every field, including the operator-authoring-only fields `concurrency_mode`/`platforms`/`min_agent_version`/`required_plugins`/`readable_payload`/`visualization_spec`/`response_templates_spec`). Twin of the legacy `GET /api/instructions/{id}/export` route and the new MCP `export_definition` tool — all three now call the same builder (`instruction_definition_export_json`), which `InstructionStore::export_definition_json` itself delegates to as well. **Diverges from the legacy route on an unknown id:** the legacy route returns `200 "{}"` (a store-export quirk, never fixed since the field it checks was designed around "found but empty"); this route resolves the definition first and returns a real `404`.
+
+**Permission:** `InstructionDefinition:Read`
+
+**404** if no definition has that id.
+
+---
+
+### Product Packs
+
+(#4029, api-parity Batch A) A product pack is a bundle of `InstructionDefinition`/`PolicyFragment`/`Policy`/`Workflow` documents installed together (`POST /api/product-packs`, legacy — unversioned, unaffected by this issue). These two routes are read-only twins of the legacy `GET /api/product-packs[/{id}]` routes and of new MCP `list_product_packs`/`get_product_pack` tools, all three sharing one builder per shape (`product_pack_model.hpp`) so they cannot drift from each other by construction.
+
+**Prerequisite fix (#4029):** `ProductPack` is used as the RBAC securable string gating every one of these routes, but was never seeded into RBAC's securable-types catalogue before this issue — no role, not even Administrator, could be granted `ProductPack:*` while RBAC was enabled. Fixed as part of this issue: `ProductPack` is now seeded with full CRUD granted to Administrator, and `Read` additionally granted to Operator/PlatformEngineer/Viewer (the same population that already holds `InstructionDefinition:Read`).
+
+#### `GET /api/v1/product-packs`
+
+List installed product packs.
+
+**Permission:** `ProductPack:Read`
+
+**Query parameters:** `name`, `limit` (default 100).
+
+**Response:**
+
+```json
+{
+  "data": [
+    {
+      "id": "pack-abc123",
+      "name": "windows-baseline",
+      "version": "1.0.0",
+      "description": "Baseline Windows fleet content",
+      "item_count": 3,
+      "items": [
+        { "kind": "InstructionDefinition", "item_id": "def-1", "name": "hardware.cpu-info" }
+      ],
+      "installed_at": 1742385600,
+      "verified": true
+    }
+  ],
+  "pagination": { "total": 1, "start": 0, "page_size": 50 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+#### `GET /api/v1/product-packs/{id}`
+
+Get a single installed product pack's detail, including the pack's own `yaml_source` (the full multi-document bundle) and each item's own `yaml_source`.
+
+**Permission:** `ProductPack:Read`
+
+**Response:**
+
+```json
+{
+  "data": {
+    "id": "pack-abc123",
+    "name": "windows-baseline",
+    "version": "1.0.0",
+    "description": "Baseline Windows fleet content",
+    "yaml_source": "apiVersion: yuzu.io/v1alpha1\nkind: ProductPack\n...",
+    "items": [
+      {
+        "kind": "InstructionDefinition",
+        "item_id": "def-1",
+        "name": "hardware.cpu-info",
+        "yaml_source": "apiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\n..."
+      }
+    ],
+    "installed_at": 1742385600,
+    "verified": true
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**404** if no product pack has that id.
+
+---
+
 ### Response Templates
 
 Named response-view configurations attached to an `InstructionDefinition` — column subset, sort order, and filter presets the dashboard's filter-bar dropdown surfaces (issue #254, Phase 8.2). Storage is the `response_templates_spec` JSON array column on `instruction_definitions`; the `__default__` template is synthesised on read from `spec.result.columns` (or the plugin's column schema) and never persists.
@@ -2789,7 +2948,7 @@ row fails to persist, the response carries a `Sec-Audit-Failed: true` header
 | `auth.admin_required` | Centralised denial event emitted by `AuthRoutes::require_admin` on every privileged-endpoint 403. `target_type=endpoint`, `target_id={req.path}`. SOC 2 CC7.2 evidence chain — captures rejected attempts that previously surfaced only in the request log. |
 | `auth.lockout.applied` | Account locked after `--auth-lockout-threshold` consecutive failed local-password logins (SOC 2 CC6.3). Emitted **once** at the threshold crossing — not once per blocked attempt (those are tracked only by `yuzu_auth_lockout_blocked_total` to avoid audit flooding). `result=ok` (the lock was applied; the warning severity is carried by the metric + analytics event, not the audit result), `target_type=User`, `detail=threshold=<N> window_secs=<S>`. |
 | `auth.lockout.cleared` | Account-lockout counter reset. `result` ∈ {`ok`, `error`}, `target_type=User`. `detail=admin_unlock` for `POST /api/v1/users/{name}/unlock`, or `reset_on_successful_login` when the user's next successful login clears a non-zero counter. |
-| `execution.detail.fetch` | `GET /api/v1/executions/{id}` (REST v1 single-execution lookup). `result=denied` only (#1634) — emitted on the 404 branch, execution genuinely nonexistent OR out of the caller's management-group scope, non-distinguishing detail text. There is currently no `result=success` row on this route's 200 path — only the denial is audited. |
+| `execution.detail.fetch` | `GET /api/v1/executions/{id}` (REST v1 single-execution lookup). `result=denied` only (#1634) on the BARE route (no `include`) — emitted on the 404 branch, execution genuinely nonexistent OR out of the caller's management-group scope, non-distinguishing detail text; there is no `result=success` row on the bare route's 200 path. **As of #4030, this no longer holds for the whole URL pattern:** `?include=agents` on this same route, and the sibling `GET /api/v1/executions/{id}/responses`, both DO write `result=success` rows under this identical verb name on their 200 path (see `docs/user-manual/audit-log.md`'s `execution.detail.fetch` row for the full, current three-way split). |
 | `execution.live_subscribe` | Server-Sent Events subscribe to `/sse/executions/{id}`. `result` ∈ {`success`, `denied`}. `success` emitted on every successful subscribe (no per-session-per-execution dedup currently — see #700). `denied` emitted (#1634) on the 404 branch — execution genuinely nonexistent OR out of the caller's management-group scope, using non-distinguishing detail text so the two cases stay audit-indistinguishable. The forensic-grade audit on first-load remains on `/fragments/executions/{id}/detail`'s `execution.detail.view`. |
 | `api.v1.events.subscribe` | Agentic-first SSE subscribe to `/api/v1/events?execution_id=<id>` (sprint W5.1). `result` ∈ {`success`, `denied`}. `success` detail format: `correlation_id=req-<hex-ms>-<hex-seq>` so SIEM rules can join the audit row to the response's `X-Correlation-Id` header. Deliberately separated from `execution.live_subscribe` so the SIEM can distinguish browser-tier vs agentic-worker consumers. Same no-dedup policy (#700). `denied` emitted (#1634) on the 404 branch (unknown execution OR out of scope), using non-distinguishing detail text — corrects an earlier version of this row, which predated #1634 and said this 404 branch never audits. |
 | `instruction.create` | Instruction definition created. `result` ∈ {`success`, `denied`, `error`}. Denied detail value: `duplicate_id` (409, explicit `id` already exists). `error` detail `db_error` on a genuine InstructionStore DB/lease failure (503, ADR-0058) — distinct from `denied`, since an infra degrade is not an operator denial. |
@@ -3746,6 +3905,242 @@ See [Audit log](audit-log.md) for the `detail` contract, which differs for secre
 
 ---
 
+### Settings
+
+**#4028 (api-parity programme #2146).** REST v1 read-twins for the eight `/fragments/settings/*`
+dashboard sub-areas (TLS, HTTPS, gateway, server-config, MCP, data-retention, analytics,
+plugin-signing) — previously gated by a whole-endpoint admin role check (`require_admin`) with no
+RBAC securable and no REST twin at all. All eight routes are **read-only** and **Administrator-only
+today** (see the per-route Permission line); broadening to another role is a separate, explicit
+decision. Every builder is shared verbatim with the corresponding HTML fragment renderer
+(`docs/api-twin-recipe.md` §1) — the REST and dashboard views cannot drift from each other.
+
+**MCP.** None of these eight routes has an MCP twin, deliberately, and no MCP token can reach any of
+them via REST either — at any tier, including readonly. Issue #520 established the rule via
+`require_admin`'s own comment: "MCP tokens are for fleet management (queries, instruction execution)
+and must not be used to administer the server itself (settings, users, TLS, OIDC)". Seven of these
+eight routes are new and were never gated by `require_admin`; the eighth
+(`/api/v2/agent/plugin-policy` — its predecessor `/api/v1/agent/plugin-policy` is deprecated,
+frozen on `require_admin`; see below) is hardened off it onto `require_permission`. Gating via
+`require_permission` alone is not sufficient to preserve #520's blanket MCP exclusion — an
+admin-owned MCP token (any tier) satisfies `require_permission`'s topology-floor legacy-role check
+the same way an interactive admin session does. #4028 closes that gap at the actual chokepoint:
+`TlsConfig`, `PluginSigning`, `ServerConfig`, and `AnalyticsConfig` are excluded from every MCP tier
+in `mcp_policy.hpp`'s `tier_allows()`, so an MCP token is denied before it ever reaches the
+role-based fallback, on every transport that consults `tier_allows()` (REST today; MCP JSON-RPC too,
+if a future tool ever names one of these securables). #4028 ships these eight sub-areas REST-only
+rather than silently widening #520 — a future MCP carve-out for read-only settings visibility would
+need its own security-guardian-reviewed amendment, not a side effect of this twin work. See
+[MCP Server](../mcp-server.md) for the full #520 policy.
+
+#### `GET /api/v1/settings/tls`
+
+TLS/mTLS listener settings: enabled state, server cert/key/CA file paths, `insecure_skip_client_verify`,
+and the management-listener TLS override paths.
+
+**Permission:** `TlsConfig:Read`. **Audit:** `settings.tls.read` (fail-closed — TLS/mTLS posture and
+cert paths are reconnaissance value for an attacker learning the mTLS enforcement posture).
+
+```json
+{
+  "data": {
+    "enabled": true,
+    "server_cert_path": "/etc/yuzu/certs/server.pem",
+    "server_key_path": "/etc/yuzu/certs/server.key",
+    "ca_cert_path": "/etc/yuzu/certs/ca.pem",
+    "insecure_skip_client_verify": false,
+    "mgmt_server_cert_path": "",
+    "mgmt_server_key_path": "",
+    "mgmt_ca_cert_path": ""
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+#### `GET /api/v1/settings/https`
+
+HTTPS listener settings: enabled state, port, cert/key file paths, HTTP-redirect state.
+
+**Permission:** `TlsConfig:Read` (same securable as `/settings/tls`). **Audit:** `settings.https.read`
+(fail-closed).
+
+```json
+{
+  "data": {
+    "enabled": true,
+    "port": 8443,
+    "cert_path": "/etc/yuzu/certs/https.pem",
+    "key_path": "/etc/yuzu/certs/https.key",
+    "redirect": true
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+#### `GET /api/v2/agent/plugin-policy`
+
+Plugin code-signing trust bundle — **this is plugin-signing's REST twin**, not a separate
+`/api/v1/settings/plugin-signing` route (deliberate: the acceptance criteria for #4028 hardens this
+pre-existing, previously off-ledger route onto the A4 envelope + OpenAPI + the shared builder
+rather than adding a parallel one). Superset of the `/fragments/settings/plugin-signing` fragment's
+data — this route alone also returns the raw `trust_bundle_pem` bytes, for out-of-band agent-config
+distribution (`--plugin-trust-bundle`).
+
+**v1 is deprecated.** `GET /api/v1/agent/plugin-policy` predates #4028 and is FROZEN at its original
+flat-body shape (`require_admin` gate, no `data` envelope, no audit, no A4 error shape) rather than
+reshaped in place — #4144 caught that the original #4028 round did exactly that and violated
+`docs/api-versioning-policy.md`. v1 keeps working through the announced deprecation window (see
+`server-admin.md`'s vNEXT note); new integrations should target v2 below.
+
+**Permission:** `PluginSigning:Read` (dedicated securable, deliberately distinct from the unrelated
+`PluginConfig` securable, which gates per-plugin runtime kill-switch config — a different domain). No
+MCP token, at any tier, satisfies this permission (see "MCP" above). **Audit:**
+`settings.plugin_signing.read` (fail-closed) — CC6.1 least-privilege: a non-admin token holder
+learning when the trust anchor rotates (sha256 changes) is useful reconnaissance for a supply-chain
+attacker.
+
+```json
+{
+  "data": {
+    "enabled": true,
+    "required": false,
+    "cert_count": 2,
+    "sha256": "a1b2c3...",
+    "subjects": ["CN=Yuzu Plugin Signer, O=Example Corp"],
+    "bundle_unreadable": false,
+    "trust_bundle_pem": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n"
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+No bundle uploaded (still 200, not 404 — a normal operational state): `enabled: false`,
+`cert_count: 0`, `sha256: ""`, `subjects: []`, `trust_bundle_pem: ""`. A bundle present on disk but
+unreadable returns 500 (A4 error envelope) instead.
+
+**Errors:** 503 (A4 envelope, `retry_after_ms` set) in two cases distinct from the audit fail-closed
+503 above — the `required` flag's backing `runtime_config_store` read failed (the response would
+otherwise be unable to distinguish a genuine outage from a healthy "not required"), or the trust
+bundle was concurrently uploaded/cleared between this request's existence check and its PEM
+re-read. Both are retryable, and neither affects real plugin-signature enforcement — see
+[When a change takes effect](#when-a-change-takes-effect) above: `plugin_signing_required` "records
+intent only," is read in exactly two places (this route and its dashboard fragment twin), and no
+server or agent code consumes it to require signatures. Agent-side enforcement, where configured,
+is that agent's own `--plugin-require-signature`/`--plugin-trust-bundle` flags, independent of this
+route and its backing store.
+
+#### `GET /api/v1/settings/gateway`
+
+Erlang gateway upstream status: enabled state, listen address, gateway mode, live session count.
+
+**Permission:** `ServerConfig:Read`. **Audit:** none — operational status, nothing secret.
+
+```json
+{
+  "data": { "enabled": true, "listen_address": "0.0.0.0:50053", "gateway_mode": false, "active_sessions": 3 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`listen_address`/`gateway_mode`/`active_sessions` are defaulted (`""`/`false`/`0`) when
+`enabled` is `false`.
+
+#### `GET /api/v1/settings/server-config`
+
+Core server configuration: gRPC/web addresses and ports, session timeout, max agents, rate limits,
+OTA/gRPC tuning knobs. Nothing secret.
+
+**Permission:** `ServerConfig:Read`. **Audit:** none.
+
+```json
+{
+  "data": {
+    "agent_grpc_address": "0.0.0.0:50051",
+    "management_grpc_address": "0.0.0.0:50052",
+    "web_address": "127.0.0.1",
+    "web_port": 8080,
+    "session_timeout_seconds": 3600,
+    "max_agents": 10000,
+    "auth_config_path": "/etc/yuzu/yuzu-server.cfg",
+    "rate_limit_per_ip": 100,
+    "login_rate_limit_per_ip": 10,
+    "ota_max_concurrent_per_peer": 2,
+    "ota_rate_refill_per_min": 1.0,
+    "ota_rate_capacity": 20.0,
+    "ota_max_concurrent_total": 64,
+    "ota_max_peers_tracked": 50000,
+    "ota_transfer_deadline_secs": 900,
+    "ota_chunk_write_deadline_secs": 30,
+    "grpc_max_concurrent_streams": 128,
+    "grpc_max_resource_memory_mb": 512
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+#### `GET /api/v1/settings/mcp`
+
+MCP server status and the client-connection info shown on the dashboard (enabled/read-only state,
+the `/mcp/v1/` endpoint URL).
+
+**Permission:** `ServerConfig:Read`. **Audit:** none — low sensitivity; an MCP client with a valid
+token already knows this endpoint exists. This route describes the MCP surface but is itself
+REST-only — see the #520 note above.
+
+```json
+{
+  "data": { "enabled": true, "read_only": false, "endpoint_url": "https://localhost:8443/mcp/v1/" },
+  "meta": { "api_version": "v1" }
+}
+```
+
+#### `GET /api/v1/settings/data-retention`
+
+Response/audit data retention windows, in days.
+
+**Permission:** `ServerConfig:Read`. **Audit:** none — lowest sensitivity of the eight (two
+integers).
+
+```json
+{
+  "data": { "response_retention_days": 90, "audit_retention_days": 365 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+#### `GET /api/v1/settings/analytics`
+
+Analytics drain configuration and ClickHouse integration settings.
+
+**Permission:** `AnalyticsConfig:Read`. **Audit:** `settings.analytics.read` (fail-closed) — mixed,
+leans high (embedded-credential risk).
+
+> **`clickhouse_url` is sanitized of embedded userinfo credentials** (a URL of the form
+> `clickhouse://user:pass@host:9000/db` has the `user:pass@` segment stripped) before being
+> returned — this closes a gap where the sibling HTML fragment previously rendered the URL
+> verbatim, masking only the separate `clickhouse_password` field. The raw password is never
+> returned at all; only `clickhouse_password_set` (a bool) is.
+
+```json
+{
+  "data": {
+    "enabled": true,
+    "drain_interval_seconds": 10,
+    "batch_size": 100,
+    "clickhouse_configured": true,
+    "clickhouse_url": "clickhouse://host:9000/yuzu",
+    "clickhouse_database": "yuzu",
+    "clickhouse_table": "yuzu_events",
+    "clickhouse_username": "default",
+    "clickhouse_password_set": true,
+    "jsonl_export_path": ""
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
 ### Custom Properties
 
 Custom properties are operator-defined key-value pairs on agents, separate from tags. Properties can have schemas that enforce a value type (`string`/`int`/`bool`/`datetime`) and an optional regex-pattern validation rule. Properties are available for use in scope expressions via the `props.<key>` prefix.
@@ -4395,12 +4790,161 @@ results. `404` for an unknown execution id; `503` on a genuine store degrade (AD
 Execution history survives its workflow being deleted — this route stays readable for an
 execution whose workflow was later soft-deleted.
 
+**Permission:** `Workflow:Read`, fleet-read confined as of #4030 — same record-level gate and
+`agent_ids`/`agents_reached` narrowing as the v1 twin below (a caller with no agent visible in
+the execution's `agent_ids` gets the same `404` as a nonexistent id). Unlike the v1 twin and the
+MCP tool, this legacy route writes **no audit row on any path** (pre-existing; out of scope for
+the #4030 confinement fix).
+
 **Usage guide:**
 
 1. Define a workflow with ordered steps (each step maps to an instruction definition).
 2. Execute the workflow against a scope expression to target specific agents.
 3. Monitor execution progress via `GET /api/workflow-executions/{id}`.
 4. Each step runs sequentially; if a step fails on an agent, subsequent steps for that agent are skipped.
+
+---
+
+### Workflows, Executions & Schedules — v1 read twins (#4030)
+
+Versioned REST + MCP twins of the legacy `/api/workflows*` routes above, the `/fragments/executions`
+and `/fragments/executions/{id}/detail` dashboard fragments, and the `/fragments/schedules`
+fragment — closing the last gaps in that domain's `docs/api-parity-ledger.md` row set. Every route
+here shares its JSON row builder with its MCP tool twin (`docs/api-twin-recipe.md` Rule 1), so the
+two surfaces cannot drift on JSON **shape** independently. This does not by itself guarantee the two
+surfaces admit the same **result set** for a given caller: `GET /api/v1/executions`'s confined
+branch (below) is materially broader than the pre-existing MCP `list_executions` confinement
+(own-dispatches-only) — a disclosed, pre-#4030 difference, not a silent one (`docs/user-manual/mcp.md`).
+
+**Prerequisite fix bundled with this PR:** `Workflow` was used as an RBAC securable throughout
+`workflow_routes.cpp` but was never seeded into `RbacStore`'s securable-types catalogue — meaning
+no role, including Administrator, could ever be granted `Workflow:Read` while RBAC was enabled.
+This PR seeds it and grants `Read` to Administrator (via the standard CRUD seed), PlatformEngineer,
+Operator, ITServiceOwner, and Viewer — the same role footprint `Schedule:Read` already has. This
+applies automatically on upgrade (no migration step, no opt-out) — an existing RBAC-enabled
+deployment picks up these four grants on its next restart; review your role assignments first if
+you've already narrowed them.
+
+#### `GET /api/v1/workflows`
+
+**Permission:** `Workflow:Read`. List workflows — the v1 twin of `GET /api/workflows` above (same
+`name`/`limit` query parameters), MCP twin `list_workflows`.
+
+**Response:**
+
+```json
+{
+  "data": [
+    { "id": "abc123", "name": "Patch and Reboot", "description": "...",
+      "steps": [ { "index": 0, "instruction_id": "windows-update-install", "condition": "",
+                   "retry_count": 0, "retry_delay_seconds": 5, "foreach": "", "label": "",
+                   "on_failure": "abort" } ],
+      "step_count": 1, "created_at": 1710849600, "updated_at": 1710849600 }
+  ],
+  "pagination": { "total": 1, "start": 0, "page_size": 50 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+#### `GET /api/v1/workflows/{id}`
+
+**Permission:** `Workflow:Read`. Fetch one workflow's full detail, including `yaml_source`. The v1
+twin of `GET /api/workflows/{id}` above, MCP twin `get_workflow`. `404` for an unknown or
+soft-deleted id.
+
+#### `GET /api/v1/workflow-executions/{id}`
+
+**Permission:** `Workflow:Read`, gated on the fleet-read chokepoint (the legacy route now shares
+this same gate — see below). Record-level confinement: a caller with no agent visible in
+`WorkflowExecution.agent_ids` gets `404`, byte-identical to a genuinely nonexistent id (never a
+narrower-but-still-present record) — not merely a field-level `agent_ids` filter. An admitted
+confined caller's `agent_ids` array is narrowed to their visible agents, and each step's `result`
+has its `agents_reached` count stripped (it's the step's full target-agent count, not the caller's
+visible subset — emitting it verbatim would disclose the true out-of-scope agent count by simple
+arithmetic). The v1 twin of `GET /api/workflow-executions/{id}` above (which now applies the same
+confinement + `agent_ids`/`agents_reached` narrowing, previously unfiltered), MCP twin
+`get_workflow_execution`. Audited as `workflow_execution.detail.fetch`, set-and-proceed (not
+REST's usual fail-closed-on-audit-failure posture — this file's `AuditFn` predates the checked-bool
+`try_persist_audit`/`emit_behavioral_audit` helpers the Executions family below uses).
+
+**Response:**
+
+```json
+{
+  "data": {
+    "id": "exec-wf-1", "workflow_id": "wf-1", "status": "completed",
+    "agent_ids": ["agent-A"], "current_step": 1,
+    "started_at": 1735689600, "completed_at": 1735689620,
+    "steps": [
+      { "step_index": 0, "instruction_id": "windows-update-install", "status": "success",
+        "result": { "status": "dispatched", "command_id": "cmd-1" },
+        "started_at": 1735689600, "completed_at": 1735689610, "attempt": 1 }
+    ]
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+For an unconfined (global-grant) caller, each step's `result` also carries `agents_reached` (the
+step's dispatch-time target-agent count) — stripped above for a confined caller, as described.
+
+#### `GET /api/v1/executions`
+
+**Permission:** `Execution:Read`, gated on the fleet-read chokepoint (ADR-0017) — **not** the plain
+permission check `GET /fragments/executions` uses; a confined caller sees only executions
+involving at least one visible agent (or that they dispatched). The v1 twin of
+`GET /fragments/executions`, MCP twin `list_executions` (widened by this PR to the same field set).
+Accepts `definition_id`, `status`, and `limit` (capped at 500) query parameters.
+
+**Response:**
+
+```json
+{
+  "data": [
+    { "id": "exec-1", "definition_id": "def-1", "definition_name": "Collect OS Info",
+      "status": "completed", "dispatched_by": "alice", "dispatched_at": 1735689600,
+      "agents_targeted": 2, "agents_responded": 2, "agents_success": 1, "agents_failure": 1,
+      "completed_at": 1735689620, "rerun_of": "", "error_preview": "boom" }
+  ],
+  "pagination": { "total": 1, "start": 0, "page_size": 50 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+#### `GET /api/v1/executions/{id}?include=agents`
+
+**Permission:** `Execution:Read` (same gate as the bare route, `docs/executions-history-ladder.md`).
+`?include=agents` is the #4030 per-agent status/duration expansion decided for this row: a query
+parameter on the existing detail route rather than a new one, so the fragment's aggregate +
+per-agent capability stays a single genuine REST+MCP twin (MCP twin: `get_execution_status` with
+`"include":["agents"]`). Adds a confined `agents` array (`agent_id`, `status`, `dispatched_at`,
+`first_response_at`, `completed_at`, `exit_code`, `error_detail`) and a `kpi` object (`total`,
+`succeeded`, `failed`, `p50_ms`, `p95_ms` — `null` percentiles when no agent has a usable duration
+yet). Unlike the bare request, this expansion **is** audited (`execution.detail.fetch`, REST
+fail-closed 503 on an audit-persist failure) because it discloses raw agent identities. Response
+bodies are a **separate** route (below), not part of this expansion.
+
+#### `GET /api/v1/executions/{id}/responses`
+
+**Permission:** `Response:Read`, gated on the fleet-read chokepoint — deliberately a **different**
+securable than the detail route's `Execution:Read`, so folding this into the detail-route expansion
+above would have over-disclosed response bodies to a caller who holds `Execution:Read` but not
+`Response:Read`. The v1 twin of MCP `query_responses`' `execution_id`-scoped filter (no new MCP
+tool — `query_responses` already covers this shape). Accepts `agent_id`, `status`, `since`, `until`,
+`limit` (capped at 1000) query parameters. **Does not accept `offset`** — matching `query_responses`
+exactly: the result set orders by a non-unique, actively-growing timestamp while an execution is
+non-terminal, so offset-based paging would silently skip or duplicate rows; a caller-supplied
+`offset` is rejected with `400`, not silently ignored. Scope pushdown mirrors `query_responses`
+exactly: the caller's visible agent set is resolved and pushed into the store query before `limit`
+(ADR-0017 INV-3) — never filtered after the fact. Audited as `execution.detail.fetch`.
+
+#### `GET /api/v1/schedules`
+
+**Permission:** same two-stage gate as `GET /fragments/schedules`: a service-scoped API token is
+denied the fleet-wide list outright (schedules carry no per-agent axis for `fleet_read_fn` to
+confine against), then `Schedule:Read`. The v1 twin of `GET /fragments/schedules`, MCP twin
+`list_schedules` (widened by this PR to include `execution_count`). **Not** the separate legacy
+unversioned `GET /api/schedules` documented above — a distinct, untouched capability.
 
 ---
 
@@ -4728,9 +5272,9 @@ re-runs a set's own source query and creates a **sibling** (same parent, new id)
 | 503 | `RESULT_SET_NO_AGENTS` — no agents were reached in the target scope. Deliberately indistinguishable from "every resolved target was outside your reach": a distinct status would disclose devices the caller may not see |
 | 503 | `RESULT_SET_DISPATCH_UNAVAILABLE` / `RESULT_SET_DISPATCH_FAILED` — dispatch not wired, or the dispatch itself raised |
 
-#### `GET /api/v1/inventory/{plugin}/{agent_id}`
+#### `GET /api/v1/inventory/{agent_id}/{plugin}`
 
-Get inventory data for a specific plugin and agent.
+Get inventory data for a specific agent and plugin.
 
 **Permission:** `Inventory:Read`
 
@@ -6716,7 +7260,7 @@ outcome's granularity.
 
 ### Settings — Plugin Code Signing
 
-These endpoints drive the **Settings → Plugin Code Signing** card. The four `/api/settings/plugin-signing/*` routes are admin-only HTMX paths that return fragment HTML; the agent-facing distribution endpoint at `/api/v1/agent/plugin-policy` returns JSON. See *user-manual/agent-plugins.md → Plugin Code Signing* for the operator workflow and *user-manual/server-admin.md → vNEXT* for the upgrade notes.
+These endpoints drive the **Settings → Plugin Code Signing** card. The four `/api/settings/plugin-signing/*` routes are admin-only HTMX paths that return fragment HTML; the agent-facing distribution endpoint at `/api/v2/agent/plugin-policy` returns JSON (its predecessor `/api/v1/agent/plugin-policy` is deprecated — see below). See *user-manual/agent-plugins.md → Plugin Code Signing* for the operator workflow and *user-manual/server-admin.md → vNEXT* for the upgrade notes. See also [Settings](#settings) below — `/api/v2/agent/plugin-policy` is plugin-signing's REST read-twin (#4028, #4144); it is documented in both places because it predates the Settings read-twins programme and keeps its original path rather than moving under `/api/v1/settings/...`.
 
 **`GET /fragments/settings/plugin-signing`** — Render the Plugin Code Signing card fragment.
 
@@ -6748,43 +7292,61 @@ These endpoints drive the **Settings → Plugin Code Signing** card. The four `/
 - **Response (200):** Re-rendered fragment, `HX-Trigger: showToast level=success`. Audit `plugin_signing.require.changed` / `success`, `target_type=RuntimeConfig`, `target_id=plugin_signing_required`, `detail=<new_val>`.
 - **Response (500):** DB write failure with the store error.
 
-**`GET /api/v1/agent/plugin-policy`** — Distribution endpoint for operator agent-config flows. Returns the current trust bundle PEM and require flag as JSON.
+**`GET /api/v2/agent/plugin-policy`** — Distribution endpoint for operator agent-config flows, and plugin-signing's REST read-twin (#4028, #4144). Returns the current trust bundle PEM and require flag as JSON.
 
-- **Permission:** Admin only. The bundle holds X.509 certificates only (no private keys), but the SHA-256 fingerprint and the trust-anchor identity are operationally sensitive — non-admin token holders are not authorized to see when the trust anchor rotates. Future automatic agent-side fetch will introduce a dedicated agent identity for this endpoint.
-- **Stability:** pilot-stable. The path `/api/v1/agent/...` and the JSON response shape may change before the GA `/v1/` contract is finalized; the field set is unlikely to shrink (forward-compatible additions only).
+**v1 deprecated.** `GET /api/v1/agent/plugin-policy` predates #4028, is now DEPRECATED, and stays on its original flat-body shape (no `data` envelope, `require_admin` gate instead of `PluginSigning:Read`, no audit row, the old bespoke error shape) — see `server-admin.md`'s vNEXT note for the announced removal window. #4028 originally hardened this route's shape in place; #4144 corrected that into the v1/v2 split below, since an in-place envelope reshape is a breaking change per `docs/api-versioning-policy.md`.
+
+- **Permission:** `PluginSigning:Read` (Administrator-only via the `rbac_store.cpp` seed; floored in `authz_topology_floor.hpp` so an RBAC-off deployment stays admin-gated — the same practical posture the prior admin-only gate had for interactive sessions and non-MCP API tokens). **No MCP token, at any tier, can satisfy this permission** — `PluginSigning` is one of four server-administration securables `mcp_policy.hpp`'s `tier_allows()` denies outright, regardless of Read/Write, so an admin-owned MCP token that would otherwise fall through the legacy role check is stopped before it gets there. The bundle holds X.509 certificates only (no private keys), but the SHA-256 fingerprint and the trust-anchor identity are operationally sensitive — non-admin token holders are not authorized to see when the trust anchor rotates. Future automatic agent-side fetch will introduce a dedicated agent identity for this endpoint.
+- **Audit:** fail-closed. `settings.plugin_signing.read` is persisted before the response is built; if the audit subsystem is unavailable the route returns 503 rather than serve settings data without durable evidence.
+- **Stability:** pilot-stable. The field set is unlikely to shrink (forward-compatible additions only). `cert_count`/`sha256`/`subjects`/`trust_bundle_pem` are derived from a single filesystem read (#4144) — they cannot describe two different bundle versions on a concurrent-upload race, unlike v1.
 - **Response (200, bundle uploaded):**
 
   ```json
   {
-    "enabled": true,
-    "required": false,
-    "trust_bundle_pem": "-----BEGIN CERTIFICATE-----\nMIIB…\n-----END CERTIFICATE-----\n",
-    "cert_count": 2,
-    "sha256": "abc123…"
+    "data": {
+      "enabled": true,
+      "required": false,
+      "cert_count": 2,
+      "sha256": "abc123…",
+      "trust_bundle_pem": "-----BEGIN CERTIFICATE-----\nMIIB…\n-----END CERTIFICATE-----\n"
+    },
+    "meta": {"api_version": "v1"}
   }
   ```
 
 - **Response (200, no bundle uploaded):**
 
   ```json
-  {"enabled": false, "required": false, "trust_bundle_pem": ""}
+  {"data": {"enabled": false, "required": false, "trust_bundle_pem": ""},
+   "meta": {"api_version": "v1"}}
   ```
 
   (Status is 200, not 404 — "no bundle uploaded" is a normal operational state, not a fetch failure.)
 
-- **Response (500, bundle on disk is unreadable):** standard `/api/v1/*` error envelope.
+- **Response (500, bundle on disk is unreadable):** standard A4 error envelope.
 
   ```json
-  {"error": {"code": 500, "message": "Trust bundle on disk is unreadable"},
+  {"error": {"code": 500, "message": "Trust bundle on disk is unreadable",
+             "correlation_id": "…", "retry_after_ms": null},
    "meta": {"api_version": "v1"}}
   ```
+
+- **Response (503, audit subsystem unavailable):** same A4 error shape with `code: 503`.
+
+- **Response (503, two further cases, #4028 fix round):** the `required` flag's backing
+  `runtime_config_store` read failed (distinguishes a genuine outage from a healthy "not required" —
+  see [When a change takes effect](#when-a-change-takes-effect) above: `plugin_signing_required`
+  "records intent only," no server or agent code consumes it to require signatures, so a degraded
+  read here does not affect real enforcement), or the trust bundle was concurrently
+  uploaded/cleared between this request's existence check and its PEM re-read. Both are retryable
+  (A4 envelope, `retry_after_ms` set).
 
 - **Operator usage:** curl this into a local file on each agent host, then point the agent at that file with `--plugin-trust-bundle`:
 
   ```bash
   curl -fsSL -H "Authorization: Bearer $YUZU_ADMIN_TOKEN" \
-    https://server.example.com:8443/api/v1/agent/plugin-policy \
-    | jq -r .trust_bundle_pem > /etc/yuzu/plugin-trust-bundle.pem
+    https://server.example.com:8443/api/v2/agent/plugin-policy \
+    | jq -r .data.trust_bundle_pem > /etc/yuzu/plugin-trust-bundle.pem
   ```
 
 ---
@@ -6817,7 +7379,7 @@ These endpoints drive the **Settings → Multi-Factor Authentication** card. The
 **`POST /api/settings/mfa/recovery-codes`** — Regenerate the 10 recovery codes.
 
 - **Permission:** Admin only. Requires existing enrollment.
-- **Effect:** Atomic DELETE + 10×INSERT inside a `BEGIN IMMEDIATE / COMMIT` transaction. All prior codes (consumed and unconsumed) are invalidated.
+- **Effect:** Atomic DELETE + 10×INSERT inside a Postgres transaction, serialized on the caller's `auth.users` row (`SELECT … FOR UPDATE`) so two concurrent regenerations cannot interleave (#3779). All prior codes (consumed and unconsumed) are invalidated. If the account has been deactivated, the codes are **not** reissued and the request fails.
 - **Response (200):** HTML fragment with the fresh 10 codes as a one-time reveal. Same `Cache-Control: no-store` headers.
 - **Audit:** `mfa.recovery_codes.generated` / `ok` (detail = `10 codes issued (rotation)`).
 
@@ -7645,6 +8207,42 @@ store-degrade path is new. `POST /api/tags/set` previously returned `200
 
 ---
 
+### Inventory (Legacy)
+
+Requires `Inventory:Read` (global — not per-agent/management-group scoped; every caller
+holding the permission sees fleet-wide data, unlike the confined `Responses` routes above).
+Predates, and is distinct from, `/api/v1/inventory/*` (§ above) — the v1 routes cover the
+same three operations (`tables`, `{agent_id}/{plugin}`, `query`) wrapped in the standard A4
+envelope; prefer the v1 surface for new integrations. These legacy routes retain their
+historical, non-A4 response shapes and remain live for existing callers.
+
+#### `GET /api/inventory/tables`
+
+List available inventory data types across the fleet: `{"tables": [{"plugin", "agent_count",
+"last_collected"}, ...], "count": N}`.
+
+#### `GET /api/inventory/{agent_id}/{plugin}`
+
+Get the most recent inventory record for one agent+plugin pair: `{"agent_id", "plugin",
+"data", "collected_at"}`. `data` is the plugin's raw collected payload, parsed as JSON when
+valid, else returned as a raw string. `404` if no record exists for that agent+plugin pair.
+
+#### `POST /api/inventory/query`
+
+Query inventory records across agents. Request body (all fields optional):
+`{"agent_id": "...", "plugin": "...", "since": <epoch>, "until": <epoch>, "limit": N}`.
+`limit` is capped at 1000 regardless of the requested value. Returns `{"results": [...],
+"count": N, "result_truncated_by_cap": bool}` — `result_truncated_by_cap` is `true` when
+more matching rows existed than `limit` allowed.
+
+**Storage failure (all three routes):** a null/unopened inventory store returns `503`
+(`{"error":{"code":503,"message":"inventory store not available"}}`); a store that opens
+but degrades mid-call also returns `503` (`"inventory store degraded"`) — distinct from the
+`404` on `GET /{agent_id}/{plugin}`, which means the store answered but the record doesn't
+exist. `POST /query` returns `400` on a malformed request body.
+
+---
+
 ### Analytics and NVD
 
 #### `GET /api/me`
@@ -8132,6 +8730,42 @@ The **agentic-first (A1) structured surface** for the same destructive purge —
 - **503** — command dispatch unavailable, or the audit row could not be persisted (`Sec-Audit-Failed` header; the purge is **not** dispatched without durable evidence).
 
 **Audit:** `tar.source.purge` `result=requested` is written **before** dispatch (fail-closed). **Metric:** `yuzu_tar_source_purge_total{result}`. **Agent version:** same `tar.purge_source` (v0.14.0+) requirement as the fragment.
+
+#### `GET /api/v1/tar/process-tree`
+
+**API-parity read twin (#4027).** The **agentic-first (A1) structured surface** for the process-tree viewer's device picker — JSON twin of the operator-scoped device list `GET /fragments/tar/process-tree` renders into its host-picker `<select>`.
+
+**Permission:** `Infrastructure:Read`. A service-scoped API token is denied outright (403, `tar.device_picker.view` denied) — the fleet-wide device-enumeration guard shared with `GET /api/v1/tar/capture-sources` below, since neither route names a single `agent_id` to confine a service-scoped token's own tag against.
+
+**Request:** no parameters.
+
+**Response:** `{"data":{"devices":[{"agent_id","hostname","os","arch","agent_version","online"}]},"meta":{"api_version":"v1"}}`. Every row carries `online`, which is **always `true` today** — the sole wired provider sources this list from the live-session registry, so a disconnected enrolled device is not included (#4027 fix round, CDX-P1-02/K1 — an earlier revision of this doc claimed offline-inclusive; that was aspirational, not the shipped behavior). Unlike the HTML picker, this list does not additionally hide any row by online status — a future offline-inclusive provider (tracked follow-up) would make that distinction meaningful.
+
+**Audit:** none on success — a device identity/online list, not per-device behavioral content (matches the fragment's own today-unaudited posture).
+
+#### `GET /api/v1/tar/capture-sources`
+
+**API-parity read twin (#4027).** Same shape and gates as `GET /api/v1/tar/process-tree` above — JSON twin of the operator-scoped device list `GET /fragments/tar/capture-sources` renders into its host picker (ADR-0015).
+
+**Permission:** `Infrastructure:Read`. Same service-scoped-token 403 as the process-tree twin.
+
+**Response:** `{"data":{"devices":[{"agent_id","hostname","os","arch","agent_version","online"}]},"meta":{"api_version":"v1"}}`.
+
+#### `GET /api/v1/tar/retention-paused`
+
+**API-parity read twin (#4027).** JSON twin of `GET /fragments/tar/retention-paused`: the **calling operator's** most recent `tar.status` scan (per-username state), filtered to their visible agents, one row per (agent, paused source).
+
+**Permission:** `Infrastructure:Read`.
+
+**Request:** no parameters.
+
+**Response:** `{"data":{"scan_id","scan_count","scan_at","agents_responded","agents_with_no_paused_sources","agents_filtered_out_of_scope","store_degraded","rows":[{"agent_id","agent_display","source","paused_at","live_rows","oldest_ts","value_error","enabled_raw"}]},"meta":{"api_version":"v1"}}`. `scan_id` is `""` when the operator has not dispatched a scan yet — `POST /fragments/tar/retention-paused/scan` is dashboard-only today (a mutating dispatch route, out of scope for #4027).
+
+**Headers:** `Cache-Control: no-store, private` + `Vary: Cookie` — per-operator-scoped data, same UP-11 posture as the fragment.
+
+**Audit:** none on success — scan/config metadata, not per-device behavioral content (matches the fragment's own today-unaudited posture).
+
+**Not twinned (#4027 exception, recorded in `scripts/ci/api-parity/tar.json`):** `GET /fragments/tar/process-tree/result` and `GET /fragments/tar/process-tree/detail` are deliberately not given REST/MCP twins by #4027 — deferred as scope, not impossibility. `/detail`'s cache `token` is a CSPRNG value minted and principal-bound only inside the `/result` handler itself; no other path mints one, so a `/detail` twin genuinely has no usable input today. `/result`'s `pcmd`/`tcmd` command-id pair is an ordinary `tar sql` dispatch result (`Infrastructure:Read`, no execute gate) and could in principle be obtained by an operator through the already-twinned generic dispatch surface (`execute_instruction` / `POST /api/command`) by reproducing the two canned `$Process_Live`/`$TCP_Live` queries verbatim — but that is not a dedicated API path, and a real `/result` twin would still need a new async "not ready yet" polling contract (REST/MCP have no htmx auto-reissue equivalent). Both routes are otherwise reachable today only via the dashboard-only `GET /fragments/tar/process-tree/run` route, itself excluded (a dispatch-shaped GET batched with a later dispatch-twin effort, #3994). Revisit once that later batch ships `/run` (and `/result`) twins that mint these artifacts directly over the API.
 
 #### `GET /fragments/tar/capture-sources`
 
