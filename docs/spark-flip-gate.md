@@ -354,7 +354,10 @@ flip, with a red-first test each:
   double fault still leaves, so no key wedges until restart.
 - **ch-1, step-(3) publish allocation seam**: PR-1 added fault point 3 (`set_drain_fault_point_for_test(3)`,
   post-verdict and pre-pop), which sits UPSTREAM of the fill-in allocation ch-1 named; that seam is still
-  absent. Criterion: PR-5 adds the fill-in-allocation seam and exercises CH-3 through it.
+  absent. Criterion: PR-5 adds the fill-in-allocation seam and exercises the step-(3)
+  publish-allocation fault through it as a named red-first test (the pass-3 chaos-injector design
+  called this scenario "CH-3"; that label lives in no committed artefact, so the criterion names the
+  fault, not the label).
 - **up-5** as recorded in the pass-3 ledger (`governance.d/`, PR-1).
 
 ## 4. #2340 scenario contract

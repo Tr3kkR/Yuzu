@@ -5625,9 +5625,12 @@ TEST_CASE("rung 9c R5.2 (governance pass-3 cs-2): a firewalled drain whose index
     auto rt = make_rt(r, b);
     const auto key = spark_key(file_spec("/a"));
 
-    // qe-101: the future is declared BEFORE the Cleanup guard (the file's idiom) so a
-    // failed REQUIRE releases the parked backend first and the future's destructor
-    // then observes attach_rule returning, instead of stalling on the deadline.
+    // qe-101: the future is declared BEFORE the Cleanup guard (the file's idiom) so on
+    // unwind the guard releases the parked backend first and the future's destructor
+    // then joins an attach_rule that has already returned. Ownership order only: with
+    // the 30 s REQUIRE and the 5 s backend_op_deadline the destructor could never stall
+    // past the deadline either way (cpp-expert cx-202); the order is load-bearing for
+    // the CHECKs under Catch2 abort mode, where the guard is the only release.
     auto fut = std::async(std::launch::async, [&] {
         return rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
     });
@@ -5696,9 +5699,12 @@ TEST_CASE("rung 9c R5.2 (governance pass-3 qe-4): detach_all withdraws a rule th
     auto rt = make_rt(r, b);
     const auto key = spark_key(file_spec("/a"));
 
-    // qe-101: the future is declared BEFORE the Cleanup guard (the file's idiom) so a
-    // failed REQUIRE releases the parked backend first and the future's destructor
-    // then observes attach_rule returning, instead of stalling on the deadline.
+    // qe-101: the future is declared BEFORE the Cleanup guard (the file's idiom) so on
+    // unwind the guard releases the parked backend first and the future's destructor
+    // then joins an attach_rule that has already returned. Ownership order only: with
+    // the 30 s REQUIRE and the 5 s backend_op_deadline the destructor could never stall
+    // past the deadline either way (cpp-expert cx-202); the order is load-bearing for
+    // the CHECKs under Catch2 abort mode, where the guard is the only release.
     auto fut = std::async(std::launch::async, [&] {
         return rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
     });

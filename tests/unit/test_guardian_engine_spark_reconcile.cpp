@@ -2599,8 +2599,11 @@ TEST_CASE("test helper: wait_until_quiescent returns false while another thread 
     // never by a trailing manual join a throw could skip. std::jthread where the library
     // has it (loops on its own stop_token: a jthread destructor calls request_stop() and
     // would never set a hand-rolled release flag, so looping on such a flag would hang the
-    // unwind path); a scope-exit join guard over std::thread otherwise (Apple Clang 15's
-    // libc++ lacks <stop_token>, the #2580 lesson).
+    // unwind path); a scope-exit join guard over std::thread on any toolchain that does not
+    // define __cpp_lib_jthread. NOTE (governance pass-5 xp-201): no CI leg compiles that
+    // fallback arm today (every shipped toolchain defines __cpp_lib_jthread); it exists
+    // because of the #2580 lesson (an untested portability arm bit on Apple Clang), so treat
+    // it as review-only code and keep it trivially simple.
 #if defined(__cpp_lib_jthread)
     std::jthread t([](std::stop_token st) {
         while (!st.stop_requested())
@@ -2620,6 +2623,9 @@ TEST_CASE("test helper: wait_until_quiescent returns false while another thread 
     struct JoinOnExit {
         std::atomic<bool>& release;
         std::thread& t;
+        JoinOnExit(std::atomic<bool>& r, std::thread& th) : release(r), t(th) {}
+        JoinOnExit(const JoinOnExit&) = delete;            // qe-204: one owner, one join
+        JoinOnExit& operator=(const JoinOnExit&) = delete;
         ~JoinOnExit() {
             release.store(true, std::memory_order_release);
             if (t.joinable())

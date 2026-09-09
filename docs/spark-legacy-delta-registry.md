@@ -435,11 +435,12 @@ doc just makes sure they're findable rather than rediscovered from scratch.
   True today under legacy; false for any rule spark has taken over post-flip — spark is
   detect-only, unconditionally, until rung 3 (B1), so nothing enforces pre-network (or
   at all) for those rules once the flip lands.
-- **This PR's own edit to `.claude/routed-concerns.md`'s Spark row** states "`prefer_spark_`
-  defaults `false`... so legacy `IGuard` remains the sole live detection path
-  (`reconcile`'s spark branch is unreachable at `prefer_spark_=false`)" and "the
-  convergence scheduler + drain worker are constructed but their threads start only under
-  `prefer_spark_`." Both clauses are true today and become false at the flip — the row
+- **This PR's own edit to `.claude/routed-concerns.md`'s Spark row** states (clause 2, as
+  trimmed under the 32,000-character instruction-file budget in rung 9c PR-1) "`prefer_spark_`
+  defaults `false` and is never passed `true` in production, so legacy `IGuard` is the sole
+  live detection path (the spark branch of `reconcile`, the scheduler/drain threads and the
+  rung 9c claim path are unreachable at `false`)". Every part of that clause is true today
+  and becomes false at the flip — the row
   that loads governance agents onto Spark-touching changes goes stale in the exact same
   way this doc exists to track, and it's higher-stakes than the items above since
   CLAUDE.md imports this row as standing authority for every `/governance` run.

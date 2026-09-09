@@ -789,9 +789,12 @@ on the sole production `attach_rule` hardcoding `emit_compliant_edge=true` - do 
    **Drain order fix (M6):** send lifecycle *before* compliance (currently `:443-444`
    sends compliance first) so a rule's "armed" audit entry never arrives after its first
    drift event.
-5. **Two-count executor + physical-orphan ceiling (Fable M4).** Today inflight counters
-   free when the worker payload is destroyed inside the thread trampoline (`~TicketCore`, `guardian_io_executor.hpp`), so `kMaxProcessIoWorkers=10`
-   is a real physical bound. Freeing the *logical* admission slot on the run() deadline
+5. **Two-count executor + physical-orphan ceiling (Fable M4).** Before rung 9c PR-1 the
+   inflight counters freed only when the worker payload was destroyed inside the thread
+   trampoline (`~TicketCore`, `guardian_io_executor.hpp`), so `kMaxProcessIoWorkers=10` was a
+   real physical bound; that is still true for `run()` workers, but `submit()` (R5.1) frees
+   its quota slot at `fn()` return, so the physical bound on an instance is now
+   `kMaxAliveIoWorkers=20` (the alive-worker ceiling below), not the quota sum. Freeing the *logical* admission slot on the run() deadline
    requires a **separate physical-orphan ceiling strictly > sum(quotas)** (else 10 wedged
    orphans re-create the exact cross-class starvation R3 eliminated) + same-key
    single-flight retained until orphan exit + an exactly-once logical-vs-physical
