@@ -12500,6 +12500,45 @@ TEST_CASE("MCP preview_management_group_agent_count: a real filter against an un
     CHECK_FALSE(envelope.contains("result"));
 }
 
+// Colleague review on #4188 (real HIGH finding, verified independently): a
+// malformed filters shape was silently dropped rather than rejected, which
+// group_agent_count_preview's own "empty filters -> genuine 0" contract then
+// turned into a fabricated successful agent_count:0 for a request that was
+// never actually evaluated. Both shapes below must be a hard error, never a
+// 200 with agent_count:0 (response_store_for_test stays nullptr — if either
+// shape reached group_agent_count_preview with a non-empty filter it would
+// degrade per the test above, not succeed at 0; catching a silent 200:0 here
+// is the falsifier for the exact defect the review found).
+TEST_CASE("MCP preview_management_group_agent_count: a non-string filter value is rejected, "
+          "never silently dropped into a false genuine-0",
+          "[mcp][devices][security]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":94,)"
+        R"("params":{"name":"preview_management_group_agent_count",)"
+        R"("arguments":{"command_id":"cmd-1","plugin":"procfetch","filters":{"pid":1234}}}})");
+    REQUIRE(res->status == 200);
+    auto envelope = nlohmann::json::parse(res->body);
+    REQUIRE(envelope.contains("error"));
+    CHECK_FALSE(envelope.contains("result"));
+}
+
+TEST_CASE("MCP preview_management_group_agent_count: an array-shaped filters is rejected, "
+          "never silently dropped into a false genuine-0",
+          "[mcp][devices][security]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":95,)"
+        R"("params":{"name":"preview_management_group_agent_count",)"
+        R"("arguments":{"command_id":"cmd-1","plugin":"procfetch","filters":["pid"]}}})");
+    REQUIRE(res->status == 200);
+    auto envelope = nlohmann::json::parse(res->body);
+    REQUIRE(envelope.contains("error"));
+    CHECK_FALSE(envelope.contains("result"));
+}
+
 TEST_CASE("MCP preview_management_group_agent_count: readonly tier is denied "
           "(ManagementGroup:Write, not Read)",
           "[mcp][devices]") {

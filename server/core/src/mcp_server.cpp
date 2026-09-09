@@ -7287,10 +7287,37 @@ McpServer::HandlerFn McpServer::build_handler(
                 const auto command_id = param_str(args, "command_id");
                 const auto plugin = param_str(args, "plugin");
                 std::vector<std::pair<std::string, std::string>> raw_fields;
-                if (args.contains("filters") && args["filters"].is_object()) {
-                    for (const auto& [key, value] : args["filters"].items())
-                        if (value.is_string())
-                            raw_fields.emplace_back(key, value.get<std::string>());
+                // Colleague review (#4188): the served inputSchema (kTools[]
+                // above) declares filters as an object of string values, but
+                // that schema is enforced ONLY on the C8 approval-gated path
+                // (#2405) — an admitted caller whose session carries no
+                // mcp_tier (so no approval ticket is ever minted) reaches
+                // this handler directly. Silently dropping a malformed
+                // filters shape (non-object, or a non-string value) here
+                // would leave raw_fields empty, which group_agent_count_preview
+                // treats as a GENUINE zero-filter result (its own documented
+                // contract, matching the dashboard fragment) — a caller who
+                // sent a malformed filter would see a fabricated successful
+                // agent_count:0 indistinguishable from "no filter". Reject
+                // explicitly instead, on every admitted path, not just the
+                // approval-gated one.
+                if (args.contains("filters")) {
+                    if (!args["filters"].is_object()) {
+                        res.set_content(
+                            error_response(id, kInvalidParams, "filters must be an object"),
+                            "application/json");
+                        return;
+                    }
+                    for (const auto& [key, value] : args["filters"].items()) {
+                        if (!value.is_string()) {
+                            res.set_content(
+                                error_response(id, kInvalidParams,
+                                               "filters values must be strings"),
+                                "application/json");
+                            return;
+                        }
+                        raw_fields.emplace_back(key, value.get<std::string>());
+                    }
                 }
                 auto filters = resolve_group_preview_filters(plugin, raw_fields);
 
