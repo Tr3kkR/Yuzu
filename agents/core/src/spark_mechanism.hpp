@@ -60,6 +60,14 @@ namespace yuzu::agent {
 /// snapshots subscribers, releases the lock, then delivers — so a mechanism may
 /// call emit() freely without risking the engine's lock (an inline consumer
 /// that re-arms takes that lock).
+///
+/// MAY THROW - guard it on any thread where an escaping exception is fatal
+/// (an OS callback, a detached worker): the engine's implementation copies the
+/// key and the subscriber snapshot under its lock (spark_engine.cpp emit_event)
+/// and the queued tier's deque push allocates (deliver()), none of it caught, so
+/// std::bad_alloc can escape; only the Inline handler's own throw is contained
+/// by deliver(). Returns void: there is no delivery acknowledgement, "submitted
+/// without throwing" is all a mechanism can know (#2012/#3840 PR-B1).
 using SparkEmitFn = std::function<void(const std::string& key, SparkData data)>;
 
 /// The engine's fault/health callback (ADR-0021 Stage 1, governance B1). A
@@ -285,6 +293,8 @@ struct RegistryMechanismDebugCounters {
     std::uint64_t drains_admission_rejected{0};
     std::uint64_t synthetic_fires{0};
     std::uint64_t health_edges{0};
+    std::uint64_t emit_failed{0};    ///< emit() threw on submit (fire callback or sweeper)
+    std::uint64_t resync_retries{0}; ///< restored resync debt re-staged by the sweeper
     std::size_t probe_workers_active{0};
     std::size_t drain_workers_active{0};
     std::size_t live_watches{0};

@@ -68,11 +68,17 @@
  *      launcher observes cancellation (generation/active mismatch), not a
  *      stolen value.
  *   6. `needs_resync` carries an epoch: set (epoch bumped) whenever an accepted
- *      watch has an observation gap (a Target-mode fire consumed, or an initial
- *      probe published past the caller budget); cleared by the sweeper when the
- *      synthetic fire is SUBMITTED through emit (SparkEmitFn returns void - there
- *      is no delivery acknowledgement to wait for), restored only if that submit
- *      threw and the epoch is unchanged.
+ *      watch has an observation gap (a Target-mode fire consumed, an initial
+ *      probe published past the caller budget, or an Ancestor -> Target
+ *      appearance found at commit); cleared by the sweeper when the synthetic
+ *      fire is SUBMITTED through emit (SparkEmitFn returns void - there is no
+ *      delivery acknowledgement to wait for); restored if that submit threw and
+ *      the epoch is unchanged, then re-staged on a D-doubling backoff (30 s cap)
+ *      rather than at the sweep cadence. The two emits a consumed notification
+ *      produces (immediate + synthetic) are two SUBMISSIONS, not two changes:
+ *      RegNotifyChangeKeyValue is one-shot, so N writes before the re-arm
+ *      coalesce into one notification, and the consumer's own dedup decides
+ *      what reaches the wire.
  *
  * LIFETIME INVARIANT that makes the raw `RegWatch*` TP_WAIT context safe: a
  * RegWatch whose wait was ever armed is destroyed ONLY after that wait has been
@@ -463,6 +469,10 @@ struct RegWatch {
     /// from an initial establishment). Survives a failed probe; cleared only by
     /// a successful commit.
     bool rearm_from_ancestor{false};
+    /// Resync debt whose Emit submit THREW (SparkEmitFn can - see its declaration)
+    /// is restored and re-staged on this schedule, never at the sweep cadence.
+    unsigned resync_attempts{0};
+    Clock::time_point resync_retry_at{};
     WindowsRegistryMechanism* owner{nullptr};
 
     ~RegWatch(); // drain_watch() safety net - see below
@@ -534,7 +544,8 @@ struct SweepWork {
     std::vector<DetachedCall<ProbeResult>> stale_calls;
     std::vector<std::unique_ptr<RegWatch>> dead_watches;
     std::vector<DrainJob> inline_drains; ///< could not even be queued - drained inline off-lock
-    std::vector<std::pair<std::string, std::uint64_t>> failed_emits; ///< restore needs_resync
+    std::vector<std::pair<std::string, std::uint64_t>> failed_emits;    ///< restore needs_resync
+    std::vector<std::pair<std::string, std::uint64_t>> succeeded_emits; ///< reset the retry schedule
 };
 
 class WindowsRegistryMechanism final : public ISparkMechanism {
@@ -842,6 +853,8 @@ public:
         d.drains_admission_rejected = drains_admission_rejected_.load(std::memory_order_relaxed);
         d.synthetic_fires = synthetic_fires_.load(std::memory_order_relaxed);
         d.health_edges = health_edges_.load(std::memory_order_relaxed);
+        d.emit_failed = emit_failed_.load(std::memory_order_relaxed);
+        d.resync_retries = resync_retries_.load(std::memory_order_relaxed);
         d.probe_workers_active = probe_lane_.active_workers();
         d.drain_workers_active = drain_lane_.active_workers();
         std::lock_guard lk(mu_);
@@ -912,9 +925,26 @@ public:
             }
         }
         // Fire with mu_ RELEASED: emit re-enters the engine under its own lock, and
-        // an inline consumer re-arming would take our mu_ → deadlock if held.
-        if (do_emit && emit)
-            emit(w.spark_key, SparkData{std::monostate{}});
+        // an inline consumer re-arming would take our mu_ -> deadlock if held.
+        // GUARDED: this runs inside a TP_WAIT callback, where an escaping exception
+        // is process death, and SparkEmitFn can throw (std::bad_alloc from the
+        // engine's own copies / queue push - see its declaration). The debt is
+        // already recorded under mu_ above (`needs_resync`, set on exactly the
+        // `do_emit` path), so a lost immediate fire is covered by the commit's
+        // synthetic fire.
+        if (do_emit && emit) {
+            try {
+                emit(w.spark_key, SparkData{std::monostate{}});
+            } catch (...) {
+                emit_failed_.fetch_add(1, std::memory_order_relaxed);
+                try {
+                    spdlog::warn("spark_registry: emit for '{}' threw from the fire callback - "
+                                 "the re-arm's synthetic fire covers it",
+                                 w.spark_key);
+                } catch (...) {
+                }
+            }
+        }
         // `stale` (if any) destroyed here: an abandon, the worker self-disposes.
     }
 
@@ -1090,6 +1120,8 @@ private:
                 wake = std::min(wake, w->next_retry_at);
                 break;
             case ProbeState::Idle:
+                if (w->armed && w->needs_resync)
+                    wake = std::min(wake, w->resync_retry_at); // restored debt, on its backoff
                 continue;
             }
             if (!w->grace_counted)
@@ -1166,6 +1198,16 @@ private:
                 }
                 break;
             case ProbeState::Idle:
+                // Restored resync debt (its Emit submit threw): re-stage on the
+                // backoff publish_locked() set, not at every sweep. Only while the
+                // watch is established - an un-armed watch has a probe outstanding
+                // and its commit stages the debt itself.
+                if (w.armed && w.needs_resync && now >= w.resync_retry_at) {
+                    work.actions.push_back(
+                        {SweepWork::Action::Kind::Emit, w.spark_key, false, "", w.resync_epoch});
+                    w.needs_resync = false;
+                    resync_retries_.fetch_add(1, std::memory_order_relaxed);
+                }
                 break;
             }
             if (w.faulted_now != w.faulted_reported) {
@@ -1205,10 +1247,13 @@ private:
                         work.fault(a.key, a.faulted, a.reason);
                 } else if (work.emit) {
                     work.emit(a.key, SparkData{std::monostate{}});
+                    work.succeeded_emits.emplace_back(a.key, a.epoch);
                 }
             } catch (...) {
-                if (a.kind == SweepWork::Action::Kind::Emit)
+                if (a.kind == SweepWork::Action::Kind::Emit) {
+                    emit_failed_.fetch_add(1, std::memory_order_relaxed);
                     work.failed_emits.emplace_back(a.key, a.epoch);
+                }
             }
         }
     }
@@ -1258,10 +1303,25 @@ private:
             }
         }
         drain_outcomes_.clear();
+        for (const auto& [key, epoch] : work.succeeded_emits) {
+            auto it = watches_.find(key);
+            if (it != watches_.end() && it->second->resync_epoch == epoch)
+                it->second->resync_attempts = 0;
+        }
+        work.succeeded_emits.clear();
         for (const auto& [key, epoch] : work.failed_emits) {
             auto it = watches_.find(key);
-            if (it != watches_.end() && it->second->active && it->second->resync_epoch == epoch)
-                it->second->needs_resync = true;
+            if (it == watches_.end() || !it->second->active || it->second->resync_epoch != epoch)
+                continue; // retired, or a newer obligation already superseded this one
+            RegWatch& w = *it->second;
+            w.needs_resync = true;
+            ++w.resync_attempts;
+            const auto delay = doubled(admission_seed(), w.resync_attempts, kRegAdmissionBackoffCap);
+            w.resync_retry_at = Clock::now() + delay;
+            spdlog::warn("spark_registry: synthetic fire for '{}' threw on submit (attempt {}) - "
+                         "retrying in {} ms",
+                         w.spark_key, w.resync_attempts,
+                         std::chrono::duration_cast<std::chrono::milliseconds>(delay).count());
         }
         work.failed_emits.clear();
     }
@@ -1364,6 +1424,8 @@ private:
     std::atomic<std::uint64_t> drains_admission_rejected_{0};
     std::atomic<std::uint64_t> synthetic_fires_{0};
     std::atomic<std::uint64_t> health_edges_{0};
+    std::atomic<std::uint64_t> emit_failed_{0};    ///< an emit() submit threw (either path)
+    std::atomic<std::uint64_t> resync_retries_{0}; ///< restored debt re-staged by the sweeper
     std::atomic<std::size_t> retiring_cap_{kRetiringCap};
     std::atomic<std::int64_t> caller_wait_ms_{kRegCallerWaitBudget.count()};
     std::atomic<std::int64_t> health_grace_ms_{kRegHealthGrace.count()};
