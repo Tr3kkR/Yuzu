@@ -225,20 +225,35 @@ jobs:
         # sized for uninstrumented runs; sanitizer instrumentation runs
         # slower (the pre-split 900s budget was justified by exactly that),
         # and 2x1200s parallel shards still fit this job's timeout.
-        run: meson test -C build-linux-asan --timeout-multiplier 2 --print-errorlogs
+        # YUZU_TEST_PROGRESS (governance follow-up, #4153 round 4): previously only
+        # enabled on the nightly windows-asan leg, so a hang here had no per-test
+        # attribution beyond the coarser suite-level testlog. Absolute path, same
+        # reason as windows-asan's own comment on this: meson's default test workdir
+        # is the build directory itself, so a bare path would double-prefix.
+        run: |
+          export YUZU_TEST_PROGRESS=1
+          export YUZU_TEST_PROGRESS_FILE="$GITHUB_WORKSPACE/build-linux-asan/meson-logs/progress.log"
+          mkdir -p "$(dirname "$YUZU_TEST_PROGRESS_FILE")"
+          rm -f "$YUZU_TEST_PROGRESS_FILE"
+          meson test -C build-linux-asan --timeout-multiplier 2 --print-errorlogs
 
       - name: ccache stats
         if: always()
         run: ccache -s
 
-      - name: Upload meson testlog (on failure)
-        if: failure()
+      - name: Upload meson testlog (on failure or cancel)
+        # `|| cancelled()` added alongside progress.log (#4153 round 4): the historical
+        # stalls this listener exists to attribute (#2345, #4018) rode to the JOB's own
+        # timeout, which GitHub Actions reports as CANCELLED, not FAILED - a bare
+        # `failure()` would silently drop exactly the artifact this fix adds.
+        if: failure() || cancelled()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: meson-testlog-asan
           path: |
             build-linux-asan/meson-logs/testlog.txt
             build-linux-asan/meson-logs/testlog.junit.xml
+            build-linux-asan/meson-logs/progress.log
           retention-days: 14
           if-no-files-found: warn
 
@@ -382,7 +397,14 @@ jobs:
         env:
           LD_PRELOAD: ${{ runner.temp }}/libgai_sync_shim.so
         # --timeout-multiplier 2: see the asan Test step (#2092 shard budgets).
-        run: meson test -C build-linux-tsan --timeout-multiplier 2 --print-errorlogs
+        # YUZU_TEST_PROGRESS (governance follow-up, #4153 round 4): see the asan Test
+        # step's comment - same rationale, same absolute-path requirement.
+        run: |
+          export YUZU_TEST_PROGRESS=1
+          export YUZU_TEST_PROGRESS_FILE="$GITHUB_WORKSPACE/build-linux-tsan/meson-logs/progress.log"
+          mkdir -p "$(dirname "$YUZU_TEST_PROGRESS_FILE")"
+          rm -f "$YUZU_TEST_PROGRESS_FILE"
+          meson test -C build-linux-tsan --timeout-multiplier 2 --print-errorlogs
 
       - name: Capture stack trace under gdb (#438 diagnostic)
         # With the gai_sync_shim active, the originally-documented #438
@@ -449,6 +471,7 @@ jobs:
           path: |
             build-linux-tsan/meson-logs/testlog.txt
             build-linux-tsan/meson-logs/testlog.junit.xml
+            build-linux-tsan/meson-logs/progress.log
             build-linux-tsan/stack-capture.log
           retention-days: 14
           if-no-files-found: warn
