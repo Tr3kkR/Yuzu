@@ -175,8 +175,11 @@ TEST_CASE("RbacStore: seed data — securable types", "[rbac_store][pg]") {
     // +ProductPack (#4029 prerequisite fix — was used as an RBAC securable string by
     // the shipped /api/product-packs* routes but never seeded) = 29,
     // +TlsConfig +PluginSigning +ServerConfig +AnalyticsConfig (#4028
-    // Settings read-twins) = 33.
-    REQUIRE(types.size() == 33);
+    // Settings read-twins) = 33,
+    // +Directory +Enrollment +OidcConfig (#4031 prerequisite fix — Directory was
+    // referenced by discovery_routes.cpp but never seeded; Enrollment/OidcConfig
+    // are the two new #4031 route securables) = 36.
+    REQUIRE(types.size() == 36);
 
     auto has = [&](const std::string& t) {
         return std::find(types.begin(), types.end(), t) != types.end();
@@ -209,6 +212,9 @@ TEST_CASE("RbacStore: seed data — securable types", "[rbac_store][pg]") {
     CHECK(has("PluginSigning"));   // #4028: plugin-signing fragment + GET /agent/plugin-policy (v2)
     CHECK(has("ServerConfig"));    // #4028: gateway/server-config/mcp/data-retention fragments
     CHECK(has("AnalyticsConfig")); // #4028: analytics fragment
+    CHECK(has("Directory"));   // #4031 prerequisite fix — AD/Entra directory-sync
+    CHECK(has("Enrollment"));  // #4031: auto-approve rules + pending-agent visibility
+    CHECK(has("OidcConfig"));  // #4031: OIDC SSO config read (deliberately not "Directory")
 }
 
 TEST_CASE("RbacStore: seed data — operations", "[rbac_store][pg]") {
@@ -243,20 +249,21 @@ TEST_CASE("RbacStore: seeded catalogues match the MCP C8 validator mirrors",
 TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_store][pg]") {
     RBAC_STORE(store);
     auto perms = store.get_role_permissions("Administrator");
-    // 33 types * 5 CRUD ops = 165 permissions, plus a single targeted Push
-    // grant on GuaranteedState (= 166), plus a single AccessReview:Attest grant
-    // (Periodic Access Reviews, CC6.2, = 167), plus a single ApiToken:Rotate
-    // grant (P2 #11, SOC 2 CC6.3) = 168 permissions total. Push, Attest, and
+    // 36 types * 5 CRUD ops = 180 permissions, plus a single targeted Push
+    // grant on GuaranteedState (= 181), plus a single AccessReview:Attest grant
+    // (Periodic Access Reviews, CC6.2, = 182), plus a single ApiToken:Rotate
+    // grant (P2 #11, SOC 2 CC6.3) = 183 permissions total. Push, Attest, and
     // Rotate are deliberately NOT cross-seeded on other securables — see the
-    // rationale in rbac_store.cpp seed_defaults(). (33rd-30th: TlsConfig/
-    // PluginSigning/ServerConfig/AnalyticsConfig, #4028 Settings read-twins;
-    // 29th: ProductPack, #4029 prerequisite fix; 28th: Workflow, #4030/#4032
-    // — previously gated but never seeded; 27th: PowerManagement, Wave 6
+    // rationale in rbac_store.cpp seed_defaults(). (36th-34th: Directory/
+    // Enrollment/OidcConfig, #4031; 33rd-30th: TlsConfig/PluginSigning/
+    // ServerConfig/AnalyticsConfig, #4028 Settings read-twins; 29th:
+    // ProductPack, #4029 prerequisite fix; 28th: Workflow, #4030/#4032 —
+    // previously gated but never seeded; 27th: PowerManagement, Wave 6
     // power_health set_power_plan; 26th-24th: UploadGrant/PluginSecret/
     // PluginConfig, PR1.9a peer finding PLAN-001; 23rd: EnginePrincipal,
     // #2376; 22nd: AccessReview, SOC 2 CC6.2; 21st: SoftwareLicensing,
     // ADR-0024.)
-    CHECK(perms.size() == 168);
+    CHECK(perms.size() == 183);
     for (auto& p : perms)
         CHECK(p.effect == "allow");
 
@@ -286,10 +293,16 @@ TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_s
 TEST_CASE("RbacStore: seed data — Viewer has read-only", "[rbac_store][pg]") {
     RBAC_STORE(store);
     auto perms = store.get_role_permissions("Viewer");
-    // 23 types * Read only (everything except Infrastructure; incl. Inventory +
+    // 24 types * Read only (everything except Infrastructure; incl. Inventory +
     // SoftwareLicensing, ADR-0024, + EnginePrincipal, #2376, + Workflow,
-    // #4030/#4032, + ProductPack, #4029)
-    CHECK(perms.size() == 23);
+    // #4030/#4032, + ProductPack, #4029, + Directory, #4031 — AD/Entra
+    // directory-sync PII, same precedent as UserManagement). Enrollment/
+    // OidcConfig deliberately do NOT join Viewer's list — see the seeding
+    // comment in rbac_store.cpp's Viewer read-loop. (Counted directly from
+    // the merged Viewer grant-loop's type list, not derived from either
+    // side's pre-merge arithmetic — see #4030's own merge-round precedent
+    // for why that check matters here.)
+    CHECK(perms.size() == 24);
     for (auto& p : perms) {
         CHECK(p.operation == "Read");
         CHECK(p.effect == "allow");
