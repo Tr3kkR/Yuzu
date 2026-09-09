@@ -77,6 +77,10 @@
  *   usage_gap_last_ts       -- epoch seconds of the most recent gap
  *   usage_feeder_enabled    -- "true"/"false", gating snapshot for P22's report
  *   usage_coverage_since    -- epoch seconds the fold has counted from (re-baseline)
+ *   usage_schema_stalled    -- "true"/"false", whether schema_version is stuck below
+ *                              kUsageDailySchemaVersion (v7's usage_daily.fold_hwm
+ *                              migration never completed) -- see the gate near the
+ *                              top of run_usage_fold()
  */
 
 #include "tar_usage.hpp"
@@ -88,6 +92,7 @@
 #include <algorithm>
 #include <charconv>
 #include <format>
+#include <map>
 #include <set>
 #include <utility>
 
@@ -112,6 +117,12 @@ std::string sql_str(std::string_view s) {
     return out;
 }
 
+// The schema_version (tar_db.cpp) at which usage_daily gained its fold_hwm
+// column -- the ALTER TABLE that column's v7 migration performs. Below this
+// version, every statement in this file that references fold_hwm (both
+// build_daily_upsert() forms) is rejected by SQLite at prepare time.
+constexpr int kUsageDailySchemaVersion = 7;
+
 int64_t parse_i64(std::string_view s, int64_t def = 0) {
     if (s.empty())
         return def;
@@ -120,6 +131,47 @@ int64_t parse_i64(std::string_view s, int64_t def = 0) {
     if (ec != std::errc{} || p != s.data() + s.size())
         return def;
     return v;
+}
+
+// One usage_daily upsert statement for `d`, either the plain additive form
+// (`guarded=false`, used for a carried-over-only key) or the fold_hwm-gated
+// form (`guarded=true`, used for a same-tick-only OR a provenance-mixed key
+// -- see the merge step ahead of run_usage_fold's `stmts` build for why a
+// mixed key must ALWAYS take this branch and never the plain one). Factored
+// to a single site so the two shapes cannot drift apart from each other, the
+// way the previous two-copy-pasted-loop version already had (identical
+// column list, identical DO UPDATE SET body, differing only in the trailing
+// fold_hwm clause).
+std::string build_daily_upsert(const DailyDelta& d, int64_t new_hwm, bool guarded) {
+    std::string sql = std::format(
+        "INSERT INTO usage_daily (day_ts, exe_key, run_count, total_seconds, first_seen, "
+        "last_seen, distinct_users, superseded_runs, expired_runs, fold_hwm) VALUES ({}, {}, "
+        "{}, {}, {}, {}, 0, {}, {}, {}) ON CONFLICT(day_ts, exe_key) DO UPDATE SET "
+        "run_count = run_count + excluded.run_count, "
+        "total_seconds = total_seconds + excluded.total_seconds, "
+        "first_seen = MIN(first_seen, excluded.first_seen), "
+        "last_seen = MAX(last_seen, excluded.last_seen), "
+        "superseded_runs = superseded_runs + excluded.superseded_runs, "
+        "expired_runs = expired_runs + excluded.expired_runs",
+        d.day_ts, sql_str(d.exe_key), d.run_count, d.total_seconds, d.first_seen, d.last_seen,
+        d.superseded_runs, d.expired_runs, new_hwm);
+    if (guarded)
+        sql += ", fold_hwm = excluded.fold_hwm WHERE fold_hwm < excluded.fold_hwm";
+    return sql;
+}
+
+// Combines two DailyDelta values for the SAME (day_ts, exe_key) key into one
+// -- used only when a key is touched by both the carried-over and same-tick
+// provenance groups within a single tick (see the merge step below).
+DailyDelta merge_daily_delta(const DailyDelta& a, const DailyDelta& b) {
+    DailyDelta out = a;
+    out.run_count += b.run_count;
+    out.total_seconds += b.total_seconds;
+    out.first_seen = std::min(out.first_seen, b.first_seen);
+    out.last_seen = std::max(out.last_seen, b.last_seen);
+    out.superseded_runs += b.superseded_runs;
+    out.expired_runs += b.expired_runs;
+    return out;
 }
 
 } // namespace
@@ -168,6 +220,40 @@ UsageFoldResult run_usage_fold(TarDatabase& db, int64_t now, int64_t max_events_
         result.ok = true; // nothing to do this tick -- not a failure
         return result;
     }
+
+    // v7 schema-migration stall gate (round-3 fix). usage_daily/
+    // usage_daily_user's fold_hwm column -- the replay guard the upsert
+    // statements below depend on -- exists only once TarDatabase::open's v7
+    // migration (tar_db.cpp, the ALTER TABLE ... ADD COLUMN fold_hwm step)
+    // has actually run. That migration can fail (disk full, I/O error) and
+    // leaves schema_version pinned at v6 until an operator manually applies
+    // it -- logged as an ERROR at open time, but with nothing to stop this
+    // function from running unconditionally every tick afterwards. Without
+    // this gate: every usage_daily/usage_daily_user statement below
+    // references a nonexistent column and is rejected by SQLite at PREPARE
+    // time -- a per-statement, transaction-preserving fault under
+    // TarDatabase::execute_atomic_batch_gated's continue-on-error contract
+    // -- while the UNRELATED usage_live DELETE/INSERT statements in the SAME
+    // batch still succeed and commit. Net effect: usage_daily permanently
+    // and silently stops accumulating while usage_live/hwm bookkeeping
+    // keeps churning as if nothing were wrong, with only a one-time log line
+    // from the failed migration itself as a trace. Failing the WHOLE tick
+    // HERE instead -- before usage_live is touched either -- keeps the
+    // existing ok=false path (tar_plugin.cpp's rate-limited warn, retried
+    // every tick until the migration completes) as the loud signal, and
+    // `usage_schema_stalled` makes the SAME condition visible on the `tar
+    // status` action (P22/P24-readable) alongside every other usage_* key,
+    // not only in a log an unattended endpoint's operator may never open.
+    if (db.schema_version() < kUsageDailySchemaVersion) {
+        db.set_config("usage_schema_stalled", "true");
+        result.error = std::format(
+            "usage fold: schema stuck at v{} (usage_daily.fold_hwm needs v{}) -- refusing to "
+            "run until the pending ALTER TABLE migration completes; see TarDatabase::open's v7 "
+            "migration failure log for the manual recovery statement",
+            db.schema_version(), kUsageDailySchemaVersion);
+        return result; // ok=false, nothing touched this tick
+    }
+    db.set_config("usage_schema_stalled", "false");
 
     // Forward-only boundary gate (Wave 7 PR7.2 adversarial review, Blocker
     // 3): the fold must never consume a process_live row before a
@@ -334,72 +420,98 @@ UsageFoldResult run_usage_fold(TarDatabase& db, int64_t now, int64_t max_events_
     const auto deltas_unguarded = fold_daily(closed_carried_over);
     const auto deltas_guarded = fold_daily(closed_same_tick);
 
+    // Merge any (day_ts, exe_key) key touched by BOTH provenance groups this
+    // tick into ONE combined delta, emitted as a single guarded statement --
+    // see the big comment below for why a split-into-two-statements shape is
+    // unsound for a mixed key, and why "always route a mixed key through the
+    // guarded form" is correct in general, not just for one reported repro.
+    //
+    // VERIFIED BUG (round 3 adversarial re-verification of round 2): the
+    // carried-over group's upsert never touches `fold_hwm` on ITS OWN
+    // ON CONFLICT branch, but on a FRESH row (no existing usage_daily row for
+    // this key before the tick) its plain INSERT ... VALUES still SETS
+    // fold_hwm = new_hwm as part of the VALUES clause -- there is no way to
+    // omit a NOT NULL column from an INSERT. If a same-tick closure for the
+    // SAME key lands in this SAME tick and the carried-over statement runs
+    // first, the guarded statement's `WHERE fold_hwm < excluded.fold_hwm`
+    // then compares new_hwm against the new_hwm the sibling statement JUST
+    // stamped moments earlier in the same transaction -- equal, not less
+    // than -- so the guard fires and the same-tick contribution is silently
+    // dropped. Reordering the two statement groups only relocates the
+    // collision (a later same-tick key could still race an earlier
+    // carried-over key writing the identical row, or vice versa, depending
+    // on which key set happens to iterate first); the actual invariant this
+    // must satisfy is that a (day_ts, exe_key) row NEVER receives more than
+    // one upsert statement per tick, since fold_hwm is a per-ROW replay
+    // marker, not a per-STATEMENT one. Merging at the key level enforces
+    // that unconditionally, and stays sound under a later replay: a
+    // carried-over closure is only ever derivable ONCE, because closing it
+    // durably mutates usage_live in the SAME commit that would need to
+    // produce it again -- so a replay of a tick whose data already committed
+    // can only ever re-derive the same-tick HALF of a merged delta, never
+    // the carried-over half a second time. Routing the merged row through
+    // the guarded form therefore protects exactly the part that can recur,
+    // and the part that cannot recur is correctly represented as part of the
+    // row's already-durable base value once the first attempt lands.
+    std::map<std::pair<int64_t, std::string>, DailyDelta> guarded_by_key;
+    for (const auto& d : deltas_guarded)
+        guarded_by_key.emplace(std::make_pair(d.day_ts, d.exe_key), d);
+
+    std::vector<DailyDelta> final_unguarded;
+    std::vector<DailyDelta> final_guarded;
+    for (const auto& d : deltas_unguarded) {
+        auto it = guarded_by_key.find({d.day_ts, d.exe_key});
+        if (it == guarded_by_key.end()) {
+            final_unguarded.push_back(d);
+        } else {
+            final_guarded.push_back(merge_daily_delta(d, it->second));
+            guarded_by_key.erase(it); // consumed -- do not also emit it below
+        }
+    }
+    for (const auto& [key, d] : guarded_by_key)
+        final_guarded.push_back(d);
+
     // ── Build the DATA transaction ──────────────────────────────────────────
     std::vector<std::string> stmts;
 
-    // Carried-over contributions: already replay-safe (see the split above),
-    // so this is the plain additive upsert -- and critically, its DO UPDATE
-    // SET never touches `fold_hwm`, so it cannot interfere with the guarded
-    // upsert below when both groups touch the SAME (day_ts, exe_key) row in
-    // the same pass (order between them would otherwise matter).
-    for (const auto& d : deltas_unguarded) {
-        stmts.push_back(std::format(
-            "INSERT INTO usage_daily (day_ts, exe_key, run_count, total_seconds, first_seen, "
-            "last_seen, distinct_users, superseded_runs, expired_runs, fold_hwm) VALUES ({}, {}, "
-            "{}, {}, {}, {}, 0, {}, {}, {}) ON CONFLICT(day_ts, exe_key) DO UPDATE SET "
-            "run_count = run_count + excluded.run_count, "
-            "total_seconds = total_seconds + excluded.total_seconds, "
-            "first_seen = MIN(first_seen, excluded.first_seen), "
-            "last_seen = MAX(last_seen, excluded.last_seen), "
-            "superseded_runs = superseded_runs + excluded.superseded_runs, "
-            "expired_runs = expired_runs + excluded.expired_runs",
-            d.day_ts, sql_str(d.exe_key), d.run_count, d.total_seconds, d.first_seen, d.last_seen,
-            d.superseded_runs, d.expired_runs, new_hwm));
-    }
+    // Carried-over-only contributions: already replay-safe (see the split
+    // above -- closing a carried-over run mutates usage_live in the same
+    // commit, so a replay can never re-derive it), so this is the plain
+    // additive upsert with no fold_hwm guard.
+    for (const auto& d : final_unguarded)
+        stmts.push_back(build_daily_upsert(d, new_hwm, /*guarded=*/false));
 
-    // Same-tick contributions: `fold_hwm` (tar_db.cpp v7 migration) is this
-    // PASS's target new_hwm, stamped on every row this loop touches, and is
-    // what makes THIS group's additive add idempotent under an exact-window
-    // replay: `WHERE fold_hwm < excluded.fold_hwm` makes the whole ON
-    // CONFLICT DO UPDATE a no-op once the row already reflects this pass's
-    // contribution (fold_hwm already >= new_hwm) instead of adding a second
-    // time. That is exactly the shape a genuine crash (or a gated tar_config
-    // statement failure) between this data commit and the usage_hwm_id
-    // advance produces: usage_hwm_id stays at the OLD value, so the next
-    // tick re-reads the SAME process_live range and re-derives the SAME
-    // same-tick closures for the SAME new_hwm -- the guard recognises that
-    // as "already applied" rather than adding on top. `new_hwm` is a sound
-    // replay key ONLY for this group: a same-tick closure requires reading
-    // at least one genuinely new event (the "started" that created it), so
+    // Same-tick-only AND provenance-mixed contributions: `fold_hwm`
+    // (tar_db.cpp v7 migration) is this PASS's target new_hwm, stamped on
+    // every row this loop touches, and is what makes a same-tick
+    // contribution idempotent under an exact-window replay: `WHERE fold_hwm
+    // < excluded.fold_hwm` makes the whole ON CONFLICT DO UPDATE a no-op
+    // once the row already reflects this pass's contribution (fold_hwm
+    // already >= new_hwm) instead of adding a second time. That is exactly
+    // the shape a genuine crash (or a gated tar_config statement failure)
+    // between this data commit and the usage_hwm_id advance produces:
+    // usage_hwm_id stays at the OLD value, so the next tick re-reads the
+    // SAME process_live range and re-derives the SAME same-tick closures for
+    // the SAME new_hwm -- the guard recognises that as "already applied"
+    // rather than adding on top. `new_hwm` is a sound replay key for this
+    // group (mixed or not) because a same-tick closure requires reading at
+    // least one genuinely new event (the "started" that created it), so
     // new_hwm strictly advances whenever a NEW (non-replay) same-tick
-    // closure occurs -- unlike the carried-over group above, where new_hwm
-    // can legitimately stay flat across multiple distinct ticks (no new
-    // process activity, yet different long-open runs individually crossing
-    // max_age) and would otherwise collide and wrongly no-op a second,
-    // genuinely new contribution. This does not, by itself, make a replay
-    // whose event WINDOW has since grown (new process_live rows arrived
-    // between the crash and the retry, past what this pass's `new_hwm`
-    // covered) safe for the OVERLAPPING portion, nor a same-key
-    // open-close-reopen-within-one-tick pid reuse racing the crash window --
-    // both residuals are bounded to the width of events arriving in the
-    // crash's own brief window and are far narrower than the
-    // unbounded-cumulative defect this closes; see the file banner.
-    for (const auto& d : deltas_guarded) {
-        stmts.push_back(std::format(
-            "INSERT INTO usage_daily (day_ts, exe_key, run_count, total_seconds, first_seen, "
-            "last_seen, distinct_users, superseded_runs, expired_runs, fold_hwm) VALUES ({}, {}, "
-            "{}, {}, {}, {}, 0, {}, {}, {}) ON CONFLICT(day_ts, exe_key) DO UPDATE SET "
-            "run_count = run_count + excluded.run_count, "
-            "total_seconds = total_seconds + excluded.total_seconds, "
-            "first_seen = MIN(first_seen, excluded.first_seen), "
-            "last_seen = MAX(last_seen, excluded.last_seen), "
-            "superseded_runs = superseded_runs + excluded.superseded_runs, "
-            "expired_runs = expired_runs + excluded.expired_runs, "
-            "fold_hwm = excluded.fold_hwm "
-            "WHERE fold_hwm < excluded.fold_hwm",
-            d.day_ts, sql_str(d.exe_key), d.run_count, d.total_seconds, d.first_seen, d.last_seen,
-            d.superseded_runs, d.expired_runs, new_hwm));
-    }
+    // closure occurs -- unlike a carried-over-only key, where new_hwm can
+    // legitimately stay flat across multiple distinct ticks (no new process
+    // activity, yet different long-open runs individually crossing max_age)
+    // and would otherwise collide and wrongly no-op a second, genuinely new
+    // contribution; that is why a carried-over-only key must NOT take this
+    // branch. This does not, by itself, make a replay whose event WINDOW has
+    // since grown (new process_live rows arrived between the crash and the
+    // retry, past what this pass's `new_hwm` covered) safe for the
+    // OVERLAPPING portion, nor a same-key open-close-reopen-within-one-tick
+    // pid reuse racing the crash window -- both residuals are bounded to the
+    // width of events arriving in the crash's own brief window and are far
+    // narrower than the unbounded-cumulative defect this closes; see the
+    // file banner.
+    for (const auto& d : final_guarded)
+        stmts.push_back(build_daily_upsert(d, new_hwm, /*guarded=*/true));
 
     std::set<std::pair<int64_t, std::string>> touched_days; // (day_ts, exe_key)
     for (const auto& c : closed) {

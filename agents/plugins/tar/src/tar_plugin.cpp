@@ -2507,6 +2507,12 @@ private:
                                      db_->get_config("usage_coverage_since", "-")));
         ctx.write_output(
             std::format("config|usage_lag_events|{}", db_->get_config("usage_lag_events", "0")));
+        // "true" iff schema_version is stuck below the v7 usage_daily.fold_hwm
+        // migration (tar_usage.cpp's kUsageDailySchemaVersion gate) -- the fold
+        // refuses to run at all rather than silently degrade while that
+        // migration is pending, and this is the operator-visible signal for it.
+        ctx.write_output(std::format("config|usage_schema_stalled|{}",
+                                     db_->get_config("usage_schema_stalled", "false")));
 
         // Currently-configured network capture method (defaults to "polling").
         auto net_method = db_->get_config("network_capture_method", "polling");

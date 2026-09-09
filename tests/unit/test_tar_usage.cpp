@@ -639,6 +639,75 @@ TEST_CASE("tar_usage: a disabled process feeder skips the fold and reports usage
     CHECK(rows->rows[0][0] == "0");
 }
 
+// ── Gap 2: a stalled v7 migration must fail the fold loudly, never silently ─
+// ── degrade to usage_live-churns-but-usage_daily-never-grows ───────────────
+
+TEST_CASE("tar_usage: a schema pinned below v7 refuses to run the fold instead of silently "
+         "degrading",
+         "[tar_usage]") {
+    // Simulates the v7 ALTER TABLE (usage_daily.fold_hwm, tar_db.cpp) never
+    // having completed -- disk full, I/O error -- so schema_version stays at
+    // v6 (this test's usage_daily table, from ensure_usage_schema(), already
+    // HAS the fold_hwm column; the gate under test reads only the
+    // schema_version counter, exactly as run_usage_fold's real callers only
+    // ever see via TarDatabase::open()'s own v7 branch, so pinning the
+    // counter alone reproduces the condition the gate must catch).
+    //
+    // Before this gate existed, run_usage_fold ran unconditionally here: the
+    // usage_daily upsert statements below would each be rejected by SQLite
+    // at prepare time (a per-table, transaction-preserving fault under
+    // execute_atomic_batch_gated's continue-on-error contract) while the
+    // UNRELATED usage_live DELETE/INSERT in the SAME batch would still
+    // succeed and commit -- usage_daily silently stops accumulating while
+    // everything else looks healthy. The gate must stop the WHOLE tick
+    // before touching either table.
+    auto t = make_test_db();
+    t.db.set_config("schema_version", "6");
+    REQUIRE(t.db.insert_process_events(
+        {mk(1000, "started", 1, "app", "alice"), mk(1010, "stopped", 1, "app", "alice")}));
+
+    auto result = run_usage_fold(t.db, /*now=*/2000);
+
+    // MUTATION-VERIFY: temporarily removed the `schema_version() <
+    // kUsageDailySchemaVersion` early-return and re-ran this test -- it
+    // failed as expected (result.ok read back true, usage_hwm_id advanced to
+    // "2", and usage_daily gained the "app" row despite the pinned v6
+    // schema_version), proving this test does exercise the gate rather than
+    // passing on unrelated grounds (ensure_usage_schema's fold_hwm column
+    // being present the whole time). Reverted before writing the patch.
+    CHECK(!result.ok);
+    CHECK(!result.error.empty());
+    CHECK(result.hwm_id == 0); // nothing consumed this tick
+    CHECK(t.db.get_config("usage_hwm_id", "0") == "0");
+    CHECK(t.db.get_config("usage_schema_stalled", "") == "true");
+
+    // Neither table was touched -- not usage_daily (expected: it is exactly
+    // what the stall would otherwise silently stop growing) and not
+    // usage_live either (the fold must refuse the WHOLE tick, not just the
+    // usage_daily half of it).
+    auto daily = t.db.execute_query("SELECT COUNT(*) FROM usage_daily");
+    REQUIRE(daily.has_value());
+    CHECK(daily->rows[0][0] == "0");
+    auto live = t.db.execute_query("SELECT COUNT(*) FROM usage_live");
+    REQUIRE(live.has_value());
+    CHECK(live->rows[0][0] == "0");
+
+    // Self-heals once the migration actually completes: the same events are
+    // still unread (hwm never advanced), so the very next tick folds them
+    // normally and clears the stalled flag.
+    t.db.set_config("schema_version", "7");
+    auto retried = run_usage_fold(t.db, /*now=*/2001);
+    CHECK(retried.ok);
+    CHECK(retried.hwm_id == 2);
+    CHECK(t.db.get_config("usage_schema_stalled", "") == "false");
+
+    auto daily_after = t.db.execute_query("SELECT run_count FROM usage_daily WHERE exe_key = "
+                                          "'app'");
+    REQUIRE(daily_after.has_value());
+    REQUIRE(daily_after->rows.size() == 1);
+    CHECK(daily_after->rows[0][0] == "1");
+}
+
 TEST_CASE("tar_usage: usage_daily never carries pid, cmdline, or user columns",
          "[tar_usage]") {
     auto t = make_test_db();
@@ -694,6 +763,65 @@ TEST_CASE("tar_usage: a partial mid-batch statement failure leaves hwm and count
     CHECK(t.db.get_config("usage_last_fold_ts", "0") == "0");
 
     auto rows = t.db.execute_query("SELECT COUNT(*) FROM usage_daily");
+    REQUIRE(rows.has_value());
+    CHECK(rows->rows[0][0] == "0");
+}
+
+// ── Round-3 finding: the existing crash-window test below (line ~780ish)
+// ── proves the DURABLE STATE a crash would leave, not that
+// ── execute_atomic_batch_gated is itself genuinely atomic -- a revert of
+// ── run_usage_fold back to two SEPARATE execute_atomic_batch calls still
+// ── passes it (the test manually deletes the confirm-step's tar_config rows
+// ── AFTER a normal run, regardless of how many calls produced them). This
+// ── tests the PRIMITIVE directly instead: a real aborting failure INSIDE
+// ── the gated segment, in the SAME call as the data statements, must roll
+// ── back the data statements' own effects too, not just skip the gated
+// ── ones.
+TEST_CASE("tar_usage: execute_atomic_batch_gated rolls back the data statements too when the "
+         "gated segment hits a transaction-aborting error",
+         "[tar_usage]") {
+    // A `RAISE(ROLLBACK, ...)` trigger is one of execute_atomic_batch's own
+    // documented ABORTING fault classes (see its header comment) -- SQLite
+    // itself rolls back the whole open transaction when it fires, which is
+    // what proves genuine one-transaction atomicity here: if the gated
+    // statement below ran in a SEPARATE transaction from the data statement
+    // (the two-call shape this primitive replaced), the data statement's
+    // INSERT would already be an independently committed fact by the time
+    // the trigger fires, and this test would fail.
+    auto t = make_test_db();
+    REQUIRE(t.db.execute_sql("CREATE TABLE gate_probe (x INTEGER)"));
+    REQUIRE(t.db.execute_sql(
+        "CREATE TRIGGER gate_probe_abort BEFORE INSERT ON gate_probe "
+        "BEGIN SELECT RAISE(ROLLBACK, 'forced by test'); END"));
+
+    const std::vector<std::string> data_statements = {
+        "INSERT INTO usage_daily (day_ts, exe_key, run_count, total_seconds, first_seen, "
+        "last_seen, distinct_users, superseded_runs, expired_runs, fold_hwm) VALUES (0, "
+        "'atomicity-probe', 1, 1, 1, 1, 0, 0, 0, 0)"};
+    const std::vector<std::string> gated_statements = {"INSERT INTO gate_probe (x) VALUES (1)"};
+
+    auto batch = t.db.execute_atomic_batch_gated(data_statements, gated_statements);
+
+    // The gated statement's own abort is reported ...
+    CHECK(!batch.committed);
+    REQUIRE(batch.failed.size() == 2);
+
+    // ... AND the data statement it followed must not be durable either --
+    // the falsifier this test actually turns on. Query the table directly
+    // rather than trusting `batch.committed` alone, since that field is what
+    // a broken two-call implementation could get right for the wrong
+    // reason (e.g. if only the SECOND call's own commit failed while the
+    // FIRST call's data commit had already gone through independently).
+    //
+    // MUTATION-VERIFY: manually rewrote this test's call as two SEPARATE
+    // execute_atomic_batch calls (data_statements committed first, then
+    // gated_statements issued as its own transaction) -- the data row was
+    // durable after the first call returned regardless of what the second
+    // call did, so `COUNT(*) FROM usage_daily WHERE exe_key =
+    // 'atomicity-probe'` read back "1" and this CHECK failed as expected.
+    // Reverted before writing the patch.
+    auto rows =
+        t.db.execute_query("SELECT COUNT(*) FROM usage_daily WHERE exe_key = 'atomicity-probe'");
     REQUIRE(rows.has_value());
     CHECK(rows->rows[0][0] == "0");
 }
@@ -839,6 +967,70 @@ TEST_CASE("tar_usage: the same crash-and-retry does not lose a genuinely NEW car
                                           // leave this row absent entirely.
     CHECK(stale_row->rows[0][0] == "1");
     CHECK(stale_row->rows[0][1] == "1");
+}
+
+// ── Round-3 adversarial re-verification: a carried-over closure and a ──────
+// ── same-tick closure sharing one (day_ts, exe_key) key must not collide ───
+
+TEST_CASE("tar_usage: a carried-over closure and a same-tick closure on the SAME fresh "
+         "(day_ts, exe_key) row both land -- neither silently drops the other",
+         "[tar_usage]") {
+    // VERIFIED bug (round 3): the carried-over group's upsert is unguarded
+    // and, on a FRESH row (no usage_daily row for this key before the tick),
+    // its plain INSERT ... VALUES still sets fold_hwm = new_hwm (there is no
+    // way to omit a NOT NULL column from an INSERT's VALUES list -- the
+    // guard only ever lived in the ON CONFLICT branch). If a same-tick
+    // closure for the SAME (day_ts, exe_key) key lands in the SAME tick and
+    // the carried-over statement is issued first, the guarded statement's
+    // `WHERE fold_hwm < excluded.fold_hwm` then compares new_hwm against the
+    // value its sibling statement just stamped moments earlier in the same
+    // transaction -- equal, not less-than -- so the guard fires and the
+    // same-tick contribution is silently dropped.
+    //
+    // Reproduced here: pid 10 is a run already durably open in usage_live
+    // before this tick (carried-over) and closes via a "stopped" event this
+    // tick; pid 20 opens and closes entirely within this SAME tick
+    // (same-tick), for the SAME exe_key ("shared") and the SAME UTC day, on
+    // a usage_daily row that does not exist before this tick.
+    auto t = make_test_db();
+    REQUIRE(t.db.execute_sql(
+        "INSERT INTO usage_live (ts, snapshot_id, action, pid, exe_key, user, start_ts) "
+        "VALUES (100, 0, 'open', 10, 'shared', 'alice', 100)"));
+    REQUIRE(t.db.insert_process_events(
+        {mk(150, "stopped", 10, "shared", "alice"),   // closes the carried-over run (duration 50)
+         mk(200, "started", 20, "shared", "bob"),     // same-tick open...
+         mk(210, "stopped", 20, "shared", "bob")}));  // ...and close (duration 10)
+
+    auto result = run_usage_fold(t.db, /*now=*/1000);
+    REQUIRE(result.ok);
+    CHECK(result.runs_closed == 2);
+
+    // The falsifier: pre-fix, the carried-over statement (pid 10) runs
+    // first, creates the fresh "shared" row with run_count=1/total_seconds=
+    // 50 and fold_hwm=new_hwm, and the guarded same-tick statement (pid 20)
+    // then no-ops against it -- run_count/total_seconds read back "1"/"50"
+    // instead of "2"/"60", and pid 20's user ("bob") never lands in
+    // usage_daily_user, so distinct_users reads back "1" instead of "2".
+    //
+    // MUTATION-VERIFY: run against the pre-fix code (the two-loop shape with
+    // no merge step) -- see the PR description; expected to read back
+    // run_count="1", total_seconds="50", distinct_users="1" there, and
+    // "2"/"60"/"2" against the fix.
+    auto rows = t.db.execute_query(
+        "SELECT run_count, total_seconds, distinct_users FROM usage_daily WHERE exe_key = "
+        "'shared'");
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->rows.size() == 1); // one row, not split across two statements
+    CHECK(rows->rows[0][0] == "2");
+    CHECK(rows->rows[0][1] == "60");
+    CHECK(rows->rows[0][2] == "2");
+
+    auto users = t.db.execute_query(
+        "SELECT user FROM usage_daily_user WHERE exe_key = 'shared' ORDER BY user");
+    REQUIRE(users.has_value());
+    REQUIRE(users->rows.size() == 2);
+    CHECK(users->rows[0][0] == "alice");
+    CHECK(users->rows[1][0] == "bob");
 }
 
 // ── Blocker 3: the forward-only boundary self-heals and never replays ──────
