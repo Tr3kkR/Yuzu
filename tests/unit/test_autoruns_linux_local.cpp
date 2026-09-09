@@ -727,6 +727,205 @@ TEST_CASE("autoruns Linux leg: is_root_executable tests raw execute-mode bits, n
     }
 }
 
+// ── PR #4154 round 9 structural finding: acquisition-failure accumulation ──
+//
+// Six Linux collectors each independently reinvented a narrower version of
+// lnx_cron_d's already-correct constraint-composition pattern, tracking
+// only EACCES/EPERM and silently dropping every other genuine acquisition
+// failure (a real, non-permission directory-open error; a per-entry stat
+// failure; a per-file read failure other than EACCES/EPERM; a crontab file
+// with rejected lines) -- reporting the source Supported with whatever
+// partial rows it did get, instead of Constrained. These tests exercise
+// the REAL, now-shared production functions (scan_run_parts_dirs,
+// scan_user_crontabs, timer_enabled) directly, asserting on the same
+// (rows, support, reason) a real dispatch would emit.
+
+TEST_CASE("autoruns Linux leg: scan_run_parts_dirs reports one successful root's row "
+          "alongside a sibling directory's real open failure, never silently dropping it",
+          "[autoruns][actions][linux]") {
+    using yuzu::autoruns::scan_run_parts_dirs;
+    using yuzu::autoruns::SourceId;
+
+    yuzu::test::TempDir good_dir("yuzu_test_autoruns_runparts_good_");
+    std::error_code ec;
+    std::filesystem::create_directories(good_dir.path, ec);
+    REQUIRE_FALSE(ec);
+    std::filesystem::path script = good_dir.path / "backup";
+    { std::ofstream(script) << "#!/bin/sh\n"; }
+    std::filesystem::permissions(script, std::filesystem::perms::owner_all, ec);
+    REQUIRE_FALSE(ec);
+
+    // A REGULAR FILE where a directory is expected: opendir() on it fails
+    // with a real, non-ENOENT, non-EACCES errno (ENOTDIR) -- standing in
+    // for any real directory-open failure class (the code path is
+    // identical for EIO), without needing root/mount tricks to construct
+    // literal EIO in a unit test.
+    yuzu::test::TempDir bad_parent("yuzu_test_autoruns_runparts_bad_");
+    std::filesystem::create_directories(bad_parent.path, ec);
+    REQUIRE_FALSE(ec);
+    std::filesystem::path not_a_dir = bad_parent.path / "not_a_dir";
+    { std::ofstream(not_a_dir) << "x"; }
+
+    auto scan = scan_run_parts_dirs({good_dir.path.string(), not_a_dir.string()},
+                                    SourceId::lnx_cron_periodic);
+
+    REQUIRE(scan.rows.size() == 1);
+    CHECK(scan.rows[0].entry == "backup");
+    CHECK(scan.support == YUZU_SUPPORT_CONSTRAINED);
+    CHECK_FALSE(scan.reason == "-");
+    CHECK_FALSE(scan.reason.empty());
+}
+
+TEST_CASE("autoruns Linux leg: scan_run_parts_dirs distinguishes zero successful roots "
+          "that genuinely don't exist from zero successful roots that failed to open "
+          "for a real reason",
+          "[autoruns][actions][linux]") {
+    using yuzu::autoruns::scan_run_parts_dirs;
+    using yuzu::autoruns::SourceId;
+
+    SECTION("every root genuinely absent -> supported|0|absent") {
+        auto scan = scan_run_parts_dirs(
+            {"/nonexistent/yuzu-test-a", "/nonexistent/yuzu-test-b"}, SourceId::lnx_cron_periodic);
+        CHECK(scan.rows.empty());
+        CHECK(scan.support == YUZU_SUPPORT_SUPPORTED);
+        CHECK(scan.reason == "absent");
+    }
+
+    SECTION("every root fails to open for a real (non-absent) reason -> constrained, "
+            "distinguishable from confirmed absence") {
+        yuzu::test::TempDir parent("yuzu_test_autoruns_runparts_allbad_");
+        std::error_code ec;
+        std::filesystem::create_directories(parent.path, ec);
+        REQUIRE_FALSE(ec);
+        std::filesystem::path not_a_dir_1 = parent.path / "f1";
+        std::filesystem::path not_a_dir_2 = parent.path / "f2";
+        { std::ofstream(not_a_dir_1) << "x"; }
+        { std::ofstream(not_a_dir_2) << "x"; }
+
+        auto scan =
+            scan_run_parts_dirs({not_a_dir_1.string(), not_a_dir_2.string()}, SourceId::lnx_cron_periodic);
+        CHECK(scan.rows.empty());
+        CHECK(scan.support == YUZU_SUPPORT_CONSTRAINED);
+        CHECK_FALSE(scan.reason == "absent");
+        CHECK_FALSE(scan.reason.empty());
+    }
+}
+
+TEST_CASE("autoruns Linux leg: scan_run_parts_dirs records a per-entry stat() failure "
+          "as a real acquisition failure, distinct from the entry simply not being "
+          "executable, among otherwise-successful entries in the same directory",
+          "[autoruns][actions][linux]") {
+    using yuzu::autoruns::scan_run_parts_dirs;
+    using yuzu::autoruns::SourceId;
+
+    yuzu::test::TempDir dir("yuzu_test_autoruns_runparts_stat_");
+    std::error_code ec;
+    std::filesystem::create_directories(dir.path, ec);
+    REQUIRE_FALSE(ec);
+
+    std::filesystem::path good = dir.path / "good";
+    { std::ofstream(good) << "#!/bin/sh\n"; }
+    std::filesystem::permissions(good, std::filesystem::perms::owner_all, ec);
+    REQUIRE_FALSE(ec);
+
+    // A dangling symlink: present in the directory listing, but ::stat()
+    // (which follows symlinks, unlike the lstat used for at-spool/user-
+    // crontabs' own non-regular-leaf check) fails with ENOENT on it a
+    // moment later -- a genuine eligibility-metadata acquisition failure,
+    // not "not executable".
+    std::filesystem::path dangling = dir.path / "dangling";
+    std::filesystem::create_symlink(dir.path / "does_not_exist", dangling, ec);
+    REQUIRE_FALSE(ec);
+
+    auto scan = scan_run_parts_dirs({dir.path.string()}, SourceId::lnx_cron_periodic);
+
+    REQUIRE(scan.rows.size() == 1);
+    CHECK(scan.rows[0].entry == "good");
+    CHECK(scan.support == YUZU_SUPPORT_CONSTRAINED);
+    CHECK_FALSE(scan.reason.empty());
+    CHECK_FALSE(scan.reason == "-");
+}
+
+TEST_CASE("autoruns Linux leg: scan_user_crontabs records a non-permission per-file "
+          "read failure (previously silently dropped -- only EACCES/EPERM were "
+          "tracked) alongside a valid sibling file's still-emitted row",
+          "[autoruns][actions][linux]") {
+    using yuzu::autoruns::kDefaultMaxReadBytes;
+    using yuzu::autoruns::scan_user_crontabs;
+    using yuzu::autoruns::SourceId;
+
+    yuzu::test::TempDir dir("yuzu_test_autoruns_usercrontabs_");
+    std::error_code ec;
+    std::filesystem::create_directories(dir.path, ec);
+    REQUIRE_FALSE(ec);
+
+    std::filesystem::path good = dir.path / "alice";
+    { std::ofstream(good) << "*/5 * * * * /usr/bin/true\n"; }
+
+    // A regular file exceeding read_file_bounded's byte cap: OVERSIZED, a
+    // real per-file failure class this collector's own bespoke
+    // EACCES/EPERM-only check never surfaced. Not a symlink or other
+    // non-regular leaf -- those are already filtered out by this
+    // function's own lstat pre-check before read_file_bounded is even
+    // called, so they can't reach this specific failure path.
+    std::filesystem::path oversized = dir.path / "bob";
+    {
+        std::ofstream out(oversized, std::ios::binary);
+        out << std::string(kDefaultMaxReadBytes + 1, 'x');
+    }
+
+    auto scan = scan_user_crontabs({dir.path.string()}, SourceId::lnx_user_crontabs);
+
+    bool found_alice = false;
+    for (const auto& row : scan.rows)
+        if (row.user == "alice") found_alice = true;
+    CHECK(found_alice);
+    CHECK(scan.support == YUZU_SUPPORT_CONSTRAINED);
+    CHECK_FALSE(scan.reason.empty());
+    CHECK_FALSE(scan.reason == "-");
+    CHECK(scan.reason.find("oversized") != std::string::npos);
+}
+
+TEST_CASE("autoruns Linux leg: timer_enabled reports unknown when no match is found "
+          "AND the user_wants_bases discovery feeding it was incomplete, but a real "
+          "match still registers as enabled despite that same incompleteness "
+          "(RECONSTRUCTION: pins PR #4154 round 9's blocker -- an incomplete /home "
+          "listing previously produced an incomplete user_wants_bases set with no "
+          "uncertainty propagated into this decision at all)",
+          "[autoruns][actions][linux]") {
+    using yuzu::autoruns::Enabled;
+    using yuzu::autoruns::Scope;
+    using yuzu::autoruns::timer_enabled;
+
+    yuzu::test::TempDir vendor_dir("yuzu_test_autoruns_incomplete_vendor_");
+    yuzu::test::TempDir enabling_user_dir("yuzu_test_autoruns_incomplete_user_");
+    std::error_code ec;
+    std::filesystem::create_directories(vendor_dir.path, ec);
+    REQUIRE_FALSE(ec);
+    std::filesystem::create_directories(enabling_user_dir.path / "timers.target.wants", ec);
+    REQUIRE_FALSE(ec);
+
+    const auto unit_file = vendor_dir.path / "backup.timer";
+    { std::ofstream f(unit_file); f << "[Timer]\nOnCalendar=daily\n"; }
+
+    SECTION("no user_wants_bases entry matches, discovery marked incomplete -> unknown, "
+            "never a confident disabled") {
+        CHECK(timer_enabled(vendor_dir.path.string(), "backup.timer", "", Scope::user, {},
+                            /*user_wants_bases_incomplete=*/true) == Enabled::unknown);
+    }
+
+    SECTION("discovery marked incomplete but the SAME timer IS enabled in an entry that "
+            "DID make it into user_wants_bases -> the real match still registers, "
+            "incompleteness does not suppress a positive result") {
+        std::filesystem::create_symlink(
+            unit_file, enabling_user_dir.path / "timers.target.wants" / "backup.timer", ec);
+        REQUIRE_FALSE(ec);
+        CHECK(timer_enabled(vendor_dir.path.string(), "backup.timer", "", Scope::user,
+                            {enabling_user_dir.path.string()},
+                            /*user_wants_bases_incomplete=*/true) == Enabled::enabled);
+    }
+}
+
 #endif // defined(__linux__)
 
 TEST_CASE("autoruns Linux leg: an unknown action is refused, not silently ignored",

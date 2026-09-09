@@ -258,6 +258,408 @@ std::string owner_uid_string(const std::string& path) {
     return std::to_string(static_cast<unsigned long>(st.st_uid));
 }
 
+// ── shared multi-root collector scanning ─────────────────────────────────
+//
+// Root-parameterized (paths passed in, never hardcoded), generalizing
+// lnx_cron_d's already-correct constraint-composition pattern
+// (ConstraintAccumulator, autoruns_parsers.hpp) across every OTHER
+// collector below that walks several directories/files -- so a test can
+// point each one at constructed temp directories, including ones
+// engineered to fail for a real (non-ENOENT) reason. PR #4154 round 9's
+// structural finding: several of these had each independently reinvented a
+// narrower version that tracked only EACCES/EPERM and silently dropped
+// every other failure class (EIO, oversized reads, non-regular leaves,
+// per-entry stat failures) -- reporting the source Supported with whatever
+// partial rows it did get, instead of Constrained.
+//
+// Every function below returns the FULLY COMPOSED (rows, support, reason)
+// its caller writes out verbatim -- not just raw facts -- so the delicate
+// "partial_<reason>" (some roots succeeded, one failed) vs plain "<reason>"
+// (every root failed) wording distinction lives in exactly one place per
+// source and is itself directly testable, not re-derived at each call site.
+
+/// Common shape returned by every scan_* function below.
+struct CollectorScanResult {
+    std::vector<Row> rows;
+    YuzuSupportLevel support = YUZU_SUPPORT_SUPPORTED;
+    std::string reason = "-";
+};
+
+/// lnx_cron_d's shape: a single crontab(5)-format directory, system format
+/// (schedule + user + command), run-parts-valid names only. A crontab file
+/// with any rejected line keeps its OTHER valid entries (never drops the
+/// whole file) but adds "malformed" to the source's status -- rejected_lines
+/// was already computed by parse_crontab and tested, but never consumed by
+/// any caller until now.
+CollectorScanResult scan_cron_d(const std::string& dir, SourceId id) {
+    CollectorScanResult out;
+    auto listing = list_dir(dir);
+    if (!listing.opened) {
+        out.support = listing.absent ? YUZU_SUPPORT_SUPPORTED : YUZU_SUPPORT_CONSTRAINED;
+        out.reason = listing.absent
+                        ? "absent"
+                        : (listing.permission_denied ? "permission_denied" : listing.other_token);
+        return out;
+    }
+    ConstraintAccumulator acc;
+    for (const auto& name : listing.names) {
+        if (!run_parts_valid_name(name)) continue;
+        std::string full = dir + "/" + name;
+        auto content = read_file_bounded(full);
+        if (!content) {
+            auto cls = classify_read_error(content.error(), /*required_by_catalog=*/false);
+            if (cls.support == YUZU_SUPPORT_CONSTRAINED) acc.add_failure(cls.reason);
+            continue;
+        }
+        auto parsed = parse_crontab(*content, /*system_format=*/true);
+        if (parsed.rejected_lines > 0) acc.add_failure("malformed");
+        const std::int64_t mtime = mtime_of(full);
+        for (const auto& e : parsed.entries) {
+            Row row;
+            row.source_id = id;
+            row.catalog_version = kAutorunSourceCatalogVersion;
+            row.location = full;
+            row.entry = e.schedule;
+            row.target = e.command;
+            row.enabled = Enabled::enabled;
+            row.scope = Scope::system;
+            row.user = e.user;
+            row.signed_state = Signed::not_checked;
+            row.mtime = mtime;
+            out.rows.push_back(std::move(row));
+        }
+    }
+    if (listing.truncated) acc.add_failure("row_cap");
+    out.support = acc.any_failure() ? YUZU_SUPPORT_CONSTRAINED : YUZU_SUPPORT_SUPPORTED;
+    out.reason = acc.any_failure() ? acc.reason() : "-";
+    return out;
+}
+
+/// lnx_cron_periodic's shape: every directory in `dirs` for run-parts-
+/// valid-named, ROOT-executable regular files (run-parts(8) executes each
+/// one as root -- see is_root_executable's banner, not this agent's own
+/// unprivileged account). A directory-open failure that isn't plain
+/// absence (permission denied, or any other real errno) is recorded rather
+/// than silently dropped just because a sibling directory opened fine; a
+/// per-entry stat() failure (the entry existed in the listing a moment
+/// earlier but its metadata could not be read -- a raced removal, a
+/// permission change, or a genuine I/O error) is likewise recorded,
+/// distinct from the entry simply not being executable (a benign skip).
+CollectorScanResult scan_run_parts_dirs(const std::vector<std::string>& dirs, SourceId id) {
+    CollectorScanResult out;
+    bool any_dir_readable = false;
+    bool any_permission_denied = false; // existing "partial_permission_denied"/
+                                        // "permission_denied" wording, preserved
+    ConstraintAccumulator acc; // NEW: row_cap + non-permission dir-open
+                               // failures + per-entry stat failures
+    for (const auto& dir : dirs) {
+        auto listing = list_dir(dir);
+        if (!listing.opened) {
+            if (listing.permission_denied) any_permission_denied = true;
+            else if (!listing.absent) acc.add_failure(listing.other_token);
+            continue;
+        }
+        any_dir_readable = true;
+        if (listing.truncated) acc.add_failure("row_cap");
+        for (const auto& name : listing.names) {
+            if (!run_parts_valid_name(name)) continue;
+            std::string full = dir + "/" + name;
+            struct stat st{};
+            if (::stat(full.c_str(), &st) != 0) {
+                acc.add_failure(lowercase_errno_token(errno_token_for(errno)));
+                continue;
+            }
+            if (!is_root_executable(st)) continue; // not eligible -- a benign skip, not a failure
+            Row row;
+            row.source_id = id;
+            row.catalog_version = kAutorunSourceCatalogVersion;
+            row.location = dir;
+            row.entry = name;
+            row.target = full;
+            row.enabled = Enabled::enabled;
+            row.scope = Scope::system;
+            row.user = "-";
+            row.signed_state = Signed::not_checked;
+            row.mtime = static_cast<std::int64_t>(st.st_mtime);
+            out.rows.push_back(std::move(row));
+        }
+    }
+    const bool any_extra = acc.any_failure();
+    if (any_dir_readable || any_extra) {
+        std::string reason;
+        if (any_permission_denied) reason = "partial_permission_denied";
+        if (any_extra) reason += (reason.empty() ? "" : ",") + acc.reason();
+        out.support = (any_permission_denied || any_extra) ? YUZU_SUPPORT_CONSTRAINED
+                                                             : YUZU_SUPPORT_SUPPORTED;
+        out.reason = reason.empty() ? "-" : reason;
+    } else if (any_permission_denied) {
+        out.support = YUZU_SUPPORT_CONSTRAINED;
+        out.reason = "permission_denied";
+    } else {
+        out.support = YUZU_SUPPORT_SUPPORTED;
+        out.reason = "absent";
+    }
+    return out;
+}
+
+/// lnx_user_crontabs's shape: every directory in `dirs`
+/// (/var/spool/cron/crontabs, /var/spool/cron), per-user format (no user
+/// column -- parse_crontab always leaves CronEntry::user as "-" there, so
+/// each row's user comes from the listing's own filename instead). Every
+/// filename is a real username; no run-parts filtering applies here.
+CollectorScanResult scan_user_crontabs(const std::vector<std::string>& dirs, SourceId id) {
+    CollectorScanResult out;
+    bool any_dir_readable = false;
+    bool any_permission_denied = false; // dir- or file-level EACCES/EPERM --
+                                        // existing "partial_permission_denied"/
+                                        // "permission_denied" wording, preserved
+                                        // exactly (docs/agent-privilege-model.md
+                                        // names this literal token for this
+                                        // source)
+    ConstraintAccumulator acc; // NEW: row_cap + every other previously-
+                               // dropped failure class (non-permission
+                               // dir-open failures, non-permission per-file
+                               // read failures, malformed crontab content)
+    for (const auto& dir : dirs) {
+        auto listing = list_dir(dir);
+        if (!listing.opened) {
+            if (listing.permission_denied) any_permission_denied = true;
+            else if (!listing.absent) acc.add_failure(listing.other_token);
+            continue;
+        }
+        any_dir_readable = true;
+        if (listing.truncated) acc.add_failure("row_cap");
+        for (const auto& name : listing.names) {
+            std::string full = dir + "/" + name;
+            struct stat st{};
+            if (::lstat(full.c_str(), &st) == 0 && !S_ISREG(st.st_mode))
+                continue; // e.g. a "crontabs" subdir under /var/spool/cron
+            auto content = read_file_bounded(full);
+            if (!content) {
+                const auto& tok = content.error().errno_token;
+                if (tok == "EACCES" || tok == "EPERM") {
+                    any_permission_denied = true;
+                } else {
+                    auto cls = classify_read_error(content.error(), /*required_by_catalog=*/false);
+                    if (cls.support == YUZU_SUPPORT_CONSTRAINED) acc.add_failure(cls.reason);
+                }
+                continue;
+            }
+            auto parsed = parse_crontab(*content, /*system_format=*/false);
+            if (parsed.rejected_lines > 0) acc.add_failure("malformed");
+            const std::int64_t mtime = mtime_of(full);
+            for (const auto& e : parsed.entries) {
+                Row row;
+                row.source_id = id;
+                row.catalog_version = kAutorunSourceCatalogVersion;
+                row.location = full;
+                row.entry = e.schedule;
+                row.target = e.command;
+                row.enabled = Enabled::enabled;
+                row.scope = Scope::user;
+                row.user = name; // user = filename, per spec
+                row.signed_state = Signed::not_checked;
+                row.mtime = mtime;
+                out.rows.push_back(std::move(row));
+            }
+        }
+    }
+    const bool any_extra = acc.any_failure();
+    if (!out.rows.empty()) {
+        std::string reason;
+        if (any_permission_denied) reason = "partial_permission_denied";
+        if (any_extra) reason += (reason.empty() ? "" : ",") + acc.reason();
+        out.support = (any_permission_denied || any_extra) ? YUZU_SUPPORT_CONSTRAINED
+                                                             : YUZU_SUPPORT_SUPPORTED;
+        out.reason = reason.empty() ? "-" : reason;
+    } else if (any_permission_denied) {
+        std::string reason = "permission_denied";
+        if (any_extra) reason += "," + acc.reason();
+        out.support = YUZU_SUPPORT_CONSTRAINED;
+        out.reason = reason;
+    } else if (any_extra) {
+        out.support = YUZU_SUPPORT_CONSTRAINED;
+        out.reason = acc.reason();
+    } else if (any_dir_readable) {
+        out.support = YUZU_SUPPORT_SUPPORTED;
+        out.reason = "-";
+    } else {
+        out.support = YUZU_SUPPORT_SUPPORTED;
+        out.reason = "absent";
+    }
+    return out;
+}
+
+/// lnx_at_spool's shape: a single directory (/var/spool/at), each entry an
+/// at(1) job file (a generated shell script; the queued command is its
+/// last non-comment, non-blank line).
+CollectorScanResult scan_at_spool(const std::string& dir, SourceId id) {
+    CollectorScanResult out;
+    auto listing = list_dir(dir);
+    if (!listing.opened) {
+        out.support = listing.absent ? YUZU_SUPPORT_SUPPORTED : YUZU_SUPPORT_CONSTRAINED;
+        out.reason = listing.absent
+                        ? "absent"
+                        : (listing.permission_denied ? "permission_denied" : listing.other_token);
+        return out;
+    }
+    bool any_permission_denied = false; // file-level EACCES/EPERM -- existing wording
+    ConstraintAccumulator acc; // NEW: row_cap + every other previously-
+                               // dropped per-file failure class
+    for (const auto& name : listing.names) {
+        if (!name.empty() && name.front() == '.') continue; // e.g. ".SEQ" sequence file
+        std::string full = dir + "/" + name;
+        struct stat lst{};
+        if (::lstat(full.c_str(), &lst) == 0 && !S_ISREG(lst.st_mode)) continue; // e.g. "spool" subdir
+        auto content = read_file_bounded(full);
+        if (!content) {
+            const auto& tok = content.error().errno_token;
+            if (tok == "EACCES" || tok == "EPERM") {
+                any_permission_denied = true;
+            } else {
+                auto cls = classify_read_error(content.error(), /*required_by_catalog=*/false);
+                if (cls.support == YUZU_SUPPORT_CONSTRAINED) acc.add_failure(cls.reason);
+            }
+            continue;
+        }
+        // Last non-comment, non-blank line is the queued command (at(1) job
+        // files are a generated shell script; the queued command is
+        // appended as the final line).
+        std::string target;
+        std::size_t pos = 0;
+        while (pos <= content->size()) {
+            std::size_t nl = content->find('\n', pos);
+            std::string_view line = nl == std::string::npos
+                                        ? std::string_view{*content}.substr(pos)
+                                        : std::string_view{*content}.substr(pos, nl - pos);
+            std::size_t nb = line.find_first_not_of(" \t");
+            if (nb != std::string_view::npos && line[nb] != '#') target = std::string{line};
+            if (nl == std::string::npos) break;
+            pos = nl + 1;
+        }
+        Row row;
+        row.source_id = id;
+        row.catalog_version = kAutorunSourceCatalogVersion;
+        row.location = full;
+        row.entry = name;
+        row.target = target;
+        row.enabled = Enabled::enabled;
+        row.scope = Scope::system;
+        row.user = "-"; // queuing user lives in an "# atrun uid=" comment; not modelled here
+        row.signed_state = Signed::not_checked;
+        row.mtime = mtime_of(full);
+        out.rows.push_back(std::move(row));
+    }
+    if (listing.truncated) acc.add_failure("row_cap");
+    const bool any_extra = acc.any_failure();
+    if (!out.rows.empty()) {
+        std::string reason;
+        if (any_permission_denied) reason = "partial_permission_denied";
+        if (any_extra) reason += (reason.empty() ? "" : ",") + acc.reason();
+        out.support = (any_permission_denied || any_extra) ? YUZU_SUPPORT_CONSTRAINED
+                                                             : YUZU_SUPPORT_SUPPORTED;
+        out.reason = reason.empty() ? "-" : reason;
+    } else if (any_permission_denied) {
+        std::string reason = "permission_denied";
+        if (any_extra) reason += "," + acc.reason();
+        out.support = YUZU_SUPPORT_CONSTRAINED;
+        out.reason = reason;
+    } else if (any_extra) {
+        out.support = YUZU_SUPPORT_CONSTRAINED;
+        out.reason = acc.reason();
+    } else {
+        out.support = YUZU_SUPPORT_SUPPORTED;
+        out.reason = "-";
+    }
+    return out;
+}
+
+/// lnx_xdg_autostart_user's shape: enumerate /home, then each user's own
+/// ~/.config/autostart. Unlike the scan_* functions above, /home's own
+/// open failure is itself part of this source's OUTER status decision
+/// (there is no sibling root to fall back on), not just a per-entry
+/// concern -- a real (non-ENOENT) /home failure must report Constrained
+/// with the actual reason, never the "supported|0|absent" this source used
+/// to fall through to (PR #4154 round 9 blocker: EIO on /home read as
+/// confirmed absence).
+CollectorScanResult scan_xdg_autostart_user(SourceId id) {
+    CollectorScanResult out;
+    auto home_listing = list_dir("/home");
+    if (!home_listing.opened) {
+        if (home_listing.permission_denied) {
+            out.support = YUZU_SUPPORT_CONSTRAINED;
+            out.reason = "permission_denied";
+        } else if (!home_listing.absent) {
+            out.support = YUZU_SUPPORT_CONSTRAINED;
+            out.reason = home_listing.other_token;
+        } else {
+            out.support = YUZU_SUPPORT_SUPPORTED;
+            out.reason = "absent";
+        }
+        return out;
+    }
+
+    bool any_permission_denied = false; // per-home EACCES/EPERM -- existing
+                                        // "partial_permission_denied" wording
+                                        // (docs/agent-privilege-model.md
+                                        // names this literal token for this
+                                        // source), preserved exactly
+    ConstraintAccumulator acc; // NEW: row_cap + non-permission per-home
+                               // directory-open failures + every other
+                               // previously-dropped per-file failure class
+    if (home_listing.truncated) acc.add_failure("row_cap");
+    for (const auto& user : home_listing.names) {
+        std::string dir = "/home/" + user + "/.config/autostart";
+        auto listing = list_dir(dir);
+        if (!listing.opened) {
+            // Absent (ENOENT, "most users have none") is benign; a real
+            // denial (EACCES on a 0700 .config under a 0750 home, the
+            // documented unprivileged agent's default posture) or any
+            // other real failure is a genuine constraint that must
+            // accumulate, never silently fold into "not found".
+            if (listing.permission_denied) any_permission_denied = true;
+            else if (!listing.absent) acc.add_failure(listing.other_token);
+            continue;
+        }
+        if (listing.truncated) acc.add_failure("row_cap");
+        const std::string uid = owner_uid_string(dir);
+        for (const auto& name : listing.names) {
+            constexpr std::string_view kSuffix = ".desktop";
+            if (name.size() <= kSuffix.size() ||
+                name.compare(name.size() - kSuffix.size(), kSuffix.size(), kSuffix) != 0)
+                continue;
+            std::string full = dir + "/" + name;
+            auto content = read_file_bounded(full);
+            if (!content) {
+                auto cls = classify_read_error(content.error(), /*required_by_catalog=*/false);
+                if (cls.support == YUZU_SUPPORT_CONSTRAINED) acc.add_failure(cls.reason);
+                continue;
+            }
+            auto entry = parse_desktop_entry(*content);
+            Row row;
+            row.source_id = id;
+            row.catalog_version = kAutorunSourceCatalogVersion;
+            row.location = full;
+            row.entry = name;
+            row.target = entry.exec;
+            row.enabled = entry.enabled;
+            row.scope = Scope::user;
+            row.user = uid;
+            row.signed_state = Signed::not_checked;
+            row.mtime = mtime_of(full);
+            out.rows.push_back(std::move(row));
+        }
+    }
+    const bool any_extra = acc.any_failure();
+    std::string reason;
+    if (any_permission_denied) reason = "partial_permission_denied";
+    if (any_extra) reason += (reason.empty() ? "" : ",") + acc.reason();
+    out.support = (any_permission_denied || any_extra) ? YUZU_SUPPORT_CONSTRAINED
+                                                         : YUZU_SUPPORT_SUPPORTED;
+    out.reason = reason.empty() ? "-" : reason;
+    return out;
+}
+
 // ── sources= allow-list filter (leg-internal; autoruns_plugin.cpp:do_list) ─
 
 bool source_wanted(std::string_view filter, SourceId id) {
@@ -292,12 +694,25 @@ struct WantsListing {
                             // with no match found is NOT proof the timer isn't
                             // enabled (the matching symlink could be past the
                             // cap), same reasoning as enumeration_error above.
+    bool open_error = false; // opendir() itself failed for a reason OTHER
+                             // than ENOENT (permission denied, EIO, ...) --
+                             // distinct from "this candidate wants dir
+                             // simply doesn't exist" (the common case: most
+                             // candidates are speculative). A caller must
+                             // not treat this the same as "opened fine, no
+                             // match" (PR #4154 round 9 blocker: a real
+                             // open failure on one candidate wants dir was
+                             // previously indistinguishable from that
+                             // candidate simply not existing).
 };
 
 WantsListing build_wants_listing(const std::string& wants_dir) {
     WantsListing out;
     DIR* d = ::opendir(wants_dir.c_str());
-    if (!d) return out;
+    if (!d) {
+        out.open_error = (errno != ENOENT);
+        return out;
+    }
     out.opened = true;
     struct DirGuard {
         DIR* d;
@@ -358,9 +773,23 @@ WantsListing build_wants_listing(const std::string& wants_dir) {
 /// the caller) is checked too for user scope, so a global-directory unit
 /// enabled by any one user is found regardless of which directory the
 /// caller happened to discover it in.
+///
+/// `user_wants_bases_incomplete` (default false) is a signal the CALLER
+/// supplies, not something this function can derive on its own: when the
+/// `user_wants_bases` list itself was built from an incomplete discovery
+/// pass (e.g. `/home` failed to enumerate every user, or hit its own entry
+/// cap), this function has no way to know the list it was handed is short
+/// a real user's wants directory -- the caller must say so explicitly. It
+/// only affects `Scope::user` (system scope never consults
+/// `user_wants_bases`). PR #4154 round 9 blocker: an incomplete `/home`
+/// listing previously produced an incomplete `user_wants_bases` set with no
+/// uncertainty propagated into this decision at all, so a genuinely-enabled
+/// GLOBAL-directory timer whose enabling user's wants dir was missed by the
+/// incomplete `/home` scan could read as a confident `disabled`.
 Enabled timer_enabled(const std::string& unit_dir, const std::string& timer_filename,
                       const std::string& wanted_by, Scope scope,
-                      const std::vector<std::string>& user_wants_bases = {}) {
+                      const std::vector<std::string>& user_wants_bases = {},
+                      bool user_wants_bases_incomplete = false) {
     const std::string_view wants_root =
         scope == Scope::system ? "/etc/systemd/system" : "/etc/systemd/user";
     std::vector<std::string> wants_base_dirs = {unit_dir};
@@ -371,30 +800,36 @@ Enabled timer_enabled(const std::string& unit_dir, const std::string& timer_file
     }
 
     bool any_opened = false;
-    bool any_incomplete = false; // a real I/O error OR a cap-truncation on any
-                                 // consulted wants dir -- either way, the
-                                 // matching symlink could be among what wasn't
-                                 // read, so "no match found" isn't proof of
-                                 // disabled (round 8's blocker: a capped scan
-                                 // with no match silently read as a confident
+    bool any_incomplete = (scope == Scope::user) && user_wants_bases_incomplete;
+                                 // seeded above with the caller's own
+                                 // discovery-completeness signal; also set
+                                 // below by a real I/O error OR a cap-
+                                 // truncation OR a real (non-ENOENT) open
+                                 // failure on any consulted wants dir --
+                                 // either way, the matching symlink could
+                                 // be among what wasn't read, so "no match
+                                 // found" isn't proof of disabled (round
+                                 // 8's blocker: a capped scan with no match
+                                 // silently read as a confident
                                  // Enabled::disabled).
     for (const auto& base : wants_base_dirs) {
         auto w1 = build_wants_listing(base + "/timers.target.wants");
         any_opened |= w1.opened;
-        any_incomplete |= w1.enumeration_error || w1.truncated;
+        any_incomplete |= w1.enumeration_error || w1.truncated || w1.open_error;
         if (w1.opened && timer_enabled_from_wants(w1.text, timer_filename)) return Enabled::enabled;
         if (!wanted_by.empty()) {
             auto w2 = build_wants_listing(base + "/" + wanted_by + ".wants");
             any_opened |= w2.opened;
-            any_incomplete |= w2.enumeration_error || w2.truncated;
+            any_incomplete |= w2.enumeration_error || w2.truncated || w2.open_error;
             if (w2.opened && timer_enabled_from_wants(w2.text, timer_filename)) return Enabled::enabled;
         }
     }
-    // A wants directory that failed partway through enumeration, or hit its
-    // entry cap, may have missed the very symlink that would have proven
-    // this timer enabled -- reporting a confident `disabled` there is the
-    // same false-negative "live persistence mechanism read as inert" defect
-    // class this file's other fixes exist to close.
+    // A wants directory that failed partway through enumeration, hit its
+    // entry cap, or failed to open for a real (non-ENOENT) reason, may have
+    // missed the very symlink that would have proven this timer enabled --
+    // reporting a confident `disabled` there is the same false-negative
+    // "live persistence mechanism read as inert" defect class this file's
+    // other fixes exist to close.
     if (any_incomplete) return Enabled::unknown;
     return any_opened ? Enabled::disabled : Enabled::unknown;
 }
@@ -423,6 +858,17 @@ struct TimerScan {
                                         // open -- distinct from "absent",
                                         // matching lnx_cron_periodic's
                                         // partial_permission_denied treatment
+    bool any_dir_open_failure = false; // a candidate dir failed to open for a
+                                       // real reason OTHER than permission-
+                                       // denied or plain absence (e.g. EIO) --
+                                       // PR #4154 round 9 blocker: previously
+                                       // dropped entirely, both for this
+                                       // scan's own candidate dirs and for a
+                                       // failed /home enumeration feeding
+                                       // lnx_systemd_timers_user's global-
+                                       // scope scans (collect_linux folds
+                                       // that failure in here too)
+    std::string dir_open_failure_reason;
 };
 
 /// A directory's (dev, ino) identity, for deduping two path spellings of the
@@ -443,13 +889,18 @@ std::optional<std::pair<dev_t, ino_t>> dir_identity(const std::string& dir) {
 void scan_systemd_timer_dir_unique(const std::string& dir, Scope scope, const std::string& user,
                                     TimerScan& out,
                                     std::vector<std::pair<dev_t, ino_t>>& seen,
-                                    const std::vector<std::string>& user_wants_bases = {});
+                                    const std::vector<std::string>& user_wants_bases = {},
+                                    bool user_wants_bases_incomplete = false);
 
 void scan_systemd_timer_dir(const std::string& dir, Scope scope, const std::string& user,
-                            TimerScan& out, const std::vector<std::string>& user_wants_bases = {}) {
+                            TimerScan& out, const std::vector<std::string>& user_wants_bases = {},
+                            bool user_wants_bases_incomplete = false) {
     auto listing = list_dir(dir);
     if (!listing.opened) {
         if (listing.permission_denied) out.any_permission_denied = true;
+        else if (!listing.absent)
+            note_file_constraint(out.any_dir_open_failure, out.dir_open_failure_reason,
+                                 listing.other_token);
         return; // absent / permission_denied / other -- not readable
     }
     out.any_dir_readable = true;
@@ -493,7 +944,8 @@ void scan_systemd_timer_dir(const std::string& dir, Scope scope, const std::stri
                 row.args += triggers[i];
             }
         }
-        row.enabled = timer_enabled(dir, name, fields.wanted_by, scope, user_wants_bases);
+        row.enabled = timer_enabled(dir, name, fields.wanted_by, scope, user_wants_bases,
+                                    user_wants_bases_incomplete);
         row.scope = scope;
         row.user = user;
         row.signed_state = Signed::not_checked;
@@ -505,11 +957,12 @@ void scan_systemd_timer_dir(const std::string& dir, Scope scope, const std::stri
 void scan_systemd_timer_dir_unique(const std::string& dir, Scope scope, const std::string& user,
                                     TimerScan& out,
                                     std::vector<std::pair<dev_t, ino_t>>& seen,
-                                    const std::vector<std::string>& user_wants_bases) {
+                                    const std::vector<std::string>& user_wants_bases,
+                                    bool user_wants_bases_incomplete) {
     auto id = dir_identity(dir);
     if (id && std::find(seen.begin(), seen.end(), *id) != seen.end()) return;
     if (id) seen.push_back(*id);
-    scan_systemd_timer_dir(dir, scope, user, out, user_wants_bases);
+    scan_systemd_timer_dir(dir, scope, user, out, user_wants_bases, user_wants_bases_incomplete);
 }
 
 /// Combines a TimerScan's cap-truncation and per-file constraint flags into
@@ -517,10 +970,13 @@ void scan_systemd_timer_dir_unique(const std::string& dir, Scope scope, const st
 /// file-read constraint are independent conditions, so both are named when
 /// both occurred.
 std::pair<YuzuSupportLevel, std::string> timer_scan_status(const TimerScan& scan) {
-    if (!scan.any_truncated && !scan.any_file_constrained && !scan.any_permission_denied)
+    if (!scan.any_truncated && !scan.any_file_constrained && !scan.any_permission_denied &&
+        !scan.any_dir_open_failure)
         return {YUZU_SUPPORT_SUPPORTED, "-"};
     std::string reason;
     if (scan.any_permission_denied) reason = "partial_permission_denied";
+    if (scan.any_dir_open_failure)
+        reason += (reason.empty() ? "" : ",") + scan.dir_open_failure_reason;
     if (scan.any_file_constrained)
         reason += (reason.empty() ? "" : ",") + scan.file_constrained_reason;
     if (scan.any_truncated) reason += (reason.empty() ? "" : ",") + std::string{"row_cap"};
@@ -553,7 +1009,14 @@ std::pair<YuzuSupportLevel, std::string> apply_narrow_search_path_coverage(
 std::tuple<YuzuSupportLevel, std::string, std::size_t> systemd_user_timer_status(
     bool any_dir_readable, bool home_listing_opened, bool home_listing_permission_denied,
     const TimerScan& scan) {
-    if (any_dir_readable || home_listing_opened) {
+    // scan.any_dir_open_failure also covers a real (non-ENOENT, non-
+    // permission-denied) /home open failure itself -- collect_linux folds
+    // that into `scan` via the same accumulation this scan's OWN candidate
+    // dirs use, before calling this function, so a failure there routes
+    // through timer_scan_status (which names the actual reason) rather
+    // than falling into the terminal "absent" branch below (PR #4154 round
+    // 9 blocker: an EIO'd /home previously read as confirmed absence).
+    if (any_dir_readable || home_listing_opened || scan.any_dir_open_failure) {
         const auto [scan_support, scan_reason] = timer_scan_status(scan);
         const auto [support, reason] = apply_narrow_search_path_coverage(scan_support, scan_reason);
         return {support, reason, scan.rows.size()};
@@ -666,7 +1129,14 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                 ctx.write_output(format_row(row));
                 ++n;
             }
-            ctx.write_output(format_source_status(id, YUZU_SUPPORT_SUPPORTED, n, "-"));
+            // A rejected line keeps every OTHER valid entry (never drops
+            // the whole file) but must not be silently absorbed into a
+            // bare Supported -- rejected_lines was already computed and
+            // tested but never consumed by this call site until now.
+            const bool malformed = parsed.rejected_lines > 0;
+            ctx.write_output(format_source_status(
+                id, malformed ? YUZU_SUPPORT_CONSTRAINED : YUZU_SUPPORT_SUPPORTED, n,
+                malformed ? "malformed" : "-"));
         } else {
             auto cls = classify_read_error(content.error(), /*required_by_catalog=*/true);
             ctx.write_output(format_source_status(id, cls.support, std::size_t{0}, cls.reason));
@@ -679,51 +1149,9 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                                               std::nullopt, "filtered"));
     } else {
         const SourceId id = SourceId::lnx_cron_d;
-        auto listing = list_dir("/etc/cron.d");
-        if (!listing.opened) {
-            YuzuSupportLevel support = listing.absent ? YUZU_SUPPORT_SUPPORTED : YUZU_SUPPORT_CONSTRAINED;
-            std::string reason =
-                listing.absent ? "absent" : (listing.permission_denied ? "permission_denied" : listing.other_token);
-            ctx.write_output(format_source_status(id, support, std::size_t{0}, reason));
-        } else {
-            std::size_t n = 0;
-            bool any_file_constrained = false;
-            std::string file_constrained_reason;
-            for (const auto& name : listing.names) {
-                if (!run_parts_valid_name(name)) continue;
-                std::string full = "/etc/cron.d/" + name;
-                auto content = read_file_bounded(full);
-                if (!content) {
-                    auto cls = classify_read_error(content.error(), /*required_by_catalog=*/false);
-                    if (cls.support == YUZU_SUPPORT_CONSTRAINED)
-                        note_file_constraint(any_file_constrained, file_constrained_reason, cls.reason);
-                    continue;
-                }
-                auto parsed = parse_crontab(*content, /*system_format=*/true);
-                const std::int64_t mtime = mtime_of(full);
-                for (const auto& e : parsed.entries) {
-                    Row row;
-                    row.source_id = id;
-                    row.catalog_version = kAutorunSourceCatalogVersion;
-                    row.location = full;
-                    row.entry = e.schedule;
-                    row.target = e.command;
-                    row.enabled = Enabled::enabled;
-                    row.scope = Scope::system;
-                    row.user = e.user;
-                    row.signed_state = Signed::not_checked;
-                    row.mtime = mtime;
-                    ctx.write_output(format_row(row));
-                    ++n;
-                }
-            }
-            std::string reason;
-            if (any_file_constrained) reason = file_constrained_reason;
-            if (listing.truncated) reason += (reason.empty() ? "" : ",") + std::string{"row_cap"};
-            ctx.write_output(format_source_status(
-                id, reason.empty() ? YUZU_SUPPORT_SUPPORTED : YUZU_SUPPORT_CONSTRAINED, n,
-                reason.empty() ? "-" : reason));
-        }
+        auto scan = scan_cron_d("/etc/cron.d", id);
+        for (const auto& row : scan.rows) ctx.write_output(format_row(row));
+        ctx.write_output(format_source_status(id, scan.support, scan.rows.size(), scan.reason));
     }
 
     // ── /etc/cron.{hourly,daily,weekly,monthly}/* (listing only) ────────
@@ -732,62 +1160,10 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                                               std::nullopt, "filtered"));
     } else {
         const SourceId id = SourceId::lnx_cron_periodic;
-        std::size_t n = 0;
-        bool any_dir_readable = false;
-        bool any_permission_denied = false;
-        bool any_truncated = false;
-        for (const char* leaf : {"hourly", "daily", "weekly", "monthly"}) {
-            std::string dir = std::string{"/etc/cron."} + leaf;
-            auto listing = list_dir(dir);
-            if (!listing.opened) {
-                if (listing.permission_denied) any_permission_denied = true;
-                continue;
-            }
-            any_dir_readable = true;
-            if (listing.truncated) any_truncated = true;
-            for (const auto& name : listing.names) {
-                if (!run_parts_valid_name(name)) continue;
-                std::string full = dir + "/" + name;
-                struct stat st{};
-                // is_root_executable, not access(X_OK): run-parts(8) executes
-                // this as root, not as this agent's own unprivileged account.
-                if (::stat(full.c_str(), &st) != 0 || !is_root_executable(st)) continue;
-                Row row;
-                row.source_id = id;
-                row.catalog_version = kAutorunSourceCatalogVersion;
-                row.location = dir;
-                row.entry = name;
-                row.target = full;
-                row.enabled = Enabled::enabled;
-                row.scope = Scope::system;
-                row.user = "-";
-                row.signed_state = Signed::not_checked;
-                row.mtime = static_cast<std::int64_t>(st.st_mtime);
-                ctx.write_output(format_row(row));
-                ++n;
-            }
-        }
-        if (any_dir_readable) {
-            // A permission-denied on a SIBLING cron.{hourly,...} directory
-            // must not be silently absorbed into an unqualified "-" reason
-            // just because at least one of the four was readable -- a
-            // partial denial, like a capped (row_cap) directory, escalates
-            // to CONSTRAINED: a genuine read failure always reports
-            // CONSTRAINED (matches lnx_cron_d's identical escalation), never
-            // SUPPORTED from row-truncation alone.
-            std::string reason;
-            if (any_permission_denied) reason = "partial_permission_denied";
-            if (any_truncated) reason += (reason.empty() ? "" : ",") + std::string{"row_cap"};
-            ctx.write_output(format_source_status(
-                id, (any_truncated || any_permission_denied) ? YUZU_SUPPORT_CONSTRAINED
-                                                              : YUZU_SUPPORT_SUPPORTED,
-                n, reason.empty() ? "-" : reason));
-        } else if (any_permission_denied) {
-            ctx.write_output(format_source_status(id, YUZU_SUPPORT_CONSTRAINED, std::size_t{0},
-                                                  "permission_denied"));
-        } else {
-            ctx.write_output(format_source_status(id, YUZU_SUPPORT_SUPPORTED, std::size_t{0}, "absent"));
-        }
+        auto scan = scan_run_parts_dirs(
+            {"/etc/cron.hourly", "/etc/cron.daily", "/etc/cron.weekly", "/etc/cron.monthly"}, id);
+        for (const auto& row : scan.rows) ctx.write_output(format_row(row));
+        ctx.write_output(format_source_status(id, scan.support, scan.rows.size(), scan.reason));
     }
 
     // ── per-user crontabs (/var/spool/cron/crontabs, /var/spool/cron) ───
@@ -796,71 +1172,9 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                                               std::nullopt, "filtered"));
     } else {
         const SourceId id = SourceId::lnx_user_crontabs;
-        std::size_t n = 0;
-        bool any_dir_readable = false;
-        bool any_permission_denied = false;
-        bool any_file_permission_denied = false;
-        bool any_truncated = false;
-        for (const char* dir : {"/var/spool/cron/crontabs", "/var/spool/cron"}) {
-            auto listing = list_dir(dir);
-            if (!listing.opened) {
-                if (listing.permission_denied) any_permission_denied = true;
-                continue;
-            }
-            any_dir_readable = true;
-            if (listing.truncated) any_truncated = true;
-            for (const auto& name : listing.names) {
-                std::string full = std::string{dir} + "/" + name;
-                struct stat st{};
-                if (::lstat(full.c_str(), &st) == 0 && !S_ISREG(st.st_mode)) continue; // e.g. a "crontabs" subdir under /var/spool/cron
-                auto content = read_file_bounded(full);
-                if (!content) {
-                    if (content.error().errno_token == "EACCES" || content.error().errno_token == "EPERM")
-                        any_file_permission_denied = true;
-                    continue;
-                }
-                auto parsed = parse_crontab(*content, /*system_format=*/false);
-                const std::int64_t mtime = mtime_of(full);
-                for (const auto& e : parsed.entries) {
-                    Row row;
-                    row.source_id = id;
-                    row.catalog_version = kAutorunSourceCatalogVersion;
-                    row.location = full;
-                    row.entry = e.schedule;
-                    row.target = e.command;
-                    row.enabled = Enabled::enabled;
-                    row.scope = Scope::user;
-                    row.user = name; // user = filename, per spec
-                    row.signed_state = Signed::not_checked;
-                    row.mtime = mtime;
-                    ctx.write_output(format_row(row));
-                    ++n;
-                }
-            }
-        }
-        if (n > 0) {
-            // A denial on a sibling directory or file must not be silently
-            // absorbed into an unqualified "-" just because SOME rows were
-            // captured -- see lnx_cron_periodic's identical treatment above.
-            // A genuine read failure always reports CONSTRAINED, matching
-            // lnx_cron_d, never SUPPORTED from partial success alone.
-            std::string reason;
-            const bool any_denied = any_permission_denied || any_file_permission_denied;
-            if (any_denied) reason = "partial_permission_denied";
-            if (any_truncated) reason += (reason.empty() ? "" : ",") + std::string{"row_cap"};
-            ctx.write_output(format_source_status(
-                id, (any_truncated || any_denied) ? YUZU_SUPPORT_CONSTRAINED : YUZU_SUPPORT_SUPPORTED,
-                n, reason.empty() ? "-" : reason));
-        } else if (any_permission_denied || any_file_permission_denied) {
-            ctx.write_output(format_source_status(id, YUZU_SUPPORT_CONSTRAINED, std::size_t{0},
-                                                  "permission_denied"));
-        } else if (any_dir_readable) {
-            ctx.write_output(format_source_status(
-                id, any_truncated ? YUZU_SUPPORT_CONSTRAINED : YUZU_SUPPORT_SUPPORTED, std::size_t{0},
-                any_truncated ? "row_cap" : "-"));
-        } else {
-            ctx.write_output(format_source_status(id, YUZU_SUPPORT_SUPPORTED, std::size_t{0}, "absent"));
-        }
+        auto scan = scan_user_crontabs({"/var/spool/cron/crontabs", "/var/spool/cron"}, id);
+        for (const auto& row : scan.rows) ctx.write_output(format_row(row));
+        ctx.write_output(format_source_status(id, scan.support, scan.rows.size(), scan.reason));
     }
 
     // ── /etc/anacrontab (required-by-catalog file) ───────────────────────
@@ -901,73 +1215,9 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                                               std::nullopt, "filtered"));
     } else {
         const SourceId id = SourceId::lnx_at_spool;
-        auto listing = list_dir("/var/spool/at");
-        if (!listing.opened) {
-            YuzuSupportLevel support = listing.absent ? YUZU_SUPPORT_SUPPORTED : YUZU_SUPPORT_CONSTRAINED;
-            std::string reason =
-                listing.absent ? "absent" : (listing.permission_denied ? "permission_denied" : listing.other_token);
-            ctx.write_output(format_source_status(id, support, std::size_t{0}, reason));
-        } else {
-            std::size_t n = 0;
-            bool any_permission_denied = false;
-            for (const auto& name : listing.names) {
-                if (!name.empty() && name.front() == '.') continue; // e.g. ".SEQ" sequence file
-                std::string full = "/var/spool/at/" + name;
-                struct stat lst{};
-                if (::lstat(full.c_str(), &lst) == 0 && !S_ISREG(lst.st_mode)) continue; // e.g. "spool" subdir
-                auto content = read_file_bounded(full);
-                if (!content) {
-                    if (content.error().errno_token == "EACCES" || content.error().errno_token == "EPERM")
-                        any_permission_denied = true;
-                    continue;
-                }
-                // Last non-comment, non-blank line is the queued command
-                // (at(1) job files are a generated shell script; the queued
-                // command is appended as the final line).
-                std::string target;
-                std::size_t pos = 0;
-                while (pos <= content->size()) {
-                    std::size_t nl = content->find('\n', pos);
-                    std::string_view line =
-                        nl == std::string::npos ? std::string_view{*content}.substr(pos)
-                                                : std::string_view{*content}.substr(pos, nl - pos);
-                    std::size_t nb = line.find_first_not_of(" \t");
-                    if (nb != std::string_view::npos && line[nb] != '#') target = std::string{line};
-                    if (nl == std::string::npos) break;
-                    pos = nl + 1;
-                }
-                Row row;
-                row.source_id = id;
-                row.catalog_version = kAutorunSourceCatalogVersion;
-                row.location = full;
-                row.entry = name;
-                row.target = target;
-                row.enabled = Enabled::enabled;
-                row.scope = Scope::system;
-                row.user = "-"; // queuing user lives in an "# atrun uid=" comment; not modelled here
-                row.signed_state = Signed::not_checked;
-                row.mtime = mtime_of(full);
-                ctx.write_output(format_row(row));
-                ++n;
-            }
-            if (n > 0) {
-                std::string reason;
-                if (any_permission_denied) reason = "partial_permission_denied";
-                if (listing.truncated) reason += (reason.empty() ? "" : ",") + std::string{"row_cap"};
-                ctx.write_output(format_source_status(
-                    id,
-                    (listing.truncated || any_permission_denied) ? YUZU_SUPPORT_CONSTRAINED
-                                                                  : YUZU_SUPPORT_SUPPORTED,
-                    n, reason.empty() ? "-" : reason));
-            } else if (any_permission_denied) {
-                ctx.write_output(format_source_status(id, YUZU_SUPPORT_CONSTRAINED, std::size_t{0},
-                                                      "permission_denied"));
-            } else {
-                ctx.write_output(format_source_status(
-                    id, listing.truncated ? YUZU_SUPPORT_CONSTRAINED : YUZU_SUPPORT_SUPPORTED,
-                    std::size_t{0}, listing.truncated ? "row_cap" : "-"));
-            }
-        }
+        auto scan = scan_at_spool("/var/spool/at", id);
+        for (const auto& row : scan.rows) ctx.write_output(format_row(row));
+        ctx.write_output(format_source_status(id, scan.support, scan.rows.size(), scan.reason));
     }
 
     // ── systemd timers (system + user), tri-state on /run/systemd/system ─
@@ -1063,8 +1313,21 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                 std::vector<std::string> home_dirs;
                 auto home_listing = list_dir("/home");
                 if (home_listing.truncated) scan.any_truncated = true;
-                if (!home_listing.opened && home_listing.permission_denied)
-                    scan.any_permission_denied = true;
+                if (!home_listing.opened) {
+                    if (home_listing.permission_denied) {
+                        scan.any_permission_denied = true;
+                    } else if (!home_listing.absent) {
+                        // A real (non-ENOENT, non-permission-denied) /home
+                        // open failure (e.g. EIO) folds into the SAME
+                        // dir-open-failure signal this scan's own candidate
+                        // dirs use, so systemd_user_timer_status's routing
+                        // picks it up and names the real reason instead of
+                        // falling through to "supported|0|absent" (PR #4154
+                        // round 9 blocker).
+                        note_file_constraint(scan.any_dir_open_failure, scan.dir_open_failure_reason,
+                                             home_listing.other_token);
+                    }
+                }
                 if (home_listing.opened) {
                     for (const auto& user : home_listing.names)
                         home_dirs.push_back("/home/" + user + "/.config/systemd/user");
@@ -1072,17 +1335,31 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                 std::vector<std::string> user_wants_bases = home_dirs;
                 user_wants_bases.emplace_back("/root/.config/systemd/user");
 
-                // Per-home and root scans do NOT get user_wants_bases: each
-                // one's own unit_dir already IS that user's wants base (see
-                // timer_enabled's banner), so passing the full cross-user
-                // list here would let a same-named timer enabled in ONE
-                // user's directory falsely mark an unrelated, never-enabled
-                // same-named timer in ANOTHER user's directory as enabled
-                // too (matching is by symlink basename only, with no
-                // per-user scoping once the list is passed through). Only
-                // the two GLOBAL-directory scans below need the correlation
-                // -- a unit discovered there has no home directory of its
-                // own to serve as an implicit wants base.
+                // /home enumeration feeding user_wants_bases: incomplete if
+                // it failed for a real (non-absent) reason OR was
+                // truncated -- either way the user_wants_bases list below
+                // may be missing a real user's wants directory, and that
+                // uncertainty must reach timer_enabled's decision for the
+                // two GLOBAL-scope scans specifically (PR #4154 round 9
+                // blocker) -- they're the only ones below that consult
+                // user_wants_bases at all (see the scoping comment next).
+                const bool home_incomplete =
+                    (!home_listing.opened && !home_listing.absent) || home_listing.truncated;
+
+                // Per-home and root scans do NOT get user_wants_bases (nor
+                // home_incomplete -- it describes /home's own enumeration,
+                // irrelevant to a scan that doesn't consult
+                // user_wants_bases at all): each one's own unit_dir already
+                // IS that user's wants base (see timer_enabled's banner),
+                // so passing the full cross-user list here would let a
+                // same-named timer enabled in ONE user's directory falsely
+                // mark an unrelated, never-enabled same-named timer in
+                // ANOTHER user's directory as enabled too (matching is by
+                // symlink basename only, with no per-user scoping once the
+                // list is passed through). Only the two GLOBAL-directory
+                // scans below need the correlation -- a unit discovered
+                // there has no home directory of its own to serve as an
+                // implicit wants base.
                 for (const auto& dir : home_dirs)
                     scan_systemd_timer_dir_unique(dir, Scope::user, owner_uid_string(dir), scan,
                                                   seen_dirs);
@@ -1094,9 +1371,9 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                 // `systemd-analyze unit-paths --user` on every systemd distro) -- omitting
                 // these makes a `supported` status false-complete.
                 scan_systemd_timer_dir_unique("/etc/systemd/user", Scope::user, "-", scan, seen_dirs,
-                                              user_wants_bases);
+                                              user_wants_bases, home_incomplete);
                 scan_systemd_timer_dir_unique("/usr/lib/systemd/user", Scope::user, "-", scan,
-                                              seen_dirs, user_wants_bases);
+                                              seen_dirs, user_wants_bases, home_incomplete);
                 for (const auto& row : scan.rows) ctx.write_output(format_row(row));
                 const auto [support, reason, row_count] = systemd_user_timer_status(
                     scan.any_dir_readable, home_listing.opened, home_listing.permission_denied, scan);
@@ -1165,72 +1442,9 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                                               YUZU_SUPPORT_SUPPORTED, std::nullopt, "filtered"));
     } else {
         const SourceId id = SourceId::lnx_xdg_autostart_user;
-        auto home_listing = list_dir("/home");
-        std::size_t n = 0;
-        bool any_truncated = home_listing.truncated;
-        bool any_file_constrained = false;
-        bool any_permission_denied = false;
-        std::string file_constrained_reason;
-        if (home_listing.opened) {
-            for (const auto& user : home_listing.names) {
-                std::string dir = "/home/" + user + "/.config/autostart";
-                auto listing = list_dir(dir);
-                if (!listing.opened) {
-                    // Absent (ENOENT, "most users have none") is benign; a
-                    // real denial (EACCES on a 0700 .config under a 0750
-                    // home, the documented unprivileged agent's default
-                    // posture) is a genuine constraint -- must accumulate
-                    // it the same way the sibling per-user loops in this
-                    // file (systemd-timer, at-spool, crontab) already do,
-                    // never silently fold it into "not found".
-                    if (listing.permission_denied) any_permission_denied = true;
-                    continue;
-                }
-                if (listing.truncated) any_truncated = true;
-                const std::string uid = owner_uid_string(dir);
-                for (const auto& name : listing.names) {
-                    constexpr std::string_view kSuffix = ".desktop";
-                    if (name.size() <= kSuffix.size() ||
-                        name.compare(name.size() - kSuffix.size(), kSuffix.size(), kSuffix) != 0)
-                        continue;
-                    std::string full = dir + "/" + name;
-                    auto content = read_file_bounded(full);
-                    if (!content) {
-                        auto cls = classify_read_error(content.error(), /*required_by_catalog=*/false);
-                        if (cls.support == YUZU_SUPPORT_CONSTRAINED)
-                            note_file_constraint(any_file_constrained, file_constrained_reason, cls.reason);
-                        continue;
-                    }
-                    auto entry = parse_desktop_entry(*content);
-                    Row row;
-                    row.source_id = id;
-                    row.catalog_version = kAutorunSourceCatalogVersion;
-                    row.location = full;
-                    row.entry = name;
-                    row.target = entry.exec;
-                    row.enabled = entry.enabled;
-                    row.scope = Scope::user;
-                    row.user = uid;
-                    row.signed_state = Signed::not_checked;
-                    row.mtime = mtime_of(full);
-                    ctx.write_output(format_row(row));
-                    ++n;
-                }
-            }
-            std::string reason;
-            if (any_permission_denied) reason = "partial_permission_denied";
-            if (any_file_constrained)
-                reason += (reason.empty() ? "" : ",") + file_constrained_reason;
-            if (any_truncated) reason += (reason.empty() ? "" : ",") + std::string{"row_cap"};
-            ctx.write_output(format_source_status(
-                id, reason.empty() ? YUZU_SUPPORT_SUPPORTED : YUZU_SUPPORT_CONSTRAINED, n,
-                reason.empty() ? "-" : reason));
-        } else if (home_listing.permission_denied) {
-            ctx.write_output(format_source_status(id, YUZU_SUPPORT_CONSTRAINED, std::size_t{0},
-                                                  "permission_denied"));
-        } else {
-            ctx.write_output(format_source_status(id, YUZU_SUPPORT_SUPPORTED, std::size_t{0}, "absent"));
-        }
+        auto scan = scan_xdg_autostart_user(id);
+        for (const auto& row : scan.rows) ctx.write_output(format_row(row));
+        ctx.write_output(format_source_status(id, scan.support, scan.rows.size(), scan.reason));
     }
 
     // ── /etc/rc.local (row only when present AND executable) ────────────

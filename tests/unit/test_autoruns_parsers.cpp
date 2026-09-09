@@ -1027,3 +1027,60 @@ TEST_CASE("autoruns: every SourceDecl declares all three OSes and the three docu
     CHECK(find(SourceId::lnx_init_d).linux == YUZU_SUPPORT_CONSTRAINED);
     CHECK(find(SourceId::lnx_systemd_timers_user).linux == YUZU_SUPPORT_CONSTRAINED);
 }
+
+// ── 16. ConstraintAccumulator ────────────────────────────────────────────
+
+TEST_CASE("autoruns: ConstraintAccumulator starts with no failure and no reason",
+          "[autoruns][parsers][constraint]") {
+    ConstraintAccumulator acc;
+    CHECK_FALSE(acc.any_failure());
+    CHECK_FALSE(acc.incomplete());
+    CHECK(acc.reason().empty());
+    CHECK(acc.reason_with("").empty());
+}
+
+TEST_CASE("autoruns: ConstraintAccumulator dedups by EXACT string, not substring "
+          "(RECONSTRUCTION: pins PR #4154 round 9's should-fix -- "
+          "note_file_constraint's reason.find(token) dedup elsewhere in this file "
+          "silently conflates 'permission_denied' with 'partial_permission_denied' "
+          "since the former is a substring of the latter; this type must not repeat "
+          "that defect)",
+          "[autoruns][parsers][constraint]") {
+    ConstraintAccumulator acc;
+    acc.add_failure("permission_denied");
+    acc.add_failure("partial_permission_denied");
+    CHECK(acc.any_failure());
+    // Both tokens survive -- neither is a false match for the other.
+    CHECK(acc.reason() == "permission_denied,partial_permission_denied");
+}
+
+TEST_CASE("autoruns: ConstraintAccumulator dedups a repeated identical token and "
+          "preserves insertion order",
+          "[autoruns][parsers][constraint]") {
+    ConstraintAccumulator acc;
+    acc.add_failure("row_cap");
+    acc.add_failure("eio");
+    acc.add_failure("row_cap"); // repeat -- must not duplicate or reorder
+    CHECK(acc.reason() == "row_cap,eio");
+}
+
+TEST_CASE("autoruns: ConstraintAccumulator.reason_with appends a permanent token "
+          "after every accumulated failure, and is a no-op when empty",
+          "[autoruns][parsers][constraint]") {
+    ConstraintAccumulator acc;
+    CHECK(acc.reason_with("narrow_search_path_coverage") == "narrow_search_path_coverage");
+
+    acc.add_failure("eio");
+    CHECK(acc.reason_with("narrow_search_path_coverage") == "eio,narrow_search_path_coverage");
+    CHECK(acc.reason_with("") == "eio"); // empty permanent token: no-op
+}
+
+TEST_CASE("autoruns: ConstraintAccumulator.mark_incomplete is independent of "
+          "add_failure -- a caller can flag incompleteness with no token of its own",
+          "[autoruns][parsers][constraint]") {
+    ConstraintAccumulator acc;
+    acc.mark_incomplete();
+    CHECK(acc.incomplete());
+    CHECK_FALSE(acc.any_failure());
+    CHECK(acc.reason().empty());
+}
