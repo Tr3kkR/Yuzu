@@ -467,6 +467,12 @@ struct RegWatch {
     bool grace_counted{false};
     bool needs_resync{false};
     std::uint64_t resync_epoch{0};
+    /// Set once the sweeper has staged this watch's first "not faulted" report
+    /// after establishment (UP-1 heal): the engine dedups repeats, so this is a
+    /// no-op for a healthy key and exactly the correcting edge for a key whose
+    /// engine-side state was flipped by a stale Fault that raced a same-key
+    /// re-arm between staging and dispatch.
+    bool health_confirmed{false};
     /// The outstanding re-arm was fire-triggered while in Ancestor mode. If it
     /// commits in Target mode the key APPEARED, which the base mechanism emitted
     /// (`old_mode == Target || w.mode == Target`) and this one must too. Kept as
@@ -542,6 +548,12 @@ struct SweepWork {
         bool faulted{false};
         const char* reason{""};
         std::uint64_t epoch{0};
+        /// Fault actions only: the watch this edge was recorded FOR. The engine
+        /// keys health by spark key, so a Fault staged for W1 and dispatched after
+        /// Guardian re-created the key (detach + arm = W1') would land on W1' and
+        /// stick (UP-1). run_off_lock() re-validates identity under mu_ right
+        /// before the call and skips a stale edge.
+        RegWatch* watch{nullptr};
     };
     std::vector<ProbeLaunch> probe_launches;
     std::vector<DrainJob> drain_launches;
@@ -1208,9 +1220,9 @@ private:
         // (one Emit, one Fault edge), <= 1 launch, <= 1 superseded event/key, <= 1
         // dead result, <= 1 stale call.
         const std::size_t cap = std::min(watches_.size(), kSweepMaxItems) + 1;
-        work.actions.reserve(2 * cap);
-        work.succeeded_emits.reserve(2 * cap);
-        work.failed_emits.reserve(2 * cap);
+        work.actions.reserve(3 * cap); // Emit + health edge + one-time heal per visit
+        work.succeeded_emits.reserve(3 * cap);
+        work.failed_emits.reserve(3 * cap);
         work.probe_launches.reserve(cap);
         work.old_events.reserve(cap);
         work.old_keys.reserve(cap);
@@ -1305,7 +1317,11 @@ private:
                 w.faulted_reported = w.faulted_now;
                 health_edges_.fetch_add(1, std::memory_order_relaxed);
                 work.actions.push_back({SweepWork::Action::Kind::Fault, w.spark_key, w.faulted_now,
-                                        w.fault_reason, 0});
+                                        w.fault_reason, 0, &w});
+            } else if (w.armed && !w.faulted_now && !w.health_confirmed) {
+                w.health_confirmed = true; // UP-1 heal: one dedup'd "healthy" per establishment
+                work.actions.push_back({SweepWork::Action::Kind::Fault, w.spark_key, false,
+                                        "established", 0, &w});
             }
         }
     }
@@ -1337,6 +1353,8 @@ private:
         for (const auto& a : work.actions) {
             try {
                 if (a.kind == SweepWork::Action::Kind::Fault) {
+                    if (!fault_action_still_current(a))
+                        continue; // UP-1: the key was re-created since this edge was staged
                     if (fault_)
                         fault_(a.key, a.faulted, a.reason);
                 } else if (emit_) {
@@ -1352,6 +1370,19 @@ private:
                 }
             }
         }
+    }
+
+    /// A staged health edge is dispatched only if the key still maps to the very
+    /// watch it was recorded for and that watch still wants that state reported
+    /// (a same-key re-arm in between would otherwise inherit W1's edge - UP-1).
+    /// A short mu_ acquisition off the sweeper's own lock; never blocks.
+    [[nodiscard]] bool fault_action_still_current(const SweepWork::Action& a) {
+        std::lock_guard lk(mu_);
+        auto it = watches_.find(a.key);
+        if (it == watches_.end() || it->second.get() != a.watch)
+            return false;
+        const RegWatch& w = *it->second;
+        return w.active && w.faulted_reported == a.faulted && w.faulted_now == a.faulted;
     }
 
     /// Relock half: publish launched probes with re-validation; file drain
