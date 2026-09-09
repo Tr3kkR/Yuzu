@@ -63,7 +63,7 @@ std::size_t est_entry_bytes(const JournalRecord& r) {
 
 } // namespace
 
-GuardianLifecycleJournal::GuardianLifecycleJournal(KvStore* kv)
+GuardianLifecycleJournal::GuardianLifecycleJournal(IJournalStore* kv)
     : kv_(kv), boot_nonce_(make_journal_nonce()) {
     // rev-4.1 #9 / review M8: confirm the durability precondition on the BUILT binary. SOFT warn
     // on != FULL (2); NEVER abort, since config drift must not kill an agent.

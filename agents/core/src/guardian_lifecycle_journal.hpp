@@ -23,13 +23,15 @@
  * thread - so it can now run genuinely concurrently with prune()/page_into_window(),
  * not merely interleaved on one thread as before. That safe overlap rests on: the
  * size gauges being atomic RMW running counters (no lost update across
- * persist-vs-prune-vs-mark_batch_sent), KvStore serialising its single connection,
- * batch_seq_ being written only by the single persist caller (boot_nonce_ is fixed
- * in the ctor, immutable thereafter), and the seed's absolute store running once in
- * the ctor before publication. mark_batch_sent()'s label is explicitly best-effort
- * (see its own doc comment) - a redundant re-page from a stale-observed label is the
- * worst case, not a correctness break. Do NOT add a second persist caller or a
- * non-RMW gauge write.
+ * persist-vs-prune-vs-mark_batch_sent), the IJournalStore contract's per-call
+ * serialisation (a real KvStore serialises its single connection under one mutex;
+ * see kv_store.hpp's IJournalStore doc comment for the contract every implementation
+ * must keep - #4153), batch_seq_ being written only by the single persist caller
+ * (boot_nonce_ is fixed in the ctor, immutable thereafter), and the seed's absolute
+ * store running once in the ctor before publication. mark_batch_sent()'s label is
+ * explicitly best-effort (see its own doc comment) - a redundant re-page from a
+ * stale-observed label is the worst case, not a correctness break. Do NOT add a
+ * second persist caller or a non-RMW gauge write.
  */
 
 #include "guardian_journal_format.hpp"
@@ -53,7 +55,7 @@
 
 namespace yuzu::agent {
 
-class KvStore;
+class IJournalStore;
 class GuardianSparkRuntime;
 
 /// A token bucket for replay paging (rev-4.1 #8). PROCESS-LIFETIME: it is NOT reset on
@@ -195,8 +197,10 @@ class YUZU_EXPORT GuardianLifecycleJournal {
 public:
     /// `kv` is BORROWED and must outlive this component (the agent owns it and
     /// destroys it after the engine - agent.cpp member order). May be null (KV
-    /// unavailable): persist() then durably writes nothing.
-    explicit GuardianLifecycleJournal(KvStore* kv);
+    /// unavailable): persist() then durably writes nothing. Production always passes
+    /// a real KvStore; a test may pass any other IJournalStore implementation (#4153)
+    /// as long as it keeps that interface's per-call contract.
+    explicit GuardianLifecycleJournal(IJournalStore* kv);
 
     /// Serialise + durably write the FIFO-ordered `pending` records in batches
     /// (each ≤ kMaxJournalEntriesPerBatch entries and ≈ kMaxJournalBatchBytes).
@@ -580,7 +584,7 @@ private:
     /// Called from the ctor; fails CLOSED (assume-at-ceiling) if the journal cannot be sized.
     void seed_size_gauges_();
 
-    KvStore* kv_;                ///< BORROWED; outlives this (agent owns it)
+    IJournalStore* kv_;          ///< BORROWED; outlives this (agent owns it)
     std::string boot_nonce_;     ///< random, fixed at construction - batch-key uniqueness across restarts
     std::uint64_t batch_seq_{0}; ///< per-process monotonic batch-key sequence (persist runs single-threaded under mtx_)
     std::atomic<std::uint64_t> batches_written_{0};
