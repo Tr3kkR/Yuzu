@@ -112,7 +112,8 @@ void ensure_usage_schema(TarDatabase& db) {
     REQUIRE(db.execute_sql(
         "CREATE TABLE IF NOT EXISTS usage_daily (day_ts INTEGER, exe_key TEXT, "
         "run_count INTEGER, total_seconds INTEGER, first_seen INTEGER, last_seen INTEGER, "
-        "distinct_users INTEGER, superseded_runs INTEGER, expired_runs INTEGER)"));
+        "distinct_users INTEGER, superseded_runs INTEGER, expired_runs INTEGER, "
+        "fold_hwm INTEGER NOT NULL DEFAULT 0)"));
     REQUIRE(db.execute_sql(
         "CREATE TABLE IF NOT EXISTS usage_daily_user (day_ts INTEGER NOT NULL, "
         "exe_key TEXT NOT NULL, user TEXT NOT NULL, PRIMARY KEY(day_ts, exe_key, user))"));
@@ -695,6 +696,149 @@ TEST_CASE("tar_usage: a partial mid-batch statement failure leaves hwm and count
     auto rows = t.db.execute_query("SELECT COUNT(*) FROM usage_daily");
     REQUIRE(rows.has_value());
     CHECK(rows->rows[0][0] == "0");
+}
+
+// ── Governance re-review fix-of-a-fix: a crash between the data commit and ─
+// ── the hwm/counter commit must not double-count on the retry ──────────────
+
+TEST_CASE("tar_usage: a crash between the data commit and the hwm advance does not "
+         "double-count usage_daily on the next tick's retry",
+         "[tar_usage]") {
+    // The Blocker 1 fix's OWN gap (Wave 7 PR7.2 governance re-review,
+    // fix-of-a-fix): the two-phase split that closed Blocker 1 (a data
+    // batch, then a SEPARATE confirm batch issued only after checking the
+    // first one's result) left a genuine process crash between those two
+    // CALLS able to durably apply usage_daily/usage_live while usage_hwm_id
+    // stayed behind -- the next tick then re-derives and re-applies the SAME
+    // additive run_count/total_seconds delta on top of already-durable data.
+    // This is a DIFFERENT defect than Blocker 1's own test above: that one
+    // proves "no partial advance on a mid-batch STATEMENT failure"; this one
+    // proves "no double-count on a retry that finds the data already
+    // applied but the hwm pointer un-advanced" -- a scenario Blocker 1's
+    // fix never protected against.
+    //
+    // A unit test cannot literally kill the process mid-transaction, so this
+    // forces the DURABLE CONSEQUENCE a crash in that exact window would
+    // leave: run a real fold to completion (this is now ONE atomic commit,
+    // tar_db.hpp's execute_atomic_batch_gated -- data and hwm/counters
+    // together), then manually revert JUST the tar_config keys the confirm
+    // step would have written, leaving usage_daily/usage_daily_user/
+    // usage_live exactly as the fold's data statements left them. That is
+    // byte-for-byte the state a crash landing after the data commit but
+    // before the (former, now-removed) confirm commit would have produced,
+    // regardless of which mechanism produced it.
+    auto t = make_test_db();
+    REQUIRE(t.db.insert_process_events(
+        {mk(1000, "started", 1, "app", "alice"), mk(1010, "stopped", 1, "app", "alice")}));
+
+    auto first = run_usage_fold(t.db, /*now=*/2000);
+    REQUIRE(first.ok);
+    REQUIRE(first.hwm_id == 2);
+
+    auto daily_after_first = t.db.execute_query(
+        "SELECT run_count, total_seconds FROM usage_daily");
+    REQUIRE(daily_after_first.has_value());
+    REQUIRE(daily_after_first->rows.size() == 1);
+    CHECK(daily_after_first->rows[0][0] == "1");
+    CHECK(daily_after_first->rows[0][1] == "10");
+
+    // Simulate the crash boundary: undo the confirm step's writes only.
+    // usage_daily/usage_live are untouched -- they are what the DATA commit
+    // (already durable, by design) left behind.
+    REQUIRE(t.db.execute_sql("DELETE FROM tar_config WHERE key IN "
+                             "('usage_hwm_id', 'usage_last_fold_ts', 'usage_lag_events')"));
+    REQUIRE(t.db.get_config("usage_hwm_id", "0") == "0");
+
+    // The retry: a fresh fold pass reading the same un-advanced hwm. It
+    // re-reads the identical process_live range (nothing new arrived) and
+    // re-derives the identical closed run.
+    auto second = run_usage_fold(t.db, /*now=*/3000);
+    CHECK(second.ok);
+    CHECK(second.hwm_id == 2); // self-heals back to the correct value
+
+    // The falsifier: the OLD two-call code re-applied the additive upsert
+    // unconditionally on this retry, so run_count/total_seconds would read
+    // back "2"/"20" here instead of "1"/"10".
+    //
+    // MUTATION-VERIFY: temporarily dropped the `fold_hwm` guard (reverted
+    // the same-tick upsert to the plain unconditional additive form with no
+    // `WHERE fold_hwm < excluded.fold_hwm` clause, matching what the
+    // two-phase-split code shipped) and re-ran this test -- it failed as
+    // expected (run_count read back "2", total_seconds "20"), proving this
+    // test does exercise the replay guard rather than passing on unrelated
+    // grounds. Reverted before writing the patch.
+    auto daily_after_second = t.db.execute_query(
+        "SELECT run_count, total_seconds FROM usage_daily");
+    REQUIRE(daily_after_second.has_value());
+    REQUIRE(daily_after_second->rows.size() == 1);
+    CHECK(daily_after_second->rows[0][0] == "1");
+    CHECK(daily_after_second->rows[0][1] == "10");
+}
+
+TEST_CASE("tar_usage: the same crash-and-retry does not lose a genuinely NEW carried-over "
+         "expiry that happens to land on the same target hwm",
+         "[tar_usage]") {
+    // The counterpart to the test above: the `fold_hwm` guard must protect
+    // ONLY same-tick opened-and-closed contributions, never a genuinely NEW
+    // closure of a run that was already durably open before the tick began
+    // (a "carried-over" closure -- see run_usage_fold's provenance split).
+    // Carried-over closures are already replay-safe on their own (closing
+    // them mutates usage_live, so a replay's `state.open` reload can never
+    // find the same run again) and must stay UNGUARDED: gating them on
+    // `new_hwm` too would wrongly collide whenever hwm is flat across
+    // multiple genuinely distinct ticks (no new process activity, yet
+    // different long-open runs individually crossing max_age) and silently
+    // drop a second, unrelated expiry.
+    auto t = make_test_db();
+
+    // pid 1 is opened directly into usage_live (as if carried over from a
+    // prior agent restart -- mirrors the "an open run survives a simulated
+    // agent restart" test elsewhere in this file) and will expire on its
+    // own, with NO corresponding event in process_live.
+    REQUIRE(t.db.execute_sql(
+        "INSERT INTO usage_live (ts, snapshot_id, action, pid, exe_key, user, start_ts) "
+        "VALUES (100, 0, 'open', 1, 'stale', 'alice', 100)"));
+    // A same-tick started+stopped run for a DIFFERENT executable seeds a
+    // real data batch this tick so the fold has process_live rows to read
+    // and a genuine new_hwm to advance to.
+    REQUIRE(t.db.insert_process_events(
+        {mk(1000, "started", 2, "app", "alice"), mk(1010, "stopped", 2, "app", "alice")}));
+
+    // now=2000 is nowhere near kDefaultMaxAgeSeconds (7 days) past pid 1's
+    // start_ts=100, so it survives this first pass untouched -- the fold's
+    // own new_hwm this tick is driven entirely by the app/pid2 events.
+    auto first = run_usage_fold(t.db, /*now=*/2000);
+    REQUIRE(first.ok);
+    REQUIRE(first.hwm_id == 2);
+
+    // Simulate the SAME crash boundary as the test above.
+    REQUIRE(t.db.execute_sql("DELETE FROM tar_config WHERE key IN "
+                             "('usage_hwm_id', 'usage_last_fold_ts', 'usage_lag_events')"));
+
+    // The retry, now far enough past pid 1's start_ts to expire it too.
+    // process_live has nothing new (still id<=2), so this pass's new_hwm is
+    // AGAIN 2 -- the identical value the first pass already stamped into
+    // usage_daily's "app" row. The pid-1 "stale" expiry is a GENUINELY NEW
+    // contribution that must still land despite sharing that new_hwm.
+    auto second = run_usage_fold(t.db, /*now=*/1000000);
+    CHECK(second.ok);
+    CHECK(second.hwm_id == 2);
+
+    auto app_row = t.db.execute_query(
+        "SELECT run_count, total_seconds FROM usage_daily WHERE exe_key = 'app'");
+    REQUIRE(app_row.has_value());
+    REQUIRE(app_row->rows.size() == 1);
+    CHECK(app_row->rows[0][0] == "1"); // unchanged -- not re-applied
+    CHECK(app_row->rows[0][1] == "10");
+
+    auto stale_row = t.db.execute_query(
+        "SELECT run_count, expired_runs FROM usage_daily WHERE exe_key = 'stale'");
+    REQUIRE(stale_row.has_value());
+    REQUIRE(stale_row->rows.size() == 1); // the falsifier: a uniform guard
+                                          // keyed on new_hwm alone would
+                                          // leave this row absent entirely.
+    CHECK(stale_row->rows[0][0] == "1");
+    CHECK(stale_row->rows[0][1] == "1");
 }
 
 // ── Blocker 3: the forward-only boundary self-heals and never replays ──────

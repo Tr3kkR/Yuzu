@@ -5,26 +5,53 @@
  * run_usage_fold() is the ONE entry point tar_plugin.cpp's collect_fast_impl
  * calls, once per fast tick, after both process feeders (gap-free stream or
  * snapshot-diff poll) have inserted for that tick. It writes usage_daily,
- * usage_daily_user, and usage_live's open-run set in ONE execute_atomic_batch
- * transaction (the DATA batch); usage_daily_user's own RETENTION prune is
- * NOT here -- it runs under tar_aggregator.cpp's clock-guarded run_retention
- * instead (see docs/clock-guarded-retention.md). tar_config counters
- * (including usage_hwm_id) are then written in a SEPARATE, SECOND
- * execute_atomic_batch, issued ONLY when the data batch committed with ZERO
- * flagged statement failures (Wave 7 PR7.2 adversarial review, Blocker 1):
+ * usage_daily_user, usage_live's open-run set, AND the tar_config counters
+ * (including usage_hwm_id) in ONE TarDatabase::execute_atomic_batch_gated
+ * call -- ONE transaction, ONE COMMIT. usage_daily_user's own RETENTION
+ * prune is NOT here -- it runs under tar_aggregator.cpp's clock-guarded
+ * run_retention instead (see docs/clock-guarded-retention.md).
+ *
+ * The data statements (usage_daily/usage_daily_user/usage_live) are the
+ * DATA group; the tar_config counters are the GATED group, issued inside
+ * that SAME transaction only if every data statement completed with zero
+ * flagged failures (Wave 7 PR7.2 adversarial review, Blocker 1):
  * TarDatabase::execute_atomic_batch is documented as deliberately NOT
  * all-or-nothing on a transaction-preserving error -- a batch can commit
  * with one statement flagged `failed[i]` while every OTHER statement in that
  * SAME commit, including a tar_config upsert, is fully durable. Folding the
- * hwm advance into the data batch therefore let a broken usage_daily/
+ * hwm advance in unconditionally would let a broken usage_daily/
  * usage_daily_user write (e.g. a stuck-at-schema-5 migration with no
  * matching unique index for `ON CONFLICT`) get silently skipped while
- * usage_hwm_id still advanced past it, forever. Splitting the transaction
- * closes that: the durable pointer can only move once the data it is
- * supposed to describe is confirmed intact. The residual trade-off (data
- * batch commits, then the SEPARATE counter batch itself fails for an
- * unrelated reason) reprocesses the same already-folded events on the next
- * tick -- a bounded overcount, not the silent permanent loss this replaces.
+ * usage_hwm_id still advanced past it, forever.
+ *
+ * An EARLIER version of this fix expressed that gate as TWO SEPARATE
+ * execute_atomic_batch calls -- a data batch, then a confirm batch issued
+ * only after checking the first one's result. That closed the original
+ * Blocker 1 gap but opened a worse one (Wave 7 PR7.2 governance re-review,
+ * fix-of-a-fix): the data batch's own COMMIT is a fully durable transaction
+ * on its own, so a genuine process crash between the two CALLS durably
+ * applied the data while usage_hwm_id stayed behind -- and the next tick's
+ * retry re-read the same un-advanced hwm, re-derived the SAME closed-run
+ * deltas, and re-applied them on top of already-durable data via the
+ * additive `run_count = run_count + excluded.run_count` upserts, silently
+ * double-counting `usage_daily`/`usage_daily_user`. This was NOT the
+ * "bounded overcount" the two-call version's own commentary claimed for its
+ * documented residual (an unrelated failure of the SEPARATE confirm call);
+ * it was the double-count Blocker 1 was written to prevent, just relocated
+ * to a new commit boundary that hadn't existed before.
+ *
+ * execute_atomic_batch_gated (tar_db.hpp/.cpp) removes that boundary instead
+ * of shrinking it: the gate decision (did every data statement complete
+ * clean?) is made in C++, inside the SAME held transaction, BEFORE the
+ * single COMMIT -- so a crash can only land before that COMMIT (nothing
+ * durable at all; SQLite's WAL recovery rolls the whole thing back on
+ * restart) or after it (data and hwm/counters durable together, always).
+ * The one residual left is narrower than before and was already accepted:
+ * a genuine transaction-preserving SQL fault on a tar_config upsert itself
+ * (not a crash, and not the data statements) still lets data commit while
+ * that specific counter is skipped -- caught below via `batch.ran_gated`
+ * and the gated `failed` entries, same "hwm unchanged, re-fold next tick"
+ * outcome Blocker 1's fix always had for this case.
  *
  * GAP CHECK FIRST, before any events are read: process_live is retained by
  * ROW COUNT (kRowCount, 100k rows, tar_schema_registry.cpp), and its prune
@@ -228,12 +255,20 @@ UsageFoldResult run_usage_fold(TarDatabase& db, int64_t now, int64_t max_events_
         result.error = open_res.error();
         return result; // ok=false, hwm unchanged
     }
+    // Snapshot of what was DURABLY open before this tick's own events are
+    // folded in -- the replay-safety split below (building `deltas_guarded`)
+    // needs to tell "this closed run was already persisted in usage_live
+    // before this tick" from "this run's whole open+close lifecycle happened
+    // within this tick's own event window", and this is the only point where
+    // that distinction is still visible (state.open is mutated below).
+    std::set<std::pair<uint32_t, std::string>> initial_open_keys;
     for (const auto& row : open_res->rows) {
         OpenRun run;
         run.pid = static_cast<uint32_t>(parse_i64(row[0]));
         run.exe_key = row[1];
         run.user = row[2];
         run.start_ts = parse_i64(row[3]);
+        initial_open_keys.insert({run.pid, run.exe_key});
         state.open[{run.pid, run.exe_key}] = run;
     }
 
@@ -275,16 +310,43 @@ UsageFoldResult run_usage_fold(TarDatabase& db, int64_t now, int64_t max_events_
         closed.push_back(std::move(c));
     result.runs_closed = static_cast<int64_t>(closed.size());
 
-    const auto deltas = fold_daily(closed);
+    // Split by provenance BEFORE aggregating -- the two groups need different
+    // upsert shapes below (see the comment ahead of the `deltas_guarded`
+    // loop). A closed run is "carried_over" iff its (pid, exe_key) was
+    // ALREADY durably open in usage_live before this tick touched anything:
+    // closing it (via a stop event, expiry, or the cap) is part of the SAME
+    // data commit that removes/rewrites its usage_live row, so a replay of
+    // this tick (hwm unmoved, same window) reloads `state.open` from
+    // usage_live and finds that row already gone/changed -- it structurally
+    // CANNOT re-derive the identical closure a second time. It is
+    // "same_tick" otherwise: the run's entire open-then-close lifecycle
+    // happened inside THIS tick's own event window, so usage_live never
+    // carried a durable trace of it at all, and replaying the SAME events
+    // (hwm unmoved) reproduces the identical closure with no signal to stop
+    // it.
+    std::vector<ClosedRun> closed_carried_over, closed_same_tick;
+    for (auto& c : closed) {
+        if (initial_open_keys.contains({c.pid, c.exe_key}))
+            closed_carried_over.push_back(c);
+        else
+            closed_same_tick.push_back(c);
+    }
+    const auto deltas_unguarded = fold_daily(closed_carried_over);
+    const auto deltas_guarded = fold_daily(closed_same_tick);
 
     // ── Build the DATA transaction ──────────────────────────────────────────
     std::vector<std::string> stmts;
 
-    for (const auto& d : deltas) {
+    // Carried-over contributions: already replay-safe (see the split above),
+    // so this is the plain additive upsert -- and critically, its DO UPDATE
+    // SET never touches `fold_hwm`, so it cannot interfere with the guarded
+    // upsert below when both groups touch the SAME (day_ts, exe_key) row in
+    // the same pass (order between them would otherwise matter).
+    for (const auto& d : deltas_unguarded) {
         stmts.push_back(std::format(
             "INSERT INTO usage_daily (day_ts, exe_key, run_count, total_seconds, first_seen, "
-            "last_seen, distinct_users, superseded_runs, expired_runs) VALUES ({}, {}, {}, {}, "
-            "{}, {}, 0, {}, {}) ON CONFLICT(day_ts, exe_key) DO UPDATE SET "
+            "last_seen, distinct_users, superseded_runs, expired_runs, fold_hwm) VALUES ({}, {}, "
+            "{}, {}, {}, {}, 0, {}, {}, {}) ON CONFLICT(day_ts, exe_key) DO UPDATE SET "
             "run_count = run_count + excluded.run_count, "
             "total_seconds = total_seconds + excluded.total_seconds, "
             "first_seen = MIN(first_seen, excluded.first_seen), "
@@ -292,7 +354,51 @@ UsageFoldResult run_usage_fold(TarDatabase& db, int64_t now, int64_t max_events_
             "superseded_runs = superseded_runs + excluded.superseded_runs, "
             "expired_runs = expired_runs + excluded.expired_runs",
             d.day_ts, sql_str(d.exe_key), d.run_count, d.total_seconds, d.first_seen, d.last_seen,
-            d.superseded_runs, d.expired_runs));
+            d.superseded_runs, d.expired_runs, new_hwm));
+    }
+
+    // Same-tick contributions: `fold_hwm` (tar_db.cpp v7 migration) is this
+    // PASS's target new_hwm, stamped on every row this loop touches, and is
+    // what makes THIS group's additive add idempotent under an exact-window
+    // replay: `WHERE fold_hwm < excluded.fold_hwm` makes the whole ON
+    // CONFLICT DO UPDATE a no-op once the row already reflects this pass's
+    // contribution (fold_hwm already >= new_hwm) instead of adding a second
+    // time. That is exactly the shape a genuine crash (or a gated tar_config
+    // statement failure) between this data commit and the usage_hwm_id
+    // advance produces: usage_hwm_id stays at the OLD value, so the next
+    // tick re-reads the SAME process_live range and re-derives the SAME
+    // same-tick closures for the SAME new_hwm -- the guard recognises that
+    // as "already applied" rather than adding on top. `new_hwm` is a sound
+    // replay key ONLY for this group: a same-tick closure requires reading
+    // at least one genuinely new event (the "started" that created it), so
+    // new_hwm strictly advances whenever a NEW (non-replay) same-tick
+    // closure occurs -- unlike the carried-over group above, where new_hwm
+    // can legitimately stay flat across multiple distinct ticks (no new
+    // process activity, yet different long-open runs individually crossing
+    // max_age) and would otherwise collide and wrongly no-op a second,
+    // genuinely new contribution. This does not, by itself, make a replay
+    // whose event WINDOW has since grown (new process_live rows arrived
+    // between the crash and the retry, past what this pass's `new_hwm`
+    // covered) safe for the OVERLAPPING portion, nor a same-key
+    // open-close-reopen-within-one-tick pid reuse racing the crash window --
+    // both residuals are bounded to the width of events arriving in the
+    // crash's own brief window and are far narrower than the
+    // unbounded-cumulative defect this closes; see the file banner.
+    for (const auto& d : deltas_guarded) {
+        stmts.push_back(std::format(
+            "INSERT INTO usage_daily (day_ts, exe_key, run_count, total_seconds, first_seen, "
+            "last_seen, distinct_users, superseded_runs, expired_runs, fold_hwm) VALUES ({}, {}, "
+            "{}, {}, {}, {}, 0, {}, {}, {}) ON CONFLICT(day_ts, exe_key) DO UPDATE SET "
+            "run_count = run_count + excluded.run_count, "
+            "total_seconds = total_seconds + excluded.total_seconds, "
+            "first_seen = MIN(first_seen, excluded.first_seen), "
+            "last_seen = MAX(last_seen, excluded.last_seen), "
+            "superseded_runs = superseded_runs + excluded.superseded_runs, "
+            "expired_runs = expired_runs + excluded.expired_runs, "
+            "fold_hwm = excluded.fold_hwm "
+            "WHERE fold_hwm < excluded.fold_hwm",
+            d.day_ts, sql_str(d.exe_key), d.run_count, d.total_seconds, d.first_seen, d.last_seen,
+            d.superseded_runs, d.expired_runs, new_hwm));
     }
 
     std::set<std::pair<int64_t, std::string>> touched_days; // (day_ts, exe_key)
@@ -349,40 +455,12 @@ UsageFoldResult run_usage_fold(TarDatabase& db, int64_t now, int64_t max_events_
     // docs/clock-guarded-retention.md's usage_daily_user register entry).
     // This fold only ever WRITES usage_daily_user, never prunes it.
 
-    // A quiet tick (no events, no expiries, no cap evictions) legitimately
-    // produces an EMPTY data batch -- execute_atomic_batch's own
-    // "statements.empty()" short-circuit returns committed=false with no
-    // BEGIN attempted and no error logged (there is nothing to roll back),
-    // which is a DIFFERENT thing from a real transaction failure. Skip the
-    // call entirely in that case rather than misreading its default-false
-    // BatchResult as a fold failure.
-    if (!stmts.empty()) {
-        const auto data_batch = db.execute_atomic_batch(stmts);
-        const bool data_stmt_failed = std::any_of(
-            data_batch.failed.begin(), data_batch.failed.end(), [](char f) { return f != 0; });
-        if (!data_batch.committed || data_stmt_failed) {
-            // BLOCKER 1 fix: a transaction-preserving statement error commits
-            // every OTHER statement in the SAME batch (TarDatabase::BatchResult's
-            // own contract) -- so if the counter upserts below were bundled into
-            // this same batch, usage_hwm_id could advance past data that was
-            // actually skipped. Bailing here, before the counter batch is even
-            // built, is what makes "no partial advance" true rather than merely
-            // claimed.
-            result.ok = false;
-            result.error = !data_batch.committed
-                              ? "usage fold data transaction rolled back"
-                              : "usage fold data transaction partially failed -- a statement was "
-                                "skipped; hwm/counters not advanced";
-            result.hwm_id = hwm; // unchanged -- report what is actually persisted
-            return result;
-        }
-    }
-
-    // ── tar_config counters, in a SEPARATE transaction ──────────────────────
-    // Issued only now that every data statement above is confirmed intact
-    // (see the file banner and BLOCKER 1 comment above). usage_hwm_id is
-    // among these, so the durable pointer can only move once the data it
-    // describes is durable too.
+    // ── tar_config counters (GATED on the data statements above) ────────────
+    // usage_hwm_id is among these, so the durable pointer can only move once
+    // the data it describes is durable too -- see execute_atomic_batch_gated
+    // in tar_db.hpp for the two-call crash window this closes (Wave 7 PR7.2
+    // governance re-review, fix-of-a-fix) and the file banner above for the
+    // original Blocker 1 this still preserves the fix for.
     std::vector<std::string> config_stmts;
     auto upsert_config = [&](std::string_view key, std::string_view value) {
         config_stmts.push_back(std::format(
@@ -409,10 +487,55 @@ UsageFoldResult run_usage_fold(TarDatabase& db, int64_t now, int64_t max_events_
         upsert_config("usage_gap_last_ts", std::to_string(now));
     }
 
-    const auto config_batch = db.execute_atomic_batch(config_stmts);
-    const bool config_stmt_failed = std::any_of(
-        config_batch.failed.begin(), config_batch.failed.end(), [](char f) { return f != 0; });
-    if (!config_batch.committed || config_stmt_failed) {
+    // ONE execute_atomic_batch_gated call, ONE COMMIT: `config_stmts` (hwm +
+    // counters) is issued inside the SAME transaction as `stmts` (the data),
+    // and ONLY if every entry of `stmts` completed with no per-statement
+    // failure. That single commit point is what makes "the pointer only
+    // advances once the data it describes is durable" true with NO interval
+    // in which the data is committed but the pointer decision has not yet
+    // been made -- a genuine process crash can only land before this one
+    // COMMIT (nothing durable at all; SQLite's own WAL recovery rolls the
+    // whole thing back) or after it (data AND hwm/counters durable
+    // together). The former two-call shape (a data batch, then a SEPARATE
+    // confirm batch) left exactly that window open: the data batch's own
+    // COMMIT was a fully durable transaction on its own, so a crash between
+    // the two calls durably applied the data while usage_hwm_id stayed
+    // behind, and the next tick's retry re-derived and re-applied the SAME
+    // deltas on top -- a silent, cumulative double-count of run_count/
+    // total_seconds, not the "bounded overcount" the two-call split's own
+    // commentary claimed (Wave 7 PR7.2 governance re-review).
+    const auto batch = db.execute_atomic_batch_gated(stmts, config_stmts);
+    const bool data_failed =
+        std::any_of(batch.failed.begin(), batch.failed.begin() + static_cast<std::ptrdiff_t>(stmts.size()),
+                    [](char f) { return f != 0; });
+    if (!batch.committed || data_failed) {
+        // BLOCKER 1 fix, unchanged: a transaction-preserving statement error
+        // still leaves every OTHER statement in the batch durable
+        // (TarDatabase::BatchResult's contract), so bailing here -- before
+        // the gated counters are even attempted -- is what makes "no
+        // partial advance" true rather than merely claimed.
+        result.ok = false;
+        result.error = !batch.committed
+                          ? "usage fold data transaction rolled back"
+                          : "usage fold data transaction partially failed -- a statement was "
+                            "skipped; hwm/counters not advanced";
+        result.hwm_id = hwm; // unchanged -- report what is actually persisted
+        return result;
+    }
+
+    const bool gated_failed =
+        !config_stmts.empty() &&
+        (!batch.ran_gated ||
+         std::any_of(batch.failed.begin() + static_cast<std::ptrdiff_t>(stmts.size()),
+                     batch.failed.end(), [](char f) { return f != 0; }));
+    if (gated_failed) {
+        // Residual, and narrower than before: this can now only be a genuine
+        // transaction-preserving SQL fault on one of the tar_config upserts
+        // THEMSELVES (data and counters share one commit, so a crash can no
+        // longer produce this state) -- data is durable, hwm is not, so the
+        // same events are safely re-folded next tick. A bounded overcount on
+        // an already-narrow, already-documented path, not the crash-induced
+        // one this fix closes.
         result.ok = false;
         result.error = "usage fold: data committed but counters failed to persist -- hwm not "
                       "advanced; the same events will be re-folded next tick";

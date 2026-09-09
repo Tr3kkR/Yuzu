@@ -606,6 +606,13 @@ public:
         /// error can leave statement i partly applied and still flagged. Do not
         /// treat a set flag as a licence to re-run a non-idempotent statement.
         std::vector<char> failed;
+
+        /// Set only by `execute_atomic_batch_gated`: true iff the gated segment
+        /// was actually attempted (i.e. every `data_statements` entry completed
+        /// with `failed[i] == 0`). false means the gated statements were never
+        /// issued -- `failed` for their indices stays 0 by default, which is NOT
+        /// the same as "succeeded"; check this flag first.
+        bool ran_gated{false};
     };
 
     /**
@@ -650,6 +657,41 @@ public:
      * offline on that endpoint until the agent restarts.
      */
     BatchResult execute_atomic_batch(const std::vector<std::string>& statements);
+
+    /**
+     * Like `execute_atomic_batch`, but takes a SECOND list of statements that
+     * are only issued -- inside the SAME transaction, before the SAME single
+     * COMMIT -- if every entry of `data_statements` completed with
+     * `failed[i] == 0`. Both groups therefore share one commit point: there is
+     * no interval in which `data_statements` can be durable while
+     * `gated_statements` is not, because a crash can only land before that one
+     * COMMIT (nothing durable, full rollback on restart) or after it (both
+     * groups durable together).
+     *
+     * This exists for a durable pointer/counter that must only advance once
+     * the data it describes is confirmed intact (e.g. a fold's high-water
+     * mark over the data it just wrote) -- the two-call shape that used to
+     * express this (a data batch, then a SEPARATE confirm batch) left exactly
+     * that crash window open: the data batch's own COMMIT is a fully durable
+     * transaction on its own, so a crash between the two calls durably
+     * applies the data while the pointer stays behind, and a naive retry
+     * re-derives and re-applies the same data a second time (tar_usage.cpp).
+     * Folding the decision into ONE call removes the window instead of
+     * shrinking it.
+     *
+     * `out.failed` is sized to `data_statements.size() + gated_statements.size()`,
+     * gated indices following data indices. `out.ran_gated` is true only when
+     * the gated segment was attempted; when false, the gated indices' `failed`
+     * entries are meaningless (never run) and must not be read as "succeeded".
+     * A transaction-preserving fault WITHIN the gated segment is reported the
+     * same way as within the data segment: `committed == true`, that entry's
+     * `failed[i] == 1`, everything else (including all of `data_statements`)
+     * durable. Callers that need "did the pointer really move" MUST check
+     * `ran_gated` and the gated `failed` entries together, not `committed`
+     * alone.
+     */
+    BatchResult execute_atomic_batch_gated(const std::vector<std::string>& data_statements,
+                                            const std::vector<std::string>& gated_statements);
 
     /**
      * Execute parameterized SQL with two int64 bind values.

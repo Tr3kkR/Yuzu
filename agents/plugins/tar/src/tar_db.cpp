@@ -19,6 +19,7 @@
 #include <sqlite3.h>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <filesystem>
@@ -72,6 +73,138 @@ public:
 private:
     char* msg_{nullptr};
 };
+
+// Shared per-statement loop for execute_atomic_batch/execute_atomic_batch_gated.
+// The caller holds mu_, has already issued BEGIN IMMEDIATE on `db`, and owns
+// `err` for the whole transaction (both callers already reuse one SqliteErrMsg
+// this way). Writes pass/fail into out_failed[offset .. offset+statements.size()),
+// which must already be sized to cover that range.
+//
+// Returns false the instant a statement ABORTS the transaction itself (see
+// execute_atomic_batch's header doc for the abort-vs-continue classification
+// this mirrors exactly) -- the caller must stop issuing statements from ANY
+// group at that point and go straight to the commit-attempt/rollback tail.
+// Returns true when every statement was attempted, whether or not some of
+// them were flagged failed (transaction-preserving faults do not stop the
+// loop, by design -- see the classification comment this used to carry
+// inline before two callers needed it).
+bool run_batch_statements_locked(sqlite3* db, const std::vector<std::string>& statements,
+                                  std::vector<char>& out_failed, std::size_t offset,
+                                  SqliteErrMsg& err) {
+    for (std::size_t i = 0; i < statements.size(); ++i) {
+        const int rc = sqlite3_exec(db, statements[i].c_str(), nullptr, nullptr, err.addr());
+        if (rc == SQLITE_OK)
+            continue;
+
+        // ASK whether SQLite aborted the transaction; do not assume it did.
+        //
+        // This used to `break` unconditionally, on the reasoning that continuing
+        // risks autocommits past an auto-rollback. That is true only of errors
+        // that abort the transaction THEMSELVES (SQLITE_FULL, a RAISE(ROLLBACK)
+        // trigger). A plain SQLITE_ERROR -- a missing column after a partial
+        // DDL, a corrupt index on ONE table -- leaves the transaction perfectly
+        // intact, and breaking there rolled the whole pass back.
+        //
+        // That turned one permanently-broken table into permanently-broken
+        // retention for EVERY table: each pass rolled back, nothing was ever
+        // deleted, and tar.db grew without bound on the endpoint behind a single
+        // warn line. Before this batch existed each statement ran independently
+        // and the COMMIT kept the successes, so this was a regression, and a
+        // silent one (governance Gate 3, cpp-expert).
+        //
+        // `sqlite3_get_autocommit` is the same question the ROLLBACK path
+        // downstream already asks, for the same reason.
+        //
+        // But autocommit ALONE is not sufficient, and reading it alone was a
+        // defect in the first version of this fix (Gate 7 security re-review).
+        // Some conditions leave the transaction technically intact while making
+        // it wrong to continue: SQLITE_CORRUPT/NOTADB would COMMIT onto a
+        // damaged database -- against the fail-closed-and-quarantine posture
+        // this store takes everywhere else (#559) -- and SQLITE_BUSY/LOCKED
+        // would pay the 5s busy_timeout PER TABLE while holding `mu_`, stalling
+        // every collector, where the old unconditional break paid it once.
+        // NOMEM/IOERR/FULL are likewise whole-database conditions, not a
+        // property of one table.
+        //
+        // So continue ONLY for the narrow per-table faults this exists for: a
+        // plain error or a constraint violation, with the transaction intact.
+        const bool per_table_fault = (rc == SQLITE_ERROR || rc == SQLITE_CONSTRAINT);
+        const bool txn_aborted = sqlite3_get_autocommit(db) != 0 || !per_table_fault;
+        spdlog::error("TarDatabase::execute_atomic_batch statement failed: {} (rc={}, {})",
+                      err.text(), rc,
+                      txn_aborted ? "abandoning the pass"
+                                  : "transaction intact and the fault is per-table, "
+                                    "skipping this table only");
+        if (txn_aborted)
+            return false;
+        // Transaction still good: fail THIS statement, keep the rest of the pass.
+        out_failed[offset + i] = 1;
+    }
+    return true;
+}
+
+// Shared commit-or-rollback tail for execute_atomic_batch/execute_atomic_batch_gated.
+// `ok` is the run_batch_statements_locked verdict for every statement group
+// issued so far (false means one already aborted the transaction and no
+// further statement was attempted). On success this attempts COMMIT; on any
+// failure -- `ok == false`, or COMMIT itself failing -- it rolls back and
+// marks the WHOLE of `out_failed` (every group's indices) failed, matching
+// execute_atomic_batch's existing "rolled back as a whole" contract. A
+// ROLLBACK that leaves the transaction wedged open closes the connection
+// (`db_slot` nulled) for the same reason execute_atomic_batch always has:
+// every later write on a connection stuck mid-transaction would be reported
+// durable and then lost.
+bool commit_or_rollback_locked(std::atomic<sqlite3*>& db_slot, sqlite3* db,
+                                std::vector<char>& out_failed, bool ok, SqliteErrMsg& err) {
+    if (ok) {
+        if (sqlite3_exec(db, "COMMIT", nullptr, nullptr, err.addr()) == SQLITE_OK)
+            return true;
+        spdlog::error("TarDatabase::execute_atomic_batch COMMIT failed: {}", err.text());
+    }
+
+    const int rb = sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, err.addr());
+    if (rb != SQLITE_OK) {
+        // A ROLLBACK error USUALLY means SQLite already rolled back on its own,
+        // which is the state we wanted. But it can also mean the rollback itself
+        // failed with the transaction still open -- and returning then would
+        // release mu_ with the connection still inside a transaction, so the
+        // NEXT writer's INSERT would silently join it and be lost, which is
+        // precisely the defect this whole method exists to prevent. Do not
+        // assume; ask.
+        if (sqlite3_get_autocommit(db) == 0) {
+            // The connection is genuinely stuck inside a transaction that will
+            // never commit. Every subsequent write on it -- a collector INSERT,
+            // a set_config, anything -- would join that transaction, be told it
+            // succeeded, and be lost at the next restart. Collection is not
+            // "still working" in that state; it is silently failing.
+            //
+            // So close the connection rather than flagging it. An earlier
+            // version set a `txn_wedged_` bool that ONLY this method consulted,
+            // which left ~118 other statement sites writing into the doomed
+            // transaction while the comment claimed writes were protected -- a
+            // guard covering one path out of 119 reads as handled and is worse
+            // than none. Nulling `db_` reuses the `if (!db_)` check every
+            // TarDatabase method already has, so all of them fail closed at once.
+            //
+            // close_v2 rather than close: it detaches immediately and defers
+            // deallocation until any outstanding statements finalize, so this is
+            // safe even though callers elsewhere may still hold prepared
+            // statements. We hold `mu_`, and every primary-connection method
+            // takes `mu_`, so no other thread is mid-statement here.
+            spdlog::error("TarDatabase: ROLLBACK failed and the connection is STILL in a "
+                          "transaction ({}). Closing the TAR database: further writes would be "
+                          "reported as durable and then lost. TAR storage is offline on this "
+                          "endpoint until the agent restarts.",
+                          err.text());
+            sqlite3_close_v2(db);
+            db_slot = nullptr;
+        } else {
+            spdlog::debug("TarDatabase::execute_atomic_batch ROLLBACK: {}", err.text());
+        }
+    }
+    out_failed.assign(out_failed.size(), 1);
+    return false;
+}
 
 // Case-insensitive ASCII equality for a short, NUL-terminated SQL identifier
 // (SQLite function/identifier names are case-insensitive).
@@ -695,6 +828,73 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
             // DB-enforced one. Retried on the next open.
             sqlite3_exec(raw_db, "ROLLBACK TO v6_migration", nullptr, nullptr, nullptr);
             sqlite3_exec(raw_db, "RELEASE v6_migration", nullptr, nullptr, nullptr);
+        }
+    }
+
+    // Version 7: usage_daily.fold_hwm -- the replay guard for the `usage`
+    // fold's additive upsert (Wave 7 PR7.2 governance re-review, fix-of-a-fix
+    // on the Blocker 1 remediation). A FRESH db already has the column from
+    // the registry DDL (create_warehouse_tables ran above, with INTEGER
+    // columns defaulting NOT NULL DEFAULT 0) -- guarded on a PRAGMA
+    // table_info existence check exactly like v4's procperf `version` column,
+    // for the same reason: an installed base sitting at v6 has usage_daily
+    // WITHOUT it.
+    //
+    // Without this column, tar_usage.cpp's run_usage_fold() has no way to
+    // tell "this (day_ts, exe_key) row already reflects this fold pass's
+    // contribution" from "it does not yet" -- so a crash (or a gated
+    // tar_config statement failure) landing after usage_daily's own commit
+    // but before usage_hwm_id advances leaves the next tick re-deriving and
+    // re-applying the SAME additive run_count/total_seconds delta on top of
+    // already-durable data. The column lets that upsert's `ON CONFLICT DO
+    // UPDATE ... WHERE fold_hwm < excluded.fold_hwm` clause recognise an
+    // exact-window replay and no-op it instead of adding twice.
+    if (db.schema_version() == 6) {
+        std::lock_guard lock(db.mu_);
+        auto has_fold_hwm_col = [&]() -> bool {
+            sqlite3_stmt* raw = nullptr;
+            if (sqlite3_prepare_v2(raw_db, "PRAGMA table_info(usage_daily)", -1, &raw, nullptr) !=
+                SQLITE_OK)
+                return false;
+            StmtPtr q(raw);
+            while (sqlite3_step(q.get()) == SQLITE_ROW) {
+                const auto* col = reinterpret_cast<const char*>(sqlite3_column_text(q.get(), 1));
+                if (col && std::string_view{col} == "fold_hwm")
+                    return true;
+            }
+            return false;
+        };
+        char* emsg = nullptr;
+        sqlite3_exec(raw_db, "SAVEPOINT v7_migration", nullptr, nullptr, nullptr);
+        bool ok = has_fold_hwm_col();
+        if (!ok &&
+            sqlite3_exec(raw_db, "ALTER TABLE usage_daily ADD COLUMN fold_hwm INTEGER NOT NULL "
+                                  "DEFAULT 0",
+                         nullptr, nullptr, &emsg) == SQLITE_OK) {
+            ok = true;
+        } else if (!ok) {
+            // ERROR, not warn: without this column the upsert's WHERE clause
+            // below has nothing to guard on, and a crash-window replay
+            // silently double-counts usage_daily -- the exact defect this
+            // migration exists to close. Give the on-call operator the exact
+            // recovery, since the schema stays at v6.
+            spdlog::error("TarDatabase: v7 ALTER usage_daily ADD COLUMN fold_hwm failed: {} -- "
+                          "schema remains at v6; the usage fold's crash-window replay guard is "
+                          "NOT active until this is fixed. Recovery: stop the agent and run "
+                          "`ALTER TABLE usage_daily ADD COLUMN fold_hwm INTEGER NOT NULL DEFAULT "
+                          "0;` on the tar.db, then restart.",
+                          emsg ? emsg : "unknown");
+            sqlite3_free(emsg);
+            emsg = nullptr;
+        }
+        if (ok) {
+            db.set_config_locked("schema_version", "7");
+            sqlite3_exec(raw_db, "RELEASE v7_migration", nullptr, nullptr, nullptr);
+            spdlog::info("TarDatabase: migrated to schema version 7 (usage_daily.fold_hwm replay "
+                         "guard)");
+        } else {
+            sqlite3_exec(raw_db, "ROLLBACK TO v7_migration", nullptr, nullptr, nullptr);
+            sqlite3_exec(raw_db, "RELEASE v7_migration", nullptr, nullptr, nullptr);
         }
     }
 
@@ -2477,112 +2677,56 @@ TarDatabase::execute_atomic_batch(const std::vector<std::string>& statements) {
     }
     out.began = true;
 
-    bool ok = true;
-    for (std::size_t i = 0; i < statements.size(); ++i) {
-        const int rc = sqlite3_exec(db_, statements[i].c_str(), nullptr, nullptr, err.addr());
-        if (rc == SQLITE_OK)
-            continue;
+    const bool ok = run_batch_statements_locked(db_, statements, out.failed, 0, err);
+    // Any per-statement failures recorded above survive a successful COMMIT:
+    // the transaction committed, so the statements that DID run are durable
+    // and only the skipped ones are reported failed.
+    out.committed = commit_or_rollback_locked(db_, db_, out.failed, ok, err);
+    return out;
+}
 
-        // ASK whether SQLite aborted the transaction; do not assume it did.
-        //
-        // This used to `break` unconditionally, on the reasoning that continuing
-        // risks autocommits past an auto-rollback. That is true only of errors
-        // that abort the transaction THEMSELVES (SQLITE_FULL, a RAISE(ROLLBACK)
-        // trigger). A plain SQLITE_ERROR -- a missing column after a partial
-        // DDL, a corrupt index on ONE table -- leaves the transaction perfectly
-        // intact, and breaking there rolled the whole pass back.
-        //
-        // That turned one permanently-broken table into permanently-broken
-        // retention for EVERY table: each pass rolled back, nothing was ever
-        // deleted, and tar.db grew without bound on the endpoint behind a single
-        // warn line. Before this batch existed each statement ran independently
-        // and the COMMIT kept the successes, so this was a regression, and a
-        // silent one (governance Gate 3, cpp-expert).
-        //
-        // `sqlite3_get_autocommit` is the same question the ROLLBACK path below
-        // already asks, for the same reason.
-        //
-        // But autocommit ALONE is not sufficient, and reading it alone was a
-        // defect in the first version of this fix (Gate 7 security re-review).
-        // Some conditions leave the transaction technically intact while making
-        // it wrong to continue: SQLITE_CORRUPT/NOTADB would COMMIT onto a
-        // damaged database -- against the fail-closed-and-quarantine posture
-        // this store takes everywhere else (#559) -- and SQLITE_BUSY/LOCKED
-        // would pay the 5s busy_timeout PER TABLE while holding `mu_`, stalling
-        // every collector, where the old unconditional break paid it once.
-        // NOMEM/IOERR/FULL are likewise whole-database conditions, not a
-        // property of one table.
-        //
-        // So continue ONLY for the narrow per-table faults this exists for: a
-        // plain error or a constraint violation, with the transaction intact.
-        const bool per_table_fault = (rc == SQLITE_ERROR || rc == SQLITE_CONSTRAINT);
-        const bool txn_aborted = sqlite3_get_autocommit(db_) != 0 || !per_table_fault;
-        spdlog::error("TarDatabase::execute_atomic_batch statement failed: {} (rc={}, {})",
-                      err.text(), rc,
-                      txn_aborted ? "abandoning the pass"
-                                  : "transaction intact and the fault is per-table, "
-                                    "skipping this table only");
-        if (txn_aborted) {
-            ok = false;
-            break;
-        }
-        // Transaction still good: fail THIS statement, keep the rest of the pass.
-        out.failed[i] = 1;
+TarDatabase::BatchResult
+TarDatabase::execute_atomic_batch_gated(const std::vector<std::string>& data_statements,
+                                         const std::vector<std::string>& gated_statements) {
+    BatchResult out;
+    out.failed.assign(data_statements.size() + gated_statements.size(), 0);
+    if (data_statements.empty() && gated_statements.empty())
+        return out;
+
+    std::lock_guard lock(mu_);
+    if (!db_) {
+        out.failed.assign(out.failed.size(), 1);
+        return out;
     }
 
-    if (ok) {
-        if (sqlite3_exec(db_, "COMMIT", nullptr, nullptr, err.addr()) == SQLITE_OK) {
-            // Any per-statement failures recorded above survive in out.failed:
-            // the transaction committed, so the statements that DID run are
-            // durable and only the skipped ones are reported failed.
-            out.committed = true;
-            return out;
-        }
-        spdlog::error("TarDatabase::execute_atomic_batch COMMIT failed: {}", err.text());
+    SqliteErrMsg err;
+    if (sqlite3_exec(db_, "BEGIN IMMEDIATE", nullptr, nullptr, err.addr()) != SQLITE_OK) {
+        spdlog::error("TarDatabase::execute_atomic_batch_gated BEGIN failed: {}", err.text());
+        out.failed.assign(out.failed.size(), 1);
+        return out; // no transaction was opened, so nothing to roll back
+    }
+    out.began = true;
+
+    bool ok = run_batch_statements_locked(db_, data_statements, out.failed, 0, err);
+
+    // The whole point of the gated split: decide whether to even ISSUE the
+    // gated statements before this transaction's single COMMIT, not after a
+    // separate call's COMMIT has already made the data durable on its own.
+    // Only run them when every data statement completed AND none was flagged
+    // failed -- an aborted transaction (ok == false) obviously skips them,
+    // and so does a data statement that failed but left the transaction
+    // intact (BLOCKER 1's original condition): either way the gated pointer
+    // must not move past data that was not actually applied intact.
+    const bool data_clean =
+        ok && std::none_of(out.failed.begin(), out.failed.begin() + data_statements.size(),
+                            [](char f) { return f != 0; });
+    if (data_clean && !gated_statements.empty()) {
+        out.ran_gated = true;
+        ok = run_batch_statements_locked(db_, gated_statements, out.failed,
+                                          data_statements.size(), err);
     }
 
-    // Rolled back as a whole, so every statement is reported failed.
-    const int rb = sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, err.addr());
-    if (rb != SQLITE_OK) {
-        // A ROLLBACK error USUALLY means SQLite already rolled back on its own,
-        // which is the state we wanted. But it can also mean the rollback itself
-        // failed with the transaction still open -- and returning then would
-        // release mu_ with the connection still inside a transaction, so the
-        // NEXT writer's INSERT would silently join it and be lost, which is
-        // precisely the defect this whole method exists to prevent. Do not
-        // assume; ask.
-        if (sqlite3_get_autocommit(db_) == 0) {
-            // The connection is genuinely stuck inside a transaction that will
-            // never commit. Every subsequent write on it -- a collector INSERT,
-            // a set_config, anything -- would join that transaction, be told it
-            // succeeded, and be lost at the next restart. Collection is not
-            // "still working" in that state; it is silently failing.
-            //
-            // So close the connection rather than flagging it. An earlier
-            // version set a `txn_wedged_` bool that ONLY this method consulted,
-            // which left ~118 other statement sites writing into the doomed
-            // transaction while the comment claimed writes were protected -- a
-            // guard covering one path out of 119 reads as handled and is worse
-            // than none. Nulling `db_` reuses the `if (!db_)` check every
-            // TarDatabase method already has, so all of them fail closed at once.
-            //
-            // close_v2 rather than close: it detaches immediately and defers
-            // deallocation until any outstanding statements finalize, so this is
-            // safe even though callers elsewhere may still hold prepared
-            // statements. We hold `mu_`, and every primary-connection method
-            // takes `mu_`, so no other thread is mid-statement here.
-            spdlog::error("TarDatabase: ROLLBACK failed and the connection is STILL in a "
-                          "transaction ({}). Closing the TAR database: further writes would be "
-                          "reported as durable and then lost. TAR storage is offline on this "
-                          "endpoint until the agent restarts.",
-                          err.text());
-            sqlite3_close_v2(db_);
-            db_ = nullptr;
-        } else {
-            spdlog::debug("TarDatabase::execute_atomic_batch ROLLBACK: {}", err.text());
-        }
-    }
-    out.failed.assign(statements.size(), 1);
+    out.committed = commit_or_rollback_locked(db_, db_, out.failed, ok, err);
     return out;
 }
 

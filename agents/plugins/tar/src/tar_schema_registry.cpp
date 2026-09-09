@@ -1147,6 +1147,19 @@ const std::vector<CaptureSourceDef>& build_sources() {
                         {"distinct_users",  "INTEGER"},
                         {"superseded_runs", "INTEGER"},
                         {"expired_runs",    "INTEGER"},
+                        // fold_hwm: the run_usage_fold() pass's TARGET new_hwm
+                        // (process_live.id) at the time this row was last
+                        // additively updated -- NOT a per-row identity or
+                        // forensic column, a replay guard. tar_db.cpp's v7
+                        // migration ALTERs an existing table for the upgrade
+                        // path (this column did not exist before Wave 7 PR7.2's
+                        // fix-of-a-fix); see tar_usage.cpp's upsert for how it
+                        // makes the additive run_count/total_seconds add
+                        // idempotent under an exact-window replay (a crash or a
+                        // gated tar_config statement failure between the data
+                        // commit and the hwm/counter commit no longer
+                        // double-counts on the next tick's identical retry).
+                        {"fold_hwm",        "INTEGER"},
                     },
                 },
             },
