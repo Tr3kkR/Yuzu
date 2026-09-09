@@ -866,15 +866,20 @@ private:
     ///     active_worker_count() reports) are freed ONLY in the destructor, i.e.
     ///     when the LAST shared holder dies. The worker's own captured copy is that
     ///     last holder, and it is destroyed by the trampoline AFTER the worker
-    ///     lambda body has fully returned (notify_all / on_complete included) -
-    ///     i.e. at the latest point observable before the OS thread itself exits.
-    ///     This is load-bearing for the orphan-exit contract: active_worker_count()
-    ///     must not read 0 while any worker code can still execute in the process
-    ///     image, even the trivial capture-destruction tail after a result has
-    ///     published. Splitting the moments lets the key-reuse fix, the refill
+    ///     lambda body has fully returned (on_abandoned / on_complete and the
+    ///     explicit user-callable resets included) - the latest SELF-observable
+    ///     point before the OS thread exits. What runs after the decrement is only
+    ///     the tail this destructor itself ends with (cv.notify_all), the remaining
+    ///     capture releases (the State shared_ptr), the payload deallocation, the
+    ///     trampoline epilogue and the CRT thread exit - process-lifetime runtime
+    ///     code, never Guardian / OpenSSL / libsystemd / Win32-RPC code, which is
+    ///     the hazard F3 names. No grace covers that tail (the drain loop returns
+    ///     on the first zero); the exposure is identical for every run() worker
+    ///     since rung 7 and is accepted (adversarial rounds 1/3/4, governance
+    ///     pass 3). Splitting the moments lets the key-reuse fix, the refill
     ///     guarantee and the orphan-count accuracy all hold - merging them (as an
-    ///     earlier revision did) made active_worker_count() reach 0 while the
-    ///     worker's OS thread was still unwinding.
+    ///     earlier revision did) freed the count at the QUOTA moment, while fn()
+    ///     or the callback could still be running.
     /// `armed` is false until admission succeeds, so a ticket destroyed before /
     /// without admission is a no-op. A ticket destroyed WITHOUT either release
     /// having run first (the rollback / never-launched / never-published paths)
@@ -946,8 +951,9 @@ private:
     /// Shared admission transaction for both dispatch forms; the CALLER holds
     /// State::mu. Order: stopping -> single-flight key -> quota -> physical ceiling
     /// (quota before ceiling so CeilingExhausted is only ever reported when quota
-    /// has room). set::insert is the ONLY throwing step and runs BEFORE the nothrow
-    /// count bumps, so a bad_alloc leaves State unmutated; the ticket is armed last.
+    /// has room). The two throwing steps - the contains() probe's pair key (a string
+    /// copy) and set::insert - both run BEFORE the nothrow count bumps, so a bad_alloc
+    /// in either leaves State unmutated; the ticket is armed last (pass-3 cx-2).
     /// On success `key` has been moved into the active set. Returns the rejection,
     /// or nullopt when admitted.
     [[nodiscard]] std::optional<IoFailure> admit_locked(std::size_t ci, std::string& key,

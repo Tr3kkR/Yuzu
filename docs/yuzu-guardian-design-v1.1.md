@@ -2485,6 +2485,17 @@ Guardian ladder must check these.
   after a bounded grace. A source left out of that sum would silently reinstate
   the use-after-free the joined-thread rule used to prevent by a different
   mechanism.
+  **Second role since rung 9c PR-1:** every `GuardianIoExecutor` worker body - `run()` and
+  `submit()` alike, their `on_abandoned`/`on_complete` callbacks included - wears
+  `GuardianDetachedWorkerRole` (`guardian_detached_worker_role.hpp`), and the same
+  `WorkerHostileMutex` tripwire aborts on an `mtx_` acquisition from it; a different hazard
+  (lock-vs-lifetime: a detached worker may outlive the engine and can never be joined), same
+  remedy. **F3 binds to the PHYSICAL alive count (#4147):** `GuardianIoExecutor::
+  active_worker_count()` is decremented at worker-payload destruction, the latest
+  self-observable point before OS-thread exit, never at the earlier quota release `submit()`
+  performs when the backend call returns - a worker still inside its completion callback
+  keeps the count nonzero. Wiring a source to the quota count instead would reinstate the
+  teardown race with no test calling it out.
 - **Journal maintenance is paced by TIME, never by wake count.** The drain
   worker wakes on every outbox enqueue, and a paging pass is a full
   `list_entries` + parse + `validate_record` sweep of the journal.

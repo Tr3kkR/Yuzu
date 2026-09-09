@@ -10,7 +10,7 @@ column shows the racy assert that was then fixed; its re-run row is the valid pa
 
 
 
-**Legend (computed from the rows below, 51 data rows):** 4 matched no test (Catch2 comma split; each superseded by its wildcard re-run row); 47 valid rows; 43 show a RED (FAILED / SIGABRT / unexpected exception) on the mutated run; 43 show GREEN after the revert; the remainder are re-run or death-test rows whose red is recorded differently (see each row). Regenerated after fix round 3.
+**Legend (computed from the rows below by `scratchpad/regen-legend.py`; method: a data row is any `| ` line outside the header/separator rows, classified on its WHOLE text because Catch2 output inside cells contains literal pipes; a no-match row reads `rc=2 (no summary)`; RED = the row names a FAILED / SIGABRT / rc=42 / unexpected-exception / rc=-11 line; GREEN = the row names a pass (`All tests passed`, `N passed`, `rc=0`, `green`); a completed pair is a row that is both):** 57 data rows; 0 matched no test (Catch2 comma split, each superseded by its wildcard re-run row); 57 valid rows; 50 RED; 51 GREEN; **49 completed red-then-green pairs** (the figure the PR body quotes; adversarial round 4 C2/K1 recount adopted: earlier legends counted rows, not pairs; the 8 non-pair rows are observed-only or first attempts that a later row completes).
 
 | # | test | mutation | red output | green |
 |---|---|---|---|---|
@@ -95,3 +95,14 @@ column shows the racy assert that was then fixed; its re-run row is the valid pa
 ## Governance Gate 8 fold (2026-09-09)
 
 | | rung 9c R5.2 (governance Gate 4 hp-1): a rule re-pushed from one key onto ANOTHER key that holds a RETAINED disarm drives BOTH its prior-key disarm and the target key's retained disarm before its own arm | G8-1 attach_rule drives prior_disarm OR head_to_drive (else-if), the pre-fix code | ../tests/unit/test_guardian_spark_runtime.cpp:4657: FAILED: REQUIRE( gen ) | test cases: 1 / 1 failed (6 assertions, 5 passed, 1 failed) | All tests passed (17 assertions in 1 test case) |
+
+## Final fold (governance pass-3 fan-out + adversarial round 4), 2026-09-09
+
+| # | test | mutation | red output | green |
+|---|---|---|---|---|
+| F1 | submit: a failed launch rolls admission back and never fires on_complete (+ every submit() case polling `calls`) | governance qe-1: pre-fix `Completion::record` ordering (`++calls` before the field stores) | TSan binary `[spark] --order rand --rng-seed 1`: `test_guardian_io_executor.cpp:979: FAILED: CHECK( c->value.load() == 4 ) with expansion: -1 == 4`; rc=42 (1 of 5 repeats) | fields stored first, `calls.fetch_add(1, release)` last: TSan seed 1 x5 rc=0; debug seeds 1-20 all rc=0 |
+| F2 | rung 9c R5.2 (governance pass-3 cs-1): a subscription reported dead completes its queued disarm claim in place | drop the completion block in on_subscription_lost | rc=42 `test_guardian_spark_runtime.cpp:5532: FAILED: CHECK( rt->claim_queue_depth_for_test(key) == 0 ) with expansion: 1 == 0` | All tests passed (5 cases, 50 assertions) after restore |
+| F3 | rung 9c R5.2 (governance pass-3 sg-3/ar-4/cs-5): a publish that throws after the verdicts are written pops the terminal head | step (3) catch keeps the old "re-Queue only if !outcome" shape | rc=42 `:5574: FAILED: REQUIRE( spin_until(depth == 0) ) with expansion: false` (Dispatched tombstone never popped) | green after restore |
+| F4 | rung 9c R5.2 (governance pass-3 cs-2): a firewalled drain whose index release fails keeps the claim as a tombstone | restore the unconditional fifo.clear() | rc=42 `:5630: FAILED: REQUIRE_NOTHROW( gen2 = rt->attach_rule("r2", ...) ) due to unexpected exception with message: unordered_map::at` (ghost mapping) | green after restore |
+| F5 | source tripwire: index_add_rollback's .fn uses the noexcept erase_rule (adversarial round 4 K2/C5) | `index_->remove_rule(rule_id)` inside the lambda | rc=42 `:5654: FAILED: CHECK( body.find("index_->erase_rule(rule_id)") != std::string::npos )` | green after restore |
+| F6 | rung 9c R5.2 (governance pass-3 qe-4): detach_all withdraws a rule that is still only CLAIMED | drop the claimed-rules loop from detach_all | rc=42 `:5685: FAILED: CHECK( gen.error() == "withdrawn" ) with expansion: "arm timed out" == "withdrawn"` | green after restore |

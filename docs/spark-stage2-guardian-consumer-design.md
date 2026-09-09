@@ -349,7 +349,15 @@ count of simultaneously-alive detached workers** — `GuardianIoExecutor` theref
 enforces a separate physical ceiling on total alive workers (strictly greater than the
 sum of all quotas; exact value pinned in the implementing PR's description, per this
 document's own §7.7b item 5, which already required this for any two-count split):
-admission is refused once that ceiling is reached, regardless of quota availability. A
+admission is refused once that ceiling is reached, regardless of quota availability.
+**Accepted consequence, named (governance pass-3 ar-7 / up-3):** a completion callback may
+itself dispatch (the compensating disarm, a refill), and when the executor refuses that
+nested dispatch the runtime falls back to a direct backend call on the same worker, which
+holds no quota and is bounded only by this ceiling; a wedged direct call therefore
+accumulates alive workers up to the per-instance ceiling, after which the instance refuses
+every admission until a worker exits. Until PR-5's deadline/quarantine, the ceiling is the
+only bound on that loop; it is recorded as a PR-5 acceptance criterion in
+`docs/spark-flip-gate.md` §3a. A
 new `GuardianDetachedWorkerRole` thread-local marker extends the existing
 `WorkerHostileMutex` tripwire (`guardian_engine.cpp`'s `abort_if_worker_thread()`) to
 executor worker threads, so nothing dispatched this way can ever take
@@ -517,7 +525,8 @@ not only an ops one"; an operator paged on this tag should not treat restart as 
 default first action without first checking whether the target is transient or
 permanently dead**); a later policy change re-evaluates the rule but cannot by itself
 re-attempt the arm. A genuine refusal
-(backend refused, worker threw, arm queue full - that is, an admission rejection) or a
+(a DISPATCHED call that returned a failure - backend refused or worker threw - or an
+admission rejection such as `CapacityExhausted`, where no call was attempted) or a
 queue-wait expiry is a different case and holds the acknowledgment indefinitely - K
 only bounds the quarantined case, never a live refusal and never a congestion-only
 outcome. **K is not a generation-wide liveness bound** (ruling 14(a)): a single wedged
@@ -536,7 +545,8 @@ worker's call returns and clears the marker), arm-recovery (a still-wanted rule'
 success commits and clears its `arm_failed` entry), and policy-acknowledgment (the
 generation advances) each have their own trigger; none implies another.
 `yuzu.guardian_arm_failed` carries a reason/phase per rule - admission-expiry,
-admission-rejection, or dispatched-timeout - and only the last bears on whether an
+admission-rejection, dispatched-refusal (backend refused or worker threw), or
+dispatched-timeout - and only the last bears on whether an
 agent restart is sane remediation (see the restart caveat above). **Commit timing
 under the implementation (PR-1, commit-in-callback):** the runtime commits a resolved
 arm on the completion callback's own thread, immediately when the backend call
@@ -552,7 +562,11 @@ heartbeat-thread stall.
 **Telemetry-tag semantics, flagged not specified (SHOULD, Gate 6 sre):**
 `yuzu.guardian_arm_pending`/`yuzu.guardian_arm_failed` (introduced here, wired in
 PR-3) need their gauge-vs-counter semantics stated before PR-3 implements them, not
-left to be inferred by analogy. R5.2's open question (b) above already implies
+left to be inferred by analogy. **Label axis (governance pass-3 sre-2):** these tags and
+every `GuardianIoExecutor` counter PR-3 exports carry a per-executor-INSTANCE label - the
+state reader and the arm/disarm executor admit independently, each against its own
+per-instance ceiling (`kMaxAliveIoWorkers` is per instance, not process-wide) - so a fleet
+gauge never folds two instances' ceilings into one figure. R5.2's open question (b) above already implies
 `arm_failed` must be a **re-statable gauge** (able to return to 0 on a late success),
 but this row's own table placement sits next to the C1/D1-style rows in
 `docs/spark-legacy-delta-registry.md`, whose tags are the OPPOSITE
@@ -654,7 +668,7 @@ reviews it as a live-path change, not a rubber-stamp of a false "inert" premise.
 The read-failure path calls `unhealthy()` **unconditionally** on every `!read.known`
 (`guardian_rule_eval.cpp:63/111/132`) — there is **no into-unknown edge guard**; only
 *recovery* is edge-forced (`pack()`'s `recovered` bit). `build_entries` then pushes a
-**fresh-`event_id`** health entry on every `Unhealthy` (`guardian_spark_runtime.cpp:405-413`).
+**fresh-`event_id`** health entry on every `Unhealthy` (`GuardianSparkRuntime::build_entries`, `guardian_spark_runtime.cpp`).
 An unhealthy rule stays in `pending_initial` (`:357`), which the priority lane re-sweeps
 every ~5 s (`ConvergenceScheduler::Config::priority_poll_ms`, default 5000 - the
 `guardian_convergence_scheduler.hpp:60` line-ref this paragraph originally cited has
@@ -1581,7 +1595,7 @@ Each rung is an independently-governed PR on `dev`, run through the full
        discharge this gate.
      - **#2818 gated PR-2 too, now FIXED (PR-2d).** At the time this was written, the engine tore down a whole spark key
        (`SparkEngine::drop_key_locked`) while `GuardianSparkRuntime` arms one shared
-       subscription per key on the 0->1 edge (`guardian_spark_runtime.cpp:159-166`),
+       subscription per key on the 0->1 edge (`attach_rule`'s `index_->add` edge, `guardian_spark_runtime.cpp`),
        and nothing tells the consumer its subscription died: Guardian goes on
        believing it holds a live subscription, `backend_->disarm(sub)` is a no-op,
        and nothing is enforced for any rule on that key. It is an ENFORCEMENT gap,
@@ -1607,7 +1621,7 @@ Each rung is an independently-governed PR on `dev`, run through the full
        caller). `detach_rule` itself IS reached pre-flip — three of its five sites
        (`:1095`, `:1124`, `:1182`) sit outside the `try_spark` block, which spans
        `:1140-1179` — but it reaches `backend_->disarm` only when
-       `index_->remove_rule` returns a key (`guardian_spark_runtime.cpp:253-258`),
+       `index_->remove_rule` returns a key (`detach_rule_locked`, `guardian_spark_runtime.cpp`),
        and pre-flip nothing was ever attached, so `keys_` is empty. Both routes are
        therefore dormant TRANSITIVELY, on the absence of a prior arm, and the wedge
        is created by the flip exactly as #2818's hole is. Its terminal outcome is a
@@ -1707,7 +1721,16 @@ Each rung is an independently-governed PR on `dev`, run through the full
      OS-watch confirmation. Independent of 9b; sequenced after PR-2c (#3848) and before
      the `prefer_spark` flip (PR-5), lands dormant. Own PR ladder, PR-0 (this docs
      change) through PR-6 - see `docs/spark-flip-gate.md` for the ladder slot between
-     PR-2d and the flip.
+     PR-2d and the flip. **Ordering inside the ladder (ruling 14(c), 2026-09-08):** PR-0 ->
+     PR-1 -> [the #2012/#3840 same-type-serialization fix, pulled forward from the post-flip
+     mechanism-hardening package and landing as two PRs] -> PR-2 -> PR-3 -> PR-4 -> PR-5 ->
+     PR-6 -> flip. **Interim cost between PR-1 and PR-5, stated (governance pass-3
+     ar-8 / up-2):** with PR-1's claim queue and no deadline yet, a re-push onto a wedged key
+     queues behind the abandoned head and waits the full `backend_op_deadline` under the
+     engine's `mtx_` on every 25 s re-apply, where the base code fail-fasted through the
+     executor's `AlreadyRunning`; PR-5's quarantine restores an immediate refusal. Accepted
+     while dormant; it re-derives HIGH at the flip (or any `prefer_spark` knob PR) and is
+     a named PR-5 acceptance criterion in `docs/spark-flip-gate.md` §3a.
 
    **F3 × `Restart=always` (must be answered in 7.7a).** `deploy/systemd/yuzu-agent.service`
    sets `Restart=always` + `RestartSec=10` and **no `StartLimitIntervalSec`/`StartLimitBurst`**,

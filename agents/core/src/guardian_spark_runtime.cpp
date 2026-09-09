@@ -339,8 +339,9 @@ void GuardianSparkRuntime::submit_disarm_off_lock(const std::shared_ptr<KeyClaim
         if (!result && result.error() != IoFailure::Timeout && result.error() != IoFailure::Stopped) {
             // ADMISSION refusal (capacity, key, ceiling, launch, or the throw above):
             // the backend call never ran. Retain the claim at the head - never drop a
-            // disarm for capacity reasons (rung 9c R5.2, closing the #3415 silent-drop
-            // gap) - and count it. The next same-key event (an attach, which then
+            // disarm for capacity reasons (rung 9c R5.2; before it the drop was one
+            // that #3415's missing counter egress left invisible - #3415 stays OPEN,
+            // it is the egress issue, not this drop) - and count it. The next same-key event (an attach, which then
             // queues its own arm behind this claim) re-drives it; there is no redrive
             // timer in PR-1. The caller returns now: "retained" is not an outcome.
             claim->dispatch = ClaimDispatch::Queued;
@@ -810,8 +811,10 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
             // bounded run() on this worker holds the class quota for the call (a wedged
             // disarm therefore never escapes the bulkhead into the physical ceiling) and
             // the head claim is still the key's marker, so a rearm that arrives meanwhile
-            // queues behind it. Direct only when the executor is stopping (R5.5: a late
-            // success is disarmed rather than left live; nothing else can run it then).
+            // queues behind it. The direct call on this worker is the fallback for EVERY
+            // non-timeout executor failure (Stopped per R5.5, and any admission refusal
+            // or launch throw - see run_compensating_disarm); a Timeout is counted and
+            // the wedged bounded disarm keeps its slot (governance pass-3 cx-1).
             run_compensating_disarm(*compensating);
             compensating.reset();
         }
@@ -1865,9 +1868,13 @@ bool GuardianSparkRuntime::enqueue_lifecycle_locked(const std::string& rule_id,
                                                     const std::string& kind,
                                                     const std::string& guard_type,
                                                     const std::string& rule_name) {
-    // Called from attach_rule/detach_rule_locked - never on the detached-post-
-    // read path - so calling agent_id_fn_() directly (not pre-snapshotted) is
-    // safe here, unlike evaluate_key's read path.
+    // Called under registry_mu_ from attach_rule's inline paths, detach_rule_locked
+    // AND - since rung 9c R5.2 (commit-in-callback) - from on_arm_complete on a
+    // detached GuardianIoExecutor worker. Calling agent_id_fn_() directly (not
+    // pre-snapshotted) is safe ONLY because set_agent_id_provider requires a
+    // provider callable from any thread that never takes GuardianEngine::mtx_ (the
+    // production provider is a value-capturing lambda); an earlier version of this
+    // comment claimed "never on the detached path" (governance pass-3 sg-2/ar-6).
     const auto wall = std::chrono::system_clock::now().time_since_epoch(); // noexcept arithmetic
     const std::int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(wall).count();
     const std::int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(wall).count();

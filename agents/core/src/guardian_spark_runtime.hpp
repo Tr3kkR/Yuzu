@@ -547,7 +547,7 @@ public:
     /// #3816 / rung 9c R5.2: an arm's completion callback found a live subscription
     /// nobody was left to adopt - the head's caller had already timed out and no
     /// queued sibling was still waiting - so it disarmed it (a bounded run() on the
-    /// same worker, direct only when the executor is stopping). The runtime's own
+    /// same worker; a direct call on any non-timeout executor failure). The runtime's own
     /// late-SUCCESS-specific view (#3813's distinction kept at the source). Lock-free.
     [[nodiscard]] std::uint64_t backend_op_late_arms() const noexcept {
         return backend_op_late_arms_.load(std::memory_order_relaxed);
@@ -947,8 +947,8 @@ private:
     /// The submit() completion callback for an ARM claim, on the detached worker:
     /// the moved post-wait commit (rung 9c R5.2, commit-in-callback). Commits the
     /// head and every live sibling against the one subscription, or fails them all;
-    /// runs the compensating disarm (bounded run() on this worker; direct only when
-    /// the executor is stopping) BEFORE publishing outcomes, so no waiter can observe
+    /// runs the compensating disarm (bounded run() on this worker; a direct call on any
+    /// non-timeout executor failure, Stopped included) BEFORE publishing outcomes, so no waiter can observe
     /// its result while a subscription nobody wants is still live; then publishes,
     /// erases the entry (unless new claims queued behind meanwhile, in which case the
     /// next head is dispatched), wakes the waiters and fires the wakers. Firewalled:
