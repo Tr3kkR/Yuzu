@@ -39,6 +39,7 @@
 #include "upload_grant_parsers.hpp"
 #include "engine_principal_store.hpp"     // PR 4.2: engine role-assignment MCP twins
 #include "dex_routes.hpp"               // dex_window_to_days / dex_iso_since (shared resolver)
+#include "group_agent_count_preview.hpp" // #4033 — create-group agent-count preview shared model
 #include "auth_routes.hpp"      // detail::sanitize_detail_value — audit-string sanitiser
 #include "rest_a4_envelope.hpp"         // detail::make_correlation_id (A4 error.data, #1463)
 #include "rest_audit.hpp"               // detail::try_persist_audit (behavioural-audit kernel, #1647)
@@ -565,6 +566,40 @@ static const ToolDef kTools[] = {
     {"list_management_groups", "List management groups (hierarchical device grouping).",
      R"({"type":"object","properties":{}})",
      R"j({"type":"object","properties":{"groups":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"description":{"type":"string"},"parent_id":{"type":"string"},"membership_type":{"type":"string"},"scope_expression":{"type":"string"}},"required":["id","name","description","parent_id","membership_type","scope_expression"]}}},"required":["groups"]})j"},
+
+    // #4033 (#2146 Batch A) — MCP twin of /fragments/create-group-form's
+    // live scoped agent-count preview (GET /api/v1/management-groups/
+    // agent-count-preview is the REST twin; group_agent_count_preview.hpp
+    // is the shared builder this tool and that REST route both call — the
+    // dashboard fragment itself keeps its own separate, behaviourally-
+    // equivalent inline implementation, unchanged by this PR). Gated
+    // ManagementGroup:Write matching the fragment EXACTLY (only an operator
+    // who could create the group may preview it) — NOT ManagementGroup:Read,
+    // even though the tool performs no mutation. Consequence: approval-gated
+    // at supervised MCP tier like every other ManagementGroup:Write surface
+    // (mcp_policy.hpp's requires_approval() supervised-tier list already
+    // carries ManagementGroup:Write) — a deliberate side effect of REST
+    // parity with the fragment's own gate, not a new policy decision by this
+    // tool.
+    {"preview_management_group_agent_count",
+     "Preview the number of currently-visible agents that would match a would-be "
+     "management group's filter criteria, BEFORE creating it. Mirrors "
+     "/fragments/create-group-form's live count and GET /api/v1/management-groups/"
+     "agent-count-preview (this tool and that REST route share one builder, so those "
+     "two cannot drift from each other; the dashboard fragment keeps its own separate "
+     "inline implementation). filters is a "
+     "map of mangled column key -> exact-match value for `plugin`'s response columns "
+     "(lowercase, spaces/dashes -> underscore, e.g. \"Local Addr\" -> \"local_addr\"); "
+     "an empty filters map returns a genuine 0 (no scoped count to report), never a "
+     "store read. Requires ManagementGroup:Write — approval-gated (supervised MCP "
+     "tier maker-checker), matching every other ManagementGroup:Write surface, even "
+     "though this tool itself performs no mutation.",
+     R"j({"type":"object","properties":{)j"
+     R"j("command_id":{"type":"string","minLength":1,"description":"The response set's instruction/command id to count against"},)j"
+     R"j("plugin":{"type":"string","minLength":1,"description":"Plugin name whose response columns filters keys are matched against (result_parsing.hpp columns_for_plugin)"},)j"
+     R"j("filters":{"type":"object","additionalProperties":{"type":"string"},"description":"Mangled column key -> exact-match value; empty/omitted means no filter (count is 0)"})j"
+     R"j(},"required":["command_id","plugin"]})j",
+     R"j({"type":"object","properties":{"agent_count":{"type":"integer","description":"Number of currently-visible agents matching filters; 0 when filters is empty"}},"required":["agent_count"]})j"},
 
     {"get_execution_status",
      "Check status of a running or completed command execution. While status is "
@@ -1915,6 +1950,10 @@ static const char* const kWriteToolsRaw[] = {
     // Human API-token rotation (P2 #11, SOC 2 CC6.3) — MCP twins of POST
     // /api/v1/tokens/{id}/rotate and /confirm.
     "rotate_api_token", "confirm_api_token_rotation",
+    // #4033 — ManagementGroup:Write (non-Read), matching the fragment's own
+    // gate; the tool performs no mutation, but the write set is keyed on the
+    // RBAC operation, not on whether a handler mutates state.
+    "preview_management_group_agent_count",
 };
 
 // Lookup set DERIVED from the raw sequence; collapse here is safe because the
@@ -2033,6 +2072,9 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"get_compliance_summary", {"Policy", "Read"}},
     {"get_fleet_compliance", {"Policy", "Read"}},
     {"list_management_groups", {"ManagementGroup", "Read"}},
+    // #4033 — matches /fragments/create-group-form's own gate exactly
+    // (Write, not Read); see the kTools[] entry's comment for why.
+    {"preview_management_group_agent_count", {"ManagementGroup", "Write"}},
     // #1634 (adversarial-review K3/D3 follow-up) — both migrated onto
     // fleet_read_fn_ alongside the response tools above; same reclassification
     // rationale.
@@ -2548,6 +2590,16 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"get_compliance_summary", {ToolEffect::ReadOnly, true, "Get compliance summary"}},
     {"get_fleet_compliance", {ToolEffect::ReadOnly, true, "Get fleet compliance"}},
     {"list_management_groups", {ToolEffect::ReadOnly, true, "List management groups"}},
+    // #4033 — NOT ToolEffect::ReadOnly: test_mcp_server.cpp's 2g PR2 cross-check
+    // mechanically requires readOnlyHint == (operation == "Read"), and this
+    // tool's operation is ManagementGroup:Write (matching the fragment's own
+    // gate). Additive is the honest remaining choice — the tool mutates
+    // nothing (readOnlyHint's mechanical rule is the ONLY reason it isn't
+    // ReadOnly) and is not destructive; idempotent:true because every call is
+    // a pure, deterministic read with no side effects (same shape as
+    // assign_engine_role's Additive/idempotent:true pairing above).
+    {"preview_management_group_agent_count",
+     {ToolEffect::Additive, true, "Preview management group agent count"}},
     {"get_execution_status", {ToolEffect::ReadOnly, true, "Get execution status"}},
     {"list_executions", {ToolEffect::ReadOnly, true, "List executions"}},
     {"list_schedules", {ToolEffect::ReadOnly, true, "List schedules"}},
@@ -7207,6 +7259,91 @@ McpServer::HandlerFn McpServer::build_handler(
                                       tool_result_split(arr.str(),
                                                          JObj().raw("groups", arr.str()).str(),
                                                          kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // ── preview_management_group_agent_count (#4033, #2146 Batch A) ─
+            // MCP twin of GET /api/v1/management-groups/agent-count-preview
+            // and /fragments/create-group-form's own live count — this tool
+            // and that REST route call the SAME shared builder
+            // (group_agent_count_preview.hpp), so those two cannot drift
+            // from each other; the fragment keeps its own separate,
+            // behaviourally-equivalent inline implementation, unchanged by
+            // this PR. Gated ManagementGroup:Write matching the fragment exactly (see
+            // kTools[]'s comment on this tool) — NOT migrated onto
+            // fleet_read_fn_ (that chokepoint is for per-agent LIST reads;
+            // this route's scope is the D3 Response:Read-visible set, a
+            // different resolver entirely).
+            if (tool_name == "preview_management_group_agent_count") {
+                if (!tier_allows(tier, "ManagementGroup", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "ManagementGroup", "Write"))
+                    return;
+                const auto command_id = param_str(args, "command_id");
+                const auto plugin = param_str(args, "plugin");
+                std::vector<std::pair<std::string, std::string>> raw_fields;
+                // Colleague review (#4188): the served inputSchema (kTools[]
+                // above) declares filters as an object of string values, but
+                // that schema is enforced ONLY on the C8 approval-gated path
+                // (#2405) — an admitted caller whose session carries no
+                // mcp_tier (so no approval ticket is ever minted) reaches
+                // this handler directly. Silently dropping a malformed
+                // filters shape (non-object, or a non-string value) here
+                // would leave raw_fields empty, which group_agent_count_preview
+                // treats as a GENUINE zero-filter result (its own documented
+                // contract, matching the dashboard fragment) — a caller who
+                // sent a malformed filter would see a fabricated successful
+                // agent_count:0 indistinguishable from "no filter". Reject
+                // explicitly instead, on every admitted path, not just the
+                // approval-gated one.
+                if (args.contains("filters")) {
+                    if (!args["filters"].is_object()) {
+                        res.set_content(
+                            error_response(id, kInvalidParams, "filters must be an object"),
+                            "application/json");
+                        return;
+                    }
+                    for (const auto& [key, value] : args["filters"].items()) {
+                        if (!value.is_string()) {
+                            res.set_content(
+                                error_response(id, kInvalidParams,
+                                               "filters values must be strings"),
+                                "application/json");
+                            return;
+                        }
+                        raw_fields.emplace_back(key, value.get<std::string>());
+                    }
+                }
+                auto filters = resolve_group_preview_filters(plugin, raw_fields);
+
+                // Elevated -> nullopt (JIT full-fleet view), else the D3
+                // resolver — mirrors DashboardRoutes::resolve_visible_scope
+                // (const auth::Session&) / the REST twin exactly.
+                std::optional<std::vector<std::string>> agent_scope;
+                if (!auth::is_elevated(*session) && response_visible_set_fn_) {
+                    if (auto scope = response_visible_set_fn_(session->username))
+                        agent_scope = std::vector<std::string>(scope->begin(), scope->end());
+                }
+
+                auto count =
+                    group_agent_count_preview(response_store, command_id, filters, agent_scope);
+                if (!count) {
+                    mcp_audit("failure", "store degraded; preview_management_group_agent_count");
+                    res.set_content(
+                        a4_error(kInternalError, "Response store degraded — preview unavailable",
+                                 {}, /*retry_after_ms=*/5000),
+                        "application/json");
+                    return;
+                }
+                mcp_audit("success");
+                res.set_content(
+                    success_response(
+                        id, tool_result(JObj().add("agent_count", *count).str(), kObjectOutputSchema)),
                     "application/json");
                 return;
             }

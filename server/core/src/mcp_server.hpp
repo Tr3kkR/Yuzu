@@ -57,6 +57,7 @@
 #include <expected>
 #include <functional>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -507,6 +508,23 @@ public:
     /// clean "unavailable" error rather than crashing when unset.
     void set_dashboard_routes(DashboardRoutes* routes) { dashboard_routes_ = routes; }
 
+    /// #4033 — the D3 Response:Read-visible agent SET resolver backing
+    /// `preview_management_group_agent_count`'s scope, mirroring
+    /// `RestApiV1::ResponseVisibleSetFn`/`DashboardRoutes::VisibleSetFn`
+    /// EXACTLY (same doc contract; server.cpp wires the SAME instance into
+    /// all three surfaces so REST, MCP, and the `/fragments/create-group-form`
+    /// fragment cannot disagree on scope for the same caller). Same setter
+    /// idiom as `set_fleet_read_fn` above — live read on the next request.
+    /// Unset (default-constructed) ⇒ legacy-open (`nullopt`, unfiltered),
+    /// matching an unwired `DashboardRoutes` fixture's behaviour — this tool
+    /// is gated on `ManagementGroup:Write` (perm_fn), not this resolver, so
+    /// "unwired" degrades to unfiltered rather than failing closed.
+    using ResponseVisibleSetFn =
+        std::function<std::optional<std::set<std::string>>(const std::string& username)>;
+    void set_response_visible_set_fn(ResponseVisibleSetFn fn) {
+        response_visible_set_fn_ = std::move(fn);
+    }
+
     /// Republish-CRL callback (PR4 B-2): mirrors `CaRoutes::PublishCrlFn` so the
     /// MCP `revoke_certificate` tool republishes the CRL after a revoke exactly as
     /// the REST `/api/v1/ca/revoke` handler does. Returns the new CRL DER, or
@@ -797,6 +815,8 @@ private:
     // #4143 review fix — see set_all_devices_fn above.
     AllDevicesFn all_devices_fn_;
     DashboardRoutes* dashboard_routes_{nullptr};
+    // #4033 — see set_response_visible_set_fn above.
+    ResponseVisibleSetFn response_visible_set_fn_;
 };
 
 // The (tool, securable, operation) test-only accessors that formerly lived here

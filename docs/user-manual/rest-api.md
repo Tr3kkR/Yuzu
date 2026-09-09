@@ -60,6 +60,7 @@ A separate, narrower shape applies to ordinary mutation routes that audit a chan
 - [Pre-Auth Request Body Caps](#pre-auth-request-body-caps-2407)
 - [REST API v1 Endpoints](#rest-api-v1-endpoints)
   - [Current User](#current-user)
+  - [Devices](#devices)
   - [Management Groups](#management-groups)
   - [API Tokens](#api-tokens)
   - [Engine Principals](#engine-principals)
@@ -330,6 +331,84 @@ Returns the authenticated user's identity and role.
   "meta": { "api_version": "v1" }
 }
 ```
+
+---
+
+### Devices
+
+The fleet device list and single-device identity read (#4033, #2146 API-parity Batch A) — the
+REST twins of the `/devices` dashboard's `list_agents`/`get_agent_details`-shaped MCP tools.
+Both routes are gated via `AuthRoutes::require_fleet_read` (the admit-then-filter chokepoint),
+not a bare permission check — a management-group-confined operator and a correctly-confined
+service-scoped token both see a real, filtered subset of the fleet rather than either the whole
+fleet or an outright denial. Neither route is audited on a successful read: device identity
+(hostname/OS/arch/version) is machine metadata, not behavioural PII — matching the
+`/fragments/devices/list`, `/fragments/device/page`, and `/fragments/device/info` dashboard
+fragments' own unaudited posture.
+
+#### `GET /api/v1/devices`
+
+List every device visible to the caller.
+
+**Permission:** `Infrastructure:Read`, via `require_fleet_read`.
+
+**Response:**
+
+```json
+{
+  "data": {
+    "devices": [
+      {
+        "agent_id": "a1b2c3d4e5f6",
+        "hostname": "web-01",
+        "os": "linux",
+        "arch": "x86_64",
+        "agent_version": "0.13.1"
+      }
+    ],
+    "count": 1,
+    "devices_omitted": 0
+  },
+  "pagination": { "total": 1, "start": 0, "page_size": 50 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`devices_omitted` counts agents dropped by the caller's management-group/service-scope
+confinement (0 when unfiltered or nothing was dropped) — the same "out of my scope" vs. "not
+present" signal `GET /api/v1/inventory/software`'s `devices_omitted` field carries.
+
+---
+
+#### `GET /api/v1/devices/{id}`
+
+Fetch one device's identity.
+
+**Permission:** `Infrastructure:Read`, via `require_fleet_read`.
+
+**Response:**
+
+```json
+{
+  "data": {
+    "agent_id": "a1b2c3d4e5f6",
+    "hostname": "web-01",
+    "os": "linux",
+    "arch": "x86_64",
+    "agent_version": "0.13.1",
+    "tags": [
+      { "key": "environment", "value": "production", "source": "server" }
+    ]
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`tags` is present only when a TagStore is configured; it is omitted entirely (never an empty
+array) when it is not. A device outside the caller's fleet-read scope returns the SAME 404 as a
+genuinely nonexistent `agent_id` — an out-of-scope match is never distinguishable from "does not
+exist" in the response body (matches the pre-existing MCP `get_agent_details` tool's
+existence-oracle closure exactly).
 
 ---
 
@@ -723,6 +802,43 @@ Remove a role assignment from this management group.
 ```json
 {
   "data": { "unassigned": true },
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+#### `GET /api/v1/management-groups/agent-count-preview`
+
+Preview the number of currently-visible agents that would match a would-be management group's
+filter criteria, before creating it (#4033, #2146 API-parity Batch A). REST/MCP/dashboard-fragment
+twin of `/fragments/create-group-form`'s own live count. This route and its MCP twin call the same
+shared builder (`group_agent_count_preview.hpp`), so those two cannot drift from each other; the
+dashboard fragment keeps its own separate, behaviourally-equivalent inline implementation
+(`DashboardRoutes::parse_filters`), unchanged by this PR — the number it shows and this route's
+`agent_count` are expected to agree today, but are not structurally guaranteed to. MCP twin:
+`preview_management_group_agent_count`.
+
+**Permission:** `ManagementGroup:Write` — matching the fragment's own gate exactly (only an
+operator who could create the group may preview it), **not** `ManagementGroup:Read`, even though
+this route performs no mutation.
+
+**Query parameters:**
+
+| Parameter | Description |
+|---|---|
+| `command_id` | The response set's instruction/command id to count against. |
+| `plugin` | Plugin name whose response columns the filter keys are matched against. |
+| `<filter keys>` | Any other query param is treated as a filter, keyed by the SAME mangling the dashboard fragment's `f_<column>` params apply to a column name — lowercase, spaces/dashes replaced with underscores (e.g. `Local Addr` → `local_addr`). Unlike the fragment, this route's keys carry **no** `f_` prefix — supply `local_addr`, not `f_local_addr`. An unrecognised key is silently ignored. |
+
+An empty filter set (no recognised filter keys supplied) returns a genuine `0` — no scoped count
+to report, and no store read is made.
+
+**Response:**
+
+```json
+{
+  "data": { "agent_count": 42 },
   "meta": { "api_version": "v1" }
 }
 ```

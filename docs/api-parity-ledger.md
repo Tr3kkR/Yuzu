@@ -101,7 +101,7 @@ plus `$ref` validity) - the #842 companion to this whole-tree script.
 
 | Domain | Rows | Twinned | Untwinned |
 |---|---:|---:|---:|
-| devices | 10 | 3 | 7 |
+| devices | 10 | 7 | 3 |
 | inventory | 6 | 1 | 5 |
 | dex | 25 | 1 | 24 |
 | guardian | 16 | 0 | 16 |
@@ -124,11 +124,11 @@ plus `$ref` validity) - the #842 companion to this whole-tree script.
 | ota | 15 | 0 | 15 |
 | enrollment | 19 | 5 | 14 |
 | other | 74 | 0 | 74 |
-| **Total** | **278** | **32** | **246** |
+| **Total** | **278** | **36** | **242** |
 
-Registered `/api/vN/*` routes: 201. OpenAPI `paths` entries: 200. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 102.
+Registered `/api/vN/*` routes: 204. OpenAPI `paths` entries: 203. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 103.
 
-Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 246.
+Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 242.
 
 <!-- END GENERATED -->
 
