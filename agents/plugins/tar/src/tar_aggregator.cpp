@@ -182,6 +182,32 @@ bool apply_source_enabled_transition(TarDatabase& db, std::string_view source,
             if (!db.set_state(std::string{key}, ""))
                 return false; // baseline NOT cleared → do not disable
         }
+        // Wave 7 PR7.2a governance round 5 (Blocker 2): `usage` has no
+        // snapshot-diff baseline (diff_state_key maps nothing for it, so the
+        // block above is a no-op here), but it has its OWN coverage marker
+        // (tar_config.usage_coverage_since, tar_usage.cpp) that a disable
+        // must clear for the identical fail-safe reason. Without this: the
+        // re-enable edge below calls usage_rebaseline() best-effort, and if
+        // THAT transiently fails, the stale marker from before the disable
+        // is still present — run_usage_fold()'s only gate is "does
+        // usage_coverage_since exist", so it reads it as "coverage already
+        // established" and folds straight from the OLD usage_hwm_id
+        // forward, silently backfilling every process_live event that
+        // accrued during the disabled window. That directly contradicts the
+        // documented forward-only guarantee for this default-on,
+        // works-council-class source (docs/user-manual/tar.md: coverage
+        // begins at first tick after enablement, never a retrospective
+        // fold). Deleting the marker here forces ANY subsequent re-enable
+        // through the SAME "coverage absent, must rebaseline before
+        // folding" gate a first-ever enable takes — whether the enable-edge
+        // rebaseline below succeeds immediately or run_usage_fold's own
+        // per-tick retry (an earlier round's Blocker 3 fix) has to pick it
+        // up later. Same fail-safe shape as the diff-state clear above: a
+        // failed delete refuses the disable rather than flip the flag with
+        // a stale marker still in place.
+        if (source == "usage" &&
+            !db.execute_sql("DELETE FROM tar_config WHERE key = 'usage_coverage_since'"))
+            return false; // marker NOT cleared → do not disable
         // KNOWN GAP, deliberately not fixed here (tracked in #2490). This write's
         // result is discarded, so a failed persist reports a successful pause
         // while collection and retention keep running on data the operator

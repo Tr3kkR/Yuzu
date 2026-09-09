@@ -13,6 +13,7 @@
 #include "tar_db.hpp"
 #include "tar_schema_registry.hpp"
 #include "tar_status_format.hpp"
+#include "tar_usage.hpp"
 #include "test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -544,6 +545,124 @@ TEST_CASE("TAR #538: disabling perf/procperf does not touch any baseline state",
 
     CHECK(db.get_config("perf_enabled", "true") == "false");
     CHECK_FALSE(db.get_state("process").empty());
+}
+
+TEST_CASE("TAR #538: disabling usage clears its own coverage marker (Blocker 2)",
+          "[tar][paused_at][issue538][governance-blocker2]") {
+    // usage has no snapshot-diff baseline (diff_state_key has no mapping for
+    // it), but it does have its own forward-only coverage marker
+    // (tar_config.usage_coverage_since) that a disable must clear too, for
+    // the same fail-safe reason #538 clears every other source's baseline.
+    yuzu::test::TempDbFile tmp{std::string_view{"tar-538-usage-marker-"}};
+    auto opened = TarDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    TarDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    REQUIRE(yuzu::tar::usage::usage_rebaseline(db, 1'735'689'600).has_value());
+    auto before = db.try_get_config("usage_coverage_since");
+    REQUIRE(before.has_value());
+    REQUIRE(before->has_value()); // rebaseline just stamped it
+
+    REQUIRE(apply_source_enabled_transition(db, "usage", "false", 1'735'689'700));
+
+    auto after = db.try_get_config("usage_coverage_since");
+    REQUIRE(after.has_value());
+    CHECK_FALSE(after->has_value()); // cleared -- absence is the point
+}
+
+TEST_CASE("TAR usage disable/re-enable: process activity accrued during the disabled window is "
+         "never folded, even when the enable edge's own rebaseline never runs (Blocker 2)",
+         "[tar][usage][governance-blocker2]") {
+    // Wave 7 PR7.2a governance round 5, Blocker 2: usage's forward-only
+    // guarantee (docs/user-manual/tar.md: "coverage begins at the first
+    // tick after enablement or upgrade... no retrospective backfill") must
+    // hold across a disable/re-enable cycle, not only a first-ever enable.
+    //
+    // Before this fix, disabling usage left the stale usage_coverage_since
+    // marker from before the disable in place. Re-enabling relies on
+    // apply_source_enabled_transition's enable edge calling
+    // usage_rebaseline() best-effort -- if that call never runs (or fails
+    // transiently), run_usage_fold()'s ONLY gate is "does
+    // usage_coverage_since exist", so it read the stale marker as "coverage
+    // already established" and folded straight from the old usage_hwm_id
+    // forward, silently backfilling every process_live row written during
+    // the disabled window.
+    //
+    // This test re-enables via a bare db.set_config -- deliberately
+    // bypassing apply_source_enabled_transition's own enable-edge rebaseline
+    // call entirely -- to model exactly that "the enable edge's rebaseline
+    // never got the chance to run" scenario. The fix under test is the
+    // DISABLE leg deleting usage_coverage_since, so run_usage_fold's own
+    // per-tick gate (an earlier round's Blocker 3 fix) is what forces the
+    // rebaseline, regardless of what the enable edge did or didn't do.
+    yuzu::test::TempDbFile tmp{std::string_view{"tar-usage-blocker2-"}};
+    auto opened = TarDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    TarDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    const int64_t t0 = 1'735'689'600;
+    db.set_config("process_enabled", "true");
+    db.set_config("usage_enabled", "true");
+    REQUIRE(yuzu::tar::usage::usage_rebaseline(db, t0).has_value());
+
+    // Establish a clean starting point: one fold with nothing to see yet.
+    auto r0 = yuzu::tar::usage::run_usage_fold(db, t0, 1000);
+    CHECK(r0.ok);
+
+    // Disable usage (process stays enabled and keeps writing process_live).
+    REQUIRE(apply_source_enabled_transition(db, "usage", "false", t0 + 10));
+
+    // MUTATION-VERIFY: with the tar_aggregator.cpp fix reverted (the DELETE
+    // of usage_coverage_since on disable removed), this run's stale marker
+    // from the rebaseline above survived the disable, run_usage_fold at r1
+    // below took the normal-fold branch instead of re-baselining, and
+    // 'pre-consent.exe' showed up in usage_daily with count "1" -- this
+    // whole test failed at the CHECK below it. Restored before writing the
+    // patch.
+
+    // Process activity that must NEVER be folded: a full started+stopped
+    // run entirely inside the disabled window.
+    REQUIRE(db.execute_sql(std::format(
+        "INSERT INTO process_live (ts, snapshot_id, action, pid, ppid, name, cmdline, user) "
+        "VALUES ({}, 0, 'started', 4242, 1, 'pre-consent.exe', '', 'alice')",
+        t0 + 20)));
+    REQUIRE(db.execute_sql(std::format(
+        "INSERT INTO process_live (ts, snapshot_id, action, pid, ppid, name, cmdline, user) "
+        "VALUES ({}, 0, 'stopped', 4242, 1, 'pre-consent.exe', '', 'alice')",
+        t0 + 25)));
+
+    // Re-enable WITHOUT going through apply_source_enabled_transition's own
+    // rebaseline call -- see the test's own header comment for why.
+    db.set_config("usage_enabled", "true");
+
+    // First tick after re-enable: coverage is absent (thanks to the disable
+    // leg's DELETE), so run_usage_fold must re-baseline instead of folding
+    // -- the pre-consent run is discarded, never appears in usage_daily.
+    auto r1 = yuzu::tar::usage::run_usage_fold(db, t0 + 30, 1000);
+    CHECK(r1.ok);
+    auto count_pre_consent =
+        db.execute_query("SELECT COUNT(*) FROM usage_daily WHERE exe_key = 'pre-consent.exe'");
+    REQUIRE(count_pre_consent.has_value());
+    CHECK(count_pre_consent->rows[0][0] == "0");
+
+    // Coverage resumes going forward -- not permanently wedged: a NEW run
+    // starting after re-enable IS folded normally.
+    REQUIRE(db.execute_sql(std::format(
+        "INSERT INTO process_live (ts, snapshot_id, action, pid, ppid, name, cmdline, user) "
+        "VALUES ({}, 0, 'started', 5252, 1, 'post-consent.exe', '', 'bob')",
+        t0 + 40)));
+    REQUIRE(db.execute_sql(std::format(
+        "INSERT INTO process_live (ts, snapshot_id, action, pid, ppid, name, cmdline, user) "
+        "VALUES ({}, 0, 'stopped', 5252, 1, 'post-consent.exe', '', 'bob')",
+        t0 + 45)));
+    auto r2 = yuzu::tar::usage::run_usage_fold(db, t0 + 50, 1000);
+    CHECK(r2.ok);
+    auto count_post_consent =
+        db.execute_query("SELECT COUNT(*) FROM usage_daily WHERE exe_key = 'post-consent.exe'");
+    REQUIRE(count_post_consent.has_value());
+    CHECK(count_post_consent->rows[0][0] == "1");
 }
 
 TEST_CASE("TAR retention: disabling one source does not pause others",
