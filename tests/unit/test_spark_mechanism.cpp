@@ -4123,25 +4123,27 @@ struct EstablishChurnWatch {
     // is a DIFFERENT concern from "T6" - a production DEADLOCK shape
     // (unwatch() holding the per-type lock, mech_ops_mu_by_type_, waiting
     // on a callback drain, while that callback is itself parked inside an
-    // inline consumer trying to re-arm and hitting the same per-type lock)
-    // surfaced during issue #3840's design exploration but NOT itself
-    // separately filed - #3840 as filed covers the general "a hung call
-    // starves other arm/disarm on the same type" stall, not this specific
-    // cyclic-deadlock scenario (verified by reading #3840's body: it
-    // describes mech_ops_mu_by_type_ being held for a call's "full,
-    // unbounded duration," never a lock-plus-wait cycle). This harness has
-    // no per-type lock at all, so neither #3840 nor T6 covers the
-    // check-then-rearm race described above;
-    // named here only so a reader chasing "what else is unverified in this
-    // delivery" has SOME tracked entry point, even an imperfect one. (Gate
-    // 6 compliance finding, PR-A round 5, corrected again at round 6 after
-    // advisor caught the correction citing #3840 as T6's actual source
-    // without checking the issue's own text first: rounds 1-3 of this
-    // comment's history all cited or mischaracterized T6 without a durable,
-    // verified reference - this is the fourth attempt, and the fix is
-    // stating plainly what's actually tracked vs. not, rather than a fifth
-    // guess. T6 should be filed as its own issue before this branch merges,
-    // not left as a comment-only reference indefinitely.)
+    // inline consumer trying to re-arm and hitting the same per-type lock),
+    // now filed as issue #4181 (2026-09-09) with the exact code-verified
+    // thread cycle: SparkEngine::disarm (spark_engine.cpp:1256, holds
+    // mech_ops_mu_by_type_) blocks in WindowsRegistryMechanism::unwatch's
+    // WaitForThreadpoolWaitCallbacks (spark_registry.cpp:304) waiting on an
+    // in-flight on_fire; that on_fire's emit() (spark_registry.cpp:349)
+    // reaches an Inline-tier subscriber synchronously (spark_engine.cpp's
+    // deliver(), :1778) which, if it re-enters the engine for the same
+    // type, needs the same mech_ops_mu_by_type_ entry Thread A already
+    // holds. #3840 as filed covers the general "a hung call starves other
+    // arm/disarm on the same type" stall, not this specific cyclic-deadlock
+    // scenario - #4181 is the correct tracked reference, #3840 is not. This
+    // harness has no per-type lock at all, so neither #3840 nor #4181
+    // covers the check-then-rearm race described above; named here only so
+    // a reader chasing "what else is unverified in this delivery" has a
+    // correct entry point. (Gate 6 compliance finding, PR-A round 5,
+    // corrected at round 6 after advisor caught a prior round citing #3840
+    // as T6's actual source without checking the issue's own text first;
+    // filed as #4181 and this comment updated at the DGRHP verification
+    // pass, closing the "should be filed before merge" item this comment
+    // used to carry.)
     static void CALLBACK on_fire(PTP_CALLBACK_INSTANCE, void* ctx, PTP_WAIT, TP_WAIT_RESULT) {
         auto* self = static_cast<EstablishChurnWatch*>(ctx);
         if (self->stop->load(std::memory_order_relaxed))
