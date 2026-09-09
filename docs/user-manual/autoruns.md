@@ -70,6 +70,26 @@ versus one that could not be read at all:
   plist truncated by `kMaxPlistBytes`); never silently folded into a
   `supported` status. `mac_emond` combines this with any directory-level
   constraint via a comma-joined reason.
+- **`constrained|<n>|narrow_search_path_coverage`** (`lnx_systemd_timers_user`
+  only) -- a permanent, catalog-declared exception (`autoruns_catalog.hpp`'s
+  third documented exception, alongside `mac_login_items`/`lnx_init_d`):
+  the scanned `systemd --user` search-path set omits several standard roots
+  (`~/.local/share/systemd/user`, `/run/systemd/user`,
+  `/usr/local/{lib,share}/systemd/user`, `/usr/share/systemd/user`). Every
+  reportable result for this one source carries this token, comma-joined
+  with any other reason on the same line -- it never reports `supported`.
+- **A real directory-enumeration I/O error, told apart from a clean
+  end-of-directory** -- every directory-walking source (Linux and macOS
+  alike) now distinguishes this from "nothing more to read", but the
+  surfaced reason token varies by call site rather than being one uniform
+  string: most sources (built on the shared `list_dir`/`walk_plist_dir`
+  helpers) fold it into the SAME `row_cap` reason a capped listing already
+  uses -- both mean "this listing is incomplete", and threading a separate
+  token through every one of those helpers' many call sites wasn't worth
+  the churn. Two macOS sources (`mac_user_launchagents`'s per-home walk,
+  `mac_periodic`) instead surface a distinct **`constrained|<n>|readdir_error`**
+  reason. Either way, a partial listing is never reported as a complete
+  `supported` result.
 
 ## Versioned source catalog
 
@@ -91,7 +111,7 @@ stubs never special-case per-OS.
 | `win_appinit_dlls` | AppInit_DLLs | S | U | U | Reg\*W |
 | `win_ifeo_debugger` | Image File Execution Options Debugger | S | U | U | Reg\*W |
 | `win_startup_folder_common` | Startup folder (All Users) | S | U | U | file listing |
-| `win_startup_folder_user` | Startup folder (current user) | S | U | U | file listing, per profile -- uses the literal `AppData\Roaming\...\Startup` suffix, not a resolved Known Folder; a profile with a redirected Startup folder (policy/`USER_SHELL_FOLDERS`) is not followed (disclosed follow-up, not a silent drop) |
+| `win_startup_folder_user` | Startup folder (current user) | S | U | U | file listing, per profile -- resolves a redirected Startup folder via the profile's own `User Shell Folders\Startup` registry value (read from the same per-user hive the HKU sources already open) when present, falling back to the literal `AppData\Roaming\...\Startup` suffix for the common non-redirected case or when the hive itself is unreachable (e.g. a logged-out profile whose offline mount fails) |
 | `win_scheduled_tasks` | Scheduled Tasks | S | U | U | ITaskService COM |
 | `win_wmi_subscriptions` | WMI permanent event subscriptions | S | U | U | bounded `root\subscription` query |
 | `lnx_etc_crontab` | `/etc/crontab` | U | S | U | file read; absent is CONSTRAINED (required) |
@@ -217,6 +237,15 @@ finding does not apply to this leg's `RegLoadKeyW`, which does.
   entire leg. Rows from that fallback carry `enabled=unknown`: the text
   output carries no wants-symlink evidence, so enablement cannot be
   determined the same way the rung-1 directory read determines it.
+
+  A rung-1-scanned timer row can ALSO carry `enabled=unknown`, even with a
+  real wants-symlink read attempted: if a wants directory consulted for that
+  timer hit a real I/O error partway through, or hit its entry cap, the
+  matching symlink could be among what wasn't read -- reporting a confident
+  `disabled` there would be the same false-negative "live persistence
+  mechanism read as inert" defect this leg's directory-enumeration fixes
+  exist to close. `unknown` here is a genuine "cannot tell", same meaning as
+  the rung-2 case above, just a different cause.
 
 ## macOS: Login Items is constrained, `osascript` is rejected
 

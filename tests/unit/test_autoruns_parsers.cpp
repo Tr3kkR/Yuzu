@@ -436,6 +436,52 @@ TEST_CASE("autoruns: parse_task_xml decodes the 5 predefined XML entities in "
     CHECK(info.actions[0].arguments == "--filter=\"x<y>z\" --tag='a&b'");
 }
 
+TEST_CASE("autoruns: parse_task_xml handles XML constructs a hand-rolled scanner was "
+          "never even asked about -- a real parser handles these BY CONSTRUCTION, not as "
+          "individually-discovered edge cases "
+          "(RECONSTRUCTION: pins the round-8 libxml2 adoption -- defensive-depth coverage "
+          "beyond what any single review round's adversarial probe specifically named)",
+          "[autoruns][parsers]") {
+    SECTION("an XML comment containing '>' and quotes, sitting between real elements, "
+            "must not confuse the real content around it") {
+        const std::string xml =
+            "<Task><Actions Context=\"Author\">"
+            "<!-- a comment with a stray > and \"quotes\" and 'more quotes' -->"
+            "<Exec><Command>C:\\real.exe</Command></Exec>"
+            "</Actions></Task>";
+        const auto info = parse_task_xml(xml);
+        REQUIRE(info.actions.size() == 1);
+        CHECK(info.actions[0].command == "C:\\real.exe");
+    }
+
+    SECTION("a real XML declaration ahead of the root element is ordinary, not an "
+            "obstacle") {
+        const std::string xml =
+            "<?xml version=\"1.0\" encoding=\"UTF-16\"?>"
+            "<Task><Triggers><LogonTrigger/></Triggers></Task>";
+        CHECK(parse_task_xml(xml).has_triggers);
+    }
+
+    SECTION("a decoy element sharing a trigger-type's local name but living OUTSIDE "
+            "<Triggers> must not be mistaken for a real trigger") {
+        const std::string xml =
+            "<Task><RegistrationInfo><LogonTrigger>decoy, not a real trigger element here"
+            "</LogonTrigger></RegistrationInfo><Triggers/></Task>";
+        CHECK_FALSE(parse_task_xml(xml).has_triggers);
+    }
+
+    SECTION("a DOCTYPE/DTD declaration is rejected outright, leaving TaskInfo at its "
+            "documented defaults, rather than trusted (matches this repo's other "
+            "untrusted-XML consumer, server/core/src/saml_provider.cpp)") {
+        const std::string xml =
+            "<?xml version=\"1.0\"?><!DOCTYPE Task [<!ENTITY x \"evil\">]>"
+            "<Task><Triggers><LogonTrigger/></Triggers></Task>";
+        const auto info = parse_task_xml(xml);
+        CHECK_FALSE(info.has_triggers);
+        CHECK(info.actions.empty());
+    }
+}
+
 TEST_CASE("autoruns: parse_task_xml's has_triggers consults each trigger's own "
           "<Enabled> value, not just bare presence of a trigger element "
           "(RECONSTRUCTION: pins round 3's should-fix -- a task with only "

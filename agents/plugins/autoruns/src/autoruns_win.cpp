@@ -1203,17 +1203,20 @@ int collect_windows(yuzu::CommandContext& ctx, std::string_view filter) {
                     profile.profile_name.empty() ? std::string_view{profile.sid}
                                                  : std::string_view{profile.profile_name};
 
+                // Default (non-redirected) Startup folder path -- the common
+                // case, and the fallback whenever a registry-declared
+                // redirection can't be resolved (hive unreachable, or the
+                // value is absent). Computed up front, unconditionally, so
+                // the listing below still runs even if with_user_hive fails
+                // entirely -- the folder listing has never depended on hive
+                // access, and must keep working exactly as before for a
+                // logged-out or otherwise hive-unreachable profile.
+                std::optional<std::wstring> startup_dir;
                 if (want(filter, SourceId::win_startup_folder_user)) {
                     if (!profile.profile_path.empty()) {
-                        // The literal AppData\Roaming\...\Startup suffix doesn't
-                        // resolve a redirected Known Folder (a profile whose Startup
-                        // folder was moved via policy/USER_SHELL_FOLDERS) -- a real
-                        // but pre-existing gap, not fixed here.
-                        const std::wstring dir = yuzu::win::to_wide(profile.profile_path) +
-                                                L"\\AppData\\Roaming\\Microsoft\\Windows\\Start "
-                                                L"Menu\\Programs\\Startup";
-                        collect_startup_folder(dir, SourceId::win_startup_folder_user, Scope::user,
-                                              user, startup_folder_user);
+                        startup_dir = yuzu::win::to_wide(profile.profile_path) +
+                                     L"\\AppData\\Roaming\\Microsoft\\Windows\\Start "
+                                     L"Menu\\Programs\\Startup";
                     } else if (profile.profile_path_unreadable) {
                         // An unreadable/ACL-denied ProfileImagePath must not
                         // silently drop this profile from a Supported source --
@@ -1225,13 +1228,38 @@ int collect_windows(yuzu::CommandContext& ctx, std::string_view filter) {
 
                 if (!want(filter, SourceId::win_run_hku) &&
                     !want(filter, SourceId::win_runonce_hku) &&
-                    !want(filter, SourceId::win_startup_approved))
+                    !want(filter, SourceId::win_startup_approved) &&
+                    !startup_dir.has_value())
                     continue;
 
                 yuzu::win::HiveAccessReport report;
                 const auto status = yuzu::win::with_user_hive(
                     profile.sid, profile.profile_path,
                     [&](HKEY root) {
+                        if (startup_dir.has_value()) {
+                            // A profile's Startup folder can be redirected via
+                            // policy/USER_SHELL_FOLDERS -- resolve it from the
+                            // same per-user hive this callback already has
+                            // open, rather than trusting the literal
+                            // AppData\Roaming suffix unconditionally. Absent,
+                            // unreadable, or empty leaves startup_dir at the
+                            // fallback already computed above -- the common,
+                            // non-redirected case.
+                            RegKey folders_key;
+                            if (RegOpenKeyExW(
+                                    root,
+                                    L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User "
+                                    L"Shell Folders",
+                                    0, KEY_READ, folders_key.put()) == ERROR_SUCCESS) {
+                                std::string startup_value, type_name;
+                                const auto st = yuzu::win::read_reg_value(
+                                    folders_key.get(), "Startup", startup_value, type_name);
+                                if (st == yuzu::win::ReadValueStatus::ok && !startup_value.empty()) {
+                                    startup_dir = yuzu::win::expand_env_strings(
+                                        yuzu::win::to_wide(startup_value));
+                                }
+                            }
+                        }
                         if (want(filter, SourceId::win_run_hku))
                             open_and_collect(root, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
                                             0, SourceId::win_run_hku,
@@ -1262,6 +1290,16 @@ int collect_windows(yuzu::CommandContext& ctx, std::string_view filter) {
                         note_constraint(runonce_hku, token);
                     if (want(filter, SourceId::win_startup_approved))
                         note_constraint(startup_approved, token);
+                    // Deliberately no constraint noted on startup_folder_user
+                    // here: the listing below still runs against the
+                    // non-redirected fallback path, which is a complete,
+                    // honest answer for this profile -- just not
+                    // redirection-aware, not a failure.
+                }
+
+                if (startup_dir.has_value()) {
+                    collect_startup_folder(*startup_dir, SourceId::win_startup_folder_user,
+                                          Scope::user, user, startup_folder_user);
                 }
             }
         }

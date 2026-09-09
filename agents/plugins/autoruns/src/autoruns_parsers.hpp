@@ -28,6 +28,15 @@
 
 #include <yuzu/plugin.h> // YuzuSupportLevel
 
+// Real XML parsing for Windows Task Scheduler XML (parse_task_xml, below) --
+// see that function's banner for why this replaced hand-rolled scanning.
+// Same library this repo already trusts for equally-adversarial XML
+// (server/core/src/saml_provider.cpp). libxml2's own headers are C headers
+// with internal extern "C" guards, safe to include directly from C++.
+#include <libxml/parser.h>
+#include <libxml/tree.h>
+
+#include <array>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
@@ -541,34 +550,8 @@ namespace detail {
 /// Task Scheduler's `Enabled` element is typed `xsd:boolean`, whose valid
 /// lexical space is `"true"`/`"false"`/`"1"`/`"0"`, optionally
 /// whitespace-padded (`" false "`) -- a bare `== "false"` string compare
-/// (this function's predecessor) treats `"0"` and any padded form as live,
-/// which is the false-positive direction (an inert trigger read as firing).
-/// Decodes the 5 predefined XML entities (&amp; &lt; &gt; &quot; &apos;) --
-/// `get_Xml`'s raw markup carries these for a Command/Arguments value
-/// containing a reserved character (e.g. a path with a literal `&`), and
-/// leaving them un-decoded breaks exact IOC/command-string matching against
-/// the real argv. No numeric character references (&#NN;/&#xHH;) or DTD
-/// entities -- Task Scheduler's own XML never emits those for this field,
-/// and decoding them would need a bigger validator than this lightweight
-/// scanner is meant to be.
-inline std::string decode_xml_entities(std::string_view v) {
-    std::string out;
-    out.reserve(v.size());
-    std::size_t i = 0;
-    while (i < v.size()) {
-        if (v[i] == '&') {
-            if (v.compare(i, 5, "&amp;") == 0) { out += '&'; i += 5; continue; }
-            if (v.compare(i, 4, "&lt;") == 0) { out += '<'; i += 4; continue; }
-            if (v.compare(i, 4, "&gt;") == 0) { out += '>'; i += 4; continue; }
-            if (v.compare(i, 6, "&quot;") == 0) { out += '"'; i += 6; continue; }
-            if (v.compare(i, 6, "&apos;") == 0) { out += '\''; i += 6; continue; }
-        }
-        out += v[i];
-        ++i;
-    }
-    return out;
-}
-
+/// treats `"0"` and any padded form as live, which is the false-positive
+/// direction (an inert trigger read as firing).
 inline bool xsd_boolean_is_false(std::string_view v) {
     const std::size_t b = v.find_first_not_of(" \t\r\n");
     if (b == std::string_view::npos) return false; // empty/whitespace-only: not a recognized false
@@ -577,178 +560,152 @@ inline bool xsd_boolean_is_false(std::string_view v) {
     return trimmed == "false" || trimmed == "0";
 }
 
-inline std::optional<std::string> extract_tag(std::string_view xml, std::string_view tag) {
-    std::string open = "<" + std::string{tag} + ">";
-    std::size_t start = xml.find(open);
-    if (start == std::string_view::npos) return std::nullopt;
-    start += open.size();
-    std::string close = "</" + std::string{tag} + ">";
-    std::size_t end = xml.find(close, start);
-    if (end == std::string_view::npos) return std::nullopt; // truncated: caller keeps the default
-    return std::string{xml.substr(start, end - start)};
+/// RAII owner for an xmlDocPtr from xmlReadMemory -- same pattern this repo
+/// already established for its other untrusted-XML consumer (`DocGuard`,
+/// server/core/src/saml_provider.cpp:855).
+struct XmlDocGuard {
+    xmlDocPtr d;
+    ~XmlDocGuard() { if (d) xmlFreeDoc(d); }
+};
+
+/// First direct-child element matching `local` by LOCAL NAME only. Task
+/// Scheduler XML uses exactly one default namespace
+/// (`xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"`) for
+/// every element -- unlike SAML's multi-namespace documents (which need
+/// find_child_ns's namespace-URI check to disambiguate), there's nothing
+/// here for a namespace check to distinguish, so local-name matching alone
+/// is correct.
+inline xmlNodePtr xml_find_child(xmlNodePtr parent, const char* local) {
+    if (!parent) return nullptr;
+    for (xmlNodePtr n = xmlFirstElementChild(parent); n; n = xmlNextElementSibling(n)) {
+        if (n->type == XML_ELEMENT_NODE && n->name && xmlStrEqual(n->name, BAD_CAST local))
+            return n;
+    }
+    return nullptr;
 }
 
-/// Like extract_tag, but the opening tag may carry attributes (e.g.
-/// Finds the position of a tag's REAL terminating '>' starting the scan at
-/// `from`, tracking open/close-quote state so a `>` inside a quoted
-/// attribute value is never mistaken for the tag's end. XML 1.0 permits a
-/// raw `>` inside a quoted attribute value (only `<` and `&` must be
-/// escaped there), and Task Scheduler's trigger/action `Id`/`id` attributes
-/// are plain `xs:string` -- so `<LogonTrigger Id="a>b"/>` and
-/// `<Exec id="a/>b">` are both schema-valid and, before this function
-/// existed, defeated the bare `xml.find('>', start)` this file's two
-/// tag-scanning helpers both used: an in-quote `>` was mistaken for the
-/// terminator (leaving the real close tag unfound -- "truncated", a live
-/// trigger reported disabled), and an in-quote `/>` was mistaken for a
-/// genuine self-close (silently dropping the element's real content --  a
-/// live task's Command/Arguments vanishing from the row). Returns npos if
-/// the tag is truncated (no unquoted '>' before the document ends).
-inline std::size_t find_tag_end(std::string_view xml, std::size_t from) {
-    char quote = '\0';
-    for (std::size_t i = from; i < xml.size(); ++i) {
-        const char c = xml[i];
-        if (quote != '\0') {
-            if (c == quote) quote = '\0';
-            continue;
-        }
-        if (c == '"' || c == '\'') { quote = c; continue; }
-        if (c == '>') return i;
-    }
-    return std::string_view::npos;
-}
-
-/// `<Actions Context="Author">`), which extract_tag's exact `<tag>` match
-/// would miss entirely. Returns the CONTENT span between the opening tag's
-/// '>' and the matching closing tag -- nullopt if the opening or closing
-/// tag isn't found (truncated document) or the match is a longer tag
-/// sharing this prefix (e.g. `<ActionsFoo>` must not match tag "Actions").
-inline std::optional<std::string_view> extract_tagged_block(std::string_view xml,
-                                                             std::string_view tag) {
-    const std::string open_prefix = "<" + std::string{tag};
-    std::size_t start = xml.find(open_prefix);
-    while (start != std::string_view::npos) {
-        const std::size_t after = start + open_prefix.size();
-        const char next = after < xml.size() ? xml[after] : '\0';
-        if (next == '>' || next == ' ' || next == '/' || next == '\t' || next == '\n' ||
-            next == '\r')
-            break; // genuinely this tag, not a longer one sharing the prefix
-        start = xml.find(open_prefix, start + 1);
-    }
-    if (start == std::string_view::npos) return std::nullopt;
-    const std::size_t gt = find_tag_end(xml, start);
-    if (gt == std::string_view::npos) return std::nullopt;
-    if (gt > 0 && xml[gt - 1] == '/') return std::string_view{}; // self-closed: empty content
-    const std::string close = "</" + std::string{tag} + ">";
-    const std::size_t end = xml.find(close, gt + 1);
-    if (end == std::string_view::npos) return std::nullopt; // truncated
-    return xml.substr(gt + 1, end - (gt + 1));
-}
-
-/// Every occurrence of `<tag ...>...</tag>` OR self-closed `<tag .../>`
-/// within `xml`, in document order -- an empty content span for a
-/// self-closed match. Task Scheduler's trigger and action base types both
-/// define an optional `Id`/`id` attribute, and a trigger with no required
-/// children (e.g. `<LogonTrigger/>`) is schema-valid self-closed, so a
-/// strict no-attributes exact-open-tag match (this function's pre-round-5
-/// form) silently drops both shapes -- confirmed against real captures
-/// twice (round 5: this function's own trigger callers; pre-existing since
-/// round 1: `<Exec id="...">`). Uses the SAME open-tag-prefix + trailing-
-/// delimiter-character logic as extract_tagged_block (this file's other,
-/// already-correct handler for both shapes) so the two stay consistent. A
-/// tag opened but never closed stops the scan there, keeping whatever
-/// complete blocks were already found rather than discarding all of them.
-inline std::vector<std::string_view> find_all_tagged_blocks(std::string_view xml,
-                                                             std::string_view tag) {
-    std::vector<std::string_view> out;
-    const std::string open_prefix = "<" + std::string{tag};
-    const std::string close = "</" + std::string{tag} + ">";
-    std::size_t pos = 0;
-    while (true) {
-        std::size_t start = xml.find(open_prefix, pos);
-        while (start != std::string_view::npos) {
-            const std::size_t after = start + open_prefix.size();
-            const char next = after < xml.size() ? xml[after] : '\0';
-            if (next == '>' || next == ' ' || next == '/' || next == '\t' || next == '\n' ||
-                next == '\r')
-                break; // genuinely this tag, not a longer one sharing the prefix
-            start = xml.find(open_prefix, start + 1);
-        }
-        if (start == std::string_view::npos) break;
-        const std::size_t gt = find_tag_end(xml, start);
-        if (gt == std::string_view::npos) break; // truncated: stop, keep what's already found
-        if (gt > 0 && xml[gt - 1] == '/') {
-            out.push_back(std::string_view{}); // self-closed: empty content
-            pos = gt + 1;
-            continue;
-        }
-        const std::size_t content_start = gt + 1;
-        const std::size_t end = xml.find(close, content_start);
-        if (end == std::string_view::npos) break; // truncated: stop, keep what's already found
-        out.push_back(xml.substr(content_start, end - content_start));
-        pos = end + close.size();
-    }
-    return out;
+inline std::string xml_get_text(xmlNodePtr node) {
+    if (!node) return {};
+    xmlChar* c = xmlNodeGetContent(node);
+    if (!c) return {};
+    std::string s(reinterpret_cast<const char*>(c));
+    xmlFree(c);
+    return s;
 }
 
 } // namespace detail
 
-/// Scans for every `<Exec>` action inside `<Actions>`, `<Enabled>`,
-/// `<UserId>` and whether `<Triggers>` is empty (self-closed `<Triggers/>` /
-/// `<Triggers />`, or an open/close pair with nothing between) versus
-/// carries at least one real trigger element. A truncated document (a tag
-/// opened but never closed) leaves the corresponding field at its default
-/// rather than throwing -- this is a best-effort scanner over untrusted
-/// XML, not a validating parser.
+/// Parses a real `IRegisteredTask::get_Xml()` document via libxml2 -- a real
+/// parser handles self-closing elements, attributes (including a quoted
+/// value containing `>` or `/>`), and entity decoding correctly BY
+/// CONSTRUCTION, closing an entire class of defects a hand-rolled
+/// find()-based scanner kept missing one shape at a time across several
+/// rounds of adversarial review (this file's prior implementation).
+///
+/// Same XXE-safe posture this repo already established for its other
+/// untrusted-XML consumer (server/core/src/saml_provider.cpp:846-863):
+/// `XML_PARSE_NONET` blocks external-entity network fetches,
+/// `XML_PARSE_NOENT` is deliberately absent (entities aren't expanded
+/// beyond the 5 predefined ones libxml2 always decodes), and a
+/// DOCTYPE/DTD is explicitly rejected rather than trusted. A parse failure,
+/// a rejected DTD, or a missing root/section leaves TaskInfo at its
+/// documented defaults -- this is still best-effort over possibly-truncated
+/// XML, not a validating parser; it just validates well-formedness instead
+/// of hand-scanning for it.
+///
+/// `xml` is ALWAYS real UTF-8 bytes by the time it reaches this function --
+/// the caller (autoruns_win.cpp) converts the raw `IRegisteredTask::get_Xml()`
+/// BSTR via wstring_to_utf8 first. The XML prolog's OWN `encoding=` attribute
+/// is stale after that conversion (`get_Xml()` commonly returns
+/// `encoding="UTF-16"`, since the BSTR itself was UTF-16 -- the declaration
+/// describes the ORIGINAL wire form, not what this function actually
+/// receives). A real parser given `encoding=nullptr` trusts that declaration
+/// and would misinterpret genuinely-UTF-8 bytes as UTF-16 -- passing "UTF-8"
+/// explicitly here overrides it with the encoding this call site actually
+/// guarantees, rather than trusting a label the upstream conversion already
+/// invalidated.
 inline TaskInfo parse_task_xml(std::string_view xml) {
     TaskInfo out;
-    if (auto v = detail::extract_tag(xml, "Enabled")) out.enabled = (*v == "true");
-    if (auto v = detail::extract_tag(xml, "UserId")) out.user_id = *v;
+    if (xml.empty()) return out;
 
-    if (auto actions_block = detail::extract_tagged_block(xml, "Actions")) {
-        for (auto exec : detail::find_all_tagged_blocks(*actions_block, "Exec")) {
-            TaskAction action;
-            if (auto v = detail::extract_tag(exec, "Command"))
-                action.command = detail::decode_xml_entities(*v);
-            if (auto v = detail::extract_tag(exec, "Arguments"))
-                action.arguments = detail::decode_xml_entities(*v);
-            out.actions.push_back(std::move(action));
+    xmlDocPtr doc = xmlReadMemory(xml.data(), static_cast<int>(xml.size()), "task.xml", "UTF-8",
+                                  XML_PARSE_NONET | XML_PARSE_NOERROR | XML_PARSE_NOWARNING);
+    if (!doc) return out;
+    detail::XmlDocGuard guard{doc};
+    if (doc->intSubset || doc->extSubset) return out; // DOCTYPE/DTD present -- treat as malformed
+
+    xmlNodePtr root = xmlDocGetRootElement(doc);
+    if (!root) return out;
+
+    // <Settings>/<Enabled> is the task-level enabled flag's real schema
+    // location -- <Triggers> (which can carry its OWN per-trigger <Enabled>
+    // children) appears earlier in document order than <Settings> in a real
+    // capture, so a document-wide "first <Enabled> anywhere" search (this
+    // function's pre-libxml2 form) could read a trigger's own Enabled value
+    // as the task's. Scoping to the real parent element removes that
+    // ambiguity entirely rather than papering over it.
+    if (xmlNodePtr settings = detail::xml_find_child(root, "Settings")) {
+        if (xmlNodePtr enabled = detail::xml_find_child(settings, "Enabled"))
+            out.enabled = !detail::xsd_boolean_is_false(detail::xml_get_text(enabled));
+    }
+    // <Principals>/<Principal>/<UserId> -- likewise the real schema location,
+    // not a document-wide first match.
+    if (xmlNodePtr principals = detail::xml_find_child(root, "Principals")) {
+        if (xmlNodePtr principal = detail::xml_find_child(principals, "Principal")) {
+            if (xmlNodePtr user_id = detail::xml_find_child(principal, "UserId"))
+                out.user_id = detail::xml_get_text(user_id);
         }
-        // A sibling action element this scanner doesn't decode -- ComHandler
-        // (COM object invocation), SendEmail and ShowMessage (both
-        // deprecated by Task Scheduler but still schema-legal) -- means the
-        // task does more than the Exec rows above show.
-        for (std::string_view unmodelled : {"<ComHandler", "<SendEmail", "<ShowMessage"}) {
-            if (actions_block->find(unmodelled) != std::string_view::npos) {
+    }
+
+    if (xmlNodePtr actions = detail::xml_find_child(root, "Actions")) {
+        for (xmlNodePtr child = xmlFirstElementChild(actions); child;
+             child = xmlNextElementSibling(child)) {
+            if (child->type != XML_ELEMENT_NODE || !child->name) continue;
+            if (xmlStrEqual(child->name, BAD_CAST "Exec")) {
+                TaskAction action;
+                action.command = detail::xml_get_text(detail::xml_find_child(child, "Command"));
+                action.arguments =
+                    detail::xml_get_text(detail::xml_find_child(child, "Arguments"));
+                out.actions.push_back(std::move(action));
+            } else if (xmlStrEqual(child->name, BAD_CAST "ComHandler") ||
+                       xmlStrEqual(child->name, BAD_CAST "SendEmail") ||
+                       xmlStrEqual(child->name, BAD_CAST "ShowMessage")) {
+                // A sibling action element this leg doesn't decode -- ComHandler
+                // (COM object invocation), SendEmail and ShowMessage (both
+                // deprecated by Task Scheduler but still schema-legal) -- means
+                // the task does more than the Exec rows above show.
                 out.has_unmodelled_action = true;
-                break;
             }
         }
     }
 
-    if (auto triggers_block = detail::extract_tagged_block(xml, "Triggers")) {
+    if (xmlNodePtr triggers = detail::xml_find_child(root, "Triggers")) {
         // Every trigger element type ITriggerCollection can hold (Task
-        // Scheduler's fixed schema) -- checked individually via
-        // find_all_tagged_blocks, which (as of round 5) handles both a
-        // self-closed trigger (schema-valid for a type with no required
-        // children, e.g. <LogonTrigger/>) and an Id-attributed one
-        // (<BootTrigger Id="...">). Each trigger's OWN direct <Enabled>
+        // Scheduler's fixed schema). Each trigger's OWN direct <Enabled>
         // child decides that trigger alone (absent -> schema-default
         // enabled, false-per-xsd:boolean -> disabled) -- never aggregated
         // document-wide, or one disabled sibling would cancel out an
         // unrelated enabled (or untagged) trigger with no relationship to
-        // it.
-        for (const char* trigger_tag :
-            {"BootTrigger", "IdleTrigger", "LogonTrigger", "TimeTrigger", "EventTrigger",
-             "SessionStateChangeTrigger", "CalendarTrigger", "RegistrationTrigger",
-             "WnfStateChangeTrigger"}) {
-            for (auto trigger : detail::find_all_tagged_blocks(*triggers_block, trigger_tag)) {
-                auto enabled_val = detail::extract_tag(trigger, "Enabled");
-                if (!enabled_val || !detail::xsd_boolean_is_false(*enabled_val)) {
-                    out.has_triggers = true;
+        // it. A real element tree makes self-closed and Id-attributed
+        // triggers ordinary children -- nothing extra needed to see them.
+        static constexpr std::array<const char*, 9> kTriggerTags{
+            "BootTrigger", "IdleTrigger", "LogonTrigger", "TimeTrigger", "EventTrigger",
+            "SessionStateChangeTrigger", "CalendarTrigger", "RegistrationTrigger",
+            "WnfStateChangeTrigger"};
+        for (xmlNodePtr trigger = xmlFirstElementChild(triggers); trigger && !out.has_triggers;
+             trigger = xmlNextElementSibling(trigger)) {
+            if (trigger->type != XML_ELEMENT_NODE || !trigger->name) continue;
+            bool is_known_trigger_type = false;
+            for (const char* tag : kTriggerTags) {
+                if (xmlStrEqual(trigger->name, BAD_CAST tag)) {
+                    is_known_trigger_type = true;
                     break;
                 }
             }
-            if (out.has_triggers) break;
+            if (!is_known_trigger_type) continue;
+            xmlNodePtr enabled_node = detail::xml_find_child(trigger, "Enabled");
+            if (!enabled_node || !detail::xsd_boolean_is_false(detail::xml_get_text(enabled_node)))
+                out.has_triggers = true;
         }
     }
     return out;

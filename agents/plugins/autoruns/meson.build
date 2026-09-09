@@ -7,7 +7,10 @@
 # foreign-OS stub for the two OSes this build does NOT compile a leg for
 # (see that header's banner), so a single leg TU is sufficient for the build
 # to link on every platform.
-autoruns_deps = [yuzu_sdk_dep, yuzu_agent_core_dep, spdlog_dep]
+# libxml2_dep declared at root meson.build scope, unconditionally (every
+# platform) -- autoruns_parsers.hpp's parse_task_xml parses Windows Task
+# Scheduler XML via real libxml2 rather than hand-rolled scanning.
+autoruns_deps = [yuzu_sdk_dep, yuzu_agent_core_dep, spdlog_dep, libxml2_dep]
 
 autoruns_sources = files('src/autoruns_plugin.cpp')
 

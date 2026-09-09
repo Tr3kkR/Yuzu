@@ -41,6 +41,7 @@
 #include "autoruns_macos.hpp"
 #include "autoruns_parsers.hpp"
 
+#include <posix_dir_walk.hpp>
 #include <yuzu/agent/scoped_cfref.hpp>
 #include <yuzu/plugin.hpp>
 
@@ -287,33 +288,36 @@ DirWalkOutcome walk_plist_dir_handle(const DirHandle& dir, OnPlist&& on_plist) {
     DirWalkOutcome outcome;
     if (!dir.valid()) return outcome;
     const int dfd = dirfd(dir.get());
-    std::size_t seen = 0;
-    struct dirent* entry = nullptr;
-    errno = 0; // readdir() only sets errno on failure -- cleared first so a real
-               // I/O error stopping the scan early can be told apart from a clean
-               // end of directory, which a bare null-return check cannot do.
-    while (seen < kMaxEntriesPerDir && (entry = readdir(dir.get())) != nullptr) {
-        ++seen;
-        const std::string_view name(entry->d_name);
-        if (name == "." || name == "..") continue;
-        if (!ends_with(name, ".plist")) continue;
-        std::vector<uint8_t> bytes;
-        std::int64_t mtime = 0;
-        PlistReadOutcome read_outcome;
-        if (!read_file_bounded(dfd, entry->d_name, bytes, mtime, read_outcome)) {
-            if (read_outcome.constrained) {
-                outcome.file_constrained = true;
-                outcome.file_constrained_reason = read_outcome.reason;
+    // yuzu::shared::walk_dir_capped (agents/shared/posix_dir_walk.hpp) --
+    // one shared, correct capped-listing primitive used by every directory
+    // walk in this file, instead of three separate hand-rolled copies (PR
+    // #4154 round 8 found the terminal-error-detection fix landed one round
+    // earlier had a gap of the same shape independently reproduced in all
+    // three; the fix now lives in exactly one place). Its `cap` counts real
+    // (non-`.`/`..`) entries reaching the callback, unlike this function's
+    // prior local loop which incremented `seen` for every raw entry
+    // including non-`.plist` files -- a directory with many unrelated
+    // files could previously hit the cap before any real `.plist` was even
+    // considered; counting only entries this walk actually cares about is
+    // strictly more correct, not a behavior this function depended on.
+    const auto walk = yuzu::shared::walk_dir_capped(
+        dir.get(), kMaxEntriesPerDir, [&](const struct dirent* entry) {
+            const std::string_view name(entry->d_name);
+            if (!ends_with(name, ".plist")) return true;
+            std::vector<uint8_t> bytes;
+            std::int64_t mtime = 0;
+            PlistReadOutcome read_outcome;
+            if (!read_file_bounded(dfd, entry->d_name, bytes, mtime, read_outcome)) {
+                if (read_outcome.constrained) {
+                    outcome.file_constrained = true;
+                    outcome.file_constrained_reason = read_outcome.reason;
+                }
+                return true;
             }
-            errno = 0; // read_file_bounded may itself have set errno
-            continue;
-        }
-        on_plist(entry->d_name, bytes, mtime);
-        errno = 0;
-    }
-    const bool readdir_error = errno != 0; // captured before the cap lookahead below
-    outcome.truncated =
-        (seen >= kMaxEntriesPerDir && readdir(dir.get()) != nullptr) || readdir_error;
+            on_plist(entry->d_name, bytes, mtime);
+            return true;
+        });
+    outcome.truncated = walk.truncated || walk.enumeration_error;
     return outcome;
 }
 
@@ -353,26 +357,16 @@ DirConstraint walk_dir_names(const std::string& dir_path, OnEntry&& on_entry) {
     DirOpenOutcome open = open_dir_no_follow_checked(dir_path);
     if (!open.handle.valid()) return DirConstraint{open.constrained, open.reason};
     const int dfd = dirfd(open.handle.get());
-    std::size_t seen = 0;
-    struct dirent* entry = nullptr;
-    errno = 0;
-    while (seen < kMaxEntriesPerDir && (entry = readdir(open.handle.get())) != nullptr) {
-        ++seen;
-        const std::string_view name(entry->d_name);
-        if (name == "." || name == "..") continue;
-        struct stat st{};
-        if (fstatat(dfd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
-            errno = 0; // fstatat may itself have set errno
-            continue;
-        }
-        if (!S_ISREG(st.st_mode) && !S_ISLNK(st.st_mode)) continue;
-        on_entry(entry->d_name, static_cast<std::int64_t>(st.st_mtime));
-        errno = 0;
-    }
-    const bool readdir_error = errno != 0;
-    if (seen >= kMaxEntriesPerDir && readdir(open.handle.get()) != nullptr)
-        return DirConstraint{true, "row_cap"};
-    if (readdir_error) return DirConstraint{true, "readdir_error"};
+    const auto walk = yuzu::shared::walk_dir_capped(
+        open.handle.get(), kMaxEntriesPerDir, [&](const struct dirent* entry) {
+            struct stat st{};
+            if (fstatat(dfd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) return true;
+            if (!S_ISREG(st.st_mode) && !S_ISLNK(st.st_mode)) return true;
+            on_entry(entry->d_name, static_cast<std::int64_t>(st.st_mtime));
+            return true;
+        });
+    if (walk.truncated) return DirConstraint{true, "row_cap"};
+    if (walk.enumeration_error) return DirConstraint{true, "readdir_error"};
     return DirConstraint{};
 }
 
@@ -514,58 +508,47 @@ DirCollectOutcome collect_user_launchagents(yuzu::CommandContext& ctx) {
     DirOpenOutcome users_open = open_dir_no_follow_checked(kUsersDir);
     if (users_open.constrained) note_dir_constraint(outcome, users_open.reason);
     if (!users_open.handle.valid()) return outcome;
-    std::size_t seen = 0;
-    struct dirent* entry = nullptr;
-    errno = 0;
-    while (seen < kMaxEntriesPerDir && (entry = readdir(users_open.handle.get())) != nullptr) {
-        ++seen;
-        // Resets errno to 0 on EVERY exit from this iteration (any of the
-        // several `continue`s below, or falling off the end) -- the body
-        // makes many syscalls that can themselves set errno, and only the
-        // NEXT readdir() call's own errno (checked once, after the loop
-        // ends) is meant to answer "did the scan stop on a real error".
-        struct ErrnoResetGuard {
-            ~ErrnoResetGuard() { errno = 0; }
-        } reset_errno_guard;
-        const std::string_view name(entry->d_name);
-        if (name == "." || name == "..") continue;
-        const std::string home = std::string{kUsersDir} + "/" + entry->d_name;
-        // O_NOFOLLOW on the home directory itself: a symlinked "user" entry
-        // under /Users is not a real per-user home this leg will read into.
-        const int home_fd = open(home.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
-        if (home_fd < 0) {
-            const int err = errno;
-            if (!is_benign_absent_errno(err)) note_dir_constraint(outcome, dir_open_constraint_token(err));
-            continue;
-        }
-        FdHandle home_handle(home_fd);
-        struct stat st{};
-        if (fstat(home_handle.get(), &st) != 0) continue;
-        if (st.st_uid < 500) continue; // system/shared account, not a real user home
-        // Walk "Library" then "LaunchAgents" as two openat() hops chained
-        // from home_fd, each independently O_NOFOLLOW-checked — a single
-        // open() on the joined "home/Library/LaunchAgents" string would let
-        // the kernel resolve the intermediate "Library" component through
-        // normal symlink-following path resolution, escaping confinement to
-        // this user's own home (see open_dir_no_follow_at_checked's banner).
-        DirOpenOutcome library_open = open_dir_no_follow_at_checked(home_handle.get(), "Library");
-        if (library_open.constrained) note_dir_constraint(outcome, library_open.reason);
-        if (!library_open.handle.valid()) continue;
-        DirOpenOutcome agents_open =
-            open_dir_no_follow_at_checked(dirfd(library_open.handle.get()), "LaunchAgents");
-        if (agents_open.constrained) note_dir_constraint(outcome, agents_open.reason);
-        if (!agents_open.handle.valid()) continue;
-        const auto result = collect_launchd_dir_handle(ctx, SourceId::mac_user_launchagents,
-                                                        agents_open.handle,
-                                                        home + "/Library/LaunchAgents", Scope::user, name);
-        outcome.rows += result.rows;
-        if (result.truncated) note_dir_constraint(outcome, "row_cap");
-        if (result.file_constrained) note_dir_constraint(outcome, result.file_constrained_reason);
-    }
-    const bool readdir_error = errno != 0;
-    if (seen >= kMaxEntriesPerDir && readdir(users_open.handle.get()) != nullptr)
-        note_dir_constraint(outcome, "row_cap");
-    if (readdir_error) note_dir_constraint(outcome, "readdir_error");
+    const auto walk = yuzu::shared::walk_dir_capped(
+        users_open.handle.get(), kMaxEntriesPerDir, [&](const struct dirent* entry) {
+            const std::string_view name(entry->d_name);
+            const std::string home = std::string{kUsersDir} + "/" + entry->d_name;
+            // O_NOFOLLOW on the home directory itself: a symlinked "user" entry
+            // under /Users is not a real per-user home this leg will read into.
+            const int home_fd = open(home.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+            if (home_fd < 0) {
+                const int err = errno;
+                if (!is_benign_absent_errno(err))
+                    note_dir_constraint(outcome, dir_open_constraint_token(err));
+                return true;
+            }
+            FdHandle home_handle(home_fd);
+            struct stat st{};
+            if (fstat(home_handle.get(), &st) != 0) return true;
+            if (st.st_uid < 500) return true; // system/shared account, not a real user home
+            // Walk "Library" then "LaunchAgents" as two openat() hops chained
+            // from home_fd, each independently O_NOFOLLOW-checked — a single
+            // open() on the joined "home/Library/LaunchAgents" string would let
+            // the kernel resolve the intermediate "Library" component through
+            // normal symlink-following path resolution, escaping confinement to
+            // this user's own home (see open_dir_no_follow_at_checked's banner).
+            DirOpenOutcome library_open = open_dir_no_follow_at_checked(home_handle.get(), "Library");
+            if (library_open.constrained) note_dir_constraint(outcome, library_open.reason);
+            if (!library_open.handle.valid()) return true;
+            DirOpenOutcome agents_open =
+                open_dir_no_follow_at_checked(dirfd(library_open.handle.get()), "LaunchAgents");
+            if (agents_open.constrained) note_dir_constraint(outcome, agents_open.reason);
+            if (!agents_open.handle.valid()) return true;
+            const auto result = collect_launchd_dir_handle(ctx, SourceId::mac_user_launchagents,
+                                                            agents_open.handle,
+                                                            home + "/Library/LaunchAgents",
+                                                            Scope::user, name);
+            outcome.rows += result.rows;
+            if (result.truncated) note_dir_constraint(outcome, "row_cap");
+            if (result.file_constrained) note_dir_constraint(outcome, result.file_constrained_reason);
+            return true;
+        });
+    if (walk.truncated) note_dir_constraint(outcome, "row_cap");
+    if (walk.enumeration_error) note_dir_constraint(outcome, "readdir_error");
     return outcome;
 }
 

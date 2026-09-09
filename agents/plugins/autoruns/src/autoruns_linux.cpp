@@ -34,6 +34,7 @@
 
 #include "autoruns_legs.hpp"
 
+#include <posix_dir_walk.hpp>
 #include <yuzu/agent/runner_status.hpp>
 #include <yuzu/agent/subprocess_runner.hpp>
 #include <yuzu/plugin.hpp>
@@ -51,6 +52,7 @@
 #include <string>
 #include <string_view>
 #include <sys/stat.h>
+#include <tuple>
 #include <unistd.h>
 #include <utility>
 #include <vector>
@@ -211,35 +213,15 @@ DirListing list_dir(const std::string& path, std::size_t cap = kMaxDirEntries) {
             if (d) ::closedir(d);
         }
     } guard{d};
-    errno = 0; // readdir() only sets errno on failure -- must be cleared first to
-               // tell "a real I/O error stopped the scan early" apart from "clean
-               // end of directory", which a bare null-return check cannot do.
-    while (struct dirent* ent = ::readdir(d)) {
-        std::string_view name{ent->d_name};
-        if (name == "." || name == "..") continue;
-        if (out.names.size() >= cap) {
-            // `ent` was already read by this iteration's while-condition --
-            // it IS the first real entry beyond the cap, proof enough of
-            // truncation on its own. (Unlike the macOS legs' `seen < cap &&
-            // readdir(...)` loop guard, which short-circuits BEFORE calling
-            // readdir once the cap is hit, this loop's condition always
-            // calls readdir first; re-reading here would silently discard
-            // `ent` and require a SECOND over-cap entry to detect
-            // truncation -- confirmed by an adversarial-review falsifier:
-            // cap=2 with exactly 3 real entries reported truncated=false.)
-            out.truncated = true;
-            break;
-        }
-        out.names.emplace_back(name);
-    }
-    // The loop above can also end because readdir() itself failed partway
-    // through (a real I/O error, e.g. the underlying filesystem going away
-    // mid-scan) -- indistinguishable from a clean end-of-directory by the
-    // null-return check alone. Folded into the SAME `truncated` signal
-    // every caller already escalates to Constrained on: a partial listing
-    // from either cause must never be reported as a complete Supported
-    // result.
-    if (errno != 0) out.truncated = true;
+    const auto walk = yuzu::shared::walk_dir_capped(d, cap, [&](const struct dirent* ent) {
+        out.names.emplace_back(std::string_view{ent->d_name});
+        return true;
+    });
+    // A real I/O error (mid-scan or at the cap-boundary lookahead) is folded
+    // into the SAME `truncated` signal every caller already escalates to
+    // Constrained on -- a partial listing from either cause must never be
+    // reported as a complete Supported result.
+    out.truncated = walk.truncated || walk.enumeration_error;
     return out;
 }
 
@@ -280,11 +262,18 @@ bool source_wanted(std::string_view filter, SourceId id) {
 struct WantsListing {
     std::string text; // "<name>[ -> <target>]\n" per entry -- see autoruns_parsers.hpp:timer_enabled_from_wants
     bool opened = false;
-    bool enumeration_error = false; // readdir() failed partway through -- the listing
-                                    // is genuinely incomplete, distinct from "opened
-                                    // fine, nothing here"; a caller must not treat
+    bool enumeration_error = false; // a real readdir() I/O error stopped the scan
+                                    // early (mid-scan OR at the cap-boundary
+                                    // lookahead) -- the listing is genuinely
+                                    // incomplete, distinct from "opened fine,
+                                    // nothing here"; a caller must not treat
                                     // `opened && no match found` as a confident
                                     // Enabled::disabled when this is set.
+    bool truncated = false; // cap hit AND a real entry remained unread -- matches
+                            // the sibling DirListing type's field; a capped scan
+                            // with no match found is NOT proof the timer isn't
+                            // enabled (the matching symlink could be past the
+                            // cap), same reasoning as enumeration_error above.
 };
 
 WantsListing build_wants_listing(const std::string& wants_dir) {
@@ -298,12 +287,8 @@ WantsListing build_wants_listing(const std::string& wants_dir) {
             if (d) ::closedir(d);
         }
     } guard{d};
-    std::size_t count = 0;
-    errno = 0;
-    while (struct dirent* ent = ::readdir(d)) {
-        if (count >= kMaxDirEntries) break;
-        std::string_view name{ent->d_name};
-        if (name == "." || name == "..") continue;
+    const auto walk = yuzu::shared::walk_dir_capped(d, kMaxDirEntries, [&](const struct dirent* ent) {
+        const std::string_view name{ent->d_name};
         out.text += std::string{name};
         std::string full = wants_dir + "/" + std::string{name};
         char target[4096];
@@ -314,19 +299,22 @@ WantsListing build_wants_listing(const std::string& wants_dir) {
             out.text += target;
         }
         out.text += '\n';
-        ++count;
-        errno = 0;
-    }
-    if (errno != 0) out.enumeration_error = true;
+        return true;
+    });
+    out.enumeration_error = walk.enumeration_error;
+    out.truncated = walk.truncated;
     return out;
 }
 
 /// A timer is enabled iff its unit file is symlinked into either the
 /// documented default `timers.target.wants/` or the WantedBy=-declared
 /// target's own `.wants/` dir (readlink, never resolve -- see
-/// autoruns_parsers.hpp:timer_enabled_from_wants). Enabled::unknown only
-/// when NEITHER candidate `.wants` directory could even be opened -- a
-/// genuine "cannot tell", not the common "not linked" case.
+/// autoruns_parsers.hpp:timer_enabled_from_wants). Enabled::unknown when
+/// NEITHER candidate `.wants` directory could even be opened, OR when a
+/// consulted directory opened but then hit a real I/O error or its entry
+/// cap partway through (the matching symlink could be among what wasn't
+/// read) -- a genuine "cannot tell" in either case, not the common "not
+/// linked" case.
 ///
 /// `systemctl enable` (system scope) always writes the enablement symlink
 /// under `/etc/systemd/system/<target>.wants/`; `systemctl --user enable`
@@ -365,25 +353,31 @@ Enabled timer_enabled(const std::string& unit_dir, const std::string& timer_file
     }
 
     bool any_opened = false;
-    bool any_enumeration_error = false;
+    bool any_incomplete = false; // a real I/O error OR a cap-truncation on any
+                                 // consulted wants dir -- either way, the
+                                 // matching symlink could be among what wasn't
+                                 // read, so "no match found" isn't proof of
+                                 // disabled (round 8's blocker: a capped scan
+                                 // with no match silently read as a confident
+                                 // Enabled::disabled).
     for (const auto& base : wants_base_dirs) {
         auto w1 = build_wants_listing(base + "/timers.target.wants");
         any_opened |= w1.opened;
-        any_enumeration_error |= w1.enumeration_error;
+        any_incomplete |= w1.enumeration_error || w1.truncated;
         if (w1.opened && timer_enabled_from_wants(w1.text, timer_filename)) return Enabled::enabled;
         if (!wanted_by.empty()) {
             auto w2 = build_wants_listing(base + "/" + wanted_by + ".wants");
             any_opened |= w2.opened;
-            any_enumeration_error |= w2.enumeration_error;
+            any_incomplete |= w2.enumeration_error || w2.truncated;
             if (w2.opened && timer_enabled_from_wants(w2.text, timer_filename)) return Enabled::enabled;
         }
     }
-    // A wants directory that failed partway through enumeration may have
-    // missed the very symlink that would have proven this timer enabled --
-    // reporting a confident `disabled` there is the same false-negative
-    // "live persistence mechanism read as inert" defect class this file's
-    // other fixes exist to close.
-    if (any_enumeration_error) return Enabled::unknown;
+    // A wants directory that failed partway through enumeration, or hit its
+    // entry cap, may have missed the very symlink that would have proven
+    // this timer enabled -- reporting a confident `disabled` there is the
+    // same false-negative "live persistence mechanism read as inert" defect
+    // class this file's other fixes exist to close.
+    if (any_incomplete) return Enabled::unknown;
     return any_opened ? Enabled::disabled : Enabled::unknown;
 }
 
@@ -526,6 +520,37 @@ std::pair<YuzuSupportLevel, std::string> apply_narrow_search_path_coverage(
     if (support == YUZU_SUPPORT_SUPPORTED) return {YUZU_SUPPORT_CONSTRAINED, "narrow_search_path_coverage"};
     reason += ",narrow_search_path_coverage";
     return {support, reason};
+}
+
+/// The full 3-way `lnx_systemd_timers_user` status decision, extracted so
+/// each of production's three mutually-exclusive branches (a readable
+/// directory somewhere; `/home` itself permission-denied; no readable
+/// directory and `/home` genuinely absent) is independently unit-testable
+/// without needing 3 different real filesystem states (PR #4154 round 8's
+/// should-fix: the one existing dispatch test only ever reaches whichever
+/// single branch this host's own `/run/systemd/system` state happens to
+/// hit, so a later edit removing the `apply_narrow_search_path_coverage`
+/// call from either of the other two branches would leave every test
+/// green).
+std::tuple<YuzuSupportLevel, std::string, std::size_t> systemd_user_timer_status(
+    bool any_dir_readable, bool home_listing_opened, bool home_listing_permission_denied,
+    const TimerScan& scan) {
+    if (any_dir_readable || home_listing_opened) {
+        const auto [scan_support, scan_reason] = timer_scan_status(scan);
+        const auto [support, reason] = apply_narrow_search_path_coverage(scan_support, scan_reason);
+        return {support, reason, scan.rows.size()};
+    }
+    if (home_listing_permission_denied) {
+        const auto [support, reason] =
+            apply_narrow_search_path_coverage(YUZU_SUPPORT_CONSTRAINED, "permission_denied");
+        return {support, reason, std::size_t{0}};
+    }
+    // Every present-systemd result routes through the same helper --
+    // including this terminal "no readable user-unit directory and /home
+    // itself is absent" case, which used to emit a bare Supported that
+    // contradicted this source's own catalog declaration.
+    const auto [support, reason] = apply_narrow_search_path_coverage(YUZU_SUPPORT_SUPPORTED, "-");
+    return {support, reason, std::size_t{0}};
 }
 
 /// Rung-2 fallback (autoruns/collect_linux#1, docs/wave7/integration-
@@ -1054,30 +1079,10 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                 scan_systemd_timer_dir_unique("/usr/lib/systemd/user", Scope::user, "-", scan,
                                               seen_dirs, user_wants_bases);
                 for (const auto& row : scan.rows) ctx.write_output(format_row(row));
-                if (scan.any_dir_readable || home_listing.opened) {
-                    const auto [scan_support, scan_reason] = timer_scan_status(scan);
-                    const auto [support, reason] =
-                        apply_narrow_search_path_coverage(scan_support, scan_reason);
-                    ctx.write_output(format_source_status(SourceId::lnx_systemd_timers_user, support,
-                                                          scan.rows.size(), reason));
-                } else if (home_listing.permission_denied) {
-                    const auto [support, reason] = apply_narrow_search_path_coverage(
-                        YUZU_SUPPORT_CONSTRAINED, "permission_denied");
-                    ctx.write_output(
-                        format_source_status(SourceId::lnx_systemd_timers_user, support,
-                                            std::size_t{0}, reason));
-                } else {
-                    // Every present-systemd result routes through the same
-                    // helper -- including this terminal "no readable
-                    // user-unit directory and /home itself is absent" case,
-                    // which used to emit a bare Supported that contradicted
-                    // this source's own catalog declaration.
-                    const auto [support, reason] =
-                        apply_narrow_search_path_coverage(YUZU_SUPPORT_SUPPORTED, "-");
-                    ctx.write_output(
-                        format_source_status(SourceId::lnx_systemd_timers_user, support,
-                                            std::size_t{0}, reason));
-                }
+                const auto [support, reason, row_count] = systemd_user_timer_status(
+                    scan.any_dir_readable, home_listing.opened, home_listing.permission_denied, scan);
+                ctx.write_output(format_source_status(SourceId::lnx_systemd_timers_user, support,
+                                                      row_count, reason));
             }
         }
     }

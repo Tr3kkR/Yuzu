@@ -13,8 +13,13 @@
 ///
 /// Both actions are ReadOnly/None. `catalog` performs no OS call at all (a
 /// pure reflection of the plugin's own static source catalog); `list` reads
-/// registry values, files, and plist/task/WMI metadata across its three legs
-/// -- nothing in either action opens a handle for write, spawns a process, or
+/// registry values, files, and plist/task/WMI metadata across its three
+/// legs, plus one bounded, read-only subprocess spawn -- the Linux leg's
+/// rung-2 `systemctl list-timers` fallback, used only when none of the
+/// three systemd unit directories is directly readable (disclosed in
+/// docs/user-manual/autoruns.md and the privilege matrix). That child is
+/// itself read-only, so the ReadOnly/no-execute-gate classification below
+/// still holds -- nothing in either action opens a handle for write or
 /// changes any persistence entry it reports on.
 ///
 /// Grouped under `Security`, matching the read-only fact-collection precedent

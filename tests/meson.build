@@ -468,6 +468,8 @@ agent_test_exe = executable(
     'unit/test_autoruns_win_local.cpp',         # Wave 7 PR7.1: Windows leg (+ OS-independent WMI join tests)
     'unit/test_autoruns_linux_local.cpp',       # Wave 7 PR7.1: Linux leg (+ read_file_bounded internals)
     'unit/test_autoruns_macos_local.cpp',       # Wave 7 PR7.1: macOS leg (CFPropertyList over REAL plists)
+    'unit/test_posix_dir_walk.cpp',     # PR #4154 round-8 remediation: shared capped
+                                        # directory-walk primitive (agents/shared/posix_dir_walk.hpp)
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -537,7 +539,10 @@ agent_test_exe = executable(
   # only way to exercise KvStore's fallible-read branches end to end rather than through
   # an injected stand-in. Already a transitive dep of yuzu_agent_core; naming it here is
   # what puts sqlite3.h on the test TU's include path (same shape as tar_test_deps).
-  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_nomain_dep, agent_test_openssl_dep, spdlog_dep, sqlite3_dep] + agent_test_native_deps,
+  # libxml2_dep: test_autoruns_parsers.cpp #includes autoruns_parsers.hpp,
+  # which parses Task Scheduler XML via real libxml2 unconditionally on
+  # every platform -- this test TU needs it on its include/link path too.
+  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_nomain_dep, agent_test_openssl_dep, spdlog_dep, sqlite3_dep, libxml2_dep] + agent_test_native_deps,
   # Ensure the fixture plugins are built before the test runs so the lookups
   # inside test_plugin_loader.cpp / test_capability_descriptor.cpp find them
   # under MESON_BUILD_ROOT/tests/.

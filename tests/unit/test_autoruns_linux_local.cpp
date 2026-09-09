@@ -566,6 +566,42 @@ TEST_CASE("autoruns Linux leg: timer_enabled correlates a global-directory "
     }
 }
 
+TEST_CASE("autoruns Linux leg: a wants-directory scan capped before reaching the real "
+          "enablement symlink reports unknown, never a confident disabled "
+          "(RECONSTRUCTION: pins PR #4154 round 8's blocker -- build_wants_listing's "
+          "kMaxDirEntries cap carried no distinct truncation signal, so timer_enabled "
+          "fell through to a confident Enabled::disabled exactly as if the symlink "
+          "genuinely didn't exist; round 8's own falsifier used 5,000 real entries in a "
+          ".wants directory with the real symlink placed beyond the cap)",
+          "[autoruns][actions][linux]") {
+    using yuzu::autoruns::Enabled;
+    using yuzu::autoruns::Scope;
+    using yuzu::autoruns::timer_enabled;
+
+    yuzu::test::TempDir dir("yuzu_test_autoruns_cap_");
+    std::filesystem::create_directories(dir.path / "timers.target.wants");
+
+    const auto unit_file = dir.path / "backup.timer";
+    { std::ofstream f(unit_file); f << "[Timer]\nOnCalendar=daily\n"; }
+
+    // One real enablement symlink for the unit under test, PLUS enough
+    // decoy entries (matching production's kMaxDirEntries, 4096) that a
+    // correct implementation cannot promise it saw the real one -- the
+    // decoys are named to sort well ahead of "backup.timer" so a
+    // lexicographic-order filesystem walk (the common case) genuinely
+    // exercises the cap-before-match path this test exists to pin, while a
+    // hash-ordered filesystem still gets a real assertion out of it (never
+    // confidently disabled, whether or not the match happened to survive).
+    std::filesystem::create_symlink(unit_file, dir.path / "timers.target.wants" / "backup.timer");
+    for (int i = 0; i < 4096; ++i) {
+        const auto decoy = dir.path / "timers.target.wants" / ("aaa-decoy-" + std::to_string(i) + ".timer");
+        std::filesystem::create_symlink(unit_file, decoy);
+    }
+
+    const auto result = timer_enabled(dir.path.string(), "backup.timer", "", Scope::user, {});
+    CHECK(result != Enabled::disabled);
+}
+
 TEST_CASE("autoruns Linux leg: note_file_constraint dedups a repeated token "
           "(RECONSTRUCTION: pins a governance-Gate-4 finding -- a per-file "
           "constraint hit across many entries/profiles used to grow the "
