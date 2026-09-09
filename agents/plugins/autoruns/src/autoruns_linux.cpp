@@ -366,6 +366,21 @@ CollectorScanResult scan_run_parts_dirs(const std::vector<std::string>& dirs, So
             std::string full = dir + "/" + name;
             struct stat st{};
             if (::stat(full.c_str(), &st) != 0) {
+                // Deliberately reports ENOENT here too, unlike
+                // classify_read_error's read-path convention elsewhere in
+                // this file (a raced deletion between listing and reading
+                // is benign absence there). Here, `::stat` follows
+                // symlinks -- an ENOENT on this call means the LISTED
+                // entry is a DANGLING symlink (the entry itself still
+                // exists; what it points to does not), which is a real
+                // run-parts(8) failure mode (run-parts would try and fail
+                // to execute it too), not a benign race. The trade-off:
+                // this also reports a genuinely raced deletion (the entry
+                // removed between listing and this stat) as "enoent"
+                // rather than silently skipping it -- accepted, since a
+                // false "enoent" constraint on an already-Constrained
+                // source is far cheaper than the false-negative this
+                // predicate exists to close.
                 acc.add_failure(lowercase_errno_token(errno_token_for(errno)));
                 continue;
             }
@@ -574,17 +589,20 @@ CollectorScanResult scan_at_spool(const std::string& dir, SourceId id) {
     return out;
 }
 
-/// lnx_xdg_autostart_user's shape: enumerate /home, then each user's own
-/// ~/.config/autostart. Unlike the scan_* functions above, /home's own
-/// open failure is itself part of this source's OUTER status decision
-/// (there is no sibling root to fall back on), not just a per-entry
-/// concern -- a real (non-ENOENT) /home failure must report Constrained
-/// with the actual reason, never the "supported|0|absent" this source used
-/// to fall through to (PR #4154 round 9 blocker: EIO on /home read as
-/// confirmed absence).
-CollectorScanResult scan_xdg_autostart_user(SourceId id) {
+/// lnx_xdg_autostart_user's shape: enumerate `home_root` (production:
+/// "/home"), then each user's own ~/.config/autostart. Unlike the scan_*
+/// functions above, home_root's own open failure is itself part of this
+/// source's OUTER status decision (there is no sibling root to fall back
+/// on), not just a per-entry concern -- a real (non-ENOENT) failure must
+/// report Constrained with the actual reason, never the
+/// "supported|0|absent" this source used to fall through to (PR #4154
+/// round 9 blocker: EIO on /home read as confirmed absence). Root-
+/// parameterized so a test can point this at a constructed temp path,
+/// including one engineered to fail to open for a real (non-ENOENT)
+/// reason.
+CollectorScanResult scan_xdg_autostart_user(SourceId id, const std::string& home_root) {
     CollectorScanResult out;
-    auto home_listing = list_dir("/home");
+    auto home_listing = list_dir(home_root);
     if (!home_listing.opened) {
         if (home_listing.permission_denied) {
             out.support = YUZU_SUPPORT_CONSTRAINED;
@@ -609,7 +627,7 @@ CollectorScanResult scan_xdg_autostart_user(SourceId id) {
                                // previously-dropped per-file failure class
     if (home_listing.truncated) acc.add_failure("row_cap");
     for (const auto& user : home_listing.names) {
-        std::string dir = "/home/" + user + "/.config/autostart";
+        std::string dir = home_root + "/" + user + "/.config/autostart";
         auto listing = list_dir(dir);
         if (!listing.opened) {
             // Absent (ENOENT, "most users have none") is benign; a real
@@ -1442,7 +1460,7 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                                               YUZU_SUPPORT_SUPPORTED, std::nullopt, "filtered"));
     } else {
         const SourceId id = SourceId::lnx_xdg_autostart_user;
-        auto scan = scan_xdg_autostart_user(id);
+        auto scan = scan_xdg_autostart_user(id, "/home");
         for (const auto& row : scan.rows) ctx.write_output(format_row(row));
         ctx.write_output(format_source_status(id, scan.support, scan.rows.size(), scan.reason));
     }

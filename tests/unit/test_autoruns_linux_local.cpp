@@ -772,8 +772,7 @@ TEST_CASE("autoruns Linux leg: scan_run_parts_dirs reports one successful root's
     REQUIRE(scan.rows.size() == 1);
     CHECK(scan.rows[0].entry == "backup");
     CHECK(scan.support == YUZU_SUPPORT_CONSTRAINED);
-    CHECK_FALSE(scan.reason == "-");
-    CHECK_FALSE(scan.reason.empty());
+    CHECK(scan.reason.find("enotdir") != std::string::npos);
 }
 
 TEST_CASE("autoruns Linux leg: scan_run_parts_dirs distinguishes zero successful roots "
@@ -806,8 +805,7 @@ TEST_CASE("autoruns Linux leg: scan_run_parts_dirs distinguishes zero successful
             scan_run_parts_dirs({not_a_dir_1.string(), not_a_dir_2.string()}, SourceId::lnx_cron_periodic);
         CHECK(scan.rows.empty());
         CHECK(scan.support == YUZU_SUPPORT_CONSTRAINED);
-        CHECK_FALSE(scan.reason == "absent");
-        CHECK_FALSE(scan.reason.empty());
+        CHECK(scan.reason.find("enotdir") != std::string::npos);
     }
 }
 
@@ -842,8 +840,7 @@ TEST_CASE("autoruns Linux leg: scan_run_parts_dirs records a per-entry stat() fa
     REQUIRE(scan.rows.size() == 1);
     CHECK(scan.rows[0].entry == "good");
     CHECK(scan.support == YUZU_SUPPORT_CONSTRAINED);
-    CHECK_FALSE(scan.reason.empty());
-    CHECK_FALSE(scan.reason == "-");
+    CHECK(scan.reason.find("enoent") != std::string::npos);
 }
 
 TEST_CASE("autoruns Linux leg: scan_user_crontabs records a non-permission per-file "
@@ -881,8 +878,6 @@ TEST_CASE("autoruns Linux leg: scan_user_crontabs records a non-permission per-f
         if (row.user == "alice") found_alice = true;
     CHECK(found_alice);
     CHECK(scan.support == YUZU_SUPPORT_CONSTRAINED);
-    CHECK_FALSE(scan.reason.empty());
-    CHECK_FALSE(scan.reason == "-");
     CHECK(scan.reason.find("oversized") != std::string::npos);
 }
 
@@ -923,6 +918,109 @@ TEST_CASE("autoruns Linux leg: timer_enabled reports unknown when no match is fo
         CHECK(timer_enabled(vendor_dir.path.string(), "backup.timer", "", Scope::user,
                             {enabling_user_dir.path.string()},
                             /*user_wants_bases_incomplete=*/true) == Enabled::enabled);
+    }
+}
+
+TEST_CASE("autoruns Linux leg: timer_enabled treats a real (non-ENOENT) open failure "
+          "on ONE candidate wants dir as incomplete, even with no "
+          "user_wants_bases_incomplete flag set and a SIBLING candidate opening fine "
+          "with no match "
+          "(RECONSTRUCTION: pins PR #4154 round 9's blocker -- build_wants_listing "
+          "previously collapsed a real open failure and plain ENOENT absence into the "
+          "same 'not opened' outcome, so a readable sibling wants dir with no match "
+          "could yield a confident disabled instead of unknown)",
+          "[autoruns][actions][linux]") {
+    using yuzu::autoruns::Enabled;
+    using yuzu::autoruns::Scope;
+    using yuzu::autoruns::timer_enabled;
+
+    yuzu::test::TempDir vendor_dir("yuzu_test_autoruns_openerr_vendor_");
+    yuzu::test::TempDir good_base("yuzu_test_autoruns_openerr_good_");
+    yuzu::test::TempDir bad_base("yuzu_test_autoruns_openerr_bad_");
+    std::error_code ec;
+    std::filesystem::create_directories(vendor_dir.path, ec);
+    REQUIRE_FALSE(ec);
+    const auto unit_file = vendor_dir.path / "backup.timer";
+    { std::ofstream f(unit_file); f << "[Timer]\nOnCalendar=daily\n"; }
+
+    // good_base's own wants dir opens fine and genuinely has no match.
+    std::filesystem::create_directories(good_base.path / "timers.target.wants", ec);
+    REQUIRE_FALSE(ec);
+
+    // bad_base's wants dir is a REGULAR FILE where a directory is expected:
+    // opendir() fails with a real, non-ENOENT errno (ENOTDIR) -- a real
+    // open failure, not plain absence.
+    std::filesystem::create_directories(bad_base.path, ec);
+    REQUIRE_FALSE(ec);
+    { std::ofstream(bad_base.path / "timers.target.wants") << "not a directory"; }
+
+    // user_wants_bases_incomplete is explicitly FALSE here -- this isolates
+    // build_wants_listing's own open_error signal from the separate
+    // caller-supplied incompleteness signal covered by the TEST_CASE above.
+    CHECK(timer_enabled(vendor_dir.path.string(), "backup.timer", "", Scope::user,
+                        {good_base.path.string(), bad_base.path.string()},
+                        /*user_wants_bases_incomplete=*/false) == Enabled::unknown);
+}
+
+TEST_CASE("autoruns Linux leg: scan_cron_d wires a rejected crontab line into a "
+          "'malformed' constraint while still emitting the file's other valid entries "
+          "(RECONSTRUCTION: pins PR #4154 round 9's should-fix -- rejected_lines was "
+          "computed and tested by parse_crontab since its introduction but never "
+          "consumed by any caller)",
+          "[autoruns][actions][linux]") {
+    using yuzu::autoruns::scan_cron_d;
+    using yuzu::autoruns::SourceId;
+
+    yuzu::test::TempDir dir("yuzu_test_autoruns_crond_malformed_");
+    std::error_code ec;
+    std::filesystem::create_directories(dir.path, ec);
+    REQUIRE_FALSE(ec);
+
+    {
+        std::ofstream f(dir.path / "myjob");
+        f << "*/5 * * * * root /usr/bin/true\n"; // valid (5 schedule + user + command)
+        f << "* * * *\troot\tcommand\n";          // malformed: only 4 schedule fields
+    }
+
+    auto scan = scan_cron_d(dir.path.string(), SourceId::lnx_cron_d);
+
+    REQUIRE(scan.rows.size() == 1);
+    CHECK(scan.rows[0].target == "/usr/bin/true");
+    CHECK(scan.support == YUZU_SUPPORT_CONSTRAINED);
+    CHECK(scan.reason.find("malformed") != std::string::npos);
+}
+
+TEST_CASE("autoruns Linux leg: scan_xdg_autostart_user distinguishes a real "
+          "(non-ENOENT) home-root open failure from genuine confirmed absence "
+          "(RECONSTRUCTION: pins PR #4154 round 9's sharpest blocker -- this "
+          "collector has NO permanent catalog-level constraint composing with it, "
+          "unlike lnx_systemd_timers_user, so a real /home failure previously fell "
+          "all the way through to a bare 'supported|0|absent')",
+          "[autoruns][actions][linux]") {
+    using yuzu::autoruns::scan_xdg_autostart_user;
+    using yuzu::autoruns::SourceId;
+
+    SECTION("home_root is a regular file, not a directory -> constrained, not "
+            "confirmed absence") {
+        yuzu::test::TempDir parent("yuzu_test_autoruns_xdguser_bad_");
+        std::error_code ec;
+        std::filesystem::create_directories(parent.path, ec);
+        REQUIRE_FALSE(ec);
+        std::filesystem::path not_a_dir = parent.path / "not_home";
+        { std::ofstream(not_a_dir) << "x"; }
+
+        auto scan = scan_xdg_autostart_user(SourceId::lnx_xdg_autostart_user, not_a_dir.string());
+        CHECK(scan.rows.empty());
+        CHECK(scan.support == YUZU_SUPPORT_CONSTRAINED);
+        CHECK(scan.reason.find("enotdir") != std::string::npos);
+    }
+
+    SECTION("home_root genuinely does not exist -> supported|0|absent") {
+        auto scan = scan_xdg_autostart_user(SourceId::lnx_xdg_autostart_user,
+                                            "/nonexistent/yuzu-test-home-root");
+        CHECK(scan.rows.empty());
+        CHECK(scan.support == YUZU_SUPPORT_SUPPORTED);
+        CHECK(scan.reason == "absent");
     }
 }
 
