@@ -7,9 +7,10 @@ tracks *what ships, in what order, who reviews it, and how we know it's done*. *
 with the ADRs, the ADR wins; on delivery status, this matrix is the source of truth.** The `/split`
 skill is a pointer to both and loses to both.
 
-**Verified against the tree 2026-09-07.** Re-stamp this line whenever the table is revised — a matrix
-from a stale checkout is worse than none, and the current-state claims below were wrong in the first
-draft because they were copied from stale ADR status columns. Grep the tree, don't trust a doc.
+**Verified against the tree 2026-09-09** (`origin/dev` @ `f9d1275c0`; WS-0 merged #4161, INV-31-4 global test found already-shipped #842/#3991/#3992 — WS-A4 re-scoped; the three-way lexical caveat re-verified against `check-api-parity.py` and `HttplibRouteSink`/`test_openapi_spec_completeness.cpp` in review round 2). Re-stamp
+this line whenever the table is revised — a matrix from a stale checkout is worse than none, and the
+current-state claims below were wrong in the first draft because they were copied from stale ADR status
+columns. Grep the tree, don't trust a doc.
 
 > **⚠️ Standing instruction — update on close.** Every PR that closes or materially changes the status
 > of a workstream in this matrix MUST update that row **and** re-stamp the Verified line in the SAME PR.
@@ -37,6 +38,16 @@ The first draft asserted a falsified current state; a three-model adversarial pa
   This ADR-level contradiction must be named, not assumed satisfied.
 - Absent (0 occurrences): `use_case_run_id`, the release-log store, the `evaluate_as_operator` seam — so
   the admission/grant/audit substrate (interlock c/d/h) is open while confinement (a/b-partial) shipped.
+- **The INV-31-4 GLOBAL contract test EXISTS and is green** — `scripts/ci/check-api-parity.py` (whole-tree
+  CI gate) + `tests/unit/server/test_openapi_spec_completeness.cpp` (in-process `TestRouteSink` half),
+  shipped out-of-band under **#842 / #3991 / #3992**; `/api/vN` drift is zero (196 routes / 195 OpenAPI
+  entries / 1 allowlisted CORS `OPTIONS`). **ADR-0031's "that test does not exist today" is STALE**
+  (corrected 2026-09-08). **Caveat:** it's a **LEXICAL tripwire, not a proof** (scans `server/core/src/*.cpp`
+  only) — a literal registration absent from OpenAPI fails the build; a non-literal *direct* verb call warns
+  (exit 0); a helper- or header-defined registration (e.g. a `register_*(sink, "/path", …)` helper whose
+  body makes the verb call) escapes **SILENTLY** — no warning, no failure (type-aware successor #2572). So WS-A4's contract-test half is DONE *for literal registrations*; what remains is the
+  *per-family* seam enforcement (gates WS-B2), the handler→API seam refactor, and the PII-audit relocation —
+  do NOT rebuild the global test.
 
 ---
 
@@ -118,12 +129,12 @@ Columns: **WS · Delivers · Axis · Owner · Depends · Gates cutover? · Revie
 
 | WS | Delivers | Axis | Owner | Depends | Gates? | Reviewers | Status |
 |----|----------|:---:|-------|---------|:---:|-----------|--------|
-| **WS-0** | Reconciliation & **interlock certification** — re-verify every deferred item **against the tree**; certify interlock (a)/(b#2665)/(c)/(d)/(h); certify no in-flight engine-path ballot ships before the merge-gate closes; ratify HA §1c with the **ADR-1005 owner (Dave Rae)** — **DONE: ratified decoupled 2026-09-07** (dissent recorded-with-rebuttal); bottom out #2665 as the engine-gate's real open question | — | THIS | — | **predecessor of all** | architect + security-guardian | planned |
+| **WS-0** | Reconciliation & **interlock certification** — re-verify every deferred item **against the tree**; certify interlock (a)/(b#2665)/(c)/(d)/(h); certify no in-flight engine-path ballot ships before the merge-gate closes; ratify HA §1c with the **ADR-1005 owner (Dave Rae)** — **DONE: ratified decoupled 2026-09-07** (dissent recorded-with-rebuttal); bottom out #2665 as the engine-gate's real open question. **DONE 2026-09-08** — certification `docs/security-reviews/split-ws0-interlock-certification-2026-09-08.md`; merge-gate armed as a hard CI tripwire (`tests/test_split_interlock_tripwire.py` + `tests/split_interlock_ledger.json`, wired into `docs-lint.yml`) PLUS a routed-concern row; gate CLOSED (b/c/d/h red — (b) is #2665 deny-precedence + #2675 seam); no in-flight engine-path ballot; ADR-0032 cells (a)/(m)/(f)/(h) found STALE → **#4124** (a tracked doc follow-up correcting the ADR's own table — NOT a WS-0 deliverable; the ledger+cert carry the correct state) | — | THIS | — | **predecessor of all** | architect + security-guardian | **done** |
 | **WS-A1** | Baseline execution-semantics repair (step 1); also interlock (i) | A | THIS | WS-0 | — | architect + cpp-safety | planned |
 | **WS-A2r** | In-process public-API contracts, **read/command paths** (step 2, read half) | A | THIS | WS-A1 | — | architect | planned |
 | **WS-A2a** | In-process **admission / grant / finalisation-receipt** contracts (step 2, admission half) — **under the standing merge-gate** | A | THIS | WS-A1, WS-A6(c/d/h) | — | architect + security-guardian | blocked on interlock |
 | **WS-A3** | Capability parity — the ~40–60 missing public REST+MCP capabilities, **per family** (devices, settings, `/auto`, …) | A | THIS (ADR-0031 §3) | WS-0 | feeds A4 per-family | consistency-auditor + architect | planned |
-| **WS-A4** | **Logical seam enforcement + INV-31-4 contract test** — handlers/renderers call the API, never a store pointer; build fails on any registered route absent from the published OpenAPI; **relocate behavioural-PII audit from `*_ui.cpp`/`rest_audit.hpp` to the API call** (audit continuity); resolve interlock (j) by building the test against the literal OpenAPI and saying so | A | THIS | WS-A2r, WS-A3 (that family) | **P (per family)** | architect + security-guardian + cpp-safety | planned |
+| **WS-A4** | **Logical seam enforcement + INV-31-4 contract test** — handlers/renderers call the API, never a store pointer; build fails on any registered route absent from the published OpenAPI; **relocate behavioural-PII audit from `*_ui.cpp`/`rest_audit.hpp` to the API call** (audit continuity). **⚠️ The GLOBAL drift test (interlock-(j)'s testability half only, LEXICAL — see the current-state caveat above) SHIPPED out-of-band under #842/#3991/#3992** — see the "INV-31-4 global contract test EXISTS" current-state bullet above for detail. Interlock (j)'s **generated-projection** half (#2678) stays RED — **currently unscheduled, tracked in ADR-0032 (j), owned by no workstream row** (only (j)'s testability half was ever in WS-A4's scope). **REMAINING for WS-A4:** per-family seam+contract enforcement (gates WS-B2) · handler→API seam refactor · PII-audit relocation. | A | THIS | WS-A2r, WS-A3 (that family) | **P (per family)** | architect + security-guardian + cpp-safety | **partial** — global drift test done (#842); per-family + seam refactor + PII relocation planned |
 | **WS-A5** | Input confinement — **SHIPPED** (`authorize_list_read` / `require_list_read` live; #1714/#1715/#1716 CLOSED). Residual: **#2665** (additive vs interlock-(b) deny-precedence) + `evaluate_as_operator` seam (absent) | A | /auth | WS-0 | **E** | security-guardian | shipped; #2665 open |
 | **WS-A6** | Admission/grant/audit substrate — (c) D12 audit with indexed `use_case_run_id`, (d) P7 release-log store, (h) capability-declaration registry with full credential fields. (a) shipped. **Under merge-gate** | A | /auth + exec-plan | WS-0, WS-A5 | **E** | security-guardian + architect + docs-writer | (a) shipped; c/d/h absent |
 | **WS-B1** | Drogon build canary (G10) — Drogon linked in the Meson/vcpkg matrix incl. MSVC static linkage | B | THIS | WS-0 | **P** | build-ci + cross-platform | planned |
@@ -147,7 +158,7 @@ Columns: **WS · Delivers · Axis · Owner · Depends · Gates cutover? · Revie
 - **INV-31-1** — presentation is a credential pipe: never asserts identity, mints a grant, or decides a permission.
 - **INV-31-2** — core confines inputs, the engine composes them (admit-then-filter via the shipped `authorize_list_read` chokepoint + the open #2665 deny-precedence reconciliation).
 - **INV-31-3** — no cross-component DB access: engine never touches `yuzu`, core holds no grant on `uce`, presentation owns no DB.
-- **INV-31-4** — no private core API: every registered route appears in the published OpenAPI; the build fails otherwise.
+- **INV-31-4** — no private core API: every registered route appears in the published OpenAPI; the build fails otherwise. *(Enforced today only by a LEXICAL gate — literal registrations fail the build, non-literal direct verb calls warn, helper-/header-defined registrations can escape undetected; #2572 is the type-aware closure.)*
 - **INV-31-5** — presentation's service identity attests infrastructure, not people.
 - **INV-31-6** — every store a component depends on appears in that component's readiness probe.
 - On-behalf-of rejected on every ingress (the four health-probe paths excepted); isolation enforced as-if-remote from day one; no UI-only capability; the ADR-0032 interlock standing merge-gate; **a component is extractable only when its safe-to-extract gate is fully green at the first cutover.**
@@ -167,9 +178,11 @@ Columns: **WS · Delivers · Axis · Owner · Depends · Gates cutover? · Revie
 - **Phase C — Extract engine:** **WS-B9** behind the engine gate (needs WS-B8 done + interlock (a)–(d)+(h)
   closed + #2665 resolved) → WS-B11(engine half) → finalize supervision/readyz.
 
-**Highest-leverage first slices after WS-0:** **WS-A4** (seam + INV-31-4 test — the widest Axis-A
-dependency and the presentation gate) and **WS-B1** (Drogon canary — gates presentation extraction, fully
-parallel); **WS-B11** (DB decomposition) is a third independent early start. None waits on an external
+**Highest-leverage first slices after WS-0:** **WS-A4's remaining work** — its GLOBAL INV-31-4 drift test
+already shipped (#842/#3991/#3992; do NOT rebuild it — see the current-state bullet), so what's left is the
+*per-family* seam+contract enforcement, the handler→API seam refactor, and the PII-audit relocation — plus
+**WS-B1** (Drogon canary — gates presentation extraction, fully parallel); **WS-B11** (DB decomposition) is
+a third independent early start. None waits on an external
 programme now that WS-A3 is THIS-owned per-family.
 
 ## Relationship to HA (the split *consumes* HA, does not gate it)

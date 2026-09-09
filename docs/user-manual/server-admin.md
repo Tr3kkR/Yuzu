@@ -249,6 +249,50 @@ a terminal verdict even while that replica is not the leader. Only the leader-ow
 *scheduling* half — the automatic due-policy dispatch and the periodic CRL freshness
 re-publish — pauses.)
 
+### vNEXT — scheduled instruction fires now go through a durable command outbox (HA WS-3 3.3; breaking for SIEM/audit-count assurance)
+
+Scheduled instruction fires no longer dispatch to agents inline from the
+poller. The poller now (a) creates the tracked execution row and (b) commits
+a durable `pending` occurrence to a new born-on-PG store, `CommandOutboxStore`
+(schema `command_outbox_store`); a leader-gated delivery loop drains that
+outbox and performs the actual wire dispatch. No operator action is required
+— the store's schema migration runs automatically on upgrade (fresh-start/
+no-backfill, since this store never existed before 3.3).
+
+**Behaviour changes you will see:**
+
+- **Added dispatch latency.** A scheduled fire is still enqueued within ~30
+  seconds of its due time (the poller cadence is unchanged), but actual
+  dispatch to agents now follows within ~5 seconds of enqueue via the
+  delivery loop — up to ~35 seconds total, where it was previously inline/
+  immediate.
+- **The audit trail for one scheduled fire is now two events, not one.**
+  `instruction.schedule_fired` (result `queued`) marks the enqueue; a new
+  `command.outbox_delivered` (result `success`/`failure`/`denied`) marks the
+  actual delivery outcome. **Any SIEM correlation rule or audit-count
+  assurance built on "one audit event per scheduled fire" must be updated**
+  to expect the pair, or to key off `command.outbox_delivered` for the
+  delivery outcome.
+- **New metrics.** Eight counters and a backlog gauge —
+  `yuzu_server_command_outbox_*` — cover enqueue-side degrade and the
+  delivery loop's outcomes (delivered / no-agents / denied / retry / errors /
+  decode-failed / degrade) plus `yuzu_server_command_outbox_pending`, the
+  primary signal that scheduled dispatch has stalled. Full reference:
+  `docs/user-manual/metrics.md` "Command outbox delivery metrics".
+- **ADR-1007 per-device concurrency is no longer enforced for scheduled
+  fires.** The inline path previously resolved a `concurrency_mode` and
+  gated on it; the outbox delivery path dispatches on the plain confined
+  path without that claim. This is a deliberate, tracked gap — restoring
+  per-device concurrency enforcement for the outbox path is a follow-up, not
+  an oversight.
+
+**Rollback note:** a `pending` outbox row committed by a 3.3-or-later binary
+is invisible to a pre-3.3 binary, which has no outbox reader. Rolling back
+mid-flight leaves that occurrence undelivered until you roll forward again —
+a narrow window, and no data corruption (the row stays durable in Postgres
+and delivers as soon as a 3.3-or-later binary is running and holds
+leadership).
+
 ### vNEXT — gateway management plane now pins its peer (#1422, breaking for custom gateway configs)
 
 The gateway's `:50063` command plane requires, on any network-reachable
@@ -534,6 +578,58 @@ operator-set grant. This is long-standing behaviour for every seeded
 securable, not new here, but it is worth knowing before you narrow a built-in
 role: express the narrowing as a **custom role** or an explicit `deny` row
 instead, both of which survive a restart.
+
+### vNEXT — three new securables for directory-sync and enrollment reads; `Viewer` auto-gains `Directory:Read` (#4031) (breaking)
+
+**Who this affects.** RBAC-**enabled** deployments with a **custom** role
+that reads AD/Entra directory-synced users, or that previously reached the
+directory-sync status / enrollment auto-approve rules / pending-agent list /
+OIDC config surfaces before this release added dedicated REST v1 routes for
+them.
+
+**What changes automatically.** Three new securables — `Directory`,
+`Enrollment`, `OidcConfig` — are seeded idempotently on every boot
+(`RbacStore::seed_defaults()`), same mechanism as `EnginePrincipal` above.
+Their built-in-role grants are **not symmetric**, unlike `EnginePrincipal`:
+
+- `Directory:Read` is seeded to **both** `Administrator` and `Viewer` —
+  matching the precedent set for other identity-adjacent PII reads
+  (`UserManagement`). A custom role that previously relied on **not**
+  inheriting directory-user PII visibility from a `Viewer`-equivalent grant
+  set should check whether that matters for its use — this is a genuine
+  **widening** of what `Viewer`-derived roles can see, not a like-for-like
+  securable split the way `EnginePrincipal:Read` was. **RBAC-enabled
+  deployments get more than a widening here, though:** `Directory` was
+  never seeded to *any* role before this release, despite `GET
+  /api/directory/users`/`/directory/status`/`/directory/sync` already
+  gating on it — under RBAC-**enabled** enforcement this denied **every**
+  role, including `Administrator`, not just non-`Viewer` custom roles. If
+  your RBAC-enabled deployment could never reach the legacy directory-sync
+  routes even as an admin, this release fixes that dead zone; the "Viewer
+  gains new PII visibility" framing above only tells the RBAC-**disabled**
+  half of the story.
+- `Enrollment:Read` and `OidcConfig:Read` are seeded to `Administrator`
+  **only** — `Viewer` deliberately does NOT gain either, since these gate
+  the fleet's enrollment admission policy and SSO configuration rather than
+  identity/inventory data. Both are also added to the authorization
+  topology floor (see the #2376 note above), so an RBAC-**disabled**
+  install denies them to a non-admin the same way it now denies
+  `AccessReview:Read`/`UserManagement:Read`/`EnginePrincipal:Read`.
+
+**What to do.** No action needed for `Administrator`/`Viewer` — the seed
+loop picks these up automatically. If a custom role needs
+`Enrollment:Read`/`OidcConfig:Read`, grant it directly (no built-in
+non-admin role holds either). If a custom role's exposure to directory-user
+PII via an inherited `Viewer`-shaped permission set is a concern, review it
+explicitly — the auto-grant is intentional but new.
+
+**Also new in this release:** the legacy `GET /api/directory/users` route
+(pre-existing, not new in #4031) previously issued **no audit call at all**
+despite returning PII; it is now audited as `directory.users.view`, though
+via a fire-and-forget path that cannot detect a dropped audit row — see
+[`audit-log.md`](audit-log.md)'s `directory.users.view` row for the full
+three-way posture (REST v1 fail-closed / MCP set-and-proceed-with-signal /
+legacy silent).
 
 ### vNEXT — approval tickets outstanding at the upgrade must be re-requested (#2442) (breaking)
 

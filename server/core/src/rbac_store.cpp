@@ -557,6 +557,7 @@ void RbacStore::seed_defaults() {
 
     // Securable types.
     const std::array<std::string_view, 35> types = {
+    const std::array<std::string_view, 36> types = {
         "Infrastructure",  "UserManagement",  "InstructionDefinition",
         "InstructionSet",  "Execution",       "Schedule",
         "Approval",        "Tag",             "AuditLog",
@@ -640,6 +641,35 @@ void RbacStore::seed_defaults() {
         // and keep the loop uniform); ITServiceOwner gets a TARGETED
         // Decommission:Delete grant below (see that grant's comment).
         "Decommission"};
+        // #4031 prerequisite 1: "Directory" is called at discovery_routes.cpp
+        // (perm_fn(..., "Directory", "Read"/"Write")) but was NEVER seeded
+        // here — role_permissions.securable_type has a hard FK to
+        // securable_types(name), so no role, including Administrator, could
+        // ever be granted Directory:Read/Write. Seeded to Administrator (CRUD
+        // via the loop below) + Viewer (Read, below) — same precedent as
+        // UserManagement (also PII-bearing identity data; Operator/
+        // PlatformEngineer deliberately do NOT get it, narrower than the
+        // Inventory/SoftwareLicensing fleet-metadata pattern since this is
+        // AD/Entra-synced email/UPN/group-membership PII, not device
+        // inventory). Scoped to ONLY this securable — the identical bug on
+        // ProductPack/Workflow is #4029/#4030's job, not this PR's (#4032
+        // tracks the general pattern).
+        "Directory",
+        // #4031 routes 3-4 (auto-approve rules + pending-agent visibility):
+        // previously admin_fn_-gated (a role check, not RBAC), so no
+        // securable existed at all. Read granted to Administrator ONLY via
+        // the CRUD loop below, matching today's admin-only gate — see
+        // authz_topology_floor.hpp for why this pair must ALSO be floored so
+        // RBAC-off doesn't silently widen admin-only to any-authenticated-user.
+        "Enrollment",
+        // #4031 route 5 (OIDC SSO config read, GET /fragments/settings/directory
+        // despite the path). Deliberately NOT named "Directory" — that would
+        // collide with the AD/Entra directory-sync securable seeded above for
+        // a wholly unrelated capability (the naming trap the issue calls out).
+        // Read granted to Administrator ONLY, same admin-only-gate parity and
+        // same topology-floor requirement as Enrollment above.
+        "OidcConfig"
+    };
     for (auto t : types)
         exec("INSERT INTO rbac_store.securable_types (name, is_system) VALUES ($1, TRUE) "
              "ON CONFLICT (name) DO NOTHING",
@@ -912,11 +942,17 @@ void RbacStore::seed_defaults() {
     // #2376 (task A) — Viewer held Security:Read (the only non-Administrator
     // role that did), so it keeps equivalent access on the new
     // EnginePrincipal securable.
-    for (std::string_view t : {"UserManagement", "InstructionDefinition", "InstructionSet",
-                               "Execution", "Schedule", "Approval", "Tag", "AuditLog", "Response",
-                               "ManagementGroup", "ApiToken", "Security", "Policy", "DeviceToken",
-                               "SoftwareDeployment", "License", "FileRetrieval", "GuaranteedState",
-                               "Inventory", "SoftwareLicensing", "EnginePrincipal",
+    // #4031: Directory (AD/Entra-synced user/group PII) joins on the same
+    // reasoning as UserManagement just above it — both are identity data,
+    // and Viewer already reads UserManagement. Enrollment/OidcConfig
+    // deliberately do NOT join this list — see their seeding comment in
+    // types[] above ("Administrator ONLY, matching today's admin-only gate").
+    for (std::string_view t : {"UserManagement", "Directory", "InstructionDefinition",
+                               "InstructionSet", "Execution", "Schedule", "Approval", "Tag",
+                               "AuditLog", "Response", "ManagementGroup", "ApiToken", "Security",
+                               "Policy", "DeviceToken", "SoftwareDeployment", "License",
+                               "FileRetrieval", "GuaranteedState", "Inventory",
+                               "SoftwareLicensing", "EnginePrincipal",
                                "Workflow", // #4030: read-only, matching Schedule's footprint.
                                // #4029: read visibility on installed product packs.
                                "ProductPack"})
