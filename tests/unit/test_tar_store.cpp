@@ -143,6 +143,45 @@ TEST_CASE("TarDatabase: purge_source drops ALL tiers for one source, leaves othe
     CHECK(count("tcp_hourly") == 1); // ...across all of its tiers
 }
 
+TEST_CASE("TarDatabase: purge_source usage also erases usage_daily_user",
+          "[tar][store][purge]") {
+    // Wave 7 PR7.2 adversarial review (Blocker 2, part 2): usage_daily_user
+    // has no tier of its own in the schema registry (composite PRIMARY
+    // KEY(day_ts, exe_key, user), no `id` column), so the generic
+    // granularity walk purge_source() otherwise uses can never reach it --
+    // an operator-initiated tar.purge_source usage would leave every
+    // username behind. Confirms the explicit extra delete in
+    // TarDatabase::purge_source erases it atomically with the registered
+    // usage_live/usage_daily tiers.
+    auto t = make_test_db();
+    REQUIRE(t.db.execute_sql(
+        "INSERT INTO usage_live (ts, snapshot_id, action, pid, exe_key, user, start_ts) "
+        "VALUES (1000, 0, 'open', 1, 'app.exe', 'alice', 1000)"));
+    REQUIRE(t.db.execute_sql(
+        "INSERT INTO usage_daily (day_ts, exe_key, run_count, total_seconds, first_seen, "
+        "last_seen, distinct_users, superseded_runs, expired_runs) VALUES "
+        "(86400, 'app.exe', 1, 10, 1000, 1000, 1, 0, 0)"));
+    REQUIRE(t.db.execute_sql("INSERT INTO usage_daily_user (day_ts, exe_key, user) VALUES "
+                             "(86400, 'app.exe', 'alice')"));
+
+    auto count = [&](const std::string& table) {
+        auto r = t.db.execute_query("SELECT COUNT(*) FROM " + table);
+        REQUIRE(r.has_value());
+        REQUIRE(!r->rows.empty());
+        return std::stoi(r->rows[0][0]);
+    };
+    REQUIRE(count("usage_live") == 1);
+    REQUIRE(count("usage_daily") == 1);
+    REQUIRE(count("usage_daily_user") == 1);
+
+    auto res = t.db.purge_source("usage");
+    REQUIRE(res.has_value());
+    CHECK(*res == 3); // usage_live + usage_daily + usage_daily_user
+    CHECK(count("usage_live") == 0);
+    CHECK(count("usage_daily") == 0);
+    CHECK(count("usage_daily_user") == 0); // the falsifier -- previously left behind
+}
+
 TEST_CASE("TarDatabase: purge_source rejects an unknown source", "[tar][store][purge]") {
     auto t = make_test_db();
     auto res = t.db.purge_source("not_a_source");

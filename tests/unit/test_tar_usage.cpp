@@ -39,6 +39,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -135,6 +136,15 @@ TestTarDb make_test_db() {
     ensure_usage_schema(*result);
     result->set_config("process_enabled", "true");
     result->set_config("usage_enabled", "true");
+    // Blocker 3's forward-only coverage gate (tar_usage.cpp) makes
+    // run_usage_fold() refuse to consume ANY process_live row until a
+    // successful baseline has stamped usage_coverage_since. Every existing
+    // fold-behavior test in this file assumes that baseline already
+    // happened (mirroring a real boot that already ran tar_plugin.cpp's
+    // rebaseline) -- set it here so those tests are unaffected. Tests that
+    // specifically exercise the gate/self-heal behavior delete this key
+    // first.
+    result->set_config("usage_coverage_since", "0");
     return TestTarDb{std::move(*result), tmp};
 }
 
@@ -562,6 +572,7 @@ TEST_CASE("tar_usage: an open run survives a simulated agent restart and closes 
         ensure_usage_schema(db);
         db.set_config("process_enabled", "true");
         db.set_config("usage_enabled", "true");
+        db.set_config("usage_coverage_since", "0"); // baseline already established -- see make_test_db()
         REQUIRE(db.insert_process_events({mk(1000, "started", 1, "app", "alice")}));
         auto result = run_usage_fold(db, /*now=*/1001);
         REQUIRE(result.ok);
@@ -601,7 +612,7 @@ TEST_CASE("tar_usage: usage_rebaseline clears open runs and stamps coverage_sinc
     REQUIRE(before.has_value());
     CHECK(before->rows[0][0] == "1"); // one open run persisted
 
-    usage_rebaseline(t.db, /*now=*/5000);
+    REQUIRE(usage_rebaseline(t.db, /*now=*/5000).has_value());
 
     auto after = t.db.execute_query("SELECT COUNT(*) FROM usage_live");
     REQUIRE(after.has_value());
@@ -638,4 +649,185 @@ TEST_CASE("tar_usage: usage_daily never carries pid, cmdline, or user columns",
         CHECK(name != "cmdline");
         CHECK(name != "user");
     }
+}
+
+// ── Blocker 1: a partial mid-batch statement failure must not advance hwm ───
+
+TEST_CASE("tar_usage: a partial mid-batch statement failure leaves hwm and counters "
+         "unadvanced -- not just committed==true with one row skipped",
+         "[tar_usage]") {
+    // Wave 7 PR7.2 adversarial review (Blocker 1): TarDatabase::
+    // execute_atomic_batch is documented as deliberately NOT all-or-nothing
+    // on a transaction-preserving error -- a `committed==true` batch can
+    // still have flagged ONE statement failed while every OTHER statement
+    // in that SAME commit, including a later tar_config upsert, is fully
+    // durable. Reproduce the concrete trigger the review cited: dropping
+    // usage_daily's own unique index (mirrors a stuck-at-schema-5 migration
+    // failure) makes the very first usage_daily upsert's
+    // `ON CONFLICT(day_ts, exe_key)` clause fail with a plain,
+    // transaction-preserving SQLITE_ERROR ("no matching PRIMARY KEY or
+    // UNIQUE constraint") -- exactly the shape execute_atomic_batch flags
+    // and continues past rather than rolling back.
+    //
+    // MUTATION-VERIFY: manually reverted the fix (restored the single
+    // execute_atomic_batch call with hwm/counters bundled into the data
+    // statements, checking only `!batch.committed`) and re-ran this test --
+    // it failed as expected (usage_hwm_id read back "2", not "0"), proving
+    // this test does exercise the split-batch guard. Reverted before
+    // writing the patch.
+    auto t = make_test_db();
+    REQUIRE(t.db.execute_sql("DROP INDEX usage_daily_day_exe_uq"));
+    REQUIRE(t.db.insert_process_events(
+        {mk(1000, "started", 1, "app", "alice"), mk(1010, "stopped", 1, "app", "alice")}));
+
+    auto result = run_usage_fold(t.db, /*now=*/2000);
+
+    CHECK(!result.ok);
+    CHECK(!result.error.empty());
+    CHECK(result.hwm_id == 0); // unchanged in the returned result
+
+    // The falsifier: the OLD code left result.ok=false but the DB's own
+    // usage_hwm_id row still advanced, because it shared a commit with the
+    // failed usage_daily insert. Confirm the persisted config did NOT move.
+    CHECK(t.db.get_config("usage_hwm_id", "0") == "0");
+    CHECK(t.db.get_config("usage_last_fold_ts", "0") == "0");
+
+    auto rows = t.db.execute_query("SELECT COUNT(*) FROM usage_daily");
+    REQUIRE(rows.has_value());
+    CHECK(rows->rows[0][0] == "0");
+}
+
+// ── Blocker 3: the forward-only boundary self-heals and never replays ──────
+
+TEST_CASE("tar_usage: a missing coverage marker self-heals via rebaseline and never folds "
+         "pre-existing rows",
+         "[tar_usage]") {
+    // Wave 7 PR7.2 adversarial review (Blocker 3): the fold must never
+    // consume a process_live row before a successful baseline transaction
+    // establishes coverage. Simulate a DB whose earlier rebaseline never
+    // ran (or never completed) by removing the marker make_test_db() sets.
+    auto t = make_test_db();
+    REQUIRE(t.db.execute_sql("DELETE FROM tar_config WHERE key = 'usage_coverage_since'"));
+
+    // Pre-existing process history the fold must NEVER consume once it
+    // establishes coverage (forward-only, rule 5).
+    REQUIRE(t.db.insert_process_events({mk(1000, "started", 1, "preexisting", "alice"),
+                                        mk(1010, "stopped", 1, "preexisting", "alice")}));
+
+    auto first = run_usage_fold(t.db, /*now=*/5000);
+    CHECK(first.ok);
+    CHECK(first.hwm_id == 2); // self-healed baseline = MAX(id) as of now
+    CHECK(t.db.get_config("usage_coverage_since", "") == "5000");
+
+    auto rows = t.db.execute_query("SELECT COUNT(*) FROM usage_daily");
+    REQUIRE(rows.has_value());
+    CHECK(rows->rows[0][0] == "0"); // the pre-existing run was never folded
+
+    // A genuinely NEW event after the baseline IS folded normally.
+    REQUIRE(t.db.insert_process_events({mk(6000, "started", 2, "fresh", "bob"),
+                                        mk(6010, "stopped", 2, "fresh", "bob")}));
+    auto second = run_usage_fold(t.db, /*now=*/7000);
+    CHECK(second.ok);
+    CHECK(second.runs_closed == 1);
+    rows = t.db.execute_query("SELECT exe_key FROM usage_daily");
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->rows.size() == 1);
+    CHECK(rows->rows[0][0] == "fresh");
+}
+
+TEST_CASE("tar_usage: a rebaseline transaction failure leaves coverage absent and refuses to "
+         "fold -- retried, never disarmed",
+         "[tar_usage]") {
+    // MUTATION-VERIFY: manually reverted the Blocker 3 fix (dropped the
+    // coverage gate from run_usage_fold, restoring the old shape gated
+    // only on the two enable flags) and re-ran this test -- it failed as
+    // expected (`retry.ok` folded the pre-existing row this test seeds
+    // rather than refusing it, and usage_coverage_since read back a value
+    // set from an earlier, unrelated path rather than being genuinely
+    // gated here). Reverted before writing the patch.
+    auto t = make_test_db();
+    REQUIRE(t.db.execute_sql("DELETE FROM tar_config WHERE key = 'usage_coverage_since'"));
+    REQUIRE(t.db.insert_process_events({mk(1000, "started", 1, "app", "alice")}));
+    REQUIRE(t.db.execute_sql("PRAGMA busy_timeout = 0"));
+
+    sqlite3* raw = nullptr;
+    REQUIRE(sqlite3_open(t.path.string().c_str(), &raw) == SQLITE_OK);
+    char* err = nullptr;
+    REQUIRE(sqlite3_exec(raw, "BEGIN EXCLUSIVE", nullptr, nullptr, &err) == SQLITE_OK);
+
+    auto result = run_usage_fold(t.db, /*now=*/2000);
+
+    sqlite3_exec(raw, "ROLLBACK", nullptr, nullptr, nullptr);
+    sqlite3_close(raw);
+
+    CHECK(!result.ok);
+    CHECK(t.db.get_config("usage_coverage_since", "") == ""); // still absent -- retry next tick
+
+    // Retry with the lock released: rebaseline succeeds, and the
+    // pre-existing row is STILL never folded (it predates the baseline).
+    auto retry = run_usage_fold(t.db, /*now=*/2001);
+    CHECK(retry.ok);
+    CHECK(t.db.get_config("usage_coverage_since", "") == "2001");
+    auto rows = t.db.execute_query("SELECT COUNT(*) FROM usage_daily");
+    REQUIRE(rows.has_value());
+    CHECK(rows->rows[0][0] == "0");
+}
+
+// ── Should-fix 2: supersede-path clamp + extreme-timestamp overflow ────────
+
+TEST_CASE("tar_usage: a backward clock step across a supersede clamps duration to 0 and counts "
+         "an anomaly",
+         "[tar_usage]") {
+    // Wave 7 PR7.2 adversarial review (should-fix 2): the duplicate-start
+    // supersede-close path was never clamped for backward clock movement,
+    // unlike the "stopped" path -- reviewers measured duration=-1000 with
+    // clock_anomalies never incremented before this fix.
+    FoldState state;
+    auto first = apply_event(state, mk(1000, "started", 1, "app", "alice"));
+    CHECK(!first.has_value()); // nothing superseded yet
+
+    // A NEW "started" for the SAME (pid, exe_key) arrives with ts BEFORE the
+    // still-open run's start_ts -- a backward clock step across the
+    // supersede boundary.
+    auto second = apply_event(state, mk(500, "started", 1, "app", "alice"));
+    REQUIRE(second.has_value());
+    CHECK(second->kind == ClosedRun::Kind::superseded);
+    CHECK(second->start_ts == 1000);
+    CHECK(second->end_ts == 1000);   // clamped -- never negative
+    CHECK(second->end_ts >= second->start_ts);
+    CHECK(state.clock_anomalies == 1);
+}
+
+TEST_CASE("tar_usage: expire_open_runs does not overflow on an extreme start_ts",
+         "[tar_usage]") {
+    // Wave 7 PR7.2 adversarial review (should-fix 2): `now - start_ts` in
+    // the previous expire_open_runs overflowed UB when start_ts was an
+    // extreme value (e.g. INT64_MIN) and now was a plausible epoch second
+    // -- reproduced under UBSan. The fix (saturating_sub) makes this safe;
+    // this test is UBSan-catchable (a sanitizer build traps the raw
+    // subtraction where this test would otherwise pass silently on a
+    // release build that happens not to crash).
+    FoldState state;
+    OpenRun run;
+    run.pid = 1;
+    run.exe_key = "app";
+    run.user = "alice";
+    run.start_ts = std::numeric_limits<int64_t>::min();
+    state.open[{run.pid, run.exe_key}] = run;
+
+    auto closed = expire_open_runs(state, /*now=*/1000);
+    REQUIRE(closed.size() == 1);
+    CHECK(closed[0].kind == ClosedRun::Kind::expired);
+    CHECK(closed[0].end_ts == closed[0].start_ts); // 0s duration, never fabricated
+    CHECK(state.open.empty());
+}
+
+TEST_CASE("tar_usage: day_ts_for does not overflow on INT64_MIN", "[tar_usage]") {
+    // Companion to the expire_open_runs overflow test: fold_daily() (and
+    // tar_usage.cpp's usage_daily_user bucketing) used to negate a negative
+    // start_ts directly, which overflows for INT64_MIN. day_ts_for()
+    // avoids the negation entirely.
+    const int64_t d = day_ts_for(std::numeric_limits<int64_t>::min());
+    CHECK(d % 86400 == 0);
+    CHECK(d <= std::numeric_limits<int64_t>::min() + 86400);
 }

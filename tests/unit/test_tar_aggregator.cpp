@@ -23,6 +23,8 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -900,6 +902,29 @@ void seed_process_monthly_at(TarDatabase& db, int64_t ts, int count) {
                                            ts)));
     }
     REQUIRE(db.execute_sql("COMMIT"));
+}
+
+// usage_daily / usage_daily_user seed helpers (Wave 7 PR7.2 adversarial
+// review, Blocker 2). usage_daily_user has no `id` column (composite
+// PRIMARY KEY(day_ts, exe_key, user)), so it cannot reuse a helper shaped
+// for the generic per-tier tables above.
+void seed_usage_daily_at(TarDatabase& db, int64_t day_ts, int count) {
+    REQUIRE(db.execute_sql("BEGIN TRANSACTION"));
+    for (int i = 0; i < count; ++i) {
+        REQUIRE(db.execute_sql(std::format(
+            "INSERT INTO usage_daily (day_ts, exe_key, run_count, total_seconds, first_seen, "
+            "last_seen, distinct_users, superseded_runs, expired_runs) VALUES "
+            "({}, 'app{}.exe', 1, 10, {}, {}, 1, 0, 0)",
+            day_ts, i, day_ts, day_ts)));
+    }
+    REQUIRE(db.execute_sql("COMMIT"));
+}
+
+void seed_usage_daily_user_at(TarDatabase& db, int64_t day_ts, const std::string& exe_key,
+                              const std::string& user) {
+    REQUIRE(db.execute_sql(std::format(
+        "INSERT INTO usage_daily_user (day_ts, exe_key, user) VALUES ({}, '{}', '{}')", day_ts,
+        exe_key, user)));
 }
 
 struct TarGuardFixture {
@@ -2258,4 +2283,91 @@ TEST_CASE("TAR #2573: a stale Wipe entry is erased, not left dangling, when NoAn
     run_retention(*f.db, kT0 + 2, f.guard);
     CHECK(declines_of(f.guard, "process_hourly") == 3);
     CHECK(row_count(*f.db, "process_hourly") == 5);
+}
+
+// ── usage_daily_user clock-guard inheritance (Wave 7 PR7.2 Blocker 2) ───────
+
+TEST_CASE("TAR usage_daily_user retention piggybacks on usage_daily's DECLINE verdict",
+         "[tar][retention][usage]") {
+    // usage_daily_user has no tier of its own in the schema registry, so it
+    // cannot receive an independent clock-guard verdict -- it is queued
+    // under usage_daily's ALREADY-COMPUTED verdict (see run_retention's
+    // "usage"+"daily" special case and docs/clock-guarded-retention.md's
+    // usage_daily_user entry). Prove the falsifier: when usage_daily's guard
+    // DECLINES (a would-wipe every-row-expired condition), usage_daily_user
+    // rows for the SAME stale day must survive too, not just usage_daily's.
+    TarGuardFixture f;
+    constexpr int64_t kUsageDailyRetentionSec = 2678400; // 31 days, schema registry
+    const int64_t old_day = kT0 - 10 * kUsageDailyRetentionSec;
+    seed_usage_daily_at(*f.db, old_day, 3);
+    for (int i = 0; i < 3; ++i)
+        seed_usage_daily_user_at(*f.db, old_day, std::format("app{}.exe", i), "alice");
+
+    run_retention(*f.db, kT0, f.guard);
+
+    CHECK(declines_of(f.guard, "usage_daily") == 1);
+    CHECK(row_count(*f.db, "usage_daily") == 3);       // preserved -- declined
+    CHECK(row_count(*f.db, "usage_daily_user") == 3); // the falsifier -- inherited the decline
+}
+
+TEST_CASE("TAR usage_daily_user retention piggybacks on usage_daily's ACCEPTED verdict",
+         "[tar][retention][usage]") {
+    // The mirror case: once usage_daily's guard ACCEPTS (a survivor defeats
+    // would-wipe), usage_daily_user's own expired rows are pruned in the
+    // SAME pass, under the SAME cutoff -- not left behind as a second,
+    // independently-timed table.
+    TarGuardFixture f;
+    constexpr int64_t kUsageDailyRetentionSec = 2678400;
+    const int64_t old_day = kT0 - 2 * kUsageDailyRetentionSec;    // expired
+    const int64_t recent_day = kT0 - 3600;                       // survivor
+    seed_usage_daily_at(*f.db, old_day, 3);
+    seed_usage_daily_at(*f.db, recent_day, 1);
+    for (int i = 0; i < 3; ++i)
+        seed_usage_daily_user_at(*f.db, old_day, std::format("app{}.exe", i), "alice");
+    seed_usage_daily_user_at(*f.db, recent_day, "survivor.exe", "bob");
+
+    run_retention(*f.db, kT0, f.guard);
+
+    CHECK(declines_of(f.guard, "usage_daily") == 0); // accepted -- a survivor defeats would_wipe
+    CHECK(row_count(*f.db, "usage_daily") == 1);      // only the recent row survives
+    CHECK(row_count(*f.db, "usage_daily_user") == 1); // pruned together, same cutoff
+}
+
+TEST_CASE("docs/clock-guarded-retention.md records usage_daily_user's adoption decision",
+         "[tar][retention][usage][docs]") {
+    // Wave 7 PR7.2 adversarial review, Blocker 2's falsifier: the doc's
+    // per-store adoption register must carry a deliberate entry for
+    // usage_daily_user (adopt-by-inheritance, in this case) -- part 6 of the
+    // clock-guarded-retention contract requires the reasoning be RECORDED,
+    // not just correct in code. Resolve the doc without assuming the
+    // working directory, mirroring test_guardian_journal_heartbeat.cpp's
+    // find_doc() pattern.
+    const auto find_doc = []() -> std::filesystem::path {
+        const std::filesystem::path rel{"docs/clock-guarded-retention.md"};
+        for (auto base : {std::filesystem::current_path(),
+                          std::filesystem::absolute(std::filesystem::path(__FILE__))
+                              .parent_path()}) {
+            for (int up = 0; up < 6; ++up) {
+                auto cand = base / rel;
+                if (std::filesystem::exists(cand))
+                    return cand;
+                if (!base.has_parent_path())
+                    break;
+                base = base.parent_path();
+            }
+        }
+        return {};
+    };
+    const std::filesystem::path doc = find_doc();
+    INFO("resolved doc path: " << doc.string());
+    REQUIRE_FALSE(doc.empty());
+
+    std::ifstream in(doc);
+    const std::string text((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+    REQUIRE_FALSE(text.empty());
+    CHECK(text.find("usage_daily_user") != std::string::npos);
+    // The register entry must actually decide something, not just mention
+    // the table's name in passing elsewhere in the doc.
+    CHECK(text.find("### `usage_daily_user`") != std::string::npos);
 }
