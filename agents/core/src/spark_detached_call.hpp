@@ -190,18 +190,24 @@ struct Cell {
     bool abandoned{false}; // guarded by mu
     std::unique_ptr<DetachedResult<T>> result; // guarded by mu. `taken` is the SOLE re-entry/
                                                // validity gate for this field, independent of
-                                               // its nullness: it can be null (never boxed, a
-                                               // ResultAllocFailed publish), moved-from-non-null
-                                               // (an ordinary take_locked() success), or
-                                               // moved-from-and-null (dispose_or_abandon()'s
-                                               // published-but-untaken path) once `taken` is
-                                               // true - see take_locked()'s own comment for why
-                                               // the pointer is deliberately never reset
-                                               // (Gate 4 re-review finding: an earlier version
-                                               // of THIS comment claimed a blanket "not null
-                                               // after take()", true of only one of those three
-                                               // reachable states - dropped the nullability
-                                               // claim rather than re-narrowing it again)
+                                               // its nullness. Exactly two states are reachable
+                                               // once `taken` is true (colleague review, PR
+                                               // #4190: take_locked() used to leave this
+                                               // engaged-but-moved-from on a successful take -
+                                               // a THIRD state this comment used to document -
+                                               // until that shape was found to force T's
+                                               // disposal under this same lock via a different
+                                               // route; take_locked() now moves the WHOLE box
+                                               // out on every taking path, so "moved-from-non-
+                                               // null" is no longer reachable here at all):
+                                               // null (never boxed, a ResultAllocFailed
+                                               // publish - take_locked() never touches this
+                                               // field), or null-because-moved-out (an ordinary
+                                               // take_locked() success, or dispose_or_abandon()'s
+                                               // published-but-untaken path - both move the
+                                               // unique_ptr itself out under this lock; see
+                                               // take_locked()'s and dispose_or_abandon()'s own
+                                               // comments)
 };
 
 /// Shared per-lane state: the admission cap/count, the shared agent-lifetime
@@ -468,8 +474,13 @@ private:
     /// return. noexcept: T's move is compile-time enforced nothrow by
     /// launch()'s static_assert(is_nothrow_move_constructible_v<T>), and
     /// DetachedCallError is a trivially-movable enum, so DetachedResult<T>'s
-    /// (std::expected's) move ctor is itself noexcept, as is optional's
-    /// converting constructor from it.
+    /// (std::expected's) move ctor is standard-specified noexcept given
+    /// those two - nothing in this function's body can throw either way it
+    /// resolves, which is what this function's own noexcept relies on (the
+    /// standard does not itself mandate optional's converting constructor
+    /// carry a matching conditional-noexcept the way optional's own move
+    /// constructor does; not load-bearing here, since the move it performs
+    /// cannot throw regardless).
     static std::optional<DetachedResult<T>>
     unbox(std::optional<std::unique_ptr<DetachedResult<T>>> boxed) noexcept {
         if (!boxed)
@@ -684,17 +695,25 @@ public:
             "throwing move there would leave that handoff in an indeterminate state (see "
             "this file's header comment, 'Ownership fix').");
         static_assert(
-            std::is_rvalue_reference_v<Fn&&>,
-            "SparkDetachedLane::launch: fn must be passed as an rvalue (a temporary, or an "
-            "lvalue wrapped in std::move()) - colleague review, PR #4190: an lvalue Fn "
-            "deduces Fn = DFn&, and the Rejected/LaunchFailed hand-back path "
-            "(r.fn.emplace(std::forward<Fn>(fn_in))) would then COPY-construct DFn instead "
-            "of moving it. Only DFn's MOVE constructor is required nothrow above - its copy "
-            "constructor is unconstrained and may throw, which would make launch() itself "
-            "throw on the Rejected/LaunchFailed path, contradicting this function's "
-            "documented {status, fn} contract (see 'Ownership fix' in the file header "
-            "comment). Every caller in this file's own tests already passes a prvalue "
-            "lambda, so this closes a hazard with no current caller, not a live defect.");
+            std::is_same_v<Fn, DFn>,
+            "SparkDetachedLane::launch: fn must be passed as an rvalue of exactly its own "
+            "value type (a temporary, or an lvalue wrapped in std::move()) - colleague "
+            "review, PR #4190, tightened twice: an lvalue Fn deduces Fn = DFn&, and the "
+            "Rejected/LaunchFailed hand-back path (r.fn.emplace(std::forward<Fn>(fn_in))) "
+            "would then COPY-construct DFn instead of moving it - only DFn's MOVE "
+            "constructor is required nothrow above, its copy constructor is unconstrained "
+            "and may throw, which would make launch() itself throw on the Rejected/"
+            "LaunchFailed path, contradicting this function's documented {status, fn} "
+            "contract (see 'Ownership fix' in the file header comment). A first version of "
+            "this assert used is_rvalue_reference_v<Fn&&>, which a CONST-qualified rvalue "
+            "(e.g. `const auto fn = ...; lane.launch(std::move(fn));`, deducing Fn = const "
+            "DFn, so Fn&& = const DFn&&) still satisfies while silently falling back to the "
+            "same unconstrained copy constructor this assert exists to foreclose, since a "
+            "const rvalue cannot bind DFn's move constructor - is_same_v<Fn, DFn> forecloses "
+            "both the lvalue-reference and the const-qualified-rvalue case in one predicate "
+            "(two independent Gate 8 reviewers found the same gap in the same session). "
+            "Every caller in this file's own tests already passes a plain prvalue lambda, so "
+            "this closes a hazard with no current caller, not a live defect.");
 
         using Result = DetachedLaunchResult<T, DFn>;
         using P = detached_detail::Payload<T, DFn>;
