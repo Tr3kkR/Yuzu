@@ -795,7 +795,17 @@ public:
             // Read succeeded and matched no row -- genuinely absent, not a
             // transient failure (a failed read here retries at the next boot
             // rather than risk re-baselining on every restart of a healthy DB).
-            yuzu::tar::usage::usage_rebaseline(*db_, now_epoch_seconds());
+            // A failure here is not fatal at BOOT: run_usage_fold() itself
+            // (tar_usage.cpp, Blocker 3 fix) checks the same marker on every
+            // fast tick and retries the rebaseline there, so a transient
+            // failure at this one boot-time attempt does not permanently
+            // disarm the forward-only guarantee.
+            if (auto rb = yuzu::tar::usage::usage_rebaseline(*db_, now_epoch_seconds());
+                !rb.has_value()) {
+                spdlog::warn("TAR: boot-time usage rebaseline failed ({}); the fast-tick fold "
+                            "will retry it",
+                            rb.error());
+            }
         }
 #ifdef _WIN32
         // Construct the Windows ETW image-load collector; the session is STARTED

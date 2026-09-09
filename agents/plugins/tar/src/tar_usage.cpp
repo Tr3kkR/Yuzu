@@ -4,14 +4,27 @@
  *
  * run_usage_fold() is the ONE entry point tar_plugin.cpp's collect_fast_impl
  * calls, once per fast tick, after both process feeders (gap-free stream or
- * snapshot-diff poll) have inserted for that tick. Everything it writes --
- * usage_daily, usage_daily_user, usage_live's open-run set, and every
- * tar_config counter below -- commits as ONE execute_atomic_batch
- * transaction. On ANY failure the whole pass rolls back: usage_hwm_id is
- * UNCHANGED, so the next successful tick re-reads from the same point (a run
- * of failures cannot lose data silently -- the MIN(id) gap check on the next
- * successful fold reports whatever process_live's retention prune took
- * meanwhile, exactly as if this tick had never run at all).
+ * snapshot-diff poll) have inserted for that tick. It writes usage_daily,
+ * usage_daily_user, and usage_live's open-run set in ONE execute_atomic_batch
+ * transaction (the DATA batch); usage_daily_user's own RETENTION prune is
+ * NOT here -- it runs under tar_aggregator.cpp's clock-guarded run_retention
+ * instead (see docs/clock-guarded-retention.md). tar_config counters
+ * (including usage_hwm_id) are then written in a SEPARATE, SECOND
+ * execute_atomic_batch, issued ONLY when the data batch committed with ZERO
+ * flagged statement failures (Wave 7 PR7.2 adversarial review, Blocker 1):
+ * TarDatabase::execute_atomic_batch is documented as deliberately NOT
+ * all-or-nothing on a transaction-preserving error -- a batch can commit
+ * with one statement flagged `failed[i]` while every OTHER statement in that
+ * SAME commit, including a tar_config upsert, is fully durable. Folding the
+ * hwm advance into the data batch therefore let a broken usage_daily/
+ * usage_daily_user write (e.g. a stuck-at-schema-5 migration with no
+ * matching unique index for `ON CONFLICT`) get silently skipped while
+ * usage_hwm_id still advanced past it, forever. Splitting the transaction
+ * closes that: the durable pointer can only move once the data it is
+ * supposed to describe is confirmed intact. The residual trade-off (data
+ * batch commits, then the SEPARATE counter batch itself fails for an
+ * unrelated reason) reprocesses the same already-folded events on the next
+ * tick -- a bounded overcount, not the silent permanent loss this replaces.
  *
  * GAP CHECK FIRST, before any events are read: process_live is retained by
  * ROW COUNT (kRowCount, 100k rows, tar_schema_registry.cpp), and its prune
@@ -42,7 +55,6 @@
 #include "tar_usage.hpp"
 
 #include "tar_aggregator.hpp"       // source_enabled
-#include "tar_schema_registry.hpp" // capture_sources (usage_daily retention lookup)
 
 #include <spdlog/spdlog.h>
 
@@ -83,35 +95,24 @@ int64_t parse_i64(std::string_view s, int64_t def = 0) {
     return v;
 }
 
-// The usage_daily granularity's retention window, read from the registry
-// (integrator-owned row, IT-TAR-SOURCE) -- usage_daily_user has no tier of
-// its own in the schema registry, so it is never reached by the generic
-// run_retention() sweep, and its cutoff must match usage_daily's by hand.
-// Falls back to process_daily's window (31 days) if the "usage" source or
-// its "daily" granularity is not yet registered, so this file degrades
-// gracefully rather than never pruning usage_daily_user at all.
-constexpr int64_t kFallbackDailyRetentionSeconds = 2678400; // 31 days
-
-int64_t usage_daily_retention_seconds() {
-    for (const auto& src : capture_sources()) {
-        if (src.name != "usage")
-            continue;
-        for (const auto& g : src.granularities) {
-            if (g.suffix == "daily")
-                return g.retention_default;
-        }
-    }
-    return kFallbackDailyRetentionSeconds;
-}
-
 } // namespace
 
-void usage_rebaseline(TarDatabase& db, int64_t now) {
-    int64_t hwm = 0;
-    if (auto res = db.execute_query("SELECT COALESCE(MAX(id), 0) FROM process_live", 1);
-        res.has_value() && !res->rows.empty() && !res->rows[0].empty()) {
-        hwm = parse_i64(res->rows[0][0]);
+std::expected<void, std::string> usage_rebaseline(TarDatabase& db, int64_t now) {
+    auto max_id_res = db.execute_query("SELECT COALESCE(MAX(id), 0) FROM process_live", 1);
+    if (!max_id_res.has_value()) {
+        // BLOCKER 3 fix: a failed probe must not proceed to persist hwm=0
+        // alongside a fresh coverage marker -- that combination is exactly
+        // what disarms the retry path (it gates on the marker's ABSENCE).
+        // Nothing is written; the caller retries with coverage still absent.
+        spdlog::error("TAR usage_rebaseline: MAX(id) probe failed ({}) -- hwm/coverage_since NOT "
+                      "written, open runs NOT cleared; will retry",
+                      max_id_res.error());
+        return std::unexpected(max_id_res.error());
     }
+    int64_t hwm = 0;
+    if (!max_id_res->rows.empty() && !max_id_res->rows[0].empty())
+        hwm = parse_i64(max_id_res->rows[0][0]);
+
     const auto batch = db.execute_atomic_batch({
         "DELETE FROM usage_live",
         std::format("INSERT INTO tar_config (key, value) VALUES ('usage_hwm_id', '{}') "
@@ -125,7 +126,9 @@ void usage_rebaseline(TarDatabase& db, int64_t now) {
         spdlog::error("TAR usage_rebaseline: transaction failed to commit -- hwm/coverage_since "
                       "unchanged, open runs NOT cleared; will retry on the next enable edge or "
                       "plugin restart");
+        return std::unexpected("rebaseline transaction failed to commit");
     }
+    return {};
 }
 
 UsageFoldResult run_usage_fold(TarDatabase& db, int64_t now, int64_t max_events_per_tick) {
@@ -136,6 +139,36 @@ UsageFoldResult run_usage_fold(TarDatabase& db, int64_t now, int64_t max_events_
     db.set_config("usage_feeder_enabled", (usage_on && process_on) ? "true" : "false");
     if (!usage_on || !process_on) {
         result.ok = true; // nothing to do this tick -- not a failure
+        return result;
+    }
+
+    // Forward-only boundary gate (Wave 7 PR7.2 adversarial review, Blocker
+    // 3): the fold must never consume a process_live row before a
+    // successful baseline transaction has established coverage. The
+    // previous shape gated only on the two enable flags above, so a
+    // transient failure in tar_plugin.cpp's boot-time try_get_config/
+    // rebaseline call -- or a rebaseline whose own MAX(id) probe or commit
+    // failed -- left usage_coverage_since absent with nothing to notice: the
+    // NEXT healthy tick would fold straight from hwm=0, replaying the whole
+    // pre-consent process_live history for this default-on,
+    // works-council-class source. Checking (and, if needed, retrying) the
+    // baseline HERE, before a single event is read, closes that: a missing
+    // marker is retried on every tick rather than only once at boot.
+    auto coverage = db.try_get_config("usage_coverage_since");
+    if (!coverage.has_value() || !coverage->has_value()) {
+        if (auto rb = usage_rebaseline(db, now); !rb.has_value()) {
+            result.error = std::format(
+                "usage fold: coverage baseline not established ({}); refusing to consume "
+                "process_live until a rebaseline succeeds",
+                !coverage.has_value() ? coverage.error() : rb.error());
+            return result; // ok=false, hwm unchanged, nothing consumed this tick
+        }
+        // Baseline just succeeded: usage_coverage_since = now, hwm =
+        // MAX(id) as of this instant. Report success but fold no events
+        // this tick -- the very next tick reads forward from this
+        // baseline, exactly as a boot-time rebaseline would have.
+        result.ok = true;
+        result.hwm_id = parse_i64(db.get_config("usage_hwm_id", "0"));
         return result;
     }
 
@@ -243,9 +276,8 @@ UsageFoldResult run_usage_fold(TarDatabase& db, int64_t now, int64_t max_events_
     result.runs_closed = static_cast<int64_t>(closed.size());
 
     const auto deltas = fold_daily(closed);
-    const int64_t daily_cutoff = now - usage_daily_retention_seconds();
 
-    // ── Build the ONE transaction ────────────────────────────────────────────
+    // ── Build the DATA transaction ──────────────────────────────────────────
     std::vector<std::string> stmts;
 
     for (const auto& d : deltas) {
@@ -265,8 +297,11 @@ UsageFoldResult run_usage_fold(TarDatabase& db, int64_t now, int64_t max_events_
 
     std::set<std::pair<int64_t, std::string>> touched_days; // (day_ts, exe_key)
     for (const auto& c : closed) {
-        // Same floor-toward-negative-infinity bucketing as fold_daily() (review M2: keep usage_daily_user on the same day as usage_daily).
-        const int64_t day_ts = (c.start_ts >= 0) ? (c.start_ts / 86400) * 86400 : -(((-c.start_ts) + 86399) / 86400) * 86400;
+        // Same bucketing rule as fold_daily() -- day_ts_for() (review M2:
+        // keep usage_daily_user on the same day as usage_daily; adversarial
+        // review, Wave 7 PR7.2: the previous hand-inlined copy of this
+        // formula negated start_ts directly, overflowing UB on INT64_MIN).
+        const int64_t day_ts = day_ts_for(c.start_ts);
         stmts.push_back(std::format(
             "INSERT OR IGNORE INTO usage_daily_user (day_ts, exe_key, user) VALUES ({}, {}, {})",
             day_ts, sql_str(c.exe_key), sql_str(c.user)));
@@ -309,17 +344,48 @@ UsageFoldResult run_usage_fold(TarDatabase& db, int64_t now, int64_t max_events_
         }
     }
 
-    // usage_daily_user retention -- mirrors usage_daily's own window; this
-    // table carries no tier of its own so the generic run_retention() sweep
-    // never reaches it (see usage_daily_retention_seconds() above).
-    stmts.push_back(
-        std::format("DELETE FROM usage_daily_user WHERE day_ts < {}", daily_cutoff));
+    // NOTE: usage_daily_user's own retention prune is NOT queued here -- it
+    // runs under tar_aggregator.cpp's clock-guarded run_retention (see
+    // docs/clock-guarded-retention.md's usage_daily_user register entry).
+    // This fold only ever WRITES usage_daily_user, never prunes it.
 
-    // tar_config counters -- written in the SAME transaction as the data
-    // above, never as a separate best-effort write, so a failure here rolls
-    // back the data too (no partial advance).
+    // A quiet tick (no events, no expiries, no cap evictions) legitimately
+    // produces an EMPTY data batch -- execute_atomic_batch's own
+    // "statements.empty()" short-circuit returns committed=false with no
+    // BEGIN attempted and no error logged (there is nothing to roll back),
+    // which is a DIFFERENT thing from a real transaction failure. Skip the
+    // call entirely in that case rather than misreading its default-false
+    // BatchResult as a fold failure.
+    if (!stmts.empty()) {
+        const auto data_batch = db.execute_atomic_batch(stmts);
+        const bool data_stmt_failed = std::any_of(
+            data_batch.failed.begin(), data_batch.failed.end(), [](char f) { return f != 0; });
+        if (!data_batch.committed || data_stmt_failed) {
+            // BLOCKER 1 fix: a transaction-preserving statement error commits
+            // every OTHER statement in the SAME batch (TarDatabase::BatchResult's
+            // own contract) -- so if the counter upserts below were bundled into
+            // this same batch, usage_hwm_id could advance past data that was
+            // actually skipped. Bailing here, before the counter batch is even
+            // built, is what makes "no partial advance" true rather than merely
+            // claimed.
+            result.ok = false;
+            result.error = !data_batch.committed
+                              ? "usage fold data transaction rolled back"
+                              : "usage fold data transaction partially failed -- a statement was "
+                                "skipped; hwm/counters not advanced";
+            result.hwm_id = hwm; // unchanged -- report what is actually persisted
+            return result;
+        }
+    }
+
+    // ── tar_config counters, in a SEPARATE transaction ──────────────────────
+    // Issued only now that every data statement above is confirmed intact
+    // (see the file banner and BLOCKER 1 comment above). usage_hwm_id is
+    // among these, so the durable pointer can only move once the data it
+    // describes is durable too.
+    std::vector<std::string> config_stmts;
     auto upsert_config = [&](std::string_view key, std::string_view value) {
-        stmts.push_back(std::format(
+        config_stmts.push_back(std::format(
             "INSERT INTO tar_config (key, value) VALUES ({}, {}) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             sql_str(key), sql_str(value)));
@@ -343,11 +409,14 @@ UsageFoldResult run_usage_fold(TarDatabase& db, int64_t now, int64_t max_events_
         upsert_config("usage_gap_last_ts", std::to_string(now));
     }
 
-    const auto batch = db.execute_atomic_batch(stmts);
-    if (!batch.committed) {
+    const auto config_batch = db.execute_atomic_batch(config_stmts);
+    const bool config_stmt_failed = std::any_of(
+        config_batch.failed.begin(), config_batch.failed.end(), [](char f) { return f != 0; });
+    if (!config_batch.committed || config_stmt_failed) {
         result.ok = false;
-        result.error = "usage fold transaction rolled back";
-        result.hwm_id = hwm; // unchanged -- report what is actually persisted
+        result.error = "usage fold: data committed but counters failed to persist -- hwm not "
+                      "advanced; the same events will be re-folded next tick";
+        result.hwm_id = hwm; // unchanged
         return result;
     }
 
