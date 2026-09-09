@@ -719,6 +719,13 @@ public:
         // 3) Relock, re-validate, commit / publish / retire.
         std::optional<std::string> error;
         SweepWork discards;
+        // This call ever produces AT MOST one of each: reserve before the lock so
+        // a push_back below cannot throw AFTER a state change it would then leave
+        // half-done (governance cs-8-1 - the same class cf6e96792 closed for the
+        // sweeper's own SweepWork, missed here because this one is local to watch()).
+        discards.stale_calls.reserve(1);
+        discards.dead_results.reserve(1);
+        discards.dead_watches.reserve(1);
         {
             std::lock_guard lk(mu_);
             auto it = watches_.find(key);
