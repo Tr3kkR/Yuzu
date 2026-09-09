@@ -400,16 +400,23 @@ CollectorScanResult scan_run_parts_dirs(const std::vector<std::string>& dirs, So
         }
     }
     const bool any_extra = acc.any_failure();
-    if (any_dir_readable || any_extra) {
+    if (any_dir_readable) {
+        // At least one root actually listed -- a permission/extra failure on
+        // a SIBLING root is a partial degradation, not a total one.
         std::string reason;
         if (any_permission_denied) reason = "partial_permission_denied";
         if (any_extra) reason += (reason.empty() ? "" : ",") + acc.reason();
         out.support = (any_permission_denied || any_extra) ? YUZU_SUPPORT_CONSTRAINED
                                                              : YUZU_SUPPORT_SUPPORTED;
         out.reason = reason.empty() ? "-" : reason;
-    } else if (any_permission_denied) {
+    } else if (any_permission_denied || any_extra) {
+        // Zero roots readable -- nothing succeeded, so this is a total
+        // degradation, never "partial_*" (matches scan_user_crontabs /
+        // scan_at_spool's equivalent branch below).
+        std::string reason = any_permission_denied ? "permission_denied" : "";
+        if (any_extra) reason += (reason.empty() ? "" : ",") + acc.reason();
         out.support = YUZU_SUPPORT_CONSTRAINED;
-        out.reason = "permission_denied";
+        out.reason = reason;
     } else {
         out.support = YUZU_SUPPORT_SUPPORTED;
         out.reason = "absent";

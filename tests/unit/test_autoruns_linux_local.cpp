@@ -809,6 +809,50 @@ TEST_CASE("autoruns Linux leg: scan_run_parts_dirs distinguishes zero successful
     }
 }
 
+TEST_CASE("autoruns Linux leg: scan_run_parts_dirs reports a total (never \"partial_\") "
+          "degradation when EVERY root fails, even when the failures are a mix of "
+          "permission-denied and another real open error "
+          "(RECONSTRUCTION: pins the fix for a branch-ordering defect the accumulator "
+          "migration introduced -- zero-readable-roots with a mixed EACCES+ENOTDIR "
+          "failure set used to land in the any_dir_readable branch by virtue of "
+          "any_extra alone, wrongly emitting \"partial_permission_denied,...\" when "
+          "nothing actually succeeded)",
+          "[autoruns][actions][linux]") {
+    using yuzu::autoruns::scan_run_parts_dirs;
+    using yuzu::autoruns::SourceId;
+
+    yuzu::test::TempDir denied_parent("yuzu_test_autoruns_runparts_mixed_denied_");
+    std::error_code ec;
+    std::filesystem::create_directories(denied_parent.path, ec);
+    REQUIRE_FALSE(ec);
+    std::filesystem::path denied_dir = denied_parent.path / "denied";
+    std::filesystem::create_directories(denied_dir, ec);
+    REQUIRE_FALSE(ec);
+    std::filesystem::permissions(denied_dir, std::filesystem::perms::none, ec);
+    if (ec) SKIP("could not remove directory permissions");
+
+    yuzu::test::TempDir other_parent("yuzu_test_autoruns_runparts_mixed_other_");
+    std::filesystem::create_directories(other_parent.path, ec);
+    REQUIRE_FALSE(ec);
+    std::filesystem::path not_a_dir = other_parent.path / "not_a_dir";
+    { std::ofstream(not_a_dir) << "x"; }
+
+    auto scan = scan_run_parts_dirs({denied_dir.string(), not_a_dir.string()},
+                                    SourceId::lnx_cron_periodic);
+
+    std::filesystem::permissions(denied_dir, std::filesystem::perms::owner_all, ec); // restore for cleanup
+    if (scan.rows.empty() && scan.support == YUZU_SUPPORT_CONSTRAINED &&
+        scan.reason.find("permission_denied") == std::string::npos) {
+        SKIP("running as root (or CAP_DAC_OVERRIDE): permission bits bypassed");
+    }
+
+    CHECK(scan.rows.empty());
+    CHECK(scan.support == YUZU_SUPPORT_CONSTRAINED);
+    CHECK(scan.reason.find("partial_") == std::string::npos);
+    CHECK(scan.reason.find("permission_denied") != std::string::npos);
+    CHECK(scan.reason.find("enotdir") != std::string::npos);
+}
+
 TEST_CASE("autoruns Linux leg: scan_run_parts_dirs records a per-entry stat() failure "
           "as a real acquisition failure, distinct from the entry simply not being "
           "executable, among otherwise-successful entries in the same directory",
