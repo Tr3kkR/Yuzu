@@ -119,7 +119,6 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
-#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
@@ -477,6 +476,11 @@ struct RegWatch {
     unsigned resync_attempts{0};
     Clock::time_point resync_retry_at{};
     WindowsRegistryMechanism* owner{nullptr};
+    /// Intrusive link while this RETIRED watch waits for a drain worker: the
+    /// allocation-free backlog a refused or untrackable drain launch parks it on
+    /// (governance sg-1/cs-1: no inline drain anywhere, ever). Guarded by mu_; a
+    /// listed watch is owned by the list.
+    RegWatch* lost_next{nullptr};
 
     ~RegWatch(); // drain_watch() safety net - see below
 };
@@ -546,7 +550,6 @@ struct SweepWork {
     std::vector<ProbeResult> dead_results;
     std::vector<DetachedCall<ProbeResult>> stale_calls;
     std::vector<std::unique_ptr<RegWatch>> dead_watches;
-    std::vector<DrainJob> inline_drains; ///< could not even be queued - drained inline off-lock
     std::vector<std::pair<std::string, std::uint64_t>> failed_emits;    ///< restore needs_resync
     std::vector<std::pair<std::string, std::uint64_t>> succeeded_emits; ///< reset the retry schedule
 };
@@ -560,7 +563,10 @@ public:
     explicit WindowsRegistryMechanism(std::shared_ptr<std::atomic<std::size_t>> f3_counter)
         : probe_lane_(f3_counter, kProbeLaneCap),
           drain_lane_(std::move(f3_counter), kDrainLaneCap) {}
-    ~WindowsRegistryMechanism() override { stop(); }
+    ~WindowsRegistryMechanism() override {
+        stop();
+        reap_residual_drains(); // nothing may outlive `this` while holding `owner`
+    }
 
     void start(SparkEmitFn emit, SparkFaultFn fault) override {
         std::lock_guard lk(mu_);
@@ -590,11 +596,17 @@ public:
         ::SetThreadpoolThreadMaximum(core->pool, 4);
         ::InitializeThreadpoolEnvironment(&core->env);
         ::SetThreadpoolCallbackPool(&core->env, core->pool);
+        // Every allocation start() needs happens BEFORE core_ is published: a
+        // throw here leaves core_ null, so a retried start() is a real retry and
+        // never the silent `if (core_) return` no-op (governance sg-7).
+        drains_in_flight_.reserve(2 * kDrainLaneCap + 16);
+        drain_outcomes_.reserve(kDrainLaneCap);
         core_ = std::move(core);
         stopping_ = false;
         sweeper_stop_ = false;
         nudged_ = false;
-        drains_in_flight_.reserve(2 * kDrainLaneCap + 16);
+        drain_refusals_ = 0;
+        drain_retry_at_ = {};
         try {
             sweeper_ = std::thread([this] { sweeper_main(); });
         } catch (...) {
@@ -721,24 +733,26 @@ public:
     }
 
     void unwatch(const std::string& key) override {
-        std::unique_ptr<RegWatch> victim;
-        {
-            std::lock_guard lk(mu_);
-            auto it = watches_.find(key);
-            if (it == watches_.end())
-                return;
-            victim = std::move(it->second);
-            watches_.erase(it);
-            victim->active = false; // no re-arm, no commit, no dispatch from here on
-            ++gen_;
-            ++retiring_count_;
-            retiring_gauge_.fetch_add(1, std::memory_order_relaxed);
-        }
-        // Disarm OUTSIDE mu_ (cheap, non-blocking; a callback already running keeps
-        // running and observes active=false). The blocking drain is the worker's.
+        std::lock_guard lk(mu_);
+        auto it = watches_.find(key);
+        if (it == watches_.end())
+            return;
+        std::unique_ptr<RegWatch> victim = std::move(it->second);
+        watches_.erase(it);
+        victim->active = false; // no re-arm, no commit, no dispatch from here on
+        ++gen_;
+        ++retiring_count_;
+        retiring_gauge_.fetch_add(1, std::memory_order_relaxed);
+        if (victim->call && !victim->call->done())
+            probe_discarded_.fetch_add(1, std::memory_order_relaxed); // abandoned with the watch
+        // Disarm (cheap, non-blocking; a callback already running keeps running and
+        // observes active=false). The blocking drain is the worker's. Held under
+        // mu_ TOGETHER with the launch below (governance cs-2): stop()'s swap of
+        // drains_in_flight_ either sees this drain or finds the watch already
+        // gone, so a drain can never land untracked after stop() took the set.
         if (victim->wait)
             ::SetThreadpoolWait(victim->wait, nullptr, nullptr);
-        retire(std::move(victim));
+        retire_locked(std::move(victim));
     }
 
     void stop() override {
@@ -756,14 +770,14 @@ public:
 
         std::map<std::string, std::unique_ptr<RegWatch>> victims;
         std::vector<DetachedCall<std::monostate>> drains;
-        std::deque<DrainJob> backlog;
+        RegWatch* lost = nullptr;
         {
             std::lock_guard lk(mu_);
             for (auto& [k, w] : watches_)
                 w->active = false;
             victims.swap(watches_);
             drains.swap(drains_in_flight_);
-            backlog.swap(drain_backlog_);
+            lost = take_lost_locked();
             ++gen_;
         }
         // Drain every callback-bearing watch OUTSIDE mu_ - an UNBOUNDED drain, on
@@ -778,10 +792,16 @@ public:
         for (auto& [k, w] : victims) {
             if (w->call && !w->call->done())
                 ++orphaned;
-            w.reset(); // ~RegWatch: drain + close; a pending call is abandoned
+            drain_watch(*w); // explicit: stop() drains; the destructor is only a net
+            w.reset();       // a pending call is abandoned with the watch
         }
-        for (auto& job : backlog)
-            job(); // retirements that never got a worker: drain them here
+        while (lost) { // retirements that never got a worker: drain them here
+            std::unique_ptr<RegWatch> w(lost);
+            lost = w->lost_next;
+            if (w->call && !w->call->done())
+                ++orphaned; // UP-7: a published probe parked on a backlogged retirement
+            drain_watch(*w);
+        }
         for (auto& d : drains) {
             for (;;) { // wait for the drain worker (unbounded - see above)
                 if (d.wait_take(Clock::now() + 1s)) {
@@ -863,7 +883,8 @@ public:
         std::lock_guard lk(mu_);
         d.live_watches = watches_.size();
         d.retiring = retiring_count_;
-        d.drain_backlog = drain_backlog_.size();
+        d.drain_backlog = lost_count_;
+        d.drains_untracked = drains_untracked_.load(std::memory_order_relaxed);
         return d;
     }
 
@@ -1130,8 +1151,10 @@ private:
             if (!w->grace_counted)
                 wake = std::min(wake, w->accepted_at + grace);
         }
-        if (!drains_in_flight_.empty() || !drain_backlog_.empty())
+        if (!drains_in_flight_.empty())
             wake = std::min(wake, now + cadence);
+        if (lost_head_)
+            wake = std::min(wake, std::max(drain_retry_at_, now + cadence));
         return wake;
     }
 
@@ -1154,9 +1177,18 @@ private:
                 ++it;
             }
         }
-        while (!drain_backlog_.empty() && work.drain_launches.size() < kDrainLaneCap) {
-            work.drain_launches.push_back(std::move(drain_backlog_.front()));
-            drain_backlog_.pop_front();
+        if (lost_head_ && Clock::now() >= drain_retry_at_) {
+            // Reserve BEFORE unlinking: a throw here leaves the list intact.
+            work.drain_launches.reserve(kDrainLaneCap);
+            if (drains_in_flight_.size() + kDrainLaneCap > drains_in_flight_.capacity())
+                drains_in_flight_.reserve(drains_in_flight_.size() + 2 * kDrainLaneCap);
+            while (lost_head_ && work.drain_launches.size() < kDrainLaneCap) {
+                RegWatch* w = lost_head_;
+                lost_head_ = w->lost_next;
+                w->lost_next = nullptr;
+                --lost_count_;
+                work.drain_launches.push_back(DrainJob{std::unique_ptr<RegWatch>(w)}); // in capacity
+            }
         }
 
         if (watches_.empty())
@@ -1286,23 +1318,24 @@ private:
         for (auto& [status, payload] : drain_outcomes_) {
             if (status == DetachedLaunch::Launched) {
                 drains_launched_.fetch_add(1, std::memory_order_relaxed);
+                drain_refusals_ = 0;
                 try {
                     drains_in_flight_.push_back(
                         std::move(std::get<DetachedCall<std::monostate>>(payload)));
                 } catch (...) {
-                    // Tracking lost, not the watch: the worker still drains and frees
-                    // it. Correct the gauge now rather than never.
+                    // Capacity was reserved under mu_ before the launch, so this needs
+                    // another thread to have consumed it in between AND a fresh reserve
+                    // to fail. The worker still drains and frees the watch; stop() can
+                    // no longer wait for it - counted and logged, never silent (sg-2).
+                    drains_untracked_.fetch_add(1, std::memory_order_relaxed);
                     if (retiring_count_)
                         --retiring_count_;
                     retiring_gauge_.fetch_sub(1, std::memory_order_relaxed);
+                    spdlog::warn("spark_registry: a launched drain could not be tracked "
+                                 "(allocation failure) - stop() will not wait for it");
                 }
             } else {
-                drains_admission_rejected_.fetch_add(1, std::memory_order_relaxed);
-                try {
-                    drain_backlog_.push_front(std::move(std::get<DrainJob>(payload)));
-                } catch (...) {
-                    work.inline_drains.push_back(std::move(std::get<DrainJob>(payload)));
-                }
+                park_lost_locked(std::get<DrainJob>(payload).w.release(), status);
             }
         }
         drain_outcomes_.clear();
@@ -1344,8 +1377,6 @@ private:
             lk.lock();
             publish_locked(work);
             lk.unlock();
-            for (auto& dj : work.inline_drains)
-                dj(); // last resort: nothing could hold the retirement, drain it here
             {
                 SweepWork dead = std::move(work); // handle closes + abandons run off-lock
             }
@@ -1353,34 +1384,77 @@ private:
         }
     }
 
-    /// Retire an already-inactive watch onto the drain lane (off-lock), then
-    /// record the outcome. Called from unwatch() with no lock held.
-    void retire(std::unique_ptr<RegWatch> victim) {
+    /// Hand an already-inactive watch to the drain lane. Under mu_: a thread
+    /// creation, not an OS wait (microseconds, inside the per-type-lock bound).
+    /// Never blocks and never drains inline: a refused launch parks the watch on
+    /// the allocation-free lost list for the sweeper to relaunch on a backoff, and
+    /// a tracking-vector growth failure parks it the same way BEFORE any launch,
+    /// so a launched drain is always tracked and stop() can wait for it.
+    void retire_locked(std::unique_ptr<RegWatch> victim) {
+        if (drains_in_flight_.size() == drains_in_flight_.capacity()) {
+            try {
+                drains_in_flight_.reserve(drains_in_flight_.capacity() * 2 + kDrainLaneCap);
+            } catch (...) {
+                park_lost_locked(victim.release(), DetachedLaunch::LaunchFailed);
+                nudge_locked();
+                return;
+            }
+        }
         auto lr = drain_lane_.launch(DrainJob{std::move(victim)});
-        std::optional<DrainJob> inline_drain;
+        if (lr.status == DetachedLaunch::Launched) {
+            drains_launched_.fetch_add(1, std::memory_order_relaxed);
+            drain_refusals_ = 0;
+            drains_in_flight_.push_back(std::move(*lr.call)); // within capacity: nothrow
+        } else {
+            park_lost_locked(lr.fn->w.release(), lr.status);
+        }
+        nudge_locked();
+    }
+
+    /// Park a retired watch on the lost list (allocation-free) and advance the
+    /// relaunch backoff (D, 2D, 4D ... capped, the admission schedule). Under mu_.
+    /// Logs on the first refusal and at every doubling of the refusal count, so a
+    /// thread-exhausted box is visible without a per-cadence log storm (UP-4).
+    void park_lost_locked(RegWatch* w, DetachedLaunch why) {
+        w->lost_next = lost_head_;
+        lost_head_ = w;
+        ++lost_count_;
+        drains_admission_rejected_.fetch_add(1, std::memory_order_relaxed);
+        ++drain_refusals_;
+        drain_retry_at_ =
+            Clock::now() + doubled(admission_seed(), drain_refusals_, kRegAdmissionBackoffCap);
+        if ((drain_refusals_ & (drain_refusals_ - 1)) == 0) {
+            spdlog::warn("spark_registry: drain worker for '{}' {} ({} retirement(s) backlogged, "
+                         "refusal #{}) - relaunching on a backoff",
+                         w->spark_key,
+                         why == DetachedLaunch::Rejected ? "refused by the lane cap"
+                                                          : "could not be started",
+                         lost_count_, drain_refusals_);
+        }
+    }
+
+    /// Take the whole lost list. Under mu_.
+    [[nodiscard]] RegWatch* take_lost_locked() {
+        RegWatch* head = lost_head_;
+        lost_head_ = nullptr;
+        lost_count_ = 0;
+        return head;
+    }
+
+    /// Wait for any drain still tracked after stop() - there should be none (the
+    /// mu_-held launch in retire_locked closes the stop()/unwatch() window), so
+    /// this is the destructor's belt and braces. Unbounded, like stop()'s own
+    /// drain wait, for the same reason: those workers own watches whose
+    /// callbacks hold `owner`.
+    void reap_residual_drains() {
+        std::vector<DetachedCall<std::monostate>> drains;
         {
             std::lock_guard lk(mu_);
-            if (lr.status == DetachedLaunch::Launched) {
-                drains_launched_.fetch_add(1, std::memory_order_relaxed);
-                try {
-                    drains_in_flight_.push_back(std::move(*lr.call));
-                } catch (...) {
-                    if (retiring_count_)
-                        --retiring_count_;
-                    retiring_gauge_.fetch_sub(1, std::memory_order_relaxed);
-                }
-            } else {
-                drains_admission_rejected_.fetch_add(1, std::memory_order_relaxed);
-                try {
-                    drain_backlog_.push_back(std::move(*lr.fn));
-                } catch (...) {
-                    inline_drain = std::move(*lr.fn);
-                }
-            }
-            nudge_locked();
+            drains.swap(drains_in_flight_);
         }
-        if (inline_drain)
-            (*inline_drain)(); // allocation failure on the queue: drain inline, off-lock
+        for (auto& d : drains)
+            while (!d.wait_take(Clock::now() + 1s) && !d.done()) {
+            }
     }
 
     mutable std::mutex mu_;
@@ -1396,7 +1470,13 @@ private:
     /// Ordered (not unordered_) so the sweep cursor can rotate over it by key.
     std::map<std::string, std::unique_ptr<RegWatch>> watches_;
     std::vector<DetachedCall<std::monostate>> drains_in_flight_;
-    std::deque<DrainJob> drain_backlog_;
+    /// Allocation-free retirement backlog (intrusive via RegWatch::lost_next):
+    /// watches whose drain launch was refused or could not be tracked, owned by
+    /// the list until the sweeper relaunches them or stop() drains them.
+    RegWatch* lost_head_{nullptr};
+    std::size_t lost_count_{0};
+    unsigned drain_refusals_{0}; ///< consecutive refusals; drives the relaunch backoff
+    Clock::time_point drain_retry_at_{};
     std::size_t retiring_count_{0};
     /// Mechanism-global (never per-watch, so a stale pointer cannot alias a fresh
     /// watch): bumped at every probe reservation and every retirement.
@@ -1425,6 +1505,7 @@ private:
     std::atomic<std::uint64_t> drains_launched_{0};
     std::atomic<std::uint64_t> drains_completed_{0};
     std::atomic<std::uint64_t> drains_admission_rejected_{0};
+    std::atomic<std::uint64_t> drains_untracked_{0}; ///< launched, tracking alloc failed (sg-2)
     std::atomic<std::uint64_t> synthetic_fires_{0};
     std::atomic<std::uint64_t> health_edges_{0};
     std::atomic<std::uint64_t> emit_failed_{0};    ///< an emit() submit threw (either path)

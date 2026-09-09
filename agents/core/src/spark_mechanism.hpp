@@ -291,6 +291,7 @@ struct RegistryMechanismDebugCounters {
     std::uint64_t drains_launched{0};
     std::uint64_t drains_completed{0};
     std::uint64_t drains_admission_rejected{0};
+    std::uint64_t drains_untracked{0}; ///< launched drains stop() cannot wait for (tracking alloc failed)
     std::uint64_t synthetic_fires{0};
     std::uint64_t health_edges{0};
     std::uint64_t emit_failed{0};    ///< emit() threw on submit (fire callback or sweeper)
