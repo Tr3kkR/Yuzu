@@ -1249,8 +1249,19 @@ int collect_windows(yuzu::CommandContext& ctx, std::string_view filter) {
                             // open, rather than trusting the literal
                             // AppData\Roaming suffix unconditionally. Absent,
                             // unreadable, or empty leaves startup_dir at the
-                            // fallback already computed above -- the common,
-                            // non-redirected case.
+                            // fallback already computed above.
+                            //
+                            // KNOWN BUG, not yet fixed: this value is a
+                            // REG_EXPAND_SZ containing %USERPROFILE%-style
+                            // tokens on essentially every profile at creation,
+                            // not only genuinely redirected ones -- so the
+                            // expand_env_strings() call below (which resolves
+                            // against THIS PROCESS's own environment, i.e.
+                            // LocalSystem, not the enumerated profile) takes
+                            // the wrong branch on most stock profiles, not a
+                            // narrow edge case. See changelog.d/
+                            // 20260909-autoruns-plugin.added.md's "Known
+                            // limitation" entry. Tracked for a follow-up fix.
                             RegKey folders_key;
                             if (RegOpenKeyExW(
                                     root,

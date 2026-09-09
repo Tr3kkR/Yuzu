@@ -62,6 +62,22 @@ family, Startup folders, or the WMI subscription content this leg formats.
    `target`/`args` empty (link targets are documented as NOT resolved) and
    a real `mtime` matching the file's last-write time.
 
+7a. **Known-bug reproduction, `win_startup_folder_user` under LocalSystem.**
+    The default path test above does NOT exercise the bug (the default
+    non-redirected path resolves correctly even with the bug present).
+    Read the test user's `HKCU\...\Explorer\User Shell Folders\Startup`
+    value directly from a session running AS that user -- it will very
+    likely already contain a `REG_EXPAND_SZ` value like
+    `%USERPROFILE%\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup`
+    (Windows populates this on essentially every profile at creation, not
+    only redirected ones). Then, from the LocalSystem-running agent, drop a
+    `.lnk` into that same user's actual Startup folder and confirm whether
+    `win_startup_folder_user`'s reported row `location` resolves to the
+    test user's real path or to `C:\Windows\System32\config\systemprofile\...`
+    (LocalSystem's own profile) -- the latter confirms the known bug
+    (`changelog.d/20260909-autoruns-plugin.added.md`), not a NEW capture
+    result to compare against a baseline.
+
 8. **Scheduled Tasks.** A1's probe (admin session, MTA):
    `CoInitializeEx` HRESULT `0x00000000`, `Connect` HRESULT `0x00000000`,
    `GetFolder` HRESULT `0x00000000`, **321** tasks recursively enumerated
