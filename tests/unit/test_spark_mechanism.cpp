@@ -4110,10 +4110,16 @@ struct EstablishChurnWatch {
     // mutex, so a pool thread already past the check below could still be
     // calling SetThreadpoolWait on `wait` at the exact moment the
     // destructor's own SetThreadpoolWait(nullptr,nullptr) disarm call ran
-    // on it. SetThreadpoolWait is explicitly NOT thread-safe (MSDN) when
-    // two threads call it concurrently on the same PTP_WAIT - a genuine
-    // data race on the OS object's internal state, not merely a benign
-    // duplicate notification. This is now fixed the same way production
+    // on it. Microsoft's own reference page for SetThreadpoolWait documents
+    // no concurrent-call guarantee for two threads calling it on the same
+    // PTP_WAIT (checked directly, Gate 8 re-review, 2026-09-09 - an earlier
+    // version of this comment claimed MSDN states this explicitly; it does
+    // not, only a different, narrower undefined-behavior case around
+    // closing the referenced handle while a wait is pending) - mutating the
+    // OS object's internal state from two threads with no synchronization
+    // is exactly the class of thing this codebase's own production code
+    // already treats as unsafe (spark_registry.cpp's mu_-guarded shape,
+    // below), not a documented-and-cited guarantee. This is now fixed the same way production
     // avoids it: `mu` below (owned by EstablishHiveLoad) is held around
     // BOTH this whole check-then-rearm AND ~EstablishHiveLoad()'s
     // stop.store() (both call sites, ctor-catch and dtor) - mirroring
@@ -4124,9 +4130,10 @@ struct EstablishChurnWatch {
     // ever happens INSIDE its own `mu_`-held section, so by the time
     // unwatch's locked section completes, no in-flight on_fire can still
     // be mid-rearm, and no future one will attempt it once the flag is
-    // visible). The lock is released before any blocking Win32 call in
-    // both places (WaitForThreadpoolWaitCallbacks in the per-watch
-    // destructor, writer.join() in ~EstablishHiveLoad) - on_fire could
+    // visible). The lock is released before any blocking call in both
+    // places (the Win32 WaitForThreadpoolWaitCallbacks in the per-watch
+    // destructor; the std::thread writer.join() in ~EstablishHiveLoad) -
+    // on_fire could
     // otherwise deadlock trying to acquire `mu` while the destructor holds
     // it across a wait for on_fire itself to finish.
     //
