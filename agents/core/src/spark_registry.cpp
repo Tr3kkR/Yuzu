@@ -179,6 +179,10 @@ constexpr std::size_t kRetiringCap = 256;
 /// yields and re-nudges itself (not N x D per pass - Astra correction).
 constexpr std::size_t kSweepMaxItems = 256;
 constexpr std::chrono::milliseconds kSweepTimeBudget{5};
+/// Consecutive failed sweeper passes after which the mechanism reports itself
+/// inert on the heartbeat (the existing capability-gap signal) - a dark sweeper
+/// must never read as a healthy idle one (governance sre6-1).
+constexpr unsigned kSweeperInertAfterFailures = 3;
 
 // The caller wait budget is the only one of the five that a Guardian control-path
 // caller can be made to wait through under the per-type lock; it must sit inside
@@ -542,8 +546,6 @@ struct SweepWork {
     std::vector<ProbeLaunch> probe_launches;
     std::vector<DrainJob> drain_launches;
     std::vector<Action> actions; ///< in recorded order - per-watch ordering matters
-    SparkEmitFn emit;
-    SparkFaultFn fault;
     // discards (destroyed off-lock)
     std::vector<detail::EventHandle> old_events;
     std::vector<RegKeyHandle> old_keys;
@@ -640,6 +642,16 @@ public:
                 return std::unexpected("registry mechanism not started");
             if (watches_.contains(key))
                 return {}; // idempotent (engine dedups, but stay safe)
+            if (sweep_cursor_.capacity() < key.size()) {
+                // The sweeper assigns the visited key into sweep_cursor_ under mu_;
+                // growing it HERE (a throw is an ordinary arm() failure, before any
+                // state changed) is what makes that assignment allocation-free.
+                try {
+                    sweep_cursor_.reserve(key.size() * 2 + 16);
+                } catch (...) {
+                    return std::unexpected("registry mechanism: allocation failure");
+                }
+            }
             if (retiring_count_ >= retiring_cap()) {
                 watch_rejected_.fetch_add(1, std::memory_order_relaxed);
                 return std::unexpected(std::string("registry mechanism: ") +
@@ -885,12 +897,13 @@ public:
         d.retiring = retiring_count_;
         d.drain_backlog = lost_count_;
         d.drains_untracked = drains_untracked_.load(std::memory_order_relaxed);
+        d.fault_failed = fault_failed_.load(std::memory_order_relaxed);
+        d.sweep_pass_failed = sweep_pass_failed_.load(std::memory_order_relaxed);
         return d;
     }
 
     // Called from the TP_WAIT callback (reg_on_wait_cb) with `w` guaranteed live.
     void on_fire(RegWatch& w) {
-        SparkEmitFn emit;
         bool do_emit = false;
         std::optional<ProbeJob> job;
         std::uint64_t gen = 0;
@@ -899,6 +912,32 @@ public:
             if (!w.active || stopping_)
                 return; // being torn down - no re-arm, no dispatch
             const WatchMode old_mode = w.mode;
+            // Build the re-arm job (two string copies) BEFORE any state changes: this
+            // runs inside a TP_WAIT callback where an escaping std::bad_alloc is
+            // process death (ce-1/cs-3). On failure the notification is consumed
+            // into a Deferred re-arm with scalar-only bookkeeping and the sweeper
+            // retries; the observation gap is recorded as usual and covered by the
+            // synthetic fire on commit.
+            if (w.probe == ProbeState::Idle) {
+                try {
+                    job.emplace(ProbeJob{w.root, w.subkey_w, w.subkey, core_, &w,
+                                         /*create_wait=*/w.wait == nullptr, probe_hook_,
+                                         traversal_budget()});
+                } catch (...) {
+                    w.armed = false;
+                    if (old_mode == WatchMode::Target) {
+                        w.needs_resync = true;
+                        w.resync_epoch = ++resync_epoch_;
+                    } else {
+                        w.rearm_from_ancestor = true;
+                    }
+                    w.accepted_at = Clock::now();
+                    w.grace_counted = false;
+                    defer_admission_locked(w, DetachedLaunch::LaunchFailed);
+                    nudge_locked();
+                    return;
+                }
+            }
             w.armed = false; // this notification is consumed; the watch must re-establish
             // Emit when the key existed before this fire (it changed / was deleted).
             // The (re)appearance case - Ancestor mode resolving to Target - is only
@@ -906,7 +945,6 @@ public:
             // ancestor noise (a sibling changed while our target stays absent)
             // emits nowhere.
             do_emit = (old_mode == WatchMode::Target);
-            emit = emit_;
             if (old_mode == WatchMode::Target) {
                 // Observation gap: from now until the re-arm commits, a change on
                 // the key is not observed - the commit's synthetic fire covers it.
@@ -915,15 +953,12 @@ public:
             } else {
                 w.rearm_from_ancestor = true;
             }
-            if (w.probe == ProbeState::Idle) {
+            if (job) {
                 w.probe = ProbeState::Pending;
                 w.probe_gen = ++gen_;
                 gen = w.probe_gen;
                 w.accepted_at = Clock::now();
                 w.grace_counted = false;
-                job.emplace(ProbeJob{w.root, w.subkey_w, w.subkey, core_, &w,
-                                     /*create_wait=*/w.wait == nullptr, probe_hook_,
-                                     traversal_budget()});
             }
             // else: a probe is already outstanding (Pending/Deferred) - it will
             // re-establish; launching a second one would duplicate the obligation.
@@ -956,9 +991,11 @@ public:
         // already recorded under mu_ above (`needs_resync`, set on exactly the
         // `do_emit` path), so a lost immediate fire is covered by the commit's
         // synthetic fire.
-        if (do_emit && emit) {
+        // emit_ is read without a copy: stop() nulls it only after every callback
+        // has been drained, so no write can race this read (ce-1).
+        if (do_emit && emit_) {
             try {
-                emit(w.spark_key, SparkData{std::monostate{}});
+                emit_(w.spark_key, SparkData{std::monostate{}});
             } catch (...) {
                 emit_failed_.fetch_add(1, std::memory_order_relaxed);
                 try {
@@ -1163,8 +1200,23 @@ private:
     /// edges. Everything blocking or dispatching is deferred into `work`.
     void sweep_locked(SweepWork& work) {
         const auto t_start = Clock::now();
-        work.emit = emit_;
-        work.fault = fault_;
+        // RESERVE BEFORE MUTATE (governance sg-7/cs-3): every container this pass
+        // can push into is sized here, before any state changes (including the lost-list unlink below), so a
+        // std::bad_alloc surfaces with nothing half-done - the pass-level catch in
+        // sweeper_main() then retries with the state exactly as it was. Bounds: at
+        // most `cap` watches are visited per pass; each visit stages <= 2 actions
+        // (one Emit, one Fault edge), <= 1 launch, <= 1 superseded event/key, <= 1
+        // dead result, <= 1 stale call.
+        const std::size_t cap = std::min(watches_.size(), kSweepMaxItems) + 1;
+        work.actions.reserve(2 * cap);
+        work.succeeded_emits.reserve(2 * cap);
+        work.failed_emits.reserve(2 * cap);
+        work.probe_launches.reserve(cap);
+        work.old_events.reserve(cap);
+        work.old_keys.reserve(cap);
+        work.dead_results.reserve(cap);
+        work.stale_calls.reserve(cap + kDrainLaneCap);
+        work.drain_launches.reserve(kDrainLaneCap);
 
         for (auto it = drains_in_flight_.begin(); it != drains_in_flight_.end();) {
             if (it->try_take()) {
@@ -1178,8 +1230,7 @@ private:
             }
         }
         if (lost_head_ && Clock::now() >= drain_retry_at_) {
-            // Reserve BEFORE unlinking: a throw here leaves the list intact.
-            work.drain_launches.reserve(kDrainLaneCap);
+            // Tracking capacity BEFORE unlinking: a throw here leaves the list intact.
             if (drains_in_flight_.size() + kDrainLaneCap > drains_in_flight_.capacity())
                 drains_in_flight_.reserve(drains_in_flight_.size() + 2 * kDrainLaneCap);
             while (lost_head_ && work.drain_launches.size() < kDrainLaneCap) {
@@ -1198,13 +1249,15 @@ private:
         for (std::size_t n = 0; n < watches_.size(); ++n) {
             if (it == watches_.end())
                 it = watches_.begin();
-            RegWatch& w = *it->second;
-            sweep_cursor_ = it->first;
-            ++it;
+            // Budget check BEFORE the cursor moves past this entry, so a truncated
+            // pass resumes AT the unprocessed watch, never one past it (ce-2).
             if (++visited > kSweepMaxItems || Clock::now() - t_start > kSweepTimeBudget) {
                 nudged_ = true; // resume from the cursor without sleeping
                 break;
             }
+            RegWatch& w = *it->second;
+            sweep_cursor_ = it->first; // capacity pre-grown in watch(): no allocation here
+            ++it;
             const auto now = Clock::now();
             switch (w.probe) {
             case ProbeState::Pending:
@@ -1220,14 +1273,17 @@ private:
                 break;
             case ProbeState::Deferred:
                 if (now >= w.next_retry_at) {
-                    w.probe = ProbeState::Pending;
-                    w.probe_gen = ++gen_;
+                    // Build + stage the launch FIRST (the ProbeJob copies two strings):
+                    // a throw leaves the watch Deferred and retried next pass, never
+                    // Pending-with-no-call (sg-7's own warning against a bare catch).
                     work.probe_launches.push_back(
-                        {w.spark_key, w.probe_gen,
+                        {w.spark_key, gen_ + 1,
                          ProbeJob{w.root, w.subkey_w, w.subkey, core_, &w,
                                   /*create_wait=*/w.wait == nullptr, probe_hook_,
                                   traversal_budget()},
                          DetachedLaunch::LaunchFailed, std::nullopt});
+                    w.probe = ProbeState::Pending;
+                    w.probe_gen = ++gen_;
                 } else {
                     grace_check_locked(w, now);
                 }
@@ -1262,32 +1318,37 @@ private:
             pl.status = lr.status;
             pl.call = std::move(lr.call);
         }
-        std::vector<std::pair<DetachedLaunch, std::variant<DetachedCall<std::monostate>, DrainJob>>>
-            drain_outcomes;
-        drain_outcomes.reserve(work.drain_launches.size());
+        // drain_outcomes_ is reserved to kDrainLaneCap in start() and cleared by
+        // publish_locked(); drain_launches never exceeds that cap, so these
+        // emplacements do not allocate (sweeper-private scratch).
         for (auto& dj : work.drain_launches) {
             auto lr = drain_lane_.launch(std::move(dj));
             if (lr.status == DetachedLaunch::Launched)
-                drain_outcomes.emplace_back(lr.status, std::move(*lr.call));
+                drain_outcomes_.emplace_back(lr.status, std::move(*lr.call));
             else
-                drain_outcomes.emplace_back(lr.status, std::move(*lr.fn));
+                drain_outcomes_.emplace_back(lr.status, std::move(*lr.fn));
         }
         work.drain_launches.clear();
-        drain_outcomes_ = std::move(drain_outcomes); // consumed by publish_locked (sweeper-private)
 
+        // emit_/fault_ are read here with mu_ released: they are written only by
+        // start() (before this thread exists) and by stop() after this thread has
+        // been joined, so no copy is needed - and a std::function copy under mu_
+        // was an allocation the sweeper must not make (governance cs-3).
         for (const auto& a : work.actions) {
             try {
                 if (a.kind == SweepWork::Action::Kind::Fault) {
-                    if (work.fault)
-                        work.fault(a.key, a.faulted, a.reason);
-                } else if (work.emit) {
-                    work.emit(a.key, SparkData{std::monostate{}});
-                    work.succeeded_emits.emplace_back(a.key, a.epoch);
+                    if (fault_)
+                        fault_(a.key, a.faulted, a.reason);
+                } else if (emit_) {
+                    emit_(a.key, SparkData{std::monostate{}});
+                    work.succeeded_emits.emplace_back(a.key, a.epoch); // reserved: nothrow
                 }
             } catch (...) {
                 if (a.kind == SweepWork::Action::Kind::Emit) {
                     emit_failed_.fetch_add(1, std::memory_order_relaxed);
-                    work.failed_emits.emplace_back(a.key, a.epoch);
+                    work.failed_emits.emplace_back(a.key, a.epoch); // reserved: nothrow
+                } else {
+                    fault_failed_.fetch_add(1, std::memory_order_relaxed);
                 }
             }
         }
@@ -1362,8 +1423,51 @@ private:
         work.failed_emits.clear();
     }
 
+    /// Undo a pass that threw, under mu_, without allocating: retirements it
+    /// unlinked go back on the lost list; launches it staged but never made go
+    /// back to Deferred on the admission schedule; if nothing was dispatched yet,
+    /// resync debt it cleared is restored and health edges it marked reported are
+    /// un-marked so the next pass re-stages them (the engine dedups repeats).
+    void unwind_pass_locked(SweepWork& work, bool dispatched) noexcept {
+        for (auto& dj : work.drain_launches) {
+            if (dj.w) {
+                RegWatch* w = dj.w.release();
+                w->lost_next = lost_head_;
+                lost_head_ = w;
+                ++lost_count_;
+            }
+        }
+        work.drain_launches.clear();
+        for (auto& pl : work.probe_launches) {
+            if (!pl.job)
+                continue; // launched: publish_locked's re-validation owns it
+            auto it = watches_.find(pl.key);
+            if (it != watches_.end() && it->second->probe == ProbeState::Pending &&
+                it->second->probe_gen == pl.gen && !it->second->call)
+                defer_admission_locked(*it->second, DetachedLaunch::LaunchFailed);
+        }
+        work.probe_launches.clear();
+        if (!dispatched) {
+            for (const auto& a : work.actions) {
+                auto it = watches_.find(a.key);
+                if (it == watches_.end())
+                    continue;
+                RegWatch& w = *it->second;
+                if (a.kind == SweepWork::Action::Kind::Emit) {
+                    if (w.resync_epoch == a.epoch)
+                        w.needs_resync = true;
+                } else {
+                    w.faulted_reported = !w.faulted_now; // re-stage the edge next pass
+                }
+            }
+            work.actions.clear();
+        }
+        nudged_ = false; // the backoff wait below decides when the next pass runs
+    }
+
     void sweeper_main() {
         std::unique_lock lk(mu_);
+        unsigned failures = 0; // consecutive failed passes
         for (;;) {
             const auto wake = next_wake_locked(Clock::now());
             cv_.wait_until(lk, wake, [&] { return sweeper_stop_ || nudged_; });
@@ -1371,16 +1475,62 @@ private:
                 return;
             nudged_ = false;
             SweepWork work;
-            sweep_locked(work);
-            lk.unlock();
-            run_off_lock(work);
-            lk.lock();
-            publish_locked(work);
+            bool ok = true;
+            bool dispatched = false; // run_off_lock reached: every staged action was offered
+            try {
+                sweep_locked(work);
+                lk.unlock();
+                dispatched = true;
+                run_off_lock(work);
+                lk.lock();
+                publish_locked(work);
+            } catch (...) {
+                // A pass threw (std::bad_alloc is the only expected source). This
+                // thread is the SOLE producer of health edges and late commits, so an
+                // escaping exception was agent death (sg-7) and a silently-retrying
+                // loop would be a mechanism that reads healthy while it is dark
+                // (sre6-1). Neither: put back what this pass took, count, back off,
+                // and after kSweeperInertAfterFailures consecutive failures publish
+                // inertness through the existing wire signal (the capability CSV).
+                ok = false;
+                if (!lk.owns_lock())
+                    lk.lock();
+                unwind_pass_locked(work, dispatched);
+            }
+            if (ok) {
+                if (failures) {
+                    spdlog::info("spark_registry: sweeper pass recovered after {} failure(s)",
+                                 failures);
+                    failures = 0;
+                    if (core_)
+                        inert_.store(false, std::memory_order_release);
+                }
+                lk.unlock();
+                {
+                    SweepWork dead = std::move(work); // handle closes + abandons run off-lock
+                }
+                lk.lock();
+                continue;
+            }
+            sweep_pass_failed_.fetch_add(1, std::memory_order_relaxed);
+            ++failures;
+            const auto delay = doubled(sweep_cadence(), failures, kRegAdmissionBackoffCap);
+            if ((failures & (failures - 1)) == 0) // 1, 2, 4, 8 ... : bounded log rate (sre6-2)
+                spdlog::error("spark_registry: sweeper pass failed (consecutive #{}) - retrying in {} ms",
+                              failures, delay.count());
+            if (failures >= kSweeperInertAfterFailures && !inert_.load(std::memory_order_acquire)) {
+                inert_.store(true, std::memory_order_release);
+                spdlog::error("spark_registry: sweeper failing persistently - registry sparks "
+                              "reported inert until a pass succeeds");
+            }
             lk.unlock();
             {
-                SweepWork dead = std::move(work); // handle closes + abandons run off-lock
+                SweepWork dead = std::move(work);
             }
             lk.lock();
+            cv_.wait_until(lk, Clock::now() + delay, [&] { return sweeper_stop_; });
+            if (sweeper_stop_)
+                return;
         }
     }
 
@@ -1490,8 +1640,11 @@ private:
     SparkDetachedLane probe_lane_;
     SparkDetachedLane drain_lane_;
 
-    /// Started, but CreateThreadpool failed — every watch() will be refused. Atomic so
-    /// stats() (const, called from the heartbeat thread) reads it without mu_.
+    /// Started, but the mechanism cannot service watches: CreateThreadpool failed
+    /// (every watch() refused), or the sweeper has failed kSweeperInertAfterFailures
+    /// passes in a row (no late commit, no health edge would be produced). Cleared
+    /// by a successful start() and by the first successful pass after failures.
+    /// Atomic so stats() (const, heartbeat thread) reads it without mu_.
     std::atomic<bool> inert_{false};
     std::atomic<std::uint64_t> retiring_gauge_{0};
     std::atomic<std::uint64_t> watch_rejected_{0};
@@ -1510,6 +1663,8 @@ private:
     std::atomic<std::uint64_t> health_edges_{0};
     std::atomic<std::uint64_t> emit_failed_{0};    ///< an emit() submit threw (either path)
     std::atomic<std::uint64_t> resync_retries_{0}; ///< restored debt re-staged by the sweeper
+    std::atomic<std::uint64_t> fault_failed_{0};     ///< a fault() submit threw (sweeper path)
+    std::atomic<std::uint64_t> sweep_pass_failed_{0}; ///< sweeper passes that threw (sg-7/sre6-1)
     std::atomic<std::size_t> retiring_cap_{kRetiringCap};
     std::atomic<std::int64_t> caller_wait_ms_{kRegCallerWaitBudget.count()};
     std::atomic<std::int64_t> health_grace_ms_{kRegHealthGrace.count()};
