@@ -4128,11 +4128,11 @@ struct EstablishChurnWatch {
     // thread cycle: SparkEngine::disarm (spark_engine.cpp:1256, holds
     // mech_ops_mu_by_type_) blocks in WindowsRegistryMechanism::unwatch's
     // WaitForThreadpoolWaitCallbacks (spark_registry.cpp:304) waiting on an
-    // in-flight on_fire; that on_fire's emit() (spark_registry.cpp:349)
+    // in-flight on_fire; that on_fire's emit() (spark_registry.cpp:351)
     // reaches an Inline-tier subscriber synchronously (spark_engine.cpp's
     // deliver(), :1778) which, if it re-enters the engine for the same
-    // type, needs the same mech_ops_mu_by_type_ entry Thread A already
-    // holds. #3840 as filed covers the general "a hung call starves other
+    // type, needs the same mech_ops_mu_by_type_ entry the disarm thread
+    // already holds. #3840 as filed covers the general "a hung call starves other
     // arm/disarm on the same type" stall, not this specific cyclic-deadlock
     // scenario - #4181 is the correct tracked reference, #3840 is not. This
     // harness has no per-type lock at all, so neither #3840 nor #4181

@@ -52,7 +52,8 @@ point D would already be baked into the code the measurement was supposed to inf
 Every Win32 call shape in the harness is modeled directly on the already-shipped
 usage in the three mechanism files (cited per case in the test file itself), not
 invented - but "modeled on real usage" is not the same as "verified to compile and
-run on Windows." That verification is exactly what the pending DGRHP pass is for.
+run on Windows." That verification is exactly what the 2026-09-09 DGRHP pass
+(Status section above) confirmed.
 
 ## Cases (see the test file for the authoritative list; summarized here)
 
@@ -70,7 +71,7 @@ run on Windows." That verification is exactly what the pending DGRHP pass is for
 | F1 | `is_directory` + `CreateFileW(BACKUP\|OVERLAPPED)` sanity, local temp dir | n=200 |
 | post-fix-cost | Bulk `SparkEngine::arm()`, TODAY's (pre-PR-B) baseline, one series per mechanism: Registry initial arm (N=200 distinct keys), Registry RE-arm (value-write on all 200, wall-clock to observe all 200 fires), File (N=200 distinct real local dirs), Service (up to N=200, cycling the host's real service list - reports explicitly if the list is shorter than 200, since a wrap makes later arms coalescing re-arms of an already-held key, not fresh arms; arm failures skipped and excluded from the timing series) | N=200 per series, wall-clock total + per-op split |
 
-## D derivation formula (to apply once real numbers exist)
+## D derivation formula (applied below against the 2026-09-09 numbers)
 
 Per the plan: `D = max(round_up_50ms(4 x p99_worst), floor)`, ceiling 500ms (File
 250ms / Registry / Service - per-type queue-depth x D must stay inside Guardian's
@@ -115,14 +116,15 @@ not estimated.
 A later commit on this same branch (PR-A's `spark_detached_call.hpp`) ships a
 `kGuardianBackendOpDeadlineMirror` constant + a `spark_deadline_below_guardian_
 backend_op()` predicate for PR-B to `static_assert` each derived D constant
-against, once these are real numbers.
+against, using the real numbers derived below.
 
 ## Results (3 runs, DGRHP, 2026-09-09)
 
 All times microseconds unless stated. `p99` below is the WORST of the 3 runs per
 metric (conservative - the "never clamp silently" posture applies to which run we
-trust, not only to the formula). Full per-run WARN output: see this branch's
-DGRHP session notes; summarized here.
+trust, not only to the formula). The per-run raw `WARN` output isn't separately
+committed anywhere - the tables below are its full summary, not an excerpt of a
+larger record.
 
 **Registry, direct-target path (R1 idle / R3 under hive load) - per-call p99, worst of 3 runs:**
 
@@ -152,9 +154,10 @@ R2's worst-of-3 p99 = **1264us**. R4 (the under-load counterpart) has no compara
 number - the harness gap above. R3-vs-R1 showed hive load did not measurably worsen
 the direct-target path; whether that generalizes to the ancestor-walk path is an
 open question, not an assumption - R4 would need roughly a 10x jump over R2's
-1264us before it could move Registry's D off the 50ms floor computed below (see
-"why R4's absence doesn't block a decision" underneath the formula). **Forward
-action item, added here:** give R4 the same `t_walk_total` bracket R2 already has.
+1264us before it could move Registry's D off the 50ms floor computed in the D
+derivation section below (see "Why Registry's D above doesn't wait on R4").
+**Forward action item, added here:** give R4 the same `t_walk_total` bracket R2
+already has.
 
 **File (F1 - no under-load counterpart in this harness):**
 
@@ -188,8 +191,9 @@ establishment, not folded into Service's D below):**
 callback to wait on). In-flight drain (a deliberately-parked 50ms callback) p99
 across the 3 runs: 48826 / 48872 / 48837us - i.e. **the drain waits essentially the
 full callback duration**, as designed. This is the direct, measured cost of the
-#2819/#4181 mechanism's *stall* case (an unwatch draining a slow-but-not-cyclic
-callback) - useful context for both issues, not a D input itself.
+#2819 (shutdown lock-wedge) / #4181 (same-type reentrant deadlock) mechanism's
+*stall* case (an unwatch draining a slow-but-not-cyclic callback) - useful
+context for both issues, not a D input itself.
 
 **post-fix-cost (today's pre-PR-B baseline - bulk `SparkEngine::arm()`, N=200/mechanism, worst-of-3 p99):**
 
@@ -228,14 +232,18 @@ expect R4 stays under the threshold, not proof of it - R4 is genuinely unmeasure
 stated as such, and the forward action item above (give R4 its own `t_walk_total`)
 should be done before this is treated as settled.
 
-## Run protocol (once DGRHP is available)
+## Run protocol (as executed 2026-09-09)
 
-Per the plan's Verification section: 3 runs idle + 3 runs under load. Report only -
-never assert these numbers as a gate on the shared Wee Tam CI pool (this harness is
-env-gated specifically so it never runs there by default). Record each run's raw
-`WARN` output here, then the derived D values, then a summary table matching
-`f11-flood-measurement-run.md`'s "Claims" section shape (mechanism-measured facts
-vs. arithmetic-derived figures, kept visibly separate).
+Per the plan's Verification section: 3 runs idle + 3 runs under load - executed
+exactly this way (Status section above). Report only - never assert these numbers
+as a gate on the shared Wee Tam CI pool (this harness is env-gated specifically so
+it never runs there by default). The Results and D-derivation sections above are
+this run's raw output plus derived figures, split into separate sections to match
+`f11-flood-measurement-run.md`'s "Claims" shape (mechanism-measured facts vs.
+arithmetic-derived figures, kept visibly separate) - within "Results" itself, the
+per-metric cells (CreateEventW, RegOpenKeyExW, etc.) are the measured facts; the
+bolded `sum`/`p99_worst` rows are already arithmetic, carried into that section
+only because they're the direct input to the D derivation that follows.
 
 **Treat a 200-sample p99 as deadline-calibration input, not evidence about cold
 boot, a dead network share, or true worst-case latency** (round-3 finding in the
@@ -250,9 +258,7 @@ document must repeat that caveat, not just this document.
    figure the plan's "post-fix fast-path cost" note asks for (today's run here is
    the "before" baseline only). Still open.
 3. ~~Compile-verify the harness itself on a real Windows toolchain~~ - DONE
-   2026-09-09: MSVC 19.44, zero warnings on this file, 83 `[spark][mechanism]`
-   cases / 3843 assertions and 11 `[establish]` cases / 6625 assertions, all
-   passing across 3 independent runs.
+   2026-09-09, see Status section above.
 4. **NEW:** give R4 (Registry ancestor-walk under hive load) its own
    `t_walk_total` bracket, mirroring R2's (`test_spark_mechanism.cpp:4267-4269`).
    Without it, Registry's ancestor-walk D contribution rests on an inference from
