@@ -2600,14 +2600,16 @@ TEST_CASE("test helper: wait_until_quiescent returns false while another thread 
     // has it (loops on its own stop_token: a jthread destructor calls request_stop() and
     // would never set a hand-rolled release flag, so looping on such a flag would hang the
     // unwind path); a scope-exit join guard over std::thread on any toolchain that does not
-    // define __cpp_lib_jthread. __cpp_lib_jthread is not guaranteed across every C++23
-    // toolchain this project's own Prerequisites list (CLAUDE.md: "GCC 13+, Clang 18+,
-    // MSVC 19.38+, or Apple Clang 15+") - the fallback exists to stay safe across that
-    // stated floor, not because a specific currently-tested compiler is known to lack the
-    // macro (governance pass-7 xp-401/xp-402: no in-tree doc states an Apple Clang
-    // compiler-version floor, and this project's macOS runner is not established to lack
-    // it either - do not cite a specific toolchain here without verifying against the
-    // actual runner/toolchain-manifest first).
+    // define __cpp_lib_jthread. Not a hypothetical fallback: Apple Clang's libc++ does NOT
+    // provide std::jthread (this project's own compiler floor, README.md:168 and
+    // docs/build-guide.md:17, includes "Apple Clang 15+"; that exact substitution already
+    // broke Apple Clang's libc++ once in this codebase on #2580 -
+    // docs/governance-skill-tuning-2026-07.md:86, .claude/skills/governance/SKILL.md:1422,
+    // and the same guard convention at tests/unit/server/test_secret_codec.cpp:1104 and
+    // tests/unit/server/test_license_store.cpp:459). No CI leg compiles this arm today (see
+    // the structural note below), so nothing here has been exercised against a real macOS
+    // toolchain by this PR - the guard exists because the fact is established elsewhere in
+    // this tree, not because this test proves it.
     // NOTE (governance pass-6 xp-201/dw-304): no CI leg compiles the fallback arm today for a
     // STRUCTURAL reason, not toolchain ubiquity - this whole test is `#ifndef _WIN32` (Windows
     // excluded above) and returns via SUCCEED() before reaching this #if on any non-Linux
