@@ -46,6 +46,11 @@
 #include "schedule_engine.hpp"
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
+#include "workflow_engine.hpp" // #4030: WorkflowEngine — list_workflows/get_workflow/get_workflow_execution
+// #4027: DeviceRow (via device_routes.hpp) + TarRetentionPausedScan/
+// TarPausedSourceRow + the tar_*_json pure builders the read-twin MCP tools
+// share with their REST siblings (api-twin-recipe.md Rule 1).
+#include "tar_tree_routes.hpp"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -63,6 +68,7 @@ class MetricsRegistry; // optional bundle-metrics sink (yuzu_bundle_*)
 }
 
 namespace yuzu::server {
+class HttpRouteSink; // #2542 PR-6: register_routes(HttpRouteSink&, ...) overload
 class SoftwareInventoryStore; // typed daily-sync software store (ADR-0016)
 class SoftwareLicensingStore; // ADR-0024 discovery store (query_software_licenses)
 // EnginePrincipalStore backs BOTH the PR 4.2 role-assignment MCP twins
@@ -82,6 +88,14 @@ class DirectorySync;
 // UploadGrantStore itself is NOT forward-declared here — it arrives fully
 // defined via file_retrieval_routes.hpp's own include above.
 class PluginConfigStore;
+// #4029 — backs list_product_packs/get_product_pack. Forward-declared
+// (pointer-only in build_handler/register_routes); the .cpp includes
+// product_pack_model.hpp, which pulls in product_pack_store.hpp.
+class ProductPackStore;
+// #4027: backs list_tar_retention_paused — forward-declared (pointer-only via
+// set_dashboard_routes below); the .cpp includes dashboard_routes.hpp for the
+// full definition.
+class DashboardRoutes;
 }
 
 namespace yuzu::server::detail {
@@ -466,6 +480,52 @@ public:
                                            const std::string& operation)>;
     void set_fleet_read_fn(FleetReadFn fn) { fleet_read_fn_ = std::move(fn); }
 
+    /// #4143 review fix (external colleague review, BLOCKING, confirmed against
+    /// ADR-0017 INV-4/INV-7 by direct source inspection): `list_tar_process_
+    /// tree_devices`/`list_tar_capture_sources_devices` previously intersected
+    /// `fleet_read_fn_`'s admit-scope with `tar_devices_fn_`'s direct-
+    /// membership-only pre-filter — two divergent resolvers, so an operator
+    /// admitted via an ancestor-ward management-group role (not a DIRECT
+    /// member) could see an incomplete or empty list despite being admitted
+    /// (INV-4/INV-7 violation, not a merely-conservative narrowing). Fixed:
+    /// both tools now read this UNFILTERED registry snapshot — the SAME
+    /// zero-arg source `list_agents`' own `agents_fn` and REST's
+    /// `GET /api/v1/devices` (#4033) use (`registry_.to_json_obj()`) — with
+    /// `gate.scope` as the SOLE filter. `list_agents`' unscoped `agents_fn` was
+    /// never the gap: `require_fleet_read`'s `gate.scope` is the actual
+    /// authorization boundary in that pattern, applied after the unfiltered
+    /// read, exactly as here.
+    using AllDevicesFn = std::function<std::vector<DeviceRow>()>;
+    void set_all_devices_fn(AllDevicesFn fn) { all_devices_fn_ = std::move(fn); }
+
+    /// #4027: `list_tar_retention_paused`'s data source — the SAME
+    /// `DashboardRoutes::gather_tar_retention_paused` the REST twin
+    /// `GET /api/v1/tar/retention-paused` calls, reached via a raw borrowed
+    /// pointer (same lifetime contract as `tar_tree_routes_`/
+    /// `dashboard_routes_` in `server.cpp`'s `ServerImpl`: a persistent
+    /// `std::unique_ptr` member that outlives the web server, per `stop()`'s
+    /// join-before-destruct ordering — safe to borrow raw, same reasoning as
+    /// `set_stream_bridge`/`set_kek_ops` above). Nullable; the tool answers a
+    /// clean "unavailable" error rather than crashing when unset.
+    void set_dashboard_routes(DashboardRoutes* routes) { dashboard_routes_ = routes; }
+
+    /// #4033 — the D3 Response:Read-visible agent SET resolver backing
+    /// `preview_management_group_agent_count`'s scope, mirroring
+    /// `RestApiV1::ResponseVisibleSetFn`/`DashboardRoutes::VisibleSetFn`
+    /// EXACTLY (same doc contract; server.cpp wires the SAME instance into
+    /// all three surfaces so REST, MCP, and the `/fragments/create-group-form`
+    /// fragment cannot disagree on scope for the same caller). Same setter
+    /// idiom as `set_fleet_read_fn` above — live read on the next request.
+    /// Unset (default-constructed) ⇒ legacy-open (`nullopt`, unfiltered),
+    /// matching an unwired `DashboardRoutes` fixture's behaviour — this tool
+    /// is gated on `ManagementGroup:Write` (perm_fn), not this resolver, so
+    /// "unwired" degrades to unfiltered rather than failing closed.
+    using ResponseVisibleSetFn =
+        std::function<std::optional<std::set<std::string>>(const std::string& username)>;
+    void set_response_visible_set_fn(ResponseVisibleSetFn fn) {
+        response_visible_set_fn_ = std::move(fn);
+    }
+
     /// #4035: the SAME cross-store fleet provider `DexRoutes`/`RestApiV1`
     /// already receive (see `RestApiV1::DexFleetFn`'s doc comment,
     /// rest_api_v1.hpp) — server.cpp wires the IDENTICAL lambda into all
@@ -600,7 +660,16 @@ public:
                             // to today, which is the correct degradation.
                             yuzu::server::detail::StreamBudget* stream_budget = nullptr,
                             StreamRevalidateFn revalidate_fn = {},
-                            StreamPrincipalAuditFn principal_audit_fn = {});
+                            StreamPrincipalAuditFn principal_audit_fn = {},
+                            // #4029 — backs list_product_packs/get_product_pack. Trailing
+                            // optional dep; nullptr leaves those two tools answering
+                            // "Product pack store unavailable" (kInternalError).
+                            ProductPackStore* product_pack_store = nullptr,
+                            // #4030: backs list_workflows/get_workflow/get_workflow_execution
+                            // — WorkflowEngine was not previously threaded into McpServer at
+                            // all. Trailing optional dep; nullptr leaves the three tools
+                            // answering an internal-error JSON-RPC response.
+                            WorkflowEngine* workflow_engine = nullptr);
 
     /// Build the GET/DELETE handlers for /mcp/v1/ (Streamable HTTP transport).
     /// Separate builders so tests can drive them without the httplib acceptor
@@ -627,8 +696,12 @@ public:
                                    const bool* streaming_disabled, McpSessionRegistry* sessions,
                                    std::vector<std::string> allowed_origins);
 
-    /// Register the /mcp/v1/ POST route on `svr` and emit the startup log line.
-    /// Production callers use this; tests prefer build_handler() above.
+    /// Register the /mcp/v1/ GET/POST/DELETE routes on `svr` and emit the startup
+    /// log line. Production callers use this (it wraps `svr` in an
+    /// HttplibRouteSink and delegates to the HttpRouteSink& overload below);
+    /// tests prefer build_handler()/build_get_handler()/build_delete_handler()
+    /// directly, or the HttpRouteSink& overload for registration-shape coverage
+    /// (#2542 PR-6 — in-process via TestRouteSink, no httplib acceptor, #438).
     void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
                          AgentsJsonFn agents_fn, RbacStore* rbac_store,
                          InstructionStore* instruction_store, ExecutionTracker* execution_tracker,
@@ -685,7 +758,55 @@ public:
                          StreamPrincipalAuditFn principal_audit_fn = {},
                          // #1788 / PLAN-006: per-request DispatchCaller deriver,
                          // forwarded to build_handler for MCP dispatch confinement.
-                         CallerFn caller_fn = {});
+                         CallerFn caller_fn = {},
+                         // #4029 — backs list_product_packs/get_product_pack.
+                         ProductPackStore* product_pack_store = nullptr,
+                         // #4030: backs list_workflows/get_workflow/get_workflow_execution —
+                         // forwarded to build_handler.
+                         WorkflowEngine* workflow_engine = nullptr);
+
+    /// HttpRouteSink overload — testable in-process via TestRouteSink (no httplib
+    /// acceptor; the #438 TSan trap). The httplib::Server& overload above wraps
+    /// `svr` in an HttplibRouteSink and delegates here; every parameter is
+    /// otherwise identical (#2542 PR-6).
+    void register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
+                         AgentsJsonFn agents_fn, RbacStore* rbac_store,
+                         InstructionStore* instruction_store, ExecutionTracker* execution_tracker,
+                         ResponseStore* response_store, AuditStore* audit_store,
+                         TagStore* tag_store, InventoryStore* inventory_store,
+                         PolicyStore* policy_store, ManagementGroupStore* mgmt_store,
+                         ApprovalManager* approval_manager, ScheduleEngine* schedule_engine,
+                         const bool& read_only_mode, const bool& mcp_disabled,
+                         DispatchFn dispatch_fn = nullptr, CaStore* ca_store = nullptr,
+                         PublishCrlFn publish_crl_fn = nullptr,
+                         GuaranteedStateStore* guaranteed_state_store = nullptr,
+                         DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
+                         ResponseScopeFn response_scope_fn = {},
+                         SoftwareInventoryStore* software_inventory_store = nullptr,
+                         yuzu::MetricsRegistry* metrics = nullptr,
+                         AppPerfProviders app_perf_providers = {},
+                         QuarantineStore* quarantine_store = nullptr,
+                         TagPushFn tag_push_fn = {},
+                         yuzu::server::detail::AgentRegistry* agent_registry = nullptr,
+                         ScopedPermFn scoped_perm_fn = {},
+                         McpSessionRegistry* sessions = nullptr,
+                         const bool* mcp_streaming_disabled = nullptr,
+                         const bool* mcp_streamed_post_enabled = nullptr,
+                         std::vector<std::string> allowed_origins = {},
+                         SoftwareLicensingStore* software_licensing_store = nullptr,
+                         EnginePrincipalStore* engine_principal_store = nullptr,
+                         AccessReviewStore* access_review_store = nullptr,
+                         AuthDB* auth_db = nullptr, DirectorySync* directory_sync = nullptr,
+                         yuzu::server::detail::StreamBudget* stream_budget = nullptr,
+                         StreamRevalidateFn revalidate_fn = {},
+                         std::size_t mcp_max_streams_per_principal =
+                             kMcpStreamsPerPrincipalDefault,
+                         StreamPrincipalAuditFn principal_audit_fn = {},
+                         CallerFn caller_fn = {},
+                         // #4029 — backs list_product_packs/get_product_pack.
+                         ProductPackStore* product_pack_store = nullptr,
+                         // #4030: backs list_workflows/get_workflow/get_workflow_execution.
+                         WorkflowEngine* workflow_engine = nullptr);
 
 private:
     // ── Engine-principal lifecycle wiring (ADR-1005 item 2b, plan PR 4.3) ──
@@ -719,6 +840,11 @@ private:
     UploadGrantListReadFn upload_grant_list_read_fn_;
     // #3290 Phase 2 — see set_fleet_read_fn above.
     FleetReadFn fleet_read_fn_;
+    // #4143 review fix — see set_all_devices_fn above.
+    AllDevicesFn all_devices_fn_;
+    DashboardRoutes* dashboard_routes_{nullptr};
+    // #4033 — see set_response_visible_set_fn above.
+    ResponseVisibleSetFn response_visible_set_fn_;
     // #4035 — see set_dex_fleet_fn above.
     DexFleetFn dex_fleet_fn_;
     // #4035 hardening (governance) — see set_dex_visible_fn above.

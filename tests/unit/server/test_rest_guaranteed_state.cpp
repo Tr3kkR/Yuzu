@@ -545,6 +545,11 @@ struct RestGsHarness {
                             wire_list_read_fn_ ? RestApiV1::ListReadFn{list_read_fn}
                                                : RestApiV1::ListReadFn{},
                             /*fleet_read_fn=*/{},
+                            // #4033: this harness doesn't exercise GET
+                            // /api/v1/devices or the agent-count preview —
+                            // unwired defaults (fail-closed / legacy-open
+                            // respectively) are correct no-ops here.
+                            /*agents_fn=*/{}, /*response_visible_set_fn=*/{},
                             // #4035: reads dex_fleet_override_ LIVE at request
                             // time (see that field's doc comment).
                             RestApiV1::DexFleetFn{[this]() { return dex_fleet_override_; }},

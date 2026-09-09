@@ -1,5 +1,7 @@
 #include "ota_transfer_watchdog.hpp"
 
+#include "background_jobs.hpp"
+
 #include <spdlog/spdlog.h>
 
 #include <cstdlib>
@@ -30,6 +32,7 @@ OtaTransferWatchdog::OtaTransferWatchdog(std::chrono::milliseconds sweep_interva
             // a dropped pass costs at most one sweep_interval of deadline latency,
             // whereas dying takes the whole server with it.
             try {
+                YUZU_ASSERT_BACKGROUND_JOB("ota_transfer_watchdog.sweep_once"); // WS-10 ReplicaSafe (per-replica)
                 sweep_once();
             } catch (...) {
                 // Observable, not silent. This watchdog is the ONLY enforcement of

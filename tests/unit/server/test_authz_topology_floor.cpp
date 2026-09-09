@@ -130,7 +130,7 @@ struct FloorFixture {
     }
 };
 
-/// Literal, INDEPENDENT copy of the three documented floored pairs — used by
+/// Literal, INDEPENDENT copy of the five documented floored pairs — used by
 /// every test below that needs to enumerate "the floored set" for anything
 /// other than `topology_floor_applies` itself. Deliberately NOT derived from
 /// `kTopologyFloor`: a test that iterates the production array to build its
@@ -147,19 +147,39 @@ constexpr FloorPair kExpectedFloorPairs[] = {
     {"AccessReview", "Read"},
     {"UserManagement", "Read"},
     {"EnginePrincipal", "Read"},
+    // #4028 (api-parity programme #2146) — Settings read-twins.
+    {"TlsConfig", "Read"},
+    {"PluginSigning", "Read"},
+    {"ServerConfig", "Read"},
+    {"AnalyticsConfig", "Read"},
+    // #4031: Enrollment/OidcConfig moved off admin_fn_ onto perm_fn_ with a
+    // freshly-minted Administrator-only securable — floored so RBAC-off
+    // doesn't silently widen admin-only to any-authenticated-user.
+    {"Enrollment", "Read"},
+    {"OidcConfig", "Read"},
 };
 
 } // namespace
 
 // ── 1. Lock the set ──────────────────────────────────────────────────────
 
-TEST_CASE("topology_floor_applies: exactly the three documented pairs are floored",
+TEST_CASE("topology_floor_applies: exactly the nine documented pairs are floored",
           "[authz][floor]") {
-    // Positive: the three floored pairs (a change to kTopologyFloor's
-    // MEMBERSHIP must break these).
+    // Positive: the nine floored pairs (a change to kTopologyFloor's
+    // MEMBERSHIP must break these). #4028 (api-parity programme #2146)
+    // added the four Settings read-twin securables to the original three;
+    // #4031 added Enrollment/OidcConfig — see authz_topology_floor.hpp's
+    // file-header note on why these PRs extended this floor beyond its
+    // original "authorization topology" framing.
     CHECK(topology_floor_applies("AccessReview", "Read"));
     CHECK(topology_floor_applies("UserManagement", "Read"));
     CHECK(topology_floor_applies("EnginePrincipal", "Read"));
+    CHECK(topology_floor_applies("TlsConfig", "Read"));
+    CHECK(topology_floor_applies("PluginSigning", "Read"));
+    CHECK(topology_floor_applies("ServerConfig", "Read"));
+    CHECK(topology_floor_applies("AnalyticsConfig", "Read"));
+    CHECK(topology_floor_applies("Enrollment", "Read"));
+    CHECK(topology_floor_applies("OidcConfig", "Read"));
 
     // Negative: a representative spread of pairs that must NOT be floored —
     // proves the set is narrow, not "every Read" or "every op on these
@@ -168,11 +188,15 @@ TEST_CASE("topology_floor_applies: exactly the three documented pairs are floore
     CHECK_FALSE(topology_floor_applies("Security", "Read"));
     CHECK_FALSE(topology_floor_applies("AccessReview", "Attest"));
     CHECK_FALSE(topology_floor_applies("UserManagement", "Write"));
+    CHECK_FALSE(topology_floor_applies("TlsConfig", "Write"));
+    CHECK_FALSE(topology_floor_applies("PluginConfig", "Read")); // unrelated securable, not floored
+    CHECK_FALSE(topology_floor_applies("Directory", "Read")); // #4031: NOT floored, see PR notes
+    CHECK_FALSE(topology_floor_applies("Enrollment", "Write"));
 
-    // Cardinality lock: a fourth pair silently added to kTopologyFloor
+    // Cardinality lock: a tenth pair silently added to kTopologyFloor
     // without updating this file's positive/negative lists must still break
     // this test even though every entry it DOES check still round-trips.
-    CHECK(std::size(kTopologyFloor) == 3);
+    CHECK(std::size(kTopologyFloor) == 9);
 }
 
 // ── 1b. Every floored securable must actually EXIST in the catalogue ─────

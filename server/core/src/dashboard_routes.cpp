@@ -3,6 +3,8 @@
 #include "dispatch_destructive_gate.hpp" // PR6.0b: the shared Destructive targeting gate (#3685)
 #include "on_behalf_guard.hpp"              // sanitize_for_log
 #include "dispatch_target_shape.hpp" // kBroadcastScope (#2500), kReasonDestructiveUntargeted
+#include "rest_a4_envelope_http.hpp" // detail::a4_error, make_correlation_id (#4027 REST twin)
+#include "tar_tree_routes.hpp" // TarRetentionPausedScan/TarPausedSourceRow/tar_retention_paused_json (#4027)
 
 #include <algorithm>
 #include <chrono>
@@ -1458,6 +1460,92 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 }
             });
 
+    // -- REST v1 twin: same per-operator scan/paused-source list, JSON (#4027).
+    // Per-operator-scoped Cache-Control posture as the fragment above;
+    // unaudited on the success path — scan/config metadata, not per-device
+    // behavioral content (matches this fragment's own today-unaudited posture; see
+    // docs/api-twin-recipe.md's list_software_deployments worked example for the
+    // same "metadata, not behavioral PII" reasoning).
+    //
+    // #4027 fix round (CDX-P1-01/K4): gate migrated from bare perm_fn_
+    // (require_permission — a GLOBAL grant check that 403s a management-group
+    // -scoped Infrastructure:Read holder before gather_tar_retention_paused
+    // ever runs) to fleet_read_fn_ (require_fleet_read, the ADR-0017
+    // admit-then-filter chokepoint) — same seam this class already wires for
+    // /fragments/results above. The explicit service-scoped-token 403 BELOW is
+    // deliberately kept even though fleet_read_fn_ would otherwise admit a
+    // correctly-confined service-scoped caller here: this route previously
+    // denied EVERY service-scoped token outright (perm_fn_'s empty
+    // kServiceScopeGlobalSafe default-deny), matching this tool's own
+    // list_tar_retention_paused MCP twin (C8 ServiceScopeClass::denied) and the
+    // two REST device-picker twins (deny_fleet_wide_device_enumeration) — this
+    // fix round repairs the management-group-scope gap, not a decision to
+    // widen service-token access on this one surface while its twins stay
+    // denied.
+    sink.Get("/api/v1/tar/retention-paused",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                const auto cid = detail::make_correlation_id();
+                res.set_header("X-Correlation-Id", cid);
+                auto session = auth_fn_(req, res);
+                if (!session) return; // auth_fn_ already wrote the A4 401 body
+                if (!session->token_scope_service.empty()) {
+                    // #4027 fix round 2 (adversarial review CDX-P2-08): the
+                    // gate this replaced (perm_fn_/require_permission) audited
+                    // this exact denial via AuthRoutes::audit_log (its
+                    // service-scope default-deny branch, auth_routes.cpp). This
+                    // explicit check must not silently drop that durable
+                    // evidence row — a metric alone carries no principal/request
+                    // detail and cannot serve as audit evidence.
+                    res.status = 403;
+                    res.set_content(
+                        detail::a4_denial(
+                            res, 403,
+                            "service-scoped tokens may not read the fleet-wide retention scan"),
+                        "application/json");
+                    audit_fn_(req, "tar.retention_paused.view", "denied", "Infrastructure", "",
+                             "service-scoped token denied fleet-wide retention scan read");
+                    if (metrics_) {
+                        metrics_->counter("yuzu_tar_dashboard_view_total",
+                                          {{"frame", "retention_rest"},
+                                           {"result", "denied"}}).increment();
+                    }
+                    return;
+                }
+                if (!fleet_read_fn_) {
+                    spdlog::error("tar.retention_paused: fleet_read_fn_ unwired — "
+                                  "misconfigured call site; failing closed; cid={}", cid);
+                    res.status = 503;
+                    res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                    "application/json");
+                    return;
+                }
+                auto gate = fleet_read_fn_(req, res, "Infrastructure", "Read");
+                if (!gate.admitted) {
+                    if (metrics_) {
+                        metrics_->counter("yuzu_tar_dashboard_view_total",
+                                          {{"frame", "retention_rest"},
+                                           {"result", "denied"}}).increment();
+                    }
+                    return; // gate already wrote the A4 error body + status
+                }
+                // Per-operator scoped data — see the fragment route's UP-11 comment.
+                res.set_header("Cache-Control", "no-store, private");
+                res.set_header("Vary", "Cookie");
+                // #4143 review fix: gate.scope is authoritative here — see
+                // gather_tar_retention_paused's doc comment.
+                const TarRetentionPausedScan scan = gather_tar_retention_paused(
+                    session->username, gate.scope, /*extra_scope_is_authoritative=*/true);
+                res.set_content(
+                    std::string("{\"data\":") + tar_retention_paused_json(scan) +
+                        ",\"meta\":{\"api_version\":\"v1\"}}",
+                    "application/json");
+                if (metrics_) {
+                    metrics_->counter("yuzu_tar_dashboard_view_total",
+                                      {{"frame", "retention_rest"},
+                                       {"result", "success"}}).increment();
+                }
+            });
+
     sink.Post("/fragments/tar/retention-paused/scan",
              [this](const httplib::Request& req, httplib::Response& res) {
                  // Dispatching a command to the fleet is an Execute action,
@@ -2753,28 +2841,33 @@ std::string DashboardRoutes::render_scope_list(const std::string& selected,
 // informational placeholders rather than table-with-zero-rows so the
 // operator gets actionable guidance.
 
-std::string DashboardRoutes::render_tar_retention_paused(
-    const std::string& username, bool can_execute, bool can_delete) const {
-    std::string scan_id;
-    int scan_count = 0;
-    int64_t scan_at = 0;
+// #4027: the data-gathering half, extracted from render_tar_retention_paused so the
+// HTML fragment renderer below AND the new GET /api/v1/tar/retention-paused REST twin
+// + list_tar_retention_paused MCP twin all read the SAME scan state / response store /
+// visibility filter exactly once (api-twin-recipe.md Rule 1) rather than the REST/MCP
+// surface re-deriving it. `store_degraded` covers BOTH "response_store_ was never
+// wired" and "the store was wired but the query itself failed" — the caller (the HTML
+// renderer's empty-state branch, or the JSON builder) doesn't need the distinction,
+// only "was this data trustworthy."
+TarRetentionPausedScan
+DashboardRoutes::gather_tar_retention_paused(const std::string& username,
+                                             const authz::VisibleSet& extra_scope,
+                                             bool extra_scope_is_authoritative) const {
+    TarRetentionPausedScan scan;
     {
         std::lock_guard<std::mutex> lk(tar_scan_mu_);
         auto it = tar_scans_by_user_.find(username);
         if (it != tar_scans_by_user_.end()) {
-            scan_id = it->second.command_id;
-            scan_count = it->second.dispatched_count;
-            scan_at = it->second.dispatched_at;
+            scan.scan_id = it->second.command_id;
+            scan.scan_count = it->second.dispatched_count;
+            scan.scan_at = it->second.dispatched_at;
         }
     }
-
-    if (scan_id.empty()) {
-        return "<div class=\"empty-state\">No scan data yet — click "
-               "<strong>Scan fleet</strong> above to query the agents "
-               "in your scope for TAR retention state.</div>";
-    }
+    if (scan.scan_id.empty())
+        return scan; // no scan yet for this operator
     if (!response_store_) {
-        return "<div class=\"empty-state\">Response store unavailable.</div>";
+        scan.store_degraded = true;
+        return scan;
     }
 
     // Build the operator's visible-agent allow-set so we can filter the
@@ -2800,8 +2893,8 @@ std::string DashboardRoutes::render_tar_retention_paused(
     // view exists to make.
     ResponseQuery q;
     q.limit = 10000;
-    auto responses_opt = response_store_->query(scan_id, q);
-    bool store_degraded = !responses_opt.has_value();
+    auto responses_opt = response_store_->query(scan.scan_id, q);
+    scan.store_degraded = !responses_opt.has_value();
     auto responses = responses_opt.value_or(std::vector<StoredResponse>{});
 
     // Each response is from one agent. Parse each line for
@@ -2809,23 +2902,9 @@ std::string DashboardRoutes::render_tar_retention_paused(
     //   config|<source>_paused_at|<ts>
     //   config|<source>_live_rows|<count>
     //   config|<source>_oldest_ts|<ts>
-    // and emit one table row for every (agent, source) pair where
-    // `<source>_enabled` == "false". Sources with `enabled=true` are
-    // dropped — the operator wants the *paused* set, not the whole fleet.
-    struct PausedRow {
-        std::string agent_id;
-        std::string agent_display;
-        std::string source;
-        int64_t paused_at{0};
-        int64_t live_rows{-1};   // -1 = unknown (older agent)
-        int64_t oldest_ts{0};
-        bool value_error{false}; // #560: <source>_enabled held a non-canonical value
-        std::string enabled_raw; // the offending value, for the value-error badge
-    };
-    std::vector<PausedRow> rows;
-    int agents_responded = 0;
-    int agents_with_no_paused_sources = 0;
-    int agents_filtered_out_of_scope = 0;
+    // and emit one row for every (agent, source) pair where `<source>_enabled` ==
+    // "false". Sources with `enabled=true` are dropped — callers want the *paused*
+    // set, not the whole fleet.
 
     // #561 — a malicious or buggy agent can spam many responses under one
     // command_id (no (command_id, agent_id) uniqueness at the write path). Dedup
@@ -2853,11 +2932,30 @@ std::string DashboardRoutes::render_tar_retention_paused(
         // Visibility gate: drop responses from agents the operator cannot
         // see. If mgmt_group_store_ is unavailable, fail closed (drop all
         // — operator sees an empty list rather than unscoped data).
-        if (!visible_set.contains(resp.agent_id)) {
-            ++agents_filtered_out_of_scope;
+        // #4027 fix round: `extra_scope` (nullopt/TOP for the HTML fragment
+        // caller, `FleetReadGate::scope` for the REST/MCP twins) is ANDed
+        // in here for the fragment caller — a row dropped by either axis
+        // counts toward `agents_filtered_out_of_scope` the same way, so the
+        // honesty counters never silently disagree with what `rows` actually
+        // holds.
+        //
+        // #4143 review fix (BLOCKING): for the REST/MCP twins
+        // (`extra_scope_is_authoritative`), `extra_scope` (= `gate.scope`,
+        // ADR-0017-authorized) is the SOLE filter — `visible_set`'s
+        // direct-membership-only check is skipped, so an ancestor-scoped
+        // (not direct-member) admitted operator no longer has their rows
+        // silently dropped by the older resolver. See set_all_devices_fn's
+        // doc comment (tar_tree_routes.hpp) for the identical rationale on
+        // the two device pickers.
+        const bool out_of_scope = extra_scope_is_authoritative
+                                       ? !authz::in_scope(extra_scope, resp.agent_id)
+                                       : (!visible_set.contains(resp.agent_id) ||
+                                          !authz::in_scope(extra_scope, resp.agent_id));
+        if (out_of_scope) {
+            ++scan.agents_filtered_out_of_scope;
             continue;
         }
-        ++agents_responded;
+        ++scan.agents_responded;
         std::unordered_map<std::string, std::string> kv;
         auto lines = split_output_lines(resp.output);
         for (const auto& line : lines) {
@@ -2886,7 +2984,7 @@ std::string DashboardRoutes::render_tar_retention_paused(
             // (silent omission shows clean state for an actually-paused source).
             const bool value_error = (it->second != "false");
 
-            PausedRow row;
+            TarPausedSourceRow row;
             row.agent_id = resp.agent_id;
             row.agent_display = registry_ ? registry_->display_name(resp.agent_id)
                                           : resp.agent_id;
@@ -2906,10 +3004,34 @@ std::string DashboardRoutes::render_tar_retention_paused(
                 ot != kv.end()) {
                 try { row.oldest_ts = std::stoll(ot->second); } catch (...) {}
             }
-            rows.push_back(std::move(row));
+            scan.rows.push_back(std::move(row));
             any_paused_for_this_agent = true;
         }
-        if (!any_paused_for_this_agent) ++agents_with_no_paused_sources;
+        if (!any_paused_for_this_agent) ++scan.agents_with_no_paused_sources;
+    }
+
+    return scan;
+}
+
+std::string DashboardRoutes::render_tar_retention_paused(
+    const std::string& username, bool can_execute, bool can_delete) const {
+    TarRetentionPausedScan scan = gather_tar_retention_paused(username);
+    const std::string& scan_id = scan.scan_id;
+    const int scan_count = scan.scan_count;
+    const int64_t scan_at = scan.scan_at;
+    const bool store_degraded = scan.store_degraded;
+    const int agents_responded = scan.agents_responded;
+    const int agents_with_no_paused_sources = scan.agents_with_no_paused_sources;
+    const int agents_filtered_out_of_scope = scan.agents_filtered_out_of_scope;
+    // Local, mutable alias (the HTML rendering below sorts in place) so the
+    // unchanged HTML-building code (which iterates `rows` and reads
+    // `TarPausedSourceRow` fields) needs no further edits.
+    std::vector<TarPausedSourceRow>& rows = scan.rows;
+
+    if (scan_id.empty()) {
+        return "<div class=\"empty-state\">No scan data yet — click "
+               "<strong>Scan fleet</strong> above to query the agents "
+               "in your scope for TAR retention state.</div>";
     }
 
     int64_t now = now_epoch();
@@ -2994,7 +3116,7 @@ std::string DashboardRoutes::render_tar_retention_paused(
     // the BOTTOM, inverting operator intent; sort 0 as the smallest (oldest)
     // instead so they rank at the top.
     std::sort(rows.begin(), rows.end(),
-              [](const PausedRow& a, const PausedRow& b) {
+              [](const TarPausedSourceRow& a, const TarPausedSourceRow& b) {
                   if (a.value_error != b.value_error)
                       return a.value_error; // errors float to the top
                   if (a.paused_at != b.paused_at)

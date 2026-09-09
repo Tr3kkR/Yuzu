@@ -15,6 +15,7 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <chrono>
@@ -620,7 +621,17 @@ ExecutionTracker::query_executions_checked(const ExecutionQuery& q,
     // #3789: MUST precede ORDER BY/LIMIT below — ADR-0017 INV-3.
     append_execution_scope_clause(sql, params, idx, scope);
     sql += " ORDER BY dispatched_at DESC LIMIT $" + std::to_string(idx++);
-    params.push_back(std::to_string(q.limit));
+    // #4030 review finding (should-fix): a schema-legal non-positive
+    // q.limit (no caller validates it before this point -- MCP
+    // list_executions's input schema declares no minimum) previously
+    // reached Postgres verbatim; Postgres rejects a negative LIMIT outright,
+    // which query_executions() (the unchecked wrapper) silently collapsed to
+    // a false-empty success. Clamp here, matching
+    // WorkflowEngine::list_workflows's identical "Clamp to at least 1"
+    // comment/fix (workflow_engine.cpp) — this protects every caller of
+    // query_executions[_checked], not just the one MCP handler that
+    // triggered the finding.
+    params.push_back(std::to_string(std::max(q.limit, 1)));
 
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
     if (res.status() != PGRES_TUPLES_OK) {
@@ -1601,7 +1612,35 @@ int ExecutionTracker::reconcile_stale_concurrency_claims(int64_t now) {
     audit_retention::Anomaly anomaly = audit_retention::Anomaly::None;
     std::string facts_str;
 
+    bool skipped_lock = false;
     const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        // SINGLE-WRITER (WS-10 / clock-guarded-retention "SINGLE-WRITER ONLY as
+        // written"): this pass reads the anchor, decides, and force-releases in
+        // one txn; two replicas running it unserialised race on the anchor and
+        // the capped release, and the clock reading paces at N x cap. Take a
+        // transaction-scoped advisory lock as the FIRST in-txn statement so the
+        // whole read-decide-write is serialised fleet-wide. try-and-skip (not
+        // blocking) fits this pass's tight ~5m cadence and its all-expired-is-
+        // routine steady state, mirroring the sibling outbox-reap: a replica
+        // that loses the race skips (the winner advances the anchor), and a
+        // miss retries next tick far inside the claim horizon. Distinct key
+        // from the two sibling reaps.
+        pg::PgResult lk = pg::exec_params(
+            conn, "SELECT pg_try_advisory_xact_lock(hashtext('execution_tracker:concurrency_reconcile'))",
+            std::vector<std::string>{});
+        if (lk.status() != PGRES_TUPLES_OK || PQntuples(lk.get()) == 0) {
+            spdlog::error("ExecutionTracker::reconcile_stale_concurrency_claims: "
+                          "advisory lock query failed: {}",
+                          PQerrorMessage(conn));
+            return false;
+        }
+        if (col_str(lk.get(), 0, 0) != "t") {
+            // Another replica holds the reconcile lock this tick — skip cleanly
+            // (released 0; the holder advances the anchor). NOT a decline.
+            skipped_lock = true;
+            return true;
+        }
+
         // Part 2 — a clock reading PERSISTED across restarts, not an
         // in-process one (an in-process reading is inert on the very pass
         // that matters: the first after a boot with an already-wrong clock).
@@ -1818,6 +1857,13 @@ int ExecutionTracker::reconcile_stale_concurrency_claims(int64_t now) {
                       "leaving the liveness gauge stale");
         return 0;
     }
+
+    // Another replica held the reconcile lock this tick — we committed nothing
+    // and reached no verdict, so do NOT advance the liveness gauge (the holder
+    // does) and do not count it as a pass. A staleness alert on the gauge then
+    // still fires if the ACTUAL holder wedges.
+    if (skipped_lock)
+        return 0;
 
     // Liveness gauge (sre, Gate 6): every pass that actually reached a
     // verdict and committed (declined or not) — the wedge case a bounded

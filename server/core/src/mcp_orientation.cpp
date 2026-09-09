@@ -47,17 +47,26 @@ namespace {
 
 constexpr std::string_view kFleet[] = {"list_agents", "get_agent_details"};
 constexpr std::string_view kTags[] = {"get_tags", "search_agents_by_tag", "set_tag", "delete_tag"};
-constexpr std::string_view kDefinitions[] = {"list_definitions", "get_definition", "list_schedules"};
+// #4029: export_definition joins the family — same domain, same securable.
+constexpr std::string_view kDefinitions[] = {"list_definitions", "get_definition",
+                                             "export_definition", "list_schedules"};
+// #4029: product packs are a distinct catalog domain (installed bundles of
+// InstructionDefinition/PolicyFragment/Policy/Workflow documents), own
+// securable (ProductPack), own family.
+constexpr std::string_view kProductPacks[] = {"list_product_packs", "get_product_pack"};
 constexpr std::string_view kResponses[] = {"query_responses", "aggregate_responses"};
 constexpr std::string_view kExecutionsAudit[] = {"get_execution_status", "list_executions",
                                                  "query_audit_log"};
 constexpr std::string_view kInventory[] = {"query_inventory", "list_inventory_tables",
                                            "get_agent_inventory", "query_installed_software",
                                            "query_software_licenses"};
-constexpr std::string_view kCompliance[] = {"list_policies", "get_compliance_summary",
-                                            "get_fleet_compliance", "get_guardian_schemas"};
+constexpr std::string_view kCompliance[] = {
+    "list_policies",    "get_compliance_summary",       "get_fleet_compliance",
+    "get_guardian_schemas", "get_policy", "list_policy_fragments",
+    "get_policy_agent_statuses"}; // #4034
 constexpr std::string_view kScope[] = {"validate_scope", "preview_scope_targets"};
-constexpr std::string_view kMgmtGroups[] = {"list_management_groups"};
+constexpr std::string_view kMgmtGroups[] = {"list_management_groups",
+                                            "preview_management_group_agent_count"};
 constexpr std::string_view kApprovals[] = {"list_pending_approvals", "approve_request",
                                            "reject_request"};
 constexpr std::string_view kDexSignals[] = {
@@ -112,11 +121,33 @@ constexpr std::string_view kAgenticHelpers[] = {"get_fleet_posture_fast",
 constexpr std::string_view kDiscovery[] = {"discover_permissions", "discover_instructions",
                                            "discover_routes", "discover_scope_kinds",
                                            "discover_plugins"};
+// #4030: WorkflowEngine's multi-step orchestration — its own family, distinct
+// from both "Instructions & schedules" (single InstructionDefinitions) and
+// "Executions & audit" (ExecutionTracker's single-instruction fan-out): a
+// Workflow composes multiple steps, and its execution record is a different
+// data model from an Execution (see get_workflow_execution's tool doc).
+constexpr std::string_view kWorkflows[] = {"list_workflows", "get_workflow",
+                                           "get_workflow_execution"};
+// #4027 — TAR (Timeline / Activity Recorder) had zero MCP presence before this
+// read-twin batch; its own family rather than folding into an unrelated one.
+constexpr std::string_view kTar[] = {"list_tar_process_tree_devices",
+                                     "list_tar_capture_sources_devices",
+                                     "list_tar_retention_paused"};
+// #4031: AD/Entra directory-sync user listing + directory-sync status (last
+// sync time/health, NOT OIDC SSO config — that lives at REST-only
+// GET /api/v1/settings/oidc, deliberately with no MCP twin per #520) — both
+// Directory:Read, deliberately their own family rather than folded into
+// Fleet & agents (directory users are IdP-sourced identity records, not
+// managed endpoints) or Engine principals (unrelated identity axis).
+constexpr std::string_view kDirectory[] = {"list_directory_users", "get_directory_status"};
 
-constexpr std::array<ToolFamily, 24> kFamilies{{
+constexpr std::array<ToolFamily, 28> kFamilies{{
     {"Fleet & agents", "connected agents, their OS/arch/version, and details", kFleet},
     {"Tags", "read and write agent tags, and find agents by tag", kTags},
-    {"Instructions & schedules", "instruction definitions and recurring schedules", kDefinitions},
+    {"Instructions & schedules", "instruction definitions, their full export, and recurring "
+                                 "schedules",
+     kDefinitions},
+    {"Product packs", "installed bundles of instruction/policy/workflow content", kProductPacks},
     {"Command responses", "query and aggregate stored command/instruction responses", kResponses},
     {"Executions & audit", "execution status/history and the who-did-what audit log",
      kExecutionsAudit},
@@ -155,6 +186,14 @@ constexpr std::array<ToolFamily, 24> kFamilies{{
      kAgenticHelpers},
     {"Discovery", "enumerate permissions, instructions, routes, scope kinds, and plugins",
      kDiscovery},
+    {"Workflows", "multi-step workflow definitions and their per-step execution records",
+     kWorkflows},
+    {"TAR process-tree & retention", "operator-scoped device pickers for the TAR process-tree "
+                                     "and capture-sources frames, and the caller's own "
+                                     "retention-paused source scan",
+     kTar},
+    {"Directory & identity", "AD/Entra directory-synced users and directory-sync status",
+     kDirectory},
 }};
 
 }  // namespace

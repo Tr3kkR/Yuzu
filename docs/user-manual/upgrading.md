@@ -886,15 +886,16 @@ steps apply as written to a Postgres-backed AuthDB.
 
 **No operator action on upgrade.** Existing deployments default to
 `--auth-mode=standard` and behave exactly as before. This release adds the
-*option* to disable local-password login fleet-wide so only OIDC SSO can mint a
+*option* to disable local-password login fleet-wide so only an SSO provider can mint a
 session.
 
 If you intend to enable `sso-only`, do this **first** — the server **fails
 closed (non-zero exit, refuses to serve)** otherwise:
 
 1. Configure OIDC (`--oidc-issuer` + the related flags) and confirm SSO works in
-   `standard` mode. `sso-only` without `--oidc-issuer` refuses to start (it would
-   lock every operator out).
+   `standard` mode. `sso-only` without an SSO provider (OIDC, or a complete SAML
+   SP config on Linux/macOS with HTTPS) refuses to start (it would lock every
+   operator out).
 2. (Recommended) Create a single break-glass local account and **enroll MFA on
    it** (Settings → Multi-Factor Authentication). Point `--break-glass-user` at
    it. `sso-only` refuses to start if the named break-glass user doesn't exist or

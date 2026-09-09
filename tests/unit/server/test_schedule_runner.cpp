@@ -6,8 +6,10 @@
  * ADR-0065, schema-per-store on one shared ephemeral database — the
  * production shape now that InstructionDbPool is deleted and all three
  * are independent Postgres stores), a real InstructionStore on the same
- * database, and a FAKE dispatch_fn that records calls and returns a
- * configurable reach count.
+ * database, and a FAKE `enqueue_fn` (WS-3 3.3) that records each
+ * OutboxEnqueueRequest and returns a controllable OutboxEnqueueOutcome —
+ * replacing the former inline dispatch_fn now that ScheduleRunner commits a
+ * durable outbox occurrence instead of dispatching to agents directly.
  * Due-ness is driven by creating schedules with next_execution_at in the
  * past (create_schedule honors an explicit value), so no clock injection is
  * needed.
@@ -41,28 +43,17 @@ using namespace yuzu::server;
 
 namespace {
 
-struct DispatchCall {
+// WS-3 3.3: what the fake `enqueue_fn` records for each fire — the shape of
+// OutboxEnqueueRequest that matters to these tests, not the whole struct.
+struct EnqueueRecord {
+    std::string occurrence_id;
     std::string plugin;
     std::string action;
     std::string scope;
     std::string execution_id;
-    DispatchCaller caller;
-    std::unordered_map<std::string, std::string> params;
-};
-
-// ADR-1007: records a call through the OTHER dispatch fn — the one
-// `dispatch_tracked` uses instead of `DispatchCall`'s `dispatch_fn` when a
-// concurrency gate is wired. Separate from `DispatchCall` so a test can
-// assert "the gated fn ran with THESE (definition_id, mode)" without also
-// having to prove the ungated one did NOT run — the two vectors staying
-// disjoint is itself part of the assertion.
-struct ConcurrencyCall {
-    std::string plugin;
-    std::string action;
-    std::string scope;
-    std::string execution_id;
-    std::string definition_id;
-    std::string concurrency_mode;
+    std::string principal;
+    std::string approval_id; // non-empty iff this occurrence cleared an approval gate
+    std::string params;      // raw OutboxEnqueueRequest::parameters (canonical JSON)
 };
 
 // InstructionStore is now a migrated Postgres store (ADR-0058). ADR-0065
@@ -120,11 +111,16 @@ struct Harness {
     ApprovalManager approvals{instr_pool};
     InstructionStore is{instr_pool};
 
-    std::vector<DispatchCall> calls;
-    std::vector<ConcurrencyCall> concurrency_calls;
-    int reach{1};        // agents "reached" by the fake dispatch
-    bool throw_on_dispatch{false};
-    // #3495: settable AFTER construction (mirrors throw_on_dispatch above) so
+    std::vector<EnqueueRecord> enqueues;
+    // WS-3 3.3: the outcome the fake enqueue_fn returns — controls whether
+    // fire()/fire_with_approval() advance the schedule (Enqueued/
+    // AlreadyEnqueued) or leave it due for retry (FencedOut/Degraded).
+    OutboxEnqueueOutcome enqueue_result{OutboxEnqueueOutcome::Enqueued};
+    // qa-1 regression coverage: when set, the fake enqueue_fn throws (models a
+    // create_execution/entropy failure) so the exec-row-cancel-on-throw path is
+    // exercised.
+    bool throw_on_enqueue{false};
+    // #3495: settable AFTER construction (mirrors enqueue_result above) so
     // existing call sites are unaffected — Deps::should_stop wraps a lambda
     // that reads this field live rather than the field's value at
     // construction time, since Deps is copied into the runner once and
@@ -142,8 +138,7 @@ struct Harness {
                               return true;
                           },
                       AuditStore* audit = nullptr, yuzu::MetricsRegistry* metrics_reg = nullptr,
-                      InstructionStore* instruction_store_override = nullptr,
-                      bool wire_concurrency_gate = false)
+                      InstructionStore* instruction_store_override = nullptr)
         : runner(ScheduleRunner::Deps{
               .schedule_engine = &engine,
               .instruction_store = instruction_store_override ? instruction_store_override : &is,
@@ -151,51 +146,17 @@ struct Harness {
               .approval_manager = &approvals,
               .audit_store = audit,
               .metrics = metrics_reg,
-              .dispatch_fn =
-                  [this](const std::string& plugin, const std::string& action,
-                         const std::vector<std::string>&, const std::string& scope,
-                         const std::unordered_map<std::string, std::string>& params,
-                         const std::string& execution_id,
-                         const DispatchCaller& caller) -> yuzu::server::ConfinedDispatchOutcome {
-                      if (throw_on_dispatch)
-                          throw std::runtime_error("dispatch boom");
-                      calls.push_back({plugin, action, scope, execution_id, caller, params});
-                      return {.sent = reach, .command_id = "cmd-" + std::to_string(calls.size())};
-                  },
-              // ADR-1007 (finding #3, reviewer): before this, NO test ever
-              // wired dispatch_fn_concurrency — a reverted fix, a swapped
-              // (definition_id, concurrency_mode) argument order, or a
-              // deleted call site all shipped with the whole suite green.
-              // `wire_concurrency_gate` opts a test into the gated fn
-              // instead of the plain one, mirroring `throw_on_dispatch`'s
-              // set-a-flag-before-tick() shape.
-              .dispatch_fn_concurrency =
-                  wire_concurrency_gate
-                      ? ScheduleRunner::ConcurrencyDispatchFn{
-                            [this](const std::string& plugin, const std::string& action,
-                                   const std::vector<std::string>&, const std::string& scope,
-                                   const std::unordered_map<std::string, std::string>&,
-                                   const std::string& execution_id, const DispatchCaller&,
-                                   const std::string& definition_id,
-                                   const std::string& concurrency_mode)
-                                -> yuzu::server::ConfinedDispatchOutcome {
-                                if (throw_on_dispatch)
-                                    throw std::runtime_error("dispatch boom");
-                                concurrency_calls.push_back({plugin, action, scope, execution_id,
-                                                             definition_id, concurrency_mode});
-                                return {.sent = reach,
-                                       .command_id = "cmd-concurrency-" +
-                                                     std::to_string(concurrency_calls.size())};
-                            }}
-                      : ScheduleRunner::ConcurrencyDispatchFn{},
-              // #3133 review fix: resolve_caller re-resolves a real,
-              // non-system caller from the schedule's creator at fire time —
-              // this fake mirrors that shape rather than a stale/system
-              // caller, so a regression back to system=true is observable
-              // via the DispatchCall.caller field above.
-              .resolve_caller =
-                  [](const std::string& username) {
-                  return DispatchCaller{.principal = username, .system = false};
+              // WS-3 3.3: records the durable-occurrence request instead of
+              // dispatching inline, and returns the test-controlled outcome.
+              .enqueue_fn =
+                  [this](const yuzu::server::OutboxEnqueueRequest& req)
+                      -> yuzu::server::OutboxEnqueueOutcome {
+                  enqueues.push_back({req.occurrence_id, req.plugin, req.action, req.scope_expr,
+                                     req.execution_id, req.principal, req.approval_id,
+                                     req.parameters});
+                  if (throw_on_enqueue)
+                      throw std::runtime_error("enqueue boom");
+                  return enqueue_result;
               },
               .arming_check = std::move(arming),
               .should_stop = [this] { return should_stop_hook && should_stop_hook(); },
@@ -272,10 +233,10 @@ TEST_CASE("ScheduleRunner: due interval schedule fires once and advances", "[sch
 
     h.runner.tick();
 
-    REQUIRE(h.calls.size() == 1);
-    CHECK(h.calls[0].plugin == "procs");
-    CHECK(h.calls[0].action == "list");
-    REQUIRE_FALSE(h.calls[0].execution_id.empty());
+    REQUIRE(h.enqueues.size() == 1);
+    CHECK(h.enqueues[0].plugin == "procs");
+    CHECK(h.enqueues[0].action == "list");
+    REQUIRE_FALSE(h.enqueues[0].execution_id.empty());
     // #2500: a schedule carries no agent_ids, so an empty scope_expression is
     // how this path has always meant "the whole fleet" — by falling into the
     // dispatch sink's empty-means-everybody default, which that issue INVERTED
@@ -283,25 +244,28 @@ TEST_CASE("ScheduleRunner: due interval schedule fires once and advances", "[sch
     // this assertion the inversion would silently turn every scope-less
     // schedule into a no-op that still advances and still logs a fire, which is
     // the worst shape a regression here could take: unattended and quiet.
-    CHECK(h.calls[0].scope == "__all__");
-    // #3133 review fix: the dispatched caller must be the schedule's creator,
-    // re-resolved via resolve_caller — NEVER system=true. Without this
-    // assertion a regression back to a hardcoded system caller (the exact
-    // bug the review found) would pass every other check in this file
-    // silently, since none of them inspect the caller at all.
-    CHECK_FALSE(h.calls[0].caller.system);
-    CHECK(h.calls[0].caller.principal == "admin");
+    CHECK(h.enqueues[0].scope == "__all__");
+    // The enqueued request's principal must be the schedule's creator — never
+    // a system/service identity. The delivery loop re-resolves the live
+    // caller/authority from this at send time.
+    CHECK(h.enqueues[0].principal == "admin");
     // #1398: a direct auto-mode fire carries no approval provenance — the
-    // gate at the dispatch chokepoint relies on principal_is_admin alone
-    // for a role-gated pair reached this way, never a fabricated ticket.
-    CHECK(h.calls[0].caller.approval_provenance == ApprovalProvenance::None);
+    // gate at the dispatch chokepoint relies on principal_is_admin alone for
+    // a role-gated pair reached this way, never a fabricated ticket. An
+    // empty approval_id is the WS-3 3.3 equivalent of the old
+    // caller.approval_provenance == ApprovalProvenance::None check.
+    CHECK(h.enqueues[0].approval_id.empty());
 
-    // Tracked execution row, targeted count recorded.
-    auto exec = h.tracker.get_execution(h.calls[0].execution_id);
+    // Tracked execution row is created at enqueue time (create-before-dispatch),
+    // so it exists immediately and shows in the Executions history. WS-3 3.3:
+    // the targeted count is set later, by the DELIVERY loop after the actual
+    // send — this schedule-only test does not run delivery, so agents_targeted is
+    // still 0 and the row is 'running' (queued, not yet delivered).
+    auto exec = h.tracker.get_execution(h.enqueues[0].execution_id);
     REQUIRE(exec.has_value());
     CHECK(exec->definition_id == "test.def");
     CHECK(exec->dispatched_by == "admin");
-    CHECK(exec->agents_targeted == 1);
+    CHECK(exec->agents_targeted == 0);
     CHECK(exec->status == "running");
 
     // Advanced: next in the future, occurrence counted.
@@ -311,7 +275,7 @@ TEST_CASE("ScheduleRunner: due interval schedule fires once and advances", "[sch
 
     // Not due any more — nothing else fires.
     h.runner.tick();
-    CHECK(h.calls.size() == 1);
+    CHECK(h.enqueues.size() == 1);
 }
 
 TEST_CASE("ScheduleRunner: 'once' schedule fires exactly once then disables",
@@ -322,7 +286,7 @@ TEST_CASE("ScheduleRunner: 'once' schedule fires exactly once then disables",
     h.runner.tick();
     h.runner.tick();
 
-    CHECK(h.calls.size() == 1);
+    CHECK(h.enqueues.size() == 1);
     CHECK(h.get(id).next_execution_at == 0); // disabled-after-fire sentinel
 }
 
@@ -333,7 +297,7 @@ TEST_CASE("ScheduleRunner: unknown definition skips the occurrence but advances"
 
     h.runner.tick();
 
-    CHECK(h.calls.empty());
+    CHECK(h.enqueues.empty());
     auto s = h.get(id);
     CHECK(s.next_execution_at > 1); // advanced — must not re-fire every tick
 }
@@ -357,7 +321,7 @@ TEST_CASE("ScheduleRunner: InstructionStore DB error skips the occurrence WITHOU
 
     h.runner.tick();
 
-    CHECK(h.calls.empty());
+    CHECK(h.enqueues.empty());
     // NOT advanced — still due, so the next tick retries rather than losing the occurrence.
     CHECK(h.get(id).next_execution_at == 1);
 }
@@ -378,39 +342,87 @@ TEST_CASE("ScheduleRunner: disabled definition skips the occurrence but advances
 
     h.runner.tick();
 
-    CHECK(h.calls.empty());
+    CHECK(h.enqueues.empty());
     CHECK(h.get(id).next_execution_at > 1);
 }
 
-TEST_CASE("ScheduleRunner: zero agents reached cancels the execution and advances",
+TEST_CASE("ScheduleRunner: a Degraded enqueue cancels the speculative execution row and leaves "
+          "the schedule due (retries next tick)",
           "[schedule][runner][pg]") {
+    // WS-3 3.3: replaces the former "zero agents reached" inline-dispatch
+    // case — reach-counting no longer lives at this layer (the delivery
+    // loop dispatches later). A Degraded enqueue is this layer's own
+    // analogous failure: enqueue_occurrence() fails closed, so unlike the
+    // old inline path (which still advanced on zero reach) the schedule
+    // stays due and retries — the stable occurrence key keeps the retry
+    // idempotent.
     Harness h;
-    h.reach = 0;
+    h.enqueue_result = OutboxEnqueueOutcome::Degraded;
     auto id = h.make_due("test.def", "interval");
 
     h.runner.tick();
 
-    REQUIRE(h.calls.size() == 1);
-    auto exec = h.tracker.get_execution(h.calls[0].execution_id);
+    REQUIRE(h.enqueues.size() == 1);
+    auto exec = h.tracker.get_execution(h.enqueues[0].execution_id);
     REQUIRE(exec.has_value());
     CHECK(exec->status == "cancelled");
-    CHECK(h.get(id).next_execution_at > 1);
+    CHECK(h.get(id).next_execution_at == 1); // NOT advanced — stays due
 }
 
-TEST_CASE("ScheduleRunner: dispatch throw cancels the execution and advances",
+TEST_CASE("ScheduleRunner: AlreadyEnqueued (idempotent re-fire) cancels the duplicate exec row "
+          "and advances",
           "[schedule][runner][pg]") {
+    // qa-2: the idempotent-re-fire branch (a crash-before-advance re-fire whose
+    // occurrence already exists). The speculative exec row this fire created is a
+    // duplicate the outbox discarded, so it must be cancelled, and the schedule
+    // advances exactly as the first fire would have.
     Harness h;
-    h.throw_on_dispatch = true;
+    h.enqueue_result = OutboxEnqueueOutcome::AlreadyEnqueued;
     auto id = h.make_due("test.def", "interval");
 
     h.runner.tick();
 
-    CHECK(h.calls.empty());
-    // The pre-created execution row must not idle at 'running' forever.
-    auto execs = h.tracker.query_executions();
-    REQUIRE(execs.size() == 1);
-    CHECK(execs[0].status == "cancelled");
-    CHECK(h.get(id).next_execution_at > 1);
+    REQUIRE(h.enqueues.size() == 1);
+    auto exec = h.tracker.get_execution(h.enqueues[0].execution_id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "cancelled");           // duplicate row cancelled
+    CHECK(h.get(id).next_execution_at > 1);       // advanced (idempotent success)
+}
+
+TEST_CASE("ScheduleRunner: FencedOut (leadership lost) cancels the exec row and leaves the "
+          "schedule due",
+          "[schedule][runner][pg]") {
+    // qa-2: the leadership-lost branch. The occurrence is left for the true
+    // leader (no advance), and the speculative exec row is cancelled.
+    Harness h;
+    h.enqueue_result = OutboxEnqueueOutcome::FencedOut;
+    auto id = h.make_due("test.def", "interval");
+
+    h.runner.tick();
+
+    REQUIRE(h.enqueues.size() == 1);
+    auto exec = h.tracker.get_execution(h.enqueues[0].execution_id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "cancelled");
+    CHECK(h.get(id).next_execution_at == 1); // NOT advanced — deferred to the true leader
+}
+
+TEST_CASE("ScheduleRunner: a throw from enqueue cancels the speculative exec row (qa-1 regression)",
+          "[schedule][runner][pg]") {
+    // qa-1: the former inline dispatch_tracked cancelled the exec row on a dispatch
+    // throw; the enqueue rewrite must preserve that. tick()'s own catch advances
+    // the schedule (fire-and-advance); enqueue_occurrence cancels the row first.
+    Harness h;
+    h.throw_on_enqueue = true;
+    auto id = h.make_due("test.def", "interval");
+
+    h.runner.tick(); // must not propagate — tick() contains per-schedule throws
+
+    REQUIRE(h.enqueues.size() == 1);
+    auto exec = h.tracker.get_execution(h.enqueues[0].execution_id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "cancelled");     // row cancelled, not orphaned at 'running'
+    CHECK(h.get(id).next_execution_at > 1); // advanced by tick()'s catch (fire-and-advance)
 }
 
 TEST_CASE("ScheduleRunner: requires_approval submits one ticket and holds the occurrence",
@@ -421,7 +433,7 @@ TEST_CASE("ScheduleRunner: requires_approval submits one ticket and holds the oc
     h.runner.tick();
     h.runner.tick(); // second tick must NOT stack a duplicate ask
 
-    CHECK(h.calls.empty());
+    CHECK(h.enqueues.empty());
     auto pending = h.approvals.query({.status = "pending"});
     REQUIRE(pending.size() == 1);
     CHECK(pending[0].definition_id == "test.def");
@@ -445,13 +457,13 @@ TEST_CASE("ScheduleRunner: approving the ticket fires the held occurrence exactl
 
     h.runner.tick(); // fires
 
-    REQUIRE(h.calls.size() == 1);
+    REQUIRE(h.enqueues.size() == 1);
     CHECK(h.get(id).execution_count == 1);
-    // #1398: firing on an approved ticket stamps Ticket provenance — the
-    // ONE non-MCP redemption loop this ladder's gate relies on for a
-    // role-gated/always-gated definition's schedule to ever fire for a
-    // non-admin creator.
-    CHECK(h.calls[0].caller.approval_provenance == ApprovalProvenance::Ticket);
+    // #1398: firing on an approved ticket carries the ticket id as
+    // approval_id (never empty) — the delivery loop stamps Ticket
+    // provenance from it. This is the WS-3 3.3 equivalent of the old
+    // caller.approval_provenance == ApprovalProvenance::Ticket check.
+    CHECK(h.enqueues[0].approval_id == pending[0].id);
 
     // One-approval == one-run: force the next occurrence due — the spent
     // (still 'approved') ticket must be stale under the occurrence anchor,
@@ -459,7 +471,7 @@ TEST_CASE("ScheduleRunner: approving the ticket fires the held occurrence exactl
     h.force_due(id);
     h.runner.tick();
 
-    CHECK(h.calls.size() == 1); // no second fire
+    CHECK(h.enqueues.size() == 1); // no second fire
     CHECK(h.approvals.query({.status = "pending"}).size() == 1);
 }
 
@@ -499,7 +511,7 @@ TEST_CASE("ScheduleRunner: a definition mutated AFTER ticket approval does not f
 
     h.runner.tick(); // must NOT fire the swapped action under the old ticket
 
-    CHECK(h.calls.empty()); // no dispatch happened at all — the swap was refused
+    CHECK(h.enqueues.empty()); // no enqueue happened at all — the swap was refused
     // A fresh ticket for the NEW content is submitted and held, distinct
     // from the original (now permanently stale — target mismatched) approved
     // one. Two separate fields (not a concatenated string, #1398
@@ -529,13 +541,13 @@ TEST_CASE("ScheduleRunner: rejecting the ticket skips the occurrence and re-asks
 
     h.runner.tick(); // occurrence skipped + advanced
 
-    CHECK(h.calls.empty());
+    CHECK(h.enqueues.empty());
     CHECK(h.get(id).next_execution_at > 1);
 
     // Next occurrence: the rejected ticket is stale — a fresh ask goes out.
     h.force_due(id);
     h.runner.tick();
-    CHECK(h.calls.empty());
+    CHECK(h.enqueues.empty());
     CHECK(h.approvals.query({.status = "pending"}).size() == 1);
 }
 
@@ -547,7 +559,7 @@ TEST_CASE("ScheduleRunner: definition approval_mode gates even without the sched
     h.runner.tick();
 
     // approval_mode="always" must not be bypassed by a scheduled fire.
-    CHECK(h.calls.empty());
+    CHECK(h.enqueues.empty());
     CHECK(h.approvals.query({.status = "pending"}).size() == 1);
 }
 
@@ -564,7 +576,7 @@ TEST_CASE("ScheduleRunner: two schedules sharing (creator,definition,scope) get 
 
     h.runner.tick(); // both hold; each submits its OWN ticket, no dedup collapse
 
-    CHECK(h.calls.empty());
+    CHECK(h.enqueues.empty());
     auto pending = h.approvals.query({.status = "pending"});
     REQUIRE(pending.size() == 2); // two tickets, not one shared ticket
 
@@ -585,7 +597,7 @@ TEST_CASE("ScheduleRunner: two schedules sharing (creator,definition,scope) get 
 
     // Exactly one fire, and it is A's — B must not be swept along just
     // because it shares (creator, definition, scope) with A.
-    REQUIRE(h.calls.size() == 1);
+    REQUIRE(h.enqueues.size() == 1);
     CHECK(h.get(id_a).execution_count == 1);
     CHECK(h.get(id_b).execution_count == 0);
 
@@ -626,7 +638,7 @@ TEST_CASE("ScheduleEngine: interval floor rejected at create, clamped on legacy 
 
     h.runner.tick();
 
-    REQUIRE(h.calls.size() == 1);
+    REQUIRE(h.enqueues.size() == 1);
     auto s = h.get(id);
     auto now = std::chrono::duration_cast<std::chrono::seconds>(
                    std::chrono::system_clock::now().time_since_epoch())
@@ -636,7 +648,7 @@ TEST_CASE("ScheduleEngine: interval floor rejected at create, clamped on legacy 
 
 // ── PR1.5a: typed schedule parameters ───────────────────────────────────────
 
-TEST_CASE("ScheduleRunner: a schedule's parameters round-trip to the dispatch fn and "
+TEST_CASE("ScheduleRunner: a schedule's parameters round-trip to the enqueued request and "
           "exec.parameter_values",
           "[schedule][runner][params][pg]") {
     Harness h;
@@ -645,22 +657,25 @@ TEST_CASE("ScheduleRunner: a schedule's parameters round-trip to the dispatch fn
 
     h.runner.tick();
 
-    REQUIRE(h.calls.size() == 1);
-    // Canonical (sorted-key) form reaches the dispatch fn's parameter map —
+    REQUIRE(h.enqueues.size() == 1);
+    // Canonical (sorted-key) form reaches the enqueue request's parameters —
     // never empty, never the raw caller order.
-    CHECK(h.calls[0].params.at("target") == "prod");
-    CHECK(h.calls[0].params.at("retries") == "3");
+    auto params = schedule_params_to_map(h.enqueues[0].params);
+    CHECK(params.at("target") == "prod");
+    CHECK(params.at("retries") == "3");
 
-    auto exec = h.tracker.get_execution(h.calls[0].execution_id);
+    auto exec = h.tracker.get_execution(h.enqueues[0].execution_id);
     REQUIRE(exec.has_value());
     // exec.parameter_values equals the stored canonical JSON — never the
-    // literal "{}" that dispatch_tracked hardcoded before this package.
+    // literal "{}" that used to be hardcoded before this package.
     CHECK(exec->parameter_values == h.get(id).parameter_values);
     CHECK(exec->parameter_values != "{}");
+    // The enqueued request carries the same canonical blob straight through.
+    CHECK(h.enqueues[0].params == h.get(id).parameter_values);
 }
 
 TEST_CASE("ScheduleRunner: a schedule created with no parameters defaults to the canonical "
-          "empty object and dispatches an empty parameter map",
+          "empty object and enqueues an empty parameter map",
           "[schedule][runner][params][pg]") {
     Harness h;
     auto id = h.make_due("test.def", "interval");
@@ -669,8 +684,9 @@ TEST_CASE("ScheduleRunner: a schedule created with no parameters defaults to the
 
     h.runner.tick();
 
-    REQUIRE(h.calls.size() == 1);
-    CHECK(h.calls[0].params.empty());
+    REQUIRE(h.enqueues.size() == 1);
+    CHECK(h.enqueues[0].params == "{}");
+    CHECK(schedule_params_to_map(h.enqueues[0].params).empty());
 }
 
 // ── D7 (PLAN-003): arming re-check on EVERY fire path ───────────────────────
@@ -682,7 +698,7 @@ TEST_CASE("ScheduleRunner: D7 a false arming_check blocks the auto (no-approval)
 
     h.runner.tick();
 
-    CHECK(h.calls.empty()); // dispatch_fn never reached
+    CHECK(h.enqueues.empty()); // enqueue_fn never reached
     CHECK(h.get(id).next_execution_at > 1); // advanced — must not spin
 }
 
@@ -696,7 +712,7 @@ TEST_CASE("ScheduleRunner: D7 a false arming_check blocks the approval-gated fir
     // Denied BEFORE the approval branch — no ticket is even submitted, so
     // this proves arming_check gates IN FRONT OF fire_with_approval rather
     // than duplicating one of its checks.
-    CHECK(h.calls.empty());
+    CHECK(h.enqueues.empty());
     CHECK(h.approvals.query({.status = "pending"}).empty());
     CHECK(h.get(id).next_execution_at > 1);
 }
@@ -710,7 +726,7 @@ TEST_CASE("ScheduleRunner: D7 an UNSET arming_check denies both the auto and app
 
     h.runner.tick();
 
-    CHECK(h.calls.empty());
+    CHECK(h.enqueues.empty());
     CHECK(h.approvals.query({.status = "pending"}).empty());
     CHECK(h.get(auto_id).next_execution_at > 1);
     CHECK(h.get(gated_id).next_execution_at > 1);
@@ -723,7 +739,7 @@ TEST_CASE("ScheduleRunner: D7 true arming_check still lets the auto and approved
 
     auto auto_id = h.make_due("test.def", "interval");
     h.runner.tick();
-    REQUIRE(h.calls.size() == 1);
+    REQUIRE(h.enqueues.size() == 1);
     CHECK(h.get(auto_id).execution_count == 1);
 
     auto gated_id = h.make_due("test.def", "interval", /*requires_approval=*/true);
@@ -733,7 +749,7 @@ TEST_CASE("ScheduleRunner: D7 true arming_check still lets the auto and approved
     REQUIRE(h.approvals.approve(pending[0].id, "boss", "ok").has_value());
     h.runner.tick(); // fires
 
-    REQUIRE(h.calls.size() == 2);
+    REQUIRE(h.enqueues.size() == 2);
     CHECK(h.get(gated_id).execution_count == 1);
 }
 
@@ -852,11 +868,11 @@ TEST_CASE("ScheduleRunner: tick() stops firing further schedules once should_sto
     // Stop signals true once the first schedule has fired — proving the
     // loop actually checks should_stop() before the SECOND schedule and
     // exits early rather than pushing through both.
-    h.should_stop_hook = [&h] { return h.calls.size() >= 1; };
+    h.should_stop_hook = [&h] { return h.enqueues.size() >= 1; };
 
     h.runner.tick();
 
-    REQUIRE(h.calls.size() == 1); // NOT 2 — the loop stopped before the second schedule
+    REQUIRE(h.enqueues.size() == 1); // NOT 2 — the loop stopped before the second schedule
 
     const auto sa = h.get(id_a);
     const auto sb = h.get(id_b);
@@ -886,24 +902,19 @@ TEST_CASE("ScheduleRunner: an unset should_stop fires every due schedule, "
     auto id_a = h.make_due("test.def", "interval");
     auto id_b = h.make_due("test.def", "daily");
 
-    std::vector<DispatchCall> calls;
+    std::vector<EnqueueRecord> enqueues;
     ScheduleRunner raw_runner(ScheduleRunner::Deps{
         .schedule_engine = &h.engine,
         .instruction_store = &h.is,
         .execution_tracker = &h.tracker,
         .approval_manager = &h.approvals,
-        .dispatch_fn =
-            [&](const std::string& plugin, const std::string& action,
-                const std::vector<std::string>&, const std::string& scope,
-                const std::unordered_map<std::string, std::string>& params,
-                const std::string& execution_id,
-                const DispatchCaller& caller) -> yuzu::server::ConfinedDispatchOutcome {
-            calls.push_back({plugin, action, scope, execution_id, caller, params});
-            return {.sent = 1, .command_id = "cmd-" + std::to_string(calls.size())};
-        },
-        .resolve_caller =
-            [](const std::string& username) {
-            return DispatchCaller{.principal = username, .system = false};
+        .enqueue_fn =
+            [&](const yuzu::server::OutboxEnqueueRequest& req)
+                -> yuzu::server::OutboxEnqueueOutcome {
+            enqueues.push_back({req.occurrence_id, req.plugin, req.action, req.scope_expr,
+                               req.execution_id, req.principal, req.approval_id,
+                               req.parameters});
+            return yuzu::server::OutboxEnqueueOutcome::Enqueued;
         },
         .arming_check = [](const std::string&, const std::string&, const std::string&) {
             return true;
@@ -913,93 +924,9 @@ TEST_CASE("ScheduleRunner: an unset should_stop fires every due schedule, "
 
     raw_runner.tick();
 
-    CHECK(calls.size() == 2); // both fired — an unset should_stop never breaks the loop
+    CHECK(enqueues.size() == 2); // both fired — an unset should_stop never breaks the loop
     const auto sa = h.get(id_a);
     const auto sb = h.get(id_b);
     CHECK(sa.next_execution_at != 1);
     CHECK(sb.next_execution_at != 1);
-}
-
-// ADR-1007 (reviewer finding #3): before this test, NOTHING wired
-// `dispatch_fn_concurrency` — a reverted fix, a swapped
-// (definition_id, concurrency_mode) argument order, or the whole call site
-// being deleted all shipped with the suite green. Pins the actually-observed
-// contract: a `per-device` definition's fire goes through the GATED fn (never
-// the plain one) carrying the correct plugin/action/definition_id/mode.
-TEST_CASE("ScheduleRunner: a per-device definition fires through the concurrency-gated "
-          "dispatch fn with the correct (definition_id, concurrency_mode)",
-          "[schedule][runner][concurrency][adr1007]") {
-    Harness h(
-        [](const std::string&, const std::string&, const std::string&) { return true; }, nullptr,
-        nullptr, nullptr, /*wire_concurrency_gate=*/true);
-
-    InstructionDefinition d;
-    d.id = "test.per-device";
-    d.name = "test.per-device";
-    d.version = "1.0.0";
-    d.type = "question";
-    d.plugin = "tar";
-    d.action = "snapshot";
-    d.enabled = true;
-    d.concurrency_mode = "per-device";
-    REQUIRE(h.is.create_definition(d).has_value());
-
-    auto id = h.make_due("test.per-device", "interval");
-    h.runner.tick();
-
-    // The PLAIN dispatch fn must never have been reached — a regression that
-    // swapped the ternary's two branches would still show one dispatch call
-    // and a naive `calls.size() == 1` assertion would miss it.
-    CHECK(h.calls.empty());
-    REQUIRE(h.concurrency_calls.size() == 1);
-    CHECK(h.concurrency_calls[0].plugin == "tar");
-    CHECK(h.concurrency_calls[0].action == "snapshot");
-    CHECK(h.concurrency_calls[0].definition_id == "test.per-device");
-    CHECK(h.concurrency_calls[0].concurrency_mode == "per-device");
-
-    auto s = h.get(id);
-    CHECK(s.execution_count == 1); // advanced normally, same as the ungated path
-}
-
-// Sibling of the above: a definition whose concurrency_mode is NOT
-// "per-device" still fires through the gated fn (it is wired for every
-// fire once opted in, per `dispatch_tracked`'s ternary), but carries that
-// OTHER mode through unchanged — the signal `wire_and_dispatch_confined`
-// reads as "no claim for this dispatch" (only the literal string
-// "per-device" arms the gate). Distinguishes "gate wired but mode says no"
-// from the happy path above ("gate wired and mode says yes"), which a
-// mutation swapping `concurrency_mode` for a hardcoded `"per-device"` would
-// pass undetected without this second case. Uses an explicit "unlimited"
-// definition rather than an unset field: `InstructionStore::create_definition`
-// coalesces an EMPTY `concurrency_mode` to `"per-device"` at write time (it
-// IS the platform default — `test.def`, created with no explicit value,
-// persists as `"per-device"`), so relying on emptiness here would silently
-// test the happy-path value instead of the "no" case.
-TEST_CASE("ScheduleRunner: a non-per-device definition still reaches the gated dispatch fn, "
-          "carrying its own (non-per-device) concurrency_mode",
-          "[schedule][runner][concurrency][adr1007]") {
-    Harness h(
-        [](const std::string&, const std::string&, const std::string&) { return true; }, nullptr,
-        nullptr, nullptr, /*wire_concurrency_gate=*/true);
-
-    InstructionDefinition d;
-    d.id = "test.unlimited";
-    d.name = "test.unlimited";
-    d.version = "1.0.0";
-    d.type = "question";
-    d.plugin = "procs";
-    d.action = "list";
-    d.enabled = true;
-    d.concurrency_mode = "unlimited";
-    REQUIRE(h.is.create_definition(d).has_value());
-
-    auto id = h.make_due("test.unlimited", "interval");
-
-    h.runner.tick();
-
-    CHECK(h.calls.empty());
-    REQUIRE(h.concurrency_calls.size() == 1);
-    CHECK(h.concurrency_calls[0].definition_id == "test.unlimited");
-    CHECK(h.concurrency_calls[0].concurrency_mode == "unlimited");
-    CHECK(h.get(id).execution_count == 1);
 }

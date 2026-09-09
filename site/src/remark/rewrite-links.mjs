@@ -37,6 +37,18 @@ export default function rewriteLinks() {
         }
       }
 
+      // Plugin READMEs (agents/plugins/<name>/README.md) are manifest entries
+      // too, keyed by their repo-relative path and routed under /plugins/.
+      const pluginsRoot = path.join(repoRoot, 'agents', 'plugins');
+      if (abs.startsWith(pluginsRoot + path.sep)) {
+        const rel = path.relative(repoRoot, abs).split(path.sep).join('/');
+        const entry = BY_FILE.get(rel.replace(/\.md$/, ''));
+        if (entry) {
+          node.url = `${BASE}/${entry.slug}/${hash}`;
+          return;
+        }
+      }
+
       // Out of scope -> point at GitHub so the link still resolves.
       const repoRel = path.relative(repoRoot, abs).split(path.sep).join('/');
       node.url = `${REPO_BLOB}/${repoRel}${hash}`;

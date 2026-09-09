@@ -28,6 +28,7 @@
 #include <chrono>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -326,6 +327,71 @@ public:
         auth::Role new_role
     );
 
+    /// Row-locked role re-check (#4107): `SELECT role FROM auth.users WHERE
+    /// username = $1 AND is_active FOR UPDATE`, same technique
+    /// `mfa_verify_login_code` already uses to close ITS OWN replay race.
+    /// Serializes against ANY concurrent `update_role()` write to this row:
+    /// if one is already committed, this call's SELECT sees it directly; if
+    /// one is mid-flight (issued, not yet committed), this call's SELECT FOR
+    /// UPDATE blocks until it commits, then reads the fresh row (standard
+    /// Postgres row-lock semantics — a plain `UPDATE` already takes an
+    /// equivalent row lock for its own transaction's duration, so the writer
+    /// side needs no changes). Either way, the value handed to
+    /// `under_row_lock` is never a value some OTHER writer's already-
+    /// in-flight commit could invalidate a moment later.
+    ///
+    /// `reactivate_user()` is asymmetric (authdb Gate 8 finding), because its
+    /// `UPDATE` deliberately carries no `is_active` filter (it's the only
+    /// writer allowed to flip a row from inactive back to active) while THIS
+    /// SELECT is filtered to `is_active = TRUE`. So: if the row is active
+    /// when this call runs, it genuinely serializes against a concurrent
+    /// `reactivate_user()` exactly like `update_role()` (either blocks
+    /// behind that UPDATE's in-flight lock, or that UPDATE blocks behind
+    /// this one). But if the row's last-COMMITTED state is already inactive,
+    /// this SELECT's `is_active = TRUE` qualifier excludes it under its own
+    /// READ COMMITTED snapshot — zero rows, `UserNotFound`, immediately, with
+    /// nothing to wait on. That holds regardless of whether a
+    /// `reactivate_user()` happens to be concurrently uncommitted at that
+    /// exact instant (authdb Gate 8 correction: an earlier draft attributed
+    /// this to "no writer in flight," which isn't the actual discriminator —
+    /// READ COMMITTED never sees another transaction's uncommitted write in
+    /// the first place, so the row's last-committed value is what decides
+    /// this, not in-flight timing). That's not a missed serialization, it's
+    /// the correct fail-closed answer (a recheck on an inactive account
+    /// should deny), but it means this call never blocks a *fresh*
+    /// `reactivate_user()` call starting against an already-inactive row —
+    /// there is no lock to contend for at that point.
+    ///
+    /// `under_row_lock` runs WHILE the row lock is held, immediately before
+    /// this call commits (releasing the lock) — use it to update
+    /// AuthManager's in-process cache under `mu_` before the lock is
+    /// released, so nothing else can commit a role change to this row while
+    /// the cache write is happening. Do NOT do any additional DB I/O inside
+    /// the callback (same rule `with_txn_on`'s doc states for its own
+    /// callers) — only fast, local, in-process work.
+    ///
+    /// This closes the SAME-PROCESS divergence residual (#4107) that an
+    /// in-memory-only version counter could only detect after the fact, not
+    /// prevent — but it does NOT close the separate, narrower "check-then-
+    /// mint" gap between this call returning and the caller actually minting
+    /// a session (`persist_new_session`): that gap is inherent to any
+    /// recheck that isn't ITSELF serialized all the way through session
+    /// creation, which this is not (external adversarial review, fjarvis,
+    /// PR #4076 — "an inherent check-then-mint gap no non-serialized recheck
+    /// can close").
+    ///
+    /// Returns `UserNotFound` (callback not invoked) if the account is not
+    /// active — mirrors `get_user()`'s filter, including for a
+    /// `remove_user()` that lands first (its soft-delete UPDATE sets
+    /// `is_active = FALSE`, participating in the SAME row-lock protocol, so
+    /// this SELECT's `WHERE ... AND is_active` correctly sees zero rows once
+    /// a concurrent removal has committed, or blocks until one in flight
+    /// does). `InvalidUsername` / `QueryFailed` on the usual input/store
+    /// failures, callback not invoked either way.
+    std::expected<void, AuthDBError>
+    recheck_role_locked(const std::string& username,
+                        const std::function<void(auth::Role)>& under_row_lock);
+
     /// Set/clear the per-user JIT-elevation eligibility flag (SOC 2 CC6.3/CC6.6):
     /// who may activate a time-boxed admin elevation via POST /api/v1/elevate,
     /// distinct from holding standing admin. Admin-managed. Single
@@ -605,7 +671,13 @@ public:
                                                                std::string_view raw_code);
 
     /// Wipe the user's existing recovery codes and issue 10 fresh ones.
-    /// Returns the raw codes for one-time display.
+    /// Returns the raw codes for one-time display. Serialized on the
+    /// `auth.users` row (`SELECT … FOR UPDATE`) so concurrent regenerates — and
+    /// a regenerate racing an enrollment/disable/remove — are ordered rather
+    /// than interleaving into a torn 20-row set with the returned codes not
+    /// matching storage (#3779). Returns `UserNotFound` when no ACTIVE user row
+    /// matches (a deactivated account never receives fresh codes);
+    /// `QueryFailed`/`WriteFailed` on a store outage (fail-closed 503).
     std::expected<std::vector<std::string>, AuthDBError>
     mfa_regenerate_recovery_codes(const std::string& username);
 

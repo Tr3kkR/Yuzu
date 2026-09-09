@@ -83,6 +83,7 @@ class DirectorySync;
 }
 
 #include <httplib.h>
+#include <nlohmann/json.hpp>
 
 #include <atomic>
 #include <functional>
@@ -159,6 +160,36 @@ public:
         std::function<authz::FleetReadGate(const httplib::Request&, httplib::Response&,
                                            const std::string& securable_type,
                                            const std::string& operation)>;
+    /// #4033 (#2146 Batch A) — the raw AgentRegistry snapshot, SAME shape/
+    /// SAME underlying call as MCP's `AgentsJsonFn`/`agents_fn()`
+    /// (`registry_.to_json_obj()`, 5 fields per agent: agent_id/hostname/os/
+    /// arch/agent_version). `GET /api/v1/devices`/`GET /api/v1/devices/{id}`
+    /// filter this UNFILTERED snapshot themselves via `fleet_read_fn`'s
+    /// returned scope (`authz::in_scope`) — deliberately NOT the dashboard's
+    /// own `get_visible_agents_json`-style pre-filtered `DevicesFn`
+    /// (`DeviceRoutes`), whose management-group-only join lacks
+    /// `require_fleet_read`'s service-scope/elevated/engine/mcp_tier caller-
+    /// class branches (see the route's own comment in rest_api_v1.cpp).
+    /// Empty/default `{}` = the two routes answer 503 (misconfiguration).
+    using AgentsJsonFn = std::function<nlohmann::json()>;
+    /// #4033 — D3 Response:Read-visible agent SET resolver for the create-
+    /// group agent-count preview (`GET /api/v1/management-groups/agent-count-
+    /// preview` + its MCP twin), mirroring `DashboardRoutes::VisibleSetFn`
+    /// EXACTLY (same doc contract: `nullopt` = caller sees all agents —
+    /// RBAC legacy-open or a global `Response:Read` grant; a present-but-
+    /// EMPTY set = fail-closed on a degraded store, never silently widened
+    /// to `nullopt`). Anchored on `Response:Read`, not `Infrastructure:Read`
+    /// — reusing `fleet_read_fn`'s `Infrastructure`-anchored scope here would
+    /// hand a global-Response:Read holder a stricter view than the fragment
+    /// this route twins (`/fragments/create-group-form`) already gives them.
+    /// Callers additionally short-circuit to `nullopt` for an ELEVATED
+    /// session (JIT full-fleet view — `auth::is_elevated`), matching
+    /// `DashboardRoutes::resolve_visible_scope(const auth::Session&)`
+    /// exactly; this fn itself is the username-only half. Empty/default `{}`
+    /// = legacy-open (`nullopt`), matching an unwired `DashboardRoutes`
+    /// fixture's behaviour.
+    using ResponseVisibleSetFn =
+        std::function<std::optional<std::set<std::string>>(const std::string& username)>;
     /// Per-agent Response-scope predicate for the fan-out response/execution
     /// readers (e.g. GET /api/v1/executions/{id}/visualization, which charts an
     /// instruction's responses across every agent that replied). Returns true
@@ -431,6 +462,14 @@ public:
         // (see FleetReadFn's doc comment above). Trailing optional dep; `{}` makes
         // the route FAIL CLOSED (503), same contract as list_read_fn.
         FleetReadFn fleet_read_fn = {},
+        // #4033 (#2146 Batch A): GET /api/v1/devices[/{id}]'s raw registry
+        // snapshot (see AgentsJsonFn's doc comment above). Trailing optional
+        // dep; `{}` makes both routes FAIL CLOSED (503).
+        AgentsJsonFn agents_fn = {},
+        // #4033: GET /api/v1/management-groups/agent-count-preview's D3
+        // Response:Read scope resolver (see ResponseVisibleSetFn's doc
+        // comment above). Trailing optional dep; `{}` = legacy-open.
+        ResponseVisibleSetFn response_visible_set_fn = {},
         // #4035: see DexFleetFn's doc comment above. Trailing optional dep; `{}`
         // degrades the fleet-dependent DEX twins (health/trends/overview/
         // catalogue-group) to their "no reporting agents" suppressed shape —
@@ -509,6 +548,12 @@ public:
         // #3290 Phase 2: see the production overload's doc comment above; identical
         // trailing-optional-dep, fail-closed-when-unwired contract.
         FleetReadFn fleet_read_fn = {},
+        // #4033: see the production overload's doc comment above; identical
+        // trailing-optional-dep, fail-closed-when-unwired contract.
+        AgentsJsonFn agents_fn = {},
+        // #4033: see the production overload's doc comment above; identical
+        // trailing-optional-dep, legacy-open-when-unwired contract.
+        ResponseVisibleSetFn response_visible_set_fn = {},
         // #4035: see the production overload's doc comment above; identical
         // trailing-optional-dep, degrade-not-crash contract.
         DexFleetFn dex_fleet_fn = {},

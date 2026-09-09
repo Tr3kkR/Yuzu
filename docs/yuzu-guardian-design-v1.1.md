@@ -2485,6 +2485,23 @@ Guardian ladder must check these.
   after a bounded grace. A source left out of that sum would silently reinstate
   the use-after-free the joined-thread rule used to prevent by a different
   mechanism.
+  **Extended for Spark (PR-A, #2012/#3840; dormant until a mechanism uses it —
+  Gate 6 compliance finding, PR-A round 5, folded in here; reworded at pass 5
+  per an architect finding — the clause below previously read as modifying
+  the primitive rather than the counter):** a second, independent additive
+  source feeds the SAME chokepoint one level up.
+  `AgentImpl::guardian_active_io_workers()` (`agent.cpp`) sums
+  `GuardianEngine::active_io_workers()` (above) with a separate
+  `spark_detached_workers_` counter — constructed via a default member
+  initializer before any `SparkEngine`/mechanism exists, and never read
+  through `spark_engine_`/`spark_boot_done_` — fed by `agents/core/src/
+  spark_detached_call.hpp`'s `SparkDetachedLane`/`DetachedCall<T>` primitive,
+  so it stays correct across a boot-time exception that resets
+  `spark_engine_`. `main.cpp`/`service_win.cpp` poll the SUM at this
+  `AgentImpl` level, not `GuardianEngine::active_io_workers()` alone; a
+  future third additive source must add a term to that same sum inside
+  `AgentImpl::guardian_active_io_workers()`, never a parallel counter read
+  elsewhere.
 - **Journal maintenance is paced by TIME, never by wake count.** The drain
   worker wakes on every outbox enqueue, and a paging pass is a full
   `list_entries` + parse + `validate_record` sweep of the journal.
@@ -2539,6 +2556,28 @@ Guardian ladder must check these.
   the agent cannot enforce (or silently drops one it can), and nothing else in
   the build catches the divergence.
 
+- **`full_sync`'s KV teardown clears `rule:` keys ONLY, never `baseline:`
+  records (#4021).** A `file-hash-equals` rule authored with no `expected_hash`
+  captures a baseline on arm; that capture is persisted per `rule_id` under
+  `__guardian__`/`baseline:` (fingerprint = assertion type + authored path,
+  schema-versioned separately from the fingerprint content so a future schema
+  bump cannot silently mass-invalidate every existing record as "a genuine
+  retarget"), and re-seeded at both arm sites (legacy
+  `start_guard_for_rule_locked`, Spark's `reconcile_rule_locked`). A future
+  blanket `kv_->clear(kKvNamespace)` — or a new key type added under this
+  namespace without updating the scoped delete — silently reinstates the
+  #4021 laundering (a genuinely drifted rule's baseline reset to whatever the
+  target currently holds, with no remediation and no visible action). Absence
+  from one push is not deletion — the server omits disabled/out-of-scope rules
+  from every push, so a rule_id's baseline record is never swept merely for
+  being absent from a full_sync. `guardian_persist_baseline` additionally
+  refuses to overwrite a well-formed, same-fingerprint record (a write reaching
+  that state can only mean a failed seed lookup — adversarial-review K1/C2-1).
+  Spark's own first-ever baseline capture is NOT yet wired to this store
+  (tracked as #4045) — under `prefer_spark_=true` (not the shipping default), a
+  rule never armed via legacy still relaunders on full_sync/restart exactly as
+  before this fix.
+
 ## 25. Lifecycle-audit journal (ADR-0021 Stage 2, item 7)
 
 Guardian's spark-backed rule engine keeps a durable audit trail of `guard.armed` /
@@ -2551,7 +2590,9 @@ names and buckets changed during implementation and that doc is a point-in-time
 design record, not maintained against the code afterward.
 
 **The guarantee.** Process-crash-durable, duplicate-tolerant, bounded-retry delivery
-of armed/disarmed lifecycle events. Once persisted, an event survives a process
+of armed/disarmed/errored lifecycle events (`"errored"` gained the same durable
+treatment as the other two in #2818/PR-2d, which fixed a replay-validation allowlist
+that had quarantined it as tampered on any restart until then). Once persisted, an event survives a process
 crash or restart and is re-sent on every reconnect/restart — regardless of any
 possible prior acceptance (acceptance is unknowable; there is no ack) — until it
 ages out of retention. A local gRPC `Write()` returning true is never delivery
@@ -2632,9 +2673,11 @@ zero — a dead worker must not read identically to a healthy idle one). A third
 
 **Not claimed:** end-to-end at-least-once (there is no server ack of an individual
 lifecycle event, by design — Option A per the source doc); deterministic sub-second
-ordering. `guard.errored` has no lifecycle-journal producer today (scope is
-armed/disarmed only). All fleet counters are unlabelled or low-cardinality —
-never keyed by raw `agent_id`.
+ordering. `guard.errored` has exactly ONE lifecycle-journal producer today (#2818:
+`GuardianSparkRuntime::on_subscription_lost`/`revalidate_subscriptions`, a spark
+subscription-death detach) — dormant while `prefer_spark_=false`; other `errored`-status
+paths (arm/boot failures) still journal nothing. All fleet counters are unlabelled or
+low-cardinality — never keyed by raw `agent_id`.
 
 **Standing invariant** (also recorded in §24): journal maintenance is paced by
 time, not by wake count — the drain worker wakes on every outbox enqueue, and a
