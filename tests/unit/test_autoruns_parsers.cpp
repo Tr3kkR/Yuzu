@@ -334,22 +334,70 @@ TEST_CASE("autoruns: parse_task_xml reads command, disabled state, principal and
           "[autoruns][parsers]") {
     const auto xml = read_fixture_reg_text("windows/sample_task.xml");
     const auto info = parse_task_xml(xml);
+    CHECK(info.parsed_ok); // a real, well-formed <Task>-rooted capture
     REQUIRE(info.actions.size() == 1);
     CHECK(info.actions[0].command == "%windir%\\system32\\appidpolicyconverter.exe");
     CHECK_FALSE(info.has_unmodelled_action);
     CHECK_FALSE(info.enabled);
     CHECK(info.user_id == "S-1-5-18");
     CHECK_FALSE(info.has_triggers); // <Triggers /> is self-closed
+    CHECK(info.registration_date.empty()); // fixture has no <RegistrationInfo>/<Date>
 }
 
-TEST_CASE("autoruns: parse_task_xml on a truncated document keeps safe defaults",
+TEST_CASE("autoruns: parse_task_xml on a truncated document reports parsed_ok=false "
+          "and keeps safe defaults "
+          "(RECONSTRUCTION: pins PR #4154 round 9's blocker -- a genuine parse "
+          "failure must be distinguishable from a well-formed task that simply has "
+          "no triggers/actions, which also has empty actions/has_triggers==false but "
+          "MUST report parsed_ok=true)",
           "[autoruns][parsers]") {
     // RECONSTRUCTION negative (acceptance criterion): a Command tag opened
     // but never closed must not throw or read past the buffer.
     const std::string truncated = "<Task><Actions><Exec><Command>C:\\partial";
     const auto info = parse_task_xml(truncated);
+    CHECK_FALSE(info.parsed_ok);
     CHECK(info.actions.empty());
     CHECK(info.enabled); // documented default when <Enabled> is absent
+}
+
+TEST_CASE("autoruns: parse_task_xml on empty input reports parsed_ok=false",
+          "[autoruns][parsers]") {
+    const auto info = parse_task_xml("");
+    CHECK_FALSE(info.parsed_ok);
+}
+
+TEST_CASE("autoruns: parse_task_xml on a well-formed task with no <Triggers> and no "
+          "<Actions> reports parsed_ok=true with empty lists "
+          "(RECONSTRUCTION: pins PR #4154 round 9's blocker -- this is a legitimate "
+          "boring task, not a parse failure, and must not be conflated with the "
+          "truncated/malformed cases above that also have empty actions/has_triggers)",
+          "[autoruns][parsers]") {
+    const std::string xml = "<Task><RegistrationInfo><Date>2026-01-01T00:00:00</Date>"
+                            "</RegistrationInfo></Task>";
+    const auto info = parse_task_xml(xml);
+    CHECK(info.parsed_ok);
+    CHECK(info.actions.empty());
+    CHECK_FALSE(info.has_triggers);
+    CHECK_FALSE(info.has_unmodelled_action);
+    CHECK(info.enabled); // documented default when <Settings>/<Enabled> is absent
+    CHECK(info.registration_date == "2026-01-01T00:00:00");
+}
+
+TEST_CASE("autoruns: parse_task_xml reads <RegistrationInfo>/<Date> through the "
+          "element tree, not a raw text scan "
+          "(RECONSTRUCTION: pins PR #4154 round 9's should-fix -- a raw "
+          "content.find(\"<Date>\") predates the libxml2 migration and is a "
+          "comment-injection weakness: a decoy <Date> string inside an XML comment "
+          "ahead of the real element would win a raw scan but must not win here)",
+          "[autoruns][parsers]") {
+    const std::string xml =
+        "<Task><RegistrationInfo>"
+        "<!-- decoy: <Date>1999-01-01T00:00:00</Date> -->"
+        "<Date>2026-06-15T12:30:00</Date>"
+        "</RegistrationInfo></Task>";
+    const auto info = parse_task_xml(xml);
+    CHECK(info.parsed_ok);
+    CHECK(info.registration_date == "2026-06-15T12:30:00");
 }
 
 TEST_CASE("autoruns: parse_task_xml reads every <Exec> action, not just the first",
@@ -470,15 +518,27 @@ TEST_CASE("autoruns: parse_task_xml handles XML constructs a hand-rolled scanner
         CHECK_FALSE(parse_task_xml(xml).has_triggers);
     }
 
-    SECTION("a DOCTYPE/DTD declaration is rejected outright, leaving TaskInfo at its "
-            "documented defaults, rather than trusted (matches this repo's other "
-            "untrusted-XML consumer, server/core/src/saml_provider.cpp)") {
+    SECTION("a DOCTYPE/DTD declaration is rejected outright, reporting parsed_ok=false "
+            "and leaving TaskInfo at its documented defaults, rather than trusted "
+            "(matches this repo's other untrusted-XML consumer, "
+            "server/core/src/saml_provider.cpp) -- RECONSTRUCTION: pins PR #4154 "
+            "round 9's blocker that this is a genuine parse failure, not a "
+            "well-formed-but-boring task") {
         const std::string xml =
             "<?xml version=\"1.0\"?><!DOCTYPE Task [<!ENTITY x \"evil\">]>"
             "<Task><Triggers><LogonTrigger/></Triggers></Task>";
         const auto info = parse_task_xml(xml);
+        CHECK_FALSE(info.parsed_ok);
         CHECK_FALSE(info.has_triggers);
         CHECK(info.actions.empty());
+    }
+
+    SECTION("an unexpected root element is also a genuine parse failure "
+            "(RECONSTRUCTION: pins PR #4154 round 9's blocker)") {
+        const std::string xml = "<NotATask><Triggers><LogonTrigger/></Triggers></NotATask>";
+        const auto info = parse_task_xml(xml);
+        CHECK_FALSE(info.parsed_ok);
+        CHECK_FALSE(info.has_triggers);
     }
 }
 

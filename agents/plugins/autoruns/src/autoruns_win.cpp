@@ -891,16 +891,25 @@ void walk_task_folder(ITaskFolder* folder, SourceOutcome& outcome, std::size_t c
             const auto info = parse_task_xml(xml_utf8);
             if (info.has_unmodelled_action)
                 note_constraint(outcome, "unmodelled_action_type");
+            // info.parsed_ok is false for a GENUINE parse failure (truncated/
+            // corrupt XML, a rejected DTD, an unexpected root) -- distinct
+            // from get_Xml() itself failing (already its own hr_token()
+            // constraint below) and distinct from a well-formed task that
+            // simply has no triggers/actions (parsed_ok=true, empty lists).
+            // Only flag "malformed" when get_Xml() actually succeeded and
+            // handed back something parse_task_xml could not make sense of
+            // -- a COM failure already has its own, more specific token.
+            if (!FAILED(xml_hr) && !info.parsed_ok)
+                note_constraint(outcome, "malformed");
 
-            std::int64_t task_mtime = 0;
-            std::size_t date_start = xml_utf8.find("<Date>");
-            if (date_start != std::string::npos) {
-                date_start += 6;
-                const std::size_t date_end = xml_utf8.find("</Date>", date_start);
-                if (date_end != std::string::npos)
-                    task_mtime = parse_iso8601_to_epoch(
-                        std::string_view{xml_utf8}.substr(date_start, date_end - date_start));
-            }
+            // <RegistrationInfo>/<Date> is read through the same libxml2
+            // tree parse_task_xml already built -- no second raw-text scan
+            // over xml_utf8. A raw `content.find("<Date>")` predates the
+            // libxml2 migration and is also a comment-injection weakness: a
+            // `<Date>` string sitting inside an XML comment ahead of the
+            // real element would win a raw scan but is correctly skipped by
+            // the element-tree lookup.
+            const std::int64_t task_mtime = parse_iso8601_to_epoch(info.registration_date);
 
             const std::string entry_base = wstring_to_utf8(last_path_component(path_w));
             const std::string location = wstring_to_utf8(path_w);
@@ -909,13 +918,15 @@ void walk_task_folder(ITaskFolder* folder, SourceOutcome& outcome, std::size_t c
             // <Triggers/> empty (no triggers defined) is Enabled==true yet
             // Task Scheduler will never invoke it on its own -- only a
             // manual Run counts, which is not persistence. Both must hold.
-            // If either accessor needed for that decision failed, the state
-            // is genuinely unknown, not a fabricated definite answer:
-            // get_Enabled failing leaves enabled_b at its VARIANT_TRUE
-            // initializer (would silently read as "enabled"), and get_Xml
-            // failing leaves info.has_triggers at its default false (would
-            // silently read as "disabled" for a task that may be firing).
-            const Enabled enabled_state = (FAILED(enabled_hr) || FAILED(xml_hr))
+            // If either accessor needed for that decision failed, OR the XML
+            // that was retrieved didn't genuinely parse, the state is
+            // unknown, never a fabricated definite answer: get_Enabled
+            // failing leaves enabled_b at its VARIANT_TRUE initializer
+            // (would silently read as "enabled"), and a parse failure
+            // leaves info.has_triggers at its default false (would silently
+            // read as "disabled" for a task whose real trigger state this
+            // function never actually determined).
+            const Enabled enabled_state = (FAILED(enabled_hr) || FAILED(xml_hr) || !info.parsed_ok)
                                               ? Enabled::unknown
                                           : (enabled_b == VARIANT_TRUE && info.has_triggers)
                                               ? Enabled::enabled

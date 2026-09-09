@@ -523,7 +523,7 @@ inline IfeoEntry parse_ifeo_debugger(std::string_view exe_name, std::string_view
     return out;
 }
 
-// ── 7. parse_task_xml (minimal tag scanner, no XML library) ──────────────
+// ── 7. parse_task_xml (libxml2-based Task Scheduler XML parser) ──────────
 
 /// One `<Exec>` action within a task's `<Actions>` block. Task Scheduler
 /// supports up to 32 sequential actions per task, ALL of which it executes
@@ -544,6 +544,19 @@ struct TaskInfo {
     bool enabled = true; // Task Scheduler's own documented default
     std::string user_id;
     bool has_triggers = false;
+    std::string registration_date; // raw <RegistrationInfo>/<Date> text,
+                                    // empty if absent -- read through this
+                                    // same libxml2 tree (caller converts to
+                                    // epoch); never a second raw-text scan.
+    // true ONLY once a well-formed, <Task>-rooted document was parsed --
+    // false means a GENUINE parse failure (empty input, malformed XML, a
+    // rejected DTD, or an unexpected root element), never "a well-formed
+    // task that happens to have no triggers or actions". A task with no
+    // <Triggers>/<Actions> children is a legitimate boring task and still
+    // reports parsed_ok=true with empty actions/has_triggers -- conflating
+    // "no elements" with "parse failed" is exactly the defect this field
+    // exists to stop a caller from reintroducing (PR #4154 round 9 blocker).
+    bool parsed_ok = false;
 };
 
 namespace detail {
@@ -636,16 +649,31 @@ inline std::string xml_get_text(xmlNodePtr node) {
 /// invalidated.
 inline TaskInfo parse_task_xml(std::string_view xml) {
     TaskInfo out;
-    if (xml.empty()) return out;
+    if (xml.empty()) return out; // nothing to parse -- parsed_ok stays false
 
     xmlDocPtr doc = xmlReadMemory(xml.data(), static_cast<int>(xml.size()), "task.xml", "UTF-8",
                                   XML_PARSE_NONET | XML_PARSE_NOERROR | XML_PARSE_NOWARNING);
-    if (!doc) return out;
+    if (!doc) return out; // genuine parse failure -- parsed_ok stays false
     detail::XmlDocGuard guard{doc};
-    if (doc->intSubset || doc->extSubset) return out; // DOCTYPE/DTD present -- treat as malformed
+    if (doc->intSubset || doc->extSubset) return out; // DOCTYPE/DTD present -- malformed
 
     xmlNodePtr root = xmlDocGetRootElement(doc);
-    if (!root) return out;
+    // The expected task-XML root is exactly <Task> -- a missing root or an
+    // unexpected one (decoy/corrupt document that still happens to parse as
+    // well-formed XML) is ALSO a genuine parse failure from this function's
+    // point of view, not merely "a task with nothing interesting in it".
+    if (!root || !root->name || !xmlStrEqual(root->name, BAD_CAST "Task")) return out;
+
+    // From here on the document is well-formed AND <Task>-rooted -- every
+    // early return below this point is a legitimate "this task has no X",
+    // never a parse failure, so parsed_ok is set now rather than at the
+    // very end (where a later restructure could accidentally skip it).
+    out.parsed_ok = true;
+
+    if (xmlNodePtr reg_info = detail::xml_find_child(root, "RegistrationInfo")) {
+        if (xmlNodePtr date = detail::xml_find_child(reg_info, "Date"))
+            out.registration_date = detail::xml_get_text(date);
+    }
 
     // <Settings>/<Enabled> is the task-level enabled flag's real schema
     // location -- <Triggers> (which can carry its OWN per-trigger <Enabled>

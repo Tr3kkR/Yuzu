@@ -293,13 +293,16 @@ DirWalkOutcome walk_plist_dir_handle(const DirHandle& dir, OnPlist&& on_plist) {
     // walk in this file, instead of three separate hand-rolled copies (PR
     // #4154 round 8 found the terminal-error-detection fix landed one round
     // earlier had a gap of the same shape independently reproduced in all
-    // three; the fix now lives in exactly one place). Its `cap` counts real
-    // (non-`.`/`..`) entries reaching the callback, unlike this function's
-    // prior local loop which incremented `seen` for every raw entry
-    // including non-`.plist` files -- a directory with many unrelated
-    // files could previously hit the cap before any real `.plist` was even
-    // considered; counting only entries this walk actually cares about is
-    // strictly more correct, not a behavior this function depended on.
+    // three; the fix now lives in exactly one place). Its `cap` counts
+    // EVERY real (non-`.`/`..`) entry the walk visits -- including ones the
+    // `.plist` filter below will go on to reject -- because the callback
+    // below runs once per directory entry and `walk_dir_capped` counts a
+    // call to it, not a call that returned a plist. A directory with many
+    // unrelated (non-`.plist`) files can still hit the cap before any real
+    // `.plist` is found; this is NOT scoped to "only entries this walk
+    // cares about", and this function's callers must treat a cap-boundary
+    // `truncated` result as "more entries existed", never as "more `.plist`
+    // entries existed".
     const auto walk = yuzu::shared::walk_dir_capped(
         dir.get(), kMaxEntriesPerDir, [&](const struct dirent* entry) {
             const std::string_view name(entry->d_name);
