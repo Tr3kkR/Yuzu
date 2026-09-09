@@ -762,8 +762,12 @@ public:
             job(); // retirements that never got a worker: drain them here
         for (auto& d : drains) {
             for (;;) { // wait for the drain worker (unbounded - see above)
-                if (d.wait_take(Clock::now() + 1s) || d.done())
+                if (d.wait_take(Clock::now() + 1s)) {
+                    drains_completed_.fetch_add(1, std::memory_order_relaxed);
                     break;
+                }
+                if (d.done())
+                    break; // already taken (cannot happen - only stop() reaps these)
             }
         }
         if (orphaned)

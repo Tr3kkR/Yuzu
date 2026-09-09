@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <cstdio> // std::fputs - the T6 child process reports its own deadlock detection
 #include <functional>
+#include <iterator> // std::istreambuf_iterator - the T6 parent reads its child's captured output
 #include <map>
 #include <memory>
 #include <mutex>
@@ -3551,12 +3552,30 @@ TEST_CASE("Registry spark: same-type disarm() does not deadlock against an in-fl
     }
     cmd += L"\" --reporter compact --durations no";
 
+    // The child's own Catch2 output (its failure messages, INFO text) is the only
+    // diagnostic a failing run leaves behind: capture it to a temp file through an
+    // inheritable handle and surface it here.
+    const std::filesystem::path child_log =
+        std::filesystem::temp_directory_path() /
+        ("yuzu_test_spark_t6_child_" + std::to_string(::GetCurrentProcessId()) + ".log");
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    HANDLE hlog = ::CreateFileW(child_log.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &sa, CREATE_ALWAYS,
+                                FILE_ATTRIBUTE_NORMAL, nullptr);
+    REQUIRE(hlog != INVALID_HANDLE_VALUE);
     STARTUPINFOW si{};
     si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = nullptr;
+    si.hStdOutput = hlog;
+    si.hStdError = hlog;
     PROCESS_INFORMATION pi{};
     // cmd.data() is writable (CreateProcessW may modify lpCommandLine).
-    REQUIRE(::CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr,
-                             nullptr, &si, &pi));
+    const BOOL created = ::CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE /*inherit*/,
+                                          CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    ::CloseHandle(hlog); // the child holds its own inherited copy
+    REQUIRE(created);
     ::CloseHandle(pi.hThread);
     const DWORD wr = ::WaitForSingleObject(pi.hProcess, 30000);
     if (wr == WAIT_TIMEOUT) {
@@ -3569,9 +3588,17 @@ TEST_CASE("Registry spark: same-type disarm() does not deadlock against an in-fl
     ::SetEnvironmentVariableA("YUZU_SPARK_T6_KEY", nullptr);
     ::RegDeleteKeyA(HKEY_CURRENT_USER, (key + "\\Second").c_str());
     ::RegDeleteKeyA(HKEY_CURRENT_USER, key.c_str());
+    std::string child_out;
+    {
+        std::ifstream in(child_log, std::ios::binary);
+        child_out.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    std::error_code ec;
+    std::filesystem::remove(child_log, ec);
 
     INFO("T6 child: WaitForSingleObject=" << wr << " (0=exited, 258=timeout->killed) exit code="
                                           << code << " (0=completed, 3=child saw the deadlock)");
+    INFO("T6 child output:\n" << child_out);
     CHECK(wr == WAIT_OBJECT_0);
     CHECK(code == 0);
 }
