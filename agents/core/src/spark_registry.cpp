@@ -43,9 +43,10 @@
  *   - unwatch(): mark inactive, disarm the wait, hand the whole RegWatch to a
  *     detached drain worker (`drain_lane_`) that performs the blocking callback
  *     drain and closes the handles. O(microseconds) on the control path.
- *   - on_fire(): emits the known-good fire immediately, then launch-and-poll
- *     re-arm (never a bounded wait on the pool thread - amendment 8) with a
- *     timed retry backstop where the old code went deaf forever.
+ *   - on_fire(): records the observation gap and launches the re-arm probe
+ *     (launch-and-poll, never a bounded wait on the pool thread - amendment
+ *     8), then emits the known-good fire with mu_ released; a timed retry
+ *     backstop replaces the old code's deaf-forever failure.
  *   - a joined `sweeper_` thread polls outstanding probes/drains, commits late
  *     results, retries on a schedule, and is the SINGLE producer of fault()
  *     edges and synthetic fires (dispatched with mu_ released).
@@ -74,8 +75,11 @@
  *      fire is SUBMITTED through emit (SparkEmitFn returns void - there is no
  *      delivery acknowledgement to wait for); restored if that submit threw and
  *      the epoch is unchanged, then re-staged on a D-doubling backoff (30 s cap)
- *      rather than at the sweep cadence. The two emits a consumed notification
- *      produces (immediate + synthetic) are two SUBMISSIONS, not two changes:
+ *      rather than at the sweep cadence. REGISTRY-SPECIFIC consequence of this
+ *      point under launch-and-poll (not a protocol requirement File/Service
+ *      must copy): a consumed TARGET-mode notification produces two emit
+ *      SUBMISSIONS (immediate + synthetic), not two changes - an Ancestor-mode
+ *      notification produces none or one (appearance at commit).
  *      RegNotifyChangeKeyValue is one-shot, so N writes before the re-arm
  *      coalesce into one notification, and the consumer's own dedup decides
  *      what reaches the wire.
@@ -87,7 +91,7 @@
  * probe but never committed is never armed, so its (possibly dangling) context
  * is never dereferenced; it is simply closed.
  *
- * D (50 ms) is PR-B's chosen initial policy value, not a proven statistical
+ * D (50 ms) is the #2012/#3840 series' chosen initial policy value, not a proven statistical
  * bound - the measured inputs (docs/spark-rebuild-baselines/stage2-watch-
  * establish-latency.md: Registry direct-target summed per-call p99 82 us, R2
  * ancestor-walk total p99 1264 us, R4 unmeasured) sit far below it. Its five
@@ -193,8 +197,8 @@ static_assert(spark_deadline_below_guardian_backend_op(kRegCallerWaitBudget),
               "kRegCallerWaitBudget must be strictly below Guardian's backend_op deadline");
 
 /// Hand-rolled HKEY owner (the ScopedWinHandle template is HANDLE-typed;
-/// mirrors guard_registry.cpp's RegKeyHandle). Movable + release() since PR-B1
-/// so a probe result can carry an opened key across threads.
+/// mirrors guard_registry.cpp's RegKeyHandle). Movable since PR-B1 so a probe
+/// result can carry an opened key across threads (by move; nothing releases).
 class RegKeyHandle {
 public:
     RegKeyHandle() = default;
@@ -214,11 +218,6 @@ public:
         if (h_ && h_ != h)
             ::RegCloseKey(h_);
         h_ = h;
-    }
-    [[nodiscard]] HKEY release() noexcept {
-        HKEY h = h_;
-        h_ = nullptr;
-        return h;
     }
     [[nodiscard]] HKEY get() const { return h_; }
     explicit operator bool() const { return h_ != nullptr; }
@@ -468,7 +467,7 @@ struct RegWatch {
     std::string subkey;
     std::wstring subkey_w;
     // committed live resources
-    detail::EventHandle event; ///< auto-reset; the TP_WAIT object of the live notify
+    detail::EventHandle event; ///< auto-reset EVENT the live notify signals; `wait` waits on it
     RegKeyHandle open_key;      ///< target in Target mode, ancestor in Ancestor mode
     PTP_WAIT wait{nullptr};     ///< armed at least once => drain before destroy
     WatchMode mode{WatchMode::Target};
@@ -734,8 +733,11 @@ public:
             if (!live) {
                 // Reservation cancelled underneath us (stop()). Whatever we hold is
                 // ours to discard - off-lock, below.
-                if (call)
+                if (call) {
+                    if (stopping_ && !call->done())
+                        quarantined_.fetch_add(1, std::memory_order_relaxed); // sg-6
                     discards.stale_calls.push_back(std::move(*call));
+                }
                 if (taken && taken->has_value())
                     discards.dead_results.push_back(std::move(**taken));
                 probe_discarded_.fetch_add(1, std::memory_order_relaxed);
@@ -850,6 +852,7 @@ public:
             drain_watch(*w);
         }
         for (auto& d : drains) {
+            unsigned waited_s = 0;
             for (;;) { // wait for the drain worker (unbounded - see above)
                 if (d.wait_take(Clock::now() + 1s)) {
                     drains_completed_.fetch_add(1, std::memory_order_relaxed);
@@ -857,6 +860,10 @@ public:
                 }
                 if (d.done())
                     break; // already taken (cannot happen - only stop() reaps these)
+                if (++waited_s == 5 || waited_s % 30 == 0) // sre-3: a stuck drain is named, not silent
+                    spdlog::warn("spark_registry: stop() still waiting for a callback drain after "
+                                 "{} s (a callback is parked inside a consumer)",
+                                 waited_s);
             }
         }
         if (orphaned)
@@ -1016,6 +1023,8 @@ public:
             } else if (lr.call) {
                 stale = std::move(lr.call); // reservation cancelled (retired) - abandon off-lock
                 probe_discarded_.fetch_add(1, std::memory_order_relaxed);
+                if (stopping_ && !stale->done())
+                    quarantined_.fetch_add(1, std::memory_order_relaxed); // sg-6: parked across stop
             }
         }
         // Fire with mu_ RELEASED: emit re-enters the engine under its own lock, and
@@ -1180,14 +1189,20 @@ private:
             commit_locked(w, std::move(*r), work);
             return;
         }
-        if (r.has_value())
+        // The fault channel carries the CLASS (fault_reason is a static const
+        // char*); the specific stage and Win32 error go to the log line, read
+        // BEFORE the result is moved out for off-lock disposal (ca-1).
+        const char* reason = "registry establishment failed";
+        if (!r.has_value()) {
+            reason = r.error() == DetachedCallError::WorkerThrew
+                         ? "registry probe threw"
+                         : "registry probe result could not be boxed";
+        } else {
+            reason = w.wait ? "registry re-arm failed" : "registry establishment failed";
+            spdlog::warn("spark_registry: probe for '{}' failed at {} (err={})", w.spark_key,
+                         r->stage, r->err);
             work.dead_results.push_back(std::move(*r));
-        // Static text only (fault_reason is a const char*): the specific stage is
-        // in the log line, the fault channel carries the class.
-        const char* reason = !r.has_value() ? (r.error() == DetachedCallError::WorkerThrew
-                                                   ? "registry probe threw"
-                                                   : "registry probe result could not be boxed")
-                                            : "registry re-arm failed";
+        }
         fail_backend_locked(w, reason);
     }
 

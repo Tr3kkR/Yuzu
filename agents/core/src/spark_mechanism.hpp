@@ -111,18 +111,27 @@ struct SparkMechanismStats {
     /// New watches refused because retiring_ was at its cap (#1979) — a
     /// failed arm() call at the SparkEngine layer, never silent.
     std::uint64_t watch_rejected_total{0};
-    /// Watches leaked to process lifetime because a cancelled I/O's
-    /// completion never arrived within the shutdown budget (#1982) — should
-    /// stay 0 in practice; the retiring_ cap bounds it structurally.
+    /// Work the mechanism had to abandon at stop() instead of completing:
+    /// File - watches leaked to process lifetime because a cancelled I/O's
+    /// completion never arrived within the shutdown budget (#1982); Registry -
+    /// establishment probes still parked on a detached worker when stop()
+    /// returned (leaked-and-counted, the worker self-disposes and is F3-counted).
+    /// Should stay 0 in practice; the retiring_ cap bounds File's structurally.
     std::uint64_t quarantined_total{0};
-    /// Mechanism-internal operations that took longer than the mechanism's
-    /// own "slow" threshold while holding its lock (#1980) — an early warning
-    /// for a stalled watcher, not a hard fault.
+    /// Watch-establishment work that exceeded the mechanism's own threshold
+    /// (#1980): File - an arm-path OS operation over its slow threshold while
+    /// holding its lock; Registry - an accepted establishment or re-arm
+    /// obligation still unestablished past its health grace (counted by the
+    /// sweeper, the OS call itself runs off-lock). An early warning for a
+    /// stalled or refused watcher, not a hard fault.
     std::uint64_t slow_op_total{0};
     /// TRUE when the mechanism started but could NOT bind its OS facility, so every
     /// watch() will be refused: no systemd system bus (a container — Dockerfile.agent
     /// ships libsystemd0, but a container has no bus), OpenSCManager denied, or the
-    /// IOCP/threadpool could not be created. The mechanism stays REGISTERED (so arm()
+    /// IOCP/threadpool could not be created; Registry also raises it while its
+    /// sweeper (the sole producer of late commits and health edges) has failed
+    /// several consecutive passes, and clears it on the next successful pass
+    /// (#2012 PR-B1). The mechanism stays REGISTERED (so arm()
     /// gets an honest rejection rather than "unknown type"), which is exactly why this
     /// bit is needed: without it, `registered` and `functional` are indistinguishable
     /// on the wire, and an inert mechanism reports byte-identically to a healthy idle
@@ -148,8 +157,9 @@ struct SparkMechanismStats {
 ///      the blocking OS call on a worker it owns, wait at most a short budget
 ///      on the control path, and commit or hand the result off later. Registry
 ///      does this since PR-B1 (spark_registry.cpp, "Ownership / dispatch
-///      protocol"); File and Service still block for the OS-call duration
-///      (PR-B2/PR-B3).
+///      protocol"). File's watch() still blocks for the OS-call duration;
+///      Service's watch()/unwatch() are already O(1) queue pushes but its SCM
+///      open/notify run head-of-line on its worker (PR-B2/PR-B3).
 ///   2. A mechanism must NEVER call emit()/fault() synchronously from inside
 ///      watch()/unwatch() - not even on an immediate-success path. The engine's
 ///      per-type lock is on that call stack, and an Inline consumer reacting by
