@@ -131,8 +131,11 @@ learns of a real acquisition failure:
   result. macOS is the same via `mac_login_items`, which isn't even
   filter-gated at all -- it always emits its one constrained status line
   (there is no real read to skip; see below). Windows has no
-  permanently-constrained source, so whether a given run degrades depends
-  on live host state.
+  *catalog-declared permanent* constraint the way Linux/macOS do, so
+  structurally whether a given run degrades depends on live host state --
+  but see the caveat below: on a real LocalSystem-run agent,
+  `win_startup_folder_user` degrades on essentially every host too, for a
+  different (data-dependent, not catalog-permanent) reason.
 - **`UNAVAILABLE` / `PARTIAL` / `autoruns:exception`** -- an exception
   escaped a leg (`execute()`'s catch clauses); the command itself aborted,
   `rc=1`.
@@ -140,8 +143,13 @@ learns of a real acquisition failure:
 Because this field is effectively constant on Linux and macOS (always
 `CONSTRAINED`/`PARTIAL`), it cannot by itself signal a *new* degradation on
 those platforms -- a fleet-scale consumer still needs to read the per-source
-`source|` text lines to detect a genuinely new failure there. Only
-Windows's typed field varies with live host state today.
+`source|` text lines to detect a genuinely new failure there. Windows's
+field is *structurally* capable of varying with live host state, but in
+practice is ALSO likely to read constrained on most real hosts today,
+because of `win_startup_folder_user`'s known redirect-resolution bug (see
+its catalog row below and the "Known bug" note there) -- not because of a
+permanent catalog declaration, but the practical effect for a fleet-scale
+consumer is similar until that bug is fixed.
 
 ## Versioned source catalog
 
