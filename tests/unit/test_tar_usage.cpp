@@ -826,6 +826,67 @@ TEST_CASE("tar_usage: execute_atomic_batch_gated rolls back the data statements 
     CHECK(rows->rows[0][0] == "0");
 }
 
+// ── Governance round 5, Blocker 3: a PERSISTENT (not crash-only) fault on a ─
+// ── gated statement must not let the data commit and re-fold unboundedly ───
+TEST_CASE("tar_usage: a persistent transaction-preserving fault on a gated statement rolls "
+         "back the data too, on every tick, not just once",
+         "[tar_usage]") {
+    // The test above ("...rolls back the data statements too when the gated
+    // segment hits a transaction-ABORTING error") proves atomicity for the
+    // ABORTING fault class (SQLITE_FULL/CORRUPT/a RAISE(ROLLBACK) trigger),
+    // which run_batch_statements_locked already stopped the loop for even
+    // before this fix. Governance round 5's Blocker 3 finding was narrower
+    // and different: a plain per-table (transaction-PRESERVING) fault --
+    // SQLITE_CONSTRAINT / SQLITE_ERROR -- on a GATED statement used to leave
+    // the loop's `ok` flag true (the whole point of that tolerance for
+    // execute_atomic_batch's retention use case: one broken table must not
+    // roll back every OTHER table's retention forever). For the gated
+    // variant that same tolerance was the bug: `commit_or_rollback_locked`
+    // then committed with the data durable and only the gated statement
+    // skipped -- and because the fault is PERSISTENT, not one-shot, it
+    // reproduces on every subsequent call with the SAME outcome, so a real
+    // fold would re-derive and re-apply the same closed-run deltas onto
+    // already-durable data every tick, forever.
+    //
+    // A CHECK constraint violation is SQLITE_CONSTRAINT with the transaction
+    // left intact -- the exact per-table-fault class this test needs, as
+    // opposed to the sibling test's aborting RAISE(ROLLBACK).
+    auto t = make_test_db();
+    REQUIRE(t.db.execute_sql("CREATE TABLE gate_probe2 (x INTEGER CHECK (x < 100))"));
+
+    const std::vector<std::string> data_statements = {
+        "INSERT INTO usage_daily (day_ts, exe_key, run_count, total_seconds, first_seen, "
+        "last_seen, distinct_users, superseded_runs, expired_runs, fold_hwm) VALUES (0, "
+        "'persistent-fault-probe', 1, 1, 1, 1, 0, 0, 0, 0)"};
+    // Always violates the CHECK constraint -- a fault that never clears,
+    // modelling a corrupt index or a permanently-wrong config value rather
+    // than a one-off transient blip.
+    const std::vector<std::string> gated_statements = {"INSERT INTO gate_probe2 (x) VALUES (999)"};
+
+    for (int tick = 0; tick < 3; ++tick) {
+        auto batch = t.db.execute_atomic_batch_gated(data_statements, gated_statements);
+        INFO("tick " << tick);
+        // MUTATION-VERIFY: reverted the tar_db.cpp fix (removed the
+        // `if (any gated failed) ok = false;` block this test exists to
+        // prove) -- `batch.committed` came back true and the row count below
+        // read "1" after the FIRST tick already, so this CHECK failed
+        // immediately. Restored before writing the patch.
+        CHECK_FALSE(batch.committed);
+
+        auto rows = t.db.execute_query(
+            "SELECT COUNT(*) FROM usage_daily WHERE exe_key = 'persistent-fault-probe'");
+        REQUIRE(rows.has_value());
+        // The falsifier: with the bug, tick 0 leaves this row durable (data
+        // committed, gated statement skipped) and it stays "1" forever,
+        // proving no accumulation is even possible to observe via THIS
+        // table's row count alone -- the real double-count would show up as
+        // repeated additive UPSERTs in a genuine fold, which this row-count
+        // check catches at the root: the row must never become durable at
+        // all while the gated fault persists.
+        CHECK(rows->rows[0][0] == "0");
+    }
+}
+
 // ── Governance re-review fix-of-a-fix: a crash between the data commit and ─
 // ── the hwm/counter commit must not double-count on the retry ──────────────
 

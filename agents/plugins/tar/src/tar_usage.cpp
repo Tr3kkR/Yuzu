@@ -46,12 +46,23 @@
  * single COMMIT -- so a crash can only land before that COMMIT (nothing
  * durable at all; SQLite's WAL recovery rolls the whole thing back on
  * restart) or after it (data and hwm/counters durable together, always).
- * The one residual left is narrower than before and was already accepted:
- * a genuine transaction-preserving SQL fault on a tar_config upsert itself
- * (not a crash, and not the data statements) still lets data commit while
- * that specific counter is skipped -- caught below via `batch.ran_gated`
- * and the gated `failed` entries, same "hwm unchanged, re-fold next tick"
- * outcome Blocker 1's fix always had for this case.
+ * A residual was accepted here in an earlier round and then found NOT to be
+ * bounded (Wave 7 PR7.2a, governance round 5, Blocker 3): a genuine
+ * transaction-preserving SQL fault on a tar_config upsert itself (not a
+ * crash, and not the data statements) used to still let the data commit
+ * while that specific counter was skipped, on the reasoning that this was
+ * "bounded to the crash's own window" like the two-call gap above. It is
+ * not -- a PERSISTENT (not one-shot) fault on the same gated statement
+ * re-fires on every subsequent tick, and each tick's data still commits, so
+ * the same un-advanced hwm makes every following tick re-derive and
+ * re-apply the SAME closed-run deltas on top of already-durable data:
+ * unbounded double-counting, for as long as the fault persists.
+ * `execute_atomic_batch_gated` (tar_db.cpp) now forces the WHOLE
+ * transaction to roll back on any gated-statement fault, so "committed" for
+ * this call always means "data and hwm/counters durable together" or
+ * "neither is" -- never split -- and the below check via `batch.committed`
+ * catches this case directly (`batch.ran_gated`/gated `failed` entries are
+ * now a defensive invariant check only; see the comment at that check).
  *
  * GAP CHECK FIRST, before any events are read: process_live is retained by
  * ROW COUNT (kRowCount, 100k rows, tar_schema_registry.cpp), and its prune
@@ -626,31 +637,47 @@ UsageFoldResult run_usage_fold(TarDatabase& db, int64_t now, int64_t max_events_
         // (TarDatabase::BatchResult's contract), so bailing here -- before
         // the gated counters are even attempted -- is what makes "no
         // partial advance" true rather than merely claimed.
+        //
+        // Governance round 5 (Blocker 3): `execute_atomic_batch_gated` now
+        // forces the WHOLE transaction to roll back on ANY gated-statement
+        // fault, including a persistent (non-crash) transaction-preserving
+        // one on a single tar_config upsert -- see that method's own comment
+        // in tar_db.cpp for why a partial "data committed, counter skipped"
+        // outcome let a persistent fault re-fold and re-apply the same
+        // closed-run deltas every tick, unboundedly. So `!batch.committed`
+        // now also covers that case (`data_failed` stays false there --
+        // `stmts` itself ran clean), and this branch is the ONE place both
+        // land: hwm/counters are guaranteed unchanged, so the same events are
+        // safely re-derived and re-applied next tick with no double-count.
         result.ok = false;
         result.error = !batch.committed
-                          ? "usage fold data transaction rolled back"
+                          ? "usage fold transaction rolled back (data statement or gated "
+                            "counter write failed); hwm/counters not advanced"
                           : "usage fold data transaction partially failed -- a statement was "
                             "skipped; hwm/counters not advanced";
         result.hwm_id = hwm; // unchanged -- report what is actually persisted
         return result;
     }
 
+    // Defensive only: with the tar_db.cpp fix above, a clean `data_clean`
+    // pass (reached this line, so `batch.committed == true`) can no longer
+    // leave a gated statement flagged failed -- ANY gated fault now forces
+    // the whole transaction to roll back, which the branch above already
+    // catches via `!batch.committed`. Kept as a hard invariant check rather
+    // than deleted: it costs nothing, and if `execute_atomic_batch_gated`'s
+    // contract ever regresses (or a future caller misuses it), this fails
+    // the tick instead of silently trusting an un-advanced pointer as if it
+    // had moved.
     const bool gated_failed =
         !config_stmts.empty() &&
         (!batch.ran_gated ||
          std::any_of(batch.failed.begin() + static_cast<std::ptrdiff_t>(stmts.size()),
                      batch.failed.end(), [](char f) { return f != 0; }));
     if (gated_failed) {
-        // Residual, and narrower than before: this can now only be a genuine
-        // transaction-preserving SQL fault on one of the tar_config upserts
-        // THEMSELVES (data and counters share one commit, so a crash can no
-        // longer produce this state) -- data is durable, hwm is not, so the
-        // same events are safely re-folded next tick. A bounded overcount on
-        // an already-narrow, already-documented path, not the crash-induced
-        // one this fix closes.
         result.ok = false;
-        result.error = "usage fold: data committed but counters failed to persist -- hwm not "
-                      "advanced; the same events will be re-folded next tick";
+        result.error = "usage fold: gated counter write reported failed despite a committed "
+                      "transaction -- execute_atomic_batch_gated invariant violation; hwm not "
+                      "advanced";
         result.hwm_id = hwm; // unchanged
         return result;
     }

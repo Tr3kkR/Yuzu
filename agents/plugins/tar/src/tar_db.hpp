@@ -683,12 +683,23 @@ public:
      * gated indices following data indices. `out.ran_gated` is true only when
      * the gated segment was attempted; when false, the gated indices' `failed`
      * entries are meaningless (never run) and must not be read as "succeeded".
-     * A transaction-preserving fault WITHIN the gated segment is reported the
-     * same way as within the data segment: `committed == true`, that entry's
-     * `failed[i] == 1`, everything else (including all of `data_statements`)
-     * durable. Callers that need "did the pointer really move" MUST check
-     * `ran_gated` and the gated `failed` entries together, not `committed`
-     * alone.
+     *
+     * Unlike the data segment (and unlike plain `execute_atomic_batch`'s
+     * retention use case), a fault WITHIN the gated segment -- including a
+     * transaction-preserving per-table fault that would otherwise just flag
+     * that one statement and continue -- forces the WHOLE transaction to roll
+     * back: `committed == false`, every entry of `failed` (data included) set
+     * (governance round 5, Blocker 3). This method's whole purpose is
+     * advancing a durable pointer/counter atomically WITH the data it
+     * describes, so there is no correct "commit the data, skip one gated
+     * statement" outcome -- a PERSISTENT (not crash-only) fault on a single
+     * gated statement would otherwise leave data durable while its pointer
+     * never advances, and every later retry re-derives and re-applies the
+     * same already-committed deltas on top, unboundedly. Callers only ever
+     * see `committed == true` when both groups are durable together, and
+     * `committed == false` (safe to retry from the last successful pointer)
+     * otherwise -- `ran_gated` still distinguishes "never attempted" (data
+     * itself was not clean) from "attempted and rolled back".
      */
     BatchResult execute_atomic_batch_gated(const std::vector<std::string>& data_statements,
                                             const std::vector<std::string>& gated_statements);

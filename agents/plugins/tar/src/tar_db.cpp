@@ -2724,6 +2724,30 @@ TarDatabase::execute_atomic_batch_gated(const std::vector<std::string>& data_sta
         out.ran_gated = true;
         ok = run_batch_statements_locked(db_, gated_statements, out.failed,
                                           data_statements.size(), err);
+        // Governance round 5 (Blocker 3): unlike execute_atomic_batch's
+        // retention use case, this gated variant exists SPECIFICALLY so a
+        // durable pointer/counter can only ever advance atomically WITH the
+        // data it describes -- there is no correct "skip this one gated
+        // statement, commit the rest" outcome here. run_batch_statements_locked
+        // still tolerates a transaction-preserving (per-table) fault by
+        // flagging that one statement and continuing, which is exactly right
+        // for the data segment (BLOCKER 1's original gate already reads
+        // `failed` for that), but left the SAME tolerance on the gated
+        // segment: a persistent (not crash-only) fault on a single gated
+        // statement -- e.g. a corrupt ON CONFLICT index specific to
+        // tar_config -- left `ok == true` here, so `commit_or_rollback_locked`
+        // committed the data anyway with only that one counter skipped. Every
+        // following tick then re-read the same un-advanced hwm, re-derived
+        // the SAME closed-run deltas, and re-applied them on top of the
+        // ALREADY-DURABLE data -- an unbounded double-count for as long as
+        // the fault persisted, not the "bounded to one crash" residual the
+        // gated design intends. Force the WHOLE transaction to roll back on
+        // any gated-statement outcome that isn't a clean success, so the
+        // caller's "committed" answer is always "both groups durable
+        // together" or "neither is, safe to retry" -- never split.
+        if (std::any_of(out.failed.begin() + static_cast<std::ptrdiff_t>(data_statements.size()),
+                        out.failed.end(), [](char f) { return f != 0; }))
+            ok = false;
     }
 
     out.committed = commit_or_rollback_locked(db_, db_, out.failed, ok, err);
