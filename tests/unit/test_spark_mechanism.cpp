@@ -3473,6 +3473,8 @@ TEST_CASE(YUZU_SPARK_T6_CHILD_CASE_NAME, "[.][t6-child]") {
     std::atomic<bool> go{false};
     std::atomic<bool> rearmed{false};
     std::atomic<int> fires{0};
+    std::mutex rearm_err_mu;
+    std::string rearm_err; // written on the callback thread, read after the joins below
     // Inline tier: the handler runs SYNCHRONOUSLY on the TP_WAIT callback thread.
     auto sub_k = engine.arm_inline(registry_spec("HKCU", sub), [&](const SparkEvent&) {
         if (fires.fetch_add(1, std::memory_order_acq_rel) != 0)
@@ -3482,6 +3484,10 @@ TEST_CASE(YUZU_SPARK_T6_CHILD_CASE_NAME, "[.][t6-child]") {
             std::this_thread::sleep_for(1ms);
         // Same-type re-entry FROM THE CALLBACK THREAD: needs mech_ops_mu_by_type_[Registry].
         auto s2 = engine.arm_inline(registry_spec("HKCU", sub2), [](const SparkEvent&) {});
+        if (!s2) {
+            std::lock_guard lk(rearm_err_mu);
+            rearm_err = s2.error();
+        }
         rearmed.store(s2.has_value(), std::memory_order_release);
     });
     REQUIRE(sub_k.has_value());
@@ -3514,8 +3520,12 @@ TEST_CASE(YUZU_SPARK_T6_CHILD_CASE_NAME, "[.][t6-child]") {
         ::TerminateProcess(::GetCurrentProcess(), 3);
     }
     CHECK(completed);
-    CHECK(rearmed.load(std::memory_order_acquire));
     disarmer.join();
+    {
+        std::lock_guard lk(rearm_err_mu);
+        INFO("same-type arm_inline from inside the Inline handler: " << (rearm_err.empty() ? "ok" : rearm_err));
+        CHECK(rearmed.load(std::memory_order_acquire));
+    }
     engine.stop();
     ::RegCloseKey(h);
     ::RegDeleteKeyA(HKEY_CURRENT_USER, sub2.c_str());
