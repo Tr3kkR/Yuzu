@@ -3,6 +3,8 @@
 
 #include "software_catalog_rollup.hpp"
 
+#include "background_jobs.hpp"
+
 #include "software_inventory_store.hpp"
 
 #include <yuzu/metrics.hpp>
@@ -61,6 +63,7 @@ void SoftwareCatalogRollup::run() {
         // calls std::terminate — catch, log, keep ticking.
         try {
             const auto t0 = std::chrono::steady_clock::now();
+            YUZU_ASSERT_BACKGROUND_JOB("software_catalog_rollup.refresh_catalog_rollup"); // WS-10 ReplicaSafe
             const bool ok = store_.refresh_catalog_rollup();
             const double secs =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();

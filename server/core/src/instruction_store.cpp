@@ -1,4 +1,6 @@
 #include "instruction_store.hpp"
+#include "instruction_definition_model.hpp" // #4029: export_definition_json delegates to the shared builder
+#include "instruction_yaml.hpp"
 #include "reserved_definition_id.hpp" // the ONE reserved-namespace rule (#2442)
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
@@ -299,6 +301,26 @@ std::optional<std::string> validate_definition_scope(const std::string& yaml_sou
     auto asn = yaml_scan::extract_yaml_section(yaml_source, "spec.assignment");
     return validate_scope_block(sb, yaml_scan::extract_yaml_value(asn, "mode"),
                                 !yaml_scan::extract_yaml_list(asn, "managementGroups").empty());
+}
+
+// #2542 PR-7: promoted verbatim from ServerImpl::validate_yaml_source
+// (server.cpp) — see instruction_store.hpp's doc comment for why this is a
+// promotion, not a duplication (a #2557 json_extract.hpp-style call site
+// straddling an extraction boundary: /fragments/instructions/yaml-preview,
+// now in instruction_fragment_routes.cpp (#2542 PR-12), shares this exact
+// function).
+std::vector<std::string> validate_yaml_source(const std::string& yaml_source) {
+    // Shared with the POST /api/instructions/yaml save path so validate
+    // and save can never diverge on what a complete definition is (#1993).
+    auto errors = instruction_yaml::validate_definition_yaml(yaml_source);
+    // Also run the store-level gates (scope-walking combos, flow-mapping
+    // scope) that create/update enforce — same contract, one verdict
+    // (governance UP-3). Skip when byte-level errors already fired.
+    if (errors.empty()) {
+        if (auto err = validate_definition_scope(yaml_source))
+            errors.push_back(*err);
+    }
+    return errors;
 }
 
 // ---------------------------------------------------------------------------
@@ -742,33 +764,12 @@ InstructionStore::export_definition_json(const std::string& id) const {
     if (!*def)
         return std::string("{}");
 
-    nlohmann::json j;
-    j["id"] = (*def)->id;
-    j["name"] = (*def)->name;
-    j["version"] = (*def)->version;
-    j["type"] = (*def)->type;
-    j["plugin"] = (*def)->plugin;
-    j["action"] = (*def)->action;
-    j["description"] = (*def)->description;
-    j["enabled"] = (*def)->enabled;
-    j["instruction_set_id"] = (*def)->instruction_set_id;
-    j["gather_ttl_seconds"] = (*def)->gather_ttl_seconds;
-    j["response_ttl_days"] = (*def)->response_ttl_days;
-    j["created_by"] = (*def)->created_by;
-    j["created_at"] = (*def)->created_at;
-    j["updated_at"] = (*def)->updated_at;
-    j["yaml_source"] = (*def)->yaml_source;
-    j["parameter_schema"] = (*def)->parameter_schema;
-    j["result_schema"] = (*def)->result_schema;
-    j["approval_mode"] = (*def)->approval_mode;
-    j["concurrency_mode"] = (*def)->concurrency_mode;
-    j["platforms"] = (*def)->platforms;
-    j["min_agent_version"] = (*def)->min_agent_version;
-    j["required_plugins"] = (*def)->required_plugins;
-    j["readable_payload"] = (*def)->readable_payload;
-    j["visualization_spec"] = (*def)->visualization_spec;
-    j["response_templates_spec"] = (*def)->response_templates_spec;
-    return j.dump(2);
+    // #4029: delegates to the shared pure builder (instruction_definition_model.hpp)
+    // so this store's export format, GET /api/v1/instructions/{id}/export, and MCP
+    // export_definition are the same shape by construction — nlohmann::json's
+    // default (map-backed, key-sorted) container makes this dump(2) byte-identical
+    // to the field-by-field construction it replaces.
+    return instruction_definition_export_json(**def).dump(2);
 }
 
 std::expected<std::string, std::string>

@@ -170,8 +170,16 @@ TEST_CASE("RbacStore: seed data — securable types", "[rbac_store][pg]") {
     auto types = store.list_securable_types();
     // +SoftwareLicensing (ADR-0024) +AccessReview (SOC 2 CC6.2) +EnginePrincipal
     // (#2376, cut away from Security:Read) +PluginConfig +PluginSecret
-    // +UploadGrant (PR1.9a, peer finding PLAN-001) = 26.
-    REQUIRE(types.size() == 27);
+    // +UploadGrant (PR1.9a, peer finding PLAN-001) +PowerManagement (Wave 6 W1B) = 27,
+    // +Workflow (#4030/#4032 — previously gated but never seeded) = 28,
+    // +ProductPack (#4029 prerequisite fix — was used as an RBAC securable string by
+    // the shipped /api/product-packs* routes but never seeded) = 29,
+    // +TlsConfig +PluginSigning +ServerConfig +AnalyticsConfig (#4028
+    // Settings read-twins) = 33,
+    // +Directory +Enrollment +OidcConfig (#4031 prerequisite fix — Directory was
+    // referenced by discovery_routes.cpp but never seeded; Enrollment/OidcConfig
+    // are the two new #4031 route securables) = 36.
+    REQUIRE(types.size() == 36);
 
     auto has = [&](const std::string& t) {
         return std::find(types.begin(), types.end(), t) != types.end();
@@ -197,6 +205,16 @@ TEST_CASE("RbacStore: seed data — securable types", "[rbac_store][pg]") {
     CHECK(has("UploadGrant"));  // PR1.9a: upload-grant mint/revoke lifecycle
     CHECK(has("EnginePrincipal")); // Engine-principal inventory + grant-graph reads (#2376),
                                    // cut away from the over-broad Security:Read
+    CHECK(has("Workflow")); // #4030/#4032: previously gated but never seeded
+    CHECK(has("ProductPack")); // #4029 prerequisite fix
+    CHECK(has("PowerManagement")); // Wave 6 W1B: power_health's set_power_plan
+    CHECK(has("TlsConfig"));       // #4028: tls/https Settings fragments
+    CHECK(has("PluginSigning"));   // #4028: plugin-signing fragment + GET /agent/plugin-policy (v2)
+    CHECK(has("ServerConfig"));    // #4028: gateway/server-config/mcp/data-retention fragments
+    CHECK(has("AnalyticsConfig")); // #4028: analytics fragment
+    CHECK(has("Directory"));   // #4031 prerequisite fix — AD/Entra directory-sync
+    CHECK(has("Enrollment"));  // #4031: auto-approve rules + pending-agent visibility
+    CHECK(has("OidcConfig"));  // #4031: OIDC SSO config read (deliberately not "Directory")
 }
 
 TEST_CASE("RbacStore: seed data — operations", "[rbac_store][pg]") {
@@ -231,17 +249,21 @@ TEST_CASE("RbacStore: seeded catalogues match the MCP C8 validator mirrors",
 TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_store][pg]") {
     RBAC_STORE(store);
     auto perms = store.get_role_permissions("Administrator");
-    // 27 types * 5 CRUD ops = 135 permissions, plus a single targeted Push
-    // grant on GuaranteedState (= 136), plus a single AccessReview:Attest grant
-    // (Periodic Access Reviews, CC6.2, = 137), plus a single ApiToken:Rotate
-    // grant (P2 #11, SOC 2 CC6.3) = 138 permissions total. Push, Attest, and
+    // 36 types * 5 CRUD ops = 180 permissions, plus a single targeted Push
+    // grant on GuaranteedState (= 181), plus a single AccessReview:Attest grant
+    // (Periodic Access Reviews, CC6.2, = 182), plus a single ApiToken:Rotate
+    // grant (P2 #11, SOC 2 CC6.3) = 183 permissions total. Push, Attest, and
     // Rotate are deliberately NOT cross-seeded on other securables — see the
-    // rationale in rbac_store.cpp seed_defaults(). (27th: PowerManagement, Wave 6
-    // power_health set_power_plan; 26th-24th: UploadGrant/
-    // PluginSecret/PluginConfig, PR1.9a peer finding PLAN-001; 23rd:
-    // EnginePrincipal, #2376; 22nd: AccessReview, SOC 2 CC6.2; 21st:
-    // SoftwareLicensing, ADR-0024.)
-    CHECK(perms.size() == 138);
+    // rationale in rbac_store.cpp seed_defaults(). (36th-34th: Directory/
+    // Enrollment/OidcConfig, #4031; 33rd-30th: TlsConfig/PluginSigning/
+    // ServerConfig/AnalyticsConfig, #4028 Settings read-twins; 29th:
+    // ProductPack, #4029 prerequisite fix; 28th: Workflow, #4030/#4032 —
+    // previously gated but never seeded; 27th: PowerManagement, Wave 6
+    // power_health set_power_plan; 26th-24th: UploadGrant/PluginSecret/
+    // PluginConfig, PR1.9a peer finding PLAN-001; 23rd: EnginePrincipal,
+    // #2376; 22nd: AccessReview, SOC 2 CC6.2; 21st: SoftwareLicensing,
+    // ADR-0024.)
+    CHECK(perms.size() == 183);
     for (auto& p : perms)
         CHECK(p.effect == "allow");
 
@@ -271,9 +293,16 @@ TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_s
 TEST_CASE("RbacStore: seed data — Viewer has read-only", "[rbac_store][pg]") {
     RBAC_STORE(store);
     auto perms = store.get_role_permissions("Viewer");
-    // 21 types * Read only (everything except Infrastructure; incl. Inventory +
-    // SoftwareLicensing, ADR-0024, + EnginePrincipal, #2376)
-    CHECK(perms.size() == 21);
+    // 24 types * Read only (everything except Infrastructure; incl. Inventory +
+    // SoftwareLicensing, ADR-0024, + EnginePrincipal, #2376, + Workflow,
+    // #4030/#4032, + ProductPack, #4029, + Directory, #4031 — AD/Entra
+    // directory-sync PII, same precedent as UserManagement). Enrollment/
+    // OidcConfig deliberately do NOT join Viewer's list — see the seeding
+    // comment in rbac_store.cpp's Viewer read-loop. (Counted directly from
+    // the merged Viewer grant-loop's type list, not derived from either
+    // side's pre-merge arithmetic — see #4030's own merge-round precedent
+    // for why that check matters here.)
+    CHECK(perms.size() == 24);
     for (auto& p : perms) {
         CHECK(p.operation == "Read");
         CHECK(p.effect == "allow");
@@ -338,6 +367,30 @@ TEST_CASE("RbacStore: seed data — Operator has Read on PluginConfig and Upload
     CHECK_FALSE(has_grant(perms, "PluginConfig", "Delete"));
     CHECK_FALSE(has_grant(perms, "UploadGrant", "Write"));
     CHECK_FALSE(has_grant(perms, "UploadGrant", "Delete"));
+}
+
+// ── #4029: ProductPack prerequisite fix ────────────────────────────────────
+
+TEST_CASE("RbacStore: seed data — Administrator has full CRUD on ProductPack",
+          "[rbac_store][4029][pg]") {
+    RBAC_STORE(store);
+    auto perms = store.get_role_permissions("Administrator");
+    for (const char* op : {"Read", "Write", "Execute", "Delete", "Approve"}) {
+        CHECK(has_grant(perms, "ProductPack", op));
+    }
+}
+
+TEST_CASE("RbacStore: seed data — Operator/PlatformEngineer/Viewer have ProductPack:Read, "
+          "never Write/Delete",
+          "[rbac_store][4029][pg]") {
+    RBAC_STORE(store);
+    for (const char* role : {"Operator", "PlatformEngineer", "Viewer"}) {
+        INFO("role=" << role);
+        auto perms = store.get_role_permissions(role);
+        CHECK(has_grant(perms, "ProductPack", "Read"));
+        CHECK_FALSE(has_grant(perms, "ProductPack", "Write"));
+        CHECK_FALSE(has_grant(perms, "ProductPack", "Delete"));
+    }
 }
 
 // ── RBAC toggle ──────────────────────────────────────────────────────────────
@@ -1179,11 +1232,13 @@ TEST_CASE("RbacStore: ITServiceOwner role seeded with correct permissions", "[rb
 
     auto perms = store.get_role_permissions("ITServiceOwner");
     // 18 types * 5 CRUD ops = 90 permissions, plus the targeted Push grant on
-    // GuaranteedState = 91 permissions total. Push is deliberately NOT
+    // GuaranteedState (= 91), plus a single Workflow:Read grant (#4030/#4032,
+    // NOT via the CRUD loop — the issue's prerequisite scopes this fix to
+    // granting Read only) = 92 permissions total. Push is deliberately NOT
     // cross-seeded on non-Guardian securables — see the rationale in
     // rbac_store.cpp seed_defaults(). (18th type: SoftwareLicensing, ADR-0024 —
     // ITServiceOwner full CRUD per the D-9 matrix.)
-    CHECK(perms.size() == 91);
+    CHECK(perms.size() == 92);
     size_t push_count = 0;
     for (auto& p : perms) {
         CHECK(p.effect == "allow");

@@ -8,6 +8,7 @@ tracks: #1939 (Stage-2 readiness checklist), #2011, #2014, #1938, #1929, #1933, 
 governance:
   - original design - 9-agent /governance pipeline, 2026-07-11 (report local, not committed to git); hardening round folded all findings into the sections below.
   - rung 9a addition (the §Rung-2 decision record + inner ladder) - 4-agent pipeline (security-guardian, docs-writer, architect, consistency-auditor), 2026-07-17; every embedded code-claim verified against origin/dev; security MEDIUMs on the F3 blast radius and intra-class lane exhaustion folded in.
+  - rung 9c addition (§Async-arm acknowledgment / R5) - the design itself went through six external review rounds (Astra/Codex ×4, Fable ×multiple, Kimi K3 ×2), 2026-09-07, against the plan document, not this doc directly; a seventh round (round 7, 2026-09-07) then adversarially reviewed this PR-0 write-up itself (Kimi + Codex, two HIGH findings against the transcription, folded in - see A3's Epistemic cell and the H-section citation fix); a full `/governance` pass then ran on this PR-0 commit (2026-09-07: Gate 2 security-guardian+docs-writer, Gate 3 architect+cpp-safety, Gate 4 happy-path+unhappy-path+consistency-auditor, Gate 6 compliance-officer+sre+enterprise-readiness - 10 agents total; Gate 5 chaos-injector skipped, no executable-chaos-shaped findings). No BLOCKING findings anywhere; ~25 non-blocking findings folded in directly (citation fixes, an "episode"/"expired" terminology clarification, telemetry-tag gauge-semantics guidance, a restart-remediation caveat cross-referencing this doc's own F3 crash-loop finding, an acknowledged-≠-compliant callout, a changelog fragment). One finding is a genuine, still-open design ambiguity rather than a wording fix: whether a queued-waiter's congestion-only "expired" outcome should count toward decision 7's K-bound the same as a genuine wedge - the plan's own decision-7 headline and its D3 mechanism disagree, unnoticed across all six prior review rounds; recorded as an explicit open question (R5.2) for PR-1/PR-2's own design pass, not resolved here.
 history:
   - 2026-07-11 - initial design; 2 governance rounds; landed as PR #2051.
   - 2026-07-17 - rung 9a - §Rung-2 decision record (R1-R4) + the inner-ladder
@@ -15,6 +16,11 @@ history:
     PR #2224; the 7.7a/7.7b/8/10/11/12 remainder). Records what was previously held
     only in commit messages and a local plan; the full as-built rewrite is rung 9b,
     after 7.7b.
+  - 2026-09-07 - rung 9c - §Async-arm acknowledgment (R5): decouples Guardian's rearm
+    window (`apply_rules`) from OS-watch confirmation, closing the ~55ms spark-vs-legacy
+    gap the #3990 diagnostic measured. Independent of 9b; sequenced after PR-2c (#3848)
+    and before the `prefer_spark` flip (PR-5). Matching rows added to
+    `docs/spark-legacy-delta-registry.md` (A3) and `docs/spark-flip-gate.md`.
 ---
 
 # Spark Stage 2 — Guardian as the first SparkEngine consumer
@@ -251,6 +257,260 @@ without which the server cannot tell which backend a device is running or distin
 **The F3 hard-exit signal cannot be a live heartbeat.** `hard_exit()` skips teardown by
 design; the process is gone before anything could be sent. It is a best-effort marker
 persisted before the exit, then read, reported and cleared on the next boot.
+
+## Async-arm acknowledgment (rung 9c)
+
+Sequenced after PR-2c (#3848) and before the `prefer_spark` flip (PR-5) — lands dormant
+behind `prefer_spark_=false`, same posture as every other pre-flip PR in this document.
+Settled 2026-09-07 after six external review rounds (Astra/Codex ×4, Fable ×multiple,
+Kimi K3 ×2) against the plan document, transcribed into this doc as §R5, into the
+registry as row A3, and into the flip-gate as §3a - plus a seventh round, an
+adversarial review of this doc's own committed PR-0 transcription (not the plan),
+which found and fixed real transcription defects (**corrected round, 2026-09-07**:
+an earlier version of this sentence collapsed the split, reading as if all seven
+rounds reviewed the plan document - contradicted its own round-7 parenthetical in the
+same sentence; see the front-matter `governance:` entry above for the precise split).
+
+### R5 - Accepted is not acknowledged: `apply_rules` never waits for an OS watch
+
+**Ruled:** `GuardianEngine::apply_rules()` and `GuardianSparkRuntime::attach_rule()`/
+`detach_all()` stop blocking on the real backend OS call (`CreateFileW`,
+`RegOpenKeyExW`, the SCM enqueue). Acceptance and acknowledgment become two distinct
+events: `apply_rules()` returns as soon as a push is *accepted* (queued for arming),
+and the policy generation reported to the server on `yuzu.guardian_generation` only
+*advances* once every accepted rule's arm has actually resolved.
+
+**Motivation.** The #3990 diagnostic measured Guardian's synchronous rearm window
+(window B: from "full_sync cleared N prior rule(s)" to "apply_rules ok") on a 62-rule
+cohort: legacy median 70-86 ms, spark 127-140 ms — both figures are the diagnostic's
+own committed measurand (`b_ms` in `fullsync-blackout-results.jsonl`). A teardown-vs-
+rearm-span sub-split (**corrected governance round, 2026-09-07**: an earlier version
+of this sentence gave specific millisecond figures for that split — spark 39 ms
+teardown / legacy 11-13 ms, spark 85-92 ms rearm / legacy 59-71 ms — attributed to the
+#3990 diagnostic itself; verified directly against the diagnostic's own committed run
+doc and raw results file, neither of which records any teardown/rearm sub-split at
+all, only the single `B` window quoted above. The split figures traced to an
+uncommitted local review brief's own log-timestamp analysis during the #3990 run, not
+to the diagnostic's committed measurand — removed here rather than misattributed)
+is not restated as a measured fact; the root cause below explains where within B the
+gap plausibly sits, without claiming a specific measured split. Root cause:
+`attach_rule()` already dispatches each rule's
+`backend->arm()` onto a detached `GuardianIoExecutor` worker, but the caller blocks on
+`cv.wait_until` for the result while `apply_rules()` holds `mtx_`, and `detach_all()`
+blocks the same way per disarm. Legacy's guards return as soon as their own thread is
+spawned; spark pays the full OS-watch establishment cost inside the window legacy
+never does. The requirement is that the rearm window returns fast, not that
+time-to-watch-live shrinks — those are different quantities, and this design closes
+the gap between them by decoupling the two, not by making the underlying OS calls
+faster.
+
+**Warrant: zero wire-protocol change.** ADR-0021 Decision 8 states the generation
+counter is a reconcile trigger only, never a compliance signal — deferring
+acknowledgment past `apply_rules()`'s own return is therefore consistent with the
+counter's designed meaning, not a reinterpretation of it. Two further facts confirm no
+new wire surface is needed: `GuardianEngine::get_status()` is dead in production
+(never dispatched; a fallback that reports every rule `errored`), and a solicited
+`__guard__` reply on the direct agent-to-server path is dropped by the server on
+arrival (gateway-connected agents' solicited replies ARE correlated and answered
+server-side — a different path, unaffected by this design either way).
+`yuzu.guardian_generation` was already the only channel a client's arm state reaches
+the server's *reconcile/acknowledgment* logic through (the server separately ingests an
+unsolicited `guard.armed` lifecycle stream, a different channel, D2 in the delta
+registry) — reporting the *acknowledged* value on the existing reconcile tag is a
+purely internal change.
+
+**R5.1 - Executor: a non-waiting dispatch form.** `GuardianIoExecutor` gains a
+`submit()` overload alongside the existing `run()`: the backend call still executes on
+a detached worker, but the caller does not block for the result — it is handed to a
+completion callback on the worker thread instead, with the admission-time quota/
+single-flight-key checks (`Stopped`/`AlreadyRunning`/`CapacityExhausted`) unchanged and
+still synchronous. Today's quota/`active_worker_count()` accounting conflates "holds a
+quota slot" with "counts toward the orphan-exit grace"; those become two independent
+counts. **The quota slot and single-flight key release when the backend call (`fn()`)
+itself returns — before the completion callback runs, not after.** A worker wedged
+*inside* the real OS call therefore still holds its slot and key for as long as it
+stays wedged; the existing dead-target bulkhead against a hung backend call is
+unaffected by this change. The window this design actually widens is *after* `fn()`
+returns but before the worker thread fully exits — while the completion callback runs
+— since a non-waiting call can dispatch a fresh operation on completion, and that
+refill must not itself be starved by its own predecessor's still-unreleased slot. **A slow or wedged completion callback frees its
+quota slot while its thread stays alive, so quota alone no longer bounds the total
+count of simultaneously-alive detached workers** — `GuardianIoExecutor` therefore also
+enforces a separate physical ceiling on total alive workers (strictly greater than the
+sum of all quotas; exact value pinned in the implementing PR's description, per this
+document's own §7.7b item 5, which already required this for any two-count split):
+admission is refused once that ceiling is reached, regardless of quota availability. A
+new `GuardianDetachedWorkerRole` thread-local marker extends the existing
+`WorkerHostileMutex` tripwire (`guardian_engine.cpp`'s `abort_if_worker_thread()`) to
+executor worker threads, so nothing dispatched this way can ever take
+`GuardianEngine::mtx_` — enforced in debug/sanitizer builds, not only by review.
+
+**R5.2 - Runtime: a per-key claim/queue state machine.** Each spark key gets a single
+entry tracking its current claim (an in-flight arm or disarm, or none) and a FIFO queue
+of siblings waiting behind it. A key that is already quarantined (see R5.3) rejects a
+new claim immediately, before any backend call is attempted. A second rule attaching to
+a key that is mid-arm queues behind the in-flight owner rather than issuing a redundant
+backend call; on the owner's success every queued sibling commits inline against the
+same subscription (Guardian's existing shared-watcher reuse, unchanged); on the owner's
+genuine failure every sibling fails with it, since the underlying key genuinely
+couldn't be armed. A disarm claim is retained until it actually executes or is
+terminally superseded — never silently dropped for capacity reasons — which is what
+makes "a key's disarm completes before its own rearm dispatches" true by construction
+rather than by a separately-maintained ordering rule. An arm attempt that never
+returns (a genuinely **wedged** OS call — the backend call itself is stuck) is bounded
+by a deadline; past it, the key is marked **quarantined** and every waiter on it fails
+without a further backend attempt, until the original wedged worker's call eventually
+completes (if ever) and clears the marker. A queued waiter can separately fail its own
+wait without ever being dispatched at all — R5.3 below also calls this **expired**,
+the same word used loosely elsewhere in this design for "past its deadline"; whether a
+waiter's own expiry is meant to be K-qualifying on the same terms as a genuinely
+wedged (quarantined) key, or is meant to hold the acknowledgment indefinitely as an
+admission-congestion signal distinct from an actual dead target, is exactly the open
+question below — this document does not disambiguate the two senses of "expired." This
+per-key quarantine marker is distinct from — and not wired to — the existing
+per-mechanism `mech_quarantined_total` counter (a fleet-alerting signal expected to
+stay at 0); this design's quarantine is the ordinary, K-bounded, non-alerting outcome
+of a single wedged key, not a mechanism-wide fault.
+
+**Open questions for PR-1/PR-2's own design pass (flagged here, round 7's adversarial
+review, not resolved by this document):** (a) **whether a queued waiter's own expiry
+(never dispatched at all, distinct from a dispatched-and-wedged backend call) is
+K-qualifying on the same terms as a genuine wedge, or holds the acknowledgment
+indefinitely as an admission-congestion signal instead** — R5.3's "wedged or expired
+key is K-bounded" phrasing and its underlying source material use "expired" both ways
+in different places, and the choice has a real consequence: if congestion-only
+expiries count toward K, a sustained #2012/#3840-style same-type stall can K-waive
+otherwise-healthy keys purely from admission pressure, never having attempted their
+backend call; if they don't, they instead hold the acknowledgment (and drive repeated
+25s full re-applies) indefinitely under the same congestion, which is also worth
+naming as a load consequence rather than a silent side effect. Similarly, whether
+`CapacityExhausted` at admission time (a push never even reaching the per-key queue)
+is classified the same way is the identical question one layer earlier and should be
+decided together, not separately; (b) whether a late-arriving result for an
+already-K-waived, already-acknowledged rule adjusts the `yuzu.guardian_arm_failed`
+health tag (does a late success clear it?), and whether that rule is left enforcing or
+is disarmed, outside the specific case R5.5 (shutdown) already covers.
+
+**What stays deferred:** same-type mechanism serialization (`mech_ops_mu_by_type_`,
+#2012/#3840) is unchanged by this design — a single stalled `watch()` can still delay
+sibling arms of the same type, and that remains a distinct, already-tracked liveness
+question, not one this design resolves. **Consequence this design adds, stated
+explicitly rather than left implicit**: once R5.3's K-bound exists, a same-type stall
+can cause otherwise-healthy sibling keys to accumulate quarantine-qualifying timeouts
+from admission congestion alone, not from an actually-dead backend target — and the
+resulting `yuzu.guardian_arm_failed` signal does not distinguish the two causes. An
+operator paged on this tag cannot tell, from the tag alone, whether a key is genuinely
+dead or merely queued behind a slow sibling of the same mechanism type.
+
+**R5.3 - Ack model: accepted vs. acknowledged.** **Acknowledged ≠ compliant/enforced,
+stated explicitly (Gate 6 compliance-officer) — mirroring this codebase's own
+"flag ≠ revoke" precedent for a similarly-named-but-distinct signal** (Periodic Access
+Reviews, `docs/security-reviews/access-reviews-2026-07-21.md`): a K-waived
+acknowledgment (below) means the server stops re-pushing this generation, NOT that
+every rule in it is actually enforced — a quarantined rule inside an acknowledged
+generation is not armed, and `yuzu.guardian_arm_failed>0` (not the acknowledged
+generation number itself) is the only durable signal that distinction is visible on.
+"Accepted" means `reconcile_rule_locked()` returned `Accepted` specifically — the async-arm outcome, as
+opposed to `Armed` (an inline type or already-committed shared watcher, resolved
+synchronously with no ack tracking needed), `Failed`, or `Inert` (a legacy-guard rule,
+unrelated to spark). An `Inert` outcome never enters the pending-arm set at all, exactly
+as it does not today — the ack predicate is structurally blind to it, so a push whose
+rules are entirely `Inert` (all legacy) satisfies the predicate immediately, with
+nothing to wait on. `apply_rules()` tracks, per accepted
+rule, whether its arm has resolved. The policy generation advances (and is persisted)
+only once every rule accepted under it has either armed or been quarantined per the
+K-bound below — never on acceptance alone. An **episode**, here, is one accepted
+rule's not-yet-resolved arm attempt under a given generation — a rule that has already
+armed has no episode left to be pending, so it does not count against the condition
+below. A same-generation re-push (the server's 25 s `full_sync=true` heartbeat retry)
+is a no-op while every *outstanding* episode for that generation is still genuinely
+pending and within its deadline — including the ordinary case where SOME rules in the
+push have already armed and the rest are still resolving, the common shape of a
+retry landing mid-drain (R5.3's own bounded drain, below, routinely spans several
+ticks) — and only triggers a full re-apply once something has actually failed,
+expired, or the push's content has changed underneath it.
+**A wedged or expired key is K-bounded, not held forever**: after three identical
+same-generation re-applies whose only unresolved rules are already-quarantined or
+already-expired, the generation acknowledges anyway, leaving
+`yuzu.guardian_arm_failed>0` as the durable fleet signal — a wedged key stays
+quarantined until its own worker returns or the agent restarts (**restart is a
+remediation only for a *transient* wedge — for a *permanently* wedged target, restart
+re-arms the same rule against the same dead target and re-wedges, matching this
+document's own F3 × `Restart=always` crash-loop finding above, "a security finding,
+not only an ops one"; an operator paged on this tag should not treat restart as a
+default first action without first checking whether the target is transient or
+permanently dead**); a later policy change re-evaluates the rule but cannot by itself
+re-attempt the arm. A genuine refusal
+(backend refused, worker threw, arm queue full) is a different case and holds the
+acknowledgment indefinitely — K only bounds the wedged/expired case, never a live
+refusal. The drain that resolves pending arms against incoming results is bounded
+per tick, matching the existing lifecycle-journal's 4-batch/1024-record shape, so a
+large outstanding batch drains over several heartbeat ticks rather than risking a
+heartbeat-thread stall.
+
+**Telemetry-tag semantics, flagged not specified (SHOULD, Gate 6 sre):**
+`yuzu.guardian_arm_pending`/`yuzu.guardian_arm_failed` (introduced here, wired in
+PR-3) need their gauge-vs-counter semantics stated before PR-3 implements them, not
+left to be inferred by analogy. R5.2's open question (b) above already implies
+`arm_failed` must be a **re-statable gauge** (able to return to 0 on a late success),
+but this row's own table placement sits next to the C1/D1-style rows in
+`docs/spark-legacy-delta-registry.md`, whose tags are the OPPOSITE
+pattern — monotonic per-sweep counters summed into a fleet gauge, `docs/
+observability-conventions.md`'s own stated "monitor-only: neither `>0` nor
+`increase()` is sound" shape. Copying that adjacent pattern by analogy would silently
+break the K-bound safety argument this whole mechanism rests on (a cleared quarantine
+would never be reflected). PR-3 must specify these as gauges matching the age-tag
+pattern (`observability-conventions.md`'s `emit_guardian_journal_age_tags`), not the
+counter-rollup pattern, and should carry the same five fields this doc's own
+risk-accept register uses elsewhere (`docs/spark-flip-gate.md`'s detection-signal /
+operator-action / owner / milestone / revisit-condition shape) rather than a bare tag
+name. The physical-orphan ceiling (R5.1) similarly has no named observability today —
+a repeated ceiling hit (implying wedging across multiple mechanism types at once,
+structurally worse than ordinary per-class quota pressure) should be independently
+alert-worthy, not folded silently into the same signal as ordinary contention.
+
+**R5.4 - Audit and durability.** The "armed" audit record is still staged only on a
+real, confirmed backend commit — never on acceptance alone, matching today's contract
+exactly. What changes is timing: that commit now happens asynchronously relative to
+`apply_rules()`'s own return, so the interval between a rule being accepted and its
+"armed" record being durably staged widens from effectively immediate to at least one
+heartbeat tick (~30 s) — and, for a completion queued behind R5.3's own per-tick drain
+cap, however many additional ticks the drain needs to reach it (R5.3's "drains over
+several heartbeat ticks"; not a flat one-tick bound for every rule in a large push, only
+for one selected on its first tick). A refused, withdrawn, or expired arm still produces
+no "armed" record at all — silence on failure is unchanged.
+
+**R5.5 - Shutdown.** `GuardianEngine::stop()` no longer parks under `mtx_` waiting on an
+in-flight arm, since `apply_rules()` itself no longer blocks there either — a hung
+backend call can no longer delay agent shutdown the way it can today. In-flight workers
+finish on their own schedule after `stop()` returns; a late-arriving success is
+disarmed rather than left live. Queued (not yet dispatched) work is dropped with a
+counted total. The existing F3 hard-exit contract (`active_io_workers()`, orphan grace)
+is unchanged — this design's non-waiting dispatch path is covered by the same
+accounting the state-read and existing arm/disarm executors already use.
+
+**R5.6 - Legacy asymmetry.** Legacy acknowledges synchronously and unconditionally,
+including a rule whose guard failed to start — that rule is silently stranded `Inert`,
+logged but not held against the generation. Spark's acknowledgment holds on a genuine
+refusal, and is K-bounded (never unconditional) on a wedged/expired key. This is a
+deliberate, documented delta (`docs/spark-legacy-delta-registry.md` row A3), not an
+oversight to reconcile — spark's stricter acknowledgment is the point of this design,
+and legacy's asymmetry pre-dates it and is out of scope to change here.
+
+**R5.7 - Re-measurement methodology.** Window B (`T1 - T0`, the existing #3990
+measurement) remains valid for direct comparison with prior runs, but it is a
+log-to-log interval, not proof of `apply_rules()`'s actual return latency:
+`apply_rules()` constructs a rollback guard whose destructor performs unbounded
+lifecycle-journal persistence on scope exit, and that destructor runs *after* the T1
+log line — so under this design, a smaller B does not by itself prove a faster actual
+function return, since work can now be staged asynchronously before T1 while the
+destructor's own persistence work still happens after it. Re-measurement must add a
+second timestamp, T2, taken from the runtime's own arm-confirmation commit (a new log
+line) — not from `SparkEngine`'s own "armed" log, which fires before the real OS call
+completes and is not a valid proxy for it. The diagnostic script's completeness check
+(confirming every expected arm actually happened) must also exclude a no-op re-push's
+own log line from that count, since a no-op returns the same `rules_size()` figure
+without a single real arm occurring.
 
 ## 7.7b split — pre-cutover hardening (settled 2026-07-18)
 
@@ -1198,7 +1458,7 @@ Each rung is an independently-governed PR on `dev`, run through the full
        rarely throws (#2278). #2797 is the reconcile-side half split out of #2270 -
        #2270 itself closes only the strong-guarantee half, so closing #2270 does not
        discharge this gate.
-     - **#2818 gates PR-2 too.** The engine tears down a whole spark key
+     - **#2818 gated PR-2 too, now FIXED (PR-2d).** At the time this was written, the engine tore down a whole spark key
        (`SparkEngine::drop_key_locked`) while `GuardianSparkRuntime` arms one shared
        subscription per key on the 0->1 edge (`guardian_spark_runtime.cpp:159-166`),
        and nothing tells the consumer its subscription died: Guardian goes on
@@ -1322,6 +1582,11 @@ Each rung is an independently-governed PR on `dev`, run through the full
    - **9b.** The full as-built rewrite of this §Rung-2 decision record and the ladder
      against the shipped 7.7a/7.7b/10 code, folding R3's resolved mechanism and R2's
      `unsupported`-vocab reconciliation. Docs-only; lands after 7.7b.
+   - **9c.** §Async-arm acknowledgment (R5) - decouples Guardian's rearm window from
+     OS-watch confirmation. Independent of 9b; sequenced after PR-2c (#3848) and before
+     the `prefer_spark` flip (PR-5), lands dormant. Own PR ladder, PR-0 (this docs
+     change) through PR-6 - see `docs/spark-flip-gate.md` for the ladder slot between
+     PR-2d and the flip.
 
    **F3 × `Restart=always` (must be answered in 7.7a).** `deploy/systemd/yuzu-agent.service`
    sets `Restart=always` + `RestartSec=10` and **no `StartLimitIntervalSec`/`StartLimitBurst`**,

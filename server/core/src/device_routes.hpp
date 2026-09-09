@@ -35,9 +35,11 @@
 
 #include <yuzu/server/auth.hpp>
 
-#include "dex_routes.hpp" // DexRoutes::DispatchFn/ResponsesFn/AuditFn + DexAgentResponse
+#include "dex_routes.hpp"      // DexRoutes::DispatchFn/ResponsesFn/AuditFn + DexAgentResponse
+#include "tag_store.hpp"       // DeviceTag — device_agent_detail_json's optional tags
 
 #include <httplib.h>
+#include <nlohmann/json.hpp>
 
 #include <cstdint>
 #include <functional>
@@ -49,6 +51,43 @@ namespace yuzu::server {
 
 class HttpRouteSink;
 class GuaranteedStateStore;
+
+// ── Shared builders (REST-only today; #4033/#2146 Batch A) ─────────────────
+// PURE JSON builders — no httplib.h, no mcp_jsonrpc.hpp — used TODAY only by
+// REST's GET /api/v1/devices[/{id}]. MCP's pre-existing list_agents/
+// get_agent_details tools independently build an IDENTICAL 5-field shape
+// inline (mcp_server.cpp) — they are NOT refactored onto these by this PR
+// (out of scope; see #4033), so this pair does NOT yet satisfy the twin
+// recipe's Rule 1 (docs/api-twin-recipe.md §1: REST, MCP, and the dashboard
+// fragment must call the SAME function so no two transports can drift).
+// Fixed by adversarial review (#4033 follow-up): an earlier version of this
+// comment claimed Rule 1 was already satisfied across REST+MCP — false; the
+// ledger's `twinned` status for these rows reflects the ledger's own
+// weaker, verified capability-level definition (docs/api-parity-ledger.md:
+// "a twin exists and is verified against the current source" — the 5-field
+// shape IS byte-identical across REST/MCP today), not Rule-1 same-function
+// conformance. Built from a single AgentRegistry JSON entry — the SAME
+// 5-field shape `AgentRegistry::to_json_obj()`/MCP's `agents_fn()` already
+// produce (agent_id/hostname/os/arch/agent_version) — deliberately NOT
+// `DeviceRow` (the dashboard-fragment-only richer shape with online/segment/
+// tags/dex_score; see this file's header). The builders exist so the NEW
+// REST routes match those tools' served shape byte-for-byte from day one,
+// and so a future refactor of the MCP handlers has a function to call
+// instead of a third inline copy.
+
+/// PURE: one device row — `agent_id`/`hostname`/`os`/`arch`/`agent_version`,
+/// defensively extracted (`.value(key, "")`) so a short/malformed source
+/// object degrades to empty fields rather than throwing. Mirrors MCP
+/// `list_agents`'/`get_agent_details`'s existing inline row-building exactly.
+nlohmann::json device_agent_row_json(const nlohmann::json& agent);
+
+/// PURE: the device DETAIL object — `device_agent_row_json`'s fields plus a
+/// `tags` array (`{key,value,source}` per entry). `tags` is `nullptr` when no
+/// TagStore is wired, in which case the `tags` key is OMITTED entirely (never
+/// a synthesised empty array) — mirrors `get_agent_details`'s conditional-tags
+/// posture on a null store.
+nlohmann::json device_agent_detail_json(const nlohmann::json& agent,
+                                        const std::vector<DeviceTag>* tags);
 
 /// One row of the fleet device list / the identity of one device. SLICE 1 carries
 /// only what the thin AgentInfo + registry session provide for real; richer CI /

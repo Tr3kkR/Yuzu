@@ -50,6 +50,66 @@ jobs:
       - name: Issue-lifecycle docs hygiene (CLAUDE.md cap, do-not-close.txt)
         run: python3 tests/test_issue_docs.py
 
+      # ADR-0032 sequencing-interlock merge-gate (WS-0). No engine-path code may
+      # merge until the unconditional set (a)-(d)+(h) lands. Governance runs from
+      # the author's working tree, so a stale branch can silently run the old
+      # pipeline and miss the routed-concern row; this test runs on the merge ref
+      # on every PR, so the gate actually binds. Data: tests/split_interlock_ledger.json.
+      - name: Split interlock merge-gate tripwire (ADR-0032)
+        run: python3 tests/test_split_interlock_tripwire.py
+
+      # Locks the tripwire's ledger against silent neutering: pins gate_set,
+      # search/exclude paths, the engine-path marker key set, and "every gate cell
+      # has a substrate marker" against frozen test constants, and re-checks the
+      # tripwire fires. A PR that edits the ledger to open the gate must also edit
+      # these constants — a loud, reviewable change, not one silent JSON value.
+      - name: Split interlock tripwire self-test
+        run: python3 tests/test_split_interlock_tripwire_selftest.py
+
+  # Plugin README touch rule (docs/plugin-readme-standard.md rule 7): a change
+  # under agents/plugins/<x>/src/** must also change agents/plugins/<x>/README.md
+  # unless the PR body states `docs-unchanged: <section> — <reason>`. The
+  # override is read from the PR body written to a file with printf — never
+  # interpolated into a shell line — so body text cannot become shell.
+  # Byte-diff of the generated fences and the README-existence ratchet live in
+  # the meson `docs` suite (tests/test_plugin_readmes.py); this job is only the
+  # part that needs the PR's own diff and body.
+  plugin-readme-touch-rule:
+    name: Plugin README touch rule
+    # pull_request only: the override lives in the PR body, which a push event
+    # has no access to — on push (a merge to dev/main) the rule would re-run
+    # against BEFORE_SHA with an empty body and turn a legitimately overridden
+    # PR into a red mainline run. Merged content was already gated at PR time.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Enforce README touch rule
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.sha }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          case "$EVENT_NAME" in
+            pull_request) BASE="$BASE_SHA" ;;
+            *)            echo "Unmodelled event '$EVENT_NAME' -- nothing to compare, skipping."; exit 0 ;;
+          esac
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+            echo "Base commit unavailable -- cannot diff, skipping (the docs suite still byte-checks the fences)."
+            exit 0
+          fi
+          # A two-tree diff needs only the base commit itself, not the whole
+          # history (the changelog-fragments job above does the same).
+          git fetch --depth=1 origin "$BASE"
+          printf '%s' "${PR_BODY:-}" > "$RUNNER_TEMP/pr-body.txt"
+          scripts/ci/check-plugin-readme-touch.sh "$BASE" "$HEAD_SHA" "$RUNNER_TEMP/pr-body.txt"
+
   # Changelog fragment convention (changelog.d/ — see changelog.d/README.md):
   # PRs add uniquely-named fragment files instead of editing CHANGELOG.md's
   # [Unreleased] section (the perpetual merge-conflict / approval-invalidation

@@ -851,8 +851,16 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
             for (const auto& params : dispatch_params) {
                 auto dispatch_result = dispatch_fn(step.instruction_id, agent_str, params);
                 if (dispatch_result) {
-                    foreach_results.push_back(
-                        nlohmann::json::parse(*dispatch_result, nullptr, false));
+                    // #4030 Gate 8 fix (Gate 4 unhappy-path finding UP-2):
+                    // an un-guarded parse embeds the nlohmann `<discarded>`
+                    // sentinel as literal text when `*dispatch_result` is
+                    // not valid JSON, producing an invalid JSON document
+                    // once `.dump()`'d downstream (verified via compile+
+                    // run). Matches the read-side guard already applied at
+                    // workflow_model.cpp's `confined_workflow_step_result_json`.
+                    auto parsed = nlohmann::json::parse(*dispatch_result, nullptr, false);
+                    foreach_results.push_back(parsed.is_discarded() ? nlohmann::json(nullptr)
+                                                                    : parsed);
                 } else {
                     foreach_failed = true;
                     foreach_results.push_back(

@@ -118,8 +118,9 @@ split OUT of PR-Ag into two separate PRs: ingest-duration histogram (lands first
 
 ## 1. Problem (verified)
 `GuardianLifecycleLog` (`guardian_outbox.hpp:314-377`) is in-memory, reject-new-on-full, never-evict
-(`:322-329`); lifecycle events (`guard.armed`/`guard.disarmed`; `guard.errored` has **no producer**, §Scope)
-pop on gRPC `Write()==true` (`guardian_spark_runtime.cpp:496-501`, `agent.cpp:2733`). No per-event ack
+(`:322-329`); lifecycle events (`guard.armed`/`guard.disarmed`/`guard.errored` - the last gained its
+first producer in #2818, see §Scope) pop on gRPC `Write()==true` (`guardian_spark_runtime.cpp:496-501`,
+`agent.cpp:2733`). No per-event ack
 (`ClientReaderWriter<CommandResponse,CommandRequest>` `agent.cpp:149`). Losses: at-most-once (pop on buffered
 `Write`), capacity-lossy (ignored `false`), crash-lossy (RAM only). → **bounded-durable-retry** (§2).
 
@@ -127,7 +128,10 @@ pop on gRPC `Write()==true` (`guardian_spark_runtime.cpp:496-501`, `agent.cpp:27
 
 ## 2. Guarantee (honest)
 
-> **Process-crash-durable, duplicate-tolerant, bounded-retry** of **armed/disarmed** lifecycle events. Once
+> **Process-crash-durable, duplicate-tolerant, bounded-retry** of **armed/disarmed/errored** lifecycle
+> events (the replay-validation allowlist that gates this guarantee was fixed in #2818/PR-2d to
+> recognize "errored" too - before that fix an errored record would have been quarantined as tampered
+> on any restart, not durably delivered). Once
 > **persisted**, an event survives a process crash/restart and is **re-sent on every reconnect/restart -
 > regardless of any possible prior acceptance (acceptance is unknowable, there is no ack) - until it ages out
 > of retention.** A local `Write()` is **never** delivery confirmation. **Retention eviction and quarantine
@@ -373,9 +377,15 @@ insert+projection, legacy + DEX duplicate-ingest coverage.
 (a) True at-least-once: server→agent per-batch **ack** (post-commit) as the deletion linearization point -
 removes sent-unacked + the re-send-all traffic. (b) Deterministic ordering: preserve **nanoseconds**
 (`guardian_ingest.cpp:91`) + per-agent **boot/session sequence** server-side. (c) Power-loss: likely already
-FULL - confirm. (d) Doc: correct §"7.7b split" item-7 "audit-grade" wording. (e) `guard.errored` producer.
+FULL - confirm. (d) Doc: correct §"7.7b split" item-7 "audit-grade" wording. (e) `guard.errored` producer -
+**partially landed via #2818** (the subscription-death path only, see below); broader `errored` coverage
+(arm/boot-failure paths) is still deferred.
 (f) **Dedup tombstones** for cross-retention resurrection (server retention < agent `D_max`).
 
-## Scope - armed/disarmed only
-`guard.errored` has no producer (`guardian_spark_runtime.cpp:164/240` are the only enqueue sites); the journal
-is kind-agnostic, so adding it later needs only a producer (deferred (e)).
+## Scope - armed/disarmed/errored(#2818 subscription-death only)
+`guard.errored` gained its first producer in #2818: `GuardianSparkRuntime::on_subscription_lost`
+(via `detach_rule_locked(rid, "errored")`) fires when a spark subscription dies out from under a
+rule, plus `revalidate_subscriptions()`'s poll-backstop path calling the same detach - both dormant
+while `prefer_spark_=false`. No other `errored` path exists yet (arm/boot failures still journal
+nothing) - the journal itself is kind-agnostic, so widening this further needs only a producer
+(deferred (e), narrowed).

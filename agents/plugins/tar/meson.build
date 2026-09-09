@@ -35,6 +35,11 @@ tar_sources = files(
   'src/tar_cursor_sources.cpp',
 )
 
+# Wave 6 PR6.2-b: the power cursor source
+tar_sources += files('src/tar_power_collector.cpp')
+# Wave 6 PR6.3: the removable cursor source
+tar_sources += files('src/tar_removable_collector.cpp')
+
 if host_machine.system() == 'windows'
   tar_deps += cxx.find_library('advapi32')
   tar_deps += cxx.find_library('iphlpapi')
@@ -48,6 +53,8 @@ if host_machine.system() == 'windows'
   tar_deps += cxx.find_library('wevtapi')  # EvtQuery / EvtNext / EvtRender (tar_netconn_win)
   tar_deps += cxx.find_library('mpr')      # WNetOpenEnumW / WNetGetUserW — outbound mapped drives (tar_mapdrive_collector)
   tar_deps += cxx.find_library('netapi32') # NetSessionEnum — inbound share sessions (tar_mapdrive_collector)
+  tar_deps += cxx.find_library('powrprof') # PowerRegisterSuspendResumeNotification /
+                                           # PowerSettingRegisterNotification (tar_power_collector)
 elif host_machine.system() == 'linux'
   # Optional sd-bus leg for the wave-2 POWER cursor source: systemd-logind's
   # PrepareForSleep signal, which is the only sleep/wake source on Linux.
@@ -89,12 +96,13 @@ elif host_machine.system() == 'darwin'
     message('TAR: EndpointSecurity framework not found (full Xcode SDK required) — '
             + 'process streaming compiles as a no-op; agent uses the sysctl poll.')
   endif
-  # Objective-C++ scaffold for the wave-2 power/removable darwin collectors
-  # (IOKit power notifications / DiskArbitration are both Objective-C-flavored
-  # C APIs most naturally driven from a .mm TU — see wifi/meson.build's
-  # wifi_corewlan.mm for the worked pattern this mirrors). No .mm source
-  # exists yet, so this stays an empty list this wave; the consuming source
-  # adds its own .mm alongside `tar_objcpp_args += apple_objcpp_args`.
+  # Wave 6 PR6.3: DiskArbitration attach/detach lives in an Objective-C++ TU —
+  # the worked pattern is wifi/meson.build's wifi_corewlan.mm. apple_objcpp_args
+  # is defined ONCE at the top-level meson.build; never re-declare its flags.
+  tar_sources += files('src/tar_removable_diskarb.mm')
+  tar_deps += dependency('appleframeworks', modules: ['DiskArbitration', 'Foundation'],
+                         include_type: 'system')
+  tar_objcpp_args += apple_objcpp_args
 endif
 
 shared_library(
