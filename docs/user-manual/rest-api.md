@@ -83,6 +83,8 @@ A separate, narrower shape applies to ordinary mutation routes that audit a chan
   - [Custom Properties](#custom-properties)
   - [Webhooks](#webhooks)
   - [Offload Targets](#offload-targets)
+  - [Directory Sync](#directory-sync)
+  - [Enrollment](#enrollment)
   - [Network Discovery](#network-discovery)
   - [Workflows](#workflows)
   - [Workflows, Executions & Schedules — v1 read twins (#4030)](#workflows-executions--schedules--v1-read-twins-4030)
@@ -4631,6 +4633,117 @@ Configure group-to-role mappings (which RBAC role a synced group's members recei
 
 **Response (503):** `directory_sync` unavailable.
 
+#### `GET /api/v1/directory/users`
+
+REST v1 twin of `GET /api/directory/users` above (#4031) — same underlying data, the versioned A4 envelope, and a real MCP twin (`list_directory_users`). Optional `?group_id=` query param filters to members of one synced group.
+
+**Permission:** `Directory:Read`
+
+Every call is audited (`directory.users.view`) — this closes a real pre-existing gap: the legacy route above returned this same email/UPN/group-membership PII with no audit call at all until this change. The route **fails closed (503)** if the audit row cannot be persisted, per the [`Sec-Audit-Failed` behavioural-PII posture](#sec-audit-failed-and-the-behavioural-pii-audit-posture) above.
+
+**Response:**
+
+```json
+{
+  "data": [
+    {
+      "id": "8f3c...",
+      "display_name": "Alice Chen",
+      "email": "alice.chen@example.com",
+      "upn": "alice.chen@example.com",
+      "enabled": true,
+      "groups": ["g-engineering"],
+      "synced_at": 1735689600
+    }
+  ],
+  "pagination": { "total": 1, "start": 0, "page_size": 50 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Response (503):** directory sync not available, or the audit subsystem is unavailable (`Sec-Audit-Failed: true`).
+
+#### `GET /api/v1/directory/status`
+
+REST v1 twin of `GET /api/directory/status` above (#4031), with a real MCP twin (`get_directory_status`). No per-person PII (counts + synced-group metadata only) — unaudited, matching the legacy route's own posture.
+
+**Permission:** `Directory:Read`
+
+**Response:**
+
+```json
+{
+  "data": {
+    "provider": "entra",
+    "status": "completed",
+    "last_sync_at": 1735689600,
+    "user_count": 42,
+    "group_count": 5,
+    "last_error": "",
+    "groups": [
+      { "id": "g-engineering", "display_name": "Engineering", "description": "", "mapped_role": "Operator", "synced_at": 1735689600 }
+    ]
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Response (503):** directory sync not available.
+
+**Prerequisite fix (#4031):** `Directory` was used as an RBAC securable on every route in this section but was never seeded into `RbacStore`'s securable-type catalogue — under RBAC-enabled deployments, no role (not even Administrator) could actually be granted `Directory:Read`/`Write`. This is now seeded (Administrator via the CRUD grant loop, Viewer for read — the same population that reads `UserManagement`) and mirrored into `mcp_server.cpp`'s RBAC securable catalogue.
+
+---
+
+### Enrollment
+
+Auto-approve rules (agent-enrollment bypass criteria) and the pending/denied agent-enrollment queue. Both were previously reachable only via `admin_fn_`-gated HTMX dashboard fragments (`GET /fragments/settings/auto-approve`, `GET /fragments/settings/pending`) with no REST v1 or MCP surface (#4031). Backed by `auth::AutoApproveEngine` and `auth::AuthManager::list_pending_agents()`.
+
+**MCP:** REST-only — no MCP twin. `admin_fn_` (the gate these fragments used, and the new `Enrollment` securable's sole initial grant) explicitly excludes MCP tokens from administering server settings/enrollment policy (`auth_routes.cpp`, #520); this is the same reviewed exception the sibling settings-fragment issue #4028 records for its own `admin_fn_`-gated fragments. See [MCP (Model Context Protocol)](#mcp-model-context-protocol) for the general MCP-tier policy.
+
+**RBAC-off note:** the new `Enrollment` securable is Administrator-only today, and — because the underlying gate moved from a role check (`admin_fn_`, always admin-only) to an RBAC permission check — the `(Enrollment, Read)` pair is in `authz_topology_floor.hpp`'s floor set so an RBAC-off deployment (the default) cannot silently widen this from admin-only to any authenticated user.
+
+#### `GET /api/v1/enrollment/auto-approve-rules`
+
+**Permission:** `Enrollment:Read` (Administrator only)
+
+Audited (`enrollment.auto_approve.view`, non-blocking) — the rule set is auto-enrollment bypass criteria, reconnaissance-valuable to an attacker but not per-person data, so the posture is a plain audit log entry rather than the fail-closed behavioural-PII posture above.
+
+**Response:**
+
+```json
+{
+  "data": {
+    "rules": [
+      { "index": 0, "type": "hostname_glob", "value": "*.prod.example.com", "label": "Production hosts", "enabled": true }
+    ],
+    "require_all": false
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`index` is the rule's position in the engine's list — the same handle the existing toggle/delete mutation routes (`POST/DELETE /api/settings/auto-approve/{index}`) key on (there is no separate rule id).
+
+#### `GET /api/v1/enrollment/pending-agents`
+
+**Permission:** `Enrollment:Read` (Administrator only in the default seed)
+
+Do not conflate with the unrelated existing MCP tool `list_pending_approvals`, which serves `ApprovalManager`'s maker-checker action-approval queue — a different domain entirely. Audited (`enrollment.pending_agents.view`, non-blocking) — device-identity fingerprint data, a lighter version of the `device_ci` GDPR-personal-data-adjacent class the agent daily-sync framework already flags for serial/UUID/MAC.
+
+**Confinement (ADR-0017):** unlike every other route in this section, each row here carries genuine per-agent identity (`agent_id` plus hostname/os/arch/agent_version), so this route gates on the admit-then-filter chokepoint (`AuthRoutes::require_fleet_read`), not a bare permission check. A holder of a management-group-scoped `Enrollment:Read` grant (rather than a global one) is admitted and gets the real visible-agent intersection — typically the empty list, since a pending (not-yet-approved) agent normally has no management-group membership yet, but this is a workflow expectation, not a data-model guarantee: an agent pre-assigned to a group before approval yields a non-empty, correctly-confined result instead. This closes a defect where such a grant was previously denied outright (403) instead of admitted with its correct, confined result — see `docs/auth-architecture.md`'s ADR-0017 migration list.
+
+**Response:**
+
+```json
+{
+  "data": [
+    { "agent_id": "a1b2c3d4", "hostname": "host1.example.com", "os": "linux", "arch": "x86_64", "agent_version": "1.4.2", "requested_at": 1735689600, "status": "pending" }
+  ],
+  "pagination": { "total": 1, "start": 0, "page_size": 50 },
+  "meta": { "api_version": "v1" }
+}
+```
+
 ---
 
 ### Network Discovery
@@ -7236,6 +7349,35 @@ outcome's granularity.
 - **Request body (form-encoded):** `issuer`, `skip_tls_verify`
 - **Response:** HTML feedback span — green on success, red on failure with specific error.
 
+#### `GET /api/v1/settings/oidc`
+
+REST v1 read twin of `GET /fragments/settings/directory` (#4031) — note that despite its legacy fragment path, this is pure OIDC SSO config, **not** the AD/Entra directory-sync feature documented under [Directory Sync](#directory-sync) above. Deliberately gated on a freshly-minted `OidcConfig` securable, never `Directory`, to avoid colliding with that unrelated capability.
+
+**Permission:** `OidcConfig:Read` (Administrator only — matches the previous `admin_fn_` gate)
+
+**MCP:** REST-only — no MCP twin, same #520 exception as the [Enrollment](#enrollment) routes above.
+
+The client secret is **never** disclosed — only a boolean `client_secret_configured` reports whether one is set, matching the existing fragment's own non-disclosure posture (a `********` UI placeholder, never the real value).
+
+Audited (`settings.oidc.view`, non-blocking) — IdP/admin-group configuration carries recon value to an attacker but is not per-person data.
+
+**Response:**
+
+```json
+{
+  "data": {
+    "configured": true,
+    "issuer": "https://login.microsoftonline.com/{tenant}/v2.0",
+    "client_id": "abcd-1234",
+    "client_secret_configured": true,
+    "redirect_uri": "https://yuzu.example.com/auth/callback",
+    "admin_group": "grp-object-id",
+    "skip_tls_verify": false
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
 ### Settings — Certificate Management
 
 **`POST /api/settings/cert-upload`** — Upload PEM certificate file.
@@ -7379,7 +7521,7 @@ These endpoints drive the **Settings → Multi-Factor Authentication** card. The
 **`POST /api/settings/mfa/recovery-codes`** — Regenerate the 10 recovery codes.
 
 - **Permission:** Admin only. Requires existing enrollment.
-- **Effect:** Atomic DELETE + 10×INSERT inside a `BEGIN IMMEDIATE / COMMIT` transaction. All prior codes (consumed and unconsumed) are invalidated.
+- **Effect:** Atomic DELETE + 10×INSERT inside a Postgres transaction, serialized on the caller's `auth.users` row (`SELECT … FOR UPDATE`) so two concurrent regenerations cannot interleave (#3779). All prior codes (consumed and unconsumed) are invalidated. If the account has been deactivated, the codes are **not** reissued and the request fails.
 - **Response (200):** HTML fragment with the fresh 10 codes as a one-time reveal. Same `Cache-Control: no-store` headers.
 - **Audit:** `mfa.recovery_codes.generated` / `ok` (detail = `10 codes issued (rotation)`).
 

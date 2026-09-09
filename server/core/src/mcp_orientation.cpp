@@ -126,8 +126,15 @@ constexpr std::string_view kWorkflows[] = {"list_workflows", "get_workflow",
 constexpr std::string_view kTar[] = {"list_tar_process_tree_devices",
                                      "list_tar_capture_sources_devices",
                                      "list_tar_retention_paused"};
+// #4031: AD/Entra directory-sync user listing + directory-sync status (last
+// sync time/health, NOT OIDC SSO config — that lives at REST-only
+// GET /api/v1/settings/oidc, deliberately with no MCP twin per #520) — both
+// Directory:Read, deliberately their own family rather than folded into
+// Fleet & agents (directory users are IdP-sourced identity records, not
+// managed endpoints) or Engine principals (unrelated identity axis).
+constexpr std::string_view kDirectory[] = {"list_directory_users", "get_directory_status"};
 
-constexpr std::array<ToolFamily, 27> kFamilies{{
+constexpr std::array<ToolFamily, 28> kFamilies{{
     {"Fleet & agents", "connected agents, their OS/arch/version, and details", kFleet},
     {"Tags", "read and write agent tags, and find agents by tag", kTags},
     {"Instructions & schedules", "instruction definitions, their full export, and recurring "
@@ -178,6 +185,8 @@ constexpr std::array<ToolFamily, 27> kFamilies{{
                                      "and capture-sources frames, and the caller's own "
                                      "retention-paused source scan",
      kTar},
+    {"Directory & identity", "AD/Entra directory-synced users and directory-sync status",
+     kDirectory},
 }};
 
 }  // namespace
