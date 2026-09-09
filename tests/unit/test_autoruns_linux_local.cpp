@@ -165,6 +165,68 @@ TEST_CASE("autoruns Linux leg: every lnx_* SourceId emits exactly one source| li
     }
 }
 
+#ifndef YUZU_AGENT_SRC_DIR
+#error "YUZU_AGENT_SRC_DIR must be injected by tests/meson.build."
+#endif
+
+TEST_CASE("autoruns Linux leg: every format_source_status() call inside collect_linux "
+          "goes through the emit_status wrapper",
+          "[autoruns][actions][linux]") {
+    // collect_linux's local emit_status wrapper (autoruns_linux.cpp) is what
+    // sets any_constrained, which feeds the typed CC-07 aggregate
+    // (autoruns_plugin.cpp) -- but lnx_init_d and lnx_systemd_timers_user
+    // are catalog-permanently-constrained, so that aggregate already reads
+    // CONSTRAINED on every real run regardless of what any OTHER one of the
+    // ~34 other call sites does. No behavioural/dispatch-level test can ever
+    // observe one of those other sites silently bypassing emit_status (a
+    // raw ctx.write_output(format_source_status(...)) call that skips the
+    // any_constrained bookkeeping) -- lnx_init_d alone always saturates the
+    // observable result. emit_status is a local lambda with no header seam
+    // (deliberately not extracted for this polish round -- that's a
+    // production-logic change out of scope here), so this closes the gap
+    // the only way available without one: a lexical scan of the real source
+    // asserting format_source_status(...) appears in collect_linux's body
+    // exactly once (the call inside emit_status's own definition) -- a
+    // silent bypass, or a new call site added without going through the
+    // wrapper, fails this loudly by name instead of going unnoticed.
+    //
+    // Path resolution: there is no YUZU_AUTORUNS_SRC_DIR macro (only
+    // YUZU_AGENT_SRC_DIR, pointed at agents/core/src by tests/meson.build) --
+    // derives the autoruns plugin's own src dir relative to it rather than
+    // adding a new build-system define for one test, mirroring
+    // test_list_read_confinement.cpp's YUZU_SERVER_SRC_DIR-based scan.
+    const fs::path autoruns_src = fs::path{YUZU_AGENT_SRC_DIR} / ".." / ".." / "plugins" /
+                                  "autoruns" / "src" / "autoruns_linux.cpp";
+    std::ifstream in(autoruns_src);
+    REQUIRE(in.is_open());
+    std::ostringstream buf;
+    buf << in.rdbuf();
+    const std::string text = buf.str();
+
+    const std::string start_anchor =
+        "int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {";
+    const std::string end_anchor = "#endif // !YUZU_AUTORUNS_LINUX_UNIT_TEST_INTERNALS_ONLY";
+    const auto start = text.find(start_anchor);
+    REQUIRE(start != std::string::npos);
+    const auto end = text.find(end_anchor, start);
+    REQUIRE(end != std::string::npos);
+    const std::string body = text.substr(start, end - start);
+
+    const std::string needle = "format_source_status(";
+    std::size_t count = 0;
+    std::istringstream body_lines(body);
+    std::string line;
+    while (std::getline(body_lines, line)) {
+        // Skip a full-line "//" comment -- the banner comment just above
+        // emit_status's own definition quotes this exact call shape in
+        // prose, which a naive substring scan would double-count.
+        const auto first_non_ws = line.find_first_not_of(" \t");
+        if (first_non_ws != std::string::npos && line.compare(first_non_ws, 2, "//") == 0) continue;
+        if (line.find(needle) != std::string::npos) ++count;
+    }
+    CHECK(count == 1);
+}
+
 #if !defined(__linux__)
 
 TEST_CASE("autoruns Linux leg: on a non-Linux build every lnx_* source reports "
