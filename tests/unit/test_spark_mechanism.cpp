@@ -4311,6 +4311,35 @@ LatencyStats summarize_us(std::vector<std::int64_t> v) {
 } // namespace
 
 namespace {
+/// RAII for a LocalAlloc'd block (SID strings, security descriptors) - governance
+/// sg-8-1: no manual LocalFree in new test code.
+struct LocalFreed {
+    void* p{nullptr};
+    LocalFreed() = default;
+    explicit LocalFreed(void* ptr) : p(ptr) {}
+    ~LocalFreed() {
+        if (p)
+            ::LocalFree(p);
+    }
+    LocalFreed(const LocalFreed&) = delete;
+    LocalFreed& operator=(const LocalFreed&) = delete;
+};
+
+/// RAII for an HKEY opened only for the duration of one function call (the DACL
+/// helpers below never carry a key across calls) - governance sg-8-1.
+struct ScopedKey {
+    HKEY h{nullptr};
+    ScopedKey() = default;
+    explicit ScopedKey(HKEY key) : h(key) {}
+    ~ScopedKey() {
+        if (h)
+            ::RegCloseKey(h);
+    }
+    ScopedKey(const ScopedKey&) = delete;
+    ScopedKey& operator=(const ScopedKey&) = delete;
+    explicit operator bool() const { return h != nullptr; }
+};
+
 /// The current process token's user SID as a string (for a test DACL).
 std::wstring current_user_sid() {
     HANDLE raw = nullptr;
@@ -4325,9 +4354,8 @@ std::wstring current_user_sid() {
     LPWSTR str = nullptr;
     if (!::ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(buf.data())->User.Sid, &str))
         return {};
-    std::wstring out(str);
-    ::LocalFree(str);
-    return out;
+    LocalFreed owned(str);
+    return std::wstring(str);
 }
 
 /// Replace a key's DACL from SDDL. Needs a handle opened with WRITE_DAC.
@@ -4336,9 +4364,8 @@ bool apply_sddl(HKEY h, const std::wstring& sddl) {
     if (!::ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &sd,
                                                                 nullptr))
         return false;
-    const LONG rc = ::RegSetKeySecurity(h, DACL_SECURITY_INFORMATION, sd);
-    ::LocalFree(sd);
-    return rc == ERROR_SUCCESS;
+    LocalFreed owned(sd);
+    return ::RegSetKeySecurity(h, DACL_SECURITY_INFORMATION, sd) == ERROR_SUCCESS;
 }
 
 /// Denies the current user KEY_NOTIFY (0x0010) on `sub` while allowing all else,
@@ -4351,27 +4378,28 @@ struct DenyNotifyScope {
     explicit DenyNotifyScope(std::string subkey) : sub(std::move(subkey)), sid(current_user_sid()) {
         if (sid.empty())
             return;
-        HKEY raw = nullptr;
-        if (::RegOpenKeyExA(HKEY_CURRENT_USER, sub.c_str(), 0, WRITE_DAC | READ_CONTROL, &raw) !=
-            ERROR_SUCCESS)
+        ScopedKey key(open_for_dac());
+        if (!key)
             return;
-        applied = apply_sddl(raw, L"D:(D;;0x0010;;;" + sid + L")(A;;KA;;;" + sid + L")");
-        ::RegCloseKey(raw);
+        applied = apply_sddl(key.h, L"D:(D;;0x0010;;;" + sid + L")(A;;KA;;;" + sid + L")");
     }
     void restore() {
         if (!applied)
             return;
-        HKEY raw = nullptr;
-        if (::RegOpenKeyExA(HKEY_CURRENT_USER, sub.c_str(), 0, WRITE_DAC | READ_CONTROL, &raw) ==
-            ERROR_SUCCESS) {
-            apply_sddl(raw, L"D:(A;;KA;;;" + sid + L")");
-            ::RegCloseKey(raw);
-        }
+        if (ScopedKey key{open_for_dac()})
+            apply_sddl(key.h, L"D:(A;;KA;;;" + sid + L")");
         applied = false;
     }
     ~DenyNotifyScope() { restore(); }
     DenyNotifyScope(const DenyNotifyScope&) = delete;
     DenyNotifyScope& operator=(const DenyNotifyScope&) = delete;
+
+private:
+    [[nodiscard]] HKEY open_for_dac() const {
+        HKEY raw = nullptr;
+        ::RegOpenKeyExA(HKEY_CURRENT_USER, sub.c_str(), 0, WRITE_DAC | READ_CONTROL, &raw);
+        return raw; // null on failure; ScopedKey handles null harmlessly
+    }
 };
 } // namespace
 
