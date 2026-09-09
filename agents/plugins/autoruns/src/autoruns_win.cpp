@@ -1259,9 +1259,19 @@ int collect_windows(yuzu::CommandContext& ctx, std::string_view filter) {
                             // against THIS PROCESS's own environment, i.e.
                             // LocalSystem, not the enumerated profile) takes
                             // the wrong branch on most stock profiles, not a
-                            // narrow edge case. See changelog.d/
-                            // 20260909-autoruns-plugin.added.md's "Known
-                            // limitation" entry. Tracked for a follow-up fix.
+                            // narrow edge case. LocalSystem's own Startup
+                            // folder is normally absent/empty, so the usual
+                            // observable symptom is NOT a visibly-wrong
+                            // location -- collect_startup_folder() treats a
+                            // not-found path as benign-empty (see its own
+                            // comment below) -- it's the profile's real
+                            // Startup entries going completely unreported. The
+                            // note_constraint() call below exists precisely so
+                            // that silent zero-rows-and-SUPPORTED is not
+                            // mistaken for "genuinely nothing there." See
+                            // changelog.d/20260909-autoruns-plugin.added.md's
+                            // "Known limitation" entry. Tracked for a
+                            // follow-up fix.
                             RegKey folders_key;
                             if (RegOpenKeyExW(
                                     root,
@@ -1272,10 +1282,28 @@ int collect_windows(yuzu::CommandContext& ctx, std::string_view filter) {
                                 const auto st = yuzu::win::read_reg_value(
                                     folders_key.get(), "Startup", startup_value, type_name);
                                 if (st == yuzu::win::ReadValueStatus::ok && !startup_value.empty()) {
-                                    startup_dir = (type_name == "REG_EXPAND_SZ")
-                                        ? yuzu::win::expand_env_strings(
-                                              yuzu::win::to_wide(startup_value))
-                                        : yuzu::win::to_wide(startup_value);
+                                    if (type_name == "REG_EXPAND_SZ") {
+                                        startup_dir = yuzu::win::expand_env_strings(
+                                            yuzu::win::to_wide(startup_value));
+                                        // KNOWN BUG (see the banner above this
+                                        // block): expand_env_strings() resolves
+                                        // against the agent's own LocalSystem
+                                        // environment, not this profile's --
+                                        // usually resolving to a path that
+                                        // doesn't exist, which
+                                        // collect_startup_folder() below would
+                                        // otherwise silently treat as "nothing
+                                        // there." Report constrained instead,
+                                        // so the profile's real (unreported)
+                                        // Startup entries aren't mistaken for
+                                        // a genuine empty result -- the exact
+                                        // invariant every other collector in
+                                        // this plugin already holds to.
+                                        note_constraint(startup_folder_user,
+                                                        "startup_redirect_env_mismatch");
+                                    } else {
+                                        startup_dir = yuzu::win::to_wide(startup_value);
+                                    }
                                 }
                             }
                         }

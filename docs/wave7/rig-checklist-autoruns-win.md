@@ -71,12 +71,17 @@ family, Startup folders, or the WMI subscription content this leg formats.
     `%USERPROFILE%\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup`
     (Windows populates this on essentially every profile at creation, not
     only redirected ones). Then, from the LocalSystem-running agent, drop a
-    `.lnk` into that same user's actual Startup folder and confirm whether
-    `win_startup_folder_user`'s reported row `location` resolves to the
-    test user's real path or to `C:\Windows\System32\config\systemprofile\...`
-    (LocalSystem's own profile) -- the latter confirms the known bug
-    (`changelog.d/20260909-autoruns-plugin.added.md`), not a NEW capture
-    result to compare against a baseline.
+    `.lnk` into that same user's actual Startup folder and check the
+    `win_startup_folder_user` result -- LocalSystem's own Startup folder is
+    normally EMPTY, so the expected (bug-confirming) outcome is most likely
+    **zero rows and a `constrained|0|startup_redirect_env_mismatch` status**
+    (the `.lnk` you just dropped goes unreported), not a row whose `location`
+    visibly points at `C:\Windows\System32\config\systemprofile\...`. Only
+    treat the run as inconclusive if the status comes back `supported` --
+    that would mean the constraint fix (`autoruns_win.cpp`, the
+    `note_constraint(startup_folder_user, ...)` call) itself regressed, which
+    is worth its own report. See `changelog.d/20260909-autoruns-plugin.added.md`
+    for the full known-limitation writeup.
 
 8. **Scheduled Tasks.** A1's probe (admin session, MTA):
    `CoInitializeEx` HRESULT `0x00000000`, `Connect` HRESULT `0x00000000`,
