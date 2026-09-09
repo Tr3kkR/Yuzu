@@ -840,8 +840,17 @@ void RbacStore::seed_defaults() {
     // prior intent forward onto the new securable BEFORE calling grant():
     // if any of the three old grants is recorded revoked for
     // ITServiceOwner, record the SAME revocation against Decommission:Delete
-    // first (idempotent), so the standard suppression path in grant() itself
-    // applies uniformly rather than a second bespoke skip here.
+    // and — critically — also DELETE any role_permissions row already
+    // granted for it. Round 1's fix inserted only the marker: on an
+    // UPGRADING replica, seed_defaults() had already run once before this
+    // block existed (or runs the CRUD/targeted-grant sequence earlier in
+    // THIS same pass, above), so a Decommission:Delete row can already be
+    // present in role_permissions — grant()'s `WHERE NOT EXISTS` guard only
+    // stops a FUTURE (re-)insert, it does not retroactively strip a row
+    // that's already there. Mirror remove_permission()'s own marker+DELETE
+    // pair exactly (same rationale: a hard DELETE with a separate bookkeeping
+    // marker, never a fabricated 'deny' row — see remove_permission()'s own
+    // comment for why) rather than relying on grant()'s guard alone.
     exec("INSERT INTO rbac_store.revoked_seed_defaults (role_name, securable_type, operation) "
         "SELECT 'ITServiceOwner', 'Decommission', 'Delete' WHERE EXISTS ("
         "  SELECT 1 FROM rbac_store.revoked_seed_defaults WHERE role_name = 'ITServiceOwner' AND "
@@ -849,6 +858,11 @@ void RbacStore::seed_defaults() {
         "   (securable_type = 'Inventory' AND operation = 'Delete') OR "
         "   (securable_type = 'GuaranteedState' AND operation = 'Delete'))"
         ") ON CONFLICT DO NOTHING");
+    exec("DELETE FROM rbac_store.role_permissions WHERE role_name = 'ITServiceOwner' AND "
+        "securable_type = 'Decommission' AND operation = 'Delete' AND EXISTS ("
+        "  SELECT 1 FROM rbac_store.revoked_seed_defaults WHERE role_name = 'ITServiceOwner' AND "
+        "  securable_type = 'Decommission' AND operation = 'Delete'"
+        ")");
     grant("ITServiceOwner", "Decommission", "Delete");
 
     // Viewer: read on all except Infrastructure.

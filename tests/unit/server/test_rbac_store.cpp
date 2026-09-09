@@ -1255,6 +1255,40 @@ TEST_CASE("RbacStore: ITServiceOwner role seeded with correct permissions", "[rb
     CHECK(decommission_count == 1);
 }
 
+// Adversarial-review finding (PR7.2a round 1, Blocker/Should-fix): an operator
+// who had revoked one of the OLD three conjunct grants (SoftwareLicensing,
+// Inventory, or GuaranteedState Delete) specifically to strip ITServiceOwner's
+// decommission ability must not silently regain it the moment the Decommission
+// securable is seeded — seed_defaults() now carries a prior revocation of any
+// of the three old grants forward onto Decommission:Delete before granting it.
+TEST_CASE("RbacStore: a decommission-ability revocation via an old conjunct grant "
+          "is preserved across the Decommission securable migration",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    REQUIRE(store.check_role_has_permission("ITServiceOwner", "Decommission", "Delete"));
+
+    // Simulate the pre-migration operator action: revoke ONE of the three old
+    // conjunct grants specifically to strip decommission ability. This is the
+    // exact real-world action the finding describes.
+    auto removed = store.remove_permission("ITServiceOwner", "SoftwareLicensing", "Delete");
+    REQUIRE(removed.has_value());
+    REQUIRE_FALSE(store.check_role_has_permission("ITServiceOwner", "SoftwareLicensing", "Delete"));
+    // The old conjunct grant's sibling ability was never seeded on Decommission
+    // by remove_permission() itself — only seed_defaults() carries it forward.
+    REQUIRE(store.check_role_has_permission("ITServiceOwner", "Decommission", "Delete"));
+
+    // A genuine replica boot: a second RbacStore construction against the SAME
+    // pool re-runs the REAL (production) seed_defaults()/grant() code path,
+    // not a hand-copy of its SQL.
+    RbacStore reopened{rbac_pool_fx_};
+    REQUIRE(reopened.is_open());
+
+    CHECK_FALSE(reopened.check_role_has_permission("ITServiceOwner", "Decommission", "Delete"));
+    // The other two old conjunct grants (never revoked) should be untouched.
+    CHECK(reopened.check_role_has_permission("ITServiceOwner", "Inventory", "Delete"));
+    CHECK(reopened.check_role_has_permission("ITServiceOwner", "GuaranteedState", "Delete"));
+}
+
 // ── check_scoped_permission ──────────────────────────────────────────────────
 
 namespace {
