@@ -129,7 +129,7 @@ struct SparkMechanismStats {
 /// One watch mechanism for one event-driven SparkType. Lifecycle mirrors the
 /// engine: register (pre-start) → start(emit, fault) → watch/unwatch as sparks
 /// arm/disarm while running → stop(). The engine calls start / watch / unwatch
-/// / stop with its own `mu_` released — but NOT lock-free: every watch() and
+/// / stop with its own `mu_` released - but NOT lock-free: every watch() and
 /// unwatch() runs under `SparkEngine::mech_ops_mu_by_type_[type]`, the per-TYPE
 /// serialiser (#1994 M2 / #2011), so a mechanism method that blocks on an OS
 /// call stalls every other arm/disarm of the SAME type for exactly that long

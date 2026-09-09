@@ -1,5 +1,5 @@
 /**
- * spark_registry.cpp — the Registry spark mechanism (ADR-0021 Stage 1 PR 1b;
+ * spark_registry.cpp - the Registry spark mechanism (ADR-0021 Stage 1 PR 1b;
  * watch establishment moved off the engine's per-type lock in #2012/#3840 PR-B1).
  *
  * Windows: one PRIVATE threadpool wait-group (TP_WAIT, min=2/max=4) servicing
@@ -17,7 +17,7 @@
  *   - Re-arm before processing (spike condition 4) is now split: the known-good
  *     Target-mode fire is delivered immediately from the callback, the re-arm is
  *     a detached probe committed later by the sweeper, and the window between
- *     the two is covered by a synthetic fire on commit (`needs_resync`) — see
+ *     the two is covered by a synthetic fire on commit (`needs_resync`) - see
  *     "Ownership / dispatch protocol" below.
  *
  * PORTS THE WATCH, NOT THE ASSERTION: no expected-value compare, no write-back,
@@ -367,7 +367,7 @@ struct ProbeJob {
         }
         const auto t0 = Clock::now();
         // Prefer the target key. REG_NOTIFY_THREAD_AGNOSTIC is a dwNotifyFilter
-        // bit (3rd arg), NOT the fAsynchronous flag (5th) — it must be OR'd into
+        // bit (3rd arg), NOT the fAsynchronous flag (5th) - it must be OR'd into
         // the filter or it is silently dropped and the notification dies with
         // this very worker thread, which exits as soon as it returns.
         HKEY h = nullptr;
@@ -852,7 +852,7 @@ public:
         {
             std::lock_guard lk(mu_);
             if (!w.active || stopping_)
-                return; // being torn down — no re-arm, no dispatch
+                return; // being torn down - no re-arm, no dispatch
             const WatchMode old_mode = w.mode;
             w.armed = false; // this notification is consumed; the watch must re-establish
             // Emit when the key existed before this fire (it changed / was deleted).
@@ -986,7 +986,7 @@ private:
             w.faulted_now = true;
             w.fault_reason = reason;
         }
-        spdlog::warn("spark_registry: establishing '{}' failed ({}) — watch is deaf until the retry",
+        spdlog::warn("spark_registry: establishing '{}' failed ({}) - watch is deaf until the retry",
                      w.spark_key, reason);
     }
 
