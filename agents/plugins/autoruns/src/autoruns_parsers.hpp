@@ -41,6 +41,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -591,9 +592,15 @@ inline std::string xml_get_text(xmlNodePtr node) {
     if (!node) return {};
     xmlChar* c = xmlNodeGetContent(node);
     if (!c) return {};
-    std::string s(reinterpret_cast<const char*>(c));
-    xmlFree(c);
-    return s;
+    // xmlNodeGetContent hands back a heap buffer only xmlFree may release.
+    // Wrap it in a move-only RAII guard BEFORE the std::string construction
+    // below -- that construction can throw (bad_alloc) on a large node, and
+    // a manual xmlFree() call placed after it (as this function previously
+    // did) would never run on that path, leaking the buffer. Same idiom
+    // this repo already established for libxml2 output buffers elsewhere
+    // (tests/unit/server/test_saml_provider.cpp's XmlStrGuard).
+    const std::unique_ptr<xmlChar, void (*)(void*)> guard{c, xmlFree};
+    return std::string(reinterpret_cast<const char*>(c));
 }
 
 } // namespace detail
