@@ -573,6 +573,53 @@ TEST_CASE("AuthRoutes::require_permission — supervised MCP tier IS allowed Api
     CHECK(ok);
 }
 
+// ---------------------------------------------------------------------------
+// #4031/#520 security regression guard: a MINTED, REAL MCP token must be
+// blocked from Enrollment/OidcConfig through the actual production
+// chokepoint (require_permission -> tier_allows), not just at the
+// tier_allows() unit level (see mcp_policy.hpp's TEST_CASEs in
+// test_mcp_server.cpp for that). This is the same class of gap the
+// ApiToken:Write regression guards above exist to close: with RBAC
+// disabled (this fixture's default) and an admin creator, the legacy
+// RBAC-off fallback would pass the request straight through on the
+// creator's role if tier_allows() did not stop it first. supervised tier
+// is the sharpest case — it is the one tier that otherwise allows
+// everything, so it is the tier where an unguarded Enrollment/OidcConfig
+// read would have been most reachable.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("AuthRoutes::require_permission — supervised MCP tier is BLOCKED from "
+          "Enrollment:Read and OidcConfig:Read (#4031/#520 server-administration deny, "
+          "verified through the real minted-token chokepoint, not just tier_allows() in "
+          "isolation)",
+          "[pg][auth_routes][scope][mcp][security]") {
+    AuthRoutesFixture fix;
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+    auto raw = fix.api_tokens->create_token("mcp-enr-sup", "test_user",
+                                            now + 3600, "", "supervised");
+    REQUIRE(raw.has_value());
+
+    {
+        auto req = request_with_header("Authorization", "Bearer " + *raw);
+        httplib::Response res;
+        bool ok = fix.ar->require_permission(req, res, "Enrollment", "Read");
+        CHECK_FALSE(ok);
+        CHECK(res.status == 403);
+        CHECK(res.body.find("MCP token tier does not allow Enrollment:Read") !=
+              std::string::npos);
+    }
+    {
+        auto req = request_with_header("Authorization", "Bearer " + *raw);
+        httplib::Response res;
+        bool ok = fix.ar->require_permission(req, res, "OidcConfig", "Read");
+        CHECK_FALSE(ok);
+        CHECK(res.status == 403);
+        CHECK(res.body.find("MCP token tier does not allow OidcConfig:Read") !=
+              std::string::npos);
+    }
+}
+
 TEST_CASE("AuthRoutes::require_permission — operator MCP tier IS allowed ApiToken:Rotate "
           "(the actual fix: a DISTINCT operation from ApiToken:Write, giving REST rotate/"
           "confirm true parity with the MCP tools without touching ApiToken:Write at all)",
