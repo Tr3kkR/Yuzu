@@ -23,6 +23,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio> // std::fputs - the T6 child process reports its own deadlock detection
 #include <map>
 #include <memory>
 #include <mutex>
@@ -3421,6 +3422,146 @@ TEST_CASE("Registry spark (real mechanism): survives key delete + recreate",
     engine.stop();
     ::RegCloseKey(h2);
     ::RegDeleteKeyA(HKEY_CURRENT_USER, sub.c_str());
+}
+
+// ── T6 (#4181): same-type disarm() against an in-flight Inline callback ──────
+//
+// The shape (issue #4181, verified against the source at the time of writing):
+//   Thread A: SparkEngine::disarm(K) takes mech_ops_mu_by_type_[Registry] and
+//             calls mech->unwatch(K).
+//   Thread B: the TP_WAIT callback for K is ALREADY inside on_fire -> emit ->
+//             deliver -> an Inline handler when A starts.
+// If unwatch(K) blocks until B's callback returns (a synchronous
+// WaitForThreadpoolWaitCallbacks(TRUE) drain), and B's handler then calls back
+// into the engine for the SAME type - here arm_inline() of a second Registry
+// key, which needs the lock A holds - neither thread can proceed. A hang, not a
+// data race, so no sanitizer sees it.
+//
+// Reproduced in a CHILD PROCESS on purpose: a genuine deadlock reproduced
+// in-process would hang this binary's own cleanup. The child is the hidden
+// ("[.]") case below, selected by EXACT NAME only (its tag list is deliberately
+// nothing a tag filter would match); the parent bounds it and reads a timeout
+// as the deadlock. Exit codes: 0 = scenario completed; 3 = the child itself
+// observed the disarm not completing and force-exited (TerminateProcess, since
+// a deadlocked thread cannot be joined); a parent-side kill = a hard hang.
+namespace {
+std::string t6_child_key() {
+    char buf[512]{};
+    const DWORD n = ::GetEnvironmentVariableA("YUZU_SPARK_T6_KEY", buf, sizeof(buf));
+    if (n > 0 && n < sizeof(buf))
+        return std::string(buf, n);
+    return "Software\\Yuzu\\SparkT6_" + std::to_string(::GetCurrentProcessId());
+}
+} // namespace
+
+// One definition for both the TEST_CASE name and the child command line: the
+// parent selects the child by EXACT name, so the two must never drift apart.
+#define YUZU_SPARK_T6_CHILD_CASE_NAME "Registry T6 child: inline same-type re-arm during disarm"
+
+TEST_CASE(YUZU_SPARK_T6_CHILD_CASE_NAME, "[.][t6-child]") {
+    const std::string sub = t6_child_key();
+    const std::string sub2 = sub + "\\Second";
+    HKEY h = nullptr;
+    REQUIRE(::RegCreateKeyExA(HKEY_CURRENT_USER, sub.c_str(), 0, nullptr, 0, KEY_SET_VALUE, nullptr,
+                              &h, nullptr) == ERROR_SUCCESS);
+
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::Registry, make_registry_mechanism()).has_value());
+    std::atomic<bool> in_handler{false};
+    std::atomic<bool> go{false};
+    std::atomic<bool> rearmed{false};
+    std::atomic<int> fires{0};
+    // Inline tier: the handler runs SYNCHRONOUSLY on the TP_WAIT callback thread.
+    auto sub_k = engine.arm_inline(registry_spec("HKCU", sub), [&](const SparkEvent&) {
+        if (fires.fetch_add(1, std::memory_order_acq_rel) != 0)
+            return; // only the first fire parks and re-enters
+        in_handler.store(true, std::memory_order_release);
+        while (!go.load(std::memory_order_acquire))
+            std::this_thread::sleep_for(1ms);
+        // Same-type re-entry FROM THE CALLBACK THREAD: needs mech_ops_mu_by_type_[Registry].
+        auto s2 = engine.arm_inline(registry_spec("HKCU", sub2), [](const SparkEvent&) {});
+        rearmed.store(s2.has_value(), std::memory_order_release);
+    });
+    REQUIRE(sub_k.has_value());
+    engine.start();
+    std::this_thread::sleep_for(200ms); // let the notify arm
+
+    const DWORD v = 1;
+    ::RegSetValueExA(h, "V", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&v), sizeof(v));
+    REQUIRE(eventually([&] { return in_handler.load(std::memory_order_acquire); }, 8000ms));
+
+    // Thread A: disarm K while B's callback is parked inside the Inline handler.
+    std::atomic<bool> disarm_done{false};
+    std::thread disarmer([&] {
+        engine.disarm(*sub_k);
+        disarm_done.store(true, std::memory_order_release);
+    });
+    // Give A time to reach unwatch(K) - and, on a pre-fix mechanism, to block
+    // there on the callback drain - BEFORE B is released to re-enter the engine.
+    std::this_thread::sleep_for(300ms);
+    go.store(true, std::memory_order_release);
+
+    const bool completed = eventually([&] { return disarm_done.load(std::memory_order_acquire); }, 5000ms);
+    if (!completed) {
+        // Deadlocked: A is inside the mechanism waiting for B, B is waiting for A's
+        // lock. Neither thread can be joined, so a normal exit would hang here too.
+        std::fputs("T6 child: disarm() did not complete while the Inline callback re-entered "
+                   "the same type - deadlock observed\n",
+                   stderr);
+        std::fflush(stderr);
+        ::TerminateProcess(::GetCurrentProcess(), 3);
+    }
+    CHECK(completed);
+    CHECK(rearmed.load(std::memory_order_acquire));
+    disarmer.join();
+    engine.stop();
+    ::RegCloseKey(h);
+    ::RegDeleteKeyA(HKEY_CURRENT_USER, sub2.c_str());
+    ::RegDeleteKeyA(HKEY_CURRENT_USER, sub.c_str());
+}
+
+TEST_CASE("Registry spark: same-type disarm() does not deadlock against an in-flight Inline "
+          "callback (T6, subprocess boundary)",
+          "[spark][mechanism][windows][t6]") {
+    wchar_t exe[MAX_PATH]{};
+    REQUIRE(::GetModuleFileNameW(nullptr, exe, MAX_PATH) > 0);
+    // The child reads its scratch key from the environment so the parent can clean
+    // it up even when the child had to be killed mid-scenario.
+    const std::string key = "Software\\Yuzu\\SparkT6_" + std::to_string(::GetCurrentProcessId());
+    REQUIRE(::SetEnvironmentVariableA("YUZU_SPARK_T6_KEY", key.c_str()));
+
+    std::wstring cmd = L"\"";
+    cmd += exe;
+    cmd += L"\" \"";
+    {
+        const std::string name = YUZU_SPARK_T6_CHILD_CASE_NAME;
+        cmd.append(name.begin(), name.end()); // ASCII name
+    }
+    cmd += L"\" --reporter compact --durations no";
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    // cmd.data() is writable (CreateProcessW may modify lpCommandLine).
+    REQUIRE(::CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr,
+                             nullptr, &si, &pi));
+    ::CloseHandle(pi.hThread);
+    const DWORD wr = ::WaitForSingleObject(pi.hProcess, 30000);
+    if (wr == WAIT_TIMEOUT) {
+        ::TerminateProcess(pi.hProcess, 9);
+        ::WaitForSingleObject(pi.hProcess, 5000);
+    }
+    DWORD code = 0xFFFFFFFFu;
+    ::GetExitCodeProcess(pi.hProcess, &code);
+    ::CloseHandle(pi.hProcess);
+    ::SetEnvironmentVariableA("YUZU_SPARK_T6_KEY", nullptr);
+    ::RegDeleteKeyA(HKEY_CURRENT_USER, (key + "\\Second").c_str());
+    ::RegDeleteKeyA(HKEY_CURRENT_USER, key.c_str());
+
+    INFO("T6 child: WaitForSingleObject=" << wr << " (0=exited, 258=timeout->killed) exit code="
+                                          << code << " (0=completed, 3=child saw the deadlock)");
+    CHECK(wr == WAIT_OBJECT_0);
+    CHECK(code == 0);
 }
 
 // ── Inline-tier dispatch latency (the ADR-0021 §3 µs claim) ──────────────────
