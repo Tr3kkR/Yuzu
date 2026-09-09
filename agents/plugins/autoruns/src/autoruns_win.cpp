@@ -1255,8 +1255,10 @@ int collect_windows(yuzu::CommandContext& ctx, std::string_view filter) {
                                 const auto st = yuzu::win::read_reg_value(
                                     folders_key.get(), "Startup", startup_value, type_name);
                                 if (st == yuzu::win::ReadValueStatus::ok && !startup_value.empty()) {
-                                    startup_dir = yuzu::win::expand_env_strings(
-                                        yuzu::win::to_wide(startup_value));
+                                    startup_dir = (type_name == "REG_EXPAND_SZ")
+                                        ? yuzu::win::expand_env_strings(
+                                              yuzu::win::to_wide(startup_value))
+                                        : yuzu::win::to_wide(startup_value);
                                 }
                             }
                         }

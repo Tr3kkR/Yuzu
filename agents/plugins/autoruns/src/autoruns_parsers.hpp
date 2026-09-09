@@ -565,7 +565,10 @@ inline bool xsd_boolean_is_false(std::string_view v) {
 /// server/core/src/saml_provider.cpp:855).
 struct XmlDocGuard {
     xmlDocPtr d;
+    explicit XmlDocGuard(xmlDocPtr doc) : d(doc) {}
     ~XmlDocGuard() { if (d) xmlFreeDoc(d); }
+    XmlDocGuard(const XmlDocGuard&) = delete;
+    XmlDocGuard& operator=(const XmlDocGuard&) = delete;
 };
 
 /// First direct-child element matching `local` by LOCAL NAME only. Task
