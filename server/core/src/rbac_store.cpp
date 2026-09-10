@@ -893,16 +893,20 @@ void RbacStore::seed_defaults() {
     // because the DELETE's only gate was "does the marker exist", and the
     // marker is permanent bookkeeping, not a one-shot flag.
     //
-    // The carry-forward is a MIGRATION, not a standing invariant: it should
-    // fire exactly once, at the moment the marker itself is first created for
-    // this triple. Detect "already migrated" the same way the rest of this
-    // file treats one-time state (schema_meta-style: presence of the marker
-    // row IS the completion flag) — probe for the marker BEFORE inserting it,
-    // and only run the insert+DELETE pair when it is not yet present. Once
-    // the marker exists, grant()'s own `WHERE NOT EXISTS` guard is what keeps
-    // suppressing a FUTURE reseed of a row an operator explicitly removed;
-    // it does not care about the marker's age, so it stays correct with the
-    // DELETE gone.
+    // The carry-forward is a MIGRATION, not a standing invariant. Detect
+    // "already migrated" the same way the rest of this file treats one-time
+    // state (schema_meta-style: presence of the marker row IS the completion
+    // flag) — probe for the marker BEFORE inserting it, and only run the
+    // insert+DELETE pair when it is not yet present. On the common
+    // no-prior-revocation install this WHERE EXISTS clause is always false,
+    // so the marker row is never inserted and the whole probe/insert/delete
+    // sequence re-runs as a harmless no-op on EVERY boot, not once — "fires
+    // exactly once" describes only the revoked-conjunction install, not the
+    // ordinary case (governance Gate 4 happy-path finding). Once the marker
+    // DOES exist (the revoked-conjunction install), grant()'s own `WHERE NOT
+    // EXISTS` guard is what keeps suppressing a FUTURE reseed of a row an
+    // operator explicitly removed; it does not care about the marker's age,
+    // so it stays correct with the DELETE gone.
     // Governance round 6: the marker-presence probe below used to conflate a
     // query FAILURE (transient PG connection/timeout error) with genuine
     // ABSENCE — both left `decommission_marker_present == false`, silently
@@ -966,11 +970,20 @@ void RbacStore::seed_defaults() {
                 // reaching here always means this boot's attempt is decisive.
                 decommission_migrated = true;
             }
+            // Reassign, don't just call: `commit()` can itself fail (e.g. a
+            // connection loss at exactly the COMMIT statement) even after
+            // every preceding statement succeeded (governance Gate 3
+            // cpp-safety finding) -- PQexec("COMMIT") returning anything but
+            // PGRES_COMMAND_OK means the txn destructor's ROLLBACK is what
+            // actually ran, so `decommission_migrated` must reflect that or
+            // the trailing grant() below runs unconditionally on a migration
+            // that never durably committed.
             if (decommission_migrated)
-                txn.commit();
-            // else: probe, insert, or delete failed -- txn destructor rolls
-            // back everything (including a lock-only transaction with no
-            // writes); decommission_migrated stays false.
+                decommission_migrated = txn.commit();
+            // else: probe, insert, delete, or commit failed -- txn
+            // destructor rolls back everything (including a lock-only
+            // transaction with no writes); decommission_migrated stays
+            // false either way.
         }
     }
     if (decommission_migrated)

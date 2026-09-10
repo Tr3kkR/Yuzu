@@ -1424,6 +1424,111 @@ TEST_CASE("RbacStore: a fault during the Decommission carry-forward DELETE does 
         second_reopen.check_role_has_permission("ITServiceOwner", "Decommission", "Delete"));
 }
 
+TEST_CASE("RbacStore: a fault at COMMIT itself (not an earlier statement) must not let the "
+          "trailing grant() silently re-instate a grant the migration was deferring",
+          "[rbac_store][pg]") {
+    // Governance Gate 3 cpp-safety finding: `if (decommission_migrated) txn.commit();`
+    // discarded commit()'s own bool. Every statement BEFORE commit can succeed
+    // (probe/insert/delete all report success) and the migration can still
+    // fail to durably persist if COMMIT itself is rejected -- a DEFERRABLE
+    // constraint check is the real-Postgres mechanism for exactly this: it
+    // passes at each statement's own execution time and is only evaluated at
+    // COMMIT, unlike the DELETE-fault test above (which fails at the DELETE
+    // statement itself, and can't isolate this specific bug -- see below).
+    //
+    // Discriminator design note: the DELETE-fault test above starts from a
+    // role_permissions row that already exists (the store's own initial
+    // seed), so a rolled-back DELETE simply leaves it in place either way --
+    // grant()'s own `WHERE NOT EXISTS(marker) ... ON CONFLICT DO NOTHING` is
+    // idempotent against an already-present row, so calling grant() when the
+    // bug is present (spuriously) and NOT calling it (correctly, under the
+    // fix) converge to the identical observable row state; that test does
+    // NOT discriminate this bug (confirmed empirically: it still passes with
+    // the fix reverted). This test instead starts with the row ABSENT and no
+    // marker, and forces the COMMIT-time fault via a trigger on the MARKER
+    // insert (revoked_seed_defaults) rather than the row DELETE, so the
+    // fault fires regardless of whether a role_permissions row exists to
+    // delete. Under the bug, the trailing grant() sees no marker (rolled
+    // back) and creates a NEW row where none existed -- silently overriding
+    // the operator's carried-forward revocation; under the fix, grant() is
+    // correctly skipped and the row stays absent.
+    RBAC_STORE(store);
+    REQUIRE(store.check_role_has_permission("ITServiceOwner", "Decommission", "Delete"));
+
+    // Strip the grant via direct SQL, NOT remove_permission() -- the latter
+    // would write its own revoked_seed_defaults marker for (ITServiceOwner,
+    // Decommission, Delete), which would make the migration's own probe see
+    // "already migrated" and skip the insert+DELETE branch entirely, never
+    // reaching the COMMIT this test exists to fault.
+    {
+        pg::PgConn conn{PQconnectdb(rbac_db_fx_.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        pg::PgResult del_res{PQexec(
+            conn.get(), "DELETE FROM rbac_store.role_permissions WHERE role_name = "
+                       "'ITServiceOwner' AND securable_type = 'Decommission' AND "
+                       "operation = 'Delete';")};
+        REQUIRE(del_res.ok());
+    }
+    REQUIRE_FALSE(store.check_role_has_permission("ITServiceOwner", "Decommission", "Delete"));
+
+    auto removed = store.remove_permission("ITServiceOwner", "SoftwareLicensing", "Delete");
+    REQUIRE(removed.has_value());
+
+    {
+        pg::PgConn conn{PQconnectdb(rbac_db_fx_.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        pg::PgResult fn_res{PQexec(
+            conn.get(),
+            "CREATE OR REPLACE FUNCTION rbac_store.f_decommission_commit_fail() "
+            "RETURNS trigger AS $$ BEGIN RAISE EXCEPTION "
+            "'test-induced carry-forward COMMIT failure'; END; $$ LANGUAGE plpgsql;")};
+        REQUIRE(fn_res.ok());
+        // CONSTRAINT TRIGGER ... DEFERRABLE INITIALLY DEFERRED: the row-level
+        // check runs, but the exception it raises is only evaluated when the
+        // transaction issues COMMIT -- not at the INSERT statement itself.
+        // Attached to the MARKER insert (fires unconditionally whenever the
+        // migration's WHERE EXISTS(old conjunct revocation) is true), not
+        // the role_permissions DELETE -- the role has no such row to delete
+        // in this test's setup.
+        pg::PgResult trig_res{PQexec(
+            conn.get(),
+            "CREATE CONSTRAINT TRIGGER t_decommission_commit_fail AFTER INSERT ON "
+            "rbac_store.revoked_seed_defaults DEFERRABLE INITIALLY DEFERRED FOR EACH ROW "
+            "WHEN (NEW.role_name = 'ITServiceOwner' AND NEW.securable_type = 'Decommission' "
+            "AND NEW.operation = 'Delete') EXECUTE FUNCTION "
+            "rbac_store.f_decommission_commit_fail();")};
+        REQUIRE(trig_res.ok());
+    }
+
+    // The migration's own probe/marker-INSERT/DELETE all report success
+    // locally (the exception only fires at COMMIT) -- the store must still
+    // come up, and the grant must stay absent: the operator's carried-
+    // forward revocation is still pending, not silently overridden by a
+    // trailing grant() call that should have been deferred.
+    {
+        RbacStore first_reopen{rbac_pool_fx_};
+        REQUIRE(first_reopen.is_open());
+        CHECK_FALSE(
+            first_reopen.check_role_has_permission("ITServiceOwner", "Decommission", "Delete"));
+    }
+
+    // No marker was durably recorded (the whole transaction, including the
+    // marker INSERT, rolled back with the failed COMMIT) -- the migration
+    // must retry and complete once the fault is cleared.
+    {
+        pg::PgConn conn{PQconnectdb(rbac_db_fx_.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        pg::PgResult drop_res{
+            PQexec(conn.get(), "DROP TRIGGER t_decommission_commit_fail ON "
+                               "rbac_store.revoked_seed_defaults;")};
+        REQUIRE(drop_res.ok());
+    }
+    RbacStore second_reopen{rbac_pool_fx_};
+    REQUIRE(second_reopen.is_open());
+    CHECK_FALSE(
+        second_reopen.check_role_has_permission("ITServiceOwner", "Decommission", "Delete"));
+}
+
 // ── check_scoped_permission ──────────────────────────────────────────────────
 
 namespace {
