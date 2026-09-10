@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -68,6 +69,20 @@ bool os_target_matches(std::string_view target, std::string_view agent_os);
 // more guard types/platforms gain support.
 bool guardian_guard_supported_on_platform(std::string_view agent_os,
                                           std::string_view spark_type);
+
+// The 3 guard-type ("spark.type") tokens this matrix explicitly distinguishes.
+// Single source shared with guardian_routes.cpp's platform-matrix-stale
+// detectability counter's closed Prometheus label set, and cross-checked
+// against the published schema catalog's "spark"-kind entries by
+// test_guardian_resilience_schema.cpp's CROSS-CHECK tests (governance Gate 4
+// finding, #4252 consolidated round) — so the schema catalog, this matrix, and
+// the stale-counter's label set can no longer drift out of sync silently the
+// way three independently hand-maintained lists could. A 4th spark type must
+// be added HERE (and to this function's branch above) for the cross-check to
+// stay green; the schema-registry side is guardian_schema_registry.cpp's
+// build_catalog().
+inline constexpr std::array<std::string_view, 3> kKnownGuardSparkTypes = {
+    "registry-change", "file-change", "service-status-change"};
 
 // Human-facing label for a raw agent platform token, for dashboard copy:
 // "darwin" -> "macOS", "windows" -> "Windows", "linux" -> "Linux"; an

@@ -174,7 +174,12 @@ struct Harness {
     GuardianRoutes routes;
     yuzu::server::test::TestRouteSink sink;
 
-    Harness() {
+    // Default true: every existing test wires the real `metrics` member above.
+    // `Harness(/*with_metrics=*/false)` exercises the `metrics_ == nullptr`
+    // degrade path (the nullable-dependency default `register_routes` itself
+    // documents) — cpp-safety flagged this path as untested in the #4252 Gate 3
+    // review.
+    explicit Harness(bool with_metrics = true) {
         if (yuzu::test::pg_admin_dsn_env() == nullptr) {
             SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
         }
@@ -228,7 +233,8 @@ struct Harness {
         };
 
         routes.register_routes(sink, auth_fn, perm_fn, audit_fn, emit_fn, store.get(),
-                               baselines.get(), agents_json_fn, push_fn, &metrics);
+                               baselines.get(), agents_json_fn, push_fn,
+                               with_metrics ? &metrics : nullptr);
     }
 
     void seed_guard(const std::string& rule_id, const std::string& name) {
@@ -1357,4 +1363,109 @@ TEST_CASE("#4252: the fixed Linux-Service case never reaches the "
               .counter("yuzu_server_guardian_platform_matrix_stale_total",
                        {{"spark_type", "service-status-change"}})
               .value() == 0.0);
+}
+
+// ── #4252 consolidated round: governance Gate 2/3/6 findings ─────────────────
+// A crafted agent_id/rule_id pair embedding the internal join separator must
+// never be treated as equivalent to an unrelated (agent, rule) pair. This is a
+// regression test for a HIGH finding independently confirmed by
+// security-guardian, architect, and compliance-officer against a delimited-
+// string composite key (`agent_id + '\x1f' + rule_id`) — the fold now uses a
+// real PairStatusKey{agent_id, rule_id} struct + hash functor instead, so no
+// separator choice matters.
+TEST_CASE("#4252: a crafted \\x1f-embedded agent_id cannot collide with an "
+          "unrelated pair's status row (PairStatusKey, not a delimited string)",
+          "[pg][guardian_routes][platform][notimpl][4252][security]") {
+    Harness h;
+    // Genuinely unsupported on Linux (Windows-only guard type) — the pair under
+    // test owns NO real status row of its own, so it must render "not
+    // implemented".
+    auto ruleX = make_rule_with_spark("ruleX", "RegistryGuard", "registry-change");
+    h.seed_rule(ruleX);
+    deploy_via_baseline(h, "ruleX", "bl1");
+
+    // A second, unrelated rule whose id is chosen so that, under the OLD
+    // delimited-string pair_key, agent "agentA" + this rule_id byte-for-byte
+    // equals the crafted pair below: pair_key("agentA", "extra\x1fruleX") ==
+    // "agentA" '\x1f' "extra" '\x1f' "ruleX" == pair_key("agentA\x1fextra", "ruleX").
+    const std::string unrelated_rule_id = std::string("extra") + '\x1f' + "ruleX";
+    auto unrelated = make_rule_with_spark(unrelated_rule_id, "Unrelated", "service-status-change");
+    h.seed_rule(unrelated);
+    deploy_via_baseline(h, unrelated_rule_id, "bl2");
+    // A real status row for the UNRELATED pair only — agent "agentA" on
+    // `unrelated_rule_id`, nothing to do with ruleX.
+    h.seed_status("e1", "agentA", unrelated_rule_id, "guard.compliant");
+
+    // The pair actually under test: a Linux agent whose id happens to embed the
+    // separator byte, targeted by ruleX. It owns no status row of its own.
+    // Built via nlohmann::json::dump() rather than a hand-typed literal — a raw
+    // control byte is not legal unescaped inside a JSON string, and dump()
+    // guarantees the correct escape (parse_online_agent_os round-trips it back
+    // to the same raw byte create_rule/insert_event stored above via the store's
+    // C++ API, which goes straight to parameterised SQL, no JSON envelope).
+    const std::string crafted_agent_id = std::string("agentA") + '\x1f' + "extra";
+    nlohmann::json agents = nlohmann::json::array();
+    agents.push_back(
+        {{"agent_id", crafted_agent_id}, {"hostname", "linuxbox"}, {"os", "linux"}});
+    h.agents_json = agents.dump();
+
+    auto res = h.sink.Get("/fragments/guardian/status?view=fleet");
+    REQUIRE(res != nullptr);
+    // Pre-fix, the collision made has_real_status() wrongly report a real
+    // status row for (crafted_agent_id, "ruleX") — silently dropping it from
+    // every bucket, so this pair never rendered "Not implemented" at all.
+    CHECK(res->body.find("Not implemented") != std::string::npos);
+}
+
+// Detectability fix (#4252 consolidated round): an unrecognised spark.type
+// token must fold to the "unknown" label, never leak as its own unbounded
+// Prometheus series (governance Gate 2/3 finding, cheap fix already shipped —
+// this pins it). Read via serialize(), not counter(garbage).value(), because
+// calling counter() with an unseen label combination would itself create the
+// phantom series this test exists to prove absent.
+TEST_CASE("#4252: an unrecognised spark.type folds to the 'unknown' metric label, "
+          "never its own series",
+          "[pg][guardian_routes][platform][notimpl][4252]") {
+    Harness h;
+    auto rule = make_rule_with_spark("garbage1", "GarbageGuard", "garbage-xyz-not-a-real-type");
+    h.seed_rule(rule);
+    deploy_via_baseline(h, "garbage1");
+    h.agents_json = R"([{"agent_id":"lin-1","hostname":"linuxbox","os":"linux"}])";
+    // Real status row so the pair is a stale-matrix-vs-reality disagreement
+    // (matrix falls back to Windows-only for an unrecognised type, so a Linux
+    // report here is exactly the "already reports real status" trigger).
+    h.seed_status("e1", "lin-1", "garbage1", "guard.compliant");
+
+    auto res = h.sink.Get("/fragments/guardian/status?view=fleet");
+    REQUIRE(res != nullptr);
+
+    const std::string dump = h.metrics.serialize();
+    CHECK(dump.find(R"(spark_type="unknown")") != std::string::npos);
+    CHECK(dump.find("garbage-xyz-not-a-real-type") == std::string::npos);
+}
+
+// cpp-safety (#4252 Gate 3): the metrics_ == nullptr degrade path — every
+// other test wires a real MetricsRegistry, so this path was untested. Must
+// not crash, and must simply not emit the counter.
+TEST_CASE("#4252: GuardianRoutes with metrics=nullptr degrades cleanly (no crash, "
+          "no counter emission)",
+          "[pg][guardian_routes][platform][notimpl][4252]") {
+    Harness h{/*with_metrics=*/false};
+    auto rule = make_rule_with_spark("reg1", "RegGuard", "registry-change");
+    h.seed_rule(rule);
+    deploy_via_baseline(h, "reg1");
+    h.agents_json = R"([{"agent_id":"lin-1","hostname":"linuxbox","os":"linux"}])";
+    // Real status row for a pair the matrix calls unsupported — exactly the
+    // note_platform_matrix_stale() trigger, exercised here with metrics_ null.
+    h.seed_status("e1", "lin-1", "reg1", "guard.compliant");
+
+    auto res = h.sink.Get("/fragments/guardian/status?view=fleet");
+    REQUIRE(res != nullptr);
+    CHECK(res->status == 200);
+    // No crash reaching this line already proves the null-check holds. The
+    // exclusion logic itself doesn't depend on metrics_ at all — the real
+    // status row still correctly suppresses the synthetic not-implemented
+    // fold and renders as the sole, fully compliant pair.
+    CHECK(res->body.find("100% compliant") != std::string::npos);
+    CHECK(res->body.find("Not implemented") == std::string::npos);
 }

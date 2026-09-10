@@ -295,29 +295,46 @@ rollup_by_rule(const std::vector<yuzu::server::GuardianAgentRuleStatus>& rows,
 }
 
 // ── #4252 shared machinery: guard-type-aware "not implemented" + double-count
-//    exclusion, used by all 4 synthetic-notimpl fold sites in this file ──────
+//    exclusion, used by all 3 synthetic-notimpl fold sites in this file ──────
 
-// Composite key for one (agent, rule) pair. rule_id is operator free text with no
-// shape validation (GuaranteedStateStore::create_rule persists it verbatim), so it
-// COULD contain "\x1f" — but the join stays unambiguous regardless, because the
-// first "\x1f" in the key is always the separator: agent_id is server-issued at
-// registration and can never contain one.
-std::string pair_key(std::string_view agent_id, std::string_view rule_id) {
-    std::string k(agent_id);
-    k += '\x1f';
-    k += rule_id;
-    return k;
-}
+// Composite key for one (agent, rule) pair. A real struct + hash functor, NOT a
+// delimiter-joined string: neither agent_id nor rule_id has a charset restriction
+// that would make a separator byte unambiguous. agent_id is client-supplied at
+// Register (length-checked only, agent_service_impl.cpp) and rule_id is
+// operator free text on the REST create path (no shape validation,
+// rest_api_v1.cpp) — governance Gate 2/3/6 independently confirmed a crafted
+// "\x1f"-containing agent_id or rule_id collided the prior delimited-string key
+// (`agentA\x1fextra` + `ruleX` == `agentA` + `extra\x1fruleX`), silently
+// dropping a real status row from every fold. A struct key has no delimiter to
+// collide on, for any byte content, by construction — this is the fix, not a
+// stricter escape. Owned std::string fields (not string_view): status_pair_index
+// is consumed by the baseline fold AFTER the scope where its backing status rows
+// were fetched closes (see render_baseline_page_fragment), so a view-based key
+// would dangle there. Precedent: stream_budget.hpp's Key/KeyHash.
+struct PairStatusKey {
+    std::string agent_id;
+    std::string rule_id;
+
+    bool operator==(const PairStatusKey& o) const noexcept {
+        return agent_id == o.agent_id && rule_id == o.rule_id;
+    }
+};
+struct PairStatusKeyHash {
+    std::size_t operator()(const PairStatusKey& k) const noexcept {
+        return std::hash<std::string>{}(k.agent_id) ^
+               (std::hash<std::string>{}(k.rule_id) * 0x9e3779b97f4a7c15ULL);
+    }
+};
 
 // (agent_id, rule_id) pairs that already own a REAL status row — built once
 // per fragment render from the SAME status vector `rollup_by_rule()` (or, for
 // the single-rule guard page, `guardian_rule_agent_status_rows()`) already
 // consumes, never a second store query.
-std::unordered_set<std::string>
+std::unordered_set<PairStatusKey, PairStatusKeyHash>
 status_pair_index(const std::vector<yuzu::server::GuardianAgentRuleStatus>& rows) {
-    std::unordered_set<std::string> s;
+    std::unordered_set<PairStatusKey, PairStatusKeyHash> s;
     s.reserve(rows.size());
-    for (const auto& r : rows) s.insert(pair_key(r.agent_id, r.rule_id));
+    for (const auto& r : rows) s.insert(PairStatusKey{r.agent_id, r.rule_id});
     return s;
 }
 
@@ -331,9 +348,9 @@ status_pair_index(const std::vector<yuzu::server::GuardianAgentRuleStatus>& rows
 // closes. Not folding this into guardian_guard_supported_on_platform itself:
 // that function answers a pure "can this platform arm this guard type"
 // question with no store/status dependency, and stays unit-testable as such.
-bool has_real_status(const std::unordered_set<std::string>& pairs, std::string_view agent_id,
-                     std::string_view rule_id) {
-    return pairs.contains(pair_key(agent_id, rule_id));
+bool has_real_status(const std::unordered_set<PairStatusKey, PairStatusKeyHash>& pairs,
+                     std::string_view agent_id, std::string_view rule_id) {
+    return pairs.contains(PairStatusKey{std::string(agent_id), std::string(rule_id)});
 }
 
 // Extract a rule's spark.type token from its canonical spec_json — the input
@@ -373,8 +390,14 @@ std::string spark_type_of(const std::string& spec_json) {
 // docs/observability-conventions.md's pre-seed rule) — deliberately NOT the
 // engine_principal_store.cpp/LogCapture pattern an earlier draft of this fix
 // cited, which does not exist anywhere in this tree.
-constexpr std::array<const char*, 3> kMatrixStaleSparkTypes = {
-    "registry-change", "file-change", "service-status-change"};
+// #4252 consolidated round: kMatrixStaleSparkTypes used to be its own separate
+// std::array here — a THIRD independent enumeration of Guardian spark types
+// alongside the schema catalog and the platform matrix, with no cross-check
+// binding them (governance Gate 4 consistency-auditor finding). Now an alias
+// for guardian::kKnownGuardSparkTypes (guardian_push_builder.hpp), the same
+// list guardian_guard_supported_on_platform's matrix and the schema-registry
+// cross-check test (test_guardian_resilience_schema.cpp) consume.
+constexpr auto& kMatrixStaleSparkTypes = guardian::kKnownGuardSparkTypes;
 constexpr const char* kMatrixStaleSparkTypeUnknown = "unknown";
 constexpr std::uint64_t kMatrixStaleLogSample = 50;
 
@@ -391,8 +414,7 @@ void note_platform_matrix_stale(yuzu::MetricsRegistry* metrics, std::string_view
     // exists to prevent (precedent: dispatch_confined_arms.hpp's kQuarantineGateOutcomes
     // drives both the pre-seed and the emit side from one closed constant). The raw token
     // still reaches the sampled log line below for forensics.
-    const bool known = std::find_if(kMatrixStaleSparkTypes.begin(), kMatrixStaleSparkTypes.end(),
-                                     [&](const char* t) { return spark_type == t; }) !=
+    const bool known = std::ranges::find(kMatrixStaleSparkTypes, spark_type) !=
                        kMatrixStaleSparkTypes.end();
     const std::string label = known ? std::string(spark_type) : std::string(kMatrixStaleSparkTypeUnknown);
     if (metrics)
@@ -401,10 +423,17 @@ void note_platform_matrix_stale(yuzu::MetricsRegistry* metrics, std::string_view
             .increment();
     const std::uint64_t n = g_matrix_stale_count.fetch_add(1, std::memory_order_relaxed) + 1;
     if (n % kMatrixStaleLogSample == 1)
+        // log_safe (web_utils.hpp): agent_id/rule_id are operator/agent-controlled with
+        // no charset restriction (the same fact that motivated PairStatusKey above) —
+        // interpolating them raw would let a crafted id forge a fake multi-line log
+        // entry (e.g. an embedded '\n'). Neutralise control bytes before they reach the
+        // format string, same as every other log/audit site in this codebase that
+        // touches untrusted identifiers.
         spdlog::info("guardian: platform support-matrix stale vs. agent-observed reality — "
                      "agent={} rule={} spark_type={} (metric_label={}) already reports real "
                      "status; suppressed a synthetic not-implemented double-count (occurrence {})",
-                     agent_id, rule_id, spark_type.empty() ? "<empty>" : std::string(spark_type),
+                     log_safe(std::string(agent_id)), log_safe(std::string(rule_id)),
+                     spark_type.empty() ? "<empty>" : log_safe(std::string(spark_type)),
                      label, n);
 }
 
@@ -1245,9 +1274,16 @@ void GuardianRoutes::create_guard_from_form(const httplib::Request& req, httplib
         const std::string sv = get("severity");
         row.severity = (sv == "critical" || sv == "high" || sv == "low") ? sv : "medium";
     }
-    // Every realtime spark today (registry-change RegNotifyChangeKeyValue,
-    // file-change ReadDirectoryChangesW) is Windows-only; os_target stamps that.
-    // Device targeting proper is set at the Baseline, not per-Guard.
+    // The dashboard create-form doesn't expose an os_target choice, so it always
+    // stamps Windows — this predates #4252 and is still correct for two of the
+    // three spark types (registry-change RegNotifyChangeKeyValue, file-change
+    // ReadDirectoryChangesW ARE Windows-only), but is now a real gap for
+    // service-status-change: SystemdServiceGuard arms on Linux too
+    // (guardian_guard_supported_on_platform), yet a dashboard-created Service
+    // Guard can never reach a Linux agent — only REST/MCP (an explicit
+    // os_target in the request body) can author one that does. Not fixed here
+    // (dashboard-form scope, not this rollup fix's); device targeting proper is
+    // set at the Baseline, not per-Guard, regardless.
     row.os_target = "windows";
     row.scope_expr = ""; // unscoped draft — device targeting is set at the Baseline
     const std::string now = format_iso_utc(now_epoch_seconds());
@@ -1839,7 +1875,7 @@ std::string GuardianRoutes::render_baseline_page_fragment(const std::string& bas
     // Pairs that already own a REAL status row — the #4252 exclusion index (see
     // has_real_status below), built from the SAME statuses read as by_rule, never
     // a second store query.
-    std::unordered_set<std::string> real_status_pairs;
+    std::unordered_set<PairStatusKey, PairStatusKeyHash> real_status_pairs;
     if (store_ && store_->is_open()) {
         auto statuses = store_->agent_rule_statuses();
         if (!statuses)
@@ -2158,8 +2194,8 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
         // (agent_id, guard_id) pair-keys that already have a real status row — the
         // #4252 exclusion index (see has_real_status); guard_id is fixed for this
         // whole page, so the composite key just carries it through for the one
-        // predicate shared with the other 3 fold sites in this file.
-        std::unordered_set<std::string> seen;
+        // predicate shared with the other 2 fold sites in this file.
+        std::unordered_set<PairStatusKey, PairStatusKeyHash> seen;
         // #4037: same shared builder as the REST/MCP twins
         // (guardian_model.hpp::guardian_rule_agent_status_rows), so all three
         // surfaces compute this census identically. ADR-0038 fix (governance
@@ -2178,7 +2214,7 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
                    "<div class=\"gp-placeholder\"><b>Guard status degraded</b><br>"
                    "Check server /healthz.</div>";
         for (const auto& s : *status_rows) {
-            seen.insert(pair_key(s.agent_id, guard_id));
+            seen.insert(PairStatusKey{s.agent_id, guard_id});
             DevRow d;
             d.online = hostname.count(s.agent_id) > 0;
             d.host = (d.online && !hostname[s.agent_id].empty()) ? hostname[s.agent_id] : s.agent_id.substr(0, 12);
@@ -2200,7 +2236,7 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
         // status_rows) already excludes any pair with a real status row — #4252:
         // a pair the agent-side Guardian DOES now arm (e.g. Linux Service) must
         // never be double-counted as both its real state and a synthetic
-        // not-implemented row. Unlike the other 3 fold sites, this page was
+        // not-implemented row. Unlike the other 2 fold sites, this page was
         // ALREADY pair-deduped pre-#4252 (this `seen` check pre-dates the fix),
         // so a real-status pair here was never at risk of a duplicate DevRow —
         // note_platform_matrix_stale() is deliberately NOT called on this path;
@@ -2465,8 +2501,9 @@ void GuardianRoutes::register_routes(HttpRouteSink& sink,
             "already reported real status for it - i.e. the matrix is stale for this "
             "spark type. Render-time only; not a continuous monitor.",
             "counter");
-        for (const char* t : kMatrixStaleSparkTypes)
-            metrics_->counter("yuzu_server_guardian_platform_matrix_stale_total", {{"spark_type", t}});
+        for (std::string_view t : kMatrixStaleSparkTypes)
+            metrics_->counter("yuzu_server_guardian_platform_matrix_stale_total",
+                              {{"spark_type", std::string(t)}});
         metrics_->counter("yuzu_server_guardian_platform_matrix_stale_total",
                           {{"spark_type", kMatrixStaleSparkTypeUnknown}});
     }
