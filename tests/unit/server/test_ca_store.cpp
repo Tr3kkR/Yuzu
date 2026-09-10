@@ -365,6 +365,50 @@ TEST_CASE("CaStore: issued provenance columns round-trip", "[ca_store][pg][issue
     CHECK((*got)->cert_pem == rec.cert_pem);
 }
 
+// gap-matrix #10: code-signing leaf issuance (server.cpp's
+// ServerImpl::issue_code_signing_leaf) records purpose="code-signing" —
+// already an allowed IssuedCertRecord::purpose value (see the doc comment),
+// so this needs no schema migration. Confirm it round-trips through
+// get_issued/list_issued like every other purpose, and that revoke() treats
+// it identically to "agent"/"https".
+TEST_CASE("CaStore: purpose=\"code-signing\" round-trips through get_issued/list_issued/revoke",
+          "[ca_store][pg][issued][code-signing]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+
+    auto rec = sample_issued("C5C1FEED", "code-signing");
+    rec.subject = "build-signer-01"; // CN=label — the non-agent namespace (never an agent_id).
+    rec.san.clear();                 // no SAN on a code-signing leaf (never a yuzu://…/agent/… URI).
+    rec.issued_by = "operator:alice";
+    REQUIRE(store.record_issued(rec).has_value());
+
+    auto got = store.get_issued("C5C1FEED");
+    REQUIRE(got.has_value());
+    REQUIRE(got->has_value());
+    CHECK((*got)->purpose == "code-signing");
+    CHECK((*got)->subject == "build-signer-01");
+    CHECK((*got)->san.empty());
+    CHECK((*got)->issued_by == "operator:alice");
+    CHECK((*got)->status == CertStatus::Active);
+
+    auto all = store.list_issued();
+    REQUIRE(all.has_value());
+    REQUIRE(all->size() == 1);
+    CHECK((*all)[0].purpose == "code-signing");
+
+    // revoke() has no purpose-specific branch — a code-signing leaf revokes
+    // exactly like every other purpose.
+    auto r = store.revoke("C5C1FEED", "operator decommission");
+    REQUIRE(r.has_value());
+    CHECK(*r);
+    REQUIRE(store.is_revoked("C5C1FEED"));
+    auto revoked = store.list_revoked();
+    REQUIRE(revoked.has_value());
+    REQUIRE(revoked->size() == 1);
+    CHECK((*revoked)[0].purpose == "code-signing");
+}
+
 TEST_CASE("CaStore: revoke is idempotent and reflected", "[ca_store][pg][revoke]") {
     YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 2}};
