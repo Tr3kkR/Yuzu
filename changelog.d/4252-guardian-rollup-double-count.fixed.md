@@ -21,4 +21,25 @@
   pair), so it is not a new class of problem, but it means such a pair is not currently
   visible on the dashboard at all. A `yuzu_server_guardian_platform_matrix_stale_total{spark_type}`
   counter now fires (render-time only, at the fleet and baseline-page views) if the
-  hardcoded support matrix ever again disagrees with what an agent actually reports.
+  hardcoded support matrix ever again disagrees with what an agent actually reports —
+  the label is folded to `unknown` for any non-canonical `spark.type`, keeping it the
+  closed set the metric docs already claimed.
+
+  Known accepted limitation, adversarial-review-identified, tracked as a follow-up issue
+  (not fixed in this PR): the new per-pair "already has a real status row" exclusion
+  cannot tell a row that is current for the rule's present guard type/platform apart
+  from one left behind by an earlier revision of the *same* `rule_id`. If an operator
+  re-authors an existing rule's `spark.type` to one unsupported on a target agent's
+  platform (e.g. Service → Registry on a Linux-targeted rule) and the replacement guard
+  fails to arm, the agent emits no new status, the prior compliant/drifted row survives,
+  and the dashboard now shows that pair as compliant with no "not implemented" marker —
+  where before this fix it was double-counted (visibly wrong, but at least visible). The
+  `..._platform_matrix_stale_total` counter above DOES fire on this exact condition
+  (checked: the call site fires it whenever the exclusion suppresses an otherwise-notimpl
+  pair, regardless of why the status row exists), so it is not undetectable, just not
+  dashboard-visible on the specific affected rule. The root cause — `update_rule()` never
+  invalidates `guardian_agent_rule_status` rows on a revision, unlike `delete_rule()`,
+  which does — predates this PR and lives entirely in `guaranteed_state_store.cpp`, which
+  this diff does not touch; fixing it (version- or platform-binding status rows, or
+  invalidating them transactionally on `update_rule`) is store-schema work that belongs
+  in its own PR — tracked as #4263.

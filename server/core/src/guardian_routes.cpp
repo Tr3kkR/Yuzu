@@ -231,18 +231,23 @@ std::string render_assertion_values(const nlohmann::json& asrt, const std::strin
     return out;
 }
 
-// Distinct colour for the "not yet implemented" class (macOS/Linux agents whose
-// agent-side guards are no-ops). Deliberately NOT green/grey so it can never read as
-// compliant or as a stale-offline "unknown" — used by the fleet census, the
-// By-Guard/By-Baseline "N not impl" tags, and the per-device drill-down.
+// Distinct colour for the "not yet implemented" class (an (agent, rule) pair whose
+// GUARD TYPE the agent-side Guardian can't arm on that agent's platform — see
+// guardian::guardian_guard_supported_on_platform for the per-type matrix; it is NOT a
+// blanket macOS/Linux exclusion, e.g. Service arms on Linux today). Deliberately NOT
+// green/grey so it can never read as compliant or as a stale-offline "unknown" — used
+// by the fleet census, the By-Guard/By-Baseline "N not impl" tags, and the per-device
+// drill-down.
 constexpr const char* kNotImplColor = "#a78bfa";  // violet
 
 // agent_id -> raw platform token ("windows"|"linux"|"darwin"|...) for currently-
 // connected agents, parsed from the registry JSON (registry_.to_json()). Used both to
 // fold liveness (a status row whose agent_id is absent is "unknown" — offline, can't
-// verify) and to flag agents on platforms the agent-side Guardian does not arm yet
-// (macOS/Linux), so they are reported "not yet implemented" rather than silently
-// looking compliant/unknown. Callers derive the online-id set from its keys.
+// verify) and, together with a rule's guard type, to flag pairs the agent-side
+// Guardian does not arm yet (guardian::guardian_guard_supported_on_platform — NOT a
+// blanket per-platform rule; see the #4252 matrix), so they are reported "not yet
+// implemented" rather than silently looking compliant/unknown. Callers derive the
+// online-id set from its keys.
 std::unordered_map<std::string, std::string> parse_online_agent_os(const std::string& agents_json) {
     std::unordered_map<std::string, std::string> m;
     auto j = nlohmann::json::parse(agents_json, nullptr, false);
@@ -292,9 +297,11 @@ rollup_by_rule(const std::vector<yuzu::server::GuardianAgentRuleStatus>& rows,
 // ── #4252 shared machinery: guard-type-aware "not implemented" + double-count
 //    exclusion, used by all 4 synthetic-notimpl fold sites in this file ──────
 
-// Composite key for one (agent, rule) pair. "\x1f" (unit separator) is not a
-// valid character in either a UUID rule_id or an agent-registration agent_id,
-// so the two ids can never collide across the join.
+// Composite key for one (agent, rule) pair. rule_id is operator free text with no
+// shape validation (GuaranteedStateStore::create_rule persists it verbatim), so it
+// COULD contain "\x1f" — but the join stays unambiguous regardless, because the
+// first "\x1f" in the key is always the separator: agent_id is server-issued at
+// registration and can never contain one.
 std::string pair_key(std::string_view agent_id, std::string_view rule_id) {
     std::string k(agent_id);
     k += '\x1f';
@@ -375,8 +382,19 @@ std::atomic<std::uint64_t> g_matrix_stale_count{0};
 
 void note_platform_matrix_stale(yuzu::MetricsRegistry* metrics, std::string_view agent_id,
                                 std::string_view rule_id, std::string_view spark_type) {
-    const std::string label =
-        spark_type.empty() ? std::string(kMatrixStaleSparkTypeUnknown) : std::string(spark_type);
+    // The metric label is the CLOSED set advertised in docs/user-manual/metrics.md — never
+    // the raw authored token. spark.type is operator-authored free text with no membership
+    // check on the create/update path (guardian_rule_spec.cpp's derive_rule_spec validates
+    // only non-emptiness), so passing it through verbatim would let a privileged operator
+    // mint an unbounded, never-evicted Prometheus series per distinct typo/garbage value —
+    // exactly what docs/observability-conventions.md's closed/bounded/pre-seeded-label rule
+    // exists to prevent (precedent: dispatch_confined_arms.hpp's kQuarantineGateOutcomes
+    // drives both the pre-seed and the emit side from one closed constant). The raw token
+    // still reaches the sampled log line below for forensics.
+    const bool known = std::find_if(kMatrixStaleSparkTypes.begin(), kMatrixStaleSparkTypes.end(),
+                                     [&](const char* t) { return spark_type == t; }) !=
+                       kMatrixStaleSparkTypes.end();
+    const std::string label = known ? std::string(spark_type) : std::string(kMatrixStaleSparkTypeUnknown);
     if (metrics)
         metrics
             ->counter("yuzu_server_guardian_platform_matrix_stale_total", {{"spark_type", label}})
@@ -384,9 +402,10 @@ void note_platform_matrix_stale(yuzu::MetricsRegistry* metrics, std::string_view
     const std::uint64_t n = g_matrix_stale_count.fetch_add(1, std::memory_order_relaxed) + 1;
     if (n % kMatrixStaleLogSample == 1)
         spdlog::info("guardian: platform support-matrix stale vs. agent-observed reality — "
-                     "agent={} rule={} spark_type={} already reports real status; suppressed a "
-                     "synthetic not-implemented double-count (occurrence {})",
-                     agent_id, rule_id, label, n);
+                     "agent={} rule={} spark_type={} (metric_label={}) already reports real "
+                     "status; suppressed a synthetic not-implemented double-count (occurrence {})",
+                     agent_id, rule_id, spark_type.empty() ? "<empty>" : std::string(spark_type),
+                     label, n);
 }
 
 } // namespace
