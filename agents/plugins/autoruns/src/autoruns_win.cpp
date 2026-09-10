@@ -1270,8 +1270,7 @@ int collect_windows(yuzu::CommandContext& ctx, std::string_view filter) {
                             // that silent zero-rows-and-SUPPORTED is not
                             // mistaken for "genuinely nothing there." See
                             // changelog.d/20260909-autoruns-plugin.added.md's
-                            // "Known limitation" entry. Tracked for a
-                            // follow-up fix.
+                            // "Known limitation" entry. Tracked in #4219.
                             RegKey folders_key;
                             if (RegOpenKeyExW(
                                     root,
