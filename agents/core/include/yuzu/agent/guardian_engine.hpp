@@ -90,7 +90,8 @@ namespace yuzu::agent {
 #  define YUZU_WORKER_MUTEX_GUARD 1
 #endif
 
-/// True iff taking GuardianEngine::mtx_ on a thread stop() joins aborts the process.
+/// True iff taking GuardianEngine::mtx_ on a thread stop() joins, or on a detached
+/// GuardianIoExecutor worker (rung 9c R5.1), aborts the process.
 [[nodiscard]] constexpr bool worker_mutex_guard_enabled() noexcept {
 #ifdef YUZU_WORKER_MUTEX_GUARD
     return true;
@@ -463,13 +464,20 @@ private:
     /// BasicLockable, so every `std::lock_guard lock(mtx_)` site is unchanged by CTAD.
     ///
     /// Holds NO reference to the worker: it asks a thread-local role marker
-    /// (on_guardian_drain_worker_thread()) instead. A pointer to the worker would have to
+    /// (on_guardian_joined_thread()) instead. A pointer to the worker would have to
     /// be read here BEFORE mu_ is held - an unsynchronised cross-thread read - and wiring
     /// rollback can destroy the worker while another thread holds that pointer, which made
     /// the safety device itself a use-after-free (#2298 Sol review).
     ///
     /// Aborts rather than asserts: `assert` is a no-op under NDEBUG, so a release build
     /// with sanitizers would have logged the violation and then walked into the deadlock.
+    ///
+    /// Second role, rung 9c R5.1 (guardian_detached_worker_role.hpp): a DETACHED
+    /// GuardianIoExecutor worker - either dispatch form, including the consumer-injected
+    /// on_abandoned/on_complete callback it runs after the backend call - is a different
+    /// hazard class (lock-vs-lifetime, not lock-vs-join: it can never be joined and may
+    /// outlive stop() or the F3 orphan grace) with the same remedy. The tripwire consults
+    /// both markers and names the role that fired.
     class WorkerHostileMutex {
     public:
         void lock() {
