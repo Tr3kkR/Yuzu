@@ -327,6 +327,56 @@ both must land before the flip proceeds, the same way #3816/#3831 (row 3) and
 on the same criterion (§2) through a different, newer document, not through #2233's
 checklist.
 
+**Ladder insertion (ruling 14(c), 2026-09-08):** the #2012/#3840 same-type-serialization fix
+lands between this track's PR-1 and PR-2, as two PRs, no longer in the post-flip package (see
+the #2012 row in §5's register).
+
+**Rung 9c PR-5 acceptance criteria (governance pass-3, independent fan-out on PR-1, 2026-09-09).**
+Three unhappy-path findings on PR-1 derive HIGH on their own facts and are capped to LOW only by
+exposure E5+E6: `prefer_spark_` is a `const bool` set solely by `GuardianEngine`'s defaulted
+constructor at the one production site (`agent.cpp`), with no CLI/env/config/build route, and
+every cited line sits downstream of `try_spark = prefer_spark_ && Available`
+(`guardian_engine.cpp`). **That cap lapses at the flip PR or any `prefer_spark` knob PR**, where
+each re-derives HIGH (E0 via the 25 s `full_sync` timer). PR-5 must close every one before the
+flip, with a red-first test each:
+- **up-2, wedged-key re-apply cost** (`GuardianSparkRuntime::attach_rule`, the claim path and
+  `wait_for_claim`): a re-push onto a wedged key queues behind the abandoned head and waits the
+  full `backend_op_deadline` under engine `mtx_` on every re-apply; the base code fail-fasted via
+  the executor's `AlreadyRunning`. Criterion: a quarantined key refuses a new claim immediately.
+- **up-3, direct compensating-disarm fallback** (`on_arm_complete`'s `run_compensating_disarm`):
+  on a non-timeout executor refusal the disarm runs direct on the worker, holding no quota;
+  wedged direct calls accumulate alive workers to the per-instance ceiling and the instance
+  refuses everything until restart. Criterion: the fallback is bounded (deadline) and counted,
+  and a ceiling hit is surfaced (PR-3 gauge).
+- **up-4, double allocation fault leaving an outcome-bearing Dispatched head**
+  (`on_arm_complete` step (3) and its catch): PR-1 pops a terminal head in the catch
+  (governance pass-3 sg-3/ar-4/cs-5 fold); criterion: a deadline sweep also clears any head a
+  double fault still leaves, so no key wedges until restart.
+- **ch-1, step-(3) publish allocation seam**: PR-1 added fault point 3 (`set_drain_fault_point_for_test(3)`,
+  post-verdict and pre-pop), which sits UPSTREAM of the fill-in allocation ch-1 named; that seam is still
+  absent. Criterion: PR-5 adds the fill-in-allocation seam and exercises the step-(3)
+  publish-allocation fault through it as a named red-first test (the pass-3 chaos-injector design
+  called this scenario "CH-3"; that label lives in no committed artefact, so the criterion names the
+  fault, not the label).
+- **up-5, retained-disarm-no-redrive under sequential teardown** (`GuardianSparkRuntime::detach_all`,
+  `submit_disarm_off_lock`): `detach_all()` submits each rule's disarm sequentially and bounded; when
+  the class quota is still held by workers draining from earlier calls in the same sweep, a later
+  disarm is admission-refused and RETAINED (`disarm_retained_`, no redrive timer in PR-1) rather than
+  dropped - by design, but with no time-based redrive. Chaos-injector's ch-202 (governance pass-5/6
+  ledger) reproduced this live under load (`disarms.load()` 57/200 and 120/200 of a 200-key
+  `detach_all()`, both far below the 5 s deadline-timeout count). Post-flip consequence: a retained
+  disarm leaves the real backend subscription armed indefinitely - `armed_key_count()` and
+  `rule_count()` both correctly read 0 (the confirmed state IS torn down), so nothing operator-visible
+  distinguishes "torn down and disarmed" from "torn down and the disarm is stuck" until the next
+  same-key attach or `begin_stop()` (which drops it, counted) redrives it. **Missing telemetry
+  (PR-3 gap)**: no gauge exposes `disarm_retained()`'s current (non-monotonic) count on the fleet
+  heartbeat, so an operator has no signal that a torn-down key still has a live watch. Criterion:
+  PR-5 either adds a bounded redrive (a periodic sweep or a convergence-lane trigger) or PR-3 exposes
+  `disarm_retained()` as a fleet-visible gauge so the gap is at least observable; either closes before
+  the flip. Test-side note: `tests/unit/test_guardian_spark_runtime.cpp`'s 200-key `detach_all` test
+  (governance qe-303) now asserts `disarms + disarm_retained() == 200` rather than the false invariant
+  `disarms == 200` this row's chaos reproduction disproved.
+
 ## 4. #2340 scenario contract
 
 Canonical home for this contract as of this PR - a local (uncommitted) delivery-plan draft
@@ -993,11 +1043,15 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   #3840 (filed 2026-09-02, `spark_engine.hpp:536–548`) is the identical "walk-off-`mu_`"
   hazard shape for Registry's `TP_WAIT` / Service's Windows SCM query - folded into this same
   mechanism-hardening package.
-- Owner: the mechanism-hardening package (File + Registry + Service together, one restructure,
-  reviewed once) - no individual named in source.
-- Milestone: early post-flip, named package.
-- Revisit trigger: **escalate to flip-gating if a production fleet materializes before this
-  lands.**
+- Owner: for the remaining #2011/#2014 piece, the mechanism-hardening package (File + Registry +
+  Service together, one restructure, reviewed once) - no individual named in source; the pulled-forward
+  #2012/#3840 piece is owned by its rung 9c kickoff (Milestone below).
+- Milestone: **split by ruling 14(c) (2026-09-08)** - the #2012/#3840 same-type-serialization piece is
+  pulled forward into rung 9c's own ladder, between its PR-1 and PR-2, landing as two PRs (kickoff:
+  `~/.claude/plans/spark-2012-3840-mechanism-walkoffmu-KICKOFF.md`, operator-local, session "SPARK 3840 Decouple");
+  #2011 (lock granularity) and #2014 stay early post-flip in the named package.
+- Revisit trigger: for the remaining #2011/#2014 piece, **escalate to flip-gating if a production
+  fleet materializes before it lands**; the #2012/#3840 piece is already pre-flip by ruling 14(c).
 
 **#2570 + #2578** (macOS spark-test flakes)
 - Detection signal: CI red on the macOS leg for these two specific named tests.
