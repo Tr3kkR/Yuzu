@@ -175,6 +175,39 @@ int64_t read_config_i64_locked(TransactionHandle& h, std::string_view key) {
     return parse_i64(col_text(stmt.get(), 0));
 }
 
+// Distinguishes a genuinely-absent key (no row -- a real, legitimate state
+// the first time a fold ever runs after baseline) from a read/parse FAILURE
+// on an existing key. read_config_i64_locked's "0 on any fault" contract
+// above is correct ONLY for its four cumulative status counters; it is wrong
+// for `usage_last_fold_ts`, which gates whether expire_open_runs may delete
+// anything -- collapsing "absent" and "failed" both to 0 let a transient
+// read fault read as a legitimate first-fold state and proceed with the
+// sweep (adversarial review Wave 7 PR7.2b fix round 1). Does not poison the
+// handle: a failed/absent anchor read declines THIS tick's expiry sweep, it
+// does not fail the whole fold (matching the existing clock-implausible
+// decline below, which also leaves every other write in this transaction
+// intact).
+std::expected<std::optional<int64_t>, std::string> read_config_i64_strict(TransactionHandle& h,
+                                                                          std::string_view key) {
+    sqlite3_stmt* raw = nullptr;
+    if (sqlite3_prepare_v2(h.raw(), "SELECT value FROM tar_config WHERE key = ?", -1, &raw,
+                           nullptr) != SQLITE_OK)
+        return std::unexpected(std::string("prepare failed"));
+    LocalStmtPtr stmt(raw);
+    sqlite3_bind_text(stmt.get(), 1, key.data(), static_cast<int>(key.size()), SQLITE_TRANSIENT);
+    const int rc = sqlite3_step(stmt.get());
+    if (rc == SQLITE_DONE)
+        return std::optional<int64_t>{}; // genuinely absent -- no row, not a fault
+    if (rc != SQLITE_ROW)
+        return std::unexpected(std::string("step failed"));
+    const std::string_view raw_val = col_text(stmt.get(), 0);
+    int64_t parsed = 0;
+    auto [p, ec] = std::from_chars(raw_val.data(), raw_val.data() + raw_val.size(), parsed);
+    if (ec != std::errc{} || p != raw_val.data() + raw_val.size())
+        return std::unexpected(std::string("malformed value"));
+    return std::optional<int64_t>(parsed);
+}
+
 } // namespace
 
 LifecycleState usage_lifecycle_state(TarDatabase& db) {
@@ -241,8 +274,18 @@ std::expected<void, std::string> usage_ensure_baselined(TarDatabase& db, int64_t
             int64_t hwm = 0;
             {
                 LocalStmtPtr stmt(raw);
-                if (sqlite3_step(stmt.get()) == SQLITE_ROW)
-                    hwm = sqlite3_column_int64(stmt.get(), 0);
+                // COALESCE(MAX(id), 0) over no WHERE clause always returns
+                // exactly one row on success -- any other step outcome can
+                // only be a fault (adversarial review Wave 7 PR7.2b fix
+                // round 1), never "legitimately no rows", so it must poison
+                // rather than silently commit hwm=0 (which would make the
+                // NEXT fold read everything since row 1 -- the retrospective
+                // -fold defect this primitive exists to close).
+                if (sqlite3_step(stmt.get()) != SQLITE_ROW) {
+                    h.fail("step MAX(id) probe failed");
+                    return std::unexpected(std::string("step MAX(id) probe failed"));
+                }
+                hwm = sqlite3_column_int64(stmt.get(), 0);
             }
 
             if (!h.exec("DELETE FROM usage_live"))
@@ -296,13 +339,11 @@ UsageFoldResult run_usage_fold(TarDatabase& db, int64_t now, int64_t max_events_
         return result;
     }
 
-    const int64_t hwm = parse_i64(db.get_config("usage_hwm_id", "0"));
-    result.hwm_id = hwm;
-
     // Captured from inside the transaction below, trusted only once
     // `checked_transaction` returns success (see TarDatabase::checked_
     // transaction's own doc comment for why this is the sanctioned pattern).
-    int64_t new_hwm = hwm;
+    int64_t hwm = 0; // read strictly below, inside the transaction
+    int64_t new_hwm = 0;
     int64_t events_seen = 0;
     int64_t runs_closed = 0;
     int64_t lag_events = 0;
@@ -310,6 +351,44 @@ UsageFoldResult run_usage_fold(TarDatabase& db, int64_t now, int64_t max_events_
 
     auto fold_result = db.checked_transaction(
         [&](TransactionHandle& h) -> std::expected<void, std::string> {
+            // ── Read usage_hwm_id strictly, INSIDE the transaction (adversarial
+            // review Wave 7 PR7.2b fix round 1). Active lifecycle guarantees
+            // usage_ensure_baselined already committed this key in the SAME
+            // checked_transaction that stamped usage_active_generation -- both
+            // succeed together or neither does -- so by the time this function
+            // sees Active, a missing/unreadable/malformed usage_hwm_id can only
+            // be a fault (corruption, a lost write, tampering), never a
+            // legitimate "not baselined yet". The prior code read this via the
+            // lossy `db.get_config(...,"0")` BEFORE the transaction even opened,
+            // so a transient or malformed read collapsed to hwm=0 and the fold
+            // below would consume `id > 0` -- everything since row 1, past the
+            // documented forward-only boundary. Poison instead.
+            {
+                sqlite3_stmt* hwm_raw = nullptr;
+                if (sqlite3_prepare_v2(h.raw(),
+                                       "SELECT value FROM tar_config WHERE key = 'usage_hwm_id'",
+                                       -1, &hwm_raw, nullptr) != SQLITE_OK) {
+                    h.fail("prepare usage_hwm_id read failed");
+                    return std::unexpected(std::string("prepare usage_hwm_id read failed"));
+                }
+                LocalStmtPtr hwm_stmt(hwm_raw);
+                if (sqlite3_step(hwm_stmt.get()) != SQLITE_ROW) {
+                    h.fail("usage_hwm_id missing or unreadable while Active");
+                    return std::unexpected(
+                        std::string("usage_hwm_id missing or unreadable while Active"));
+                }
+                const std::string_view raw_val = col_text(hwm_stmt.get(), 0);
+                int64_t parsed = 0;
+                auto [p, ec] =
+                    std::from_chars(raw_val.data(), raw_val.data() + raw_val.size(), parsed);
+                if (ec != std::errc{} || p != raw_val.data() + raw_val.size()) {
+                    h.fail("usage_hwm_id malformed while Active");
+                    return std::unexpected(std::string("usage_hwm_id malformed while Active"));
+                }
+                hwm = parsed;
+            }
+            new_hwm = hwm;
+
             // ── Gap check + event read, in ONE statement (see file banner for
             // why this is inside the transaction, not a separate db.execute_
             // query() call before it) ──
@@ -417,17 +496,50 @@ UsageFoldResult run_usage_fold(TarDatabase& db, int64_t now, int64_t max_events_
             // decline the expiry sweep only, not the whole fold (every other
             // write below still commits).
             constexpr int64_t kMaxPlausibleFoldGapSeconds = 86400; // 24h of missed ticks
-            const int64_t prior_fold_ts = read_config_i64_locked(h, "usage_last_fold_ts");
-            const bool clock_plausible =
-                prior_fold_ts == 0 || (now >= prior_fold_ts &&
-                                       now - prior_fold_ts <= kMaxPlausibleFoldGapSeconds);
+            // `read_config_i64_strict`, not `read_config_i64_locked` (adversarial
+            // review Wave 7 PR7.2b fix round 1) -- the latter's "0 on any
+            // fault" contract conflated a transient read failure with a
+            // legitimate first-ever-fold absence, both proceeding as
+            // "plausible" (TAR's own established convention, quoted in
+            // .claude/routed-concerns.md's clock-guard row, treats a missing
+            // stored reading as a DECLINE trigger in its own right).
+            //
+            // `advance_anchor` stays true (write `now` as the next tick's
+            // trusted anchor) in every case EXCEPT one: a REAL prior anchor
+            // that says `now` is untrustworthy. Absent and read-failed both
+            // still advance -- there is no prior value being overridden
+            // untrustworthily, and NOT advancing on "absent" would trap the
+            // guard in absent-forever (nothing else ever writes this key).
+            // Only a genuine clock-implausibility must refuse to let the
+            // rejected `now` become the next tick's trusted anchor -- that
+            // was the second half of this defect: one skewed tick used to
+            // permanently disarm the guard from then on.
+            const auto anchor = read_config_i64_strict(h, "usage_last_fold_ts");
+            bool clock_plausible = false;
+            bool advance_anchor = true;
+            if (!anchor.has_value()) {
+                spdlog::warn("TAR usage: declining this tick's open-run expiry sweep -- failed "
+                            "to read the last-fold anchor ({}); re-anchoring to this tick's "
+                            "clock",
+                            anchor.error());
+            } else if (!anchor->has_value()) {
+                // Genuinely no anchor yet -- a freshly-baselined source has no
+                // open runs to expire this early anyway, so declining costs
+                // nothing.
+            } else {
+                const int64_t prior_fold_ts = **anchor;
+                clock_plausible = now >= prior_fold_ts &&
+                                  now - prior_fold_ts <= kMaxPlausibleFoldGapSeconds;
+                if (!clock_plausible) {
+                    advance_anchor = false;
+                    spdlog::warn("TAR usage: declining this tick's open-run expiry sweep -- "
+                                "`now` ({}) is implausible against the last fold's anchor ({})",
+                                now, prior_fold_ts);
+                }
+            }
             if (clock_plausible) {
                 for (auto& c : expire_open_runs(state, now))
                     closed.push_back(std::move(c));
-            } else {
-                spdlog::warn("TAR usage: declining this tick's open-run expiry sweep -- `now` "
-                            "({}) is implausible against the last fold's anchor ({})",
-                            now, prior_fold_ts);
             }
             for (auto& c : cap_open_runs(state))
                 closed.push_back(std::move(c));
@@ -504,8 +616,10 @@ UsageFoldResult run_usage_fold(TarDatabase& db, int64_t now, int64_t max_events_
                 return std::unexpected(h.error());
             if (!upsert_config("usage_lag_events", std::to_string(lag_events)))
                 return std::unexpected(h.error());
-            if (!upsert_config("usage_last_fold_ts", std::to_string(now)))
-                return std::unexpected(h.error());
+            if (advance_anchor) {
+                if (!upsert_config("usage_last_fold_ts", std::to_string(now)))
+                    return std::unexpected(h.error());
+            }
             if (state.unmatched_stops > 0) {
                 const int64_t prior = read_config_i64_locked(h, "usage_unmatched_stops");
                 if (!upsert_config("usage_unmatched_stops",
@@ -534,7 +648,11 @@ UsageFoldResult run_usage_fold(TarDatabase& db, int64_t now, int64_t max_events_
     if (!fold_result.has_value()) {
         result.ok = false;
         result.error = fold_result.error();
-        result.hwm_id = hwm; // unchanged -- report what is actually persisted
+        // `hwm` may be 0 here if the strict read above is itself what failed
+        // (no trustworthy value exists to report) -- no caller reads hwm_id
+        // on the failure path (tar_plugin.cpp only checks `.ok`), so this is
+        // diagnostic-only.
+        result.hwm_id = hwm;
         return result;
     }
 

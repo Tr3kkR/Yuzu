@@ -491,3 +491,112 @@ TEST_CASE("usage: a rollback leaves the connection usable and open runs are re-d
     CHECK(row->rows[0][0] == "1");   // run_count == 1, not 2 -- applied exactly once
     CHECK(row->rows[0][1] == "100"); // total_seconds == 100, not 200
 }
+
+// =============================================================================
+// Adversarial review Wave 7 PR7.2b fix round 1: forward-only boundary reads
+// (Blocker 1) and clock-guard anchor tri-state / re-anchoring (Blocker 2)
+// =============================================================================
+
+TEST_CASE("usage: run_usage_fold refuses (not folds-from-row-1) when usage_hwm_id is absent "
+          "while Active",
+          "[tar][usage][fold]") {
+    // The core regression: before the fix, a lossy pre-transaction read of
+    // usage_hwm_id defaulted an absent/unreadable key to 0, so the fold would
+    // consume `id > 0` -- every pre-boundary process_live row. Delete the key
+    // out from under an otherwise-Active source (simulating corruption/a lost
+    // write) and prove the fold refuses instead of silently folding from
+    // row 1.
+    auto t = make_test_db();
+    REQUIRE(usage_ensure_baselined(t.db, 1000).has_value());
+    seed_process_pair(t.db, 1, "pre.exe", 100, 200); // predates baseline -- must never be folded
+    REQUIRE(t.db.execute_sql("DELETE FROM tar_config WHERE key = 'usage_hwm_id'"));
+
+    auto result = run_usage_fold(t.db, /*now=*/2000);
+    CHECK_FALSE(result.ok);
+    CHECK(count_rows(t.db, "usage_daily") == 0); // pre.exe was never folded
+    CHECK(count_rows(t.db, "usage_live") == 0);
+}
+
+TEST_CASE("usage: run_usage_fold refuses when usage_hwm_id is malformed while Active",
+          "[tar][usage][fold]") {
+    // The prepare/step-failure sub-cases of the same defect are exercised by
+    // code inspection only (matching commit 1's own precedent for a bare
+    // read that cannot be fault-injected without corrupting the store file);
+    // the parse-failure sub-case is directly testable and goes through the
+    // identical `h.fail()` path.
+    auto t = make_test_db();
+    REQUIRE(usage_ensure_baselined(t.db, 1000).has_value());
+    seed_process_pair(t.db, 1, "pre.exe", 100, 200);
+    REQUIRE(t.db.set_config("usage_hwm_id", "not_a_number"));
+
+    auto result = run_usage_fold(t.db, /*now=*/2000);
+    CHECK_FALSE(result.ok);
+    CHECK(count_rows(t.db, "usage_daily") == 0);
+}
+
+TEST_CASE("usage: expire sweep declines on a genuinely-absent anchor (first fold after "
+          "baseline) rather than proceeding",
+          "[tar][usage][fold]") {
+    // Before the fix, read_config_i64_locked's "0 on any fault OR absence"
+    // return let an absent usage_last_fold_ts read as clock_plausible=true,
+    // inverting TAR's own no-stored-reading-is-a-decline-trigger convention.
+    // Seed a run already older than max_age so a wrongly-proceeding sweep
+    // would expire it on this very first fold.
+    auto t = make_test_db();
+    REQUIRE(usage_ensure_baselined(t.db, 1000).has_value());
+    seed_process_pair(t.db, 1, "old.exe", 1000, -1); // started only -- stays open
+
+    auto result = run_usage_fold(t.db, /*now=*/1000 + yuzu::tar::usage::kDefaultMaxAgeSeconds + 1);
+    REQUIRE(result.ok);
+    CHECK(result.runs_closed == 0);            // NOT expired -- sweep declined
+    CHECK(count_rows(t.db, "usage_live") == 1); // the run is still open
+}
+
+TEST_CASE("usage: expire sweep declines when the anchor read fails, and still advances the "
+          "anchor for the next tick",
+          "[tar][usage][fold]") {
+    auto t = make_test_db();
+    REQUIRE(usage_ensure_baselined(t.db, 1000).has_value());
+    seed_process_pair(t.db, 1, "old.exe", 1000, -1);
+    REQUIRE(t.db.set_config("usage_last_fold_ts", "not_a_number")); // malformed -- read fails
+
+    auto result = run_usage_fold(t.db, /*now=*/1000 + yuzu::tar::usage::kDefaultMaxAgeSeconds + 1);
+    REQUIRE(result.ok); // the read/parse failure declines the SWEEP only, not the whole fold
+    CHECK(result.runs_closed == 0);
+    CHECK(count_rows(t.db, "usage_live") == 1);
+    CHECK(cfg(t.db, "usage_last_fold_ts") ==
+          std::to_string(1000 + yuzu::tar::usage::kDefaultMaxAgeSeconds + 1)); // re-anchored
+}
+
+TEST_CASE("usage: a declined tick does NOT advance the anchor, so a later tick still declines "
+          "against the ORIGINAL good anchor rather than the rejected skewed one",
+          "[tar][usage][fold]") {
+    // The second half of Blocker 2: before the fix, usage_last_fold_ts was
+    // upserted unconditionally even on a declined tick, so one implausible
+    // `now` became the next tick's trusted anchor and permanently disarmed
+    // the guard for the rest of a sustained clock skew.
+    auto t = make_test_db();
+    REQUIRE(usage_ensure_baselined(t.db, 1000).has_value());
+    seed_process_pair(t.db, 1, "old.exe", 1500, -1); // stays open across every tick below
+
+    // Tick 1: establishes a real anchor at now=2000 (small gap, plausible).
+    auto fold1 = run_usage_fold(t.db, /*now=*/2000);
+    REQUIRE(fold1.ok);
+    CHECK(cfg(t.db, "usage_last_fold_ts") == "2000");
+
+    // Tick 2: a huge forward clock jump (> kMaxPlausibleFoldGapSeconds=86400
+    // past the real anchor) -- must decline AND must not advance the anchor.
+    auto fold2 = run_usage_fold(t.db, /*now=*/2000 + 100000);
+    REQUIRE(fold2.ok);
+    CHECK(cfg(t.db, "usage_last_fold_ts") == "2000"); // unchanged -- the core fix
+    CHECK(count_rows(t.db, "usage_live") == 1);       // run 1 still open, not expired
+
+    // Tick 3: `now` that would look plausible against tick 2's SKEWED value
+    // (gap ~500s) but is still >86400 past the real anchor from tick 1 -- if
+    // the bug were present, this tick would wrongly proceed and expire the
+    // run (it is well past kDefaultMaxAgeSeconds by now); the fix must keep
+    // declining against the un-advanced, honest anchor.
+    auto fold3 = run_usage_fold(t.db, /*now=*/2000 + 100000 + 500);
+    REQUIRE(fold3.ok);
+    CHECK(count_rows(t.db, "usage_live") == 1); // STILL open -- guard never healed to the skew
+}
