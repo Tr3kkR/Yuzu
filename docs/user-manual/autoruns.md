@@ -51,22 +51,29 @@ versus one that could not be read at all:
   read failure. Never conflated with `absent`: a caller that only checks
   `row_count == 0` cannot distinguish "empty" from "denied" without reading
   `reason`.
-- **`constrained|<n>|<token>`** (Windows COM/WMI/registry, non-errno) -- a
-  closed set of specific failure causes on this platform, each its own
-  token rather than folded into a generic one: `hr_cominit_failed`
-  (`CoInitializeEx` itself failed before Scheduled Tasks/WMI could even
+- **`constrained|<n>|<token>`** (Windows, non-errno) -- specific failure
+  causes on this platform, each its own token rather than folded into a
+  generic one, spanning COM, WMI, the registry, and plain file listing
+  depending on the source. NOT a closed set: any other COM `HRESULT`
+  Scheduled Tasks/WMI code paths can return falls through to `hr_token()`'s
+  open-ended `hr_0x<hex>` token instead of one of the named ones below.
+  Named tokens: `hr_cominit_failed` (Scheduled
+  Tasks' `CoInitializeEx` itself failed before `ITaskService` could even
   start), `unresolved_ref` (WMI subscription enumeration returned a
-  reference this leg could not resolve), `enumeration_incomplete`/
-  `enumeration_error` (a COM/WMI enumerator stopped or faulted partway
-  through -- same "partial != complete" principle as the directory-walk
-  caps below), `reg_open_failed` (a registry key open failed for a reason
-  other than simple absence), `oversized`/`changed_during_read` (a
-  registry VALUE read hit its size cap or the value mutated mid-read).
-  `null_task`/`null_subfolder`/`unmodelled_action_type` are Scheduled
-  Tasks-specific: a COM call returned a null interface pointer where a
-  real one was expected, or a task action type this leg's schema doesn't
-  decode -- reported as a constraint on that one task, never silently
-  dropped or misread as "no actions."
+  reference this leg could not resolve), `enumeration_incomplete` (a
+  registry key's value enumeration, `RegEnumValueW`, stopped partway
+  through), `enumeration_error` (the Startup-folder's `FindNextFileW`
+  directory listing faulted partway through -- both `enumeration_*` tokens
+  share the same "partial != complete" principle as the directory-walk
+  caps below, just for different underlying mechanisms), `reg_open_failed`
+  (a registry key open failed for a reason other than simple absence),
+  `oversized`/`changed_during_read` (a registry VALUE read hit its size
+  cap or the value mutated mid-read). `null_task`/`null_subfolder`/
+  `unmodelled_action_type` are Scheduled Tasks-specific: a COM call
+  returned a null interface pointer where a real one was expected, or a
+  task action type this leg's schema doesn't decode -- reported as a
+  constraint on that one task, never silently dropped or misread as "no
+  actions."
 - **`unsupported|0|foreign_os`** -- this source belongs to an OS this build
   isn't running on (autoruns_legs.hpp's stub).
 - **`constrained|0|btm_private_database_no_public_api`** (`mac_login_items`)
