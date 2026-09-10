@@ -17922,7 +17922,16 @@ private:
                 // #4029: backs list_product_packs/get_product_pack.
                 product_pack_store_.get(),
                 // #4030: backs list_workflows/get_workflow/get_workflow_execution.
-                workflow_engine_.get());
+                workflow_engine_.get(),
+                // gap-matrix #10: backs the issue_code_signing_cert MCP tool
+                // (ADR-1005 parity with POST /api/v1/ca/issue-code-signing) — the
+                // SAME ServerImpl seam the CaRoutes registration above wires, so the
+                // REST route and the MCP twin mint identically-scoped leaves.
+                [this](const std::string& csr_pem, const std::string& label,
+                       std::optional<int> validity_days,
+                       const std::string& issued_by) -> std::expected<CodeSigningIssuance, std::string> {
+                    return issue_code_signing_leaf(csr_pem, label, validity_days, issued_by);
+                });
         }
 
         // -- Listen -----------------------------------------------------------
