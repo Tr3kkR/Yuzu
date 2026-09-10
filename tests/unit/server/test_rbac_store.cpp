@@ -1351,6 +1351,79 @@ TEST_CASE("RbacStore: an operator's explicit re-grant of Decommission:Delete sur
     CHECK(second_reopen.check_role_has_permission("ITServiceOwner", "Decommission", "Delete"));
 }
 
+// Adversarial review Wave 7 PR7.2b fix round 1: the marker INSERT and
+// permission DELETE used to be two SEPARATE autocommit statements. A fault
+// isolated to the DELETE (marker already committed) durably recorded
+// "migration complete" while the revocation it was supposed to carry
+// forward silently never happened -- and because the marker now existed,
+// grant()'s own WHERE NOT EXISTS guard meant NO LATER boot ever retried it
+// either, so the operator's revoked-SoftwareLicensing intent was permanently
+// never carried onto Decommission:Delete. Force the DELETE to fail via a
+// trigger, confirm the grant survives that boot (the failed attempt must not
+// half-apply), remove the trigger, and confirm the NEXT boot actually
+// retries and completes the carry-forward -- proving the marker was NOT
+// left behind by the failed attempt (the old bug's exact mechanism).
+TEST_CASE("RbacStore: a fault during the Decommission carry-forward DELETE does not durably "
+          "record the marker -- the migration retries and completes on a later boot",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    REQUIRE(store.check_role_has_permission("ITServiceOwner", "Decommission", "Delete"));
+
+    auto removed = store.remove_permission("ITServiceOwner", "SoftwareLicensing", "Delete");
+    REQUIRE(removed.has_value());
+
+    // Force the carry-forward DELETE to fail with a genuine SQL execution
+    // error (never merely a zero-row match) -- a BEFORE DELETE trigger that
+    // raises only for the exact row this migration targets. Scoped to this
+    // test's own cloned database, so it can't leak into any other test.
+    {
+        pg::PgConn conn{PQconnectdb(rbac_db_fx_.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        pg::PgResult fn_res{PQexec(
+            conn.get(),
+            "CREATE OR REPLACE FUNCTION rbac_store.f_decommission_delete_fail() "
+            "RETURNS trigger AS $$ BEGIN IF OLD.role_name = 'ITServiceOwner' AND "
+            "OLD.securable_type = 'Decommission' AND OLD.operation = 'Delete' THEN "
+            "RAISE EXCEPTION 'test-induced carry-forward DELETE failure'; END IF; "
+            "RETURN OLD; END; $$ LANGUAGE plpgsql;")};
+        REQUIRE(fn_res.ok());
+        pg::PgResult trig_res{PQexec(
+            conn.get(),
+            "CREATE TRIGGER t_decommission_delete_fail BEFORE DELETE ON "
+            "rbac_store.role_permissions FOR EACH ROW EXECUTE FUNCTION "
+            "rbac_store.f_decommission_delete_fail();")};
+        REQUIRE(trig_res.ok());
+    }
+
+    // First reopen: the carry-forward attempt's DELETE is blocked. The whole
+    // transaction (including the marker INSERT staged in the SAME
+    // transaction) must roll back -- the grant must survive this boot
+    // UNCHANGED, and no marker may be left behind.
+    {
+        RbacStore first_reopen{rbac_pool_fx_};
+        REQUIRE(first_reopen.is_open());
+        CHECK(first_reopen.check_role_has_permission("ITServiceOwner", "Decommission", "Delete"));
+    }
+
+    // Remove the trigger, then reopen again: if the marker was (incorrectly)
+    // left behind by the failed attempt, this boot's probe would see it
+    // present and skip the migration forever, permanently failing to honor
+    // the operator's revocation. It must instead see the marker still
+    // ABSENT, retry, and this time succeed.
+    {
+        pg::PgConn conn{PQconnectdb(rbac_db_fx_.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        pg::PgResult drop_res{
+            PQexec(conn.get(), "DROP TRIGGER t_decommission_delete_fail ON "
+                               "rbac_store.role_permissions;")};
+        REQUIRE(drop_res.ok());
+    }
+    RbacStore second_reopen{rbac_pool_fx_};
+    REQUIRE(second_reopen.is_open());
+    CHECK_FALSE(
+        second_reopen.check_role_has_permission("ITServiceOwner", "Decommission", "Delete"));
+}
+
 // ── check_scoped_permission ──────────────────────────────────────────────────
 
 namespace {

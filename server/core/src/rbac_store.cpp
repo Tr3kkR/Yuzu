@@ -911,31 +911,74 @@ void RbacStore::seed_defaults() {
     // failed probe must SKIP this migration attempt for the current boot
     // (logged, like every other statement in this function), never be
     // read as "not yet migrated, do the migration."
-    pg::PgResult decommission_marker = pg::exec_params(c,
-        "SELECT 1 FROM rbac_store.revoked_seed_defaults WHERE role_name = 'ITServiceOwner' AND "
-        "securable_type = 'Decommission' AND operation = 'Delete'", std::vector<std::string>{});
-    if (decommission_marker.status() != PGRES_TUPLES_OK) {
-        spdlog::error("RbacStore: seed_defaults Decommission carry-forward probe failed: {}",
-                      PQerrorMessage(c));
+    //
+    // Adversarial review Wave 7 PR7.2b fix round 1 (third instance of this
+    // fail-open class, after rounds 5/6 above): the probe, the marker
+    // INSERT, and the permission DELETE used to run as three SEPARATE
+    // autocommit statements outside any lock, with the INSERT/DELETE bool
+    // results discarded entirely. A transient failure between the marker
+    // INSERT and the permission DELETE durably recorded "migration
+    // complete" via the marker while silently failing to honor the
+    // operator's revocation — grant()'s WHERE NOT EXISTS guard then saw the
+    // marker and skipped re-inserting, so the pre-migration grant the
+    // operator revoked survived, unrevoked, with no error anywhere. Now one
+    // transaction under kRevokeCoordLockSql (the SAME lock grant()/
+    // remove_permission() take for this identical revoke/grant coherence
+    // problem — see that constant's own comment), every statement's result
+    // checked, and the trailing grant() call runs ONLY once this boot's
+    // attempt was decisive (committed, whether or not there was anything to
+    // carry forward) — never after an ambiguous partial failure.
+    bool decommission_migrated = false;
+    if (exec("BEGIN")) {
+        pg::PgTxn txn(c);
+        if (exec(kRevokeCoordLockSql)) {
+            pg::PgResult marker = pg::exec_params(
+                c,
+                "SELECT 1 FROM rbac_store.revoked_seed_defaults WHERE role_name = "
+                "'ITServiceOwner' AND securable_type = 'Decommission' AND operation = 'Delete'",
+                std::vector<std::string>{});
+            if (marker.status() != PGRES_TUPLES_OK) {
+                spdlog::error(
+                    "RbacStore: seed_defaults Decommission carry-forward probe failed: {}",
+                    PQerrorMessage(c));
+            } else if (PQntuples(marker.get()) > 0) {
+                decommission_migrated = true; // already migrated on an earlier boot
+            } else if (exec("INSERT INTO rbac_store.revoked_seed_defaults (role_name, "
+                            "securable_type, operation) SELECT 'ITServiceOwner', "
+                            "'Decommission', 'Delete' WHERE EXISTS ("
+                            "  SELECT 1 FROM rbac_store.revoked_seed_defaults WHERE role_name = "
+                            "'ITServiceOwner' AND "
+                            "  ((securable_type = 'SoftwareLicensing' AND operation = 'Delete') "
+                            "OR "
+                            "   (securable_type = 'Inventory' AND operation = 'Delete') OR "
+                            "   (securable_type = 'GuaranteedState' AND operation = 'Delete'))"
+                            ") ON CONFLICT DO NOTHING") &&
+                      exec("DELETE FROM rbac_store.role_permissions WHERE role_name = "
+                          "'ITServiceOwner' AND "
+                          "securable_type = 'Decommission' AND operation = 'Delete' AND EXISTS ("
+                          "  SELECT 1 FROM rbac_store.revoked_seed_defaults WHERE role_name = "
+                          "'ITServiceOwner' AND "
+                          "  securable_type = 'Decommission' AND operation = 'Delete'"
+                          ")")) {
+                // Succeeds (as valid, zero-or-one-row SQL statements) whether
+                // or not an old revocation actually existed to carry forward
+                // -- the WHERE EXISTS clauses correctly no-op either way, so
+                // reaching here always means this boot's attempt is decisive.
+                decommission_migrated = true;
+            }
+            if (decommission_migrated)
+                txn.commit();
+            // else: probe, insert, or delete failed -- txn destructor rolls
+            // back everything (including a lock-only transaction with no
+            // writes); decommission_migrated stays false.
+        }
     }
-    const bool decommission_marker_probe_ok = decommission_marker.status() == PGRES_TUPLES_OK;
-    const bool decommission_marker_present =
-        decommission_marker_probe_ok && PQntuples(decommission_marker.get()) > 0;
-    if (decommission_marker_probe_ok && !decommission_marker_present) {
-        exec("INSERT INTO rbac_store.revoked_seed_defaults (role_name, securable_type, operation) "
-            "SELECT 'ITServiceOwner', 'Decommission', 'Delete' WHERE EXISTS ("
-            "  SELECT 1 FROM rbac_store.revoked_seed_defaults WHERE role_name = 'ITServiceOwner' AND "
-            "  ((securable_type = 'SoftwareLicensing' AND operation = 'Delete') OR "
-            "   (securable_type = 'Inventory' AND operation = 'Delete') OR "
-            "   (securable_type = 'GuaranteedState' AND operation = 'Delete'))"
-            ") ON CONFLICT DO NOTHING");
-        exec("DELETE FROM rbac_store.role_permissions WHERE role_name = 'ITServiceOwner' AND "
-            "securable_type = 'Decommission' AND operation = 'Delete' AND EXISTS ("
-            "  SELECT 1 FROM rbac_store.revoked_seed_defaults WHERE role_name = 'ITServiceOwner' AND "
-            "  securable_type = 'Decommission' AND operation = 'Delete'"
-            ")");
-    }
-    grant("ITServiceOwner", "Decommission", "Delete");
+    if (decommission_migrated)
+        grant("ITServiceOwner", "Decommission", "Delete");
+    else
+        spdlog::warn("RbacStore: seed_defaults Decommission carry-forward not migrated this "
+                    "boot; ITServiceOwner Decommission:Delete grant deferred, will retry next "
+                    "boot");
 
     // Viewer: read on all except Infrastructure.
     // #2376 (task A) — Viewer held Security:Read (the only non-Administrator
