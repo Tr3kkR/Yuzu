@@ -2037,6 +2037,69 @@ dashboard action is CSRF-protected and requires `Security:Delete`.
 > gateway, not the server, so also disconnect it at the gateway. See
 > `docs/auth-architecture.md` "Gateway-proxied agents: revocation scope".
 
+### Issuing a code-signing certificate (gap-matrix #10)
+
+The internal CA can issue a **code-signing-only** leaf for signing agent
+plugins (`agents/plugins/*.so`, see `docs/user-manual/agent-plugins.md`
+"Plugin Signing"), so operators don't have to stand up a separate hand-rolled
+CA just to get a signer cert. This is **not** a key-minting service — the
+operator generates and keeps the private key; the server only sees and signs a
+CSR.
+
+**End-to-end workflow:**
+
+1. **Generate a keypair and CSR locally** (never sent to the server):
+   ```bash
+   openssl ecparam -genkey -name prime256v1 -out signer.key
+   openssl req -new -key signer.key -out signer.csr -subj "/CN=Plugin Signer"
+   ```
+2. **Submit the CSR** to `POST /api/v1/ca/issue-code-signing` (`Security:Write`)
+   with a `label` (becomes the leaf's subject CN, `^[A-Za-z0-9._-]{1,64}$`) and
+   an optional `validity_days` (default 365, hard ceiling 730):
+   ```bash
+   curl -s -X POST -H "X-Yuzu-Token: $TOKEN" -H 'Content-Type: application/json' \
+     -d "{\"csr_pem\": $(jq -Rs . < signer.csr), \"label\": \"plugin-signer-2026\"}" \
+     https://localhost:8443/api/v1/ca/issue-code-signing > issuance.json
+   jq -r .certificate_pem < issuance.json > signer.pem
+   jq -r .chain_pem       < issuance.json > signer_chain.pem
+   ```
+   The equivalent MCP tool is `issue_code_signing_cert` (same schema,
+   supervised-tier + approval-gated like every other `Security:Write` MCP
+   tool). The issuance is also visible afterward in **Settings → Internal CA**'s
+   issued-certificate inventory (`purpose: code-signing`).
+3. **Sign the plugin** with the returned leaf, including the issuer chain:
+   ```bash
+   openssl cms -sign -binary \
+     -signer signer.pem -inkey signer.key -certfile signer_chain.pem \
+     -in chargen.so -outform pem -out chargen.so.sig
+   ```
+4. **Distribute the trust bundle to agents.** Since the leaf chains to the
+   server's own CA, the trust bundle agents need is simply the already-public
+   CA root — `GET /api/v1/ca/root` — no separate CA-distribution step. Ship it
+   as `/etc/yuzu/plugin-trust-bundle.pem` alongside the `.sig` files, same as
+   any other plugin-signing setup.
+
+**Why this route is scoped to code-signing only.** Usage is hard-pinned to
+`codeSigning` (never `clientAuth`/`serverAuth`), so a leaf issued here is
+rejected outright by the mTLS `SSL_CLIENT` purpose check and can never
+impersonate an agent at the #1118 identity gate regardless of its CN — which is
+what makes it safe to ship while the **general** `POST /api/v1/ca/issue`
+(operator-chosen CN, operator-chosen EKU) stays deferred. See
+`docs/pki-architecture.md` "Code-signing certificate issuance" for the full
+argument.
+
+**Revocation and expiry — operational caveats.** Revoking a code-signing leaf
+(`POST /api/v1/ca/revoke`, same as any other issued cert) republishes the CRL
+and marks it revoked in the issued-certificate inventory — but the agent-side
+plugin-load verifier (`docs/user-manual/agent-plugins.md` "Plugin Code
+Signing") does **not** consult the CRL, so revocation does not yet stop an
+agent from loading a plugin already signed with that leaf. Closing this gap is
+a tracked follow-up (`#4234`); until then, treat "revoked" as "will not be
+reissued/renewed", not "immediately rejected fleet-wide". Separately, the
+signer leaf's own **expiry** already matters: once its `not_after` passes,
+`CMS_verify` rejects the signature at the agent's *next restart* — track
+`not_after` from the issuance response and re-sign/re-issue before it lapses.
+
 ---
 
 ## TLS Configuration

@@ -83,7 +83,10 @@ constexpr std::string_view kNetwork[] = {"get_network_fleet", "list_network_devi
 constexpr std::string_view kExecution[] = {"execute_instruction", "execute_bundle",
                                            "get_bundle_result"};
 constexpr std::string_view kRemediation[] = {"quarantine_device"};
-constexpr std::string_view kCerts[] = {"list_issued_certs", "revoke_certificate"};
+// gap-matrix #10 (ADR-1005 A5 parity): issue_code_signing_cert joins the
+// family — same Security securable domain, same "Certificates" mental model.
+constexpr std::string_view kCerts[] = {"list_issued_certs", "revoke_certificate",
+                                       "issue_code_signing_cert"};
 // KEK rotation (#2395 track C) is its own family, distinct from Certificates:
 // a KEK is the server's own secrets-at-rest encryption key, not a PKI
 // certificate, and it gates on a different lifecycle (rotate/rewrap/status,
@@ -180,7 +183,10 @@ constexpr std::array<ToolFamily, 30> kFamilies{{
     {"Live execution", "dispatch plugin actions or bundles to endpoints and collect results",
      kExecution},
     {"Device remediation", "quarantine a device (destructive, approval-gated)", kRemediation},
-    {"Certificates", "list issued agent certificates and revoke one", kCerts},
+    {"Certificates",
+     "list issued agent certificates, revoke one, and issue a code-signing certificate via "
+     "CSR custody",
+     kCerts},
     {"KEK rotation", "rotate the server's secrets-at-rest encryption key, resume an "
                      "interrupted re-wrap, and check rotation status",
      kKekRotation},

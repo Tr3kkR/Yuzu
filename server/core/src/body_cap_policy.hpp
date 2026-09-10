@@ -270,6 +270,12 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // rejects anything the handler itself would still admit.
     {"POST", "/api/v1/ca/import-chain", 256u * 1024, false, "ca_import_chain"},
 
+    // POST /api/v1/ca/issue-code-signing — code-signing leaf issuance via CSR
+    // custody (gap-matrix #10; ca_routes.cpp kMaxIssueCodeSigningBody,
+    // enforced before nlohmann::json::parse). Mirrors that bound exactly —
+    // same two-authority-split precedent as ca_import_chain/ca_revoke below.
+    {"POST", "/api/v1/ca/issue-code-signing", 64u * 1024, false, "ca_issue_code_signing"},
+
     // POST /api/v1/ca/revoke — serial-scoped cert revocation, JSON body
     // (ca_routes.cpp:24 kMaxRevokeBody, enforced at ca_routes.cpp:394 before
     // the body reaches nlohmann::json::parse). Mirrors that bound exactly —
