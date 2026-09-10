@@ -263,7 +263,13 @@ and the fleet/by-baseline breakdowns.
 **What you will see, if your fleet has Linux endpoints with deployed
 Service-type Guards:** the affected Guard(s)' "% compliant" figure will likely
 move — typically upward, since the double-count previously inflated the
-denominator without inflating the numerator. The fleet honesty banner (the
+denominator without inflating the numerator. If some of those Linux Service
+Guards never actually arm (see the known limitations below), part of any
+upward movement is those pairs going from "counted as not implemented" to
+"not counted at all" — also raises the %, but is coverage disappearing, not
+new enforcement; don't read the whole jump as pure correctness without
+checking D-Bus/systemd reachability on the affected endpoints. The fleet
+honesty banner (the
 list of agents flagged as running on a platform Guardian doesn't fully cover)
 also narrows: it now names an agent only if it owns an *actually*-unenforced
 Guard pair, not merely for being on a less-covered platform, so a Linux agent
