@@ -37,6 +37,7 @@
 
 #include "../test_helpers.hpp"
 
+#include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -95,6 +96,21 @@ GuaranteedStateRuleRow make_rule(std::string rule_id, std::string name) {
     return r;
 }
 
+// #4252: make_rule() leaves spec_json empty, so its rule always falls back to
+// the OS-only rule under guardian::guardian_guard_supported_on_platform. This
+// variant stamps a minimal spec_json carrying a real spark.type (the input the
+// guard-type-aware check actually reads), for tests exercising Service-vs-
+// Registry/File platform-support differences. `os_target` defaults to "" (all
+// OSes) since these tests need to reach agents on multiple platforms from one
+// rule.
+GuaranteedStateRuleRow make_rule_with_spark(std::string rule_id, std::string name,
+                                            std::string spark_type, std::string os_target = "") {
+    GuaranteedStateRuleRow r = make_rule(std::move(rule_id), std::move(name));
+    r.os_target = std::move(os_target);
+    r.spec_json = R"({"spark":{"type":")" + spark_type + R"("},"assertion":{},"remediation":{}})";
+    return r;
+}
+
 struct AuditRecord {
     std::string action;
     std::string result;
@@ -149,6 +165,11 @@ struct Harness {
 
     std::vector<AuditRecord> audit_log;
     std::vector<PushCall> pushes;
+
+    // Real MetricsRegistry (#4252) so tests can assert on
+    // yuzu_server_guardian_platform_matrix_stale_total{spark_type} — the
+    // detectability signal for the double-count exclusion predicate.
+    yuzu::MetricsRegistry metrics;
 
     GuardianRoutes routes;
     yuzu::server::test::TestRouteSink sink;
@@ -207,11 +228,37 @@ struct Harness {
         };
 
         routes.register_routes(sink, auth_fn, perm_fn, audit_fn, emit_fn, store.get(),
-                               baselines.get(), agents_json_fn, push_fn);
+                               baselines.get(), agents_json_fn, push_fn, &metrics);
     }
 
     void seed_guard(const std::string& rule_id, const std::string& name) {
         REQUIRE(store->create_rule(make_rule(rule_id, name)));
+    }
+
+    // Seed a rule directly (bypassing seed_guard's plain make_rule) — for tests
+    // that need a real spark.type (#4252 guard-type-aware platform support).
+    void seed_rule(const GuaranteedStateRuleRow& rule) {
+        REQUIRE(store->create_rule(rule));
+    }
+
+    // Seed a real (agent, rule) status row via a Guardian event — mirrors
+    // RestGsHarness::seed_status in test_rest_guaranteed_state.cpp. event_type
+    // drives the derived state per event_state_from_type (guaranteed_state_
+    // store.cpp): "guard.compliant"/"drift.remediated" -> compliant,
+    // "drift.detected" -> drifted, "guard.unhealthy" -> errored. The upsert
+    // keeps a row only when the new updated_at >= the existing one, so reuse a
+    // strictly increasing ts per (agent, rule) across multiple seeds.
+    void seed_status(const std::string& event_id, const std::string& agent_id,
+                     const std::string& rule_id, const std::string& event_type,
+                     const std::string& ts = "2026-09-01T00:00:00Z") {
+        GuaranteedStateEventRow e;
+        e.event_id = event_id;
+        e.rule_id = rule_id;
+        e.agent_id = agent_id;
+        e.event_type = event_type;
+        e.severity = "info";
+        e.timestamp = ts;
+        REQUIRE(store->insert_event(e).has_value());
     }
 
     // Set up a Baseline directly in the store (state setup for deploy/edit/delete
@@ -975,4 +1022,330 @@ TEST_CASE("a deployed Windows-only Guard does not list connected macOS agents",
     REQUIRE(res != nullptr);
     CHECK(res->body.find("not yet implemented") == std::string::npos);
     CHECK(res->body.find("macbook") == std::string::npos);
+}
+
+// ── #4252: guard-type-aware platform support — the double-count fix ──────────
+// guardian_guard_supported_on_platform now knows Service guards arm (observe-
+// only) on Linux, not just Windows. The core regression: a real Linux Service
+// status row must be counted ONCE, never also folded into the synthetic
+// not-implemented bucket for the same (agent, rule) pair, across every
+// fragment route that computes the census.
+
+TEST_CASE("#4252: a real Linux Service status row is never ALSO folded into "
+          "not-implemented — 2 pairs / 50% compliant, not 3 pairs / 33%",
+          "[pg][guardian_routes][platform][notimpl][4252]") {
+    Harness h;
+    auto rule = make_rule_with_spark("svc1", "ServiceGuard", "service-status-change");
+    h.seed_rule(rule);
+    deploy_via_baseline(h, "svc1");
+
+    // One online Linux agent reporting real DRIFT, one online Windows agent
+    // reporting real COMPLIANCE. Pre-#4252, guardian_enforced_on_platform's
+    // blanket Windows-only check ALSO counted the Linux agent as
+    // not-implemented for this rule — 3 pairs / 33% compliant instead of the
+    // correct 2 pairs / 50%.
+    h.agents_json = R"([
+        {"agent_id":"lin-1","hostname":"linuxbox","os":"linux"},
+        {"agent_id":"win-1","hostname":"winbox","os":"windows"}
+    ])";
+    h.seed_status("e1", "lin-1", "svc1", "drift.detected");
+    h.seed_status("e2", "win-1", "svc1", "guard.compliant");
+
+    SECTION("fleet overview (view=fleet): 50% compliant, no not-implemented, no banner") {
+        auto res = h.sink.Get("/fragments/guardian/status?view=fleet");
+        REQUIRE(res != nullptr);
+        const std::string& body = res->body;
+        CHECK(body.find("50% compliant") != std::string::npos);
+        CHECK(body.find("Not implemented") == std::string::npos);
+        // Both agents own a real, currently-enforced pair — the pair-level
+        // honesty banner must not fire for either of them.
+        CHECK(body.find("Windows only") == std::string::npos);
+    }
+
+    SECTION("by-guard view (view=guard): the card shows the real drift, not not-impl") {
+        auto res = h.sink.Get("/fragments/guardian/status?view=guard");
+        REQUIRE(res != nullptr);
+        const std::string& body = res->body;
+        CHECK(body.find("drifted on 1 of 2 agents") != std::string::npos);
+        CHECK(body.find("not impl") == std::string::npos);
+    }
+
+    SECTION("guard detail page: both devices listed with real state, no not-implemented row") {
+        auto res = h.sink.Get("/fragments/guardian/guard/svc1/page");
+        REQUIRE(res != nullptr);
+        const std::string& body = res->body;
+        CHECK(body.find("linuxbox") != std::string::npos);
+        CHECK(body.find("winbox") != std::string::npos);
+        CHECK(body.find("&#9679; drifted") != std::string::npos);
+        CHECK(body.find("&#9679; compliant") != std::string::npos);
+        CHECK(body.find("not yet implemented") == std::string::npos);
+    }
+
+    SECTION("baseline detail page: 50% compliant, no not-implemented") {
+        auto res = h.sink.Get("/fragments/guardian/baseline/bl1/page");
+        REQUIRE(res != nullptr);
+        const std::string& body = res->body;
+        CHECK(body.find("50%") != std::string::npos);
+        CHECK(body.find("Not implemented") == std::string::npos);
+    }
+}
+
+TEST_CASE("#4252: Registry/File stay Windows-only, and Service stays unsupported "
+          "on macOS — unaffected by the Linux Service fix",
+          "[pg][guardian_routes][platform][notimpl][4252]") {
+    Harness h;
+    SECTION("a deployed Registry guard still flags a Linux agent as not-implemented") {
+        auto rule = make_rule_with_spark("reg1", "RegGuard", "registry-change");
+        h.seed_rule(rule);
+        deploy_via_baseline(h, "reg1");
+        h.agents_json = R"([{"agent_id":"lin-1","hostname":"linuxbox","os":"linux"}])";
+        auto res = h.sink.Get("/fragments/guardian/guard/reg1/page");
+        REQUIRE(res != nullptr);
+        CHECK(res->body.find("not yet implemented") != std::string::npos);
+        CHECK(res->body.find("linuxbox") != std::string::npos);
+    }
+    SECTION("a deployed File guard still flags a Linux agent as not-implemented") {
+        auto rule = make_rule_with_spark("file1", "FileGuard", "file-change");
+        h.seed_rule(rule);
+        deploy_via_baseline(h, "file1");
+        h.agents_json = R"([{"agent_id":"lin-1","hostname":"linuxbox","os":"linux"}])";
+        auto res = h.sink.Get("/fragments/guardian/guard/file1/page");
+        REQUIRE(res != nullptr);
+        CHECK(res->body.find("not yet implemented") != std::string::npos);
+        CHECK(res->body.find("linuxbox") != std::string::npos);
+    }
+    SECTION("a deployed Service guard still flags a macOS agent as not-implemented") {
+        auto rule = make_rule_with_spark("svc2", "ServiceGuard2", "service-status-change");
+        h.seed_rule(rule);
+        deploy_via_baseline(h, "svc2");
+        h.agents_json = R"([{"agent_id":"mac-1","hostname":"macbook","os":"darwin"}])";
+        auto res = h.sink.Get("/fragments/guardian/guard/svc2/page");
+        REQUIRE(res != nullptr);
+        CHECK(res->body.find("not yet implemented") != std::string::npos);
+        CHECK(res->body.find("macbook") != std::string::npos);
+    }
+}
+
+TEST_CASE("#4252: a real status row for a DIFFERENT rule (same agent) does not "
+          "wrongly suppress THIS rule's genuine not-implemented pair",
+          "[pg][guardian_routes][platform][notimpl][4252]") {
+    Harness h;
+    // ruleA: no spec_json -> unknown spark.type -> falls back to the
+    // Windows-only rule, targets all OSes so it also reaches the Mac.
+    auto ruleA = make_rule("regA", "RegA");
+    ruleA.os_target = "";
+    h.seed_rule(ruleA);
+    // ruleB: a Service guard (Linux+Windows supported, not macOS) — deployed
+    // alongside ruleA so both are live at once.
+    auto ruleB = make_rule_with_spark("svcB", "SvcB", "service-status-change");
+    h.seed_rule(ruleB);
+    h.seed_baseline("bl1", "bl1", {"regA", "svcB"});
+    auto dep = h.sink.dispatch("POST", "/fragments/guardian/baseline/bl1/deploy", "",
+                               "application/x-www-form-urlencoded");
+    REQUIRE(dep != nullptr);
+    REQUIRE(dep->status == 200);
+
+    h.agents_json = R"([{"agent_id":"mac-1","hostname":"macbook","os":"darwin"}])";
+    // mac-1 has a REAL status row for ruleB only. The exclusion index is keyed
+    // by (agent, rule) — this must NOT suppress ruleA's genuine
+    // not-implemented pair for the SAME agent.
+    h.seed_status("e1", "mac-1", "svcB", "guard.compliant");
+
+    auto resA = h.sink.Get("/fragments/guardian/guard/regA/page");
+    REQUIRE(resA != nullptr);
+    CHECK(resA->body.find("not yet implemented") != std::string::npos);
+    CHECK(resA->body.find("macbook") != std::string::npos);
+
+    auto resB = h.sink.Get("/fragments/guardian/guard/svcB/page");
+    REQUIRE(resB != nullptr);
+    CHECK(resB->body.find("&#9679; compliant") != std::string::npos);
+    CHECK(resB->body.find("not yet implemented") == std::string::npos);
+
+    // Fleet view: 1 real compliant pair (svcB) + 1 genuine not-implemented pair
+    // (regA), never folded together.
+    auto resFleet = h.sink.Get("/fragments/guardian/status?view=fleet");
+    REQUIRE(resFleet != nullptr);
+    CHECK(resFleet->body.find("50% compliant") != std::string::npos);
+    CHECK(resFleet->body.find("Not implemented") != std::string::npos);
+}
+
+TEST_CASE("#4252: malformed or unknown spark.type falls back to the Windows-only "
+          "rule — never regresses Registry/File support",
+          "[pg][guardian_routes][platform][notimpl][4252]") {
+    Harness h;
+    SECTION("non-string spark.type") {
+        auto rule = make_rule("bad1", "Bad1");
+        rule.os_target = "";
+        rule.spec_json = R"({"spark":{"type":123}})";
+        h.seed_rule(rule);
+        deploy_via_baseline(h, "bad1");
+        h.agents_json = R"([{"agent_id":"lin-1","hostname":"linuxbox","os":"linux"}])";
+        auto res = h.sink.Get("/fragments/guardian/guard/bad1/page");
+        REQUIRE(res != nullptr);
+        CHECK(res->body.find("not yet implemented") != std::string::npos);
+    }
+    SECTION("missing spark block entirely") {
+        auto rule = make_rule("bad2", "Bad2");
+        rule.os_target = "";
+        rule.spec_json = R"({"assertion":{}})";
+        h.seed_rule(rule);
+        deploy_via_baseline(h, "bad2");
+        h.agents_json = R"([{"agent_id":"lin-1","hostname":"linuxbox","os":"linux"}])";
+        auto res = h.sink.Get("/fragments/guardian/guard/bad2/page");
+        REQUIRE(res != nullptr);
+        CHECK(res->body.find("not yet implemented") != std::string::npos);
+    }
+    SECTION("unparseable spec_json") {
+        auto rule = make_rule("bad3", "Bad3");
+        rule.os_target = "";
+        rule.spec_json = "{not valid json";
+        h.seed_rule(rule);
+        deploy_via_baseline(h, "bad3");
+        h.agents_json = R"([{"agent_id":"lin-1","hostname":"linuxbox","os":"linux"}])";
+        auto res = h.sink.Get("/fragments/guardian/guard/bad3/page");
+        REQUIRE(res != nullptr);
+        CHECK(res->body.find("not yet implemented") != std::string::npos);
+    }
+}
+
+TEST_CASE("#4252: an agent with MULTIPLE unenforced pairs is counted ONCE in the "
+          "pair-level honesty banner",
+          "[pg][guardian_routes][platform][notimpl][4252]") {
+    Harness h;
+    auto rule1 = make_rule("reg1", "Reg1");
+    rule1.os_target = "";
+    auto rule2 = make_rule("reg2", "Reg2");
+    rule2.os_target = "";
+    h.seed_rule(rule1);
+    h.seed_rule(rule2);
+    h.seed_baseline("bl1", "bl1", {"reg1", "reg2"});
+    auto dep = h.sink.dispatch("POST", "/fragments/guardian/baseline/bl1/deploy", "",
+                               "application/x-www-form-urlencoded");
+    REQUIRE(dep != nullptr);
+    REQUIRE(dep->status == 200);
+    // One Mac targeted by BOTH deployed rules -> 2 unenforced pairs, but the
+    // SAME agent -> the banner's per-platform count must be 1, not 2.
+    h.agents_json = R"([{"agent_id":"mac-1","hostname":"macbook","os":"darwin"}])";
+
+    auto res = h.sink.Get("/fragments/guardian/status?view=fleet");
+    REQUIRE(res != nullptr);
+    CHECK(res->body.find("macOS 1") != std::string::npos);
+    CHECK(res->body.find("macOS 2") == std::string::npos);
+}
+
+TEST_CASE("#4252: a Linux agent whose Service guard never arms and never reports "
+          "vanishes from the denominator entirely — not double-counted a second way",
+          "[pg][guardian_routes][platform][notimpl][4252]") {
+    Harness h;
+    auto rule = make_rule_with_spark("svc1", "ServiceGuard", "service-status-change");
+    h.seed_rule(rule);
+    deploy_via_baseline(h, "svc1");
+    // Connected Linux agent targeted by the deployed Service rule, but it NEVER
+    // reports any status event for it — the accepted #4252 limitation: agent-
+    // side arm failure (D-Bus unavailable, hitting every containerized/compose
+    // agent including this repo's own UAT rigs; a disabled build flag; or an
+    // invalid unit name) leaves no event for the server to observe. Since
+    // guardian_guard_supported_on_platform now says Linux Service IS
+    // supported, this pair is no longer folded into "not implemented" either
+    // — it must simply be ABSENT everywhere, exactly like an unreported
+    // Windows pair already is, never counted twice.
+    h.agents_json = R"([{"agent_id":"lin-1","hostname":"linuxbox","os":"linux"}])";
+
+    SECTION("fleet overview: no pairs at all, no not-implemented, no banner") {
+        auto res = h.sink.Get("/fragments/guardian/status?view=fleet");
+        REQUIRE(res != nullptr);
+        const std::string& body = res->body;
+        CHECK(body.find("Not implemented") == std::string::npos);
+        CHECK(body.find("Windows only") == std::string::npos);
+        CHECK(body.find("No device check-ins recorded yet") != std::string::npos);
+    }
+
+    SECTION("guard detail page: the agent is not listed at all") {
+        auto res = h.sink.Get("/fragments/guardian/guard/svc1/page");
+        REQUIRE(res != nullptr);
+        const std::string& body = res->body;
+        CHECK(body.find("linuxbox") == std::string::npos);
+        CHECK(body.find("not yet implemented") == std::string::npos);
+        CHECK(body.find("No device has reported this Guard's state yet") != std::string::npos);
+    }
+
+    SECTION("baseline detail page: no pairs at all, no not-implemented") {
+        auto res = h.sink.Get("/fragments/guardian/baseline/bl1/page");
+        REQUIRE(res != nullptr);
+        const std::string& body = res->body;
+        CHECK(body.find("Not implemented") == std::string::npos);
+        CHECK(body.find("No device check-ins recorded yet") != std::string::npos);
+    }
+}
+
+TEST_CASE("#4252: a real status row for a pair the support matrix still calls "
+          "unsupported fires the platform-matrix-stale detectability counter, "
+          "and is not double-counted",
+          "[pg][guardian_routes][platform][notimpl][4252]") {
+    // NOTE on this fixture: registry-change is genuinely Windows-only, both
+    // before and after #4252 — this is deliberate. The counter/exclusion
+    // predicate is a GENERAL safety net for "the matrix says unsupported, but
+    // a real status row exists anyway" (e.g. a future guard type shipping
+    // agent-side before this file's matrix catches up), not something special
+    // to Service/Linux specifically. Constructing that disagreement directly
+    // (a real status row on a pair the matrix still calls unsupported) is the
+    // only way to exercise the mechanism today, since the one case #4252
+    // itself fixed (Service on Linux) is now correctly classified "supported"
+    // and can never reach this code path (see the sibling double-count test
+    // above, which asserts exactly that — 0 hits on this counter there).
+    Harness h;
+    auto rule = make_rule_with_spark("reg1", "RegGuard", "registry-change");
+    h.seed_rule(rule);
+    deploy_via_baseline(h, "reg1");
+    h.agents_json = R"([{"agent_id":"lin-1","hostname":"linuxbox","os":"linux"}])";
+    h.seed_status("e1", "lin-1", "reg1", "drift.detected");
+
+    auto counter = [&] {
+        return h.metrics
+            .counter("yuzu_server_guardian_platform_matrix_stale_total",
+                     {{"spark_type", "registry-change"}})
+            .value();
+    };
+    CHECK(counter() == 0.0);
+
+    // Fleet view (call site #1) detects + suppresses the double-count, firing once.
+    auto resFleet = h.sink.Get("/fragments/guardian/status?view=fleet");
+    REQUIRE(resFleet != nullptr);
+    CHECK(resFleet->body.find("Not implemented") == std::string::npos);
+    CHECK(counter() == 1.0);
+
+    // Baseline detail page (call site #3) independently re-derives the same
+    // condition for the SAME pair on its own render — a separate render-time
+    // detection each time a fragment is loaded, not deduplicated across fragments.
+    auto resBaseline = h.sink.Get("/fragments/guardian/baseline/bl1/page");
+    REQUIRE(resBaseline != nullptr);
+    CHECK(counter() == 2.0);
+
+    // Guard detail page (call site #4) was ALREADY pair-deduped before #4252
+    // (its `seen` set), so it was never at risk of the double-count and
+    // deliberately does not fire this counter.
+    auto resGuard = h.sink.Get("/fragments/guardian/guard/reg1/page");
+    REQUIRE(resGuard != nullptr);
+    CHECK(resGuard->body.find("&#9679; drifted") != std::string::npos);
+    CHECK(resGuard->body.find("not yet implemented") == std::string::npos);
+    CHECK(counter() == 2.0);
+}
+
+TEST_CASE("#4252: the fixed Linux-Service case never reaches the "
+          "platform-matrix-stale counter (it is now correctly classified "
+          "supported, not merely double-count-suppressed)",
+          "[pg][guardian_routes][platform][notimpl][4252]") {
+    Harness h;
+    auto rule = make_rule_with_spark("svc1", "ServiceGuard", "service-status-change");
+    h.seed_rule(rule);
+    deploy_via_baseline(h, "svc1");
+    h.agents_json = R"([{"agent_id":"lin-1","hostname":"linuxbox","os":"linux"}])";
+    h.seed_status("e1", "lin-1", "svc1", "drift.detected");
+
+    auto res = h.sink.Get("/fragments/guardian/status?view=fleet");
+    REQUIRE(res != nullptr);
+    CHECK(h.metrics
+              .counter("yuzu_server_guardian_platform_matrix_stale_total",
+                       {{"spark_type", "service-status-change"}})
+              .value() == 0.0);
 }
