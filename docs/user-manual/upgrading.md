@@ -3170,12 +3170,21 @@ on its next call — **the three old grants no longer suffice**, because the rou
 them at all. Audit your custom roles before upgrading:
 
 ```sql
-SELECT DISTINCT pr.principal_type, pr.principal_id, pr.role_name
+SELECT pr.principal_type, pr.principal_id, pr.role_name
   FROM rbac_store.principal_roles pr
   JOIN rbac_store.role_permissions rp ON rp.role_name = pr.role_name
   WHERE rp.securable_type IN ('SoftwareLicensing', 'Inventory', 'GuaranteedState')
-    AND rp.operation = 'Delete';
+    AND rp.operation = 'Delete'
+    AND rp.effect = 'allow'
+  GROUP BY pr.principal_type, pr.principal_id, pr.role_name
+  HAVING COUNT(DISTINCT rp.securable_type) = 3;
 ```
+
+The old gate was a strict three-way AND — all three grants required together, `effect = 'allow'`
+on each. Matching on any ONE of the three (or including an explicit `effect = 'deny'` row, a legal
+`role_permissions` state) over-reports: a role holding, say, only `Inventory:Delete` for an
+unrelated purpose never had decommission ability under the old conjunction, and granting it
+`Decommission:Delete` now would be a NEW grant, not a preserved one.
 
 Grant `Decommission:Delete` to any custom role in that list that must retain the ability to erase a
 decommissioned device's data. `SoftwareLicensing:Delete`, `Inventory:Delete`, and

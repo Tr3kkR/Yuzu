@@ -359,11 +359,15 @@ schedule-creation time), never by a broadcast exemption carved into this targeti
 surface may cite this exception; every other caller of a Forensics-classified row stays
 single-target, no exceptions.
 
-**`execution_artifacts` (the first Forensics-class plugin) ships default-off.**
-`PluginConfigStore::seed_kill_switch_default_off` seeds a plugin-level kill-switch row
-(`enabled=false`, `set_by="system"`) at boot, `ON CONFLICT (scope_key) DO NOTHING` so it never
-clobbers an operator's own kill-switch decision. An operator enables it explicitly via
-`PUT /api/v1/plugin-config/execution_artifacts/kill-switch`.
+**`execution_artifacts` — planned, not yet built.** This PR ships the `Forensics` securable and
+its single-target dispatch rule with zero registered consumers: no plugin, no
+`capability_decls/*.hpp` row classifies anything `Forensics` yet. `execution_artifacts` (a future
+companion package, referenced elsewhere in this codebase only as a forward-looking name and as a
+synthetic fixture string in `test_dispatch_destructive_gate.cpp`) is planned to be the first
+Forensics-class plugin, but its default-off posture, its kill-switch mechanism, and its enable
+endpoint are planned, not yet designed in detail — there is no `seed_kill_switch_default_off` (or
+equivalent) anywhere in this tree today. Until it lands, `Forensics` exists as authorization
+infrastructure only.
 
 ## Testing
 
