@@ -83,6 +83,32 @@ replica sees live execution progress driven from any replica. See
 | `yuzu_exec_outbox_reap_clock_anomaly_total` | counter | Retention sweep passes DECLINED because the substrate `now()` reading was implausible (forward- or backward-skewed vs the persisted anchor) — the clock-guard refusing to delete under a mistrusted clock. A non-zero/rising value means investigate host/DB clock integrity, not retention. |
 | `yuzu_exec_outbox_store_degrade_total` | counter | `event_outbox` **reap OR cross-replica poll** passes that failed outright (pool-acquire timeout / query error), distinct from a clock-anomaly decline. The two sources share one series today (a `stage` label to separate reap from poll is a follow-up); correlate with `yuzu_pg_acquire_timeout_total` / Postgres health. |
 
+## Command outbox delivery metrics (HA WS-3 3.3)
+
+Scheduled instruction fires enqueue a durable `pending` occurrence to
+`CommandOutboxStore` (schema `command_outbox_store`) instead of dispatching
+inline; a leader-gated delivery loop drains it and performs the actual wire
+dispatch. See `docs/user-manual/instructions.md` "Execution semantics" and
+`docs/postgres-migration-ladder.md`'s `CommandOutboxStore` row.
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_server_command_outbox_degrade_total` | counter | Store-level operation (enqueue/claim) that failed outright against Postgres (pool-acquire timeout / query error), labeled `op`/`reason`. Distinct from the delivery loop's own degrade counter below. |
+| `yuzu_server_command_outbox_delivered_total` | counter | Occurrences the delivery loop actually dispatched to at least one agent (`outcome.sent > 0`). The delivered SLI — deliberately excludes the "reached no agents" outcome below so a rise in no-agent misses cannot mask a drop here. |
+| `yuzu_server_command_outbox_deliver_no_agents_total` | counter | Delivery attempted but reached zero agents right now (nothing currently in scope). Recorded and skipped — same as any other terminal outcome, **not** retried into a backlog. |
+| `yuzu_server_command_outbox_deliver_denied_total` | counter | Re-authorization at send time (arming check) denied the occurrence — authority was revoked between enqueue and delivery. Permanent; the occurrence is marked failed, not retried. |
+| `yuzu_server_command_outbox_deliver_retry_total` | counter | Delivery deferred with back-off because the dispatch-gate read was systemically unreadable (e.g. containment status), a transient condition — the occurrence stays `pending` and is re-driven. A sustained climb means the gate dependency, not the schedule, is unhealthy. |
+| `yuzu_server_command_outbox_deliver_errors_total` | counter | An unexpected exception during `deliver()` for one occurrence — the tick treats it as transient and reschedules with back-off rather than letting it starve the rest of the batch. |
+| `yuzu_server_command_outbox_deliver_decode_failed_total` | counter | A pending row's opaque payload (`agent_ids`/`parameters`) failed to decode — a malformed row, marked failed (permanent), never dispatched with an empty target/param set. |
+| `yuzu_server_command_outbox_deliver_degrade_total` | counter | The delivery loop's own Postgres reads/writes degraded — a `list_pending` read failure (deferring the whole tick) or a `mark_sent` write failure (the wire send already happened; the row stays `pending` and is re-driven, absorbed by agent-side `command_id` dedup). |
+| `yuzu_server_command_outbox_audit_failed_total` | counter | The delivery loop's `command.outbox_delivered` audit row failed to persist (`AuditStore::log()` returned false). A background loop has no request to fail closed, so the dropped compliance row is surfaced here + a warn log rather than swallowed. Any non-zero value means delivery-outcome audit evidence is incomplete — alert on it. |
+| `yuzu_server_command_outbox_pending` | gauge | The current `pending`-occurrence backlog (delivery queue depth). **The primary signal that scheduled dispatch has stalled** — a stuck delivery loop (leadership never acquired, a persistently degraded gate) shows flat event counters everywhere else, so this gauge growing without bound is the tell. |
+
+Until a dedicated alert ships (tracked for WS-11), monitor this family
+manually: alert on `yuzu_server_command_outbox_pending` growing without
+bound, or on `yuzu_server_command_outbox_deliver_retry_total` climbing
+steadily.
+
 ## SSO login metrics
 
 Every SAML and OIDC login attempt — success or failure — increments its provider's login counter. Both counters carry a uniform `{result, role}` label set on every series (including error paths), so a dashboard can group by either label without hitting an unlabelled/labelled split.
@@ -141,6 +167,7 @@ pre-seeded to 0 at boot so `increase()` alerting is meaningful.
 | `yuzu_auth_session_reap_total` | counter, no labels | Expired durable-session rows deleted by the ~15-minute clock-guarded retention sweep — the storage-limitation evidence artifact; belongs alongside the `Yuzu*Retention*` series on a retention dashboard. |
 | `yuzu_auth_session_reap_clock_anomaly_total` | counter, no labels | The **DB-PRIMARY** clock-integrity monitor (ADR-2002 §4 mitigation (a)): a reap pass was declined because Postgres `now()` (read in-SQL — the same clock that authors `expires_at`) was implausibly ahead of/behind the persisted anchor, i.e. a backward/forward DB-primary clock step. A backward step is what would un-expire sessions / extend elevation & MFA windows toward their authored max. `YuzuSessionReapClockAnomaly` alerts on it — investigate the **database primary's** clock first. |
 | `yuzu_auth_local_clock_backward_total` | counter, no labels | The **LOCAL host-clock** drift monitor (#3715): a replica's own wall clock was observed falling behind monotonic time. DISTINCT from the reap series — under DB-clock authority session adjudication no longer rides this host's wall clock, so a local wobble is a host-health signal, NOT a session-integrity one (do not conflate the two during a clock incident). Observe-only today; no dedicated alert. |
+| `yuzu_auth_get_user_role_store_error_total` | counter, no labels | `AuthManager::get_user_role()` (the DB-authoritative role check behind legacy API-token authentication) hit a genuine AuthDB store error, not a plain not-found/invalid-username miss (#4020). Each occurrence floors the caller's legacy-token-authenticated request to `Role::user` via `auth_routes.cpp`'s `.value_or(Role::user)` — the only caller-visible signal that a store degradation is silently demoting requests, since the paired `spdlog::error` line is easy to miss under load. Pre-seeded to 0; no dedicated alert yet (follow-up). |
 
 | Metric | Type | Meaning |
 |---|---|---|
@@ -1243,8 +1270,8 @@ upgraded to a spark-capable (rung-1+) build. During a phased agent rollout of a
 | `yuzu_fleet_spark_mechanisms{os,mechanism}` | gauge | Agents **of that OS** whose spark capability includes that mechanism (from the `spark_mechs` CSV). Counts only mechanisms that are registered **and functional**: one that started but could not bind its OS facility — most commonly a **containerised Linux host, which has no systemd system bus** — is reported inert and **excluded**, because every watch on it would be refused. An OS with agents in `_reporting` but no `{mechanism}` series either does not support it (e.g. no `file` on `linux`) or cannot use it there |
 | `yuzu_fleet_spark_armed_faulted{os}` | gauge | Fleet sum of armed watches a mechanism reported deaf. A **live** gauge (recovers when the watch recovers), not cumulative — `> 0` means detection is silently down for that many watches. 0 at rung 1 (nothing armed) |
 | `yuzu_fleet_spark_watch_rejected{os,mechanism}` | gauge | Fleet sum of cumulative watch-cap rejections (a rule that could not arm — denial-of-detection). 0 at rung 1 |
-| `yuzu_fleet_spark_quarantined{os,mechanism}` | gauge | Fleet sum of cumulative mechanism quarantines — a structural leak that should stay 0. 0 at rung 1 |
-| `yuzu_fleet_spark_slow_op{os,mechanism}` | gauge | Fleet sum of cumulative slow watch/unwatch ops (a stalled/contended watcher). 0 at rung 1 |
+| `yuzu_fleet_spark_quarantined{os,mechanism}` | gauge | Fleet sum of work a mechanism had to abandon at stop() instead of completing: File - watches leaked to process lifetime (a structural leak); Registry - establishment probes still parked on a detached worker when the mechanism stopped (leaked-and-counted, self-disposing). Should stay 0. 0 at rung 1 |
+| `yuzu_fleet_spark_slow_op{os,mechanism}` | gauge | Fleet sum of cumulative watch-establishment work past the mechanism's own threshold: File - a slow arm-path OS operation under its lock; Registry - an arm or re-arm obligation unestablished past its 50 ms health grace (a stalled, refused or admission-saturated watcher). 0 at rung 1 |
 | `yuzu_fleet_spark_unsupported{os,mechanism}` | gauge | Fleet sum of rules **currently** classified `unsupported` - a known spark type with no mechanism on that host, enforced by **neither** backend (F7, #2298 rung 2). A **live** gauge recomputed every sweep, not cumulative - it can legally decrease (e.g. a mechanism becoming available, or the rule being disabled/removed). **0 today**: classification only runs once an agent's `prefer_spark` is enabled, which is not yet true anywhere in production (see `yuzu.guardian_backend`, still `legacy` fleet-wide). Once enabled, every rule on macOS reads `unsupported`, since macOS registers none of file/registry/service - routine and expected there, not page-worthy |
 | `yuzu_fleet_spark_watch_faults{os}` | gauge | Fleet sum of cumulative post-arm watch-fault edges (`watch_faults_total`). 0 at rung 1 |
 | `yuzu_fleet_spark_queued_dropped{os}` | gauge | Fleet sum of cumulative queued events dropped (bounded-queue overflow + shutdown). On the enforce lane (rung 3) a drop is a silent compliance failure. 0 at rung 1 |

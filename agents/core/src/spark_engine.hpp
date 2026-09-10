@@ -177,6 +177,12 @@ struct SparkEngineStats {
     std::uint64_t mech_watch_rejected_total{0};
     std::uint64_t mech_quarantined_total{0};
     std::uint64_t mech_slow_op_total{0};
+    /// #2818: Lost notifications actually DELIVERED (i.e. the drop_key_locked call site
+    /// found >=1 live subscriber to notify before erasing the key). Distinct from
+    /// watch_faults_total/armed_faulted, which already cover the Faulted/Recovered edge
+    /// at the key level — this counts the previously-invisible hard-kill case
+    /// specifically. Monotonic.
+    std::uint64_t subscription_lost_total{0};
 };
 
 class YUZU_EXPORT SparkEngine {
@@ -286,6 +292,11 @@ public:
     [[nodiscard]] bool is_running() const noexcept;
 
     [[nodiscard]] SparkEngineStats stats() const;
+
+    /// #2818: cheap, lock-only (mu_), no I/O — safe to call from any context, including
+    /// a periodic backstop sweep (GuardianSparkRuntime::revalidate_subscriptions). See
+    /// SubscriptionHealth's own doc comment for why this needs no incarnation counter.
+    [[nodiscard]] SubscriptionHealth subscription_health(SubscriptionId id) const;
 
     /// Per-mechanism-type snapshot of the mechanism-owned counters (#2011 rung 1).
     /// Keyed by the registered SparkType — the KEY that stats() sums away — so the
@@ -572,16 +583,33 @@ private:
     /// RESOLVED cross-mechanism coupling (#2011): a slow watch() on one
     /// mechanism no longer blocks a concurrent arm/disarm on a DIFFERENT
     /// mechanism (e.g. File no longer blocks Registry/Service) — the HARD GATE
-    /// closed before Stage 2 wires the second live mechanism under load. STILL
-    /// OPEN (distinct follow-up, NOT closed by #2011): a slow watch() still
-    /// stalls its OWN type's arm/disarm queue for the full duration, and that
-    /// duration is unbounded — spark_file's arm_ancestor deadline (#1980) bounds
-    /// the NUMBER of slow probes to ~one, not the wall-clock of any one probe
-    /// (fs::is_directory is uninterruptible, so a hung probe on a dead UNC path
-    /// holds File's lock for the full OS network timeout); Registry (TP_WAIT)
-    /// and Service (SCM query) watch latencies are entirely UNCHARACTERISED.
-    /// Truly bounding the per-type stall needs the walk-off-mu_ (probe on a
-    /// separate thread) restructure — a deferred follow-up, unscheduled.
+    /// closed before Stage 2 wires the second live mechanism under load.
+    /// SAME-TYPE stall (#2012/#3840, the walk-off-mu_ restructure), per
+    /// mechanism: a slow watch() stalls its OWN type's arm/disarm queue for as
+    /// long as the mechanism lets it. REGISTRY is bounded since PR-B1
+    /// (spark_registry.cpp): watch() reserves under the mechanism's own lock,
+    /// runs the probe on a detached F3-counted worker, waits at most
+    /// kRegCallerWaitBudget (50 ms - PR-B's chosen initial policy value, not a
+    /// measured bound; the measured inputs in docs/spark-rebuild-baselines/
+    /// stage2-watch-establish-latency.md sit at 82 us / 1264 us p99) and
+    /// otherwise publishes the probe to its sweeper; unwatch() hands the
+    /// blocking callback drain to a detached worker and returns in
+    /// microseconds - which also closes the #4181 same-type reentrant deadlock
+    /// (this lock held across that drain while the drained callback's Inline
+    /// consumer needed it). Cost: a consumed Target-mode Registry notification is now TWO
+    /// emit submissions (the immediate fire, then a synthetic fire when the
+    /// asynchronous re-arm commits) - a queued consumer's per-consumer,
+    /// drop-oldest queue (deliver()) can therefore be pushed by a noisy key's
+    /// synthetic fire into evicting a quiet key's only fire, a detection-
+    /// latency/fairness cost, and nothing here dedups on the wire (Guardian's
+    /// decide_emit re-emits Drift past debounce_ms regardless). STILL OPEN for
+    /// FILE and SERVICE (PR-B2/PR-B3): a
+    /// File watch() still blocks for the OS-call duration - spark_file's
+    /// arm_ancestor deadline (#1980) bounds the NUMBER of slow probes to ~one,
+    /// not the wall-clock of any one probe (fs::is_directory is uninterruptible,
+    /// so a hung probe on a dead UNC path holds File's lock for the full OS
+    /// network timeout); Service's queue-push watch()/unwatch() are already
+    /// O(1) but its SCM open/notify run head-of-line on its worker.
     /// Populated in register_mechanism() under mu_, in lockstep with
     /// mechanisms_, and — like mechanisms_ — never erased thereafter, so a
     /// std::mutex& obtained via .at(type) is safe to hold across the blocking
@@ -646,6 +674,7 @@ private:
     std::atomic<std::uint64_t> arm_race_unwatch_failures_{0}; ///< monotonic; teardown_arm_race ONLY (#2270)
     std::atomic<std::uint64_t> disarm_unwatch_failures_{0};   ///< monotonic; disarm() ONLY (#2270)
     std::atomic<std::uint64_t> teardown_join_timeouts_{0};    ///< monotonic; stop()'s lease wait expired (#2815)
+    std::atomic<std::uint64_t> subscription_lost_{0}; ///< monotonic; #2818 Lost notifications delivered
 
     /// #2815 TEARDOWN LEASE. Callers currently inside one of the FOUR windows that
     /// resolve a raw `ISparkMechanism*` (and this engine's mech_ops_mu_by_type_ entry)

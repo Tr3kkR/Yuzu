@@ -905,7 +905,7 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
             guarded(command_id, "audit_quarantine_dispatch_denied_batch", deps.metrics, [&] {
                 deps.audit_quarantine_dispatch_denied_batch_fn(
                     "command", caller.principal, caller.principal_role, command_id,
-                    std::move(denied_quarantined));
+                    denied_quarantined);
             });
         }
         guarded(command_id, "audit_unknown_plugin_dispatch", deps.metrics, [&] {

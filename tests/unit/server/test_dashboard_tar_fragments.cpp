@@ -210,7 +210,8 @@ struct FragmentHarness {
         // twice — first-match-wins would then serve handlers bound to the
         // FIRST call's dependencies while the members hold the second call's.
         // Nothing else would fail, so pin the count.
-        REQUIRE(sink.route_count() == 12);
+        // #4027: +1 for GET /api/v1/tar/retention-paused.
+        REQUIRE(sink.route_count() == 13);
 
         // PR6.0b: `/api/dashboard/execute` now consults a `ClassifyFn` for the
         // Destructive TARGETING gate, and an UNWIRED one refuses every

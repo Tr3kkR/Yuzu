@@ -24,6 +24,7 @@ All `curl` examples assume a running Yuzu server at `https://localhost:8080` (HT
 | [Installed-Software Inventory](inventory.md) | Daily machine-scope installed-software sync to central Postgres (hash-skip, fleet-wide queries); first source of the agent daily-sync framework |
 | [Software Licence Detection (SLE)](software-licensing.md) | Daily detection of installed software licences — type, channel, status, expiry — across Windows/Linux/macOS; the `/api/v1/sle/*` read surface + audited erasure; per-user `user_ref` privacy controls |
 | [Agent Plugins](agent-plugins.md) | Plugin architecture, available plugins, and plugin development |
+| [Autoruns](autoruns.md) | Persistence-source enumeration ("what starts automatically") across Windows (Run keys, Scheduled Tasks, WMI subscriptions), Linux (cron/systemd timers, XDG autostart), and macOS (launchd, Login Items) — the versioned 34-source catalog, row/status semantics, and real-hardware verification |
 | [Cookbook](cookbook.md) | Practical examples for every plugin -- YAML, Python, CEL, Dashboard UI, and instruction chaining |
 | [Policy Engine](policy-engine.md) | Desired-state rules, triggers, compliance checks, and auto-remediation |
 | [Pre-flight readiness (`/auto`)](preflight.md) | Operator go/no-go checks across a device cohort before a fleet change — app/OS/disk/reboot thresholds, grouped by device, owner-scoped persisted runs with re-dispatch-on-reconnect |
@@ -52,7 +53,7 @@ The following features are documented within the files listed above:
 | Device Quarantine | [Security Hardening](security-hardening.md#device-quarantine) | Network isolation for compromised devices |
 | IOC Checking | [Security Hardening](security-hardening.md#ioc-checking) | Indicator of Compromise scanning for threat hunting |
 | Certificate Inventory | [Security Hardening](security-hardening.md#certificate-inventory) | System certificate enumeration, inspection, and deletion |
-| WiFi & WoL | [Agent Plugins](agent-plugins.md#wifi) | WiFi network scanning and Wake-on-LAN magic packets |
+| WiFi & WoL | [Agent Plugins](agent-plugins.md) · `agents/plugins/wifi/README.md`, `agents/plugins/wol/README.md` | WiFi network scanning and Wake-on-LAN magic packets |
 | Patch Management | [REST API](rest-api.md) | Patch deployment, status tracking, and fleet compliance (via `PatchManager`) |
 | Webhooks | [REST API](rest-api.md) | Event-driven HTTP notifications to external systems |
 | Product Packs | [REST API](rest-api.md) | Signed YAML bundles containing definitions, policies, and templates |
@@ -66,6 +67,8 @@ The following features are documented within the files listed above:
 | [Disaster Recovery](../operations/disaster-recovery.md) | Backup strategy, restore procedures, and failover architecture |
 | [Certificate Renewal](../operations/certificate-renewal.md) | TLS certificate lifecycle, rotation, and automated renewal |
 | [Capacity Planning](../operations/capacity-planning.md) | Server sizing, storage growth, network bandwidth, and scaling patterns |
+| [TAR Power Source](tar-power.md) | TAR power capture source: AC-line and sleep/wake history — on by default |
+| [TAR Removable Source](tar-removable.md) | TAR removable-media capture source: attach/detach and executed-from-removable evidence — on by default |
 
 ---
 

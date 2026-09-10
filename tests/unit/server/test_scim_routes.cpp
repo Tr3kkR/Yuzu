@@ -1077,14 +1077,20 @@ TEST_CASE("ScimRoutes: deprovision refused once an operator elevates the SCIM ac
 TEST_CASE("ScimRoutes: deprovision refused for a DB-elevated admin even with a COLD "
          "AuthManager cache (H2, 2026-07-08 review — fail-closed, not fail-open)",
          "[pg][scim][routes][deprov_role][cold_cache]") {
-    // H2: AuthManager::get_user_role only ever reads the in-memory `users_`
-    // cache, which nothing preloads at construction. A freshly-started
-    // process (modeled here by a SECOND AuthManager wired to the SAME
-    // AuthDB, whose cache has never seen this username) previously read
-    // back nullopt for a DB-elevated admin and treated that as "no
-    // elevation on file" — deactivating an admin an operator had promoted
-    // out of SCIM's ownership. The fix reads the role authoritatively from
-    // AuthDB (db_authoritative_role) instead.
+    // H2 (2026-07-08 review): AuthManager::get_user_role ONLY EVER read the
+    // in-memory `users_` cache at the time, which nothing preloads at
+    // construction. A freshly-started process (modeled here by a SECOND
+    // AuthManager wired to the SAME AuthDB, whose cache has never seen this
+    // username) previously read back nullopt for a DB-elevated admin and
+    // treated that as "no elevation on file" — deactivating an admin an
+    // operator had promoted out of SCIM's ownership. THIS test's fix
+    // (contemporaneous with H2) reads the role authoritatively from AuthDB
+    // via a dedicated helper (db_authoritative_role) at the specific
+    // deprovision-role-check call site. (get_user_role() ITSELF stayed
+    // cache-only until a much later, separate governance BLOCKING fix — see
+    // the NOTE a few lines below — so as of THIS test's own authoring date
+    // the description above was accurate; it is preserved for history, not
+    // because it's still true of the function today.)
     Fixture f;
     auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "cora"}})->body);
     auto id = created["id"].get<std::string>();
@@ -1098,11 +1104,15 @@ TEST_CASE("ScimRoutes: deprovision refused for a DB-elevated admin even with a C
 
     // A second AuthManager over the SAME AuthDB file/object, standing in
     // for a fresh process: its users_ cache has never been populated for
-    // either username.
+    // either username. (NOTE: get_user_role() is no longer a valid "cache is
+    // cold" probe as of a later governance BLOCKING fix that made it itself
+    // AuthDB-authoritative — see auth.cpp's doc on that method. This
+    // incidentally closes PR #2018's own N1 follow-up, which flagged that
+    // get_user_role()'s staleness class also reached two SCIM PUT/PATCH
+    // desync branches beyond the H2 fix below; those now read live state
+    // too, with no further change needed here.)
     auth::AuthManager cold_auth_mgr;
     cold_auth_mgr.set_auth_db(f.auth_db.get());
-    REQUIRE_FALSE(cold_auth_mgr.get_user_role("cora").has_value());
-    REQUIRE_FALSE(cold_auth_mgr.get_user_role("dana").has_value());
 
     // Prime the cache for "dana" only, via `reactivate_user` — a legitimate,
     // idempotent AuthDB write (harmless on an already-active row; clears
@@ -1426,6 +1436,16 @@ TEST_CASE("revoke_deprovision_credentials: revokes tokens and sessions for EVERY
          "the resolved set",
          "[pg][scim][adr2001][orchestrator]") {
     Fixture f;
+    // #4107 Gate 8 CI finding: create_local_session() now fails closed
+    // (via post_mint_role_recheck) when the account has no AuthDB `users`
+    // row at all - the same UserNotFound branch that denies a genuinely
+    // removed account. In production every create_local_session() caller
+    // reaches it only after a real local-auth verify_password() call,
+    // which already guarantees the row exists; this test used to mint a
+    // session for "yolanda" directly, with no such row, an unrealistic
+    // precondition no real caller can produce. Seed it for real instead of
+    // weakening the production fail-closed check.
+    REQUIRE(f.auth_mgr.upsert_user("yolanda", "yolandapassword1", auth::Role::user));
     auto slug_token = f.token_store->create_token("t1", "yolanda");
     REQUIRE(slug_token.has_value());
     const std::string oidc_principal =

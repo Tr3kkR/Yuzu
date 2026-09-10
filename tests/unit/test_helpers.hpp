@@ -33,6 +33,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <system_error> // std::error_code (wait_until_quiescent)
 #include <functional>
 #include <random>
 #include <string>
@@ -1315,5 +1316,50 @@ template <typename Sqlite3T> struct SqliteHandleOwner {
 };
 /// Pins the sealing above: a copy or a move would double-close.
 static_assert(kSqliteOwnerIsSealed<struct SqliteOwnerSealCheck>);
+
+/// Wait until this process is thread-quiescent: no thread other than the caller (plus,
+/// under ThreadSanitizer, TSan's own lazily-started background thread) exists. For the
+/// fork()-without-exec death tests: a detached executor worker from an EARLIER test case
+/// can still be in its exit tail at fork time (every such case spins for
+/// active_worker_count()==0, which is the last SELF-observable point, not OS-thread exit),
+/// and TSan then kills the child the moment it starts a thread ("starting new threads
+/// after multi-threaded fork is not supported", die_after_fork) - observed 2 of 6 runs of
+/// the `[spark][guardian][reconcile]` tag under TSan on rung 9c PR-1 (governance pass-3
+/// qe-2/cp-1/cs-4). Linux only (reads /proc/self/task); elsewhere it returns true at once
+/// and the pre-existing residual stands. Bounded by `timeout` (scaled like spin_until);
+/// false on timeout so a caller can REQUIRE it and fail loudly instead of forking blind.
+[[nodiscard]] inline bool wait_until_quiescent(std::chrono::milliseconds timeout =
+                                                   std::chrono::seconds(5)) {
+#if defined(__linux__)
+    constexpr int kTsanBackground =
+#if defined(__SANITIZE_THREAD__)
+        1;
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+        1;
+#else
+        0;
+#endif
+#else
+        0;
+#endif
+    const auto live_tasks = [] {
+        int n = 0;
+        std::error_code ec;
+        for (const auto& e : std::filesystem::directory_iterator("/proc/self/task", ec)) {
+            (void)e;
+            ++n;
+        }
+        return ec ? -1 : n; // -1: /proc unreadable -> treat as quiescent (do not wedge)
+    };
+    return spin_until([&] {
+        const int n = live_tasks();
+        return n < 0 || n <= 1 + kTsanBackground;
+    }, timeout);
+#else
+    (void)timeout;
+    return true;
+#endif
+}
 
 } // namespace yuzu::test

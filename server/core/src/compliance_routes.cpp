@@ -5,17 +5,20 @@
 
 #include "compliance_routes.hpp"
 
+#include "compliance_model.hpp"      // shared REST/MCP/fragment builders (#4034, recipe Rule 1)
 #include "dispatch_target_shape.hpp" // check_targeting_shape (#2500)
 
 #include "policy_evaluator.hpp"
-#include "rest_a4_envelope_http.hpp" // detail::a4_denial (deny_service_scoped_) — mints/reuses
-                                     // X-Correlation-Id so header and body always agree
+#include "rest_a4_envelope_http.hpp" // detail::a4_denial/a4_error/ensure_correlation_id — mints/
+                                     // reuses X-Correlation-Id so header and body always agree
+#include "rest_audit.hpp"           // detail::emit_behavioral_audit (#1647, #4034 follow-up)
 #include "store_errors.hpp"
 #include "web_utils.hpp"
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <chrono>
 #include <string>
 #include <vector>
@@ -24,6 +27,32 @@
 extern const char* const kComplianceHtml;
 
 namespace yuzu::server {
+
+namespace {
+
+/// #4034 — local A4-envelope success wrappers, same shape/rationale as
+/// rest_api_v1.cpp's/sle_routes.cpp's own TU-local `ok_json`/`list_json`
+/// (each self-registering route module keeps its own copy rather than
+/// sharing one across TUs — see sle_routes.cpp's file header for the
+/// established precedent this file follows).
+std::string ok_json(nlohmann::json data) {
+    nlohmann::json out;
+    out["data"] = std::move(data);
+    out["meta"] = nlohmann::json{{"api_version", "v1"}};
+    return out.dump();
+}
+
+std::string list_json(nlohmann::json data, int64_t total, int64_t start = 0,
+                      int64_t page_size = 50) {
+    nlohmann::json out;
+    out["data"] = std::move(data);
+    out["pagination"] =
+        nlohmann::json{{"total", total}, {"start", start}, {"page_size", page_size}};
+    out["meta"] = nlohmann::json{{"api_version", "v1"}};
+    return out.dump();
+}
+
+} // namespace
 
 // ── Static helpers ──────────────────────────────────────────────────────────
 
@@ -64,14 +93,20 @@ std::string ComplianceRoutes::render_compliance_summary_fragment() {
                     degraded = true;
                     continue;
                 }
+                // #4034 Rule 1: identity/scope/enabled and compliant/total come
+                // from the SAME builders GET /api/v1/policies and
+                // GET /api/v1/compliance/{id} call — this fragment cannot drift
+                // from the REST/MCP field selection (docs/api-twin-recipe.md §1).
+                nlohmann::json row_j = policy_list_row_json(p);
+                nlohmann::json cs_j = compliance_summary_json(*cs);
                 PolicyRow row;
-                row.id = p.id;
-                row.name = p.name;
-                row.scope = p.scope_expression;
-                row.total = static_cast<int>(cs->total);
-                row.compliant = static_cast<int>(cs->compliant);
-                row.pct = (cs->total > 0) ? static_cast<int>(cs->compliant * 100 / cs->total) : 0;
-                row.enabled = p.enabled;
+                row.id = row_j.at("id").get<std::string>();
+                row.name = row_j.at("name").get<std::string>();
+                row.scope = row_j.at("scope_expression").get<std::string>();
+                row.enabled = row_j.at("enabled").get<bool>();
+                row.compliant = static_cast<int>(cs_j.at("compliant").get<int64_t>());
+                row.total = static_cast<int>(cs_j.at("total").get<int64_t>());
+                row.pct = (row.total > 0) ? (row.compliant * 100 / row.total) : 0;
                 policies.push_back(std::move(row));
             }
         }
@@ -179,27 +214,38 @@ std::string ComplianceRoutes::render_compliance_detail_fragment(const std::strin
 
     std::vector<AgentRow> agents;
     bool degraded = false;
+    // #4034 Rule 1: same confined_policy_compliance tally REST's
+    // GET /api/v1/compliance/{id} and MCP's get_policy_agent_statuses use to
+    // count agents by status (scope=nullopt/TOP — this fragment has no
+    // confinement gate of its own to derive a narrower scope from; the
+    // fragment's separate lack-of-RBAC-gate gap is #4042's job, not this
+    // one's). Default-constructed (all-zero) until the block below runs, so
+    // it stays valid across the degraded/empty early-returns further down.
+    ConfinedPolicyCompliance confined;
+    confined.summary.policy_id = policy_id;
     if (policy_store_ && policy_store_->is_open()) {
         auto statuses = policy_store_->get_policy_agent_statuses(policy_id);
         if (!statuses) {
             degraded = true;
             statuses = std::vector<PolicyAgentStatus>{};
         }
-        for (const auto& s : *statuses) {
+        confined = confined_policy_compliance(*statuses, /*scope=*/std::nullopt, policy_id);
+        for (const auto& s : confined.visible) {
+            nlohmann::json row_j = policy_agent_status_json(s);
             AgentRow row;
-            row.agent_id = s.agent_id;
-            row.status = s.status;
-            row.detail = s.check_result;
+            row.agent_id = row_j.at("agent_id").get<std::string>();
+            row.status = row_j.at("status").get<std::string>();
+            row.detail = row_j.at("check_result").get<std::string>();
 
             // Look up hostname/os from agent registry
-            row.hostname = s.agent_id;
+            row.hostname = row.agent_id;
             row.os = "";
             try {
                 auto agents_json_str = agents_json_fn_();
                 auto arr = nlohmann::json::parse(agents_json_str);
                 for (const auto& a : arr) {
-                    if (a.value("agent_id", std::string{}) == s.agent_id) {
-                        row.hostname = a.value("hostname", s.agent_id);
+                    if (a.value("agent_id", std::string{}) == row.agent_id) {
+                        row.hostname = a.value("hostname", row.agent_id);
                         row.os = a.value("os", std::string{});
                         break;
                     }
@@ -207,11 +253,12 @@ std::string ComplianceRoutes::render_compliance_detail_fragment(const std::strin
             } catch (...) {}
 
             // Format last_check as relative time
-            if (s.last_check_at > 0) {
+            const int64_t last_check_at = row_j.at("last_check_at").get<int64_t>();
+            if (last_check_at > 0) {
                 auto now = std::chrono::duration_cast<std::chrono::seconds>(
                                std::chrono::system_clock::now().time_since_epoch())
                                .count();
-                auto delta = now - s.last_check_at;
+                auto delta = now - last_check_at;
                 if (delta < 60) row.last_check = std::to_string(delta) + "s ago";
                 else if (delta < 3600) row.last_check = std::to_string(delta / 60) + " min ago";
                 else row.last_check = std::to_string(delta / 3600) + "h ago";
@@ -243,15 +290,13 @@ std::string ComplianceRoutes::render_compliance_detail_fragment(const std::strin
                "Agents will report status once the policy triggers fire.</div></div>";
     }
 
-    // Count statuses
-    int compliant = 0, non_compliant = 0, unknown = 0, fixing = 0, error_count = 0;
-    for (const auto& a : agents) {
-        if (a.status == "compliant") ++compliant;
-        else if (a.status == "non_compliant") ++non_compliant;
-        else if (a.status == "unknown") ++unknown;
-        else if (a.status == "fixing") ++fixing;
-        else if (a.status == "error") ++error_count;
-    }
+    // Status counts come from the SAME confined_policy_compliance tally the
+    // agent-row loop above populated `confined.summary` with (#4034 Rule 1) —
+    // no second hand-rolled status if/else chain.
+    const int compliant = static_cast<int>(confined.summary.compliant);
+    const int non_compliant = static_cast<int>(confined.summary.non_compliant);
+    const int unknown = static_cast<int>(confined.summary.unknown);
+    const int fixing = static_cast<int>(confined.summary.fixing);
 
     std::string html;
     html += "<div class=\"detail-panel\">"
@@ -355,7 +400,8 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
                                        PolicyStore* policy_store,
                                        AgentsJsonFn agents_json_fn,
                                        PolicyEvaluator* policy_evaluator,
-                                       yuzu::MetricsRegistry* metrics) {
+                                       yuzu::MetricsRegistry* metrics,
+                                       FleetReadFn fleet_read_fn) {
     // Production shim — wrap the real server in an HttplibRouteSink and
     // delegate to the sink-based overload. Same handlers, same lambdas,
     // same observable behaviour. Test code calls the sink overload directly
@@ -363,7 +409,7 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
                     std::move(emit_event_fn), policy_store, std::move(agents_json_fn),
-                    policy_evaluator, metrics);
+                    policy_evaluator, metrics, std::move(fleet_read_fn));
 }
 
 void ComplianceRoutes::register_routes(HttpRouteSink& sink,
@@ -374,7 +420,8 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
                                        PolicyStore* policy_store,
                                        AgentsJsonFn agents_json_fn,
                                        PolicyEvaluator* policy_evaluator,
-                                       yuzu::MetricsRegistry* metrics) {
+                                       yuzu::MetricsRegistry* metrics,
+                                       FleetReadFn fleet_read_fn) {
     // Store dependency pointers
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
@@ -384,6 +431,7 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
     policy_store_ = policy_store;
     agents_json_fn_ = std::move(agents_json_fn);
     policy_evaluator_ = policy_evaluator;
+    fleet_read_fn_ = std::move(fleet_read_fn);
 
     // -- Compliance dashboard page ----------------------------------------
     sink.Get("/compliance",
@@ -1171,6 +1219,303 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
                                 {"agents", agents_arr}})
                     .dump(),
                 "application/json");
+        });
+
+    // ── /api/v1/compliance* + /api/v1/polic* — REST v1 twins of the legacy
+    // /api/compliance*, /api/policies*, /api/policy-fragments routes above
+    // (api-parity #4034). All five call the SAME shared builders
+    // (compliance_model.hpp) the legacy routes' JSON bodies above are
+    // hand-rolled duplicates of — Rule 1, docs/api-twin-recipe.md §1.
+    // `GET /api/v1/compliance/{id}` is the one exception to plain
+    // `perm_fn_`: its per-agent status list is a fan-out read of per-agent
+    // data, so the routed-concerns RBAC row requires `fleet_read_fn_`
+    // (require_fleet_read) as its SOLE gate instead — never stacked with
+    // perm_fn_. The other four (aggregate/definition reads, no per-agent
+    // identity data) stay unaudited, matching the legacy routes' existing
+    // posture. `GET /api/v1/compliance/{id}` is the one exception on BOTH
+    // axes: its per-agent list names agent_ids fleet-wide AND its
+    // `check_result` field can carry raw, unrestricted agent-instruction
+    // output, so it gets a FAIL-CLOSED (503) `emit_behavioral_audit` trail,
+    // not a set-and-proceed one — see that route's own comment.
+
+    // GET /api/v1/policy-fragments -- list all fragments (MCP twin:
+    // list_policy_fragments)
+    sink.Get("/api/v1/policy-fragments",
+        [this](const httplib::Request& req, httplib::Response& res) {
+            detail::ensure_correlation_id(res);
+            if (!perm_fn_(req, res, "Policy", "Read"))
+                return;
+            if (!policy_store_ || !policy_store_->is_open()) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "policy store not available"),
+                                "application/json");
+                return;
+            }
+            FragmentQuery q;
+            if (req.has_param("name"))
+                q.name_filter = req.get_param_value("name");
+            // #4034 follow-up: clamp in 64-bit BEFORE narrowing — mirrors
+            // GET /api/v1/inventory/software's identical idiom
+            // (rest_api_v1.cpp) and MCP's list_policy_fragments sibling
+            // (mcp_server.cpp), which already clamped its own `limit` arg to
+            // [1,1000]. A negative or huge value can no longer reach the
+            // store's SQL LIMIT unbounded, and the clamped value (not
+            // FragmentQuery's raw default) drives pagination.page_size below
+            // — previously hard-coded to list_json's own 50 default
+            // regardless of what limit was actually applied.
+            std::int64_t want_limit = q.limit; // FragmentQuery's own default (100)
+            try {
+                if (req.has_param("limit"))
+                    want_limit = std::stoll(req.get_param_value("limit"));
+            } catch (const std::exception&) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
+                                "application/json");
+                return;
+            }
+            q.limit = static_cast<int>(std::clamp<std::int64_t>(want_limit, 1, 1000));
+            auto frags = policy_store_->query_fragments(q);
+            if (!frags) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "policy store degraded"),
+                                "application/json");
+                return;
+            }
+            nlohmann::json arr = nlohmann::json::array();
+            for (const auto& f : *frags)
+                arr.push_back(policy_fragment_list_row_json(f));
+            res.set_content(
+                list_json(arr, static_cast<int64_t>(frags->size()), /*start=*/0, q.limit),
+                "application/json");
+        });
+
+    // GET /api/v1/policies -- list all policies (MCP twin: list_policies —
+    // note that tool's own served fields are a narrower 5-field subset of
+    // this row shape; see #4034's PR description for why it stays as-is)
+    sink.Get("/api/v1/policies",
+        [this](const httplib::Request& req, httplib::Response& res) {
+            detail::ensure_correlation_id(res);
+            if (!perm_fn_(req, res, "Policy", "Read"))
+                return;
+            if (!policy_store_ || !policy_store_->is_open()) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "policy store not available"),
+                                "application/json");
+                return;
+            }
+            PolicyQuery q;
+            if (req.has_param("name"))
+                q.name_filter = req.get_param_value("name");
+            if (req.has_param("fragment_id"))
+                q.fragment_filter = req.get_param_value("fragment_id");
+            // #4034 follow-up: `enabled_only` is a documented boolean query
+            // parameter (docs/user-manual/rest-api.md) — presence alone must
+            // not decide it, or `enabled_only=false` silently behaves like
+            // `enabled_only=true` (the caller asked to see disabled policies
+            // and got the opposite). An unrecognized value 400s, matching
+            // this handler's own existing posture for a malformed `limit`.
+            if (req.has_param("enabled_only")) {
+                auto v = req.get_param_value("enabled_only");
+                if (v == "true" || v == "1") {
+                    q.enabled_only = true;
+                } else if (v == "false" || v == "0") {
+                    q.enabled_only = false;
+                } else {
+                    res.status = 400;
+                    res.set_content(
+                        detail::a4_error(res, "invalid boolean query parameter: enabled_only"),
+                        "application/json");
+                    return;
+                }
+            }
+            // Clamp in 64-bit BEFORE narrowing — mirrors GET
+            // /api/v1/inventory/software's identical idiom and MCP's
+            // list_policy_fragments sibling; see the identical comment on
+            // GET /api/v1/policy-fragments above for the full rationale.
+            std::int64_t want_limit = q.limit; // PolicyQuery's own default (100)
+            try {
+                if (req.has_param("limit"))
+                    want_limit = std::stoll(req.get_param_value("limit"));
+            } catch (const std::exception&) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
+                                "application/json");
+                return;
+            }
+            q.limit = static_cast<int>(std::clamp<std::int64_t>(want_limit, 1, 1000));
+            auto policies = policy_store_->query_policies(q);
+            if (!policies) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "policy store degraded"),
+                                "application/json");
+                return;
+            }
+            nlohmann::json arr = nlohmann::json::array();
+            for (const auto& p : *policies)
+                arr.push_back(policy_list_row_json(p));
+            res.set_content(
+                list_json(arr, static_cast<int64_t>(policies->size()), /*start=*/0, q.limit),
+                "application/json");
+        });
+
+    // GET /api/v1/policies/:id -- single-policy detail (MCP twin: get_policy)
+    sink.Get(R"(/api/v1/policies/([^/]+))",
+        [this](const httplib::Request& req, httplib::Response& res) {
+            detail::ensure_correlation_id(res);
+            if (!perm_fn_(req, res, "Policy", "Read"))
+                return;
+            if (!policy_store_) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                return;
+            }
+            auto id = req.matches[1].str();
+            auto policy_res = policy_store_->get_policy(id);
+            if (!policy_res) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "policy store degraded"),
+                                "application/json");
+                return;
+            }
+            if (!*policy_res) {
+                res.status = 404;
+                res.set_content(detail::a4_error(res, "policy not found"), "application/json");
+                return;
+            }
+            const Policy& policy = **policy_res;
+            auto cs = policy_store_->get_compliance_summary(id);
+            if (!cs) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "policy store degraded"),
+                                "application/json");
+                return;
+            }
+            // Remediation is only offered where the bound fragment defines a
+            // fix_instruction — mirrors the legacy route's own fail-soft
+            // posture (a degraded fragment read reads as "not offered", not
+            // as a distinct error — this only gates a UI affordance, not a
+            // grant/enforce decision).
+            bool remediation_available = false;
+            auto frag = policy_store_->get_fragment(policy.fragment_id);
+            if (frag && *frag)
+                remediation_available = !(*frag)->fix_instruction.empty();
+            res.set_content(ok_json(single_policy_detail_json(policy, *cs, remediation_available)),
+                            "application/json");
+        });
+
+    // GET /api/v1/compliance -- fleet compliance summary (MCP twin:
+    // get_fleet_compliance)
+    sink.Get("/api/v1/compliance",
+        [this](const httplib::Request& req, httplib::Response& res) {
+            detail::ensure_correlation_id(res);
+            if (!perm_fn_(req, res, "Policy", "Read"))
+                return;
+            if (!policy_store_) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                return;
+            }
+            auto fc = policy_store_->get_fleet_compliance();
+            if (!fc) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "policy store degraded"),
+                                "application/json");
+                return;
+            }
+            res.set_content(ok_json(fleet_compliance_json(*fc)), "application/json");
+        });
+
+    // GET /api/v1/compliance/:policy_id -- per-policy compliance detail +
+    // per-agent status fan-out (MCP twin: get_policy_agent_statuses — the
+    // agents half; get_compliance_summary pre-exists for the summary-only
+    // half, see #4034's PR description).
+    sink.Get(R"(/api/v1/compliance/([^/]+))",
+        [this](const httplib::Request& req, httplib::Response& res) {
+            const auto cid = detail::ensure_correlation_id(res);
+            if (!fleet_read_fn_) {
+                spdlog::error("GET /api/v1/compliance/{{id}}: fleet_read_fn_ unwired — "
+                              "misconfigured call site; failing closed; cid={}",
+                              cid);
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                return;
+            }
+            // require_fleet_read is the SOLE gate here — never stacked with
+            // perm_fn_ (routed-concerns RBAC row; the same BLOCKING rule
+            // rest_api_v1.cpp's GET /api/v1/inventory/software route
+            // documents). It renders 401/403/503 itself and returns
+            // !admitted on denial.
+            auto gate = fleet_read_fn_(req, res, "Policy", "Read");
+            if (!gate.admitted)
+                return;
+            if (!policy_store_) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                return;
+            }
+            auto policy_id = req.matches[1].str();
+            auto statuses = policy_store_->get_policy_agent_statuses(policy_id);
+            if (!statuses) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "policy store degraded"),
+                                "application/json");
+                return;
+            }
+            // The confined tally (never the store's own unfiltered aggregate)
+            // — a confined caller must never see fleet-wide counts for
+            // agents it cannot itself list. See compliance_model.hpp's
+            // confined_policy_compliance doc comment.
+            auto confined = confined_policy_compliance(*statuses, gate.scope, policy_id);
+            nlohmann::json agents_arr = nlohmann::json::array();
+            for (const auto& s : confined.visible)
+                agents_arr.push_back(policy_agent_status_json(s));
+
+            // #4034 follow-up: fail CLOSED on audit-persist failure, matching
+            // this codebase's own documented REST-JSON contract
+            // (rest_audit.hpp's header comment, #1647: "REST JSON
+            // integrations FAIL CLOSED (503)") — the same posture GET
+            // /api/v1/guaranteed-state/events' dex.device.view audit uses
+            // (rest_api_v1.cpp). Reclassified from the original set-and-
+            // proceed posture this route shipped with: `check_result`
+            // (policy_agent_status_json) carries up to 1000 bytes of the RAW
+            // output of whatever instruction the bound fragment's
+            // check_instruction names — free-form, operator-authored at
+            // fragment-creation time, and not restricted to a
+            // non-behavioural content class (e.g. a fragment bound to
+            // processes/list_hashed would put process names/paths here), so
+            // this route cannot make the same "not behavioural PII" claim
+            // GET /api/v1/inventory/software genuinely can (that route's
+            // data is machine-scope by construction, ADR-0016 §8; this
+            // route's is not, since check_instruction is unconstrained).
+            // Refusing to serve on a KNOWN audit-persist failure is the
+            // conservative, documented-contract-conformant choice. The MCP
+            // twin (get_policy_agent_statuses) is unaffected by this change —
+            // it already follows ITS OWN documented convention (surfacing
+            // the gap via an `audit_persisted:false` body field rather than
+            // a header/status code), which is what rest_audit.hpp prescribes
+            // for MCP specifically ("MCP wraps the kernel itself and
+            // surfaces the gap through its own body field").
+            if (!detail::emit_behavioral_audit(
+                    audit_fn_, req, res, "compliance.agent_statuses.view", "success", "Policy",
+                    policy_id, "agents=" + std::to_string(agents_arr.size()) + " cid=" + cid)) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res,
+                                     "audit subsystem unavailable; refusing to serve per-agent "
+                                     "compliance status without durable evidence",
+                                     detail::A4ErrorOpts{.retry_after_ms = 5000}),
+                    "application/json");
+                spdlog::warn(
+                    "compliance.agent_statuses.view audit fail-closed (503) policy_id={} cid={}",
+                    policy_id, cid);
+                return;
+            }
+
+            nlohmann::json data;
+            data["policy_id"] = policy_id;
+            data["summary"] = compliance_summary_json(confined.summary);
+            data["agents"] = agents_arr;
+            res.set_content(ok_json(data), "application/json");
         });
 }
 

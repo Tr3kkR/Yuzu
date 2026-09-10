@@ -22,8 +22,10 @@
 
 #include <chrono>
 #include <format>
+#include <optional>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace yuzu::server {
@@ -190,6 +192,50 @@ std::string make_check_result(const StoredResponse& r) {
     return j.dump();
 }
 
+/// HA WS-3 3.4 (fold-in #3, PR #3939 review / #3424 / #3511): `.sent` is a
+/// COUNT, never a set of ids — the DELIVERED subset of `claimed` can only be
+/// recovered by walking `outcome`'s per-id fields, mirroring
+/// deployment_engine.cpp's `settle_claimed_batch` residual accounting
+/// exactly. PolicyEvaluator's dispatch always runs as
+/// `DispatchCaller{.system = true}` (server.cpp's `command_dispatch_fn`),
+/// i.e. `exec_visible = nullopt` (unfiltered) — unlike deployment_engine.cpp
+/// there is therefore no exec_visible-excluded residual to compute here; a
+/// caller-visibility narrowing simply cannot happen on this dispatch path.
+std::vector<std::string>
+compute_delivered(const std::vector<std::string>& claimed,
+                  const yuzu::server::ConfinedDispatchOutcome& outcome) {
+    if (outcome.containment_unreadable)
+        // The gate itself failed closed — nothing in `claimed` was
+        // individually evaluated, so there is no per-device fact to act on,
+        // only a systemic one: treat the WHOLE batch as not delivered.
+        return {};
+
+    std::unordered_set<std::string> not_delivered;
+    for (const auto& a : outcome.denied_quarantined)
+        not_delivered.insert(a);
+    for (const auto& a : outcome.unknown_plugin)
+        not_delivered.insert(a);
+    for (const auto& a : outcome.not_sent)
+        not_delivered.insert(a);
+
+    // Residual: nothing in `claimed` was individually identified (no named
+    // permanent withhold, no not_sent) AND nothing was sent either — a
+    // chokepoint denial before the per-id arm walk ever ran. Only reachable
+    // when outcome.sent == 0; once anything was sent, denied, plugin-absent,
+    // or not_sent, the count and the identified ids line up exactly and this
+    // is empty by construction (matches settle_claimed_batch's own residual).
+    if (outcome.sent == 0 && claimed.size() > not_delivered.size())
+        for (const auto& a : claimed)
+            not_delivered.insert(a);
+
+    std::vector<std::string> delivered;
+    delivered.reserve(claimed.size());
+    for (const auto& a : claimed)
+        if (!not_delivered.count(a))
+            delivered.push_back(a);
+    return delivered;
+}
+
 } // namespace
 
 PolicyEvaluator::PolicyEvaluator(Deps deps) : d_(std::move(deps)) {
@@ -244,12 +290,12 @@ std::vector<std::string> PolicyEvaluator::resolve_targets(const Policy& p) const
     return out;
 }
 
-std::expected<std::string, std::string>
+std::expected<PolicyEvaluator::DispatchInstructionResult, std::string>
 PolicyEvaluator::dispatch_instruction(const std::string& instruction_id,
                                       const std::unordered_map<std::string, std::string>& parameters,
                                       const std::vector<std::string>& targets) {
     if (targets.empty() || !d_.dispatch_fn)
-        return "";
+        return DispatchInstructionResult{};
     // db_error, not a legitimate no-op (gov Gate 3 architect finding): a null
     // instruction_store is a genuine unavailability, not "no targets"/"unknown
     // instruction" — collapsing it into the same "" those return would silently
@@ -274,12 +320,13 @@ PolicyEvaluator::dispatch_instruction(const std::string& instruction_id,
     }
     if (!*def_result) {
         spdlog::warn("policy_evaluator: unknown check/fix instruction '{}'", instruction_id);
-        return "";
+        return DispatchInstructionResult{};
     }
     const auto& def = **def_result;
     auto execid = gen_execution_id();
-    d_.dispatch_fn(def.plugin, def.action, targets, /*scope_expr=*/"", parameters, execid);
-    return execid;
+    auto outcome = d_.dispatch_fn(def.plugin, def.action, targets, /*scope_expr=*/"", parameters,
+                                  execid);
+    return DispatchInstructionResult{.execution_id = execid, .outcome = std::move(outcome)};
 }
 
 std::expected<std::string, std::string> PolicyEvaluator::kickoff_check(const Policy& p) {
@@ -319,12 +366,12 @@ std::expected<std::string, std::string> PolicyEvaluator::kickoff_check(const Pol
     // dispatch_instruction invokes the blocking dispatch_fn — call it WITHOUT mu_.
     // ADR-0058: a genuine InstructionStore error propagates as `unexpected` here
     // too, the same way the degraded-fragment-read path above does.
-    auto execid_result = dispatch_instruction(frag.check_instruction, params, targets);
-    if (!execid_result)
-        return std::unexpected(execid_result.error());
-    if (execid_result->empty())
+    auto dispatch_result = dispatch_instruction(frag.check_instruction, params, targets);
+    if (!dispatch_result)
+        return std::unexpected(dispatch_result.error());
+    if (dispatch_result->execution_id.empty())
         return "";
-    const std::string& execid = *execid_result;
+    const std::string& execid = dispatch_result->execution_id;
 
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -544,44 +591,49 @@ PolicyEvaluator::remediate(const std::string& policy_id,
         return out;
     }
 
-    // Governance UP-3 (2026-08-24): reserve this policy_id BEFORE dispatch,
-    // not after — unlike kickoff_check's Check-phase dedupe (which only
-    // needs to avoid a duplicate DISPATCH), a second concurrent remediate()
-    // call reaching the blocking dispatch below would burn the retry-attempt
-    // cap twice (update_agent_status's "fixing" write increments it) on a
-    // fix instruction that may not be idempotent — a real double-run, not
-    // just a duplicate in-flight record. The comment on update_agent_status's
-    // UPSERT calling itself "naturally idempotent against a racing manual
-    // remediate() on another replica" is true for the STATUS ROW but was
-    // never true for the ATTEMPT COUNTER; this reservation only covers same
-    // process concurrency (two REST calls landing on this replica), not a
-    // cross-replica race — that residual is unchanged and tracked in
-    // ADR-0056's Follow-ups, same as kickoff_check's cross-replica gap.
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        bool already = remediating_.count(policy_id) > 0;
-        if (!already)
-            for (const auto& f : in_flight_)
-                if (f.phase == Phase::FixWait && f.policy_id == policy_id)
-                    already = true;
-        if (already) {
-            out.error = "remediation already in flight for this policy";
-            return out;
-        }
-        remediating_.insert(policy_id);
+    // HA WS-3 3.4: claim BEFORE dispatch via a durable per-(policy,agent) CAS
+    // in PolicyStore, replacing the old process-local `remediating_`/
+    // `ReservationGuard` reservation (ADR-2002 §6 finding 6a) — that guard
+    // only ever covered same-process concurrency (two REST calls landing on
+    // THIS replica); a sibling replica's independent remediate() call for
+    // the same policy had no shared state to see and would dispatch a
+    // second, genuinely duplicate fix, double-incrementing
+    // update_agent_status's fix_attempt_count on a fix instruction that may
+    // not be idempotent. The durable claim closes that gap: it is visible to
+    // every replica immediately, per agent (finer-grained than the old
+    // per-policy guard), and the SAME `fixing_stale_seconds` window
+    // claim_due_policies' own stranded-fixing sweep uses ages it out if the
+    // claiming replica dies mid-flight (see collect_ready()'s FixWait
+    // maturation and the sweep itself for the two release paths).
+    auto claim_result =
+        d_.policy_store->claim_remediation(policy_id, targets, d_.fixing_stale_seconds);
+    if (!claim_result) {
+        out.error = "policy store degraded — could not claim remediation targets";
+        out.degraded = true;
+        if (d_.metrics)
+            // Distinct from dispatch_due's "claim" phase (line ~415, the leader-driven
+            // claim_due_policies degrade): this is the operator-synchronous remediation
+            // claim, a different failure site — keep them separately countable.
+            d_.metrics->counter("yuzu_server_policy_eval_errors_total", {{"phase", "remediate_claim"}})
+                .increment();
+        return out;
     }
-    // RAII: erase the reservation on every exit from here down. Once the
-    // FixWait entry lands in in_flight_ on the success path, that entry
-    // itself is what a later concurrent call's scan above sees — the
-    // reservation only needs to cover THIS call's own window.
-    struct ReservationGuard {
-        PolicyEvaluator* self;
-        std::string id;
-        ~ReservationGuard() {
-            std::lock_guard<std::mutex> lk(self->mu_);
-            self->remediating_.erase(id);
-        }
-    } reservation_guard{this, policy_id};
+    const std::vector<std::string>& claimed = claim_result->ids;
+    const int64_t claim_gen = claim_result->generation;
+    if (claimed.empty()) {
+        // Every requested target is either already mid-remediation (a live
+        // claim — this replica or another) or has already exhausted its
+        // retry cap — claim_remediation's WHERE guard cannot distinguish the
+        // two without a second query (out of scope for this slice; tracked
+        // as a follow-up), so this message states BOTH possible causes
+        // honestly (agentic-first A4) rather than the misleading "already in
+        // flight" alone, which would tell a capped, no-longer-in-flight
+        // caller to retry forever. MUST keep the exact substring "already in
+        // flight" — compliance_routes.cpp's handler classifies it to a 409,
+        // and that contract must not change underneath it.
+        out.error = "remediation already in flight or retry cap reached for this policy";
+        return out;
+    }
 
     auto fix_params = build_params(frag->fix_parameters, p->inputs);
     std::string verify_instr = !frag->post_check_instruction.empty() ? frag->post_check_instruction
@@ -592,12 +644,18 @@ PolicyEvaluator::remediate(const std::string& policy_id,
         !frag->post_check_parameters.empty() ? frag->post_check_parameters : frag->check_parameters,
         p->inputs);
 
-    // Dispatch the fix BEFORE marking 'fixing' (gov UP-7): marking first would
-    // burn an attempt against the retry cap even when the dispatch fails (unknown
-    // instruction / all targets offline), eventually locking the agent to 'error'
-    // with no fix ever sent. dispatch_instruction must run without mu_ held.
-    auto dispatch_result = dispatch_instruction(frag->fix_instruction, fix_params, targets);
+    // Dispatch the fix to the CLAIMED subset only (never the full `targets`
+    // — a target the claim above did not win must never be dispatched to).
+    // dispatch_instruction must run without mu_ held.
+    auto dispatch_result = dispatch_instruction(frag->fix_instruction, fix_params, claimed);
     if (!dispatch_result) {
+        // Dispatch never happened — release every claim so it does not sit
+        // orphaned until the stale window expires.
+        auto rel = d_.policy_store->release_remediation_claim(policy_id, claimed, claim_gen);
+        if (!rel)
+            spdlog::warn("policy_evaluator: remediate: failed to release claim for policy {} "
+                        "after a dispatch error: {}",
+                        policy_id, rel.error());
         out.degraded = true;
         // Gate 3 ARCH-1: dispatch_result.error() carries raw PQerrorMessage() text on a
         // genuine DB failure — genericized here at the source so both consumers
@@ -607,36 +665,72 @@ PolicyEvaluator::remediate(const std::string& policy_id,
                                                        dispatch_result.error());
         return out;
     }
-    if (dispatch_result->empty()) {
+    if (dispatch_result->execution_id.empty()) {
+        auto rel = d_.policy_store->release_remediation_claim(policy_id, claimed, claim_gen);
+        if (!rel)
+            spdlog::warn("policy_evaluator: remediate: failed to release claim for policy {} "
+                        "after an empty dispatch: {}",
+                        policy_id, rel.error());
         out.error = "fix dispatch failed (unknown instruction or no agents)";
         return out;
     }
-    const auto& execid = *dispatch_result;
+    const auto& execid = dispatch_result->execution_id;
 
-    // Now mark fixing (increments the attempt counter; >3 auto-transitions to error).
-    for (const auto& tgt : targets) {
-        auto r = d_.policy_store->update_agent_status(policy_id, tgt, "fixing");
+    // fold-in #3 (PR #3939 review, #3424/#3511): `.sent` is a COUNT, not a
+    // set — recompute the DELIVERED subset from the outcome's per-id fields.
+    std::vector<std::string> delivered = compute_delivered(claimed, dispatch_result->outcome);
+    std::vector<std::string> not_delivered;
+    {
+        std::unordered_set<std::string> delivered_set(delivered.begin(), delivered.end());
+        for (const auto& a : claimed)
+            if (!delivered_set.count(a))
+                not_delivered.push_back(a);
+    }
+    if (!not_delivered.empty()) {
+        // Release WITHOUT touching fix_attempt_count (ADR-2002 §6 finding
+        // 6a(ii)): a failed DELIVERY must never burn a capped retry attempt.
+        auto rel = d_.policy_store->release_remediation_claim(policy_id, not_delivered, claim_gen);
+        if (!rel)
+            spdlog::warn("policy_evaluator: remediate: failed to release claim for {} "
+                        "not-delivered target(s) of policy {}: {}",
+                        not_delivered.size(), policy_id, rel.error());
+    }
+
+    // Now mark fixing (increments the attempt counter; >3 auto-transitions to
+    // error) — DELIVERED targets only.
+    for (const auto& tgt : delivered) {
+        auto r = d_.policy_store->update_agent_status(policy_id, tgt, "fixing", "", claim_gen);
         if (!r)
             spdlog::warn("policy_evaluator: remediate: failed to mark {} fixing for policy {}: {}",
                         tgt, policy_id, r.error());
+        else if (!*r && d_.metrics)
+            // fenced no-op — a sibling reclaimed this row between our claim and
+            // this write (see PolicyStore::update_agent_status); visible so a
+            // mis-threaded gen does not silently vanish every remediation.
+            d_.metrics->counter("yuzu_server_policy_remediation_fence_skip_total").increment();
     }
 
-    {
+    if (!delivered.empty()) {
         std::lock_guard<std::mutex> lk(mu_);
         in_flight_.push_back(InFlight{.phase = Phase::FixWait,
                                       .policy_id = policy_id,
                                       .execution_id = execid,
                                       .instruction_id = frag->fix_instruction,
                                       .compliance_expr = "",
-                                      .targets = targets,
+                                      .targets = delivered,
                                       .dispatched_at = now(),
+                                      .claim_gen = claim_gen,
                                       .verify_instruction = std::move(verify_instr),
                                       .verify_compliance = std::move(verify_cel),
                                       .verify_parameters_json = map_to_json_obj(verify_params)});
     }
     out.ok = true;
     out.execution_id = execid;
-    out.agents = static_cast<int>(targets.size());
+    // Honest count (agentic-first A4): a claimed-but-not-delivered target
+    // (offline/not_sent, released above without burning a retry attempt) was
+    // NOT remediated by this call — counting it here would overstate the
+    // result to the caller.
+    out.agents = static_cast<int>(delivered.size());
     return out;
 }
 
@@ -701,26 +795,64 @@ void PolicyEvaluator::collect_ready() {
                     cr = make_check_result(it->second);
                 }
                 if (d_.policy_store) {
-                    auto r = d_.policy_store->update_agent_status(f.policy_id, tgt, status, cr);
+                    // Shared Check-phase write: a REMEDIATION verify entry
+                    // carries claim_gen != 0 and its verdict is fenced on it
+                    // (a sibling may have reclaimed while the verify was in
+                    // flight); an ordinary DETECTION entry carries 0 and writes
+                    // unconditionally.
+                    std::optional<int64_t> gen =
+                        f.claim_gen != 0 ? std::optional<int64_t>(f.claim_gen) : std::nullopt;
+                    auto r = d_.policy_store->update_agent_status(f.policy_id, tgt, status, cr, gen);
                     if (!r)
                         spdlog::warn("policy_evaluator: update_agent_status failed: {}", r.error());
+                    else if (!*r && d_.metrics)
+                        d_.metrics->counter("yuzu_server_policy_remediation_fence_skip_total")
+                            .increment();
                 }
                 if (d_.metrics)
                     d_.metrics->counter("yuzu_server_policy_verdicts_total", {{"status", status}})
                         .increment();
             }
         } else { // Phase::FixWait — fix dispatched; failures error out, the rest go to verify.
+            // HA WS-3 3.4: this FixWait entry maturing is the normal,
+            // replica-local release path for the durable claim
+            // remediate() took on these targets — the dispatching replica
+            // is the only holder of this in-memory entry, so this stays
+            // per-replica with nothing to coordinate (same reasoning as
+            // update_agent_status's own per-replica FixWait writes below).
+            // Released unconditionally, BEFORE the verify dispatch and
+            // regardless of the fix's own outcome: whether a target's fix
+            // failed (-> 'error' below) or succeeds (-> verify), its
+            // remediation attempt is over either way, and a later
+            // legitimate remediate() call for the same agent must not be
+            // refused as "already in flight" by a claim this evaluator no
+            // longer needs.
+            if (d_.policy_store) {
+                auto rel =
+                    d_.policy_store->release_remediation_claim(f.policy_id, f.targets, f.claim_gen);
+                if (!rel)
+                    spdlog::warn("policy_evaluator: collect_ready: failed to release remediation "
+                                "claim for policy {}: {}",
+                                f.policy_id, rel.error());
+            }
             std::vector<std::string> verify_targets;
             for (const auto& tgt : f.targets) {
                 auto it = best.find(tgt);
                 if (it != best.end() && is_terminal_failure(it->second.status)) {
                     if (d_.policy_store) {
                         auto r = d_.policy_store->update_agent_status(
-                            f.policy_id, tgt, "error", R"({"phase":"fix","result":"failed"})");
+                            f.policy_id, tgt, "error", R"({"phase":"fix","result":"failed"})",
+                            f.claim_gen);
                         if (!r)
                             spdlog::warn("policy_evaluator: fix-failure status write failed for "
                                         "{}/{}: {}",
                                         f.policy_id, tgt, r.error());
+                        else if (!*r && d_.metrics)
+                            // fenced no-op: a sibling reclaimed after our
+                            // release above — do not stomp its fresh 'fixing'.
+                            d_.metrics
+                                ->counter("yuzu_server_policy_remediation_fence_skip_total")
+                                .increment();
                     }
                     if (d_.metrics)
                         d_.metrics
@@ -733,15 +865,19 @@ void PolicyEvaluator::collect_ready() {
             if (!verify_targets.empty()) {
                 auto vparams = params_from_json_obj(f.verify_parameters_json);
                 auto result = dispatch_instruction(f.verify_instruction, vparams, verify_targets);
-                if (result && !result->empty()) {
+                if (result && !result->execution_id.empty()) {
                     std::lock_guard<std::mutex> lk(mu_);
                     in_flight_.push_back(InFlight{.phase = Phase::Check,
                                                   .policy_id = f.policy_id,
-                                                  .execution_id = *result,
+                                                  .execution_id = result->execution_id,
                                                   .instruction_id = f.verify_instruction,
                                                   .compliance_expr = f.verify_compliance,
                                                   .targets = verify_targets,
                                                   .dispatched_at = now(),
+                                                  // propagate the claim gen so the
+                                                  // verify verdict write (:790) stays
+                                                  // fenced on it.
+                                                  .claim_gen = f.claim_gen,
                                                   .verify_instruction = "",
                                                   .verify_compliance = "",
                                                   .verify_parameters_json = ""});
@@ -753,11 +889,16 @@ void PolicyEvaluator::collect_ready() {
                     for (const auto& tgt : verify_targets) {
                         auto r = d_.policy_store->update_agent_status(
                             f.policy_id, tgt, "error",
-                            std::format(R"({{"phase":"verify","result":"{}"}})", result_tag));
+                            std::format(R"({{"phase":"verify","result":"{}"}})", result_tag),
+                            f.claim_gen);
                         if (!r)
                             spdlog::warn("policy_evaluator: verify-dispatch-failed status write "
                                         "failed for {}/{}: {}",
                                         f.policy_id, tgt, r.error());
+                        else if (!*r && d_.metrics)
+                            d_.metrics
+                                ->counter("yuzu_server_policy_remediation_fence_skip_total")
+                                .increment();
                         if (d_.metrics)
                             d_.metrics
                                 ->counter("yuzu_server_policy_eval_errors_total",
@@ -770,9 +911,19 @@ void PolicyEvaluator::collect_ready() {
     }
 }
 
-void PolicyEvaluator::tick() {
+void PolicyEvaluator::tick(bool dispatch_due_allowed) {
+    // collect_ready() ALWAYS runs on its owning replica (WS-3 3.2, PR #4134 review):
+    // it is the ONLY production path that matures an in-flight Check/FixWait record —
+    // created by the operator-synchronous evaluate_now()/remediate() REST handlers,
+    // which run on whichever replica received the call — to a terminal verdict. It is
+    // replica-local + in-memory and takes no durable claim needing fencing, so gating
+    // it would strand an accepted operator remediation as `fixing` forever on any
+    // non-leader (the two-dispatch-planes rule: never fence an operator-synchronous
+    // path). Only dispatch_due() — the leader-owned durable due-policy scheduling
+    // (ADR-0056 claim_due_policies) — is fenced, via `dispatch_due_allowed`.
     collect_ready();
-    dispatch_due();
+    if (dispatch_due_allowed)
+        dispatch_due();
 }
 
 } // namespace yuzu::server

@@ -273,21 +273,16 @@ struct Harness {
               .instruction_store = &is,
               .execution_tracker = &tracker,
               .approval_manager = &approvals,
-              .dispatch_fn =
-                  [this](const std::string& plugin, const std::string& action,
-                         const std::vector<std::string>&, const std::string&,
-                         const std::unordered_map<std::string, std::string>&,
-                         const std::string&,
-                         const DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
-                      dispatched_actions.push_back(plugin + "." + action);
-                      return {.sent = 1, .command_id = "cmd-" + std::to_string(dispatched_actions.size())};
-                  },
-              // #3133 review fix: resolve_caller re-resolves a real caller
-              // from the schedule's creator at fire time — see
-              // test_schedule_runner.cpp's identical wiring.
-              .resolve_caller =
-                  [](const std::string& username) {
-                      return DispatchCaller{.principal = username, .system = false};
+              // WS-3 3.3: scheduled fires enqueue a durable outbox occurrence
+              // instead of dispatching inline (the delivery loop sends). The
+              // arming gate still runs at fire time BEFORE the enqueue, so a
+              // denied fire records nothing here exactly as a denied dispatch did
+              // — which is what these operator-surface-twin cases assert.
+              .enqueue_fn =
+                  [this](const yuzu::server::OutboxEnqueueRequest& req)
+                      -> yuzu::server::OutboxEnqueueOutcome {
+                      dispatched_actions.push_back(req.plugin + "." + req.action);
+                      return yuzu::server::OutboxEnqueueOutcome::Enqueued;
                   },
               .arming_check =
                   [this](const std::string& principal, const std::string& plugin,
@@ -428,6 +423,74 @@ constexpr TwinRow kExpectedTwins[] = {
     {"mint_upload_grant", "UploadGrant", "Write", false},
     {"list_upload_grants", "UploadGrant", "Read", true},
     {"revoke_upload_grant", "UploadGrant", "Delete", false},
+    // #4036 (api-parity Batch A) — pinned against preflight_routes.cpp's /
+    // deployment_routes.cpp's new GET /api/v1/preflight/runs / GET
+    // /api/v1/deployments/preview handlers (same (securable, operation) each
+    // REST twin gates on).
+    {"list_preflight_runs", "Infrastructure", "Read", true},
+    {"get_deployment_preview", "SoftwareDeployment", "Read", true},
+    // #4030: executions/workflows/schedules read-twin programme.
+    {"list_workflows", "Workflow", "Read", true},
+    {"get_workflow", "Workflow", "Read", true},
+    {"get_workflow_execution", "Workflow", "Read", true},
+    // #4029 (api-parity Batch A content/catalog half): instruction-definition
+    // read twins, pinned against instruction_definition_model.hpp / the new
+    // GET /api/v1/instructions* routes (rest_api_v1.cpp).
+    {"list_definitions", "InstructionDefinition", "Read", true},
+    {"get_definition", "InstructionDefinition", "Read", true},
+    {"export_definition", "InstructionDefinition", "Read", true},
+    // #4029: product-pack read twins, pinned against product_pack_model.hpp /
+    // the new GET /api/v1/product-packs* routes.
+    {"list_product_packs", "ProductPack", "Read", true},
+    {"get_product_pack", "ProductPack", "Read", true},
+    // #4027 — TAR process-tree/capture-sources/retention-paused read twins.
+    // Same Infrastructure:Read gate as GET /fragments/tar/process-tree,
+    // .../capture-sources, .../retention-paused (tar_tree_routes.cpp /
+    // dashboard_routes.cpp).
+    {"list_tar_process_tree_devices", "Infrastructure", "Read", true},
+    {"list_tar_capture_sources_devices", "Infrastructure", "Read", true},
+    {"list_tar_retention_paused", "Infrastructure", "Read", true},
+    // #4031: directory-sync (AD/Entra) read twin — parity with GET
+    // /api/v1/directory/users. The OIDC-config, auto-approve-rules, and
+    // pending-agents read twins are REST-only per #520 (see
+    // docs/mcp-server.md) and so carry no MCP tool, no row here.
+    //
+    // get_directory_status (the /directory/status twin) is deliberately NOT
+    // listed here even though it shares Directory:Read: it takes no input
+    // parameters, so its schema is the honest, bounded
+    // {"type":"object","properties":{}} shape — same precedent as
+    // get_guardian_schemas above, also absent from this array for the same
+    // reason (the A5 sweep below asserts every LISTED tool's schema differs
+    // from that literal, which is correct for this curated list but not a
+    // universal rule; validate_tool_security_registration's boot-time check
+    // is what proves get_directory_status's own table entries are
+    // consistent, and test_mcp_server.cpp exercises its dispatch directly).
+    {"list_directory_users", "Directory", "Read", true},
+    // #4033 (#2146 Batch A) — pinned against
+    // /fragments/create-group-form's own ManagementGroup:Write gate
+    // (dashboard_routes.cpp) and its REST twin GET /api/v1/management-groups/
+    // agent-count-preview (rest_api_v1.cpp).
+    {"preview_management_group_agent_count", "ManagementGroup", "Write", false},
+    // #4034 — compliance/policy REST v1 read twins.
+    {"get_policy", "Policy", "Read", true},
+    {"list_policy_fragments", "Policy", "Read", true},
+    {"get_policy_agent_statuses", "Policy", "Read", true},
+    // #4035 (api-parity #2146 Batch A): MCP-only gaps closing the REST-only
+    // twins for /fragments/device/dex and /fragments/dex/device/app-perf —
+    // see docs/api-twin-recipe.md §6/§7/§8, which directs a twin PR to extend
+    // this array (not only the plugin-config/upload-grant families the
+    // header comment above was originally pinned against).
+    {"get_dex_device_score", "GuaranteedState", "Read", true},
+    {"get_dex_device_app_perf", "GuaranteedState", "Read", true},
+    // #4035: the 8 genuinely-new REST+MCP twins from the same issue.
+    {"get_dex_app", "GuaranteedState", "Read", true},
+    {"list_dex_apps", "GuaranteedState", "Read", true},
+    {"get_dex_catalogue_group", "GuaranteedState", "Read", true},
+    {"get_dex_device_history", "GuaranteedState", "Read", true},
+    {"get_dex_observation", "GuaranteedState", "Read", true},
+    {"get_dex_health", "GuaranteedState", "Read", true},
+    {"get_dex_trends", "GuaranteedState", "Read", true},
+    {"get_dex_overview", "GuaranteedState", "Read", true},
     // #4037 — Guardian read twins (api-parity #2146 Batch A). Pinned against
     // rest_api_v1.cpp's /api/v1/guaranteed-state/{status,rules,events,
     // rules/{id}/status,agents/{id}/rules} routes.
@@ -491,13 +554,17 @@ TEST_CASE("operator surface MCP twins: every tool satisfies the A5 contract",
         // A bare {"type":"object","properties":{}} with no further structure
         // would be the free-form-object footgun the spec forbids for any
         // tool that DOES take an argument — the original 11 rows here all
-        // do. A tool that genuinely takes ZERO arguments (#4037's
+        // do. A tool that genuinely takes ZERO arguments (#4027's three
+        // list_tar_* tools, same shape as list_agents; #4037's
         // get_guardian_status/list_guardian_rules — the same "{}" shape
         // get_guardian_schemas already uses, outside this array) is not a
         // footgun; "{}" correctly documents "no arguments," it isn't a
         // lazily-typed free-form object. Exempted explicitly so the check
         // stays a real signal for every tool that DOES take arguments.
         static const std::unordered_set<std::string_view> kNoArgTools = {
+            "list_tar_process_tree_devices",
+            "list_tar_capture_sources_devices",
+            "list_tar_retention_paused",
             "get_guardian_status",
             "list_guardian_rules",
         };

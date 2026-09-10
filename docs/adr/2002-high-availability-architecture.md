@@ -261,6 +261,21 @@ claim-commit and the external send is unavoidable:
 - **Transactional outbox:** a side-effecting dispatch commits a `pending` outbound-command row (with a
   **stable occurrence/command ID**) in the same transaction as the state transition; a claimed
   delivery loop drives `pending → sent`. A crash re-drives from `pending`.
+  - **Documented exception — the stable-occurrence-key producer (WS-3 3.3, `CommandOutboxStore`).**
+    A producer whose state transition lives in a *different* store than the outbox cannot literally
+    share one transaction with the enqueue. `CommandOutboxStore` therefore ships **two** enqueue APIs:
+    `claim_and_enqueue_on(conn, …)` for a future producer whose state IS in Postgres and CAN share the
+    txn (the literal contract above), and the autocommitting `claim_and_enqueue(…)` for a producer
+    whose transition is a separate write. The **first and only wired producer, `ScheduleRunner`**, uses
+    the latter: its transition (`ScheduleEngine::advance_schedule`) is a separate write, committed
+    *after* the enqueue. This is a **deliberate, reviewed substitute for same-txn atomicity, not a
+    violation of the guarantee**: the `occurrence_id` is a deterministic PRIMARY KEY, so a crash between
+    the enqueue commit and the advance re-derives the identical key and reads `AlreadyEnqueued` on the
+    re-fire — no lost fire (enqueue commits *before* advance, and advance runs only on enqueue success)
+    and no double fire. The one non-atomic consequence — a second producer-side execution row + a
+    duplicate `queued` audit on the re-fire — is suppressed at the producer (the re-fire cancels its
+    duplicate execution row and does not re-audit). Restoring literal same-txn atomicity via
+    `claim_and_enqueue_on` is tracked (#4165) as a cleanliness improvement, not a correctness fix.
 - **Receiver idempotency:** the **agent** dedups on `command_id` at the true endpoint (the gateway
   forwards transparently, no gateway-side dedup today), so an at-least-once re-drive is effectively-once
   — **contingent on WS-0** making the agent's dedup durable (today's `dedup_current_`/`dedup_previous_`
@@ -268,21 +283,26 @@ claim-commit and the external send is unavoidable:
 - **Fencing token in the claim transaction:** every claim CAS checks the leader's fencing token, so a
   stale ex-leader cannot commit a claim even before it notices its lock dropped. A boolean "I am
   leader" cached outside the lock connection is prohibited.
-- **`PolicyEvaluator` remediation is redesigned** (it currently dispatches the fix *before* recording
-  `fixing`, `policy_evaluator.cpp:421`, under process-local mutex/maps): it gets a durable occurrence
-  key, claim-before-dispatch, and outbox delivery — the same shape — so two stale leaders or two
-  concurrent operator remediations cannot both fire. **Two code-level obligations for WS-3 (finding
-  6a):** (i) `dispatch_instruction` currently **discards** `CommandDispatchFn`'s
-  `(execution_id, sent_count)` return (`PolicyEvaluator::dispatch_instruction`,
-  `policy_evaluator.cpp:281`) and always yields a non-empty
-  execid regardless of whether any target was reached — the redesign must thread `sent_count` through
-  so "all targets offline" is a real signal; (ii) it must **preserve the reason** the current code
-  dispatches before recording `fixing` — a *failed* dispatch must not burn a capped retry attempt, or
-  the agent eventually auto-locks to `error` with no fix ever sent. Claim-before-side-effect must
-  distinguish "occurrence claimed and delivered" from "occurrence claimed but delivery failed → retry,
-  don't consume the attempt."
+- **`PolicyEvaluator` remediation is redesigned** (WS-3 3.4 LANDED): it now claims each target durably
+  before dispatching the fix via `PolicyStore::claim_remediation` (a durable per-(policy,agent) CAS
+  guarding `remediation_claim_at`, migration v2), dispatches only to the claimed subset, and releases
+  the claim at FixWait maturation or when an undelivered target's stranded-fixing sweep window expires.
+  The mechanism is a plain guarded-column CAS on an ordinary pooled connection, NOT the leader epoch
+  fence — the operator-synchronous remediation path runs on any replica and must never be leader-gated.
+  Both code-level findings (6a) are addressed: (i) `dispatch_instruction` now threads `sent_count`
+  through so "all targets offline" is a real signal; (ii) failed delivery does not burn a retry
+  attempt — a claimed-but-undelivered target (offline / quarantined / plugin-absent) releases the
+  claim without consuming the attempt, so retry logic stays correct under HA. Behavioral change
+  operators may notice: a `remediate()` for a target that has exhausted its fix-retry cap is now
+  refused at claim time (HTTP 409, message: "remediation already in flight or retry cap reached for
+  this policy") rather than dispatching a wasted extra fix.
 - Already-correct guards (Deployment CAS, retention/rotation advisory locks) stay as
   defense-in-depth; idempotent/read-only loops run leader-only with no claim.
+
+**Status (WS-3): 3.1 done (#4011); 3.2 done (#4134); 3.3 done (#4169); 3.4 LANDED.** `leader_elector.{hpp,cpp}`
+exists (the fenced-lock primitive) and is wired in `ServerImpl` for the leader-election loop (3.2).
+The transactional command outbox (3.3) has merged; `PolicyEvaluator` remediation redesign (3.4)
+has landed with the durable per-(policy,agent) claim.
 
 ### 7. Gateway cluster topology + routing (Q7)
 **Independent gateway clusters, one per trust zone / region** (internal-vs-external is a trust

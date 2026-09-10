@@ -96,7 +96,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--jit-max-elevation-secs` | `3600` | **JIT admin elevation** maximum window (SOC 2 CC6.3/CC6.6). Caps the lifetime of a time-boxed admin elevation activated via `POST /api/v1/elevate`; a request asking for longer is clamped. Range 1–86400 (24h). Eligibility is the per-user `users.elevation_eligible` flag (admin-set via `POST /api/v1/users/<name>/elevation-eligibility`), elevation requires a fresh MFA step-up, and for Postgres-backed deployments the grant is **durably persisted** to the cookie session's `SessionStore` row (HA WS-1/1a, ADR-2002 §4), so it **survives a restart** — bounded by this 24h ceiling and the session's own absolute expiry, and auto-reverting on lapse, logout, or explicit revoke (config-file-only deployments keep the old in-memory-per-session behavior a restart drops). API/MCP tokens can never be elevated. Env: `YUZU_JIT_MAX_ELEVATION_SECS`. |
 | `--jit-oidc-amr-elevation` / `--no-jit-oidc-amr-elevation` | `true` (enabled) | Whether an OIDC session whose IdP login attested MFA (the `amr` claim, seeding `Session::mfa_verified_at` at `/auth/callback`) can satisfy `POST /api/v1/elevate`'s mandatory second-factor requirement **without** local TOTP enrollment. An OIDC session never consults a local namesake account's TOTP enrollment — a single-factor (no-`amr`) OIDC session is **always** denied regardless of this flag. Pass `--no-jit-oidc-amr-elevation` to disable JIT elevation for OIDC sessions **entirely** — an OIDC session cannot present a local TOTP step-up (its step-up challenge is re-authenticating via SSO, not a TOTP code), so with the flag off an operator must switch to a local-authenticated session with local TOTP to elevate. A one-time INFO log line is emitted at boot when OIDC is configured and this flag is on. ⚠️ **This flag currently has no observable effect** — since the #1837/#1857 identity re-key, an OIDC session is denied JIT elevation at the eligibility gate (its `oidc:<iss>#<sub>` principal has no local `users` row), before the `amr` branch this flag controls is reached; OIDC elevation is restored by #1852. Env: `YUZU_JIT_OIDC_AMR_ELEVATION`. |
 | `--session-inactivity-secs` | `0` | **Idle (inactivity) session timeout** (SOC 2 CC6.3). Seconds of inactivity after which an operator **dashboard cookie session** is invalidated server-side — a **sliding** window that resets on each authenticated request, *under* the absolute 8-hour session lifetime. `0` (default) **disables** it (only the absolute lifetime applies — existing deployments are unaffected); a recommended hardened value is `900` (15 min). Scope is cookie sessions only: **API tokens and MCP tokens are never idle-timed-out** (long-lived automation is unaffected); OIDC users simply re-authenticate via SSO. The active window is logged once at boot for evidence; a value ≥ the absolute 8-hour session lifetime (28800s) is accepted but elicits a startup `WARN` (the idle window can never fire before absolute expiry). Env: `YUZU_SESSION_INACTIVITY_SECS`. |
-| `--auth-mode` | `standard` | Local-password login policy (SOC 2 CC6.3). `standard` = password login enabled. `sso-only` = **local-password login is disabled fleet-wide** — only OIDC SSO mints a session — so the server **refuses to start** unless OIDC is configured (`--oidc-issuer`). A rejected local login returns the **same generic 401** as a bad password (no oracle) and is counted via the metric `yuzu_auth_local_disabled_total` (metric, not a per-attempt audit row — avoids audit-flood under credential spray). A single `--break-glass-user` is exempt while armed. Env: `YUZU_AUTH_MODE`. |
+| `--auth-mode` | `standard` | Local-password login policy (SOC 2 CC6.3). `standard` = password login enabled. `sso-only` = **local-password login is disabled fleet-wide** — only an SSO provider mints a session — so the server **refuses to start** unless OIDC (`--oidc-issuer` + `--oidc-client-id`) or, on Linux/macOS with HTTPS enabled, a complete SAML SP config is present. A rejected local login returns the **same generic 401** as a bad password (no oracle) and is counted via the metric `yuzu_auth_local_disabled_total` (metric, not a per-attempt audit row — avoids audit-flood under credential spray). A single `--break-glass-user` is exempt while armed. Env: `YUZU_AUTH_MODE`. |
 | `--break-glass-user <username>` | *(none)* | The single local account exempt from `--auth-mode=sso-only`, exempt **only while armed** (see `--break-glass-arm`). Under `sso-only` the server **refuses to start** unless this account exists and has **MFA enrolled** (a break-glass account must carry a second factor). A break-glass login is forced through MFA regardless of `--mfa-enforcement` and writes an `auth.breakglass.login` audit row. Env: `YUZU_BREAK_GLASS_USER`. |
 | `--break-glass-window-secs` | `86400` | Seconds the break-glass account stays armed after `--break-glass-arm` (default 24h). The arm **auto-expires** (evaluated lazily at login like the lockout window) — it is never a permanent standing exemption. Env: `YUZU_BREAK_GLASS_WINDOW_SECS`. |
 | `--break-glass-arm` | off | **Break-glass.** Arms `--break-glass-user` for the configured window and exits **without starting the server** — the recovery path when the IdP is down under `--auth-mode=sso-only`. Run on the server host as the service account (arming deliberately does **not** require a session). Validates the account (exists + MFA), verifies the audit store is writable **before** arming, and writes an `auth.breakglass.armed` audit row (principal = the OS account that ran the CLI). Requires `--break-glass-user` + `--data-dir`. Refuses (exit non-zero) if any check fails. |
@@ -207,6 +207,145 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 ---
 
 ## Upgrade Notes
+
+### vNEXT — the server now elects a background-work leader at startup (HA WS-3; NOT breaking)
+
+New, non-breaking, and inert on a single-server deployment. As one step toward
+making a second server replica safe, the singleton background loops that
+*dispatch* — scheduled instructions, policy remediation, quarantine containment
+reconciliation, and the CRL freshness re-publish — now run only on a fenced
+leader elected over a dedicated Postgres coordination connection (ADR-2002 §3).
+On a single server the sole replica is always the leader, so behaviour is
+unchanged.
+
+> **This is the *attempt-gate* half only — do NOT run a second server replica on
+> the strength of this change alone.** It ensures only the leader *attempts* the
+> dispatching loops; the correctness guarantee that a paused ex-leader cannot
+> still commit a dispatch (the epoch fence in the claim write) lands in a
+> follow-on slice, and a supported active-active deployment additionally needs
+> gateway-fronted routing, shared agent presence, and PKI HA. Running a second
+> replica against this slice alone can double-dispatch destructive singleton work
+> (quarantine, deployment, policy remediation). Single-server is the only
+> supported topology today.
+
+What you will see, on **every** deployment including single-server, are new
+startup log lines — these are routine, not a fault:
+
+- `leader_elector: coordination connection established (host=… port=… dbname=…; dedicated, never-recycled)`
+- `leader_elector: election loop started (poll=5s)`
+- `leader_elector: acquired leadership 'server_background_leader' at epoch N`
+
+If instead you see `[HA] leader_elector could not open its coordination
+connection; FencedLeaderOnly background loops are PAUSED …`, the server could not
+reach its Postgres coordination connection: it keeps serving and re-tries every
+election cycle (so a transient blip self-heals within seconds), but while the
+message persists the four dispatching loops above do not run. This is fail-closed
+by design — a paused loop never double-dispatches — and a persistent occurrence
+is a Postgres-reachability problem to investigate, not a server bug. (The
+operator-triggered paths are unaffected: a manual policy remediation or evaluation,
+and an operator CRL revoke, run on whichever replica received the request — and a
+remediation/evaluation is also *completed* on that same replica, so it still reaches
+a terminal verdict even while that replica is not the leader. Only the leader-owned
+*scheduling* half — the automatic due-policy dispatch and the periodic CRL freshness
+re-publish — pauses.)
+
+### vNEXT — scheduled instruction fires now go through a durable command outbox (HA WS-3 3.3; breaking for SIEM/audit-count assurance)
+
+Scheduled instruction fires no longer dispatch to agents inline from the
+poller. The poller now (a) creates the tracked execution row and (b) commits
+a durable `pending` occurrence to a new born-on-PG store, `CommandOutboxStore`
+(schema `command_outbox_store`); a leader-gated delivery loop drains that
+outbox and performs the actual wire dispatch. No operator action is required
+— the store's schema migration runs automatically on upgrade (fresh-start/
+no-backfill, since this store never existed before 3.3).
+
+**Behaviour changes you will see:**
+
+- **Added dispatch latency.** A scheduled fire is still enqueued within ~30
+  seconds of its due time (the poller cadence is unchanged), but actual
+  dispatch to agents now follows within ~5 seconds of enqueue via the
+  delivery loop — up to ~35 seconds total, where it was previously inline/
+  immediate.
+- **The audit trail for one scheduled fire is now two events, not one.**
+  `instruction.schedule_fired` (result `queued`) marks the enqueue; a new
+  `command.outbox_delivered` (result `success`/`failure`/`denied`) marks the
+  actual delivery outcome. **Any SIEM correlation rule or audit-count
+  assurance built on "one audit event per scheduled fire" must be updated**
+  to expect the pair, or to key off `command.outbox_delivered` for the
+  delivery outcome.
+- **New metrics.** Eight counters and a backlog gauge —
+  `yuzu_server_command_outbox_*` — cover enqueue-side degrade and the
+  delivery loop's outcomes (delivered / no-agents / denied / retry / errors /
+  decode-failed / degrade) plus `yuzu_server_command_outbox_pending`, the
+  primary signal that scheduled dispatch has stalled. Full reference:
+  `docs/user-manual/metrics.md` "Command outbox delivery metrics".
+- **ADR-1007 per-device concurrency is no longer enforced for scheduled
+  fires.** The inline path previously resolved a `concurrency_mode` and
+  gated on it; the outbox delivery path dispatches on the plain confined
+  path without that claim. This is a deliberate, tracked gap — restoring
+  per-device concurrency enforcement for the outbox path is a follow-up, not
+  an oversight.
+
+**Rollback note:** a `pending` outbox row committed by a 3.3-or-later binary
+is invisible to a pre-3.3 binary, which has no outbox reader. Rolling back
+mid-flight leaves that occurrence undelivered until you roll forward again —
+a narrow window, and no data corruption (the row stays durable in Postgres
+and delivers as soon as a 3.3-or-later binary is running and holds
+leadership).
+
+### vNEXT — manual policy remediation is now claimed durably, cross-replica (HA WS-3 3.4; breaking for automation asserting `agents == len(agent_ids)`)
+
+`POST /api/policies/{id}/remediate` now arbitrates its per-target claim
+through a durable per-`(policy, agent)` row in `PolicyStore`
+(`policy_status.remediation_claim_at`), instead of an in-process-only guard.
+This closes the cross-replica gap noted in the ADR-0056 Follow-ups: two
+replicas racing a remediate call for the same policy/agent can no longer both
+dispatch a fix.
+
+**Scope of the guarantee.** This holds between replicas running the **same
+schema version**. A rolling upgrade across the migration boundary can
+transiently run an old binary that predates the durable claim alongside a new
+one; that mixed-version window is gated today by issue #4014 (which blocks
+running a second production replica) pending a durable cluster-capability
+admission gate. The exposure is one-directional: a row written by an old
+binary carries claim-generation `0`, a value a new binary never mints.
+Separately, this is effectively-once, not exactly-once (consistent with
+ADR-2002): a replica that pauses for longer than `fixing_stale_seconds`
+between winning a claim and actually sending a command over gRPC — the fix,
+or the subsequent post-fix verify — can still
+dispatch that one send after a sibling has reclaimed the target — the wire
+send is not itself transactionally fenced. The durable claim prevents
+concurrent or duplicate *claims*; it bounds, but does not make impossible, a
+single late duplicate *dispatch* from a long-paused claim-holder.
+
+**Behaviour changes you will see:**
+
+- **A new 409 cause.** `POST /api/policies/{id}/remediate` can now refuse
+  with `409` and body message `"remediation already in flight or retry cap
+  reached for this policy"` when a target is already claimed for remediation
+  (by this replica or a sibling) or has exhausted its fix-retry cap for this
+  policy — in addition to the existing no-fix-instruction and
+  no-non-compliant-agents 409 causes.
+- **`agents` in the `202` response is now the delivered count, not the
+  attempted count (breaking).** A claimed-but-undelivered target (offline,
+  quarantined, plugin absent) releases its claim without consuming a retry
+  attempt and is excluded from `agents`. Automation asserting `agents ==
+  len(agent_ids)` (or `== number of non-compliant agents` for an omitted
+  `agent_ids`) must be updated to tolerate `agents` being smaller than the
+  number of targets requested.
+
+**Migration note:** schema migrations v2–v4 add
+`policy_status.remediation_claim_at` (v2), `policy_status.remediation_claim_gen`
+(v3, the ABA claim-generation fence), and the `remediation_claim_seq` sequence
+(v4) — all `BIGINT NOT NULL DEFAULT 0` columns plus one sequence. They run
+automatically on upgrade, are metadata-only, and require no operator action
+and no downtime.
+
+**Post-restart note:** after a restart, a durable claim left behind by the
+previous process may briefly block re-remediation of the agents it was
+mid-flight for. This self-heals once the claim ages past the staleness
+window (`fixing_stale_seconds`, default 1800s) — the same window
+`claim_due_policies`'s own stranded-`fixing` sweep uses.
 
 ### vNEXT — gateway management plane now pins its peer (#1422, breaking for custom gateway configs)
 
@@ -493,6 +632,58 @@ operator-set grant. This is long-standing behaviour for every seeded
 securable, not new here, but it is worth knowing before you narrow a built-in
 role: express the narrowing as a **custom role** or an explicit `deny` row
 instead, both of which survive a restart.
+
+### vNEXT — three new securables for directory-sync and enrollment reads; `Viewer` auto-gains `Directory:Read` (#4031) (breaking)
+
+**Who this affects.** RBAC-**enabled** deployments with a **custom** role
+that reads AD/Entra directory-synced users, or that previously reached the
+directory-sync status / enrollment auto-approve rules / pending-agent list /
+OIDC config surfaces before this release added dedicated REST v1 routes for
+them.
+
+**What changes automatically.** Three new securables — `Directory`,
+`Enrollment`, `OidcConfig` — are seeded idempotently on every boot
+(`RbacStore::seed_defaults()`), same mechanism as `EnginePrincipal` above.
+Their built-in-role grants are **not symmetric**, unlike `EnginePrincipal`:
+
+- `Directory:Read` is seeded to **both** `Administrator` and `Viewer` —
+  matching the precedent set for other identity-adjacent PII reads
+  (`UserManagement`). A custom role that previously relied on **not**
+  inheriting directory-user PII visibility from a `Viewer`-equivalent grant
+  set should check whether that matters for its use — this is a genuine
+  **widening** of what `Viewer`-derived roles can see, not a like-for-like
+  securable split the way `EnginePrincipal:Read` was. **RBAC-enabled
+  deployments get more than a widening here, though:** `Directory` was
+  never seeded to *any* role before this release, despite `GET
+  /api/directory/users`/`/directory/status`/`/directory/sync` already
+  gating on it — under RBAC-**enabled** enforcement this denied **every**
+  role, including `Administrator`, not just non-`Viewer` custom roles. If
+  your RBAC-enabled deployment could never reach the legacy directory-sync
+  routes even as an admin, this release fixes that dead zone; the "Viewer
+  gains new PII visibility" framing above only tells the RBAC-**disabled**
+  half of the story.
+- `Enrollment:Read` and `OidcConfig:Read` are seeded to `Administrator`
+  **only** — `Viewer` deliberately does NOT gain either, since these gate
+  the fleet's enrollment admission policy and SSO configuration rather than
+  identity/inventory data. Both are also added to the authorization
+  topology floor (see the #2376 note above), so an RBAC-**disabled**
+  install denies them to a non-admin the same way it now denies
+  `AccessReview:Read`/`UserManagement:Read`/`EnginePrincipal:Read`.
+
+**What to do.** No action needed for `Administrator`/`Viewer` — the seed
+loop picks these up automatically. If a custom role needs
+`Enrollment:Read`/`OidcConfig:Read`, grant it directly (no built-in
+non-admin role holds either). If a custom role's exposure to directory-user
+PII via an inherited `Viewer`-shaped permission set is a concern, review it
+explicitly — the auto-grant is intentional but new.
+
+**Also new in this release:** the legacy `GET /api/directory/users` route
+(pre-existing, not new in #4031) previously issued **no audit call at all**
+despite returning PII; it is now audited as `directory.users.view`, though
+via a fire-and-forget path that cannot detect a dropped audit row — see
+[`audit-log.md`](audit-log.md)'s `directory.users.view` row for the full
+three-way posture (REST v1 fail-closed / MCP set-and-proceed-with-signal /
+legacy silent).
 
 ### vNEXT — approval tickets outstanding at the upgrade must be re-requested (#2442) (breaking)
 
@@ -1664,7 +1855,7 @@ Plugin signature verification ships in two parts: an agent-side CMS verifier and
 
 **New audit actions.** `plugin_signing.bundle.uploaded`, `plugin_signing.bundle.cleared`, `plugin_signing.require.changed` — see `audit-log.md` for the result and detail conventions. SIEM rules already filtering on `success`/`failure`/`denied` will pick these up unchanged; no new vocabulary tokens.
 
-**Operator distribution.** The server hosts the bundle at `GET /api/v1/agent/plugin-policy` (admin-only). Agents are pointed at a local copy via `--plugin-trust-bundle <path>`; the manual workflow today is `curl` + `jq` + write the JSON's `trust_bundle_pem` field to disk on each agent host. Automatic agent-side fetch is a forthcoming change.
+**Operator distribution.** The server hosts the bundle at `GET /api/v2/agent/plugin-policy` (`PluginSigning:Read`, Administrator-only; unreachable by any MCP token at any tier as of #4028). Agents are pointed at a local copy via `--plugin-trust-bundle <path>`; the manual workflow today is `curl` + `jq` + write the JSON's `data.trust_bundle_pem` field to disk on each agent host. The old `GET /api/v1/agent/plugin-policy` (flat top-level body, no `data` envelope) is **deprecated** — see the vNEXT note below for the migration and removal window. Automatic agent-side fetch is a forthcoming change.
 
 **Fleet-suicide caveat.** The Yuzu release pipeline does not yet sign the 44 in-tree plugins under `agents/plugins/`. **Do NOT enable "Require signed plugins" until you have signed every plugin your fleet uses, including the in-tree ones.** Use the transitional mode (bundle uploaded, Require off) during rollout. The Settings card surfaces this warning inline.
 
@@ -1774,6 +1965,23 @@ dpkg-query -W -f='${db:Status-Abbrev}\n' | grep -c '^hi'
 ```
 
 A nonzero result means that host's `installed_count` will report a higher number after upgrading, by exactly that many. If your automation only compares the count to a rough threshold or trend, no action is needed; if it asserts an exact expected value, re-baseline it after upgrading.
+
+### vNEXT — `GET /api/v1/agent/plugin-policy` is DEPRECATED; use `GET /api/v2/agent/plugin-policy` (#4028, #4144)
+
+**What changed, and why there are now two versions.** This route already existed pre-#4028 (documented here as the trust-bundle-PEM distribution path for agent config management) but was off the REST-v1 API-parity ledger. #4028 originally hardened it onto the same conventions every other `/api/v1/*` route in this manual uses — but did so **in place**, reshaping `GET /api/v1/agent/plugin-policy`'s response envelope without a version bump. An external review (#4144) caught that this violates `docs/api-versioning-policy.md`'s own rule ("changing an error envelope's shape" requires a `/api/v2/` sibling and a deprecation cycle). Corrected: the hardened behavior now lives at `GET /api/v2/agent/plugin-policy`; `GET /api/v1/agent/plugin-policy` is restored to its exact pre-#4028 shape and formally deprecated.
+
+**`GET /api/v2/agent/plugin-policy` (the hardened route — migrate to this):**
+
+- **Success body is enveloped, under `data`.** `{"data": {"enabled":..., "required":..., "cert_count":..., "sha256":..., "subjects": [...], "bundle_unreadable": <bool>, "bundle_error"?: <string>, "trust_bundle_pem":...}, "meta": {"api_version": "v1"}}`. `subjects` and `bundle_unreadable`/`bundle_error` are new fields versus the v1 shape below.
+- **Error body is the standard A4 envelope** — `error.code`/`error.message`/`error.correlation_id`/`error.retry_after_ms`.
+- **Authorization is the `PluginSigning:Read` RBAC permission** (seeded Administrator-only). An MCP-tier token is denied this route regardless, at the tier chokepoint, before the permission check runs.
+- **Two `503` (retry) responses** where v1 answers `200` with a value it cannot stand behind: a `runtime_config_store` outage backing the `required` flag (v1 silently reports `required:false`), and a concurrent trust-bundle upload/clear racing this request's PEM re-read (v1 can pair a stale `sha256` with the newly-uploaded `trust_bundle_pem` on this exact race — #4144 also closed this integrity gap by deriving every field from a single read of the bundle).
+
+**`GET /api/v1/agent/plugin-policy` (DEPRECATED — unchanged since before #4028):** flat top-level body (`{"enabled":..., "required":..., "trust_bundle_pem":..., "cert_count":..., "sha256":...}`), `require_admin` gate (not RBAC), the old bespoke error shape, no audit row, and the pre-existing runtime_config_store/PEM-race behavior described above. Kept exactly as it always was — no new hardening is being back-ported to it.
+
+**Deprecation window (per `docs/api-versioning-policy.md`).** Announced 2026-09-08. `GET /api/v1/agent/plugin-policy` keeps working for at least 90 days **and** at least one intervening feature release, whichever is longer (so no earlier than 2026-12-07, and not before the next feature release ships) — removal will carry its own `CHANGELOG.md` **Breaking/Removed** entry per the cycle's Step 3, never a silent drop.
+
+**Who this affects, and what to do.** Any script, admin tool, or manual `curl` pipeline reading this route directly. Point it at `/api/v2/agent/plugin-policy` and read `response["data"]["trust_bundle_pem"]` (was `response["trust_bundle_pem"]`) — no CLI flag or configuration change is needed, this is a URL and response-shape change only. No action is required before the removal window closes, but migrating now also picks up the TOCTOU integrity fix.
 
 ---
 
@@ -2632,7 +2840,7 @@ the `openssl` keypair-generation and IdP-registration recipe.
 ### Known limitations in this release
 
 - **MFA step-up:** MFA step-up is not supported for SAML sessions — a SAML session hitting any step-up-gated endpoint receives a 403 regardless of `--mfa-enforcement`. Use `optional` and rely on the IdP to enforce MFA. Avoid `required` for SAML deployments.
-- **`--auth-mode=sso-only`:** Requires OIDC configuration. A SAML-only deployment cannot disable local-password login.
+- **`--auth-mode=sso-only`:** Requires an SSO provider — OIDC, or (Linux/macOS, HTTPS enabled) a complete SAML SP config. A SAML-only deployment **can** disable local-password login. Note: SAML sessions cannot use JIT elevation (grant admin via `--saml-admin-group` instead), and there is no login-page SAML button — SAML operators go to `/auth/saml/start`.
 - **HA / multi-replica:** Pending AuthnRequest state is in-process. Configure load-balancer sticky sessions (session affinity) on `/auth/saml/start` + `/saml/acs`. Without affinity, approximately `(N−1)/N` of logins fail as unsolicited. OIDC shares this limitation.
 - **IdP cert rotation:** Update `--saml-idp-cert` and restart the server. There is no hot-reload.
 - **No login-page button:** Navigate directly to `GET /auth/saml/start`; there is no "Sign in with SAML" button on the login page.
@@ -2713,6 +2921,8 @@ For containerized deployments (Docker Compose), ensure the host volume backing `
 The server's storage substrate is **PostgreSQL** (ADR-0006/0007; the agent stays SQLite). As of the cut-over (#1320 PR 3) the server **requires a reachable database at boot and fails closed without one** — it constructs a shared connection pool at startup and, if `--postgres-dsn` / `YUZU_POSTGRES_DSN` is unset or the database is unreachable, **refuses to start and exits non-zero** (no SQLite fallback for the server). There is a distinct `[PG] Refusing to start` log line so the cause is unambiguous in `systemd` / `kubectl` logs.
 
 > **Upgrade action (BREAKING):** before upgrading to this release, provision PostgreSQL and set `YUZU_POSTGRES_DSN`. Docker Compose deployments already bundle the `postgres` service and wire the DSN (no action beyond pulling the new images). Native installs must run the provisioning helper below (or point the DSN at a managed PostgreSQL 16+) **first** — otherwise the upgraded server will not boot. Restore pairing (ADR-0010): a database restore must be paired with the matching `--ca-dir` / key-directory restore.
+
+**Dedicated coordination connection (HA WS-3, ADR-2002 §10).** Beyond the pool, each server holds **one** additional, never-recycled Postgres connection for background-work leader election — so budget `N_servers × 1` connections against Postgres `max_connections` on top of the pool size below. Per §10 it is deliberately outside the pool and must reach the primary directly (an HAProxy-to-primary front is fine; a *transaction-mode* pooler is not, as it breaks the session advisory lock leadership rests on).
 
 **Connection-pool sizing.** The server opens up to `--postgres-pool-size` / `YUZU_POSTGRES_POOL_SIZE` connections (default **16**). Each heartbeat persists last-seen with one short-lived lease (≈33/s at 1 000 agents on a 30 s heartbeat — well within 16), and `/viz/fleet` draws one. Raise the size for large fleets (rule of thumb: +1 per ~1 000 agents beyond 5 000, plus headroom per additional Postgres-backed store as they migrate) or for a slow managed-PG link. Tune against the `yuzu_pg_pool_{in_use,open,size}` gauges, the `yuzu_pg_acquire_wait_seconds` histogram (the leading saturation signal), and the `yuzu_pg_{connect_failed,acquire_timeout,unhealthy_discard}_total` counters (`unhealthy_discard` counts pooled connections dropped on a failed health probe); the bundled alert rules (`YuzuPgPoolSaturated`, `YuzuPgAcquireWaitHigh`, `YuzuPgConnectFailing` in `docs/prometheus/yuzu-alerts.yml`) fire before `/readyz` is affected. The heartbeat upsert is best-effort with a 250 ms acquire deadline, so a saturated pool degrades the stale-host display, never the live fleet.
 

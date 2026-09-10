@@ -8,8 +8,9 @@
 
 /// @file execution_scope_rules.hpp
 /// #3789: pure confinement-decision helpers shared by every migrated legacy
-/// `/api/executions*` route (`server.cpp`) and their unit tests. Factored
-/// out so a route change and a test change exercise the SAME
+/// `/api/executions*` route (`execution_routes.cpp` — extracted from
+/// `server.cpp` onto the `HttpRouteSink` seam, #2542 PR-7) and their unit
+/// tests. Factored out so a route change and a test change exercise the SAME
 /// implementation — a hand-copied loop per route is exactly how the
 /// terminal-status-only counting bug (`running` miscounted as `responded`)
 /// recurred twice on the sibling #1634 workstream before landing here once.

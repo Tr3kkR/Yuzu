@@ -7,11 +7,22 @@
  *   1. Pure execution_scope_rules.hpp unit tests — no I/O, no PG.
  *   2. A real-rig (PG) confinement test proving `require_fleet_read`'s
  *      resolved scope actually excludes an out-of-scope agent for Bob.
- *   3. Source tripwires proving every one of the 7 migrated routes in
- *      server.cpp actually calls the fleet gate + the shared rule helpers,
- *      not a hand-copied loop (the terminal-status-only counting bug
- *      recurred twice on the sibling #1634 workstream from exactly that
- *      kind of copy-paste).
+ *   3. Source tripwires proving every one of the 7 migrated routes
+ *      actually calls the fleet gate + the shared rule helpers, not a
+ *      hand-copied loop (the terminal-status-only counting bug recurred
+ *      twice on the sibling #1634 workstream from exactly that kind of
+ *      copy-paste).
+ *
+ * #2542 PR-7: the 7 routes moved from server.cpp's inline `web_server_->`
+ * registrations onto the HttpRouteSink seam (`execution_routes.cpp`,
+ * `sink.Get`/`sink.Post`, `deps.fleet_read_fn`/`deps.perm_fn`/
+ * `deps.audit_fn` replacing the bare `require_fleet_read`/
+ * `require_permission`/`audit_log` calls) — the tripwires below now scan
+ * THAT file, not server.cpp. Handler bodies are otherwise byte-identical
+ * (verified against the pre-move source before this update), so every
+ * literal being searched for is either unchanged (method names like
+ * `get_execution_checked`, string literals) or updated to the new
+ * `deps.<closure>` spelling.
  */
 
 #include "authz_model.hpp"
@@ -40,8 +51,10 @@ httplib::Request bearer_request(const std::string& token) {
 #error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
 #endif
 
-std::string read_server_cpp() {
-    std::ifstream input(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
+// #2542 PR-7: reads execution_routes.cpp (the extracted owner file), not
+// server.cpp — see this file's header comment.
+std::string read_execution_routes_cpp() {
+    std::ifstream input(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "execution_routes.cpp");
     REQUIRE(input.is_open());
     return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
 }
@@ -49,7 +62,9 @@ std::string read_server_cpp() {
 std::string route_block(const std::string& source, const std::string& marker) {
     const auto begin = source.find(marker);
     REQUIRE(begin != std::string::npos);
-    const auto end = source.find("web_server_->", begin + marker.size());
+    // #2542 PR-7: end-of-block sentinel updated from server.cpp's
+    // `web_server_->` receiver to execution_routes.cpp's `sink.` receiver.
+    const auto end = source.find("sink.", begin + marker.size());
     return source.substr(begin, (end == std::string::npos ? source.size() : end) - begin);
 }
 
@@ -316,8 +331,8 @@ TEST_CASE("legacy executions: Bob's global Execute grant admits a complete, "
 TEST_CASE("legacy executions routes: every route retains the fleet gate, not the "
           "bare flat permission gate",
           "[execution][scope][3789][source_tripwire]") {
-    const auto source = read_server_cpp();
-    const auto list_route = route_block(source, R"(web_server_->Get("/api/executions",)");
+    const auto source = read_execution_routes_cpp();
+    const auto list_route = route_block(source, R"(sink.Get("/api/executions",)");
     const auto detail = route_block(source, R"(/api/executions/([^/]+))");
     const auto summary = route_block(source, R"(/api/executions/([^/]+)/summary)");
     const auto agents = route_block(source, R"(/api/executions/([^/]+)/agents)");
@@ -327,16 +342,18 @@ TEST_CASE("legacy executions routes: every route retains the fleet gate, not the
 
     for (const auto* block :
         {&list_route, &detail, &summary, &agents, &rerun, &cancel, &children}) {
-        CHECK(block->find(R"(require_fleet_read(req, res, "Execution", "Read"))") !=
+        // #2542 PR-7: the bare `require_fleet_read(...)` call became
+        // `deps.fleet_read_fn(...)` — same tuple, new receiver.
+        CHECK(block->find(R"(deps.fleet_read_fn(req, res, "Execution", "Read"))") !=
               std::string::npos);
-        CHECK(block->find(R"(require_permission(req, res, "Execution", "Read"))") ==
+        CHECK(block->find(R"(deps.perm_fn(req, res, "Execution", "Read"))") ==
               std::string::npos);
     }
     // Mutations additionally keep the pre-existing Execute permission gate —
     // the fleet gate is structurally Read-only (authz_gates.cpp) and cannot
     // replace it.
     for (const auto* block : {&rerun, &cancel}) {
-        CHECK(block->find(R"(require_permission(req, res, "Execution", "Execute"))") !=
+        CHECK(block->find(R"(deps.perm_fn(req, res, "Execution", "Execute"))") !=
               std::string::npos);
     }
 }
@@ -344,7 +361,7 @@ TEST_CASE("legacy executions routes: every route retains the fleet gate, not the
 TEST_CASE("legacy executions detail route: redaction literal and checked reads "
           "are present, unchecked get_execution/get_agent_statuses are not",
           "[execution][scope][3789][source_tripwire]") {
-    const auto source = read_server_cpp();
+    const auto source = read_execution_routes_cpp();
     const auto detail = route_block(source, R"(/api/executions/([^/]+))");
     CHECK(detail.find("(redacted - confined view)") != std::string::npos);
     CHECK(detail.find("get_execution_checked") != std::string::npos);
@@ -359,7 +376,7 @@ TEST_CASE("legacy executions detail route: redaction literal and checked reads "
 TEST_CASE("legacy executions agents route: filters to in-scope agents via the "
           "checked status read",
           "[execution][scope][3789][source_tripwire]") {
-    const auto source = read_server_cpp();
+    const auto source = read_execution_routes_cpp();
     const auto agents = route_block(source, R"(/api/executions/([^/]+)/agents)");
     CHECK(agents.find("get_agent_statuses_checked") != std::string::npos);
     CHECK(agents.find("authz::in_scope") != std::string::npos);
@@ -369,8 +386,8 @@ TEST_CASE("legacy executions agents route: filters to in-scope agents via the "
 TEST_CASE("legacy executions list route: SQL scope pushdown precedes the "
           "checked query, and the limit is capped",
           "[execution][scope][3789][source_tripwire]") {
-    const auto source = read_server_cpp();
-    const auto list_route = route_block(source, R"(web_server_->Get("/api/executions",)");
+    const auto source = read_execution_routes_cpp();
+    const auto list_route = route_block(source, R"(sink.Get("/api/executions",)");
     CHECK(list_route.find("query_executions_checked") != std::string::npos);
     CHECK(list_route.find("ExecutionListScope") != std::string::npos);
     CHECK(list_route.find("get_agent_statuses_for_executions_checked") != std::string::npos);
@@ -385,7 +402,7 @@ TEST_CASE("legacy executions list route: SQL scope pushdown precedes the "
 TEST_CASE("legacy executions summary route: unknown-id collapses to 404 for every "
           "caller, not the old zero-filled 200",
           "[execution][scope][3789][source_tripwire]") {
-    const auto source = read_server_cpp();
+    const auto source = read_execution_routes_cpp();
     const auto summary = route_block(source, R"(/api/executions/([^/]+)/summary)");
     CHECK(summary.find("get_execution_checked") != std::string::npos);
     CHECK(summary.find(R"("not found")") != std::string::npos);
@@ -396,7 +413,7 @@ TEST_CASE("legacy executions summary route: unknown-id collapses to 404 for ever
 TEST_CASE("legacy executions children route: each child is checked against the "
           "same visibility predicate as its parent, not truthfully passed through",
           "[execution][scope][3789][source_tripwire]") {
-    const auto source = read_server_cpp();
+    const auto source = read_execution_routes_cpp();
     const auto children = route_block(source, R"(/api/executions/([^/]+)/children)");
     CHECK(children.find("get_children_checked") != std::string::npos);
     CHECK(children.find("get_agent_statuses_for_executions_checked") != std::string::npos);
@@ -406,7 +423,7 @@ TEST_CASE("legacy executions children route: each child is checked against the "
 TEST_CASE("legacy executions rerun/cancel routes: mutation admission uses the "
           "complete-cohort rule, not a bare visibility check",
           "[execution][scope][3789][source_tripwire]") {
-    const auto source = read_server_cpp();
+    const auto source = read_execution_routes_cpp();
     const auto rerun = route_block(source, R"(/api/executions/([^/]+)/rerun)");
     const auto cancel = route_block(source, R"(/api/executions/([^/]+)/cancel)");
     for (const auto* block : {&rerun, &cancel}) {
@@ -439,7 +456,7 @@ TEST_CASE("legacy executions GET routes: the 'denied' audit row fires only "
           "under an engaged scope, never for an unconfined caller's "
           "genuinely-nonexistent id (#3789 Gate 8 compliance-officer F2)",
           "[execution][scope][3789][source_tripwire]") {
-    const auto source = read_server_cpp();
+    const auto source = read_execution_routes_cpp();
     const auto detail = strip_line_comments(route_block(source, R"(/api/executions/([^/]+))"));
     const auto summary =
         strip_line_comments(route_block(source, R"(/api/executions/([^/]+)/summary)"));
@@ -451,8 +468,9 @@ TEST_CASE("legacy executions GET routes: the 'denied' audit row fires only "
     // — a caller with no engaged scope always has `!scope` visibility true
     // (execution_scope_rules.hpp), so this branch's audit is reachable ONLY
     // when a real confinement decision could have produced it.
+    // #2542 PR-7: `(void)audit_log(...)` became `(void)deps.audit_fn(...)`.
     static const std::regex gated_audit(
-        R"(if\s*\(gate\.scope\)\s*\{\s*\(void\)audit_log\(req,\s*"execution\.read",\s*"denied")");
+        R"(if\s*\(gate\.scope\)\s*\{\s*\(void\)deps\.audit_fn\(req,\s*"execution\.read",\s*"denied")");
     for (const auto* block : {&detail, &summary, &agents, &children})
         CHECK(std::regex_search(*block, gated_audit));
 }
@@ -461,8 +479,8 @@ TEST_CASE("legacy executions confined routes: an empty resolved username "
           "fails closed with 503 rather than falling through to agent-only "
           "visibility (#3789 Gate 8, security-guardian LOW / unhappy-path UP-6)",
           "[execution][scope][3789][source_tripwire]") {
-    const auto source = read_server_cpp();
-    const auto list_route = route_block(source, R"(web_server_->Get("/api/executions",)");
+    const auto source = read_execution_routes_cpp();
+    const auto list_route = route_block(source, R"(sink.Get("/api/executions",)");
     const auto detail = route_block(source, R"(/api/executions/([^/]+))");
     const auto summary = route_block(source, R"(/api/executions/([^/]+)/summary)");
     const auto agents = route_block(source, R"(/api/executions/([^/]+)/agents)");
