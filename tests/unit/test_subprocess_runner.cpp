@@ -228,17 +228,57 @@ TEST_CASE("run_bounded_subprocess: a natural nonzero exit survives the stop_afte
     // (that would report a failed tool as SUCCESS -- the exact honesty
     // violation the runner exists to prevent). Only the -1 signal-death
     // sentinel may be rewritten to 0.
-    SubprocessResult result = run_bounded_subprocess(
-        {"/bin/sh", "-c", "printf 'a\\nb\\n'; exit 3"},
-        SubprocessOptions{.deadline = 5000ms, .max_lines = 2, .stop_after_max_lines = true});
-
-    CHECK_FALSE(result.timed_out);
-    CHECK(result.tool_ran);
-    CHECK(result.exit_code == 3); // NOT clobbered to 0
-    // The child exited on its own (child_reaped was already true when the
-    // line-cap kill decision ran) -- termination_reason correctly credits
-    // `exited`, not `line_limit`, even though the cap was also hit.
-    CHECK(result.termination_reason == TerminationReason::exited);
+    //
+    // K-5 races the line-cap's SIGKILL against the child's own exit(3) the
+    // same way K1 (below) races the deadline/cancel kill against a natural
+    // exit: try_reap() only runs once per poll iteration, before that same
+    // iteration reads the pipe, notices the cap was just hit, and decides
+    // whether to kill -- so a child that has already called exit(3) in real
+    // wall-clock time, but hasn't been reaped yet when the cap decision
+    // runs, can still lose the race to a genuine SIGKILL under CPU
+    // contention (#4019: reproduced on a Big Tam box saturated by a
+    // concurrently-running Coverage job -- the runner's own kill won,
+    // exit_code came back -1/signaled instead of the child's real 3, on
+    // BOTH the ASan and TSan legs). This is an unavoidable race, not a
+    // runner bug -- brought to K1's already-reviewed implication form:
+    // only assert the exited/exit-code shape on an iteration where a
+    // natural exit was actually observed (WIFEXITED, i.e. exit_code != -1);
+    // an iteration where the kill genuinely won is legitimately skipped,
+    // matching K1's own "Runs where the kill genuinely wins carry the -1
+    // sentinel and are legitimately skipped by the implication" comment.
+    // `timed_out`/`tool_ran` are asserted unconditionally: the line-cap
+    // kill path never sets `timed_out` (that flag is exclusive to the
+    // deadline/cancel branch, subprocess_runner.cpp's `line_cap_stop`
+    // branch never touches it), and `tool_ran` is decided purely by exec
+    // outcome (`exec_confirmed_ok && !exec_failed`), independent of which
+    // side of the kill race the child landed on.
+    int natural_exits = 0;
+    for (int i = 0; i < 40; ++i) {
+        SubprocessResult result = run_bounded_subprocess(
+            {"/bin/sh", "-c", "printf 'a\\nb\\n'; exit 3"},
+            SubprocessOptions{.deadline = 5000ms, .max_lines = 2, .stop_after_max_lines = true});
+        CHECK_FALSE(result.timed_out);
+        CHECK(result.tool_ran);
+        if (result.exit_code != -1) { // WIFEXITED observed => the exit predates the kill
+            ++natural_exits;
+            CHECK(result.exit_code == 3); // NOT clobbered to 0
+            // The child exited on its own (child_reaped was already true
+            // when the line-cap kill decision ran) -- termination_reason
+            // correctly credits `exited`, not `line_limit`, even though the
+            // cap was also hit.
+            CHECK(result.termination_reason == TerminationReason::exited);
+        }
+    }
+#if defined(__linux__)
+    // Non-vacuity floor, Linux only: matches K1's own floor below (see its
+    // comment for the pidfd-wake reasoning and what a genuinely saturated
+    // host does to it). Deliberately NOT bumped past 40 and NOT given a
+    // bare retry here -- see K1's floor comment below for the considered,
+    // documented decision this shares.
+    CHECK(natural_exits > 0);
+#else
+    (void)natural_exits;
+#endif
 }
 
 // K1/CDX-P2-002 (review blocker): the deadline twin of K-5. A child that ran
@@ -272,6 +312,30 @@ TEST_CASE("a natural exit racing the deadline is reported exited, never deadline
     // a slow-starting /bin/sh and the kill then legitimately wins, so the
     // floor would flake under load; the implication above still bites
     // whenever the window is hit.
+    //
+    // #4019, deliberate decision on this floor's behaviour under real host
+    // saturation (not left as a silent gap): the ASan/TSan nightly legs both
+    // hit 0/40 natural exits on a Big Tam box running a concurrent Coverage
+    // job (i.e. every single iteration lost the race, not just a handful) --
+    // a genuine, sustained-for-the-whole-test CPU-contention condition, NOT
+    // a sanitizer-instrumentation effect (this loop's own child processes
+    // are never sanitizer-instrumented; only the parent test binary is).
+    // Ruled OUT as the fix here: bumping 40 to a larger N (more exposure to
+    // the same sustained contention, no reason to expect a different ratio)
+    // and a bounded retry of this loop (the original failure was 0/40 for
+    // the test's entire duration, not a brief transient blip a moments-later
+    // retry would plausibly ride out, since the co-scheduled job that
+    // starved it runs far longer than one retry pass). This is a real test-
+    // design gap under load with no cheap in-test fix -- closing it for real
+    // needs either an explicit ordering seam (a way for the test to observe
+    // "the child's exit(3) call itself, not just its reap, predates the kill
+    // decision" deterministically, which the runner does not expose today)
+    // or a CI-scheduling-level compensating control (not co-scheduling
+    // Coverage with the Linux sanitizer legs on the same shared runner
+    // pool). Neither is in scope for this fix; the floor stays at 40/
+    // `natural_exits > 0` and this decision is recorded here so a future
+    // occurrence is read as "shared-runner contention recurred," not a
+    // silent flake to paper over with a bigger number.
     CHECK(natural_exits > 0);
 #else
     (void)natural_exits;
