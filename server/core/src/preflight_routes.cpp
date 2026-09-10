@@ -569,8 +569,13 @@ void PreflightRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
             return;
         if (!run_store_) {
             res.status = 503;
-            res.set_content(detail::a4_error(res, "pre-flight run store is unavailable on this server"),
-                            "application/json");
+            // retry_after_ms=2000 matches the MCP twin's kMcpStoreFaultShortRetryMs
+            // (mcp_retry.hpp) — the two surfaces must not disagree on how long a
+            // caller should back off for the identical condition.
+            res.set_content(
+                detail::a4_error(res, "pre-flight run store is unavailable on this server",
+                                 {.retry_after_ms = 2000}),
+                "application/json");
             return;
         }
         // `limit`: default matches the fragment rail's own cap (12); callers
@@ -601,8 +606,10 @@ void PreflightRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                                                      static_cast<int>(limit));
         if (!rows_or) {
             res.status = 503;
-            res.set_content(detail::a4_error(res, "pre-flight run store is unavailable on this server"),
-                            "application/json");
+            res.set_content(
+                detail::a4_error(res, "pre-flight run store is unavailable on this server",
+                                 {.retry_after_ms = 2000}),
+                "application/json");
             return;
         }
         const auto& rows = *rows_or;

@@ -5822,8 +5822,10 @@ void RestApiV1::register_routes(
                  auto def_result = instruction_store->get_definition(id);
                  if (!def_result) {
                      res.status = 503;
-                     res.set_content(detail::a4_error(res, "instruction store read failed"),
-                                     "application/json");
+                     res.set_content(
+                         detail::a4_error(res, "instruction store read failed",
+                                          {.retry_after_ms = 5000}),
+                         "application/json");
                      return;
                  }
                  if (!*def_result) {
@@ -5863,10 +5865,15 @@ void RestApiV1::register_routes(
         auto packs_result = product_pack_store->list(q);
         if (!packs_result) {
             res.status = product_pack_error_status(packs_result.error());
-            res.set_content(detail::a4_error(res, product_pack_client_message(
-                                                       "GET /api/v1/product-packs",
-                                                       packs_result.error())),
-                            "application/json");
+            // Only the genuine DB/lease-fault (503) classification is transient —
+            // a 400 validation/business-rule error is never retryable.
+            res.set_content(
+                detail::a4_error(res,
+                                 product_pack_client_message("GET /api/v1/product-packs",
+                                                             packs_result.error()),
+                                 res.status == 503 ? detail::A4ErrorOpts{.retry_after_ms = 5000}
+                                                    : detail::A4ErrorOpts{}),
+                "application/json");
             return;
         }
         JArr arr;
@@ -5890,10 +5897,15 @@ void RestApiV1::register_routes(
                  auto pack_result = product_pack_store->get(id);
                  if (!pack_result) {
                      res.status = product_pack_error_status(pack_result.error());
-                     res.set_content(detail::a4_error(res, product_pack_client_message(
-                                                                "GET /api/v1/product-packs/{id}",
-                                                                pack_result.error())),
-                                     "application/json");
+                     res.set_content(
+                         detail::a4_error(res,
+                                          product_pack_client_message(
+                                              "GET /api/v1/product-packs/{id}",
+                                              pack_result.error()),
+                                          res.status == 503
+                                              ? detail::A4ErrorOpts{.retry_after_ms = 5000}
+                                              : detail::A4ErrorOpts{}),
+                         "application/json");
                      return;
                  }
                  if (!*pack_result) {

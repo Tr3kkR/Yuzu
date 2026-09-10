@@ -492,8 +492,13 @@ void DeploymentRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, Perm
             return;
         if (!preflight_store_) {
             res.status = 503;
-            res.set_content(detail::a4_error(res, "pre-flight run store is unavailable on this server"),
-                            "application/json");
+            // retry_after_ms=2000 matches the MCP twin's kMcpStoreFaultShortRetryMs
+            // (mcp_retry.hpp) — the two surfaces must not disagree on how long a
+            // caller should back off for the identical condition.
+            res.set_content(
+                detail::a4_error(res, "pre-flight run store is unavailable on this server",
+                                 {.retry_after_ms = 2000}),
+                "application/json");
             return;
         }
         const std::string run_id = param(req, "run");
@@ -516,8 +521,10 @@ void DeploymentRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, Perm
         auto run_or = preflight_store_->get_run_checked(run_id, session->username);
         if (!run_or) {
             res.status = 503;
-            res.set_content(detail::a4_error(res, "pre-flight run store is unavailable on this server"),
-                            "application/json");
+            res.set_content(
+                detail::a4_error(res, "pre-flight run store is unavailable on this server",
+                                 {.retry_after_ms = 2000}),
+                "application/json");
             return;
         }
         const auto& run = *run_or;
