@@ -111,23 +111,25 @@ checks run.
 | `scope_expression` | Scope engine expression for device targeting |
 | `enabled` | Whether the policy is active (can be toggled) |
 | `inputs` | Key-value parameters passed to the fragment's instructions |
-| `triggers` | When to evaluate. **Only `interval` actually drives evaluation today** — see "Trigger Configuration" below. |
+| `triggers` | When to evaluate. **Only `interval` triggers are honoured as declared — every other type is silently ignored and the policy falls back to hourly evaluation of its full scope regardless** — see "Trigger Configuration" below (#4244). |
 | `management_groups` | Group IDs this policy is scoped to |
 
 ### Trigger Configuration
 
-Triggers are stored per-policy with type-specific JSON configuration. **Corrected 2026-09-10 (Gate-of-record pass 3, sec-2/UP-16): only `interval` actually drives evaluation.** `trigger_type` is a free-text column and every kind below is accepted and persisted without validation, but the due-policy scheduling query that determines which policies get (re-)evaluated only ever joins on `trigger_type = 'interval'` (`server/core/src/policy_store.cpp:1249-1250`). A trigger of any other type is silently inert: it is stored, it never errors, and it never causes an evaluation to run.
+Triggers are stored per-policy with type-specific JSON configuration. **Corrected 2026-09-10 (Gate-of-record pass 4, item 3 — supersedes the pass 3 wording below, which was itself wrong): non-interval trigger types are accepted and stored, but IGNORED — they do NOT suppress evaluation.** `trigger_type` is a free-text column and every kind below is accepted and persisted without validation. The due-policy scheduling query is a **`LEFT JOIN`** from `policies` to `policy_triggers` filtered to `trigger_type='interval'` **in the join condition, not the `WHERE` clause** (`server/core/src/policy_store.cpp:1242-1252`) — so every enabled policy produces exactly one row whether or not it has an interval trigger. A policy with only a `file_change`/`service_status`/`event_log`/`registry`/`startup` trigger (or no trigger at all) still gets that row, with `config_json` = `NULL`, and `NULL` falls back to the **3600-second platform default** (`interval_from_config_json(..., default_interval_seconds)`). **The practical effect: a policy configured with a non-interval trigger still evaluates — every hour, against its full declared scope — as if it had an `interval` trigger set to the default, with no error, no warning at create time, no indication in REST reads that this is happening, and no dedicated cadence metric distinguishing "genuinely configured for hourly" from "fell back because the declared trigger type is a no-op" (tracked as issue #4244).** This is the opposite failure mode from "never evaluated": it's "evaluated on a schedule you didn't ask for, silently."
 
-| Trigger Type | Config Example | Actually drives evaluation? |
+| Trigger Type | Config Example | What actually happens |
 |---|---|---|
-| `interval` | `{"interval_seconds": 300}` | **Yes** — the only trigger kind the scheduler selects. |
-| `file_change` | `{"path": "/etc/hosts"}` | No — accepted and stored, never evaluated (`policy_store.cpp:1250`). |
-| `service_status` | `{"service": "sshd"}` | No — accepted and stored, never evaluated (`policy_store.cpp:1250`). |
-| `event_log` | `{"log": "Security", "event_id": 4625}` | No — accepted and stored, never evaluated (`policy_store.cpp:1250`). |
-| `registry` | `{"hive": "HKLM", "key": "SOFTWARE\\..."}` | No — accepted and stored, never evaluated (`policy_store.cpp:1250`). |
-| `startup` | `{}` | No — accepted and stored, never evaluated (`policy_store.cpp:1250`). |
+| `interval` | `{"interval_seconds": 300}` | Evaluates on your declared cadence (floored at 60s). |
+| `file_change` | `{"path": "/etc/hosts"}` | **Ignored** — the file-change condition has no effect. The policy still evaluates every **3600s** (default) against its full scope. See #4244. |
+| `service_status` | `{"service": "sshd"}` | **Ignored** — same fallback to the 3600s default. See #4244. |
+| `event_log` | `{"log": "Security", "event_id": 4625}` | **Ignored** — same fallback to the 3600s default. See #4244. |
+| `registry` | `{"hive": "HKLM", "key": "SOFTWARE\\..."}` | **Ignored** — same fallback to the 3600s default. See #4244. |
+| `startup` | `{}` | **Ignored** — same fallback to the 3600s default. See #4244. |
 
-If you need a policy to re-evaluate promptly, use an `interval` trigger with a short `interval_seconds`; do not rely on `file_change`/`service_status`/`event_log`/`registry`/`startup` triggers to cause evaluation — as of this baseline they do not. (Real-time, kernel-backed enforcement for a narrower set of settings exists on the agent-side Guardian path — see `docs/yuzu-guardian-design-v1.1.md` — which is a different mechanism from this server-side policy trigger configuration.)
+If you need a policy to re-evaluate on a specific cadence, declare an explicit `interval` trigger with the `interval_seconds` you want — do not assume a `file_change`/`service_status`/`event_log`/`registry`/`startup` trigger changes *when* evaluation happens; it doesn't, and the policy will silently run hourly against its full scope regardless. (Real-time, kernel-backed enforcement for a narrower set of settings exists on the agent-side Guardian path — see `docs/yuzu-guardian-design-v1.1.md` — which is a different mechanism from this server-side policy trigger configuration.)
+
+> **Common mistake:** pasting one of the non-`interval` examples above (or any policy with no `triggers:` block at all) does not mean "this policy never runs" — it means "this policy runs every hour against its full scope, invisibly." Nothing in policy creation, the REST read endpoints, or the dashboard currently surfaces that fallback as distinct from a deliberately-configured hourly interval (#4244). If a policy's checks are expensive or its scope is large, declare an explicit `interval` trigger with a cadence you've chosen on purpose, rather than relying on (or being unaware of) the default.
 
 > **Trigger limit:** The agent's trigger engine enforces a configurable maximum trigger count (default: 2000). Triggers beyond this limit are rejected with a warning log message. This prevents runaway policy deployments from exhausting agent resources. The limit can be configured via the agent API. (Note: this is the *agent's own* `TriggerType` engine used elsewhere in the product, e.g. §17 of the capability map — distinct from the server-side `PolicyStore` trigger-type column described above, which does not dispatch through that engine at all.)
 
@@ -150,12 +152,21 @@ spec:
   scope: "tag:environment = 'production'"
   triggers:
     - type: interval
-      interval: 300
+      interval_seconds: 300
   managementGroups:
     - eu-production-servers
   inputs:
     severity_threshold: "high"
 ```
+
+**The interval trigger's config key is `interval_seconds`, not `interval`.** The
+loader reads it via `extract_yaml_value(item_block, "interval_seconds")`
+(`server/core/src/policy_store.cpp:655`) — a trigger block with any other key
+name (including the easy-to-guess `interval:`) parses with no `config_json`
+and silently falls back to the **3600-second** platform default
+(`policy_evaluator.hpp:107`), not the value you wrote. This corrects an
+earlier revision of this manual that itself used the wrong key. *(Corrected
+2026-09-10, Gate-of-record pass 4 item 1.)*
 
 ---
 
@@ -409,6 +420,25 @@ spec:
 
 ### Policy
 
+**Do not put `#` comments inside the `triggers:` sequence — not on their own
+line, not trailing a `- type:` entry, anywhere between `triggers:` and the
+next sibling key.** The parser that reads `spec.triggers` (`policy_store.cpp:622-660`)
+locates each trigger entry with a raw `std::string::find('-')` scan of the
+whole `triggers:` block, before any comment-stripping happens — a stray `-`
+character inside a comment (even an innocuous one like "non-interval" or
+"re-evaluate", both hyphenated) is indistinguishable from a trigger's own
+leading dash and corrupts the indent the scanner locks onto for every
+subsequent entry. In the worst case (a comment appears *before* the first
+real `- type:` line) this silently parses **zero triggers** from an
+otherwise well-formed policy — no error, no warning, just an empty trigger
+list. The example below is deliberately comment-free inside `triggers:` for
+exactly this reason; only `type: interval` currently has any effect on
+*when* the policy evaluates (see "Trigger Configuration" above and its
+"Common mistake" callout) — every other type in the schema line below is
+accepted, stored, and functionally ignored. *(Corrected 2026-09-10,
+Gate-of-record pass 4 item 2 — an earlier revision of this example put
+explanatory comments inside the sequence and broke on this exact bug.)*
+
 ```yaml
 apiVersion: yuzu.io/v1alpha1
 kind: Policy
@@ -419,13 +449,8 @@ spec:
   fragment: <fragment-name-or-id>
   scope: <scope-expression>
   triggers:
-    # As of this baseline, only `type: interval` actually causes evaluation
-    # (server/core/src/policy_store.cpp:1249-1250 joins trigger_type='interval'
-    # only). The other type values below are accepted and stored but silently
-    # never fire an evaluation — see "Trigger Configuration" above.
-    - type: interval          # the only trigger type that drives evaluation today
-      interval: <seconds>
-    # - type: <file_change|service_status|event_log|registry|startup>  # accepted, but inert
+    - type: <interval|file_change|service_status|event_log|registry|startup>
+      interval_seconds: <seconds>
   managementGroups:
     - <group-name-or-id>
   inputs:
