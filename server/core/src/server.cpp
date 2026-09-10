@@ -154,6 +154,7 @@
 #include "capability_decls/plugin_action_catalogue_disk_actions.hpp"
 #include "capability_decls/plugin_action_catalogue_filesystem_posture.hpp"
 #include "capability_decls/plugin_action_catalogue_power_health.hpp"
+#include "capability_decls/plugin_action_catalogue_autoruns.hpp"
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
@@ -17457,6 +17458,11 @@ private:
             // with no MCP twin — an ADR-1005 gap for an ordinary
             // authenticated operator action).
             mcp_server_->set_plugin_config_store(plugin_config_store_.get());
+            // #4036 (api-parity Batch A) — backs list_preflight_runs +
+            // get_deployment_preview. Same store PreflightRoutes/
+            // DeploymentRoutes already hold (constructed well before this
+            // point, server.cpp:4041) — no new construction needed.
+            mcp_server_->set_preflight_run_store(preflight_run_store_.get());
             mcp_server_->set_upload_grant_ops(
                 upload_grant_store_.get(),
                 // SAME logic as the REST list_read_fn wired at the
@@ -17926,6 +17932,7 @@ private:
         yuzu::server::capdecls::plugin_action_catalogue_disk_actions(),
         yuzu::server::capdecls::plugin_action_catalogue_filesystem_posture(),
         yuzu::server::capdecls::plugin_action_catalogue_power_health(),
+        yuzu::server::capdecls::plugin_action_catalogue_autoruns(),
     };
     /// Shared Postgres connection pool — the server storage substrate (ADR-0006/
     /// 0007). Constructed in the ctor BEFORE any Postgres-backed store (fail

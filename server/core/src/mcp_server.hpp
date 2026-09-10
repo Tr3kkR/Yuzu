@@ -89,6 +89,12 @@ class DirectorySync;
 // UploadGrantStore itself is NOT forward-declared here — it arrives fully
 // defined via file_retrieval_routes.hpp's own include above.
 class PluginConfigStore;
+// #4036 (api-parity Batch A) — backs list_preflight_runs +
+// get_deployment_preview (the latter reads ONLY the pre-flight store, never
+// DeploymentRunStore — see deployment_routes.cpp's own /fragments/auto/deploy
+// handler, which is the same shape). Forward-declared (pointer-only in the
+// setter below); the .cpp includes preflight_run_store.hpp for the definition.
+class PreflightRunStore;
 // #4029 — backs list_product_packs/get_product_pack. Forward-declared
 // (pointer-only in build_handler/register_routes); the .cpp includes
 // product_pack_model.hpp, which pulls in product_pack_store.hpp.
@@ -460,6 +466,16 @@ public:
         upload_grant_store_ = store;
         upload_grant_list_read_fn_ = std::move(list_read_fn);
     }
+
+    /// #4036 (api-parity Batch A) — the pre-flight run store, backing
+    /// `list_preflight_runs` (owner-scoped, mirrors GET
+    /// /api/v1/preflight/runs) and `get_deployment_preview` (mirrors GET
+    /// /api/v1/deployments/preview — reads ONLY this store, never
+    /// DeploymentRunStore, matching the fragment's own
+    /// `/fragments/auto/deploy` handler). Same setter idiom as
+    /// `set_plugin_config_store` above. Unset (`nullptr`, the default) ⇒
+    /// both tools answer "unavailable" rather than crashing.
+    void set_preflight_run_store(PreflightRunStore* store) { preflight_run_store_ = store; }
 
     /// #3290 Phase 2 — the injected-callback twin of
     /// `AuthRoutes::require_fleet_read`, backing `query_installed_software`'s
@@ -851,6 +867,8 @@ private:
     UploadGrantListReadFn upload_grant_list_read_fn_;
     // #3290 Phase 2 — see set_fleet_read_fn above.
     FleetReadFn fleet_read_fn_;
+    // #4036 (api-parity Batch A) — see set_preflight_run_store above.
+    PreflightRunStore* preflight_run_store_{nullptr};
     // #4143 review fix — see set_all_devices_fn above.
     AllDevicesFn all_devices_fn_;
     DashboardRoutes* dashboard_routes_{nullptr};

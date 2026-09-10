@@ -121,6 +121,11 @@ constexpr std::string_view kAgenticHelpers[] = {"get_fleet_posture_fast",
 constexpr std::string_view kDiscovery[] = {"discover_permissions", "discover_instructions",
                                            "discover_routes", "discover_scope_kinds",
                                            "discover_plugins"};
+// #4036 (api-parity Batch A) — the /auto pre-flight ASSESS + deploy ACT
+// stages' read twins. Own family, distinct from Fleet & agents / Live
+// execution: these are owner-scoped readiness/preview reads over the
+// operator's OWN saved runs, not fleet-wide agent data or dispatch.
+constexpr std::string_view kPreflightDeploy[] = {"list_preflight_runs", "get_deployment_preview"};
 // #4030: WorkflowEngine's multi-step orchestration — its own family, distinct
 // from both "Instructions & schedules" (single InstructionDefinitions) and
 // "Executions & audit" (ExecutionTracker's single-instruction fan-out): a
@@ -141,7 +146,7 @@ constexpr std::string_view kTar[] = {"list_tar_process_tree_devices",
 // managed endpoints) or Engine principals (unrelated identity axis).
 constexpr std::string_view kDirectory[] = {"list_directory_users", "get_directory_status"};
 
-constexpr std::array<ToolFamily, 28> kFamilies{{
+constexpr std::array<ToolFamily, 29> kFamilies{{
     {"Fleet & agents", "connected agents, their OS/arch/version, and details", kFleet},
     {"Tags", "read and write agent tags, and find agents by tag", kTags},
     {"Instructions & schedules", "instruction definitions, their full export, and recurring "
@@ -186,6 +191,9 @@ constexpr std::array<ToolFamily, 28> kFamilies{{
      kAgenticHelpers},
     {"Discovery", "enumerate permissions, instructions, routes, scope kinds, and plugins",
      kDiscovery},
+    {"Pre-flight & deploy", "owner-scoped saved pre-flight runs and the deploy-config go/warn "
+                            "preview for one of them",
+     kPreflightDeploy},
     {"Workflows", "multi-step workflow definitions and their per-step execution records",
      kWorkflows},
     {"TAR process-tree & retention", "operator-scoped device pickers for the TAR process-tree "

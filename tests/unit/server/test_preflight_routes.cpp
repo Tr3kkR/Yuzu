@@ -402,3 +402,203 @@ TEST_CASE("preflight routes: rail/result/delete deny a service-scoped token "
     CHECK(audit_log[1] == "preflight.run|denied");         // result poll
     CHECK(audit_log[2] == "preflight.run.delete|denied");  // delete — own verb
 }
+
+// #4036 (api-parity Batch A) — GET /api/v1/preflight/runs REST twin.
+
+TEST_CASE("preflight routes: GET /api/v1/preflight/runs is owner-scoped and "
+          "shares preflight_run_row_json with the MCP twin's builder",
+          "[pg][preflight][routes][rest]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, preflight_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PreflightRunStore run_store{pool};
+    REQUIRE(run_store.is_open());
+
+    const auto t = now_ms();
+    auto alice_run = make_run("run-alice-1", t);
+    alice_run.created_by = "alice";
+    REQUIRE(run_store.create_run(alice_run, {{"agent-1", "host-1", "windows"}}));
+    // create_run always inserts status='running' (hardcoded in its own SQL —
+    // the row's initial state is never caller-supplied); persist_grid sets
+    // the summary counts, complete_run then flips the lifecycle column,
+    // mirroring the real persist_and_maybe_complete production sequence.
+    REQUIRE(run_store.persist_grid("run-alice-1", {}, 5, /*go=*/3, /*warn=*/1, /*nogo=*/0,
+                                   /*inc=*/1));
+    REQUIRE(run_store.complete_run("run-alice-1", t + 1000));
+
+    auto bob_run = make_run("run-bob-1", t);
+    bob_run.created_by = "bob";
+    REQUIRE(run_store.create_run(bob_run, {{"agent-2", "host-2", "linux"}}));
+
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        auth::Session s;
+        s.username = "alice";
+        return std::optional<auth::Session>(s);
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+
+    PreflightRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    routes.register_routes(sink, okAuth, okPerm, /*devices_fn=*/{}, /*groups_fn=*/{},
+                           /*group_members_fn=*/{}, /*dispatch_fn=*/{}, /*collect_fn=*/{},
+                           /*audit_fn=*/{}, &run_store);
+
+    auto res = sink.Get("/api/v1/preflight/runs");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK(body["meta"]["api_version"] == "v1");
+    REQUIRE(body["data"].is_array());
+    // Owner-scoped: alice's own run only, bob's run is invisible.
+    REQUIRE(body["data"].size() == 1);
+    CHECK(body["data"][0]["run_id"] == "run-alice-1");
+    CHECK(body["data"][0]["go"] == 3);
+    CHECK(body["data"][0]["warn"] == 1);
+    CHECK(body["data"][0]["nogo"] == 0);
+    CHECK(body["data"][0]["incomplete"] == 1);
+    CHECK(body["data"][0]["status"] == "complete");
+    // Fields the shared builder emits that the flattened rail label doesn't
+    // carry — proves this is the structured twin, not a re-formatted string.
+    CHECK(body["data"][0].contains("scope_label"));
+    CHECK(body["data"][0].contains("created_at_ms"));
+    CHECK(body["pagination"]["total"] == 1);
+}
+
+TEST_CASE("preflight routes: GET /api/v1/preflight/runs denies a service-scoped "
+          "token sharing the run creator's username, audited under "
+          "preflight.run.view (not preflight.run)",
+          "[pg][preflight][routes][rest][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, preflight_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PreflightRunStore run_store{pool};
+    REQUIRE(run_store.is_open());
+
+    const auto t = now_ms();
+    auto run = make_run("run-svc-1", t);
+    run.created_by = "alice";
+    REQUIRE(run_store.create_run(run, {{"agent-1", "host-1", "windows"}}));
+
+    auto serviceScopedAuth = [](const httplib::Request&, httplib::Response&) {
+        auth::Session s;
+        s.username = "alice";
+        s.token_scope_service = "printers";
+        return std::optional<auth::Session>(s);
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    std::vector<std::string> audit_log;
+    auto audit = [&](const httplib::Request&, const std::string& a, const std::string& r,
+                     const std::string&, const std::string&, const std::string&) -> bool {
+        audit_log.push_back(a + "|" + r);
+        return true;
+    };
+
+    PreflightRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    routes.register_routes(sink, serviceScopedAuth, okPerm, /*devices_fn=*/{}, /*groups_fn=*/{},
+                           /*group_members_fn=*/{}, /*dispatch_fn=*/{}, /*collect_fn=*/{}, audit,
+                           &run_store);
+
+    auto res = sink.Get("/api/v1/preflight/runs");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("run-svc-1") == std::string::npos);
+    REQUIRE(audit_log.size() == 1);
+    // The issue's own correction: reusing "preflight.run" (the run-CREATION
+    // verb) here would make a denied list read indistinguishable from a run
+    // creation event in the audit log.
+    CHECK(audit_log[0] == "preflight.run.view|denied");
+}
+
+TEST_CASE("preflight routes: GET /api/v1/preflight/runs 503s when the run "
+          "store is unwired",
+          "[preflight][routes][rest]") {
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+
+    PreflightRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    routes.register_routes(sink, okAuth, okPerm, /*devices_fn=*/{}, /*groups_fn=*/{},
+                           /*group_members_fn=*/{}, /*dispatch_fn=*/{}, /*collect_fn=*/{},
+                           /*audit_fn=*/{}, /*run_store=*/nullptr);
+
+    auto res = sink.Get("/api/v1/preflight/runs");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+}
+
+TEST_CASE("preflight routes: GET /api/v1/preflight/runs 503s (not an empty "
+          "200) when the run store's connection pool is exhausted, #4036 "
+          "hardening round",
+          "[pg][preflight][routes][rest]") {
+    // A store-level fault must not read as "you have zero saved runs" —
+    // list_runs' plain accessor collapsed a pool-acquire timeout into the
+    // same empty vector as a genuinely-empty rail; list_runs_checked
+    // distinguishes them, and this route must surface the distinction as
+    // 503 rather than 200 + {"data":[]}. Same pool-starvation recipe as
+    // test_api_token_store.cpp's "an EXHAUSTED connection pool is
+    // kUnavailable, not kInvalid".
+    YUZU_REQUIRE_PG_DB_TPL(db, preflight_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}}; // sole connection, held below
+    PreflightRunStore run_store{pool};
+    REQUIRE(run_store.is_open());
+
+    const auto t = now_ms();
+    auto run = make_run("run-starved-1", t);
+    run.created_by = "alice";
+    REQUIRE(run_store.create_run(run, {{"agent-1", "host-1", "windows"}}));
+
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        auth::Session s;
+        s.username = "alice";
+        return std::optional<auth::Session>(s);
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+
+    PreflightRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    routes.register_routes(sink, okAuth, okPerm, /*devices_fn=*/{}, /*groups_fn=*/{},
+                           /*group_members_fn=*/{}, /*dispatch_fn=*/{}, /*collect_fn=*/{},
+                           /*audit_fn=*/{}, &run_store);
+
+    // Hold the pool's only connection with a longer timeout than the store's
+    // own kReadTimeout (2s), so the route's internal acquire times out first.
+    auto hog = pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(hog); // we now hold the only connection
+
+    auto res = sink.Get("/api/v1/preflight/runs");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->body.find("run-starved-1") == std::string::npos);
+}
+
+TEST_CASE("preflight routes: GET /api/v1/preflight/runs 400s on an invalid limit",
+          "[pg][preflight][routes][rest]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, preflight_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PreflightRunStore run_store{pool};
+    REQUIRE(run_store.is_open());
+
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        auth::Session s;
+        s.username = "alice";
+        return std::optional<auth::Session>(s);
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+
+    PreflightRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    routes.register_routes(sink, okAuth, okPerm, /*devices_fn=*/{}, /*groups_fn=*/{},
+                           /*group_members_fn=*/{}, /*dispatch_fn=*/{}, /*collect_fn=*/{},
+                           /*audit_fn=*/{}, &run_store);
+
+    auto res = sink.Get("/api/v1/preflight/runs?limit=not-a-number");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+}
