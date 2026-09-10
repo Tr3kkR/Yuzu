@@ -111,23 +111,25 @@ checks run.
 | `scope_expression` | Scope engine expression for device targeting |
 | `enabled` | Whether the policy is active (can be toggled) |
 | `inputs` | Key-value parameters passed to the fragment's instructions |
-| `triggers` | When to evaluate (interval, file_change, event_log, etc.) |
+| `triggers` | When to evaluate. **Only `interval` actually drives evaluation today** — see "Trigger Configuration" below. |
 | `management_groups` | Group IDs this policy is scoped to |
 
 ### Trigger Configuration
 
-Triggers are stored per-policy with type-specific JSON configuration:
+Triggers are stored per-policy with type-specific JSON configuration. **Corrected 2026-09-10 (Gate-of-record pass 3, sec-2/UP-16): only `interval` actually drives evaluation.** `trigger_type` is a free-text column and every kind below is accepted and persisted without validation, but the due-policy scheduling query that determines which policies get (re-)evaluated only ever joins on `trigger_type = 'interval'` (`server/core/src/policy_store.cpp:1249-1250`). A trigger of any other type is silently inert: it is stored, it never errors, and it never causes an evaluation to run.
 
-| Trigger Type | Config Example |
-|---|---|
-| `interval` | `{"interval_seconds": 300}` |
-| `file_change` | `{"path": "/etc/hosts"}` |
-| `service_status` | `{"service": "sshd"}` |
-| `event_log` | `{"log": "Security", "event_id": 4625}` |
-| `registry` | `{"hive": "HKLM", "key": "SOFTWARE\\..."}` |
-| `startup` | `{}` |
+| Trigger Type | Config Example | Actually drives evaluation? |
+|---|---|---|
+| `interval` | `{"interval_seconds": 300}` | **Yes** — the only trigger kind the scheduler selects. |
+| `file_change` | `{"path": "/etc/hosts"}` | No — accepted and stored, never evaluated (`policy_store.cpp:1250`). |
+| `service_status` | `{"service": "sshd"}` | No — accepted and stored, never evaluated (`policy_store.cpp:1250`). |
+| `event_log` | `{"log": "Security", "event_id": 4625}` | No — accepted and stored, never evaluated (`policy_store.cpp:1250`). |
+| `registry` | `{"hive": "HKLM", "key": "SOFTWARE\\..."}` | No — accepted and stored, never evaluated (`policy_store.cpp:1250`). |
+| `startup` | `{}` | No — accepted and stored, never evaluated (`policy_store.cpp:1250`). |
 
-> **Trigger limit:** The agent's trigger engine enforces a configurable maximum trigger count (default: 2000). Triggers beyond this limit are rejected with a warning log message. This prevents runaway policy deployments from exhausting agent resources. The limit can be configured via the agent API.
+If you need a policy to re-evaluate promptly, use an `interval` trigger with a short `interval_seconds`; do not rely on `file_change`/`service_status`/`event_log`/`registry`/`startup` triggers to cause evaluation — as of this baseline they do not. (Real-time, kernel-backed enforcement for a narrower set of settings exists on the agent-side Guardian path — see `docs/yuzu-guardian-design-v1.1.md` — which is a different mechanism from this server-side policy trigger configuration.)
+
+> **Trigger limit:** The agent's trigger engine enforces a configurable maximum trigger count (default: 2000). Triggers beyond this limit are rejected with a warning log message. This prevents runaway policy deployments from exhausting agent resources. The limit can be configured via the agent API. (Note: this is the *agent's own* `TriggerType` engine used elsewhere in the product, e.g. §17 of the capability map — distinct from the server-side `PolicyStore` trigger-type column described above, which does not dispatch through that engine at all.)
 
 ### Management Group Bindings
 
@@ -417,10 +419,13 @@ spec:
   fragment: <fragment-name-or-id>
   scope: <scope-expression>
   triggers:
-    - type: <interval|file_change|service_status|event_log|registry|startup>
-      interval: <seconds>     # for type: interval
-      path: <file-path>       # for type: file_change
-      service: <service-name> # for type: service_status
+    # As of this baseline, only `type: interval` actually causes evaluation
+    # (server/core/src/policy_store.cpp:1249-1250 joins trigger_type='interval'
+    # only). The other type values below are accepted and stored but silently
+    # never fire an evaluation — see "Trigger Configuration" above.
+    - type: interval          # the only trigger type that drives evaluation today
+      interval: <seconds>
+    # - type: <file_change|service_status|event_log|registry|startup>  # accepted, but inert
   managementGroups:
     - <group-name-or-id>
   inputs:

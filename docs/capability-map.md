@@ -31,7 +31,7 @@ Each capability is rated on two axes:
 > outside its own domain, and each entry counts once against its `T1`/`T2`/`T3` tier label.
 > Reproduce with:
 > `awk '/^### [0-9]+\.[0-9]+/ { if ($0 ~ /:white_check_mark:/) d++; else if ($0 ~ /:large_orange_diamond:/) p++; else if ($0 ~ /:x:/) n++ } END { print d, p, n, d+p+n }' docs/capability-map.md`
-> → `195 23 47 265`. Tier tallies (`Foundation`=T1, `Advanced`=T2, `Future`=T3) add the same
+> → `193 25 47 265`. Tier tallies (`Foundation`=T1, `Advanced`=T2, `Future`=T3) add the same
 > awk pattern filtered on `` `T1` ``/`` `T2` ``/`` `T3` ``. The former "New (Ph 8-16)" interim
 > row is retired — those phases are now ordinary domains 25-31, and 2026 additions land as
 > domains 32-39 rather than an undifferentiated bucket. **Domains 32-39 were verified for
@@ -39,14 +39,19 @@ Each capability is rated on two axes:
 > their per-row behavioural claims (exact signal counts, retention windows, etc.) are inherited
 > from the unmerged 2026-07 capability-industry review rather than independently re-derived
 > this session — honest scoping over implied uniform depth. Domains 1-31's regraded rows each
-> carry their own inline evidence citation and verification date. **Rows regraded or added on
-> 2026-09-07 carry the marker `*(verified 2026-09-07)*`; all other rows carry their v3.0
-> (2026-03-30) grade unchanged and were NOT re-verified in this pass** — reproduce with
-> `grep -c '\*(verified 2026-09-07)\*' docs/capability-map.md` → `73` (71 `###` rows across
-> §5, §7, §10, §12-14, §17-18, §20-22, §24, §26-28, §30-31, all of §32-39, plus one Appendix A
-> caption note, plus this sentence's own citation of the literal marker string). Of the 265
-> total rows, 194 (265 - 71) are un-regraded v3.0 carry-overs — this document does NOT
-> represent whole-document verification against dev @ d295db964, only the 71 marked rows do.
+> carry their own inline evidence citation and verification date. **Rows regraded or added carry
+> the marker `*(verified <date>)*`; all other rows carry their v3.0 (2026-03-30) grade unchanged
+> and were NOT re-verified.** The marker carries **two possible dates**: `2026-09-07` (the v4.0
+> baseline pass + subsequent governance folds through Gate-of-record pass 2) and `2026-09-10`
+> (Gate-of-record pass 3's fixes + its targeted keyword sweep — a row keeps its original `07`
+> date if only prose was corrected without a grade change, and gets bumped to `10` if this pass
+> changed its icon or newly added the marker) — reproduce with
+> `grep -cE '\*\(verified 2026-09-(07|10)\)\*' docs/capability-map.md` → `82` (81 `###` rows —
+> 71 dated `07` across §5, §7, §10, §12-14, §17-18, §20-22, §24, §26-28, §30-31, all of §32-39,
+> plus 10 dated `10` across §2, §3, §4, §9, §14, §16, §20, §30-31 — plus one Appendix A caption
+> note dated `07`). Of the 265 total rows, 184 (265 - 81) are un-regraded v3.0 carry-overs —
+> this document does NOT represent whole-document verification against dev @ d295db964, only
+> the 81 marked rows do.
 > Four hand-maintained views
 > must be updated together whenever a row's icon or tier changes: the headline/tier bars below,
 > the per-domain summary table, Appendix A's plugin count, and Appendix B's Foundation tally —
@@ -54,10 +59,10 @@ Each capability is rated on two axes:
 
 ```
 Foundation   [==============================--]  55/59 done  (93%) (1 partial)
-Advanced     [========================--------]  131/172 done (76%) (19 partial)
+Advanced     [========================--------]  129/172 done (75%) (21 partial)
 Future       [========------------------------]  9/34 done   (26%) (3 partial)
 ─────────────────────────────────────────────────────────────────
-Overall      [========================--------]  195/265 done (74%) (23 partial)
+Overall      [=======================---------]  193/265 done (73%) (25 partial)
 ```
 
 | Domain | Total | Done | Partial | Not Started |
@@ -77,7 +82,7 @@ Overall      [========================--------]  195/265 done (74%) (23 partial)
 | 13. Content Distribution | 5 | 3 | 0 | 2 |
 | 14. User Interaction | 6 | 5 | 0 | 1 |
 | 15. Inventory and Data Collection | 5 | 4 | 0 | 1 |
-| 16. Policy and Compliance Engine | 8 | 8 | 0 | 0 |
+| 16. Policy and Compliance Engine | 8 | 7 | 1 | 0 |
 | 17. Triggers and Event-Driven Automation | 7 | 5 | 1 | 1 |
 | 18. Server: Authentication and Authorization | 10 | 9 | 1 | 0 |
 | 19. Server: Device and Group Management | 7 | 7 | 0 | 0 |
@@ -92,7 +97,7 @@ Overall      [========================--------]  195/265 done (74%) (23 partial)
 | 28. Response Visualization | 9 | 5 | 2 | 2 |
 | 29. Consumer Applications | 4 | 0 | 0 | 4 |
 | 30. Scope Walking & Result Sets | 4 | 3 | 1 | 0 |
-| 31. System Guardian | 10 | 2 | 6 | 2 |
+| 31. System Guardian | 10 | 1 | 7 | 2 |
 | 32. DEX — Digital Employee Experience | 7 | 6 | 0 | 1 |
 | 33. Network Quality | 4 | 3 | 0 | 1 |
 | 34. Device Pages and Live Snapshot | 3 | 3 | 0 | 0 |
@@ -101,7 +106,7 @@ Overall      [========================--------]  195/265 done (74%) (23 partial)
 | 37. Internal PKI / Certificate Authority | 5 | 5 | 0 | 0 |
 | 38. Server Storage Substrate — PostgreSQL | 4 | 4 | 0 | 0 |
 | 39. Headless Platform — Engine Principals & On-Behalf-Of (ADR-1005) | 3 | 3 | 0 | 0 |
-| **TOTAL** | **265** | **195** | **23** | **47** |
+| **TOTAL** | **265** | **193** | **25** | **47** |
 
 > **Scaffolded vs production-quality.** The percentages above measure feature presence, not enterprise hardening. "Done" means "implemented and functional" — not "hardened, observable, and proven at large-fleet scale" on every domain. Known gaps at the §-level (e.g. configurable heartbeat in §1.2, unified diagnostics bundle in §1.3, runtime plugin install in §1.5) remain even where a domain is marked Done. The `docs/capability-agentic-audit-2026-05.md` audit (figures as of 2026-05 — its counts predate this v4.0 tally) is the source for the production-quality dimension; subsequent reviews should keep it current.
 
@@ -199,9 +204,9 @@ Session ID returned on registration. `WatchEvents` tracks connect/disconnect eve
 
 `ScheduleEngine` (ADR-0065: migrated to PostgreSQL, schema `schedule_engine`) with frequency types (daily, weekly, monthly, sub-day), scope expressions evaluated dynamically at dispatch, enable/disable toggle, execution history tracking. REST CRUD via `/api/schedules`.
 
-### 2.10 Instruction Approval Workflows :white_check_mark: `T2`
+### 2.10 Instruction Approval Workflows :white_check_mark: `T2` *(verified 2026-09-10)*
 
-`ApprovalManager` (ADR-0065: migrated to PostgreSQL, schema `approval_manager`) with submit/approve/reject, ownership validation (reviewer != submitter), pending count, scope expression, and full audit trail. Per-definition approval mode (auto/role-gated/always).
+`ApprovalManager` (ADR-0065: migrated to PostgreSQL, schema `approval_manager`) with submit/approve/reject, ownership validation (reviewer != submitter), pending count, scope expression, and full audit trail. Per-definition approval mode (auto/role-gated/always). *(Spot-checked 2026-09-10, Gate-of-record pass 3 sweep item 5: `approval.approve`/`approval.reject`/`approval.read` all write real `audit_log`/`audit_fn` rows — `server/core/src/server.cpp:17412-17478`, `rest_api_v1.cpp:7284`. "Full audit trail" claim holds.)*
 
 ### 2.11 Target Estimation :white_check_mark: `T2`
 
@@ -261,9 +266,9 @@ Implemented as a special-purpose tag via the device tagging system (`TagStore`).
 
 Not implemented. Enumerate connected printers for asset tracking.
 
-### 3.10 Device Tagging (Key-Value Metadata) :white_check_mark: `T2`
+### 3.10 Device Tagging (Key-Value Metadata) :white_check_mark: `T2` *(verified 2026-09-10)*
 
-`TagStore` on the PostgreSQL substrate (ADR-0050, schema `tag_store`). Full CRUD: set, get, get_all, delete, check, clear, count. Agent-side `tags` plugin with server-side sync on Register. Validation: key max 64 chars, value max 448 bytes. `agents_with_tag()` for scope queries; typed degrade-distinguishable reads (a store failure never reads as "no tags").
+`TagStore` on the PostgreSQL substrate (ADR-0050, schema `tag_store`). Full CRUD: set, get, get_all, delete, check, clear, count. Agent-side `tags` plugin with server-side sync on Register. Validation: key max 64 chars, value max 448 bytes. `agents_with_tag()` for scope queries; typed degrade-distinguishable reads (a store failure never reads as "no tags"). *(Spot-checked 2026-09-10, Gate-of-record pass 3 sweep item 5: `tag_store.hpp` genuinely returns `std::expected<...>`/`std::optional<T>` — "read fine, genuinely nothing here" is type-distinguished from a degrade, with its own `yuzu_server_tag_store_read_degrade_total{reason}` metric. Claim holds.)*
 
 ---
 
@@ -288,9 +293,9 @@ resolution -- folded from the retired sockwho plugin, #3403).
 
 `network_config` plugin.
 
-### 4.5 DNS Cache Retrieval :white_check_mark: `T1`
+### 4.5 DNS Cache Retrieval :white_check_mark: `T1` *(verified 2026-09-10)*
 
-`network_actions` plugin has flush DNS. `dns_cache` action in `network_config` plugin dumps DNS cache (Windows: `DnsGetCacheDataTable` via dnsapi.dll, Linux: systemd-resolved query).
+`network_actions` plugin has flush DNS. `dns_cache` action in `network_config` plugin dumps DNS cache (Windows: `DnsGetCacheDataTable` via dnsapi.dll, Linux: systemd-resolved query). *(Spot-checked 2026-09-10, Gate-of-record pass 3 sweep item 5: `network_actions` plugin's real `acts[]` includes `"flush_dns"` — `agents/plugins/network_actions/src/network_actions_plugin.cpp:99`. Claim holds.)*
 
 ### 4.6 WiFi Network Enumeration :white_check_mark: `T2`
 
@@ -482,13 +487,16 @@ Not implemented. Event emission for SIEM/compliance integration.
 
 *Antivirus, firewall, encryption, vulnerability scanning, and device quarantine.*
 
-### 9.1 Antivirus Status and Product Detection :white_check_mark: `T1`
+### 9.1 Antivirus Status and Product Detection :white_check_mark: `T1` *(verified 2026-09-10)*
 
 `antivirus` plugin (cross-platform). macOS `products` probes the XProtect
 definition bundle (version row; `unknown` when unreadable, never assumed
 active) and enumerates endpoint-security system extensions for third-party
 EDR/AV; macOS `status` reports XProtect definition version/freshness plus
-Remediator/MRT engine versions (`security.antivirus.xprotect_status`).
+Remediator/MRT engine versions (`security.antivirus.xprotect_status`). *(Spot-checked
+2026-09-10, Gate-of-record pass 3 sweep item 5: `antivirus_parsers.hpp:238` defaults
+an unreadable field to `"unknown"` rather than guessing — the honest-empty pattern
+this claim describes is real in the source. Claim holds.)*
 
 ### 9.2 Firewall Status and Rule Enumeration :white_check_mark: `T1`
 
@@ -718,9 +726,9 @@ Not implemented. P2P caching to reduce WAN bandwidth. Requires agent mesh networ
 
 `interaction` plugin with `notify` action. Toast/balloon notifications with info/warning/error severity. Cross-platform: ShellNotifyIcon (Windows), notify-send (Linux), osascript (macOS).
 
-### 14.2 Announcement Dialog :white_check_mark: `T2`
+### 14.2 Announcement Dialog :white_check_mark: `T2` *(verified 2026-09-10)*
 
-`interaction` plugin with `message_box` action. Modal message box with configurable buttons (ok, okcancel, yesno). Returns the user's button in `response`. On macOS the agent is a GUI-less root LaunchDaemon: when no desktop session can be reached it reports `status|not_reachable` honestly (never a fabricated `response|ok`). Delivering a dialog to the logged-in user's session is a deferred per-session helper.
+`interaction` plugin with `message_box` action. Modal message box with configurable buttons (ok, okcancel, yesno). Returns the user's button in `response`. On macOS the agent is a GUI-less root LaunchDaemon: when no desktop session can be reached it reports `status|not_reachable` honestly (never a fabricated `response|ok`). Delivering a dialog to the logged-in user's session is a deferred per-session helper. *(Spot-checked 2026-09-10, Gate-of-record pass 3 sweep item 5: `interaction_plugin.cpp:477,490` genuinely returns/writes `not_reachable` rather than fabricating a button click. Claim holds.)*
 
 ### 14.3 Question / Confirmation Dialog :white_check_mark: `T2`
 
@@ -776,9 +784,9 @@ Not implemented. Agent-side cache with delta sync.
 
 `PolicyStore` with `PolicyFragment` (check/fix/postCheck pattern) and `Policy` kinds. YAML-defined with CEL compliance expressions. CRUD via REST API.
 
-### 16.2 Policy Evaluation and Enforcement :white_check_mark: `T2`
+### 16.2 Policy Evaluation and Enforcement :large_orange_diamond: `T2` *(verified 2026-09-10)*
 
-`PolicyStore` tracks per-agent compliance status (compliant, non_compliant, unknown, fixing, error). Trigger-based evaluation with configurable trigger types (interval, file_change, service_status, event_log, registry, startup).
+**Regraded 2026-09-10 (Gate-of-record pass 3, sec-2/UP-16): Done → Partial — interval-only in practice.** `PolicyStore` tracks per-agent compliance status (compliant, non_compliant, unknown, fixing, error). `trigger_type` is a free-text column (`policy_store.hpp:68`: `"interval", "file_change", "event_log", etc.`) and a policy's YAML can name any of those trigger kinds — the store accepts and persists them all without validation (`policy_store.cpp:729-731`). **But the due-policy scheduling query that actually drives evaluation only ever selects `trigger_type = 'interval'`**: `"LEFT JOIN policy_store.policy_triggers t ON t.policy_id = p.id AND t.trigger_type = 'interval'"` (`server/core/src/policy_store.cpp:1249-1250`). A policy configured with `file_change`, `event_log`, `service_status`, `registry`, or `startup` as its trigger type is silently never picked up by this join — it is accepted at write time and then does nothing at evaluation time, with no error surfaced to the author. Interval-based evaluation (§16's 10s tick / 15s grace / 3600s default, see the domain intro) is the only trigger kind that genuinely drives a policy re-check. *(Evidence: `policy_store.hpp:68`; `policy_store.cpp:729-731,1243-1250`; verified 2026-09-10 — previously mis-graded Done for trigger kinds that are stored but never evaluated.)*
 
 ### 16.3 Policy Assignment to Device Groups :white_check_mark: `T2`
 
@@ -948,9 +956,9 @@ CSV and JSON export endpoints for responses, audit, and inventory data. RFC 4180
 
 Named response-view configurations (column subset, sort order, filter presets) attached to an `InstructionDefinition`. Synthesised `__default__` view derived from `spec.result.columns` (or the plugin's column schema) so every definition has at least one selectable view. REST CRUD at `/api/v1/definitions/{id}/response-templates[/{template_id}]` gated on `InstructionDefinition:Read` (List/Get) and `InstructionDefinition:Write` (POST/PUT/DELETE). Dashboard surfaces the templates as a **View** dropdown in the filter bar; selecting one re-renders the table with the template's column subset, sort order, and equals-op filters auto-applied. YAML authoring via `spec.responseTemplates`. Phase 8.2, issue #254.
 
-### 20.7 Response Offloading :white_check_mark: `T3`
+### 20.7 Response Offloading :white_check_mark: `T3` *(verified 2026-09-10)*
 
-Operator-registered external HTTP endpoints (*offload targets*) that receive a copy of `agent.registered` and `execution.completed` events as they fire. Sibling `OffloadTargetStore` (Postgres schema `offload_target_store`, ADR-0059) wired into `AgentServiceImpl` next to the existing webhook fan-out — every event that fires a webhook also fans out to every enabled offload target whose `event_types` filter matches. Typed auth: none / bearer / basic / hmac (Authorization headers are CRLF-guarded against header injection). Server-side batching: `batch_size > 1` accumulates events into a per-target buffer and flushes on threshold; flush body is JSON of shape `{"events":[…]}`. REST CRUD at `/api/v1/offload-targets` gated on `Infrastructure:Read`/`Write`. `auth_credential` is `SecretCodec`-encrypted at rest (ADR-0010) and never returned by any read endpoint (a `has_credential` flag reports whether one is configured; paranoia-double-check assertion in REST tests). YAML authoring via `spec.offload.targets` is documented; dispatcher-side correlation (per-instruction filter honouring) deferred to a follow-up. Phase 8.3, issue #255.
+Operator-registered external HTTP endpoints (*offload targets*) that receive a copy of `agent.registered` and `execution.completed` events as they fire. Sibling `OffloadTargetStore` (Postgres schema `offload_target_store`, ADR-0059) wired into `AgentServiceImpl` next to the existing webhook fan-out — every event that fires a webhook also fans out to every enabled offload target whose `event_types` filter matches. Typed auth: none / bearer / basic / hmac (Authorization headers are CRLF-guarded against header injection). Server-side batching: `batch_size > 1` accumulates events into a per-target buffer and flushes on threshold; flush body is JSON of shape `{"events":[…]}`. **Caveat added 2026-09-10 (Gate-of-record pass 3, sweep item 5):** batched (not yet flushed) events are **dropped on destruction**, not persisted or retried — `offload_target_store.cpp:316-320`'s own comment: "Intentionally NOT calling `flush_all()` here — buffered (`batch_size>1`) events not yet flushed are dropped on destruction... Operators needing at-least-once semantics should set `batch_size=1` (immediate dispatch, no buffer) or call `flush_all()` on a graceful [shutdown]." So `batch_size > 1` trades at-least-once delivery for fewer HTTP calls; that tradeoff is real and operator-controllable, but it wasn't previously documented here. REST CRUD at `/api/v1/offload-targets` gated on `Infrastructure:Read`/`Write`. `auth_credential` is `SecretCodec`-encrypted at rest (ADR-0010) and never returned by any read endpoint (a `has_credential` flag reports whether one is configured; paranoia-double-check assertion in REST tests). YAML authoring via `spec.offload.targets` is documented; dispatcher-side correlation (per-instruction filter honouring) deferred to a follow-up. Phase 8.3, issue #255. *(Evidence: `offload_target_store.cpp:316-320`; verified 2026-09-10.)*
 
 ### 20.8 Executions-History Ladder and Agentic Event Stream :white_check_mark: `T2` *(new row, v4.0)* *(verified 2026-09-07)*
 
@@ -966,7 +974,7 @@ The `command_id → execution_id` map + `ExecutionEventBus` SSE stream unifying 
 
 `WatchEvents` RPC.
 
-### 21.2 Audit Trail of User Actions :white_check_mark: `T2`
+### 21.2 Audit Trail of User Actions :white_check_mark: `T2` *(verified 2026-09-07)*
 
 `AuditStore` (migrated to PostgreSQL, ADR-0040/Wave 1.3, PR #2697 — fail-hard writes, degrade→deny reads, SOC-2 evidence chain; verified 2026-09-07 via `pg::PgPool`/`pg::PgMigration` usage in `audit_store.cpp`, previous row text stale-claimed SQLite). Structured events: timestamp, principal, principal_role, action, target_type, target_id, detail, source_ip, result. Query with filtering and pagination via `/api/audit`. Default 365-day retention.
 
@@ -1253,13 +1261,13 @@ Not implemented. `yuzu-sdk` Python package wrapping REST API v1 with async suppo
 
 Shipped 2026-05-31 (Phase 15.B; `68427bba`). **Update 2026-09-07: `result_set_store.{cpp,hpp}` is now PostgreSQL** — the Postgres-migration ladder item this row originally flagged is done (verified via `PGconn`/`pg::` usage in `result_set_store.cpp`; part of the broader server-store migration, see §38). The REST surface lives in `rest_api_v1.cpp`. A named, TTL-bounded set of device IDs produced by a query, action result, or operator-curated list — the unit of composable scope. Stable identity (`rs_<ulid>`), optional human-readable per-operator alias, immutable lineage edges that record the chain of `(parent_result_set, narrowing_query)` back to a ground set, source-payload JSON sufficient to live-re-evaluate the producing query without operator re-input. Persisted in the `result_set_store` PostgreSQL schema (ADR-0036; formerly `result_sets.db`) with `ON DELETE CASCADE` member rows; pinning extends TTL beyond the default 1 hour for incident-response sessions; per-operator quotas (10K result sets, 50 pins) and a 5-minute background GC sweep prevent runaway scripts from filling the table. REST: `/api/v1/result-sets/...` covering create-from-inventory/tar/instruction, members, lineage, pin/unpin/re-eval, delete. Audit row per state transition for forensic reconstruction. Design: `docs/scope-walking-design.md` §3, §6, §9.
 
-### 30.2 Composable Scope from Previous Query :white_check_mark: `T2`
+### 30.2 Composable Scope from Previous Query :white_check_mark: `T2` *(verified 2026-09-10)*
 
-Shipped 2026-05-31 (Phase 15.C; `68427bba`, hardening `4f10a69b`). The Scope Engine grammar gains a third short-circuit kind, `from_result_set:<id-or-alias>`, alongside the existing `__all__` and `group:<name>`. Composes with attribute predicates via `AND`/`OR`/`NOT` so a result set can be the candidate set and the predicate is a real-time refinement against current device attributes. Stale members (offline > 24h, decommissioned, removed from management group) are silently dropped at resolve time with a dashboard-surfaced warning rather than failing the query — operators iterating an IR chain need progress, not a stop, and the audit row records the dropped IDs for forensic completeness. Dashboard surfacing: persistent left-rail sidebar of the operator's active result sets, chain breadcrumb above every query frame mirroring the lineage, scope chip in every query/instruction/policy frame for one-click rebinding. Design: `docs/scope-walking-design.md` §4, §8.
+Shipped 2026-05-31 (Phase 15.C; `68427bba`, hardening `4f10a69b`). The Scope Engine grammar gains a third short-circuit kind, `from_result_set:<id-or-alias>`, alongside the existing `__all__` and `group:<name>`. Composes with attribute predicates via `AND`/`OR`/`NOT` so a result set can be the candidate set and the predicate is a real-time refinement against current device attributes. Stale members (offline > 24h, decommissioned, removed from management group) are silently dropped at resolve time with a dashboard-surfaced warning rather than failing the query — operators iterating an IR chain need progress, not a stop. **Corrected 2026-09-10 (Gate-of-record pass 3, sre-1): removed the "audit row records the dropped IDs for forensic completeness" claim — no such audit row exists.** `AgentRegistry::evaluate_scope()` (`server/core/src/agent_registry.cpp:1402+`) and `ResultSetStore::member_set_owned()` (`server/core/src/result_set_store.cpp:590`, whose own comment documents the "stale members drop silently" contract) contain no `audit`/`audit_fn` call anywhere in the drop path. The only result-set audit verbs that exist anywhere in the codebase are `result_set.access`, `result_set.create`, `result_set.delete`, `result_set.pin`, `result_set.unpin` (`server/core/src/rest_api_v1.cpp`) — none of them fire during scope-resolution-time stale-member dropping, which happens deep in `AgentRegistry`, not through a REST route's `audit_fn`. The dashboard-surfaced warning at query time is real; a durable, queryable audit trail of exactly which device IDs were silently excluded is not. Dashboard surfacing: persistent left-rail sidebar of the operator's active result sets, chain breadcrumb above every query frame mirroring the lineage, scope chip in every query/instruction/policy frame for one-click rebinding. Design: `docs/scope-walking-design.md` §4, §8. *(Evidence: `agent_registry.cpp:1402-1460`, `result_set_store.cpp:590`, `rest_api_v1.cpp` verb grep; verified 2026-09-10.)*
 
-### 30.3 YAML DSL `fromResultSet:` Surface :white_check_mark: `T2`
+### 30.3 YAML DSL `fromResultSet:` Surface :white_check_mark: `T2` *(verified 2026-09-10)*
 
-Shipped 2026-05-31 (Phase 15.E; `e6361a3a`). Instruction/instruction-set paths done; **Policy `fromResultSet:` deferred to PR-E2** (result-set TTL vs. continuous policy evaluation). The `scope:` block in `InstructionDefinition`, `InstructionSet`, and `Policy` gains `fromResultSet:` as a mutually-exclusive (or composable-with-`selector:`) alternative form so YAML-defined automation can target the device set produced by a previous query. Validation rules: `fromResultSet + assignment.managementGroups` rejected at YAML load (a result set already has a fixed device set, layering management-group filtering on top is redundant); `fromResultSet` requires `assignment.mode = static` (the whole point of a result set is a fixed target — `dynamic` re-evaluation against management groups would defeat it). Resolution at instruction *invocation* time, not YAML load time, so a definition carrying `fromResultSet:` is valid YAML even if the referenced set has expired by invocation. Resolution failure surfaces as `INSTRUCTION_SCOPE_RESOLUTION_FAILED` with the result-set ID and reason in the audit row. Design: `docs/scope-walking-design.md` §7.
+Shipped 2026-05-31 (Phase 15.E; `e6361a3a`). Instruction/instruction-set paths done; **Policy `fromResultSet:` deferred to PR-E2** (result-set TTL vs. continuous policy evaluation). The `scope:` block in `InstructionDefinition`, `InstructionSet`, and `Policy` gains `fromResultSet:` as a mutually-exclusive (or composable-with-`selector:`) alternative form so YAML-defined automation can target the device set produced by a previous query. Validation rules: `fromResultSet + assignment.managementGroups` rejected at YAML load (a result set already has a fixed device set, layering management-group filtering on top is redundant); `fromResultSet` requires `assignment.mode = static` (the whole point of a result set is a fixed target — `dynamic` re-evaluation against management groups would defeat it). Resolution at instruction *invocation* time, not YAML load time, so a definition carrying `fromResultSet:` is valid YAML even if the referenced set has expired by invocation. Resolution failure surfaces as `INSTRUCTION_SCOPE_RESOLUTION_FAILED` with the result-set ID and reason in the audit row. Design: `docs/scope-walking-design.md` §7. *(Spot-checked 2026-09-10, Gate-of-record pass 3 sweep item 5 — distinguish from §30.2's finding: this audit row IS real, unlike §30.2's now-removed claim. `server/core/src/server.cpp:11548-11559` genuinely constructs an `AuditEvent{action="instruction.scope_resolution_failed", ...}` and calls `audit_store_->log(ev)` on this specific resolution-failure path. Claim holds.)*
 
 ### 30.4 Result Set Operational Hardening :large_orange_diamond: `T2`
 
@@ -1311,11 +1319,17 @@ Partial. **Corrected 2026-09-08 (governance sec-H2):** Registry/service drift de
 
 ### 31.7 Audit Journal and Server Store :large_orange_diamond: `T2` *(verified 2026-09-07)*
 
-**Regraded 2026-09-08 (governance sre-H1): Done → Partial — implemented, inert by default.** Server store shipped and live: `server/core/src/guaranteed_state_store.{hpp,cpp}`, PostgreSQL schema `guaranteed_state_store` (ADR-0038), immutable event log, no FK cascade on rule delete so historical events persist for forensic review. The **agent-side** journal/outbox-drain machinery is fully implemented under renamed files from the original plan's `guard_audit.{hpp,cpp}`: `guardian_lifecycle_journal.cpp` + `guardian_journal_format.cpp` (local journal + wire format) and `guardian_outbox_drain_worker.cpp` (the drain-to-server worker), all confirmed compiled in `agents/core/meson.build` — **but it is entirely gated on `prefer_spark_`, which defaults `false` in production**: `GuardianEngine::persist_lifecycle_journal_locked()` (`agents/core/src/guardian_engine.cpp:421`) returns immediately `if (!prefer_spark_ || !spark_runtime_ || !lifecycle_journal_)`, and `GuardianEngine::journal_age_stats()` (`guardian_engine.cpp:567`) likewise returns `std::nullopt` at `!prefer_spark_`. So today, with Spark inert (per §31.1), **no drift/remediation event is journaled or drained to the server through this path in production — its counters are provably zero.** The legacy (live) `IGuard` enforcement path has no equivalent push-journal of its own; `GuardianEngine::sync_with_server()` (`guardian_engine.cpp:325`) only logs a connection message today, it does not drain any event queue (that claim in an earlier draft of this row, citing `CommandResponse{plugin:"__guard__",action:"event"}`, no longer matches the code). The only live signal from the legacy path is the poll-based `get_status()` (§31.2's fail-closed reporting). *(Evidence: `guardian_engine.cpp:325,421,567`; verified 2026-09-08 — previously mis-graded Done.)*
+**Regraded 2026-09-08 (governance sre-H1): Done → Partial — implemented, inert by default.** **Corrected 2026-09-10 (Gate-of-record pass 3, sec-1): the previous fold of this row wrongly claimed the legacy path pushes no events at all — that is false; two distinct mechanisms exist and must be named separately.** Server store shipped and live: `server/core/src/guaranteed_state_store.{hpp,cpp}`, PostgreSQL schema `guaranteed_state_store` (ADR-0038), immutable event log, no FK cascade on rule delete so historical events persist for forensic review.
 
-### 31.8 Pre-Login Activation and Offline Capability :white_check_mark: `T2` *(verified 2026-09-07)*
+**Mechanism 1 — live, fire-and-forget event push (works today, NOT gated on Spark).** Every guard — legacy `IGuard` and Spark alike — reports drift/remediation through `GuardianEngine::emit_guard_event()` (`agents/core/src/guardian_engine.cpp:929`), which calls the currently-wired `event_sink_`. That sink is `Agent::emit_guardian_event()` (`agents/core/src/agent.cpp:3378-3387`), wired unconditionally whenever `guardian_` exists (`agent.cpp:2026-2027`, not conditioned on `prefer_spark_`): it builds a `__guard__`/`event` `CommandResponse` and writes it over the live Subscribe stream. Server-side, `AgentServiceImpl` ingests exactly this message — a command-id-less `__guard__` response is treated as an unsolicited drift event and routed to `ingest_guardian_response()` (`server/core/src/agent_service_impl.cpp:1212-1220`). So **legacy guards do push drift events over `__guard__`, and the server does ingest them, live, while the agent is connected.**
 
-Pre-login activation works by construction today: the agent runs as a Windows service with `SERVICE_AUTO_START` + `FailureActions` configured at install time (`agents/core/src/main.cpp:536`, `:602-609`, and `agents/core/src/service_win.{hpp,cpp}` for the SCM `ServiceMain`/control-handler dispatcher that actually makes `sc start` succeed — #1822); systemd unit on Linux with `Type=notify` + `Restart=always`; launchd `KeepAlive=true` + `RunAtLoad=true` on macOS. `GuardianEngine::start_local()` runs before the Register RPC, so with the registry/SCM guards shipped (§31.2; the file guard is detect-only, `guard_file.cpp:18`) enforcement begins as soon as the service starts — before any user can log in. Offline capability comes from caching policy in `kv_store.db` under `__guardian__` namespace; enforcement continues with last-known-good rules when the server is unreachable, and queued events flush when the server returns. Marked `:white_check_mark:` because the service-install side is operational (genuinely so as of #1822 — before it, `sc start YuzuAgent` failed with error 1053 on every real Windows install, so this claim was aspirational, not true, until this fix landed); the *enforcement* half now rests on the shipped registry/SCM guards in §31.2/§31.6 (file: detection only; re-verified 2026-09-07 — this sentence previously still said "gated on PR 3+").
+**Mechanism 2 — durable local journal + retry-capable outbox (Spark-gated, inert by default).** This is the *only* part that is dormant. The agent-side journal/outbox-drain machinery — `guardian_lifecycle_journal.cpp` + `guardian_journal_format.cpp` (local journal + wire format) and `guardian_outbox_drain_worker.cpp` (the drain-to-server worker), all confirmed compiled in `agents/core/meson.build` — is entirely gated on `prefer_spark_`, which defaults `false` in production: `GuardianEngine::persist_lifecycle_journal_locked()` (`guardian_engine.cpp:421`) returns immediately `if (!prefer_spark_ || !spark_runtime_ || !lifecycle_journal_)`, and `GuardianEngine::journal_age_stats()` (`guardian_engine.cpp:567`) likewise returns `std::nullopt` at `!prefer_spark_`. With Spark inert (per §31.1), this durable path's counters are provably zero.
+
+**What this means in practice:** Mechanism 1 has no retry or local durability of its own — per its own source comments, `GuardianEngine::emit_guard_event()` drops the event if the sink isn't wired yet (pre-network arm, `guardian_engine.cpp:939`: "drop; durable buffering is A3"), and `Agent::emit_guardian_event()` drops it if the Subscribe stream is down (`agent.cpp:3376`: "Drops the event if the link is down between reconnects... durable buffering is A3"). So an event raised while the agent is disconnected from the server is **lost, not queued** — durable, retry-safe delivery is exactly what Mechanism 2 (the Spark-gated outbox) would provide, and it is inert. Graded Partial because the server-store half and the live-connected push half both genuinely work; the durable/retry half does not. *(Evidence: `guardian_engine.cpp:421,567,929,939`; `agent.cpp:2026-2027,3376-3387`; `agent_service_impl.cpp:1212-1220`; verified 2026-09-10 — corrects the 2026-09-08 fold's false "no push mechanism" claim.)*
+
+### 31.8 Pre-Login Activation and Offline Capability :large_orange_diamond: `T2` *(verified 2026-09-10)*
+
+**Regraded 2026-09-10 (Gate-of-record pass 3, cons-1): Done → Partial** — pre-login activation is solid, but the "offline capability" half over-promised. Pre-login activation works by construction today: the agent runs as a Windows service with `SERVICE_AUTO_START` + `FailureActions` configured at install time (`agents/core/src/main.cpp:536`, `:602-609`, and `agents/core/src/service_win.{hpp,cpp}` for the SCM `ServiceMain`/control-handler dispatcher that actually makes `sc start` succeed — #1822); systemd unit on Linux with `Type=notify` + `Restart=always`; launchd `KeepAlive=true` + `RunAtLoad=true` on macOS. `GuardianEngine::start_local()` runs before the Register RPC, so with the registry/SCM guards shipped (§31.2; the file guard is detect-only, `guard_file.cpp:18`) enforcement begins as soon as the service starts — before any user can log in. Offline capability comes from caching policy in `kv_store.db` under `__guardian__` namespace; enforcement continues with last-known-good rules when the server is unreachable. **Corrected: events raised while disconnected are DROPPED, not queued and flushed.** `GuardianEngine::emit_guard_event()` drops silently if the sink isn't wired (`guardian_engine.cpp:939`), and `Agent::emit_guardian_event()` drops silently if the Subscribe stream is down (`agent.cpp:3376-3387`: "Drops the event if the link is down between reconnects... durable buffering is A3") — the durable outbox that *would* retain and retry them (§31.7 Mechanism 2) exists but is gated on `prefer_spark_`, which defaults `false` in production. Marked Partial because the service-install/pre-login side is genuinely operational (as of #1822 — before it, `sc start YuzuAgent` failed with error 1053 on every real Windows install) and enforcement itself does continue offline with last-known-good rules, but the audit trail of what happened *while* offline is lossy, not durable, until Spark is the default backend. *(Evidence: `guardian_engine.cpp:939`; `agent.cpp:3376-3387`; verified 2026-09-10 — corrects the prior "queued events flush when the server returns" claim, which no code supports.)*
 
 ### 31.9 Dashboard and Approval Workflow :large_orange_diamond: `T2` *(verified 2026-09-07)*
 
