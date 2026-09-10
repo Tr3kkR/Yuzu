@@ -9252,7 +9252,11 @@ TEST_CASE("MCP #3685: Destructive + omitted target is refused with the new envel
     CHECK_FALSE(dispatched);
     REQUIRE_FALSE(ts.audit_log.empty());
     CHECK(ts.audit_log.back() == "mcp.execute_instruction|denied");
-    CHECK(ts.audit_details.back().find("destructive_untargeted") != std::string::npos);
+    // Exact prefix, not just a substring match (governance Gate 4
+    // consistency-auditor: this OPERATOR-tier backstop arm used to omit
+    // "reason=" here despite the C8 pre-mint arm's identical detail string
+    // carrying it) -- pin both arms to the SAME format.
+    CHECK(ts.audit_details.back().find("reason=destructive_untargeted") != std::string::npos);
 }
 
 TEST_CASE("MCP #3685: Destructive + scope target (real scope or __all__) is refused identically, "
@@ -9346,11 +9350,11 @@ TEST_CASE("MCP #3685: an untargeted Destructive supervised call is refused pre-m
     CHECK(appr.pending_count() == 0);
     CHECK_FALSE(dispatched);
     // Gate 8 round 3 (residual B, coordinator follow-up): this is the C8
-    // pre-mint RefuseUntargeted arm specifically — the audit-detail test at
-    // line ~7111 above exercises the OPERATOR-tier main-handler backstop's
-    // RefuseUntargeted arm instead, so it cannot see this arm's "reason="
-    // prefix (added in the prior commit for parity with the adjacent
-    // ClassifyMiss arm). Assert it here so the prefix ships with coverage.
+    // pre-mint RefuseUntargeted arm specifically. The OPERATOR-tier
+    // main-handler backstop's own RefuseUntargeted arm (test above, role
+    // "operator") used to omit this "reason=" prefix despite an adjacent
+    // comment there claiming parity with this arm -- governance Gate 4
+    // consistency-auditor caught the drift; both arms now agree.
     REQUIRE_FALSE(ts.audit_log.empty());
     CHECK(ts.audit_log.back() == "mcp.execute_instruction|denied");
     CHECK(ts.audit_details.back().find("reason=destructive_untargeted") != std::string::npos);

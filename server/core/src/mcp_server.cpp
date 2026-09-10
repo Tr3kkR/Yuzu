@@ -1209,7 +1209,10 @@ static const ToolDef kTools[] = {
      "WARNING: If neither scope nor agent_ids is provided, the command targets ALL connected "
      "agents. EXCEPTION (#3685): a Destructive-classified plugin.action pair requires explicit, "
      "non-empty agent_ids - broadcast and scope fan-out (including __all__) are refused before a "
-     "ticket is minted or consumed, matching REST POST /api/command. "
+     "ticket is minted or consumed, matching REST POST /api/command. A SECOND, STRICTER "
+     "EXCEPTION (Wave 7 PR7.2b): a Forensics-classified plugin.action pair requires EXACTLY ONE "
+     "explicit, in-scope agent_id - not merely non-empty agent_ids, and scope is refused outright "
+     "even when it would resolve to one device - a forensic read is per-device by nature. "
      "DENIAL DISCRIMINATION (#3687): a dispatch-authorization denial is a JSON-RPC error whose "
      "error.data.reason is one of the six machine-readable values \"unclassified\", "
      "\"ambiguous\", \"anonymous_operator\", \"forbidden\", \"approval_required\", "
@@ -10483,7 +10486,13 @@ McpServer::HandlerFn McpServer::build_handler(
                         // single-target refusal (reason=forensic_untargeted).
                         const bool audit_ok = mcp_audit(
                             "denied",
-                            std::string(gate.refusal_reason) + " " +
+                            // "reason=" prefix -- matches the C8 pre-mint site
+                            // above; governance Gate 4 consistency-auditor
+                            // finding: this site previously omitted it despite
+                            // the adjacent comment claiming parity, so a
+                            // `reason=(\S+)` audit-log parser silently lost
+                            // the reason on every refusal routed through here.
+                            std::string("reason=") + std::string(gate.refusal_reason) + " " +
                                 yuzu::server::detail::sanitize_detail_value(plugin) + ":" +
                                 yuzu::server::detail::sanitize_detail_value(action) +
                                 " correlation_id=" + cid);
