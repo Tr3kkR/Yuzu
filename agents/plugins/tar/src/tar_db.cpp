@@ -2519,6 +2519,87 @@ TarDatabase::execute_atomic_batch(const std::vector<std::string>& statements) {
     return out;
 }
 
+bool TransactionHandle::exec(const std::string& sql) {
+    if (poisoned_)
+        return false; // already aborted or failed -- do not autocommit past it
+
+    SqliteErrMsg err;
+    if (sqlite3_exec(db_, sql.c_str(), nullptr, nullptr, err.addr()) == SQLITE_OK)
+        return true;
+
+    fail(err.text());
+    return false;
+}
+
+void TransactionHandle::fail(std::string reason) {
+    if (!poisoned_) // first failure wins -- see the class doc for why this is load-bearing
+        error_ = std::move(reason);
+    poisoned_ = true;
+}
+
+std::expected<void, std::string> TarDatabase::checked_transaction(
+    const std::function<std::expected<void, std::string>(TransactionHandle&)>& operation) {
+    std::lock_guard lock(mu_);
+    if (!db_)
+        return std::unexpected("database not open");
+
+    SqliteErrMsg err;
+    if (sqlite3_exec(db_, "BEGIN IMMEDIATE", nullptr, nullptr, err.addr()) != SQLITE_OK) {
+        spdlog::error("TarDatabase::checked_transaction BEGIN failed: {}", err.text());
+        return std::unexpected(std::string("BEGIN failed: ") + err.text());
+        // No transaction was opened, so nothing to roll back.
+    }
+
+    TransactionHandle handle(db_);
+    std::expected<void, std::string> op_result;
+    try {
+        op_result = operation(handle);
+    } catch (const std::exception& e) {
+        handle.fail(std::string("exception: ") + e.what());
+    } catch (...) {
+        handle.fail("unknown exception");
+    }
+
+    // Poisoned wins regardless of what `operation` returned -- a callback
+    // that ignores one intermediate `raw()` failure and returns success
+    // anyway must not be able to erase that failure. See TransactionHandle's
+    // doc comment.
+    const bool ok = op_result.has_value() && !handle.poisoned();
+    // Poisoned takes precedence when both fired: it is the more specific
+    // diagnostic (a real SQLite error) over the callback's own postcondition
+    // text, and is the only one of the two that can fire alongside a
+    // has_value() op_result (the "ignored intermediate failure" case).
+    std::string failure_reason;
+    if (!ok)
+        failure_reason = handle.poisoned() ? handle.error() : op_result.error();
+
+    if (ok) {
+        if (sqlite3_exec(db_, "COMMIT", nullptr, nullptr, err.addr()) == SQLITE_OK)
+            return {};
+        spdlog::error("TarDatabase::checked_transaction COMMIT failed: {}", err.text());
+        failure_reason = std::string("COMMIT failed: ") + err.text();
+    }
+
+    // Rolled back (or never should have been committed) -- same wedge
+    // handling as execute_atomic_batch: ask sqlite3_get_autocommit rather
+    // than assume, because a ROLLBACK failure can mean SQLite already rolled
+    // back on its own OR that the connection is genuinely stuck inside a
+    // transaction that will never commit. See that method's doc comment for
+    // the full reasoning; this is the identical pattern, reused rather than
+    // reinvented.
+    const int rb = sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, err.addr());
+    if (rb != SQLITE_OK && sqlite3_get_autocommit(db_) == 0) {
+        spdlog::error("TarDatabase: checked_transaction ROLLBACK failed and the connection is "
+                      "STILL in a transaction ({}). Closing the TAR database: further writes "
+                      "would be reported as durable and then lost. TAR storage is offline on "
+                      "this endpoint until the agent restarts.",
+                      err.text());
+        sqlite3_close_v2(db_);
+        db_ = nullptr;
+    }
+    return std::unexpected(failure_reason);
+}
+
 bool TarDatabase::execute_sql_range(const std::string& sql, int64_t from, int64_t to) {
     std::lock_guard lock(mu_);
     if (!db_)

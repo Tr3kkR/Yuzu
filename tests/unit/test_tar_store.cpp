@@ -18,6 +18,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -1686,3 +1687,237 @@ TEST_CASE("TarDatabase: a corrupt-and-unmovable tar.db fails closed (#559 primar
     // dir_guard restores perms + removes the dir.
 }
 #endif // _WIN32
+
+// =============================================================================
+// checked_transaction (Wave 7 PR7.2b commit 1: strict TAR transaction executor)
+// =============================================================================
+//
+// Fault-injection idiom matches TAR #2361's execute_atomic_batch tests
+// (test_tar_aggregator.cpp): a `RAISE(ABORT, ...)` trigger leaves the
+// transaction intact (a statement-preserving fault); `RAISE(ROLLBACK, ...)`
+// aborts it. Both are real SQLite behaviour, not a mock.
+
+namespace {
+
+int64_t row_count(TarDatabase& db, const std::string& table) {
+    auto r = db.execute_query("SELECT COUNT(*) FROM " + table);
+    REQUIRE(r.has_value());
+    REQUIRE(!r->rows.empty());
+    return std::stoll(r->rows[0][0]);
+}
+
+} // namespace
+
+TEST_CASE("checked_transaction: happy path commits every statement together",
+          "[tar][store][checked_transaction]") {
+    auto t = make_test_db();
+    auto result = t.db.checked_transaction([](TransactionHandle& h) -> std::expected<void, std::string> {
+        if (!h.exec("INSERT INTO process_live (ts,snapshot_id,action,pid,ppid,name,cmdline,user) "
+                    "VALUES (1,1,'started',1,0,'a.exe','','u')"))
+            return std::unexpected(h.error());
+        if (!h.exec("INSERT INTO process_live (ts,snapshot_id,action,pid,ppid,name,cmdline,user) "
+                    "VALUES (2,1,'started',2,0,'b.exe','','u')"))
+            return std::unexpected(h.error());
+        return {};
+    });
+    CHECK(result.has_value());
+    CHECK(row_count(t.db, "process_live") == 2);
+}
+
+TEST_CASE("checked_transaction: a fault on the FIRST statement commits nothing",
+          "[tar][store][checked_transaction]") {
+    auto t = make_test_db();
+    REQUIRE(t.db.execute_sql("CREATE TRIGGER block_ins BEFORE INSERT ON process_live "
+                             "BEGIN SELECT RAISE(ABORT, 'blocked'); END;"));
+
+    auto result = t.db.checked_transaction([](TransactionHandle& h) -> std::expected<void, std::string> {
+        if (!h.exec("INSERT INTO process_live (ts,snapshot_id,action,pid,ppid,name,cmdline,user) "
+                    "VALUES (1,1,'started',1,0,'a.exe','','u')"))
+            return std::unexpected(h.error());
+        // Never reached in a correct implementation -- but written anyway to
+        // prove the SECOND statement is not what stops the commit; poisoning
+        // is what does, whether or not the callback keeps going.
+        h.exec("INSERT INTO tar_config (key,value) VALUES ('canary','1')");
+        return {};
+    });
+    CHECK_FALSE(result.has_value());
+    CHECK(row_count(t.db, "process_live") == 0);
+    CHECK(t.db.get_config("canary", "") == ""); // the "second statement" never committed either
+}
+
+TEST_CASE("checked_transaction: a fault on a MIDDLE statement commits nothing, "
+          "not even the earlier statements in the same transaction",
+          "[tar][store][checked_transaction]") {
+    auto t = make_test_db();
+    REQUIRE(t.db.execute_sql("CREATE TRIGGER block_cfg BEFORE INSERT ON tar_config "
+                             "BEGIN SELECT RAISE(ABORT, 'blocked'); END;"));
+
+    auto result = t.db.checked_transaction([](TransactionHandle& h) -> std::expected<void, std::string> {
+        if (!h.exec("INSERT INTO process_live (ts,snapshot_id,action,pid,ppid,name,cmdline,user) "
+                    "VALUES (1,1,'started',1,0,'a.exe','','u')"))
+            return std::unexpected(h.error());
+        if (!h.exec("INSERT INTO tar_config (key,value) VALUES ('mid','1')"))
+            return std::unexpected(h.error());
+        if (!h.exec("INSERT INTO process_live (ts,snapshot_id,action,pid,ppid,name,cmdline,user) "
+                    "VALUES (2,1,'started',2,0,'b.exe','','u')"))
+            return std::unexpected(h.error());
+        return {};
+    });
+    CHECK_FALSE(result.has_value());
+    // This is the property execute_atomic_batch does NOT have: the first
+    // statement here would be durable under that primitive (it precedes the
+    // failure and the batch's data segment is tolerant). checked_transaction
+    // has no such segment -- the whole thing is one all-or-nothing unit.
+    CHECK(row_count(t.db, "process_live") == 0);
+}
+
+TEST_CASE("checked_transaction: a fault on the LAST statement commits nothing",
+          "[tar][store][checked_transaction]") {
+    auto t = make_test_db();
+    REQUIRE(t.db.execute_sql("CREATE TRIGGER block_cfg BEFORE INSERT ON tar_config "
+                             "BEGIN SELECT RAISE(ABORT, 'blocked'); END;"));
+
+    auto result = t.db.checked_transaction([](TransactionHandle& h) -> std::expected<void, std::string> {
+        if (!h.exec("INSERT INTO process_live (ts,snapshot_id,action,pid,ppid,name,cmdline,user) "
+                    "VALUES (1,1,'started',1,0,'a.exe','','u')"))
+            return std::unexpected(h.error());
+        if (!h.exec("INSERT INTO tar_config (key,value) VALUES ('last','1')"))
+            return std::unexpected(h.error());
+        return {};
+    });
+    CHECK_FALSE(result.has_value());
+    CHECK(row_count(t.db, "process_live") == 0);
+}
+
+TEST_CASE("checked_transaction: a statement-preserving fault (RAISE ABORT) leaves the "
+          "connection usable, and a retry without the fault applies exactly once",
+          "[tar][store][checked_transaction]") {
+    auto t = make_test_db();
+    REQUIRE(t.db.execute_sql("CREATE TRIGGER block_ins BEFORE INSERT ON process_live "
+                             "BEGIN SELECT RAISE(ABORT, 'blocked'); END;"));
+
+    auto first = t.db.checked_transaction([](TransactionHandle& h) -> std::expected<void, std::string> {
+        if (!h.exec("INSERT INTO process_live (ts,snapshot_id,action,pid,ppid,name,cmdline,user) "
+                    "VALUES (1,1,'started',1,0,'a.exe','','u')"))
+            return std::unexpected(h.error());
+        return {};
+    });
+    CHECK_FALSE(first.has_value());
+    CHECK(t.db.is_open()); // statement-preserving -- the store is NOT taken offline
+    REQUIRE(row_count(t.db, "process_live") == 0);
+
+    REQUIRE(t.db.execute_sql("DROP TRIGGER block_ins"));
+
+    auto retry = t.db.checked_transaction([](TransactionHandle& h) -> std::expected<void, std::string> {
+        if (!h.exec("INSERT INTO process_live (ts,snapshot_id,action,pid,ppid,name,cmdline,user) "
+                    "VALUES (1,1,'started',1,0,'a.exe','','u')"))
+            return std::unexpected(h.error());
+        return {};
+    });
+    CHECK(retry.has_value());
+    CHECK(row_count(t.db, "process_live") == 1); // applied exactly once, not twice
+}
+
+TEST_CASE("checked_transaction: a transaction-aborting fault (RAISE ROLLBACK) stops the "
+          "operation from issuing further statements",
+          "[tar][store][checked_transaction]") {
+    auto t = make_test_db();
+    REQUIRE(t.db.execute_sql("CREATE TRIGGER block_ins BEFORE INSERT ON process_live "
+                             "BEGIN SELECT RAISE(ROLLBACK, 'aborted'); END;"));
+
+    int exec_attempts = 0;
+    auto result = t.db.checked_transaction(
+        [&exec_attempts](TransactionHandle& h) -> std::expected<void, std::string> {
+            ++exec_attempts;
+            h.exec("INSERT INTO process_live (ts,snapshot_id,action,pid,ppid,name,cmdline,user) "
+                   "VALUES (1,1,'started',1,0,'a.exe','','u')"); // aborts the transaction
+            ++exec_attempts;
+            // poisoned() now true -- this exec() must no-op, never touch SQLite,
+            // never insert the canary row.
+            CHECK(h.poisoned());
+            const bool second_ran =
+                h.exec("INSERT INTO tar_config (key,value) VALUES ('canary','1')");
+            CHECK_FALSE(second_ran);
+            return {}; // deliberately ignored by the callback -- proves poisoning
+                       // wins over a callback that forgets to check
+        });
+    CHECK_FALSE(result.has_value());
+    CHECK(exec_attempts == 2); // both exec() CALLS were attempted by the callback...
+    CHECK(t.db.get_config("canary", "") == ""); // ...but the second never touched the DB
+    CHECK(row_count(t.db, "process_live") == 0);
+}
+
+TEST_CASE("checked_transaction: an already-offline store refuses immediately, no crash",
+          "[tar][store][checked_transaction]") {
+    // Rollback-fails-with-transaction-still-open (the path that actually
+    // TAKES a store offline) needs a disk-level fault this harness cannot
+    // induce -- same limitation TAR #2361's "a closed store skips the pass"
+    // test documents for execute_atomic_batch's identical wedge path
+    // (test_tar_aggregator.cpp). This test covers the downstream behaviour:
+    // checked_transaction against an ALREADY-offline connection (db_ ==
+    // nullptr, simulated via move exactly as that test does) must refuse via
+    // the `if (!db_)` pre-check, never attempt BEGIN, never crash.
+    auto t = make_test_db();
+    TarDatabase live = std::move(t.db); // t.db is now the closed store
+
+    auto result =
+        t.db.checked_transaction([](TransactionHandle&) -> std::expected<void, std::string> {
+            FAIL("operation must not run against an offline store");
+            return {};
+        });
+    CHECK_FALSE(result.has_value());
+    CHECK(result.error() == "database not open");
+}
+
+TEST_CASE("checked_transaction: an exception thrown from the operation still rolls back",
+          "[tar][store][checked_transaction]") {
+    auto t = make_test_db();
+    auto result = t.db.checked_transaction([](TransactionHandle& h) -> std::expected<void, std::string> {
+        if (!h.exec("INSERT INTO process_live (ts,snapshot_id,action,pid,ppid,name,cmdline,user) "
+                    "VALUES (1,1,'started',1,0,'a.exe','','u')"))
+            return std::unexpected(h.error());
+        throw std::runtime_error("simulated fault mid-operation");
+    });
+    CHECK_FALSE(result.has_value());
+    CHECK(result.error().find("simulated fault mid-operation") != std::string::npos);
+    CHECK(row_count(t.db, "process_live") == 0); // the pre-throw INSERT did not survive
+    CHECK(t.db.is_open()); // an exception is not a wedge -- the connection stays usable
+
+    // And the connection genuinely still works afterward.
+    auto retry = t.db.checked_transaction([](TransactionHandle& h) -> std::expected<void, std::string> {
+        if (!h.exec("INSERT INTO process_live (ts,snapshot_id,action,pid,ppid,name,cmdline,user) "
+                    "VALUES (1,1,'started',1,0,'a.exe','','u')"))
+            return std::unexpected(h.error());
+        return {};
+    });
+    CHECK(retry.has_value());
+    CHECK(row_count(t.db, "process_live") == 1);
+}
+
+TEST_CASE("checked_transaction: every statement individually succeeding does not imply "
+          "success -- a COMMIT-time failure (deferred FK) still rolls back",
+          "[tar][store][checked_transaction]") {
+    // The one failure class none of the per-statement triggers above can
+    // reach: every exec() in the operation returns true, so nothing pokes
+    // poisoned() -- the failure only exists at COMMIT. A deferred foreign key
+    // is real SQLite behaviour that manifests exactly there, so this proves
+    // checked_transaction's own COMMIT check is load-bearing and not
+    // redundant with poisoned().
+    auto t = make_test_db();
+    REQUIRE(t.db.execute_sql("PRAGMA foreign_keys=ON"));
+    REQUIRE(t.db.execute_sql("CREATE TABLE fk_parent (id INTEGER PRIMARY KEY)"));
+    REQUIRE(t.db.execute_sql(
+        "CREATE TABLE fk_child (id INTEGER PRIMARY KEY, parent_id INTEGER "
+        "REFERENCES fk_parent(id) DEFERRABLE INITIALLY DEFERRED)"));
+
+    auto result = t.db.checked_transaction([](TransactionHandle& h) -> std::expected<void, std::string> {
+        // Every exec() below returns true -- the FK violation is deferred to
+        // COMMIT, not caught here.
+        if (!h.exec("INSERT INTO fk_child (id, parent_id) VALUES (1, 999)")) // no such parent
+            return std::unexpected(h.error());
+        return {};
+    });
+    CHECK_FALSE(result.has_value());
+    CHECK(result.error().find("COMMIT failed") != std::string::npos);
+    CHECK(row_count(t.db, "fk_child") == 0);
+}
