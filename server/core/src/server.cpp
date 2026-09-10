@@ -16069,6 +16069,14 @@ private:
         wf_deps.execution_event_bus = execution_event_bus_.get();
         wf_deps.stream_budget = stream_budget_.get(); // ADR-0034: one budget, every surface
         wf_deps.metrics = &metrics_;                  // #2500 targeting-refusal counter
+        // BR-001 — the SAME capability_registry_ classifier /api/command, MCP
+        // execute_instruction and the exec console consult, so a fourth
+        // operator-facing dispatch surface cannot disagree with them about
+        // whether a plugin.action is Destructive or Forensics. Wired
+        // UNCONDITIONALLY, exactly like set_capability_classify_fn on
+        // DashboardRoutes/McpServer above: capability_registry_ is a plain
+        // ServerImpl member, never conditional on another store's presence.
+        wf_deps.capability_registry = &capability_registry_;
         workflow_routes_->register_routes(*web_server_, std::move(wf_deps));
 
         // NotificationRoutes — /api/notifications/*

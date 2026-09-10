@@ -178,8 +178,9 @@ TEST_CASE("RbacStore: seed data — securable types", "[rbac_store][pg]") {
     // Settings read-twins) = 33,
     // +Directory +Enrollment +OidcConfig (#4031 prerequisite fix — Directory was
     // referenced by discovery_routes.cpp but never seeded; Enrollment/OidcConfig
-    // are the two new #4031 route securables) = 36.
-    REQUIRE(types.size() == 36);
+    // are the two new #4031 route securables) = 36,
+    // +Forensics (37th) +Decommission (38th, Wave 7 PR7.2) = 38.
+    REQUIRE(types.size() == 38);
 
     auto has = [&](const std::string& t) {
         return std::find(types.begin(), types.end(), t) != types.end();
@@ -212,6 +213,8 @@ TEST_CASE("RbacStore: seed data — securable types", "[rbac_store][pg]") {
     CHECK(has("PluginSigning"));   // #4028: plugin-signing fragment + GET /agent/plugin-policy (v2)
     CHECK(has("ServerConfig"));    // #4028: gateway/server-config/mcp/data-retention fragments
     CHECK(has("AnalyticsConfig")); // #4028: analytics fragment
+    CHECK(has("Forensics")); // Wave 7 forensics class (execution_artifacts, app_usage)
+    CHECK(has("Decommission")); // Wave 7 PR7.2: whole-device erasure cascade
     CHECK(has("Directory"));   // #4031 prerequisite fix — AD/Entra directory-sync
     CHECK(has("Enrollment"));  // #4031: auto-approve rules + pending-agent visibility
     CHECK(has("OidcConfig"));  // #4031: OIDC SSO config read (deliberately not "Directory")
@@ -249,12 +252,13 @@ TEST_CASE("RbacStore: seeded catalogues match the MCP C8 validator mirrors",
 TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_store][pg]") {
     RBAC_STORE(store);
     auto perms = store.get_role_permissions("Administrator");
-    // 36 types * 5 CRUD ops = 180 permissions, plus a single targeted Push
-    // grant on GuaranteedState (= 181), plus a single AccessReview:Attest grant
-    // (Periodic Access Reviews, CC6.2, = 182), plus a single ApiToken:Rotate
-    // grant (P2 #11, SOC 2 CC6.3) = 183 permissions total. Push, Attest, and
+    // 38 types * 5 CRUD ops = 190 permissions, plus a single targeted Push
+    // grant on GuaranteedState (= 191), plus a single AccessReview:Attest grant
+    // (Periodic Access Reviews, CC6.2, = 192), plus a single ApiToken:Rotate
+    // grant (P2 #11, SOC 2 CC6.3) = 193 permissions total. Push, Attest, and
     // Rotate are deliberately NOT cross-seeded on other securables — see the
-    // rationale in rbac_store.cpp seed_defaults(). (36th-34th: Directory/
+    // rationale in rbac_store.cpp seed_defaults(). (38th: Decommission, Wave 7
+    // PR7.2; 37th: Forensics, Wave 7 forensics class; 36th-34th: Directory/
     // Enrollment/OidcConfig, #4031; 33rd-30th: TlsConfig/PluginSigning/
     // ServerConfig/AnalyticsConfig, #4028 Settings read-twins; 29th:
     // ProductPack, #4029 prerequisite fix; 28th: Workflow, #4030/#4032 —
@@ -263,7 +267,7 @@ TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_s
     // PluginConfig, PR1.9a peer finding PLAN-001; 23rd: EnginePrincipal,
     // #2376; 22nd: AccessReview, SOC 2 CC6.2; 21st: SoftwareLicensing,
     // ADR-0024.)
-    CHECK(perms.size() == 183);
+    CHECK(perms.size() == 193);
     for (auto& p : perms)
         CHECK(p.effect == "allow");
 
@@ -1234,12 +1238,17 @@ TEST_CASE("RbacStore: ITServiceOwner role seeded with correct permissions", "[rb
     // 18 types * 5 CRUD ops = 90 permissions, plus the targeted Push grant on
     // GuaranteedState (= 91), plus a single Workflow:Read grant (#4030/#4032,
     // NOT via the CRUD loop — the issue's prerequisite scopes this fix to
-    // granting Read only) = 92 permissions total. Push is deliberately NOT
-    // cross-seeded on non-Guardian securables — see the rationale in
+    // granting Read only) = 92, plus the targeted Decommission:Delete grant
+    // (Wave 7 PR7.2 — the promoted erasure securable; ITSO could decommission
+    // under the old SoftwareLicensing∧Inventory∧GuaranteedState:Delete
+    // conjunction and still can) = 93 permissions total. Push, the Workflow
+    // grant, and the Decommission grant are deliberately NOT cross-seeded on
+    // other securables — see the rationale in
     // rbac_store.cpp seed_defaults(). (18th type: SoftwareLicensing, ADR-0024 —
     // ITServiceOwner full CRUD per the D-9 matrix.)
-    CHECK(perms.size() == 92);
+    CHECK(perms.size() == 93);
     size_t push_count = 0;
+    size_t decommission_count = 0;
     for (auto& p : perms) {
         CHECK(p.effect == "allow");
         // Should not include UserManagement, Security, ApiToken
@@ -1250,8 +1259,96 @@ TEST_CASE("RbacStore: ITServiceOwner role seeded with correct permissions", "[rb
             ++push_count;
             CHECK(p.securable_type == "GuaranteedState");
         }
+        if (p.securable_type == "Decommission") {
+            ++decommission_count;
+            CHECK(p.operation == "Delete");
+        }
     }
     CHECK(push_count == 1);
+    CHECK(decommission_count == 1);
+}
+
+// Adversarial-review finding (PR7.2a round 1, Blocker/Should-fix): an operator
+// who had revoked one of the OLD three conjunct grants (SoftwareLicensing,
+// Inventory, or GuaranteedState Delete) specifically to strip ITServiceOwner's
+// decommission ability must not silently regain it the moment the Decommission
+// securable is seeded — seed_defaults() now carries a prior revocation of any
+// of the three old grants forward onto Decommission:Delete before granting it.
+TEST_CASE("RbacStore: a decommission-ability revocation via an old conjunct grant "
+          "is preserved across the Decommission securable migration",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    REQUIRE(store.check_role_has_permission("ITServiceOwner", "Decommission", "Delete"));
+
+    // Simulate the pre-migration operator action: revoke ONE of the three old
+    // conjunct grants specifically to strip decommission ability. This is the
+    // exact real-world action the finding describes.
+    auto removed = store.remove_permission("ITServiceOwner", "SoftwareLicensing", "Delete");
+    REQUIRE(removed.has_value());
+    REQUIRE_FALSE(store.check_role_has_permission("ITServiceOwner", "SoftwareLicensing", "Delete"));
+    // The old conjunct grant's sibling ability was never seeded on Decommission
+    // by remove_permission() itself — only seed_defaults() carries it forward.
+    REQUIRE(store.check_role_has_permission("ITServiceOwner", "Decommission", "Delete"));
+
+    // A genuine replica boot: a second RbacStore construction against the SAME
+    // pool re-runs the REAL (production) seed_defaults()/grant() code path,
+    // not a hand-copy of its SQL.
+    RbacStore reopened{rbac_pool_fx_};
+    REQUIRE(reopened.is_open());
+
+    CHECK_FALSE(reopened.check_role_has_permission("ITServiceOwner", "Decommission", "Delete"));
+    // The other two old conjunct grants (never revoked) should be untouched.
+    CHECK(reopened.check_role_has_permission("ITServiceOwner", "Inventory", "Delete"));
+    CHECK(reopened.check_role_has_permission("ITServiceOwner", "GuaranteedState", "Delete"));
+}
+
+// Governance round 5 (Blocker 1): the carry-forward marker+DELETE pair above
+// must fire ONCE, at the moment the marker is first created — not on every
+// boot. Prior code re-ran the unconditional DELETE on every seed_defaults()
+// call gated only on "does the marker exist" (which is permanent), so an
+// operator's later EXPLICIT re-grant of Decommission:Delete via
+// set_permission() (which never touches revoked_seed_defaults) was silently
+// wiped out again on the very next restart. Sequence under test: revoke an
+// old conjunct grant -> first reopen carries the marker forward and deletes
+// the seeded Decommission:Delete row (matches the existing preservation test
+// above) -> operator explicitly RE-GRANTS Decommission:Delete -> second
+// reopen must NOT delete it again.
+TEST_CASE("RbacStore: an operator's explicit re-grant of Decommission:Delete survives "
+          "a later seed_defaults() reboot",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    REQUIRE(store.check_role_has_permission("ITServiceOwner", "Decommission", "Delete"));
+
+    // Pre-migration operator action: revoke one of the three old conjunct
+    // grants specifically to strip decommission ability.
+    auto removed = store.remove_permission("ITServiceOwner", "SoftwareLicensing", "Delete");
+    REQUIRE(removed.has_value());
+
+    // First reboot: the real seed_defaults() carries the revocation forward
+    // onto Decommission:Delete and deletes the row (the marker is created
+    // here for the first time).
+    {
+        RbacStore first_reopen{rbac_pool_fx_};
+        REQUIRE(first_reopen.is_open());
+        REQUIRE_FALSE(
+            first_reopen.check_role_has_permission("ITServiceOwner", "Decommission", "Delete"));
+
+        // Operator explicitly re-grants Decommission:Delete via the RBAC
+        // editor's own path — set_permission() writes role_permissions
+        // directly and never touches revoked_seed_defaults.
+        auto regranted =
+            first_reopen.set_permission({"ITServiceOwner", "Decommission", "Delete", "allow"});
+        REQUIRE(regranted.has_value());
+        REQUIRE(
+            first_reopen.check_role_has_permission("ITServiceOwner", "Decommission", "Delete"));
+    }
+
+    // Second reboot: the marker from the first reopen is still present, but
+    // the carry-forward DELETE must not fire again — the re-grant must
+    // survive.
+    RbacStore second_reopen{rbac_pool_fx_};
+    REQUIRE(second_reopen.is_open());
+    CHECK(second_reopen.check_role_has_permission("ITServiceOwner", "Decommission", "Delete"));
 }
 
 // ── check_scoped_permission ──────────────────────────────────────────────────
