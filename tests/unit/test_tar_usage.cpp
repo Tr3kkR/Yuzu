@@ -650,13 +650,20 @@ TEST_CASE("usage: a declined tick DOES advance the anchor, so an ordinary sleep/
     CHECK(cfg(t.db, "usage_expiry_declined_count") == "1"); // unchanged -- tick 3 didn't decline
 }
 
-TEST_CASE("usage: a sustained bad clock still declines on its OWN first implausible tick "
-          "(the protection this guard was actually built for is unchanged)",
+TEST_CASE("usage: a sustained bad clock still declines on its OWN first implausible tick",
           "[tar][usage][fold]") {
     // Unconditional anchor advancement (the fix above) does not weaken the
     // guard's per-tick decision -- it only stops a single decline from
     // becoming permanent. A clock that is wrong on tick N is still
-    // correctly declined on tick N, every time it happens.
+    // correctly declined on tick N, every time it happens. This does NOT
+    // prove protection against a SUSTAINED bad clock across multiple ticks --
+    // per the design comment above run_usage_fold's anchor read, no local
+    // heuristic can distinguish a one-off skip from a clock that stays wrong
+    // and self-consistent, so a smoothly-incrementing bad clock is laundered
+    // into trust after exactly one decline (governance Gate 8 security-
+    // guardian re-review finding, LOW: this test's own title previously
+    // overclaimed "the protection this guard was actually built for is
+    // unchanged").
     auto t = make_test_db();
     REQUIRE(usage_ensure_baselined(t.db, 1000).has_value());
     seed_process_pair(t.db, 1, "old.exe", 1500, -1);

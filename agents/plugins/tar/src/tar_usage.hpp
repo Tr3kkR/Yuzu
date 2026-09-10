@@ -205,9 +205,15 @@ constexpr size_t kMaxOpenRuns = 20000;
 /// the FIRST extreme value in a bucket -- a SECOND extreme value accumulating
 /// into an already-large total_seconds can overflow the `+=` itself even
 /// though neither operand alone was out of range at the point it was computed.
+/// Self-defending (governance Gate 8 cpp-safety re-review): `INT64_MAX - b`
+/// is itself UB for a negative `b`, so this checks both directions via
+/// subtraction rather than trusting the "nonneg" contract at the call site --
+/// the name documents intended usage, the implementation doesn't require it.
 [[nodiscard]] constexpr int64_t saturating_add_nonneg(int64_t a, int64_t b) noexcept {
-    if (a > std::numeric_limits<int64_t>::max() - b)
+    if (b > 0 && a > std::numeric_limits<int64_t>::max() - b)
         return std::numeric_limits<int64_t>::max();
+    if (b < 0 && a < std::numeric_limits<int64_t>::min() - b)
+        return std::numeric_limits<int64_t>::min();
     return a + b;
 }
 
