@@ -287,37 +287,28 @@ detail) — see `docs/observability-conventions.md`.
 Five SLOs (`/readyz` availability, command dispatch latency, agent heartbeat
 freshness, audit write success, PostgreSQL substrate degrade events), each
 backed by a metric verified present in the codebase and — where one ships —
-the exact Prometheus alert that pages on it: `docs/ops-runbooks/slo.md`
+the exact Prometheus alert that **fires** on it (not "pages" — no
+Alertmanager ships; see `docs/ops-runbooks/slo.md`'s own correction on this
+point, governance sre3-1): `docs/ops-runbooks/slo.md`
 (one caveat on "verified present": the `/readyz`-availability proxy,
 `up{job="yuzu-server"}`, is a Prometheus **scrape** metric, not a metric
 Yuzu itself emits — verified present in the *scrape config*, not in
-`server/core/src`, unlike the other four). Two backup/restore drills were
-**executed** (not merely described): against the containerized
-`docker-compose.reference.yml` header procedure (measured RTO **4m27s
-end-to-end, ~23s of that mechanical** — the rest is a `stop_grace_period`
-wait, not backup/restore work) and, separately, against
-`docs/operations/disaster-recovery.md`'s native-install procedure (measured
-RTO 6m9s as actually run) — both with a row-count/audit-chain integrity
-check post-restore, and the native-procedure run additionally **found**
-(not fixed in this change) two real script/doc defects along the way (a
-`yuzu-backup.sh` manifest bug; a `pg_restore` ownership pitfall that can
-leave a database in a WORSE state than before the restore if followed
-incorrectly), plus a further 26 findings on re-review. **The fix for all of
-these, and a fourth drill attempt validating the corrected procedure
-(~3m40s projected RTO), ships on a separate branch/PR (`po/dr-procedure`)
-— this document's own copy of `docs/operations/disaster-recovery.md` was
-reverted to `origin/dev` (pre-fix) as part of a PO decision to split the
-assurance-evidence and DR-procedure work into independently-reviewable
-PRs.** Full transcripts: `docs/ops-runbooks/restore-drill-2026-09.md`
-(attempts 1-3, this PR, evidence of the defects) and
-`docs/ops-runbooks/dr-procedure-drill-2026-09.md` (attempt 4, `po/dr-procedure`,
-the corrected procedure). **Caveat carried from the
-containerized drill:** its audit-chain integrity check verified the
-**legacy SQLite `audit.db`** chain, not the PostgreSQL `audit_store` schema
-(ADR-0040) — that drill's server image build predates the migration; see
-the drill runbook's "Image note" and "Gaps found" #6 for the full account
-and what re-running against a newer image would additionally prove. The
-optional HA-Postgres profile's separately-measured failover figures:
+`server/core/src`, unlike the other four). **Backup/restore drills were
+executed against this procedure (not merely described) — but the
+transcripts, and the corrected version of `docs/operations/disaster-recovery.md`
+they validate, do not ship on this branch/PR at all.** This document's own
+copy of `docs/operations/disaster-recovery.md` is the unmodified,
+pre-fix `origin/dev` version (reverted as part of a PO decision to split
+assurance-evidence work from DR-procedure work into independently-reviewable
+PRs) — treat every claim about what the DR procedure does, how long it
+takes, or what it was proven to do as **not applicable to this checkout**.
+For the actual drill transcripts (four attempts total, RTO/RPO figures,
+every defect found and how each was fixed and verified), the corrected
+procedure, and the corrected `scripts/yuzu-backup.sh`/`yuzu-restore.sh`:
+see PR `po/dr-procedure` (`docs/ops-runbooks/restore-drill-2026-09.md`,
+`docs/ops-runbooks/dr-procedure-drill-2026-09.md`). The optional
+HA-Postgres profile's separately-measured failover figures (an unrelated,
+already-shipped mechanism, not affected by the DR-procedure split):
 `docs/user-manual/ha-postgres.md`.
 
 **Planned, not yet shipped:** a direct `/readyz`-content availability probe
@@ -328,8 +319,9 @@ this gap); a second
 server replica (ADR-2002 Phase B) to raise the single-replica 99.5%/30d
 availability target to 99.9%/30d; a scheduled (cron/systemd-timer) backup
 job (today's procedure is a documented manual/scriptable command, not an
-automatically-scheduled one — see `docs/ops-runbooks/restore-drill-2026-09.md`
-"Gaps found").
+automatically-scheduled one, and this branch's copy carries none of the
+`po/dr-procedure` fixes — see that PR for the corrected version and its
+gap list).
 
 ## 6. Supply chain integrity
 
@@ -406,7 +398,6 @@ current phase status: `docs/adr-1005-execution-plan.md`.
 `docs/user-manual/audit-log.md` ·
 `docs/ops-runbooks/audit-store-clock-guard.md` ·
 `docs/ops-runbooks/slo.md` ·
-`docs/ops-runbooks/restore-drill-2026-09.md` ·
 `docs/user-manual/ha-postgres.md` ·
 `docs/user-manual/release-verification.md` ·
 `docs/enterprise-readiness-soc2-first-customer.md` §3.5 ·

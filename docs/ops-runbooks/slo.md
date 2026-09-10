@@ -23,7 +23,12 @@ target and a real alert wired to it, not a promise with nothing behind it.
 Windows are 30-day rolling unless stated otherwise. "Burn" means the rate at
 which the SLO's error budget is being consumed, not the raw threshold alone —
 each section names the existing Prometheus alert (`docs/prometheus/yuzu-alerts.yml`)
-that pages on it, or says explicitly that no alert ships yet.
+that **fires** on it, or says explicitly that no alert ships yet.
+**"Fires" is not "pages" (governance sre3-1) and "exists in the file" is
+not "is evaluated by a running Prometheus" (governance sre6-5) — see
+"Verifying this file's claims" near the end of this document for both
+distinctions before treating any "Alert: existing" line below as a
+standing, routed, continuously-evaluated control.**
 
 ---
 
@@ -172,8 +177,17 @@ rises — the system already treats any audit-write failure as an outage of
 those routes rather than a tolerable degradation, so the SLO mirrors that
 design rather than inventing a softer target.
 
-**Window:** 30-day rolling; the underlying alert pages within minutes of any
-single failure (see below) — this is not a budget that "burns slowly."
+**Window:** 30-day rolling; the underlying alert **fires as a Prometheus
+alert within minutes of any single failure** (see below) — this is not a
+budget that "burns slowly." **Correction (governance sre3-1):** "fires"
+is not "pages." Routing/paging requires an operator-provided Alertmanager
+— none ships with this repo (`deploy/docker/docker-compose.observability.yml`'s
+own header lists Alertmanager as an open #2857 follow-up, and every
+`severity:` label in `docs/prometheus/yuzu-alerts.yml` "routes nowhere"
+until one is wired). See `docs/enterprise-readiness-soc2-first-customer.md`
+WS-D for the current status. A firing alert is visible in Prometheus's own
+UI/API (`/api/v1/alerts`) even with no Alertmanager — it does not reach an
+on-call human until one is configured.
 
 **Alert:** existing — `YuzuAuditPersistFailures`
 (`docs/prometheus/yuzu-alerts.yml`, `severity: critical`):
@@ -275,9 +289,18 @@ docker run --rm --entrypoint /bin/promtool \
 Expected output: `SUCCESS: 116 rules found` (115 alert rules + 1 recording
 rule — see `docs/enterprise-readiness-soc2-first-customer.md` §3.4 for
 where that count is cross-checked against a raw `grep -c` of the file).
-See #2857 for why no shipped stack evaluates these rules at runtime yet —
-`deploy/docker/docker-compose.observability.yml` is the first one that
-does, for the UAT rig.
+See #2857 for why no shipped stack loads these rules at all today. **Do
+not read the observability overlay below as closing that gap yet**
+(governance sre6-5/R4-1/UP4-4/UP4-5): `deploy/docker/docker-compose.observability.yml`
+is a first attempt at wiring `docs/prometheus/yuzu-alerts.yml` into a
+running Prometheus, but its own documented verification step cannot
+detect the failure mode it exists to catch, there is no rule-reload path
+(a restart is required, undocumented), and the rules mount is a
+single-file bind that pins to a stale inode across a restart. Until those
+are fixed, the honest claim is **"these 115 rules exist and parse"**
+(`promtool check rules`, above — a real, CI-checkable fact) — **not**
+"these rules are evaluated by a live system," which this repo cannot
+currently substantiate.
 
 ## Related
 
@@ -292,9 +315,10 @@ does, for the UAT rig.
   §5 above (the *server's* pool-level view of that substrate) or for §1
   (the server listener's own availability, which HA-Postgres does not
   address at all — see §1's ADR-2002 Phase B note).
-- `docs/ops-runbooks/restore-drill-2026-09.md` — the executed backup/restore
-  drill and its measured RTO/RPO for the non-HA, single-replica deployment
-  this document's §1 target describes.
+- Restore drill and the corrected DR procedure (measured RTO/RPO for the
+  non-HA, single-replica deployment this document's §1 target describes):
+  see PR `po/dr-procedure` (`docs/ops-runbooks/restore-drill-2026-09.md`,
+  `dr-procedure-drill-2026-09.md`) — neither ships on this branch.
 - The server dead-man's-switch gap this document's §1 proposed alert would
   close is **untracked** — `docs/ops-runbooks/audit-store-clock-guard.md`
   cites #2956 for it, which is closed and does not (re-)name a live

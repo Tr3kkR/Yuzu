@@ -83,11 +83,15 @@ exhausted (`FATAL: sorry, too many clients already`).
 
 Yuzu restarts cleanly once Postgres is reachable — no Yuzu-side repair is
 needed, and **no auth data is lost by the outage itself**. **Correction
-(2026-09-08):** sessions are PostgreSQL-backed since HA WS-1/1a and survive
-this kind of restart (see the corrected section below) — an operator whose
-session was already established does **not** need to sign in again purely
-because the server restarted; a login is only required if the outage
-itself prevented a session validation from completing while it was down.
+(2026-09-08, version-qualified 2026-09-11):** on builds carrying HA WS-1/1a
+(this checkout), sessions are PostgreSQL-backed and survive this kind of
+restart (see the corrected, version-qualified section below) — an operator
+whose session was already established does **not** need to sign in again
+purely because the server restarted; a login is only required if the
+outage itself prevented a session validation from completing while it was
+down. **On `v0.13.0` and earlier, sessions are in-memory and this outage
+DOES sign everyone out** — check which build you are running (see the
+version check in the section below) before assuming otherwise.
 
 ### `auth` schema migration failure
 
@@ -224,26 +228,45 @@ Step 3 is the one people skip. It is the only cheap check that distinguishes
 "restored correctly" from "restored, and every MFA user will be locked out the
 moment they try to log in".
 
-## ⚠️ CORRECTION (2026-09-08) — sessions are PostgreSQL-backed; a restart does NOT revoke them
+## ⚠️ CORRECTION (2026-09-08, version-qualified 2026-09-11) — sessions are PostgreSQL-backed at `dev`-HEAD; a restart does NOT revoke them THERE — but this section is FALSE for the latest tagged release
 
-> **This section previously said the opposite and was WRONG — read this
-> before acting on an emergency revocation.** It claimed sessions were
-> in-memory only and that a server restart revoked every session
-> fleet-wide. That has been false since **HA WS-1/1a (ADR-2002 §4)**:
-> `SessionStore` is a born-on-PG durable store, wired into `AuthManager` so
-> sessions write-through to PostgreSQL and **survive a restart, a crash, or
-> a replica failover** (`server/core/src/server.cpp:4216-4225`;
+> **Read the version check below BEFORE acting on an emergency
+> revocation — the correct emergency action is the OPPOSITE one depending
+> on which build you are running.**
+>
+> **At `dev`-HEAD (this checkout, and any build carrying HA WS-1/1a, ADR-2002
+> §4):** `SessionStore` is a born-on-PG durable store, wired into
+> `AuthManager` so sessions write-through to PostgreSQL and **survive a
+> restart, a crash, or a replica failover**
+> (`server/core/src/server.cpp:4216-4225`;
 > `tests/unit/server/test_auth_session_store.cpp`'s "a session survives on
 > a fresh replica" case, `[auth][session_store][pg]`, pins exactly this
 > behaviour). **If you restart the server expecting to kill a compromised
 > session, it will still be live when the server comes back up.** Use the
 > REST revocation surface below instead — it is the only thing that
-> actually revokes a session.
+> actually revokes a session on this build.
+>
+> **On `v0.13.0` (the latest TAGGED release as of this writing) and any
+> earlier build: the opposite is true.** `session_store.hpp` does not exist
+> in that release (confirmed: `git cat-file -e v0.13.0:server/core/src/session_store.hpp`
+> fails) — sessions are in-memory only, and **a server restart IS the
+> fastest fleet-wide revocation there is, requiring no database access.**
+> Check which build you are running before choosing an emergency action:
+> `SELECT store, version FROM session_store.schema_meta` (or equivalent)
+> succeeding means you are on the durable-session build and restart will
+> NOT help; the query failing with "relation does not exist" (or the
+> binary's own `--version` predating this fix) means you are on the
+> legacy build and restart DOES help. Governance UP4-9: an earlier
+> revision of this correction gave the `dev`-HEAD answer unconditionally,
+> which would have told a `v0.13.0` operator to give up their best,
+> fastest, no-DB-access emergency tool during an active compromise.
 
-There **is** a sessions table (`session_store` schema, PostgreSQL). Do not
-restart the server as an emergency-revocation step — it accomplishes
-nothing against sessions and only adds downtime. For targeted revocation
-while the server is running, use the REST surface:
+There **is** a sessions table (`session_store` schema, PostgreSQL) **on
+builds carrying HA WS-1/1a** — see the version check above before deciding
+whether restarting helps. On those builds, do not restart the server as an
+emergency-revocation step — it accomplishes nothing against sessions and
+only adds downtime; for targeted revocation while the server is running,
+use the REST surface:
 
 ```bash
 # Revoke every session for one operator (admin).
@@ -506,11 +529,8 @@ sudo systemctl restart yuzu-server
   a separate branch/PR, `po/dr-procedure`) — run the corrected procedure
   from that branch, not this checkout, before relying on this page's
   checks as the second half of a real recovery.
-- `docs/ops-runbooks/restore-drill-2026-09.md` — an executed restore drill
-  (containerized rig) and, via its attempt-3 addendum, the PRE-FIX
-  `disaster-recovery.md` procedure exercised end-to-end on the same
-  disposable project — this is where the defects were found, not where
-  they were fixed (see that file's own branch-split note at the top).
-- `docs/ops-runbooks/dr-procedure-drill-2026-09.md` (on `po/dr-procedure`,
-  not this branch) — attempt 4, the corrected procedure exercised end to
-  end with every defect fixed and disclosed.
+- Restore drill and the corrected DR procedure: see PR `po/dr-procedure`
+  (`docs/ops-runbooks/restore-drill-2026-09.md`,
+  `dr-procedure-drill-2026-09.md`) — neither file ships on this branch;
+  do not expect either path to exist in this checkout or in a release cut
+  from it alone.

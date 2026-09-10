@@ -296,52 +296,59 @@ absence of threat modeling altogether.
 
 - Monitoring dashboards, incident tickets/postmortems, backup logs, restore drill reports.
 
-**Status (2026-09-07).** SLO definitions for the five required signals
-(server-listener availability, command dispatch latency, agent heartbeat
-freshness, audit write success, PostgreSQL substrate degrade events) —
-each backed by a metric verified present in the codebase and, where one
-ships, the exact Prometheus alert that pages on it: `docs/ops-runbooks/slo.md`.
-A first backup/restore drill has been **executed** (not merely documented)
-against the `pg_dump`/`pg_restore`/`tar` procedure already in
-`docker-compose.reference.yml`'s header, run **verbatim** (attempt 2, the
-primary transcript — an earlier attempt 1 that deviated from the header's
-exact commands is kept as a labelled appendix), with measured RTO (4m27s
-end-to-end; 3m30s of that is the header's own `docker compose down server`
-step alone, bound by `stop_grace_period: 210s` — the mechanical
-backup/restore work is ~23s) and an explicit RPO framing (= backup cadence
-— see the gap below), plus a post-restore row-count and audit-chain
-integrity check, including a deliberately-injected post-backup corruption
-row proven rolled back exactly by the restore (stronger evidence than a
-row-count match alone):
-`docs/ops-runbooks/restore-drill-2026-09.md`. **Caveat:** that audit-chain
-check verified the legacy SQLite `audit.db` chain, not the PostgreSQL
-`audit_store` schema (ADR-0040) — the drill's server image build predates
-that migration; see the runbook's "Image note" and "Gaps found" #6. That
-drill surfaced concrete gaps carried forward rather than closed: **(1) no
-scheduled backup job exists** (the procedure is a documented
-manual/scriptable command, not a cron/systemd-timer unit); **(2) the header
-procedure's own literal commands have four independent bugs** (runbook
-"Gaps found" #2-4b), confirmed by running the header's exact text, not by
-substituting different commands and describing them as the header's — a
-bare `-v server-data:/data`-style volume reference that does not account
-for Compose's project-name volume prefixing (silently backs up an empty
-auto-created volume instead of the real one); `pg_restore --role=yuzu`
-throwing 2 non-fatal `vector`-extension-ownership errors regardless of
-which user connects; the documented `docker compose down server` step
-taking 3m30s in this run (`stop_grace_period: 210s`, dominating the
-restore's wall-clock cost); and the restore section never restoring the
-certs volume its own backup section captures separately — all four filed
-against `docker-compose.reference.yml`, not fixed by this change; and
-**(3) `docs/prometheus/yuzu-alerts.yml`'s 115 alert rules + 1 recording
-rule (116 total, per `promtool check rules`) were, until this change,
-evaluated by no shipped Prometheus stack at all** — closed for the UAT rig
-by the new
-`deploy/docker/docker-compose.observability.yml` overlay (issue #2857;
-`promtool check rules` passes, `docker compose ... config` confirms the
-rules load — that overlay applies to the UAT rig specifically;
-`docker-compose.reference.yml` ships no Prometheus at all). The
-Alertmanager-routing and alerts-file-checksum halves of #2857 remain open
-follow-ups, not addressed by this change. **Also found while auditing
+**Status (2026-09-07, DR-procedure evidence relocated 2026-09-11).** SLO
+definitions for the five required signals (server-listener availability,
+command dispatch latency, agent heartbeat freshness, audit write success,
+PostgreSQL substrate degrade events) — each backed by a metric verified
+present in the codebase and, where one ships, the exact Prometheus alert
+that **fires** on it (not "pages" — no Alertmanager ships, see below):
+`docs/ops-runbooks/slo.md`.
+
+**Backup/restore drills were executed (four attempts total, real
+containers, measured timings) against both the containerized
+`docker-compose.reference.yml` header procedure and the native
+`docs/operations/disaster-recovery.md` procedure — but the transcripts, the
+corrected DR procedure they validate, and the corrected
+`scripts/yuzu-backup.sh`/`yuzu-restore.sh` do not ship on this branch/PR.**
+Per PO decision, DR-procedure work (drills, the runbook, the corrected
+scripts and doc) moved to a separate, independently-reviewable PR,
+`po/dr-procedure` — see `docs/ops-runbooks/restore-drill-2026-09.md` and
+`docs/ops-runbooks/dr-procedure-drill-2026-09.md` there for the full
+account: every defect found (backup manifest self-reference, `pg_restore`
+ownership pitfalls that can leave a database worse than before a restore,
+world-readable backup permissions exposing the CA root key, version-skew
+handling, and more), each one's fix, and the fix's own verification. This
+branch's copy of `docs/operations/disaster-recovery.md`,
+`scripts/yuzu-backup.sh`, and `scripts/yuzu-restore.sh` are the unmodified
+`origin/dev` (pre-fix) versions — do not treat any DR-procedure defect as
+fixed or verified in this checkout.
+
+**`docs/prometheus/yuzu-alerts.yml`'s 115 alert rules + 1 recording
+rule (116 total per `promtool check rules` — measured at the time of this
+writing, not CI-bound to this figure; governance UP4-12: re-derive with
+`promtool check rules` rather than trusting this number, the file is
+actively churning and nothing gates this citation, `slo.md`, or the matrix
+to it) were, until this change, evaluated by no shipped Prometheus stack at
+all** — the new `deploy/docker/docker-compose.observability.yml` overlay
+(issue #2857) is the first shipped stack that **can** evaluate them for the
+UAT rig (`docker-compose.reference.yml` ships no Prometheus at all).
+**"Can," not "is verified to on an ongoing basis" (governance sre6-5):**
+`docker compose ... config` does **not** confirm the rules load (R4-1,
+BLOCKING — `rule_files:` lives inside the mounted config file, never in
+Compose's own merged model, and the wrong `-f` order silently loads zero
+rules while `config` still shows the file mount); the real check is
+Prometheus's own API post-boot (`curl localhost:9090/api/v1/rules`, must
+return ≥115 rules — verified live this pass, both the correct order
+(116 rules, 21 groups) and the reversed order (0 rules) were actually
+booted and checked). The overlay also lacked a rules-reload path
+(`--web.enable-lifecycle`, now added) and used a single-file bind that
+pins to a stale inode across a restart (now a directory mount) — both
+fixed and verified this pass (UP4-4/UP4-5/UP4-14). No CI regression gate
+boots this overlay and asserts on `/api/v1/rules` yet (tracked sre6-4) —
+until one exists, this is a manually-verified capability, not a
+continuously-enforced one. The Alertmanager-routing and
+alerts-file-checksum halves of #2857 remain open follow-ups, not addressed
+by this change. **Also found while auditing
 #2857 (governance-reproduced, sre2-2/arch2-2):** the now-deleted
 `deploy/grafana/yuzu-alerts.yml` (10 alerts, zero references anywhere in
 the repo, deleted in an earlier round of this change) was not a strict
