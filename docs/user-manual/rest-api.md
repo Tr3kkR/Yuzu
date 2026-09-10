@@ -275,6 +275,7 @@ Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (l
 | POST | `/api/export/json-to-csv` | 100 MiB | `json_to_csv_export` | Unbounded by design — converts a full exported dataset to CSV, and its size follows directly from the caller's own prior query. Kept at httplib's backstop, same treatment as `ota_upload`, rather than squeezed or given an arbitrary MiB judgment-call number. |
 | POST | `/api/nvd/match` | 8 MiB | `nvd_match` | ‡ No aggregate contract; reasoned to this content's own realistic scale (one device's software census, generously overestimated at ~200 bytes/item ⇒ 40000+ items) rather than borrowed from a sibling class. |
 | POST | `/api/v1/ca/import-chain` | 256 KiB | `ca_import_chain` | Mirrors the handler's own 256 KiB bound exactly. |
+| POST | `/api/v1/ca/issue-code-signing` | 64 KiB | `ca_issue_code_signing` | Code-signing leaf issuance via CSR custody (gap-matrix #10); mirrors the handler's own `kMaxIssueCodeSigningBody` exactly. |
 | POST | `/api/v1/ca/revoke` | 64 KiB | `ca_revoke` | Mirrors the handler's own `kMaxRevokeBody` exactly. |
 | POST | `/api/v1/secrets/kek/` | 64 KiB | `kek_ops` | Covers both `/rotate` and `/rewrap` — both take zero body fields and share the handler's own `kMaxKekBody`. |
 | POST | `/api/settings/ca/import-chain` | 512 KiB | `ca_import_chain_dashboard` | † 2× the REST JSON twin's cap — reasoned headroom for form-encoding overhead, not a measured worst case. |
@@ -1931,6 +1932,59 @@ will not see it until the next successful publish. Errors: `400` (missing/invali
 serial, unknown field, bad JSON), `403` (missing `Security:Delete`), `404` (serial
 not found or already revoked), `413` (body too large), `503` (CA unavailable).
 
+#### `POST /api/v1/ca/issue-code-signing` (gap-matrix #10)
+
+Issue a code-signing leaf certificate via CSR custody — the operator holds the
+private key and submits only a PKCS#10 CSR; the server never sees the key. See
+`docs/pki-architecture.md` "Code-signing certificate issuance" and
+`docs/user-manual/agent-plugins.md` "Plugin Signing" for the full workflow.
+**Permission:** `Security:Write`. MCP twin: `issue_code_signing_cert` (same
+schema, supervised-tier + approval-gated like every other `Security:Write` MCP
+tool). Request body (max 64 KiB):
+
+```json
+{
+  "csr_pem": "-----BEGIN CERTIFICATE REQUEST-----\n...",
+  "label": "plugin-signer-2026",
+  "validity_days": 365
+}
+```
+
+`csr_pem` is required. `label` is required and becomes the leaf's subject CN —
+must match `^[A-Za-z0-9._-]{1,64}$` (never an agent-style
+`yuzu://…/agent/…` URI SAN). `validity_days` is optional, `[1, 730]`, default
+`365`, refused outright (not silently clamped) if requested out of range;
+always further clamped so the leaf cannot outlive the issuing CA. Unknown JSON
+fields are rejected. Usage is hard-pinned to `codeSigning` only — never
+`clientAuth`/`serverAuth` — which is what makes this route safe to expose while
+the general `POST /api/v1/ca/issue` stays deferred (see `pki-architecture.md`).
+Response:
+
+```json
+{
+  "certificate_pem": "-----BEGIN CERTIFICATE-----\n...",
+  "chain_pem": "-----BEGIN CERTIFICATE-----\n...",
+  "serial_hex": "3A4B5C6D...",
+  "not_after": "2027-09-10T00:00:00Z",
+  "purpose": "code-signing",
+  "meta": { "api_version": "v1" }
+}
+```
+
+`chain_pem` is the issuing cert plus, in subordinate-CA mode, the parent chain
+above it — feed both `certificate_pem` and `chain_pem` to `openssl cms -sign
+-certfile` to build a signature an agent can chain to its trust anchor. Errors
+use the A4 envelope: `400` (missing/invalid `csr_pem`, invalid `label`,
+`validity_days` out of range, unknown field, bad JSON), `403` (missing
+`Security:Write`), `409` (no CA root — generate default certs first), `413`
+(body too large), `503` (CA unavailable). Audited as `ca.cert.issued`
+(`target_type=CodeSigningCertificate`, `target_id=<label or serial>`,
+`detail` carries `purpose=code-signing`) — the same action name an agent-leaf
+issuance uses, distinguished by `purpose`. Revoking the issued leaf uses the
+existing `POST /api/v1/ca/revoke` above; **revocation does not yet reach the
+agent-side plugin-load verifier via the CRL** — see
+`docs/pki-architecture.md`'s caveat before relying on this operationally.
+
 #### Subordinate-CA (root your CA in an enterprise PKI)
 
 By default Yuzu's CA is a self-signed install root (`trust mode: built-in`). An
@@ -3083,7 +3137,7 @@ row fails to persist, the response carries a `Sec-Audit-Failed: true` header
 | `policy.remediate` | Manual remediation triggered via `POST /api/policies/{id}/remediate`. `result` ∈ {`success`, `denied`, `error`}. Success detail `execution_id=<id> agents=<n>` (`agents` = delivered count, see the route doc); denied detail carries the reason (e.g. fragment defines no `fix` instruction, no non-compliant agents, a target is already claimed for remediation, or a target has reached its fix-retry cap for this policy); `error` is a genuine store/evaluator degrade, distinct from `denied`. |
 | `quarantine.enable` | Device quarantined |
 | `quarantine.disable` | Device released from quarantine |
-| `ca.cert.issued` | Internal CA signed a per-agent client certificate at enrollment. `target_type=AgentCertificate`, `target_id=<serial>`, `result=success`. |
+| `ca.cert.issued` | Internal CA signed a per-agent client certificate at enrollment. `target_type=AgentCertificate`, `target_id=<serial>`, `result=success`. Also emitted by `POST /api/v1/ca/issue-code-signing` (gap-matrix #10) / MCP `issue_code_signing_cert`: `target_type=CodeSigningCertificate`, `target_id=<label>` on a rejected request or `<serial_hex>` on success, `detail` carries `purpose=code-signing`; `result=success`, `result=denied` (no CA root, or a bad/unparseable CSR), or `result=failure` (a genuine 5xx — key-load, signing, or `ca_store` write failure). |
 | `ca.cert.revoked` | Certificate revoked via `POST /api/v1/ca/revoke`. `target_type=AgentCertificate`, `target_id=<serial>`. `result=success`; `result=denied` with `detail="serial not found or already revoked"` for an unknown/already-revoked serial (reject without state change, matches every destructive sibling); `result=failure` (ADR-0053) for a genuine ca_store DB/lease error — kept distinct from `denied` so a database outage is never audited as a rejected revoke attempt. |
 | `ca.crl.published` | CRL (re)published after a revocation. `target_type=Security`, `target_id=<serial that triggered it>`. `result=success`, or `result=failure` when the CRL could not be rebuilt/recorded (the revocation still stands; the public CRL is momentarily stale). |
 | `ca.root_csr.exported` | The install CA's CSR was exported via `GET /api/v1/ca/root-csr` (subordinate-CA setup). `target_type=CaRoot`, `target_id=root`. `result=success`, or `result=failure` if generation failed. |

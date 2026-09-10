@@ -95,8 +95,8 @@ SOC 2 alignment: CC6.1 (logical access), CC6.2 (provisioning), CC6.3
 | **Service-account governance** (separate principal type, no human login) | "Privileged access controls" | CC6.6 | **SHIPPED** — the `engine` principal class (ADR-0031), full 4.1–4.5 ladder merged: `EnginePrincipalStore`, no login surface, credential-only auth, overlap-pair rotation, per-principal quota cap, live `principal_class="engine"` metric. Resolves authority **RBAC-only** (403 RBAC-off/no-grant, 503 store-unavailable). **Grants are default-deny but FLEET-WIDE ONLY** — `PrincipalRole` has no per-assignment scope field, and management-group-scoped engine assignment is *rejected* pending ADR-0017/Phase 5 (the scoped-assignment reject in the `/engine-principals/{id}/roles` handler, `rest_api_v1.cpp`). **Literal** admin/built-in roles are structurally barred (`kEngineDisallowedRoles` + the `is_system` check in `assign_role`); a *custom* role granted unrestricted permissions is auditor-**detected**, not prevented — by design (`rbac_store.cpp` deliberately refuses to enumerate "dangerous" permission combos). Phase 5 (delegation, RFC 8693 token exchange) remains design-only. See Section 3 item 14. |
 | **Conditional access** (geo / IP / device posture, optional) | implicit ("MFA requirements") | CC6.1 | **MISSING (P3)** |
 | **Sampled auth-log evidence export** for auditors | "sampled auth logs" | CC7.2 | **SHIPPED** — `GET /api/v1/audit/auth-sample` (`rest_api_v1.cpp`); `AuditQuery.action_prefixes` + `random_sample` (`audit_store.{hpp,cpp}`); scoped to `auth.`/`mfa.`/`session.`; `AuditLog:Read`; export audited as `audit.auth_sample.exported` |
-| **Self-managed Certificate Authority** — issuer for (a) mTLS server + agent certs and (b) plugin code-signing certs. | implicit ("certificate management lifecycle") | CC6.1 / CC6.7 | **PARTIAL — mTLS half shipped, code-signing half not built.** `CaStore`/`ca_store` (Postgres schema, ADR-0053; `ca_root`/`ca_issued`/`ca_crl_versions`), root private key behind `KeyProvider` and never in the DB, `sign_agent_csr` (the `ServerImpl` chokepoint, `server.cpp:8124` — **not** a function in `x509_ca.hpp`, which declares `pki::sign_csr`) as the single shared signer for `Register` + `ProxyRegister` (subject/SAN/EKU server-chosen, CSR ignored), full `ca.*` audit chain. **Route permissions are NOT uniformly `Security:*`** — `GET /ca/root` and `GET /ca/crl` are **PUBLIC by design** (login-exempt at `web_utils.hpp:237`; clients need the root to trust the install and it is already in the TLS handshake), `/ca/issued` + `/ca/root-csr` are `Security:Read`, `/ca/revoke` is `Security:Delete`, `/ca/import-chain` is `Security:Write`. Issuance is enrollment-driven — there is deliberately **no** generic `POST /ca/issue`. Not built: code-signing cert issuance (the `codeSigning` EKU exists at `x509_ca.cpp:296` with no caller), so `--plugin-trust-bundle` still needs an external CA. Doc: `docs/pki-architecture.md`. See Section 3 item 10. |
-| **Plugin code-signing trust anchor** — operator-configured PEM trust bundle on the agent, CMS-verify of `<plugin>.sig` against it before `dlopen`. *Trust bundle accepts any X.509 root — Yuzu's self-managed CA (future) or any public CA / operator-internal CA today*. | implicit ("supply-chain integrity") | CC6.1 / CC7.1 | **PARTIAL — verifier shipped, CA upstream pending** |
+| **Self-managed Certificate Authority** — issuer for (a) mTLS server + agent certs and (b) plugin code-signing certs. | implicit ("certificate management lifecycle") | CC6.1 / CC6.7 | **SHIPPED — mTLS half + code-signing-issuance half both shipped; general operator-issue route remains deliberately deferred (item 10 re-verified 2026-09-10, `feat/auth-ca-code-signing`).** `CaStore`/`ca_store` (Postgres schema, ADR-0053; `ca_root`/`ca_issued`/`ca_crl_versions`), root private key behind `KeyProvider` and never in the DB, `sign_agent_csr` (the `ServerImpl` chokepoint, `server.cpp:8124` — **not** a function in `x509_ca.hpp`, which declares `pki::sign_csr`) as the single shared signer for `Register` + `ProxyRegister` (subject/SAN/EKU server-chosen, CSR ignored), full `ca.*` audit chain. **Route permissions are NOT uniformly `Security:*`** — `GET /ca/root` and `GET /ca/crl` are **PUBLIC by design** (login-exempt at `web_utils.hpp:237`; clients need the root to trust the install and it is already in the TLS handshake), `/ca/issued` + `/ca/root-csr` are `Security:Read`, `/ca/revoke` is `Security:Delete`, `/ca/import-chain` and `/ca/issue-code-signing` are `Security:Write`. Agent-mTLS issuance stays enrollment-driven; the **general** `POST /ca/issue` (operator-chosen CN, operator-chosen EKU) is deliberately still absent (namespace-collision risk at the #1118 identity gate). **Code-signing cert issuance now SHIPPED** — `POST /ca/issue-code-signing` + MCP twin `issue_code_signing_cert`, CSR-custody (operator holds the key), usage hard-pinned to `codeSigning` only — so `--plugin-trust-bundle` no longer requires an external CA; see item 10 below for the full contract and the two remaining follow-ups (CRL-distribution-to-agent-verifier enforcement, an optional CSR-mode CLI). Doc: `docs/pki-architecture.md`. See Section 3 item 10. |
+| **Plugin code-signing trust anchor** — operator-configured PEM trust bundle on the agent, CMS-verify of `<plugin>.sig` against it before `dlopen`. *Trust bundle accepts any X.509 root — Yuzu's self-managed CA or any public CA / operator-internal CA*. | implicit ("supply-chain integrity") | CC6.1 / CC7.1 | **SHIPPED — verifier shipped, self-managed CA upstream (code-signing issuance) now shipped too; CRL-distribution-to-verifier enforcement remains a tracked follow-up (`#TBD`, see item 10).** |
 
 ### Hard invariants that must NOT regress when adding any of the above
 
@@ -533,10 +533,11 @@ duplicate `10`; the one live cross-reference to the old numbering
    See `docs/auth-architecture.md` "JIT admin elevation";
    `tests/unit/server/test_auth_jit_elevation.cpp`.
 10. **Self-managed Certificate Authority** — **mTLS half SHIPPED;
-    code-signing half NOT BUILT.** The matrix previously listed this whole
-    item as MISSING; that was stale by the entire PKI ladder (#1237–#1244 —
-    an inclusive range with one hole: #1242 is an MCP prompt-argument fix,
-    not PKI).
+    code-signing issuance half now SHIPPED too (CSR-custody model, REST +
+    MCP twin — item 10 re-verified 2026-09-10, `feat/auth-ca-code-signing`).**
+    The matrix previously listed this whole item as MISSING; that was stale
+    by the entire PKI ladder (#1237–#1244 — an inclusive range with one hole:
+    #1242 is an MCP prompt-argument fix, not PKI).
     Routed doc: `docs/pki-architecture.md`.
 
     **Shipped (mTLS):** `CaStore` over the `ca_store` Postgres schema (ADR-0053,
@@ -566,14 +567,46 @@ duplicate `10`; the one live cross-reference to the old numbering
     the server chooses every field of every cert it signs. Do not add an
     operator-facing "issue me a cert for X" route without re-deciding that.
 
-    **Remaining — plugin code-signing issuance.** `x509_ca.hpp:95` carries a
-    `code_signing` flag and `x509_ca.cpp:296` emits the `codeSigning` EKU, but
-    **nothing sets it** — there is no route, no CLI, and no caller. So today
-    an operator wanting to sign their own plugins must still bring an external
-    CA for `--plugin-trust-bundle` (`agents/core/src/main.cpp:394`). The
-    verifier (issue #80) is already format-agnostic and needs no change; the
-    work is a gated issuance surface plus the operator workflow. This closes a
-    UX gap, not a security gap.
+    **Shipped (code-signing issuance, gap-matrix #10):**
+    `POST /api/v1/ca/issue-code-signing` (`Security:Write`) + MCP twin
+    `issue_code_signing_cert` (supervised tier, approval-gated like every
+    other `Security:Write` MCP tool). **CSR-custody model** — the operator
+    generates their own key and CSR locally and submits only the CSR
+    (`{csr_pem,label,validity_days?}`); the server never sees the private
+    key and returns only `{certificate_pem,chain_pem,serial_hex,not_after,
+    purpose:"code-signing"}`. A server-side key-minting CLI was deliberately
+    **not** built — that would put the server in transient custody of a
+    secret whose compromise signs arbitrary plugins, exactly the boundary
+    this feature exists to avoid. Usage is hard-pinned to
+    `pki::LeafUsage{.code_signing=true}` (never `clientAuth`/`serverAuth`,
+    so the leaf is rejected by the mTLS `SSL_CLIENT` purpose check and can
+    never reach the #1118 agent-identity gate) and the subject CN is the
+    caller's validated `label` (`^[A-Za-z0-9._-]{1,64}$`), never an
+    agent-style SAN — this is what makes issuance safe here while the
+    **general** `POST /api/v1/ca/issue` (operator-chosen CN, operator-chosen
+    EKU) stays deferred, unchanged from above. Validity defaults to 365 days,
+    caller-selectable up to a hard 730-day ceiling, clamped to the issuing
+    CA's own expiry. Issuance is recorded in `ca_store`
+    (`purpose="code-signing"`), so it appears in `GET /ca/issued` and is
+    revocable via the existing `POST /ca/revoke`; audits `ca.cert.issued`
+    (`target_type=CodeSigningCertificate`). `docs/user-manual/agent-plugins.md`
+    "Signing a plugin" now leads with this route; the pre-existing
+    bring-your-own-CA `openssl req -x509`/`openssl cms -sign` recipe remains
+    documented as an alternative for operators not using the internal CA. The
+    verifier (issue #80) needed no change — it was already CA-agnostic.
+
+    **Remaining (two tracked follow-ups, both honest gaps, not overstated):**
+    (a) **CRL-distribution enforcement.** Revoking a code-signing leaf via
+    `POST /ca/revoke` records the revocation and republishes the CRL, but the
+    agent-side plugin-load verifier (`detached_signature.cpp`) does not
+    consult the CRL — so revocation does not yet reach agents at plugin-load
+    time, identical to today's hand-rolled-external-CA posture. Tracked
+    follow-up: `#TBD`. (b) **Optional CSR-mode operator CLI convenience** — an
+    `--out`-style local helper that wraps the `openssl req`/`curl
+    /ca/issue-code-signing`/`openssl cms -sign` sequence documented in
+    `docs/user-manual/server-admin.md` "Issuing a code-signing certificate"
+    into one command. Neither is a security gap; both are UX/observability
+    polish on top of a shipped, CSR-custody-safe issuance path.
 
 ### Priority 2 — long-tail polish
 

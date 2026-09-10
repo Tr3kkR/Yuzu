@@ -184,34 +184,34 @@ yuzu-agent \
 | `--plugin-trust-bundle <path>` | Enables signature verification. PEM file with one or more CA certs. Env: `YUZU_PLUGIN_TRUST_BUNDLE`. |
 | `--plugin-require-signature` | When set, plugins without a `.sig` sibling are rejected. When unset (default), unsigned plugins are allowed (transitional mode for ops rolling out signing). Env: `YUZU_PLUGIN_REQUIRE_SIGNATURE`. |
 
-**Signing a plugin (operator workflow with openssl(1)):**
+**Signing a plugin (operator workflow, internal CA — recommended):**
+
+The server's internal CA now issues code-signing leaves directly (gap-matrix #10): the operator still generates their own key and CSR locally — the server never sees the private key (CSR-custody model) — and submits only the CSR to `POST /api/v1/ca/issue-code-signing` (`Security:Write`). The server signs it with usage **hard-pinned** to `codeSigning` only (never `clientAuth`/`serverAuth`), so there is no `-extfile`/EKU step to get right by hand — the constraint the old self-signed recipe enforced manually is now enforced server-side unconditionally.
 
 ```bash
-# One-time: generate an operator CA + signing leaf, or use your existing PKI.
-openssl ecparam -genkey -name prime256v1 -out ca.key
-openssl req -new -x509 -key ca.key -out ca.pem -days 3650 \
-  -subj "/CN=My Yuzu Plugin CA" \
-  -addext "basicConstraints=critical,CA:TRUE"
-
+# One-time: generate your own signing keypair + CSR. The server never
+# sees signer.key.
 openssl ecparam -genkey -name prime256v1 -out signer.key
 openssl req -new -key signer.key -out signer.csr \
   -subj "/CN=Plugin Signer"
-# extendedKeyUsage=codeSigning is REQUIRED — the agent's verifier
-# enforces X509_PURPOSE_CODE_SIGN, so a leaf without this EKU is
-# rejected even if it chains to the trusted CA. This prevents a CA that
-# also issues mTLS or S/MIME certs from being a plugin-signing
-# authority for those siblings.
-openssl x509 -req -in signer.csr -CA ca.pem -CAkey ca.key \
-  -CAcreateserial -out signer.pem -days 365 \
-  -extfile <(printf "extendedKeyUsage=codeSigning\nkeyUsage=critical,digitalSignature")
 
-# Per-plugin: sign with the leaf, distribute ca.pem as the trust bundle.
+# Submit the CSR; `label` becomes the leaf's CN and must match
+# ^[A-Za-z0-9._-]{1,64}$. Returns the signed leaf plus the issuer chain.
+curl -s -X POST -H "X-Yuzu-Token: $TOKEN" -H 'Content-Type: application/json' \
+  -d "{\"csr_pem\": $(jq -Rs . < signer.csr), \"label\": \"plugin-signer-2026\"}" \
+  https://localhost:8443/api/v1/ca/issue-code-signing > signer_issuance.json
+jq -r .certificate_pem < signer_issuance.json > signer.pem
+jq -r .chain_pem       < signer_issuance.json > signer_chain.pem
+
+# Per-plugin: sign with the leaf, include the issuer chain via -certfile.
 openssl cms -sign -binary -nodetach=false \
-  -signer signer.pem -inkey signer.key \
+  -signer signer.pem -inkey signer.key -certfile signer_chain.pem \
   -in chargen.so -outform pem -out chargen.so.sig
 ```
 
-Distribute `ca.pem` to every agent (e.g. as `/etc/yuzu/plugin-trust-bundle.pem`) and ship the `.sig` files alongside each `.so` in the plugin directory.
+The agent trust bundle is the already-public CA root — `GET /api/v1/ca/root` — no separate distribution step for a self-signed CA is needed. Fetch it once (as in the server-managed trust-bundle recipe above) and ship the `.sig` files alongside each `.so`.
+
+**Bring-your-own-CA (alternative, for operators not using the internal CA):** the verifier's code path is CA-agnostic and accepts any chain that validates against the configured trust bundle, so an existing external PKI (or a throwaway self-signed CA) still works — generate `ca.key`/`ca.pem`, issue a signing leaf with `extendedKeyUsage=codeSigning` (REQUIRED — the agent's verifier enforces `X509_PURPOSE_CODE_SIGN`, rejecting a leaf without this EKU even if it chains to the trusted CA), sign with `openssl cms -sign` as above, and distribute your own `ca.pem` as the trust bundle instead of the internal CA root.
 
 **Behavior:**
 
@@ -222,11 +222,12 @@ Distribute `ca.pem` to every agent (e.g. as `/etc/yuzu/plugin-trust-bundle.pem`)
 - Verification happens **before** `dlopen`/`LoadLibrary`. Cert validity (`notBefore`/`notAfter`), digest match over file bytes, and chain anchor are all enforced.
 - Rejection reason is recorded as a stable label on `yuzu_agent_plugin_rejected_total`: `signature_missing`, `signature_invalid`, or `signature_untrusted_chain` — alert distinctly on each.
 
-**Self-managed CA roadmap.** A future Yuzu release will ship a server-managed CA whose root cert is published at a known URL; pointing `--plugin-trust-bundle` at that file lets operators sign plugins against the same CA they use for mTLS. The verifier itself does not change — the same code path accepts public-CA, internal-CA, and Yuzu-CA issued certs.
+**Self-managed CA — shipped for code signing.** The internal CA's `POST /api/v1/ca/issue-code-signing` (above) already lets operators sign plugins against the same server-managed CA used for mTLS — the CA root is published at the already-public `GET /api/v1/ca/root`. The verifier itself did not change to support this: the same code path accepts public-CA, internal-CA, and internal-CA-issued codeSigning certs. A separate server-side key-minting CLI (the server generating the signer's private key on the operator's behalf) was deliberately NOT built — CSR-custody keeps the private key off the server end to end.
 
 **Not yet supported (follow-up work):**
 
-- CRL / OCSP revocation checking. Today only `notBefore`/`notAfter` and chain anchor are enforced; revoke a compromised signing cert by removing its issuing CA from the trust bundle or rotating to a new CA.
+- CRL / OCSP revocation checking at plugin-load time. Revoking a code-signing leaf issued via `POST /api/v1/ca/issue-code-signing` (via `POST /api/v1/ca/revoke`) is recorded in the issued-cert inventory and republishes the CRL, but the agent's plugin-load verifier (this section) does **not** consult the CRL — so revocation does not yet reach agents at plugin-load time, exactly like a hand-rolled external CA today. Revoke a compromised signing cert by removing its issuing CA from the trust bundle or rotating to a new CA (or, for an internal-CA-issued leaf, by letting it expire — see below). Tracked follow-up: `#TBD`.
+- Signer-cert expiry has an operational consequence worth calling out explicitly: `CMS_verify` checks the signer leaf's `notBefore`/`notAfter` at verification time, so once a code-signing leaf expires its plugins stop *loading* at the next agent restart (existing running plugin instances are unaffected until then) — track signer expiry (`not_after` from the issuance response) and re-sign/re-issue before it lapses.
 - Authenticode-signed Windows DLLs. The agent uses the same CMS PEM format on every platform; Authenticode is a separate signature format and is not currently consumed.
 
 ### Output Format

@@ -169,10 +169,80 @@ curl -s -X POST -H "X-Yuzu-Token: $TOKEN" -H 'Content-Type: application/json' \
      https://localhost:8443/api/v1/ca/revoke | jq
 ```
 
-`POST /api/v1/ca/issue` (general operator-chosen-CN signing for service / code-
-signing certs) is **deferred**: an operator-issued client leaf whose CN collides
-with an `agent_id` could impersonate that agent at the #1118 identity gate, so it
-needs a dedicated non-agent namespace + EKU policy. Tracked follow-up.
+`POST /api/v1/ca/issue` — a **general** operator-chosen-CN, operator-chosen-EKU
+signing route — is **deferred**: an operator-issued client leaf whose CN collides
+with an `agent_id` could impersonate that agent at the #1118 identity gate, so a
+general route needs a dedicated non-agent namespace + EKU policy before it can
+ship. Tracked follow-up. Code-signing issuance specifically now ships as its own
+narrowly-scoped route — see below.
+
+### Code-signing certificate issuance (gap-matrix #10)
+
+`POST /api/v1/ca/issue-code-signing` (`Security:Write`; MCP twin
+`issue_code_signing_cert`, same tier + approval posture as every other
+`Security:Write` MCP tool) issues a **code-signing-only** leaf from an
+operator-submitted CSR, so operators can sign `agents/plugins/*.so` (see
+`docs/user-manual/agent-plugins.md` "Plugin Signing") against the same
+server-managed CA used for mTLS instead of hand-rolling one.
+
+**CSR custody, not key minting.** The operator generates their own private key
+and CSR locally (`openssl req -new -key signer.key -out signer.csr`) and submits
+only the CSR (`{"csr_pem","label","validity_days"?}`); the server signs it and
+returns `{"certificate_pem","chain_pem","serial_hex","not_after","purpose":
+"code-signing"}` — it never sees, stores, or emits the private key. A
+server-side key-minting CLI was deliberately **not** built: minting the key
+server-side would mean the server holds (even transiently) a secret whose
+compromise lets an attacker sign arbitrary plugins, which is exactly the custody
+boundary this feature exists to avoid crossing.
+
+**Why this is safe to expose when the general `/ca/issue` route is not.** The
+general route stays deferred because an operator-chosen CN + operator-chosen EKU
+could collide with an `agent_id` and impersonate that agent at the #1118
+identity gate. This route sidesteps that risk for one narrow, non-agent-
+impersonating case only, by construction rather than by policy:
+
+- **Usage is hard-pinned** to `pki::LeafUsage{.code_signing=true}` — never
+  `clientAuth`/`serverAuth`. A codeSigning-only EKU is rejected by the mTLS
+  `SSL_CLIENT` purpose check, so a leaf issued here can never reach the #1118
+  agent-identity gate regardless of what its CN is.
+- **The subject CN is `label`**, a caller-supplied value validated against
+  `^[A-Za-z0-9._-]{1,64}$` (`ca_routes.hpp::is_valid_code_signing_label`,
+  shared byte-for-byte between the REST validation and `server.cpp`'s
+  defense-in-depth re-check at the point the value is actually placed in the
+  certificate) — **never** an agent-style `yuzu://…/agent/…` URI SAN; this
+  leaf's SAN is left empty entirely.
+- The response carries `purpose:"code-signing"` so a caller (or an auditor
+  reading `ca.cert.issued`) can distinguish this leaf class from an agent
+  enrollment leaf without inspecting the certificate.
+
+Validity defaults to 365 days, operator-selectable up to a hard 730-day
+ceiling (`server.cpp::issue_code_signing_leaf`'s
+`kDefaultCodeSigningValidityDays`/`kMaxCodeSigningValidityDays`) — a request
+outside `[1, 730]` is refused outright rather than silently clamped. The leaf's
+`not_after` is further clamped so it can never outlive the issuing CA (mirrors
+`sign_agent_csr`'s `ca_not_after` clamp). Same key-custody discipline as
+`sign_agent_csr` reusing the same signing seam: the CA private key is loaded
+transiently via `FileKeyProvider` and zeroed on every exit path, including
+exception unwind. Every issuance is recorded in `ca_store` (`purpose=
+"code-signing"`) so it shows up in `GET /api/v1/ca/issued` and can be revoked
+via the existing `POST /api/v1/ca/revoke`, and audits `ca.cert.issued`
+(`target_type=CodeSigningCertificate`) exactly like an agent-issuance event, so
+both classes are indistinguishable in the audit log except by `purpose`.
+
+**Revocation and expiry — read this before relying on it operationally.**
+Revoking a code-signing leaf through `POST /api/v1/ca/revoke` records the
+revocation in `ca_store` and republishes the CRL, same as revoking an agent
+cert — but the **agent-side plugin-load verifier does not consult the CRL**
+(`agents/core/src/detached_signature.cpp`; see `docs/user-manual/agent-plugins.md`
+"Not yet supported"). So revoking a signer here stops it being usable for
+*new* signatures and shows up in the issued-cert inventory as revoked, but does
+**not** yet cause an agent to reject plugins it already signed at the next
+restart — the same limitation a hand-rolled external signing CA has today.
+Closing this is a tracked follow-up (`#TBD`). Separately, signer **expiry**
+already matters operationally: `CMS_verify` checks the signer leaf's validity
+window at verify time, so once a code-signing leaf's `not_after` passes, plugins
+it signed stop *loading* at the agent's next restart — track `not_after` from
+the issuance response and re-sign before it lapses.
 
 ## Gateway TLS (PR5)
 
@@ -576,9 +646,12 @@ DACL via `SetNamedSecurityInfoW` is a tracked follow-up shared with
 | PR5c | One-way (server-authenticated) TLS on the agent listener — vendored+patched grpcbox (`_checkouts/grpcbox`) makes `verify`/`fail_if_no_peer_cert` configurable; agent listener enabled in `sys.config.prod`. Closes the plaintext agent↔gateway edge with no client cert required (bootstrap-safe). Live-wiring + CA distribution + boot-test shipped in #1314 (wired live in `docker-compose.reference-gateway.yml`). | shipped |
 | PR5b → #1314 | Distribution flip — drop `--no-tls`/`--no-https` from the image CMDs + shared cert volume + **wire PR5c one-way TLS live + distribute the CA to agents** (HTTPS healthcheck, volume timing, `--cert-san`). The original PR5b branch (#1271) was **closed**; the deliverable **shipped as #1314** (secure-by-default images + agent CA auto-discovery; `docker-compose.reference-gateway.yml` is the worked example). Residuals tracked as #1291 (inert `YUZU_GW_TLS_*` env — use a mounted `sys.config`), #1313 (compose wizard), #660 (agent plaintext default). | shipped (#1314) |
 | PR6 (M2) | Subordinate-CA — export the CA CSR (`GET /ca/root-csr`) + import an enterprise-signed intermediate (`POST /ca/import-chain`, validates carries-our-key + is-CA + chains-to-parent) → `CaMode::Subordinate`; issued leaves chain to the corporate root, issuing key unchanged. Engine `cert_matches_key`/`cert_is_ca`/`verify_chain_to_bundle`; `ca_root.chain_pem` (migration v4); dashboard import panel. See "Subordinate-CA" above. | in review |
+| — (gap-matrix #10) | Code-signing certificate issuance — `POST /api/v1/ca/issue-code-signing` + MCP twin `issue_code_signing_cert`, CSR-custody, usage hard-pinned to `codeSigning`. See "Code-signing certificate issuance" above. CRL-distribution-to-agent-verifier enforcement and an optional operator CSR-mode `--out` CLI convenience remain tracked follow-ups. | shipped |
 
-Deferred follow-ups tracked across the ladder: `POST /api/v1/ca/issue` with
-namespace separation; **gateway mgmt-listener mTLS for the server
+Deferred follow-ups tracked across the ladder: `POST /api/v1/ca/issue` (the
+GENERAL operator-chosen-CN, operator-chosen-EKU route) with
+namespace separation — code-signing issuance specifically now ships as its own
+scoped route, see above; **gateway mgmt-listener mTLS for the server
 command-forwarding client** (one-way TLS would leave the privileged mgmt plane
 unauthenticated — use strict mTLS there, not the agent-listener one-way posture);
 **MCP approval re-dispatch** — the `revoke_certificate`
