@@ -106,8 +106,8 @@ plus `$ref` validity) - the #842 companion to this whole-tree script.
 | dex | 25 | 17 | 8 |
 | guardian | 16 | 0 | 16 |
 | tar | 12 | 4 | 8 |
-| auto-preflight | 4 | 0 | 4 |
-| auto-deploy | 4 | 0 | 4 |
+| auto-preflight | 4 | 1 | 3 |
+| auto-deploy | 4 | 1 | 3 |
 | auto-verify | 3 | 0 | 3 |
 | network | 2 | 1 | 1 |
 | viz | 2 | 2 | 0 |
@@ -124,11 +124,11 @@ plus `$ref` validity) - the #842 companion to this whole-tree script.
 | ota | 15 | 0 | 15 |
 | enrollment | 19 | 5 | 14 |
 | other | 74 | 0 | 74 |
-| **Total** | **278** | **57** | **221** |
+| **Total** | **278** | **59** | **219** |
 
-Registered `/api/vN/*` routes: 218. OpenAPI `paths` entries: 217. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 117.
+Registered `/api/vN/*` routes: 220. OpenAPI `paths` entries: 219. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 119.
 
-Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 221.
+Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 219.
 
 <!-- END GENERATED -->
 

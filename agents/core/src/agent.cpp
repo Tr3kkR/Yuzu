@@ -1241,7 +1241,14 @@ public:
                                      spark_type_token(type), r.error());
                 };
                 try_register(SparkType::File, make_file_mechanism());
-                try_register(SparkType::Registry, make_registry_mechanism());
+                // Registry takes the shared F3 counter (#2012/#3840 PR-B1): its
+                // detached probe/drain workers are admitted against
+                // spark_detached_workers_, which guardian_active_io_workers()
+                // sums. Passed unconditionally - the platform split lives inside
+                // the factory (real on Windows, nullptr elsewhere), same as the
+                // zero-argument forms. File/Service keep the zero-argument form
+                // until their own restructures (PR-B2/PR-B3) add lanes.
+                try_register(SparkType::Registry, make_registry_mechanism(spark_detached_workers_));
                 try_register(SparkType::Service, make_service_mechanism());
                 spark_engine_->start();
                 spdlog::info("SparkEngine: instantiated OBSERVE-ONLY (no consumer at rung 1); "
@@ -4007,11 +4014,13 @@ private:
     // F3 orphan-exit accounting for mechanism-internal detached workers
     // (#2012/#3840 plan, "F3 orphan-exit accounting - Route A (corrected)").
     // A SparkDetachedLane (agents/core/src/spark_detached_call.hpp) inside a
-    // future Spark mechanism (PR-B; no mechanism uses this yet) increments
-    // this counter at admission and decrements it only once a detached
-    // worker's own closure is fully torn down - see that header's own doc
-    // comment ("Ticketing"). Summed into guardian_active_io_workers() below,
-    // additively with guardian_'s own count.
+    // Spark mechanism increments this counter at admission and decrements it
+    // only once a detached worker's own closure is fully torn down - see that
+    // header's own doc comment ("Ticketing"). Summed into
+    // guardian_active_io_workers() below, additively with guardian_'s own
+    // count. First consumer: the Windows Registry mechanism (PR-B1, handed in
+    // via make_registry_mechanism(spark_detached_workers_) in the spark boot
+    // block); File and Service follow in PR-B2/PR-B3.
     //
     // DEFAULT MEMBER INITIALIZER, DELIBERATELY - NOT declaration-order-
     // coupled to spark_engine_/guardian_ the way THEY are coupled to each
