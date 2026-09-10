@@ -58,6 +58,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 namespace yuzu::agent {
@@ -1802,6 +1803,20 @@ void GuardianEngine::wire_spark_engine(SparkEngine* engine, bool spark_disabled_
         // The durable journal is engine-owned and borrows kv_ (may be null → it durably
         // writes nothing). Constructed whenever spark is wired; persist stays gated on
         // prefer_spark_ in persist_lifecycle_journal_locked, so it is inert at 7.7a.
+        //
+        // GUARDRAIL (#4153 round 4): the journal's constructor accepts any IJournalStore*
+        // so tests can pass an in-memory FakeJournalStore - production must always pass a
+        // real KvStore. That is enforced today by kv_'s own declared type (KvStore*, not
+        // IJournalStore*), not by anything at this call site - so if a future refactor
+        // ever widens kv_'s type, this assert fires as a compile error right here, forcing
+        // that change to be a conscious, reviewed decision rather than a silent widening.
+        // Scope, stated honestly: this only catches kv_'s TYPE being widened. It cannot
+        // catch a future refactor that leaves kv_'s type alone but substitutes a
+        // different pointer at the construction call site below.
+        static_assert(std::is_same_v<decltype(kv_), KvStore*>,
+                      "GuardianEngine::kv_ must stay KvStore*, not IJournalStore* - "
+                      "production must never construct GuardianLifecycleJournal against "
+                      "anything but a real KvStore (see kv_store.hpp's IJournalStore doc)");
         lifecycle_journal_ = std::make_shared<GuardianLifecycleJournal>(kv_);
 
         auto id = engine->register_consumer("guardian-spark",

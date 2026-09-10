@@ -11,6 +11,8 @@
 #include "bundle_service.hpp"      // validate_bundle_steps / aggregate_to_json
 #include "engine_principal_store.hpp" // PR 4.2: engine role-assignment authoring surface
 #include "dex_routes.hpp" // dex_window_to_days / dex_iso_since (shared window resolver)
+#include "device_routes.hpp" // device_agent_row_json/device_agent_detail_json — #4033 shared builders
+#include "group_agent_count_preview.hpp" // #4033 — create-group agent-count preview shared model
 #include "engine_principal_store.hpp" // PR 4.3 — /api/v1/engine-principals
 #include "live_kinds.hpp" // shared live-read kind table + wire-format parser (S2)
 #include "mcp_policy.hpp" // mcp::is_valid_tier — canonical MCP-tier closed set
@@ -784,13 +786,26 @@ const std::string& openapi_spec() {
           "review_comment": {"type": "string"},
           "scope_expression": {"type": "string"}
         }
-      }
+      })json"
+        // Split literal (#4033 follow-up): the new /devices, /devices/{id},
+        // and /management-groups/agent-count-preview OpenAPI entries below
+        // pushed the previous single literal to 17,284 bytes, past MSVC's
+        // 16,380-byte C2026 cap (docs/cpp-conventions.md). Adjacent string
+        // literals are concatenated at compile time, so the emitted OpenAPI
+        // JSON is byte-identical to the unsplit form.
+        R"json(
     }
   },
   "security": [{"bearerAuth": [], "apiKeyHeader": [], "cookieAuth": []}],
   "paths": {
     "/me": {
       "get": {"summary": "Get current user info", "tags": ["Authentication"], "responses": {"200": {"description": "Current user details"}}}
+    },
+    "/devices": {
+      "get": {"summary": "Fleet device list (#4033, #2146 API-parity Batch A)", "tags": ["Devices"], "description": "Requires Infrastructure:Read, gated via AuthRoutes::require_fleet_read (the canonical admit-then-filter chokepoint — SOLE gate, never stacked with a bare permission check). Row shape matches the pre-existing MCP list_agents tool exactly: agent_id/hostname/os/arch/agent_version, 5 fields, sourced from the live AgentRegistry. devices_omitted counts agents dropped by the caller's management-group/service-scope confinement (0 = unfiltered or nothing dropped). Not audited on success (device identity is machine metadata, not behavioural PII) — require_fleet_read itself audits every denial path internally.", "responses": {"200": {"description": "{data: {devices[], count, devices_omitted}, pagination, meta}"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks Infrastructure:Read"}, "503": {"description": "Route misconfigured (fleet_read_fn/device registry unwired) or authorization store unavailable"}}}
+    },
+    "/devices/{id}": {
+      "get": {"summary": "Single-device detail (#4033, #2146 API-parity Batch A)", "tags": ["Devices"], "description": "Requires Infrastructure:Read via require_fleet_read — matches the pre-existing MCP get_agent_details tool's pattern exactly, including its existence-oracle closure: an agent outside the caller's fleet-read scope collapses to the SAME 404 as a genuinely nonexistent agent_id (the distinction is recorded only server-side). Adds a tags array (key/value/source) when a TagStore is wired; omitted entirely when it is not. Not audited (neither success nor not-found) — device identity/tags are machine metadata, matching the /fragments/device/page and /fragments/device/info dashboard fragments' own unaudited posture.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{data: {agent_id, hostname, os, arch, agent_version, tags?}, meta}"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks Infrastructure:Read"}, "404": {"description": "Not found, or found but outside the caller's fleet-read scope (indistinguishable by design)"}, "503": {"description": "Route misconfigured, authorization store unavailable, or tag store degraded"}}}
     },
     "/management-groups": {
       "get": {"summary": "List management groups", "tags": ["Management Groups"], "responses": {"200": {"description": "List of management groups"}}},
@@ -811,6 +826,9 @@ const std::string& openapi_spec() {
       "get": {"summary": "List roles assigned to a management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "List of role assignments"}}},
       "post": {"summary": "Assign a role on a management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"201": {"description": "Role assigned"}}},
       "delete": {"summary": "Unassign a role from a management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Role unassigned"}}}
+    },
+    "/management-groups/agent-count-preview": {
+      "get": {"summary": "Preview the agent count a would-be management group would match (#4033, #2146 Batch A)", "tags": ["Management Groups"], "description": "MCP twin: preview_management_group_agent_count. REST/MCP/dashboard-fragment twin of /fragments/create-group-form's own live scoped count — this route and the MCP twin call the same shared builder (group_agent_count_preview.hpp) so those two cannot drift from each other; the dashboard fragment keeps its own separate, behaviourally-equivalent inline implementation, unchanged by this PR. Used before POST /api/v1/management-groups to preview how many currently-visible agents would match. Requires ManagementGroup:Write, matching the fragment's gate exactly (only an operator who could create the group may preview it) — not ManagementGroup:Read, even though this route performs no mutation. filters are supplied as repeated query params using the SAME mangling the fragment applies to a column name (lowercase, spaces/dashes -> underscore, e.g. Local Addr -> local_addr) but WITHOUT the fragment's f_ key prefix (supply local_addr, not f_local_addr); an empty filter set returns a genuine 0 (no scoped count to report), never a store read. Scope is the D3 Response:Read-visible agent set, with an elevated session getting the JIT full-fleet view.", "parameters": [{"name": "command_id", "in": "query", "schema": {"type": "string"}, "description": "The response set's instruction/command id to count against"}, {"name": "plugin", "in": "query", "schema": {"type": "string"}, "description": "Plugin name whose response columns the filter keys are matched against"}], "responses": {"200": {"description": "{data: {agent_count}, meta}"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks ManagementGroup:Write"}, "503": {"description": "Response store degraded — preview unavailable"}}}
     },
     "/engine-principals/{id}/roles": {
       "get": {"summary": "List fleet-wide RBAC roles assigned to an engine principal", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Engine principal slug (without the engine: prefix)"}], "responses": {"200": {"description": "List of role assignments"}, "403": {"description": "Requires EnginePrincipal:Read"}, "503": {"description": "RBAC store unavailable"}}},
@@ -950,6 +968,21 @@ const std::string& openapi_spec() {
     },
     "/inventory/software": {
       "get": {"summary": "Fleet-wide installed-software inventory (typed daily-sync store, ADR-0016)", "tags": ["Inventory"], "description": "Installed-software rows across the fleet from the typed SoftwareInventoryStore (DISTINCT from the generic /inventory/* routes, which read the generic blob store). Rows carry name, version, publisher, install_date plus the blob-v2 package fields: kind (package|app), ecosystem (rpm|deb|apk|pacman|windows|macos|homebrew), epoch, release, arch, signature_status (rpm stored-tag), distro_id, distro_version — fields an ecosystem does not store are empty, never synthesised. Requires Inventory:Read (#3290 Phase 2: the SOLE gate is the ADR-0017 admit-then-filter fleet-read gate, never stacked with a separate permission check). Results are scoped to the caller's management groups AND, for a service-scoped API token, to that token's service-tagged agents (the intersection of both when both apply); out-of-scope devices are dropped and counted in devices_omitted (a positive value means matching software exists outside your scope — an empty/short result does NOT mean the software is absent fleet-wide). A correctly-confined service-scoped token now gets a real filtered read here rather than an outright 403. Capped at limit rows (max 1000); result_truncated_by_cap=true means more exist past the cap (keyset pagination is a follow-up). On store degradation, or the caller's tag-scope lookup degrading, the endpoint returns 503 (never an empty 200) so a vulnerability query cannot read a transient outage as 'installed nowhere'.", "parameters": [{"name": "name", "in": "query", "schema": {"type": "string"}, "description": "Exact software-name filter (optional)"}, {"name": "agent_id", "in": "query", "schema": {"type": "string"}, "description": "Exact agent filter (optional)"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "{data:{software[], count, devices_omitted, result_truncated_by_cap?, audit_persisted?}}"}, "400": {"description": "Non-integer limit"}, "401": {"description": "Unauthenticated"}, "403": {"description": "No management-group grant for Inventory:Read (or a service-scoped token whose RBAC/ITServiceOwner grant is missing/RBAC disabled)"}, "503": {"description": "Software inventory store unavailable/degraded, RBAC/management-group/tag store unavailable, or the fleet-read gate unwired"}}}
+    },
+    "/policy-fragments": {
+      "get": {"summary": "List policy fragments (api-parity #4034)", "tags": ["Compliance"], "description": "REST v1 twin of legacy GET /api/policy-fragments; MCP twin list_policy_fragments. Requires Policy:Read.", "parameters": [{"name": "name", "in": "query", "schema": {"type": "string"}, "description": "Substring name filter (optional)"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100}}], "responses": {"200": {"description": "{data:[{id,name,description,check_instruction,check_compliance,fix_instruction,post_check_instruction,created_at,updated_at}], pagination}"}, "400": {"description": "Non-integer limit"}, "503": {"description": "Policy store not available/degraded"}}}
+    },
+    "/policies": {
+      "get": {"summary": "List policies (api-parity #4034)", "tags": ["Compliance"], "description": "REST v1 twin of legacy GET /api/policies; MCP twin list_policies (a narrower 5-field subset of this row shape). Requires Policy:Read.", "parameters": [{"name": "name", "in": "query", "schema": {"type": "string"}}, {"name": "fragment_id", "in": "query", "schema": {"type": "string"}}, {"name": "enabled_only", "in": "query", "schema": {"type": "boolean"}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100}}], "responses": {"200": {"description": "{data:[{id,name,description,fragment_id,scope_expression,enabled,inputs,triggers,management_groups,created_at,updated_at}], pagination}"}, "400": {"description": "Non-integer limit"}, "503": {"description": "Policy store not available/degraded"}}}
+    },
+    "/policies/{id}": {
+      "get": {"summary": "Get single-policy detail (api-parity #4034)", "tags": ["Compliance"], "description": "REST v1 twin of legacy GET /api/policies/{id} (flat fields, not nested under a policy key); MCP twin get_policy. Requires Policy:Read.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{data:{id,name,description,yaml_source,fragment_id,scope_expression,enabled,remediation_available,inputs,triggers,management_groups,created_at,updated_at,compliance:{compliant,non_compliant,unknown,fixing,error,total}}}"}, "404": {"description": "Policy not found"}, "503": {"description": "Policy store not available/degraded"}}}
+    },
+    "/compliance": {
+      "get": {"summary": "Fleet compliance percentages (api-parity #4034)", "tags": ["Compliance"], "description": "REST v1 twin of legacy GET /api/compliance; MCP twin get_fleet_compliance. Requires Policy:Read.", "responses": {"200": {"description": "{data:{compliance_pct,total_checks,compliant,non_compliant,unknown,fixing,error}}"}, "503": {"description": "Policy store not available/degraded"}}}
+    },
+    "/compliance/{id}": {
+      "get": {"summary": "Per-policy compliance detail + per-agent status fan-out (api-parity #4034)", "tags": ["Compliance"], "description": "REST v1 twin of legacy GET /api/compliance/{policy_id}, plus a policy_id sibling field. AUTHORIZATION IS require_fleet_read (Policy:Read), NOT a bare permission check — the agents array is a fan-out read of per-agent data (routed-concerns RBAC row): a management-group/service-scope-confined caller sees only its own visible agents, and summary is tallied from exactly that filtered set, never the store's unfiltered fleet-wide aggregate. MCP twin get_policy_agent_statuses (same shape); get_compliance_summary covers the summary-only half. Audited as compliance.agent_statuses.view, FAIL-CLOSED (503 on an audit-persist miss, never a Sec-Audit-Failed set-and-proceed) — check_result carries raw, unrestricted agent-instruction output (the bound fragment's check_instruction is operator-authored and unconstrained), so this route cannot make the same not-behavioural-PII claim GET /api/v1/inventory/software genuinely can.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{data:{policy_id,summary:{compliant,non_compliant,unknown,fixing,error,total},agents:[{agent_id,status,last_check_at,last_fix_at,check_result}]}}"}, "401": {"description": "Unauthenticated"}, "403": {"description": "No management-group grant for Policy:Read (or a service-scoped token whose RBAC/ITServiceOwner grant is missing/RBAC disabled)"}, "503": {"description": "Policy store not available/degraded, the fleet-read gate unwired, or the audit write for this read failed (fail-closed)"}}}
     },)json"
         // #4029 (api-parity Batch A content/catalog half) — GET /api/v1/instructions*
         // and GET /api/v1/product-packs*. Own segment (MSVC C2026 16,380-byte cap).
@@ -1405,6 +1438,24 @@ const std::string& openapi_spec() {
     },
     "/license/alerts": {
       "get": {"summary": "List license alerts (expiration warnings, seat-limit approaching)", "tags": ["License Management"], "description": "Only available when LicenseStore is wired — the server does not construct it today (licensing deliberately shelved, ADR-0048); documented for when a future change re-wires it. Requires License:Read.", "parameters": [{"name": "unacknowledged", "in": "query", "required": false, "schema": {"type": "boolean"}, "description": "When present/true, return only unacknowledged alerts"}], "responses": {"200": {"description": "{data: [{id, alert_type, message, triggered_at, acknowledged}]}"}, "503": {"description": "A genuine database read failure"}}}
+    })json"
+        // Fresh literal split (MSVC C2026 16,380-byte cap) — #4031 directory/
+        // enrollment/OIDC-config read twins.
+        R"json(,
+    "/directory/users": {
+      "get": {"summary": "List AD/Entra-synced directory users", "tags": ["Directory Sync"], "description": "#4031 REST v1 twin of legacy GET /api/directory/users and MCP tool list_directory_users — all three call the same directory_user_row_json builder. Requires Directory:Read. Genuinely PII (email/UPN/group membership); every call is audited (directory.users.view) and the route FAILS CLOSED (503) if the audit row cannot be persisted (docs/api-twin-recipe.md §4). Plain cache read of the Postgres-backed directory_sync schema — no live LDAP/Entra call (that is the separate POST /api/directory/sync).", "parameters": [{"name": "group_id", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Filter to users in this directory group"}], "responses": {"200": {"description": "{data: [{id, display_name, email, upn, enabled, groups, synced_at}], pagination: {total}}"}, "403": {"description": "Directory:Read denied"}, "503": {"description": "Directory sync not available, or the audit subsystem is unavailable (refuses to serve PII without durable evidence)", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Set when the audit row failed to persist; the 503 body itself is returned in that case, not partial data."}}}}}
+    },
+    "/directory/status": {
+      "get": {"summary": "Get AD/Entra directory-sync status", "tags": ["Directory Sync"], "description": "#4031 REST v1 twin of legacy GET /api/directory/status and MCP tool get_directory_status — all three call the same directory_status_json builder. Requires Directory:Read. No per-person PII (counts + synced-group metadata only), so unaudited, matching the legacy route's own posture. groups[].mapped_role (the AD-group -> Yuzu-role authorization map) is the empty string for a non-admin caller — admin-only, same posture as OidcConfig's admin_group field.", "responses": {"200": {"description": "{data: {provider, status, last_sync_at, user_count, group_count, last_error, groups: [{id, display_name, description, mapped_role, synced_at}]}}"}, "403": {"description": "Directory:Read denied"}, "503": {"description": "Directory sync not available"}}}
+    },
+    "/enrollment/auto-approve-rules": {
+      "get": {"summary": "List auto-approve enrollment rules", "tags": ["Enrollment"], "description": "#4031 REST v1 twin of GET /fragments/settings/auto-approve. Requires Enrollment:Read — REST-only, no MCP twin (reviewed exception to #520: auto_approve_engine, like settings, is not a fleet-query surface MCP tokens are meant to reach; see docs/mcp-server.md and the sibling settings issue #4028's identical decision). Administrator-only today (matching the previous admin_fn_ gate); the (Enrollment, Read) pair is in authz_topology_floor.hpp's kTopologyFloor so an RBAC-off deployment cannot silently widen this to any authenticated user. Audited (enrollment.auto_approve.view, non-blocking — rule set is auto-enrollment bypass criteria, reconnaissance-valuable but not per-person PII).", "responses": {"200": {"description": "{data: {rules: [{index, type, value, label, enabled}], require_all}}"}, "403": {"description": "Enrollment:Read denied"}, "503": {"description": "Auto-approve engine not available"}}}
+    },
+    "/enrollment/pending-agents": {
+      "get": {"summary": "List pending/denied agent-enrollment requests", "tags": ["Enrollment"], "description": "#4031 REST v1 twin of GET /fragments/settings/pending. Requires Enrollment:Read — REST-only, no MCP twin, same #520 exception as auto-approve-rules above; do NOT conflate with the unrelated existing MCP tool list_pending_approvals (ApprovalManager's maker-checker action-approval queue, a different domain). Administrator-only in the default seed, floored in authz_topology_floor.hpp for RBAC-off. Rows carry genuine per-agent identity (agent_id/hostname/os/arch/agent_version), so unlike this file's other Enrollment/OidcConfig/Directory routes this one gates on the ADR-0017 admit-then-filter chokepoint (require_fleet_read), not a bare permission check — a management-group-scoped Enrollment:Read grant is admitted and gets the real visible-agent intersection, typically empty for pending (not-yet-approved) agents since they normally hold no group membership yet (not a data-model guarantee — a pre-assigned membership row yields a non-empty, correctly-confined result), rather than being denied outright. Audited (enrollment.pending_agents.view, non-blocking — device-identity fingerprint data, a lighter version of the device_ci GDPR-personal-data-adjacent class).", "responses": {"200": {"description": "{data: [{agent_id, hostname, os, arch, agent_version, requested_at, status}], pagination: {total}} — data is the caller's confined slice: unfiltered for a global grant, the real (typically empty, but not data-model-guaranteed) intersection for a management-group-scoped one"}, "403": {"description": "Enrollment:Read denied"}, "503": {"description": "Auth manager not available, or the ADR-0017 authorization gate is unavailable"}}}
+    },
+    "/settings/oidc": {
+      "get": {"summary": "Get OIDC SSO configuration", "tags": ["Settings"], "description": "#4031 REST v1 twin of GET /fragments/settings/directory — despite that legacy path, this is pure OIDC SSO config (Issuer/Client ID/Redirect URI/Admin Group/Skip-TLS-Verify), NOT the AD/Entra directory-sync feature (see /directory/users, /directory/status above); deliberately gated on the freshly-minted OidcConfig securable, never Directory, to avoid colliding with that unrelated capability. Requires OidcConfig:Read — REST-only, no MCP twin, same #520 exception as the enrollment routes above. Administrator-only today, floored in authz_topology_floor.hpp. Audited (settings.oidc.view, non-blocking — IdP/admin-group recon value). The client secret is never disclosed, masked/placeholder-only, only client_secret_configured (bool) is returned.", "responses": {"200": {"description": "{data: {configured, issuer, client_id, client_secret_configured, redirect_uri, admin_group, skip_tls_verify}}"}, "403": {"description": "OidcConfig:Read denied"}, "503": {"description": "Server config not available"}}}
     }
   }
 })json";
@@ -1643,7 +1694,8 @@ void RestApiV1::register_routes(
     ResponseScopeFn response_scope_fn, AppPerfProviders app_perf_providers,
     EnginePrincipalStore* engine_principal_store, AccessReviewStore* access_review_store,
     AuthDB* auth_db, DirectorySync* directory_sync, detail::StreamBudget* stream_budget,
-    ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn, FleetReadFn fleet_read_fn) {
+    ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn, FleetReadFn fleet_read_fn,
+    AgentsJsonFn agents_fn, ResponseVisibleSetFn response_visible_set_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -1658,7 +1710,8 @@ void RestApiV1::register_routes(
                     std::move(response_scope_fn),
                     std::move(app_perf_providers), engine_principal_store, access_review_store,
                     auth_db, directory_sync, stream_budget, std::move(exec_visible_fn),
-                    std::move(list_read_fn), std::move(fleet_read_fn));
+                    std::move(list_read_fn), std::move(fleet_read_fn), std::move(agents_fn),
+                    std::move(response_visible_set_fn));
 }
 
 void RestApiV1::register_routes(
@@ -1679,7 +1732,8 @@ void RestApiV1::register_routes(
     ResponseScopeFn response_scope_fn, AppPerfProviders app_perf_providers,
     EnginePrincipalStore* engine_principal_store, AccessReviewStore* access_review_store,
     AuthDB* auth_db, DirectorySync* directory_sync, detail::StreamBudget* stream_budget,
-    ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn, FleetReadFn fleet_read_fn) {
+    ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn, FleetReadFn fleet_read_fn,
+    AgentsJsonFn agents_fn, ResponseVisibleSetFn response_visible_set_fn) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -2721,6 +2775,77 @@ void RestApiV1::register_routes(
                      principal_id + ":" + role_name);
             res.set_content(ok_json(JObj().add("unassigned", true).str()), "application/json");
         });
+
+    // GET /api/v1/management-groups/agent-count-preview (#4033, #2146 Batch
+    // A) — REST/MCP twin of `/fragments/create-group-form`'s agent-count
+    // preview (dashboard_routes.cpp, ~line 496): the same live scoped
+    // agent-count read used to render "N agents match" before an operator
+    // commits to POST /api/v1/management-groups. Gated `ManagementGroup:Write`
+    // matching the fragment EXACTLY (only an operator who could create the
+    // group may preview it) — a bare perm_fn check, deliberately NOT migrated
+    // onto require_fleet_read by this PR (the fragment's own gate is flat,
+    // and the acceptance criteria ask for parity with the fragment here, not
+    // the list-route chokepoint migration). Scope is the D3
+    // Response:Read-visible agent set (response_visible_set_fn,
+    // ResponseVisibleSetFn's doc comment) with the fragment's own
+    // elevated-session JIT full-fleet-view short-circuit
+    // (DashboardRoutes::resolve_visible_scope(const auth::Session&)).
+    //
+    // filters are supplied as repeated `field=value` query params using the
+    // SAME mangled column-key convention the fragment's `f_<column>` params
+    // use (group_agent_count_preview.hpp's mangle_column_key) — e.g.
+    // `?plugin=procfetch&pid=1234` for procfetch's PID column. Shared builder
+    // group_agent_count_preview (group_agent_count_preview.{hpp,cpp}) is the
+    // SAME function the MCP twin preview_management_group_agent_count calls
+    // (recipe Rule 1) — an empty filter set is a GENUINE 0, never a store
+    // call, matching the fragment's own "no filter -> no scoped count"
+    // branch exactly.
+    sink.Get("/api/v1/management-groups/agent-count-preview",
+             [auth_fn, perm_fn, response_store, response_visible_set_fn](
+                 const httplib::Request& req, httplib::Response& res) {
+                 const auto cid = detail::make_correlation_id();
+                 res.set_header("X-Correlation-Id", cid);
+                 if (!perm_fn(req, res, "ManagementGroup", "Write"))
+                     return;
+                 auto session = auth_fn(req, res);
+                 if (!session)
+                     return;
+
+                 const std::string command_id =
+                     req.has_param("command_id") ? req.get_param_value("command_id") : "";
+                 const std::string plugin =
+                     req.has_param("plugin") ? req.get_param_value("plugin") : "";
+
+                 std::vector<std::pair<std::string, std::string>> raw_fields;
+                 for (const auto& [key, value] : req.params) {
+                     if (key == "command_id" || key == "plugin")
+                         continue;
+                     raw_fields.emplace_back(key, value);
+                 }
+                 auto filters = resolve_group_preview_filters(plugin, raw_fields);
+
+                 // Elevated -> nullopt (JIT full-fleet view), else the D3
+                 // resolver — mirrors DashboardRoutes::resolve_visible_scope
+                 // (const auth::Session&) exactly.
+                 std::optional<std::vector<std::string>> agent_scope;
+                 if (!auth::is_elevated(*session) && response_visible_set_fn) {
+                     if (auto scope = response_visible_set_fn(session->username))
+                         agent_scope = std::vector<std::string>(scope->begin(), scope->end());
+                 }
+
+                 auto count =
+                     group_agent_count_preview(response_store, command_id, filters, agent_scope);
+                 if (!count) {
+                     res.status = 503;
+                     res.set_content(
+                         detail::error_json_a4(503, "response store degraded — preview unavailable",
+                                               cid, 5000, "retry the request"),
+                         "application/json");
+                     return;
+                 }
+                 res.set_content(ok_json(JObj().add("agent_count", *count).str()),
+                                 "application/json");
+             });
 
     // ── Engine Principal Role Assignments (/api/v1/engine-principals/:id/roles) ──
     // PR 4.2 (design doc `docs/auth-engine-principals-design.md` §4.1) — the
@@ -7286,6 +7411,174 @@ void RestApiV1::register_routes(
                  if (!audit_ok)
                      data.add("audit_persisted", false);
                  res.set_content(ok_json(data.str()), "application/json");
+             });
+
+    // ── Devices (#4033, #2146 API-parity Batch A) ─────────────────────────
+    // GET /api/v1/devices — the fleet device list, migrated onto
+    // AuthRoutes::require_fleet_read (the canonical admit-then-filter
+    // chokepoint), rather than reimplementing the dashboard fragment's
+    // (`/fragments/devices/list`, device_routes.cpp) bespoke
+    // get_visible_agents_json-style logic — see AgentsJsonFn's doc comment
+    // (rest_api_v1.hpp) for why: that join is management-group-only and
+    // lacks require_fleet_read's service-scope/elevated/engine/mcp_tier
+    // caller-class branches, so a management-group-confined operator AND a
+    // correctly-confined service-scoped token both get a real, working,
+    // filtered read here (exact parity with GET /api/v1/inventory/software
+    // above). fleet_read_fn is the SOLE gate — never stacked with perm_fn
+    // (its own doc comment has the BLOCKING falsifier). Row shape matches
+    // MCP's PRE-EXISTING list_agents tool's IDENTICAL 5-field output
+    // (agent_id/hostname/os/arch/agent_version) — this route builds it via
+    // device_agent_row_json (device_routes.hpp); MCP's list_agents builds
+    // the same shape inline and is NOT (yet) refactored onto that builder
+    // (fixed by adversarial review, #4033 follow-up: an earlier version of
+    // this comment claimed the two "now share" the builder — false; see
+    // device_routes.hpp's header comment for the corrected posture). The
+    // richer dashboard-only
+    // DeviceRow shape (online/segment/tags/dex_score) and the fragment's
+    // q/os/status filters are deliberately NOT reproduced here — this route
+    // matches list_agents' capability, not the fragment's; a fleet-scale
+    // filtered/paginated device-list REST surface is a tracked follow-up,
+    // out of this issue's scope.
+    //
+    // list_agents (MCP) itself is NOT migrated onto require_fleet_read by
+    // this PR — its unconfined-fan-out gap (Evidence item 1's correction) is
+    // filed separately as #4041 (P1, same-priority follow-up per the
+    // acceptance criteria's "or file an explicit...follow-up" clause).
+    //
+    // NOT audited on a successful read: device identity/OS/arch/version is
+    // machine metadata, not behavioural PII — matches the fragment's OWN
+    // unaudited posture (it never emits an audit row for a successful list
+    // render either) rather than emit_behavioral_audit's fail-closed PII
+    // contract (#4033 acceptance criteria, explicit). require_fleet_read
+    // already audits every DENIAL path internally (`auth.fleet_read_required`).
+    sink.Get("/api/v1/devices",
+             [fleet_read_fn, agents_fn](const httplib::Request& req, httplib::Response& res) {
+                 const auto cid = detail::make_correlation_id();
+                 res.set_header("X-Correlation-Id", cid);
+                 if (!fleet_read_fn) {
+                     spdlog::error("devices.list: fleet_read_fn unwired — misconfigured call "
+                                   "site; failing closed; cid={}",
+                                   cid);
+                     res.status = 503;
+                     res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                     "application/json");
+                     return;
+                 }
+                 auto gate = fleet_read_fn(req, res, "Infrastructure", "Read");
+                 if (!gate.admitted)
+                     return; // gate already wrote the A4 error body + status.
+                 if (!agents_fn) {
+                     res.status = 503;
+                     res.set_content(detail::error_json_a4(503, "device registry unavailable", cid),
+                                     "application/json");
+                     return;
+                 }
+                 const auto agents = agents_fn();
+                 JArr arr;
+                 std::size_t dropped = 0;
+                 for (const auto& a : agents) {
+                     if (!authz::in_scope(gate.scope, a.value("agent_id", ""))) {
+                         ++dropped;
+                         continue;
+                     }
+                     arr.add_raw(device_agent_row_json(a).dump());
+                 }
+                 JObj data;
+                 data.raw("devices", arr.str());
+                 data.add("count", arr.size());
+                 // Surface the scope-filter drop count (0 = unfiltered/nothing
+                 // dropped) — same agentic-first "out of my scope" vs "doesn't
+                 // exist" signal GET /api/v1/inventory/software's
+                 // devices_omitted carries (gov UP-12 false-negative guard).
+                 data.add("devices_omitted", static_cast<int64_t>(dropped));
+                 res.set_content(list_json(data.str(), arr.size()), "application/json");
+             });
+
+    // GET /api/v1/devices/{id} — single-device detail, matching MCP's
+    // PRE-EXISTING get_agent_details tool's pattern EXACTLY (#1700/#3290
+    // Phase 2 precedent): fleet_read_fn is the SOLE gate (no perm_fn stack —
+    // same BLOCKING defect its doc comment warns against), and an
+    // out-of-scope agent_id collapses to the SAME "not found" response as a
+    // genuinely nonexistent one — the existence-oracle closure this pattern
+    // exists for. The scan does NOT early-break on an out-of-scope match
+    // (scan-length symmetry — the #3564/Gate-8 timing-side-channel lesson):
+    // both !found sub-cases are indistinguishable in every caller-visible
+    // channel (response body AND scan length); the distinction is recorded
+    // ONLY server-side (spdlog), never audited with a caller-queryable
+    // detail string (get_agent_details' own #3564 fix note explains why a
+    // per-id audit detail string cannot safely carry it).
+    //
+    // NOT audited (neither success nor not-found): matches list's posture
+    // above and the fragments' (`/fragments/device/page`,
+    // `/fragments/device/info`) own unaudited posture exactly — device
+    // identity/tags are machine metadata, not behavioural PII. This is a
+    // deliberate DEPARTURE from get_agent_details' own mcp_audit-on-every-
+    // path posture (out of scope for this PR to change) — #4033's
+    // acceptance criteria are explicit that list/detail need no
+    // emit_behavioral_audit, and take the fragments' unaudited posture as
+    // the standard to match rather than MCP's.
+    sink.Get(R"(/api/v1/devices/([^/]+))",
+             [fleet_read_fn, agents_fn, tag_store](const httplib::Request& req,
+                                                   httplib::Response& res) {
+                 const auto cid = detail::make_correlation_id();
+                 res.set_header("X-Correlation-Id", cid);
+                 if (!fleet_read_fn) {
+                     spdlog::error("devices.detail: fleet_read_fn unwired — misconfigured call "
+                                   "site; failing closed; cid={}",
+                                   cid);
+                     res.status = 503;
+                     res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                     "application/json");
+                     return;
+                 }
+                 auto gate = fleet_read_fn(req, res, "Infrastructure", "Read");
+                 if (!gate.admitted)
+                     return;
+                 const std::string agent_id = req.matches[1].str();
+                 if (!agents_fn) {
+                     res.status = 503;
+                     res.set_content(detail::error_json_a4(503, "device registry unavailable", cid),
+                                     "application/json");
+                     return;
+                 }
+                 const auto agents = agents_fn();
+                 bool found = false;
+                 bool exists_out_of_scope = false;
+                 nlohmann::json match;
+                 for (const auto& a : agents) {
+                     if (a.value("agent_id", "") != agent_id)
+                         continue;
+                     if (authz::in_scope(gate.scope, agent_id)) {
+                         match = a;
+                         found = true;
+                         break; // only the in-scope match short-circuits the scan.
+                     }
+                     // Keep scanning — see the route's header comment on why an
+                     // out-of-scope match must not break here.
+                     exists_out_of_scope = true;
+                 }
+                 if (!found) {
+                     spdlog::debug("devices.detail: {} for {} (caller-visible response unchanged)",
+                                   exists_out_of_scope ? "out-of-scope match" : "no match", agent_id);
+                     res.status = 404;
+                     res.set_content(detail::error_json_a4(404, "Device not found: " + agent_id, cid),
+                                     "application/json");
+                     return;
+                 }
+                 std::optional<std::vector<DeviceTag>> tags;
+                 if (tag_store) {
+                     auto t = tag_store->get_all_tags(agent_id);
+                     if (!t) {
+                         res.status = 503;
+                         res.set_content(detail::error_json_a4(503, "tag store unavailable", cid),
+                                         "application/json");
+                         return;
+                     }
+                     tags = std::move(*t);
+                 }
+                 res.set_content(
+                     ok_json(device_agent_detail_json(match, tags ? &*tags : nullptr).dump()),
+                     "application/json");
              });
 
     // ── Execution Statistics (capability 1.9) ────────────────────────────

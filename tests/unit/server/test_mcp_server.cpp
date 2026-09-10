@@ -29,6 +29,7 @@
 #include "test_analytics_pg_helper.hpp" // AnalyticsEventStorePg — ADR-0049 PG port
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "test_approval_manager_pg_helper.hpp" // ApprovalManagerPg — ADR-0065 PG port
+#include "test_directory_sync_pg_helper.hpp" // DirectorySyncPg — #4031 list_directory_users/get_directory_status
 #include "test_execution_tracker_pg_helper.hpp" // ExecutionTrackerPg — ADR-0065 PG port
 #include "test_response_execution_authz_pg_helper.hpp"
 #include "test_tag_store_pg_helper.hpp"  // TagStorePg — ADR-0050 PG port
@@ -312,7 +313,9 @@ TEST_CASE("MCP Policy: operator tier DOES allow the distinct ApiToken:Rotate "
     CHECK(tier_allows("operator", "ApiToken", "Rotate"));
 }
 
-TEST_CASE("MCP Policy: supervised tier allows everything", "[mcp][policy]") {
+TEST_CASE("MCP Policy: supervised tier allows everything except server "
+          "self-administration (Enrollment/OidcConfig)",
+          "[mcp][policy]") {
     CHECK(tier_allows("supervised", "Infrastructure", "Read"));
     CHECK(tier_allows("supervised", "Execution", "Execute"));
     CHECK(tier_allows("supervised", "Policy", "Write"));
@@ -327,6 +330,37 @@ TEST_CASE("MCP Policy: supervised tier allows everything", "[mcp][policy]") {
 TEST_CASE("MCP Policy: unknown tier denies everything", "[mcp][policy]") {
     CHECK(!tier_allows("bogus", "Infrastructure", "Read"));
     CHECK(!tier_allows("bogus", "Tag", "Write"));
+}
+
+TEST_CASE("MCP Policy: #4031/#520 Enrollment and OidcConfig are denied at "
+          "EVERY tier, including supervised — MCP tokens must never "
+          "administer the server itself (settings, users, TLS, OIDC)",
+          "[mcp][policy][security]") {
+    // The bug this pins: tier_allows() checked only the OPERATION
+    // ("Read"), never the SECURABLE, so a readonly-tier MCP token could
+    // reach the #4031 REST v1 enrollment/auto-approve-rules,
+    // enrollment/pending-agents, and settings/oidc routes purely because
+    // those routes' perm_fn asks "is this Read?" — the same question a
+    // readonly token answers yes to for every OTHER securable too.
+    CHECK_FALSE(tier_allows("readonly", "Enrollment", "Read"));
+    CHECK_FALSE(tier_allows("readonly", "OidcConfig", "Read"));
+    CHECK_FALSE(tier_allows("operator", "Enrollment", "Read"));
+    CHECK_FALSE(tier_allows("operator", "OidcConfig", "Read"));
+    // supervised tier allows everything else (see "MCP Policy: supervised
+    // tier allows everything except server self-administration" above) —
+    // this is the one carve-out, matching require_admin()'s unconditional
+    // posture for the equivalent admin_fn_-gated dashboard surface.
+    CHECK_FALSE(tier_allows("supervised", "Enrollment", "Read"));
+    CHECK_FALSE(tier_allows("supervised", "OidcConfig", "Read"));
+    CHECK_FALSE(tier_allows("supervised", "Enrollment", "Write"));
+    CHECK_FALSE(tier_allows("supervised", "OidcConfig", "Write"));
+
+    // Directory is deliberately NOT in this deny set — it has real MCP twins
+    // (list_directory_users/get_directory_status) by design, so it must stay
+    // reachable at readonly tier, unlike Enrollment/OidcConfig which have
+    // none.
+    CHECK(tier_allows("readonly", "Directory", "Read"));
+    CHECK(tier_allows("supervised", "Directory", "Read"));
 }
 
 // #4028/#520 security regression guard: server-administration securables
@@ -984,6 +1018,13 @@ struct McpTestServer {
         return {true, std::nullopt};
     };
 
+    /// #4033 — the fake twin of the D3 Response:Read-visible-set resolver
+    /// backing preview_management_group_agent_count. Default: TOP
+    /// (nullopt, unfiltered) — a test that cares about scoping overrides
+    /// this per-case.
+    yuzu::server::mcp::McpServer::ResponseVisibleSetFn response_visible_set_fn_for_test =
+        [](const std::string&) -> std::optional<std::set<std::string>> { return std::nullopt; };
+
     /// ADR-0024 (SLE discovery): optionally wire a typed SoftwareLicensingStore so
     /// query_software_licenses (the MCP twin of the GET /sle/agents/{id} drill) is
     /// exercised end-to-end — success shape, the deliberate user_scope/user_ref PII
@@ -1004,6 +1045,9 @@ struct McpTestServer {
     yuzu::server::TagStore* tag_store_for_test{nullptr};
     yuzu::server::ApprovalManager* approval_manager_for_test{nullptr};
     yuzu::server::QuarantineStore* quarantine_store_for_test{nullptr};
+    /// #4031: list_directory_users / get_directory_status. Default nullptr
+    /// keeps every pre-existing test on the store-unavailable path.
+    yuzu::server::DirectorySync* directory_sync_for_test{nullptr};
     /// Records (agent_id,key) pairs pushed via the tag-push closure (D4), so a
     /// set_tag test can assert the agent push fired.
     std::vector<std::pair<std::string, std::string>> tag_pushes;
@@ -1220,6 +1264,12 @@ private:
         // shape for every pre-existing test that never touches it.
         mcp.set_fleet_read_fn(fleet_read_fn_for_test);
 
+        // #4033: response_visible_set_fn ALSO rides a setter, same pattern
+        // as fleet_read_fn above — wire before the handlers are built.
+        // Unconditional: the fixture default above is TOP/unfiltered, a
+        // no-op for every pre-existing test.
+        mcp.set_response_visible_set_fn(response_visible_set_fn_for_test);
+
         // #3685: the Destructive-targeting classifier ALSO rides a setter,
         // same pattern as the two above — wire before the handlers are
         // built. UNCONDITIONAL, but NOT a no-op default like its siblings:
@@ -1302,7 +1352,7 @@ private:
             /*engine_principal_store=*/nullptr,
             /*access_review_store=*/nullptr,
             /*auth_db=*/nullptr,
-            /*directory_sync=*/nullptr,
+            /*directory_sync=*/directory_sync_for_test,
             /*caller_fn=*/caller_fn_for_test,
             // 2f PR 3b: the POST handler leases from the SAME budget as GET.
             // Default nullptr keeps every pre-3b test on the plain path - a test
@@ -1770,8 +1820,9 @@ TEST_CASE("MCP 2383: RBAC catalogue mirrors have the expected cardinality", "[mc
     // + 1 (#4030/#4032: Workflow, previously gated but never seeded) = 28,
     // + 1 (#4029: ProductPack prerequisite fix) = 29,
     // + 4 #4028 additions (TlsConfig, PluginSigning, ServerConfig,
-    // AnalyticsConfig — Settings read-twins) = 33.
-    CHECK(rbac_securables_for_test().size() == 33);
+    // AnalyticsConfig — Settings read-twins) = 33,
+    // + 3 #4031 additions (Directory, Enrollment, OidcConfig) = 36.
+    CHECK(rbac_securables_for_test().size() == 36);
 }
 
 TEST_CASE("MCP 2383: three-way dispatch classifier — knownness decides first", "[mcp][2g]") {
@@ -3444,6 +3495,87 @@ TEST_CASE("MCP Integration: get_guardian_schemas matches the REST catalog",
     REQUIRE(contents.size() >= 1);
     auto resource_catalog = nlohmann::json::parse(contents[0]["text"].get<std::string>());
     CHECK(resource_catalog == rest_catalog);
+}
+
+// ── Compliance/policy REST v1 read twins (api-parity #4034) ─────────────────
+// McpTestServer wires policy_store=nullptr (no live Postgres in this fixture,
+// matching the pre-existing #3559 item 3 ComplianceHarness gap on the REST
+// side), so these round trips prove each new tool is REGISTERED, DISPATCHED
+// through the real JSON-RPC surface, passes its tier/perm(/fleet-read) gate,
+// and reaches its handler body's null-store branch — not that it returns
+// live compliance data (compliance_model.hpp's pure builders are unit-tested
+// directly, no store needed, in test_compliance_model.cpp).
+
+TEST_CASE("MCP Integration: tools/call get_policy reaches the null-store branch",
+          "[mcp][integration][compliance]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":30,)"
+        R"("params":{"name":"get_policy","arguments":{"policy_id":"pol_1"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["id"] == 30);
+    // Dispatched (not kMethodNotFound) and reached the handler: a real
+    // JSON-RPC error, not a bare 404/500, with the store-unavailable message
+    // — proves param parsing + tier_allows + perm_fn all passed.
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["message"].get<std::string>().find("Policy store unavailable") !=
+          std::string::npos);
+}
+
+TEST_CASE("MCP Integration: tools/call list_policy_fragments reaches the null-store branch",
+          "[mcp][integration][compliance]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":31,)"
+        R"("params":{"name":"list_policy_fragments","arguments":{}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["message"].get<std::string>().find("Policy store unavailable") !=
+          std::string::npos);
+}
+
+TEST_CASE("MCP Integration: tools/call get_policy_agent_statuses passes its fleet_read_fn_ "
+          "gate then reaches the null-store branch",
+          "[mcp][integration][compliance]") {
+    McpTestServer ts;
+    ts.start(); // fixture default fleet_read_fn_for_test admits unfiltered (nullopt scope)
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":32,)"
+        R"("params":{"name":"get_policy_agent_statuses","arguments":{"policy_id":"pol_1"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["message"].get<std::string>().find("Policy store unavailable") !=
+          std::string::npos);
+}
+
+TEST_CASE("MCP Integration: tools/call get_policy_agent_statuses fails closed when "
+          "fleet_read_fn_ is genuinely unwired",
+          "[mcp][integration][compliance][security]") {
+    McpTestServer ts;
+    ts.fleet_read_fn_for_test = {}; // genuinely empty std::function, not the fixture default
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":33,)"
+        R"("params":{"name":"get_policy_agent_statuses","arguments":{"policy_id":"pol_1"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"].get<int>() == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"].get<std::string>().find("service unavailable") !=
+          std::string::npos);
 }
 
 // ── A2 discovery tools (roadmap Issue 17.1) ─────────────────────────────────
@@ -11373,6 +11505,140 @@ TEST_CASE("MCP operator surface: list_upload_grants is confined to what's actual
     CHECK(ts.audit_log[1] == "mcp.list_upload_grants|success");
 }
 
+// ── #4031: list_directory_users / get_directory_status ──────────────────
+//
+// Round-trip dispatch tests proving the shared-builder claim (docs/
+// api-twin-recipe.md §1) actually holds for these two tools: both call the
+// SAME directory_user_row_json / directory_status_json functions the REST
+// v1 twins (enrollment_directory_routes.cpp) and the legacy
+// /api/directory/* routes (discovery_routes.cpp) use. Deliberately does NOT
+// seed data via sync_entra/apply_entra_sync — see
+// test_enrollment_directory_routes.cpp's identical note (sync_entra makes a
+// real outbound Graph call; apply_entra_sync's test seam is a file-local
+// friend struct in test_directory_sync.cpp, not safely duplicable here
+// without an ODR risk). A freshly-opened, empty store already proves the
+// tool's registration, gating, and response-shape wiring.
+
+TEST_CASE("MCP #4031: list_directory_users dispatches, returns the shared builder's shape, and "
+          "uses the REST-domain audit verb (not mcp.list_directory_users)",
+          "[pg][mcp][integration]") {
+    yuzu::test::DirectorySyncPg ds;
+
+    McpTestServer ts;
+    ts.directory_sync_for_test = ds.get();
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"list_directory_users",)"
+        R"("arguments":{}}})");
+    REQUIRE(res);
+    auto payload = operator_surface_payload(res);
+    REQUIRE(payload["users"].is_array());
+    CHECK(payload["users"].empty());
+    CHECK(payload["count"] == 0);
+
+    // Prefers the REST-established domain verb over the generic
+    // mcp.<tool_name> action (docs/api-twin-recipe.md §4).
+    REQUIRE(ts.audit_log.size() == 1);
+    CHECK(ts.audit_log[0] == "directory.users.view|success");
+}
+
+TEST_CASE("MCP #4031: list_directory_users answers store-unavailable when directory_sync is "
+          "unwired",
+          "[mcp][integration]") {
+    McpTestServer ts;
+    // directory_sync_for_test stays nullptr — default.
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"list_directory_users",)"
+        R"("arguments":{}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+}
+
+TEST_CASE("MCP #4031: get_directory_status dispatches, returns the shared builder's shape, and "
+          "is NOT audited (no per-person PII)",
+          "[pg][mcp][integration]") {
+    yuzu::test::DirectorySyncPg ds;
+
+    McpTestServer ts;
+    ts.directory_sync_for_test = ds.get();
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"get_directory_status",)"
+        R"("arguments":{}}})");
+    REQUIRE(res);
+    auto payload = operator_surface_payload(res);
+    CHECK(payload.contains("provider"));
+    CHECK(payload.contains("status"));
+    CHECK(payload.contains("user_count"));
+    CHECK(payload.contains("group_count"));
+    REQUIRE(payload["groups"].is_array());
+
+    CHECK(ts.audit_log.empty());
+}
+
+// Colleague-review finding on #4176: groups[].mapped_role (the AD-group ->
+// Yuzu-role authorization map, same data class as the floored
+// OidcConfig:admin_group) must stay admin-only even at readonly MCP tier —
+// see enrollment_directory_model.hpp's directory_status_json doc comment.
+TEST_CASE("MCP #4031/#4176: get_directory_status redacts mapped_role for a non-admin caller at "
+          "readonly tier, reveals it for admin",
+          "[pg][mcp][integration][security]") {
+    yuzu::test::DirectorySyncPg ds;
+    {
+        auto lease = ds.pool().acquire();
+        REQUIRE(lease);
+        auto ins = pg::exec_params(
+            lease.get(),
+            "INSERT INTO directory_sync.directory_groups (id, display_name, description, "
+            "synced_at) VALUES ($1, $2, $3, $4)",
+            std::vector<std::string>{"g1", "Engineering", "", "100"});
+        REQUIRE(ins.ok());
+    }
+    ds->configure_group_role_mapping("g1", "Administrator");
+    REQUIRE(ds->get_synced_groups().size() == 1);
+
+    McpTestServer ts;
+    ts.directory_sync_for_test = ds.get();
+    ts.start("readonly");
+    ts.mock_role = yuzu::server::auth::Role::user;
+
+    auto call = R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":)"
+               R"("get_directory_status","arguments":{}}})";
+    auto denied_payload = operator_surface_payload(ts.call(call));
+    REQUIRE(denied_payload["groups"].size() == 1);
+    CHECK(denied_payload["groups"][0]["mapped_role"] == "");
+
+    // Admin session, same readonly MCP tier — the field is role-gated, not
+    // tier-gated, so an admin sees it even at readonly.
+    ts.mock_role = yuzu::server::auth::Role::admin;
+    auto revealed_payload = operator_surface_payload(ts.call(call));
+    REQUIRE(revealed_payload["groups"].size() == 1);
+    CHECK(revealed_payload["groups"][0]["mapped_role"] == "Administrator");
+}
+
+TEST_CASE("MCP #4031: list_directory_users respects perm_fn denial on Directory:Read",
+          "[pg][mcp][integration]") {
+    yuzu::test::DirectorySyncPg ds;
+
+    McpTestServer ts;
+    ts.directory_sync_for_test = ds.get();
+    ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+        return !(securable == "Directory" && op == "Read");
+    };
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"list_directory_users",)"
+        R"("arguments":{}}})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+}
+
 TEST_CASE("MCP operator surface: revoke_upload_grant flips the REAL store row to revoked and "
           "the grant becomes unredeemable — proven via a direct open_session() attempt",
           "[pg][mcp][integration][operator_surface]") {
@@ -12269,6 +12535,130 @@ TEST_CASE("MCP query_installed_software: a degraded store errors, never success+
         if (a == "mcp.query_installed_software|failure") // file-wide audit-status convention
             saw_failure_audit = true;
     CHECK(saw_failure_audit);
+}
+
+// ── preview_management_group_agent_count (#4033, #2146 API-parity Batch A) ──
+// MCP twin of GET /api/v1/management-groups/agent-count-preview — REST and
+// MCP call the SAME shared builder (group_agent_count_preview.hpp) so those
+// two cannot drift from each other. Fixed by adversarial review (#4033
+// follow-up): an earlier version of this comment claimed
+// /fragments/create-group-form's own live count shares it too (a third
+// "all three" surface) — false; the fragment keeps its own separate inline
+// implementation (dashboard_routes.cpp), unchanged by this PR. No Postgres
+// substrate needed here: response_store_for_test stays nullptr, which exercises the
+// "empty filters -> genuine 0, no store call" branch and the "non-empty
+// filters against an unconfigured store -> degrade" branch, both entirely
+// store-free per the shared model's own contract (see
+// test_group_agent_count_preview.cpp for direct coverage of that contract).
+
+TEST_CASE("MCP preview_management_group_agent_count: no filters is a genuine 0",
+          "[mcp][devices]") {
+    McpTestServer ts; // response_store_for_test stays nullptr
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":90,)"
+        R"("params":{"name":"preview_management_group_agent_count",)"
+        R"("arguments":{"command_id":"cmd-1","plugin":"procfetch"}}})");
+    REQUIRE(res->status == 200);
+    auto envelope = nlohmann::json::parse(res->body);
+    REQUIRE(envelope.contains("result"));
+    auto data = nlohmann::json::parse(envelope["result"]["content"][0]["text"].get<std::string>());
+    CHECK(data["agent_count"].get<int64_t>() == 0);
+}
+
+TEST_CASE("MCP preview_management_group_agent_count: a real filter against an unwired "
+          "store degrades, never a false 0",
+          "[mcp][devices]") {
+    McpTestServer ts; // response_store_for_test stays nullptr
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":91,)"
+        R"("params":{"name":"preview_management_group_agent_count",)"
+        R"("arguments":{"command_id":"cmd-1","plugin":"procfetch","filters":{"pid":"1234"}}}})");
+    REQUIRE(res->status == 200);
+    auto envelope = nlohmann::json::parse(res->body);
+    REQUIRE(envelope.contains("error"));
+    CHECK_FALSE(envelope.contains("result"));
+}
+
+// Colleague review on #4188 (real HIGH finding, verified independently): a
+// malformed filters shape was silently dropped rather than rejected, which
+// group_agent_count_preview's own "empty filters -> genuine 0" contract then
+// turned into a fabricated successful agent_count:0 for a request that was
+// never actually evaluated. Both shapes below must be a hard error, never a
+// 200 with agent_count:0 (response_store_for_test stays nullptr — if either
+// shape reached group_agent_count_preview with a non-empty filter it would
+// degrade per the test above, not succeed at 0; catching a silent 200:0 here
+// is the falsifier for the exact defect the review found).
+TEST_CASE("MCP preview_management_group_agent_count: a non-string filter value is rejected, "
+          "never silently dropped into a false genuine-0",
+          "[mcp][devices][security]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":94,)"
+        R"("params":{"name":"preview_management_group_agent_count",)"
+        R"("arguments":{"command_id":"cmd-1","plugin":"procfetch","filters":{"pid":1234}}}})");
+    REQUIRE(res->status == 200);
+    auto envelope = nlohmann::json::parse(res->body);
+    REQUIRE(envelope.contains("error"));
+    CHECK_FALSE(envelope.contains("result"));
+}
+
+TEST_CASE("MCP preview_management_group_agent_count: an array-shaped filters is rejected, "
+          "never silently dropped into a false genuine-0",
+          "[mcp][devices][security]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":95,)"
+        R"("params":{"name":"preview_management_group_agent_count",)"
+        R"("arguments":{"command_id":"cmd-1","plugin":"procfetch","filters":["pid"]}}})");
+    REQUIRE(res->status == 200);
+    auto envelope = nlohmann::json::parse(res->body);
+    REQUIRE(envelope.contains("error"));
+    CHECK_FALSE(envelope.contains("result"));
+}
+
+TEST_CASE("MCP preview_management_group_agent_count: readonly tier is denied "
+          "(ManagementGroup:Write, not Read)",
+          "[mcp][devices]") {
+    McpTestServer ts;
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":92,)"
+        R"("params":{"name":"preview_management_group_agent_count",)"
+        R"("arguments":{"command_id":"cmd-1","plugin":"procfetch"}}})");
+    REQUIRE(res->status == 200);
+    auto envelope = nlohmann::json::parse(res->body);
+    REQUIRE(envelope.contains("error"));
+}
+
+TEST_CASE("MCP preview_management_group_agent_count: RBAC denial (ManagementGroup:Write) "
+          "blocks the call",
+          "[mcp][devices]") {
+    McpTestServer ts;
+    ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+        return !(securable == "ManagementGroup" && op == "Write");
+    };
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":93,)"
+        R"("params":{"name":"preview_management_group_agent_count",)"
+        R"("arguments":{"command_id":"cmd-1","plugin":"procfetch"}}})");
+    REQUIRE(res->status == 403);
+}
+
+TEST_CASE("MCP preview_management_group_agent_count: securable/operation registration "
+          "matches the REST twin",
+          "[mcp][devices]") {
+    const auto rows = tool_security_rows_for_test();
+    auto it = std::find_if(rows.begin(), rows.end(), [](const auto& r) {
+        return r.name == "preview_management_group_agent_count";
+    });
+    REQUIRE(it != rows.end());
+    CHECK(it->securable == "ManagementGroup");
+    CHECK(it->operation == "Write");
 }
 
 // ── query_software_licenses (ADR-0024 SLE discovery — the MCP twin of the ──────
@@ -14596,6 +14986,11 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
         {"delete_plugin_config", nlohmann::json::parse(R"({"plugin":"p","key":"k"})")},
         {"delete_plugin_secret", nlohmann::json::parse(R"({"plugin":"p","key":"k"})")},
         {"revoke_upload_grant", nlohmann::json::parse(R"({"grant_id":"ab12"})")},
+        // #4033: ManagementGroup:Write is in the supervised-tier gated list —
+        // this tool inherits that gate as a consequence of matching the
+        // fragment's own gate exactly (see its kTools[] entry's comment).
+        {"preview_management_group_agent_count",
+         nlohmann::json::parse(R"({"command_id":"cmd-1","plugin":"procfetch"})")},
     };
 
     // Tether: the gated set derived from security rows + requires_approval()

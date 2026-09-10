@@ -60,6 +60,7 @@ A separate, narrower shape applies to ordinary mutation routes that audit a chan
 - [Pre-Auth Request Body Caps](#pre-auth-request-body-caps-2407)
 - [REST API v1 Endpoints](#rest-api-v1-endpoints)
   - [Current User](#current-user)
+  - [Devices](#devices)
   - [Management Groups](#management-groups)
   - [API Tokens](#api-tokens)
   - [Engine Principals](#engine-principals)
@@ -83,6 +84,8 @@ A separate, narrower shape applies to ordinary mutation routes that audit a chan
   - [Custom Properties](#custom-properties)
   - [Webhooks](#webhooks)
   - [Offload Targets](#offload-targets)
+  - [Directory Sync](#directory-sync)
+  - [Enrollment](#enrollment)
   - [Network Discovery](#network-discovery)
   - [Workflows](#workflows)
   - [Workflows, Executions & Schedules — v1 read twins (#4030)](#workflows-executions--schedules--v1-read-twins-4030)
@@ -328,6 +331,84 @@ Returns the authenticated user's identity and role.
   "meta": { "api_version": "v1" }
 }
 ```
+
+---
+
+### Devices
+
+The fleet device list and single-device identity read (#4033, #2146 API-parity Batch A) — the
+REST twins of the `/devices` dashboard's `list_agents`/`get_agent_details`-shaped MCP tools.
+Both routes are gated via `AuthRoutes::require_fleet_read` (the admit-then-filter chokepoint),
+not a bare permission check — a management-group-confined operator and a correctly-confined
+service-scoped token both see a real, filtered subset of the fleet rather than either the whole
+fleet or an outright denial. Neither route is audited on a successful read: device identity
+(hostname/OS/arch/version) is machine metadata, not behavioural PII — matching the
+`/fragments/devices/list`, `/fragments/device/page`, and `/fragments/device/info` dashboard
+fragments' own unaudited posture.
+
+#### `GET /api/v1/devices`
+
+List every device visible to the caller.
+
+**Permission:** `Infrastructure:Read`, via `require_fleet_read`.
+
+**Response:**
+
+```json
+{
+  "data": {
+    "devices": [
+      {
+        "agent_id": "a1b2c3d4e5f6",
+        "hostname": "web-01",
+        "os": "linux",
+        "arch": "x86_64",
+        "agent_version": "0.13.1"
+      }
+    ],
+    "count": 1,
+    "devices_omitted": 0
+  },
+  "pagination": { "total": 1, "start": 0, "page_size": 50 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`devices_omitted` counts agents dropped by the caller's management-group/service-scope
+confinement (0 when unfiltered or nothing was dropped) — the same "out of my scope" vs. "not
+present" signal `GET /api/v1/inventory/software`'s `devices_omitted` field carries.
+
+---
+
+#### `GET /api/v1/devices/{id}`
+
+Fetch one device's identity.
+
+**Permission:** `Infrastructure:Read`, via `require_fleet_read`.
+
+**Response:**
+
+```json
+{
+  "data": {
+    "agent_id": "a1b2c3d4e5f6",
+    "hostname": "web-01",
+    "os": "linux",
+    "arch": "x86_64",
+    "agent_version": "0.13.1",
+    "tags": [
+      { "key": "environment", "value": "production", "source": "server" }
+    ]
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`tags` is present only when a TagStore is configured; it is omitted entirely (never an empty
+array) when it is not. A device outside the caller's fleet-read scope returns the SAME 404 as a
+genuinely nonexistent `agent_id` — an out-of-scope match is never distinguishable from "does not
+exist" in the response body (matches the pre-existing MCP `get_agent_details` tool's
+existence-oracle closure exactly).
 
 ---
 
@@ -721,6 +802,43 @@ Remove a role assignment from this management group.
 ```json
 {
   "data": { "unassigned": true },
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+#### `GET /api/v1/management-groups/agent-count-preview`
+
+Preview the number of currently-visible agents that would match a would-be management group's
+filter criteria, before creating it (#4033, #2146 API-parity Batch A). REST/MCP/dashboard-fragment
+twin of `/fragments/create-group-form`'s own live count. This route and its MCP twin call the same
+shared builder (`group_agent_count_preview.hpp`), so those two cannot drift from each other; the
+dashboard fragment keeps its own separate, behaviourally-equivalent inline implementation
+(`DashboardRoutes::parse_filters`), unchanged by this PR — the number it shows and this route's
+`agent_count` are expected to agree today, but are not structurally guaranteed to. MCP twin:
+`preview_management_group_agent_count`.
+
+**Permission:** `ManagementGroup:Write` — matching the fragment's own gate exactly (only an
+operator who could create the group may preview it), **not** `ManagementGroup:Read`, even though
+this route performs no mutation.
+
+**Query parameters:**
+
+| Parameter | Description |
+|---|---|
+| `command_id` | The response set's instruction/command id to count against. |
+| `plugin` | Plugin name whose response columns the filter keys are matched against. |
+| `<filter keys>` | Any other query param is treated as a filter, keyed by the SAME mangling the dashboard fragment's `f_<column>` params apply to a column name — lowercase, spaces/dashes replaced with underscores (e.g. `Local Addr` → `local_addr`). Unlike the fragment, this route's keys carry **no** `f_` prefix — supply `local_addr`, not `f_local_addr`. An unrecognised key is silently ignored. |
+
+An empty filter set (no recognised filter keys supplied) returns a genuine `0` — no scoped count
+to report, and no store read is made.
+
+**Response:**
+
+```json
+{
+  "data": { "agent_count": 42 },
   "meta": { "api_version": "v1" }
 }
 ```
@@ -3329,6 +3447,39 @@ Delete a policy fragment.
 
 ---
 
+#### `GET /api/v1/policy-fragments`
+
+REST v1 twin of `GET /api/policy-fragments` above (api-parity #4034) — same query
+parameters, same row shape, A4-enveloped. MCP twin: `list_policy_fragments`.
+
+**Permission:** `Policy:Read`
+
+**Response:**
+
+```json
+{
+  "data": [
+    {
+      "id": "frag-abc123",
+      "name": "ensure-defender-enabled",
+      "description": "Verify Windows Defender is active",
+      "check_instruction": "security.defender-status",
+      "check_compliance": "result.enabled == true",
+      "fix_instruction": "security.enable-defender",
+      "post_check_instruction": "",
+      "created_at": 1710849600,
+      "updated_at": 1710849600
+    }
+  ],
+  "pagination": { "total": 1, "start": 0, "page_size": 50 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Response (503):** `{"error":{"code":503,"message":"policy store not available"},"meta":{"api_version":"v1"}}`
+
+---
+
 ### Policies
 
 Policies bind fragments to devices via scope expressions, triggers, and management group bindings.
@@ -3616,6 +3767,64 @@ is a store degrade, never a business rejection).
 
 ---
 
+#### `GET /api/v1/policies`
+
+REST v1 twin of `GET /api/policies` above (api-parity #4034) — same query
+parameters, same row shape, A4-enveloped. MCP twin: `list_policies` (a narrower
+5-field subset of this row shape — id/name/description/enabled/scope_expression
+only).
+
+**Permission:** `Policy:Read`
+
+**Response:** same `data`/`pagination`/`meta` envelope shape as
+`GET /api/v1/policy-fragments` above, wrapping the same per-policy row
+`GET /api/policies` documents.
+
+---
+
+#### `GET /api/v1/policies/{id}`
+
+REST v1 twin of `GET /api/policies/{id}` above (api-parity #4034) — flat
+top-level fields (not nested under a `"policy"` key), A4-enveloped. MCP twin:
+`get_policy`.
+
+**Permission:** `Policy:Read`
+
+**Response:**
+
+```json
+{
+  "data": {
+    "id": "pol-xyz789",
+    "name": "baseline-security",
+    "description": "",
+    "yaml_source": "apiVersion: yuzu.io/v1alpha1\nkind: Policy\n...",
+    "fragment_id": "frag-abc123",
+    "scope_expression": "tag:environment = 'production'",
+    "enabled": true,
+    "remediation_available": true,
+    "inputs": { "severity": "high" },
+    "triggers": [{ "id": 1, "type": "interval", "config": { "interval_seconds": 300 } }],
+    "management_groups": ["eu-production"],
+    "created_at": 1710849600,
+    "updated_at": 1710849600,
+    "compliance": {
+      "compliant": 42,
+      "non_compliant": 3,
+      "unknown": 5,
+      "fixing": 1,
+      "error": 0,
+      "total": 51
+    }
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Response (404):** `{"error":{"code":404,"message":"policy not found"},"meta":{"api_version":"v1"}}`
+
+---
+
 ### Compliance
 
 Fleet and per-policy compliance status endpoints.
@@ -3678,6 +3887,91 @@ Per-policy compliance detail with per-agent statuses.
 
 **Response (503):** `policy store degraded`, on either the summary or the
 per-agent-status read.
+
+---
+
+#### `GET /api/v1/compliance`
+
+REST v1 twin of `GET /api/compliance` above (api-parity #4034), A4-enveloped.
+MCP twin: `get_fleet_compliance`.
+
+**Permission:** `Policy:Read`
+
+**Response:**
+
+```json
+{
+  "data": {
+    "compliance_pct": 92.5,
+    "total_checks": 200,
+    "compliant": 185,
+    "non_compliant": 8,
+    "unknown": 5,
+    "fixing": 2,
+    "error": 0
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+#### `GET /api/v1/compliance/{policy_id}`
+
+REST v1 twin of `GET /api/compliance/{policy_id}` above (api-parity #4034),
+A4-enveloped, plus a `policy_id` sibling field the legacy route also returns
+(the legacy route's own doc example above omits it — pre-existing doc drift,
+not introduced by this route). **Authorization is `require_fleet_read`
+(`Policy:Read`), not a bare permission check** — the per-agent `agents` array
+is a fan-out read of per-agent data (routed-concerns RBAC row), so a
+management-group- or service-scope-confined caller sees only the agents
+visible to it, and `summary` is tallied from exactly that filtered set, never
+the store's unfiltered fleet-wide aggregate. MCP twin: `get_policy_agent_statuses`
+(same shape) — `get_compliance_summary` covers the `summary`-only half.
+
+**Permission:** `Policy:Read` (fleet-read gate)
+
+**Response:**
+
+```json
+{
+  "data": {
+    "policy_id": "pol-xyz789",
+    "summary": {
+      "compliant": 42,
+      "non_compliant": 3,
+      "unknown": 5,
+      "fixing": 1,
+      "error": 0,
+      "total": 51
+    },
+    "agents": [
+      {
+        "agent_id": "agent-01",
+        "status": "compliant",
+        "last_check_at": 1710936000,
+        "last_fix_at": 0,
+        "check_result": "{\"realtime_protection\": true}"
+      }
+    ]
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Audit:** `compliance.agent_statuses.view` — **fail-closed** (`503` +
+`Sec-Audit-Failed: true`, never a `2xx` on an audit-persist miss), matching
+this API's general behavioural-PII posture (see [`Sec-Audit-Failed` and the
+behavioural-PII audit posture](#sec-audit-failed-and-the-behavioural-pii-audit-posture)
+above). Unlike the five sibling routes above it, this route's `check_result`
+field carries the raw, unrestricted output of whatever instruction the
+bound fragment's `check_instruction` names — free-form and
+operator-authored at fragment-creation time, not a fixed machine-scope
+shape — so it cannot make the same "not behavioural PII" claim
+`GET /api/v1/inventory/software` genuinely can. The MCP twin
+(`get_policy_agent_statuses`) is unaffected: it follows MCP's own
+convention of surfacing the same gap via an `audit_persisted:false` body
+field rather than a header/status code.
 
 ---
 
@@ -4630,6 +4924,117 @@ Configure group-to-role mappings (which RBAC role a synced group's members recei
 **Response (400):** malformed body, or a missing `mappings` array.
 
 **Response (503):** `directory_sync` unavailable.
+
+#### `GET /api/v1/directory/users`
+
+REST v1 twin of `GET /api/directory/users` above (#4031) — same underlying data, the versioned A4 envelope, and a real MCP twin (`list_directory_users`). Optional `?group_id=` query param filters to members of one synced group.
+
+**Permission:** `Directory:Read`
+
+Every call is audited (`directory.users.view`) — this closes a real pre-existing gap: the legacy route above returned this same email/UPN/group-membership PII with no audit call at all until this change. The route **fails closed (503)** if the audit row cannot be persisted, per the [`Sec-Audit-Failed` behavioural-PII posture](#sec-audit-failed-and-the-behavioural-pii-audit-posture) above.
+
+**Response:**
+
+```json
+{
+  "data": [
+    {
+      "id": "8f3c...",
+      "display_name": "Alice Chen",
+      "email": "alice.chen@example.com",
+      "upn": "alice.chen@example.com",
+      "enabled": true,
+      "groups": ["g-engineering"],
+      "synced_at": 1735689600
+    }
+  ],
+  "pagination": { "total": 1, "start": 0, "page_size": 50 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Response (503):** directory sync not available, or the audit subsystem is unavailable (`Sec-Audit-Failed: true`).
+
+#### `GET /api/v1/directory/status`
+
+REST v1 twin of `GET /api/directory/status` above (#4031), with a real MCP twin (`get_directory_status`). No per-person PII (counts + synced-group metadata only) — unaudited, matching the legacy route's own posture.
+
+**Permission:** `Directory:Read`
+
+**Response:**
+
+```json
+{
+  "data": {
+    "provider": "entra",
+    "status": "completed",
+    "last_sync_at": 1735689600,
+    "user_count": 42,
+    "group_count": 5,
+    "last_error": "",
+    "groups": [
+      { "id": "g-engineering", "display_name": "Engineering", "description": "", "mapped_role": "Operator", "synced_at": 1735689600 }
+    ]
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Response (503):** directory sync not available.
+
+**Prerequisite fix (#4031):** `Directory` was used as an RBAC securable on every route in this section but was never seeded into `RbacStore`'s securable-type catalogue — under RBAC-enabled deployments, no role (not even Administrator) could actually be granted `Directory:Read`/`Write`. This is now seeded (Administrator via the CRUD grant loop, Viewer for read — the same population that reads `UserManagement`) and mirrored into `mcp_server.cpp`'s RBAC securable catalogue.
+
+---
+
+### Enrollment
+
+Auto-approve rules (agent-enrollment bypass criteria) and the pending/denied agent-enrollment queue. Both were previously reachable only via `admin_fn_`-gated HTMX dashboard fragments (`GET /fragments/settings/auto-approve`, `GET /fragments/settings/pending`) with no REST v1 or MCP surface (#4031). Backed by `auth::AutoApproveEngine` and `auth::AuthManager::list_pending_agents()`.
+
+**MCP:** REST-only — no MCP twin. `admin_fn_` (the gate these fragments used, and the new `Enrollment` securable's sole initial grant) explicitly excludes MCP tokens from administering server settings/enrollment policy (`auth_routes.cpp`, #520); this is the same reviewed exception the sibling settings-fragment issue #4028 records for its own `admin_fn_`-gated fragments. See [MCP (Model Context Protocol)](#mcp-model-context-protocol) for the general MCP-tier policy.
+
+**RBAC-off note:** the new `Enrollment` securable is Administrator-only today, and — because the underlying gate moved from a role check (`admin_fn_`, always admin-only) to an RBAC permission check — the `(Enrollment, Read)` pair is in `authz_topology_floor.hpp`'s floor set so an RBAC-off deployment (the default) cannot silently widen this from admin-only to any authenticated user.
+
+#### `GET /api/v1/enrollment/auto-approve-rules`
+
+**Permission:** `Enrollment:Read` (Administrator only)
+
+Audited (`enrollment.auto_approve.view`, non-blocking) — the rule set is auto-enrollment bypass criteria, reconnaissance-valuable to an attacker but not per-person data, so the posture is a plain audit log entry rather than the fail-closed behavioural-PII posture above.
+
+**Response:**
+
+```json
+{
+  "data": {
+    "rules": [
+      { "index": 0, "type": "hostname_glob", "value": "*.prod.example.com", "label": "Production hosts", "enabled": true }
+    ],
+    "require_all": false
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`index` is the rule's position in the engine's list — the same handle the existing toggle/delete mutation routes (`POST/DELETE /api/settings/auto-approve/{index}`) key on (there is no separate rule id).
+
+#### `GET /api/v1/enrollment/pending-agents`
+
+**Permission:** `Enrollment:Read` (Administrator only in the default seed)
+
+Do not conflate with the unrelated existing MCP tool `list_pending_approvals`, which serves `ApprovalManager`'s maker-checker action-approval queue — a different domain entirely. Audited (`enrollment.pending_agents.view`, non-blocking) — device-identity fingerprint data, a lighter version of the `device_ci` GDPR-personal-data-adjacent class the agent daily-sync framework already flags for serial/UUID/MAC.
+
+**Confinement (ADR-0017):** unlike every other route in this section, each row here carries genuine per-agent identity (`agent_id` plus hostname/os/arch/agent_version), so this route gates on the admit-then-filter chokepoint (`AuthRoutes::require_fleet_read`), not a bare permission check. A holder of a management-group-scoped `Enrollment:Read` grant (rather than a global one) is admitted and gets the real visible-agent intersection — typically the empty list, since a pending (not-yet-approved) agent normally has no management-group membership yet, but this is a workflow expectation, not a data-model guarantee: an agent pre-assigned to a group before approval yields a non-empty, correctly-confined result instead. This closes a defect where such a grant was previously denied outright (403) instead of admitted with its correct, confined result — see `docs/auth-architecture.md`'s ADR-0017 migration list.
+
+**Response:**
+
+```json
+{
+  "data": [
+    { "agent_id": "a1b2c3d4", "hostname": "host1.example.com", "os": "linux", "arch": "x86_64", "agent_version": "1.4.2", "requested_at": 1735689600, "status": "pending" }
+  ],
+  "pagination": { "total": 1, "start": 0, "page_size": 50 },
+  "meta": { "api_version": "v1" }
+}
+```
 
 ---
 
@@ -7235,6 +7640,35 @@ outcome's granularity.
 - **Permission:** Admin only
 - **Request body (form-encoded):** `issuer`, `skip_tls_verify`
 - **Response:** HTML feedback span — green on success, red on failure with specific error.
+
+#### `GET /api/v1/settings/oidc`
+
+REST v1 read twin of `GET /fragments/settings/directory` (#4031) — note that despite its legacy fragment path, this is pure OIDC SSO config, **not** the AD/Entra directory-sync feature documented under [Directory Sync](#directory-sync) above. Deliberately gated on a freshly-minted `OidcConfig` securable, never `Directory`, to avoid colliding with that unrelated capability.
+
+**Permission:** `OidcConfig:Read` (Administrator only — matches the previous `admin_fn_` gate)
+
+**MCP:** REST-only — no MCP twin, same #520 exception as the [Enrollment](#enrollment) routes above.
+
+The client secret is **never** disclosed — only a boolean `client_secret_configured` reports whether one is set, matching the existing fragment's own non-disclosure posture (a `********` UI placeholder, never the real value).
+
+Audited (`settings.oidc.view`, non-blocking) — IdP/admin-group configuration carries recon value to an attacker but is not per-person data.
+
+**Response:**
+
+```json
+{
+  "data": {
+    "configured": true,
+    "issuer": "https://login.microsoftonline.com/{tenant}/v2.0",
+    "client_id": "abcd-1234",
+    "client_secret_configured": true,
+    "redirect_uri": "https://yuzu.example.com/auth/callback",
+    "admin_group": "grp-object-id",
+    "skip_tls_verify": false
+  },
+  "meta": { "api_version": "v1" }
+}
+```
 
 ### Settings — Certificate Management
 

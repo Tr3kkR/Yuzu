@@ -265,6 +265,15 @@ offline/unreachable agent also produces (CLOSED by #3687 for
 `execute_instruction`, widened to `execute_bundle` and `quarantine_device` —
 every MCP tool that can reach this chokepoint — by #3893). See
 `docs/mcp-server.md` "Security Model" for the full gate list.
+
+[^4031]: Except `Enrollment` and `OidcConfig` (#4031) — MCP tokens must
+never administer the server itself (settings, users, TLS, OIDC — #520), so
+these two securables are denied Read at **every** tier including
+`supervised`, not just `readonly`/`operator`. This is why the enrollment
+auto-approve-rules, pending-agents, and OIDC-config REST v1 routes have no
+MCP tool twin. `Directory` (AD/Entra directory-sync) is unaffected — it has
+real MCP twins (`list_directory_users`/`get_directory_status`) by design.
+
 ## Authorization Tiers
 
 MCP tokens use a **tier** system that restricts what operations are available,
@@ -274,9 +283,9 @@ all writes.
 
 | Tier | Read | Tag Write/Delete | Execute Instructions | Policy/Security/Group Write | Delete (any) |
 |---|---|---|---|---|---|
-| `readonly` | Yes | No | No | No | No |
-| `operator` | Yes | Yes | Yes (auto-approved)[^1398] | No | Tags only (via approval) |
-| `supervised` | Yes | Yes | Yes (via approval) | Yes (via approval) | Yes (via approval) |
+| `readonly` | Yes[^4031] | No | No | No | No |
+| `operator` | Yes[^4031] | Yes | Yes (auto-approved)[^1398] | No | Tags only (via approval) |
+| `supervised` | Yes[^4031] | Yes | Yes (via approval) | Yes (via approval) | Yes (via approval) |
 
 ### Tier details
 
@@ -494,6 +503,12 @@ for the tool to execute.
 | 78 | `list_tar_process_tree_devices` (#4027) | List the operator-scoped device picker for the TAR process-tree viewer; each row carries `online`, which is always `true` today (the sole wired provider sources this list from the live-session registry, so a disconnected enrolled device is not included — #4027 fix round, CDX-P1-02/K1). Read through the SAME per-operator scoped provider as the REST twin and the `/fragments/tar/process-tree` HTML picker — not `list_agents`' fleet-wide `agents_fn`. Mirrors `GET /api/v1/tar/process-tree`. | `Infrastructure:Read` |
 | 79 | `list_tar_capture_sources_devices` (#4027) | List the operator-scoped device picker for the TAR capture-sources (ADR-0015 enable/disable) frame. Same row shape and provider as `list_tar_process_tree_devices`. Mirrors `GET /api/v1/tar/capture-sources`. | `Infrastructure:Read` |
 | 80 | `list_tar_retention_paused` (#4027) | List the calling operator's most recent TAR retention-paused source scan (per-username state; filtered to the operator's visible agents), one row per (agent, paused source). `scan_id` is `""` when the operator has not dispatched a scan yet — `POST /fragments/tar/retention-paused/scan` is dashboard-only today. Mirrors `GET /api/v1/tar/retention-paused`. | `Infrastructure:Read` |
+| 81 | `list_directory_users` (#4031) | List AD/Entra-synced directory users, optionally filtered by `group_id`. Returns email/UPN/group-membership PII — every call is audited (`directory.users.view`, the same domain verb as the REST twin, not the generic `mcp.list_directory_users`). Mirrors `GET /api/v1/directory/users` and the legacy `GET /api/directory/users` — all three call the same shared row builder. No new constructor wiring: `DirectorySync*` was already threaded into `McpServer` for access-review email enrichment. | `Directory:Read` |
+| 82 | `get_directory_status` (#4031) | AD/Entra directory-sync status: provider, last sync time/error, user/group counts, synced group catalog. No per-person PII (counts + group metadata only) — unaudited, matching the REST twins' identical decision. `groups[].mapped_role` (the AD-group -> Yuzu-role authorization map, same data class as the floored `OidcConfig` `admin_group` field) is the empty string for a non-admin caller regardless of MCP tier — admin session role required, checked via `auth::effective_role`. Mirrors `GET /api/v1/directory/status` and the legacy `GET /api/directory/status`. | `Directory:Read` |
+| 83 | `preview_management_group_agent_count` (#4033, #2146 API-parity Batch A) | Preview the number of currently-visible agents that would match a would-be management group's filter criteria, before creating it. Mirrors `/fragments/create-group-form`'s own live count and REST `GET /api/v1/management-groups/agent-count-preview`. This tool and the REST route call the same shared builder (`group_agent_count_preview.hpp`), so those two cannot drift from each other; the dashboard fragment keeps its own separate, behaviourally-equivalent inline implementation (`DashboardRoutes::parse_filters`), unchanged by this PR. `filters` is a map of mangled column key -> exact-match value for `plugin`'s response columns (lowercase, spaces/dashes -> underscore, e.g. `"Local Addr"` -> `"local_addr"`); an empty/omitted `filters` returns a genuine `0` (no scoped count to report), never a store read; a malformed `filters` (non-string value, or `filters` shaped as an array) is rejected with `kInvalidParams` rather than silently treated as empty. Gated `ManagementGroup:Write` — matching the fragment's own gate exactly, **not** `ManagementGroup:Read`, even though the tool performs no mutation; a deliberate consequence: approval-gated at the supervised MCP tier (maker-checker), like every other `ManagementGroup:Write` surface. | `ManagementGroup:Write` |
+| 84 | `get_policy` (api-parity #4034) | Single-policy detail, including its compliance summary — the fields `list_policies` does not carry (yaml_source, remediation_available, inputs, triggers, management_groups, compliance breakdown). Mirrors `GET /api/v1/policies/{id}` exactly (same shared builder). | `Policy:Read` |
+| 85 | `list_policy_fragments` (api-parity #4034) | List reusable check/fix/postCheck policy fragments, optionally filtered by name substring. Mirrors `GET /api/v1/policy-fragments`. | `Policy:Read` |
+| 86 | `get_policy_agent_statuses` (api-parity #4034) | One policy's per-agent compliance statuses (fan-out list) plus a `summary` tallied from exactly the agents returned — the per-agent half `get_compliance_summary` does not carry. **Confined via the ADR-0017 `require_fleet_read` gate**, not a bare permission check: a management-group- or service-scope-confined caller sees only its own visible agents, and `summary` counts only that filtered set, never the store's unfiltered fleet-wide aggregate. Mirrors `GET /api/v1/compliance/{id}` exactly (same shape, same shared builder). Audited as `compliance.agent_statuses.view`, set-and-proceed (`audit_persisted:false` on a persist miss, never a failed call) — MCP's own convention for surfacing an audit-persist gap, NOT because `check_result` is deemed non-behavioural-PII (it isn't — it carries raw, unrestricted per-agent instruction output; the REST twin `GET /api/v1/compliance/{id}` fails closed with `503` for exactly that reason). | `Policy:Read` |
 
 > **TAR read twins (#4027) — two related fragments deliberately NOT twinned,
 > deferred as scope, not impossibility.**
@@ -593,7 +608,9 @@ for the tool to execute.
 > `approval_id` + `status_url`, and after an admin approves, a re-call with the
 > `approval_id` argument performs the revoke. `list_issued_certs` is read-only
 > (`Security:Read`) and works on **every** tier including `readonly` (the
-> `readonly` tier permits all Read operations). Exposing both keeps MCP at parity
+> `readonly` tier permits Read on `Security`, along with every other
+> securable except the #520 server-administration set — see the tier
+> table's footnote below). Exposing both keeps MCP at parity
 > with the dashboard/REST CA surface (agentic-first principle A1).
 
 > **`assign_engine_role`/`unassign_engine_role` tier behavior (PR 4.2):** both
