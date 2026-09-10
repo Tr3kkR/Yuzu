@@ -283,6 +283,16 @@ struct RegistryMechanismTestControls {
     /// allocation (the pass is unwound, counted and retried on a backoff;
     /// persistent failure reports the mechanism inert). Null clears it.
     std::function<void()> sweep_hook;
+    /// Runs on the sweeper thread inside run_off_lock(), off-lock, on any pass
+    /// that staged at least one probe launch - right after that launch loop,
+    /// before drain/dispatch processing. Throwing here models an allocation
+    /// failure landing after a probe in the SAME pass has already launched
+    /// successfully but before publish_locked() can commit it - the exact
+    /// interleaving PR #4225's review found could otherwise strand that
+    /// probe's watch permanently. Fires only when a launch was actually
+    /// staged, so a test can arm it once, up front, with no timing race
+    /// against the sweeper's own cadence. Null clears it.
+    std::function<void()> emit_bookkeeping_hook;
     std::size_t probe_lane_cap{0};
     std::size_t drain_lane_cap{0};
     std::size_t retiring_cap{0};

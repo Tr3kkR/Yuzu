@@ -4264,6 +4264,90 @@ TEST_CASE("Registry mechanism (direct): a throwing emit is contained on the fire
     mech->stop();
 }
 
+TEST_CASE("Registry mechanism (direct): an allocation failure after a probe launches "
+          "successfully does not permanently strand the watch (PR #4225 review)",
+          "[spark][mechanism][windows][walkoff]") {
+    // Sequence: an initial probe parks past the caller budget (published to
+    // the sweeper), then throws (WorkerThrew) -> fail_backend_locked ->
+    // Deferred. The NEXT sweep pass promotes Deferred -> Pending and stages a
+    // real launch (this time the probe succeeds normally) - run_off_lock()
+    // launches it, then the injected hook throws, modelling an allocation
+    // failure landing in the SAME pass, after that launch. Pre-fix, this
+    // stranded the watch: unwind_pass_locked() skipped the already-launched
+    // entry on the (here false) assumption publish_locked() would handle it,
+    // leaving w.probe == Pending with w.call == nullptr forever - unrescuable
+    // by on_fire() (Idle-only relaunch) or watch() (idempotent no-op on an
+    // already-watched key). Post-fix, reconcile_probe_launches_locked() runs
+    // unconditionally from unwind_pass_locked() too, adopts the launched call,
+    // and the watch re-establishes on the very next pass.
+    ScratchRegKey a("strand_probe");
+    auto mech = make_registry_mechanism();
+    REQUIRE(mech != nullptr);
+    std::atomic<int> probe_calls{0};
+    std::atomic<bool> strand_once{true}; // armed from the start: see emit_bookkeeping_hook's
+                                          // doc comment - it only ever fires on a pass that
+                                          // staged a real launch, so there is no timing race
+                                          // against the sweeper's own cadence to coordinate.
+    {
+        RegistryMechanismTestControls ctl;
+        ctl.caller_wait_budget = 30ms;   // short, so the first (parked) probe publishes fast
+        ctl.backend_retry_base = 40ms;   // short, so the Deferred retry is fast
+        ctl.sweep_cadence = 20ms;        // short, so the sweeper notices promptly
+        ctl.probe_hook = [&](std::string_view) {
+            if (probe_calls.fetch_add(1, std::memory_order_acq_rel) == 0) {
+                std::this_thread::sleep_for(120ms); // past caller_wait_budget
+                throw std::runtime_error("injected backend failure (probe #1)");
+            }
+            // probe #2 (the Deferred retry): proceeds to a real establishment.
+        };
+        ctl.emit_bookkeeping_hook = [&] {
+            if (strand_once.exchange(false, std::memory_order_acq_rel))
+                throw std::runtime_error(
+                    "injected run_off_lock failure after a successful probe launch "
+                    "(models an allocation failure, PR #4225 review)");
+        };
+        REQUIRE(set_registry_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    std::atomic<int> delivered{0};
+    mech->start([&](const std::string&, SparkData) { delivered.fetch_add(1, std::memory_order_acq_rel); },
+                [&](const std::string&, bool, std::string_view) {});
+    const auto spec = registry_spec("HKCU", a.sub);
+    REQUIRE(mech->watch(spark_key(spec), spec.params).has_value());
+
+    // Probe #1 parks, times out the caller, then throws -> Deferred. Confirm
+    // the backend failure actually landed before waiting on recovery, so a
+    // failure here points at the wrong half of the setup, not the fix itself.
+    REQUIRE(eventually(
+        [&] {
+            auto d = registry_debug_counters_for_test(*mech);
+            return d.has_value() && d->probe_backend_failed >= 1;
+        },
+        3000ms));
+
+    // The Deferred retry (probe #2) launches, the injected hook strands it
+    // (pre-fix) or the fix reconciles it (post-fix) - either way this is the
+    // one pass that matters. Give it generous margin past backend_retry_base
+    // + a few sweep cadences, then require the SAME key to still be
+    // observable: a real registry write must still produce a Fired event.
+    // Pre-fix this hangs the whole 6 s deadline (permanently no live wait);
+    // post-fix it resolves within one or two sweep cadences of the write.
+    std::this_thread::sleep_for(300ms);
+    a.write(1);
+    INFO("probe_calls=" << probe_calls.load() << " strand_hook_consumed="
+                        << !strand_once.load(std::memory_order_acquire));
+    CHECK(eventually([&] { return delivered.load(std::memory_order_acquire) >= 1; }, 6000ms));
+    {
+        auto d = registry_debug_counters_for_test(*mech);
+        REQUIRE(d.has_value());
+        INFO("probe_launched=" << d->probe_launched << " probe_backend_failed="
+                                << d->probe_backend_failed << " sweep_pass_failed="
+                                << d->sweep_pass_failed);
+        CHECK(d->sweep_pass_failed >= 1); // the injected throw genuinely failed a pass
+        CHECK_FALSE(strand_once.load(std::memory_order_acquire)); // the hook did fire once
+    }
+    mech->stop();
+}
+
 // ── Inline-tier dispatch latency (the ADR-0021 §3 µs claim) ──────────────────
 //
 // SCOPE — read before trusting these numbers. This measures ONLY the

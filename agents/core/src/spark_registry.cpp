@@ -582,6 +582,10 @@ struct SweepWork {
     std::vector<std::unique_ptr<RegWatch>> dead_watches;
     std::vector<std::pair<std::string, std::uint64_t>> failed_emits;    ///< restore needs_resync
     std::vector<std::pair<std::string, std::uint64_t>> succeeded_emits; ///< reset the retry schedule
+    /// Captured under mu_ at the top of sweep_locked() (the live member can be
+    /// rewritten off-lock by a test at any time - this is the pass's own
+    /// snapshot, race-free to read in run_off_lock()). Null outside tests.
+    std::shared_ptr<const std::function<void()>> emit_bookkeeping_hook;
 };
 
 class WindowsRegistryMechanism final : public ISparkMechanism {
@@ -630,6 +634,15 @@ public:
         // throw here leaves core_ null, so a retried start() is a real retry and
         // never the silent `if (core_) return` no-op (governance sg-7).
         drains_in_flight_.reserve(2 * kDrainLaneCap + 16);
+        // PR #4225 review (LOW, test-seam-only): reserved against the
+        // COMPILE-TIME cap, but sweep_locked() batches drain_launches against
+        // the RUNTIME-overridable drain_lane_cap_ (set_registry_test_controls_
+        // for_test). No test today raises drain_lane_cap above kDrainLaneCap
+        // (verified - the one override in test_spark_mechanism.cpp sets it to
+        // 1, below this constant), so run_off_lock()'s drain_outcomes_.emplace_
+        // back stays within this reservation in every case exercised. A future
+        // test that raises the cap above kDrainLaneCap would need this reserve
+        // raised to match drain_lane_cap_'s new value.
         drain_outcomes_.reserve(kDrainLaneCap);
         core_ = std::move(core);
         stopping_ = false;
@@ -904,6 +917,11 @@ public:
             sweep_hook_ = std::make_shared<const std::function<void()>>(std::move(c.sweep_hook));
         else
             sweep_hook_.reset();
+        if (c.emit_bookkeeping_hook)
+            emit_bookkeeping_hook_ =
+                std::make_shared<const std::function<void()>>(std::move(c.emit_bookkeeping_hook));
+        else
+            emit_bookkeeping_hook_.reset();
         if (c.probe_lane_cap)
             probe_lane_.set_cap_for_test(c.probe_lane_cap);
         if (c.drain_lane_cap) {
@@ -1257,6 +1275,7 @@ private:
     /// edges. Everything blocking or dispatching is deferred into `work`.
     void sweep_locked(SweepWork& work) {
         const auto t_start = Clock::now();
+        work.emit_bookkeeping_hook = emit_bookkeeping_hook_; // shared_ptr copy: nothrow
         // RESERVE BEFORE MUTATE (governance sg-7/cs-3): every container this pass
         // can push into is sized here, before any state changes (including the lost-list unlink below), so a
         // std::bad_alloc surfaces with nothing half-done - the pass-level catch in
@@ -1365,22 +1384,44 @@ private:
                 break;
             }
             if (w.faulted_now != w.faulted_reported) {
-                w.faulted_reported = w.faulted_now;
-                health_edges_.fetch_add(1, std::memory_order_relaxed);
+                // Stage the record BEFORE flipping state (PR #4225 review,
+                // same root cause as the probe-launch fix above): push_back's
+                // capacity is reserved but the Action's own string-key copy
+                // can still throw. Ordered this way, a throw here leaves
+                // faulted_reported untouched, so the NEXT pass simply
+                // re-attempts this same edge instead of believing (wrongly)
+                // that it was already reported.
                 work.actions.push_back({SweepWork::Action::Kind::Fault, w.spark_key, w.faulted_now,
                                         w.fault_reason, 0, &w});
+                w.faulted_reported = w.faulted_now;
+                health_edges_.fetch_add(1, std::memory_order_relaxed);
             }
         }
     }
 
     /// Off-lock half of a pass: launches, then dispatch in recorded order.
     void run_off_lock(SweepWork& work) {
+        const bool had_probe_launches = !work.probe_launches.empty();
         for (auto& pl : work.probe_launches) {
             auto lr = probe_lane_.launch(std::move(*pl.job));
             pl.job.reset();
             pl.status = lr.status;
             pl.call = std::move(lr.call);
         }
+        // PR #4225 review: nothing below this point is wrapped in a try/catch
+        // that would keep a throw from escaping run_off_lock() entirely - the
+        // actions loop's own try/catch(...) absorbs a throw from emit_()/
+        // fault_() or from staging succeeded_emits/failed_emits, but a throw
+        // from drain-outcome bookkeeping, or ANY throw at this exact point,
+        // propagates straight out. If a probe launch above already succeeded
+        // (its `pl.job` is now reset), the caller's catch handler must still
+        // reconcile it - see reconcile_probe_launches_locked()'s doc comment.
+        // The test-only hook below (fired only on a pass that actually staged
+        // a launch, so a test can arm it once, up front, with no timing race
+        // against the sweeper) models exactly that interleaving without
+        // needing a genuine allocation failure.
+        if (had_probe_launches && work.emit_bookkeeping_hook && *work.emit_bookkeeping_hook)
+            (*work.emit_bookkeeping_hook)();
         // drain_outcomes_ is reserved to kDrainLaneCap in start() and cleared by
         // publish_locked(); drain_launches never exceeds that cap, so these
         // emplacements do not allocate (sweeper-private scratch).
@@ -1406,12 +1447,23 @@ private:
                         fault_(a.key, a.faulted, a.reason);
                 } else if (emit_) {
                     emit_(a.key, SparkData{std::monostate{}});
-                    work.succeeded_emits.emplace_back(a.key, a.epoch); // reserved: nothrow
+                    // PR #4225 review: the vector's CAPACITY is reserved (no
+                    // reallocation), but constructing the pair's std::string
+                    // key here is a separate heap allocation reserve() does
+                    // not cover - this can throw, and IS caught by this
+                    // action's own catch(...) below (converted to a counted
+                    // failed_emits entry) rather than escaping run_off_lock()
+                    // - the run_off_lock()-escaping case this PR fixes is
+                    // modelled by the hook near the top of that function
+                    // instead, since only a throw with no enclosing catch
+                    // reaches unwind_pass_locked() with a probe already
+                    // launched.
+                    work.succeeded_emits.emplace_back(a.key, a.epoch);
                 }
             } catch (...) {
                 if (a.kind == SweepWork::Action::Kind::Emit) {
                     emit_failed_.fetch_add(1, std::memory_order_relaxed);
-                    work.failed_emits.emplace_back(a.key, a.epoch); // reserved: nothrow
+                    work.failed_emits.emplace_back(a.key, a.epoch); // same allocation caveat as above
                 } else {
                     fault_failed_.fetch_add(1, std::memory_order_relaxed);
                 }
@@ -1432,19 +1484,47 @@ private:
         return w.active && w.faulted_reported == a.faulted && w.faulted_now == a.faulted;
     }
 
-    /// Relock half: publish launched probes with re-validation; file drain
-    /// outcomes; restore any resync obligation whose submit threw.
-    void publish_locked(SweepWork& work) {
+    /// Resolve every staged probe launch, under mu_. Shared by the normal-pass
+    /// path (publish_locked, where run_off_lock() ran its launch loop to
+    /// completion so every entry's `pl.job` is already reset) and the
+    /// threw-mid-pass recovery path (unwind_pass_locked, where the launch loop
+    /// may have been aborted partway through - some entries launched, some
+    /// not). An entry whose `pl.job` is still populated never reached the
+    /// launch call at all: defer it exactly as sweep_locked staged it, same as
+    /// before. An entry whose `pl.job` is empty already ran the real launch
+    /// (`pl.status`/`pl.call` are its actual outcome) - `publish_locked` would
+    /// have committed that outcome; if a LATER throw in the same pass
+    /// (fault-edge/emit-action string copies, drain-outcome bookkeeping)
+    /// preempted it, this must still do so, not skip it (PR #4225 review
+    /// finding: skipping left the watch stuck ProbeState::Pending with
+    /// w.call == nullptr forever - sweep_locked's Pending case is then a
+    /// permanent no-op, unrescuable by on_fire, which only relaunches from
+    /// Idle, or watch(), which is an idempotent no-op on an already-watched
+    /// key - nothing signals the operator, and the key reports
+    /// last-known-healthy indefinitely).
+    /// noexcept: every operation here is scalar/atomic or a noexcept optional
+    /// move (DetachedCall's move ops are noexcept) - no allocation, so this is
+    /// safe to call from the noexcept recovery path too. `pl.call`, if left
+    /// unused (the never-launched or `!live` branches), is abandoned when
+    /// `work` itself is destroyed by the caller (self-disposing, off-lock) -
+    /// never pushed into a container that could itself throw in here.
+    void reconcile_probe_launches_locked(SweepWork& work) noexcept {
         for (auto& pl : work.probe_launches) {
+            if (pl.job) {
+                // Never reached run_off_lock's launch call for this entry.
+                auto it = watches_.find(pl.key);
+                if (it != watches_.end() && it->second->probe == ProbeState::Pending &&
+                    it->second->probe_gen == pl.gen && !it->second->call)
+                    defer_admission_locked(*it->second, DetachedLaunch::LaunchFailed);
+                continue;
+            }
             auto it = watches_.find(pl.key);
             RegWatch* w = it != watches_.end() ? it->second.get() : nullptr;
             const bool live = w && w->active && !stopping_ && w->probe == ProbeState::Pending &&
                               w->probe_gen == pl.gen && !w->call;
             if (!live) {
-                if (pl.call)
-                    work.stale_calls.push_back(std::move(*pl.call));
                 probe_discarded_.fetch_add(1, std::memory_order_relaxed);
-                continue;
+                continue; // pl.call (if any) abandoned with `work`, off-lock
             }
             if (pl.status == DetachedLaunch::Launched) {
                 probe_launched_.fetch_add(1, std::memory_order_relaxed);
@@ -1454,6 +1534,12 @@ private:
             }
         }
         work.probe_launches.clear();
+    }
+
+    /// Relock half: publish launched probes with re-validation; file drain
+    /// outcomes; restore any resync obligation whose submit threw.
+    void publish_locked(SweepWork& work) {
+        reconcile_probe_launches_locked(work);
         for (auto& [status, payload] : drain_outcomes_) {
             if (status == DetachedLaunch::Launched) {
                 drains_launched_.fetch_add(1, std::memory_order_relaxed);
@@ -1516,6 +1602,11 @@ private:
             }
         }
         work.drain_launches.clear();
+        // TEMP (pre-fix, for RED evidence): the ORIGINAL buggy skip logic,
+        // restored here only long enough to capture a red run against the new
+        // test - see reconcile_probe_launches_locked() a few commits later
+        // for the real fix and why this comment ("publish_locked's
+        // re-validation owns it") is false on this exact path.
         for (auto& pl : work.probe_launches) {
             if (!pl.job)
                 continue; // launched: publish_locked's re-validation owns it
@@ -1717,6 +1808,7 @@ private:
         drain_outcomes_; ///< sweeper-thread private scratch between run_off_lock and publish_locked
     std::shared_ptr<const ProbeHook> probe_hook_;                ///< test seam
     std::shared_ptr<const std::function<void()>> sweep_hook_; ///< test seam (sre6-1 coverage)
+    std::shared_ptr<const std::function<void()>> emit_bookkeeping_hook_; ///< test seam (PR #4225 review)
     SparkDetachedLane probe_lane_;
     SparkDetachedLane drain_lane_;
 
