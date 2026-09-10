@@ -21,6 +21,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
+#include <expected>
 #include <memory>
 #include <optional>
 #include <string>
@@ -80,6 +81,22 @@ struct Harness {
     std::string last_import_chain;
     int import_calls{0};
 
+    // gap-matrix #10: code-signing leaf issuance fake. Defaults to a
+    // successful, fixed issuance so happy-path tests need not set anything;
+    // `issue_result` overrides for a failure-classification test.
+    std::expected<CodeSigningIssuance, std::string> issue_result{
+        CodeSigningIssuance{.certificate_pem = "-----BEGIN CERTIFICATE-----\nLEAF\n-----END "
+                                               "CERTIFICATE-----\n",
+                           .chain_pem = "-----BEGIN CERTIFICATE-----\nROOT\n-----END "
+                                        "CERTIFICATE-----\n",
+                           .serial_hex = "C5C1FEED",
+                           .not_after = "2027-01-01T00:00:00Z"}};
+    int issue_calls{0};
+    std::string last_issue_csr;
+    std::string last_issue_label;
+    std::optional<int> last_issue_validity_days;
+    std::string last_issue_issued_by;
+
     Harness() {
         // Hand-expanded YUZU_REQUIRE_PG_DB_TPL (that macro declares its own function-local
         // `var`, which cannot become a class member — see db_holder's doc comment above for
@@ -131,8 +148,19 @@ struct Harness {
             last_import_chain = ch;
             return import_outcome;
         };
+        IssueCodeSigningFn issue_code_signing =
+            [this](const std::string& csr_pem, const std::string& label,
+                  std::optional<int> validity_days,
+                  const std::string& issued_by) -> std::expected<CodeSigningIssuance, std::string> {
+            ++issue_calls;
+            last_issue_csr = csr_pem;
+            last_issue_label = label;
+            last_issue_validity_days = validity_days;
+            last_issue_issued_by = issued_by;
+            return issue_result;
+        };
         routes.register_routes(sink, auth, perm, audit, null_store ? nullptr : store.get(), crl,
-                               export_csr, import_chain);
+                               export_csr, import_chain, issue_code_signing);
     }
 };
 
@@ -532,6 +560,10 @@ TEST_CASE("ca_routes: 503 when CA store unavailable", "[ca_routes][pki][pg]") {
                            R"({"intermediate_pem":"x","chain_pem":"y"})");
     REQUIRE(imp);
     REQUIRE(imp->status == 503);
+    auto issue = h.sink.Post("/api/v1/ca/issue-code-signing",
+                             R"({"csr_pem":"x","label":"y"})");
+    REQUIRE(issue);
+    REQUIRE(issue->status == 503);
 }
 
 // ── PR6 subordinate-CA REST ─────────────────────────────────────────────────
@@ -810,5 +842,168 @@ TEST_CASE("ca_routes: dashboard fragment renders empty-CA + no-root states witho
         auto res = h.sink.Get("/fragments/settings/ca");
         REQUIRE(res);
         REQUIRE(res->body.find("unavailable") != std::string::npos);
+    }
+}
+
+// ── gap-matrix #10: code-signing leaf issuance ──────────────────────────────
+
+TEST_CASE("ca_routes: POST /ca/issue-code-signing issues, returns the JSON shape, audits",
+          "[ca_routes][pki][code-signing][security][pg]") {
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root()));
+    h.wire();
+
+    auto ok = h.sink.Post("/api/v1/ca/issue-code-signing",
+                          R"({"csr_pem":"-----BEGIN CERTIFICATE REQUEST-----\nFAKE\n-----END )"
+                          R"(CERTIFICATE REQUEST-----\n","label":"build-signer-01",)"
+                          R"("validity_days":90})");
+    REQUIRE(ok);
+    REQUIRE(ok->status == 200);
+    REQUIRE(h.last_perm_type == "Security");
+    REQUIRE(h.last_perm_op == "Write");
+    REQUIRE(h.issue_calls == 1);
+    REQUIRE(h.last_issue_label == "build-signer-01");
+    REQUIRE(h.last_issue_validity_days.has_value());
+    REQUIRE(*h.last_issue_validity_days == 90);
+    REQUIRE(h.last_issue_csr.find("FAKE") != std::string::npos);
+
+    auto j = json::parse(ok->body);
+    REQUIRE(j["certificate_pem"] == h.issue_result->certificate_pem);
+    REQUIRE(j["chain_pem"] == h.issue_result->chain_pem);
+    REQUIRE(j["serial_hex"] == "C5C1FEED");
+    REQUIRE(j["not_after"] == "2027-01-01T00:00:00Z");
+    REQUIRE(j["purpose"] == "code-signing");
+    REQUIRE(j["meta"]["api_version"] == "v1");
+
+    bool saw_issue = false;
+    for (const auto& a : h.audits) {
+        if (a.action == "ca.cert.issued" && a.result == "success") {
+            saw_issue = true;
+            REQUIRE(a.target_type == "CodeSigningCertificate");
+            REQUIRE(a.target_id == "C5C1FEED");
+        }
+    }
+    REQUIRE(saw_issue);
+
+    // validity_days is optional.
+    h.issue_calls = 0;
+    auto no_validity = h.sink.Post("/api/v1/ca/issue-code-signing",
+                                   R"({"csr_pem":"CSR","label":"another-signer"})");
+    REQUIRE(no_validity);
+    REQUIRE(no_validity->status == 200);
+    REQUIRE(h.issue_calls == 1);
+    REQUIRE_FALSE(h.last_issue_validity_days.has_value());
+}
+
+TEST_CASE("ca_routes: POST /ca/issue-code-signing gates on Security:Write",
+          "[ca_routes][pki][code-signing][security][pg]") {
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root()));
+    h.perm_allow = false;
+    h.wire();
+
+    auto denied = h.sink.Post("/api/v1/ca/issue-code-signing",
+                              R"({"csr_pem":"CSR","label":"signer"})");
+    REQUIRE(denied);
+    REQUIRE(denied->status == 403);
+    REQUIRE(h.issue_calls == 0); // gate fired BEFORE the injected fn ran
+}
+
+TEST_CASE("ca_routes: POST /ca/issue-code-signing rejects an invalid label",
+          "[ca_routes][pki][code-signing][security][pg]") {
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root()));
+    h.wire();
+
+    // Empty, too long (65 chars), and containing a DN-metacharacter / space —
+    // none of these ever reach the injected issuance fn.
+    const std::string too_long(65, 'a');
+    for (const std::string& bad_label :
+        {std::string(""), too_long, std::string("has space"), std::string("cn=evil"),
+         std::string("yuzu://inst/agent/x")}) {
+        h.issue_calls = 0;
+        auto j = json::object();
+        j["csr_pem"] = "CSR";
+        j["label"] = bad_label;
+        auto r = h.sink.Post("/api/v1/ca/issue-code-signing", j.dump());
+        REQUIRE(r);
+        REQUIRE(r->status == 400);
+        REQUIRE(h.issue_calls == 0);
+    }
+
+    // A conforming label (letters, digits, '.', '_', '-') is accepted.
+    auto ok = h.sink.Post("/api/v1/ca/issue-code-signing",
+                          R"({"csr_pem":"CSR","label":"build.signer_01-x"})");
+    REQUIRE(ok);
+    REQUIRE(ok->status == 200);
+}
+
+TEST_CASE("ca_routes: POST /ca/issue-code-signing rejects unknown fields + missing csr_pem + "
+          "oversized body",
+          "[ca_routes][pki][code-signing][security][pg]") {
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root()));
+    h.wire();
+
+    // Mass-assignment guard: an unknown field 400s before the fn runs.
+    auto extra = h.sink.Post(
+        "/api/v1/ca/issue-code-signing",
+        R"({"csr_pem":"CSR","label":"signer","is_admin":true})");
+    REQUIRE(extra);
+    REQUIRE(extra->status == 400);
+    REQUIRE(h.issue_calls == 0);
+
+    // csr_pem is required.
+    auto missing = h.sink.Post("/api/v1/ca/issue-code-signing", R"({"label":"signer"})");
+    REQUIRE(missing);
+    REQUIRE(missing->status == 400);
+    REQUIRE(h.issue_calls == 0);
+
+    // Non-integer validity_days is rejected.
+    auto bad_validity = h.sink.Post(
+        "/api/v1/ca/issue-code-signing",
+        R"({"csr_pem":"CSR","label":"signer","validity_days":"90"})");
+    REQUIRE(bad_validity);
+    REQUIRE(bad_validity->status == 400);
+    REQUIRE(h.issue_calls == 0);
+
+    // Oversized body → 413, bounded before the JSON parser (mirrors revoke's
+    // Hermes M3 precedent).
+    std::string big =
+        R"({"csr_pem":")" + std::string(70000, 'x') + R"(","label":"signer"})";
+    auto big_res = h.sink.Post("/api/v1/ca/issue-code-signing", big);
+    REQUIRE(big_res);
+    REQUIRE(big_res->status == 413);
+    REQUIRE(h.issue_calls == 0);
+}
+
+TEST_CASE("ca_routes: POST /ca/issue-code-signing classifies fn failures via the prefix scheme",
+          "[ca_routes][pki][code-signing][security][pg]") {
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root()));
+    h.wire();
+
+    struct Case {
+        std::string error;
+        int status;
+        const char* result;
+    };
+    const Case cases[] = {
+        {std::string(kCodeSigningNoRootPrefix) + "no CA root", 409, "denied"},
+        {std::string(kCodeSigningBadCsrPrefix) + "csr_pem is invalid", 400, "denied"},
+        {"failed to record issued certificate", 500, "failure"}, // unprefixed → generic failure
+    };
+    for (const auto& c : cases) {
+        h.audits.clear();
+        h.issue_result = std::unexpected(c.error);
+        auto r = h.sink.Post("/api/v1/ca/issue-code-signing",
+                             R"({"csr_pem":"CSR","label":"signer"})");
+        REQUIRE(r);
+        REQUIRE(r->status == c.status);
+        bool saw = false;
+        for (const auto& a : h.audits)
+            if (a.action == "ca.cert.issued" && a.result == c.result)
+                saw = true;
+        REQUIRE(saw);
     }
 }

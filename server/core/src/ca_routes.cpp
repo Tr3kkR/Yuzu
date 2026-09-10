@@ -26,6 +26,17 @@ constexpr std::size_t kMaxRevokeBody = 64 * 1024; // bound the revoke POST body
 // + parent chain is a few KB; 256 KiB is generous headroom while still refusing
 // a multi-MB POST on this privileged trust-root-switching endpoint (PR6).
 constexpr std::size_t kMaxImportBody = 256 * 1024;
+// Bound the code-signing issuance POST body before parsing (gap-matrix #10).
+// The JSON body wraps a PEM CSR (server.cpp's issue_code_signing_leaf enforces
+// the same 16 KiB CSR-PEM ceiling sign_agent_csr uses) as an escaped JSON
+// string — each PEM newline costs 2 bytes escaped ("\n") — plus a <=64 byte
+// label and a small validity_days integer. 64 KiB is 4x the raw 16 KiB CSR
+// ceiling: generous headroom over the worst-case ~2x JSON-escaping cost, with
+// room to spare for the other two fields and JSON framing, while still three
+// orders of magnitude under httplib's 100 MiB backstop on this privileged
+// endpoint. Mirrored exactly by body_cap_policy.hpp's ca_issue_code_signing
+// row — same two-authority-split precedent as kMaxRevokeBody/kMaxImportBody.
+constexpr std::size_t kMaxIssueCodeSigningBody = 64 * 1024;
 
 int clamp_int(const httplib::Request& req, const char* key, int def, int lo, int hi) {
     auto it = req.params.find(key);
@@ -234,16 +245,22 @@ std::string render_ca_fragment(CaStore* ca_store) {
 
 void CaRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
                                CaStore* ca_store, PublishCrlFn publish_crl_fn,
-                               ExportCsrFn export_csr_fn, ImportChainFn import_chain_fn) {
+                               ExportCsrFn export_csr_fn, ImportChainFn import_chain_fn,
+                               IssueCodeSigningFn issue_code_signing_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), ca_store,
-                    std::move(publish_crl_fn), std::move(export_csr_fn), std::move(import_chain_fn));
+                    std::move(publish_crl_fn), std::move(export_csr_fn), std::move(import_chain_fn),
+                    std::move(issue_code_signing_fn));
 }
 
 void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
                                CaStore* ca_store, PublishCrlFn publish_crl_fn,
-                               ExportCsrFn export_csr_fn, ImportChainFn import_chain_fn) {
-    (void)auth_fn; // principal is resolved inside audit_fn/perm_fn from the request
+                               ExportCsrFn export_csr_fn, ImportChainFn import_chain_fn,
+                               IssueCodeSigningFn issue_code_signing_fn) {
+    // auth_fn is captured by the new /issue-code-signing handler below (to
+    // attribute IssuedCertRecord::issued_by to the calling operator); every
+    // other handler in this file still resolves its principal from
+    // audit_fn/perm_fn alone.
     spdlog::info("CA routes: registering /api/v1/ca/* + Settings CA panel");
 
     // Shared revoke core (REST + dashboard wrapper) over an ALREADY-normalised
@@ -508,6 +525,140 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                               {"meta", {{"api_version", "v1"}}}};
         res.set_content(out.dump(), kJson);
     });
+
+    // ── POST /api/v1/ca/issue-code-signing ── Security:Write: code-signing ────
+    // leaf issuance via CSR custody (gap-matrix #10). The operator holds the
+    // private key and submits a CSR; the server signs and returns ONLY the
+    // leaf + chain. Body: {"csr_pem","label","validity_days"?}. SAFE because
+    // the injected issue_code_signing_fn (ServerImpl) hard-pins usage to
+    // {.code_signing=true} and sets CN=label — see this file's ca_routes.hpp
+    // header for why that never reaches the #1118 agent-identity gate.
+    sink.Post(
+        "/api/v1/ca/issue-code-signing",
+        [perm_fn, audit_fn, auth_fn, ca_store, issue_code_signing_fn](
+            const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn(req, res, "Security", "Write"))
+                return;
+            if (!ca_store || !ca_store->is_open() || !issue_code_signing_fn) {
+                res.status = 503;
+                res.set_content(error_json_a4(503, "CA not available", make_correlation_id()),
+                                kJson);
+                return;
+            }
+            if (req.body.size() > kMaxIssueCodeSigningBody) {
+                res.status = 413;
+                res.set_content(
+                    error_json_a4(413, "request body too large", make_correlation_id()), kJson);
+                return;
+            }
+            nlohmann::json body;
+            try {
+                body = nlohmann::json::parse(req.body, nullptr, false);
+            } catch (...) {
+                res.status = 400;
+                res.set_content(error_json_a4(400, "invalid JSON body", make_correlation_id()),
+                                kJson);
+                return;
+            }
+            if (!body.is_object()) {
+                res.status = 400;
+                res.set_content(error_json_a4(400, "invalid JSON body", make_correlation_id()),
+                                kJson);
+                return;
+            }
+            // Mass-assignment guard (mirrors POST /ca/revoke above).
+            for (const auto& [k, v] : body.items()) {
+                if (k != "csr_pem" && k != "label" && k != "validity_days") {
+                    res.status = 400;
+                    res.set_content(
+                        error_json_a4(400, "unknown field in request body", make_correlation_id(),
+                                     "only csr_pem, label and validity_days are accepted"),
+                        kJson);
+                    return;
+                }
+            }
+            const std::string csr_pem = body.value("csr_pem", "");
+            const std::string label = body.value("label", "");
+            if (csr_pem.empty()) {
+                res.status = 400;
+                res.set_content(error_json_a4(400, "csr_pem is required", make_correlation_id()),
+                                kJson);
+                return;
+            }
+            if (!is_valid_code_signing_label(label)) {
+                res.status = 400;
+                res.set_content(error_json_a4(400, "label must match ^[A-Za-z0-9._-]{1,64}$",
+                                              make_correlation_id()),
+                                kJson);
+                return;
+            }
+            std::optional<int> validity_days;
+            if (body.contains("validity_days") && !body["validity_days"].is_null()) {
+                if (!body["validity_days"].is_number_integer()) {
+                    res.status = 400;
+                    res.set_content(error_json_a4(400, "validity_days must be an integer",
+                                                  make_correlation_id()),
+                                    kJson);
+                    return;
+                }
+                const int v = body["validity_days"].get<int>();
+                if (v < 1) {
+                    res.status = 400;
+                    res.set_content(error_json_a4(400, "validity_days must be >= 1",
+                                                  make_correlation_id()),
+                                    kJson);
+                    return;
+                }
+                validity_days = v;
+            }
+            // Re-derive the session (perm_fn above already authenticated this
+            // request) ONLY to attribute IssuedCertRecord::issued_by to the
+            // calling operator — matches the discovery_routes.cpp/
+            // command_routes.cpp precedent for a post-perm_fn auth_fn re-read.
+            std::string issued_by = "operator:unknown";
+            if (auth_fn) {
+                if (auto session = auth_fn(req, res))
+                    issued_by = "operator:" + session->username;
+            }
+            auto issued = issue_code_signing_fn(csr_pem, label, validity_days, issued_by);
+            if (!issued) {
+                const std::string& err = issued.error();
+                const bool no_root = err.starts_with(kCodeSigningNoRootPrefix);
+                const bool bad_csr = err.starts_with(kCodeSigningBadCsrPrefix);
+                int status = 500;
+                std::string result = "failure";
+                std::string msg = "code-signing issuance failed";
+                if (no_root) {
+                    status = 409;
+                    result = "denied";
+                    msg = "no CA root to issue from (generate default certs first)";
+                } else if (bad_csr) {
+                    status = 400;
+                    result = "denied";
+                    msg = "csr_pem is invalid or fails proof-of-possession";
+                }
+                const bool audit_ok = audit_fn(req, "ca.cert.issued", result,
+                                               "CodeSigningCertificate", label,
+                                               "purpose=code-signing reason=" + err);
+                if (!audit_ok)
+                    res.set_header("Sec-Audit-Failed", "true");
+                res.status = status;
+                res.set_content(error_json_a4(status, msg, make_correlation_id()), kJson);
+                return;
+            }
+            const bool audit_ok =
+                audit_fn(req, "ca.cert.issued", "success", "CodeSigningCertificate",
+                         issued->serial_hex, "purpose=code-signing label=" + label);
+            if (!audit_ok)
+                res.set_header("Sec-Audit-Failed", "true");
+            nlohmann::json out = {{"certificate_pem", issued->certificate_pem},
+                                  {"chain_pem", issued->chain_pem},
+                                  {"serial_hex", issued->serial_hex},
+                                  {"not_after", issued->not_after},
+                                  {"purpose", "code-signing"},
+                                  {"meta", {{"api_version", "v1"}}}};
+            res.set_content(out.dump(), kJson);
+        });
 
     // ── GET /api/v1/ca/root-csr ── Security:Read: export the install CA's CSR ──
     // (PR6) for an enterprise root to sign into a subordinate-CA intermediate.
