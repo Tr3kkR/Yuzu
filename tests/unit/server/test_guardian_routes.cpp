@@ -1070,6 +1070,15 @@ TEST_CASE("#4252: a real Linux Service status row is never ALSO folded into "
         CHECK(body.find("not impl") == std::string::npos);
     }
 
+    SECTION("by-baseline view (view=baseline): the card shows 50% compliant, no not-impl chip") {
+        auto res = h.sink.Get("/fragments/guardian/status?view=baseline");
+        REQUIRE(res != nullptr);
+        const std::string& body = res->body;
+        CHECK(body.find("50% compliant") != std::string::npos);
+        CHECK(body.find("1 of 1 guards drifting") != std::string::npos);
+        CHECK(body.find("not impl") == std::string::npos);
+    }
+
     SECTION("guard detail page: both devices listed with real state, no not-implemented row") {
         auto res = h.sink.Get("/fragments/guardian/guard/svc1/page");
         REQUIRE(res != nullptr);
