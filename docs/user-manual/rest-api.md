@@ -2774,7 +2774,7 @@ List all instruction definitions.
 
 **Permission:** `InstructionDefinition:Read`
 
-**404** if no definition has that id.
+**404** if no definition has that id. **503** if the instruction store is unavailable or the read fails (A4 envelope, `retry_after_ms: 5000`).
 
 ---
 
@@ -2791,6 +2791,8 @@ List installed product packs.
 **Permission:** `ProductPack:Read`
 
 **Query parameters:** `name`, `limit` (default 100).
+
+**503** on a genuine DB/lease fault (A4 envelope, `retry_after_ms: 5000`) — a validation/business-rule error is `400`, never retryable.
 
 **Response:**
 
@@ -2822,6 +2824,8 @@ List installed product packs.
 Get a single installed product pack's detail, including the pack's own `yaml_source` (the full multi-document bundle) and each item's own `yaml_source`.
 
 **Permission:** `ProductPack:Read`
+
+**503** on a genuine DB/lease fault (A4 envelope, `retry_after_ms: 5000`) — a validation/business-rule error is `400`, never retryable.
 
 **Response:**
 
@@ -6611,7 +6615,7 @@ share).
 |---|---|
 | `limit` cannot be parsed as an integer (e.g. non-numeric) | `400` — a parseable but out-of-range value (0, negative, or > 100) is clamped, not rejected |
 | A service-scoped API token — this owner-scoped read cannot be confined to the token's service | `403`, audited under `preflight.run.view` (a distinct verb from `preflight.run`, the run-**creation** verb — see the audit note below) |
-| Pre-flight run store unavailable | `503` |
+| Pre-flight run store unavailable | `503` (A4 envelope, `retry_after_ms: 2000` — matches the MCP twin's own `kMcpStoreFaultShortRetryMs`) |
 
 **Audit:** unaudited on a successful read (run scope/lifecycle metadata, not per-agent behavioural
 PII — matches the fragment's own posture); a service-scoped-token denial is audited under
@@ -6650,7 +6654,7 @@ ready to receive an installer, before you configure and start a deployment.
 | Missing `run` parameter | `400` |
 | A service-scoped API token — this owner-scoped read cannot be confined to the token's service | `403`, audited under `deployment.config.view` |
 | No such run, or it belongs to another operator | `404` — indistinguishable by design (closes the existence oracle) |
-| Pre-flight run store unavailable | `503` |
+| Pre-flight run store unavailable | `503` (A4 envelope, `retry_after_ms: 2000` — matches the MCP twin's own `kMcpStoreFaultShortRetryMs`) |
 
 **Audit:** unaudited on a successful read (same rationale as the runs list above); a
 service-scoped-token denial is audited under `deployment.config.view` — already distinct from
@@ -7344,7 +7348,7 @@ List all Guaranteed State rules.
 - **Permission:** `GuaranteedState:Read`
 - **Response:** `data[]` of `GuaranteedStateRule` objects (see OpenAPI schema).
 - **4xx:** `403` if a service-scoped API token queries this route — the rule catalogue isn't owned by any one IT service, so there's no per-target shape to confine against; the bare permission gate alone checks only the token's ITServiceOwner role, never its own service-tag scope.
-- **5xx:** `503` if the store is unavailable.
+- **5xx:** `503` if the store is unavailable (A4 envelope, `retry_after_ms: 5000`).
 - **Audit:** `guaranteed_state.rule.read` (`denied` only — an ordinary successful list read is not audited).
 - **MCP twin:** `list_guardian_rules` (#4037) — same store call, same service-scoped-token deny.
 
@@ -7413,7 +7417,7 @@ Per-guard fleet-wide agent-status drilldown (#4037, api-parity #2146 Batch A) �
 - **Permission:** `GuaranteedState:Read` via `AuthRoutes::require_list_read`, this route's **sole** authorization gate (ADR-0017 admit-then-filter) — the same chokepoint `GET .../status` uses, not a bare `perm_fn`. A service-scoped API token is refused outright (a rule has no single owning IT service to confine to); a management-group-confined grant's visible-agent set filters the returned rows.
 - **Response:** `data[]` of `{agent_id, state, updated_at}`, `pagination.total`. Raw census — does **not** apply the dashboard fragment's own offline-agent-folds-to-unknown rollup (same posture `GET .../status` already established for the identical class of data).
 - **4xx:** `404` if `rule_id` names no rule; `403` for a service-scoped token or no `GuaranteedState:Read` grant anywhere.
-- **5xx:** `503` if the store is degraded, the gate is unwired, or the `guaranteed_state.rule.view` audit row cannot persist (fail-closed, `Sec-Audit-Failed: true`).
+- **5xx:** `503` if the store is degraded (A4 envelope, `retry_after_ms: 5000`), the gate is unwired, or the `guaranteed_state.rule.view` audit row cannot persist (fail-closed, `Sec-Audit-Failed: true`, also `retry_after_ms: 5000`).
 - **Audit:** `guaranteed_state.rule.view` (`success`/`not_found`), `target_type=GuaranteedState`, `target_id=<rule_id>` — the SAME verb the per-guard dashboard drilldown emits (not `guardian.device.view`; a fleet-wide-per-rule read is a different shape from a per-device read). MCP twin: `get_guardian_rule_status` (`audit_persisted:false` posture instead of fail-closed).
 
 #### `GET /api/v1/guaranteed-state/agents/{agent_id}/rules`
@@ -7422,7 +7426,7 @@ Per-device all-guards view (#4037, api-parity #2146 Batch A) — every guard's s
 
 - **Permission:** `GuaranteedState:Read`, per-device scoped (management-group aware) — same `scoped_perm_fn(GuaranteedState, Read, agent_id)` gate `GET .../device-compliance` and the dashboard Guardian device lens both use.
 - **Response:** `data.agent_id`, `data.guards[]` of `{rule_id, name, state, updated_at}`, `data.total_guards`. A device with no reported guards returns an empty `guards[]`, not an error.
-- **5xx:** `503` if the scoped-permission gate is unwired, the store is degraded, or the `guardian.device.view` audit row cannot persist (fail-closed).
+- **5xx:** `503` if the scoped-permission gate is unwired, the store is degraded (A4 envelope, `retry_after_ms: 5000`), or the `guardian.device.view` audit row cannot persist (fail-closed).
 - **Audit:** `guardian.device.view`, `target_type=Agent`, `target_id=<agent_id>` — the SAME verb `GET .../status/{agent_id}` and the dashboard Guardian device lens emit. MCP twin: `get_guardian_device_guards` (`audit_persisted:false` posture instead of fail-closed).
 
 #### `POST /api/v1/guaranteed-state/push`
@@ -7499,7 +7503,7 @@ if the audit row cannot persist.
 
 - **Permission:** `GuaranteedState:Read`, per-device scoped
 - **Response keys:** `agent_id`, `total_rules`, `compliant_rules`, `drifted_rules`, `errored_rules`.
-- **5xx:** `503` on an unwired scope gate/store, an audit-persistence failure, or a degraded store — never a silent `0`.
+- **5xx:** `503` on an unwired scope gate/store, an audit-persistence failure, or a degraded store (A4 envelope, `retry_after_ms: 5000`) — never a silent `0`.
 
 #### `GET /api/v1/guaranteed-state/device-compliance?baseline={name}&agent_id={id}`
 

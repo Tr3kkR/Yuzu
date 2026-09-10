@@ -5764,8 +5764,9 @@ void RestApiV1::register_routes(
         auto defs_result = instruction_store->query_definitions(q);
         if (!defs_result) {
             res.status = 503;
-            res.set_content(detail::a4_error(res, "instruction store read failed"),
-                            "application/json");
+            res.set_content(
+                detail::a4_error(res, "instruction store read failed", {.retry_after_ms = 5000}),
+                "application/json");
             return;
         }
         JArr arr;
@@ -5789,8 +5790,10 @@ void RestApiV1::register_routes(
                  auto def_result = instruction_store->get_definition(id);
                  if (!def_result) {
                      res.status = 503;
-                     res.set_content(detail::a4_error(res, "instruction store read failed"),
-                                     "application/json");
+                     res.set_content(
+                         detail::a4_error(res, "instruction store read failed",
+                                          {.retry_after_ms = 5000}),
+                         "application/json");
                      return;
                  }
                  if (!*def_result) {
@@ -10529,8 +10532,10 @@ void RestApiV1::register_routes(
                  auto rows = guaranteed_state_store->list_rules();
                  if (!rows) {
                      res.status = 503;
-                     res.set_content(detail::a4_error(res, "guaranteed-state store degraded"),
-                                     "application/json");
+                     res.set_content(
+                         detail::a4_error(res, "guaranteed-state store degraded",
+                                          {.retry_after_ms = 5000}),
+                         "application/json");
                      return;
                  }
                  JArr arr;
@@ -10786,8 +10791,10 @@ void RestApiV1::register_routes(
             auto row = guaranteed_state_store->get_rule(rule_id);
             if (!row) {
                 res.status = 503;
-                res.set_content(detail::error_json_a4(503, "guaranteed-state store degraded", cid),
-                                "application/json");
+                res.set_content(
+                    detail::error_json_a4(503, "guaranteed-state store degraded", cid,
+                                          {.retry_after_ms = 5000}),
+                    "application/json");
                 return;
             }
             const bool found = static_cast<bool>(*row);
@@ -10819,8 +10826,10 @@ void RestApiV1::register_routes(
             auto rows = guardian_rule_agent_status_rows(*guaranteed_state_store, rule_id);
             if (!rows) {
                 res.status = 503;
-                res.set_content(detail::error_json_a4(503, "guaranteed-state store degraded", cid),
-                                "application/json");
+                res.set_content(
+                    detail::error_json_a4(503, "guaranteed-state store degraded", cid,
+                                          {.retry_after_ms = 5000}),
+                    "application/json");
                 return;
             }
             JArr arr;
@@ -13521,8 +13530,10 @@ void RestApiV1::register_routes(
             }
             if (!statuses_result) {
                 res.status = 503;
-                res.set_content(detail::error_json_a4(503, "guaranteed-state store degraded", cid),
-                                "application/json");
+                res.set_content(
+                    detail::error_json_a4(503, "guaranteed-state store degraded", cid,
+                                          {.retry_after_ms = 5000}),
+                    "application/json");
                 spdlog::warn("guaranteed-state.status.agent store degraded (503) cid={} "
                              "agent_id={}",
                              cid, agent_id);
@@ -13537,8 +13548,10 @@ void RestApiV1::register_routes(
             auto rule_names_result = guaranteed_state_store->rule_names_for(rule_ids);
             if (!rule_names_result) {
                 res.status = 503;
-                res.set_content(detail::error_json_a4(503, "guaranteed-state store degraded", cid),
-                                "application/json");
+                res.set_content(
+                    detail::error_json_a4(503, "guaranteed-state store degraded", cid,
+                                          {.retry_after_ms = 5000}),
+                    "application/json");
                 spdlog::warn("guaranteed-state.status.agent store degraded (503) cid={} "
                              "agent_id={}",
                              cid, agent_id);
@@ -13640,8 +13653,10 @@ void RestApiV1::register_routes(
             }
             if (!rows) {
                 res.status = 503;
-                res.set_content(detail::error_json_a4(503, "guaranteed-state store degraded", cid),
-                                "application/json");
+                res.set_content(
+                    detail::error_json_a4(503, "guaranteed-state store degraded", cid,
+                                          {.retry_after_ms = 5000}),
+                    "application/json");
                 return;
             }
             JArr arr;

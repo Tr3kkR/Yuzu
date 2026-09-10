@@ -6459,7 +6459,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto defs_result = instruction_store->query_definitions(iq);
                 if (!defs_result) {
                     res.set_content(
-                        error_response(id, kInternalError, "Instruction store unavailable"),
+                        a4_error(kInternalError, "instruction store read failed", {},
+                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;
                 }
@@ -6507,7 +6508,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!def_result) {
                     res.set_content(
                         a4_error(kInternalError, "instruction store read failed", {},
-                                /*retry_after_ms=*/5000),
+                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;
                 }
@@ -6554,7 +6555,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!def_result) {
                     res.set_content(
                         a4_error(kInternalError, "instruction store read failed", {},
-                                /*retry_after_ms=*/5000),
+                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;
                 }
@@ -6614,7 +6615,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         a4_error(kInternalError,
                                 product_pack_client_message("list_product_packs",
                                                             packs_result.error()),
-                                {}, transient ? 5000 : -1),
+                                {}, transient ? mcp::kMcpStoreFaultRetryMs : -1),
                         "application/json");
                     return;
                 }
@@ -6658,7 +6659,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         a4_error(kInternalError,
                                 product_pack_client_message("get_product_pack",
                                                             pack_result.error()),
-                                {}, transient ? 5000 : -1),
+                                {}, transient ? mcp::kMcpStoreFaultRetryMs : -1),
                         "application/json");
                     return;
                 }
@@ -8325,7 +8326,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         a4_error(kInternalError,
                                 yuzu::server::genericize_db_error("list_schedules",
                                                                   schedules_result.error()),
-                                {}, /*retry_after_ms=*/5000),
+                                {}, /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;
                 }
@@ -8381,7 +8382,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         a4_error(kInternalError,
                                 yuzu::server::genericize_db_error("list_workflows",
                                                                   workflows_result.error()),
-                                {}, /*retry_after_ms=*/5000),
+                                {}, /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;
                 }
@@ -8419,7 +8420,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         a4_error(kInternalError,
                                 yuzu::server::genericize_db_error("get_workflow",
                                                                   workflow_result.error()),
-                                {}, /*retry_after_ms=*/5000),
+                                {}, /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;
                 }
@@ -8466,7 +8467,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         a4_error(kInternalError,
                                 yuzu::server::genericize_db_error("get_execution",
                                                                   exec_result.error()),
-                                {}, /*retry_after_ms=*/5000),
+                                {}, /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;
                 }
@@ -8804,7 +8805,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!rollup) {
                     res.set_content(
                         a4_error(kInternalError, "guaranteed-state store degraded", {},
-                                /*retry_after_ms=*/5000),
+                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;
                 }
@@ -8852,7 +8853,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!rows) {
                     res.set_content(
                         a4_error(kInternalError, "guaranteed-state store degraded", {},
-                                /*retry_after_ms=*/5000),
+                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;
                 }
@@ -9030,7 +9031,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!row) {
                     res.set_content(
                         a4_error(kInternalError, "guaranteed-state store degraded", {},
-                                /*retry_after_ms=*/5000),
+                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;
                 }
@@ -9054,7 +9055,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!rows) {
                     res.set_content(
                         a4_error(kInternalError, "guaranteed-state store degraded", {},
-                                /*retry_after_ms=*/5000),
+                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;
                 }
@@ -9127,7 +9128,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!rows) {
                     res.set_content(
                         a4_error(kInternalError, "guaranteed-state store degraded", {},
-                                /*retry_after_ms=*/5000),
+                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;
                 }
@@ -16757,7 +16758,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     // (no server-wide set_exception_handler is installed on
                     // web_server_ — see rest_api_v1.cpp's identical note).
                     res.set_content(
-                        error_response(id, kInternalError, "Instruction store unavailable"),
+                        a4_error(kInternalError, "instruction store read failed", {},
+                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;
                 }

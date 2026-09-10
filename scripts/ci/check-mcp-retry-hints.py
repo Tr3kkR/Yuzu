@@ -134,7 +134,9 @@ def main() -> int:
     head_src = git_show(args.head, MCP_SERVER_CPP)
     if head_src is None:
         print(f"check-mcp-retry-hints: {MCP_SERVER_CPP} not found at {args.head}")
-        return 0  # nothing to check -- not this script's problem to report
+        print("check-mcp-retry-hints: FAIL (cannot verify the A5 retry-hint gate -- fail closed;")
+        print("if the file genuinely moved, update MCP_SERVER_CPP in this script)")
+        return 1  # fail CLOSED: an unreadable target must never look like a clean gate
 
     base_tools = tool_names(base_src) if base_src is not None else set()
     head_tools = tool_names(head_src)
