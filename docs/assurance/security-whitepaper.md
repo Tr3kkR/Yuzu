@@ -14,14 +14,38 @@ source doc materially changes (its own change-log/date is the trigger).
 **Version anchor.** This document describes Yuzu at `dev` @ `d295db964`
 (2026-09-07) unless a claim is explicitly marked otherwise. **The latest
 tagged release is v0.13.0** (2026-07-11), which **predates** several
-controls this document describes as shipped: the PostgreSQL-backed audit
-store (ADR-0040 — v0.13.0's audit trail is still the legacy SQLite
-`audit.db`), the `CaStore` PostgreSQL migration (ADR-0053), and the
-`RbacStore` PostgreSQL migration (ADR-0041). A reviewer evaluating a
-specific deployed version should confirm which of these have shipped in
-that build rather than assume dev-HEAD posture. ADR-1005 (§9) is accepted
-as of 2026-09-07 (#4099) but is itself a `dev`-only fact at this writing —
-it has not yet reached a tagged release either.
+controls this document describes as shipped — every item below verified by
+`git log`/`git diff v0.13.0..d295db964 -- <file>`, not asserted from
+memory:
+
+- The PostgreSQL-backed audit store (ADR-0040) — v0.13.0's audit trail is
+  still the legacy SQLite `audit.db` (§3.5/§4/§7).
+- The `CaStore` PostgreSQL migration (ADR-0053) — v0.13.0 still uses
+  `ca.db` (§2.1, matrix "CA / key custody").
+- The `RbacStore` PostgreSQL migration (ADR-0041) (§3.5, matrix "RBAC
+  configuration").
+- **The `ManagementGroupStore` PostgreSQL migration (ADR-0042)** — a
+  substantial rewrite between v0.13.0 and this anchor (826 insertions/533
+  deletions in `management_group_store.cpp` alone); v0.13.0's management
+  groups are SQLite-backed (§3.5's management-group scoping claims).
+- **`SessionStore` (durable, PostgreSQL-backed operator sessions, HA
+  WS-1/1a, ADR-2002 §4)** — `server/core/src/session_store.hpp` does not
+  exist at all in v0.13.0 (confirmed: `git cat-file -e
+  v0.13.0:server/core/src/session_store.hpp` fails). A v0.13.0 deployment's
+  sessions are in-memory only and do NOT survive a restart — the opposite
+  of what `docs/ops-runbooks/auth-db-recovery.md`'s corrected guidance
+  states for `dev`-HEAD (§3.1's "Durable operator sessions" claim is
+  dev-only).
+- **MCP Streamable HTTP transport** (`mcp_transport.hpp`, `mcp_session.hpp`,
+  ADR-1005 execution-plan Decision 15 / track 2f) — neither file exists in
+  v0.13.0 (same `git cat-file -e` check). §8's "is live" claim is dev-only;
+  a v0.13.0 deployment has the older, non-session MCP transport only.
+
+A reviewer evaluating a specific deployed version should confirm which of
+these have shipped in that build rather than assume dev-HEAD posture.
+ADR-1005 (§9) is accepted as of 2026-09-07 (#4099) but is itself a
+`dev`-only fact at this writing — it has not yet reached a tagged release
+either.
 
 **Threat model status.** No platform-level threat model exists in the
 repository; domain threat models exist for authentication/MFA
@@ -64,11 +88,17 @@ ADR-0006/0007/0008/0012 and `docs/postgres-store-playbook.md`.
 
 **Optional HA profile:** a Patroni-managed three-node PostgreSQL topology
 with automatic failover is available (`docs/user-manual/ha-postgres.md`) —
-measured failover RTO ~15-40s, RPO=0 while a synchronous standby holds
-(`quorum3` durability profile, the shipped default). This is **available,
-not the default single-node deployment**; see
-`docs/ops-runbooks/slo.md` §1 for how the server-listener SLO differs from
-this database-layer figure.
+measured failover RTO **~30-40 seconds** (correction: a prior revision of
+this document said "~15-40s", which matched no source in this repo; the
+cited doc's own "What you get" section states "~30-40 seconds" from its
+failover smoke test). **This is a different mechanism, and a different
+number, from the restore-from-backup RTO in §5 below** — failover promotes
+a standby without rebuilding the server (seconds); restore-from-backup
+rebuilds from a backup file (minutes) — do not conflate the two. RPO=0
+while a synchronous standby holds (`quorum3` durability profile, the
+shipped default). This is **available, not the default single-node
+deployment**; see `docs/ops-runbooks/slo.md` §1 for how the
+server-listener SLO differs from this database-layer figure.
 
 ## 2. Cryptography
 
@@ -257,22 +287,36 @@ detail) — see `docs/observability-conventions.md`.
 Five SLOs (`/readyz` availability, command dispatch latency, agent heartbeat
 freshness, audit write success, PostgreSQL substrate degrade events), each
 backed by a metric verified present in the codebase and — where one ships —
-the exact Prometheus alert that pages on it: `docs/ops-runbooks/slo.md`. A
-backup/restore drill was executed (not merely described) against the
-documented `pg_dump`/`pg_restore`/`tar` procedure, with measured RTO/RPO and
-a row-count/audit-chain integrity check post-restore:
-`docs/ops-runbooks/restore-drill-2026-09.md`. **Caveat carried from that
-drill:** the audit-chain integrity check verified the **legacy SQLite
-`audit.db`** chain, not the PostgreSQL `audit_store` schema (ADR-0040) —
-the drill's server image build predates that migration; see the drill
-runbook's "Image note" and "Gaps found" #4 for the full account and what
-re-running against a newer image would additionally prove. The optional
-HA-Postgres profile's separately-measured failover figures:
+the exact Prometheus alert that pages on it: `docs/ops-runbooks/slo.md`
+(one caveat on "verified present": the `/readyz`-availability proxy,
+`up{job="yuzu-server"}`, is a Prometheus **scrape** metric, not a metric
+Yuzu itself emits — verified present in the *scrape config*, not in
+`server/core/src`, unlike the other four). Two backup/restore drills were
+**executed** (not merely described): against the containerized
+`docker-compose.reference.yml` header procedure (measured RTO **4m27s
+end-to-end, ~23s of that mechanical** — the rest is a `stop_grace_period`
+wait, not backup/restore work) and, separately, against
+`docs/operations/disaster-recovery.md`'s native-install procedure (measured
+RTO 6m9s as actually run, ~3m40s projected for the now-corrected recipe) —
+both with a row-count/audit-chain integrity check post-restore, and the
+native-procedure run additionally found and fixed two real script/doc
+defects along the way (a `yuzu-backup.sh` manifest bug; a `pg_restore`
+ownership pitfall that can leave a database in a WORSE state than before
+the restore if followed incorrectly). Full transcripts, both drills:
+`docs/ops-runbooks/restore-drill-2026-09.md`. **Caveat carried from the
+containerized drill:** its audit-chain integrity check verified the
+**legacy SQLite `audit.db`** chain, not the PostgreSQL `audit_store` schema
+(ADR-0040) — that drill's server image build predates the migration; see
+the drill runbook's "Image note" and "Gaps found" #6 for the full account
+and what re-running against a newer image would additionally prove. The
+optional HA-Postgres profile's separately-measured failover figures:
 `docs/user-manual/ha-postgres.md`.
 
 **Planned, not yet shipped:** a direct `/readyz`-content availability probe
 (today's proxy is Prometheus scrape health of the `/metrics` endpoint, not a
-dedicated blackbox probe of `/readyz` itself — tracked #2459); a second
+dedicated blackbox probe of `/readyz` itself — untracked; proposed, see
+`docs/ops-runbooks/slo.md` §1's correction, neither #2956 nor #2459 names
+this gap); a second
 server replica (ADR-2002 Phase B) to raise the single-replica 99.5%/30d
 availability target to 99.9%/30d; a scheduled (cron/systemd-timer) backup
 job (today's procedure is a documented manual/scriptable command, not an
@@ -325,15 +369,21 @@ track.
 
 **ADR-1005 is accepted (2026-09-07, #4099)** — as of the version anchor
 above, this is a `dev`-only fact; it has not reached a tagged release (see
-the version anchor at the top of this document). Once accepted, its
-requirement is that every capability be reachable by an authenticated
-external principal via both versioned REST **and** MCP (or a recorded
-exception in the ADR-1005 ledger) — there is no UI-only capability surface
-— and that on-behalf-of header assertions are rejected at every ingress
-except the four health-probe paths (so a header-stamping proxy cannot
-crash-loop the server). **Phase 7 (the NVD-sync strangler re-home) has not
+the version anchor at the top of this document). **Its requirement is
+prospective, not a present-tense universal claim about every existing
+capability:** on acceptance, its Decisions govern *new and changed*
+capabilities from the acceptance date forward — that a capability be
+reachable by an authenticated external principal via both versioned REST
+**and** MCP (or a recorded exception in the ADR-1005 ledger), no UI-only
+capability surface — and do **not** retroactively condemn the surfaces the
+ADR itself records as grandfathered as of acceptance. On-behalf-of header
+assertions are rejected at every ingress except the four health-probe
+paths (so a header-stamping proxy cannot crash-loop the server) — this
+Interim rule binds immediately on acceptance, unlike the prospective
+Decisions above. **Phase 7 (the NVD-sync strangler re-home) has not
 started** — do not represent that migration as complete or in-flight to a
-reviewer. Full policy: `docs/adr/1005-headless-platform-use-case-engines.md`;
+reviewer. Full policy: `docs/adr/1005-headless-platform-use-case-engines.md`
+(see its grandfather-clause enumeration for what is exempted and why);
 current phase status: `docs/adr-1005-execution-plan.md`.
 
 ---

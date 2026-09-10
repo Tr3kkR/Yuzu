@@ -4,8 +4,14 @@ Workstream D (Reliability, Availability, and Operational Readiness),
 `docs/enterprise-readiness-soc2-first-customer.md` §3.4. Five SLOs, one per
 required signal (`/readyz` availability, command dispatch latency, agent
 heartbeat freshness, audit write success, PostgreSQL substrate degrade
-events). Every metric below is verified present in `server/core/src` (grep
-citation on each) — none is aspirational.
+events). Four of the five metrics are verified present in `server/core/src`
+(grep citation on each) — none of those four is aspirational. **The fifth,
+§1's `up{job="yuzu-server"}`, is a Prometheus *scrape* metric, not
+something Yuzu itself emits** — verified present in the scrape config
+(`deploy/prometheus/prometheus.yml` / `prometheus-uat.yml` /
+`prometheus-full-uat.yml`), a different kind of verification than a grep
+hit in `server/core/src`. Said explicitly in §1 below; do not read this
+paragraph's "verified present" as covering all five uniformly.
 
 **PO decision 2026-09-07** — the targets in this document were set by the
 product owner on that date and are to be **re-baselined after 90 days of
@@ -28,9 +34,13 @@ no blackbox_exporter anywhere in `deploy/`, no `up`-based dead-man's-switch
 for the server process — `docs/ops-runbooks/audit-store-clock-guard.md`
 names this gap explicitly under `YuzuServerRestartLoop`: *"There is no
 dead-man's-switch (`up == 0`) rule for the server process in this file
-today (tracked: #2956)"* (quoted verbatim as that doc currently reads;
-**the live tracker for this gap has since moved to #2459** — cite #2459
-going forward, not #2956). The practical proxy is Prometheus's own scrape
+today (tracked: #2956)"* (quoted verbatim as that doc currently reads).
+**Correction (2026-09-10, governance-reproduced, C2-3):** #2956 is
+CLOSED, and a prior revision of this document redirected the citation to
+#2459 — but #2459 does not name this gap either (verified). Treat this gap
+as **untracked; proposed** until a real tracking issue exists — do not cite
+either #2956 or #2459 as the live tracker. The practical proxy is
+Prometheus's own scrape
 health of the `/metrics` endpoint on the same server process: `up{job="yuzu-server"}`
 (`deploy/prometheus/prometheus.yml` / `prometheus-uat.yml` / `prometheus-full-uat.yml`,
 job name `yuzu-server`). This proves the HTTP listener is alive; it does
@@ -38,7 +48,7 @@ job name `yuzu-server`). This proves the HTTP listener is alive; it does
 that is up but reporting a degraded store — e.g. `stores.audit` closed —
 would still show `up == 1` here). Closing that gap needs a blackbox-exporter
 job scraping `/readyz` directly and asserting on HTTP status, which is not
-part of this change — tracked as a follow-up alongside #2459.
+part of this change — untracked; proposed (see the correction above).
 
 **Target:** **99.5% / 30d for a single-replica deployment** (~3h39m of
 allowed downtime/month) — what ships today. Target rises to **99.9% / 30d**
@@ -55,8 +65,10 @@ listener — see that doc's "What you get").
 
 ```yaml
 # PROPOSED — NOT SHIPPED. Mirrors YuzuGatewayDown's up{job=~".*gateway.*"}==0
-# pattern (docs/prometheus/yuzu-alerts.yml) applied to the server job, closing
-# the gap tracked in #2459. For the PO/workflow owner to route into the real file.
+# pattern (docs/prometheus/yuzu-alerts.yml) applied to the server job. The
+# gap this closes is untracked (neither #2956, closed, nor #2459 names it —
+# see the correction above) — proposed for the PO/workflow owner to route
+# into the real file and file a tracking issue for.
 - alert: YuzuServerDown
   expr: up{job="yuzu-server"} == 0
   for: 2m
@@ -248,11 +260,24 @@ only a failure episode that outlasts the alert's own `for: 2m` window is.
 
 ## Verifying this file's claims
 
-`promtool check rules docs/prometheus/yuzu-alerts.yml` (see
-`docs/ops-runbooks/restore-drill-2026-09.md` for the exact invocation used
-against this repo, and #2857 for why no shipped stack evaluates these rules
-yet — `deploy/docker/docker-compose.observability.yml` is the first one
-that does, for the UAT rig).
+**Correction (2026-09-10, governance-reproduced, C2-4):** this section
+previously pointed at `docs/ops-runbooks/restore-drill-2026-09.md` for the
+exact `promtool` invocation — that invocation is not in that file. The
+actual command, run against this repo (no local `promtool` binary
+required):
+
+```bash
+docker run --rm --entrypoint /bin/promtool \
+  -v "$PWD/docs/prometheus:/r" \
+  prom/prometheus:v3.2.1@sha256:6927e0919a144aa7616fd0137d4816816d42f6b816de3af269ab065250859a62 \
+  check rules /r/yuzu-alerts.yml
+```
+Expected output: `SUCCESS: 116 rules found` (115 alert rules + 1 recording
+rule — see `docs/enterprise-readiness-soc2-first-customer.md` §3.4 for
+where that count is cross-checked against a raw `grep -c` of the file).
+See #2857 for why no shipped stack evaluates these rules at runtime yet —
+`deploy/docker/docker-compose.observability.yml` is the first one that
+does, for the UAT rig.
 
 ## Related
 
@@ -268,6 +293,8 @@ that does, for the UAT rig).
 - `docs/ops-runbooks/restore-drill-2026-09.md` — the executed backup/restore
   drill and its measured RTO/RPO for the non-HA, single-replica deployment
   this document's §1 target describes.
-- Issue #2459 — the server dead-man's-switch gap this document's §1 proposed
-  alert would close (the same gap `docs/ops-runbooks/audit-store-clock-guard.md`
-  names against #2956; that citation moved to #2459 — see §1 above).
+- The server dead-man's-switch gap this document's §1 proposed alert would
+  close is **untracked** — `docs/ops-runbooks/audit-store-clock-guard.md`
+  cites #2956 for it, which is closed and does not (re-)name a live
+  successor; #2459 was checked and does not name this gap either (see §1's
+  correction). File a tracking issue rather than citing either number.

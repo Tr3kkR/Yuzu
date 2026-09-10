@@ -499,3 +499,11 @@ sudo systemctl restart yuzu-server
 - `docs/postgres-store-playbook.md` — store authoring contract
 - `docs/agent-privilege-model.md` — service accounts and sudoers
 - `docs/ops-runbooks/engine-principal-store-recovery.md` — `engine:` namespace
+- `docs/operations/disaster-recovery.md` — the full backup/restore procedure
+  this doc's "Post-restore verification" section and the corrected sessions
+  section (above) are cited from; run that doc's Restore Procedure first,
+  this page's checks second.
+- `docs/ops-runbooks/restore-drill-2026-09.md` — an executed restore drill
+  (containerized rig) and, as of the attempt-3 addendum, the disaster-recovery.md
+  procedure exercised end-to-end on the same disposable project, with
+  measured timings and every defect found along the way.

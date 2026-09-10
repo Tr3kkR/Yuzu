@@ -96,11 +96,27 @@ The reference image expects an interactive first-run admin setup
 `yuzu-server.cfg` exists — not viable non-interactively. Pre-seeded one
 directly into the `server-data` volume, mirroring exactly what
 `scripts/start-UAT.sh`'s `generate_config()` does for the native rig
-(PBKDF2-SHA256, 100k iterations, format `user:role:salt_hex:hash_hex`),
-written with `chown 999:999` (the container's runtime uid — a
-`root:root`-owned file is silently unreadable and produces the same "No
-user config found" log line as a genuinely missing file, no
-permission-denied signal; see "Gaps found" #3).
+(PBKDF2-SHA256, 100k iterations, format `user:role:salt_hex:hash_hex`).
+**Exact commands** (this is where `YuzuDrillAdmin1!`, the password step 2
+logs in with below, comes from — it is chosen here, in plaintext, by this
+step; nowhere else):
+
+```
+$ docker stop yuzu-server
+$ python3 -c "
+import hashlib, os
+salt = os.urandom(16)
+dk = hashlib.pbkdf2_hmac('sha256', 'YuzuDrillAdmin1!'.encode(), salt, 100000, dklen=32)
+print(f'admin:admin:{salt.hex()}:{dk.hex()}')" > yuzu-server.cfg
+$ docker run --rm -v yuzu-drill_server-data:/data -v "$PWD":/seed alpine sh -c \
+    "cp /seed/yuzu-server.cfg /data/yuzu-server.cfg && chown 999:999 /data/yuzu-server.cfg && chmod 600 /data/yuzu-server.cfg"
+$ docker start yuzu-server
+```
+`chown 999:999` sets the container's runtime uid (a `root:root`-owned file
+— the default of a plain `docker run` write — is silently unreadable and
+produces the same "No user config found" log line as a genuinely missing
+file, no permission-denied signal; see "Gaps found" #3, which this exact
+sequence is what surfaced).
 
 Server healthy and `/readyz` green at `09:39:17Z`:
 ```
@@ -178,9 +194,28 @@ $ docker exec -e PGPASSWORD="$YUZU_DB_PASSWORD" yuzu-postgres psql -U yuzu -d yu
      VALUES ('DISASTER-CORRUPTION-MARKER', 'corrupt-host', 'corrupt-os', 0);"
 INSERT 0 1
 ```
-Then the header's own literal restore-procedure step 1:
+Then the header's own literal restore-procedure step 1 — **transcribed here
+exactly as it was actually run in this drill**, i.e. against the disposable
+project (`-p yuzu-drill`) and with the port-remap override
+(`-f drill-override.example.yml`) both still supplied. **The header's own
+text shows the bare form** (`docker compose -f docker-compose.reference.yml
+down server`, no `-p`, no override) **— running it literally as printed
+there is itself one of the header's defects (#4135, governance-confirmed
+CA-1/rd2-7/UP2-7):** a bare invocation targets whatever Compose project
+name the operator's shell/directory defaults to, which is a DIFFERENT
+project from the one `up` was run under in step 1 above — it would be a
+no-op against this drill's actual containers (Compose reports "no such
+service" or silently matches nothing, depending on version), and if it
+somehow did match, `up -d server` in the header's final step would publish
+the BASE ports (8443/8080/50051/50052) since the override wouldn't be
+layered in, which is exactly the port set this drill deliberately avoided
+to not collide with the concurrently-running viz-UAT rig. Every command
+below carries the same `-p`/`-f` flags used throughout this transcript;
+treat the header's own bare form as something to correct when you copy it,
+not something to run as printed:
 ```
-$ docker compose -f docker-compose.reference.yml down server
+$ docker compose -p yuzu-drill -f docker-compose.reference.yml \
+    -f drill-override.example.yml down server
 ```
 **Measured: this single command took 3 minutes 30 seconds** —
 `09:40:32Z` → `09:44:02Z` — exactly matching
@@ -248,9 +283,11 @@ attributed this to using `-U yuzu` for the connection; re-running with the
 header's exact `-U postgres --role=yuzu` proves the connecting user was
 never the cause — `--role=yuzu` is.
 
-Bring the server back up — header's exact final step:
+Bring the server back up — header's final step, same `-p`/`-f` correction
+as above (see the callout before step 4's `down server`):
 ```
-$ docker compose -f docker-compose.reference.yml up -d server
+$ docker compose -p yuzu-drill -f docker-compose.reference.yml \
+    -f drill-override.example.yml up -d server
 ```
 Polled `/readyz` + `docker inspect .State.Health.Status` every 2s:
 ```
@@ -401,7 +438,7 @@ immediately after cleanup.
 8. **Not exercised: `scripts/yuzu-backup.sh` / `scripts/yuzu-restore.sh`
    (the native/systemd install path).** This entire drill ran against the
    containerized `docker-compose.reference.yml` rig and its own `pg_dump`/
-   `pg_restore`/`tar` procedure — it says nothing about whether
+   `pg_restore`/`tar` procedure — it originally said nothing about whether
    `yuzu-backup.sh`'s output actually restores cleanly via
    `yuzu-restore.sh`. Separately, and more importantly for a real
    deployment: `docs/operations/disaster-recovery.md` previously showed
@@ -410,11 +447,275 @@ immediately after cleanup.
    the CA/keys directory (`scripts/yuzu-backup.sh:123-133`); a cron running
    it alone **cannot restore the server**, since the server's authoritative
    state (ADR-0006) lives in PostgreSQL. Fixed in that doc (external review,
-   2026-09-08) to add the missing `pg_dump` + keys-directory steps; not
-   fixed by re-running this drill, since this drill never touched
-   `yuzu-backup.sh`/`yuzu-restore.sh` at all. A future drill iteration
-   should exercise the native path specifically, not just the containerized
-   one.
+   2026-09-08) to add the missing `pg_dump` + keys-directory steps.
+   **UPDATE (2026-09-10, attempt 3 below): now executed, not just fixed on
+   paper.** `yuzu-backup.sh`/`yuzu-restore.sh` were run for real (inside the
+   containerized rig's server container, since that's the only running
+   Yuzu filesystem available to this drill), a real `yuzu-backup.sh` bug
+   was found and fixed (see Gap #9), and the corrected
+   `docs/operations/disaster-recovery.md` procedure — all seven restore
+   steps, including the corrected PostgreSQL superuser recipe — was
+   exercised end to end. See "Attempt 3" below.
+9. **`scripts/yuzu-backup.sh`'s SHA256 manifest was self-referentially
+   broken** (found in attempt 3, fixed 2026-09-10): `... > "$OUTPUT/SHA256SUMS"`
+   opens/truncates that file before the `*` glob inside the subshell
+   expands, so the glob picks up the now-existing zero-byte SHA256SUMS,
+   hashes its own empty self, and ships a manifest with one entry that is
+   wrong the instant the real content lands — `yuzu-restore.sh`'s
+   `sha256sum -c` then fails "backup may be corrupted" on an otherwise
+   intact backup. Fixed: compute into a dotfile-named temp path the glob
+   does not match, then rename into place. Verified fixed by a real
+   backup→restore roundtrip in attempt 3 below (88 files, manifest verified
+   clean) and by a minimal roundtrip test beforehand.
+10. **A naive fix to Gap #3 (dropping `--role=yuzu`, adding
+    `--exit-on-error`) is not sufficient on its own — reproduced live in
+    attempt 3.** Restoring via the app-role DSN, even without `--role=yuzu`,
+    still fails on the `vector` extension (the app role never owned it
+    either — only the connecting SUPERUSER can touch `CREATE`/`DROP
+    EXTENSION`, unrelated to `--role`), and with `--exit-on-error` that
+    failure now ABORTS the restore instead of continuing past it — but
+    `--clean --if-exists` had already DROPPED objects before hitting that
+    error, so the aborted run left the database with `public.schema_meta`
+    dropped and never recreated: measurably **worse than before the
+    restore started**, not merely "unchanged." The actual fix needs two
+    changes together, not one: (a) restore as the cluster's real
+    PostgreSQL superuser (peer-auth `sudo -u postgres` for a
+    locally-provisioned cluster; an external admin credential for managed
+    Postgres) — never the app-role DSN, regardless of flags; and (b) do
+    **not** pass `--no-owner` when restoring as superuser, or every
+    restored object ends up owned by the superuser instead of the app
+    role, and the server's own runtime DSN gets "permission denied" on its
+    own tables post-restore (also reproduced live). Both fixes are in
+    `docs/operations/disaster-recovery.md`'s Restore Procedure step 3 now.
+
+## Attempt 3 — the disaster-recovery.md procedure, executed end to end (2026-09-10)
+
+**Rig:** the same disposable `-p yuzu-drill` project as attempts 1/2
+(`docker-compose.reference.yml` + `drill-override.example.yml`,
+`YUZU_VERSION=0.13.0`), fresh containers. `disaster-recovery.md` is written
+for a native/systemd install (`/etc/yuzu`, `/var/lib/yuzu`, `systemctl`);
+this containerized rig is the only running Yuzu filesystem available to
+this drill, so every native-shaped command below ran **inside** the
+`yuzu-server`/`yuzu-postgres` containers (`docker exec`/`docker cp`) against
+their real `/var/lib/yuzu`, `/etc/yuzu/certs`, and the containerized
+Postgres — a deliberate, documented substitution of *where* the commands
+run, never of *what* they are. `systemctl stop/start` → `docker
+stop`/`docker compose up -d server` (the closest analogue available); no
+`/etc/yuzu/yuzu-server.env` exists in this container shape (env vars are
+injected directly, not via file), so the DSN was supplied to each command
+directly instead of via `. /etc/yuzu/yuzu-server.env` — same effective
+value, different delivery mechanism.
+
+**Image note:** this build (0.13.0) predates both ADR-0040 (audit→PG) and
+ADR-0041 (RBAC→PG) — confirmed directly this run:
+`rbac_store.rbac_meta` does not exist (`relation "rbac_store.rbac_meta"
+does not exist`), and neither does `audit_store.audit_events`. Both `rbac.db`
+and `audit.db` are still real SQLite files at `/var/lib/yuzu/` on this
+build, which `yuzu-backup.sh` captures directly — so this run's SQLite half
+genuinely round-trips real RBAC + audit data, just not through the
+Postgres-schema checks `disaster-recovery.md`'s step 7 names for a
+current/dev-HEAD deployment. The `rbac_enabled`/`audit_store.audit_events`
+checks in that doc's step 7 are written for the schema names a **current**
+deployment has; against this specific pre-migration image they were
+substituted below for the SQLite-side equivalents (REST audit row count;
+`rbac.db` restored + login succeeding is the practical proof RBAC config
+round-tripped, since this build's `/readyz` already gates on `rbac_store`
+being open — SQLite here, not the PG schema).
+
+### Backup — `09:26:22Z` → `09:26:39Z` (~17s total, three jobs)
+
+Job 1 — `yuzu-backup.sh` (the **fixed** version), run inside the server
+container against its real paths, then tarred to match the canonical
+layout:
+```
+$ docker cp scripts/yuzu-backup.sh yuzu-server:/tmp/yuzu-backup.sh
+$ docker exec yuzu-server bash /tmp/yuzu-backup.sh --data-dir /var/lib/yuzu \
+    --config-dir /etc/yuzu --output /tmp/server-data --no-color
+=== Backup Complete ===
+Files:  88
+Size:   13243 KB
+$ docker exec yuzu-server tar czf /tmp/server-data.tar.gz -C /tmp/server-data .
+$ docker cp yuzu-server:/tmp/server-data.tar.gz "$D/server-data.tar.gz"
+```
+**Manifest self-reference check (Gap #9's fix, verified):**
+```
+$ docker exec yuzu-server sh -c "grep -c SHA256SUMS /tmp/server-data/SHA256SUMS; wc -l /tmp/server-data/SHA256SUMS"
+0
+88 /tmp/server-data/SHA256SUMS
+```
+Zero self-references, 88 entries for 88 files — the bug this drill found
+and fixed does not reproduce against the fixed script.
+
+Job 2 — `pg_dump`, DSN passed straight through, no `sed`:
+```
+$ docker exec yuzu-postgres sh -c "pg_dump --format=custom --file=/tmp/postgres.dump \
+    'postgresql://yuzu:${YUZU_DB_PASSWORD}@localhost:5432/yuzu'"
+$ docker cp yuzu-postgres:/tmp/postgres.dump "$D/postgres.dump"
+```
+Job 3 — certs:
+```
+$ docker run --rm -v yuzu-drill_certs:/certs -v "$D":/backup alpine \
+    tar czf "/backup/certs.tar.gz" -C /certs .
+```
+All three completed in under a second each (`09:26:22Z`→`09:26:25Z` for job
+1's backup step, `09:26:39Z` for jobs 2-3). **RPO reference point:
+2026-09-10T09:26:39Z.**
+
+### Pre-disaster baseline + corruption injection
+
+Same corruption-injection technique as attempt 2, for the same reason (a
+stronger post-restore proof than a row count alone):
+```
+$ docker exec yuzu-postgres psql -U yuzu -d yuzu -c \
+    "INSERT INTO endpoint_state.endpoints (agent_id, hostname, os, last_heartbeat_ms)
+     VALUES ('DISASTER-CORRUPTION-MARKER', 'corrupt-host', 'corrupt-os', 0);"
+INSERT 0 1
+```
+Baseline: `schema_meta`=8, `catalog_rollup_meta`=1, `endpoints`=1 (the
+marker), 241 audit rows (SQLite, via REST), 88-file SHA256SUMS manifest.
+
+### Disaster — `09:26:53Z` (stop issued) → `09:30:23Z` (volumes destroyed)
+
+```
+$ docker stop yuzu-server
+```
+**Measured: 3 minutes 30 seconds** (`09:26:53Z`→`09:30:23Z`) — the identical
+`stop_grace_period: 210s` cost attempt 2 measured against the same compose
+file's `down server`. `docker stop` alone pays it too, since the container
+was created carrying that same stop-timeout setting.
+```
+$ docker rm yuzu-server
+$ docker volume rm yuzu-drill_server-data yuzu-drill_certs
+```
+`yuzu-postgres` untouched throughout — matching `disaster-recovery.md`'s
+own Restore Procedure, which never stops/recreates PostgreSQL.
+
+### Restore — steps 2-7, `09:30:46Z` → `09:33:02Z`
+
+**Step 2** (SQLite/config, via the fixed `yuzu-restore.sh`) —
+`09:30:46Z`→`09:30:48Z` (2s):
+```
+$ docker volume create yuzu-drill_server-data && docker volume create yuzu-drill_certs
+$ docker run --rm --entrypoint bash -v yuzu-drill_server-data:/var/lib/yuzu \
+    -v "$D":/backup -v ./scripts:/scripts:ro ghcr.io/tr3kkr/yuzu-server:0.13.0 -c "
+      mkdir -p /tmp/staging && tar xzf /backup/server-data.tar.gz -C /tmp/staging &&
+      bash /scripts/yuzu-restore.sh /tmp/staging --data-dir /var/lib/yuzu \
+        --config-dir /var/lib/yuzu --yes --no-color &&
+      chown -R 999:999 /var/lib/yuzu"
+--- Verifying manifest ---
+[... 88 lines, all "OK" ...]
+Manifest verification passed
+=== Restore Complete ===
+Files restored: 88
+```
+Clean pass — no self-reference failure, confirming Gap #9's fix under a
+real restore, not just the isolated roundtrip test.
+
+**Step 3** (PostgreSQL) — **this is where Gap #10 was found live.** First,
+the naive fix (drop `--role=yuzu`, add `--exit-on-error`, keep the
+app-role DSN + `--no-owner`) — `09:30:58Z`:
+```
+$ docker exec yuzu-postgres sh -c "pg_restore --exit-on-error --clean --if-exists \
+    --no-owner --dbname='postgresql://yuzu:${YUZU_DB_PASSWORD}@localhost:5432/yuzu' \
+    /tmp/postgres.dump"
+pg_restore: error: could not execute query: ERROR:  must be owner of extension vector
+Command was: DROP EXTENSION IF EXISTS vector;
+exit code: 1
+```
+Checked what that aborted run left behind, **before** attempting any fix —
+this is the finding:
+```
+$ psql ... -c "select count(*) from public.schema_meta;"
+ERROR:  relation "public.schema_meta" does not exist
+```
+`--clean` had already dropped `schema_meta`; `--exit-on-error` stopped
+before it was recreated. The database was now in a **worse** state than
+before this restore attempt began. Retried as the cluster superuser,
+keeping `--no-owner` — `09:31:23Z`, exit code 0, but:
+```
+$ psql -U yuzu -d yuzu -c "select count(*) from endpoint_state.endpoints;"
+ERROR:  permission denied for schema endpoint_state
+```
+Every object now owned by `postgres` (the connecting user, since
+`--no-owner` skipped the ownership handoff) — the app role locked out of
+its own tables. Retried a third time, superuser connection, **without**
+`--no-owner` — `09:31:47Z`, exit code 0:
+```
+$ docker exec yuzu-postgres sh -c "pg_restore --exit-on-error --clean --if-exists \
+    --dbname='postgresql://postgres:${YUZU_POSTGRES_PASSWORD}@localhost:5432/yuzu' \
+    /tmp/postgres.dump"
+$ psql -U yuzu -d yuzu -tA -c "select 'schema_meta',count(*) from public.schema_meta
+    union all select 'endpoints',count(*) from endpoint_state.endpoints
+    union all select 'catalog_rollup_meta',count(*) from software_inventory_store.catalog_rollup_meta;"
+schema_meta|8
+endpoints|0
+catalog_rollup_meta|1
+```
+Clean: `schema_meta` back to 8 rows, the app role can query its own tables
+again, and — the strongest proof — `endpoints` is back to **0**, the
+injected corruption marker gone, restored exactly to the backup snapshot.
+This third form (superuser connection, no `--no-owner`, `--exit-on-error`)
+is what `docs/operations/disaster-recovery.md`'s Restore Procedure step 3
+now documents.
+
+**Step 4** (certs) — `09:32:54Z`→`09:32:55Z` (1s):
+```
+$ docker run --rm -v yuzu-drill_certs:/certs -v "$D":/backup alpine sh -c \
+    "tar xzf /backup/certs.tar.gz -C /certs && chown -R 999:999 /certs"
+```
+
+**Step 6** (start server) — `09:32:55Z`→`09:33:02Z` (7s), polled the same
+way as attempts 1/2:
+```
+09:32:56Z  docker=starting  readyz=000
+09:32:58Z  docker=starting  readyz=200
+09:33:00Z  docker=starting  readyz=200
+09:33:02Z  docker=healthy   readyz=200   <- RESTORE VERIFIED READY
+```
+
+**Step 7** (verify — the checks that replace the false readyz/KEK-only
+claim, adapted for this image per the "Image note" above):
+```
+$ curl -sk -c cookies2.txt -X POST https://localhost:18443/login \
+    --data-urlencode "username=admin" --data-urlencode "password=YuzuDrillAdmin1!"
+{"status":"ok"}                                                          # 200
+$ curl -sk -b cookies2.txt "https://localhost:18443/api/v1/audit?limit=1000" | ...
+rows: 242                                                                # 241 restored + 1 new login
+$ psql -U yuzu -d yuzu -tA -c "select 'schema_meta',count(*) ... ;"
+schema_meta|8
+catalog_rollup_meta|1
+endpoints|0
+```
+
+### RTO / RPO measured (attempt 3)
+
+- **RTO, as actually measured this run (disaster declared → verified
+  ready): 6 minutes 9 seconds** — `09:26:53Z`→`09:33:02Z`. This figure
+  **includes** the live diagnosis of Gap #10 (two wrong pg_restore forms
+  tried and rejected, ~49s of iteration) — it is not the number a corrected
+  recipe produces, and is reported honestly rather than cleaned up after
+  the fact.
+- **RTO, projected for the now-corrected recipe** (skip straight to the
+  superuser-without-`--no-owner` form): `stop_grace_period` 3m30s + SQLite
+  restore 2s + `pg_restore` <1s + certs 1s + server start-to-ready 7s ≈
+  **3 minutes 40 seconds**. Same order of magnitude as attempt 2's 4m14s
+  restore-only figure (the two procedures share the dominant
+  `stop_grace_period`/`down server` cost) — consistent, not coincidental,
+  since both are fundamentally "stop the one container, restore data,
+  start it again" shapes.
+- **RPO reference point: 2026-09-10T09:26:39Z** (last backup artifact
+  written). Zero data loss verified via the corruption-rollback proof
+  above, same method as attempt 2.
+
+### Cleanup
+
+```
+$ docker kill yuzu-server yuzu-postgres && docker rm -f yuzu-server yuzu-postgres
+$ docker volume rm yuzu-drill_server-data yuzu-drill_certs yuzu-drill_postgres-data
+$ docker network rm yuzu-drill_default
+```
+Confirmed empty afterward; `yuzu-viz-gateway`/`yuzu-viz-postgres` confirmed
+still running and untouched throughout (same check as attempts 1/2).
 
 ## Appendix — attempt 1 (2026-09-07, deviated from the header)
 
@@ -511,3 +812,13 @@ restored `server.default_certs_generated` row's CA fingerprint
 - `scripts/yuzu-backup.sh` / `scripts/yuzu-restore.sh` — the SQLite/config-only
   half for non-containerized (systemd/package) installs; explicitly do not
   cover PostgreSQL or the CA/keys directory (see their own `--help` output).
+  Both fixed 2026-09-10 (Gap #9) — see "Attempt 3" above for the
+  reproduced bug and the fix, verified by that attempt's real
+  backup→restore roundtrip.
+- `docs/operations/disaster-recovery.md` — the native-install procedure
+  "Attempt 3" above executes end to end; that doc's Restore Procedure step
+  3 carries the corrected PostgreSQL superuser recipe Gap #10 found.
+- `docs/ops-runbooks/auth-db-recovery.md` — auth-specific recovery
+  scenarios and the "Post-restore verification" checklist that
+  `disaster-recovery.md`'s Restore Procedure step 7 points at as the
+  stronger, can't-lie-as-easily check beyond a raw row count.

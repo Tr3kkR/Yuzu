@@ -341,7 +341,32 @@ by the new
 rules load — that overlay applies to the UAT rig specifically;
 `docker-compose.reference.yml` ships no Prometheus at all). The
 Alertmanager-routing and alerts-file-checksum halves of #2857 remain open
-follow-ups, not addressed by this change. Incident response lifecycle and
+follow-ups, not addressed by this change. **Also found while auditing
+#2857 (governance-reproduced, sre2-2/arch2-2):** the now-deleted
+`deploy/grafana/yuzu-alerts.yml` (10 alerts, zero references anywhere in
+the repo, deleted in an earlier round of this change) was not a strict
+subset of the canonical `docs/prometheus/yuzu-alerts.yml` — 7 of its 10
+alerts have **no equivalent** in the canonical file and were retired with
+no shipped replacement when that legacy file was superseded:
+
+| Retired alert | What it covered | Canonical equivalent |
+|---|---|---|
+| `YuzuNoAgentsConnected` (`yuzu_agents_connected == 0`, 5m) | Zero agents connected fleet-wide | None |
+| `YuzuCommandProcessingStalled` (agents connected but `rate(yuzu_commands_dispatched_total[15m]) == 0`) | Dispatch pipeline stalled while agents are present | None |
+| `YuzuFleetUnhealthy` (`(connected − healthy) / connected > 0.1`) | >10% of the fleet unhealthy (percentage form; the canonical `YuzuAgentDisconnected` alerts on the raw count instead) | None (partial overlap in spirit with `YuzuAgentDisconnected`, not equivalent — that alert has no percentage/ratio form) |
+| `YuzuHeartbeatsStopped` (agents connected but `rate(yuzu_heartbeats_received_total[5m]) == 0`) | Heartbeat pipeline stalled while agents are present | None |
+| `YuzuGatewayUpstreamErrors` (`rate(yuzu_gw_upstream_rpc_errors_total[5m]) > 0.1`) | Gateway→server upstream RPC error rate | None |
+| `YuzuGatewayMemoryHigh` (`yuzu_gw_beam_memory_bytes{type="total"} > 4GiB`, 10m) | Erlang gateway BEAM memory pressure | None |
+| `YuzuGatewayHighChurn` (`rate(yuzu_gw_agents_disconnected_total[5m]) > 10`) | Gateway-side agent disconnect churn | None |
+
+Three of the ten (`YuzuAgentDisconnected`, `YuzuHighCommandFailureRate`,
+`YuzuHighCommandLatency`) do have canonical equivalents and were not lost.
+None of the seven retired rules is restored here — `docs/prometheus/yuzu-alerts.yml`
+is not an owned file of this change — this table exists so "115 alert
+rules ship" is not read as "every alert this project has ever had still
+ships"; propose these seven as new issues against the canonical file if
+the coverage they represented (gateway health, stalled-pipeline detection,
+zero-agents) is still wanted. Incident response lifecycle and
 capacity plans for 1k/5k/10k+ agents remain undocumented — not addressed by
 this change, still open.
 
