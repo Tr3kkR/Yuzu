@@ -1602,20 +1602,17 @@ private:
             }
         }
         work.drain_launches.clear();
-        // TEMP (pre-fix, for RED evidence): the ORIGINAL buggy skip logic,
-        // restored here only long enough to capture a red run against the new
-        // test - see reconcile_probe_launches_locked() a few commits later
-        // for the real fix and why this comment ("publish_locked's
-        // re-validation owns it") is false on this exact path.
-        for (auto& pl : work.probe_launches) {
-            if (!pl.job)
-                continue; // launched: publish_locked's re-validation owns it
-            auto it = watches_.find(pl.key);
-            if (it != watches_.end() && it->second->probe == ProbeState::Pending &&
-                it->second->probe_gen == pl.gen && !it->second->call)
-                defer_admission_locked(*it->second, DetachedLaunch::LaunchFailed);
-        }
-        work.probe_launches.clear();
+        // PR #4225 review fix (BLOCKING): reconcile EVERY staged launch the
+        // same way publish_locked() would have, whether or not
+        // run_off_lock() reached its launch call for a given entry - the
+        // previous inline logic here skipped any entry whose `pl.job` was
+        // already reset (i.e. actually launched), on the assumption
+        // publish_locked()'s re-validation would still run for it - which it
+        // does not, on exactly this (threw-mid-pass) path, permanently
+        // stranding that entry's watch. See reconcile_probe_launches_locked()'s
+        // doc comment for the full failure chain and why it is safe to call
+        // unconditionally here.
+        reconcile_probe_launches_locked(work);
         if (!dispatched) {
             for (const auto& a : work.actions) {
                 auto it = watches_.find(a.key);
