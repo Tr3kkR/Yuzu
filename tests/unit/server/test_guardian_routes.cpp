@@ -32,6 +32,7 @@
 #include "guardian_routes.hpp"
 #include "guaranteed_state_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 #include "test_route_sink.hpp"
 
 #include "../test_helpers.hpp"
@@ -365,6 +366,70 @@ TEST_CASE("deploy_baseline on a store degraded AFTER open reports degraded, neve
     CHECK(h.audit_count("guaranteed_state.baseline.deploy", "degraded") == 1);
     CHECK(h.audit_count("guaranteed_state.baseline.deploy", "denied") == 0);
     CHECK(h.pushes.empty()); // never reached the push fan-out
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// Governance finding SEC-2 (governance.d/4037-guardian-read-twins.*.jsonl):
+// ADR-0038 fix — a degraded agent_rule_statuses() read on the per-guard and
+// per-baseline detail pages now renders a distinct "degraded" placeholder,
+// never a silent empty census indistinguishable from "no devices report
+// this guard/baseline". Sabotages ONLY the census table
+// (guardian_agent_rule_status) via a raw connection — NOT the
+// gs_db_pg.reset()/DROP-DATABASE pattern the deploy_baseline degrade test
+// above uses — because get_rule() (a DIFFERENT table,
+// guaranteed_state_rules) must keep succeeding so the page reaches the
+// census read instead of falling through to the earlier, differently-
+// handled "Guard/Baseline not found" placeholder (get_rule's own degrade
+// posture is a separate, pre-existing, out-of-#4037-scope case — see its
+// comment above real_rule's assignment).
+// ═════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("guard detail page: a degraded status read renders a degrade placeholder, "
+          "never an empty census",
+          "[pg][guardian_routes][guard][degraded][adr0038]") {
+    Harness h;
+    h.seed_guard("g1", "GuardOne");
+    h.agents_json = R"([{"agent_id":"WS-1","hostname":"ws1","os":"windows"}])";
+
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.gs_db_pg->dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE guaranteed_state_store.guardian_agent_rule_status")};
+        REQUIRE(d.ok());
+    }
+
+    auto res = h.sink.Get("/fragments/guardian/guard/g1/page");
+    REQUIRE(res != nullptr);
+    CHECK(res->status == 200); // fragments render inline, not as an HTTP error
+    CHECK(res->body.find("degraded") != std::string::npos);
+    // Must NOT render as though zero devices report this guard, and must not
+    // fall through to the earlier "Guard not found" placeholder either — the
+    // guard genuinely exists (get_rule still succeeds), only the status read
+    // failed.
+    CHECK(res->body.find("Guard not found") == std::string::npos);
+}
+
+TEST_CASE("baseline detail page: a degraded status read renders a degrade placeholder, "
+          "never an empty per-member rollup",
+          "[pg][guardian_routes][baseline][degraded][adr0038]") {
+    Harness h;
+    h.seed_guard("g1", "GuardOne");
+    h.seed_baseline("bl1", "BL1", {"g1"});
+
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.gs_db_pg->dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE guaranteed_state_store.guardian_agent_rule_status")};
+        REQUIRE(d.ok());
+    }
+
+    auto res = h.sink.Get("/fragments/guardian/baseline/bl1/page");
+    REQUIRE(res != nullptr);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("degraded") != std::string::npos);
+    CHECK(res->body.find("Baseline not found") == std::string::npos);
 }
 
 TEST_CASE("editing a deployed Baseline does not change what the fleet enforces until re-deploy",

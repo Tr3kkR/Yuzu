@@ -17413,6 +17413,12 @@ private:
             // decision for the same caller (same conversion, same underlying
             // require_fleet_read call).
             mcp_server_->set_fleet_read_fn(fleet_read_fn);
+            // #4037 — the SAME list_read_fn lambda wired into the REST
+            // registration's trailing list_read_fn param below, so the REST
+            // GET /guaranteed-state/status and MCP get_guardian_status twins
+            // cannot observe a different admit decision for the same caller
+            // (same conversion, same underlying require_list_read call).
+            mcp_server_->set_list_read_fn(list_read_fn);
             // #4027 fix round (CDX-P1-01/K4): the RBAC/management-group AXIS
             // for these three tools is the fleet_read_fn_ already wired above
             // (the SAME instance query_installed_software uses).
