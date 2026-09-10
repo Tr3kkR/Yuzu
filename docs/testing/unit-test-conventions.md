@@ -23,6 +23,20 @@ For route-handler tests, `TestRouteSink` (`tests/unit/server/test_route_sink.hpp
 
 For server tests that need a live `ExecutionTracker` in `AgentServiceImpl`, use the `TrackerScope` RAII helper in `tests/unit/server/test_agent_service_impl.cpp` — takes a `pg::PgPool&` (ADR-0065; PG-backed, not `:memory:` SQLite), `set_execution_tracker`, nulls the borrowed pointer before the tracker destructs (the production shutdown contract, `agent_service_impl.hpp:113`). Promote to `test_helpers.hpp` once a second file needs it.
 
+## Agent-side journal storage tests — `FakeJournalStore`
+
+For any Guardian journal concurrency checkpoint that needs a storage backend without real
+SQLite I/O, use `yuzu::test::FakeJournalStore` (`tests/unit/fake_journal_store.hpp`) — an
+in-memory `IJournalStore` implementation, self-serialised under one mutex, mirroring
+`KvStore`'s locking/ownership contract exactly (see the header's own doc comment for the
+full contract and its one documented divergence: case-sensitive prefix matching vs SQLite's
+ASCII-case-insensitive `LIKE`). Contract pinned by `tests/unit/test_fake_journal_store.cpp`.
+Unlike `PageRig`/`JournalRig` (same test file / `test_guardian_outbox_drain_worker.cpp`),
+which construct `GuardianLifecycleJournal` against a real on-disk `KvStore` and remain the
+right choice for tests that need genuine SQLite semantics (quarantine `Conflict` ordering,
+extended result codes, `list_entries` byte-exactness), `FakeJournalStore` is for tests where
+the concurrency property under test — not the storage engine — is the point (#4153).
+
 ## Live PostgreSQL — which macro to use
 
 For server tests needing live **PostgreSQL**, use `PostgresTestDb` + `YUZU_REQUIRE_PG_DB(var)` from `test_helpers.hpp` (behind `YUZU_TEST_ENABLE_PG`, server suite only). Creates an ephemeral `yuzu_test_<epoch>_<salt>_<n>` DB on `YUZU_TEST_POSTGRES_DSN`, drops it `WITH (FORCE)`; the name-embedded epoch drives a suite-start sweep of databases leaked by killed runs. Skip-vs-fail: env **unset** → skip (local dev); **set but broken** → FAIL (`scripts/ci/ensure-postgres.sh` guarantees a reachable instance on every CI server-test leg). **Store-behaviour tests use the pre-migrated template variant** `YUZU_REQUIRE_PG_DB_TPL(var, tpl)` + a file-local `PgTestTemplate` (clones an already-migrated DB — per-test migration DDL drove the 2026-07-12 Windows server-suite timeout; recipe: `docs/postgres-store-playbook.md` step 7); plain `YUZU_REQUIRE_PG_DB` is only for fresh-DB / pg-substrate behaviour tests. **Migration-in-substance tests** (a real fresh migrate, `!is_open` on failure, backfill/upgrade, drift-detection) use `YUZU_REQUIRE_PG_MIGRATION_DB(var)` instead (#2354, #3443) — same contract, SKIPs on Windows by default (fail-closed; `YUZU_TEST_PG_MIGRATION_DDL=1` overrides), so a new store's migration test belongs on this macro, never plain `YUZU_REQUIRE_PG_DB`. Local: run `postgres:18` on `:5433`, then `export YUZU_TEST_POSTGRES_DSN=postgresql://yuzu:yuzu@localhost:5433/yuzu`.

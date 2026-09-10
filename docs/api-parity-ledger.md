@@ -101,11 +101,11 @@ plus `$ref` validity) - the #842 companion to this whole-tree script.
 
 | Domain | Rows | Twinned | Untwinned |
 |---|---:|---:|---:|
-| devices | 10 | 3 | 7 |
+| devices | 10 | 7 | 3 |
 | inventory | 6 | 1 | 5 |
-| dex | 25 | 1 | 24 |
+| dex | 25 | 17 | 8 |
 | guardian | 16 | 0 | 16 |
-| tar | 12 | 1 | 11 |
+| tar | 12 | 4 | 8 |
 | auto-preflight | 4 | 1 | 3 |
 | auto-deploy | 4 | 1 | 3 |
 | auto-verify | 3 | 0 | 3 |
@@ -113,8 +113,8 @@ plus `$ref` validity) - the #842 companion to this whole-tree script.
 | viz | 2 | 2 | 0 |
 | executions | 6 | 1 | 5 |
 | scope-result-sets | 1 | 0 | 1 |
-| instructions | 24 | 0 | 24 |
-| compliance-policy | 19 | 1 | 18 |
+| instructions | 24 | 11 | 13 |
+| compliance-policy | 19 | 6 | 13 |
 | settings | 15 | 0 | 15 |
 | rbac | 8 | 0 | 8 |
 | auth-mfa | 7 | 0 | 7 |
@@ -122,13 +122,13 @@ plus `$ref` validity) - the #842 companion to this whole-tree script.
 | access-reviews | 2 | 0 | 2 |
 | ca-pki | 3 | 2 | 1 |
 | ota | 15 | 0 | 15 |
-| enrollment | 19 | 0 | 19 |
+| enrollment | 19 | 5 | 14 |
 | other | 74 | 0 | 74 |
-| **Total** | **278** | **15** | **263** |
+| **Total** | **278** | **59** | **219** |
 
-Registered `/api/v1/*` routes: 175. OpenAPI `paths` entries: 174. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 93.
+Registered `/api/vN/*` routes: 219. OpenAPI `paths` entries: 218. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 118.
 
-Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 263.
+Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 219.
 
 <!-- END GENERATED -->
 

@@ -293,11 +293,64 @@ Operator                     Server                                  Agent
 
 Most HTTP surfaces the server exposes — REST, dashboard fragments, MCP — are registered by a
 **route owner**: a class with a `register_routes(...)` method that the server calls once at
-startup. `server.cpp` wires those owners, *and* registers a further **105 routes inline** on
-`web_server_->{Get,Post,Put,Delete}` — the health and readiness probes, the static-asset surface,
-much of the `/api/*` dashboard JSON, and `POST /api/command`
-(`server/core/src/server.cpp:7951`). It constructs no `HttplibRouteSink` of its own, so none of
-those inline routes is reachable from the in-process test harness.
+startup. As of #2542 PR-12, `server.cpp` **registers zero routes inline** on
+`web_server_->{Get,Post,Put,Delete}` — every surface this prose has ever tracked here has moved to
+its own `HttpRouteSink` module, and the campaign's inline-extraction goal (issue #438: an
+in-process-untestable handler is an authorization/CSRF/scope-check blind spot) is complete. (Twenty
+surfaces this prose previously credited to this inline count have moved to their own
+`HttpRouteSink` modules: `POST /api/command` is `command_routes.cpp` (#2557); the
+page-shell/static-asset surface — `/static/*`, `/`, `/chargen`, `/procfetch`, `/api/help*`,
+`/help`, `/tar`, `/result-sets`, `/viz/fleet`, `/viz/host/:id`, `/instructions`; 25 routes — is
+`page_routes.{hpp,cpp}` (#2542 PR-2); a #2542 follow-up split 10 further scattered routes into
+`dashboard_api_routes.{hpp,cpp}` (`/api/me`, `/api/agents`, `/api/audit`, `POST
+/api/export/json-to-csv`, `POST /api/scope/validate`, `/api/analytics/{status,recent}`; 7 routes)
+and `nvd_routes.{hpp,cpp}` (`/api/nvd/{status,sync,match}`; 3 routes); the 5-route Custom
+Properties API (7.6) — `/api/agents/:id/properties[/:key]`, `/api/property-schemas` — is
+`custom_properties_routes.{hpp,cpp}` (#2542 PR-4); the Result Sets fragment API —
+`/fragments/result-sets/{sidebar,create}` plus the three `:id`-scoped
+`/fragments/result-sets/:id/{detail,pin,unpin,delete}`; 6 routes — is
+`result_set_routes.{hpp,cpp}` (#2542 PR-5); the 13-route Instruction Definitions + Instruction Sets
+API — `GET/POST /api/instructions`, `GET/PUT/DELETE /api/instructions/:id`,
+`GET /api/instructions/:id/export`, `POST /api/instructions/import`,
+`GET/POST /api/instruction-sets`, `DELETE /api/instruction-sets/:id`,
+`GET /fragments/instructions/editor`, `POST /api/instructions/yaml`,
+`POST /api/instructions/validate-yaml` — is `instruction_routes.{hpp,cpp}` (#2542 PR-7); the
+7-route legacy pre-v1 Executions API — `GET /api/executions`, `GET /api/executions/:id`,
+`GET /api/executions/:id/{summary,agents,children}`, `POST /api/executions/:id/{rerun,cancel}` —
+is `execution_routes.{hpp,cpp}` (#2542 PR-7); the 4-route Schedules API —
+`GET/POST /api/schedules`, `DELETE /api/schedules/:id`, `POST /api/schedules/:id/enable` — is
+`schedule_routes.{hpp,cpp}` (#2542 PR-8); the 4-route Approval API — `GET /api/approvals`,
+`GET /api/approvals/pending/count`, `POST /api/approvals/:id/{approve,reject}` — is
+`approval_routes.{hpp,cpp}` (#2542 PR-9); the 6-route Health/Infra cluster — `GET /metrics`,
+`GET /health`, `GET /api/health`, `GET /livez`, `GET /readyz`, `GET /fragments/health/summary` — is
+`health_routes.{hpp,cpp}` (#2542 PR-10); the 3-route legacy pre-v1 Responses API — `GET
+/api/responses/:id/aggregate`, `GET /api/responses/:id/export`, `GET /api/responses/(.+)` — is
+`response_routes.{hpp,cpp}` (#2542 PR-11); the 4-route Tags API — `GET /api/tags`, `POST
+/api/tags/set`, `POST /api/tags/delete`, `POST /api/tags/query` — is `tag_routes.{hpp,cpp}` (#2542
+PR-11); the 3-route generic plugin-data Inventory API (Issue 7.17) — `GET
+/api/inventory/tables`, `GET /api/inventory/:agent_id/:plugin`, `POST /api/inventory/query` — is
+`data_inventory_routes.{hpp,cpp}` (#2542 PR-11, namespace `yuzu::server::data_inventory` to avoid
+colliding with `inventory_routes.hpp`'s unrelated `/inventory` dashboard, which lives directly in
+`yuzu::server`); and #2542 PR-12 (the Infra/Misc bundle — six small, heterogeneous modules with no
+single owning store, matching the `dashboard_api_routes`/`nvd_routes` bundling precedent) split a
+further 14 routes into six modules: the 2-route Runtime Configuration API (7.3) —
+`GET /api/config`, `PUT /api/config/:key` — is `config_routes.{hpp,cpp}`; the 5-route Chargen +
+Procfetch diagnostic API — `POST /api/chargen/{start,stop}`, `POST /api/procfetch/fetch`,
+`GET /api/chargen/status`, `GET /api/procfetch/status` — is `diagnostics_routes.{hpp,cpp}`; the
+legacy `GET /events` SSE stream is `legacy_events_routes.{hpp,cpp}`; the 2-route Instructions HTMX
+fragment pair — `GET /fragments/instructions`, `POST /fragments/instructions/yaml-preview` — is
+`instruction_fragment_routes.{hpp,cpp}` (deliberately not part of PR-7's `instruction_routes.cpp`
+— see that module's header comment); the Approvals HTMX fragment — `GET /fragments/approvals` — is
+`approvals_fragment_routes.{hpp,cpp}` (deliberately not part of PR-9's `approval_routes.cpp`); and
+the 3-route MCP-disabled stub triple — `POST/GET/DELETE /mcp/v1/`, registered only when
+`cfg_.mcp_disable` is true — is `mcp_disabled_routes.{hpp,cpp}`. Of the nineteen #2542 owner files
+(everything above except `command_routes.cpp`, which is #2557), eighteen register against the same
+stack-local `inline_sink`, constructed in `start_web_server()`. `mcp_disabled_routes.cpp` is the
+one exception: it registers against its own local sink inside the `if (cfg_.mcp_disable)` block —
+`inline_sink` is in fact still in scope there, but this module deliberately follows the
+own-local-sink pattern `command_routes.cpp` already established, rather than reaching back out to
+the shared one. Either would work identically at runtime — `HttplibRouteSink` is a stateless
+forwarding wrapper — so this is a stylistic precedent, not a scope constraint.)
 
 Counting the surface therefore needs a receiver-agnostic pattern, not a search for one variable
 name:
@@ -307,8 +360,9 @@ grep -rnE '\b[A-Za-z_][A-Za-z0-9_]*(\.|->)(Get|Post|Put|Delete|Patch|Options)\('
 ```
 
 Route owners name their receiver `svr` or `sink`; `server.cpp` names its `web_server_`. Grepping
-only for `svr\.` returns nothing from `server.cpp` and reads as "no inline routes" — a false
-negative that was published in this document and in #2542 before it was caught. `/api/command`'s
+only for `svr\.` returned nothing from `server.cpp` and read as "no inline routes" — a false
+negative published in this document and in #2542 before it was caught; the receiver-agnostic
+pattern above exists so a future inline registration can't hide the same way. `/api/command`'s
 untestability is tracked by #2557; the owner-side migration by #2542.
 
 **The registration seam.** A route owner's real `register_routes` takes `HttpRouteSink&`
@@ -332,12 +386,56 @@ fragments shipped a destructive operation with no route-handler coverage until #
 **Invariant.** New route owners register through `HttpRouteSink&`; new routes on an existing owner
 register through the sink that owner already uses. Do not add a handler that only the
 `httplib::Server&` overload — or an inline `web_server_->` call in `server.cpp` — can reach.
-Registrations outside the sink are pre-existing debt, not a precedent to copy: after #2542 PR-1
-(`VerifyRoutes` and `NotificationRoutes` joined the sink pattern), `mcp_server.cpp` is the only
-remaining route owner registering directly on a raw `svr.{Get,Post,Delete}` (3 registrations) —
-plus `server.cpp`'s own 105 inline routes (a bare `grep -c` of the pattern above returns 106; one
-hit at `server.cpp:9468` is a comment, not a registration), which are not a route-owner class and
-are untouched by this migration; 108 registrations remain outside the sink in total.
+A registration outside the sink is a regression, not debt to extend: after #2542 PR-1
+(`VerifyRoutes` and `NotificationRoutes` joined the sink pattern), the page-shell/static-asset
+extraction (`page_routes.{hpp,cpp}`, PR-2, 25 routes registered against `inline_sink`), a #2542
+follow-up (`dashboard_api_routes.{hpp,cpp}` + `nvd_routes.{hpp,cpp}`, 10 more scattered routes
+registered against the same `inline_sink`), the Custom Properties API extraction
+(`custom_properties_routes.{hpp,cpp}`, 5 routes, #2542 PR-4), the Result Sets fragment
+extraction (`result_set_routes.{hpp,cpp}`, PR-5, 6 routes, also against `inline_sink`), and the
+3-route MCP JSON-RPC endpoint (`mcp_server.{hpp,cpp}`, #2542 PR-6 — `McpServer::register_routes`
+gained the `HttpRouteSink&` overload; its `httplib::Server&` overload is now the thin wrapper,
+matching every other owning-class route module (`DeviceRoutes`, `ComplianceRoutes`, `DexRoutes`,
+...) rather than the free-function `Deps`-struct + `inline_sink` pattern the other modules above
+use — `server.cpp` still calls `mcp_server_->register_routes(*web_server_, ...)` unchanged, exactly
+as it does for every other owning-class module), the Instruction Definitions + Instruction Sets /
+legacy pre-v1 Executions extraction (`instruction_routes.{hpp,cpp}` +
+`execution_routes.{hpp,cpp}`, PR-7, 13 + 7 = 20 routes, also against `inline_sink`), the Schedules
+API extraction (`schedule_routes.{hpp,cpp}`, PR-8, 4 routes, also against `inline_sink`), the
+Approval API extraction (`approval_routes.{hpp,cpp}`, PR-9, 4 routes, also against `inline_sink`),
+the Health/Infra cluster extraction (`health_routes.{hpp,cpp}`, PR-10, 6 routes — `/metrics`,
+`/health`, `/api/health`, `/livez`, `/readyz`, `/fragments/health/summary` — also against
+`inline_sink`), the Data APIs extraction — the legacy pre-v1 Responses API
+(`response_routes.{hpp,cpp}`, 3 routes), the Tags API (`tag_routes.{hpp,cpp}`, 4 routes), and the
+generic plugin-data Inventory API (`data_inventory_routes.{hpp,cpp}`, 3 routes) — three separate
+single-store modules landing together as one bundle PR (#2542 PR-11, 3 + 4 + 3 = 10 routes, also
+against `inline_sink`), and the Infra/Misc bundle (PR-12, 14 routes across six modules —
+`config_routes.{hpp,cpp}`, `diagnostics_routes.{hpp,cpp}`, `legacy_events_routes.{hpp,cpp}`,
+`instruction_fragment_routes.{hpp,cpp}`, and `approvals_fragment_routes.{hpp,cpp}` against
+`inline_sink`; `mcp_disabled_routes.{hpp,cpp}` against its own local sink inside
+`if (cfg_.mcp_disable)`, the same pattern `command_routes.cpp` uses) — `server.cpp` registers ZERO
+routes inline now; there is nothing left outside the sink for a further campaign PR to touch. An
+earlier version of this sentence predicted otherwise twice ("no further PR touches them") and was
+falsified both times; this is not a third prediction, it is the anchored count reading zero. Count
+these with the anchored pattern
+`grep -cE '^\s*web_server_->(Get|Post|Put|Delete|Patch|Options)\('
+server/core/src/server.cpp`, not a bare `grep -c` of the receiver-agnostic pattern above — the
+unanchored form over-counts by picking up at least one comment-line false match, which is how a
+105/106 figure was previously published here; the anchored count was 104 immediately before the
+page-shell extraction (independently re-verified during that extraction), 79 after it, 64 once both
+the `dashboard_api_routes`/`nvd_routes` follow-up (-10) and the Custom Properties API extraction
+(-5) had landed together, 58 once the Result Sets fragment extraction (-6) also landed, stayed 58
+after the MCP extraction (#2542 PR-6) — that PR removed the last 3 raw `svr.{Get,Post,Delete}`
+registrations in `mcp_server.cpp` (verify with
+`grep -cE '\bsvr\.(Get|Post|Put|Delete|Patch|Options)\(' server/core/src/mcp_server.cpp`, now 0),
+which were never counted by the `web_server_->` pattern above in the first place since they were
+never inline in `server.cpp` — dropped to 38 once the Instruction Definitions + Instruction Sets /
+legacy pre-v1 Executions extraction (-20, PR-7) landed, 34 once the Schedules API extraction (-4,
+PR-8) also landed, 30 once the Approval API extraction (-4, PR-9) also landed, 24 once the
+Health/Infra cluster extraction (-6, PR-10) also landed, 14 once the Data APIs bundle extraction
+(-10: Responses -3, Tags -4, Inventory -3, PR-11) also landed, and is 0 now that the Infra/Misc
+bundle (-14, PR-12) has also landed. Zero registrations remain outside the sink — the #2542
+campaign's inline-route-extraction goal is complete.
 
 ## Storage Architecture
 

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "dispatch_confined_arms.hpp" // #3424/#3511: ConfinedDispatchOutcome -- DispatchFn/CommandDispatchFn return type
+#include "command_outbox_store.hpp" // WS-3 3.3: OutboxEnqueueRequest / OutboxEnqueueOutcome
 
 /// @file schedule_runner.hpp
 /// Drives the recurring-instruction schedules that were previously dead.
@@ -10,13 +10,19 @@
 /// nothing ever called either in production (#1191) — schedules were
 /// created, listed and never fired. This component closes that gap.
 ///
-/// Model: a background thread in ServerImpl `tick()`s on a cadence (the
-/// policy_eval_thread_ / preflight_runner_thread_ pattern). Each tick pulls
-/// the due schedules and fires them through the SAME shared dispatch lambda
-/// as operator-initiated commands, creating a tracked execution row before
-/// dispatch (the create-before-dispatch contract from the executions-history
-/// ladder, UP2-4) so scheduled runs appear in the Executions history exactly
-/// like manual runs.
+/// Model (WS-3 3.3, ADR-2002 §6): a background thread in ServerImpl `tick()`s
+/// on a cadence (the policy_eval_thread_ / preflight_runner_thread_ pattern).
+/// Each tick pulls the due schedules and, for each fire, creates a tracked
+/// execution row (the create-before-dispatch contract from the
+/// executions-history ladder, UP2-4) and COMMITS A DURABLE `pending` OUTBOX
+/// OCCURRENCE — it no longer dispatches to agents inline. The leader-gated
+/// `CommandOutboxDelivery` loop performs the actual wire send. This is
+/// claim-before-side-effect: a crash between the enqueue and the send re-drives
+/// from `pending`, and the occurrence's stable id keeps it effectively-once. A
+/// fire-time crash before advance re-fires next tick, but the occurrence key
+/// (`schedule_id:next_execution_at`) is idempotent (`AlreadyEnqueued`), so the
+/// re-fire produces no second occurrence. Scheduled runs still appear in the
+/// Executions history exactly like manual runs (the exec row is created here).
 ///
 /// Approval posture — a scheduled fire NEVER bypasses the approval gate the
 /// interactive execute path enforces. A fire requires approval when the
@@ -49,8 +55,6 @@
 /// not a second copy of it — a denial here means fire_with_approval never
 /// runs at all for that occurrence.
 
-#include "dispatch_caller.hpp"
-
 #include <functional>
 #include <string>
 #include <unordered_map>
@@ -73,46 +77,18 @@ struct InstructionSchedule;
 
 class ScheduleRunner {
 public:
-    /// Same shape as WorkflowRoutes::CommandDispatchFn — the server hands the
-    /// runner the one shared dispatch lambda so scheduled fires travel the
-    /// exact same path as operator-initiated commands. Review finding
-    /// (external PR review, #3133): this used to be narrower than its
-    /// sibling — no `caller` parameter at all — so every fire went through
-    /// `command_dispatch_fn`'s hardcoded `DispatchCaller{.system = true}`,
-    /// bypassing the classify+authorize chokepoint's per-action check
-    /// entirely. Widened to actually match the shape this comment always
-    /// claimed.
-    using CommandDispatchFn = std::function<yuzu::server::ConfinedDispatchOutcome(
-        const std::string& plugin, const std::string& action,
-        const std::vector<std::string>& agent_ids, const std::string& scope_expr,
-        const std::unordered_map<std::string, std::string>& parameters,
-        const std::string& execution_id, const yuzu::server::DispatchCaller& caller)>;
-
-    /// ADR-1007 — a deliberate SIBLING of `CommandDispatchFn`, not a
-    /// widening (same rationale as `WorkflowRoutes::ConcurrencyDispatchFn`,
-    /// whose doc comment this mirrors): `CommandDispatchFn` here is bound
-    /// from the SAME shared `command_dispatch_caller_fn` lambda server.cpp
-    /// wires into dashboard/REST/MCP too, so widening it would ripple far
-    /// beyond this file. Default-constructed (unwired) ⇒ `dispatch_tracked`
-    /// falls back to `dispatch_fn` with no concurrency gate.
-    using ConcurrencyDispatchFn = std::function<yuzu::server::ConfinedDispatchOutcome(
-        const std::string& plugin, const std::string& action,
-        const std::vector<std::string>& agent_ids, const std::string& scope_expr,
-        const std::unordered_map<std::string, std::string>& parameters,
-        const std::string& execution_id, const yuzu::server::DispatchCaller& caller,
-        const std::string& definition_id, const std::string& concurrency_mode)>;
-
-    /// Resolves the CURRENT `DispatchCaller` for a stored username at fire
-    /// time — re-resolving live permissions, never trusting a stale
-    /// creation-time snapshot (a schedule's creator may have gained or lost
-    /// grants since `s.created_by` was recorded). A schedule fire has no
-    /// live HTTP session to derive from, unlike every other dispatch
-    /// surface's `CallerFn` — server.cpp wires this to a lookup against the
-    /// current auth/RBAC state. REQUIRED: an unwired resolver would
-    /// reproduce exactly the system-caller bypass this field exists to
-    /// close, so `dispatch_tracked` calls it unconditionally rather than
-    /// falling back to an unfiltered default.
-    using ResolveCallerFn = std::function<yuzu::server::DispatchCaller(const std::string& username)>;
+    /// WS-3 3.3 — commit ONE durable `pending` outbox occurrence for a fire,
+    /// replacing the former inline dispatch. server.cpp binds this to a lambda
+    /// that mints the occurrence's stable `command_id`, reads the current leader
+    /// epoch, and calls `CommandOutboxStore::claim_and_enqueue` — so this file
+    /// stays free of the store/elector concrete types and its tests can inject a
+    /// fake. The delivery loop (`CommandOutboxDelivery`) performs the actual send
+    /// and re-authorization; this runner only DECIDES a fire and durably records
+    /// it. REQUIRED: an unwired `enqueue_fn` means a fire cannot be durably
+    /// queued, so `enqueue_occurrence` fails closed (the schedule stays due and
+    /// retries) rather than silently dropping the occurrence.
+    using EnqueueFn =
+        std::function<yuzu::server::OutboxEnqueueOutcome(const yuzu::server::OutboxEnqueueRequest&)>;
 
     /// Re-verify the arming principal's current authority to fire ONE
     /// plugin.action (D7, peer finding PLAN-003). Checked in `fire()`
@@ -133,9 +109,7 @@ public:
         ApprovalManager* approval_manager{nullptr};     // optional (see fire())
         AuditStore* audit_store{nullptr};               // optional forensic sink
         yuzu::MetricsRegistry* metrics{nullptr};        // optional observability sink
-        CommandDispatchFn dispatch_fn;                  // required
-        ConcurrencyDispatchFn dispatch_fn_concurrency;   // optional (ADR-1007) — see doc comment
-        ResolveCallerFn resolve_caller;                 // required
+        EnqueueFn enqueue_fn;                            // required (WS-3 3.3) — see doc comment
         ArmingCheckFn arming_check;                      // fail-closed when unset — see above
         // #3495: lets a shutdown request stop tick() from firing further due
         // schedules once stop_requested_ flips — checked once per schedule,
@@ -164,11 +138,15 @@ private:
     bool fire_with_approval(const InstructionSchedule& s, const std::string& plugin,
                             const std::string& action);
 
-    // Tracked dispatch shared by the direct and approved arms. Returns the
-    // number of agents reached (0 on failure; the execution row, when a
-    // tracker is wired, is cancelled on failure so it cannot idle forever).
-    int dispatch_tracked(const InstructionSchedule& s, const std::string& plugin,
-                         const std::string& action, const std::string& approval_id);
+    // Create the tracked execution row and commit ONE durable pending outbox
+    // occurrence, shared by the direct and approved arms (WS-3 3.3). Returns
+    // true iff the occurrence is durably queued (Enqueued or the idempotent
+    // AlreadyEnqueued) and the caller should advance the schedule; false on a
+    // degraded/fenced-out enqueue (the schedule stays due and retries — the
+    // stable occurrence key keeps the retry idempotent). Does NOT dispatch to
+    // agents — the delivery loop does that.
+    bool enqueue_occurrence(const InstructionSchedule& s, const std::string& plugin,
+                            const std::string& action, const std::string& approval_id);
 
     void audit(const InstructionSchedule& s, const std::string& action,
                const std::string& result, const std::string& detail);

@@ -11,13 +11,17 @@
 
 #include "ca_store.hpp"
 #include "key_provider.hpp"
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 #include "x509_ca.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include "../test_helpers.hpp"
 #include "../test_log_capture.hpp"
+
+#include <libpq-fe.h> // PQconnectdb/PQstatus/PGRES_* used directly by the UP-3 side-lock rendezvous
 
 #include <openssl/bio.h>
 #include <openssl/pem.h>
@@ -28,6 +32,7 @@
 #include <array>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -715,161 +720,185 @@ TEST_CASE("default_certs: a losing HA replica self-heals from the shared cert di
     // pre-existing UP-2 self-heal branch (it finds the winner's key already on
     // disk and adopts it there) WITHOUT ever reaching this fix's own code. The
     // new fingerprint-mismatch poll loop only fires for a racer whose OWN
-    // get_root() check raced BEFORE the winner committed. Six concurrent
-    // candidates make this LIKELY but not GUARANTEED on every run — under
-    // real system load (confirmed empirically: this happened during a full
-    // 10-shard suite run, never in ~15 isolated runs) every racer's get_root()
-    // can land after the winner already committed, so all six correctly take
-    // the pre-existing UP-2 path and the run is a legitimate, non-buggy
-    // outcome that simply doesn't exercise THIS fix's own new code.
+    // get_root() gate saw EMPTY, generated its own candidate, and only THEN
+    // lost the try_insert_root() CAS.
     //
-    // BOUNDED retry of the WHOLE scenario (fresh dir + fresh store each
-    // attempt — a stale store already has a root, which cannot restage the
-    // "genuinely empty" precondition this race needs), mirroring
-    // test_mcp_stream_bridge.cpp's #3357 "quiesce B before the experiment"
-    // shape: exceeding the bound is a REQUIRE failure (a red assertion, not a
-    // silent pass or an infinite spin) — if six racers under
-    // kMaxSchedulingAttempts tries never once produce a genuine CAS loser,
-    // that is itself worth investigating, not something to retry away.
+    // DETERMINISTIC RENDEZVOUS AT THE CAS (was a 15-attempt retry-until-lucky
+    // loop, #3475 — deflaked here). The old test spawned the six racers and
+    // RETRIED the whole scenario up to 15× hoping the scheduler produced that
+    // interleaving; under a loaded runner (Big Tam: four agents + parallel PG
+    // shards) every racer's get_root() could land after the winner committed
+    // all 15× — a hard, mechanism-less red. A thread-launch start barrier was
+    // tried and measured WORSE (it synchronizes thread launch, not the
+    // get_root()-vs-commit ordering that actually matters).
     //
-    // Widened from 5 (#3475): a heavily-loaded runner can make the "every
-    // racer's get_root() lands after the winner already committed" outcome
-    // land 5 times in a row — PgPool is lazily-connecting (no eager warm-up
-    // in its constructor), so most racers' first real work after thread
-    // creation is its own connect+query round trip (the CaStore constructor
-    // primes one connection into the pool before racers spawn, so one racer
-    // gets an instant idle-pool hit instead), and under contention
-    // that stagger dominates over pure CPU scheduling. A start barrier was
-    // tried and measured WORSE under load on this box (13/15 failures vs.
-    // baseline's occasional single miss) — it synchronizes thread launch,
-    // not the connection/keygen work after it, and forcing 6 threads to
-    // begin their CPU-heavy P-384 keygen simultaneously adds contention at
-    // the worst possible moment. Pure margin, not a mechanism claim.
+    // The rendezvous IS the CAS itself, forced at the Postgres layer with ZERO
+    // production-code change (mirrors test_engine_principal_store.cpp's side
+    // lock and test_auth.cpp's pg_stat_activity observation): a side connection
+    // holds `LOCK TABLE ca_store.ca_root IN EXCLUSIVE MODE`, which ADMITS the
+    // six get_root() SELECTs (ACCESS SHARE) but BLOCKS the six try_insert_root
+    // INSERTs (ROW EXCLUSIVE). Because no INSERT can commit while the lock is
+    // held, every racer's earlier empty-root gate necessarily sees empty → every
+    // racer generates a candidate → every racer reaches the CAS. We poll
+    // pg_stat_activity until all six backends are genuinely WAITING on that lock
+    // (a direct observation of the mechanism, not a wall-clock proxy), then
+    // ROLLBACK to release them together: ON CONFLICT DO NOTHING picks exactly
+    // one winner and the other five read back the winner's fingerprint — five
+    // GENUINE UP-3 losers, every run. The losers then poll the shared dir for
+    // the winner's on-disk complete set (the real kLoserSelfHealPollWindow poll
+    // — NOT stubbed), so the self-heal wait is still genuinely exercised.
+    //
+    // The rendezvous also eliminates the CAPG-042 deferred-key-write refusal
+    // window the retry version had to tolerate: that refusal requires the
+    // top-of-function B-2 check to observe a COMMITTED root, which cannot happen
+    // while the lock blocks every INSERT — so all six racers succeed and the
+    // tolerance block is gone.
     constexpr int kRacers = 6;
-    constexpr int kMaxSchedulingAttempts = 15;
-    for (int attempt = 0;; ++attempt) {
-        INFO("scheduling attempt " << attempt << ": did every racer's get_root() land after "
-             "the winner already committed? (legitimate, just doesn't exercise this fix's "
-             "own new code — retrying to get a genuine CAS loser)");
-        REQUIRE(attempt < kMaxSchedulingAttempts);
 
-        TempDir dir;
-        YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
-        // Pool sized generously above server-admin.md's documented "N+1
-        // connections per racer needing the bootstrap lock" floor: with
-        // kRacers genuine candidates, several may independently reach the
-        // lock (winner + any that raced the UP-2 shortcut), each needing an
-        // outer lease plus its own nested per-call leases. This test
-        // deliberately over-races well beyond a realistic HA topology (2-3
-        // replicas) specifically to reliably exercise the new poll-loop
-        // branch — a small pool here would hit the SAME documented capacity
-        // constraint the file's own kBootstrapLockAcquireTimeout comment
-        // describes, which is a property of this test's exaggerated
-        // concurrency, not a defect.
-        yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 32}};
-        CaStore store{pool};
-        REQUIRE(store.is_open());
-        REQUIRE_FALSE(store.has_root());
+    TempDir dir;
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    // Racer pool: lock_timeout raised well above the poll budget below so a
+    // racer INSERT blocked on the side lock can never lock_timeout-error before
+    // the unconditional ROLLBACK releases it (the 10s default would race a slow
+    // sixth racer on a loaded box). Sized generously above server-admin.md's
+    // "N+1 connections per racer needing the bootstrap lock" floor — several
+    // racers independently reach the lock, each needing an outer lease plus
+    // nested per-call leases; a small pool would hit that documented capacity
+    // limit, a property of this test's exaggerated concurrency, not a defect.
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 32, .lock_timeout_ms = 60000}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE_FALSE(store.has_root());
 
-        std::array<DefaultCertSet, kRacers> sets;
-        std::array<bool, kRacers> oks{};
-        std::string logs;
-        {
-            yuzu::test::LogCapture log;
-            std::vector<std::thread> threads;
-            threads.reserve(kRacers);
-            for (int i = 0; i < kRacers; ++i) {
-                threads.emplace_back([&, i] {
-                    oks[static_cast<size_t>(i)] = ensure_default_certs(
-                        dir.path, "host-" + std::to_string(i), &store,
-                        sets[static_cast<size_t>(i)]);
-                });
-            }
-            for (auto& t : threads)
-                t.join();
-            log.stop();
-            logs = log.text();
+    // Side connection holds ca_store.ca_root EXCLUSIVE so every racer blocks at
+    // its INSERT while its get_root() SELECT still passes. Manual BEGIN/LOCK/
+    // ROLLBACK (PgConn's dtor also PQfinishes, tearing down any open txn) —
+    // matches test_engine_principal_store.cpp's side-lock shape.
+    yuzu::server::pg::PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(yuzu::server::pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+    REQUIRE(yuzu::server::pg::exec_params(locker.get(),
+                                          "LOCK TABLE ca_store.ca_root IN EXCLUSIVE MODE",
+                                          std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    // Dedicated connection for observing the blocked backends — pg_stat_activity
+    // reflects live backend state synchronously, not an MVCC snapshot.
+    yuzu::server::pg::PgConn watch{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(watch.get()) == CONNECTION_OK);
+
+    std::array<DefaultCertSet, kRacers> sets;
+    std::array<bool, kRacers> oks{};
+    std::string logs;
+    int observed = 0;        // written on the main thread while racers are joinable
+    bool rollback_ok = false;
+    {
+        yuzu::test::LogCapture log;
+        std::vector<std::thread> threads;
+        threads.reserve(kRacers);
+        for (int i = 0; i < kRacers; ++i) {
+            threads.emplace_back([&, i] {
+                oks[static_cast<size_t>(i)] = ensure_default_certs(
+                    dir.path, "host-" + std::to_string(i), &store,
+                    sets[static_cast<size_t>(i)]);
+            });
         }
-
-        // ALL racers succeed in the common case. One legitimate, accepted
-        // exception (CAPG-042, docs/resource-ledgers/default-certs-bootstrap-
-        // lock.md): deferring the CAS winner's key write past its win opens a
-        // narrow window where a SLOW racer reaches the pre-existing, unrelated
-        // top-of-function B-2 self-heal check after ca_store already has a
-        // root but before the winner has finished persisting its key file,
-        // and refuses immediately rather than waiting — fail-closed,
-        // availability-only, and distinguishable by its own log line, which
-        // maps 1:1 to a `return false` at that call site (never emitted
-        // elsewhere). Any OTHER oks[i]==false is unexplained and stays a hard
-        // failure — so this must be a COUNT match against the number of
-        // failed racers, not a bare substring presence check: a presence
-        // check would let one known-window failure mask a second, unrelated,
-        // genuinely-failing racer in the same attempt (cpp-safety, closure
-        // re-verify of d54311fce, 2026-08-21).
-        const auto failed_count =
-            static_cast<std::size_t>(std::count(oks.begin(), oks.end(), false));
-        if (failed_count > 0) {
-            static const std::string kRefusalNeedle =
-                "Refusing to regenerate — a fresh CA would re-root the fleet";
-            std::size_t refusal_count = 0;
-            for (std::size_t pos = logs.find(kRefusalNeedle); pos != std::string::npos;
-                 pos = logs.find(kRefusalNeedle, pos + kRefusalNeedle.size()))
-                ++refusal_count;
-            INFO("a racer failed this attempt; captured logs:\n" << logs);
-            REQUIRE(refusal_count == failed_count);
-            continue; // every failure this attempt is the known, accepted, fail-closed race
+        // Poll (≤15s, 5ms interval — well under the racer pool's 60s
+        // lock_timeout) until all six racers are genuinely WAITING on the
+        // ca_store.ca_root lock. Scoped to THIS test's own database and
+        // excluding this connection's own backend: pg_stat_activity is
+        // cluster-wide and this repo runs many [pg] shards concurrently against
+        // one Postgres under the same role and table names (#1871), so an
+        // unscoped query could match an unrelated shard. NO Catch2 macro runs
+        // in this window — the racer threads are still joinable, and a throwing
+        // REQUIRE here would unwind past them and std::terminate the shard
+        // (test_auth.cpp's documented hazard); only plain locals are written,
+        // and std::atoi never throws (garbage → 0 → keep polling).
+        for (int i = 0; i < 3000 && observed < kRacers; ++i) {
+            yuzu::server::pg::PgResult res = yuzu::server::pg::exec_params(
+                watch.get(),
+                "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
+                "AND query ILIKE '%INSERT INTO ca_store.ca_root%' "
+                "AND datname = current_database() AND pid <> pg_backend_pid()",
+                std::vector<std::string>{});
+            if (res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) == 1)
+                observed = std::atoi(PQgetvalue(res.get(), 0, 0));
+            if (observed >= kRacers)
+                break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
+        // Release the blocked INSERTs together — UNCONDITIONAL, so a racer that
+        // never blocked (a genuine keygen/dir failure → oks[i]==false, caught
+        // below) still completes and the threads can join rather than hang.
+        rollback_ok =
+            yuzu::server::pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK;
+        for (auto& t : threads)
+            t.join();
+        log.stop();
+        logs = log.text();
+    }
+    INFO("captured boot logs:\n" << logs);
 
-        const bool exercised_new_branch =
-            logs.find("lost the first-boot CA-root race") != std::string::npos &&
-            logs.find("self-healed onto the winning root") != std::string::npos;
-        if (!exercised_new_branch)
-            continue; // legitimate scheduling outcome — retry for a genuine CAS loser
+    REQUIRE(rollback_ok);
+    // Every racer reached the CAS and blocked on the side lock — the whole point
+    // of the rendezvous. Fewer than six means the interleaving this test asserts
+    // never formed (investigate — never retry away).
+    REQUIRE(observed == kRacers);
 
-        // Scoped to the rest of THIS attempt — Catch2's INFO is lexically
-        // scoped, so it must outlive every assertion it should annotate.
-        INFO("captured boot logs from the attempt that exercised the new branch:\n" << logs);
+    // All six succeed: under the lock no INSERT commits, so no racer's top-of-
+    // function gate can see a committed root, so none diverts to UP-2 and none
+    // hits the CAPG-042 deferred-key-write refusal window.
+    REQUIRE(std::count(oks.begin(), oks.end(), true) == kRacers);
 
-        // The core claim of this fix: at least one racer actually reached the
-        // NEW poll loop (lost the fingerprint CAS after generating its own
-        // candidate) and self-healed via it — restated as an explicit
-        // assertion (not just the branch condition above) so a future
-        // refactor that breaks this check still fails loudly at the specific
-        // claim, not just silently loops forever until the attempt bound.
-        REQUIRE(logs.find("lost the first-boot CA-root race") != std::string::npos);
-        REQUIRE(logs.find("self-healed onto the winning root") != std::string::npos);
+    // Exactly one racer won the CAS and generated; the other five lost it and
+    // self-healed via the NEW poll-loop branch. COUNT occurrences, not mere
+    // presence (a presence check would let one masked case hide another): the
+    // loser needle "lost the first-boot CA-root race" (default_certs.cpp) is
+    // distinct from ca_store.cpp's "LOST the first-boot race" (case-sensitive,
+    // no "CA-root"), so == kRacers - 1 is exact.
+    auto count_occurrences = [&](std::string_view needle) {
+        std::size_t n = 0;
+        for (std::size_t pos = logs.find(needle); pos != std::string::npos;
+             pos = logs.find(needle, pos + needle.size()))
+            ++n;
+        return n;
+    };
+    REQUIRE(count_occurrences("lost the first-boot CA-root race") ==
+            static_cast<std::size_t>(kRacers - 1));
+    REQUIRE(count_occurrences("self-healed onto the winning root") ==
+            static_cast<std::size_t>(kRacers - 1));
 
-        auto root = store.get_root();
-        REQUIRE(root.has_value());
-        REQUIRE(root->has_value());
+    // Exactly one racer actually generated; try_use_existing_complete_set()
+    // never sets this true, so every self-healed loser reads false.
+    const auto winners = std::count_if(sets.begin(), sets.end(),
+                                       [](const auto& s) { return s.freshly_generated; });
+    REQUIRE(winners == 1);
 
-        // Every racer converges on the SAME winning root's material — no
-        // divergent view, and nobody adopted its own discarded generation.
-        for (int i = 0; i < kRacers; ++i)
-            REQUIRE(sets[static_cast<size_t>(i)].ca_fingerprint_sha256 ==
-                   (*root)->fingerprint_sha256);
-        // Exactly one racer actually generated; try_use_existing_complete_set()
-        // never sets this true, so every self-healed loser reads false.
-        const auto winners = std::count_if(sets.begin(), sets.end(),
-                                           [](const auto& s) { return s.freshly_generated; });
-        REQUIRE(winners == 1);
+    auto root = store.get_root();
+    REQUIRE(root.has_value());
+    REQUIRE(root->has_value());
 
-        // Still exactly 3 issued rows — no racer re-purges or re-records once
-        // it adopts the winner's already-written set.
-        auto issued = store.list_issued();
-        REQUIRE(issued.has_value());
-        REQUIRE(issued->size() == 3);
+    // Every racer converges on the SAME winning root's material — no divergent
+    // view, and nobody adopted its own discarded generation.
+    for (int i = 0; i < kRacers; ++i)
+        REQUIRE(sets[static_cast<size_t>(i)].ca_fingerprint_sha256 ==
+               (*root)->fingerprint_sha256);
 
-        // Every on-disk pair is genuinely consistent (every racer's `out`
-        // points at the same shared dir, so this checks the one real set on
-        // disk).
-        for (const auto& [cert_path, key_path] :
-            {std::pair{sets[0].https_cert, sets[0].https_key},
-             std::pair{sets[0].server_cert, sets[0].server_key},
-             std::pair{sets[0].gateway_cert, sets[0].gateway_key}}) {
-            CHECK(pki::cert_matches_key(read_file(cert_path), read_file(key_path)));
-        }
-        break; // scenario fully exercised and asserted — done
+    // Still exactly 3 issued rows — no racer re-purges or re-records once it
+    // adopts the winner's already-written set.
+    auto issued = store.list_issued();
+    REQUIRE(issued.has_value());
+    REQUIRE(issued->size() == 3);
+
+    // Every on-disk pair is genuinely consistent (every racer's `out` points at
+    // the same shared dir, so this checks the one real set on disk).
+    for (const auto& [cert_path, key_path] :
+        {std::pair{sets[0].https_cert, sets[0].https_key},
+         std::pair{sets[0].server_cert, sets[0].server_key},
+         std::pair{sets[0].gateway_cert, sets[0].gateway_key}}) {
+        CHECK(pki::cert_matches_key(read_file(cert_path), read_file(key_path)));
     }
 }
 

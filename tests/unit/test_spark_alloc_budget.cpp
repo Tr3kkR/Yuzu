@@ -275,7 +275,8 @@ TEST_CASE("arm_impl: the failed-watch path allocates nothing after the commit (#
     // The window round 3 got wrong. Counting is armed from the phase-1 fault seam,
     // which fires immediately BEFORE sub_keys_.emplace, and stops when arm() returns
     // — so the window is that emplace plus everything after it: the publish, the
-    // contained "armed" log, the mechanism's return, drop_key_locked, the error
+    // contained "armed" log, the mechanism's return, the defensive unwatch() +
+    // Lost-notification snapshot/delivery (#2818), drop_key_locked, the error
     // completion, and the return itself. (An earlier version of this comment said
     // counting started inside the mechanism's watch(); it does not, and the sibling
     // comment below always had it right — governance round 4, sec-2.)
@@ -311,14 +312,22 @@ TEST_CASE("arm_impl: the failed-watch path allocates nothing after the commit (#
     REQUIRE(armed_counter);
     REQUIRE(mech->watch_calls() == 1);
     CHECK_FALSE(sub.error().empty()); // the error still arrives, from the bounded buffer
-    // Budget: the sub_keys_ emplace and NOTHING after it. That emplace costs TWO,
-    // not one — the map node, plus a heap buffer for the key, which is longer than
-    // this standard library's SSO threshold (measured directly: the same emplace
-    // with a short key costs 1, which is also why kPath is deliberately long — a
-    // short key would hide a regression inside the SSO buffer).
-    // Everything the failure path does after it — the mechanism's return,
-    // drop_key_locked, completing the error message, returning it — adds nothing.
-    CHECK(post_commit == 2);
+    // Budget: the sub_keys_ emplace costs TWO — the map node, plus a heap buffer for
+    // the key, which is longer than this standard library's SSO threshold (measured
+    // directly: the same emplace with a short key costs 1, which is also why kPath is
+    // deliberately long — a short key would hide a regression inside the SSO buffer).
+    //
+    // #2818 raised this from 2 to 6 (measured): the failure path now snapshots the
+    // one live subscriber and delivers a Lost notification before drop_key_locked
+    // runs. Four new allocations, each an over-SSO `key` copy or the vector this
+    // engine has exactly one subscriber to hold: the vector<Subscriber> snapshot
+    // itself (1), the Lost SparkEvent's own `key` copy (1), deliver()'s per-recipient
+    // `stamped = ev` copy's `key` (1), and the consumer queue's `push_back(out)`
+    // copy's `key` (1). `detail` (the mechanism's short "nope" error) stays within
+    // SSO throughout and contributes nothing. The defensive `mech->unwatch(key)` this
+    // fix also adds contributes nothing here — CountingMechanism's unwatch() only
+    // locks + erases from an empty set (`record_` is off in this test).
+    CHECK(post_commit == 6);
     CHECK(engine.stats().armed_sparks == 0);
     engine.stop();
 }

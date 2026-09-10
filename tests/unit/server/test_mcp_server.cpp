@@ -29,6 +29,7 @@
 #include "test_analytics_pg_helper.hpp" // AnalyticsEventStorePg — ADR-0049 PG port
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "test_approval_manager_pg_helper.hpp" // ApprovalManagerPg — ADR-0065 PG port
+#include "test_directory_sync_pg_helper.hpp" // DirectorySyncPg — #4031 list_directory_users/get_directory_status
 #include "test_execution_tracker_pg_helper.hpp" // ExecutionTrackerPg — ADR-0065 PG port
 #include "test_response_execution_authz_pg_helper.hpp"
 #include "test_tag_store_pg_helper.hpp"  // TagStorePg — ADR-0050 PG port
@@ -42,13 +43,17 @@
 #include "discover_routes.hpp"     // A2 discovery builders (Issue 17.1)
 #include "event_bus.hpp"
 #include "execution_tracker.hpp"
+#include "instruction_definition_model.hpp" // #4029: shared row/detail/export builders
 #include "instruction_store.hpp"
+#include "product_pack_model.hpp" // #4029: shared row/detail builders
+#include "product_pack_store.hpp"
 #include "quarantine_store.hpp"
 #include "openapi_spec_access.hpp" // openapi_spec_json()
 #include "rbac_store.hpp"
 #include "response_store.hpp"
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
+#include "workflow_engine.hpp" // #4030 Gate 8 fix: mcp_workflow_tpl / get_workflow_execution tests
 // M5 remediation (ADR-0031 operator-surface functional coverage): mcp_server.hpp
 // only forward-declares PluginConfigStore (its .cpp includes the real header) —
 // the store's live-state assertions below need the full definition + its
@@ -109,6 +114,14 @@ yuzu::test::PgTestTemplate mcp_instr_tpl{"mcpinstr", [](const std::string& dsn) 
     yuzu::server::InstructionStore store{pool};
     if (!store.is_open())
         throw std::runtime_error("mcpinstr template: store failed to migrate");
+}};
+// #4030 Gate 8 fix: WorkflowEngine is Postgres-backed (ADR-0064) -- no MCP
+// test wired one before this fix (get_workflow_execution had zero coverage).
+yuzu::test::PgTestTemplate mcp_workflow_tpl{"mcpworkflow", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    yuzu::server::WorkflowEngine store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("mcpworkflow template: store failed to migrate");
 }};
 } // namespace
 
@@ -301,7 +314,9 @@ TEST_CASE("MCP Policy: operator tier DOES allow the distinct ApiToken:Rotate "
     CHECK(tier_allows("operator", "ApiToken", "Rotate"));
 }
 
-TEST_CASE("MCP Policy: supervised tier allows everything", "[mcp][policy]") {
+TEST_CASE("MCP Policy: supervised tier allows everything except server "
+          "self-administration (Enrollment/OidcConfig)",
+          "[mcp][policy]") {
     CHECK(tier_allows("supervised", "Infrastructure", "Read"));
     CHECK(tier_allows("supervised", "Execution", "Execute"));
     CHECK(tier_allows("supervised", "Policy", "Write"));
@@ -316,6 +331,60 @@ TEST_CASE("MCP Policy: supervised tier allows everything", "[mcp][policy]") {
 TEST_CASE("MCP Policy: unknown tier denies everything", "[mcp][policy]") {
     CHECK(!tier_allows("bogus", "Infrastructure", "Read"));
     CHECK(!tier_allows("bogus", "Tag", "Write"));
+}
+
+TEST_CASE("MCP Policy: #4031/#520 Enrollment and OidcConfig are denied at "
+          "EVERY tier, including supervised — MCP tokens must never "
+          "administer the server itself (settings, users, TLS, OIDC)",
+          "[mcp][policy][security]") {
+    // The bug this pins: tier_allows() checked only the OPERATION
+    // ("Read"), never the SECURABLE, so a readonly-tier MCP token could
+    // reach the #4031 REST v1 enrollment/auto-approve-rules,
+    // enrollment/pending-agents, and settings/oidc routes purely because
+    // those routes' perm_fn asks "is this Read?" — the same question a
+    // readonly token answers yes to for every OTHER securable too.
+    CHECK_FALSE(tier_allows("readonly", "Enrollment", "Read"));
+    CHECK_FALSE(tier_allows("readonly", "OidcConfig", "Read"));
+    CHECK_FALSE(tier_allows("operator", "Enrollment", "Read"));
+    CHECK_FALSE(tier_allows("operator", "OidcConfig", "Read"));
+    // supervised tier allows everything else (see "MCP Policy: supervised
+    // tier allows everything except server self-administration" above) —
+    // this is the one carve-out, matching require_admin()'s unconditional
+    // posture for the equivalent admin_fn_-gated dashboard surface.
+    CHECK_FALSE(tier_allows("supervised", "Enrollment", "Read"));
+    CHECK_FALSE(tier_allows("supervised", "OidcConfig", "Read"));
+    CHECK_FALSE(tier_allows("supervised", "Enrollment", "Write"));
+    CHECK_FALSE(tier_allows("supervised", "OidcConfig", "Write"));
+
+    // Directory is deliberately NOT in this deny set — it has real MCP twins
+    // (list_directory_users/get_directory_status) by design, so it must stay
+    // reachable at readonly tier, unlike Enrollment/OidcConfig which have
+    // none.
+    CHECK(tier_allows("readonly", "Directory", "Read"));
+    CHECK(tier_allows("supervised", "Directory", "Read"));
+}
+
+// #4028/#520 security regression guard: server-administration securables
+// (TLS, plugin-signing, server-process config, analytics/ClickHouse config)
+// must stay unreachable by an MCP token at EVERY tier, including
+// readonly/supervised Read — otherwise an admin-owned MCP token would fall
+// through to require_permission's topology-floor legacy-role check and
+// reach settings data require_admin's own #520 comment names by name. See
+// mcp_policy.hpp's tier_allows() comment for the full mechanism.
+TEST_CASE("MCP Policy: no tier admits the #4028 server-administration securables",
+          "[mcp][policy][security]") {
+    for (const std::string_view securable :
+         {"TlsConfig", "PluginSigning", "ServerConfig", "AnalyticsConfig"}) {
+        CAPTURE(securable);
+        CHECK_FALSE(tier_allows("readonly", securable, "Read"));
+        CHECK_FALSE(tier_allows("operator", securable, "Read"));
+        CHECK_FALSE(tier_allows("supervised", securable, "Read"));
+        // Not just Read — no operation on these securables is tier-admitted.
+        CHECK_FALSE(tier_allows("supervised", securable, "Write"));
+    }
+    // An empty tier (not an MCP token at all) is unaffected — RBAC/legacy
+    // role checks alone gate ordinary sessions and non-MCP API tokens.
+    CHECK(tier_allows("", "TlsConfig", "Read"));
 }
 
 TEST_CASE("MCP Policy: readonly never requires approval", "[mcp][policy]") {
@@ -848,6 +917,14 @@ struct McpTestServer {
     /// MCP test that needs the lifecycle to be a no-op.
     yuzu::server::ExecutionTracker* execution_tracker_for_test{nullptr};
 
+    /// #4030 Gate 8 fix: optionally wire a real WorkflowEngine so
+    /// list_workflows/get_workflow/get_workflow_execution can be exercised
+    /// end-to-end -- until this fix, no MCP test wired one at all (every
+    /// existing test hit the "Workflow engine unavailable" internal-error
+    /// path unconditionally). Default nullptr preserves that prior
+    /// behaviour for tests that don't opt in.
+    yuzu::server::WorkflowEngine* workflow_engine_for_test{nullptr};
+
     /// Slice 1 (agentic fan-out scale-hardening): optionally wire a real
     /// ResponseStore so query_responses can be exercised end-to-end, including
     /// the new execution_id exact-correlation collect path. Default nullptr
@@ -949,6 +1026,29 @@ struct McpTestServer {
         return {true, std::nullopt};
     };
 
+    /// #4033 — the fake twin of the D3 Response:Read-visible-set resolver
+    /// backing preview_management_group_agent_count. Default: TOP
+    /// (nullopt, unfiltered) — a test that cares about scoping overrides
+    /// this per-case.
+    yuzu::server::mcp::McpServer::ResponseVisibleSetFn response_visible_set_fn_for_test =
+        [](const std::string&) -> std::optional<std::set<std::string>> { return std::nullopt; };
+
+    /// #4035 — the DexFleet provider for get_dex_health/get_dex_trends/
+    /// get_dex_overview/get_dex_catalogue_group. Default DexFleet{} (all-zero:
+    /// no online agents), matching production's unwired-degrades-not-crashes
+    /// contract; a test targeting the fleet-dependent shape mutates this
+    /// field (read LIVE at request time via the wiring lambda below).
+    DexFleet dex_fleet_for_test;
+
+    /// #4035 hardening (governance) — the visible-agent-set resolver for
+    /// get_dex_app/get_dex_overview (ADR-0017 World A confinement,
+    /// independent of the service-scoped-token deny belt). nullopt (default)
+    /// = unfiltered, matching every EXISTING test in this file. Ignores
+    /// `username` — this stub doesn't model per-username resolution, only
+    /// whether the caller's set is engaged (read LIVE at request time via the
+    /// wiring lambda below).
+    std::optional<std::set<std::string>> dex_visible_for_test;
+
     /// ADR-0024 (SLE discovery): optionally wire a typed SoftwareLicensingStore so
     /// query_software_licenses (the MCP twin of the GET /sle/agents/{id} drill) is
     /// exercised end-to-end — success shape, the deliberate user_scope/user_ref PII
@@ -969,6 +1069,9 @@ struct McpTestServer {
     yuzu::server::TagStore* tag_store_for_test{nullptr};
     yuzu::server::ApprovalManager* approval_manager_for_test{nullptr};
     yuzu::server::QuarantineStore* quarantine_store_for_test{nullptr};
+    /// #4031: list_directory_users / get_directory_status. Default nullptr
+    /// keeps every pre-existing test on the store-unavailable path.
+    yuzu::server::DirectorySync* directory_sync_for_test{nullptr};
     /// Records (agent_id,key) pairs pushed via the tag-push closure (D4), so a
     /// set_tag test can assert the agent push fired.
     std::vector<std::pair<std::string, std::string>> tag_pushes;
@@ -981,6 +1084,10 @@ struct McpTestServer {
     yuzu::server::RbacStore* rbac_store_for_test{nullptr};
     yuzu::server::InstructionStore* instruction_store_for_test{nullptr};
     yuzu::server::detail::AgentRegistry* agent_registry_for_test{nullptr};
+    /// #4029: optionally wire a real ProductPackStore so list_product_packs /
+    /// get_product_pack can be exercised end-to-end. Default nullptr keeps
+    /// every other test on the store-unavailable path.
+    yuzu::server::ProductPackStore* product_pack_store_for_test{nullptr};
 
     /// H1 (PR #1796): optionally wire a per-device scope gate so the device-
     /// targeted write tools (set_tag / delete_tag / quarantine_device) exercise
@@ -1181,6 +1288,24 @@ private:
         // shape for every pre-existing test that never touches it.
         mcp.set_fleet_read_fn(fleet_read_fn_for_test);
 
+        // #4033: response_visible_set_fn ALSO rides a setter, same pattern
+        // as fleet_read_fn above — wire before the handlers are built.
+        // Unconditional: the fixture default above is TOP/unfiltered, a
+        // no-op for every pre-existing test.
+        mcp.set_response_visible_set_fn(response_visible_set_fn_for_test);
+
+        // #4035: same setter idiom, reads dex_fleet_for_test LIVE at request
+        // time (see that field's doc comment) — unconditional, no-op-shaped
+        // default for every pre-existing test.
+        mcp.set_dex_fleet_fn([this]() { return dex_fleet_for_test; });
+
+        // #4035 hardening (governance): same setter idiom, reads
+        // dex_visible_for_test LIVE at request time (see that field's doc
+        // comment) — unconditional, no-op-shaped default for every
+        // pre-existing test.
+        mcp.set_dex_visible_fn(
+            [this](const std::string&) { return dex_visible_for_test; });
+
         // #3685: the Destructive-targeting classifier ALSO rides a setter,
         // same pattern as the two above — wire before the handlers are
         // built. UNCONDITIONAL, but NOT a no-op default like its siblings:
@@ -1267,14 +1392,16 @@ private:
             /*engine_principal_store=*/nullptr,
             /*access_review_store=*/nullptr,
             /*auth_db=*/nullptr,
-            /*directory_sync=*/nullptr,
+            /*directory_sync=*/directory_sync_for_test,
             /*caller_fn=*/caller_fn_for_test,
             // 2f PR 3b: the POST handler leases from the SAME budget as GET.
             // Default nullptr keeps every pre-3b test on the plain path - a test
             // that does not opt in cannot accidentally start streaming.
             /*stream_budget=*/stream_budget_for_test,
             /*revalidate_fn=*/revalidate_fn_for_test,
-            /*principal_audit_fn=*/principal_audit_fn_for_test);
+            /*principal_audit_fn=*/principal_audit_fn_for_test,
+            /*product_pack_store=*/product_pack_store_for_test,
+            /*workflow_engine=*/workflow_engine_for_test);
     }
 };
 
@@ -1729,8 +1856,13 @@ TEST_CASE("MCP 2383: RBAC catalogue mirrors have the expected cardinality", "[mc
     // comment for why a shared op would have been a privilege escalation).
     CHECK(rbac_ops_for_test().size() == 8);
     // 23 + 3 PR1.9a additions (PluginConfig, PluginSecret, UploadGrant)
-    // + 1 Wave 6 (PowerManagement, power_health's set_power_plan).
-    CHECK(rbac_securables_for_test().size() == 27);
+    // + 1 Wave 6 (PowerManagement, power_health's set_power_plan) = 27,
+    // + 1 (#4030/#4032: Workflow, previously gated but never seeded) = 28,
+    // + 1 (#4029: ProductPack prerequisite fix) = 29,
+    // + 4 #4028 additions (TlsConfig, PluginSigning, ServerConfig,
+    // AnalyticsConfig — Settings read-twins) = 33,
+    // + 3 #4031 additions (Directory, Enrollment, OidcConfig) = 36.
+    CHECK(rbac_securables_for_test().size() == 36);
 }
 
 TEST_CASE("MCP 2383: three-way dispatch classifier — knownness decides first", "[mcp][2g]") {
@@ -3291,6 +3423,77 @@ TEST_CASE("MCP Integration: tools/call list_agents", "[mcp][integration]") {
     CHECK(ts.audit_log.back() == "mcp.list_agents|success");
 }
 
+// ── #4027: TAR read-twin round-trip — proves registration (kTools/
+// kToolSecurityRows/kWriteTools/kToolAnnotation) actually dispatches through the
+// JSON-RPC surface, matching this file's own recipe-cited job for a round-trip
+// test (the kExpectedTwins table-parity check proves registration is internally
+// consistent; this proves the handler is reachable and answers the documented
+// shape). McpTestServer doesn't wire set_all_devices_fn/set_dashboard_routes
+// (neither existed before #4027 and no other test needs them), so these pin the
+// nullable-seam contract rather than real device/scan data — that data-shape
+// coverage lives in test_tar_tree_routes.cpp's REST twin tests, which call the
+// SAME shared builder (api-twin-recipe.md Rule 1).
+//
+// #4143 review fix (SILENTFAIL-1): an unwired all_devices_fn_ now answers a
+// LOUD "unavailable" error, same contract as list_tar_retention_paused's own
+// unwired-DashboardRoutes test below — previously these two tools alone
+// answered a silent empty list on this exact misconfiguration, indistinguishable
+// from a genuinely-empty-scope caller.
+TEST_CASE("MCP Integration: tools/call list_tar_process_tree_devices (unwired seam)",
+          "[mcp][integration][tar]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":41,"params":)"
+        R"({"name":"list_tar_process_tree_devices"}})");
+    REQUIRE(res);
+    CHECK(res->status == 200); // JSON-RPC errors still answer HTTP 200
+
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["id"] == 41);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"] == "service unavailable");
+}
+
+TEST_CASE("MCP Integration: tools/call list_tar_capture_sources_devices (unwired seam)",
+          "[mcp][integration][tar]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":42,"params":)"
+        R"({"name":"list_tar_capture_sources_devices"}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"] == "service unavailable");
+}
+
+TEST_CASE("MCP Integration: tools/call list_tar_retention_paused answers a clean "
+          "\"unavailable\" when DashboardRoutes is unwired, never a crash",
+          "[mcp][integration][tar]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":43,"params":)"
+        R"({"name":"list_tar_retention_paused"}})");
+    REQUIRE(res);
+    CHECK(res->status == 200); // JSON-RPC errors still answer HTTP 200
+
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["id"] == 43);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"] ==
+         "TAR retention-paused surface unavailable");
+}
+
 // ── Guardian schema discovery on the MCP plane (contract §4 dec.3 / §9 G9) ───
 // The schema catalog must be discoverable on BOTH the REST plane and the MCP
 // plane, byte-for-byte identical (single source: guardian_schema_catalog), so an
@@ -3332,6 +3535,87 @@ TEST_CASE("MCP Integration: get_guardian_schemas matches the REST catalog",
     REQUIRE(contents.size() >= 1);
     auto resource_catalog = nlohmann::json::parse(contents[0]["text"].get<std::string>());
     CHECK(resource_catalog == rest_catalog);
+}
+
+// ── Compliance/policy REST v1 read twins (api-parity #4034) ─────────────────
+// McpTestServer wires policy_store=nullptr (no live Postgres in this fixture,
+// matching the pre-existing #3559 item 3 ComplianceHarness gap on the REST
+// side), so these round trips prove each new tool is REGISTERED, DISPATCHED
+// through the real JSON-RPC surface, passes its tier/perm(/fleet-read) gate,
+// and reaches its handler body's null-store branch — not that it returns
+// live compliance data (compliance_model.hpp's pure builders are unit-tested
+// directly, no store needed, in test_compliance_model.cpp).
+
+TEST_CASE("MCP Integration: tools/call get_policy reaches the null-store branch",
+          "[mcp][integration][compliance]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":30,)"
+        R"("params":{"name":"get_policy","arguments":{"policy_id":"pol_1"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["id"] == 30);
+    // Dispatched (not kMethodNotFound) and reached the handler: a real
+    // JSON-RPC error, not a bare 404/500, with the store-unavailable message
+    // — proves param parsing + tier_allows + perm_fn all passed.
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["message"].get<std::string>().find("Policy store unavailable") !=
+          std::string::npos);
+}
+
+TEST_CASE("MCP Integration: tools/call list_policy_fragments reaches the null-store branch",
+          "[mcp][integration][compliance]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":31,)"
+        R"("params":{"name":"list_policy_fragments","arguments":{}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["message"].get<std::string>().find("Policy store unavailable") !=
+          std::string::npos);
+}
+
+TEST_CASE("MCP Integration: tools/call get_policy_agent_statuses passes its fleet_read_fn_ "
+          "gate then reaches the null-store branch",
+          "[mcp][integration][compliance]") {
+    McpTestServer ts;
+    ts.start(); // fixture default fleet_read_fn_for_test admits unfiltered (nullopt scope)
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":32,)"
+        R"("params":{"name":"get_policy_agent_statuses","arguments":{"policy_id":"pol_1"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["message"].get<std::string>().find("Policy store unavailable") !=
+          std::string::npos);
+}
+
+TEST_CASE("MCP Integration: tools/call get_policy_agent_statuses fails closed when "
+          "fleet_read_fn_ is genuinely unwired",
+          "[mcp][integration][compliance][security]") {
+    McpTestServer ts;
+    ts.fleet_read_fn_for_test = {}; // genuinely empty std::function, not the fixture default
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":33,)"
+        R"("params":{"name":"get_policy_agent_statuses","arguments":{"policy_id":"pol_1"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"].get<int>() == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"].get<std::string>().find("service unavailable") !=
+          std::string::npos);
 }
 
 // ── A2 discovery tools (roadmap Issue 17.1) ─────────────────────────────────
@@ -3539,7 +3823,9 @@ TEST_CASE("MCP Integration: discover_plugins wired vs unwired", "[mcp][integrati
     CHECK(got == expected);
     REQUIRE(got.contains("limitation"));
 
-    // Unwired (AgentRegistry left null) — JSON-RPC tool error.
+    // Unwired (AgentRegistry left null) — JSON-RPC tool error, A4-shaped
+    // (PR #4112 review, should-fix): correlation_id + a non-null,
+    // transient-failure retry_after_ms, not a bare {code,message}.
     McpTestServer ts_unwired;
     ts_unwired.start("readonly");
     auto res2 = ts_unwired.call(
@@ -3547,6 +3833,289 @@ TEST_CASE("MCP Integration: discover_plugins wired vs unwired", "[mcp][integrati
     REQUIRE(res2);
     auto body2 = nlohmann::json::parse(res2->body);
     CHECK(body2.contains("error"));
+    REQUIRE(body2["error"].contains("data"));
+    CHECK(body2["error"]["data"].contains("correlation_id"));
+    CHECK_FALSE(body2["error"]["data"]["correlation_id"].get<std::string>().empty());
+    REQUIRE(body2["error"]["data"].contains("retry_after_ms"));
+    CHECK_FALSE(body2["error"]["data"]["retry_after_ms"].is_null());
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// #4029 (api-parity Batch A, content/catalog half): instruction-definition /
+// product-pack read twins — MCP round-trip. Proves docs/api-twin-recipe.md
+// Rule 1 actually holds: each tool's response is asserted BYTE-IDENTICAL to
+// the same shared builder (instruction_definition_model.hpp /
+// product_pack_model.hpp) the REST v1 routes call for the same store state —
+// not just "returns something".
+// ═════════════════════════════════════════════════════════════════════════
+
+namespace {
+yuzu::test::PgTestTemplate mcp_pp_tpl{"mcpproductpack", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    yuzu::server::ProductPackStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("mcpproductpack template: store failed to migrate");
+}};
+} // namespace
+
+TEST_CASE("MCP Integration: list_definitions — full filter set + reconciled row shape",
+          "[mcp][integration][instructions][4029][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_instr_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore store(pool);
+    REQUIRE(store.is_open());
+
+    yuzu::server::InstructionDefinition def;
+    def.name = "Get Hostname";
+    def.version = "1.0";
+    def.plugin = "system_info_4029";
+    def.action = "query";
+    def.type = "question";
+    def.description = "test";
+    def.enabled = true;
+    def.instruction_set_id = "set-4029";
+    REQUIRE(store.create_definition(def).has_value());
+
+    McpTestServer ts;
+    ts.instruction_store_for_test = &store;
+    ts.start("readonly");
+
+    // Extended filter set (name/plugin/type/set_id/enabled_only/limit) — was
+    // plugin/type only before this PR.
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":100,"params":{"name":"list_definitions",)"
+        R"("arguments":{"plugin":"system_info_4029","set_id":"set-4029","enabled_only":true,"limit":10}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto structured = body["result"]["structuredContent"];
+    REQUIRE(structured.contains("definitions"));
+    REQUIRE_FALSE(structured["definitions"].empty());
+    auto got_row = structured["definitions"][0];
+
+    // Reconciled row shape: instruction_set_id/created_at/updated_at were
+    // REST-fragment-only (missing from MCP) before this PR.
+    CHECK(got_row.contains("instruction_set_id"));
+    CHECK(got_row.contains("created_at"));
+    CHECK(got_row.contains("updated_at"));
+    CHECK(got_row["instruction_set_id"] == "set-4029");
+    CHECK(got_row["plugin"] == "system_info_4029");
+
+    // Rule 1: byte-identical to the shared builder's own output for the same
+    // store state.
+    auto defs = store.query_definitions();
+    REQUIRE(defs.has_value());
+    REQUIRE_FALSE(defs->empty());
+    CHECK(got_row == yuzu::server::instruction_definition_row_json((*defs)[0]));
+}
+
+TEST_CASE("MCP Integration: get_definition — reconciled superset shape",
+          "[mcp][integration][instructions][4029][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_instr_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore store(pool);
+    REQUIRE(store.is_open());
+
+    yuzu::server::InstructionDefinition def;
+    def.name = "Get Hostname";
+    def.version = "1.0";
+    def.plugin = "system_info_4029b";
+    def.action = "query";
+    def.type = "question";
+    def.description = "test";
+    def.enabled = true;
+    def.approval_mode = "auto";
+    def.parameter_schema = R"({"type":"object"})";
+    def.result_schema = R"({"type":"object"})";
+    def.yaml_source = "apiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\n";
+    auto created = store.create_definition(def);
+    REQUIRE(created.has_value());
+
+    McpTestServer ts;
+    ts.instruction_store_for_test = &store;
+    ts.start("readonly");
+
+    auto res = ts.call(nlohmann::json{{"jsonrpc", "2.0"},
+                                      {"method", "tools/call"},
+                                      {"id", 101},
+                                      {"params",
+                                       {{"name", "get_definition"},
+                                        {"arguments", {{"id", *created}}}}}}
+                           .dump());
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto got = body["result"]["structuredContent"];
+
+    // Superset: the legacy REST fragment's fields AND MCP's pre-existing
+    // fields, together — was one or the other before this PR, never both.
+    CHECK(got.contains("gather_ttl_seconds"));
+    CHECK(got.contains("response_ttl_days"));
+    CHECK(got.contains("created_by"));
+    CHECK(got.contains("approval_mode"));
+    CHECK(got.contains("parameter_schema"));
+    CHECK(got.contains("result_schema"));
+    CHECK(got.contains("yaml_source"));
+
+    auto def_result = store.get_definition(*created);
+    REQUIRE(def_result.has_value());
+    REQUIRE(def_result->has_value());
+    CHECK(got == yuzu::server::instruction_definition_detail_json(**def_result));
+}
+
+TEST_CASE("MCP Integration: export_definition — full document, matches the shared builder",
+          "[mcp][integration][instructions][4029][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_instr_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore store(pool);
+    REQUIRE(store.is_open());
+
+    yuzu::server::InstructionDefinition def;
+    def.name = "Get Hostname";
+    def.version = "1.0";
+    def.plugin = "system_info_4029c";
+    def.action = "query";
+    def.type = "question";
+    def.description = "test";
+    def.enabled = true;
+    def.yaml_source = "apiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\n";
+    auto created = store.create_definition(def);
+    REQUIRE(created.has_value());
+
+    McpTestServer ts;
+    ts.instruction_store_for_test = &store;
+    ts.start("readonly");
+
+    auto res = ts.call(nlohmann::json{{"jsonrpc", "2.0"},
+                                      {"method", "tools/call"},
+                                      {"id", 102},
+                                      {"params",
+                                       {{"name", "export_definition"},
+                                        {"arguments", {{"id", *created}}}}}}
+                           .dump());
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    auto got = body["result"]["structuredContent"];
+    CHECK(got.contains("concurrency_mode"));
+    CHECK(got.contains("visualization_spec"));
+    CHECK(got.contains("response_templates_spec"));
+    CHECK(got["yaml_source"] == def.yaml_source);
+
+    auto def_result = store.get_definition(*created);
+    REQUIRE(def_result.has_value());
+    REQUIRE(def_result->has_value());
+    CHECK(got == yuzu::server::instruction_definition_export_json(**def_result));
+}
+
+TEST_CASE("MCP Integration: export_definition — unknown id is kInvalidParams",
+          "[mcp][integration][instructions][4029][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_instr_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore store(pool);
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.instruction_store_for_test = &store;
+    ts.start("readonly");
+
+    auto res = ts.call(nlohmann::json{{"jsonrpc", "2.0"},
+                                      {"method", "tools/call"},
+                                      {"id", 104},
+                                      {"params",
+                                       {{"name", "export_definition"},
+                                        {"arguments", {{"id", "does-not-exist"}}}}}}
+                           .dump());
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body.contains("error"));
+}
+
+TEST_CASE("MCP Integration: list_product_packs / get_product_pack round-trip",
+          "[mcp][integration][product_pack][4029][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_pp_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::ProductPackStore store(pool);
+    REQUIRE(store.is_open());
+    store.set_require_signed_packs(false);
+
+    constexpr const char* kBundle = R"(apiVersion: yuzu.io/v1alpha1
+kind: ProductPack
+name: test-pack-4029
+version: 1.0.0
+description: MCP round-trip test pack
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+name: test-instruction-4029
+)";
+    auto install_fn =
+        [](const std::string&, const std::string&) -> std::expected<std::string, std::string> {
+        return std::string{"item-id"};
+    };
+    auto install_res = store.install(kBundle, install_fn);
+    REQUIRE(install_res.has_value());
+    const std::string pack_id = *install_res;
+
+    McpTestServer ts;
+    ts.product_pack_store_for_test = &store;
+    ts.start("readonly");
+
+    // list_product_packs
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":110,"params":{"name":"list_product_packs","arguments":{"name":"test-pack-4029"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto structured = body["result"]["structuredContent"];
+    REQUIRE(structured.contains("product_packs"));
+    REQUIRE_FALSE(structured["product_packs"].empty());
+    auto got_row = structured["product_packs"][0];
+    CHECK(got_row["id"] == pack_id);
+    CHECK(got_row.contains("item_count"));
+    CHECK_FALSE(got_row.contains("yaml_source")); // list row, not detail
+
+    auto packs = store.list({});
+    REQUIRE(packs.has_value());
+    auto it = std::find_if(packs->begin(), packs->end(),
+                           [&](const auto& p) { return p.id == pack_id; });
+    REQUIRE(it != packs->end());
+    CHECK(got_row == yuzu::server::product_pack_row_json(*it));
+
+    // get_product_pack
+    auto res2 = ts.call(nlohmann::json{{"jsonrpc", "2.0"},
+                                       {"method", "tools/call"},
+                                       {"id", 111},
+                                       {"params",
+                                        {{"name", "get_product_pack"},
+                                         {"arguments", {{"id", pack_id}}}}}}
+                            .dump());
+    REQUIRE(res2);
+    CHECK(res2->status == 200);
+    auto body2 = nlohmann::json::parse(res2->body);
+    auto got_detail = body2["result"]["structuredContent"];
+    CHECK(got_detail["id"] == pack_id);
+    REQUIRE(got_detail.contains("items"));
+    REQUIRE_FALSE(got_detail["items"].empty());
+    CHECK(got_detail["items"][0].contains("yaml_source"));
+
+    auto pack_result = store.get(pack_id);
+    REQUIRE(pack_result.has_value());
+    REQUIRE(pack_result->has_value());
+    CHECK(got_detail == yuzu::server::product_pack_detail_json(**pack_result));
+
+    // Unknown id — kInvalidParams.
+    auto res3 = ts.call(nlohmann::json{{"jsonrpc", "2.0"},
+                                       {"method", "tools/call"},
+                                       {"id", 112},
+                                       {"params",
+                                        {{"name", "get_product_pack"},
+                                         {"arguments", {{"id", "does-not-exist"}}}}}}
+                            .dump());
+    REQUIRE(res3);
+    auto body3 = nlohmann::json::parse(res3->body);
+    CHECK(body3.contains("error"));
 }
 
 TEST_CASE("MCP: all five discover_* tools are advertised in tools/list",
@@ -3950,6 +4519,670 @@ TEST_CASE("MCP DEX: get_dex_signal_detail denies a service-scoped token, "
     CHECK(saw_denied);
 }
 
+// ── #4035 (api-parity #2146 Batch A): get_dex_device_score — the MCP-only gap ──
+//    closing GET /api/v1/dex/devices/{id}'s REST-only twin. Per-device SCOPED
+//    (query_software_licenses' gate shape), not the global perm_fn.
+
+TEST_CASE("MCP DEX: get_dex_device_score returns the shape, confined to THIS device, "
+          "AND emits dex.device.view",
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_obs(store, "o1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    mcp_seed_obs(store, "o2", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T11:00:00Z");
+    mcp_seed_obs(store, "o3", "WS-2", "os.boot", "boot", "windows", "2026-06-10T08:00:00Z");
+    std::vector<std::string> calls;
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.scoped_perm_fn_for_test = [&](const httplib::Request&, httplib::Response&,
+                                     const std::string& sec, const std::string& op,
+                                     const std::string& agent_id) -> bool {
+        calls.push_back(sec + ":" + op + ":" + agent_id);
+        return true;
+    };
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":95,"params":{"name":"get_dex_device_score","arguments":{"agent_id":"WS-1","window":"all"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["agent_id"] == "WS-1");
+    CHECK(payload["window"] == "all");
+    REQUIRE(payload["signals"].is_array());
+    bool saw_crashed = false, saw_other = false;
+    for (const auto& s : payload["signals"]) {
+        if (s["obs_type"] == "process.crashed") {
+            saw_crashed = true;
+            CHECK(s["count"].get<int64_t>() == 2);
+        }
+        if (s["obs_type"] == "os.boot")
+            saw_other = true; // WS-2's signal must never leak into WS-1's summary
+    }
+    CHECK(saw_crashed);
+    CHECK_FALSE(saw_other);
+    // structuredContent mirrors content[0].text (A5 typed output).
+    REQUIRE(body["result"].contains("structuredContent"));
+    CHECK(body["result"]["structuredContent"] == payload);
+
+    REQUIRE(calls.size() == 1);
+    CHECK(calls[0] == "GuaranteedState:Read:WS-1");
+    bool saw_view = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "dex.device.view|success")
+            saw_view = true;
+    CHECK(saw_view);
+    CHECK(ts.audit_log.back() == "mcp.get_dex_device_score|success");
+}
+
+TEST_CASE("MCP DEX: get_dex_device_score scope gate unwired -> fail closed, never global",
+          "[mcp][integration][dex]") {
+    McpTestServer ts; // scoped_perm_fn_for_test left empty
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":96,"params":{"name":"get_dex_device_score","arguments":{"agent_id":"WS-1"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("scope gate not configured") != std::string::npos);
+    CHECK(res->body.find("\"result\"") == std::string::npos);
+}
+
+TEST_CASE("MCP DEX: get_dex_device_score missing agent_id -> invalid params",
+          "[mcp][integration][dex]") {
+    McpTestServer ts;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":97,"params":{"name":"get_dex_device_score","arguments":{}}})");
+    REQUIRE(res);
+    CHECK(res->body.find("agent_id is required") != std::string::npos);
+    CHECK(res->body.find("-32602") != std::string::npos); // kInvalidParams
+}
+
+TEST_CASE("MCP DEX: get_dex_device_score off-enum window -> invalid params, never a "
+          "silently-defaulted 7d (parity with REST GET /api/v1/dex/devices/{id})",
+          "[pg][mcp][integration][dex]") {
+    // A real store must be wired (not left null): the store-unavailable branch
+    // is checked BEFORE the window validation (same order as the REST twin),
+    // so a null store would short-circuit to 503 before ever reaching the
+    // window check this test targets -- an earlier version of this test made
+    // exactly that mistake ("no store wired" premise, silently testing the
+    // wrong branch).
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":971,"params":{"name":"get_dex_device_score","arguments":{"agent_id":"WS-1","window":"banana"}}})");
+    REQUIRE(res);
+    CHECK(res->body.find("invalid window") != std::string::npos);
+    CHECK(res->body.find("-32602") != std::string::npos); // kInvalidParams
+}
+
+TEST_CASE("MCP DEX: list_dex_apps off-enum window -> invalid params, never a "
+          "silently-defaulted 7d (parity with REST GET /api/v1/dex/apps)",
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":982,"params":{"name":"list_dex_apps","arguments":{"window":"banana"}}})");
+    REQUIRE(res);
+    CHECK(res->body.find("invalid window") != std::string::npos);
+    CHECK(res->body.find("-32602") != std::string::npos); // kInvalidParams
+}
+
+TEST_CASE("MCP DEX: get_dex_catalogue_group off-enum window -> invalid params, never a "
+          "silently-defaulted 7d (parity with REST GET /api/v1/dex/catalogue/group)",
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":983,"params":{"name":"get_dex_catalogue_group","arguments":{"name":"App reliability","window":"banana"}}})");
+    REQUIRE(res);
+    CHECK(res->body.find("invalid window") != std::string::npos);
+    CHECK(res->body.find("-32602") != std::string::npos); // kInvalidParams
+}
+
+TEST_CASE("MCP DEX: get_dex_health off-enum window -> invalid params, never a "
+          "silently-defaulted 7d (parity with REST GET /api/v1/dex/health)",
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":984,"params":{"name":"get_dex_health","arguments":{"window":"banana"}}})");
+    REQUIRE(res);
+    CHECK(res->body.find("invalid window") != std::string::npos);
+    CHECK(res->body.find("-32602") != std::string::npos); // kInvalidParams
+}
+
+TEST_CASE("MCP DEX: get_dex_trends off-enum window -> invalid params, never a "
+          "silently-defaulted 7d (parity with REST GET /api/v1/dex/trends)",
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":985,"params":{"name":"get_dex_trends","arguments":{"window":"banana"}}})");
+    REQUIRE(res);
+    CHECK(res->body.find("invalid window") != std::string::npos);
+    CHECK(res->body.find("-32602") != std::string::npos); // kInvalidParams
+}
+
+TEST_CASE("MCP DEX: get_dex_overview off-enum window -> invalid params, never a "
+          "silently-defaulted 7d (parity with REST GET /api/v1/dex/overview)",
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":986,"params":{"name":"get_dex_overview","arguments":{"window":"banana"}}})");
+    REQUIRE(res);
+    CHECK(res->body.find("invalid window") != std::string::npos);
+    CHECK(res->body.find("-32602") != std::string::npos); // kInvalidParams
+}
+
+TEST_CASE("MCP DEX: get_dex_device_score out-of-scope device -> 403, no store read",
+          "[mcp][integration][dex]") {
+    McpTestServer ts; // no store wired: proves the gate short-circuits first
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response& res,
+                                    const std::string&, const std::string&,
+                                    const std::string& agent_id) -> bool {
+        if (agent_id == "WS-9") {
+            res.status = 403;
+            res.set_content(R"({"error":"forbidden"})", "application/json");
+            return false;
+        }
+        return true;
+    };
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":98,"params":{"name":"get_dex_device_score","arguments":{"agent_id":"WS-9"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("Guaranteed State store unavailable") == std::string::npos);
+}
+
+// ── #4035: get_dex_device_app_perf — the MCP-only gap closing GET ─────────────
+//    /api/v1/dex/devices/{id}/app-perf's REST-only twin (docs/api-twin-recipe.md
+//    §4's own worked "no MCP twin yet" example).
+
+TEST_CASE("MCP DEX: get_dex_device_app_perf returns the shape AND emits "
+          "dex.device.app_perf.view",
+          "[mcp][integration][dex][app_perf]") {
+    McpTestServer ts;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.app_perf_providers_for_test.device =
+        [](std::string_view agent_id) -> std::optional<std::vector<yuzu::server::AppPerfDailyRow>> {
+        CHECK(agent_id == "WS-1");
+        yuzu::server::AppPerfDailyRow chrome;
+        chrome.app_name = "chrome.exe";
+        chrome.version = "124.0";
+        chrome.day = 1'700'000'000;
+        chrome.samples = 24;
+        chrome.instances_max = 3;
+        chrome.cpu_avg = 12.5;
+        chrome.cpu_max = 40.0;
+        chrome.ws_avg_bytes = 500'000'000;
+        chrome.ws_max_bytes = 900'000'000;
+        yuzu::server::AppPerfDailyRow other;
+        other.app_name = "notepad.exe";
+        other.version = "1.0";
+        other.day = 1'700'000'000;
+        other.samples = 1;
+        return std::vector<yuzu::server::AppPerfDailyRow>{chrome, other};
+    };
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":99,"params":{"name":"get_dex_device_app_perf","arguments":{"agent_id":"WS-1","app":"chrome.exe"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["agent_id"] == "WS-1");
+    CHECK(payload["app"] == "chrome.exe");
+    REQUIRE(payload["rows"].is_array());
+    REQUIRE(payload["rows"].size() == 1); // filtered to chrome.exe only
+    CHECK(payload["rows"][0]["app_name"] == "chrome.exe");
+    CHECK(payload["rows"][0]["version"] == "124.0");
+    CHECK(payload["rows"][0]["samples"].get<int64_t>() == 24);
+
+    bool saw_view = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "dex.device.app_perf.view|success")
+            saw_view = true;
+    CHECK(saw_view);
+    CHECK(ts.audit_log.back() == "mcp.get_dex_device_app_perf|success");
+}
+
+TEST_CASE("MCP DEX: get_dex_device_app_perf provider absent -> A4 internal error",
+          "[mcp][integration][dex][app_perf]") {
+    McpTestServer ts; // app_perf_providers_for_test.device left unwired
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":100,"params":{"name":"get_dex_device_app_perf","arguments":{"agent_id":"WS-1"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+}
+
+TEST_CASE("MCP DEX: get_dex_device_app_perf out-of-scope device -> 403, no provider read",
+          "[mcp][integration][dex][app_perf]") {
+    McpTestServer ts; // provider left unwired: proves the gate short-circuits first
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response& res,
+                                    const std::string&, const std::string&,
+                                    const std::string& agent_id) -> bool {
+        if (agent_id == "WS-9") {
+            res.status = 403;
+            res.set_content(R"({"error":"forbidden"})", "application/json");
+            return false;
+        }
+        return true;
+    };
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":101,"params":{"name":"get_dex_device_app_perf","arguments":{"agent_id":"WS-9"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("service unavailable") == std::string::npos);
+}
+
+// ═══ #4035 (api-parity #2146 Batch A): the 8 genuinely-new DEX MCP twins ═══
+
+TEST_CASE("MCP DEX: get_dex_app returns the blast-radius shape, audits dex.app.view, "
+          "service-scoped token denied",
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_obs(store, "a1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    mcp_seed_obs(store, "a2", "WS-2", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T11:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":972,"params":{"name":"get_dex_app","arguments":{"name":"chrome.exe","window":"all"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["process_name"] == "chrome.exe");
+    CHECK(payload["crashes"].get<int64_t>() == 2);
+    REQUIRE(payload["devices"].is_array());
+    CHECK(payload["devices"].size() == 2);
+    bool saw_view = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "dex.app.view|success")
+            saw_view = true;
+    CHECK(saw_view);
+
+    // service-scoped token -> 403, no data.
+    McpTestServer ts2;
+    ts2.guaranteed_state_store_for_test = &store;
+    ts2.mock_token_scope_service = "printers";
+    ts2.start("readonly");
+    auto denied = ts2.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":973,"params":{"name":"get_dex_app","arguments":{"name":"chrome.exe"}}})");
+    REQUIRE(denied);
+    CHECK(denied->body.find("chrome.exe") == std::string::npos);
+}
+
+// #4035 hardening (governance): closure evidence for the ADR-0017 World A
+// confinement gap — get_dex_app's devices[] previously ALWAYS passed
+// visible=nullptr to the shared builder, the same defect as its REST twin
+// (see test_rest_guaranteed_state.cpp's matching regression test).
+TEST_CASE("MCP DEX: get_dex_app devices[] confined to the caller's visible set "
+          "(ADR-0017 World A — regression coverage for the governance fix)",
+          "[pg][mcp][integration][dex][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_obs(store, "sa1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    mcp_seed_obs(store, "sa2", "WS-2", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T11:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+
+    auto unconfined = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":9721,"params":{"name":"get_dex_app","arguments":{"name":"chrome.exe","window":"all"}}})");
+    REQUIRE(unconfined);
+    auto ubody = nlohmann::json::parse(unconfined->body);
+    auto upayload =
+        nlohmann::json::parse(ubody["result"]["content"][0]["text"].get<std::string>());
+    CHECK(upayload["devices"].size() == 2);
+
+    ts.dex_visible_for_test = std::set<std::string>{"WS-1"};
+    auto confined = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":9722,"params":{"name":"get_dex_app","arguments":{"name":"chrome.exe","window":"all"}}})");
+    REQUIRE(confined);
+    auto cbody = nlohmann::json::parse(confined->body);
+    auto cpayload =
+        nlohmann::json::parse(cbody["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(cpayload["devices"].is_array());
+    CHECK(cpayload["devices"].size() == 1);
+    CHECK(cpayload["devices"][0]["agent_id"] == "WS-1");
+    for (const auto& d : cpayload["devices"])
+        CHECK(d["agent_id"].get<std::string>() != "WS-2");
+}
+
+TEST_CASE("MCP DEX: list_dex_apps returns the stability list, no audit (aggregate)",
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_obs(store, "b1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":974,"params":{"name":"list_dex_apps","arguments":{"window":"all"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(payload["apps"].is_array());
+    bool saw_chrome = false;
+    for (const auto& a : payload["apps"])
+        if (a["subject"] == "chrome.exe")
+            saw_chrome = true;
+    CHECK(saw_chrome);
+    // Fleet aggregate — only the generic tool-call audit, never a domain verb.
+    CHECK(ts.audit_log.back() == "mcp.list_dex_apps|success");
+    for (const auto& a : ts.audit_log)
+        CHECK(a.find("dex.app.view") == std::string::npos);
+}
+
+TEST_CASE("MCP DEX: get_dex_catalogue_group returns the family drill, unknown family -> "
+          "invalid params",
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_obs(store, "c1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":975,"params":{"name":"get_dex_catalogue_group","arguments":{"name":"App reliability","window":"all"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["group_name"] == "App reliability");
+    CHECK(payload["total_type_count"].get<int64_t>() > 0);
+
+    auto unknown = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":976,"params":{"name":"get_dex_catalogue_group","arguments":{"name":"NoSuchFamily"}}})");
+    REQUIRE(unknown);
+    CHECK(unknown->body.find("-32602") != std::string::npos);
+}
+
+TEST_CASE("MCP DEX: get_dex_health suppressed with no reporting agents, real fleet -> real score",
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_obs(store, "d1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":977,"params":{"name":"get_dex_health","arguments":{"window":"all"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["score"].is_null());
+
+    ts.dex_fleet_for_test.windows_online = 5;
+    auto res2 = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":978,"params":{"name":"get_dex_health","arguments":{"window":"all"}}})");
+    REQUIRE(res2);
+    auto body2 = nlohmann::json::parse(res2->body);
+    auto payload2 = nlohmann::json::parse(body2["result"]["content"][0]["text"].get<std::string>());
+    CHECK_FALSE(payload2["score"].is_null());
+}
+
+TEST_CASE("MCP DEX: get_dex_trends returns families + days, no audit (aggregate)",
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_obs(store, "e1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":979,"params":{"name":"get_dex_trends","arguments":{"window":"all"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(payload["families"].is_array());
+    REQUIRE(payload["days"].is_array());
+    // Fleet aggregate — only the generic tool-call audit, never a domain verb.
+    CHECK(ts.audit_log.back() == "mcp.get_dex_trends|success");
+}
+
+TEST_CASE("MCP DEX: get_dex_overview returns the fleet summary, audits dex.overview.view, "
+          "service-scoped token denied",
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_obs(store, "f1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    mcp_seed_obs(store, "f2", "WS-2", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T11:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":980,"params":{"name":"get_dex_overview","arguments":{"window":"all"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(payload["top_apps"].is_array());
+    bool saw_chrome = false;
+    for (const auto& a : payload["top_apps"])
+        if (a["subject"] == "chrome.exe")
+            saw_chrome = true;
+    CHECK(saw_chrome);
+    bool saw_view = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "dex.overview.view|success")
+            saw_view = true;
+    CHECK(saw_view);
+
+    McpTestServer ts2;
+    ts2.guaranteed_state_store_for_test = &store;
+    ts2.mock_token_scope_service = "printers";
+    ts2.start("readonly");
+    auto denied = ts2.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":981,"params":{"name":"get_dex_overview","arguments":{}}})");
+    REQUIRE(denied);
+    CHECK(denied->body.find("chrome.exe") == std::string::npos);
+}
+
+// #4035 hardening (governance): closure evidence for the ADR-0017 World A
+// confinement gap on get_dex_overview's top_devices[] — same defect class
+// and same fix as get_dex_app above.
+TEST_CASE("MCP DEX: get_dex_overview top_devices[] confined to the caller's visible set "
+          "(ADR-0017 World A — regression coverage for the governance fix)",
+          "[pg][mcp][integration][dex][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_obs(store, "st1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    mcp_seed_obs(store, "st2", "WS-2", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T11:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+
+    auto unconfined = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":9801,"params":{"name":"get_dex_overview","arguments":{"window":"all"}}})");
+    REQUIRE(unconfined);
+    auto ubody = nlohmann::json::parse(unconfined->body);
+    auto upayload =
+        nlohmann::json::parse(ubody["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(upayload["top_devices"].is_array());
+    CHECK(upayload["top_devices"].size() == 2);
+
+    ts.dex_visible_for_test = std::set<std::string>{"WS-1"};
+    auto confined = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":9802,"params":{"name":"get_dex_overview","arguments":{"window":"all"}}})");
+    REQUIRE(confined);
+    auto cbody = nlohmann::json::parse(confined->body);
+    auto cpayload =
+        nlohmann::json::parse(cbody["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(cpayload["top_devices"].is_array());
+    CHECK(cpayload["top_devices"].size() == 1);
+    CHECK(cpayload["top_devices"][0]["agent_id"] == "WS-1");
+    for (const auto& d : cpayload["top_devices"])
+        CHECK(d["agent_id"].get<std::string>() != "WS-2");
+}
+
+TEST_CASE("MCP DEX: get_dex_device_history returns per-device history, audits dex.device.view "
+          "(same verb get_dex_device_score uses), out-of-scope device -> 403",
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_obs(store, "g1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    mcp_seed_obs(store, "g2", "WS-2", "os.boot", "boot", "windows", "2026-06-10T08:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":982,"params":{"name":"get_dex_device_history","arguments":{"agent_id":"WS-1","window":"all"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["agent_id"] == "WS-1");
+    REQUIRE(payload["history"].is_array());
+    bool saw_it = false, saw_other = false;
+    for (const auto& r : payload["history"]) {
+        if (r["obs_type"] == "process.crashed")
+            saw_it = true;
+        if (r["subject"] == "boot")
+            saw_other = true;
+    }
+    CHECK(saw_it);
+    CHECK_FALSE(saw_other);
+    bool saw_view = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "dex.device.view|success")
+            saw_view = true;
+    CHECK(saw_view);
+
+    McpTestServer ts2;
+    ts2.guaranteed_state_store_for_test = &store;
+    ts2.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response& res,
+                                     const std::string&, const std::string&,
+                                     const std::string& agent_id) -> bool {
+        if (agent_id == "WS-9") {
+            res.status = 403;
+            res.set_content(R"({"error":"forbidden"})", "application/json");
+            return false;
+        }
+        return true;
+    };
+    ts2.start("readonly");
+    auto denied = ts2.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":983,"params":{"name":"get_dex_device_history","arguments":{"agent_id":"WS-9"}}})");
+    REQUIRE(denied);
+    CHECK(denied->status == 403);
+}
+
+TEST_CASE("MCP DEX: get_dex_observation returns the detail, audits dex.observation.view, "
+          "foreign event_id -> invalid params (same as genuinely-absent, no oracle)",
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_obs(store, "h1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    mcp_seed_obs(store, "h2", "WS-2", "os.boot", "boot", "windows", "2026-06-10T08:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":984,"params":{"name":"get_dex_observation","arguments":{"agent_id":"WS-1","event_id":"h1"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["event_id"] == "h1");
+    CHECK(payload["agent_id"] == "WS-1");
+    bool saw_view = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "dex.observation.view|success")
+            saw_view = true;
+    CHECK(saw_view);
+
+    // h2 belongs to WS-2, not WS-1 -- same error as a genuinely-absent event.
+    auto foreign = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":985,"params":{"name":"get_dex_observation","arguments":{"agent_id":"WS-1","event_id":"h2"}}})");
+    REQUIRE(foreign);
+    CHECK(foreign->body.find("-32602") != std::string::npos);
+}
+
 TEST_CASE("MCP DEX: tools report unavailable when no Guaranteed State store is wired",
           "[mcp][integration][dex]") {
     McpTestServer ts; // guaranteed_state_store_for_test stays nullptr
@@ -3960,6 +5193,22 @@ TEST_CASE("MCP DEX: tools report unavailable when no Guaranteed State store is w
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+
+    // #4035 fix-round: get_dex_health / get_dex_trends / get_dex_catalogue_group
+    // previously had NO null-store guard and would silently degrade to
+    // reporting:0/score:null instead of erroring — indistinguishable from a
+    // genuine "no reporting agents" answer. Same explicit-503-equivalent
+    // contract as list_dex_signals above now applies to all three.
+    for (const char* const call :
+         {R"({"jsonrpc":"2.0","method":"tools/call","id":45,"params":{"name":"get_dex_health"}})",
+          R"({"jsonrpc":"2.0","method":"tools/call","id":46,"params":{"name":"get_dex_trends"}})",
+          R"({"jsonrpc":"2.0","method":"tools/call","id":47,"params":{"name":"get_dex_catalogue_group","arguments":{"name":"App reliability"}}})"}) {
+        auto r = ts.call(call);
+        REQUIRE(r);
+        auto b = nlohmann::json::parse(r->body);
+        REQUIRE(b.contains("error"));
+        CHECK(b["error"]["code"] == yuzu::server::mcp::kInternalError);
+    }
 }
 
 // #2298 PR 3 §3c: the C8 chokepoint's default-deny classification. Before
@@ -5126,7 +6375,7 @@ TEST_CASE("MCP Integration: resources/list returns the expected resources", "[mc
     REQUIRE(result.contains("resources"));
     auto& resources = result["resources"];
     REQUIRE(resources.is_array());
-    CHECK(resources.size() == 11); // existing 9 + 2g PR4 specs-as-resources
+    CHECK(resources.size() == 12); // existing 9 + 2g PR4 specs-as-resources + plugin-docs
 
     // The Guardian schema discovery resource is advertised on the MCP plane.
     std::set<std::string> uris;
@@ -5140,6 +6389,7 @@ TEST_CASE("MCP Integration: resources/list returns the expected resources", "[mc
     CHECK(uris.count("yuzu://golden-prompts/enterprise-it-v1") == 1);
     CHECK(uris.count("yuzu://openapi") == 1);
     CHECK(uris.count("yuzu://scope-dsl") == 1);
+    CHECK(uris.count("yuzu://plugin-docs") == 1);
 
     // Each resource should have uri, name, description, mimeType
     for (const auto& r : resources) {
@@ -5242,6 +6492,106 @@ TEST_CASE("MCP 2g PR4: yuzu://openapi and yuzu://scope-dsl deny at an unrecogniz
     auto body2 = nlohmann::json::parse(res_scope_dsl->body);
     REQUIRE(body2.contains("error"));
     CHECK(body2["error"]["code"] == yuzu::server::mcp::kTierDenied);
+}
+
+// ── Plugin README standard (docs/plugin-readme-standard.md rule 10):
+// yuzu://plugin-docs — the build-embedded per-plugin documentation manifests,
+// same static builder as GET /api/v1/discover/plugin-docs, same tier-then-perm
+// gate as the two 2g PR4 resources above.
+
+TEST_CASE("MCP plugin-docs: yuzu://plugin-docs matches plugin_docs_catalog()",
+          "[mcp][plugin_docs][integration]") {
+    McpTestServer ts;
+    ts.start("readonly");
+
+    const auto expected = nlohmann::json::parse(yuzu::server::plugin_docs_catalog().json);
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"resources/read","id":36,"params":{"uri":"yuzu://plugin-docs"}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto& contents = body["result"]["contents"];
+    REQUIRE(contents.is_array());
+    REQUIRE(contents.size() == 1);
+    CHECK(contents[0]["uri"] == "yuzu://plugin-docs");
+    CHECK(contents[0]["mimeType"] == "application/json");
+    auto got = nlohmann::json::parse(contents[0]["text"].get<std::string>());
+    CHECK(got == expected);
+
+    // Envelope shape — the manifests themselves are content, not asserted here
+    // beyond the contract every entry must satisfy.
+    CHECK(got["catalog"] == "plugin-docs");
+    CHECK(got["source"] == "build-embedded");
+    REQUIRE(got["plugins"].is_array());
+    CHECK(got["plugin_count"].get<std::size_t>() == got["plugins"].size());
+    CHECK(got["skipped_invalid"] == 0);
+    CHECK(got["plugin_count"].get<std::size_t>() >= 2); // the pilots; never vacuous
+    for (const auto& m : got["plugins"]) {
+        CHECK(m["manifest_version"].is_number_integer());
+        CHECK(m["name"].is_string());
+        CHECK(m["actions"].is_array());
+        CHECK(m["readme"].is_string());
+    }
+}
+
+TEST_CASE("MCP plugin-docs: yuzu://plugin-docs denies without Infrastructure:Read and at an "
+          "unrecognized tier",
+          "[mcp][plugin_docs][integration]") {
+    {
+        McpTestServer ts;
+        ts.perm_override_for_test = [](const std::string& securable, const std::string& operation) {
+            return !(securable == "Infrastructure" && operation == "Read");
+        };
+        ts.start("readonly");
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"resources/read","id":37,"params":{"uri":"yuzu://plugin-docs"}})");
+        REQUIRE(res);
+        CHECK(res->status != 200);
+    }
+    {
+        McpTestServer ts;
+        ts.start("bogus-unrecognized-tier");
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"resources/read","id":38,"params":{"uri":"yuzu://plugin-docs"}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kTierDenied);
+    }
+}
+
+TEST_CASE("MCP plugin-docs: discover_plugins outputSchema types the per-plugin docs summary",
+          "[mcp][plugin_docs][integration]") {
+    // The #2986 completeness case guards top-level keys only; the item-level
+    // `docs` property (object-or-null, always present — the catalog 2 -> 3
+    // change) is pinned here so a revert of the schema hunk fails a test.
+    McpTestServer ts;
+    ts.start("readonly");
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":39})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    bool found = false;
+    for (const auto& t : body["result"]["tools"]) {
+        if (t.value("name", "") != "discover_plugins")
+            continue;
+        found = true;
+        REQUIRE(t.contains("outputSchema"));
+        const auto& items = t["outputSchema"]["properties"]["plugins"]["items"];
+        REQUIRE(items.contains("properties"));
+        REQUIRE(items["properties"].contains("docs"));
+        const auto& docs = items["properties"]["docs"];
+        CHECK(docs["type"] == nlohmann::json::array({"object", "null"}));
+        CHECK(docs["properties"].contains("summary"));
+        CHECK(docs["properties"].contains("platforms"));
+        CHECK(docs["properties"].contains("readme"));
+        CHECK(docs["properties"].contains("resource"));
+        const auto& required = items["required"];
+        CHECK(std::find(required.begin(), required.end(), "docs") != required.end());
+    }
+    CHECK(found);
 }
 
 // ── 11. Unknown method — verify kMethodNotFound ─────────────────────────────
@@ -5656,6 +7006,139 @@ TEST_CASE("MCP get_execution_status: invisible execution collapses to the same "
     CHECK(missing_json["error"]["message"].get<std::string>().starts_with("Execution not found:"));
 }
 
+// #4030 Gate 8 fix: get_workflow_execution had ZERO prior MCP-level test
+// coverage (quality-engineer + cpp-safety, Gate 3) -- the confinement fix
+// (security-guardian, Gate 2 HIGH: workflow_execution_detail_json had no
+// record-level confinement gate, only `agent_ids` was field-filtered; a
+// caller with zero visibility into an execution's target agents still got
+// the full status/steps/results) is verified here on the MCP surface,
+// mirroring get_execution_status's own #1634 zero-overlap test above.
+// PRE-fix this call returned 200 with the full unfiltered record.
+TEST_CASE("MCP get_workflow_execution: zero-overlap confined caller gets the "
+          "same not-found error as a nonexistent id (#4030 Gate 8 fix)",
+          "[pg][mcp][integration][workflow][scope][notfound]") {
+    YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ResponseExecutionAuthzPgRig authz{authz_db.dsn()};
+    // The shared rig grants bob Response:Read/Execution:Read via his
+    // management group -- "Workflow" is a brand-new securable this PR
+    // introduces (rbac_store.cpp seeding), so it is not part of the rig's
+    // own fixed setup. Grant it the same way (management-group-scoped),
+    // mirroring the rig's own ResponseReader1634/ExecutionReader1634 shape.
+    REQUIRE(authz.rbac.create_role({"WorkflowReader4030", "", false, 0}).has_value());
+    REQUIRE(
+        authz.rbac.set_permission({"WorkflowReader4030", "Workflow", "Read", "allow"}).has_value());
+    REQUIRE(authz.mgmt.assign_role({authz.bob_group, "user", "bob", "WorkflowReader4030"})
+                .has_value());
+
+    YUZU_REQUIRE_PG_DB_TPL(wf_db, mcp_workflow_tpl);
+    yuzu::server::pg::PgPool wf_pool{{.conninfo = wf_db.dsn(), .size = 4}};
+    yuzu::server::WorkflowEngine workflows{wf_pool};
+    REQUIRE(workflows.is_open());
+
+    const std::string yaml = "kind: Workflow\n"
+                             "metadata:\n"
+                             "  displayName: mcp-wf-scope\n"
+                             "spec:\n"
+                             "  steps:\n"
+                             "    - instruction: def-mcp-wf\n";
+    auto wf_id = workflows.create_workflow(yaml);
+    REQUIRE(wf_id.has_value());
+
+    auto dispatch_fn = [](const std::string&, const std::string&,
+                          const std::string&) -> std::expected<std::string, std::string> {
+        return std::string(
+            R"({"status":"dispatched","command_id":"cmd-mcp-wf","agents_reached":1})");
+    };
+    // Target agent-A only -- bob's confined scope below (mint_bob) is
+    // disjoint from it (mirrors get_execution_status's own bob/alice-agent
+    // disjoint setup above).
+    auto exec_id = workflows.execute(*wf_id, {"agent-A"}, dispatch_fn);
+    REQUIRE(exec_id.has_value());
+
+    McpTestServer ts;
+    ts.workflow_engine_for_test = &workflows;
+    ts.fleet_read_fn_for_test = authz.fleet_read_fn();
+    ts.mock_username = "bob";
+    ts.start("operator");
+
+    const auto token = authz.mint_bob();
+    auto call = [&](const std::string& id) {
+        return ts.call_raw(
+            "POST",
+            std::string(
+                R"({"jsonrpc":"2.0","method":"tools/call","id":740,)"
+                R"("params":{"name":"get_workflow_execution","arguments":{"execution_id":")") +
+                id + R"("}}})",
+            {{"Authorization", "Bearer " + token}});
+    };
+    auto invisible = call(*exec_id);
+    auto missing = call("wfexec-does-not-exist-at-all");
+    REQUIRE(invisible);
+    REQUIRE(missing);
+    auto invisible_json = nlohmann::json::parse(invisible->body);
+    auto missing_json = nlohmann::json::parse(missing->body);
+    REQUIRE(invisible_json.contains("error"));
+    REQUIRE(missing_json.contains("error"));
+    CHECK(invisible_json["error"]["code"] == missing_json["error"]["code"]);
+    CHECK(invisible_json["error"]["message"].get<std::string>().starts_with(
+        "Workflow execution not found:"));
+    CHECK(missing_json["error"]["message"].get<std::string>().starts_with(
+        "Workflow execution not found:"));
+    // PRE-fix regression proof: the error response has no "result" key at
+    // all -- the record (status/steps/results) genuinely was not returned,
+    // not merely field-filtered.
+    CHECK_FALSE(invisible_json.contains("result"));
+}
+
+// Regression guard for the fix above: an UNCONFINED caller must still see
+// the full record, including the raw `agents_reached` count in each step's
+// result (the confined-only redaction the fix's count-disclosure guard
+// applies must not fire for a caller with no scope at all).
+TEST_CASE("MCP get_workflow_execution: unconfined caller still sees the full "
+          "record including agents_reached (#4030 Gate 8 fix regression guard)",
+          "[pg][mcp][integration][workflow][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(wf_db, mcp_workflow_tpl);
+    yuzu::server::pg::PgPool wf_pool{{.conninfo = wf_db.dsn(), .size = 4}};
+    yuzu::server::WorkflowEngine workflows{wf_pool};
+    REQUIRE(workflows.is_open());
+
+    const std::string yaml = "kind: Workflow\n"
+                             "metadata:\n"
+                             "  displayName: mcp-wf-unconfined\n"
+                             "spec:\n"
+                             "  steps:\n"
+                             "    - instruction: def-mcp-wf2\n";
+    auto wf_id = workflows.create_workflow(yaml);
+    REQUIRE(wf_id.has_value());
+    auto dispatch_fn = [](const std::string&, const std::string&,
+                          const std::string&) -> std::expected<std::string, std::string> {
+        return std::string(
+            R"({"status":"dispatched","command_id":"cmd-mcp-wf2","agents_reached":2})");
+    };
+    auto exec_id = workflows.execute(*wf_id, {"agent-X", "agent-Y"}, dispatch_fn);
+    REQUIRE(exec_id.has_value());
+
+    McpTestServer ts;
+    ts.workflow_engine_for_test = &workflows;
+    // fleet_read_fn_for_test's own default (checked above) admits
+    // unconfined -- no authz rig wired for this direction.
+    ts.start("operator");
+
+    auto res = ts.call(
+        std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":741,)"
+                    R"("params":{"name":"get_workflow_execution","arguments":{"execution_id":")") +
+        *exec_id + R"("}}})");
+    REQUIRE(res);
+    auto sc = nlohmann::json::parse(res->body)["result"]["structuredContent"];
+    CHECK(sc["status"] == "completed");
+    REQUIRE(sc["agent_ids"].is_array());
+    CHECK(sc["agent_ids"].size() == 2);
+    REQUIRE(sc["steps"].is_array());
+    REQUIRE(sc["steps"].size() == 1);
+    REQUIRE(sc["steps"][0]["result"].contains("agents_reached"));
+    CHECK(sc["steps"][0]["result"]["agents_reached"] == 2);
+}
+
 // #1634: execution rows carry no single agent_id, so a confined caller is
 // restricted to their own dispatches (ExecutionQuery::dispatched_by) rather than
 // a full per-row visible-agent check — never another operator's execution.
@@ -5749,6 +7232,42 @@ TEST_CASE("MCP list_executions: confined caller's counts reflect only in-scope, 
     // never 2 (alice-agent's out-of-scope success must not leak in either).
     CHECK(sc[0]["agents_targeted"] == 1);
     CHECK(sc[0]["agents_responded"] == 0);
+}
+
+// #4030 review finding (blocking, HIGH): list_executions used to call the
+// unchecked query_executions()/get_agent_statuses_for_executions(), which
+// silently collapsed a degraded tracker (not-open / pool-exhausted /
+// query-failed) into an empty executions list -- indistinguishable from a
+// genuinely empty fleet, and the exact defect class already fixed for
+// list_schedules (5686776fe) two commits earlier in this same PR. Mirrors
+// "create_execution failure degrades..." above: an ExecutionTracker bound to
+// an unreachable pool fails its own connect attempt deterministically
+// (ADR-0065, test_engine_principal_store.cpp's #2456 precedent) -- no live
+// database needed, so this carries no [pg] tag.
+TEST_CASE("MCP list_executions: a degraded tracker surfaces a store-fault "
+          "error, never a false empty-success list (#4030 fix regression)",
+          "[mcp][integration][execution]") {
+    pg::PgPool unreachable{{.conninfo = "host=127.0.0.1 port=1 dbname=yuzu connect_timeout=1",
+                            .size = 1,
+                            .connect_timeout_s = 1}};
+    REQUIRE(unreachable.valid()); // conninfo parses; the host is just unreachable
+    ExecutionTracker broken(unreachable);
+    REQUIRE(!broken.is_open());
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &broken;
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":733,"params":{"name":"list_executions"}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInternalError);
+    // Never the pre-fix shape: a "success" result with an empty executions
+    // array, indistinguishable from a genuinely-empty fleet.
+    CHECK_FALSE(body.contains("result"));
 }
 
 TEST_CASE("MCP Agentic demo: ceo_demo prompt is live-only and ignores injected args (ADR-0016)",
@@ -10706,6 +12225,140 @@ TEST_CASE("MCP operator surface: list_upload_grants is confined to what's actual
     CHECK(ts.audit_log[1] == "mcp.list_upload_grants|success");
 }
 
+// ── #4031: list_directory_users / get_directory_status ──────────────────
+//
+// Round-trip dispatch tests proving the shared-builder claim (docs/
+// api-twin-recipe.md §1) actually holds for these two tools: both call the
+// SAME directory_user_row_json / directory_status_json functions the REST
+// v1 twins (enrollment_directory_routes.cpp) and the legacy
+// /api/directory/* routes (discovery_routes.cpp) use. Deliberately does NOT
+// seed data via sync_entra/apply_entra_sync — see
+// test_enrollment_directory_routes.cpp's identical note (sync_entra makes a
+// real outbound Graph call; apply_entra_sync's test seam is a file-local
+// friend struct in test_directory_sync.cpp, not safely duplicable here
+// without an ODR risk). A freshly-opened, empty store already proves the
+// tool's registration, gating, and response-shape wiring.
+
+TEST_CASE("MCP #4031: list_directory_users dispatches, returns the shared builder's shape, and "
+          "uses the REST-domain audit verb (not mcp.list_directory_users)",
+          "[pg][mcp][integration]") {
+    yuzu::test::DirectorySyncPg ds;
+
+    McpTestServer ts;
+    ts.directory_sync_for_test = ds.get();
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"list_directory_users",)"
+        R"("arguments":{}}})");
+    REQUIRE(res);
+    auto payload = operator_surface_payload(res);
+    REQUIRE(payload["users"].is_array());
+    CHECK(payload["users"].empty());
+    CHECK(payload["count"] == 0);
+
+    // Prefers the REST-established domain verb over the generic
+    // mcp.<tool_name> action (docs/api-twin-recipe.md §4).
+    REQUIRE(ts.audit_log.size() == 1);
+    CHECK(ts.audit_log[0] == "directory.users.view|success");
+}
+
+TEST_CASE("MCP #4031: list_directory_users answers store-unavailable when directory_sync is "
+          "unwired",
+          "[mcp][integration]") {
+    McpTestServer ts;
+    // directory_sync_for_test stays nullptr — default.
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"list_directory_users",)"
+        R"("arguments":{}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+}
+
+TEST_CASE("MCP #4031: get_directory_status dispatches, returns the shared builder's shape, and "
+          "is NOT audited (no per-person PII)",
+          "[pg][mcp][integration]") {
+    yuzu::test::DirectorySyncPg ds;
+
+    McpTestServer ts;
+    ts.directory_sync_for_test = ds.get();
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"get_directory_status",)"
+        R"("arguments":{}}})");
+    REQUIRE(res);
+    auto payload = operator_surface_payload(res);
+    CHECK(payload.contains("provider"));
+    CHECK(payload.contains("status"));
+    CHECK(payload.contains("user_count"));
+    CHECK(payload.contains("group_count"));
+    REQUIRE(payload["groups"].is_array());
+
+    CHECK(ts.audit_log.empty());
+}
+
+// Colleague-review finding on #4176: groups[].mapped_role (the AD-group ->
+// Yuzu-role authorization map, same data class as the floored
+// OidcConfig:admin_group) must stay admin-only even at readonly MCP tier —
+// see enrollment_directory_model.hpp's directory_status_json doc comment.
+TEST_CASE("MCP #4031/#4176: get_directory_status redacts mapped_role for a non-admin caller at "
+          "readonly tier, reveals it for admin",
+          "[pg][mcp][integration][security]") {
+    yuzu::test::DirectorySyncPg ds;
+    {
+        auto lease = ds.pool().acquire();
+        REQUIRE(lease);
+        auto ins = pg::exec_params(
+            lease.get(),
+            "INSERT INTO directory_sync.directory_groups (id, display_name, description, "
+            "synced_at) VALUES ($1, $2, $3, $4)",
+            std::vector<std::string>{"g1", "Engineering", "", "100"});
+        REQUIRE(ins.ok());
+    }
+    ds->configure_group_role_mapping("g1", "Administrator");
+    REQUIRE(ds->get_synced_groups().size() == 1);
+
+    McpTestServer ts;
+    ts.directory_sync_for_test = ds.get();
+    ts.start("readonly");
+    ts.mock_role = yuzu::server::auth::Role::user;
+
+    auto call = R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":)"
+               R"("get_directory_status","arguments":{}}})";
+    auto denied_payload = operator_surface_payload(ts.call(call));
+    REQUIRE(denied_payload["groups"].size() == 1);
+    CHECK(denied_payload["groups"][0]["mapped_role"] == "");
+
+    // Admin session, same readonly MCP tier — the field is role-gated, not
+    // tier-gated, so an admin sees it even at readonly.
+    ts.mock_role = yuzu::server::auth::Role::admin;
+    auto revealed_payload = operator_surface_payload(ts.call(call));
+    REQUIRE(revealed_payload["groups"].size() == 1);
+    CHECK(revealed_payload["groups"][0]["mapped_role"] == "Administrator");
+}
+
+TEST_CASE("MCP #4031: list_directory_users respects perm_fn denial on Directory:Read",
+          "[pg][mcp][integration]") {
+    yuzu::test::DirectorySyncPg ds;
+
+    McpTestServer ts;
+    ts.directory_sync_for_test = ds.get();
+    ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+        return !(securable == "Directory" && op == "Read");
+    };
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"list_directory_users",)"
+        R"("arguments":{}}})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+}
+
 TEST_CASE("MCP operator surface: revoke_upload_grant flips the REAL store row to revoked and "
           "the grant becomes unredeemable — proven via a direct open_session() attempt",
           "[pg][mcp][integration][operator_surface]") {
@@ -11870,6 +13523,130 @@ TEST_CASE("MCP query_installed_software: a degraded store errors, never success+
         if (a == "mcp.query_installed_software|failure") // file-wide audit-status convention
             saw_failure_audit = true;
     CHECK(saw_failure_audit);
+}
+
+// ── preview_management_group_agent_count (#4033, #2146 API-parity Batch A) ──
+// MCP twin of GET /api/v1/management-groups/agent-count-preview — REST and
+// MCP call the SAME shared builder (group_agent_count_preview.hpp) so those
+// two cannot drift from each other. Fixed by adversarial review (#4033
+// follow-up): an earlier version of this comment claimed
+// /fragments/create-group-form's own live count shares it too (a third
+// "all three" surface) — false; the fragment keeps its own separate inline
+// implementation (dashboard_routes.cpp), unchanged by this PR. No Postgres
+// substrate needed here: response_store_for_test stays nullptr, which exercises the
+// "empty filters -> genuine 0, no store call" branch and the "non-empty
+// filters against an unconfigured store -> degrade" branch, both entirely
+// store-free per the shared model's own contract (see
+// test_group_agent_count_preview.cpp for direct coverage of that contract).
+
+TEST_CASE("MCP preview_management_group_agent_count: no filters is a genuine 0",
+          "[mcp][devices]") {
+    McpTestServer ts; // response_store_for_test stays nullptr
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":90,)"
+        R"("params":{"name":"preview_management_group_agent_count",)"
+        R"("arguments":{"command_id":"cmd-1","plugin":"procfetch"}}})");
+    REQUIRE(res->status == 200);
+    auto envelope = nlohmann::json::parse(res->body);
+    REQUIRE(envelope.contains("result"));
+    auto data = nlohmann::json::parse(envelope["result"]["content"][0]["text"].get<std::string>());
+    CHECK(data["agent_count"].get<int64_t>() == 0);
+}
+
+TEST_CASE("MCP preview_management_group_agent_count: a real filter against an unwired "
+          "store degrades, never a false 0",
+          "[mcp][devices]") {
+    McpTestServer ts; // response_store_for_test stays nullptr
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":91,)"
+        R"("params":{"name":"preview_management_group_agent_count",)"
+        R"("arguments":{"command_id":"cmd-1","plugin":"procfetch","filters":{"pid":"1234"}}}})");
+    REQUIRE(res->status == 200);
+    auto envelope = nlohmann::json::parse(res->body);
+    REQUIRE(envelope.contains("error"));
+    CHECK_FALSE(envelope.contains("result"));
+}
+
+// Colleague review on #4188 (real HIGH finding, verified independently): a
+// malformed filters shape was silently dropped rather than rejected, which
+// group_agent_count_preview's own "empty filters -> genuine 0" contract then
+// turned into a fabricated successful agent_count:0 for a request that was
+// never actually evaluated. Both shapes below must be a hard error, never a
+// 200 with agent_count:0 (response_store_for_test stays nullptr — if either
+// shape reached group_agent_count_preview with a non-empty filter it would
+// degrade per the test above, not succeed at 0; catching a silent 200:0 here
+// is the falsifier for the exact defect the review found).
+TEST_CASE("MCP preview_management_group_agent_count: a non-string filter value is rejected, "
+          "never silently dropped into a false genuine-0",
+          "[mcp][devices][security]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":94,)"
+        R"("params":{"name":"preview_management_group_agent_count",)"
+        R"("arguments":{"command_id":"cmd-1","plugin":"procfetch","filters":{"pid":1234}}}})");
+    REQUIRE(res->status == 200);
+    auto envelope = nlohmann::json::parse(res->body);
+    REQUIRE(envelope.contains("error"));
+    CHECK_FALSE(envelope.contains("result"));
+}
+
+TEST_CASE("MCP preview_management_group_agent_count: an array-shaped filters is rejected, "
+          "never silently dropped into a false genuine-0",
+          "[mcp][devices][security]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":95,)"
+        R"("params":{"name":"preview_management_group_agent_count",)"
+        R"("arguments":{"command_id":"cmd-1","plugin":"procfetch","filters":["pid"]}}})");
+    REQUIRE(res->status == 200);
+    auto envelope = nlohmann::json::parse(res->body);
+    REQUIRE(envelope.contains("error"));
+    CHECK_FALSE(envelope.contains("result"));
+}
+
+TEST_CASE("MCP preview_management_group_agent_count: readonly tier is denied "
+          "(ManagementGroup:Write, not Read)",
+          "[mcp][devices]") {
+    McpTestServer ts;
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":92,)"
+        R"("params":{"name":"preview_management_group_agent_count",)"
+        R"("arguments":{"command_id":"cmd-1","plugin":"procfetch"}}})");
+    REQUIRE(res->status == 200);
+    auto envelope = nlohmann::json::parse(res->body);
+    REQUIRE(envelope.contains("error"));
+}
+
+TEST_CASE("MCP preview_management_group_agent_count: RBAC denial (ManagementGroup:Write) "
+          "blocks the call",
+          "[mcp][devices]") {
+    McpTestServer ts;
+    ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+        return !(securable == "ManagementGroup" && op == "Write");
+    };
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":93,)"
+        R"("params":{"name":"preview_management_group_agent_count",)"
+        R"("arguments":{"command_id":"cmd-1","plugin":"procfetch"}}})");
+    REQUIRE(res->status == 403);
+}
+
+TEST_CASE("MCP preview_management_group_agent_count: securable/operation registration "
+          "matches the REST twin",
+          "[mcp][devices]") {
+    const auto rows = tool_security_rows_for_test();
+    auto it = std::find_if(rows.begin(), rows.end(), [](const auto& r) {
+        return r.name == "preview_management_group_agent_count";
+    });
+    REQUIRE(it != rows.end());
+    CHECK(it->securable == "ManagementGroup");
+    CHECK(it->operation == "Write");
 }
 
 // ── query_software_licenses (ADR-0024 SLE discovery — the MCP twin of the ──────
@@ -14197,6 +15974,11 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
         {"delete_plugin_config", nlohmann::json::parse(R"({"plugin":"p","key":"k"})")},
         {"delete_plugin_secret", nlohmann::json::parse(R"({"plugin":"p","key":"k"})")},
         {"revoke_upload_grant", nlohmann::json::parse(R"({"grant_id":"ab12"})")},
+        // #4033: ManagementGroup:Write is in the supervised-tier gated list —
+        // this tool inherits that gate as a consequence of matching the
+        // fragment's own gate exactly (see its kTools[] entry's comment).
+        {"preview_management_group_agent_count",
+         nlohmann::json::parse(R"({"command_id":"cmd-1","plugin":"procfetch"})")},
     };
 
     // Tether: the gated set derived from security rows + requires_approval()
