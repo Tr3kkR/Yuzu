@@ -33,6 +33,7 @@
 #include "guardian_backend.hpp" // GuardianBackend, guardian_backend_from_state/label (F7)
 #include "guardian_convergence_scheduler.hpp"
 #include "guardian_drift_event.hpp" // apply_drift_to_event (shared with the spark path)
+#include "guardian_detached_worker_role.hpp" // rung 9c R5.1: executor workers
 #include "guardian_joined_thread_role.hpp"
 #include "guardian_journal_heartbeat.hpp" // GuardianJournalStats (item 7 PR-Ag §8)
 #include "guardian_lifecycle_journal.hpp" // durable lifecycle journal (item 7 PR-Ag)
@@ -57,6 +58,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 namespace yuzu::agent {
@@ -635,13 +637,28 @@ void GuardianEngine::WorkerHostileMutex::abort_if_worker_thread() noexcept {
     // __SANITIZE_THREAD__/__SANITIZE_ADDRESS__, Clang answers __has_feature. A release build
     // without sanitizers compiles this away entirely, so the production hot path pays
     // nothing for an invariant CI proves.
-    if (!on_guardian_joined_thread())
+    const bool joined = on_guardian_joined_thread();
+    const bool detached = on_guardian_detached_worker_thread();
+    if (!joined && !detached)
         return;
     try {
-        spdlog::critical("Guardian: a worker thread that stop() joins took GuardianEngine::"
-                         "mtx_ - this deadlocks against stop(), which holds mtx_ while joining "
-                         "it. Aborting rather than hanging. See "
-                         "guardian_joined_thread_role.hpp (#2298).");
+        if (joined) {
+            spdlog::critical("Guardian: a worker thread that stop() joins took GuardianEngine::"
+                             "mtx_ - this deadlocks against stop(), which holds mtx_ while joining "
+                             "it. Aborting rather than hanging. See "
+                             "guardian_joined_thread_role.hpp (#2298).");
+        } else {
+            // rung 9c R5.1: the second role. A detached GuardianIoExecutor worker (run()
+            // or submit() body, or its on_abandoned/on_complete callback) can never be
+            // joined and may outlive stop() - blocking it here either stalls the F3
+            // orphan grace into a hard_exit() or resumes it into a torn-down engine.
+            spdlog::critical("Guardian: a detached GuardianIoExecutor worker (run()/submit() "
+                             "body or its completion/abandon callback) took GuardianEngine::"
+                             "mtx_ - such a worker may outlive the engine and can never be "
+                             "joined: this either stalls the F3 orphan grace into a hard_exit "
+                             "or resumes into a destroyed engine. Aborting rather than "
+                             "wedging. See guardian_detached_worker_role.hpp (R5.1).");
+        }
     } catch (...) {
     }
     // Deliberately std::abort, not assert: assert is a no-op under NDEBUG, which would have
@@ -1786,6 +1803,20 @@ void GuardianEngine::wire_spark_engine(SparkEngine* engine, bool spark_disabled_
         // The durable journal is engine-owned and borrows kv_ (may be null → it durably
         // writes nothing). Constructed whenever spark is wired; persist stays gated on
         // prefer_spark_ in persist_lifecycle_journal_locked, so it is inert at 7.7a.
+        //
+        // GUARDRAIL (#4153 round 4): the journal's constructor accepts any IJournalStore*
+        // so tests can pass an in-memory FakeJournalStore - production must always pass a
+        // real KvStore. That is enforced today by kv_'s own declared type (KvStore*, not
+        // IJournalStore*), not by anything at this call site - so if a future refactor
+        // ever widens kv_'s type, this assert fires as a compile error right here, forcing
+        // that change to be a conscious, reviewed decision rather than a silent widening.
+        // Scope, stated honestly: this only catches kv_'s TYPE being widened. It cannot
+        // catch a future refactor that leaves kv_'s type alone but substitutes a
+        // different pointer at the construction call site below.
+        static_assert(std::is_same_v<decltype(kv_), KvStore*>,
+                      "GuardianEngine::kv_ must stay KvStore*, not IJournalStore* - "
+                      "production must never construct GuardianLifecycleJournal against "
+                      "anything but a real KvStore (see kv_store.hpp's IJournalStore doc)");
         lifecycle_journal_ = std::make_shared<GuardianLifecycleJournal>(kv_);
 
         auto id = engine->register_consumer("guardian-spark",

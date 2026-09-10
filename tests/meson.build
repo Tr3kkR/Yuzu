@@ -248,6 +248,7 @@ agent_test_exe = executable(
     'unit/test_metrics.cpp',
     'unit/test_metrics_perf.cpp',
     'unit/test_kv_store.cpp',
+    'unit/test_fake_journal_store.cpp', # IJournalStore test double contract (#4153)
     'unit/test_command_dedup_store.cpp',
     'unit/test_trigger_engine.cpp',
     'unit/test_guardian_engine.cpp',
@@ -276,6 +277,7 @@ agent_test_exe = executable(
     'unit/test_shutdown_pipe.cpp',
     'unit/test_hard_exit.cpp',
     'unit/test_shutdown_deadline_guard.cpp',
+    'unit/test_spark_detached_call.cpp',
     'unit/test_spark_disk.cpp',
     'unit/test_spark_engine.cpp',
     'unit/test_spark_key_rule_index.cpp',
@@ -602,24 +604,38 @@ agent_test_exe = executable(
                 windows_updates_plugin_lib,
                 ],
 )
-# Three agent tests are [tsan-heavy] (#3848 added the third, a concurrency soak against a
-# BLOCKING Spark backend/send callback - not a SQLite spin-loop, but genuinely contention-
-# dominated in the same way, ~4-15s under TSan): concurrency STRESS checkpoints that spin
-# four to five threads with no throttle, two of them on real SQLite I/O. Their wall time is
-# contention-dominated - it ballooned under Big Tam filesystem contention (four CI jobs
-# sharing one host's /tmp), where one stalled ~8 minutes and timed the whole agent suite out
-# (#2345), and the same mechanism recurred on Wee Tam/Windows under ASan (#4018). In a PLAIN
-# build they detect nothing (no instrumentation), so that cost buys no signal there - skip
-# them. A sanitizer build runs everything, but as of #2373's split (below) NOT in this same
-# entry: they get their OWN test() with its own budget, so a stall here no longer risks
-# timing out the other fast cases sharing this entry's ceiling. The OTHER four [tsan]
-# tests are cheap and bounded (no real SQLite, or a fixed sleep) and stay in every build. A
-# coverage build (b_coverage, no sanitizer) also skips the two heavy tests; their concurrent
-# code paths are line-covered by the sequential prune/page/gauge tests and the cheap
-# concurrent tests, so no meaningful line coverage is lost.
-# #2373 (split/redesign) is now acted on directly below, not merely tracked: a wall-clock cap
-# on these tests was tried and backed out (a busy main thread starving the workers it waited
-# on), so the fix is a separately-budgeted entry, never a tighter deadline on this one.
+# ONE agent test is [tsan-heavy] as of #4153 (down from three): the #3848 concurrency soak
+# against a BLOCKING Spark backend/send callback ("...TSan checkpoint, #3848)"). It is
+# SQLite-free (FakeBackend + BlockingGate, no KvStore anywhere in it) but genuinely
+# contention-dominated in the same way its two former siblings were - a real 60ms backend
+# deadline, 30s watchdogs, a releaser pulsing sleep_for(1ms) - ~4-15s under TSan, and the
+# reason it stays out of the plain/coverage suite: a PLAIN build has no instrumentation to
+# find a race with, so the cost buys no signal there, and its concurrent code paths are
+# line-covered by the sequential prune/page/gauge tests plus the cheap [tsan] cases below.
+# It keeps its OWN test() with its own budget (below) so a stall here cannot time out the
+# fast entry's other cases.
+#
+# The other two used to live here too - "concurrent pagers + a drainer" and QE-1 "concurrent
+# persist + page + prune + drain" - and were genuinely SQLite-bound: four to five threads
+# spinning UNTHROTTLED `while(!stop)` loops against a real on-disk KvStore (WAL, a 5s busy
+# timeout), with termination depending on the MAIN thread winning lock races against those
+# spinning workers. That starved under contention - it ballooned under Big Tam filesystem
+# contention (four CI jobs sharing one host's /tmp), where one stalled ~8 minutes and timed
+# out the whole agent suite (#2345), and the same mechanism recurred on Wee Tam/Windows under
+# ASan (#4018, one run took 1010s, the other never finished in 1200s). #4153 redesigned both
+# off SQLite entirely (an in-memory FakeJournalStore, IJournalStore seam) and off the
+# stop-flag race (fixed per-thread iteration counts; a portable jthread-alike with fixed
+# producer loops, latches, and bounded/stop-token-aware polling waits for the drainer and
+# persister, replacing a spin) - termination now depends on fixed iteration counts and
+# 30s-bounded main-thread waits, never on the main thread winning a lock race, so they
+# moved to [tsan] (below with the other cheap cases) and run in EVERY build, not only
+# sanitizer ones.
+# #2373 (the split that first isolated [tsan-heavy] into its own budgeted entry, keeping a
+# stall here from timing out the fast suite) is superseded for those two tests by #4153's
+# redesign above; it remains the reason the sole survivor still gets its own entry. A
+# wall-clock cap inside these tests was tried and backed out before either fix (a busy main
+# thread starving the workers it waited on) - #4153's fixed iteration counts are a different
+# shape, not a revival of that approach.
 # ── #2270 allocation-budget probe (separate binary, deliberately) ────────────
 # test_spark_alloc_budget.cpp REPLACES the global operator new/delete to count
 # allocations, which is process-wide and cannot be scoped to one test. Two
@@ -649,32 +665,47 @@ if host_machine.system() == 'linux' and get_option('b_sanitize') == 'none'
   )
 endif
 
-# [tsan-heavy] is now ALWAYS excluded from this entry (previously only in a plain build) -
-# see the #2373 split comment above and the dedicated 'agent tsan-heavy checkpoints' entry
-# below, which is the only place a sanitizer build runs them now.
+# [tsan-heavy] is ALWAYS excluded from this entry (previously only in a plain build) - see
+# the #2373/#4153 split comment above and the dedicated 'agent tsan-heavy checkpoints' entry
+# below, which is the only place a sanitizer build runs the sole survivor now.
 agent_test_args = ['~[tsan-heavy]']
 test(
   'agent unit tests',
   agent_test_exe,
   args: agent_test_args,
   suite: 'agent',
-  timeout: 240, # restored after moving the (now three, #3848) [tsan-heavy] tests to sanitizer-only (#2345): plain suite is ~28s, so 240s is ~8x headroom and surfaces a genuine hang rather than absorbing it into a loose ceiling.
+  timeout: 240, # restored after moving [tsan-heavy] tests to sanitizer-only (#2345): plain suite is ~28-60s, so 240s is generous headroom and surfaces a genuine hang rather than absorbing it into a loose ceiling. #4153 moved two of the three former [tsan-heavy] cases INTO this entry (retagged [tsan]) - still comfortably inside this budget (measured).
   depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin, abi3_fixture_plugin],
 )
 
 if get_option('b_sanitize') != 'none'
-  # #2373's split, acted on: these three [tsan-heavy] checkpoints are contention-dominated
-  # (two spin unthrottled real SQLite I/O; #2345 measured one stalling ~8 minutes on Big Tam
-  # under shared-filesystem contention, and #4018 saw the same mechanism recur on Wee
-  # Tam/Windows ASan). Their own entry means a stall here times out AT ITS OWN BUDGET,
-  # classifiably, instead of either being absorbed into the fast suite's tight 240s ceiling
-  # (windows-asan's prior state, #4018) or dragging the whole fast suite down with
-  # it. 600s is sized off the measured ~480s (8-minute) stall with headroom, not the plain
-  # suite's ~28s baseline; nightly's own --timeout-multiplier 2 (Linux legs) / the
-  # windows-asan job's now-added multiplier scale this to 1200s under sanitizer instrumentation
-  # plus contention. Do NOT replace this with a wall-clock cap inside the tests themselves -
+  # #2373's split (below) still applies to the ONE remaining [tsan-heavy] case (#3848, a
+  # BLOCKING-backend soak, SQLite-free but genuinely contention-dominated: a real 60ms backend
+  # deadline, 30s watchdogs, a releaser pulsing sleep_for(1ms), ~4-15s under TSan uncontended).
+  # CORRECTION (#4153 round 3, governance-caught): #2345's ~8-minute Big Tam stall and #4018's
+  # Wee Tam/Windows ASan recurrence were NEVER #3848 - #3848 wasn't added until 2026-09-04, six
+  # weeks after #2345 merged, so it cannot have caused an incident that predates it. Both
+  # incidents belonged to the two SQLite-bound [tsan-heavy] cases this entry ALSO held before
+  # #4153 (below). This entry's own budget means a stall here times out AT ITS OWN BUDGET,
+  # classifiably, instead of either being absorbed into the fast suite's tight 240s
+  # ceiling (windows-asan's prior state, #4018) or dragging the whole fast suite down with it.
+  # #4153 redesigned the OTHER two former [tsan-heavy] cases off real on-disk SQLite entirely
+  # (an in-memory FakeJournalStore) and off the unbounded stop-flag race that caused #2345/
+  # #4018's stalls - they moved to [tsan] and now run in the fast entry above, in every build.
+  # 600s here was ORIGINALLY sized off the measured ~480s (8-minute) stall when this entry held
+  # all three cases; #4153 removed the two tests that stall belonged to, so #3848 alone now
+  # runs against this budget with generous headroom (measured ~3s uncontended, within the ~4-15s
+  # range above once real contention is added, both well under 600s) -
+  # left unchanged rather than tightened, since a single-test entry has no other case to protect
+  # from a stall's blast radius, and #3848's own 30s watchdogs already bound its own worst case.
+  # Not the plain suite's ~28-60s fast-entry baseline above; nightly's own --timeout-multiplier 2
+  # (Linux legs) / the windows-asan job's now-added multiplier scale 600s to 1200s under
+  # sanitizer instrumentation plus contention. Do NOT replace this with a wall-clock cap inside
+  # the tests themselves -
   # that was tried and backed out (comment above): a busy main thread starves the worker
-  # threads whose progress it is waiting on.
+  # threads whose progress it is waiting on. #4153's fixed-iteration-count redesign of the two
+  # moved-out tests is a DIFFERENT shape, not a revival of that approach - see their own
+  # comments in test_guardian_spark_runtime.cpp.
   #
   # is_parallel: false on Windows ONLY (governance Gate 4/6, #4018 hardening round):
   # neither this entry nor 'agent unit tests' caps --num-processes, so meson's own
@@ -919,6 +950,7 @@ if build_server
       'unit/server/test_sensitive_instruction_params.cpp',
       'unit/server/test_workflow_routes.cpp',
       'unit/server/test_compliance_routes.cpp',
+      'unit/server/test_compliance_model.cpp',
       'unit/server/test_verify_routes.cpp',
       'unit/server/test_notification_routes.cpp',
       'unit/server/test_command_routes.cpp',
@@ -927,6 +959,12 @@ if build_server
       'unit/server/test_nvd_routes.cpp',
       'unit/server/test_result_set_routes.cpp',
       'unit/server/test_approval_routes.cpp', # #2542 PR-9: the 4-route Approval API, extracted onto the HttpRouteSink seam
+      'unit/server/test_config_routes.cpp', # #2542 PR-12: the 2-route Runtime Configuration API (7.3), extracted onto the HttpRouteSink seam
+      'unit/server/test_legacy_diagnostic_routes.cpp', # #2542 PR-12: the 5-route Chargen + Procfetch diagnostic API (diagnostics_routes.cpp), extracted onto the HttpRouteSink seam -- named away from test_diagnostics_*/test_chargen_*/test_procfetch_* to avoid a plugin_doc_gen.py filename collision with the agent plugins of those names
+      'unit/server/test_legacy_events_routes.cpp', # #2542 PR-12: the legacy GET /events SSE stream, extracted onto the HttpRouteSink seam
+      'unit/server/test_instruction_fragment_routes.cpp', # #2542 PR-12: the 2-route Instructions HTMX fragment pair, extracted onto the HttpRouteSink seam
+      'unit/server/test_approvals_fragment_routes.cpp', # #2542 PR-12: the Approvals HTMX fragment, extracted onto the HttpRouteSink seam
+      'unit/server/test_mcp_disabled_routes.cpp', # #2542 PR-12: the 3-route MCP-disabled stub triple, extracted onto the HttpRouteSink seam
       'unit/server/test_agent_service_impl.cpp',
       'unit/server/test_analytics_event.cpp',
       'unit/server/test_agent_health_store.cpp',
@@ -1119,10 +1157,13 @@ if build_server
       'unit/server/test_openapi_spec_completeness.cpp',   # #3991 F1: ADR-0031 INV-31-4 / #842 unit-test half
       'unit/server/test_rest_software_packages.cpp',
       'unit/server/test_rest_inventory_software.cpp',
+      'unit/server/test_rest_devices.cpp',   # #4033 (#2146 Batch A): GET /api/v1/devices[/{id}] + agent-count-preview
+      'unit/server/test_group_agent_count_preview.cpp',   # #4033: pure shared create-group-preview model
       'unit/server/test_rest_sessions.cpp',
       'unit/server/test_rest_guaranteed_state.cpp',
       'unit/server/test_deployment_store.cpp', # ADR-0043: deployment_jobs Postgres migration
       'unit/server/test_discovery_routes.cpp', # A2 discovery surface (Issue 17.1)
+      'unit/server/test_enrollment_directory_routes.cpp', # #4031: enrollment/directory/OIDC-config read twins
       'unit/server/test_security_headers.cpp',
       'unit/server/test_on_behalf_guard.cpp', # ADR-1005 PR 1.1 reserved-key guard
       'unit/server/test_principal_quota.cpp', # PR 4.4 per-principal quota cap primitive

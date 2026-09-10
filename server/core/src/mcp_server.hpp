@@ -23,6 +23,7 @@
 #include "dex_app_perf_model.hpp"
 #include "dex_perf_model.hpp"
 #include "network_api.hpp" // ADR-0031 WS-A4: the public in-process /network API seam
+#include "dex_routes.hpp" // #4035: DexFleet -- the DexFleetFn provider seam below
 #include "network_perf_model.hpp"
 #include "execution_tracker.hpp"
 #include "guaranteed_state_store.hpp"
@@ -58,6 +59,7 @@
 #include <expected>
 #include <functional>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -508,6 +510,50 @@ public:
     /// clean "unavailable" error rather than crashing when unset.
     void set_dashboard_routes(DashboardRoutes* routes) { dashboard_routes_ = routes; }
 
+    /// #4033 — the D3 Response:Read-visible agent SET resolver backing
+    /// `preview_management_group_agent_count`'s scope, mirroring
+    /// `RestApiV1::ResponseVisibleSetFn`/`DashboardRoutes::VisibleSetFn`
+    /// EXACTLY (same doc contract; server.cpp wires the SAME instance into
+    /// all three surfaces so REST, MCP, and the `/fragments/create-group-form`
+    /// fragment cannot disagree on scope for the same caller). Same setter
+    /// idiom as `set_fleet_read_fn` above — live read on the next request.
+    /// Unset (default-constructed) ⇒ legacy-open (`nullopt`, unfiltered),
+    /// matching an unwired `DashboardRoutes` fixture's behaviour — this tool
+    /// is gated on `ManagementGroup:Write` (perm_fn), not this resolver, so
+    /// "unwired" degrades to unfiltered rather than failing closed.
+    using ResponseVisibleSetFn =
+        std::function<std::optional<std::set<std::string>>(const std::string& username)>;
+    void set_response_visible_set_fn(ResponseVisibleSetFn fn) {
+        response_visible_set_fn_ = std::move(fn);
+    }
+
+    /// #4035: the SAME cross-store fleet provider `DexRoutes`/`RestApiV1`
+    /// already receive (see `RestApiV1::DexFleetFn`'s doc comment,
+    /// rest_api_v1.hpp) — server.cpp wires the IDENTICAL lambda into all
+    /// three surfaces so the dashboard fragment, the REST twin, and this MCP
+    /// twin can never read a different fleet snapshot for the same request.
+    /// Unset (default-constructed) degrades the fleet-dependent DEX tools
+    /// (get_dex_health/get_dex_trends/get_dex_overview/get_dex_catalogue_group)
+    /// to their "no reporting agents" suppressed shape — never a crash.
+    using DexFleetFn = std::function<DexFleet()>;
+    void set_dex_fleet_fn(DexFleetFn fn) { dex_fleet_fn_ = std::move(fn); }
+
+    /// #4035 hardening (governance): the SAME username-keyed visible-agent-set
+    /// resolver `RestApiV1::DexVisibleFn` receives (see its doc comment,
+    /// rest_api_v1.hpp) — server.cpp wires the IDENTICAL lambda
+    /// (`visible_set_fn`) into the dashboard fragment, the REST twin, and this
+    /// MCP twin, so `get_dex_app`/`get_dex_overview` confine their
+    /// devices/top_devices lists to the caller's management-group scope
+    /// (ADR-0017 World A) exactly like `/fragments/dex/app` and
+    /// `/fragments/dex/overview` already do. This is a SECOND, independent
+    /// belt alongside `deny_fleet_wide_service_scoped` — that closes the
+    /// service-scoped-token axis, this closes the confined-OPERATOR axis.
+    /// Unset (default-constructed) degrades to "no confinement" (matching the
+    /// fragment's own unwired-`visible_set_fn_` posture), never a crash.
+    using DexVisibleFn =
+        std::function<std::optional<std::set<std::string>>(const std::string& username)>;
+    void set_dex_visible_fn(DexVisibleFn fn) { dex_visible_fn_ = std::move(fn); }
+
     /// Republish-CRL callback (PR4 B-2): mirrors `CaRoutes::PublishCrlFn` so the
     /// MCP `revoke_certificate` tool republishes the CRL after a revoke exactly as
     /// the REST `/api/v1/ca/revoke` handler does. Returns the new CRL DER, or
@@ -808,6 +854,12 @@ private:
     // #4143 review fix — see set_all_devices_fn above.
     AllDevicesFn all_devices_fn_;
     DashboardRoutes* dashboard_routes_{nullptr};
+    // #4033 — see set_response_visible_set_fn above.
+    ResponseVisibleSetFn response_visible_set_fn_;
+    // #4035 — see set_dex_fleet_fn above.
+    DexFleetFn dex_fleet_fn_;
+    // #4035 hardening (governance) — see set_dex_visible_fn above.
+    DexVisibleFn dex_visible_fn_;
 };
 
 // The (tool, securable, operation) test-only accessors that formerly lived here

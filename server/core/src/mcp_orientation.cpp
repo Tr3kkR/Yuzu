@@ -60,18 +60,25 @@ constexpr std::string_view kExecutionsAudit[] = {"get_execution_status", "list_e
 constexpr std::string_view kInventory[] = {"query_inventory", "list_inventory_tables",
                                            "get_agent_inventory", "query_installed_software",
                                            "query_software_licenses"};
-constexpr std::string_view kCompliance[] = {"list_policies", "get_compliance_summary",
-                                            "get_fleet_compliance", "get_guardian_schemas"};
+constexpr std::string_view kCompliance[] = {
+    "list_policies",    "get_compliance_summary",       "get_fleet_compliance",
+    "get_guardian_schemas", "get_policy", "list_policy_fragments",
+    "get_policy_agent_statuses"}; // #4034
 constexpr std::string_view kScope[] = {"validate_scope", "preview_scope_targets"};
-constexpr std::string_view kMgmtGroups[] = {"list_management_groups"};
+constexpr std::string_view kMgmtGroups[] = {"list_management_groups",
+                                            "preview_management_group_agent_count"};
 constexpr std::string_view kApprovals[] = {"list_pending_approvals", "approve_request",
                                            "reject_request"};
-constexpr std::string_view kDexSignals[] = {"list_dex_signals", "get_dex_signal_scope",
-                                            "get_dex_signal_detail"};
+constexpr std::string_view kDexSignals[] = {
+    "list_dex_signals",       "get_dex_signal_scope",     "get_dex_signal_detail",
+    "get_dex_device_score",   "get_dex_app",              "list_dex_apps",
+    "get_dex_catalogue_group", "get_dex_device_history",  "get_dex_observation",
+    "get_dex_health",         "get_dex_trends",           "get_dex_overview"};
 constexpr std::string_view kDexPerf[] = {"get_dex_perf_fleet",   "get_dex_perf_cohorts",
                                          "get_dex_perf_cohort_diff", "list_dex_perf_devices",
                                          "list_dex_perf_apps",   "get_dex_app_perf",
-                                         "get_dex_group_app_perf",   "compare_app_perf_versions"};
+                                         "get_dex_group_app_perf",   "compare_app_perf_versions",
+                                         "get_dex_device_app_perf"};
 constexpr std::string_view kNetwork[] = {"get_network_fleet", "list_network_devices"};
 constexpr std::string_view kExecution[] = {"execute_instruction", "execute_bundle",
                                            "get_bundle_result"};
@@ -126,8 +133,15 @@ constexpr std::string_view kWorkflows[] = {"list_workflows", "get_workflow",
 constexpr std::string_view kTar[] = {"list_tar_process_tree_devices",
                                      "list_tar_capture_sources_devices",
                                      "list_tar_retention_paused"};
+// #4031: AD/Entra directory-sync user listing + directory-sync status (last
+// sync time/health, NOT OIDC SSO config — that lives at REST-only
+// GET /api/v1/settings/oidc, deliberately with no MCP twin per #520) — both
+// Directory:Read, deliberately their own family rather than folded into
+// Fleet & agents (directory users are IdP-sourced identity records, not
+// managed endpoints) or Engine principals (unrelated identity axis).
+constexpr std::string_view kDirectory[] = {"list_directory_users", "get_directory_status"};
 
-constexpr std::array<ToolFamily, 27> kFamilies{{
+constexpr std::array<ToolFamily, 28> kFamilies{{
     {"Fleet & agents", "connected agents, their OS/arch/version, and details", kFleet},
     {"Tags", "read and write agent tags, and find agents by tag", kTags},
     {"Instructions & schedules", "instruction definitions, their full export, and recurring "
@@ -178,6 +192,8 @@ constexpr std::array<ToolFamily, 27> kFamilies{{
                                      "and capture-sources frames, and the caller's own "
                                      "retention-paused source scan",
      kTar},
+    {"Directory & identity", "AD/Entra directory-synced users and directory-sync status",
+     kDirectory},
 }};
 
 }  // namespace

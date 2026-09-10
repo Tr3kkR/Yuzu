@@ -262,6 +262,24 @@ struct RestGsHarness {
         std::make_shared<yuzu::server::test::FnNetworkApi>(
             [](const std::string&) { return yuzu::server::NetPerfSnapshot{}; });
 
+    // #4035: the DexFleet provider for GET /dex/{health,trends,overview,
+    // catalogue/group}. Default DexFleet{} (all-zero: no online agents) so
+    // every EXISTING test in this file is unaffected; a test targeting these
+    // 4 new routes' fleet-dependent shape sets dex_fleet_override_ before
+    // constructing the harness is not possible (register_routes captures the
+    // lambda at construction) — so instead the lambda reads this field LIVE
+    // at request time, letting a test mutate it after construction.
+    yuzu::server::DexFleet dex_fleet_override_;
+
+    // #4035 hardening (governance): the visible-agent-set resolver for GET
+    // /api/v1/dex/app and GET /api/v1/dex/overview (ADR-0017 World A
+    // confinement — ind. of the service-scoped-token deny belt above).
+    // nullopt (default) = unfiltered, matching every EXISTING test in this
+    // file (and matching an unwired dex_visible_fn / RBAC-off / global-read
+    // production posture). A test proving confinement sets this to a
+    // specific agent set before issuing the request.
+    std::optional<std::set<std::string>> dex_visible_override_;
+
     // What the wired VERIFY cohort provider returns (default = present-but-empty
     // CohortRead → the compare reads "insufficient"). A test sets member_count +
     // rows to drive the paired-compare path, or sets it to nullopt to prove the
@@ -526,7 +544,23 @@ struct RestGsHarness {
                                   }}
                                 : RestApiV1::ExecVisibleFn{},
                             wire_list_read_fn_ ? RestApiV1::ListReadFn{list_read_fn}
-                                               : RestApiV1::ListReadFn{});
+                                               : RestApiV1::ListReadFn{},
+                            /*fleet_read_fn=*/{},
+                            // #4033: this harness doesn't exercise GET
+                            // /api/v1/devices or the agent-count preview —
+                            // unwired defaults (fail-closed / legacy-open
+                            // respectively) are correct no-ops here.
+                            /*agents_fn=*/{}, /*response_visible_set_fn=*/{},
+                            // #4035: reads dex_fleet_override_ LIVE at request
+                            // time (see that field's doc comment).
+                            RestApiV1::DexFleetFn{[this]() { return dex_fleet_override_; }},
+                            // #4035 hardening (governance): reads
+                            // dex_visible_override_ LIVE at request time
+                            // (ignores `username` — this stub doesn't model
+                            // per-username resolution, only whether the
+                            // caller's set is engaged).
+                            RestApiV1::DexVisibleFn{
+                                [this](const std::string&) { return dex_visible_override_; }});
     }
 
     // The fleet /status route's real AuthRoutes::require_list_read gate needs
@@ -1993,6 +2027,288 @@ TEST_CASE("OpenAPI lists /dex/devices/{id} and the whole spec still parses",
     REQUIRE(res->body.find(R"("/dex/devices/{id}":)") != std::string::npos);
     // And the embedded spec remains valid JSON after the insertion.
     REQUIRE_NOTHROW(nlohmann::json::parse(res->body));
+}
+
+// ═══ #4035 (api-parity #2146 Batch A): the 8 genuinely-new DEX REST twins ═══
+
+TEST_CASE("REST dex/app: blast-radius drill, audited, service-scoped token denied",
+          "[pg][rest][dex][app]") {
+    RestGsHarness h;
+    h.seed_obs("a1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.seed_obs("a2", "WS-2", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/dex/app?name=chrome.exe&window=all");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["process_name"].get<std::string>() == "chrome.exe");
+    CHECK(j["data"]["crashes"].get<int64_t>() == 2);
+    CHECK(j["data"]["distinct_devices"].get<int64_t>() == 2);
+    REQUIRE(j["data"]["devices"].is_array());
+    CHECK(j["data"]["devices"].size() == 2);
+    bool audited = false;
+    for (const auto& a : h.audit_log)
+        if (a.action == "dex.app.view" && a.result == "success")
+            audited = true;
+    CHECK(audited);
+
+    // missing required name -> 400
+    auto missing = h.sink.Get("/api/v1/dex/app?window=all");
+    REQUIRE(missing);
+    CHECK(missing->status == 400);
+
+    // service-scoped token -> 403, denied audit only
+    RestGsHarness h2;
+    h2.session_token_scope_service = "printers";
+    auto denied = h2.sink.Get("/api/v1/dex/app?name=chrome.exe");
+    REQUIRE(denied);
+    CHECK(denied->status == 403);
+}
+
+// #4035 hardening (governance): closure evidence for the ADR-0017 World A
+// confinement gap — GET /api/v1/dex/app's devices[] list previously ALWAYS
+// passed visible=nullptr to the shared builder regardless of the caller's
+// management-group scope, unlike its own /fragments/dex/app dashboard
+// fragment (which confines via resolve_visible). A management-group-confined
+// operator could read affected agent_ids fleet-wide through this route even
+// though the equivalent dashboard fragment would have hidden them.
+TEST_CASE("REST dex/app: devices[] confined to the caller's visible set "
+          "(ADR-0017 World A — regression coverage for the governance fix)",
+          "[pg][rest][dex][app][scope]") {
+    RestGsHarness h;
+    h.seed_obs("s1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.seed_obs("s2", "WS-2", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
+
+    // Unconfined (default, matches production RBAC-off / global-read): both
+    // devices are visible.
+    auto unconfined = h.sink.Get("/api/v1/dex/app?name=chrome.exe&window=all");
+    REQUIRE(unconfined);
+    CHECK(unconfined->status == 200);
+    auto uj = nlohmann::json::parse(unconfined->body);
+    CHECK(uj["data"]["devices"].size() == 2);
+
+    // Confined to WS-1 only (simulating a management-group-scoped operator):
+    // WS-2 must NEVER appear, even though the aggregate crash COUNT still
+    // reflects the whole fleet (the SCOPING NOTE's tracked, separate,
+    // aggregate-numerator follow-up — not this fix's scope).
+    h.dex_visible_override_ = std::set<std::string>{"WS-1"};
+    auto confined = h.sink.Get("/api/v1/dex/app?name=chrome.exe&window=all");
+    REQUIRE(confined);
+    CHECK(confined->status == 200);
+    auto cj = nlohmann::json::parse(confined->body);
+    REQUIRE(cj["data"]["devices"].is_array());
+    CHECK(cj["data"]["devices"].size() == 1);
+    CHECK(cj["data"]["devices"][0]["agent_id"].get<std::string>() == "WS-1");
+    for (const auto& d : cj["data"]["devices"])
+        CHECK(d["agent_id"].get<std::string>() != "WS-2");
+
+    // Confined to a DISJOINT set (simulating an operator with no visibility
+    // into either device): devices[] is empty, never a 403/404 — matching
+    // the fragment's own admit-then-filter posture (ADR-0017 INV-2: engaged-
+    // empty is a legitimate, distinct outcome from "unfiltered").
+    h.dex_visible_override_ = std::set<std::string>{};
+    auto empty_scope = h.sink.Get("/api/v1/dex/app?name=chrome.exe&window=all");
+    REQUIRE(empty_scope);
+    CHECK(empty_scope->status == 200);
+    auto ej = nlohmann::json::parse(empty_scope->body);
+    CHECK(ej["data"]["devices"].empty());
+}
+
+TEST_CASE("REST dex/apps: app-centric stability list, no audit (aggregate)",
+          "[pg][rest][dex][apps]") {
+    RestGsHarness h;
+    h.seed_obs("b1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.seed_obs("b2", "WS-2", "process.hung", "notepad.exe", "windows", "2026-06-10T11:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/dex/apps?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j["data"]["apps"].is_array());
+    bool saw_chrome = false;
+    for (const auto& a : j["data"]["apps"])
+        if (a["subject"].get<std::string>() == "chrome.exe")
+            saw_chrome = true;
+    CHECK(saw_chrome);
+    CHECK(h.audit_log.empty()); // fleet aggregate — no per-agent identity
+}
+
+TEST_CASE("REST dex/catalogue/group: family drill, unknown family -> 404, no audit",
+          "[pg][rest][dex][catalogue][group]") {
+    RestGsHarness h;
+    h.seed_obs("c1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/dex/catalogue/group?name=" +
+                          std::string("App%20reliability") + "&window=all");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["group_name"].get<std::string>() == "App reliability");
+    CHECK(j["data"]["total_type_count"].get<int64_t>() > 0);
+    CHECK(h.audit_log.empty());
+
+    auto unknown = h.sink.Get("/api/v1/dex/catalogue/group?name=NoSuchFamily");
+    REQUIRE(unknown);
+    CHECK(unknown->status == 404);
+
+    auto missing = h.sink.Get("/api/v1/dex/catalogue/group");
+    REQUIRE(missing);
+    CHECK(missing->status == 400);
+}
+
+TEST_CASE("REST dex/health: composite score suppressed with no reporting agents, no audit",
+          "[pg][rest][dex][health]") {
+    RestGsHarness h;
+    h.seed_obs("d1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    // No dex_fleet_override_ set -> windows_online stays 0 -> suppressed.
+    auto res = h.sink.Get("/api/v1/dex/health?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["score"].is_null());
+    CHECK(j["data"]["reporting"].get<int64_t>() == 0);
+    CHECK(h.audit_log.empty());
+
+    // With a reporting fleet, the score is a real number.
+    h.dex_fleet_override_.windows_online = 5;
+    auto res2 = h.sink.Get("/api/v1/dex/health?window=all");
+    REQUIRE(res2);
+    auto j2 = nlohmann::json::parse(res2->body);
+    CHECK_FALSE(j2["data"]["score"].is_null());
+}
+
+TEST_CASE("REST dex/trends: cross-OS + per-family day counts, no audit",
+          "[pg][rest][dex][trends]") {
+    RestGsHarness h;
+    h.seed_obs("e1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    auto res = h.sink.Get("/api/v1/dex/trends?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j["data"]["families"].is_array());
+    REQUIRE(j["data"]["days"].is_array());
+    CHECK(h.audit_log.empty());
+}
+
+TEST_CASE("REST dex/overview: fleet summary, audited, service-scoped token denied",
+          "[pg][rest][dex][overview]") {
+    RestGsHarness h;
+    h.seed_obs("f1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.seed_obs("f2", "WS-2", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/dex/overview?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j["data"]["top_apps"].is_array());
+    bool saw_chrome = false;
+    for (const auto& a : j["data"]["top_apps"])
+        if (a["subject"].get<std::string>() == "chrome.exe")
+            saw_chrome = true;
+    CHECK(saw_chrome);
+    bool audited = false;
+    for (const auto& a : h.audit_log)
+        if (a.action == "dex.overview.view" && a.result == "success")
+            audited = true;
+    CHECK(audited);
+
+    RestGsHarness h2;
+    h2.session_token_scope_service = "printers";
+    auto denied = h2.sink.Get("/api/v1/dex/overview");
+    REQUIRE(denied);
+    CHECK(denied->status == 403);
+}
+
+// #4035 hardening (governance): closure evidence for the ADR-0017 World A
+// confinement gap on GET /api/v1/dex/overview's top_devices[] — same defect
+// class and same fix as GET /api/v1/dex/app above.
+TEST_CASE("REST dex/overview: top_devices[] confined to the caller's visible set "
+          "(ADR-0017 World A — regression coverage for the governance fix)",
+          "[pg][rest][dex][overview][scope]") {
+    RestGsHarness h;
+    h.seed_obs("t1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.seed_obs("t2", "WS-2", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
+
+    auto unconfined = h.sink.Get("/api/v1/dex/overview?window=all");
+    REQUIRE(unconfined);
+    CHECK(unconfined->status == 200);
+    auto uj = nlohmann::json::parse(unconfined->body);
+    REQUIRE(uj["data"]["top_devices"].is_array());
+    CHECK(uj["data"]["top_devices"].size() == 2);
+
+    h.dex_visible_override_ = std::set<std::string>{"WS-1"};
+    auto confined = h.sink.Get("/api/v1/dex/overview?window=all");
+    REQUIRE(confined);
+    CHECK(confined->status == 200);
+    auto cj = nlohmann::json::parse(confined->body);
+    REQUIRE(cj["data"]["top_devices"].is_array());
+    CHECK(cj["data"]["top_devices"].size() == 1);
+    CHECK(cj["data"]["top_devices"][0]["agent_id"].get<std::string>() == "WS-1");
+    for (const auto& d : cj["data"]["top_devices"])
+        CHECK(d["agent_id"].get<std::string>() != "WS-2");
+}
+
+TEST_CASE("REST dex/devices/{id}/history: per-device signal history, audited dex.device.view "
+          "(same verb the score-only route uses), out-of-scope device -> 403",
+          "[pg][rest][dex][device][history]") {
+    RestGsHarness h;
+    h.seed_obs("g1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.seed_obs("g2", "WS-2", "os.boot", "boot", "windows", "2026-06-10T08:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/dex/devices/WS-1/history?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["agent_id"].get<std::string>() == "WS-1");
+    REQUIRE(j["data"]["history"].is_array());
+    bool saw_it = false, saw_other = false;
+    for (const auto& r : j["data"]["history"]) {
+        if (r["obs_type"].get<std::string>() == "process.crashed")
+            saw_it = true;
+        if (r["subject"].get<std::string>() == "boot")
+            saw_other = true; // WS-2's row must never leak into WS-1's history
+    }
+    CHECK(saw_it);
+    CHECK_FALSE(saw_other);
+    bool audited = false;
+    for (const auto& a : h.audit_log)
+        if (a.action == "dex.device.view" && a.target_id == "WS-1")
+            audited = true;
+    CHECK(audited);
+
+    h.deny_scoped_agent = "WS-9";
+    auto denied = h.sink.Get("/api/v1/dex/devices/WS-9/history");
+    REQUIRE(denied);
+    CHECK(denied->status == 403);
+}
+
+TEST_CASE("REST dex/devices/{id}/observations/{event_id}: single-observation detail, audited, "
+          "foreign event_id -> 404 (same as genuinely-absent, no oracle)",
+          "[pg][rest][dex][device][observation]") {
+    RestGsHarness h;
+    h.seed_obs("h1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.seed_obs("h2", "WS-2", "os.boot", "boot", "windows", "2026-06-10T08:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/dex/devices/WS-1/observations/h1");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["event_id"].get<std::string>() == "h1");
+    CHECK(j["data"]["agent_id"].get<std::string>() == "WS-1");
+    CHECK(j["data"]["obs_type"].get<std::string>() == "process.crashed");
+    bool audited = false;
+    for (const auto& a : h.audit_log)
+        if (a.action == "dex.observation.view" && a.target_id == "WS-1")
+            audited = true;
+    CHECK(audited);
+
+    // h2 belongs to WS-2, not WS-1 -- same 404 as a genuinely-absent event.
+    auto foreign = h.sink.Get("/api/v1/dex/devices/WS-1/observations/h2");
+    REQUIRE(foreign);
+    CHECK(foreign->status == 404);
+    auto absent = h.sink.Get("/api/v1/dex/devices/WS-1/observations/no-such-event");
+    REQUIRE(absent);
+    CHECK(absent->status == 404);
 }
 
 TEST_CASE("REST dex/devices/{id}: out-of-scope device → 403, no data leak, no audit",

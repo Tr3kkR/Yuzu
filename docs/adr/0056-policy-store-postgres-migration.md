@@ -548,7 +548,14 @@ except one deferred — see below) plus confirmation the Fifth correction's ADR 
 degrade strings, all `"policy store"`-prefixed) was accurate, not an overclaim. unhappy-path found
 one genuinely new BLOCKING defect and several SHOULD-level residuals:
 
-- **`remediate()` had no in-flight dedup, unlike `kickoff_check`'s Check-phase guard (unhappy-path
+- **Superseded (2026-09) by HA WS-3 3.4:** the `remediating_`/`ReservationGuard` design described in
+  this bullet, and its "cross-replica double-remediate remains possible … not fixed here" residual
+  below, are historical — `PolicyStore::claim_remediation` now arbitrates each `(policy, agent)`
+  target with a durable, cross-replica-safe claim, closing the cross-replica gap this bullet
+  describes. See `docs/adr/2002-high-availability-architecture.md` §6. Left as-written below for the
+  historical record; do not read the "not fixed here" residual as current.
+
+  **`remediate()` had no in-flight dedup, unlike `kickoff_check`'s Check-phase guard (unhappy-path
   UP-3, BLOCKING).** Two concurrent `POST /remediate` calls for the same policy (an operator
   double-click, or a client retry racing a slow response — an ordinary occurrence, not a rare race,
   hence E3 not E5 in the derivation) had no guard preventing both from reaching the blocking dispatch

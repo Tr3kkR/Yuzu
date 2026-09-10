@@ -72,7 +72,7 @@ struct Deps {
     using TheadForPluginFn = std::function<std::string(const std::string&)>;
     using ForwardGatewayPendingFn = std::function<void()>;
     using AuditQuarantineFailClosedFn = std::function<void(std::string_view, const std::string&, const std::string&, const std::string&, std::size_t)>;
-    using AuditQuarantineDeniedBatchFn = std::function<void(std::string_view, const std::string&, const std::string&, const std::string&, std::vector<std::string>)>;
+    using AuditQuarantineDeniedBatchFn = std::function<void(std::string_view, const std::string&, const std::string&, const std::string&, const std::vector<std::string>&)>;
     using AuditUnknownPluginFn = std::function<void(std::string_view, const std::string&, const std::string&, const std::string&, const std::string&, std::size_t)>;
     using AuditScopeResolutionFailedFn = std::function<void(const std::string&, const std::string&, const std::string&, const std::string&)>;
     using AuditScopeEvaluationAbortedFn = std::function<void(const std::string&, const std::string&, const std::string&, const std::string&)>;

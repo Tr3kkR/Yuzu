@@ -44,6 +44,7 @@ namespace yuzu::server {
 
 class GuaranteedStateStore;
 struct GuardianObservationRow;
+struct DexSignalCount; // guaranteed_state_store.hpp -- forward decl only, see DexFamilyRollup below
 class HttpRouteSink;
 
 /// Fleet-size denominator for the DEX rates — sourced cross-store from the agent
@@ -90,6 +91,10 @@ const std::vector<DexSignalGroup>& dex_signal_groups();
 /// Total catalogued display types (sum over the groups).
 std::size_t dex_catalogued_type_count();
 
+/// obs_type -> index into dex_signal_groups(), or -1 when uncatalogued. Shared
+/// by the Trends fragment's family x day matrix and (#4035) its REST/MCP twin.
+int dex_family_index(const std::string& obs_type);
+
 /// Friendly display label for an obs_type; unknown types fall back to the
 /// HTML-escaped raw obs_type (forward-compatible, render-safe).
 std::string dex_signal_label(const std::string& obs_type);
@@ -134,6 +139,44 @@ std::vector<std::string> dex_obs_platforms(const std::string& obs_type);
 /// null. The fleet-scale path (heartbeat rollup) is a follow-up.
 int dex_device_score(const GuaranteedStateStore* store, const std::string& agent_id,
                      const std::string& since);
+
+/// One family's rolled-up signal counts (events/active-types/peak-signal-devices/
+/// top signal) — the shared basis both the Catalogue grid and the health-score
+/// deduction read. External linkage already (defined outside dex_routes.cpp's
+/// anonymous namespace); declared here so `dex_read_model.cpp` can call it
+/// without a second copy (#4035, Rule 1).
+struct DexFamilyRollup {
+    int64_t events = 0;
+    int active = 0;
+    int total = 0;
+    int64_t max_signal_devices = 0; ///< #1374: max of member signals, not the family union
+    const DexSignalCount* top = nullptr;
+    bool benign = false;
+};
+DexFamilyRollup dex_family_rollup(const DexSignalGroup& g,
+                                  const std::vector<DexSignalCount>& signals);
+
+/// One family's health deduction (the per-family term of dex_compute_health,
+/// "default" preset) — the same number the Catalogue's per-card score shows.
+double dex_family_health_deduction(const DexSignalGroup& g,
+                                   const std::vector<DexSignalCount>& signals, int64_t N);
+
+/// The composite-health result: score (100 − Σ deductions; -1 when N<=0, no
+/// reporting agents to score) + the per-family deduction breakdown.
+struct DexHealthResult {
+    double score = -1.0;
+    struct Ded {
+        std::string name, sev;
+        double deduction = 0.0;
+    };
+    std::vector<Ded> deds;
+};
+
+/// PURE: the shared health-score computation — the Health page and the
+/// Overview hub's health teaser both call this (`weighting` = one of the
+/// allowlisted presets default/stability/productivity/security).
+DexHealthResult dex_compute_health(const std::vector<DexSignalCount>& signals, int64_t N,
+                                   const std::string& preset);
 
 /// Catalogue View 1 — the 13 family cards (mockup dex-catalogue-coverage.html).
 /// COVERAGE-first: a family lights when a CONNECTED platform (scoped by `os_filter`:

@@ -293,6 +293,60 @@ a narrow window, and no data corruption (the row stays durable in Postgres
 and delivers as soon as a 3.3-or-later binary is running and holds
 leadership).
 
+### vNEXT — manual policy remediation is now claimed durably, cross-replica (HA WS-3 3.4; breaking for automation asserting `agents == len(agent_ids)`)
+
+`POST /api/policies/{id}/remediate` now arbitrates its per-target claim
+through a durable per-`(policy, agent)` row in `PolicyStore`
+(`policy_status.remediation_claim_at`), instead of an in-process-only guard.
+This closes the cross-replica gap noted in the ADR-0056 Follow-ups: two
+replicas racing a remediate call for the same policy/agent can no longer both
+dispatch a fix.
+
+**Scope of the guarantee.** This holds between replicas running the **same
+schema version**. A rolling upgrade across the migration boundary can
+transiently run an old binary that predates the durable claim alongside a new
+one; that mixed-version window is gated today by issue #4014 (which blocks
+running a second production replica) pending a durable cluster-capability
+admission gate. The exposure is one-directional: a row written by an old
+binary carries claim-generation `0`, a value a new binary never mints.
+Separately, this is effectively-once, not exactly-once (consistent with
+ADR-2002): a replica that pauses for longer than `fixing_stale_seconds`
+between winning a claim and actually sending a command over gRPC — the fix,
+or the subsequent post-fix verify — can still
+dispatch that one send after a sibling has reclaimed the target — the wire
+send is not itself transactionally fenced. The durable claim prevents
+concurrent or duplicate *claims*; it bounds, but does not make impossible, a
+single late duplicate *dispatch* from a long-paused claim-holder.
+
+**Behaviour changes you will see:**
+
+- **A new 409 cause.** `POST /api/policies/{id}/remediate` can now refuse
+  with `409` and body message `"remediation already in flight or retry cap
+  reached for this policy"` when a target is already claimed for remediation
+  (by this replica or a sibling) or has exhausted its fix-retry cap for this
+  policy — in addition to the existing no-fix-instruction and
+  no-non-compliant-agents 409 causes.
+- **`agents` in the `202` response is now the delivered count, not the
+  attempted count (breaking).** A claimed-but-undelivered target (offline,
+  quarantined, plugin absent) releases its claim without consuming a retry
+  attempt and is excluded from `agents`. Automation asserting `agents ==
+  len(agent_ids)` (or `== number of non-compliant agents` for an omitted
+  `agent_ids`) must be updated to tolerate `agents` being smaller than the
+  number of targets requested.
+
+**Migration note:** schema migrations v2–v4 add
+`policy_status.remediation_claim_at` (v2), `policy_status.remediation_claim_gen`
+(v3, the ABA claim-generation fence), and the `remediation_claim_seq` sequence
+(v4) — all `BIGINT NOT NULL DEFAULT 0` columns plus one sequence. They run
+automatically on upgrade, are metadata-only, and require no operator action
+and no downtime.
+
+**Post-restart note:** after a restart, a durable claim left behind by the
+previous process may briefly block re-remediation of the agents it was
+mid-flight for. This self-heals once the claim ages past the staleness
+window (`fixing_stale_seconds`, default 1800s) — the same window
+`claim_due_policies`'s own stranded-`fixing` sweep uses.
+
 ### vNEXT — gateway management plane now pins its peer (#1422, breaking for custom gateway configs)
 
 The gateway's `:50063` command plane requires, on any network-reachable
@@ -578,6 +632,58 @@ operator-set grant. This is long-standing behaviour for every seeded
 securable, not new here, but it is worth knowing before you narrow a built-in
 role: express the narrowing as a **custom role** or an explicit `deny` row
 instead, both of which survive a restart.
+
+### vNEXT — three new securables for directory-sync and enrollment reads; `Viewer` auto-gains `Directory:Read` (#4031) (breaking)
+
+**Who this affects.** RBAC-**enabled** deployments with a **custom** role
+that reads AD/Entra directory-synced users, or that previously reached the
+directory-sync status / enrollment auto-approve rules / pending-agent list /
+OIDC config surfaces before this release added dedicated REST v1 routes for
+them.
+
+**What changes automatically.** Three new securables — `Directory`,
+`Enrollment`, `OidcConfig` — are seeded idempotently on every boot
+(`RbacStore::seed_defaults()`), same mechanism as `EnginePrincipal` above.
+Their built-in-role grants are **not symmetric**, unlike `EnginePrincipal`:
+
+- `Directory:Read` is seeded to **both** `Administrator` and `Viewer` —
+  matching the precedent set for other identity-adjacent PII reads
+  (`UserManagement`). A custom role that previously relied on **not**
+  inheriting directory-user PII visibility from a `Viewer`-equivalent grant
+  set should check whether that matters for its use — this is a genuine
+  **widening** of what `Viewer`-derived roles can see, not a like-for-like
+  securable split the way `EnginePrincipal:Read` was. **RBAC-enabled
+  deployments get more than a widening here, though:** `Directory` was
+  never seeded to *any* role before this release, despite `GET
+  /api/directory/users`/`/directory/status`/`/directory/sync` already
+  gating on it — under RBAC-**enabled** enforcement this denied **every**
+  role, including `Administrator`, not just non-`Viewer` custom roles. If
+  your RBAC-enabled deployment could never reach the legacy directory-sync
+  routes even as an admin, this release fixes that dead zone; the "Viewer
+  gains new PII visibility" framing above only tells the RBAC-**disabled**
+  half of the story.
+- `Enrollment:Read` and `OidcConfig:Read` are seeded to `Administrator`
+  **only** — `Viewer` deliberately does NOT gain either, since these gate
+  the fleet's enrollment admission policy and SSO configuration rather than
+  identity/inventory data. Both are also added to the authorization
+  topology floor (see the #2376 note above), so an RBAC-**disabled**
+  install denies them to a non-admin the same way it now denies
+  `AccessReview:Read`/`UserManagement:Read`/`EnginePrincipal:Read`.
+
+**What to do.** No action needed for `Administrator`/`Viewer` — the seed
+loop picks these up automatically. If a custom role needs
+`Enrollment:Read`/`OidcConfig:Read`, grant it directly (no built-in
+non-admin role holds either). If a custom role's exposure to directory-user
+PII via an inherited `Viewer`-shaped permission set is a concern, review it
+explicitly — the auto-grant is intentional but new.
+
+**Also new in this release:** the legacy `GET /api/directory/users` route
+(pre-existing, not new in #4031) previously issued **no audit call at all**
+despite returning PII; it is now audited as `directory.users.view`, though
+via a fire-and-forget path that cannot detect a dropped audit row — see
+[`audit-log.md`](audit-log.md)'s `directory.users.view` row for the full
+three-way posture (REST v1 fail-closed / MCP set-and-proceed-with-signal /
+legacy silent).
 
 ### vNEXT — approval tickets outstanding at the upgrade must be re-requested (#2442) (breaking)
 

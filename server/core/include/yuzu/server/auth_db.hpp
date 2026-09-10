@@ -671,7 +671,13 @@ public:
                                                                std::string_view raw_code);
 
     /// Wipe the user's existing recovery codes and issue 10 fresh ones.
-    /// Returns the raw codes for one-time display.
+    /// Returns the raw codes for one-time display. Serialized on the
+    /// `auth.users` row (`SELECT … FOR UPDATE`) so concurrent regenerates — and
+    /// a regenerate racing an enrollment/disable/remove — are ordered rather
+    /// than interleaving into a torn 20-row set with the returned codes not
+    /// matching storage (#3779). Returns `UserNotFound` when no ACTIVE user row
+    /// matches (a deactivated account never receives fresh codes);
+    /// `QueryFailed`/`WriteFailed` on a store outage (fail-closed 503).
     std::expected<std::vector<std::string>, AuthDBError>
     mfa_regenerate_recovery_codes(const std::string& username);
 

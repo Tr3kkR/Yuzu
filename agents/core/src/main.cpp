@@ -929,9 +929,16 @@ int main(int argc, char* argv[]) {
             // below - same rationale as log_quietly() elsewhere in this file
             // (Sol rung-7.6 review finding 2).
             try {
-                spdlog::critical("{} Guardian I/O worker(s) still active {}s after shutdown - "
-                                 "forcing process exit rather than race static/DSO teardown "
-                                 "against them",
+                // "Guardian I/O worker(s)" until PR-A (#2012/#3840): n is now a
+                // SUM (guardian_active_io_workers()'s own doc comment) of
+                // Guardian's own IO executors AND Spark mechanisms' detached
+                // probes - naming only the first source here would misattribute
+                // an incident's real cause once a live Spark consumer lands
+                // (Gate 6 sre finding, PR-A round 5; today n's Spark addend is
+                // provably always 0, so this was latent, not yet observable).
+                spdlog::critical("{} orphaned Guardian I/O / Spark worker(s) still active {}s "
+                                 "after shutdown - forcing process exit rather than race "
+                                 "static/DSO teardown against them",
                                  n, yuzu::agent::kOrphanDrainGrace.count());
             } catch (...) {
             }

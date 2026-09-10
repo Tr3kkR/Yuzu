@@ -2485,6 +2485,34 @@ Guardian ladder must check these.
   after a bounded grace. A source left out of that sum would silently reinstate
   the use-after-free the joined-thread rule used to prevent by a different
   mechanism.
+  **Second role since rung 9c PR-1:** every `GuardianIoExecutor` worker body - `run()` and
+  `submit()` alike, their `on_abandoned`/`on_complete` callbacks included - wears
+  `GuardianDetachedWorkerRole` (`guardian_detached_worker_role.hpp`), and the same
+  `WorkerHostileMutex` tripwire aborts on an `mtx_` acquisition from it; a different hazard
+  (lock-vs-lifetime: a detached worker may outlive the engine and can never be joined), same
+  remedy. **F3 binds to the PHYSICAL alive count (#4147):** `GuardianIoExecutor::
+  active_worker_count()` is decremented at worker-payload destruction, the latest
+  self-observable point before OS-thread exit, never at the earlier quota release `submit()`
+  performs when the backend call returns - a worker still inside its completion callback
+  keeps the count nonzero. Wiring a source to the quota count instead would reinstate the
+  teardown race with no test calling it out.
+  **Extended for Spark (PR-A, #2012/#3840; dormant until a mechanism uses it —
+  Gate 6 compliance finding, PR-A round 5, folded in here; reworded at pass 5
+  per an architect finding — the clause below previously read as modifying
+  the primitive rather than the counter):** a second, independent additive
+  source feeds the SAME chokepoint one level up.
+  `AgentImpl::guardian_active_io_workers()` (`agent.cpp`) sums
+  `GuardianEngine::active_io_workers()` (above) with a separate
+  `spark_detached_workers_` counter — constructed via a default member
+  initializer before any `SparkEngine`/mechanism exists, and never read
+  through `spark_engine_`/`spark_boot_done_` — fed by `agents/core/src/
+  spark_detached_call.hpp`'s `SparkDetachedLane`/`DetachedCall<T>` primitive,
+  so it stays correct across a boot-time exception that resets
+  `spark_engine_`. `main.cpp`/`service_win.cpp` poll the SUM at this
+  `AgentImpl` level, not `GuardianEngine::active_io_workers()` alone; a
+  future third additive source must add a term to that same sum inside
+  `AgentImpl::guardian_active_io_workers()`, never a parallel counter read
+  elsewhere.
 - **Journal maintenance is paced by TIME, never by wake count.** The drain
   worker wakes on every outbox enqueue, and a paging pass is a full
   `list_entries` + parse + `validate_record` sweep of the journal.
