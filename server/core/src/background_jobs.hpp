@@ -146,9 +146,11 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
      "MUST run per-replica: the ONLY completion path that matures an in-flight Check/FixWait created by "
      "the operator-synchronous evaluate_now()/remediate() plane (accepted on any replica, ungated) to a "
      "terminal verdict — gating it strands an operator remediation as `fixing` forever on a non-leader "
-     "(two-dispatch-planes rule). Replica-local + in-memory, no durable claim to fence"},
+     "(two-dispatch-planes rule). Replica-local + in-memory; the durable per-(policy,agent) remediation "
+     "claim it RELEASES at FixWait maturation (WS-3 3.4) is held only by this dispatching replica, so "
+     "there is still nothing to fence"},
     {"policy_evaluator.dispatch_due", "policy_eval_thread_", BackgroundJobClass::FencedLeaderOnly,
-     "side-effecting due-policy scheduling dispatch; ADR-0056 claim_due_policies is fleet-safe but the leader-only gate cuts non-leader churn (WS-3 3.2/3.4)"},
+     "side-effecting due-policy scheduling dispatch; ADR-0056 claim_due_policies is fleet-safe but the leader-only gate cuts non-leader churn (WS-3 3.2). The operator remediation plane (WS-3 3.4) is a SEPARATE, ungated path with its own durable per-(policy,agent) CAS — not this due-scheduling dispatch"},
 
     // ---- schedule_tick_thread_ (30s schedule eval; 5s outbox delivery sub-tick) ----
     {"schedule_runner.tick", "schedule_tick_thread_", BackgroundJobClass::FencedLeaderOnly,

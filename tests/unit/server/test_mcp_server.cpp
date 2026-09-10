@@ -64,6 +64,7 @@
 #include "pg/pg_raii.hpp"     // PgConn/PgResult — direct-SQL secret-row verification
 #include "pg/secret_codec.hpp"
 #include "plugin_config_store.hpp"
+#include "preflight_run_store.hpp" // #4036: PreflightRunStore for list_preflight_runs / get_deployment_preview
 
 #include <yuzu/metrics.hpp>
 
@@ -973,6 +974,13 @@ struct McpTestServer {
     yuzu::server::UploadGrantStore* upload_grant_store_for_test{nullptr};
     yuzu::server::mcp::McpServer::UploadGrantListReadFn upload_grant_list_read_fn_for_test{};
 
+    /// #4036 (api-parity Batch A) — optionally wire a real PreflightRunStore
+    /// so list_preflight_runs / get_deployment_preview can be exercised
+    /// end-to-end against live Postgres state, same setter-idiom pattern as
+    /// plugin_config_store_for_test above. Default nullptr keeps every
+    /// pre-existing test on the "store unavailable" path.
+    yuzu::server::PreflightRunStore* preflight_run_store_for_test{nullptr};
+
     /// ar-S1: optionally wire a GuaranteedStateStore so the DEX read tools
     /// (list_dex_signals / get_dex_signal_scope / get_dex_signal_detail) can be
     /// exercised. Default nullptr keeps every existing test on the no-store path
@@ -1324,6 +1332,10 @@ private:
             mcp.set_plugin_config_store(plugin_config_store_for_test);
         if (upload_grant_store_for_test)
             mcp.set_upload_grant_ops(upload_grant_store_for_test, upload_grant_list_read_fn_for_test);
+        // #4036: preflight_run_store ALSO rides a setter, same pattern as
+        // the two above — wire before the handlers are built.
+        if (preflight_run_store_for_test)
+            mcp.set_preflight_run_store(preflight_run_store_for_test);
 
         // 2f: build GET/DELETE handlers FIRST — they copy auth_fn/audit_fn, which
         // build_handler std::move()s below.
@@ -12404,6 +12416,274 @@ TEST_CASE("MCP operator surface: revoke_upload_grant flips the REAL store row to
     CHECK(ts.audit_log[1] == "mcp.mint_upload_grant|success");
     CHECK(ts.audit_log[2] == "upload_grant.revoke|success");
     CHECK(ts.audit_log[3] == "mcp.revoke_upload_grant|success");
+}
+
+// ── #4036 (api-parity Batch A) — list_preflight_runs / get_deployment_preview ──
+// Round-trip proof that the MCP dispatch branch actually reaches
+// PreflightRunStore and returns real rows built by preflight_run_row_json /
+// deploy_preview_json — the SAME functions the REST twins call
+// (test_preflight_routes.cpp / test_deployment_routes.cpp), per the
+// api-twin-recipe.md Rule 1 this issue's shared-builder requirement exists
+// to prove. Fixture shape mirrors the plugin-config/upload-grant sections
+// above: wire a LIVE Postgres-backed PreflightRunStore into McpTestServer via
+// set_preflight_run_store (the same seam production server.cpp uses).
+
+namespace {
+
+yuzu::test::PgTestTemplate mcp_preflight_tpl{"preflight", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    yuzu::server::PreflightRunStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("mcp preflight template: store failed to migrate");
+}};
+
+} // namespace
+
+TEST_CASE("MCP operator surface: list_preflight_runs reads LIVE store state, "
+          "owner-scoped, sharing preflight_run_row_json with the REST twin",
+          "[pg][mcp][integration][operator_surface]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_preflight_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::PreflightRunStore store{pool};
+    REQUIRE(store.is_open());
+
+    // Seed directly through the store, bypassing MCP entirely — proves the
+    // tool reads real rows, not an echo of anything it wrote itself.
+    yuzu::server::PreflightRunRow alice_run;
+    alice_run.run_id = "mcp-run-alice-1";
+    alice_run.execution_id = "preflight-mcp-run-alice-1";
+    alice_run.created_by = "test-user"; // McpTestServer's default mock_username
+    alice_run.name = "MCP-seeded run";
+    alice_run.scope_label = "all visible devices";
+    alice_run.config_json = R"({"app_name":"","min_gib":20})";
+    alice_run.window_seconds = 300;
+    alice_run.created_at_ms = 1000;
+    alice_run.deadline_at_ms = 301000;
+    REQUIRE(store.create_run(alice_run, {{"agent-1", "host-1", "windows"}}));
+    REQUIRE(store.persist_grid("mcp-run-alice-1", {}, 5, /*go=*/3, /*warn=*/1, /*nogo=*/0,
+                               /*inc=*/1));
+
+    yuzu::server::PreflightRunRow bob_run = alice_run;
+    bob_run.run_id = "mcp-run-bob-1";
+    bob_run.execution_id = "preflight-mcp-run-bob-1";
+    bob_run.created_by = "someone-else";
+    REQUIRE(store.create_run(bob_run, {{"agent-2", "host-2", "linux"}}));
+
+    McpTestServer ts;
+    ts.preflight_run_store_for_test = &store;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"list_preflight_runs",)"
+        R"("arguments":{}}})");
+    REQUIRE(res);
+    auto payload = operator_surface_payload(res);
+    REQUIRE(payload["data"].is_array());
+    // Owner-scoped: only test-user's own run, not "someone-else"'s.
+    REQUIRE(payload["data"].size() == 1);
+    CHECK(payload["data"][0]["run_id"] == "mcp-run-alice-1");
+    CHECK(payload["data"][0]["go"] == 3);
+    CHECK(payload["data"][0]["warn"] == 1);
+    CHECK(payload["data"][0]["nogo"] == 0);
+    CHECK(payload["data"][0]["incomplete"] == 1);
+
+    // MCP audits successful reads via the generic mcp_audit("success")
+    // convention (#4036 stated decision — matches list_management_groups /
+    // list_upload_grants / list_plugin_config, the dominant pattern for
+    // sibling read tools in this file), deliberately diverging from the
+    // REST twin's own unaudited-read posture (test_preflight_routes.cpp).
+    REQUIRE(ts.audit_log.size() == 1);
+    CHECK(ts.audit_log[0] == "mcp.list_preflight_runs|success");
+}
+
+TEST_CASE("MCP operator surface: get_deployment_preview reads LIVE "
+          "pre-flight store state, sharing deploy_preview_json with the "
+          "REST twin",
+          "[pg][mcp][integration][operator_surface]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_preflight_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::PreflightRunStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::server::PreflightRunRow run;
+    run.run_id = "mcp-preview-run-1";
+    run.execution_id = "preflight-mcp-preview-run-1";
+    run.created_by = "test-user";
+    run.name = "Preview target run";
+    run.scope_label = "all visible devices";
+    run.config_json = R"({"app_name":"","min_gib":20})";
+    run.window_seconds = 300;
+    run.created_at_ms = 1000;
+    run.deadline_at_ms = 301000;
+    REQUIRE(store.create_run(run, {{"agent-1", "host-1", "windows"}}));
+    REQUIRE(store.persist_grid("mcp-preview-run-1", {}, 6, /*go=*/4, /*warn=*/2, /*nogo=*/0,
+                               /*inc=*/0));
+
+    McpTestServer ts;
+    ts.preflight_run_store_for_test = &store;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"get_deployment_preview",)"
+        R"("arguments":{"run_id":"mcp-preview-run-1"}}})");
+    REQUIRE(res);
+    auto payload = operator_surface_payload(res);
+    CHECK(payload["run_id"] == "mcp-preview-run-1");
+    CHECK(payload["name"] == "Preview target run");
+    CHECK(payload["go"] == 4);
+    CHECK(payload["warn"] == 2);
+    // Same generic mcp_audit("success") convention as list_preflight_runs
+    // above — deliberately diverges from the REST twin's own unaudited
+    // posture (test_deployment_routes.cpp).
+    REQUIRE(ts.audit_log.size() == 1);
+    CHECK(ts.audit_log[0] == "mcp.get_deployment_preview|success");
+
+    // Unknown run_id -> kInvalidParams, not a crash or a fabricated preview.
+    auto missing = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"get_deployment_preview",)"
+        R"("arguments":{"run_id":"does-not-exist"}}})");
+    REQUIRE(missing);
+    auto missing_body = nlohmann::json::parse(missing->body);
+    REQUIRE(missing_body.contains("error"));
+    CHECK(missing_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+}
+
+// #2298 PR 3 §3c (C8 default-deny) — both new tools are plain 2-element
+// {securable, operation} kToolSecurityRows entries (ServiceScopeClass::denied
+// by default), so a service-scoped token must be denied structurally at C8,
+// before either tool's own dispatch branch ever runs — same shape as the
+// list_agents C8 proof above.
+TEST_CASE("MCP C8: list_preflight_runs and get_deployment_preview deny a "
+          "service-scoped token by the default-deny classification",
+          "[mcp][integration][security][service_scope]") {
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.mock_token_scope_service = "printers";
+    ts.metrics_for_test = &reg;
+    ts.start();
+
+    auto res1 = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"list_preflight_runs",)"
+        R"("arguments":{}}})");
+    REQUIRE(res1);
+    auto body1 = nlohmann::json::parse(res1->body);
+    REQUIRE(body1.contains("error"));
+    CHECK(body1["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+
+    auto res2 = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"get_deployment_preview",)"
+        R"("arguments":{"run_id":"whatever"}}})");
+    REQUIRE(res2);
+    auto body2 = nlohmann::json::parse(res2->body);
+    REQUIRE(body2.contains("error"));
+    CHECK(body2["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+
+    bool saw_list_denied = false, saw_preview_denied = false;
+    for (const auto& a : ts.audit_log) {
+        if (a == "mcp.list_preflight_runs|denied")
+            saw_list_denied = true;
+        if (a == "mcp.get_deployment_preview|denied")
+            saw_preview_denied = true;
+        CHECK(a.find("|success") == std::string::npos);
+    }
+    CHECK(saw_list_denied);
+    CHECK(saw_preview_denied);
+
+    CHECK(reg.counter("yuzu_auth_service_scope_default_denied_total",
+                       {{"permission", "Infrastructure:Read"}, {"path_class", "mcp"}})
+              .value() == 1.0);
+    CHECK(reg.counter("yuzu_auth_service_scope_default_denied_total",
+                       {{"permission", "SoftwareDeployment:Read"}, {"path_class", "mcp"}})
+              .value() == 1.0);
+}
+
+// #4036 hardening round: a store-level fault (pool exhausted) must surface as
+// a genuinely retryable kInternalError, not the same permanent-looking
+// classification as "you have zero runs" / "run not found" — see the
+// identical REST-twin tests (test_preflight_routes.cpp /
+// test_deployment_routes.cpp). Same pool-starvation recipe as
+// test_api_token_store.cpp's "an EXHAUSTED connection pool is kUnavailable,
+// not kInvalid".
+TEST_CASE("MCP list_preflight_runs: an exhausted pool answers kInternalError "
+          "+ retry_after_ms, never a silent empty list, #4036 hardening round",
+          "[pg][mcp][integration][operator_surface]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_preflight_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 1}}; // sole connection, held below
+    yuzu::server::PreflightRunStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::server::PreflightRunRow run;
+    run.run_id = "mcp-run-starved-1";
+    run.execution_id = "preflight-mcp-run-starved-1";
+    run.created_by = "test-user";
+    run.name = "starved-pool run";
+    run.scope_label = "all visible devices";
+    run.config_json = R"({"app_name":"","min_gib":20})";
+    run.window_seconds = 300;
+    run.created_at_ms = 1000;
+    run.deadline_at_ms = 301000;
+    REQUIRE(store.create_run(run, {{"agent-1", "host-1", "windows"}}));
+
+    McpTestServer ts;
+    ts.preflight_run_store_for_test = &store;
+    ts.start();
+
+    // Hold the pool's only connection with a longer timeout than the store's
+    // own kReadTimeout (2s), so the tool's internal acquire times out first.
+    auto hog = pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(hog); // we now hold the only connection
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"list_preflight_runs",)"
+        R"("arguments":{}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["data"]["retry_after_ms"].get<int>() ==
+          mcp::kMcpStoreFaultShortRetryMs); // A5: genuinely retryable
+    CHECK(res->body.find("mcp-run-starved-1") == std::string::npos);
+}
+
+TEST_CASE("MCP get_deployment_preview: an exhausted pool answers "
+          "kInternalError + retry_after_ms, never the same kInvalidParams as "
+          "a genuine not-found, #4036 hardening round",
+          "[pg][mcp][integration][operator_surface]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_preflight_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    yuzu::server::PreflightRunStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::server::PreflightRunRow run;
+    run.run_id = "mcp-preview-starved-1";
+    run.execution_id = "preflight-mcp-preview-starved-1";
+    run.created_by = "test-user";
+    run.name = "starved-pool preview run";
+    run.scope_label = "all visible devices";
+    run.config_json = R"({"app_name":"","min_gib":20})";
+    run.window_seconds = 300;
+    run.created_at_ms = 1000;
+    run.deadline_at_ms = 301000;
+    REQUIRE(store.create_run(run, {{"agent-1", "host-1", "windows"}}));
+
+    McpTestServer ts;
+    ts.preflight_run_store_for_test = &store;
+    ts.start();
+
+    auto hog = pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(hog); // we now hold the only connection
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"get_deployment_preview",)"
+        R"("arguments":{"run_id":"mcp-preview-starved-1"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["data"]["retry_after_ms"].get<int>() ==
+          mcp::kMcpStoreFaultShortRetryMs); // A5: genuinely retryable, NOT
+                                            // the kInvalidParams a genuine
+                                            // miss returns.
 }
 
 // ── Live-query bundle MCP tools (ADR-0011) ──────────────────────────────────

@@ -110,7 +110,11 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # already-merged #4027/#4028/#4029/#4030/#4031/#4033/#4034 twins (237) --
 # reconciled post-merge against the actual measured count below, not
 # hand-added from either side's stale pre-merge value.
-BASELINE_UNTWINNED = 221
+#
+# #4036 (preflight/deploy read-twin batch) flips 2 more rows to "twinned"
+# on top of origin/dev's 221 -- reconciled post-merge against the actual
+# measured count, not hand-added.
+BASELINE_UNTWINNED = 219
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.

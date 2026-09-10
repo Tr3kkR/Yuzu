@@ -219,9 +219,35 @@ use-after-free guard any shutdown refactor must preserve.
 
 > **Remediation is never automatic.** Detection runs on the schedule above;
 > applying a fix is always an explicit, operator-gated action (see
-> `POST /api/policies/{id}/remediate` below). On a server restart, any agent
-> left mid-remediation (`fixing`) is reset to `unknown` and re-evaluated, since
-> the in-flight fix/verify state does not survive the restart.
+> `POST /api/policies/{id}/remediate` below). A server restart does **not**
+> reset an in-flight `fixing` row — the durable claim behind it survives the
+> process. If the replica dispatching a fix dies mid-flight, the stranded
+> `fixing` row is instead aged back to `unknown` (and becomes eligible for
+> re-evaluation) by a continuous, age-gated sweep once `last_fix_at` is older
+> than `fixing_stale_seconds` (default 1800s) — not immediately, and not tied
+> to any restart.
+>
+> **High Availability (HA): manual remediation is now safe on multi-replica servers.** Each target
+> is claimed durably before the fix is dispatched, so two replicas cannot independently remediate
+> the same agent. If a target has already exhausted its fix-retry cap for the policy, the
+> remediation request is refused with HTTP 409 and the message "remediation already in flight or
+> retry cap reached for this policy". The remediate response's `agents` count reflects **delivered**
+> targets (the fix was actually dispatched to them), not attempted targets.
+>
+> **Scope of the guarantee.** The claim prevents two replicas from independently *claiming* the
+> same `(policy, agent)` target only when both are running the **same schema version**. During a
+> rolling upgrade across the migration boundary, an old binary that predates the durable claim can
+> transiently run alongside a new one; that mixed-version window is gated today by issue #4014
+> (which blocks running a second production replica) pending a durable cluster-capability admission
+> gate. The exposure is one-directional — a row written by an old binary carries claim-generation
+> `0`, a value a new binary never mints for its own claims. Separately, the guarantee is
+> effectively-once, not exactly-once (consistent with ADR-2002): a replica that pauses for longer
+> than `fixing_stale_seconds` between winning the claim and actually sending a command over gRPC —
+> the fix, or the subsequent post-fix verify — can still deliver that one send after a sibling has
+> reclaimed the target, because the wire send itself
+> is not transactionally fenced. The durable claim prevents concurrent or duplicate *claims*; it
+> bounds, but does not make impossible, a single late duplicate *dispatch* from a long-paused
+> claim-holder.
 
 ### Forcing an immediate evaluation
 

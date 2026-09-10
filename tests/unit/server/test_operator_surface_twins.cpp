@@ -421,6 +421,12 @@ constexpr TwinRow kExpectedTwins[] = {
     {"mint_upload_grant", "UploadGrant", "Write", false},
     {"list_upload_grants", "UploadGrant", "Read", true},
     {"revoke_upload_grant", "UploadGrant", "Delete", false},
+    // #4036 (api-parity Batch A) — pinned against preflight_routes.cpp's /
+    // deployment_routes.cpp's new GET /api/v1/preflight/runs / GET
+    // /api/v1/deployments/preview handlers (same (securable, operation) each
+    // REST twin gates on).
+    {"list_preflight_runs", "Infrastructure", "Read", true},
+    {"get_deployment_preview", "SoftwareDeployment", "Read", true},
     // #4030: executions/workflows/schedules read-twin programme.
     {"list_workflows", "Workflow", "Read", true},
     {"get_workflow", "Workflow", "Read", true},
