@@ -298,19 +298,42 @@ TEST_CASE("build_agent_push: enforce on a denylisted key is downgraded to audit 
             CHECK(r.assertion().type() == "registry-value-equals");
 }
 
-TEST_CASE("guardian_enforced_on_platform — Windows only today; unknown is open",
+TEST_CASE("guardian_guard_supported_on_platform — type-aware support matrix; unknown is open",
           "[guardian_push_builder][platform]") {
-    using guardian::guardian_enforced_on_platform;
-    // Guards arm only on Windows (RegistryGuard/FileGuard::start() are no-ops
-    // elsewhere) — so darwin/linux must read as NOT enforced and never armed.
-    CHECK(guardian_enforced_on_platform("windows"));
-    CHECK(guardian_enforced_on_platform("Windows"));  // normalize_os lower-cases (exact token)
-    CHECK_FALSE(guardian_enforced_on_platform("darwin"));
-    CHECK_FALSE(guardian_enforced_on_platform("macos"));  // author/alias token too
-    CHECK_FALSE(guardian_enforced_on_platform("linux"));
+    using guardian::guardian_guard_supported_on_platform;
+    // registry-change / file-change: Windows only (RegistryGuard/FileGuard::
+    // start() are no-ops on macOS+Linux) — unaffected by #4252's fix.
+    CHECK(guardian_guard_supported_on_platform("windows", "registry-change"));
+    CHECK(guardian_guard_supported_on_platform("Windows", "registry-change"));  // normalize_os lower-cases
+    CHECK_FALSE(guardian_guard_supported_on_platform("darwin", "registry-change"));
+    CHECK_FALSE(guardian_guard_supported_on_platform("macos", "registry-change"));  // author/alias token too
+    CHECK_FALSE(guardian_guard_supported_on_platform("linux", "registry-change"));
+    CHECK(guardian_guard_supported_on_platform("windows", "file-change"));
+    CHECK_FALSE(guardian_guard_supported_on_platform("linux", "file-change"));
+    CHECK_FALSE(guardian_guard_supported_on_platform("macos", "file-change"));
+
+    // service-status-change: Windows AND Linux (SystemdServiceGuard arms,
+    // observe-only) — NOT macOS. This is #4252's fix: Linux was wrongly
+    // reported as "not implemented" here before.
+    CHECK(guardian_guard_supported_on_platform("windows", "service-status-change"));
+    CHECK(guardian_guard_supported_on_platform("linux", "service-status-change"));
+    CHECK_FALSE(guardian_guard_supported_on_platform("darwin", "service-status-change"));
+    CHECK_FALSE(guardian_guard_supported_on_platform("macos", "service-status-change"));
+
+    // Unknown/missing spark_type falls back to the Windows-only rule — never
+    // regress a type this function doesn't recognise.
+    CHECK(guardian_guard_supported_on_platform("windows", "some-future-type"));
+    CHECK_FALSE(guardian_guard_supported_on_platform("linux", "some-future-type"));
+    CHECK(guardian_guard_supported_on_platform("windows", ""));
+    CHECK_FALSE(guardian_guard_supported_on_platform("linux", ""));
+    CHECK_FALSE(guardian_guard_supported_on_platform("macos", ""));
+
     // Unknown OS (disconnect race / partial registration) must NOT be mislabelled
-    // "not implemented" — fail open, same posture as os_target_matches.
-    CHECK(guardian_enforced_on_platform(""));
+    // "not implemented" — fail open, same posture as os_target_matches, for
+    // every spark_type including Service.
+    CHECK(guardian_guard_supported_on_platform("", "registry-change"));
+    CHECK(guardian_guard_supported_on_platform("", "service-status-change"));
+    CHECK(guardian_guard_supported_on_platform("", ""));
 }
 
 TEST_CASE("platform_display_name — raw agent token to operator-facing label",

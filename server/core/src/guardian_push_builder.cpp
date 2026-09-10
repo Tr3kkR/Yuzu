@@ -84,13 +84,29 @@ bool os_target_matches(std::string_view target, std::string_view agent_os) {
     return normalize_os(target) == normalize_os(agent_os);
 }
 
-bool guardian_enforced_on_platform(std::string_view agent_os) {
+bool guardian_guard_supported_on_platform(std::string_view agent_os, std::string_view spark_type) {
     if (agent_os.empty())
         return true;  // unknown OS — never mislabel it "not implemented"
-    // Guards arm on Windows only today (guard_registry.cpp / guard_file.cpp start()
-    // return false on every other platform). normalize_os folds darwin->macos and
-    // lower-cases, so a verbose "Windows 11 Pro" still resolves to "windows".
-    return normalize_os(agent_os) == "windows";
+    // normalize_os only lower-cases and maps darwin->macos — it does NOT parse
+    // a verbose free-text string like "Windows 11 Pro" down to "windows".
+    // agent_os is always the raw kAgentOs token, never free text, so this is a
+    // non-issue in practice; a prior version of this comment claimed
+    // normalize_os handled the verbose case, which was false (#4252).
+    const std::string os = normalize_os(agent_os);
+    if (spark_type == "service-status-change")
+        // SystemdServiceGuard (guard_systemd.cpp's make_service_guard(),
+        // :157-163) arms on Linux too — observe-only, enforce deliberately
+        // deferred, but NOT a no-op like Registry/File are on Linux. Windows
+        // ServiceGuard enforces; macOS falls to the no-op ServiceGuard stub.
+        // docs/os-capability-matrix.md's "Guardian — service run-state guard"
+        // row and docs/user-manual/guaranteed-state.md's Service section.
+        return os == "windows" || os == "linux";
+    // registry-change / file-change: RegistryGuard::start() / FileGuard::
+    // start() are compiled no-ops on macOS and Linux — Windows only. Any
+    // spark_type this function doesn't recognise (empty/malformed/future)
+    // falls back to the same Windows-only rule, so it can never silently
+    // regress Registry/File support.
+    return os == "windows";
 }
 
 std::string platform_display_name(std::string_view agent_os) {

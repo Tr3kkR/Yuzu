@@ -15212,7 +15212,8 @@ private:
             // registration time, so the ordering is fine.
             [this](const std::string& scope, bool full_sync) -> int {
                 return guardian_push_fn_ ? guardian_push_fn_(scope, full_sync) : -2;
-            });
+            },
+            &metrics_); // #4252 — platform-support-matrix-stale counter
 
         // F2a: the fleet perf snapshot provider — joins AgentHealthStore heartbeat
         // perf tags (validated through the SAME dex_perf_rules the Prometheus

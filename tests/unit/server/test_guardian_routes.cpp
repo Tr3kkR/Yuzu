@@ -938,12 +938,19 @@ TEST_CASE("an UNDEPLOYED all-OS Guard does not inflate the not-implemented censu
     // …but it is a member of no deployed Baseline, so it reaches no device.
     h.agents_json = R"([{"agent_id":"mac-1","hostname":"macbook","os":"darwin"}])";
 
-    SECTION("fleet census shows no not-implemented class for the undeployed guard") {
+    SECTION("fleet census shows no not-implemented class, AND no banner, for the "
+            "undeployed guard") {
         auto res = h.sink.Get("/fragments/guardian/status?view=fleet");
         REQUIRE(res != nullptr);
-        // The capability banner still notes the connected Mac…
-        CHECK(res->body.find("Windows only") != std::string::npos);
-        // …but the per-device-guard census has no not-implemented pairs (nothing deployed).
+        // #4252 banner-semantics decision: PAIR-level, not agent-level. The
+        // connected Mac owns zero actually-unenforced pairs (its only targeting
+        // rule is undeployed, so it reaches no device) — the honesty banner must
+        // NOT fire for it. Pre-#4252 this asserted the banner STILL fired here
+        // (agent-level: "any connected Mac trips it"), which was itself the
+        // over-attribution this fix corrects on the banner, mirroring the
+        // census fix below.
+        CHECK(res->body.find("Windows only") == std::string::npos);
+        // …and the per-device-guard census has no not-implemented pairs (nothing deployed).
         CHECK(res->body.find("Not implemented") == std::string::npos);
     }
     SECTION("per-device drill-down lists no devices for the undeployed guard") {
