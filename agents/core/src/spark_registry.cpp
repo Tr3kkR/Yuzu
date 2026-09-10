@@ -1504,10 +1504,12 @@ private:
     /// last-known-healthy indefinitely).
     /// noexcept: every operation here is scalar/atomic or a noexcept optional
     /// move (DetachedCall's move ops are noexcept) - no allocation, so this is
-    /// safe to call from the noexcept recovery path too. `pl.call`, if left
-    /// unused (the never-launched or `!live` branches), is abandoned when
-    /// `work` itself is destroyed by the caller (self-disposing, off-lock) -
-    /// never pushed into a container that could itself throw in here.
+    /// safe to call from the noexcept recovery path too. `pl.call`, if it
+    /// exists on the never-launched branch, is abandoned right here (never
+    /// launched, so nothing to close). On the `!live` branch it is instead
+    /// MOVED into `work.stale_calls` (pre-reserved by sweep_locked - the move
+    /// itself cannot throw) so its handle-closing destructor runs when `work`
+    /// is destroyed by the caller, off-lock - never destroyed here, under mu_.
     void reconcile_probe_launches_locked(SweepWork& work) noexcept {
         for (auto& pl : work.probe_launches) {
             if (pl.job) {
@@ -1523,8 +1525,10 @@ private:
             const bool live = w && w->active && !stopping_ && w->probe == ProbeState::Pending &&
                               w->probe_gen == pl.gen && !w->call;
             if (!live) {
+                if (pl.call)
+                    work.stale_calls.push_back(std::move(*pl.call)); // reserved: nothrow
                 probe_discarded_.fetch_add(1, std::memory_order_relaxed);
-                continue; // pl.call (if any) abandoned with `work`, off-lock
+                continue;
             }
             if (pl.status == DetachedLaunch::Launched) {
                 probe_launched_.fetch_add(1, std::memory_order_relaxed);
