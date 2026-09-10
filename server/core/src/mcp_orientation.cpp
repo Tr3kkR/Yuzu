@@ -69,12 +69,16 @@ constexpr std::string_view kMgmtGroups[] = {"list_management_groups",
                                             "preview_management_group_agent_count"};
 constexpr std::string_view kApprovals[] = {"list_pending_approvals", "approve_request",
                                            "reject_request"};
-constexpr std::string_view kDexSignals[] = {"list_dex_signals", "get_dex_signal_scope",
-                                            "get_dex_signal_detail"};
+constexpr std::string_view kDexSignals[] = {
+    "list_dex_signals",       "get_dex_signal_scope",     "get_dex_signal_detail",
+    "get_dex_device_score",   "get_dex_app",              "list_dex_apps",
+    "get_dex_catalogue_group", "get_dex_device_history",  "get_dex_observation",
+    "get_dex_health",         "get_dex_trends",           "get_dex_overview"};
 constexpr std::string_view kDexPerf[] = {"get_dex_perf_fleet",   "get_dex_perf_cohorts",
                                          "get_dex_perf_cohort_diff", "list_dex_perf_devices",
                                          "list_dex_perf_apps",   "get_dex_app_perf",
-                                         "get_dex_group_app_perf",   "compare_app_perf_versions"};
+                                         "get_dex_group_app_perf",   "compare_app_perf_versions",
+                                         "get_dex_device_app_perf"};
 constexpr std::string_view kNetwork[] = {"get_network_fleet", "list_network_devices"};
 constexpr std::string_view kExecution[] = {"execute_instruction", "execute_bundle",
                                            "get_bundle_result"};

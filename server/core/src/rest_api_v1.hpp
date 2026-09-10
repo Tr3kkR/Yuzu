@@ -16,6 +16,7 @@
 #include "device_token_store.hpp"
 #include "dex_app_perf_model.hpp"
 #include "dex_perf_model.hpp"
+#include "dex_routes.hpp" // DexFleet -- the DexFleetFn provider type below
 #include "network_perf_model.hpp"
 #include "execution_tracker.hpp"
 #include "guaranteed_state_store.hpp"
@@ -253,6 +254,36 @@ public:
     /// the agent dispatch path. Returns the number of agents pushed to, or -1 on an
     /// invalid scope expression. Injected from server.cpp where the registry/scope live.
     using GuardianPushFn = std::function<int(const std::string& scope, bool full_sync)>;
+    /// #4035: the SAME cross-store fleet denominator DexRoutes::FleetFn already
+    /// supplies to the dashboard fragments (windows/linux/macos-online counts +
+    /// connected-agent list) — reused verbatim (not re-derived) so the new
+    /// GET /api/v1/dex/{health,trends,overview,catalogue/group} twins read the
+    /// exact same fleet snapshot the fragments render against. Injected from
+    /// server.cpp, which already builds one `DexFleet` provider lambda for
+    /// DexRoutes; that SAME lambda is passed here too (see server.cpp). Trailing
+    /// optional (`{}`) for source-stability of existing call sites/tests — a
+    /// route that needs it treats an unwired fn as "no fleet data" (score/
+    /// crash-free suppressed), never a crash.
+    using DexFleetFn = std::function<DexFleet()>;
+    /// #4035 hardening (governance): the SAME username-keyed visible-agent-set
+    /// resolver `DexRoutes::register_routes`'s own `resolve_visible` (dex_routes.cpp)
+    /// already applies to confine `/fragments/dex/app`'s and
+    /// `/fragments/dex/overview`'s device-id lists to the caller's management-group
+    /// scope (ADR-0017 World A) — GET /api/v1/dex/app and GET /api/v1/dex/overview
+    /// enumerate the identical affected/top-devices lists and MUST apply the same
+    /// confinement, not just the sibling service-scoped-token deny belt
+    /// (`deny_fleet_wide_service_scoped`). Two independent belts are required
+    /// together, per the SCOPING NOTE on the `dex_fleet_fn` provider in server.cpp:
+    /// this fn closes the management-group-confined-OPERATOR axis,
+    /// `deny_fleet_wide_service_scoped` closes the service-scoped-API-token axis —
+    /// neither substitutes for the other. `nullopt` = unfiltered (global read /
+    /// RBAC off, or the session could not be resolved); engaged (incl. empty) =
+    /// filter to exactly these agents. Trailing optional (`{}`) for
+    /// source-stability of existing call sites/tests — a route that needs it
+    /// treats an unwired fn as "no confinement" (matching the fragment's own
+    /// unwired-`visible_set_fn_` posture), never a crash.
+    using DexVisibleFn =
+        std::function<std::optional<std::set<std::string>>(const std::string& username)>;
 
     /// Outcome of a session-revocation REST call. `cookie_sessions_revoked`
     /// is the number of in-memory cookie sessions wiped (the operationally
@@ -438,7 +469,17 @@ public:
         // #4033: GET /api/v1/management-groups/agent-count-preview's D3
         // Response:Read scope resolver (see ResponseVisibleSetFn's doc
         // comment above). Trailing optional dep; `{}` = legacy-open.
-        ResponseVisibleSetFn response_visible_set_fn = {});
+        ResponseVisibleSetFn response_visible_set_fn = {},
+        // #4035: see DexFleetFn's doc comment above. Trailing optional dep; `{}`
+        // degrades the fleet-dependent DEX twins (health/trends/overview/
+        // catalogue-group) to their "no reporting agents" suppressed shape —
+        // never a crash.
+        DexFleetFn dex_fleet_fn = {},
+        // #4035 hardening (governance): see DexVisibleFn's doc comment above.
+        // Trailing optional dep; `{}` degrades GET /api/v1/dex/app and GET
+        // /api/v1/dex/overview to "no confinement" (matching the fragment's own
+        // unwired-`visible_set_fn_` posture), never a crash.
+        DexVisibleFn dex_visible_fn = {});
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
@@ -512,7 +553,14 @@ public:
         AgentsJsonFn agents_fn = {},
         // #4033: see the production overload's doc comment above; identical
         // trailing-optional-dep, legacy-open-when-unwired contract.
-        ResponseVisibleSetFn response_visible_set_fn = {});
+        ResponseVisibleSetFn response_visible_set_fn = {},
+        // #4035: see the production overload's doc comment above; identical
+        // trailing-optional-dep, degrade-not-crash contract.
+        DexFleetFn dex_fleet_fn = {},
+        // #4035 hardening (governance): see the production overload's doc
+        // comment above (DexVisibleFn); identical trailing-optional-dep,
+        // degrade-to-no-confinement contract.
+        DexVisibleFn dex_visible_fn = {});
 
     /// PR 4.3 — engine-principal lifecycle store backing
     /// `/api/v1/engine-principals`, threaded post-construction. (During the
