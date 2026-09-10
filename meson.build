@@ -289,6 +289,27 @@ endif
 sqlite3_dep     = dependency('SQLite3', method: 'cmake', modules: ['SQLite::SQLite3'],
   required: true, include_type: 'system')
 
+# libxml2 — real XML parsing for the autoruns plugin's Task Scheduler XML
+# (agents/plugins/autoruns) and its portable test TU (both include
+# autoruns_parsers.hpp, which parses via libxml2 unconditionally on every
+# platform, not just Windows), AND for server/core's Windows-deferred SAML
+# feature (server/core/meson.build reuses this SAME declaration rather than
+# re-declaring it — do not add a second libxml2_dep anywhere; one global
+# declaration, reused by every consumer). Declared here at root scope,
+# UNCONDITIONALLY (no host_machine.system() guard) because autoruns needs it
+# on every platform including Windows, even though SAML's own consumption of
+# it is Windows-deferred — that gate says nothing about whether libxml2
+# itself links on Windows. It does: libxml2 is not in
+# triplets/x64-windows.cmake's static-linkage override list (scoped to
+# abseil/grpc/protobuf/upb/re2/c-ares/utf8-range only, the #375 landmine), so
+# it resolves as an ordinary dynamic DLL + import lib on Windows, same shape
+# as sqlite3/libpq/openssl above.
+libxml2_dep = dependency('LibXml2', method: 'cmake', modules: ['LibXml2::LibXml2'],
+  required: false, include_type: 'system')
+if not libxml2_dep.found()
+  libxml2_dep = dependency('libxml-2.0', required: true, include_type: 'system')
+endif
+
 # libpq — Postgres client library for the server storage substrate (ADR-0006/
 # ADR-0008). Server-only: the agent stays SQLite (ADR-0006), so agent-only
 # (-Dbuild_server=false) and cross builds must not require libpq at configure.
@@ -471,6 +492,7 @@ if build_agent
     subdir('agents/plugins/discovery')
     subdir('agents/plugins/license_scan')
     subdir('agents/plugins/power_health')
+    subdir('agents/plugins/autoruns')  # Wave 7 PR7.1
   endif
 endif
 

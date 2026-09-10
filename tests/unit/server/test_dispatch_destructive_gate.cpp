@@ -43,6 +43,7 @@
 #include "capability_decls/plugin_action_catalogue_disk_actions.hpp"
 #include "capability_decls/plugin_action_catalogue_filesystem_posture.hpp"
 #include "capability_decls/plugin_action_catalogue_power_health.hpp"
+#include "capability_decls/plugin_action_catalogue_autoruns.hpp"
 #include "command_capability.hpp"
 #include "dispatch_caller.hpp"
 
@@ -337,7 +338,7 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 17,
           "[server][dispatch][security]") {
     namespace capdecls = yuzu::server::capdecls;
 
-    const std::array<std::span<const CommandCapability>, 9> sources{{
+    const std::array<std::span<const CommandCapability>, 10> sources{{
         capdecls::plugin_action_catalogue_content_dist(),
         capdecls::plugin_action_catalogue_a(),
         capdecls::plugin_action_catalogue_b(),
@@ -346,6 +347,7 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 17,
         capdecls::plugin_action_catalogue_disk_actions(),
         capdecls::plugin_action_catalogue_power_health(),
         capdecls::plugin_action_catalogue_filesystem_posture(),
+        capdecls::plugin_action_catalogue_autoruns(),
         capdecls::core_dispatch_capabilities(),
     }};
 
@@ -393,6 +395,7 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 17,
         capdecls::plugin_action_catalogue_disk_actions(),
         capdecls::plugin_action_catalogue_power_health(),
         capdecls::plugin_action_catalogue_filesystem_posture(),
+        capdecls::plugin_action_catalogue_autoruns(),
         capdecls::core_dispatch_capabilities(),
     };
     auto classified = registry.classify("tar", "purge_source");

@@ -66,13 +66,16 @@ endif
 # block in the root meson.build is load-bearing and must not be disturbed
 # (see CLAUDE.md "Windows grpc/protobuf/abseil is load-bearing").
 if host_machine.system() != 'windows'
-  libxml2_dep = dependency('LibXml2', method: 'cmake',
-    modules: ['LibXml2::LibXml2'],
-    required: false, include_type: 'system')
-  if not libxml2_dep.found()
-    libxml2_dep = dependency('libxml-2.0', required: true, include_type: 'system')
-  endif
-
+  # libxml2_dep itself is declared once, unconditionally, at root scope
+  # (see meson.build's own comment on that declaration) -- reuse it here
+  # rather than re-declaring the same dependency under the same variable
+  # name. Meson has no subdir()-local scoping (one flat variable
+  # namespace across every subdir() call), so a second declaration here
+  # would not "shadow" anything -- it would just deterministically
+  # overwrite the root value, order notwithstanding. Two declarations of
+  # the same dependency under the same name is simply redundant and a
+  # future-drift risk (e.g. if one copy's method/fallback ever changes
+  # without the other), not a shadowing hazard.
   xmlsec_dep = dependency('unofficial-xmlsec', method: 'cmake',
     modules: ['unofficial::xmlsec::xmlsec1-openssl'],
     required: false, include_type: 'system')
