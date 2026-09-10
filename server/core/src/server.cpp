@@ -17570,6 +17570,11 @@ private:
             // with no MCP twin — an ADR-1005 gap for an ordinary
             // authenticated operator action).
             mcp_server_->set_plugin_config_store(plugin_config_store_.get());
+            // #4036 (api-parity Batch A) — backs list_preflight_runs +
+            // get_deployment_preview. Same store PreflightRoutes/
+            // DeploymentRoutes already hold (constructed well before this
+            // point, server.cpp:4041) — no new construction needed.
+            mcp_server_->set_preflight_run_store(preflight_run_store_.get());
             mcp_server_->set_upload_grant_ops(
                 upload_grant_store_.get(),
                 // SAME logic as the REST list_read_fn wired at the
