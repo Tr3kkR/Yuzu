@@ -18,8 +18,10 @@
 /// THIS IS THE ATTEMPT GATE, NOT THE CORRECTNESS FENCE (§6; ws3-plan §5).
 /// `is_leader()` gates whether a loop ATTEMPTS its side effect; a momentarily-
 /// stale leader can still pass it. The guarantee against a paused ex-leader is
-/// the `epoch_fence_sql()` predicate embedded in each claim's WRITE (slices
-/// 3.3/3.4), NOT this gate. On the single-replica deployment this gate is
+/// the `epoch_fence_sql()` predicate embedded in each LEADER-DRIVEN claim's
+/// WRITE (slice 3.3's command outbox), NOT this gate. Operator-synchronous
+/// claims (slice 3.4's remediation) use their own plain guarded CAS instead —
+/// see TWO DISPATCH PLANES below. On the single-replica deployment this gate is
 /// operationally inert: the sole replica is always the leader once it acquires,
 /// so every `FencedLeaderOnly` loop runs exactly as before.
 ///

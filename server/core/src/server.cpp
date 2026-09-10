@@ -11403,9 +11403,13 @@ private:
                                                   caller.principal_role, command_id,
                                                   outcome.denied_quarantined_count);
         } else {
+            // NO std::move (review B1): the sink takes const ref, and
+            // `outcome.denied_quarantined` MUST survive this call — the closure
+            // returns `outcome` and compute_delivered() reads its denied set to
+            // exclude quarantined targets from the delivered count.
             audit_quarantine_dispatch_denied_batch("dispatch_closure", caller.principal,
                                                    caller.principal_role, command_id,
-                                                   std::move(outcome.denied_quarantined));
+                                                   outcome.denied_quarantined);
         }
         audit_unknown_plugin_dispatch("dispatch_closure", caller.principal, caller.principal_role,
                                       command_id, plugin, outcome.unknown_plugin_count);
@@ -11843,7 +11847,7 @@ private:
                                                 const std::string& principal,
                                                 const std::string& principal_role,
                                                 const std::string& command_id,
-                                                std::vector<std::string> ordered) {
+                                                const std::vector<std::string>& denied) {
         // WHICH rows get elided must not be the caller's choice.
         //
         // The Ids arm's target list is the caller's own `agent_ids` array and
@@ -11860,14 +11864,17 @@ private:
         // the elided IDENTITIES are logged below rather than dropped. The audit
         // store is what the cap protects; the log is not, and it is where the
         // forensic answer lives when a row was elided.
-        // Taken BY VALUE and sorted in place: the callers own their vectors and
-        // do not read them afterwards, so a `std::move` at the call site makes
-        // this free rather than a fleet-scale copy on the dispatch thread —
-        // which is the allocation shape the fail-closed path was just changed
-        // to avoid. Note the call sites are declared non-const for that reason:
-        // `std::move` on a `const` object yields `const T&&`, which cannot bind
-        // to the move constructor and silently selects the COPY — two of the
-        // three sites did exactly that until this was measured.
+        // Taken by CONST REF and copied here for the in-place sort (review B1).
+        // It USED to take the vector by value, and the dispatch closure passed
+        // `std::move(outcome.denied_quarantined)` — which emptied the outcome's
+        // own denied set BEFORE `dispatch_confined` returned it, so
+        // compute_delivered() (policy_evaluator.cpp) then read an empty vector
+        // and silently counted a quarantined target in a mixed batch as
+        // DELIVERED: marked it 'fixing' and burned one of kMaxFixAttempts. This
+        // sink must NEVER consume the caller's vector. The copy is bounded by
+        // the denial set (itself bounded by the dispatch batch), and only
+        // kMaxPerDeviceQuarantineAuditRows rows are emitted below.
+        std::vector<std::string> ordered(denied.begin(), denied.end());
         std::sort(ordered.begin(), ordered.end());
         const std::size_t emit = std::min(ordered.size(), kMaxPerDeviceQuarantineAuditRows);
         for (std::size_t i = 0; i < emit; ++i)
@@ -14107,9 +14114,9 @@ private:
                     .audit_quarantine_dispatch_denied_batch_fn =
                         [this](std::string_view route, const std::string& principal,
                                const std::string& principal_role, const std::string& command_id,
-                               std::vector<std::string> ordered) {
+                               const std::vector<std::string>& ordered) {
                         audit_quarantine_dispatch_denied_batch(route, principal, principal_role,
-                                                               command_id, std::move(ordered));
+                                                               command_id, ordered);
                     },
                     .audit_unknown_plugin_dispatch_fn =
                         [this](std::string_view route, const std::string& principal,
@@ -17963,7 +17970,7 @@ private:
         } else {
             audit_quarantine_dispatch_denied_batch("legacy", caller.principal,
                                                    caller.principal_role, command_id,
-                                                   std::move(result.denied_quarantined));
+                                                   result.denied_quarantined);
         }
         audit_unknown_plugin_dispatch("legacy", caller.principal, caller.principal_role,
                                       command_id, plugin, result.unknown_plugin_count);
