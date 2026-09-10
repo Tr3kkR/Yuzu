@@ -483,7 +483,7 @@ is HELD, with the server's 25 s `full_sync` retry re-applying the whole push unt
 contention clears. `yuzu.guardian_arm_failed` therefore carries a reason/phase
 (admission-expiry / admission-rejection / dispatched-timeout, R5.3), so an operator
 paged on it can tell a genuinely dead target from a key queued behind a slow sibling of
-the same mechanism type.
+the same mechanism type. PR-B1 (#2012/#3840) has since landed the Registry half of this fix - see "#2012/#3840 PR-B1 (landed, Registry only)" below; File and Service remain open.
 
 **R5.3 - Ack model: accepted vs. acknowledged.** **Acknowledged ≠ compliant/enforced,
 stated explicitly (Gate 6 compliance-officer) — mirroring this codebase's own
@@ -1055,12 +1055,14 @@ plugin call is a compile error, per Decision 3) *and* watchdog-histogram evidenc
 that a given enforce action stays inside budget. Registry write-back is the
 plausible first candidate; it is **not** promoted in Stage 2.
 
-Pre-Stage-3 dependency: `Service::watch()` SCM latency is currently unbounded
-under the ops lock (`mech_ops_mu_by_type_`'s member comment: Registry and
-Service watch latencies are "entirely UNCHARACTERISED" and the per-type stall
-duration is unbounded); #2011's per-mechanism-type lock (rung 0) removes only
-*cross-mechanism* coupling. Gate rung 3 on a measured Service-arm-latency ceiling
-(or the walk-off-`mu_` restructure the header defers). (architect S4.)
+Pre-Stage-3 dependency: File's `watch()` still blocks for its OS-call duration
+under the ops lock, and Service's SCM open/notify run head-of-line on its worker
+(`mech_ops_mu_by_type_`'s member comment, corrected in PR-B1; the earlier
+"entirely UNCHARACTERISED" wording is superseded for Registry, whose establishment
+latencies are measured in `docs/spark-rebuild-baselines/stage2-watch-establish-latency.md`);
+#2011's per-mechanism-type lock (rung 0) removes only *cross-mechanism* coupling. Gate
+rung 3 on the File and Service halves of the walk-off-`mu_` restructure (PR-B2/PR-B3)
+or a measured ceiling for each. (architect S4.)
 
 **#2233 item 3 (landed)** bounds the wall-clock a *caller* of `GuardianSparkRuntime`
 waits for one File/Registry/Service arm/disarm - a dedicated `GuardianIoExecutor`
@@ -1084,6 +1086,20 @@ deliver and correctly reaches neither), so
 `GuardianSparkRuntime`'s arm consumer can disarm a late success instead of leaking
 it; the state reader needs no callback (a late read is wasted work, nothing
 escapes). See `docs/spark-flip-gate.md` §3 row 3.
+
+**#2012/#3840 PR-B1 (landed, Registry only)**: the Registry mechanism's `watch()` now
+reserves under its own lock, runs the key open / notify / nearest-ancestor walk on a
+detached F3-counted worker, waits at most `kRegCallerWaitBudget` (50 ms) on the
+control path and otherwise publishes the probe to the mechanism's own sweeper thread;
+`unwatch()` hands the blocking callback drain to a detached worker and returns in
+microseconds. The per-type lock hold for Registry is therefore bounded by that budget,
+which also removes the #4181 same-type reentrant disarm deadlock on the Registry path
+(the issue stays open until File and Service land). Costs recorded in
+`docs/spark-legacy-delta-registry.md` D12: a consumed Target-mode notification is two
+emit submissions (immediate + synthetic on re-arm commit), an establishment that misses
+the 50 ms health grace produces a Faulted/Recovered pair, and an Ancestor->Target
+appearance is emitted at commit rather than inline. File (PR-B2) and Service (PR-B3)
+remain the open half of this dependency.
 
 ## Health / status surface — the #1939 checklist
 
@@ -1390,9 +1406,9 @@ upgrade note for this enforcement-posture default change (not deferred to rung 5
   `mech_ops_mu_by_type_` (`std::map<SparkType, std::mutex>`), so a slow `watch()`
   on one mechanism can no longer block arm/disarm on another. Cross-mechanism
   coupling is closed; the residual same-type stall (an unbounded `watch()` still
-  blocks its own type's queue) is a distinct, deferred walk-off-`mu_` follow-up,
-  gated as a Stage-2/rung-3 pre-arm dependency (measured Registry/Service
-  `watch()` latency ceiling). The observability half of #2011 (per-type
+  blocks its own type's queue) is the walk-off-`mu_` follow-up, landed for Registry
+  in PR-B1 (#2012/#3840, bounded at 50 ms on the control path) and still open for
+  File and Service (PR-B2/PR-B3), gated as a Stage-2/rung-3 pre-arm dependency. The observability half of #2011 (per-type
   `SparkEngineStats` emission + alerts) is DEFERRED to rung 1, where SparkEngine
   is first instantiated.
 - **#2014 (BLOCKING-before-Stage-2):** resolved by the no-blocking-inline-consumer
