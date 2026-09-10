@@ -121,6 +121,16 @@ constexpr std::string_view kAgenticHelpers[] = {"get_fleet_posture_fast",
 constexpr std::string_view kDiscovery[] = {"discover_permissions", "discover_instructions",
                                            "discover_routes", "discover_scope_kinds",
                                            "discover_plugins"};
+// #4037: live Guardian rule/event/device state — distinct from
+// "Policy & compliance"'s get_guardian_schemas, which is the static rule
+// SCHEMA catalog, not live enforcement state. get_guardian_status is the
+// fleet rollup; list_guardian_rules/get_guardian_rule_status are per-rule
+// views; list_guardian_events is the __observation__/enforcement event feed
+// (confined, not denied — see its kToolSecurityRows comment);
+// get_guardian_device_guards is the per-device all-guards census.
+constexpr std::string_view kGuardian[] = {"get_guardian_status", "list_guardian_rules",
+                                          "get_guardian_rule_status", "list_guardian_events",
+                                          "get_guardian_device_guards"};
 // #4036 (api-parity Batch A) — the /auto pre-flight ASSESS + deploy ACT
 // stages' read twins. Own family, distinct from Fleet & agents / Live
 // execution: these are owner-scoped readiness/preview reads over the
@@ -146,7 +156,7 @@ constexpr std::string_view kTar[] = {"list_tar_process_tree_devices",
 // managed endpoints) or Engine principals (unrelated identity axis).
 constexpr std::string_view kDirectory[] = {"list_directory_users", "get_directory_status"};
 
-constexpr std::array<ToolFamily, 29> kFamilies{{
+constexpr std::array<ToolFamily, 30> kFamilies{{
     {"Fleet & agents", "connected agents, their OS/arch/version, and details", kFleet},
     {"Tags", "read and write agent tags, and find agents by tag", kTags},
     {"Instructions & schedules", "instruction definitions, their full export, and recurring "
@@ -191,6 +201,9 @@ constexpr std::array<ToolFamily, 29> kFamilies{{
      kAgenticHelpers},
     {"Discovery", "enumerate permissions, instructions, routes, scope kinds, and plugins",
      kDiscovery},
+    {"Guardian", "live Guardian rule/event state and per-device guard status (not the schema "
+                "catalog -- see Policy & compliance for that)",
+     kGuardian},
     {"Pre-flight & deploy", "owner-scoped saved pre-flight runs and the deploy-config go/warn "
                             "preview for one of them",
      kPreflightDeploy},

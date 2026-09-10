@@ -472,6 +472,7 @@ yuzu_server_core_lib = static_library(
     'src/guardian_rule_spec.cpp',
     'src/guardian_schema_registry.cpp',
     'src/guardian_form_render.cpp',
+    'src/guardian_model.cpp',
     'src/dex_alert_router.cpp',
     'src/dex_blast_radius.cpp',
     'src/custom_properties_store.cpp',
@@ -494,6 +495,7 @@ yuzu_server_core_lib = static_library(
     'src/dex_app_perf_ui.cpp',
     'src/dex_perf_ui.cpp',
     'src/network_perf_model.cpp',
+    'src/network_api.cpp', # ADR-0031 WS-A4: the first per-family in-process API seam pilot
     'src/network_routes.cpp',
     'src/network_ui.cpp',
     'src/device_routes.cpp',

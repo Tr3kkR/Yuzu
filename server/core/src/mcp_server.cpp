@@ -28,6 +28,7 @@
 #include "product_pack_model.hpp" // #4029: ProductPackStore (fwd-declared only in mcp_server.hpp) + shared builders
 #include "engine_principal_store.hpp"   // EnginePrincipalStore (fwd-declared only in mcp_server.hpp)
 #include "openapi_spec_access.hpp"      // openapi_spec_json() (discover_routes tool)
+#include "guardian_model.hpp"           // #4037 shared status-rollup / rule-agent-status / device-guards read models
 #include "guardian_schema_registry.hpp" // guardian_schema_catalog (Guardian discovery surface)
 #include "software_inventory_store.hpp"  // query_installed_software (typed daily-sync store)
 #include "software_licensing_store.hpp"  // query_software_licenses (ADR-0024 discovery store)
@@ -749,6 +750,56 @@ static const ToolDef kTools[] = {
      R"({"type":"object","properties":{}})",
      R"j({"type":"object","properties":{"version":{"type":"integer"},"description":{"type":"string"},"schemas":{"type":"object","additionalProperties":true,"description":"category -> type -> JSON Schema; inherently open-ended as Guard types are added, so left loose"}},"required":["version","description","schemas"]})j"},
 
+    // ── Guardian read tools (#4037, api-parity #2146 Batch A) ──────────────
+    {"get_guardian_status",
+     "Fleet Guaranteed State status rollup: total_rules (global rule-catalogue size, never "
+     "confined), compliant_rules/drifted_rules (still 0 — full status ingest lands in a later "
+     "rung), errored_rules (real, management-group-confined for a non-global caller). Mirrors "
+     "GET /api/v1/guaranteed-state/status exactly — same shared builder, same "
+     "require_list_read (ADR-0017) confinement. A service-scoped API token is refused outright "
+     "(this is a fleet rollup with no per-service slice to narrow to).",
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{"total_rules":{"type":"integer"},"compliant_rules":{"type":"integer"},"drifted_rules":{"type":"integer"},"errored_rules":{"type":"integer"},"note":{"type":"string"}},"required":["total_rules","compliant_rules","drifted_rules","errored_rules"]})j"},
+
+    {"list_guardian_rules",
+     "List every Guaranteed State rule (Guard) in the catalogue — full rule bodies "
+     "(yaml_source/spec_json) plus metadata. Mirrors GET /api/v1/guaranteed-state/rules "
+     "exactly, same store read. Fleet-wide rule catalogue (a rule has no single owning "
+     "device/service); a service-scoped API token is refused outright.",
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{"rules":{"type":"array","items":{"type":"object","properties":{"rule_id":{"type":"string"},"name":{"type":"string"},"yaml_source":{"type":"string"},"spec_json":{"type":"string"},"version":{"type":"integer"},"enabled":{"type":"boolean"},"enforcement_mode":{"type":"string"},"severity":{"type":"string"},"os_target":{"type":"string"},"scope_expr":{"type":"string"},"created_at":{"type":"string"},"updated_at":{"type":"string"},"created_by":{"type":"string"},"updated_by":{"type":"string"}},"required":["rule_id","name","version","enabled","enforcement_mode"]}},"total":{"type":"integer"}},"required":["rules","total"]})j"},
+
+    {"list_guardian_events",
+     "Query Guaranteed State events (rule violations, remediations, agent sync events; also "
+     "carries ruleless DEX signal observations under rule_id='__observation__'). Optional "
+     "rule_id/agent_id/severity filters, limit (max 1000)/offset paging. Mirrors GET "
+     "/api/v1/guaranteed-state/events exactly, same store query. When agent_id is supplied the "
+     "read is scoped to that one device (management-group aware); when omitted it is a "
+     "fleet-wide read gated by a bare GuaranteedState:Read plus a service-scoped-token deny "
+     "(the SAME posture the REST route has today — issue #3238 tracks giving this fleet-wide "
+     "branch real per-caller confinement; this tool does not fix or paper over that gap).",
+     R"({"type":"object","properties":{"rule_id":{"type":"string"},"agent_id":{"type":"string","maxLength":256},"severity":{"type":"string"},"limit":{"type":"integer","minimum":0,"maximum":1000},"offset":{"type":"integer","minimum":0}}})",
+     R"j({"type":"object","properties":{"events":{"type":"array","items":{"type":"object","properties":{"event_id":{"type":"string"},"rule_id":{"type":"string"},"agent_id":{"type":"string"},"event_type":{"type":"string"},"severity":{"type":"string"},"guard_type":{"type":"string"},"guard_category":{"type":"string"},"detected_value":{"type":"string"},"expected_value":{"type":"string"},"detail_json":{"type":"string"},"remediation_action":{"type":"string"},"remediation_success":{"type":"boolean"},"detection_latency_us":{"type":"integer"},"remediation_latency_us":{"type":"integer"},"timestamp":{"type":"string"}},"required":["event_id","rule_id","event_type","severity","timestamp"]}},"total":{"type":"integer"},"offset":{"type":"integer"}},"required":["events","total","offset"]})j"},
+
+    {"get_guardian_rule_status",
+     "Per-guard fleet-wide agent-status drilldown: agent_id/state/updated_at for EVERY agent "
+     "that has reported this ONE rule's state. Mirrors the new GET "
+     "/api/v1/guaranteed-state/rules/{rule_id}/status exactly, same shared builder, same "
+     "require_list_read (ADR-0017) confinement as get_guardian_status. Raw census — does NOT "
+     "fold an offline agent's last-reported state to \"unknown\" the way the dashboard fragment "
+     "does. 404-equivalent (kInvalidParams) if rule_id names no rule.",
+     R"({"type":"object","properties":{"rule_id":{"type":"string","minLength":1}},"required":["rule_id"]})",
+     R"j({"type":"object","properties":{"rule_id":{"type":"string"},"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"state":{"type":"string"},"updated_at":{"type":"string"}},"required":["agent_id","state","updated_at"]}},"total":{"type":"integer"}},"required":["rule_id","agents","total"]})j"},
+
+    {"get_guardian_device_guards",
+     "Per-device all-guards view: every Guard's state for ONE device, unscoped to any one "
+     "Baseline (contrast with the existing device-compliance surface, which is scoped to one "
+     "named Baseline). Mirrors the new GET /api/v1/guaranteed-state/agents/{agent_id}/rules "
+     "exactly, same shared builder. Per-device scoped (management-group aware) via the same "
+     "gate the device-compliance / per-agent status routes already use.",
+     R"({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"maxLength":256}},"required":["agent_id"]})",
+     R"j({"type":"object","properties":{"agent_id":{"type":"string"},"guards":{"type":"array","items":{"type":"object","properties":{"rule_id":{"type":"string"},"name":{"type":"string"},"state":{"type":"string"},"updated_at":{"type":"string"}},"required":["rule_id","name","state","updated_at"]}},"total_guards":{"type":"integer"}},"required":["agent_id","guards","total_guards"]})j"},
+
     // ── DEX (Digital Employee Experience) read tools — parity with /api/v1/dex/* ──
     {"list_dex_signals",
      "List the DEX signal catalogue rollup: every observation type seen in the window with its "
@@ -1142,7 +1193,9 @@ static const ToolDef kTools[] = {
      "blended number on a mixed fleet) and the /network Overview cards. A null metric means no "
      "device reported it (absent, never zero); rtt_reporting is the "
      "honest RTT denominator. cooccurrence counts net-degraded devices that ALSO show device-perf "
-     "pressure / app instability (measured co-occurrence, never a cause). Mirrors GET "
+     "pressure / app instability (measured co-occurrence, never a cause). available_keys lists the "
+     "fleet's tag keys for a cohort-picker UI (parity with the /network fragment and "
+     "get_dex_perf_cohorts). Mirrors GET "
      "/api/v1/network/fleet. Requires GuaranteedState:Read.",
      R"({"type":"object","properties":{}})",
      R"j({"type":"object","properties":{)j"
@@ -1150,8 +1203,9 @@ static const ToolDef kTools[] = {
      R"j("retrans_pct":{"type":["object","null"],"properties":{"avg":{"type":"number"},"p50":{"type":"number"},"p90":{"type":"number"},"max":{"type":"number"},"n":{"type":"integer"}}},)j"
      R"j("throughput_bps":{"type":["object","null"],"properties":{"avg":{"type":"number"},"p50":{"type":"number"},"p90":{"type":"number"},"max":{"type":"number"},"n":{"type":"integer"}}},)j"
      R"j("reporting":{"type":"integer"},"rtt_reporting":{"type":"integer"},"online":{"type":"integer"},)j"
-     R"j("cooccurrence":{"type":"object","properties":{"degraded":{"type":"integer"},"also_device":{"type":"integer"},"also_app":{"type":"integer"},"network_only":{"type":"integer"}},"required":["degraded","also_device","also_app","network_only"]})j"
-     R"j(},"required":["rtt_ms","retrans_pct","throughput_bps","reporting","rtt_reporting","online","cooccurrence"]})j"},
+     R"j("cooccurrence":{"type":"object","properties":{"degraded":{"type":"integer"},"also_device":{"type":"integer"},"also_app":{"type":"integer"},"network_only":{"type":"integer"}},"required":["degraded","also_device","also_app","network_only"]},)j"
+     R"j("available_keys":{"type":"array","items":{"type":"string"}})j"
+     R"j(},"required":["rtt_ms","retrans_pct","throughput_bps","reporting","rtt_reporting","online","cooccurrence","available_keys"]})j"},
 
     {"list_network_devices",
      "The device list behind every network-quality drill: worst devices by a metric (default rtt), "
@@ -2355,6 +2409,30 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"list_directory_users", {"Directory", "Read"}},
     {"get_directory_status", {"Directory", "Read"}},
     {"get_guardian_schemas", {"GuaranteedState", "Read"}},
+    // #4037 — get_guardian_status/list_guardian_rules/get_guardian_rule_status
+    // deny a service-scoped token outright: fleet-wide reads (status/rules) or
+    // a rule-centric drilldown with no single-agent slice to confine to,
+    // mirroring their REST siblings' require_list_read bare-deny posture.
+    {"get_guardian_status", {"GuaranteedState", "Read"}},
+    {"list_guardian_rules", {"GuaranteedState", "Read"}},
+    // list_guardian_events is `confined`, not `denied`: unlike the other three
+    // #4037 denied-class tools (get_guardian_status, list_guardian_rules,
+    // get_guardian_rule_status below), its handler has TWO branches — an
+    // optional agent_id narrows to a real per-device scoped_perm_fn gate,
+    // matching REST GET /guaranteed-state/events exactly. `denied` would 403
+    // a service-scoped token's agent_id-supplied call before the handler's
+    // own branch logic ever runs (C8 fires before tier/approval), refusing a
+    // call REST admits — a stricter MCP-only gate, the same class of defect
+    // the issue says not to introduce, just in the opposite direction. The
+    // handler's own fleet-wide branch still calls deny_fleet_wide_service_scoped
+    // (#3238, explicitly NOT this issue's job to fix — kept identical to REST's
+    // gap, not "fixed" here with different MCP-only behavior).
+    {"list_guardian_events", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
+    {"get_guardian_rule_status", {"GuaranteedState", "Read"}},
+    // get_guardian_device_guards uses scoped_perm_fn_ (require_scoped_permission),
+    // which DOES apply a service-scoped token's own service-tag confinement per
+    // target — a real mechanism, same classification as get_dex_signal_detail below.
+    {"get_guardian_device_guards", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
     {"list_dex_signals", {"GuaranteedState", "Read"}},
     {"get_dex_signal_scope", {"GuaranteedState", "Read"}},
     {"get_dex_signal_detail", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
@@ -2906,6 +2984,11 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"list_directory_users", {ToolEffect::ReadOnly, true, "List directory users"}},
     {"get_directory_status", {ToolEffect::ReadOnly, true, "Get directory sync status"}},
     {"get_guardian_schemas", {ToolEffect::ReadOnly, true, "Get Guardian schemas"}},
+    {"get_guardian_status", {ToolEffect::ReadOnly, true, "Get Guardian status rollup"}},
+    {"list_guardian_rules", {ToolEffect::ReadOnly, true, "List Guardian rules"}},
+    {"list_guardian_events", {ToolEffect::ReadOnly, true, "List Guardian events"}},
+    {"get_guardian_rule_status", {ToolEffect::ReadOnly, true, "Get per-guard agent status"}},
+    {"get_guardian_device_guards", {ToolEffect::ReadOnly, true, "Get per-device all-guards view"}},
     {"list_dex_signals", {ToolEffect::ReadOnly, true, "List DEX signals"}},
     {"get_dex_signal_scope", {ToolEffect::ReadOnly, true, "Get DEX signal scope"}},
     {"get_dex_signal_detail", {ToolEffect::ReadOnly, true, "Get DEX signal detail"}},
@@ -3658,7 +3741,8 @@ McpServer::HandlerFn McpServer::build_handler(
     ApprovalManager* approval_manager, ScheduleEngine* schedule_engine, const bool& read_only_mode,
     const bool& mcp_disabled, DispatchFn dispatch_fn, CaStore* ca_store,
     PublishCrlFn publish_crl_fn, GuaranteedStateStore* guaranteed_state_store,
-    DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn, ResponseScopeFn response_scope_fn,
+    DexPerfFn dex_perf_fn, std::shared_ptr<const NetworkApi> network_api,
+    ResponseScopeFn response_scope_fn,
     SoftwareInventoryStore* software_inventory_store,
     yuzu::MetricsRegistry* metrics, AppPerfProviders app_perf_providers,
     QuarantineStore* quarantine_store, TagPushFn tag_push_fn,
@@ -8648,6 +8732,379 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
+            // ── Guardian read tools (#4037, api-parity #2146 Batch A) ──────
+            if (tool_name == "get_guardian_status") {
+                // require_list_read (ADR-0017) is the SOLE gate here,
+                // mirroring REST GET /guaranteed-state/status — it already
+                // replicates the MCP-tier ladder internally, so no separate
+                // tier_allows/perm_fn call (stacking either would be the
+                // same BLOCKING defect class require_fleet_read's own doc
+                // comment warns against).
+                if (!list_read_fn_) {
+                    spdlog::error("get_guardian_status: list_read_fn_ unwired — misconfigured "
+                                  "call site; failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto gate = list_read_fn_(req, res, "GuaranteedState", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the A4 error body + status.
+                if (!guaranteed_state_store) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Guaranteed State store unavailable"),
+                        "application/json");
+                    return;
+                }
+                // #4037: guardian_status_rollup (guardian_model.hpp) is the SAME function
+                // REST's GET /guaranteed-state/status calls — cannot drift on
+                // total_rules/errored_rules derivation by construction.
+                auto rollup = guardian_status_rollup(*guaranteed_state_store, gate.scope);
+                if (!rollup) {
+                    res.set_content(
+                        error_response(id, kInternalError, "guaranteed-state store degraded"),
+                        "application/json");
+                    return;
+                }
+                mcp_audit("success");
+                res.set_content(
+                    success_response(
+                        id, tool_result(JObj()
+                                             .add("total_rules", rollup->total_rules)
+                                             .add("compliant_rules", rollup->compliant_rules)
+                                             .add("drifted_rules", rollup->drifted_rules)
+                                             .add("errored_rules", rollup->errored_rules)
+                                             .str(),
+                                        kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "list_guardian_rules") {
+                if (!tier_allows(tier, "GuaranteedState", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                // Fleet-wide rule catalogue: no per-target shape to scope a
+                // service-scoped token's own service against (a Guard isn't
+                // owned by any one IT service) — same rationale as REST GET
+                // /guaranteed-state/rules's deny_fleet_wide_service_scoped.
+                if (deny_fleet_wide_service_scoped(
+                        "guaranteed_state.rule.read", "GuaranteedState",
+                        "fleet-wide Guaranteed State rule list denied to a service-scoped token "
+                        "(MCP list_guardian_rules)",
+                        "service-scoped tokens may not read the fleet-wide Guaranteed State "
+                        "rule catalogue"))
+                    return;
+                if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                    return;
+                if (!guaranteed_state_store) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Guaranteed State store unavailable"),
+                        "application/json");
+                    return;
+                }
+                auto rows = guaranteed_state_store->list_rules();
+                if (!rows) {
+                    res.set_content(
+                        error_response(id, kInternalError, "guaranteed-state store degraded"),
+                        "application/json");
+                    return;
+                }
+                // Mirrors rest_api_v1.cpp's rule_to_jobj field-for-field (GET
+                // /guaranteed-state/rules) — same GuaranteedStateRuleRow
+                // struct, same fields; no computation to share beyond the
+                // store call above (guardian_model.hpp's header comment).
+                JArr arr;
+                for (const auto& r : *rows) {
+                    arr.add(JObj()
+                                .add("rule_id", r.rule_id)
+                                .add("name", r.name)
+                                .add("yaml_source", r.yaml_source)
+                                .add("spec_json", r.spec_json)
+                                .add("version", static_cast<int64_t>(r.version))
+                                .add("enabled", r.enabled)
+                                .add("enforcement_mode", r.enforcement_mode)
+                                .add("severity", r.severity)
+                                .add("os_target", r.os_target)
+                                .add("scope_expr", r.scope_expr)
+                                .add("created_at", r.created_at)
+                                .add("updated_at", r.updated_at)
+                                .add("created_by", r.created_by)
+                                .add("updated_by", r.updated_by));
+                }
+                mcp_audit("success");
+                res.set_content(
+                    success_response(
+                        id, tool_result(JObj()
+                                             .raw("rules", arr.str())
+                                             .add("total", static_cast<int64_t>(rows->size()))
+                                             .str(),
+                                        kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "list_guardian_events") {
+                if (!tier_allows(tier, "GuaranteedState", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!guaranteed_state_store) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Guaranteed State store unavailable"),
+                        "application/json");
+                    return;
+                }
+                GuaranteedStateEventQuery q;
+                q.rule_id = param_str(args, "rule_id");
+                q.agent_id = param_str(args, "agent_id");
+                q.severity = param_str(args, "severity");
+                if (!q.agent_id.empty()) {
+                    // Same floor + control-character rejection as REST GET
+                    // /guaranteed-state/events (rest_api_v1.cpp).
+                    if (q.agent_id.size() > auth::kMaxAgentIdLength) {
+                        res.set_content(error_response(id, kInvalidParams, "agent_id is too long"),
+                                        "application/json");
+                        return;
+                    }
+                    bool has_control_char = false;
+                    for (unsigned char c : q.agent_id)
+                        if (c < 0x20) { has_control_char = true; break; }
+                    if (has_control_char) {
+                        res.set_content(
+                            error_response(id, kInvalidParams,
+                                          "agent_id contains control characters"),
+                            "application/json");
+                        return;
+                    }
+                }
+                if (!q.agent_id.empty()) {
+                    if (!scoped_perm_fn) {
+                        res.set_content(
+                            error_response(id, kInternalError, "scope gate not configured"),
+                            "application/json");
+                        return;
+                    }
+                    if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", q.agent_id))
+                        return;
+                } else {
+                    // #3238 (explicitly NOT this issue's job): the fleet-wide
+                    // branch shares the REST route's own confinement gap —
+                    // bare perm_fn behind a blanket service-scoped deny, not
+                    // a real per-caller filter. Kept identical deliberately,
+                    // not "fixed" here with a different MCP-only gate.
+                    if (deny_fleet_wide_service_scoped(
+                            "dex.device.view", "GuaranteedState",
+                            "fleet-wide Guaranteed State events denied to a service-scoped "
+                            "token (MCP list_guardian_events)",
+                            "service-scoped tokens may not read fleet-wide Guaranteed State "
+                            "events; supply agent_id"))
+                        return;
+                    if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                        return;
+                }
+                q.limit = std::clamp(param_int32(args, "limit", 100), 0, 1000);
+                q.offset = std::max(0, param_int32(args, "offset", 0));
+                const bool fleet = q.agent_id.empty();
+                // Behavioral-PII access audit — same verb/target shape as the
+                // REST twin (dex.device.view; target_type "Agent" per-device,
+                // "GuaranteedState" fleet-wide). MCP set-and-proceed posture:
+                // audit_persisted:false on a dropped row, never fail closed
+                // (unlike REST's 503-before-serve).
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "dex.device.view", "success",
+                    fleet ? "GuaranteedState" : "Agent", q.agent_id,
+                    "Guaranteed State events via MCP list_guardian_events");
+                auto rows = guaranteed_state_store->query_events(q);
+                JArr arr;
+                for (const auto& e : rows) {
+                    arr.add(JObj()
+                                .add("event_id", e.event_id)
+                                .add("rule_id", e.rule_id)
+                                .add("agent_id", e.agent_id)
+                                .add("event_type", e.event_type)
+                                .add("severity", e.severity)
+                                .add("guard_type", e.guard_type)
+                                .add("guard_category", e.guard_category)
+                                .add("detected_value", e.detected_value)
+                                .add("expected_value", e.expected_value)
+                                .add("detail_json", e.detail_json)
+                                .add("remediation_action", e.remediation_action)
+                                .add("remediation_success", e.remediation_success)
+                                .add("detection_latency_us",
+                                     static_cast<int64_t>(e.detection_latency_us))
+                                .add("remediation_latency_us",
+                                     static_cast<int64_t>(e.remediation_latency_us))
+                                .add("timestamp", e.timestamp));
+                }
+                JObj payload;
+                payload.raw("events", arr.str())
+                    .add("total", static_cast<int64_t>(rows.size()))
+                    .add("offset", static_cast<int64_t>(q.offset));
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
+                res.set_content(
+                    success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "get_guardian_rule_status") {
+                // require_list_read (ADR-0017) is the SOLE gate, mirroring
+                // the new REST GET /guaranteed-state/rules/{rule_id}/status
+                // route exactly — same reasoning as get_guardian_status above.
+                if (!list_read_fn_) {
+                    spdlog::error("get_guardian_rule_status: list_read_fn_ unwired — "
+                                  "misconfigured call site; failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto gate = list_read_fn_(req, res, "GuaranteedState", "Read");
+                if (!gate.admitted)
+                    return;
+                if (!guaranteed_state_store) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Guaranteed State store unavailable"),
+                        "application/json");
+                    return;
+                }
+                const std::string rule_id = param_str(args, "rule_id");
+                if (rule_id.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "rule_id is required"),
+                                    "application/json");
+                    return;
+                }
+                // get_rule is three-state (ADR-0038): found / genuinely
+                // absent / degraded — a degrade must error, never collapse
+                // into "not found".
+                auto row = guaranteed_state_store->get_rule(rule_id);
+                if (!row) {
+                    res.set_content(
+                        error_response(id, kInternalError, "guaranteed-state store degraded"),
+                        "application/json");
+                    return;
+                }
+                const bool found = static_cast<bool>(*row);
+                // Anti-enumeration audit-on-open — MCP set-and-proceed
+                // posture (never fail closed, unlike the REST twin's
+                // 503-before-404). target_type "GuaranteedState" matches
+                // this verb's established contract (guardian_routes.cpp's
+                // comment on why it must not collide with
+                // guardian.device.view's target_type=Agent convention).
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "guaranteed_state.rule.view",
+                    found ? "success" : "not_found", "GuaranteedState", rule_id,
+                    "per-guard fleet-wide agent-status drilldown via MCP");
+                if (!found) {
+                    res.set_content(error_response(id, kInvalidParams, "rule not found"),
+                                    "application/json");
+                    return;
+                }
+                auto rows = guardian_rule_agent_status_rows(*guaranteed_state_store, rule_id);
+                if (!rows) {
+                    res.set_content(
+                        error_response(id, kInternalError, "guaranteed-state store degraded"),
+                        "application/json");
+                    return;
+                }
+                JArr arr;
+                int64_t total = 0;
+                for (const auto& r : *rows) {
+                    // ADR-0017 INV-2/INV-3: gate.scope filters rows here in
+                    // C++ — agent_rule_statuses(rule_id) has no scope
+                    // parameter of its own (same shape as the REST twin).
+                    if (gate.scope &&
+                        std::find(gate.scope->begin(), gate.scope->end(), r.agent_id) ==
+                            gate.scope->end())
+                        continue;
+                    arr.add(JObj()
+                                .add("agent_id", r.agent_id)
+                                .add("state", r.state)
+                                .add("updated_at", r.updated_at));
+                    ++total;
+                }
+                JObj payload;
+                payload.add("rule_id", rule_id).raw("agents", arr.str()).add("total", total);
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
+                res.set_content(
+                    success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "get_guardian_device_guards") {
+                if (!tier_allows(tier, "GuaranteedState", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                const std::string agent_id = param_str(args, "agent_id");
+                if (agent_id.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "agent_id is required"),
+                                    "application/json");
+                    return;
+                }
+                if (agent_id.size() > auth::kMaxAgentIdLength) {
+                    res.set_content(error_response(id, kInvalidParams, "agent_id is too long"),
+                                    "application/json");
+                    return;
+                }
+                if (!scoped_perm_fn) {
+                    res.set_content(error_response(id, kInternalError, "scope gate not configured"),
+                                    "application/json");
+                    return;
+                }
+                if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
+                    return;
+                if (!guaranteed_state_store) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Guaranteed State store unavailable"),
+                        "application/json");
+                    return;
+                }
+                auto rows = guardian_device_all_guards(*guaranteed_state_store, agent_id);
+                // Behavioral-PII access audit — same verb/target as REST GET
+                // /guaranteed-state/agents/{agent_id}/rules and the
+                // dashboard Guardian device lens. MCP set-and-proceed
+                // posture (audit_persisted:false on a dropped row, never
+                // fail closed).
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "guardian.device.view", rows ? "success" : "failure", "Agent",
+                    agent_id, "per-device all-guards view via MCP");
+                if (!rows) {
+                    res.set_content(
+                        error_response(id, kInternalError, "guaranteed-state store degraded"),
+                        "application/json");
+                    return;
+                }
+                JArr arr;
+                for (const auto& r : *rows) {
+                    arr.add(JObj()
+                                .add("rule_id", r.rule_id)
+                                .add("name", r.name)
+                                .add("state", r.state)
+                                .add("updated_at", r.updated_at));
+                }
+                JObj payload;
+                payload.add("agent_id", agent_id)
+                    .raw("guards", arr.str())
+                    .add("total_guards", static_cast<int64_t>(rows->size()));
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
+                res.set_content(
+                    success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
             // ── DEX read tools (parity with /api/v1/dex/*; ar-S1) ─────────
             // Window token resolved via the shared dex_window_to_days /
             // dex_iso_since helpers so MCP, REST and the dashboard cannot drift
@@ -10032,8 +10489,9 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             // ── N1: network quality tools (parity with /api/v1/network/*) ──
-            // Same NetPerfFn provider the REST endpoints and /network fragments
-            // use — two surfaces, one read model. Cohort handling mirrors the
+            // Same NetworkApi (ADR-0031 WS-A4) the REST endpoints and /network
+            // fragments call — one instance, three surfaces, never disagreeing.
+            // Cohort handling mirrors the
             // FRAGMENT (empty `key` default, light length guard), NOT the DEX
             // tools' "model"/validate_key. Aggregate + device link-health
             // telemetry: only the generic mcp.<tool> audit.
@@ -10060,7 +10518,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
                     return;
-                if (!net_perf_fn) {
+                if (!network_api) {
                     res.set_content(
                         error_response(id, kInternalError, "Network perf provider unavailable"),
                         "application/json");
@@ -10083,7 +10541,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 // on the generic mcp.<tool> audit.
                 bool device_list_audit_ok = true;
                 if (tool_name == "get_network_fleet") {
-                    const auto now = net_perf_fleet_now(net_perf_fn(std::string{}));
+                    const auto now = network_api->fleet_now(std::string{});
+                    JArr keys;
+                    for (const auto& k : now.available_keys)
+                        keys.add(k);
                     payload = JObj()
                                   .raw("rtt_ms", stat_json(now.rtt))
                                   .raw("retrans_pct", stat_json(now.retrans))
@@ -10098,6 +10559,10 @@ McpServer::HandlerFn McpServer::build_handler(
                                            .add("also_app", now.cooc.also_app)
                                            .add("network_only", now.cooc.network_only)
                                            .str())
+                                  // ADR-0031 WS-A4 parity addition: mirrors the
+                                  // REST twin (GET /api/v1/network/fleet) and the
+                                  // dashboard fragment's cohort-key picker.
+                                  .raw("available_keys", keys.str())
                                   .str();
                 } else { // list_network_devices
                     const auto metric =
@@ -10127,10 +10592,15 @@ McpServer::HandlerFn McpServer::build_handler(
                     device_list_audit_ok = yuzu::server::detail::try_persist_audit(
                         audit_fn, req, "network.device.view", "success", "GuaranteedState", "",
                         "fleet-wide network device list via MCP list_network_devices");
+                    NetDeviceQuery q;
+                    q.metric = metric;
+                    q.not_reporting = not_reporting;
+                    q.cooc = cooc;
+                    q.cohort_key = cohort_key;
+                    q.cohort_filter = cohort_filter;
+                    q.limit = limit;
                     JArr arr;
-                    for (const auto& r : net_perf_device_list(net_perf_fn(cohort_key), metric,
-                                                              not_reporting, cooc, cohort_filter,
-                                                              limit)) {
+                    for (const auto& r : network_api->device_list(q)) {
                         JObj o;
                         o.add("agent_id", r.agent_id)
                             .add("platform", r.platform)
@@ -12626,13 +13096,13 @@ McpServer::HandlerFn McpServer::build_handler(
                     missing.add("DEX signal store");
                 if (!dex_perf_fn)
                     missing.add("DEX performance provider");
-                if (!net_perf_fn)
+                if (!network_api)
                     missing.add("network performance provider");
                 JArr next;
                 next.add("classify_operational_question")
                     .add("get_incident_playbook")
                     .add("summarize_working_set");
-                if (net_perf_fn)
+                if (network_api)
                     next.add("get_network_fleet");
                 if (guaranteed_state_store)
                     next.add("list_dex_signals");
@@ -12683,7 +13153,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                  .str())
                         .raw("network",
                              JObj()
-                                 .add("performance_available", static_cast<bool>(net_perf_fn))
+                                 .add("performance_available", static_cast<bool>(network_api))
                                  .str())
                         .raw("recommended_next_tools", next.str())
                         .str();
@@ -16397,7 +16867,8 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 const bool& mcp_disabled, DispatchFn dispatch_fn, CaStore* ca_store,
                                 PublishCrlFn publish_crl_fn,
                                 GuaranteedStateStore* guaranteed_state_store,
-                                DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn,
+                                DexPerfFn dex_perf_fn,
+                                std::shared_ptr<const NetworkApi> network_api,
                                 ResponseScopeFn response_scope_fn,
                                 SoftwareInventoryStore* software_inventory_store,
                                 yuzu::MetricsRegistry* metrics,
@@ -16424,7 +16895,7 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                     response_store, audit_store, tag_store, inventory_store, policy_store,
                     mgmt_store, approval_manager, schedule_engine, read_only_mode, mcp_disabled,
                     std::move(dispatch_fn), ca_store, std::move(publish_crl_fn),
-                    guaranteed_state_store, std::move(dex_perf_fn), std::move(net_perf_fn),
+                    guaranteed_state_store, std::move(dex_perf_fn), std::move(network_api),
                     std::move(response_scope_fn), software_inventory_store, metrics,
                     std::move(app_perf_providers), quarantine_store, std::move(tag_push_fn),
                     agent_registry, std::move(scoped_perm_fn), sessions, mcp_streaming_disabled,
@@ -16446,7 +16917,8 @@ void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                                 const bool& mcp_disabled, DispatchFn dispatch_fn, CaStore* ca_store,
                                 PublishCrlFn publish_crl_fn,
                                 GuaranteedStateStore* guaranteed_state_store,
-                                DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn,
+                                DexPerfFn dex_perf_fn,
+                                std::shared_ptr<const NetworkApi> network_api,
                                 ResponseScopeFn response_scope_fn,
                                 SoftwareInventoryStore* software_inventory_store,
                                 yuzu::MetricsRegistry* metrics,
@@ -16484,7 +16956,7 @@ void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                             mgmt_store, approval_manager, schedule_engine, read_only_mode,
                             mcp_disabled, std::move(dispatch_fn), ca_store,
                             std::move(publish_crl_fn), guaranteed_state_store,
-                            std::move(dex_perf_fn), std::move(net_perf_fn),
+                            std::move(dex_perf_fn), std::move(network_api),
                             std::move(response_scope_fn), software_inventory_store, metrics,
                             std::move(app_perf_providers), quarantine_store,
                             std::move(tag_push_fn), agent_registry, std::move(scoped_perm_fn),
