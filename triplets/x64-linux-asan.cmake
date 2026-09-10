@@ -11,15 +11,49 @@
 # read on an adjacent slot trips a spurious `use-after-poison` ASan
 # error before any Yuzu test runs. Issue around governance pipeline,
 # v0.12.0-rc /test sweep.
+#
+# VCPKG_LIBRARY_LINKAGE is STATIC (#4019, matching the stock x64-linux
+# triplet — see triplets/x64-linux.cmake in $VCPKG_ROOT). It was DYNAMIC
+# from this triplet's introduction (afd390475) through #4019; that
+# commit's rationale was entirely about the -fsanitize=... compile-flag
+# propagation below making abseil auto-detect
+# ABSL_HAVE_ADDRESS_SANITIZER, never about needing dynamic linkage
+# specifically, and flag propagation is orthogonal to linkage mode — the
+# flags below apply to a static archive exactly as they did to a .so
+# (proven in this repo already: the libpq carve-out that used to live
+# here forced static linkage for libpq alone and its sanitizer coverage
+# was never in question).
+#
+# Root cause fixed by going static: under dynamic linkage, protobuf/
+# grpc/re2/etc. each become separate .so images, and each independently
+# embeds abseil's hash-mixing internals (abseil ships static-archive-only
+# from vcpkg regardless of this triplet's linkage; grpc's own build also
+# vendors a private copy of some abseil internals into libgpr.so — see
+# nightly.yml's `ASAN_OPTIONS: detect_odr_violation=0`, already carrying
+# the `libgpr.so embeds a static copy of abseil's kToUpper` comment for
+# this exact class of split). `MixingHashState::kSeed` is self-referential
+# (derived from its own storage address), so each image's copy legitimately
+# differs — a protobuf::Map populated by one image's hash function and
+# queried by another's silently misses ~50% of the time. This is the same
+# shape as the pre-existing #501 cross-image hash-seed incident (see the
+# `guardian_dispatch_push_bytes_for_test` serialize-then-dispatch workaround
+# in tests/unit/test_guardian_engine.cpp), spilling wider because the
+# sanitizer triplets introduce MORE separate .so images than the stock
+# static triplet has. Static linkage collapses grpc/protobuf/re2/abseil
+# back into the same single image as the rest of the app, removing the
+# opportunity for a divergent copy.
 
 set(VCPKG_TARGET_ARCHITECTURE x64)
 set(VCPKG_CRT_LINKAGE dynamic)
-set(VCPKG_LIBRARY_LINKAGE dynamic)
+set(VCPKG_LIBRARY_LINKAGE static)
 set(VCPKG_CMAKE_SYSTEM_NAME Linux)
 
-# libpq (Postgres substrate, ADR-0006) must be STATIC even though the rest of the
-# sanitizer dep tree is dynamic — two reasons, both surfaced by the Big Tam cold
-# sanitizer build (the deps haven't been rebuilt from source since libpq landed):
+# libpq (Postgres substrate, ADR-0006): now redundant with the base
+# VCPKG_LIBRARY_LINKAGE above (both are `static`), kept only so libpq's
+# own linkage can't silently drift if the base setting ever changes again.
+# libpq specifically NEEDS static regardless of what the rest of the dep
+# tree uses — two reasons, both surfaced by the Big Tam cold sanitizer
+# build:
 #   1. meson.build's unix libpq block hard-requires the static
 #      libpgcommon.a/libpgport.a archives (scram/auth helpers) that ONLY the
 #      static build emits; a dynamic libpq.so has no standalone pgcommon → meson
@@ -28,9 +62,6 @@ set(VCPKG_CMAKE_SYSTEM_NAME Linux)
 #      symbols as "calling exit". vcpkg's libpq Makefile builds the .so only on
 #      the `all-shared-lib` path; the static path (`all-static-lib`) skips the .so
 #      and that check entirely.
-# Matches the stock x64-linux triplet (which is already static). The triplet's
-# -fsanitize flags still apply to the static archive, so sanitizer coverage
-# inside libpq is preserved.
 if(PORT STREQUAL "libpq")
     set(VCPKG_LIBRARY_LINKAGE static)
 endif()
