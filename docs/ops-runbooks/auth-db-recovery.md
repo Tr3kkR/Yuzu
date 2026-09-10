@@ -499,11 +499,18 @@ sudo systemctl restart yuzu-server
 - `docs/postgres-store-playbook.md` — store authoring contract
 - `docs/agent-privilege-model.md` — service accounts and sudoers
 - `docs/ops-runbooks/engine-principal-store-recovery.md` — `engine:` namespace
-- `docs/operations/disaster-recovery.md` — the full backup/restore procedure
-  this doc's "Post-restore verification" section and the corrected sessions
-  section (above) are cited from; run that doc's Restore Procedure first,
-  this page's checks second.
+- `docs/operations/disaster-recovery.md` — the full backup/restore
+  procedure this doc's "Post-restore verification" section is cited from.
+  **This file's own copy is the pre-fix version** (reverted to
+  `origin/dev` as part of a PO decision splitting DR-procedure fixes into
+  a separate branch/PR, `po/dr-procedure`) — run the corrected procedure
+  from that branch, not this checkout, before relying on this page's
+  checks as the second half of a real recovery.
 - `docs/ops-runbooks/restore-drill-2026-09.md` — an executed restore drill
-  (containerized rig) and, as of the attempt-3 addendum, the disaster-recovery.md
-  procedure exercised end-to-end on the same disposable project, with
-  measured timings and every defect found along the way.
+  (containerized rig) and, via its attempt-3 addendum, the PRE-FIX
+  `disaster-recovery.md` procedure exercised end-to-end on the same
+  disposable project — this is where the defects were found, not where
+  they were fixed (see that file's own branch-split note at the top).
+- `docs/ops-runbooks/dr-procedure-drill-2026-09.md` (on `po/dr-procedure`,
+  not this branch) — attempt 4, the corrected procedure exercised end to
+  end with every defect fixed and disclosed.

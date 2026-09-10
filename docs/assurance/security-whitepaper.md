@@ -297,13 +297,21 @@ Yuzu itself emits — verified present in the *scrape config*, not in
 end-to-end, ~23s of that mechanical** — the rest is a `stop_grace_period`
 wait, not backup/restore work) and, separately, against
 `docs/operations/disaster-recovery.md`'s native-install procedure (measured
-RTO 6m9s as actually run, ~3m40s projected for the now-corrected recipe) —
-both with a row-count/audit-chain integrity check post-restore, and the
-native-procedure run additionally found and fixed two real script/doc
-defects along the way (a `yuzu-backup.sh` manifest bug; a `pg_restore`
-ownership pitfall that can leave a database in a WORSE state than before
-the restore if followed incorrectly). Full transcripts, both drills:
-`docs/ops-runbooks/restore-drill-2026-09.md`. **Caveat carried from the
+RTO 6m9s as actually run) — both with a row-count/audit-chain integrity
+check post-restore, and the native-procedure run additionally **found**
+(not fixed in this change) two real script/doc defects along the way (a
+`yuzu-backup.sh` manifest bug; a `pg_restore` ownership pitfall that can
+leave a database in a WORSE state than before the restore if followed
+incorrectly), plus a further 26 findings on re-review. **The fix for all of
+these, and a fourth drill attempt validating the corrected procedure
+(~3m40s projected RTO), ships on a separate branch/PR (`po/dr-procedure`)
+— this document's own copy of `docs/operations/disaster-recovery.md` was
+reverted to `origin/dev` (pre-fix) as part of a PO decision to split the
+assurance-evidence and DR-procedure work into independently-reviewable
+PRs.** Full transcripts: `docs/ops-runbooks/restore-drill-2026-09.md`
+(attempts 1-3, this PR, evidence of the defects) and
+`docs/ops-runbooks/dr-procedure-drill-2026-09.md` (attempt 4, `po/dr-procedure`,
+the corrected procedure). **Caveat carried from the
 containerized drill:** its audit-chain integrity check verified the
 **legacy SQLite `audit.db`** chain, not the PostgreSQL `audit_store` schema
 (ADR-0040) — that drill's server image build predates the migration; see

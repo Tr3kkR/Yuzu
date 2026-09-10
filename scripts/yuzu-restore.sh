@@ -97,12 +97,11 @@ for db in "$BACKUP_DIR"/*.db "$BACKUP_DIR"/*.db-wal "$BACKUP_DIR"/*.db-shm; do
     green "  $(basename "$db") -> $DATA_DIR/"
 done
 
-# Restore configuration files (including yuzu-server.env, the systemd
-# EnvironmentFile — hp2-2: yuzu-backup.sh now captures it, restore must too)
+# Restore configuration files
 echo ""
 echo "--- Restoring configuration files ---"
 mkdir -p "$CONFIG_DIR"
-for cfg in "$BACKUP_DIR"/*.cfg "$BACKUP_DIR"/*.conf "$BACKUP_DIR"/*.env; do
+for cfg in "$BACKUP_DIR"/*.cfg "$BACKUP_DIR"/*.conf; do
     [[ -f "$cfg" ]] || continue
     cp "$cfg" "$CONFIG_DIR/"
     FILE_COUNT=$((FILE_COUNT + 1))

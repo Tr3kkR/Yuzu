@@ -1,5 +1,29 @@
 # Restore drill — 2026-09-07 / 2026-09-08
 
+> **Branch-split note (2026-09-10, PO decision).** This file's attempts 1-3
+> below are kept as **evidence** — they are what found the reference-header
+> defects (Gaps #2-4b) and the `docs/operations/disaster-recovery.md`
+> defects this file's own "Image note"/"Gaps found" sections describe. They
+> are **not** re-executed or corrected here. The corrected
+> `disaster-recovery.md` procedure, the corrected `scripts/yuzu-backup.sh`/
+> `yuzu-restore.sh`, and a new attempt-4 drill that executes the corrected
+> procedure end to end all live on a **separate branch/PR**,
+> `po/dr-procedure` (new file
+> `docs/ops-runbooks/dr-procedure-drill-2026-09.md` there). **Every
+> reference below to `docs/operations/disaster-recovery.md` describes the
+> PRE-FIX version of that document** — this file's own copy of that doc was
+> reverted to `origin/dev` as part of the branch split (this PR does not
+> ship a DR-procedure fix; that is `po/dr-procedure`'s job). Read
+> `po/dr-procedure`'s drill for the corrected procedure and its measured
+> timings; read this file for the evidence that a fix was needed.
+> Also disclosed here (governance C4-1/co3-1, found against attempt 3): the
+> "real MFA login" attempt 3's Image note does not mention as a
+> substitution — the login exercised was a plain single-factor password
+> login, MFA was never enrolled on the drill's admin account. Attempt 4 (on
+> `po/dr-procedure`) discloses this and every other substitution explicitly
+> in its own "Disclosed substitutions" section; treat that section, not
+> this note, as the template for what full disclosure looks like.
+
 Workstream D (Reliability), `docs/enterprise-readiness-soc2-first-customer.md`
 §3.4, Priority-1 backlog item "Execute first documented backup restore
 drill." This drill was **executed**, not simulated — every command below ran

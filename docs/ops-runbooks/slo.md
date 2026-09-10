@@ -285,7 +285,9 @@ does, for the UAT rig.
   retention alert family in detail.
 - `docs/user-manual/ha-postgres.md` — the separate, more specific RTO/RPO
   figures for the optional Patroni-managed HA-Postgres profile (failover
-  RTO ~15-40s, RPO=0 under `quorum3`). Those numbers describe the
+  RTO **~30-40 seconds** per that doc's own "What you get" section —
+  correction, governance arch2-3: a prior revision said "~15-40s" here,
+  which matched no source in this repo), RPO=0 under `quorum3`. Those numbers describe the
   **PostgreSQL substrate's own** failover; they are not a substitute for
   §5 above (the *server's* pool-level view of that substrate) or for §1
   (the server listener's own availability, which HA-Postgres does not

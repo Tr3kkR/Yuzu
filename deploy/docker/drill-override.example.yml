@@ -29,12 +29,29 @@
 # the server image version matters for which stores are Postgres-backed
 # vs. still-SQLite at that build. Point this at whatever postgres image tag
 # you have (`yuzu-postgres:local`, or a released `ghcr.io/tr3kkr/yuzu-postgres:X.Y.Z`).
+#
+# container_name overrides are NOT optional (governance UP2-6/ch3-rig,
+# BLOCKING — reproduced/escalated by three independent reviewers).
+# docker-compose.reference.yml hard-codes `container_name: yuzu-server` /
+# `container_name: yuzu-postgres`, and Compose does NOT project-prefix an
+# EXPLICIT container_name the way it prefixes volume and network names —
+# `-p yuzu-drill` alone namespaces the volumes/network only. Without the
+# overrides below, every `docker kill/rm/stop/exec/cp yuzu-server` in a
+# drill transcript addresses the GLOBAL container name — on a box that also
+# runs a real reference deployment (docker-compose.reference.yml, same
+# container names, no -p), the drill would kill/destroy/pg_restore against
+# THAT deployment instead of its own disposable one. Every drill command
+# must address containers via `docker compose -p yuzu-drill ... kill
+# <service>` (which resolves through Compose's own project/service mapping)
+# or via these literal namespaced names — never the bare global name.
 services:
   server:
+    container_name: yuzu-drill-server
     ports: !override
       - "18443:8443"
       - "18080:8080"
       - "61051:50051"
       - "61052:50052"
   postgres:
+    container_name: yuzu-drill-postgres
     image: yuzu-postgres:local

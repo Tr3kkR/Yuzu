@@ -107,34 +107,10 @@ for cfg_file in yuzu-server.cfg enrollment-tokens.cfg pending-agents.cfg; do
     fi
 done
 
-# yuzu-server.env — the systemd EnvironmentFile carrying YUZU_POSTGRES_DSN
-# (see docs/user-manual/server-admin.md "Backing up PostgreSQL state"). Not
-# a .cfg/.conf file so the globs above miss it; the restore procedure needs
-# it to reach the DSN used for the paired pg_dump/pg_restore steps.
-for env_dir in "$CONFIG_DIR" "$DATA_DIR"; do
-    if [[ -f "$env_dir/yuzu-server.env" ]] && [[ ! -f "$OUTPUT/yuzu-server.env" ]]; then
-        cp "$env_dir/yuzu-server.env" "$OUTPUT/"
-        FILE_COUNT=$((FILE_COUNT + 1))
-        green "  yuzu-server.env"
-    fi
-done
-
 # Generate SHA256 manifest
-#
-# BUG FIX (2026-09-10, governance-reproduced, UP2-2): writing directly via
-# `... > "$OUTPUT/SHA256SUMS"` opens/truncates that file BEFORE the `*` glob
-# inside the subshell expands — so the glob matches the now-existing
-# zero-byte SHA256SUMS, sha256sum hashes its own empty self, and the
-# manifest ships a self-referential entry that is wrong the instant the
-# real content is written (the same redirect that's about to fill it).
-# `yuzu-restore.sh`'s `sha256sum -c` then fails on that one entry: "backup
-# may be corrupted" on an otherwise-intact backup. Fix: compute into a
-# dotfile the glob does not match, then rename into place — no window where
-# the target name exists with wrong (empty) content while the glob runs.
 echo ""
 echo "--- Generating manifest ---"
-(cd "$OUTPUT" && sha256sum * 2>/dev/null || shasum -a 256 * 2>/dev/null) > "$OUTPUT/.SHA256SUMS.tmp"
-mv "$OUTPUT/.SHA256SUMS.tmp" "$OUTPUT/SHA256SUMS"
+(cd "$OUTPUT" && sha256sum * 2>/dev/null || shasum -a 256 * 2>/dev/null) > "$OUTPUT/SHA256SUMS"
 green "  SHA256SUMS"
 
 # Summary
