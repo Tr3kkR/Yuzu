@@ -70,6 +70,8 @@
  *   usage_clock_anomalies    -- cumulative, += per fold
  *   usage_lag_events         -- max(0, max_id - new hwm), snapshot as of last fold
  *   usage_last_fold_ts       -- epoch seconds of the last fold attempt (any outcome)
+ *   usage_expiry_declined_count -- cumulative count of ticks whose open-run
+ *                               expiry sweep declined for clock implausibility
  *   usage_gap_count          -- cumulative count of gap events detected
  *   usage_gap_lost_events    -- cumulative count of events lost to gaps
  *   usage_gap_last_ts        -- epoch seconds of the most recent gap
@@ -489,34 +491,53 @@ UsageFoldResult run_usage_fold(TarDatabase& db, int64_t now, int64_t max_events_
             // can wrongly close open runs at 0s duration, never delete
             // unbounded identity data -- the full clock-guarded-retention
             // seven-part machinery would be disproportionate here). Compare
-            // `now` against the persisted anchor from the LAST successful
-            // fold: a backward step, or a forward step wider than a generous
-            // number of fast ticks could plausibly have elapsed, means `now`
-            // itself is not trustworthy for an age comparison this tick --
-            // decline the expiry sweep only, not the whole fold (every other
-            // write below still commits).
+            // `now` against the persisted anchor from the LAST fold tick: a
+            // backward step, or a forward step wider than a generous number
+            // of fast ticks could plausibly have elapsed, means `now` itself
+            // is not trustworthy for an age comparison THIS tick -- decline
+            // the expiry sweep only, not the whole fold (every other write
+            // below still commits).
             constexpr int64_t kMaxPlausibleFoldGapSeconds = 86400; // 24h of missed ticks
-            // `read_config_i64_strict`, not `read_config_i64_locked` (adversarial
-            // review Wave 7 PR7.2b fix round 1) -- the latter's "0 on any
-            // fault" contract conflated a transient read failure with a
-            // legitimate first-ever-fold absence, both proceeding as
-            // "plausible" (TAR's own established convention, quoted in
-            // .claude/routed-concerns.md's clock-guard row, treats a missing
-            // stored reading as a DECLINE trigger in its own right).
+            // `read_config_i64_strict`, not `read_config_i64_locked` -- the
+            // latter's "0 on any fault" contract conflates a transient read
+            // failure with a legitimate first-ever-fold absence; both must
+            // decline THIS tick's sweep (TAR's own established convention,
+            // quoted in .claude/routed-concerns.md's clock-guard row, treats
+            // a missing stored reading as a decline trigger in its own
+            // right).
             //
-            // `advance_anchor` stays true (write `now` as the next tick's
-            // trusted anchor) in every case EXCEPT one: a REAL prior anchor
-            // that says `now` is untrustworthy. Absent and read-failed both
-            // still advance -- there is no prior value being overridden
-            // untrustworthily, and NOT advancing on "absent" would trap the
-            // guard in absent-forever (nothing else ever writes this key).
-            // Only a genuine clock-implausibility must refuse to let the
-            // rejected `now` become the next tick's trusted anchor -- that
-            // was the second half of this defect: one skewed tick used to
-            // permanently disarm the guard from then on.
+            // DELIBERATE (Wave 7 PR7.2b fix round 2, correcting fix round
+            // 1's own overcorrection): the anchor ADVANCES to `now` on
+            // EVERY tick below, including a declined one. Fix round 1 made
+            // it advance only on a plausible tick, which reads as the safer
+            // choice but is not: `usage_last_fold_ts` has exactly ONE writer
+            // in this whole file (below), so once one tick declines, every
+            // LATER tick compares `now` against that SAME frozen value --
+            // the gap only grows, since real time never runs backward -- and
+            // the sweep declines forever. An ordinary laptop closed over a
+            // weekend (a routine >24h gap, not an attack) permanently and
+            // silently disabled the 7-day open-run backstop for that device
+            // under fix round 1's logic, with no recovery short of direct
+            // `tar_config` surgery -- strictly worse than what it replaced.
+            // There is no LOCAL, clock-reading-only way to tell "the clock
+            // skipped once and is now stable-and-correct" (advancing is
+            // right) from "the clock skipped once and is now
+            // stable-but-still-wrong" (advancing is wrong) -- both produce
+            // an identical next reading, so no cleverer local heuristic
+            // closes this. Given that, and given the harm THIS guard bounds
+            // is already capped (kMaxOpenRuns, 0s-duration closes credited
+            // to `expired_runs`, never unbounded loss), unconditional
+            // advance is the chosen tradeoff: self-healing after ordinary
+            // sleep/wake within ~2 ticks is worth more than the narrow,
+            // un-closeable protection against a sustained-broken-clock's
+            // one-tick-delayed self-consistency. `usage_expiry_declined_count`
+            // (written below alongside the other cumulative counters) makes
+            // every decline countable on a fleet-status surface, so an
+            // operator can see how often this fires without the guard
+            // itself needing to become a one-way trap to be observable.
             const auto anchor = read_config_i64_strict(h, "usage_last_fold_ts");
             bool clock_plausible = false;
-            bool advance_anchor = true;
+            bool anchor_declined = false;
             if (!anchor.has_value()) {
                 spdlog::warn("TAR usage: declining this tick's open-run expiry sweep -- failed "
                             "to read the last-fold anchor ({}); re-anchoring to this tick's "
@@ -531,9 +552,11 @@ UsageFoldResult run_usage_fold(TarDatabase& db, int64_t now, int64_t max_events_
                 clock_plausible = now >= prior_fold_ts &&
                                   now - prior_fold_ts <= kMaxPlausibleFoldGapSeconds;
                 if (!clock_plausible) {
-                    advance_anchor = false;
+                    anchor_declined = true;
                     spdlog::warn("TAR usage: declining this tick's open-run expiry sweep -- "
-                                "`now` ({}) is implausible against the last fold's anchor ({})",
+                                "`now` ({}) is implausible against the last fold's anchor ({}); "
+                                "re-anchoring to this tick's clock so an ordinary sleep/wake "
+                                "self-heals within ~2 ticks",
                                 now, prior_fold_ts);
                 }
             }
@@ -616,8 +639,13 @@ UsageFoldResult run_usage_fold(TarDatabase& db, int64_t now, int64_t max_events_
                 return std::unexpected(h.error());
             if (!upsert_config("usage_lag_events", std::to_string(lag_events)))
                 return std::unexpected(h.error());
-            if (advance_anchor) {
-                if (!upsert_config("usage_last_fold_ts", std::to_string(now)))
+            // Unconditional -- see the comment above the anchor read for why
+            // a declined tick must still advance this.
+            if (!upsert_config("usage_last_fold_ts", std::to_string(now)))
+                return std::unexpected(h.error());
+            if (anchor_declined) {
+                const int64_t prior = read_config_i64_locked(h, "usage_expiry_declined_count");
+                if (!upsert_config("usage_expiry_declined_count", std::to_string(prior + 1)))
                     return std::unexpected(h.error());
             }
             if (state.unmatched_stops > 0) {

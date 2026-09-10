@@ -2504,6 +2504,8 @@ private:
                                      db_->get_config("usage_gap_lost_events", "0")));
         ctx.write_output(
             std::format("config|usage_gap_last_ts|{}", db_->get_config("usage_gap_last_ts", "-")));
+        ctx.write_output(std::format("config|usage_expiry_declined_count|{}",
+                                     db_->get_config("usage_expiry_declined_count", "0")));
         ctx.write_output(std::format("config|usage_coverage_since|{}",
                                      db_->get_config("usage_coverage_since", "-")));
         ctx.write_output(

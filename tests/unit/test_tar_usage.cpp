@@ -224,6 +224,38 @@ TEST_CASE("usage: fold_daily aggregates run_count/total_seconds by (day_ts, exe_
     CHECK(delta.superseded_runs == 1); // d
 }
 
+TEST_CASE("usage: fold_daily saturates instead of overflowing on an extreme start_ts, and a "
+          "SECOND extreme run in the same bucket saturates the accumulator too",
+          "[tar][usage][pure]") {
+    // Governance Gate 3 cpp-expert finding: apply_event's clamp guarantees
+    // end_ts >= start_ts (mathematical non-negativity), not int64_t
+    // representability -- a corrupt/adversarial process_live row with
+    // start_ts near INT64_MIN still overflowed the plain subtraction this
+    // file's own saturating_sub was added to prevent, at exactly the one
+    // call site that hardening pass missed.
+    ClosedRun extreme;
+    extreme.pid = 1;
+    extreme.exe_key = "corrupt.exe";
+    extreme.user = "u";
+    extreme.start_ts = std::numeric_limits<int64_t>::min() + 100;
+    extreme.end_ts = 1000; // ordinary epoch second -- duration is ~INT64_MAX
+    extreme.kind = ClosedRun::Kind::normal;
+
+    auto deltas = fold_daily({extreme});
+    REQUIRE(deltas.size() == 1);
+    CHECK(deltas[0].total_seconds == std::numeric_limits<int64_t>::max()); // saturated, not UB
+
+    // A second extreme run in the SAME (day_ts, exe_key) bucket: without its
+    // own saturating accumulation, `total_seconds += duration` would overflow
+    // AGAIN even though the first duration was already clamped to max().
+    ClosedRun extreme2 = extreme;
+    extreme2.pid = 2;
+    auto deltas2 = fold_daily({extreme, extreme2});
+    REQUIRE(deltas2.size() == 1);
+    CHECK(deltas2[0].total_seconds == std::numeric_limits<int64_t>::max()); // still saturated
+    CHECK(deltas2[0].run_count == 2); // both runs still counted, only the sum saturates
+}
+
 // =============================================================================
 // Lifecycle: usage_lifecycle_state, usage_set_enabled, usage_ensure_baselined
 // =============================================================================
@@ -568,13 +600,20 @@ TEST_CASE("usage: expire sweep declines when the anchor read fails, and still ad
           std::to_string(1000 + yuzu::tar::usage::kDefaultMaxAgeSeconds + 1)); // re-anchored
 }
 
-TEST_CASE("usage: a declined tick does NOT advance the anchor, so a later tick still declines "
-          "against the ORIGINAL good anchor rather than the rejected skewed one",
+TEST_CASE("usage: a declined tick DOES advance the anchor, so an ordinary sleep/wake gap "
+          "self-heals within ~2 ticks instead of freezing the guard forever",
           "[tar][usage][fold]") {
-    // The second half of Blocker 2: before the fix, usage_last_fold_ts was
-    // upserted unconditionally even on a declined tick, so one implausible
-    // `now` became the next tick's trusted anchor and permanently disarmed
-    // the guard for the rest of a sustained clock skew.
+    // Wave 7 PR7.2b fix round 2, correcting fix round 1's own overcorrection
+    // (governance Gate 4 happy-path finding): fix round 1 made
+    // usage_last_fold_ts advance ONLY on a plausible tick. Since this key
+    // has exactly one writer in the whole file, that meant ANY single
+    // declined tick froze the anchor permanently -- every later tick
+    // compared against the same stale value, the gap only grew, and the
+    // guard declined forever. An ordinary laptop closed over a weekend hit
+    // this on the very first wake tick. This test proves the corrected
+    // behavior: the anchor advances even on a declined tick, so the NEXT
+    // tick (a normal small gap relative to the just-advanced anchor) looks
+    // plausible again and the sweep resumes.
     auto t = make_test_db();
     REQUIRE(usage_ensure_baselined(t.db, 1000).has_value());
     seed_process_pair(t.db, 1, "old.exe", 1500, -1); // stays open across every tick below
@@ -583,20 +622,51 @@ TEST_CASE("usage: a declined tick does NOT advance the anchor, so a later tick s
     auto fold1 = run_usage_fold(t.db, /*now=*/2000);
     REQUIRE(fold1.ok);
     CHECK(cfg(t.db, "usage_last_fold_ts") == "2000");
+    CHECK(cfg(t.db, "usage_expiry_declined_count") == ""); // never written -- no decline yet
 
-    // Tick 2: a huge forward clock jump (> kMaxPlausibleFoldGapSeconds=86400
-    // past the real anchor) -- must decline AND must not advance the anchor.
-    auto fold2 = run_usage_fold(t.db, /*now=*/2000 + 100000);
+    // Tick 2: a huge forward clock jump (device slept > kMaxPlausibleFoldGapSeconds
+    // = 86400s) -- must decline THIS tick's sweep (the run must not be
+    // wrongly force-closed against an untrustworthy `now`) but the anchor
+    // MUST still advance, and the decline must be counted.
+    const int64_t wake_now = 2000 + 700000; // > 8 days "asleep"
+    auto fold2 = run_usage_fold(t.db, wake_now);
     REQUIRE(fold2.ok);
-    CHECK(cfg(t.db, "usage_last_fold_ts") == "2000"); // unchanged -- the core fix
-    CHECK(count_rows(t.db, "usage_live") == 1);       // run 1 still open, not expired
+    CHECK(cfg(t.db, "usage_last_fold_ts") == std::to_string(wake_now)); // advanced -- the fix
+    CHECK(count_rows(t.db, "usage_live") == 1); // run 1 still open, not wrongly expired
+    CHECK(cfg(t.db, "usage_expiry_declined_count") == "1");
 
-    // Tick 3: `now` that would look plausible against tick 2's SKEWED value
-    // (gap ~500s) but is still >86400 past the real anchor from tick 1 -- if
-    // the bug were present, this tick would wrongly proceed and expire the
-    // run (it is well past kDefaultMaxAgeSeconds by now); the fix must keep
-    // declining against the un-advanced, honest anchor.
-    auto fold3 = run_usage_fold(t.db, /*now=*/2000 + 100000 + 500);
+    // Tick 3: a normal small gap (500s) relative to tick 2's just-advanced
+    // anchor -- must be judged plausible and resume the sweep. The run
+    // (started at ts=1500) is now genuinely older than kDefaultMaxAgeSeconds
+    // (7 days) measured against the real clock, so a correctly-healed guard
+    // expires it; a still-frozen guard (the round-1 bug) would keep
+    // declining forever and this run would never expire.
+    const int64_t healed_now = wake_now + 500;
+    auto fold3 = run_usage_fold(t.db, healed_now);
     REQUIRE(fold3.ok);
-    CHECK(count_rows(t.db, "usage_live") == 1); // STILL open -- guard never healed to the skew
+    REQUIRE(healed_now - 1500 > yuzu::tar::usage::kDefaultMaxAgeSeconds); // sanity: old enough
+    CHECK(count_rows(t.db, "usage_live") == 0);  // expired -- the guard self-healed
+    CHECK(cfg(t.db, "usage_last_fold_ts") == std::to_string(healed_now));
+    CHECK(cfg(t.db, "usage_expiry_declined_count") == "1"); // unchanged -- tick 3 didn't decline
+}
+
+TEST_CASE("usage: a sustained bad clock still declines on its OWN first implausible tick "
+          "(the protection this guard was actually built for is unchanged)",
+          "[tar][usage][fold]") {
+    // Unconditional anchor advancement (the fix above) does not weaken the
+    // guard's per-tick decision -- it only stops a single decline from
+    // becoming permanent. A clock that is wrong on tick N is still
+    // correctly declined on tick N, every time it happens.
+    auto t = make_test_db();
+    REQUIRE(usage_ensure_baselined(t.db, 1000).has_value());
+    seed_process_pair(t.db, 1, "old.exe", 1500, -1);
+
+    auto fold1 = run_usage_fold(t.db, /*now=*/2000);
+    REQUIRE(fold1.ok);
+
+    // A backward clock step is exactly as implausible as a huge forward one.
+    auto fold2 = run_usage_fold(t.db, /*now=*/1500);
+    REQUIRE(fold2.ok);
+    CHECK(count_rows(t.db, "usage_live") == 1); // declined -- not wrongly force-closed
+    CHECK(cfg(t.db, "usage_expiry_declined_count") == "1");
 }

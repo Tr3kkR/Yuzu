@@ -198,6 +198,19 @@ constexpr size_t kMaxOpenRuns = 20000;
     return a - b;
 }
 
+/// `a + b` for two values a caller guarantees are non-negative (fold_daily's
+/// durations and its accumulating total_seconds never go negative), saturating
+/// at INT64_MAX instead of invoking UB on overflow. governance Gate 3
+/// cpp-expert finding: a single saturating_sub on the duration only protects
+/// the FIRST extreme value in a bucket -- a SECOND extreme value accumulating
+/// into an already-large total_seconds can overflow the `+=` itself even
+/// though neither operand alone was out of range at the point it was computed.
+[[nodiscard]] constexpr int64_t saturating_add_nonneg(int64_t a, int64_t b) noexcept {
+    if (a > std::numeric_limits<int64_t>::max() - b)
+        return std::numeric_limits<int64_t>::max();
+    return a + b;
+}
+
 /// Floor-toward-negative-infinity bucketing of `ts` into a UTC day boundary,
 /// without ever negating `ts` directly -- negating INT64_MIN overflows
 /// (adversarial review, Wave 7 PR7.2), which the previous
@@ -387,9 +400,17 @@ struct DailyDelta {
             d.first_seen = r.start_ts;
             d.last_seen = r.start_ts;
         }
-        const int64_t duration = r.end_ts - r.start_ts; // already clamped >= 0 by apply_event
+        // Non-negative by apply_event's clamp, but NOT representability-safe:
+        // an extreme start_ts (e.g. INT64_MIN from a corrupt process_live
+        // row) still overflows a plain subtraction (governance Gate 3
+        // cpp-expert finding -- this file's own saturating_sub was added for
+        // exactly this threat model and missed this call site). The
+        // accumulator needs its own saturating add too, since a second
+        // extreme value in the same (day_ts, exe_key) bucket can re-overflow
+        // even after the first one already saturated.
+        const int64_t duration = saturating_sub(r.end_ts, r.start_ts);
         ++d.run_count;
-        d.total_seconds += duration;
+        d.total_seconds = saturating_add_nonneg(d.total_seconds, duration);
         d.first_seen = std::min(d.first_seen, r.start_ts);
         d.last_seen = std::max(d.last_seen, r.start_ts);
         if (r.kind == ClosedRun::Kind::superseded)
