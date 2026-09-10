@@ -12,12 +12,31 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
      then diff against the tables below. **`stateReason` is load-bearing, not optional**: a `state`-only
      pull cannot distinguish a genuinely-delivered `COMPLETED` closure from a `NOT_PLANNED` backlog-reset
      closure (2026-07-14 closed 11 issues NOT_PLANNED — #252, #263–#268, #283, #286, #292, #552 — none of
-     which are "delivered" by the closure alone). Status vocabulary: **Done** = closed COMPLETED, or
-     closed NOT_PLANNED *with* a cited delivery-evidence path/ADR (the thing shipped differently from how
-     the issue described it); **Closed — not planned** = closed NOT_PLANNED with no delivery evidence (a
-     real decision not to build it); **Open** = still open; **Deferred** = open but explicitly re-scoped
-     pending a decision (see Phase 9). Verify each NOT_PLANNED row's delivery claim by `grep`/`ls` against
-     the cited files — do not infer delivery from the closure alone.
+     which are "delivered" by the closure alone).
+
+     **Status vocabulary — a counting contract, not prose.** Every Index row's Status cell MUST begin
+     (after stripping any leading `**`/`__` markdown emphasis) with EXACTLY one of these 5 literal
+     strings; everything after an em dash (—) or opening paren is free-text annotation the counting rule
+     ignores:
+       - `Done` — closed COMPLETED, or closed NOT_PLANNED *with* a cited delivery-evidence path/ADR (the
+         thing shipped differently from how the issue described it, or shipped with a small non-blocking
+         gap called out in the annotation — a genuinely unshipped major capability is `Partial`, not `Done`).
+       - `Partial` — real delivery exists but a materially advertised capability of the issue does not
+         work end-to-end (e.g. records+audits with no working dispatch path).
+       - `Closed — not planned` — closed NOT_PLANNED with NO delivery evidence (a real decision not to
+         build it, distinct from `Done`-via-NOT_PLANNED above).
+       - `Open` — still open on GitHub, including "in progress" work (a PR ladder or partial soak does not
+         promote an open issue to `Done`/`Partial` — put the detail in the free-text annotation instead).
+       - `Deferred` — open but explicitly re-scoped pending a decision (see Phase 9 banner) — distinct from
+         plain `Open` (no decision is pending on a plain-`Open` row, just unstarted work).
+     **Counting rule:** `Done` counts toward the rollup's Done column; `Partial`/`Open`/`Deferred`/
+     `Closed — not planned` all count toward Open. No other literal, no synonym (`Shipped`, `Largely
+     shipped`, `In progress`, `Resolved`, etc.), and no special-casing in the parser — if a row needs a
+     different verdict, change the row's leading literal, not the parser. Verify each NOT_PLANNED row's
+     delivery claim by `grep`/`ls` against the cited files — do not infer delivery from the closure alone.
+     A reference parser implementing exactly this rule: strip each Index row's Status cell of leading
+     `**`/`__`, match `^(Done|Partial|Closed — not planned|Open|Deferred)\b`, sum `Done` vs everything
+     else per phase. No table of synonyms, no regex alternation beyond the 5 literals above.
      Cross-check "Recommended Execution Order" / "Delivered outside the roadmap" claims with
      `gh pr list --state open --search <term>` and `grep`/`ls` against the cited files — never restate
      status from memory of a prior version of this doc. -->
@@ -108,7 +127,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 9.5 | [#260](https://github.com/Tr3kkR/Yuzu/issues/260) | ServiceNow Connector | **Deferred** — see Phase 9 body note |
 | | 9.6 | [#261](https://github.com/Tr3kkR/Yuzu/issues/261) | WSUS Connector | **Deferred** — see Phase 9 body note |
 | | 9.7 | [#262](https://github.com/Tr3kkR/Yuzu/issues/262) | CSV / File Upload Connector | **Deferred** — see Phase 9 body note |
-| | 9.8 | [#263](https://github.com/Tr3kkR/Yuzu/issues/263) | Inventory Consolidation & Normalization | **Closed — not planned** (NOT_PLANNED, 2026-07-14) — no dedup/normalization code found, see body note |
+| | 9.8 | [#263](https://github.com/Tr3kkR/Yuzu/issues/263) | Inventory Consolidation & Normalization | **Closed — not planned** (NOT_PLANNED, 2026-07-14) — consolidation/dedup absent; normalization primitives exist (`product_normalize.cpp`) but no cross-source consolidation, see body note |
 | **10** | 10.1 | [#264](https://github.com/Tr3kkR/Yuzu/issues/264) | Software Catalog Store | **Done** (NOT_PLANNED, 2026-07-14, delivered differently: ADR-0024 keeps the product registry permanently server-resident core, shipped as `ProductRegistryStore`) |
 | | 10.2 | [#265](https://github.com/Tr3kkR/Yuzu/issues/265) | Software Usage Tracking | **Closed — not planned** (NOT_PLANNED, 2026-07-14) — ADR-0024 places usage metering/reclamation in the **SAM UCE module** (Decision D15, distinct from ADR-1005's vulnerability UCE); no agent usage-sync source exists in-server |
 | | 10.3 | [#266](https://github.com/Tr3kkR/Yuzu/issues/266) | License Entitlements & Compliance | **Closed — not planned** (NOT_PLANNED, 2026-07-14) — ADR-0024 places the entitlement plane in the **SAM UCE module** (Decision D12, distinct from ADR-1005's vulnerability UCE); not built in-server |
@@ -141,15 +160,15 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 14.4 | [#293](https://github.com/Tr3kkR/Yuzu/issues/293) | vCenter Connector | Open |
 | | 14.5 | [#294](https://github.com/Tr3kkR/Yuzu/issues/294) | Additional Connectors (BigFix, O365, Oracle) | Open |
 | | 14.6 | [#295](https://github.com/Tr3kkR/Yuzu/issues/295) | High Availability | Open (stale — superseded by ADR-2002, see body note) |
-| **15** | 15.A | [#547](https://github.com/Tr3kkR/Yuzu/issues/547) | TAR dashboard page shell + retention-paused source list | **Shipped** (paused_at + status extension + dashboard page + Scan + Re-enable + typed-confirmation Purge) |
-| | 15.B | [#548](https://github.com/Tr3kkR/Yuzu/issues/548) | Result-set store + REST API (composable scope, the differentiator) | **Shipped** (closed 2026-07-04) |
-| | 15.C | [#549](https://github.com/Tr3kkR/Yuzu/issues/549) | Scope-engine `from_result_set:` + dashboard chip + sidebar + breadcrumb | **Shipped** (closed 2026-07-04) |
-| | 15.D | [#550](https://github.com/Tr3kkR/Yuzu/issues/550) | TAR SQL frame: relocate, scope-walking-aware, "save as result set" | **Shipped** (closed 2026-07-04) |
-| | 15.E | [#551](https://github.com/Tr3kkR/Yuzu/issues/551) | YAML DSL `fromResultSet:` + `definition_store` validation + spec amendment | **Shipped** (closed 2026-07-04) |
+| **15** | 15.A | [#547](https://github.com/Tr3kkR/Yuzu/issues/547) | TAR dashboard page shell + retention-paused source list | **Done** (paused_at + status extension + dashboard page + Scan + Re-enable + typed-confirmation Purge) |
+| | 15.B | [#548](https://github.com/Tr3kkR/Yuzu/issues/548) | Result-set store + REST API (composable scope, the differentiator) | **Done** (closed 2026-07-04) |
+| | 15.C | [#549](https://github.com/Tr3kkR/Yuzu/issues/549) | Scope-engine `from_result_set:` + dashboard chip + sidebar + breadcrumb | **Done** (closed 2026-07-04) |
+| | 15.D | [#550](https://github.com/Tr3kkR/Yuzu/issues/550) | TAR SQL frame: relocate, scope-walking-aware, "save as result set" | **Done** (closed 2026-07-04) |
+| | 15.E | [#551](https://github.com/Tr3kkR/Yuzu/issues/551) | YAML DSL `fromResultSet:` + `definition_store` validation + spec amendment | **Done** (closed 2026-07-04) |
 | | 15.F | [#552](https://github.com/Tr3kkR/Yuzu/issues/552) | Reference walkthrough integration test (Chrome IR end-to-end) | **Done** (NOT_PLANNED, 2026-07-14, delivered differently: an in-process Catch2 test, `tests/unit/server/test_chrome_ir_chain.cpp`, not the originally-scoped scripted UAT variant, see body) |
-| | 15.G | [#553](https://github.com/Tr3kkR/Yuzu/issues/553) | Operational hardening — live re-eval, GC sweep, Prometheus + audit polish | **Largely shipped** (closed 2026-07-04) — `yuzu_result_set_resolve_seconds` histogram + audit-polish pass still outstanding, see body |
-| | 15.H | [#554](https://github.com/Tr3kkR/Yuzu/issues/554) | TAR process tree viewer | **Shipped** 2026-06-18 (as-built: local-TAR-data-only reconstruction, no seed; `docs/tar-dashboard.md` §5). REST/MCP parity deferred. |
-| **16** | 16.A | [#555](https://github.com/Tr3kkR/Yuzu/issues/555) | System Guardian — Windows-first delivery (PRs 1-15 per implementation plan) | **In progress** — Spark engine rungs 1-7+, `GuardianEngine`, `BaselineStore`, `/guaranteed-state` UI shipped; Spark is wired (`agent.cpp:1255`) but inert by default — `prefer_spark_=false`, legacy `IGuard` remains the sole live enforcement path; 59 merged guardian PRs (issue itself still open — no sub-checklist tracks the PR ladder) |
+| | 15.G | [#553](https://github.com/Tr3kkR/Yuzu/issues/553) | Operational hardening — live re-eval, GC sweep, Prometheus + audit polish | **Done** (closed 2026-07-04) — `yuzu_result_set_resolve_seconds` histogram + audit-polish pass still outstanding (minor, non-blocking), see body |
+| | 15.H | [#554](https://github.com/Tr3kkR/Yuzu/issues/554) | TAR process tree viewer | **Done** 2026-06-18 (as-built: local-TAR-data-only reconstruction, no seed; `docs/tar-dashboard.md` §5). REST/MCP parity deferred. |
+| **16** | 16.A | [#555](https://github.com/Tr3kkR/Yuzu/issues/555) | System Guardian — Windows-first delivery (PRs 1-15 per implementation plan) | Open — in progress: Spark engine rungs 1-7+, `GuardianEngine`, `BaselineStore`, `/guaranteed-state` UI shipped; Spark is wired (`agent.cpp:1255`) but inert by default — `prefer_spark_=false`, legacy `IGuard` remains the sole live enforcement path; 59 merged guardian PRs (issue itself still open — no sub-checklist tracks the PR ladder) |
 | | 16.B | [#556](https://github.com/Tr3kkR/Yuzu/issues/556) | System Guardian — Linux delivery (inotify, netlink, D-Bus, audit, sysctl) | Open — **started early** (`guard_systemd.cpp` exists) ahead of the stated 16.A-soak gate, see body note |
 | | 16.C | [#557](https://github.com/Tr3kkR/Yuzu/issues/557) | System Guardian — macOS delivery (Endpoint Security, fseventsd, launchd) | Open (gated on 16.A + 16.B soak + ES entitlement) |
 
@@ -1066,6 +1085,8 @@ REST: `GET/POST/DELETE /api/v1/offload-targets`, `GET /api/v1/offload-targets/{i
 > Consolidation & Normalization, #263) closed NOT_PLANNED with no delivery (see its own
 > **Closed — not planned** status) and is unaffected by this deferral either way.
 
+The 9.x sketches predate ADR-0006; any future implementation is Postgres-native (ADR-0012), never SQLite.
+
 ### Issue 9.1: Connector Framework (Core)
 **Capability:** new | **Scope:** Server | **Status:** Deferred (see banner above)
 
@@ -1163,7 +1184,7 @@ Import inventory data from structured files:
 **Files:** New `server/core/src/connectors/file_upload_connector.cpp`
 
 ### Issue 9.8: Inventory Consolidation & Normalization
-**Capability:** new | **Scope:** Server | **Status:** **Closed — not planned** (#263 closed NOT_PLANNED, 2026-07-14) — **not delivered**: `server/core/src/software_catalog_rollup.{hpp,cpp}` exists but contains no deduplication, title/vendor normalization, or consolidation-reporting logic (verified 2026-09-07); it is a rollup view, not the cleanup pipeline sketched below
+**Capability:** new | **Scope:** Server | **Status:** **Closed — not planned** (#263 closed NOT_PLANNED, 2026-07-14) — **not delivered as this issue's cleanup pipeline**: consolidation/dedup absent — `server/core/src/software_catalog_rollup.{hpp,cpp}` is a rollup view, not a cross-source consolidation pipeline, and contains no deduplication or consolidation-reporting logic. Normalization primitives *do* exist, just not in service of this issue's scope: `server/core/src/product_normalize.{hpp,cpp}` is deterministic title/vendor normalization for the ADR-0024 SLE catalog matcher (Decision 6), not the multi-source cross-connector consolidation this issue sketched (verified 2026-09-10)
 **Depends on:** 9.2 (moot — 9.1–9.7 are deferred, see Phase 9 banner, and 9.8 was closed not-planned rather than shipped)
 
 Multi-source inventory cleanup pipeline (never built):
@@ -1920,9 +1941,9 @@ These capabilities are tracked but not yet scheduled. Each will become a GitHub 
 ## Dependency Graph
 
 ```
-Phase 0–7 (All Done)
-  └── Foundation → Data Infrastructure → Instruction System → Security/RBAC
-      → Agent Infrastructure → Policy Engine → Windows Depth → Scale & Integration
+Phase 0–7 (substantially done; 2 items Partial, not Done — see below)
+  └── Foundation → Data Infrastructure → Instruction System (2.9 Partial) → Security/RBAC
+      → Agent Infrastructure → Policy Engine → Windows Depth → Scale & Integration (7.8 Partial)
 
 Phase 8 (Visualization & Response Experience)
   ├── 8.1 Visualization Engine ── builds on ResponseStore + InstructionStore
@@ -1933,9 +1954,11 @@ Phase 9 (Connector Framework) — DEFERRED, see Phase 9 body banner
   ├── 9.1 Connector Core ──────── independent (new subsystem) — not started
   ├── 9.2 Repository Model ────── requires 9.1 — not started
   ├── 9.3–9.7 Connectors ─────── require 9.1 (all independent of each other) — not started
-  └── 9.8 Consolidation ──────── requires 9.2 — CLOSED — NOT PLANNED (#263, no delivery): no dedup/
-                                    normalization code exists; `software_catalog_rollup.{hpp,cpp}` is a
-                                    separate, narrower rollup that does not substitute for this scope
+  └── 9.8 Consolidation ──────── requires 9.2 — CLOSED — NOT PLANNED (#263, no delivery): consolidation/
+                                    dedup absent; normalization primitives exist (`product_normalize.cpp`,
+                                    ADR-0024's SLE catalog matcher) but no cross-source consolidation;
+                                    `software_catalog_rollup.{hpp,cpp}` is a separate, narrower rollup
+                                    that does not substitute for this scope
 
 Phase 10 (Software Catalog) — PARTIALLY DONE under ADR-0024 "Software Licensing & Entitlements" (SLE);
   NOT fully shipped — only 10.1 delivered in-server, 10.2–10.4 closed NOT_PLANNED with no delivery
@@ -1978,7 +2001,9 @@ Phase 14 (Scale & Enterprise)
   └── 14.6 High Availability ──── SUPERSEDED by ADR-2002 below — see the HA block
 
 Cross-phase dependencies:
-  Phase 10 ──→ Phase 9.8 (catalog needs normalized inventory) — both done, ships as the ADR-0024 SLE program
+  Phase 10 ──→ Phase 9.8 (catalog needs normalized inventory, as originally scoped) — the dependency
+    itself is now moot: Phase 10 is Partial (only 10.1 Done in-server, see Phase 10 note) and 9.8 is
+    Closed — not planned (no consolidation code shipped); 10.1 did not in fact need 9.8
   Phase 13.2 ──→ Phase 7.14 (chains extend workflows) — done
   Phase 14.4–14.5 ──→ Phase 9.1 (connectors need framework) — both blocked on the deferred Phase 9
 
@@ -2034,15 +2059,20 @@ High Availability (ADR-2002, `docs/ha-delivery-matrix.md`) — supersedes Phase 
   └── Phase C (enable/validate/operate: WS-9, WS-11, WS-12, WS-14) ── not started
 
 Route-sink refactor (#2542) — cross-cutting, ongoing
+  [as of dev @ `d295db964`, verified by ancestry, not `gh pr view` state]
   └── extracts remaining route owners onto HttpRouteSink for testability, across Phases 3-14's REST
-      surfaces; PR #4083 (custom-properties) open, PR #4057 (dashboard/nvd) merged into d295db964
+      surfaces; PR #4083 (custom-properties) merged 2026-09-07 14:29 UTC — AFTER the pin, NOT an
+      ancestor of `d295db964`; PR #4057 (dashboard/nvd) IS an ancestor — it is in fact `d295db964`
+      itself (#4057's merge commit sha == the pin sha)
 ```
 
 ---
 
 ## Recommended Execution Order
 
-Phases 0–8 and 15 are complete; Phase 10 is 25% delivered in-server (10.1 only — see Phase 10 note).
+Phases 0, 1, 3, 4, 5, 6, 8, and 15 are complete (all-Done). Phase 2 and Phase 7 are 92%/95% Done
+respectively — each has exactly one Partial item (2.9 concurrency, 7.8 patch deployment; see the Index
+for both). Phase 10 is 25% delivered in-server (10.1 only — see Phase 10 note).
 Phase 9 is demoted (deferred pending an owner placement decision, not an ADR-1005 consequence — see
 Phase 9 body banner — no longer the #2 slot it held since 2026-03). The order below leads with the fronts the commit log and
 open-PR list show as currently active, then works through the remaining backlog phases. PR and
@@ -2066,10 +2096,13 @@ before acting on any "open" / "in progress" claim:
    wired, no runtime change) — the rest of Phase B (WS-3 3.2/3.3/3.4, WS-4, WS-5, WS-6, WS-8-readyz,
    WS-13) plus all of WS-10 remain the gate for a 2nd server replica. `docs/ha-delivery-matrix.md` at
    the pin agrees (WS-2a-2 outstanding / WS-3 planned / WS-10 planned there too) — the matrix's own
-   re-stamp for WS-2a-2 and WS-3 together (`a38fe5dac`) landed on `dev` 2026-09-06 19:14 UTC+1, and
-   WS-10's docs update ships inside PR #4092 itself (merged 2026-09-07 12:58 UTC) — both **after**
-   this pin, so the matrix and this roadmap should converge once `dev` moves past them; the roadmap
-   here follows verified ancestry, not the matrix file's stamp date or `gh pr view`'s live state. See
+   re-stamp for WS-2a-2 and WS-3 (`a38fe5dac`, committed 2026-09-06 19:14 UTC+1 on a sibling lineage)
+   first reached `dev` via merge `a27f179e3` on 2026-09-07 13:44 UTC+1 — after this pin, so it is not
+   an ancestor of `d295db964`; the matrix visible at the pin therefore still shows the pre-re-stamp
+   state. WS-10's docs update ships inside PR #4092 itself (merged 2026-09-07 12:58 UTC) — likewise
+   **after** this pin, so the matrix and this roadmap should converge once `dev` moves past them; the
+   roadmap here follows verified ancestry, not the matrix file's stamp date or `gh pr view`'s live
+   state. See
    `docs/ha-delivery-matrix.md`; re-verify before acting — this cluster of PRs merged within a 4-day
    window straddling the pin (#3924 2026-09-03, #4011 2026-09-06, #4092 2026-09-07 12:58 — the pin
    itself is 2026-09-07 11:01, between #4011 and #4092).
@@ -2079,8 +2112,10 @@ before acting on any "open" / "in progress" claim:
    accept and drop the gate, or pause 16.B. 16.C macOS remains blocked on the Endpoint Security
    entitlement.
 4. **Route-sink refactor (#2542).** Ongoing cross-cutting hygiene (8 route owners moving onto
-   `HttpRouteSink` for testability) — rides along with other phase work rather than blocking it;
-   PR #4083 (custom-properties) open, PR #4057 (dashboard/nvd) merged into d295db964.
+   `HttpRouteSink` for testability) — rides along with other phase work rather than blocking it. As of
+   dev @ `d295db964`, verified by ancestry: PR #4083 (custom-properties) merged 2026-09-07 14:29 UTC,
+   **after** the pin — not an ancestor, so it was still open at the pin; PR #4057 (dashboard/nvd) is an
+   ancestor — it is `d295db964` itself.
 5. **Phase 12** — Remaining agent capabilities (closes capability map further; no blockers;
    parallelizable). 12.1 and 12.8 already shipped.
 6. **Phase 11** — Consumer model & SDKs (platform extensibility, parallelizable with 12). 11.1 closed
@@ -2119,7 +2154,7 @@ before acting on any "open" / "in progress" claim:
 | 12: Agent Capabilities | 13 | 13 |
 | 13: Security & Polish | 5 | 5 |
 | 14: Scale & Enterprise | 6 | 6 |
-| 15: TAR Dashboard & Scope Walking | 7 | 8 |
+| 15: TAR Dashboard & Scope Walking | 8 | 8 |
 | 16: System Guardian (Real-Time GS) | 3 | 10 |
 | **Total** | **126** | **159** |
 
