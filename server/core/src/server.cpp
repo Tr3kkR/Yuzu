@@ -2602,7 +2602,7 @@ public:
         // gov F11: HELP text updated for gap-matrix #10 (code-signing leaves) —
         // purpose now has two values, via has grown two more.
         metrics_.describe("yuzu_server_ca_cert_issued_total",
-                          "Certificates issued by the internal CA — per-agent client leaves at "
+                          "Certificates issued by the internal CA - per-agent client leaves at "
                           "enrollment (PKI PR3) or operator-requested code-signing leaves "
                           "(gap-matrix #10). Labelled purpose (agent|code-signing) and via "
                           "(direct|gateway_proxy|rest|mcp)",
