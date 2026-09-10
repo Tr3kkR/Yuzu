@@ -1343,6 +1343,25 @@ static const ToolDef kTools[] = {
      R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"})j"
      R"j(},"required":["revoked","serial_hex","crl_republished"]})j"},
 
+    {"issue_code_signing_cert",
+     "Issue a code-signing leaf certificate via CSR custody (mirrors POST /api/v1/ca/"
+     "issue-code-signing, gap-matrix #10, ADR-1005 A5 parity with list_issued_certs/"
+     "revoke_certificate). The caller holds the private key and submits a PKCS#10 CSR — "
+     "only its public key is used, subject/EKU/SAN are server-chosen: CN=label, usage "
+     "hard-pinned to codeSigning-only (never client/server-auth, so this leaf can never "
+     "reach the #1118 agent-identity gate), no SAN. Mutating (creates a new issued-cert "
+     "record) and privileged — requires Security:Write (supervised MCP tier; "
+     "approval-gated like every other Security:Write MCP op).",
+     R"j({"type":"object","properties":{)j"
+     R"j("csr_pem":{"type":"string","maxLength":16384,"description":"PEM PKCS#10 CSR; only its public key is used — subject/EKU/SAN are server-chosen"},)j"
+     R"j("label":{"type":"string","pattern":"^[A-Za-z0-9._-]{1,64}$","maxLength":64,"description":"Signer label; becomes the leaf CN (non-agent namespace)"},)j"
+     R"j("validity_days":{"type":"integer","minimum":1,"maximum":730,"description":"Optional; defaults to 365, clamped to CA notAfter"})j"
+     R"j(},"required":["csr_pem","label"]})j",
+     R"j({"type":"object","properties":{"certificate_pem":{"type":"string"},"chain_pem":{"type":"string"},"serial_hex":{"type":"string"},"not_after":{"type":"string"},)j"
+     R"j("purpose":{"const":"code-signing"},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"})j"
+     R"j(},"required":["certificate_pem","chain_pem","serial_hex","not_after","purpose"]})j"},
+
     // ── Engine-principal lifecycle tools (ADR-1005 item 2b, plan PR 4.3;
     // MCP twins of the REST /api/v1/engine-principals/* surface, design doc
     // docs/auth-engine-principals-design.md). An engine principal is the
@@ -2139,7 +2158,7 @@ static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
 static const char* const kWriteToolsRaw[] = {
     "set_tag",         "delete_tag",     "execute_instruction",
     "approve_request", "reject_request", "quarantine_device",
-    "revoke_certificate", "execute_bundle",
+    "revoke_certificate", "execute_bundle", "issue_code_signing_cert",
     // Engine-principal lifecycle tools (ADR-1005 item 2b, plan PR 4.3).
     "create_engine_principal", "revoke_engine_principal",
     "mint_engine_credential",  "rotate_engine_credential",
@@ -2385,6 +2404,7 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // PKI CA tools (PR4 B-2 — MCP/REST parity for the /api/v1/ca/* surface).
     {"list_issued_certs", {"Security", "Read"}},
     {"revoke_certificate", {"Security", "Delete"}},
+    {"issue_code_signing_cert", {"Security", "Write"}},
     // Engine-principal lifecycle tools (ADR-1005 item 2b, plan PR 4.3).
     {"create_engine_principal", {"Security", "Write"}},
     {"revoke_engine_principal", {"Security", "Write"}},
@@ -2923,6 +2943,13 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     // create/mint: pure INSERT of NEW state, nothing existing overwritten → Additive
     // (approval-gated + high-impact, but that is the tier's job, not this hint).
     {"create_engine_principal", {ToolEffect::Additive, false, "Create engine principal"}},
+    // issue_code_signing_cert: same shape as create_engine_principal above — a pure
+    // INSERT of a new issued-cert record, nothing existing is overwritten or revoked
+    // → Additive, not Destructive (destructiveHint is honestly false: this tool
+    // grants signing authority, it does not destroy anything). Each call is a fresh
+    // signing operation over a caller-supplied CSR → a new serial every time, so
+    // NOT idempotent (unlike set_tag's overwrite-to-same-state).
+    {"issue_code_signing_cert", {ToolEffect::Additive, false, "Issue code-signing certificate"}},
     {"revoke_engine_principal", {ToolEffect::Destructive, false, "Revoke engine principal"}},
     {"transfer_engine_principal_owner",
      {ToolEffect::Destructive, false, "Transfer engine principal owner"}},
@@ -3619,7 +3646,7 @@ McpServer::HandlerFn McpServer::build_handler(
     AuthDB* auth_db, DirectorySync* directory_sync, CallerFn caller_fn,
     yuzu::server::detail::StreamBudget* stream_budget, StreamRevalidateFn revalidate_fn,
     StreamPrincipalAuditFn principal_audit_fn, ProductPackStore* product_pack_store,
-    WorkflowEngine* workflow_engine) {
+    WorkflowEngine* workflow_engine, IssueCodeSigningFn issue_code_signing_fn) {
 
     // Live reads via a pointer captured by value in the [=] handler below, so a
     // runtime settings-UI toggle of mcp_read_only / mcp_disable reaches this
@@ -13059,6 +13086,103 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
+            // ── issue_code_signing_cert ───────────────────────────────────
+            // MCP/REST parity for POST /api/v1/ca/issue-code-signing (gap-matrix
+            // #10, ADR-1005 A5 parity with list_issued_certs/revoke_certificate).
+            // Mutating + privileged: Security:Write, which the generic C8 gate
+            // above already tier-checks + approval-gates (supervised tier only —
+            // tier_allows() denies operator/readonly outright for Security:Write,
+            // so this branch is only ever reached on a supervised, already-
+            // approved call). The schema above already bounds csr_pem/label/
+            // validity_days and is validated by the C8 gate BEFORE a ticket is
+            // minted or consumed (#2405) — the re-checks below are defense in
+            // depth, mirroring server.cpp's own re-check of the same label
+            // pattern at the boundary that actually places it in the
+            // certificate. Mirrors the REST handler's validate -> issue ->
+            // audit -> typed-output shape exactly, including the
+            // no_root/bad_csr business-refusal classification from the shared
+            // ca_routes.hpp prefixes, so both surfaces are indistinguishable in
+            // the audit log.
+            if (tool_name == "issue_code_signing_cert") {
+                if (!tier_allows(tier, "Security", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Security", "Write"))
+                    return;
+                if (!ca_store || !ca_store->is_open() || !issue_code_signing_fn) {
+                    res.set_content(error_response(id, kInternalError, "CA not available"),
+                                    "application/json");
+                    return;
+                }
+                const std::string csr_pem = param_str(args, "csr_pem");
+                const std::string label = param_str(args, "label");
+                if (csr_pem.empty() || !is_valid_code_signing_label(label)) {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "csr_pem is required and label must match "
+                                       "^[A-Za-z0-9._-]{1,64}$"),
+                        "application/json");
+                    return;
+                }
+                std::optional<int> validity_days;
+                if (args.contains("validity_days") && args["validity_days"].is_number_integer())
+                    validity_days = args["validity_days"].get<int>();
+                // session is already the auth_fn-resolved caller from the top of
+                // this handler (no need to re-derive it as the REST route does —
+                // MCP resolves it once, up front).
+                const std::string issued_by = "operator:" + session->username;
+                auto issued = issue_code_signing_fn(csr_pem, label, validity_days, issued_by);
+                if (!issued) {
+                    const std::string& err = issued.error();
+                    const bool no_root = err.starts_with(kCodeSigningNoRootPrefix);
+                    const bool bad_csr = err.starts_with(kCodeSigningBadCsrPrefix);
+                    std::string result = "failure";
+                    std::string msg = "code-signing issuance failed";
+                    if (no_root) {
+                        result = "denied";
+                        msg = "no CA root to issue from (generate default certs first)";
+                    } else if (bad_csr) {
+                        result = "denied";
+                        msg = "csr_pem is invalid or fails proof-of-possession";
+                    }
+                    const bool audit_ok = audit_fn(req, "ca.cert.issued", result,
+                                                   "CodeSigningCertificate", label,
+                                                   "purpose=code-signing reason=" + err);
+                    // Business refusal (no_root/bad_csr) is client-caused ->
+                    // kInvalidParams; anything else (key-load/store failure) is a
+                    // genuine server-side fault -> kInternalError. Matches
+                    // revoke_certificate's kInvalidParams-for-denied /
+                    // kInternalError-for-store-failure split above.
+                    const int rpc_code = (no_root || bad_csr) ? kInvalidParams : kInternalError;
+                    res.set_content(
+                        error_response(id, rpc_code, msg,
+                                       audit_ok ? std::string_view{}
+                                                : std::string_view{R"({"audit_persisted":false})"}),
+                        "application/json");
+                    return;
+                }
+                const bool audit_ok =
+                    audit_fn(req, "ca.cert.issued", "success", "CodeSigningCertificate",
+                             issued->serial_hex, "purpose=code-signing label=" + label);
+                nlohmann::json payload_j = {{"certificate_pem", issued->certificate_pem},
+                                            {"chain_pem", issued->chain_pem},
+                                            {"serial_hex", issued->serial_hex},
+                                            {"not_after", issued->not_after},
+                                            {"purpose", "code-signing"}};
+                if (!audit_ok)
+                    payload_j["audit_persisted"] = false;
+                const std::string payload = payload_j.dump();
+                // L2 (#1240): record the tool-layer invocation too (mcp.<tool>) so
+                // MCP usage correlates with the ca.* domain events in the audit store.
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(payload, kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
             // ── KEK (key-encryption-key) rotation tools (#2395 track C) ──────
             // MCP twins of POST/GET /api/v1/secrets/kek/* (kek_routes.cpp), reusing
             // the SAME KekOps seam (injected via set_kek_ops) and emitting the SAME
@@ -16258,7 +16382,8 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 std::size_t mcp_max_streams_per_principal,
                                 StreamPrincipalAuditFn principal_audit_fn,
                                 CallerFn caller_fn, ProductPackStore* product_pack_store,
-                                WorkflowEngine* workflow_engine) {
+                                WorkflowEngine* workflow_engine,
+                                IssueCodeSigningFn issue_code_signing_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
                     std::move(agents_fn), rbac_store, instruction_store, execution_tracker,
@@ -16273,7 +16398,8 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                     software_licensing_store, engine_principal_store, access_review_store,
                     auth_db, directory_sync, stream_budget, std::move(revalidate_fn),
                     mcp_max_streams_per_principal, std::move(principal_audit_fn),
-                    std::move(caller_fn), product_pack_store, workflow_engine);
+                    std::move(caller_fn), product_pack_store, workflow_engine,
+                    std::move(issue_code_signing_fn));
 }
 
 void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
@@ -16307,7 +16433,8 @@ void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                                 std::size_t mcp_max_streams_per_principal,
                                 StreamPrincipalAuditFn principal_audit_fn,
                                 CallerFn caller_fn, ProductPackStore* product_pack_store,
-                                WorkflowEngine* workflow_engine) {
+                                WorkflowEngine* workflow_engine,
+                                IssueCodeSigningFn issue_code_signing_fn) {
     // GET + DELETE first: they COPY auth_fn / audit_fn / allowed_origins, which
     // build_handler std::move()s below. &mcp_disabled is a live pointer into the
     // cfg_ member (outlives the handlers).
@@ -16338,7 +16465,8 @@ void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                             // moving here is safe) - one arithmetic for every
                             // held-open worker, whichever verb pinned it.
                             stream_budget, std::move(revalidate_fn),
-                            std::move(principal_audit_fn), product_pack_store, workflow_engine));
+                            std::move(principal_audit_fn), product_pack_store, workflow_engine,
+                            std::move(issue_code_signing_fn)));
 
     // Streaming is ON only when a registry is wired AND the kill switch is off —
     // report the true state, not just the kill-switch bit (governance arch/sre NICE).

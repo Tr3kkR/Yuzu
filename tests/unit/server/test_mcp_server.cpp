@@ -943,6 +943,14 @@ struct McpTestServer {
     bool crl_publish_succeeds_{true};
     int crl_publish_calls_{0};
 
+    /// gap-matrix #10 (ADR-1005 A5 parity): optionally wire a stub
+    /// IssueCodeSigningFn so issue_code_signing_cert can be exercised
+    /// end-to-end, mirroring ca_store_for_test/crl_publish_succeeds_ above.
+    /// Default unset (empty std::function) keeps every existing test on the
+    /// "CA not available" path — matches production's issue_code_signing_fn
+    /// == nullptr degradation.
+    yuzu::server::IssueCodeSigningFn issue_code_signing_fn_for_test{};
+
     /// #2384: optionally wire an ApiTokenStore as the engine-credential store so
     /// rotate_engine_credential / confirm_engine_rotation can be exercised
     /// end-to-end at the MCP surface. Default nullptr keeps every existing test
@@ -1389,7 +1397,8 @@ private:
             /*revalidate_fn=*/revalidate_fn_for_test,
             /*principal_audit_fn=*/principal_audit_fn_for_test,
             /*product_pack_store=*/product_pack_store_for_test,
-            /*workflow_engine=*/workflow_engine_for_test);
+            /*workflow_engine=*/workflow_engine_for_test,
+            /*issue_code_signing_fn=*/issue_code_signing_fn_for_test);
     }
 };
 
@@ -11262,6 +11271,247 @@ TEST_CASE("MCP 2444: yuzu_mcp_approval_burned_total fires on a post-consume hand
               .value() == 0.0);
 }
 
+// ── gap-matrix #10: issue_code_signing_cert (MCP/REST parity for POST
+// /api/v1/ca/issue-code-signing, ADR-1005 A5) ─────────────────────────────
+
+TEST_CASE("MCP CA: issue_code_signing_cert is advertised with a bounded schema, typed output "
+          "and an honest A5 annotation",
+          "[mcp][integration][pki]") {
+    McpTestServer ts;
+    ts.start("readonly");
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+
+    const nlohmann::json* tool = nullptr;
+    for (const auto& t : body["result"]["tools"])
+        if (t["name"] == "issue_code_signing_cert") {
+            tool = &t;
+            break;
+        }
+    REQUIRE(tool != nullptr);
+
+    // Bounded input schema — mirrors server.cpp's issue_code_signing_leaf clamp
+    // (kDefaultCodeSigningValidityDays=365, kMaxCodeSigningValidityDays=730) and
+    // ca_routes.hpp's is_valid_code_signing_label pattern exactly.
+    const auto& props = (*tool)["inputSchema"]["properties"];
+    REQUIRE(props.contains("csr_pem"));
+    CHECK(props["csr_pem"]["maxLength"] == 16384);
+    REQUIRE(props.contains("label"));
+    CHECK(props["label"]["pattern"] == "^[A-Za-z0-9._-]{1,64}$");
+    CHECK(props["label"]["maxLength"] == 64);
+    REQUIRE(props.contains("validity_days"));
+    CHECK(props["validity_days"]["minimum"] == 1);
+    CHECK(props["validity_days"]["maximum"] == 730);
+    std::set<std::string> required((*tool)["inputSchema"]["required"].begin(),
+                                   (*tool)["inputSchema"]["required"].end());
+    CHECK(required == std::set<std::string>{"csr_pem", "label"});
+
+    // Typed output schema mirrors the REST response shape verbatim.
+    REQUIRE(tool->contains("outputSchema"));
+    std::set<std::string> out_required((*tool)["outputSchema"]["required"].begin(),
+                                       (*tool)["outputSchema"]["required"].end());
+    CHECK(out_required == std::set<std::string>{"certificate_pem", "chain_pem", "serial_hex",
+                                                 "not_after", "purpose"});
+
+    // A5: mutates state (creates a new issued-cert record) but is NOT
+    // destructive — destructiveHint must be honestly false, matching the
+    // Additive classification (not Destructive like revoke_certificate).
+    REQUIRE(tool->contains("annotations"));
+    const auto& ann = (*tool)["annotations"];
+    CHECK(ann["destructiveHint"] == false);
+    CHECK(ann["readOnlyHint"] == false);
+    CHECK(ann["idempotentHint"] == false);
+    CHECK_FALSE((*tool)["description"].get<std::string>().empty());
+}
+
+TEST_CASE("MCP CA: issue_code_signing_cert sits in the elevated (write-tools) tier and is "
+          "tier-denied below supervised (Security:Write)",
+          "[mcp][integration][pki][security]") {
+    // Structural: the elevated/write-tools set (kWriteToolsRaw) — same set the
+    // --mcp-read-only proactive guard consults — must name this tool, exactly
+    // like its revoke_certificate/create_engine_principal siblings.
+    auto writes = yuzu::server::mcp::write_tool_names_for_test();
+    CHECK(std::find(writes.begin(), writes.end(), std::string_view{"issue_code_signing_cert"}) !=
+          writes.end());
+
+    // Behavioural: operator tier cannot reach Security:Write at all (the
+    // generic C8 gate denies before the handler, an approval manager, or a CA
+    // store is ever consulted) — mirrors revoke_certificate's Security:Delete
+    // tier-denial test.
+    McpTestServer ts;
+    ts.start("operator");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"issue_code_signing_cert","arguments":{"csr_pem":"csr","label":"signer-1"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kTierDenied);
+}
+
+TEST_CASE("MCP CA: issue_code_signing_cert denies without Security:Write, even after an "
+          "approved ticket (RBAC)",
+          "[mcp][integration][pki][security][approval][pg]") {
+        yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.perm_override_for_test = [](const std::string& securable, const std::string& operation) {
+        return !(securable == "Security" && operation == "Write");
+    };
+    ts.start("supervised");
+
+    auto mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"issue_code_signing_cert","arguments":{"csr_pem":"csr","label":"signer-1"}}})");
+    REQUIRE(mint);
+    auto mint_body = nlohmann::json::parse(mint->body);
+    REQUIRE(mint_body.contains("error"));
+    CHECK(mint_body["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
+    const std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+
+    std::string recall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":4,"params":{"name":"issue_code_signing_cert","arguments":{"csr_pem":"csr","label":"signer-1","approval_id":")" +
+        approval_id + R"("}}})";
+    auto res = ts.call(recall);
+    REQUIRE(res);
+    // perm_fn's own mock 403 (the RBAC denial fires inside the handler, after
+    // the ticket is consumed) — not a JSON-RPC "result" envelope.
+    CHECK(res->status == 403);
+}
+
+TEST_CASE("MCP CA: issue_code_signing_cert without a CA returns an error, not a crash",
+          "[mcp][integration][pki][approval][pg]") {
+        yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts; // ca_store_for_test / issue_code_signing_fn_for_test stay unset
+    ts.approval_manager_for_test = &appr;
+    ts.start("supervised");
+
+    auto mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":5,"params":{"name":"issue_code_signing_cert","arguments":{"csr_pem":"csr","label":"signer-1"}}})");
+    REQUIRE(mint);
+    auto mint_body = nlohmann::json::parse(mint->body);
+    const std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+
+    std::string recall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":6,"params":{"name":"issue_code_signing_cert","arguments":{"csr_pem":"csr","label":"signer-1","approval_id":")" +
+        approval_id + R"("}}})";
+    auto res = ts.call(recall);
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+}
+
+TEST_CASE("MCP CA: issue_code_signing_cert full approval-ticket round-trip reaches the typed "
+          "output, mirroring the REST route's shape",
+          "[mcp][integration][pki][security][approval][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
+    REQUIRE(store.is_open());
+
+        yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.ca_store_for_test = &store;
+    ts.approval_manager_for_test = &appr;
+    int calls = 0;
+    ts.issue_code_signing_fn_for_test =
+        [&](const std::string& csr_pem, const std::string& label,
+            std::optional<int> validity_days,
+            const std::string& issued_by) -> std::expected<yuzu::server::CodeSigningIssuance, std::string> {
+        ++calls;
+        CHECK(csr_pem == "-----BEGIN CERTIFICATE REQUEST-----fake-----END CERTIFICATE REQUEST-----");
+        CHECK(label == "release-signer");
+        CHECK(validity_days == 90);
+        CHECK(issued_by == "operator:tester");
+        return yuzu::server::CodeSigningIssuance{
+            .certificate_pem = "-----BEGIN CERTIFICATE-----leaf-----END CERTIFICATE-----",
+            .chain_pem = "-----BEGIN CERTIFICATE-----root-----END CERTIFICATE-----",
+            .serial_hex = "C0FFEE",
+            .not_after = "2027-01-01T00:00:00Z",
+        };
+    };
+    ts.mock_username = "tester";
+    ts.start("supervised");
+
+    auto mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":7,"params":{"name":"issue_code_signing_cert","arguments":{"csr_pem":"-----BEGIN CERTIFICATE REQUEST-----fake-----END CERTIFICATE REQUEST-----","label":"release-signer","validity_days":90}}})");
+    REQUIRE(mint);
+    auto mint_body = nlohmann::json::parse(mint->body);
+    REQUIRE(mint_body.contains("error"));
+    CHECK(mint_body["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
+    const std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+    CHECK(calls == 0); // not yet consumed
+
+    std::string recall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":8,"params":{"name":"issue_code_signing_cert","arguments":{"csr_pem":"-----BEGIN CERTIFICATE REQUEST-----fake-----END CERTIFICATE REQUEST-----","label":"release-signer","validity_days":90,"approval_id":")" +
+        approval_id + R"("}}})";
+    auto res = ts.call(recall);
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result")); // SUCCESS
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["certificate_pem"] ==
+         "-----BEGIN CERTIFICATE-----leaf-----END CERTIFICATE-----");
+    CHECK(payload["chain_pem"] == "-----BEGIN CERTIFICATE-----root-----END CERTIFICATE-----");
+    CHECK(payload["serial_hex"] == "C0FFEE");
+    CHECK(payload["not_after"] == "2027-01-01T00:00:00Z");
+    CHECK(payload["purpose"] == "code-signing");
+    CHECK(calls == 1);
+    CHECK(ts.audit_log.back() == "mcp.issue_code_signing_cert|success");
+    // structuredContent mirrors content[0].text exactly (2712 convention).
+    REQUIRE(body["result"].contains("structuredContent"));
+    CHECK(body["result"]["structuredContent"] == payload);
+}
+
+TEST_CASE("MCP CA: issue_code_signing_cert's bounded schema rejects a bad label, an oversize "
+          "csr_pem, and an out-of-range validity_days at compile-validate",
+          "[mcp][2g][schema]") {
+    using yuzu::server::mcp::compile_input_schema;
+    std::map<std::string, std::string> schemas;
+    for (const auto& row : input_schemas_for_test())
+        schemas.emplace(row.name, row.schema_json);
+
+    auto c = compile_input_schema(schemas.at("issue_code_signing_cert"));
+    REQUIRE(c);
+
+    // Valid baseline.
+    CHECK_FALSE(c->validate(
+        nlohmann::json::parse(R"({"csr_pem":"csr","label":"signer-1"})")));
+
+    // Bad label: whitespace/DN metacharacters not in ^[A-Za-z0-9._-]{1,64}$.
+    auto bad_label = c->validate(
+        nlohmann::json::parse(R"({"csr_pem":"csr","label":"signer with spaces"})"));
+    REQUIRE(bad_label);
+    CHECK(bad_label->path == "/label");
+
+    // Oversize csr_pem (>16384 bytes).
+    auto oversize_csr = c->validate(nlohmann::json::parse(
+        R"({"csr_pem":")" + std::string(16385, 'a') + R"(","label":"signer-1"})"));
+    REQUIRE(oversize_csr);
+    CHECK(oversize_csr->path == "/csr_pem");
+
+    // validity_days out of [1, 730].
+    CHECK(c->validate(nlohmann::json::parse(
+        R"({"csr_pem":"csr","label":"signer-1","validity_days":0})")));
+    CHECK(c->validate(nlohmann::json::parse(
+        R"({"csr_pem":"csr","label":"signer-1","validity_days":731})")));
+    CHECK_FALSE(c->validate(nlohmann::json::parse(
+        R"({"csr_pem":"csr","label":"signer-1","validity_days":730})")));
+
+    // Missing required fields.
+    CHECK(c->validate(nlohmann::json::parse(R"({"label":"signer-1"})")));
+    CHECK(c->validate(nlohmann::json::parse(R"({"csr_pem":"csr"})")));
+}
+
 // ── #2395 track D: KEK rotation MCP tools (parity with kek_routes.cpp) ────────
 // rotate_kek / rewrap_secrets / get_kek_status are the MCP twins of
 // POST/GET /api/v1/secrets/kek/*, sharing the SAME KekOps seam (kek_ops_for_test,
@@ -15664,6 +15914,8 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
          nlohmann::json::parse(R"({"agent_id":"a","steps":[{"plugin":"p","action":"a"}]})")},
         {"quarantine_device", nlohmann::json::parse(R"({"agent_id":"a"})")},
         {"revoke_certificate", nlohmann::json::parse(R"({"serial_hex":"AB12"})")},
+        {"issue_code_signing_cert",
+         nlohmann::json::parse(R"({"csr_pem":"-----BEGIN CERTIFICATE REQUEST-----","label":"my-signer"})")},
         {"create_engine_principal",
          nlohmann::json::parse(
              R"({"principal_id":"engine:v","display_name":"d","owner_username":"o","justification":"j","classification":"internal"})")},
