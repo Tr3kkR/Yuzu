@@ -1220,7 +1220,7 @@ const std::string& openapi_spec() {
     })json"
         R"json(,
     "/network/fleet": {
-      "get": {"summary": "Fleet network quality now-stats", "tags": ["Network"], "description": "Requires GuaranteedState:Read. Current-cycle fleet stats (avg/p50/p90/max + n) for smoothed RTT ms, the interval TCP retransmit rate % and device throughput bps, computed at request time over registry heartbeat NETWORK facts — OS-blended across the fleet (the per-OS yuzu_fleet_net_* Prometheus gauges split the same facts by os, so a gauge series differs from this blended number on a mixed fleet; the /network Overview cards show this same blended view). A metric nobody reported is null (absent, never 0); reporting, rtt_reporting (the honest RTT denominator) and online carry the populations. cooccurrence counts net-degraded devices that also show device-perf pressure / app instability (measured co-occurrence, never a cause). Device-aggregate link health — NOT audited.", "responses": {"200": {"description": "Fleet now object (rtt_ms|null, retrans_pct|null, throughput_bps|null, reporting, rtt_reporting, online, cooccurrence{degraded, also_device, also_app, network_only})"}, "503": {"description": "service unavailable"}}}
+      "get": {"summary": "Fleet network quality now-stats", "tags": ["Network"], "description": "Requires GuaranteedState:Read. Current-cycle fleet stats (avg/p50/p90/max + n) for smoothed RTT ms, the interval TCP retransmit rate % and device throughput bps, computed at request time over registry heartbeat NETWORK facts — OS-blended across the fleet (the per-OS yuzu_fleet_net_* Prometheus gauges split the same facts by os, so a gauge series differs from this blended number on a mixed fleet; the /network Overview cards show this same blended view). A metric nobody reported is null (absent, never 0); reporting, rtt_reporting (the honest RTT denominator) and online carry the populations. cooccurrence counts net-degraded devices that also show device-perf pressure / app instability (measured co-occurrence, never a cause). available_keys lists the fleet's tag keys for a cohort-picker UI (parity with the /network dashboard fragment and GET /dex/perf/cohorts, ADR-0031 WS-A4). Device-aggregate link health — NOT audited.", "responses": {"200": {"description": "Fleet now object (rtt_ms|null, retrans_pct|null, throughput_bps|null, reporting, rtt_reporting, online, cooccurrence{degraded, also_device, also_app, network_only}, available_keys[])"}, "503": {"description": "service unavailable"}}}
     })json"
         // Split again (MSVC C2026 ~16 KB per-literal cap); concatenated at
         // compile time. This segment grew past the cap after the origin/dev
@@ -1733,7 +1733,8 @@ void RestApiV1::register_routes(
     GuaranteedStateStore* guaranteed_state_store, yuzu::MetricsRegistry* metrics_registry,
     SessionRevokeFn session_revoke_fn, ExecutionEventBus* execution_event_bus,
     ResultSetStore* result_set_store, CommandDispatchFn command_dispatch_fn, StepUpFn step_up_fn,
-    GuardianPushFn guardian_push_fn, DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn,
+    GuardianPushFn guardian_push_fn, DexPerfFn dex_perf_fn,
+    std::shared_ptr<const NetworkApi> network_api,
     LockoutClearFn lockout_clear_fn, BaselineStore* baseline_store, ScopedPermFn scoped_perm_fn,
     SoftwareInventoryStore* software_inventory_store,
     ResponseScopeFn response_scope_fn, AppPerfProviders app_perf_providers,
@@ -1751,7 +1752,7 @@ void RestApiV1::register_routes(
                     guaranteed_state_store, metrics_registry, std::move(session_revoke_fn),
                     execution_event_bus, result_set_store, std::move(command_dispatch_fn),
                     std::move(step_up_fn), std::move(guardian_push_fn), std::move(dex_perf_fn),
-                    std::move(net_perf_fn), std::move(lockout_clear_fn), baseline_store,
+                    std::move(network_api), std::move(lockout_clear_fn), baseline_store,
                     std::move(scoped_perm_fn), software_inventory_store,
                     std::move(response_scope_fn),
                     std::move(app_perf_providers), engine_principal_store, access_review_store,
@@ -1773,7 +1774,8 @@ void RestApiV1::register_routes(
     GuaranteedStateStore* guaranteed_state_store, yuzu::MetricsRegistry* metrics_registry,
     SessionRevokeFn session_revoke_fn, ExecutionEventBus* execution_event_bus,
     ResultSetStore* result_set_store, CommandDispatchFn command_dispatch_fn, StepUpFn step_up_fn,
-    GuardianPushFn guardian_push_fn, DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn,
+    GuardianPushFn guardian_push_fn, DexPerfFn dex_perf_fn,
+    std::shared_ptr<const NetworkApi> network_api,
     LockoutClearFn lockout_clear_fn, BaselineStore* baseline_store, ScopedPermFn scoped_perm_fn,
     SoftwareInventoryStore* software_inventory_store,
     ResponseScopeFn response_scope_fn, AppPerfProviders app_perf_providers,
@@ -13096,8 +13098,8 @@ void RestApiV1::register_routes(
     //
     // Machine-readable A1 parity with the /network fragments — "is the fleet's
     // link health OK?" must be answerable without scraping HTML. Same
-    // render-time aggregation over registry heartbeat NETWORK facts the
-    // fragments use (one NetPerfFn provider, two surfaces), same
+    // NetworkApi (ADR-0031 WS-A4) the fragments and the MCP network tools
+    // call — one instance, three surfaces, never disagreeing — same
     // GuaranteedState:Read gate. NOT audited: device-aggregate link health
     // (RTT/retransmit/throughput — device state, not behavioral data), mirroring
     // the DEX-perf rationale. Cohort handling mirrors the /network FRAGMENT
@@ -13122,16 +13124,19 @@ void RestApiV1::register_routes(
     // same per-device facts the per-OS yuzu_fleet_net_* gauges carry (a gauge
     // series, split by os, differs from this blended number on a mixed fleet).
     sink.Get("/api/v1/network/fleet",
-             [perm_fn, net_perf_fn, net_stat_json](const httplib::Request& req,
+             [perm_fn, network_api, net_stat_json](const httplib::Request& req,
                                                    httplib::Response& res) {
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
-                 if (!net_perf_fn) {
+                 if (!network_api) {
                      res.status = 503;
                      res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
-                 const auto now = net_perf_fleet_now(net_perf_fn(std::string{}));
+                 const auto now = network_api->fleet_now(std::string{});
+                 JArr keys;
+                 for (const auto& k : now.available_keys)
+                     keys.add(k);
                  res.set_content(
                      ok_json(JObj()
                                  .raw("rtt_ms", net_stat_json(now.rtt))
@@ -13147,6 +13152,16 @@ void RestApiV1::register_routes(
                                           .add("also_app", now.cooc.also_app)
                                           .add("network_only", now.cooc.network_only)
                                           .str())
+                                 // ADR-0031 WS-A4 parity addition: the dashboard
+                                 // fragment's cohort-key picker already had this;
+                                 // the REST twin didn't. NOTE: unlike DEX (which
+                                 // serves available_keys only from the dedicated
+                                 // GET /dex/perf/cohorts route, NOT its fleet
+                                 // endpoint), network has no /cohorts route, so
+                                 // the distinct tag KEYS are surfaced here on the
+                                 // pollable fleet resource — cheap because the 5s
+                                 // NetworkApi memo bounds get_distinct_keys().
+                                 .raw("available_keys", keys.str())
                                  .str()),
                      "application/json");
              });
@@ -13158,7 +13173,7 @@ void RestApiV1::register_routes(
     // carry the co-occurring FACTS (under_pressure/app_unstable) and the fleet
     // percentile — evidence shown for correlation, never a verdict.
     sink.Get("/api/v1/network/devices",
-             [perm_fn, audit_fn, net_perf_fn, deny_fleet_wide_service_scoped](
+             [perm_fn, audit_fn, network_api, deny_fleet_wide_service_scoped](
                  const httplib::Request& req, httplib::Response& res) {
                  // Fleet-wide identity-linked disclosure (sibling of the SEC-3 gap
                  // closed on GET /guaranteed-state/events): each row names an
@@ -13176,7 +13191,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
-                 if (!net_perf_fn) {
+                 if (!network_api) {
                      res.status = 503;
                      res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
@@ -13236,8 +13251,14 @@ void RestApiV1::register_routes(
                      spdlog::warn("network.device.view audit fail-closed (503) cid={}", cid);
                      return;
                  }
-                 const auto rows = net_perf_device_list(net_perf_fn(cohort_key), metric,
-                                                        not_reporting, cooc, cohort_filter, limit);
+                 NetDeviceQuery q;
+                 q.metric = metric;
+                 q.not_reporting = not_reporting;
+                 q.cooc = cooc;
+                 q.cohort_key = cohort_key;
+                 q.cohort_filter = cohort_filter;
+                 q.limit = limit;
+                 const auto rows = network_api->device_list(q);
                  JArr arr;
                  for (const auto& r : rows) {
                      JObj o;
