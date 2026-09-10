@@ -128,9 +128,11 @@ Source of truth: `docs/ha-delivery-matrix.md`. Read it before this skill
 claims a status. WS-0…WS-10 come from ADR-2002 §Decomposition; WS-11…WS-14 are
 delivery/ops workstreams the three-model review surfaced as missing.
 
-**Verified 2026-09-07 (against `origin/dev`): DONE — WS-0 (#3662), WS-1 (1a+1b+1c),
-WS-2a (2a-1 + 2a-2 #3924), WS-3 3.1 (#4011), WS-7 (#3627), WS-10 10.1/10.2. In flight:
-none. Next gate items: WS-3 3.2, WS-4, WS-5, WS-6, WS-8-readyz.**
+**Verified 2026-09-10 (against `origin/dev`): DONE — WS-0 (#3662), WS-1 (1a+1b+1c),
+WS-2a (2a-1 + 2a-2 #3924), WS-3 (3.1–3.4 — #4011/#4134/#4169/#4194), WS-7 (#3627),
+WS-10 10.1/10.2. In flight: WS-4 (4.1 built — fenced agent→cluster routing directory,
+INERT — not yet merged to `origin/dev`). Next gate items: WS-4 (4.2-4.4), WS-5, WS-6,
+WS-8-readyz.**
 
 > **⚠️ Standing instruction — update on close.** Every PR that closes or materially
 > changes the status of a workstream here MUST update its row **and** re-stamp the
@@ -146,14 +148,14 @@ none. Next gate items: WS-3 3.2, WS-4, WS-5, WS-6, WS-8-readyz.**
 | **WS-0** | Durable agent-side command idempotency **+ terminal-outcome replay** (dup replays stored result, not bare `REJECTED`) | — | **Y** | `cpp-safety`+`cpp-expert` | P0 | **done (PR #3662 merged)** |
 | **WS-1** | Server-plane state → Postgres: (1a) sessions DB-time; (1b) `execution_tracker`+command-correlation atomic counters; (1c) HA-critical store subset | migration ladder (serializes at the migration-version counter) | **Y** | `authdb`+`security-guardian` (1a); `architect`+`sre`+`cpp-safety` (1b/1c) | P0 | **done — 1a+1b+1c** |
 | **WS-2** | (2a) durable **event outbox** + NOTIFY fan-out [monolith-OK]; (2b) **core→presentation event spine** [*defers to ADR-1005*]; MCP session/replay durability | 2a: WS-1(1b); 2b: ADR-1005 split | **Y** (2a) | `architect`+`sre`+`security-guardian`(MCP)+`docs-writer` | P1 | **2a done (2a-1 + 2a-2 #3924); 2b/MCP outstanding** |
-| **WS-3** | Coordination seam: **fenced `LeaderElector`** (monotonic epoch in claim txn) + leader/**transactional-outbox**/receiver-idempotency worker refactor incl. policy remediation | **WS-0, WS-1, WS-2(2a)** | **Y** | `architect`+`cpp-safety`+`security-guardian` | P1 | **3.1 done (#4011); 3.2/3.3/3.4 planned** |
-| **WS-4** | Gateway routing + multi-cluster: fenced `agent→cluster` directory, **net-new distributed intra-cluster agent→node routing**, `gateway_node` convergence | **WS-1, WS-3, WS-0** | **Y** | `gateway-erlang`+`security-guardian`+`architect`+`cpp-safety` | P1 | planned |
+| **WS-3** | Coordination seam: **fenced `LeaderElector`** (monotonic epoch in claim txn) + leader/**transactional-outbox**/receiver-idempotency worker refactor incl. policy remediation | **WS-0, WS-1, WS-2(2a)** | **Y** | `architect`+`cpp-safety`+`security-guardian` | P1 | **3.1 done (#4011); 3.2 done (#4134); 3.3 done (#4169); 3.4 done (#4194)** |
+| **WS-4** | Gateway routing + multi-cluster: fenced `agent→cluster` directory, **net-new distributed intra-cluster agent→node routing**, `gateway_node` convergence | **WS-1, WS-3, WS-0** | **Y** | `gateway-erlang`+`security-guardian`+`architect`+`cpp-safety` | P1 | **in progress (4.1 done)** |
 | **WS-5** | Shared agent presence / health / **scope-eval population** across core replicas | **WS-4, WS-1, WS-3, WS-10** | **Y** | `security-guardian`+`architect`+`sre`+`docs-writer` | P1 | planned |
 | **WS-6** | PKI/CA HA: CA key → `SecretCodec` blob in PG, `CaStore` → PG, **durable CRL numbering + publication state machine**, KEK versioning/rollout/rollback, enrollment → PG | **WS-1(`ca_store`), WS-3** | **Y** | `security-guardian`+`cpp-safety`+`docs-writer` | P1 | planned |
 | **WS-7** | **HA-PG delivery**: Patroni+etcd+HAProxy Compose profile, selectable durability (3-node quorum default, distinct failure domains), operator-plane LB profile | — (storage axis; parallel) | **N** | `release-deploy`+`build-ci`+`sre` | P1 | **done (PR #3627 merged to dev)** |
 | **WS-8** | Per-tier health contract (`/livez` vs `/readyz`; presentation→operator LB, core→presentation routing). **BYO-LB doc** + LB/session semantics | conceptual on WS-1/WS-2; readyz before LB fronts replicas | **Y** (readyz) | `docs-writer`+`release-deploy`+`sre` | P0 readyz / P2 doc | planned |
 | **WS-9** | **Failover test harness** — continuous, incremental scenarios added as each feature lands (not a final gate): session survival, no double-dispatch, effectively-once, cursor-poll no-loss, re-home races, quorum-degrade, standby loss | scenarios track WS-0…WS-7 as they land | N | `build-ci`+`release-deploy`; scenarios by `chaos-injector` | P1 (continuous) | planned |
-| **WS-10** | **Background-job replica-safety classification** — checked-in, CI-auditable table (job → fenced-leader-only / replica-safe / disabled-until-fixed); bring #2508 wall-clock passes to clock-guard | audit+disable need nothing; `fenced-leader-only` enforcement needs WS-3 | **Y** | `cpp-safety`+`sre`+`compliance-officer` | P0 | **10.1/10.2 done; 10.3 pending WS-3 3.2** |
+| **WS-10** | **Background-job replica-safety classification** — checked-in, CI-auditable table (job → fenced-leader-only / replica-safe / disabled-until-fixed); bring #2508 wall-clock passes to clock-guard | audit+disable need nothing; `fenced-leader-only` enforcement needs WS-3 | **Y** | `cpp-safety`+`sre`+`compliance-officer` | P0 | **10.1/10.2 done (#4092); 10.3 enforcement wired by WS-3 3.2** |
 | **WS-11** | **HA-state observability** (NEW): leader identity/epoch, replica lag, quorum state, outbox backlog, failover duration, routing re-homes, split-brain alerts — Prometheus metrics + rules | WS-3, WS-7 | N (ship *with* the 2nd replica) | `sre`+`docs-writer` (+ alert-rule gate) | P1 | planned |
 | **WS-12** | **Single→HA cutover + DR** (NEW): runbook to move an existing single deployment to HA-PG + gateway-front rollout; **backup/PITR/WAL under HA-PG** (replaces superseded `disaster-recovery.md`) | WS-7 | N | `release-deploy`+`sre`+`docs-writer` | P1 | planned |
 | **WS-13** | **Agent-side gateway failover rollout** (NEW): agent endpoint discovery/failover + fleet rollout flipping direct-connect fleets to gateway-front | WS-4 | Y (gateway-fronted fleets) | `cross-platform`+`security-guardian` | P1 | planned |

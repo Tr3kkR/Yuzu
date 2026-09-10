@@ -74,7 +74,8 @@
         event                   => 'CONNECTED' | 'DISCONNECTED' | integer(), % = 3, optional, enum yuzu.gateway.v1.StreamStatusNotification.Event
         peer_addr               => unicode:chardata(), % = 4, optional
         gateway_node            => unicode:chardata(), % = 5, optional
-        wire_capabilities       => [unicode:chardata()] % = 6, repeated
+        wire_capabilities       => [unicode:chardata()], % = 6, repeated
+        cluster_id              => unicode:chardata() % = 7, optional
        }.
 
 -type 'yuzu.gateway.v1.StreamStatusAck'() ::
@@ -385,13 +386,24 @@ encode_msg(Msg, MsgName, Opts) ->
                  end;
              _ -> B4
          end,
+    B6 = case M of
+             #{wire_capabilities := F6} ->
+                 TrF6 = id(F6, TrUserData),
+                 if TrF6 == [] -> B5;
+                    true -> 'e_field_yuzu.gateway.v1.StreamStatusNotification_wire_capabilities'(TrF6, B5, TrUserData)
+                 end;
+             _ -> B5
+         end,
     case M of
-        #{wire_capabilities := F6} ->
-            TrF6 = id(F6, TrUserData),
-            if TrF6 == [] -> B5;
-               true -> 'e_field_yuzu.gateway.v1.StreamStatusNotification_wire_capabilities'(TrF6, B5, TrUserData)
+        #{cluster_id := F7} ->
+            begin
+                TrF7 = id(F7, TrUserData),
+                case is_empty_string(TrF7) of
+                    true -> B6;
+                    false -> e_type_string(TrF7, <<B6/binary, 58>>, TrUserData)
+                end
             end;
-        _ -> B5
+        _ -> B6
     end.
 
 'encode_msg_yuzu.gateway.v1.StreamStatusAck'(Msg, TrUserData) -> 'encode_msg_yuzu.gateway.v1.StreamStatusAck'(Msg, <<>>, TrUserData).
@@ -1955,105 +1967,114 @@ decode_msg_2_doit('yuzu.common.v1.ScopeCombinator', Bin, TrUserData) -> id('deco
 'skip_64_yuzu.gateway.v1.BatchHeartbeatResponse'(<<_:64, Rest/binary>>, Z1, Z2, F, F@_1, TrUserData) -> 'dfp_read_field_def_yuzu.gateway.v1.BatchHeartbeatResponse'(Rest, Z1, Z2, F, F@_1, TrUserData).
 
 'decode_msg_yuzu.gateway.v1.StreamStatusNotification'(Bin, TrUserData) ->
-    'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(Bin, 0, 0, 0, id(<<>>, TrUserData), id(<<>>, TrUserData), id('CONNECTED', TrUserData), id(<<>>, TrUserData), id(<<>>, TrUserData), id([], TrUserData), TrUserData).
+    'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(Bin, 0, 0, 0, id(<<>>, TrUserData), id(<<>>, TrUserData), id('CONNECTED', TrUserData), id(<<>>, TrUserData), id(<<>>, TrUserData), id([], TrUserData), id(<<>>, TrUserData), TrUserData).
 
-'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(<<10, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
-    'd_field_yuzu.gateway.v1.StreamStatusNotification_agent_id'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(<<18, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
-    'd_field_yuzu.gateway.v1.StreamStatusNotification_session_id'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(<<24, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
-    'd_field_yuzu.gateway.v1.StreamStatusNotification_event'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(<<34, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
-    'd_field_yuzu.gateway.v1.StreamStatusNotification_peer_addr'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(<<42, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
-    'd_field_yuzu.gateway.v1.StreamStatusNotification_gateway_node'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(<<50, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
-    'd_field_yuzu.gateway.v1.StreamStatusNotification_wire_capabilities'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(<<>>, 0, 0, _, F@_1, F@_2, F@_3, F@_4, F@_5, R1, TrUserData) ->
-    #{agent_id => F@_1, session_id => F@_2, event => F@_3, peer_addr => F@_4, gateway_node => F@_5, wire_capabilities => lists_reverse(R1, TrUserData)};
-'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(Other, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
-    'dg_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(Other, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData).
+'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(<<10, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
+    'd_field_yuzu.gateway.v1.StreamStatusNotification_agent_id'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(<<18, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
+    'd_field_yuzu.gateway.v1.StreamStatusNotification_session_id'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(<<24, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
+    'd_field_yuzu.gateway.v1.StreamStatusNotification_event'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(<<34, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
+    'd_field_yuzu.gateway.v1.StreamStatusNotification_peer_addr'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(<<42, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
+    'd_field_yuzu.gateway.v1.StreamStatusNotification_gateway_node'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(<<50, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
+    'd_field_yuzu.gateway.v1.StreamStatusNotification_wire_capabilities'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(<<58, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
+    'd_field_yuzu.gateway.v1.StreamStatusNotification_cluster_id'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(<<>>, 0, 0, _, F@_1, F@_2, F@_3, F@_4, F@_5, R1, F@_7, TrUserData) ->
+    #{agent_id => F@_1, session_id => F@_2, event => F@_3, peer_addr => F@_4, gateway_node => F@_5, wire_capabilities => lists_reverse(R1, TrUserData), cluster_id => F@_7};
+'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(Other, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
+    'dg_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(Other, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData).
 
-'dg_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 32 - 7 ->
-    'dg_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'dg_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(<<0:1, X:7, Rest/binary>>, N, Acc, _, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
+'dg_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) when N < 32 - 7 ->
+    'dg_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'dg_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(<<0:1, X:7, Rest/binary>>, N, Acc, _, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
     Key = X bsl N + Acc,
     case Key of
-        10 -> 'd_field_yuzu.gateway.v1.StreamStatusNotification_agent_id'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-        18 -> 'd_field_yuzu.gateway.v1.StreamStatusNotification_session_id'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-        24 -> 'd_field_yuzu.gateway.v1.StreamStatusNotification_event'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-        34 -> 'd_field_yuzu.gateway.v1.StreamStatusNotification_peer_addr'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-        42 -> 'd_field_yuzu.gateway.v1.StreamStatusNotification_gateway_node'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-        50 -> 'd_field_yuzu.gateway.v1.StreamStatusNotification_wire_capabilities'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
+        10 -> 'd_field_yuzu.gateway.v1.StreamStatusNotification_agent_id'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+        18 -> 'd_field_yuzu.gateway.v1.StreamStatusNotification_session_id'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+        24 -> 'd_field_yuzu.gateway.v1.StreamStatusNotification_event'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+        34 -> 'd_field_yuzu.gateway.v1.StreamStatusNotification_peer_addr'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+        42 -> 'd_field_yuzu.gateway.v1.StreamStatusNotification_gateway_node'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+        50 -> 'd_field_yuzu.gateway.v1.StreamStatusNotification_wire_capabilities'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+        58 -> 'd_field_yuzu.gateway.v1.StreamStatusNotification_cluster_id'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
         _ ->
             case Key band 7 of
-                0 -> 'skip_varint_yuzu.gateway.v1.StreamStatusNotification'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-                1 -> 'skip_64_yuzu.gateway.v1.StreamStatusNotification'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-                2 -> 'skip_length_delimited_yuzu.gateway.v1.StreamStatusNotification'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-                3 -> 'skip_group_yuzu.gateway.v1.StreamStatusNotification'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-                5 -> 'skip_32_yuzu.gateway.v1.StreamStatusNotification'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData)
+                0 -> 'skip_varint_yuzu.gateway.v1.StreamStatusNotification'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+                1 -> 'skip_64_yuzu.gateway.v1.StreamStatusNotification'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+                2 -> 'skip_length_delimited_yuzu.gateway.v1.StreamStatusNotification'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+                3 -> 'skip_group_yuzu.gateway.v1.StreamStatusNotification'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+                5 -> 'skip_32_yuzu.gateway.v1.StreamStatusNotification'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData)
             end
     end;
-'dg_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(<<>>, 0, 0, _, F@_1, F@_2, F@_3, F@_4, F@_5, R1, TrUserData) ->
-    #{agent_id => F@_1, session_id => F@_2, event => F@_3, peer_addr => F@_4, gateway_node => F@_5, wire_capabilities => lists_reverse(R1, TrUserData)}.
+'dg_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(<<>>, 0, 0, _, F@_1, F@_2, F@_3, F@_4, F@_5, R1, F@_7, TrUserData) ->
+    #{agent_id => F@_1, session_id => F@_2, event => F@_3, peer_addr => F@_4, gateway_node => F@_5, wire_capabilities => lists_reverse(R1, TrUserData), cluster_id => F@_7}.
 
-'d_field_yuzu.gateway.v1.StreamStatusNotification_agent_id'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 57 ->
-    'd_field_yuzu.gateway.v1.StreamStatusNotification_agent_id'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'d_field_yuzu.gateway.v1.StreamStatusNotification_agent_id'(<<0:1, X:7, Rest/binary>>, N, Acc, F, _, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
+'d_field_yuzu.gateway.v1.StreamStatusNotification_agent_id'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) when N < 57 ->
+    'd_field_yuzu.gateway.v1.StreamStatusNotification_agent_id'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'d_field_yuzu.gateway.v1.StreamStatusNotification_agent_id'(<<0:1, X:7, Rest/binary>>, N, Acc, F, _, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
     {NewFValue, RestF} = begin Len = X bsl N + Acc, <<Bytes:Len/binary, Rest2/binary>> = Rest, Bytes2 = binary:copy(Bytes), {id(Bytes2, TrUserData), Rest2} end,
-    'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(RestF, 0, 0, F, NewFValue, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData).
+    'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(RestF, 0, 0, F, NewFValue, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData).
 
-'d_field_yuzu.gateway.v1.StreamStatusNotification_session_id'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 57 ->
-    'd_field_yuzu.gateway.v1.StreamStatusNotification_session_id'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'d_field_yuzu.gateway.v1.StreamStatusNotification_session_id'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, _, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
+'d_field_yuzu.gateway.v1.StreamStatusNotification_session_id'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) when N < 57 ->
+    'd_field_yuzu.gateway.v1.StreamStatusNotification_session_id'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'d_field_yuzu.gateway.v1.StreamStatusNotification_session_id'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, _, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
     {NewFValue, RestF} = begin Len = X bsl N + Acc, <<Bytes:Len/binary, Rest2/binary>> = Rest, Bytes2 = binary:copy(Bytes), {id(Bytes2, TrUserData), Rest2} end,
-    'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(RestF, 0, 0, F, F@_1, NewFValue, F@_3, F@_4, F@_5, F@_6, TrUserData).
+    'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(RestF, 0, 0, F, F@_1, NewFValue, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData).
 
-'d_field_yuzu.gateway.v1.StreamStatusNotification_event'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 57 ->
-    'd_field_yuzu.gateway.v1.StreamStatusNotification_event'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'d_field_yuzu.gateway.v1.StreamStatusNotification_event'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, _, F@_4, F@_5, F@_6, TrUserData) ->
+'d_field_yuzu.gateway.v1.StreamStatusNotification_event'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) when N < 57 ->
+    'd_field_yuzu.gateway.v1.StreamStatusNotification_event'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'d_field_yuzu.gateway.v1.StreamStatusNotification_event'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, _, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
     {NewFValue, RestF} = {id('d_enum_yuzu.gateway.v1.StreamStatusNotification.Event'(begin <<Res:32/signed-native>> = <<(X bsl N + Acc):32/unsigned-native>>, id(Res, TrUserData) end), TrUserData), Rest},
-    'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(RestF, 0, 0, F, F@_1, F@_2, NewFValue, F@_4, F@_5, F@_6, TrUserData).
+    'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(RestF, 0, 0, F, F@_1, F@_2, NewFValue, F@_4, F@_5, F@_6, F@_7, TrUserData).
 
-'d_field_yuzu.gateway.v1.StreamStatusNotification_peer_addr'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 57 ->
-    'd_field_yuzu.gateway.v1.StreamStatusNotification_peer_addr'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'d_field_yuzu.gateway.v1.StreamStatusNotification_peer_addr'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, _, F@_5, F@_6, TrUserData) ->
+'d_field_yuzu.gateway.v1.StreamStatusNotification_peer_addr'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) when N < 57 ->
+    'd_field_yuzu.gateway.v1.StreamStatusNotification_peer_addr'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'d_field_yuzu.gateway.v1.StreamStatusNotification_peer_addr'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, _, F@_5, F@_6, F@_7, TrUserData) ->
     {NewFValue, RestF} = begin Len = X bsl N + Acc, <<Bytes:Len/binary, Rest2/binary>> = Rest, Bytes2 = binary:copy(Bytes), {id(Bytes2, TrUserData), Rest2} end,
-    'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(RestF, 0, 0, F, F@_1, F@_2, F@_3, NewFValue, F@_5, F@_6, TrUserData).
+    'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(RestF, 0, 0, F, F@_1, F@_2, F@_3, NewFValue, F@_5, F@_6, F@_7, TrUserData).
 
-'d_field_yuzu.gateway.v1.StreamStatusNotification_gateway_node'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 57 ->
-    'd_field_yuzu.gateway.v1.StreamStatusNotification_gateway_node'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'d_field_yuzu.gateway.v1.StreamStatusNotification_gateway_node'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, _, F@_6, TrUserData) ->
+'d_field_yuzu.gateway.v1.StreamStatusNotification_gateway_node'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) when N < 57 ->
+    'd_field_yuzu.gateway.v1.StreamStatusNotification_gateway_node'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'d_field_yuzu.gateway.v1.StreamStatusNotification_gateway_node'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, _, F@_6, F@_7, TrUserData) ->
     {NewFValue, RestF} = begin Len = X bsl N + Acc, <<Bytes:Len/binary, Rest2/binary>> = Rest, Bytes2 = binary:copy(Bytes), {id(Bytes2, TrUserData), Rest2} end,
-    'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(RestF, 0, 0, F, F@_1, F@_2, F@_3, F@_4, NewFValue, F@_6, TrUserData).
+    'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(RestF, 0, 0, F, F@_1, F@_2, F@_3, F@_4, NewFValue, F@_6, F@_7, TrUserData).
 
-'d_field_yuzu.gateway.v1.StreamStatusNotification_wire_capabilities'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 57 ->
-    'd_field_yuzu.gateway.v1.StreamStatusNotification_wire_capabilities'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'d_field_yuzu.gateway.v1.StreamStatusNotification_wire_capabilities'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, Prev, TrUserData) ->
+'d_field_yuzu.gateway.v1.StreamStatusNotification_wire_capabilities'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) when N < 57 ->
+    'd_field_yuzu.gateway.v1.StreamStatusNotification_wire_capabilities'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'d_field_yuzu.gateway.v1.StreamStatusNotification_wire_capabilities'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, Prev, F@_7, TrUserData) ->
     {NewFValue, RestF} = begin Len = X bsl N + Acc, <<Bytes:Len/binary, Rest2/binary>> = Rest, Bytes2 = binary:copy(Bytes), {id(Bytes2, TrUserData), Rest2} end,
-    'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(RestF, 0, 0, F, F@_1, F@_2, F@_3, F@_4, F@_5, cons(NewFValue, Prev, TrUserData), TrUserData).
+    'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(RestF, 0, 0, F, F@_1, F@_2, F@_3, F@_4, F@_5, cons(NewFValue, Prev, TrUserData), F@_7, TrUserData).
 
-'skip_varint_yuzu.gateway.v1.StreamStatusNotification'(<<1:1, _:7, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
-    'skip_varint_yuzu.gateway.v1.StreamStatusNotification'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'skip_varint_yuzu.gateway.v1.StreamStatusNotification'(<<0:1, _:7, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
-    'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData).
+'d_field_yuzu.gateway.v1.StreamStatusNotification_cluster_id'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) when N < 57 ->
+    'd_field_yuzu.gateway.v1.StreamStatusNotification_cluster_id'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'d_field_yuzu.gateway.v1.StreamStatusNotification_cluster_id'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, _, TrUserData) ->
+    {NewFValue, RestF} = begin Len = X bsl N + Acc, <<Bytes:Len/binary, Rest2/binary>> = Rest, Bytes2 = binary:copy(Bytes), {id(Bytes2, TrUserData), Rest2} end,
+    'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(RestF, 0, 0, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, NewFValue, TrUserData).
 
-'skip_length_delimited_yuzu.gateway.v1.StreamStatusNotification'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 57 ->
-    'skip_length_delimited_yuzu.gateway.v1.StreamStatusNotification'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'skip_length_delimited_yuzu.gateway.v1.StreamStatusNotification'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
+'skip_varint_yuzu.gateway.v1.StreamStatusNotification'(<<1:1, _:7, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
+    'skip_varint_yuzu.gateway.v1.StreamStatusNotification'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'skip_varint_yuzu.gateway.v1.StreamStatusNotification'(<<0:1, _:7, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
+    'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData).
+
+'skip_length_delimited_yuzu.gateway.v1.StreamStatusNotification'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) when N < 57 ->
+    'skip_length_delimited_yuzu.gateway.v1.StreamStatusNotification'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData);
+'skip_length_delimited_yuzu.gateway.v1.StreamStatusNotification'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
     Length = X bsl N + Acc,
     <<_:Length/binary, Rest2/binary>> = Rest,
-    'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(Rest2, 0, 0, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData).
+    'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(Rest2, 0, 0, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData).
 
-'skip_group_yuzu.gateway.v1.StreamStatusNotification'(Bin, _, Z2, FNum, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
+'skip_group_yuzu.gateway.v1.StreamStatusNotification'(Bin, _, Z2, FNum, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
     {_, Rest} = read_group(Bin, FNum),
-    'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(Rest, 0, Z2, FNum, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData).
+    'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(Rest, 0, Z2, FNum, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData).
 
-'skip_32_yuzu.gateway.v1.StreamStatusNotification'(<<_:32, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
-    'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData).
+'skip_32_yuzu.gateway.v1.StreamStatusNotification'(<<_:32, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
+    'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData).
 
-'skip_64_yuzu.gateway.v1.StreamStatusNotification'(<<_:64, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
-    'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData).
+'skip_64_yuzu.gateway.v1.StreamStatusNotification'(<<_:64, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData) ->
+    'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, TrUserData).
 
 'decode_msg_yuzu.gateway.v1.StreamStatusAck'(Bin, TrUserData) -> 'dfp_read_field_def_yuzu.gateway.v1.StreamStatusAck'(Bin, 0, 0, 0, id(false, TrUserData), TrUserData).
 
@@ -4316,11 +4337,16 @@ merge_msgs(Prev, New, MsgName, Opts) ->
              {#{gateway_node := PFgateway_node}, _} -> S5#{gateway_node => PFgateway_node};
              _ -> S5
          end,
+    S7 = case {PMsg, NMsg} of
+             {#{wire_capabilities := PFwire_capabilities}, #{wire_capabilities := NFwire_capabilities}} -> S6#{wire_capabilities => 'erlang_++'(PFwire_capabilities, NFwire_capabilities, TrUserData)};
+             {_, #{wire_capabilities := NFwire_capabilities}} -> S6#{wire_capabilities => NFwire_capabilities};
+             {#{wire_capabilities := PFwire_capabilities}, _} -> S6#{wire_capabilities => PFwire_capabilities};
+             {_, _} -> S6
+         end,
     case {PMsg, NMsg} of
-        {#{wire_capabilities := PFwire_capabilities}, #{wire_capabilities := NFwire_capabilities}} -> S6#{wire_capabilities => 'erlang_++'(PFwire_capabilities, NFwire_capabilities, TrUserData)};
-        {_, #{wire_capabilities := NFwire_capabilities}} -> S6#{wire_capabilities => NFwire_capabilities};
-        {#{wire_capabilities := PFwire_capabilities}, _} -> S6#{wire_capabilities => PFwire_capabilities};
-        {_, _} -> S6
+        {_, #{cluster_id := NFcluster_id}} -> S7#{cluster_id => NFcluster_id};
+        {#{cluster_id := PFcluster_id}, _} -> S7#{cluster_id => PFcluster_id};
+        _ -> S7
     end.
 
 -compile({nowarn_unused_function,'merge_msg_yuzu.gateway.v1.StreamStatusAck'/3}).
@@ -5004,12 +5030,17 @@ verify_msg(Msg, MsgName, Opts) ->
             end;
         _ -> ok
     end,
+    case M of
+        #{cluster_id := F7} -> v_type_string(F7, [cluster_id | Path], TrUserData);
+        _ -> ok
+    end,
     lists:foreach(fun (agent_id) -> ok;
                       (session_id) -> ok;
                       (event) -> ok;
                       (peer_addr) -> ok;
                       (gateway_node) -> ok;
                       (wire_capabilities) -> ok;
+                      (cluster_id) -> ok;
                       (OtherKey) -> mk_type_error({extraneous_key, OtherKey}, M, Path)
                   end,
                   maps:keys(M)),
@@ -6048,7 +6079,8 @@ get_msg_defs() ->
        #{name => event, fnum => 3, rnum => 4, type => {enum, 'yuzu.gateway.v1.StreamStatusNotification.Event'}, occurrence => optional, opts => []},
        #{name => peer_addr, fnum => 4, rnum => 5, type => string, occurrence => optional, opts => []},
        #{name => gateway_node, fnum => 5, rnum => 6, type => string, occurrence => optional, opts => []},
-       #{name => wire_capabilities, fnum => 6, rnum => 7, type => string, occurrence => repeated, opts => []}]},
+       #{name => wire_capabilities, fnum => 6, rnum => 7, type => string, occurrence => repeated, opts => []},
+       #{name => cluster_id, fnum => 7, rnum => 8, type => string, occurrence => optional, opts => []}]},
      {{msg, 'yuzu.gateway.v1.StreamStatusAck'}, [#{name => acknowledged, fnum => 1, rnum => 2, type => bool, occurrence => optional, opts => []}]},
      {{msg, 'yuzu.gateway.v1.ForwardGuardianRequest'},
       [#{name => agent_id, fnum => 1, rnum => 2, type => string, occurrence => optional, opts => []}, #{name => response, fnum => 2, rnum => 3, type => {msg, 'yuzu.agent.v1.CommandResponse'}, occurrence => optional, opts => []}]},
@@ -6250,7 +6282,8 @@ find_msg_def('yuzu.gateway.v1.StreamStatusNotification') ->
      #{name => event, fnum => 3, rnum => 4, type => {enum, 'yuzu.gateway.v1.StreamStatusNotification.Event'}, occurrence => optional, opts => []},
      #{name => peer_addr, fnum => 4, rnum => 5, type => string, occurrence => optional, opts => []},
      #{name => gateway_node, fnum => 5, rnum => 6, type => string, occurrence => optional, opts => []},
-     #{name => wire_capabilities, fnum => 6, rnum => 7, type => string, occurrence => repeated, opts => []}];
+     #{name => wire_capabilities, fnum => 6, rnum => 7, type => string, occurrence => repeated, opts => []},
+     #{name => cluster_id, fnum => 7, rnum => 8, type => string, occurrence => optional, opts => []}];
 find_msg_def('yuzu.gateway.v1.StreamStatusAck') -> [#{name => acknowledged, fnum => 1, rnum => 2, type => bool, occurrence => optional, opts => []}];
 find_msg_def('yuzu.gateway.v1.ForwardGuardianRequest') ->
     [#{name => agent_id, fnum => 1, rnum => 2, type => string, occurrence => optional, opts => []}, #{name => response, fnum => 2, rnum => 3, type => {msg, 'yuzu.agent.v1.CommandResponse'}, occurrence => optional, opts => []}];
