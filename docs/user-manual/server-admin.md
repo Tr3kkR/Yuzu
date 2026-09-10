@@ -2094,7 +2094,7 @@ and marks it revoked in the issued-certificate inventory — but the agent-side
 plugin-load verifier (`docs/user-manual/agent-plugins.md` "Plugin Code
 Signing") does **not** consult the CRL, so revocation does not yet stop an
 agent from loading a plugin already signed with that leaf. Closing this gap is
-a tracked follow-up (`#TBD`); until then, treat "revoked" as "will not be
+a tracked follow-up (`#4234`); until then, treat "revoked" as "will not be
 reissued/renewed", not "immediately rejected fleet-wide". Separately, the
 signer leaf's own **expiry** already matters: once its `not_after` passes,
 `CMS_verify` rejects the signature at the agent's *next restart* — track

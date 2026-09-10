@@ -243,7 +243,7 @@ cert — but the **agent-side plugin-load verifier does not consult the CRL**
 *new* signatures and shows up in the issued-cert inventory as revoked, but does
 **not** yet cause an agent to reject plugins it already signed at the next
 restart — the same limitation a hand-rolled external signing CA has today.
-Closing this is a tracked follow-up (`#TBD`). Separately, signer **expiry**
+Closing this is a tracked follow-up (`#4234`). Separately, signer **expiry**
 already matters operationally: `CMS_verify` checks the signer leaf's validity
 window at verify time, so once a code-signing leaf's `not_after` passes, plugins
 it signed stop *loading* at the agent's next restart — track `not_after` from
