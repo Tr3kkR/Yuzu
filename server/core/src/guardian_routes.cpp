@@ -8,6 +8,11 @@
 #include "baseline_store.hpp"
 #include "http_route_sink.hpp"
 #include "guardian_form_render.hpp"
+#include "guardian_model.hpp" // #4037 — shared per-guard census builder
+                              // (guardian_rule_agent_status_rows), so this
+                              // fragment computes the SAME census as the REST
+                              // /rules/{rule_id}/status and MCP
+                              // get_guardian_rule_status twins
 #include "guardian_push_builder.hpp"  // guardian_enforced_on_platform / platform_display_name / os_target_matches
 #include "guardian_rule_spec.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_denial — mints/reuses X-Correlation-Id so
@@ -1655,9 +1660,22 @@ std::string GuardianRoutes::render_baseline_page_fragment(const std::string& bas
     std::unordered_set<std::string> online;
     online.reserve(online_os.size());
     for (const auto& [aid, aos] : online_os) online.insert(aid);
-    const auto by_rule = (store_ && store_->is_open())
-                             ? rollup_by_rule(store_->agent_rule_statuses().value_or(std::vector<GuardianAgentRuleStatus>{}), online)
-                             : std::unordered_map<std::string, StateRollup>{};
+    // ADR-0038 fix (governance finding SEC-2, ledger
+    // governance.d/4037-guardian-read-twins.*.jsonl): a degraded read now
+    // returns the same "store degraded" placeholder the top-of-function
+    // guards already use, instead of folding to an empty rollup via
+    // value_or and rendering every member as compliance-blank —
+    // indistinguishable from a baseline with no reported status at all.
+    // `!store_->is_open()` (store never wired) is a SEPARATE, pre-existing,
+    // deliberately unchanged case — this page still renders Baseline
+    // metadata with an empty rollup when GuaranteedStateStore isn't wired.
+    std::unordered_map<std::string, StateRollup> by_rule;
+    if (store_ && store_->is_open()) {
+        auto statuses = store_->agent_rule_statuses();
+        if (!statuses)
+            return stub("Guardian store degraded");
+        by_rule = rollup_by_rule(*statuses, online);
+    }
 
     // One list_rules() into a rid->row map (reused for enforcement_mode + os_target +
     // the member labels below) so the page does not issue a get_rule() per member.
@@ -1952,7 +1970,24 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
                     }
         }
         std::unordered_set<std::string> seen;  // agent_ids that already have a status row
-        for (const auto& s : store_->agent_rule_statuses(guard_id).value_or(std::vector<GuardianAgentRuleStatus>{})) {
+        // #4037: same shared builder as the REST/MCP twins
+        // (guardian_model.hpp::guardian_rule_agent_status_rows), so all three
+        // surfaces compute this census identically. ADR-0038 fix (governance
+        // finding SEC-2, ledger governance.d/4037-guardian-read-twins.*.jsonl):
+        // a degraded read (nullopt) now returns a distinct placeholder BELOW,
+        // instead of folding to an empty vector via value_or and rendering
+        // "no devices report this guard" — indistinguishable from a genuinely
+        // unreported guard. Matches the main guards-overview route's existing
+        // posture (this file, ~line 401) and the per-device Guardian lens
+        // (device_routes.cpp). See the sibling fix in
+        // render_baseline_page_fragment's by_rule computation above in this
+        // file for the same class of gap on the baseline detail page.
+        auto status_rows = yuzu::server::guardian_rule_agent_status_rows(*store_, guard_id);
+        if (!status_rows)
+            return "<a class=\"gp-back\" href=\"/guardian\">&larr; All guards</a>"
+                   "<div class=\"gp-placeholder\"><b>Guard status degraded</b><br>"
+                   "Check server /healthz.</div>";
+        for (const auto& s : *status_rows) {
             seen.insert(s.agent_id);
             DevRow d;
             d.online = hostname.count(s.agent_id) > 0;

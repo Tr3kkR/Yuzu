@@ -165,6 +165,7 @@
 #include "guardian_ingest.hpp" // kGuardianEventStoreDurationMetric + warm_create_guardian_event_store_metric
 #include "dex_perf_rules.hpp"
 #include "dex_routes.hpp"
+#include "network_api.hpp" // ADR-0031 WS-A4: the public in-process /network API seam
 #include "network_perf_rules.hpp"
 #include "inventory_routes.hpp"
 #include "inventory_ci_join.hpp"
@@ -231,6 +232,7 @@
 #include "agent_registry.hpp"
 #include "agent_service_impl.hpp"
 #include "cidr_match.hpp"
+#include "gateway_route_store.hpp"
 #include "gateway_service_impl.hpp"
 
 #include <grpc/grpc_security_constants.h>
@@ -2600,9 +2602,13 @@ public:
                           "counter");
         // PKI PR3: per-agent client certificates signed at enrollment. A spike is
         // an enrollment storm (mass deploy) or, if sustained, a CSR-flood signal.
+        // gov F11: HELP text updated for gap-matrix #10 (code-signing leaves) —
+        // purpose now has two values, via has grown two more.
         metrics_.describe("yuzu_server_ca_cert_issued_total",
-                          "Per-agent client certificates issued by the internal CA at agent "
-                          "enrollment (PKI PR3). Labelled purpose (agent)",
+                          "Certificates issued by the internal CA - per-agent client leaves at "
+                          "enrollment (PKI PR3) or operator-requested code-signing leaves "
+                          "(gap-matrix #10). Labelled purpose (agent|code-signing) and via "
+                          "(direct|gateway_proxy|rest|mcp)",
                           "counter");
         // PKI PR4 (gov sre/unhappy SHOULD): the CRL could not be (re)built/signed —
         // the public CRL is stale relative to ca_store. Alert on >0 since a revocation,
@@ -3656,7 +3662,12 @@ public:
         // construct a ServerImpl (auth_mgr_.metrics_ stays nullptr there).
         auth_mgr_.set_metrics_registry(&metrics_);
 
-        // Create gateway upstream service if configured
+        // Create gateway upstream service if configured. Its born-on-PG route
+        // store (HA WS-4 4.1, GatewayRouteStore) is constructed further below,
+        // AFTER the PostgreSQL substrate, and wired in via set_gateway_route_store
+        // — same optional-borrowed-pointer pattern as every other PG-backed store
+        // this service touches (mgmt_group_store_ etc.), so no construction-order
+        // dependency on pg_pool_ here.
         if (!cfg_.gateway_upstream_address.empty()) {
             gateway_service_ = std::make_unique<detail::GatewayUpstreamServiceImpl>(
                 registry_, event_bus_, auth_mgr, auto_approve_, &metrics_, &health_store_);
@@ -4159,6 +4170,27 @@ public:
                               "(database reachable but the deployment_run_store schema could not be "
                               "created/opened)");
                 startup_failed_ = true;
+            }
+        }
+
+        // GatewayRouteStore — born-on-PG agent->cluster routing directory (HA
+        // WS-4 slice 4.1; see gateway_route_store.hpp). INERT this slice: written
+        // by GatewayUpstreamServiceImpl's connect/heartbeat/disconnect paths (wired
+        // below via set_gateway_route_store, same optional-borrowed-pointer
+        // discipline as every other PG-backed store this service touches —
+        // mgmt_group_store_/inventory_store_/etc. below), read by nobody yet.
+        // Same fail-CLOSED construction posture as PreflightRunStore/
+        // DeploymentRunStore (ADR-0012 §1) — only built when a gateway upstream is
+        // actually configured.
+        if (!cfg_.gateway_upstream_address.empty() && pg_pool_ && !startup_failed_) {
+            gateway_route_store_ = std::make_unique<GatewayRouteStore>(*pg_pool_);
+            if (!gateway_route_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: gateway-route store migration/open failed "
+                              "(database reachable but the gateway_route_store schema could not "
+                              "be created/opened)");
+                startup_failed_ = true;
+            } else if (gateway_service_) {
+                gateway_service_->set_gateway_route_store(gateway_route_store_.get());
             }
         }
 
@@ -9253,6 +9285,15 @@ public:
         // thread this PR; keep the ADR-0012 teardown discipline so a future engine
         // can't UAF).
         vuln_finding_store_.reset();
+        // GatewayRouteStore (HA WS-4 4.1) borrows pg_pool_ — drop before the pool.
+        // Null the borrowed pointer in gateway_service_ FIRST, same discipline as
+        // every other PG-backed store it touches below (mgmt_group_store_ etc.) —
+        // agent_server_/mgmt_server_->Shutdown(deadline) already ran above, so no
+        // in-flight ProxyRegister/BatchHeartbeat/NotifyStreamStatus handler can
+        // still be touching it, but null it anyway (belt-and-braces).
+        if (gateway_service_)
+            gateway_service_->set_gateway_route_store(nullptr);
+        gateway_route_store_.reset();
         // AccessReviewStore borrows pg_pool_ — drop before the pool. No background
         // thread borrows it (only rest_api_v1_/mcp_server_ hold a raw pointer, and
         // every HTTP/MCP handler thread is already quiesced by the drain above);
@@ -10095,7 +10136,21 @@ private:
             }
             const auto now_epoch = static_cast<int64_t>(std::time(nullptr));
             for (const auto& rev : *revoked_or_err) {
-                if (rev.subject == agent_id && rev.not_after > now_epoch) {
+                // gap-matrix #10: `rev.subject` is a bare identifier with no
+                // namespace of its own — a revoked CODE-SIGNING leaf's CN
+                // (the operator's own `label`) could coincidentally equal a
+                // real agent_id, and without this purpose filter would
+                // wrongly block that agent's re-enrollment forever (a
+                // cross-namespace denial-of-service this gate must not
+                // cause). Only a revoked AGENT cert gates agent re-issuance.
+                // gov F12/UP-2 TRIPWIRE: this cross-namespace safety depends on
+                // EVERY agent-cert recording site setting `purpose="agent"`
+                // (see the `rec.purpose = "agent"` assignment below) — a future
+                // agent-issuance path that records a different/empty purpose
+                // would silently fall out of this filter and reopen the
+                // revocation bypass this check exists to close.
+                if (rev.purpose == "agent" && rev.subject == agent_id &&
+                    rev.not_after > now_epoch) {
                     spdlog::warn("PKI: refusing to re-issue for agent {} — a revoked, "
                                  "non-expired cert (serial {}) exists; an operator must clear "
                                  "the revocation before this agent can re-provision",
@@ -10200,6 +10255,11 @@ private:
         rec.serial_hex = issued->serial_hex;
         rec.subject = agent_id;
         rec.san = lp.san.uris.empty() ? std::string{} : lp.san.uris.front();
+        // gov F12/UP-2 TRIPWIRE: the reissue-block filter above keys off this
+        // EXACT literal ("agent") to distinguish a revoked agent identity from
+        // a revoked code-signing leaf whose CN happens to collide with an
+        // agent_id. Any future agent-cert recording site must set this same
+        // purpose or the cross-namespace guard silently stops covering it.
         rec.purpose = "agent";
         rec.not_after =
             std::chrono::duration_cast<std::chrono::seconds>(not_after.time_since_epoch()).count();
@@ -10253,6 +10313,179 @@ private:
         // corporate trust anchor. chain_pem is empty in Builtin mode, leaving the
         // M1 single-cert behaviour unchanged.
         return std::make_pair(issued->cert_pem, root->cert_pem + root->chain_pem);
+    }
+
+    /// Sign a code-signing leaf from an operator-submitted CSR (gap-matrix
+    /// #10). CSR-custody model: the operator holds the private key; this
+    /// server never sees it. SAFE to expose without the #1118 agent-
+    /// impersonation risk that keeps the general `/ca/issue` route deferred —
+    /// see ca_routes.hpp's file header for the argument in full — because
+    /// usage is HARD-PINNED to `pki::LeafUsage{.code_signing=true}` (rejected
+    /// by the mTLS SSL_CLIENT purpose check, so it can never reach the
+    /// agent-identity gate) and the subject CN is the caller's validated
+    /// `label`, never an agent-style `yuzu://…/agent/…` URI SAN (this leaf's
+    /// SAN is left empty). Same key-custody discipline as sign_agent_csr: the
+    /// CA private key is loaded transiently and zeroed on every exit path,
+    /// including exception unwind.
+    std::expected<CodeSigningIssuance, std::string>
+    issue_code_signing_leaf(const std::string& csr_pem, const std::string& label,
+                            std::optional<int> validity_days, const std::string& issued_by,
+                            const std::string& via) {
+        if (!ca_store_ || !ca_store_->is_open())
+            return std::unexpected("ca store not open");
+        auto root_or_err = ca_store_->get_root();
+        if (!root_or_err) {
+            spdlog::error("PKI: code-signing issuance aborted — ca_store read failed: {}",
+                          root_or_err.error());
+            return std::unexpected("ca store read failed");
+        }
+        auto& root = *root_or_err;
+        if (!root) {
+            spdlog::warn("PKI: code-signing issuance requested but ca_store has no root");
+            return std::unexpected(std::string(kCodeSigningNoRootPrefix) + "no CA root");
+        }
+
+        // Defense-in-depth: the REST route already validates this, but the CN
+        // below is set DIRECTLY from `label` — re-check here too, since this
+        // is the boundary that actually places the value in the certificate.
+        if (!is_valid_code_signing_label(label))
+            return std::unexpected(std::string(kCodeSigningBadCsrPrefix) + "invalid label");
+
+        // Same CSR size bound sign_agent_csr enforces (16 KiB is generous
+        // slack over a realistic PEM CSR). A separate chokepoint from that
+        // one (agent enrollment vs. operator code-signing issuance), so it is
+        // re-stated here rather than shared — matches this file's existing
+        // per-signing-path style (sign_agent_csr also declares its own local
+        // constant rather than a shared one).
+        constexpr std::size_t kMaxCsrPemBytes = 16 * 1024;
+        if (csr_pem.size() > kMaxCsrPemBytes) {
+            spdlog::warn("PKI: rejecting oversize code-signing CSR ({} bytes > {}) for label {}",
+                         csr_pem.size(), kMaxCsrPemBytes, label);
+            return std::unexpected(std::string(kCodeSigningBadCsrPrefix) + "csr_pem too large");
+        }
+
+        // gov B1 (HIGH, fleet-RCE class): floor the SUBJECT key strength before
+        // this CA ever signs it into a trusted codeSigning anchor. A sub-2048-bit
+        // RSA / unapproved-curve EC key would become a factorable plugin-signing
+        // identity — check BEFORE loading the CA key so a weak-key refusal never
+        // touches the CA private key at all.
+        if (!pki::subject_key_meets_code_signing_floor(csr_pem)) {
+            spdlog::warn(
+                "PKI: rejecting code-signing CSR with a weak/unsupported subject key for "
+                "label {}",
+                label);
+            return std::unexpected(std::string(kCodeSigningWeakKeyPrefix) +
+                                   "signing key too weak (RSA must be 2048-16384 bits; EC "
+                                   "must be P-256, P-384, or P-521)");
+        }
+
+        const std::filesystem::path dir =
+            cfg_.ca_dir.empty() ? auth::default_cert_dir() : cfg_.ca_dir;
+        FileKeyProvider kp(dir);
+        auto ca_key = kp.load_key(root->key_ref);
+        if (!ca_key) {
+            spdlog::error("PKI: cannot load CA issuing key — code-signing cert not issued");
+            return std::unexpected("cannot load CA issuing key");
+        }
+        // Zero the CA key on every exit path, including exception unwind.
+        detail::ScopedKeyZero ca_key_zero{*ca_key};
+
+        // Validity: default 1y (mirrors the agent leaf default), operator may
+        // request a shorter/longer window up to a hard 2y ceiling — a request
+        // outside [1, kMaxCodeSigningValidityDays] is REFUSED rather than
+        // silently clamped, so an operator asking for e.g. 5y gets an honest
+        // error instead of a shorter cert than they thought they requested.
+        // Always further clamped so the leaf can never outlive the issuing CA
+        // (mirrors sign_agent_csr's ca_not_after clamp).
+        constexpr int kDefaultCodeSigningValidityDays = 365;
+        constexpr int kMaxCodeSigningValidityDays = 730;
+        const int days = validity_days.value_or(kDefaultCodeSigningValidityDays);
+        // gov F6/UP-5/UP-7: a business refusal (bad range), NOT a malformed
+        // CSR — DISTINCT prefix so the caller sees the real reason instead of
+        // "csr_pem is invalid".
+        if (days < 1 || days > kMaxCodeSigningValidityDays) {
+            return std::unexpected(std::string(kCodeSigningBadValidityPrefix) +
+                                   "validity_days must be between 1 and " +
+                                   std::to_string(kMaxCodeSigningValidityDays));
+        }
+        const auto now = std::chrono::system_clock::now();
+        auto not_after = now + std::chrono::hours(24 * days);
+        const auto ca_not_after =
+            std::chrono::system_clock::time_point{std::chrono::seconds{root->not_after}};
+        if (not_after > ca_not_after)
+            not_after = ca_not_after;
+        // gov F6: an at-or-past-expiry CA clamps `not_after` to (or before) `now`
+        // above — refuse rather than mint a leaf that is already invalid at
+        // issuance. Same kCodeSigningBadValidityPrefix classification: this is
+        // a business refusal (the CA needs re-rooting), not a bad CSR.
+        if (not_after <= now) {
+            spdlog::warn("PKI: refusing code-signing issuance for label {} — CA is at or past "
+                         "expiry (ca_not_after={})",
+                         label, root->not_after);
+            return std::unexpected(std::string(kCodeSigningBadValidityPrefix) +
+                                   "CA is at or past expiry; cannot issue");
+        }
+
+        pki::LeafParams lp;
+        // CN=label — the non-agent namespace. NEVER agent_id: this is what
+        // keeps this leaf out of the #1118 identity-match namespace.
+        lp.subject = {label, "Yuzu"};
+        // NO SAN — in particular no `yuzu://…/agent/…` URI (the agent
+        // identity form). Leaving `san` default-empty is deliberate, not an
+        // omission.
+        lp.validity = {now - pki::kClockSkewBackdate, not_after};
+        // HARD-PINNED — never client_auth/server_auth. A codeSigning-only EKU
+        // is rejected by the mTLS SSL_CLIENT purpose check, so this leaf can
+        // never reach the #1118 agent-identity gate regardless of its CN.
+        lp.usage = pki::LeafUsage{.code_signing = true};
+
+        auto issued = pki::sign_csr(csr_pem, root->cert_pem, *ca_key, lp);
+        if (!issued) {
+            spdlog::warn("PKI: sign_csr failed for code-signing label {}", label);
+            return std::unexpected(std::string(kCodeSigningBadCsrPrefix) +
+                                   "csr_pem is invalid or fails proof-of-possession");
+        }
+
+        // Record the issued leaf so it can be revoked / inventoried (ca_store).
+        IssuedCertRecord rec;
+        rec.serial_hex = issued->serial_hex;
+        rec.subject = label;
+        rec.san.clear(); // no SAN on this leaf — see lp.san above.
+        rec.purpose = "code-signing";
+        rec.not_after =
+            std::chrono::duration_cast<std::chrono::seconds>(not_after.time_since_epoch()).count();
+        rec.cert_pem = issued->cert_pem;
+        rec.issued_by = issued_by;
+        if (auto kid = pki::issuer_key_id(root->cert_pem))
+            rec.issuer_key_id = *kid;
+        rec.issuer_fingerprint = root->fingerprint_sha256;
+        if (auto rec_result = ca_store_->record_issued(rec); !rec_result) {
+            // Fail closed: an unrecorded cert can't be revoked, so don't hand
+            // it out (mirrors sign_agent_csr's record_issued failure path).
+            spdlog::error(
+                "PKI: failed to record issued code-signing cert for {} — not issuing: {}", label,
+                rec_result.error());
+            return std::unexpected("failed to record issued certificate");
+        }
+
+        // gov (sre SHOULD) + F10: reuse the existing issuance counter with a
+        // "code-signing" purpose label + the CALLER's transport (`via`, "rest"
+        // or "mcp") — the agent issuance path keeps its own
+        // "agent"/direct|gateway labelling unchanged.
+        metrics_
+            .counter("yuzu_server_ca_cert_issued_total",
+                     {{"purpose", "code-signing"}, {"via", via}})
+            .increment();
+
+        return CodeSigningIssuance{
+            .certificate_pem = issued->cert_pem,
+            // Same "issuing cert PLUS parent chain above it" shape as
+            // sign_agent_csr's returned chain — what an operator needs for
+            // `openssl cms -sign -certfile` to build a full path.
+            .chain_pem = root->cert_pem + root->chain_pem,
+            .serial_hex = issued->serial_hex,
+            .not_after = format_iso_utc(rec.not_after),
+        };
     }
 
     /// PR6 subordinate-CA: export the install CA's CSR (PKCS#10 PEM) over its
@@ -15336,130 +15569,16 @@ private:
         // NetworkRoutes — /network (page shell) + /fragments/network/* (the
         // network-quality lens + net/device/app co-occurrence evidence).
         //
-        // Provider: assemble a NetPerfSnapshot from the health store's network
-        // facts (net_snapshot — SAME 90s staleness as recompute_metrics, so the
-        // page and the yuzu_fleet_net_* gauges see the same population) joined
-        // with session OS + cohort tags. Mirrors dex_perf_uncached. app_unstable
-        // is wired with the per-connection collector slice (the co-occurrence
-        // "also app" band stays empty until net_degraded facts exist).
-        auto net_perf_uncached = [this](const std::string& cohort_key) -> NetPerfSnapshot {
-            NetPerfSnapshot snap;
-            snap.cohort_key = cohort_key;
-            std::unordered_map<std::string, std::string> cohort_values;
-            if (tag_store_ && !cohort_key.empty()) {
-                // Render/telemetry caller — same degrade posture as
-                // dex_perf_uncached above (ADR-0036/ADR-0050).
-                snap.available_keys =
-                    tag_store_->get_distinct_keys().value_or(std::vector<std::string>{});
-                cohort_values = tag_store_->get_values_for_key(cohort_key)
-                                    .value_or(std::unordered_map<std::string, std::string>{});
-            }
-            const auto health = health_store_.net_snapshot(std::chrono::seconds{90});
-            std::unordered_map<std::string, const detail::AgentHealthSnapshot*> by_id;
-            by_id.reserve(health.size());
-            for (const auto& h : health)
-                by_id[h.agent_id] = &h;
-
-            auto fill_facts = [](NetPerfDevice& d,
-                                 const std::unordered_map<std::string, std::string>& tags) {
-                auto get = [&](const char* k) -> std::string {
-                    auto t = tags.find(k);
-                    return t != tags.end() ? t->second : std::string{};
-                };
-                d.rtt_ms = detail::parse_net_rtt_ms(get(detail::kNetTagRttP50Ms));
-                d.retrans_pct = detail::parse_net_retrans_pct(get(detail::kNetTagRetransPct));
-                d.throughput_bps =
-                    detail::parse_net_throughput_bps(get(detail::kNetTagThroughputBps));
-                if (auto deg = detail::parse_net_degraded(get(detail::kNetTagDegraded)))
-                    d.net_degraded = *deg;
-                d.cpu_pct = detail::parse_perf_cpu_pct(get(detail::kPerfTagCpuPct));
-                d.commit_pct = detail::parse_perf_commit_pct(get(detail::kPerfTagCommitPct));
-                d.disk_lat_ms = detail::parse_perf_disk_lat_ms(get(detail::kPerfTagDiskLatMs));
-                d.app_unstable = false; // wired with the per-connection collector slice
-            };
-
-            std::unordered_set<std::string> seen;
-            for (const auto& id : registry_.all_ids()) {
-                auto s = registry_.get_session(id);
-                if (!s)
-                    continue;
-                NetPerfDevice d;
-                d.agent_id = id;
-                std::string os = s->os;
-                for (auto& c : os)
-                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                d.platform = os; // "windows" / "linux" / "darwin"
-                if (auto it = by_id.find(id); it != by_id.end())
-                    fill_facts(d, it->second->status_tags);
-                if (!cohort_key.empty()) {
-                    // STORE-FIRST precedence (operator-declared cohort wins over
-                    // a self-reported tag) — same posture as dex_perf_uncached.
-                    if (auto cv = cohort_values.find(id); cv != cohort_values.end())
-                        d.cohort = cv->second;
-                    else if (auto it = s->scopable_tags.find(cohort_key);
-                             it != s->scopable_tags.end() &&
-                             TagStore::validate_value(it->second))
-                        d.cohort = it->second;
-                }
-                snap.devices.push_back(std::move(d));
-                seen.insert(id);
-            }
-            // C-S1: health-only devices (session reaped, heartbeat still fresh)
-            // must also appear so the page and the gauges agree.
-            for (const auto& h : health) {
-                if (seen.contains(h.agent_id))
-                    continue;
-                NetPerfDevice d;
-                d.agent_id = h.agent_id;
-                fill_facts(d, h.status_tags);
-                if (!cohort_key.empty())
-                    if (auto cv = cohort_values.find(h.agent_id); cv != cohort_values.end())
-                        d.cohort = cv->second;
-                snap.devices.push_back(std::move(d));
-            }
-            return snap;
-        };
-        // 5s TTL memo keyed by cohort key (mirrors the dex_perf_fn memo) —
-        // heartbeat data changes on a ~30s cadence, so this bounds the per-request
-        // fleet walk (all_ids + per-id get_session + net_snapshot copy-under-mutex)
-        // under hard operator polling and the future REST surface.
-        struct NetPerfMemo {
-            std::mutex mu;
-            struct Entry {
-                std::chrono::steady_clock::time_point at;
-                NetPerfSnapshot snap;
-            };
-            std::unordered_map<std::string, Entry> by_key;
-        };
-        auto net_memo = std::make_shared<NetPerfMemo>();
-        auto net_perf_fn = [memo = net_memo,
-                            net_perf_uncached](const std::string& cohort_key) -> NetPerfSnapshot {
-            constexpr auto kTtl = std::chrono::seconds{5};
-            constexpr std::size_t kMaxMemoEntries = 8;
-            const auto now = std::chrono::steady_clock::now();
-            {
-                std::lock_guard lk(memo->mu);
-                if (auto it = memo->by_key.find(cohort_key);
-                    it != memo->by_key.end() && now - it->second.at < kTtl)
-                    return it->second.snap;
-            }
-            auto snap = net_perf_uncached(cohort_key);
-            {
-                std::lock_guard lk(memo->mu);
-                if (memo->by_key.size() >= kMaxMemoEntries && !memo->by_key.contains(cohort_key)) {
-                    auto oldest = memo->by_key.begin();
-                    for (auto it = memo->by_key.begin(); it != memo->by_key.end(); ++it)
-                        if (it->second.at < oldest->second.at)
-                            oldest = it;
-                    memo->by_key.erase(oldest);
-                }
-                memo->by_key[cohort_key] = {now, snap};
-            }
-            return snap;
-        };
+        // ADR-0031 WS-A4: the store-reaching assembly (net_snapshot — SAME 90s
+        // staleness as recompute_metrics; STORE-FIRST cohort precedence; C-S1
+        // health-only devices; the 5s TTL / 8-entry memo) moved verbatim behind
+        // the NetworkApi seam (network_api.{hpp,cpp}) — one instance, shared by
+        // this dashboard provider, the REST /api/v1/network/* siblings, and the
+        // MCP network tools, so all three can never disagree.
+        auto network_api = make_local_network_api(health_store_, registry_, tag_store_.get());
 
         network_routes_ = std::make_unique<NetworkRoutes>();
-        network_routes_->register_routes(*web_server_, auth_fn, perm_fn, audit_fn, net_perf_fn);
+        network_routes_->register_routes(*web_server_, auth_fn, perm_fn, audit_fn, network_api);
 
         // DeviceRoutes — /devices (fleet list) + /device?id= (the shared device
         // page; Device-info lens). Sourced from the live registry (the CONNECTED
@@ -16238,6 +16357,12 @@ private:
             [this](const std::string& intermediate_pem,
                    const std::string& parent_chain_pem) -> CaRoutes::ImportOutcome {
                 return import_subordinate_chain(intermediate_pem, parent_chain_pem);
+            },
+            // gap-matrix #10: code-signing leaf issuance via CSR custody.
+            [this](const std::string& csr_pem, const std::string& label,
+                   std::optional<int> validity_days,
+                   const std::string& issued_by) -> std::expected<CodeSigningIssuance, std::string> {
+                return issue_code_signing_leaf(csr_pem, label, validity_days, issued_by, "rest");
             });
 
         // -- #2395: KEK rotation REST surface (/api/v1/secrets/kek/*) -------------
@@ -17283,10 +17408,10 @@ private:
             // the /dex Performance fragments and the MCP perf tools use, so
             // REST, dashboard and MCP can never disagree.
             dex_perf_fn,
-            // N1: the shared network-quality snapshot provider — the same closure
-            // the /network fragments use, so the /api/v1/network/* siblings and
+            // N1/ADR-0031 WS-A4: the shared NetworkApi — the same instance the
+            // /network fragments use, so the /api/v1/network/* siblings and
             // MCP tools can never disagree with the dashboard.
-            net_perf_fn,
+            network_api,
             // lockout_clear_fn — admin unlock (POST /api/v1/users/<name>/unlock).
             // Wraps AuthDB::clear_failed_logins so RestApiV1 stays decoupled from
             // AuthDB (same injection pattern as session_revoke_fn). SOC 2 CC6.3.
@@ -17526,6 +17651,12 @@ private:
             // decision for the same caller (same conversion, same underlying
             // require_fleet_read call).
             mcp_server_->set_fleet_read_fn(fleet_read_fn);
+            // #4037 — the SAME list_read_fn lambda wired into the REST
+            // registration's trailing list_read_fn param below, so the REST
+            // GET /guaranteed-state/status and MCP get_guardian_status twins
+            // cannot observe a different admit decision for the same caller
+            // (same conversion, same underlying require_list_read call).
+            mcp_server_->set_list_read_fn(list_read_fn);
             // #4027 fix round (CDX-P1-01/K4): the RBAC/management-group AXIS
             // for these three tools is the fleet_read_fn_ already wired above
             // (the SAME instance query_installed_software uses).
@@ -17657,8 +17788,8 @@ private:
                 // F2a: the shared fleet perf snapshot provider (one closure,
                 // three surfaces — fragments, REST, MCP).
                 dex_perf_fn,
-                // N1: the shared network-quality provider (fragments + REST + MCP).
-                net_perf_fn,
+                // N1/ADR-0031 WS-A4: the shared NetworkApi (fragments + REST + MCP).
+                network_api,
                 // #1550 HIGH-1 / #1634: per-agent response-scope predicate for
                 // query_responses{execution_id} AND aggregate_responses. Routes through
                 // the single response_agent_in_scope helper — the SAME fail-closed
@@ -17772,7 +17903,16 @@ private:
                 // #4029: backs list_product_packs/get_product_pack.
                 product_pack_store_.get(),
                 // #4030: backs list_workflows/get_workflow/get_workflow_execution.
-                workflow_engine_.get());
+                workflow_engine_.get(),
+                // gap-matrix #10: backs the issue_code_signing_cert MCP tool
+                // (ADR-1005 parity with POST /api/v1/ca/issue-code-signing) — the
+                // SAME ServerImpl seam the CaRoutes registration above wires, so the
+                // REST route and the MCP twin mint identically-scoped leaves.
+                [this](const std::string& csr_pem, const std::string& label,
+                       std::optional<int> validity_days,
+                       const std::string& issued_by) -> std::expected<CodeSigningIssuance, std::string> {
+                    return issue_code_signing_leaf(csr_pem, label, validity_days, issued_by, "mcp");
+                });
         }
 
         // -- Listen -----------------------------------------------------------
@@ -18139,6 +18279,16 @@ private:
     /// declared after it so it destructs before the pool; reset in stop().
     std::unique_ptr<PreflightRunStore> preflight_run_store_;
     std::unique_ptr<DeploymentRunStore> deployment_run_store_;
+    /// HA WS-4 slice 4.1: born-on-PG agent->cluster routing directory (see
+    /// gateway_route_store.hpp). Borrows pg_pool_ → declared after it, so it
+    /// destructs before the pool. Borrowed by gateway_service_ via
+    /// set_gateway_route_store. NOTE the lifetime guarantee is stop(), NOT
+    /// declaration order: gateway_service_ is declared EARLIER, so it destructs
+    /// AFTER this store — on a raw member teardown the borrow would dangle. It
+    /// is safe because ~ServerImpl always runs stop(), which Shutdown(deadline)-
+    /// drains in-flight RPCs, THEN nulls the borrowed pointer, THEN resets this
+    /// store — same discipline as mgmt_group_store_/inventory_store_ etc. below.
+    std::unique_ptr<GatewayRouteStore> gateway_route_store_;
     /// Born-on-PG CAVM findings + per-agent coverage projection (ADR-0012).
     /// Borrows pg_pool_ → declared after it; reset in stop() before the pool.
     /// DORMANT this PR: constructed + wired into /readyz+/healthz, no engine yet.

@@ -108,6 +108,8 @@ constexpr ExpectedResolution kExpected[] = {
     {"POST",   "/api/v1/ca/import-chain",                 256u * 1024,        false, "ca_import_chain"},
     // ca_routes.cpp:24 kMaxRevokeBody,:394.
     {"POST",   "/api/v1/ca/revoke",                       64u * 1024,         false, "ca_revoke"},
+    // ca_routes.cpp kMaxIssueCodeSigningBody (gap-matrix #10).
+    {"POST",   "/api/v1/ca/issue-code-signing",           64u * 1024,         false, "ca_issue_code_signing"},
     // kek_routes.cpp:46 kMaxKekBody,:54 validate_empty_body — shared by rotate+rewrap.
     {"POST",   "/api/v1/secrets/kek/rotate",               64u * 1024,        false, "kek_ops"},
     {"POST",   "/api/v1/secrets/kek/rewrap",               64u * 1024,        false, "kek_ops"},
@@ -166,6 +168,7 @@ constexpr std::string_view kExpectedPathClasses[] = {
     "json_to_csv_export",
     "nvd_match",
     "ca_import_chain",
+    "ca_issue_code_signing",
     "ca_revoke",
     "kek_ops",
     "ca_import_chain_dashboard",
@@ -308,9 +311,10 @@ TEST_CASE("kBodyCapTable: the path_class label set is exactly the documented, fi
 TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
     // Independent of the label-set check above: a new row using an EXISTING
     // label (e.g. a second SCIM method already covered) would pass that
-    // check while still silently growing the table. 27 = mcp(1) +
+    // check while still silently growing the table. 28 = mcp(1) +
     // bundles(1) + ota_upload(1) + json_to_csv_export(1) + nvd_match(1) +
-    // ca_import_chain(1) + ca_revoke(1) +
+    // ca_import_chain(1) + ca_issue_code_signing(1: gap-matrix #10) +
+    // ca_revoke(1) +
     // kek_ops(1: one prefix entry covers both rotate and rewrap) +
     // ca_import_chain_dashboard(1) + plugin_trust_bundle(1) + scim(3:
     // POST/PUT/PATCH) + saml_acs(1) + response_templates(2: POST/PUT) +
@@ -320,7 +324,7 @@ TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
     // instruction_yaml(3: save/validate/preview) + upload_session(1: the
     // PR1.6a chunked-receive surface) + plugin_config(1: the PR1.5 config/
     // secret plane) + default(1).
-    CHECK(std::size(kBodyCapTable) == 27);
+    CHECK(std::size(kBodyCapTable) == 28);
 }
 
 // ── 7. requires_measurable: ON for /mcp/ and upload_session, OFF elsewhere ──

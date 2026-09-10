@@ -366,6 +366,18 @@ public:
                                                     bool client_identity_matches,
                                                     const std::vector<std::string>& trusted_nat_cidrs);
 
+    /// The metadata key carrying the session id on the direct Subscribe path
+    /// (see Subscribe's own use below). Public — HA WS-4 4.1's
+    /// GatewayUpstreamServiceImpl::ProxyRegister reuses this SAME key + reader
+    /// to recognise a gateway circuit-recovery replay, so the two paths cannot
+    /// silently drift onto different metadata keys.
+    static constexpr std::string_view kSessionMetadataKey = "x-yuzu-session-id";
+
+    /// Read a single gRPC client-metadata value by key, or empty if absent.
+    /// Public for the same reason as `kSessionMetadataKey` above.
+    static std::string client_metadata_value(const grpc::ServerContext& context,
+                                             std::string_view key);
+
     void publish_output_rows(const std::string& agent_id, const std::string& plugin,
                              const std::string& raw_output);
 
@@ -392,7 +404,6 @@ private:
     auth::AutoApproveEngine& auto_approve_;
     yuzu::MetricsRegistry& metrics_;
 
-    static constexpr std::string_view kSessionMetadataKey = "x-yuzu-session-id";
     static constexpr auto kPendingRegistrationTtl = std::chrono::seconds(60);
 
     // -- PendingRegistration (must be complete before use in unordered_map) -----
@@ -555,8 +566,6 @@ private:
     static std::string extract_peer_cert_pem(const grpc::ServerContext& context);
     static bool peer_identity_matches_agent_id(const grpc::ServerContext& context,
                                                const std::string& agent_id);
-    static std::string client_metadata_value(const grpc::ServerContext& context,
-                                             std::string_view key);
     static bool has_identity_overlap(const std::vector<std::string>& lhs,
                                      const std::vector<std::string>& rhs);
 
