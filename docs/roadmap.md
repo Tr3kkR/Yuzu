@@ -16,13 +16,24 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 
      **Status vocabulary — a counting contract, not prose.** Every Index row's Status cell MUST begin
      (after stripping any leading `**`/`__` markdown emphasis) with EXACTLY one of these 5 literal
-     strings; everything after an em dash (—) or opening paren is free-text annotation the counting rule
-     ignores:
+     strings, followed by a word boundary — this is a plain-English restatement of the reference
+     parser's regex below, nothing more: a trailing `**`/`__` closing the emphasis, a space, an em
+     dash, a paren, or end-of-line all count as the boundary; anything else (e.g. the literal fused
+     into a longer word) does not match. Everything from that boundary onward is free-text annotation
+     the counting rule ignores. A `Done` cell's annotation must never itself negate delivery (no "not
+     shipped"/"not built"/"not implemented" after a `Done` literal) — a row whose annotation qualifies
+     *how* something shipped stays `Done`; a row whose annotation says nothing shipped must carry
+     `Partial` instead, never `Done`. The 5 literals:
        - `Done` — closed COMPLETED, or closed NOT_PLANNED *with* a cited delivery-evidence path/ADR (the
          thing shipped differently from how the issue described it, or shipped with a small non-blocking
          gap called out in the annotation — a genuinely unshipped major capability is `Partial`, not `Done`).
        - `Partial` — real delivery exists but a materially advertised capability of the issue does not
-         work end-to-end (e.g. records+audits with no working dispatch path).
+         work end-to-end (e.g. records+audits with no working dispatch path). **Decay path:** a `Partial`
+         row promoted to `Done` by a later edit MUST re-verify the specific gap the annotation named is
+         actually closed (re-run the `grep`/`ls` check the row's own annotation cites) — do not promote
+         on the strength of unrelated GitHub activity (a new commit, a closed follow-up issue, a merged
+         PR) without checking the row's own cited evidence path first; this is the same `stateReason`
+         discipline this recipe already applies to closures, extended to Partial→Done edits.
        - `Closed — not planned` — closed NOT_PLANNED with NO delivery evidence (a real decision not to
          build it, distinct from `Done`-via-NOT_PLANNED above).
        - `Open` — still open on GitHub, including "in progress" work (a PR ladder or partial soak does not
@@ -37,6 +48,9 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
      A reference parser implementing exactly this rule: strip each Index row's Status cell of leading
      `**`/`__`, match `^(Done|Partial|Closed — not planned|Open|Deferred)\b`, sum `Done` vs everything
      else per phase. No table of synonyms, no regex alternation beyond the 5 literals above.
+     **Negation check** (must return nothing before trusting any `Done` count): `grep -nE '^\|[^|]*\|
+     [^|]*\|[^|]*\|[^|]*\| *\**Done\**[^|]*(NOT|not) (shipped|built|implemented)' docs/roadmap.md` — a
+     hit means a `Done` row's own annotation contradicts its literal and must be regraded `Partial`.
      Cross-check "Recommended Execution Order" / "Delivered outside the roadmap" claims with
      `gh pr list --state open --search <term>` and `grep`/`ls` against the cited files — never restate
      status from memory of a prior version of this doc. -->
@@ -128,7 +142,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 9.6 | [#261](https://github.com/Tr3kkR/Yuzu/issues/261) | WSUS Connector | **Deferred** — see Phase 9 body note |
 | | 9.7 | [#262](https://github.com/Tr3kkR/Yuzu/issues/262) | CSV / File Upload Connector | **Deferred** — see Phase 9 body note |
 | | 9.8 | [#263](https://github.com/Tr3kkR/Yuzu/issues/263) | Inventory Consolidation & Normalization | **Closed — not planned** (NOT_PLANNED, 2026-07-14) — consolidation/dedup absent; normalization primitives exist (`product_normalize.cpp`) but no cross-source consolidation, see body note |
-| **10** | 10.1 | [#264](https://github.com/Tr3kkR/Yuzu/issues/264) | Software Catalog Store | **Done** (NOT_PLANNED, 2026-07-14, delivered differently: ADR-0024 keeps the product registry permanently server-resident core, shipped as `ProductRegistryStore`) |
+| **10** | 10.1 | [#264](https://github.com/Tr3kkR/Yuzu/issues/264) | Software Catalog Store | **Partial** — store + normalizer compiled and tested; no production writer/reader at the pin — the SLE matcher that populates it is PR4 (`product_registry_store.cpp:43`) |
 | | 10.2 | [#265](https://github.com/Tr3kkR/Yuzu/issues/265) | Software Usage Tracking | **Closed — not planned** (NOT_PLANNED, 2026-07-14) — ADR-0024 places usage metering/reclamation in the **SAM UCE module** (Decision D15, distinct from ADR-1005's vulnerability UCE); no agent usage-sync source exists in-server |
 | | 10.3 | [#266](https://github.com/Tr3kkR/Yuzu/issues/266) | License Entitlements & Compliance | **Closed — not planned** (NOT_PLANNED, 2026-07-14) — ADR-0024 places the entitlement plane in the **SAM UCE module** (Decision D12, distinct from ADR-1005's vulnerability UCE); not built in-server |
 | | 10.4 | [#267](https://github.com/Tr3kkR/Yuzu/issues/267) | Software Tags | **Closed — not planned** (NOT_PLANNED, 2026-07-14) — no server-side software-tags code found; NOT UCE-scoped (ADR-0024 Decision 15 keeps product tags core), just not yet built (tracked as a future `product_tags` migration, "PR4") |
@@ -156,7 +170,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 13.5 | [#289](https://github.com/Tr3kkR/Yuzu/issues/289) | MCP Phase 2 (Write Tools) | Done |
 | **14** | 14.1 | [#290](https://github.com/Tr3kkR/Yuzu/issues/290) | P2P Content Distribution | Open |
 | | 14.2 | [#291](https://github.com/Tr3kkR/Yuzu/issues/291) | Multi-Gateway Topology | Open |
-| | 14.3 | [#292](https://github.com/Tr3kkR/Yuzu/issues/292) | Database Sharding (Response Partitioning) | **Done** (NOT_PLANNED, 2026-07-14, delivered differently: the Postgres substrate migration, ADR-0039, obsoleted the need — not implemented as designed, see body note) |
+| | 14.3 | [#292](https://github.com/Tr3kkR/Yuzu/issues/292) | Database Sharding (Response Partitioning) | **Partial** (#292 closed NOT_PLANNED, 2026-07-14) — not implemented as designed (no sharding/partitioning code); the underlying scaling need is addressed differently by the Postgres substrate migration (ADR-0039), see body note |
 | | 14.4 | [#293](https://github.com/Tr3kkR/Yuzu/issues/293) | vCenter Connector | Open |
 | | 14.5 | [#294](https://github.com/Tr3kkR/Yuzu/issues/294) | Additional Connectors (BigFix, O365, Oracle) | Open |
 | | 14.6 | [#295](https://github.com/Tr3kkR/Yuzu/issues/295) | High Availability | Open (stale — superseded by ADR-2002, see body note) |
@@ -186,16 +200,16 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | 7: Scale & Integration | 19 | 1 | 20 | 95% — 7.8 is **Partial**, not Done (patch deploy records + audits only; dispatch #4138 and ingestion #3676 are unwired) |
 | 8: Visualization & Response Experience | 3 | 0 | 3 | 100% |
 | 9: Connector Framework & Multi-Source Inventory | 0 | 8 | 8 | 0% — **Deferred** (owner decision 2026-09-07: placement — core vs. use-case-engine — is an open question to be settled before any re-plan, see Phase 9 body note); demoted out of the #2 execution-order slot it held since 2026-03 |
-| 10: Software Catalog & License Compliance | 1 | 3 | 4 | 25% — only 10.1 (product registry) shipped in-server; 10.2–10.4 closed NOT_PLANNED with no delivery, see Phase 10 note |
+| 10: Software Catalog & License Compliance | 0 | 4 | 4 | 0% — 10.1 (product registry) is **Partial** (store compiled/tested, no production writer/reader at the pin); 10.2–10.4 closed NOT_PLANNED with no delivery, see Phase 10 note |
 | 11: Consumer Model & Platform Extensibility | 0 | 4 | 4 | 0% |
 | 12: Remaining Agent Capabilities | 3 | 10 | 13 | 23% |
 | 13: Security Hardening & Operational Polish | 2 | 3 | 5 | 40% |
-| 14: Scale & Enterprise Readiness | 1 | 5 | 6 | 17% |
+| 14: Scale & Enterprise Readiness | 0 | 6 | 6 | 0% — 14.3 is **Partial** (not implemented as designed; the underlying need is addressed differently by the Postgres substrate migration) |
 | 15: TAR Dashboard & Scope Walking | 8 | 0 | 8 | 100% |
 | 16: System Guardian — Real-Time GS | 0 | 3 | 3 | 0% — issue-closure only; substantial implementation progress not reflected here, see 16.A/16.B body notes |
-| **Total** | **88** | **38** | **126** | **70%** |
+| **Total** | **86** | **40** | **126** | **68%** |
 
-**Done** requires verified delivery: closed COMPLETED, or closed NOT_PLANNED *with* a cited delivery-evidence path/ADR (e.g. 12.12/#283 shipped differently as ADR-0016's hash-skip sync). **Open** is everything else, including issues closed **NOT_PLANNED with no delivery** (a real decision not to build the thing, distinct from a still-open backlog item — see the Issue Index's "Closed — not planned" rows for the per-issue distinction and `stateReason`) and **Partial** items (real but narrower delivery than "Done" implies: 2.9 per-device-only concurrency; 7.8 patch deploy records+audits with no working dispatch/ingestion path). The number moved from 94/126 (75%) → 90/126 (71%) → 89/126 (71%) → **88/126 (70%)** across three corrective passes: first, the initial pull used `state` without `stateReason` and miscounted 5 NOT_PLANNED-with-no-delivery closures (9.8, 10.2, 10.3, 10.4, 11.1) as Done while missing 1 NOT_PLANNED-with-delivery closure (12.12) that should have counted — net **−4**; second, 2.9 was reverted from Done to **Partial** per ADR-1007's own text ("Issue 2.9 no longer claims 'Done'; it reflects the real, narrower scope this ADR ships," `docs/adr/1007-concurrency-enforcement-scope.md:986`) — net **−1**; third, 7.8 was reverted from Done to **Partial** — the HTTP deploy path audits "Deployed … to N agents" but dispatches nothing (#4138) and patch inventory ingestion has zero production callers (#3676) — net **−1**. 94 − 4 − 1 − 1 = **88**.
+**Done** requires verified delivery: closed COMPLETED, or closed NOT_PLANNED *with* a cited delivery-evidence path/ADR (e.g. 12.12/#283 shipped differently as ADR-0016's hash-skip sync). A row whose annotation itself negates delivery (contains "not shipped"/"not built"/"not implemented") MUST carry the **Partial** literal, never `Done` — the annotation may qualify a `Done` row's *manner* of delivery, never contradict *that* delivery happened. **Open** is everything else, including issues closed **NOT_PLANNED with no delivery** (a real decision not to build the thing, distinct from a still-open backlog item — see the Issue Index's "Closed — not planned" rows for the per-issue distinction and `stateReason`) and **Partial** items (real but narrower delivery than "Done" implies: 2.9 per-device-only concurrency; 7.8 patch deploy records+audits with no working dispatch/ingestion path; 10.1 store+normalizer compiled/tested with zero production writer/reader at the pin; 14.3 not implemented as designed, underlying need addressed differently). The number moved from 94/126 (75%) → 90/126 (71%) → 89/126 (71%) → 88/126 (70%) → 87/126 (69%) → **86/126 (68%)** across five corrective passes: first, the initial pull used `state` without `stateReason` and miscounted 5 NOT_PLANNED-with-no-delivery closures (9.8, 10.2, 10.3, 10.4, 11.1) as Done while missing 1 NOT_PLANNED-with-delivery closure (12.12) that should have counted — net **−4**; second, 2.9 was reverted from Done to **Partial** per ADR-1007's own text ("Issue 2.9 no longer claims 'Done'; it reflects the real, narrower scope this ADR ships," `docs/adr/1007-concurrency-enforcement-scope.md:986`) — net **−1**; third, 7.8 was reverted from Done to **Partial** — the HTTP deploy path audits "Deployed … to N agents" but dispatches nothing (#4138) and patch inventory ingestion has zero production callers (#3676) — net **−1**; fourth, 10.1 was reverted from Done to **Partial** — `ProductRegistryStore` is constructed at boot and `/readyz`-wired but has zero production call sites invoking its data methods anywhere outside itself and its unit tests (`product_normalize.cpp` likewise uncalled in production; the SLE matcher that would use both is PR4, `product_registry_store.cpp:43`) — net **−1**; fifth, 14.3 was reverted from Done to **Partial** — its own annotation said "not implemented as designed," which the anti-negation rule above now forces onto the honest literal rather than leaving as a self-contradicting `Done` cell — net **−1**. 94 − 4 − 1 − 1 − 1 − 1 = **86**.
 
 **Scaffolded** means DDL/structs/stubs exist but business logic is not wired. See `docs/Instruction-Engine.md` for Phase 2 scaffold details.
 
@@ -419,7 +433,7 @@ Implement the 4-category error code taxonomy from `docs/Instruction-Engine.md` S
 **Files:** `server/core/src/execution_tracker.hpp`, `server/core/src/execution_tracker.cpp`, `agents/core/src/agent.cpp`, `proto/yuzu/common/v1/common.proto`
 
 ### Issue 2.9: Concurrency Enforcement (real-usage scope, ADR-1007)
-**Scope:** Server | **Status:** Partial — per-device enforcement shipped (ADR-1007, 2026-09-02); the four other originally advertised modes are out of scope by decision, not pending. ADR-1007 itself records this: "`docs/roadmap.md` Issue 2.9 no longer claims 'Done'; it reflects the real, narrower scope this ADR ships" (`docs/adr/1007-concurrency-enforcement-scope.md:986`).
+**Scope:** Server | **Status:** Partial — the four other originally advertised modes are out of scope by decision, not pending; only per-device enforcement shipped (ADR-1007, 2026-09-02). ADR-1007 itself records this: "`docs/roadmap.md` Issue 2.9 no longer claims 'Done'; it reflects the real, narrower scope this ADR ships" (`docs/adr/1007-concurrency-enforcement-scope.md:986`).
 
 Only `per-device` is enforced, server-side, via a dedicated `concurrency_claims` table in
 `execution_tracker`'s Postgres schema (a partial unique index gives race-free claim/release — see
@@ -908,7 +922,7 @@ Server-initiated agent installation on discovered endpoints:
 **Files:** New `server/core/src/deploy.cpp`, `server/core/src/server.cpp`
 
 ### Issue 7.8: Patch Deployment Workflow
-**Capabilities:** 8.3-8.8 | **Scope:** Plugin + Server | **Status:** **Partial** — records + audits only; dispatch (#4138) and ingestion (#3676) are unwired
+**Capabilities:** 8.3-8.8 | **Scope:** Plugin + Server | **Status:** **Partial** — dispatch (#4138) and ingestion (#3676) are unwired; only records + audits work
 
 New `patch` plugin and server-side patch management:
 - **Plugin (agent-side):** Deploy patch (download + install), get status, test patch server connection, restart with notification
@@ -1080,18 +1094,19 @@ REST: `GET/POST/DELETE /api/v1/offload-targets`, `GET /api/v1/offload-targets/{i
 > core — so "connectors belong in a UCE" is not a settled ADR-1005 consequence, it is the open question
 > this deferral is waiting on. The sketches below (9.1–9.7) are retained for traceability but are not
 > necessarily the design that ships once the placement question resolves — a core re-plan keeps the
-> SQLite-backed in-server `ConnectorStore`/`ConnectorEngine` shape (evolved); a use-case-engine re-plan
+> in-server `ConnectorStore`/`ConnectorEngine` shape (evolved; sketch: originally SQLite; any
+> implementation is Postgres-native per ADR-0006:37-38); a use-case-engine re-plan
 > would instead build on ADR-1005's engine-principal / REST+MCP-twin model. 9.8 (Inventory
 > Consolidation & Normalization, #263) closed NOT_PLANNED with no delivery (see its own
 > **Closed — not planned** status) and is unaffected by this deferral either way.
 
-The 9.x sketches predate ADR-0006; any future implementation is Postgres-native (ADR-0012), never SQLite.
+The 9.x sketches predate ADR-0006; any future implementation is Postgres-native — ADR-0006:37-38 is the normative rule ("No new server-side SQLite store is added without an explicit exception ADR"), never SQLite. ADR-0012 is the author contract for whoever builds it, not the substrate rule itself.
 
 ### Issue 9.1: Connector Framework (Core)
 **Capability:** new | **Scope:** Server | **Status:** Deferred (see banner above)
 
 Pluggable connector architecture for bidirectional data sync with external systems:
-- `ConnectorStore` (SQLite): connector type, name, config (encrypted credentials), schedule, status
+- `ConnectorStore` (sketch: originally SQLite; any implementation is Postgres-native per ADR-0006:37-38): connector type, name, config (encrypted credentials), schedule, status
 - `ConnectorEngine`: background sync with pluggable connector implementations
 - Connector interface:
   ```cpp
@@ -1113,7 +1128,7 @@ Pluggable connector architecture for bidirectional data sync with external syste
 **Depends on:** 9.1
 
 Named repositories for partitioned inventory data:
-- `RepositoryStore` (SQLite): named repositories per type (inventory, compliance, entitlement)
+- `RepositoryStore` (sketch: originally SQLite; any implementation is Postgres-native per ADR-0006:37-38): named repositories per type (inventory, compliance, entitlement)
 - Default repository created on first boot (cannot be deleted)
 - Connectors bound to repositories; multiple connectors per repository
 - Consolidation, deduplication, normalization pipeline
@@ -1210,7 +1225,9 @@ Multi-source inventory cleanup pipeline (never built):
 > (Software Asset Management) module. Neither is the other. Against that ADR: only **licence
 > discovery** (a new agent `license_scan` plugin on the ADR-0016 daily-sync framework) and the
 > **product registry** (the SQLite `CatalogStore` sketch becomes the born-on-Postgres
-> `ProductRegistryStore`) are built in-server. The **entitlement plane** (5 sources: manual, CSV, M365
+> `ProductRegistryStore`) are built in-server — a placement claim, not a delivery claim: the store
+> compiles and is unit-tested but has no production writer/reader yet (10.1 is **Partial**, see below).
+> The **entitlement plane** (5 sources: manual, CSV, M365
 > connector, agent-observed FlexLM/KMS — Decisions D12/D14) and **usage metering & reclamation**
 > (Decision D15) are re-scoped to the **SAM UCE module** and are **not built in-server** — 10.2/10.3
 > below did not ship as designed and their GitHub issues closed NOT_PLANNED, not delivered.
@@ -1223,7 +1240,7 @@ Multi-source inventory cleanup pipeline (never built):
 > retained for traceability (10.1–10.4 ↔ #264–#267).
 
 ### Issue 10.1: Software Catalog Store
-**Capability:** new | **Scope:** Server | **Status:** **Done** (#264 closed NOT_PLANNED, 2026-07-14 — delivered differently: ADR-0024 keeps the product registry permanently server-resident core, shipped as `ProductRegistryStore`, see banner above)
+**Capability:** new | **Scope:** Server | **Status:** **Partial** (#264 closed NOT_PLANNED, 2026-07-14) — store + normalizer compiled and tested (`ProductRegistryStore`, `product_normalize.{hpp,cpp}`, per ADR-0024's product-registry-stays-core decision, see banner above), but no production writer/reader at the pin: `product_registry_store_` is constructed at boot, wired into `/readyz`, and metrics-registered, with zero call sites invoking its data methods (insert/find/match) anywhere outside the store itself and its unit tests — the SLE matcher that would populate/query it is PR4 (`product_registry_store.cpp:43`)
 **Depends on:** 9.8 (moot — see 9.8's own Closed-not-planned status)
 
 Canonical software registry:
@@ -1576,7 +1593,7 @@ Server supports multiple concurrent gateway registrations:
 **Files:** `server/core/src/agent_registry.cpp`, `server/core/src/gateway_service_impl.cpp`, `gateway/apps/yuzu_gw/src/yuzu_gw_cluster.erl`
 
 ### Issue 14.3: Database Sharding (Response Partitioning)
-**Capability:** new | **Scope:** Server | **Status:** **Done** (closed 2026-07-14) — **obsoleted by the Postgres substrate migration**, not implemented as designed below
+**Capability:** new | **Scope:** Server | **Status:** **Partial** (#292 closed NOT_PLANNED, 2026-07-14) — not implemented as designed below (no sharding/partitioning code exists); **obsoleted by the Postgres substrate migration**, which addresses the underlying scaling need differently
 
 The original design (monthly SQLite files with a query router spanning partitions, to reduce single-file WAL contention) is moot: `response_store.cpp` migrated off SQLite onto PostgreSQL (ADR-0039, Wave 1.2, PR #2691), which handles high-throughput partitioning/scaling at the substrate layer instead. Issue closed as superseded rather than implemented.
 
@@ -1960,9 +1977,12 @@ Phase 9 (Connector Framework) — DEFERRED, see Phase 9 body banner
                                     `software_catalog_rollup.{hpp,cpp}` is a separate, narrower rollup
                                     that does not substitute for this scope
 
-Phase 10 (Software Catalog) — PARTIALLY DONE under ADR-0024 "Software Licensing & Entitlements" (SLE);
-  NOT fully shipped — only 10.1 delivered in-server, 10.2–10.4 closed NOT_PLANNED with no delivery
-  ├── 10.1 Catalog Store ──────── DONE — shipped as `ProductRegistryStore` (born-on-Postgres)
+Phase 10 (Software Catalog) — NOT DONE under ADR-0024 "Software Licensing & Entitlements" (SLE);
+  0/4 Done — 10.1 is Partial (placed in-server but unwired to any producer/consumer), 10.2–10.4
+  closed NOT_PLANNED with no delivery
+  ├── 10.1 Catalog Store ──────── PARTIAL — `ProductRegistryStore` (born-on-Postgres) + `product_normalize`
+  │                                 compile and are unit-tested; zero production writer/reader at the pin
+  │                                 — the SLE matcher that would use both is PR4
   ├── 10.2 Usage Tracking ─────── CLOSED — NOT PLANNED (#265, no delivery): ADR-0024 re-scopes this to
   │                                 the SAM UCE module (Decision D15); no in-server usage-sync source
   ├── 10.3 Entitlements ───────── CLOSED — NOT PLANNED (#266, no delivery): ADR-0024 re-scopes this to
@@ -1995,14 +2015,16 @@ Phase 13 (Security & Polish)
 Phase 14 (Scale & Enterprise)
   ├── 14.1 P2P Content ────────── independent (agent-side mesh) — not started
   ├── 14.2 Multi-Gateway ──────── requires 7.1 + 7.1.1 — not started
-  ├── 14.3 DB Sharding ────────── DONE (closed) — obsoleted by the Postgres substrate migration below, not implemented as designed
+  ├── 14.3 DB Sharding ────────── PARTIAL (closed NOT_PLANNED) — not implemented as designed; the
+  │                                 underlying scaling need is obsoleted by the Postgres substrate
+  │                                 migration below, addressed differently
   ├── 14.4 vCenter Connector ──── requires 9.1 (deferred — see Phase 9) — not started
   ├── 14.5 Additional Connectors ── requires 9.1 (deferred — see Phase 9) — not started
   └── 14.6 High Availability ──── SUPERSEDED by ADR-2002 below — see the HA block
 
 Cross-phase dependencies:
   Phase 10 ──→ Phase 9.8 (catalog needs normalized inventory, as originally scoped) — the dependency
-    itself is now moot: Phase 10 is Partial (only 10.1 Done in-server, see Phase 10 note) and 9.8 is
+    itself is now moot: Phase 10 is 0/4 Done (10.1 Partial in-server, see Phase 10 note) and 9.8 is
     Closed — not planned (no consolidation code shipped); 10.1 did not in fact need 9.8
   Phase 13.2 ──→ Phase 7.14 (chains extend workflows) — done
   Phase 14.4–14.5 ──→ Phase 9.1 (connectors need framework) — both blocked on the deferred Phase 9
@@ -2013,8 +2035,9 @@ Postgres substrate migration (ADR-0006, ADR-0007, ADR-0008, ADR-0010, ADR-0012, 
 
 Software Licensing & Entitlements (ADR-0024, status: proposed) — supersedes the Phase 10 sketch above;
   spans TWO placements, not one — see the Phase 9/10 block above for the per-issue breakdown
-  ├── In-server (DONE): `ProductRegistryStore` (#264/10.1) — the SQLite `CatalogStore` sketch's
-  │     replacement; product tags (10.4/#267) are core-scoped by Decision 15 but not yet built
+  ├── In-server placement (PARTIAL): `ProductRegistryStore` (#264/10.1) — the SQLite `CatalogStore`
+  │     sketch's replacement; compiles and is tested but has no production writer/reader at the pin;
+  │     product tags (10.4/#267) are core-scoped by Decision 15 but not yet built
   └── Re-scoped to the **SAM UCE module** (NOT built in-server, #265/10.2 + #266/10.3 closed
         NOT_PLANNED with no delivery): the 5-source entitlement plane (D12) and usage metering/
         reclamation (D15) — distinct from ADR-1005 Phase 7's *vulnerability* UCE below
@@ -2072,7 +2095,8 @@ Route-sink refactor (#2542) — cross-cutting, ongoing
 
 Phases 0, 1, 3, 4, 5, 6, 8, and 15 are complete (all-Done). Phase 2 and Phase 7 are 92%/95% Done
 respectively — each has exactly one Partial item (2.9 concurrency, 7.8 patch deployment; see the Index
-for both). Phase 10 is 25% delivered in-server (10.1 only — see Phase 10 note).
+for both). Phase 10 is 0/4 Done — 10.1 is placed in-server but Partial (no production writer/reader at
+the pin); 10.2–10.4 closed NOT_PLANNED with no delivery (see Phase 10 note).
 Phase 9 is demoted (deferred pending an owner placement decision, not an ADR-1005 consequence — see
 Phase 9 body banner — no longer the #2 slot it held since 2026-03). The order below leads with the fronts the commit log and
 open-PR list show as currently active, then works through the remaining backlog phases. PR and
