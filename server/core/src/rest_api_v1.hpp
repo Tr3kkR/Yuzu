@@ -16,6 +16,7 @@
 #include "device_token_store.hpp"
 #include "dex_app_perf_model.hpp"
 #include "dex_perf_model.hpp"
+#include "network_api.hpp" // ADR-0031 WS-A4: the public in-process /network API seam
 #include "dex_routes.hpp" // DexFleet -- the DexFleetFn provider type below
 #include "network_perf_model.hpp"
 #include "execution_tracker.hpp"
@@ -412,7 +413,12 @@ public:
         ExecutionEventBus* execution_event_bus = nullptr,
         ResultSetStore* result_set_store = nullptr, CommandDispatchFn command_dispatch_fn = {},
         StepUpFn step_up_fn = {}, GuardianPushFn guardian_push_fn = {},
-        DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
+        DexPerfFn dex_perf_fn = {},
+        // ADR-0031 WS-A4: the public in-process /network API seam (replaces
+        // the former NetPerfFn ad-hoc provider) — the SAME instance the
+        // /network dashboard fragments and the MCP network tools call, so
+        // REST, dashboard and MCP can never disagree.
+        std::shared_ptr<const NetworkApi> network_api = nullptr,
         LockoutClearFn lockout_clear_fn = {},
         // Name-anchored per-device Guardian status route (appended as a trailing
         // optional dep to keep every existing register_routes call site source-stable).
@@ -509,7 +515,12 @@ public:
         ExecutionEventBus* execution_event_bus = nullptr,
         ResultSetStore* result_set_store = nullptr, CommandDispatchFn command_dispatch_fn = {},
         StepUpFn step_up_fn = {}, GuardianPushFn guardian_push_fn = {},
-        DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
+        DexPerfFn dex_perf_fn = {},
+        // ADR-0031 WS-A4: the public in-process /network API seam (replaces
+        // the former NetPerfFn ad-hoc provider) — the SAME instance the
+        // /network dashboard fragments and the MCP network tools call, so
+        // REST, dashboard and MCP can never disagree.
+        std::shared_ptr<const NetworkApi> network_api = nullptr,
         LockoutClearFn lockout_clear_fn = {},
         // Name-anchored per-device Guardian status route (appended as a trailing
         // optional dep to keep every existing register_routes call site source-stable).

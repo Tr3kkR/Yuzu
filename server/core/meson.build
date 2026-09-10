@@ -493,6 +493,7 @@ yuzu_server_core_lib = static_library(
     'src/dex_app_perf_ui.cpp',
     'src/dex_perf_ui.cpp',
     'src/network_perf_model.cpp',
+    'src/network_api.cpp', # ADR-0031 WS-A4: the first per-family in-process API seam pilot
     'src/network_routes.cpp',
     'src/network_ui.cpp',
     'src/device_routes.cpp',

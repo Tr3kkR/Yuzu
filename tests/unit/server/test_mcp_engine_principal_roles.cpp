@@ -143,7 +143,7 @@ struct McpEngineRolesHarness {
             /*publish_crl_fn=*/nullptr,
             /*guaranteed_state_store=*/nullptr,
             /*dex_perf_fn=*/{},
-            /*net_perf_fn=*/{},
+            /*network_api=*/{},
             /*response_scope_fn=*/{},
             /*software_inventory_store=*/nullptr,
             /*metrics=*/nullptr,

@@ -53,6 +53,7 @@
 #include "response_store.hpp"
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
+#include "test_network_api_double.hpp"
 #include "workflow_engine.hpp" // #4030 Gate 8 fix: mcp_workflow_tpl / get_workflow_execution tests
 // M5 remediation (ADR-0031 operator-surface functional coverage): mcp_server.hpp
 // only forward-declares PluginConfigStore (its .cpp includes the real header) —
@@ -1347,6 +1348,14 @@ private:
             mcp.build_delete_handler(auth_fn, audit_fn, &mcp_disabled_, &streaming_disabled_,
                                      session_registry_for_test, allowed_origins_for_test);
 
+        // ADR-0031 WS-A4: wrap this file's plain NetPerfSnapshot(cohort_key)
+        // provider function in the NetworkApi seam — an unset
+        // net_perf_fn_for_test stays null (the "no provider wired" path).
+        std::shared_ptr<const yuzu::server::NetworkApi> network_api_for_test;
+        if (net_perf_fn_for_test)
+            network_api_for_test =
+                std::make_shared<yuzu::server::test::FnNetworkApi>(net_perf_fn_for_test);
+
         handler = mcp.build_handler(
             std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), std::move(agents_fn),
             /*rbac_store=*/rbac_store_for_test,
@@ -1370,7 +1379,7 @@ private:
             },
             /*guaranteed_state_store=*/guaranteed_state_store_for_test,
             /*dex_perf_fn=*/dex_perf_fn_for_test,
-            /*net_perf_fn=*/net_perf_fn_for_test,
+            /*network_api=*/network_api_for_test,
             /*response_scope_fn=*/response_scope_fn_for_test,
             /*software_inventory_store=*/software_inventory_store_for_test,
             /*metrics=*/metrics_for_test,
@@ -17322,7 +17331,7 @@ TEST_CASE("MCP approval recall executes through the real AuthRoutes::require_per
         /*inventory_store=*/nullptr, /*policy_store=*/nullptr, /*mgmt_store=*/nullptr, &appr,
         /*schedule_engine=*/nullptr, read_only, disabled,
         /*dispatch_fn=*/nullptr, /*ca_store=*/nullptr, /*publish_crl_fn=*/{},
-        /*guaranteed_state_store=*/nullptr, /*dex_perf_fn=*/{}, /*net_perf_fn=*/{},
+        /*guaranteed_state_store=*/nullptr, /*dex_perf_fn=*/{}, /*network_api=*/{},
         /*response_scope_fn=*/{}, /*software_inventory_store=*/nullptr,
         /*metrics=*/nullptr, /*app_perf_providers=*/{},
         /*quarantine_store=*/nullptr, /*tag_push_fn=*/{}, /*agent_registry=*/nullptr,

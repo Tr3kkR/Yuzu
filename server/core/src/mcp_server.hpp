@@ -22,6 +22,7 @@
 #include "file_retrieval_routes.hpp"
 #include "dex_app_perf_model.hpp"
 #include "dex_perf_model.hpp"
+#include "network_api.hpp" // ADR-0031 WS-A4: the public in-process /network API seam
 #include "dex_routes.hpp" // #4035: DexFleet -- the DexFleetFn provider seam below
 #include "network_perf_model.hpp"
 #include "execution_tracker.hpp"
@@ -600,7 +601,13 @@ public:
                             const bool& mcp_disabled, DispatchFn dispatch_fn = nullptr,
                             CaStore* ca_store = nullptr, PublishCrlFn publish_crl_fn = nullptr,
                             GuaranteedStateStore* guaranteed_state_store = nullptr,
-                            DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
+                            DexPerfFn dex_perf_fn = {},
+                            // ADR-0031 WS-A4: the public in-process /network API
+                            // seam (replaces the former NetPerfFn ad-hoc
+                            // provider) — the SAME instance the /network
+                            // dashboard fragments and REST /api/v1/network/*
+                            // call, so all three surfaces can never disagree.
+                            std::shared_ptr<const NetworkApi> network_api = nullptr,
                             ResponseScopeFn response_scope_fn = {},
                             SoftwareInventoryStore* software_inventory_store = nullptr,
                             yuzu::MetricsRegistry* metrics = nullptr,
@@ -729,7 +736,9 @@ public:
                          DispatchFn dispatch_fn = nullptr, CaStore* ca_store = nullptr,
                          PublishCrlFn publish_crl_fn = nullptr,
                          GuaranteedStateStore* guaranteed_state_store = nullptr,
-                         DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
+                         DexPerfFn dex_perf_fn = {},
+                         // ADR-0031 WS-A4: see build_handler's doc comment above.
+                         std::shared_ptr<const NetworkApi> network_api = nullptr,
                          ResponseScopeFn response_scope_fn = {},
                          SoftwareInventoryStore* software_inventory_store = nullptr,
                          yuzu::MetricsRegistry* metrics = nullptr,
@@ -796,7 +805,9 @@ public:
                          DispatchFn dispatch_fn = nullptr, CaStore* ca_store = nullptr,
                          PublishCrlFn publish_crl_fn = nullptr,
                          GuaranteedStateStore* guaranteed_state_store = nullptr,
-                         DexPerfFn dex_perf_fn = {}, NetPerfFn net_perf_fn = {},
+                         DexPerfFn dex_perf_fn = {},
+                         // ADR-0031 WS-A4: see build_handler's doc comment above.
+                         std::shared_ptr<const NetworkApi> network_api = nullptr,
                          ResponseScopeFn response_scope_fn = {},
                          SoftwareInventoryStore* software_inventory_store = nullptr,
                          yuzu::MetricsRegistry* metrics = nullptr,

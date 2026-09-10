@@ -31,6 +31,7 @@
 #include "rbac_store.hpp"
 #include "response_store.hpp"
 #include "rest_api_v1.hpp"
+#include "test_network_api_double.hpp"
 #include "test_route_sink.hpp"
 
 #include <catch2/catch_approx.hpp>
@@ -257,9 +258,9 @@ struct RestGsHarness {
     yuzu::server::DexPerfFn dex_perf_fn_ = [](const std::string&) {
         return yuzu::server::DexPerfSnapshot{};
     };
-    yuzu::server::NetPerfFn net_perf_fn_ = [](const std::string&) {
-        return yuzu::server::NetPerfSnapshot{};
-    };
+    std::shared_ptr<const yuzu::server::NetworkApi> net_perf_fn_ =
+        std::make_shared<yuzu::server::test::FnNetworkApi>(
+            [](const std::string&) { return yuzu::server::NetPerfSnapshot{}; });
 
     // #4035: the DexFleet provider for GET /dex/{health,trends,overview,
     // catalogue/group}. Default DexFleet{} (all-zero: no online agents) so

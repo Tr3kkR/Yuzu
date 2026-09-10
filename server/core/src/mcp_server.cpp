@@ -1142,7 +1142,9 @@ static const ToolDef kTools[] = {
      "blended number on a mixed fleet) and the /network Overview cards. A null metric means no "
      "device reported it (absent, never zero); rtt_reporting is the "
      "honest RTT denominator. cooccurrence counts net-degraded devices that ALSO show device-perf "
-     "pressure / app instability (measured co-occurrence, never a cause). Mirrors GET "
+     "pressure / app instability (measured co-occurrence, never a cause). available_keys lists the "
+     "fleet's tag keys for a cohort-picker UI (parity with the /network fragment and "
+     "get_dex_perf_cohorts). Mirrors GET "
      "/api/v1/network/fleet. Requires GuaranteedState:Read.",
      R"({"type":"object","properties":{}})",
      R"j({"type":"object","properties":{)j"
@@ -1150,8 +1152,9 @@ static const ToolDef kTools[] = {
      R"j("retrans_pct":{"type":["object","null"],"properties":{"avg":{"type":"number"},"p50":{"type":"number"},"p90":{"type":"number"},"max":{"type":"number"},"n":{"type":"integer"}}},)j"
      R"j("throughput_bps":{"type":["object","null"],"properties":{"avg":{"type":"number"},"p50":{"type":"number"},"p90":{"type":"number"},"max":{"type":"number"},"n":{"type":"integer"}}},)j"
      R"j("reporting":{"type":"integer"},"rtt_reporting":{"type":"integer"},"online":{"type":"integer"},)j"
-     R"j("cooccurrence":{"type":"object","properties":{"degraded":{"type":"integer"},"also_device":{"type":"integer"},"also_app":{"type":"integer"},"network_only":{"type":"integer"}},"required":["degraded","also_device","also_app","network_only"]})j"
-     R"j(},"required":["rtt_ms","retrans_pct","throughput_bps","reporting","rtt_reporting","online","cooccurrence"]})j"},
+     R"j("cooccurrence":{"type":"object","properties":{"degraded":{"type":"integer"},"also_device":{"type":"integer"},"also_app":{"type":"integer"},"network_only":{"type":"integer"}},"required":["degraded","also_device","also_app","network_only"]},)j"
+     R"j("available_keys":{"type":"array","items":{"type":"string"}})j"
+     R"j(},"required":["rtt_ms","retrans_pct","throughput_bps","reporting","rtt_reporting","online","cooccurrence","available_keys"]})j"},
 
     {"list_network_devices",
      "The device list behind every network-quality drill: worst devices by a metric (default rtt), "
@@ -3658,7 +3661,8 @@ McpServer::HandlerFn McpServer::build_handler(
     ApprovalManager* approval_manager, ScheduleEngine* schedule_engine, const bool& read_only_mode,
     const bool& mcp_disabled, DispatchFn dispatch_fn, CaStore* ca_store,
     PublishCrlFn publish_crl_fn, GuaranteedStateStore* guaranteed_state_store,
-    DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn, ResponseScopeFn response_scope_fn,
+    DexPerfFn dex_perf_fn, std::shared_ptr<const NetworkApi> network_api,
+    ResponseScopeFn response_scope_fn,
     SoftwareInventoryStore* software_inventory_store,
     yuzu::MetricsRegistry* metrics, AppPerfProviders app_perf_providers,
     QuarantineStore* quarantine_store, TagPushFn tag_push_fn,
@@ -10032,8 +10036,9 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             // ── N1: network quality tools (parity with /api/v1/network/*) ──
-            // Same NetPerfFn provider the REST endpoints and /network fragments
-            // use — two surfaces, one read model. Cohort handling mirrors the
+            // Same NetworkApi (ADR-0031 WS-A4) the REST endpoints and /network
+            // fragments call — one instance, three surfaces, never disagreeing.
+            // Cohort handling mirrors the
             // FRAGMENT (empty `key` default, light length guard), NOT the DEX
             // tools' "model"/validate_key. Aggregate + device link-health
             // telemetry: only the generic mcp.<tool> audit.
@@ -10060,7 +10065,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
                     return;
-                if (!net_perf_fn) {
+                if (!network_api) {
                     res.set_content(
                         error_response(id, kInternalError, "Network perf provider unavailable"),
                         "application/json");
@@ -10083,7 +10088,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 // on the generic mcp.<tool> audit.
                 bool device_list_audit_ok = true;
                 if (tool_name == "get_network_fleet") {
-                    const auto now = net_perf_fleet_now(net_perf_fn(std::string{}));
+                    const auto now = network_api->fleet_now(std::string{});
+                    JArr keys;
+                    for (const auto& k : now.available_keys)
+                        keys.add(k);
                     payload = JObj()
                                   .raw("rtt_ms", stat_json(now.rtt))
                                   .raw("retrans_pct", stat_json(now.retrans))
@@ -10098,6 +10106,10 @@ McpServer::HandlerFn McpServer::build_handler(
                                            .add("also_app", now.cooc.also_app)
                                            .add("network_only", now.cooc.network_only)
                                            .str())
+                                  // ADR-0031 WS-A4 parity addition: mirrors the
+                                  // REST twin (GET /api/v1/network/fleet) and the
+                                  // dashboard fragment's cohort-key picker.
+                                  .raw("available_keys", keys.str())
                                   .str();
                 } else { // list_network_devices
                     const auto metric =
@@ -10127,10 +10139,15 @@ McpServer::HandlerFn McpServer::build_handler(
                     device_list_audit_ok = yuzu::server::detail::try_persist_audit(
                         audit_fn, req, "network.device.view", "success", "GuaranteedState", "",
                         "fleet-wide network device list via MCP list_network_devices");
+                    NetDeviceQuery q;
+                    q.metric = metric;
+                    q.not_reporting = not_reporting;
+                    q.cooc = cooc;
+                    q.cohort_key = cohort_key;
+                    q.cohort_filter = cohort_filter;
+                    q.limit = limit;
                     JArr arr;
-                    for (const auto& r : net_perf_device_list(net_perf_fn(cohort_key), metric,
-                                                              not_reporting, cooc, cohort_filter,
-                                                              limit)) {
+                    for (const auto& r : network_api->device_list(q)) {
                         JObj o;
                         o.add("agent_id", r.agent_id)
                             .add("platform", r.platform)
@@ -12626,13 +12643,13 @@ McpServer::HandlerFn McpServer::build_handler(
                     missing.add("DEX signal store");
                 if (!dex_perf_fn)
                     missing.add("DEX performance provider");
-                if (!net_perf_fn)
+                if (!network_api)
                     missing.add("network performance provider");
                 JArr next;
                 next.add("classify_operational_question")
                     .add("get_incident_playbook")
                     .add("summarize_working_set");
-                if (net_perf_fn)
+                if (network_api)
                     next.add("get_network_fleet");
                 if (guaranteed_state_store)
                     next.add("list_dex_signals");
@@ -12683,7 +12700,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                  .str())
                         .raw("network",
                              JObj()
-                                 .add("performance_available", static_cast<bool>(net_perf_fn))
+                                 .add("performance_available", static_cast<bool>(network_api))
                                  .str())
                         .raw("recommended_next_tools", next.str())
                         .str();
@@ -16397,7 +16414,8 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 const bool& mcp_disabled, DispatchFn dispatch_fn, CaStore* ca_store,
                                 PublishCrlFn publish_crl_fn,
                                 GuaranteedStateStore* guaranteed_state_store,
-                                DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn,
+                                DexPerfFn dex_perf_fn,
+                                std::shared_ptr<const NetworkApi> network_api,
                                 ResponseScopeFn response_scope_fn,
                                 SoftwareInventoryStore* software_inventory_store,
                                 yuzu::MetricsRegistry* metrics,
@@ -16424,7 +16442,7 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                     response_store, audit_store, tag_store, inventory_store, policy_store,
                     mgmt_store, approval_manager, schedule_engine, read_only_mode, mcp_disabled,
                     std::move(dispatch_fn), ca_store, std::move(publish_crl_fn),
-                    guaranteed_state_store, std::move(dex_perf_fn), std::move(net_perf_fn),
+                    guaranteed_state_store, std::move(dex_perf_fn), std::move(network_api),
                     std::move(response_scope_fn), software_inventory_store, metrics,
                     std::move(app_perf_providers), quarantine_store, std::move(tag_push_fn),
                     agent_registry, std::move(scoped_perm_fn), sessions, mcp_streaming_disabled,
@@ -16446,7 +16464,8 @@ void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                                 const bool& mcp_disabled, DispatchFn dispatch_fn, CaStore* ca_store,
                                 PublishCrlFn publish_crl_fn,
                                 GuaranteedStateStore* guaranteed_state_store,
-                                DexPerfFn dex_perf_fn, NetPerfFn net_perf_fn,
+                                DexPerfFn dex_perf_fn,
+                                std::shared_ptr<const NetworkApi> network_api,
                                 ResponseScopeFn response_scope_fn,
                                 SoftwareInventoryStore* software_inventory_store,
                                 yuzu::MetricsRegistry* metrics,
@@ -16484,7 +16503,7 @@ void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                             mgmt_store, approval_manager, schedule_engine, read_only_mode,
                             mcp_disabled, std::move(dispatch_fn), ca_store,
                             std::move(publish_crl_fn), guaranteed_state_store,
-                            std::move(dex_perf_fn), std::move(net_perf_fn),
+                            std::move(dex_perf_fn), std::move(network_api),
                             std::move(response_scope_fn), software_inventory_store, metrics,
                             std::move(app_perf_providers), quarantine_store,
                             std::move(tag_push_fn), agent_registry, std::move(scoped_perm_fn),
