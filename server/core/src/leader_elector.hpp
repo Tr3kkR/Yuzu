@@ -19,8 +19,8 @@
 ///     `leader_state.current_leader_epoch` — done ON the lock-owning
 ///     connection, so mutual exclusion guarantees only the true holder writes
 ///     it, and each new leader's epoch is strictly greater than any prior one.
-///   * Every SIDE-EFFECTING claim (slices 3.3/3.4, on an ORDINARY pooled
-///     connection) embeds the `epoch_fence_sql()` predicate
+///   * Every LEADER-DRIVEN side-effecting claim (the slice-3.3 command outbox,
+///     on an ORDINARY pooled connection) embeds the `epoch_fence_sql()` predicate
 ///     (`current_leader_epoch == expected_epoch`) INTO its claim's WRITE
 ///     statement, so the epoch is verified ATOMICALLY with the side effect. A
 ///     stale ex-leader's cached epoch is < the current one, so the guarded write
@@ -108,8 +108,10 @@ public:
     /// every worker tick asking "may I run?" for the OS TCP timeout. The loop
     /// publishes leadership through the atomic so a stalled probe can never block
     /// a reader. A momentarily-stale `true` here is acceptable BY DESIGN — this is
-    /// the attempt gate, and the epoch fence in the claim WRITE (slices 3.3/3.4)
-    /// is the correctness guarantee that rejects a stale ex-leader.
+    /// the attempt gate, and the epoch fence in a leader-driven claim's WRITE
+    /// (slice 3.3's command outbox) is the correctness guarantee that rejects a
+    /// stale ex-leader. Operator-synchronous claims (slice 3.4's remediation) are
+    /// arbitrated by their own plain guarded CAS, never this epoch (see below).
     [[nodiscard]] bool is_leader() const;
 
     /// The epoch stamped at our last successful acquire; `nullopt` if not leader.

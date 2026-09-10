@@ -484,6 +484,7 @@ yuzu_server_core_lib = static_library(
     'src/compliance_routes.cpp',
     'src/guardian_routes.cpp',
     'src/dex_routes.cpp',
+    'src/dex_read_model.cpp',
     'src/dex_perf_model.cpp',
     'src/dex_app_perf_model.cpp',
     'src/dex_app_perf_ui.cpp',

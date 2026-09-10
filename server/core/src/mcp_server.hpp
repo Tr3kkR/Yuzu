@@ -22,6 +22,7 @@
 #include "file_retrieval_routes.hpp"
 #include "dex_app_perf_model.hpp"
 #include "dex_perf_model.hpp"
+#include "dex_routes.hpp" // #4035: DexFleet -- the DexFleetFn provider seam below
 #include "network_perf_model.hpp"
 #include "execution_tracker.hpp"
 #include "guaranteed_state_store.hpp"
@@ -525,6 +526,33 @@ public:
         response_visible_set_fn_ = std::move(fn);
     }
 
+    /// #4035: the SAME cross-store fleet provider `DexRoutes`/`RestApiV1`
+    /// already receive (see `RestApiV1::DexFleetFn`'s doc comment,
+    /// rest_api_v1.hpp) — server.cpp wires the IDENTICAL lambda into all
+    /// three surfaces so the dashboard fragment, the REST twin, and this MCP
+    /// twin can never read a different fleet snapshot for the same request.
+    /// Unset (default-constructed) degrades the fleet-dependent DEX tools
+    /// (get_dex_health/get_dex_trends/get_dex_overview/get_dex_catalogue_group)
+    /// to their "no reporting agents" suppressed shape — never a crash.
+    using DexFleetFn = std::function<DexFleet()>;
+    void set_dex_fleet_fn(DexFleetFn fn) { dex_fleet_fn_ = std::move(fn); }
+
+    /// #4035 hardening (governance): the SAME username-keyed visible-agent-set
+    /// resolver `RestApiV1::DexVisibleFn` receives (see its doc comment,
+    /// rest_api_v1.hpp) — server.cpp wires the IDENTICAL lambda
+    /// (`visible_set_fn`) into the dashboard fragment, the REST twin, and this
+    /// MCP twin, so `get_dex_app`/`get_dex_overview` confine their
+    /// devices/top_devices lists to the caller's management-group scope
+    /// (ADR-0017 World A) exactly like `/fragments/dex/app` and
+    /// `/fragments/dex/overview` already do. This is a SECOND, independent
+    /// belt alongside `deny_fleet_wide_service_scoped` — that closes the
+    /// service-scoped-token axis, this closes the confined-OPERATOR axis.
+    /// Unset (default-constructed) degrades to "no confinement" (matching the
+    /// fragment's own unwired-`visible_set_fn_` posture), never a crash.
+    using DexVisibleFn =
+        std::function<std::optional<std::set<std::string>>(const std::string& username)>;
+    void set_dex_visible_fn(DexVisibleFn fn) { dex_visible_fn_ = std::move(fn); }
+
     /// Republish-CRL callback (PR4 B-2): mirrors `CaRoutes::PublishCrlFn` so the
     /// MCP `revoke_certificate` tool republishes the CRL after a revoke exactly as
     /// the REST `/api/v1/ca/revoke` handler does. Returns the new CRL DER, or
@@ -817,6 +845,10 @@ private:
     DashboardRoutes* dashboard_routes_{nullptr};
     // #4033 — see set_response_visible_set_fn above.
     ResponseVisibleSetFn response_visible_set_fn_;
+    // #4035 — see set_dex_fleet_fn above.
+    DexFleetFn dex_fleet_fn_;
+    // #4035 hardening (governance) — see set_dex_visible_fn above.
+    DexVisibleFn dex_visible_fn_;
 };
 
 // The (tool, securable, operation) test-only accessors that formerly lived here
