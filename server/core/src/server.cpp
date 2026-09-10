@@ -2599,9 +2599,13 @@ public:
                           "counter");
         // PKI PR3: per-agent client certificates signed at enrollment. A spike is
         // an enrollment storm (mass deploy) or, if sustained, a CSR-flood signal.
+        // gov F11: HELP text updated for gap-matrix #10 (code-signing leaves) —
+        // purpose now has two values, via has grown two more.
         metrics_.describe("yuzu_server_ca_cert_issued_total",
-                          "Per-agent client certificates issued by the internal CA at agent "
-                          "enrollment (PKI PR3). Labelled purpose (agent)",
+                          "Certificates issued by the internal CA — per-agent client leaves at "
+                          "enrollment (PKI PR3) or operator-requested code-signing leaves "
+                          "(gap-matrix #10). Labelled purpose (agent|code-signing) and via "
+                          "(direct|gateway_proxy|rest|mcp)",
                           "counter");
         // PKI PR4 (gov sre/unhappy SHOULD): the CRL could not be (re)built/signed —
         // the public CRL is stale relative to ca_store. Alert on >0 since a revocation,
@@ -10101,6 +10105,12 @@ private:
                 // wrongly block that agent's re-enrollment forever (a
                 // cross-namespace denial-of-service this gate must not
                 // cause). Only a revoked AGENT cert gates agent re-issuance.
+                // gov F12/UP-2 TRIPWIRE: this cross-namespace safety depends on
+                // EVERY agent-cert recording site setting `purpose="agent"`
+                // (see the `rec.purpose = "agent"` assignment below) — a future
+                // agent-issuance path that records a different/empty purpose
+                // would silently fall out of this filter and reopen the
+                // revocation bypass this check exists to close.
                 if (rev.purpose == "agent" && rev.subject == agent_id &&
                     rev.not_after > now_epoch) {
                     spdlog::warn("PKI: refusing to re-issue for agent {} — a revoked, "
@@ -10207,6 +10217,11 @@ private:
         rec.serial_hex = issued->serial_hex;
         rec.subject = agent_id;
         rec.san = lp.san.uris.empty() ? std::string{} : lp.san.uris.front();
+        // gov F12/UP-2 TRIPWIRE: the reissue-block filter above keys off this
+        // EXACT literal ("agent") to distinguish a revoked agent identity from
+        // a revoked code-signing leaf whose CN happens to collide with an
+        // agent_id. Any future agent-cert recording site must set this same
+        // purpose or the cross-namespace guard silently stops covering it.
         rec.purpose = "agent";
         rec.not_after =
             std::chrono::duration_cast<std::chrono::seconds>(not_after.time_since_epoch()).count();
@@ -10276,7 +10291,8 @@ private:
     /// including exception unwind.
     std::expected<CodeSigningIssuance, std::string>
     issue_code_signing_leaf(const std::string& csr_pem, const std::string& label,
-                            std::optional<int> validity_days, const std::string& issued_by) {
+                            std::optional<int> validity_days, const std::string& issued_by,
+                            const std::string& via) {
         if (!ca_store_ || !ca_store_->is_open())
             return std::unexpected("ca store not open");
         auto root_or_err = ca_store_->get_root();
@@ -10310,6 +10326,21 @@ private:
             return std::unexpected(std::string(kCodeSigningBadCsrPrefix) + "csr_pem too large");
         }
 
+        // gov B1 (HIGH, fleet-RCE class): floor the SUBJECT key strength before
+        // this CA ever signs it into a trusted codeSigning anchor. A sub-2048-bit
+        // RSA / unapproved-curve EC key would become a factorable plugin-signing
+        // identity — check BEFORE loading the CA key so a weak-key refusal never
+        // touches the CA private key at all.
+        if (!pki::subject_key_meets_code_signing_floor(csr_pem)) {
+            spdlog::warn(
+                "PKI: rejecting code-signing CSR with a weak/unsupported subject key for "
+                "label {}",
+                label);
+            return std::unexpected(std::string(kCodeSigningWeakKeyPrefix) +
+                                   "signing key too weak (RSA must be 2048-16384 bits; EC "
+                                   "must be P-256 or stronger)");
+        }
+
         const std::filesystem::path dir =
             cfg_.ca_dir.empty() ? auth::default_cert_dir() : cfg_.ca_dir;
         FileKeyProvider kp(dir);
@@ -10331,10 +10362,13 @@ private:
         constexpr int kDefaultCodeSigningValidityDays = 365;
         constexpr int kMaxCodeSigningValidityDays = 730;
         const int days = validity_days.value_or(kDefaultCodeSigningValidityDays);
+        // gov F6/UP-5/UP-7: a business refusal (bad range), NOT a malformed
+        // CSR — DISTINCT prefix so the caller sees the real reason instead of
+        // "csr_pem is invalid".
         if (days < 1 || days > kMaxCodeSigningValidityDays) {
-            return std::unexpected(std::string(kCodeSigningBadCsrPrefix) +
-                                   "validity_days out of range [1, " +
-                                   std::to_string(kMaxCodeSigningValidityDays) + "]");
+            return std::unexpected(std::string(kCodeSigningBadValidityPrefix) +
+                                   "validity_days must be between 1 and " +
+                                   std::to_string(kMaxCodeSigningValidityDays));
         }
         const auto now = std::chrono::system_clock::now();
         auto not_after = now + std::chrono::hours(24 * days);
@@ -10342,6 +10376,17 @@ private:
             std::chrono::system_clock::time_point{std::chrono::seconds{root->not_after}};
         if (not_after > ca_not_after)
             not_after = ca_not_after;
+        // gov F6: an at-or-past-expiry CA clamps `not_after` to (or before) `now`
+        // above — refuse rather than mint a leaf that is already invalid at
+        // issuance. Same kCodeSigningBadValidityPrefix classification: this is
+        // a business refusal (the CA needs re-rooting), not a bad CSR.
+        if (not_after <= now) {
+            spdlog::warn("PKI: refusing code-signing issuance for label {} — CA is at or past "
+                         "expiry (ca_not_after={})",
+                         label, root->not_after);
+            return std::unexpected(std::string(kCodeSigningBadValidityPrefix) +
+                                   "CA is at or past expiry; cannot issue");
+        }
 
         pki::LeafParams lp;
         // CN=label — the non-agent namespace. NEVER agent_id: this is what
@@ -10385,12 +10430,13 @@ private:
             return std::unexpected("failed to record issued certificate");
         }
 
-        // gov (sre SHOULD): reuse the existing issuance counter with a
-        // "code-signing" purpose label + via="rest" — the agent issuance path
-        // keeps its own "agent"/direct|gateway labelling unchanged.
+        // gov (sre SHOULD) + F10: reuse the existing issuance counter with a
+        // "code-signing" purpose label + the CALLER's transport (`via`, "rest"
+        // or "mcp") — the agent issuance path keeps its own
+        // "agent"/direct|gateway labelling unchanged.
         metrics_
             .counter("yuzu_server_ca_cert_issued_total",
-                     {{"purpose", "code-signing"}, {"via", "rest"}})
+                     {{"purpose", "code-signing"}, {"via", via}})
             .increment();
 
         return CodeSigningIssuance{
@@ -16392,7 +16438,7 @@ private:
             [this](const std::string& csr_pem, const std::string& label,
                    std::optional<int> validity_days,
                    const std::string& issued_by) -> std::expected<CodeSigningIssuance, std::string> {
-                return issue_code_signing_leaf(csr_pem, label, validity_days, issued_by);
+                return issue_code_signing_leaf(csr_pem, label, validity_days, issued_by, "rest");
             });
 
         // -- #2395: KEK rotation REST surface (/api/v1/secrets/kek/*) -------------
@@ -17930,7 +17976,7 @@ private:
                 [this](const std::string& csr_pem, const std::string& label,
                        std::optional<int> validity_days,
                        const std::string& issued_by) -> std::expected<CodeSigningIssuance, std::string> {
-                    return issue_code_signing_leaf(csr_pem, label, validity_days, issued_by);
+                    return issue_code_signing_leaf(csr_pem, label, validity_days, issued_by, "mcp");
                 });
         }
 

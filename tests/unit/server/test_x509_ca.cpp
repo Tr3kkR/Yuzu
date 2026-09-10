@@ -23,6 +23,7 @@
 #include <openssl/cms.h>
 #include <openssl/evp.h>
 #include <openssl/objects.h>
+#include <openssl/rsa.h> // EVP_RSA_gen — gov B1 weak-key-floor coverage
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 #include <openssl/x509_vfy.h>
@@ -84,6 +85,35 @@ TestCa make_test_ca(const std::string& cn = "Yuzu Test CA") {
 
 bool contains(const std::vector<std::string>& v, const std::string& s) {
     return std::find(v.begin(), v.end(), s) != v.end();
+}
+
+// gov B1: unencrypted RSA private key PEM at the given modulus size — used ONLY
+// to build a CSR whose SUBJECT key the floor must classify. Mirrors
+// test_saml_provider.cpp's generate_small_rsa_key_pem/EVP_RSA_gen idiom.
+std::string generate_rsa_key_pem(int bits) {
+    EVP_PKEY* pkey = EVP_RSA_gen(static_cast<unsigned int>(bits));
+    REQUIRE(pkey != nullptr);
+    struct PkeyGuard {
+        EVP_PKEY* k;
+        ~PkeyGuard() {
+            if (k)
+                EVP_PKEY_free(k);
+        }
+    } pg{pkey};
+
+    BIO* bio = BIO_new(BIO_s_mem());
+    REQUIRE(bio != nullptr);
+    struct BioGuard {
+        BIO* b;
+        ~BioGuard() {
+            if (b)
+                BIO_free(b);
+        }
+    } bg{bio};
+    REQUIRE(PEM_write_bio_PrivateKey(bio, pkey, nullptr, nullptr, 0, nullptr, nullptr) == 1);
+    BUF_MEM* bptr = nullptr;
+    BIO_get_mem_ptr(bio, &bptr);
+    return std::string(bptr->data, bptr->length);
 }
 
 // ── Raw-OpenSSL helpers for the code-signing test cases ────────────────────────
@@ -468,6 +498,40 @@ TEST_CASE("x509_ca: code-signing leaf verifies a CMS detached signature "
     REQUIRE(not_signer_key);
 
     REQUIRE(sign_and_verify(not_signer_cert.get(), not_signer_key.get()) != 1);
+}
+
+// gov B1 (UP-1, HIGH, fleet-RCE class): the subject-key strength floor
+// `issue_code_signing_leaf` (server.cpp) checks BEFORE ever calling sign_csr on
+// an operator-submitted CSR. Exercises the shared pki:: predicate directly —
+// the crypto is the engine's job, server.cpp's own coverage is the
+// call-site-classification test in test_ca_routes.cpp.
+TEST_CASE("x509_ca: subject_key_meets_code_signing_floor rejects a sub-2048-bit RSA key, "
+          "accepts RSA-2048 and P-256 EC",
+          "[pki][leaf][security]") {
+    CsrParams cp;
+    cp.subject = {"weak-signer", "Yuzu"};
+
+    // 1024-bit RSA — factorable, must be REJECTED.
+    auto weak_key_pem = generate_rsa_key_pem(1024);
+    auto weak_csr = make_csr(weak_key_pem, cp);
+    REQUIRE(weak_csr);
+    REQUIRE_FALSE(subject_key_meets_code_signing_floor(*weak_csr));
+
+    // RSA-2048 — meets the floor, must be ACCEPTED.
+    auto ok_rsa_key_pem = generate_rsa_key_pem(2048);
+    auto ok_rsa_csr = make_csr(ok_rsa_key_pem, cp);
+    REQUIRE(ok_rsa_csr);
+    REQUIRE(subject_key_meets_code_signing_floor(*ok_rsa_csr));
+
+    // P-256 EC — an approved curve, must be ACCEPTED.
+    auto ec_key_pem = generate_private_key(KeyAlgo::EcP256);
+    REQUIRE(ec_key_pem);
+    auto ec_csr = make_csr(*ec_key_pem, cp);
+    REQUIRE(ec_csr);
+    REQUIRE(subject_key_meets_code_signing_floor(*ec_csr));
+
+    // A garbage / unparseable CSR fails CLOSED — never a default-accept.
+    REQUIRE_FALSE(subject_key_meets_code_signing_floor("not a csr"));
 }
 
 TEST_CASE("x509_ca: leaf may not outlive the issuing CA", "[pki][leaf][security]") {

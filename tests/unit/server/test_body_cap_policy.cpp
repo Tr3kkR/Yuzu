@@ -108,6 +108,8 @@ constexpr ExpectedResolution kExpected[] = {
     {"POST",   "/api/v1/ca/import-chain",                 256u * 1024,        false, "ca_import_chain"},
     // ca_routes.cpp:24 kMaxRevokeBody,:394.
     {"POST",   "/api/v1/ca/revoke",                       64u * 1024,         false, "ca_revoke"},
+    // ca_routes.cpp kMaxIssueCodeSigningBody (gap-matrix #10).
+    {"POST",   "/api/v1/ca/issue-code-signing",           64u * 1024,         false, "ca_issue_code_signing"},
     // kek_routes.cpp:46 kMaxKekBody,:54 validate_empty_body — shared by rotate+rewrap.
     {"POST",   "/api/v1/secrets/kek/rotate",               64u * 1024,        false, "kek_ops"},
     {"POST",   "/api/v1/secrets/kek/rewrap",               64u * 1024,        false, "kek_ops"},

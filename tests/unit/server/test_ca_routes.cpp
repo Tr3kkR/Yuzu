@@ -298,6 +298,75 @@ TEST_CASE("ca_routes: POST /ca/revoke flow", "[ca_routes][pki][security][pg]") {
     REQUIRE(h.audits.size() == audits_before); // handler emitted no audit row on 403
 }
 
+// gov B2 (F1: arch-1 + compliance HIGH): the `ca.cert.revoked` target_type must
+// come from the cert's OWN recorded purpose, never a hardcoded
+// "AgentCertificate" — now that code-signing certs (gap-matrix #10) are
+// revocable through this same route, the old hardcode would durably mis-audit
+// a code-signing revocation.
+TEST_CASE("ca_routes: POST /ca/revoke derives target_type from the cert's own purpose",
+          "[ca_routes][pki][security][pg]") {
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root()));
+    REQUIRE(h.store->record_issued(sample_issued("FACE01"))); // purpose="agent"
+
+    IssuedCertRecord cs_rec;
+    cs_rec.serial_hex = "C0DE51";
+    cs_rec.subject = "build-signer-01";
+    cs_rec.purpose = "code-signing";
+    cs_rec.not_after = 9999999999;
+    cs_rec.cert_pem = "-----BEGIN CERTIFICATE-----\nleaf\n-----END CERTIFICATE-----\n";
+    cs_rec.issued_by = "operator:tester";
+    REQUIRE(h.store->record_issued(cs_rec));
+    h.wire();
+
+    // A code-signing revocation audits CodeSigningCertificate — the headline
+    // regression this finding closes.
+    auto revoked_cs =
+        h.sink.Post("/api/v1/ca/revoke", R"({"serial_hex":"C0DE51","reason":"key_compromise"})");
+    REQUIRE(revoked_cs);
+    REQUIRE(revoked_cs->status == 200);
+    bool saw_code_signing = false;
+    for (const auto& a : h.audits) {
+        if (a.action == "ca.cert.revoked" && a.result == "success" && a.target_id == "C0DE51") {
+            saw_code_signing = true;
+            REQUIRE(a.target_type == "CodeSigningCertificate");
+        }
+    }
+    REQUIRE(saw_code_signing);
+
+    // An agent-cert revocation still audits AgentCertificate — regression guard
+    // proving the derivation didn't just flip the hardcode the other way.
+    h.audits.clear();
+    auto revoked_agent =
+        h.sink.Post("/api/v1/ca/revoke", R"({"serial_hex":"FACE01","reason":"key_compromise"})");
+    REQUIRE(revoked_agent);
+    REQUIRE(revoked_agent->status == 200);
+    bool saw_agent = false;
+    for (const auto& a : h.audits) {
+        if (a.action == "ca.cert.revoked" && a.result == "success" && a.target_id == "FACE01") {
+            saw_agent = true;
+            REQUIRE(a.target_type == "AgentCertificate");
+        }
+    }
+    REQUIRE(saw_agent);
+
+    // A never-issued serial (no record to derive purpose from) falls back to
+    // the neutral "Certificate", not a guess.
+    h.audits.clear();
+    auto not_found =
+        h.sink.Post("/api/v1/ca/revoke", R"({"serial_hex":"BAADF00D","reason":"x"})");
+    REQUIRE(not_found);
+    REQUIRE(not_found->status == 404);
+    bool saw_denied = false;
+    for (const auto& a : h.audits) {
+        if (a.action == "ca.cert.revoked" && a.result == "denied") {
+            saw_denied = true;
+            REQUIRE(a.target_type == "Certificate");
+        }
+    }
+    REQUIRE(saw_denied);
+}
+
 TEST_CASE("ca_routes: GET /ca/crl serves latest-or-503, never builds on the public path",
           "[ca_routes][pki][security][pg]") {
     Harness h;
@@ -992,6 +1061,18 @@ TEST_CASE("ca_routes: POST /ca/issue-code-signing classifies fn failures via the
         {std::string(kCodeSigningNoRootPrefix) + "no CA root", 409, "denied"},
         {std::string(kCodeSigningBadCsrPrefix) + "csr_pem is invalid", 400, "denied"},
         {"failed to record issued certificate", 500, "failure"}, // unprefixed → generic failure
+        // gov B1: weak subject key — a distinct classification from bad_csr.
+        {std::string(kCodeSigningWeakKeyPrefix) +
+             "signing key too weak (RSA must be 2048-16384 bits; EC must be P-256 or "
+             "stronger)",
+         400, "denied"},
+        // gov F6/UP-5/UP-7: business-refusal validity classification — distinct
+        // from bad_csr, covering both the range refusal and the CA-expiry
+        // refusal (same prefix, two possible detail strings).
+        {std::string(kCodeSigningBadValidityPrefix) + "validity_days must be between 1 and 730",
+         400, "denied"},
+        {std::string(kCodeSigningBadValidityPrefix) + "CA is at or past expiry; cannot issue",
+         400, "denied"},
     };
     for (const auto& c : cases) {
         h.audits.clear();
@@ -1005,5 +1086,64 @@ TEST_CASE("ca_routes: POST /ca/issue-code-signing classifies fn failures via the
             if (a.action == "ca.cert.issued" && a.result == c.result)
                 saw = true;
         REQUIRE(saw);
+    }
+}
+
+// gov B1/F6: the weak_key/bad_validity messages surfaced to the caller are the
+// crafted, caller-safe text AFTER the prefix — never the generic "csr_pem is
+// invalid" bad_csr message.
+TEST_CASE("ca_routes: POST /ca/issue-code-signing surfaces the weak_key/bad_validity "
+          "message verbatim, not the generic bad_csr message",
+          "[ca_routes][pki][code-signing][security][pg]") {
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root()));
+    h.wire();
+
+    h.issue_result = std::unexpected(
+        std::string(kCodeSigningWeakKeyPrefix) +
+        "signing key too weak (RSA must be 2048-16384 bits; EC must be P-256 or stronger)");
+    auto weak = h.sink.Post("/api/v1/ca/issue-code-signing",
+                            R"({"csr_pem":"CSR","label":"signer"})");
+    REQUIRE(weak);
+    REQUIRE(weak->status == 400);
+    auto weak_j = json::parse(weak->body);
+    const std::string weak_msg = weak_j["error"]["message"].get<std::string>();
+    REQUIRE(weak_msg.find("too weak") != std::string::npos);
+    REQUIRE(weak_msg.find("csr_pem") == std::string::npos);
+
+    h.issue_result =
+        std::unexpected(std::string(kCodeSigningBadValidityPrefix) +
+                        "validity_days must be between 1 and 730");
+    auto bv = h.sink.Post("/api/v1/ca/issue-code-signing",
+                          R"({"csr_pem":"CSR","label":"signer"})");
+    REQUIRE(bv);
+    REQUIRE(bv->status == 400);
+    auto bv_j = json::parse(bv->body);
+    const std::string bv_msg = bv_j["error"]["message"].get<std::string>();
+    REQUIRE(bv_msg == "validity_days must be between 1 and 730");
+}
+
+// gov F6/UP-5/UP-7: the REST handler's OWN pre-check catches an out-of-[1,730]
+// validity_days (including a value far outside int32 range) BEFORE the
+// injected issuance fn ever runs, and reports the SAME "validity_days must be
+// between 1 and 730" message the fn-side classification above produces — not
+// the generic bad_csr wording.
+TEST_CASE("ca_routes: POST /ca/issue-code-signing rejects an out-of-range validity_days "
+          "(0, 731, and a huge value) with the bad_validity message, never bad_csr",
+          "[ca_routes][pki][code-signing][security][pg]") {
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root()));
+    h.wire();
+
+    for (std::string_view validity_days_literal : {"0", "731", "999999999999"}) {
+        h.issue_calls = 0;
+        const std::string body = R"({"csr_pem":"CSR","label":"signer","validity_days":)" +
+                                 std::string(validity_days_literal) + "}";
+        auto r = h.sink.Post("/api/v1/ca/issue-code-signing", body);
+        REQUIRE(r);
+        REQUIRE(r->status == 400);
+        REQUIRE(h.issue_calls == 0); // rejected before the injected fn ran
+        auto j = json::parse(r->body);
+        REQUIRE(j["error"]["message"] == "validity_days must be between 1 and 730");
     }
 }

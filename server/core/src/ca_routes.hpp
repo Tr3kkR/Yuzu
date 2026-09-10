@@ -81,6 +81,21 @@ inline constexpr const char* kCodeSigningNoRootPrefix = "no_root: ";
 /// Caller-attributable, mapped to 400 + audit result="denied".
 inline constexpr const char* kCodeSigningBadCsrPrefix = "bad_csr: ";
 
+/// gov B1: the CSR's subject public key fails
+/// `pki::subject_key_meets_code_signing_floor` (sub-2048-bit RSA, an
+/// unapproved EC curve, or an unrecognised key type) — a DISTINCT refusal
+/// from `kCodeSigningBadCsrPrefix` so the caller sees "signing key too weak",
+/// never the generic "csr_pem invalid" message. Caller-attributable, mapped
+/// to 400 + audit result="denied".
+inline constexpr const char* kCodeSigningWeakKeyPrefix = "weak_key: ";
+
+/// gov F6/UP-5/UP-7: the requested `validity_days` is out of range, or the CA
+/// itself is at/past expiry so no positive validity window can be computed —
+/// a business refusal, NOT a malformed CSR. Caller-attributable, mapped to
+/// 400 + audit result="denied". The text after the prefix is already
+/// caller-safe and is surfaced verbatim by the REST/MCP handlers.
+inline constexpr const char* kCodeSigningBadValidityPrefix = "bad_validity: ";
+
 /// Result of a successful code-signing leaf issuance (gap-matrix #10). The
 /// CSR-custody model: the operator holds the private key, the server never
 /// sees it. `chain_pem` is the issuer chain the operator needs to build an

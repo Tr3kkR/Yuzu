@@ -13139,6 +13139,11 @@ McpServer::HandlerFn McpServer::build_handler(
                     const std::string& err = issued.error();
                     const bool no_root = err.starts_with(kCodeSigningNoRootPrefix);
                     const bool bad_csr = err.starts_with(kCodeSigningBadCsrPrefix);
+                    // gov B1 / F6/UP-5/UP-7: distinct classifications, mirroring
+                    // the REST twin, so a weak signing key or an out-of-range
+                    // validity_days is never reported as "csr_pem is invalid".
+                    const bool weak_key = err.starts_with(kCodeSigningWeakKeyPrefix);
+                    const bool bad_validity = err.starts_with(kCodeSigningBadValidityPrefix);
                     std::string result = "failure";
                     std::string msg = "code-signing issuance failed";
                     if (no_root) {
@@ -13147,16 +13152,25 @@ McpServer::HandlerFn McpServer::build_handler(
                     } else if (bad_csr) {
                         result = "denied";
                         msg = "csr_pem is invalid or fails proof-of-possession";
+                    } else if (weak_key) {
+                        result = "denied";
+                        msg = err.substr(std::string_view(kCodeSigningWeakKeyPrefix).size());
+                    } else if (bad_validity) {
+                        result = "denied";
+                        msg = err.substr(std::string_view(kCodeSigningBadValidityPrefix).size());
                     }
                     const bool audit_ok = audit_fn(req, "ca.cert.issued", result,
                                                    "CodeSigningCertificate", label,
                                                    "purpose=code-signing reason=" + err);
-                    // Business refusal (no_root/bad_csr) is client-caused ->
-                    // kInvalidParams; anything else (key-load/store failure) is a
-                    // genuine server-side fault -> kInternalError. Matches
-                    // revoke_certificate's kInvalidParams-for-denied /
-                    // kInternalError-for-store-failure split above.
-                    const int rpc_code = (no_root || bad_csr) ? kInvalidParams : kInternalError;
+                    // Business refusal (no_root/bad_csr/weak_key/bad_validity) is
+                    // client-caused -> kInvalidParams; anything else (key-load/
+                    // store failure) is a genuine server-side fault ->
+                    // kInternalError. Matches revoke_certificate's
+                    // kInvalidParams-for-denied / kInternalError-for-store-
+                    // failure split above.
+                    const int rpc_code =
+                        (no_root || bad_csr || weak_key || bad_validity) ? kInvalidParams
+                                                                          : kInternalError;
                     res.set_content(
                         error_response(id, rpc_code, msg,
                                        audit_ok ? std::string_view{}

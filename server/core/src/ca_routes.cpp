@@ -37,6 +37,11 @@ constexpr std::size_t kMaxImportBody = 256 * 1024;
 // endpoint. Mirrored exactly by body_cap_policy.hpp's ca_issue_code_signing
 // row — same two-authority-split precedent as kMaxRevokeBody/kMaxImportBody.
 constexpr std::size_t kMaxIssueCodeSigningBody = 64 * 1024;
+// gov F6/UP-7: mirrors server.cpp's issue_code_signing_leaf ceiling exactly
+// (its own locally-declared constant — same per-signing-path style as
+// kMaxCsrPemBytes there) so REST rejects an out-of-range validity_days at the
+// door instead of deferring entirely to the server-side refusal.
+constexpr int kMaxCodeSigningValidityDaysRest = 730;
 
 int clamp_int(const httplib::Request& req, const char* key, int def, int lo, int hi) {
     auto it = req.params.find(key);
@@ -270,12 +275,28 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
     auto revoke_core = [ca_store, audit_fn, publish_crl_fn](
                            const httplib::Request& req, const std::string& serial,
                            const std::string& reason) -> RevokeResult {
+        // gov B2 (F1: arch-1 + compliance HIGH): derive the audit target_type
+        // from the cert's OWN recorded purpose — now that code-signing certs
+        // (gap-matrix #10) are revocable through this same route, hardcoding
+        // "AgentCertificate" would durably mis-audit a code-signing revocation.
+        // A read failure (genuine store error, distinct from "not found" — see
+        // get_issued()'s contract) and a genuine "no such serial" both fall
+        // back to the neutral "Certificate": the StoreError/NotFound outcomes
+        // below already carry the more specific signal for that case.
+        std::string target_type = "Certificate";
+        if (auto rec_or_err = ca_store->get_issued(serial); rec_or_err && rec_or_err->has_value()) {
+            const std::string& purpose = (*rec_or_err)->purpose;
+            if (purpose == "agent")
+                target_type = "AgentCertificate";
+            else if (purpose == "code-signing")
+                target_type = "CodeSigningCertificate";
+        }
         auto revoked_or_err = ca_store->revoke(serial, reason);
         if (!revoked_or_err) {
             // ADR-0053: a genuine DB/lease failure — distinct from "not found or already
             // revoked" (a business fact). Must NOT be folded into "denied": that would falsely
             // audit a database outage as a rejected revoke attempt.
-            const bool ok = audit_fn(req, "ca.cert.revoked", "failure", "AgentCertificate", serial,
+            const bool ok = audit_fn(req, "ca.cert.revoked", "failure", target_type, serial,
                                      revoked_or_err.error());
             return {RevokeOutcome::StoreError, ok};
         }
@@ -283,11 +304,11 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
             // #1240: unknown/already-revoked is reject-without-state-change →
             // result="denied" (matches every destructive sibling + idempotent
             // retry-safe); "failure" is reserved for an authorized-but-errored op.
-            const bool ok = audit_fn(req, "ca.cert.revoked", "denied", "AgentCertificate", serial,
+            const bool ok = audit_fn(req, "ca.cert.revoked", "denied", target_type, serial,
                                      "serial not found or already revoked");
             return {RevokeOutcome::NotFound, ok};
         }
-        bool audit_ok = audit_fn(req, "ca.cert.revoked", "success", "AgentCertificate", serial,
+        bool audit_ok = audit_fn(req, "ca.cert.revoked", "success", target_type, serial,
                                  reason);
         // publish_crl() now fails honestly (#1240 B-1): has_value() is true ONLY
         // when the new CRL was persisted, so crl_ok never falsely claims success.
@@ -577,6 +598,22 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                     return;
                 }
             }
+            // gov F9 (cpp-1): a present-but-non-string csr_pem/label throws
+            // nlohmann's type_error.302 out of `.value<std::string>()` — an
+            // uncaught throw here is a bare 500 with no A4 envelope. Guard the
+            // same way the validity_days check below already does.
+            if (body.contains("csr_pem") && !body["csr_pem"].is_string()) {
+                res.status = 400;
+                res.set_content(error_json_a4(400, "csr_pem must be a string", make_correlation_id()),
+                                kJson);
+                return;
+            }
+            if (body.contains("label") && !body["label"].is_string()) {
+                res.status = 400;
+                res.set_content(error_json_a4(400, "label must be a string", make_correlation_id()),
+                                kJson);
+                return;
+            }
             const std::string csr_pem = body.value("csr_pem", "");
             const std::string label = body.value("label", "");
             if (csr_pem.empty()) {
@@ -601,15 +638,33 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                                     kJson);
                     return;
                 }
-                const int v = body["validity_days"].get<int>();
-                if (v < 1) {
+                // gov F6/UP-7: read as int64 and range-check BEFORE narrowing to
+                // int — get<int>() on an out-of-int-range JSON integer (e.g.
+                // 2^32+365) silently truncates, and a truncated value landing
+                // INSIDE [1,730] would sail past a post-narrowing check. Also
+                // makes REST reject >730 explicitly, matching MCP's schema
+                // maximum:730 (the two twins now reject identically) instead of
+                // deferring the ceiling entirely to the server-side refusal.
+                int64_t v64 = 0;
+                try {
+                    v64 = body["validity_days"].get<int64_t>();
+                } catch (...) {
+                    // A JSON integer outside int64_t range (e.g. an unsigned
+                    // value > INT64_MAX) — definitely outside [1,730].
                     res.status = 400;
-                    res.set_content(error_json_a4(400, "validity_days must be >= 1",
+                    res.set_content(error_json_a4(400, "validity_days must be between 1 and 730",
                                                   make_correlation_id()),
                                     kJson);
                     return;
                 }
-                validity_days = v;
+                if (v64 < 1 || v64 > kMaxCodeSigningValidityDaysRest) {
+                    res.status = 400;
+                    res.set_content(error_json_a4(400, "validity_days must be between 1 and 730",
+                                                  make_correlation_id()),
+                                    kJson);
+                    return;
+                }
+                validity_days = static_cast<int>(v64);
             }
             // Re-derive the session (perm_fn above already authenticated this
             // request) ONLY to attribute IssuedCertRecord::issued_by to the
@@ -625,6 +680,11 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                 const std::string& err = issued.error();
                 const bool no_root = err.starts_with(kCodeSigningNoRootPrefix);
                 const bool bad_csr = err.starts_with(kCodeSigningBadCsrPrefix);
+                // gov B1 / F6/UP-5/UP-7: two more caller-attributable
+                // classifications, each with its own message so a weak key or a
+                // bad validity_days is never reported as "csr_pem is invalid".
+                const bool weak_key = err.starts_with(kCodeSigningWeakKeyPrefix);
+                const bool bad_validity = err.starts_with(kCodeSigningBadValidityPrefix);
                 int status = 500;
                 std::string result = "failure";
                 std::string msg = "code-signing issuance failed";
@@ -636,6 +696,15 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                     status = 400;
                     result = "denied";
                     msg = "csr_pem is invalid or fails proof-of-possession";
+                } else if (weak_key) {
+                    status = 400;
+                    result = "denied";
+                    // Already caller-safe — crafted at the server.cpp call site.
+                    msg = err.substr(std::string_view(kCodeSigningWeakKeyPrefix).size());
+                } else if (bad_validity) {
+                    status = 400;
+                    result = "denied";
+                    msg = err.substr(std::string_view(kCodeSigningBadValidityPrefix).size());
                 }
                 const bool audit_ok = audit_fn(req, "ca.cert.issued", result,
                                                "CodeSigningCertificate", label,

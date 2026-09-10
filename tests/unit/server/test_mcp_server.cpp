@@ -11407,6 +11407,59 @@ TEST_CASE("MCP CA: issue_code_signing_cert without a CA returns an error, not a 
     CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
 }
 
+// gov F6/UP-5/UP-7: mirrors the REST twin's classification test —
+// kCodeSigningBadValidityPrefix maps to kInvalidParams with the crafted,
+// caller-safe message verbatim, never the generic "csr_pem is invalid or
+// fails proof-of-possession" bad_csr wording.
+TEST_CASE("MCP CA: issue_code_signing_cert maps a bad_validity fn refusal to kInvalidParams "
+          "with the caller-safe message, not the generic bad_csr message",
+          "[mcp][integration][pki][security][approval][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
+    REQUIRE(store.is_open());
+
+        yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.ca_store_for_test = &store;
+    ts.approval_manager_for_test = &appr;
+    ts.issue_code_signing_fn_for_test =
+        [](const std::string&, const std::string&, std::optional<int>,
+           const std::string&) -> std::expected<yuzu::server::CodeSigningIssuance, std::string> {
+        return std::unexpected(std::string(yuzu::server::kCodeSigningBadValidityPrefix) +
+                               "validity_days must be between 1 and 730");
+    };
+    ts.mock_username = "tester";
+    ts.start("supervised");
+
+    // validity_days stays WITHIN the tool's own bounded schema (1..730, #2405
+    // enforces it before minting a ticket) — the fake fn below produces the
+    // bad_validity refusal regardless of the actual value; this test exercises
+    // the CLASSIFICATION/message pass-through, not schema range enforcement
+    // (that is the REST twin's `validity_days=0/731/huge` test).
+    auto mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":9,"params":{"name":"issue_code_signing_cert","arguments":{"csr_pem":"csr","label":"signer-1","validity_days":400}}})");
+    REQUIRE(mint);
+    auto mint_body = nlohmann::json::parse(mint->body);
+    REQUIRE(mint_body.contains("error"));
+    const std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+
+    std::string recall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":10,"params":{"name":"issue_code_signing_cert","arguments":{"csr_pem":"csr","label":"signer-1","validity_days":400,"approval_id":")" +
+        approval_id + R"("}}})";
+    auto res = ts.call(recall);
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    const std::string msg = body["error"]["message"].get<std::string>();
+    CHECK(msg == "validity_days must be between 1 and 730");
+    CHECK(msg.find("csr_pem") == std::string::npos);
+}
+
 TEST_CASE("MCP CA: issue_code_signing_cert full approval-ticket round-trip reaches the typed "
           "output, mirroring the REST route's shape",
           "[mcp][integration][pki][security][approval][pg]") {

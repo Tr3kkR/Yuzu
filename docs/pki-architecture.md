@@ -225,9 +225,14 @@ outside `[1, 730]` is refused outright rather than silently clamped. The leaf's
 transiently via `FileKeyProvider` and zeroed on every exit path, including
 exception unwind. Every issuance is recorded in `ca_store` (`purpose=
 "code-signing"`) so it shows up in `GET /api/v1/ca/issued` and can be revoked
-via the existing `POST /api/v1/ca/revoke`, and audits `ca.cert.issued`
-(`target_type=CodeSigningCertificate`) exactly like an agent-issuance event, so
-both classes are indistinguishable in the audit log except by `purpose`.
+via the existing `POST /api/v1/ca/revoke`, and audits `ca.cert.issued` with
+`target_type=CodeSigningCertificate` — DISTINCT from an agent-issuance event's
+`target_type=AgentCertificate`, with `purpose` as a second, redundant
+discriminator in the detail string. `POST /api/v1/ca/revoke` derives the same
+`target_type` from the cert's own recorded `purpose` before emitting
+`ca.cert.revoked`, so a code-signing revocation is never durably mis-audited
+as `AgentCertificate` either — both the issue AND the revoke events are
+distinguishable by `target_type` alone, without inspecting `purpose` at all.
 
 **Revocation and expiry — read this before relying on it operationally.**
 Revoking a code-signing leaf through `POST /api/v1/ca/revoke` records the
