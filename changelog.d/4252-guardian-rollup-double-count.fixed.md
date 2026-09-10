@@ -23,7 +23,11 @@
   counter now fires (render-time only, at the fleet and baseline-page views) if the
   hardcoded support matrix ever again disagrees with what an agent actually reports —
   the label is folded to `unknown` for any non-canonical `spark.type`, keeping it the
-  closed set the metric docs already claimed.
+  closed set the metric docs already claimed. This limitation is deliberately NOT filed
+  as its own follow-up issue: it is accepted-by-design (the alternative — inventing a
+  "guard never armed" status distinct from "never reported" — is a larger, separate
+  behavior change to the agent/server status contract, not a bug in this fix), and is
+  fully covered by a regression test pinning the current, intended behavior.
 
   Known accepted limitation, adversarial-review-identified, tracked as a follow-up issue
   (not fixed in this PR): the new per-pair "already has a real status row" exclusion
@@ -43,3 +47,16 @@
   this diff does not touch; fixing it (version- or platform-binding status rows, or
   invalidating them transactionally on `update_rule`) is store-schema work that belongs
   in its own PR — tracked as #4263.
+
+  **Security hardening (governance review, this same PR):** the shared exclusion
+  predicate's (agent_id, rule_id) composite key was originally a delimiter-joined string
+  (`agent_id + '\x1f' + rule_id`). Three independent governance reviewers
+  (security-guardian, architect, compliance-officer) confirmed neither `agent_id`
+  (client-supplied at Register, length-checked only) nor `rule_id` (operator free text on
+  the REST create path, no shape validation) is guaranteed free of the separator byte, so
+  a crafted pair could collide with an unrelated pair's real status row and silently drop
+  the crafted pair from every compliance bucket. Fixed by replacing the string key with a
+  `PairStatusKey` struct + hash functor (no delimiter to collide on, for any byte
+  content), pinned by a regression test. The new diagnostic log line's `agent_id`/`rule_id`
+  interpolation is also now passed through this codebase's existing `log_safe()` helper,
+  closing a related log-forging angle on the same unvalidated-charset fact.

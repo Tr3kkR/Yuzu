@@ -47,6 +47,14 @@ Health probes (`/livez`, `/readyz`, `/health`, `/api/health`) are exempt from th
 | Trigger not firing | Verify trigger type and interval in policy YAML |
 | Wrong scope | Test scope expression against target device |
 
+## Guardian Dashboard Compliance Looks Wrong
+
+| Symptom | Explanation / fix |
+|-------|-----|
+| A Guard shows compliant but the customer says it isn't enforcing | Check the `yuzu_server_guardian_platform_matrix_stale_total{spark_type}` Prometheus counter and whether that rule's `spark.type` was re-authored (a PUT changing e.g. Service → Registry on the same rule id) — a status row from before the change can survive and render as compliant. Root cause tracked in issue #4263 (not yet fixed); confirm by checking the Guard's revision history / `updated_at` against the device's last-reported status timestamp. |
+| A Linux agent disappeared from the honesty banner or from a Guard's device list after an upgrade | Expected if that agent's only deployed Guard is a Service Guard that never armed (no system D-Bus — every containerized/compose agent — a disabled build flag, or an invalid unit name): it reports nothing, so it's indistinguishable from an unreported pair and silently drops out rather than showing "not implemented". Not a regression — verify D-Bus/systemd reachability on the endpoint before assuming a bug. |
+| The "% compliant" number for a rule jumped after an upgrade, with no configuration change | Expected, one-time, if the fleet has Linux endpoints with deployed Service-type Guards — see the #4252 upgrade note in [server-admin.md](../user-manual/server-admin.md). The number was previously double-counted (inflated denominator); the corrected figure is what actually shipped. |
+
 ## High Memory Usage
 
 | Check | Fix |

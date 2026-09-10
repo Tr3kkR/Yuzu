@@ -249,6 +249,41 @@ a terminal verdict even while that replica is not the leader. Only the leader-ow
 *scheduling* half — the automatic due-policy dispatch and the periodic CRL freshness
 re-publish — pauses.)
 
+### vNEXT — Guardian compliance % and the fleet honesty banner now reflect Linux Service Guards correctly (#4252; NOT breaking)
+
+New, non-breaking, and inert on a fleet with no deployed Service-type Guards.
+The `/guardian` dashboard's compliance rollup previously treated every
+non-Windows agent as "not implemented" for **every** Guard type — correct for
+Registry/File (genuinely Windows-only), but wrong for Service, which arms
+(observe-only) on Linux today. A Linux agent with a real compliant/drifted
+status row for a deployed Service Guard was folded into that Guard's
+"not implemented" bucket a second time, corrupting the "% compliant" headline
+and the fleet/by-baseline breakdowns.
+
+**What you will see, if your fleet has Linux endpoints with deployed
+Service-type Guards:** the affected Guard(s)' "% compliant" figure will likely
+move — typically upward, since the double-count previously inflated the
+denominator without inflating the numerator. The fleet honesty banner (the
+list of agents flagged as running on a platform Guardian doesn't fully cover)
+also narrows: it now names an agent only if it owns an *actually*-unenforced
+Guard pair, not merely for being on a less-covered platform, so a Linux agent
+whose only deployed Guard is a Service Guard may disappear from that banner.
+Nothing about how a Guard is authored, deployed, or enforced changes — this is
+a dashboard-reporting correctness fix only, with no REST/MCP-visible effect
+(the `/api/v1/guaranteed-state/status` endpoint never applied this fold and is
+unaffected).
+
+Two known, accepted limitations of this fold — see
+[guaranteed-state.md](guaranteed-state.md#compliance-overview) for detail and
+[metrics.md](metrics.md)'s `yuzu_server_guardian_platform_matrix_stale_total`
+entry for the diagnostic signal: a Service Guard that never actually arms on a
+genuinely-supported platform (no system D-Bus — every containerized/compose
+Linux agent, a disabled build flag, or an invalid unit name) now silently
+drops out of the denominator rather than showing "not implemented"; and a
+status row surviving a guard-*type* revision on the same rule id can render a
+now-unenforced pair as compliant with no marker on that rule (tracked as
+#4263, not yet fixed).
+
 ### vNEXT — scheduled instruction fires now go through a durable command outbox (HA WS-3 3.3; breaking for SIEM/audit-count assurance)
 
 Scheduled instruction fires no longer dispatch to agents inline from the
