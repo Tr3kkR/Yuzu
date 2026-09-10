@@ -394,9 +394,10 @@ std::string spark_type_of(const std::string& spec_json) {
 // std::array here — a THIRD independent enumeration of Guardian spark types
 // alongside the schema catalog and the platform matrix, with no cross-check
 // binding them (governance Gate 4 consistency-auditor finding). Now an alias
-// for guardian::kKnownGuardSparkTypes (guardian_push_builder.hpp), the same
-// list guardian_guard_supported_on_platform's matrix and the schema-registry
-// cross-check test (test_guardian_resilience_schema.cpp) consume.
+// for guardian::kKnownGuardSparkTypes (guardian_push_builder.hpp) — no third
+// copy. That header's own comment states precisely what IS and is NOT bound
+// by the schema-registry cross-check test: this array, not
+// guardian_guard_supported_on_platform's literal if-chain.
 constexpr auto& kMatrixStaleSparkTypes = guardian::kKnownGuardSparkTypes;
 constexpr const char* kMatrixStaleSparkTypeUnknown = "unknown";
 constexpr std::uint64_t kMatrixStaleLogSample = 50;

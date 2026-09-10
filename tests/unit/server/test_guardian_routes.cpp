@@ -1439,8 +1439,17 @@ TEST_CASE("#4252: an unrecognised spark.type folds to the 'unknown' metric label
     auto res = h.sink.Get("/fragments/guardian/status?view=fleet");
     REQUIRE(res != nullptr);
 
+    // quality-engineer (Gate 8 re-review): asserting the "unknown" label is
+    // merely PRESENT in the dump is non-discriminating — register_routes
+    // pre-seeds it at 0 regardless of whether this fold ever fires. Assert the
+    // actual counter VALUE via the real MetricsRegistry API instead (safe here
+    // — "unknown" is pre-seeded, so this read creates no phantom series, unlike
+    // reading the raw garbage token directly would).
+    CHECK(h.metrics
+              .counter("yuzu_server_guardian_platform_matrix_stale_total",
+                       {{"spark_type", "unknown"}})
+              .value() == 1.0);
     const std::string dump = h.metrics.serialize();
-    CHECK(dump.find(R"(spark_type="unknown")") != std::string::npos);
     CHECK(dump.find("garbage-xyz-not-a-real-type") == std::string::npos);
 }
 

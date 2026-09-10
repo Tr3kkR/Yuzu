@@ -72,15 +72,24 @@ bool guardian_guard_supported_on_platform(std::string_view agent_os,
 
 // The 3 guard-type ("spark.type") tokens this matrix explicitly distinguishes.
 // Single source shared with guardian_routes.cpp's platform-matrix-stale
-// detectability counter's closed Prometheus label set, and cross-checked
-// against the published schema catalog's "spark"-kind entries by
-// test_guardian_resilience_schema.cpp's CROSS-CHECK tests (governance Gate 4
-// finding, #4252 consolidated round) — so the schema catalog, this matrix, and
-// the stale-counter's label set can no longer drift out of sync silently the
-// way three independently hand-maintained lists could. A 4th spark type must
-// be added HERE (and to this function's branch above) for the cross-check to
-// stay green; the schema-registry side is guardian_schema_registry.cpp's
-// build_catalog().
+// detectability counter's closed Prometheus label set (that counter now
+// aliases this array directly — no third copy), and cross-checked against the
+// published schema catalog's "spark"-kind entries by
+// test_guardian_resilience_schema.cpp's CROSS-CHECK test (governance Gate 4
+// finding, #4252 consolidated round) — so the schema catalog and this array
+// can no longer drift out of sync silently.
+//
+// What that cross-check does NOT bind (governance Gate 8 re-review,
+// architect + consistency-auditor): guardian_guard_supported_on_platform's
+// if-chain above is a set of STRING LITERALS, not a lookup over this array —
+// adding a 4th entry here and to the schema catalog, with no corresponding
+// branch in that function, leaves the cross-check green while the actual
+// platform-support decision silently falls through to the Windows-only
+// default. test_guardian_push_builder.cpp's platform test pins this array's
+// entries against that function's literal branches directly (an
+// unrecognised entry there fails loudly); update BOTH tests, and this
+// function's branch, when adding a spark type — the schema-registry side is
+// guardian_schema_registry.cpp's build_catalog().
 inline constexpr std::array<std::string_view, 3> kKnownGuardSparkTypes = {
     "registry-change", "file-change", "service-status-change"};
 

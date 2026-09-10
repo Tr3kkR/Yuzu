@@ -320,6 +320,25 @@ TEST_CASE("guardian_guard_supported_on_platform — type-aware support matrix; u
     CHECK_FALSE(guardian_guard_supported_on_platform("darwin", "service-status-change"));
     CHECK_FALSE(guardian_guard_supported_on_platform("macos", "service-status-change"));
 
+    // Gate 8 re-review (architect + consistency-auditor): the new schema-catalog
+    // CROSS-CHECK test (test_guardian_resilience_schema.cpp) binds
+    // guardian::kKnownGuardSparkTypes to the published catalog, but
+    // guardian_guard_supported_on_platform's if-chain above is a set of string
+    // LITERALS, not a lookup over that array — so the cross-check passing does
+    // NOT prove this function has a branch for every entry in it. A 4th type
+    // could be added to kKnownGuardSparkTypes (and the schema catalog) with no
+    // corresponding branch here, silently falling through to the Windows-only
+    // default while the cross-check test stays green. Pin the array itself:
+    // every entry must be one of the 3 literals this test already covers above
+    // — an unrecognised entry here means a new spark type was added without its
+    // platform-support matrix decision (fix: add the CHECK lines above too).
+    for (std::string_view t : guardian::kKnownGuardSparkTypes) {
+        INFO("kKnownGuardSparkTypes entry not covered by this test's pinned "
+             "matrix above: " << t);
+        CHECK((t == "registry-change" || t == "file-change" ||
+              t == "service-status-change"));
+    }
+
     // Unknown/missing spark_type falls back to the Windows-only rule — never
     // regress a type this function doesn't recognise.
     CHECK(guardian_guard_supported_on_platform("windows", "some-future-type"));
