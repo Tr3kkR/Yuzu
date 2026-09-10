@@ -10338,7 +10338,7 @@ private:
                 label);
             return std::unexpected(std::string(kCodeSigningWeakKeyPrefix) +
                                    "signing key too weak (RSA must be 2048-16384 bits; EC "
-                                   "must be P-256 or stronger)");
+                                   "must be P-256, P-384, or P-521)");
         }
 
         const std::filesystem::path dir =

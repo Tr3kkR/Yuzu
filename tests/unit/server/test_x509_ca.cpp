@@ -503,8 +503,11 @@ TEST_CASE("x509_ca: code-signing leaf verifies a CMS detached signature "
 // gov B1 (UP-1, HIGH, fleet-RCE class): the subject-key strength floor
 // `issue_code_signing_leaf` (server.cpp) checks BEFORE ever calling sign_csr on
 // an operator-submitted CSR. Exercises the shared pki:: predicate directly —
-// the crypto is the engine's job, server.cpp's own coverage is the
-// call-site-classification test in test_ca_routes.cpp.
+// the crypto is the engine's job. The server.cpp call site that runs this floor
+// BEFORE sign_csr is verified by inspection only: the REST/MCP tests inject a
+// stub issuance fn, so no test yet exercises the real issue_code_signing_leaf
+// ordering (tracked with the reissue-block/usage-pin end-to-end coverage
+// follow-up, F4/F5). This case covers the shared pki:: predicate directly.
 TEST_CASE("x509_ca: subject_key_meets_code_signing_floor rejects a sub-2048-bit RSA key, "
           "accepts RSA-2048 and P-256 EC",
           "[pki][leaf][security]") {

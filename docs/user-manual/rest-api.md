@@ -1975,12 +1975,15 @@ Response:
 above it — feed both `certificate_pem` and `chain_pem` to `openssl cms -sign
 -certfile` to build a signature an agent can chain to its trust anchor. Errors
 use the A4 envelope: `400` (missing/invalid `csr_pem`, invalid `label`,
-`validity_days` out of range, unknown field, bad JSON), `403` (missing
+`validity_days` out of range, a signing key below the strength floor — RSA
+outside 2048-16384 bits or an EC curve other than P-256/P-384/P-521 (Ed25519 and
+Ed448 are accepted) — unknown field, bad JSON), `403` (missing
 `Security:Write`), `409` (no CA root — generate default certs first), `413`
 (body too large), `503` (CA unavailable). Audited as `ca.cert.issued`
 (`target_type=CodeSigningCertificate`, `target_id=<label or serial>`,
 `detail` carries `purpose=code-signing`) — the same action name an agent-leaf
-issuance uses, distinguished by `purpose`. Revoking the issued leaf uses the
+issuance uses, distinguished by `target_type` (`CodeSigningCertificate` vs
+`AgentCertificate`), with `purpose` as a secondary discriminator. Revoking the issued leaf uses the
 existing `POST /api/v1/ca/revoke` above; **revocation does not yet reach the
 agent-side plugin-load verifier via the CRL** — see
 `docs/pki-architecture.md`'s caveat before relying on this operationally.
@@ -3138,7 +3141,7 @@ row fails to persist, the response carries a `Sec-Audit-Failed: true` header
 | `quarantine.enable` | Device quarantined |
 | `quarantine.disable` | Device released from quarantine |
 | `ca.cert.issued` | Internal CA signed a per-agent client certificate at enrollment. `target_type=AgentCertificate`, `target_id=<serial>`, `result=success`. Also emitted by `POST /api/v1/ca/issue-code-signing` (gap-matrix #10) / MCP `issue_code_signing_cert`: `target_type=CodeSigningCertificate`, `target_id=<label>` on a rejected request or `<serial_hex>` on success, `detail` carries `purpose=code-signing`; `result=success`, `result=denied` (no CA root, or a bad/unparseable CSR), or `result=failure` (a genuine 5xx — key-load, signing, or `ca_store` write failure). |
-| `ca.cert.revoked` | Certificate revoked via `POST /api/v1/ca/revoke`. `target_type=AgentCertificate`, `target_id=<serial>`. `result=success`; `result=denied` with `detail="serial not found or already revoked"` for an unknown/already-revoked serial (reject without state change, matches every destructive sibling); `result=failure` (ADR-0053) for a genuine ca_store DB/lease error — kept distinct from `denied` so a database outage is never audited as a rejected revoke attempt. |
+| `ca.cert.revoked` | Certificate revoked via `POST /api/v1/ca/revoke`. `target_type` is derived from the revoked cert's `purpose` — `AgentCertificate` for an agent leaf, `CodeSigningCertificate` for a code-signing leaf (gap-matrix #10), or the neutral `Certificate` when the serial is not found or the `ca_store` read fails; `target_id=<serial>`. `result=success`; `result=denied` with `detail="serial not found or already revoked"` for an unknown/already-revoked serial (reject without state change, matches every destructive sibling); `result=failure` (ADR-0053) for a genuine ca_store DB/lease error — kept distinct from `denied` so a database outage is never audited as a rejected revoke attempt. |
 | `ca.crl.published` | CRL (re)published after a revocation. `target_type=Security`, `target_id=<serial that triggered it>`. `result=success`, or `result=failure` when the CRL could not be rebuilt/recorded (the revocation still stands; the public CRL is momentarily stale). |
 | `ca.root_csr.exported` | The install CA's CSR was exported via `GET /api/v1/ca/root-csr` (subordinate-CA setup). `target_type=CaRoot`, `target_id=root`. `result=success`, or `result=failure` if generation failed. |
 | `ca.subordinate.imported` | An enterprise-signed intermediate was imported via `POST /api/v1/ca/import-chain` (or the dashboard wrapper). `target_type=CaRoot`, `target_id=root`. `result=success` on a validated switch to subordinate mode; `result=denied` when the uploaded material is rejected (not a CA / wrong key / does not chain); `result=failure` on a server-side persistence error. `detail` carries `reason=...` on rejection and `via=dashboard` for the panel path. |
