@@ -204,7 +204,7 @@ jq -r .certificate_pem < signer_issuance.json > signer.pem
 jq -r .chain_pem       < signer_issuance.json > signer_chain.pem
 
 # Per-plugin: sign with the leaf, include the issuer chain via -certfile.
-openssl cms -sign -binary -nodetach=false \
+openssl cms -sign -binary \
   -signer signer.pem -inkey signer.key -certfile signer_chain.pem \
   -in chargen.so -outform pem -out chargen.so.sig
 ```

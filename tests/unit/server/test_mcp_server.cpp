@@ -11117,6 +11117,99 @@ TEST_CASE("MCP CA: revoke_certificate full approval-ticket round-trip reaches re
     CHECK(body2["result"]["structuredContent"] == payload);
 }
 
+// gov HIGH-1: MCP revoke_certificate must derive target_type from the cert's
+// OWN recorded purpose (via the shared ca_routes.hpp::derive_cert_audit_target_type
+// helper), exactly like REST's revoke_core — mirrors
+// test_ca_routes.cpp "ca_routes: POST /ca/revoke derives target_type from the
+// cert's own purpose". Before this fix, this handler hardcoded
+// "AgentCertificate" for every serial, durably mis-auditing a code-signing
+// revocation.
+TEST_CASE("MCP CA: revoke_certificate derives target_type from the cert's own purpose "
+          "(gov HIGH-1)",
+          "[mcp][integration][pki][security][approval][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
+
+    yuzu::server::IssuedCertRecord agent_rec;
+    agent_rec.serial_hex = "FACE02";
+    agent_rec.subject = "agent-hi1";
+    agent_rec.purpose = "agent";
+    agent_rec.not_after = 4102444800;
+    REQUIRE(store.record_issued(agent_rec).has_value());
+
+    yuzu::server::IssuedCertRecord cs_rec;
+    cs_rec.serial_hex = "C0DE52";
+    cs_rec.subject = "build-signer-hi1";
+    cs_rec.purpose = "code-signing";
+    cs_rec.not_after = 4102444800;
+    REQUIRE(store.record_issued(cs_rec).has_value());
+
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.ca_store_for_test = &store;
+    ts.approval_manager_for_test = &appr;
+    ts.start("supervised");
+
+    int next_id = 100;
+    auto revoke = [&](const std::string& serial) {
+        const int mint_id = next_id++;
+        const int recall_id = next_id++;
+        auto mint = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":)" + std::to_string(mint_id) +
+            R"(,"params":{"name":"revoke_certificate","arguments":{"serial_hex":")" + serial +
+            R"(","reason":"key_compromise"}}})");
+        REQUIRE(mint);
+        auto mint_body = nlohmann::json::parse(mint->body);
+        REQUIRE(mint_body.contains("error"));
+        const std::string approval_id =
+            mint_body["error"]["data"]["approval_id"].get<std::string>();
+        REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+        std::string recall = R"({"jsonrpc":"2.0","method":"tools/call","id":)" +
+                             std::to_string(recall_id) +
+                             R"(,"params":{"name":"revoke_certificate","arguments":{"serial_hex":")" +
+                             serial + R"(","reason":"key_compromise","approval_id":")" +
+                             approval_id + R"("}}})";
+        auto res = ts.call(recall);
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+
+    // audit_log/audit_target_types are parallel, in audit_fn CALL order. A
+    // success round-trip additionally emits an mcp.<tool> tool-layer audit
+    // (target_type "mcp_tool") AFTER the domain "ca.cert.revoked" row, so
+    // `.back()` alone would observe the wrong call on the success path —
+    // find the LAST "ca.cert.revoked|..." entry and read its own paired
+    // target_type instead.
+    auto last_revoked_target_type = [&]() -> std::string {
+        for (std::size_t i = ts.audit_log.size(); i-- > 0;) {
+            if (ts.audit_log[i].starts_with("ca.cert.revoked|"))
+                return ts.audit_target_types[i];
+        }
+        return "";
+    };
+
+    // A code-signing revocation audits CodeSigningCertificate.
+    auto body_cs = revoke("C0DE52");
+    REQUIRE(body_cs.contains("result")); // success
+    REQUIRE_FALSE(ts.audit_target_types.empty());
+    CHECK(last_revoked_target_type() == "CodeSigningCertificate");
+
+    // An agent-cert revocation still audits AgentCertificate — regression
+    // guard proving the derivation didn't just flip the hardcode the other way.
+    auto body_agent = revoke("FACE02");
+    REQUIRE(body_agent.contains("result")); // success
+    CHECK(last_revoked_target_type() == "AgentCertificate");
+
+    // A never-issued serial (no record to derive purpose from) falls back to
+    // the neutral "Certificate", not a guess.
+    auto body_unknown = revoke("BAADF0");
+    REQUIRE(body_unknown.contains("error")); // "serial not found or already revoked"
+    CHECK(last_revoked_target_type() == "Certificate");
+}
+
 // Gate 4 consistency-auditor SHOULD (2026-08-21): the StoreError (genuine ca_store
 // DB failure, not "serial not found") branch discarded audit_fn's return value —
 // unlike its "denied"/"success" siblings, an agentic caller had no way to learn a
@@ -11535,6 +11628,69 @@ TEST_CASE("MCP CA: issue_code_signing_cert full approval-ticket round-trip reach
     // structuredContent mirrors content[0].text exactly (2712 convention).
     REQUIRE(body["result"].contains("structuredContent"));
     CHECK(body["result"]["structuredContent"] == payload);
+}
+
+// gov HIGH-2 (docs/mcp-server.md:166, ADR-1005 "mutations fail closed on
+// audit failure"): a dropped ca.cert.issued audit row must withhold the
+// freshly issued certificate, not return it in an unaudited success — mirrors
+// the #3937 mint_engine_credential precedent (`MCP #3937: mint_engine_credential
+// fails CLOSED and withholds the secret on a dropped audit` above) exactly,
+// for the code-signing issuance surface.
+TEST_CASE("MCP CA: issue_code_signing_cert fails CLOSED and withholds the certificate on a "
+          "dropped audit (gov HIGH-2)",
+          "[mcp][integration][pki][security][approval][audit_failclose][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
+    REQUIRE(store.is_open());
+
+        yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.ca_store_for_test = &store;
+    ts.approval_manager_for_test = &appr;
+    ts.issue_code_signing_fn_for_test =
+        [](const std::string&, const std::string&, std::optional<int>,
+           const std::string&) -> std::expected<yuzu::server::CodeSigningIssuance, std::string> {
+        return yuzu::server::CodeSigningIssuance{
+            .certificate_pem = "-----BEGIN CERTIFICATE-----leaf-----END CERTIFICATE-----",
+            .chain_pem = "-----BEGIN CERTIFICATE-----root-----END CERTIFICATE-----",
+            .serial_hex = "FACADE",
+            .not_after = "2027-01-01T00:00:00Z",
+        };
+    };
+    ts.mock_username = "tester";
+    ts.start("supervised");
+
+    auto mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":11,"params":{"name":"issue_code_signing_cert","arguments":{"csr_pem":"-----BEGIN CERTIFICATE REQUEST-----fake-----END CERTIFICATE REQUEST-----","label":"failclose-signer"}}})");
+    REQUIRE(mint);
+    auto mint_body = nlohmann::json::parse(mint->body);
+    REQUIRE(mint_body.contains("error"));
+    const std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+
+    // Only NOW force the domain audit to fail — after the ticket minted
+    // (which doesn't itself audit) so the round trip exercises exactly the
+    // issuance-audit failure path, not an approval-flow audit.
+    ts.audit_succeeds_ = false;
+
+    std::string recall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":12,"params":{"name":"issue_code_signing_cert","arguments":{"csr_pem":"-----BEGIN CERTIFICATE REQUEST-----fake-----END CERTIFICATE REQUEST-----","label":"failclose-signer","approval_id":")" +
+        approval_id + R"("}}})";
+    auto res = ts.call(recall);
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    // Fail closed: a JSON-RPC ERROR, not a success result.
+    REQUIRE(body.contains("error"));
+    REQUIRE_FALSE(body.contains("result"));
+    CHECK(body["error"]["message"].get<std::string>().find("could not be persisted") !=
+          std::string::npos);
+    CHECK(res->body.find("\"audit_persisted\":false") != std::string::npos);
+    // The certificate is WITHHELD — neither PEM key ever appears in the body.
+    CHECK(res->body.find("\"certificate_pem\"") == std::string::npos);
+    CHECK(res->body.find("\"chain_pem\"") == std::string::npos);
 }
 
 TEST_CASE("MCP CA: issue_code_signing_cert's bounded schema rejects a bad label, an oversize "

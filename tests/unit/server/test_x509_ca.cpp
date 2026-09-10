@@ -116,6 +116,37 @@ std::string generate_rsa_key_pem(int bits) {
     return std::string(bptr->data, bptr->length);
 }
 
+// gov MED-2: an Ed25519 private key PEM — used ONLY to build a CSR whose
+// SUBJECT key the floor must now REJECT (openssl cms -sign fails on an
+// Ed25519 codeSigning cert with "no default digest", so the floor must refuse
+// to issue one even though detached_signature.cpp's own CMS_verify would
+// accept it).
+std::string generate_ed25519_key_pem() {
+    EVP_PKEY* pkey = EVP_PKEY_Q_keygen(nullptr, nullptr, "ED25519");
+    REQUIRE(pkey != nullptr);
+    struct PkeyGuard {
+        EVP_PKEY* k;
+        ~PkeyGuard() {
+            if (k)
+                EVP_PKEY_free(k);
+        }
+    } pg{pkey};
+
+    BIO* bio = BIO_new(BIO_s_mem());
+    REQUIRE(bio != nullptr);
+    struct BioGuard {
+        BIO* b;
+        ~BioGuard() {
+            if (b)
+                BIO_free(b);
+        }
+    } bg{bio};
+    REQUIRE(PEM_write_bio_PrivateKey(bio, pkey, nullptr, nullptr, 0, nullptr, nullptr) == 1);
+    BUF_MEM* bptr = nullptr;
+    BIO_get_mem_ptr(bio, &bptr);
+    return std::string(bptr->data, bptr->length);
+}
+
 // ── Raw-OpenSSL helpers for the code-signing test cases ────────────────────────
 //
 // CertDetails (parse_certificate's public shape) does not expose EKU/keyUsage,
@@ -219,6 +250,34 @@ std::string build_csr_with_eku_and_san(EVP_PKEY* key, const std::string& cn,
     sk_X509_EXTENSION_pop_free(exts, X509_EXTENSION_free);
 
     REQUIRE(X509_REQ_sign(req.get(), key, EVP_sha256()) > 0);
+
+    ssl_ptr<BIO> bio{BIO_new(BIO_s_mem())};
+    REQUIRE(bio);
+    REQUIRE(PEM_write_bio_X509_REQ(bio.get(), req.get()) == 1);
+    char* data = nullptr;
+    const long len = BIO_get_mem_data(bio.get(), &data);
+    REQUIRE(len > 0);
+    return std::string(data, static_cast<std::size_t>(len));
+}
+
+// gov MED-2: a bare CSR (subject CN only, no extensions) signed with a NULL
+// digest — required for Ed25519/Ed448, which are "pure" signature schemes and
+// reject `X509_REQ_sign`'s normal digest-then-sign path (the exact "no
+// default digest" failure `openssl cms -sign` hits, which is why the floor
+// must reject these keys). `make_csr` (x509_ca.cpp) always passes a concrete
+// digest, so it cannot build this CSR — only used to get an Ed25519 CSR PEM
+// past parsing; `subject_key_meets_code_signing_floor` never verifies the
+// CSR's own signature, only its subject public key.
+std::string make_csr_null_digest(EVP_PKEY* key, const std::string& cn) {
+    ssl_ptr<X509_REQ> req{X509_REQ_new()};
+    REQUIRE(req);
+    REQUIRE(X509_REQ_set_version(req.get(), 0) == 1);
+    X509_NAME* name = X509_REQ_get_subject_name(req.get());
+    REQUIRE(X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+                                       reinterpret_cast<const unsigned char*>(cn.c_str()), -1, -1,
+                                       0) == 1);
+    REQUIRE(X509_REQ_set_pubkey(req.get(), key) == 1);
+    REQUIRE(X509_REQ_sign(req.get(), key, nullptr) > 0);
 
     ssl_ptr<BIO> bio{BIO_new(BIO_s_mem())};
     REQUIRE(bio);
@@ -508,8 +567,8 @@ TEST_CASE("x509_ca: code-signing leaf verifies a CMS detached signature "
 // stub issuance fn, so no test yet exercises the real issue_code_signing_leaf
 // ordering (tracked with the reissue-block/usage-pin end-to-end coverage
 // follow-up, F4/F5). This case covers the shared pki:: predicate directly.
-TEST_CASE("x509_ca: subject_key_meets_code_signing_floor rejects a sub-2048-bit RSA key, "
-          "accepts RSA-2048 and P-256 EC",
+TEST_CASE("x509_ca: subject_key_meets_code_signing_floor rejects a sub-2048-bit RSA key and "
+          "Ed25519, accepts RSA-2048 and P-256 EC",
           "[pki][leaf][security]") {
     CsrParams cp;
     cp.subject = {"weak-signer", "Yuzu"};
@@ -532,6 +591,18 @@ TEST_CASE("x509_ca: subject_key_meets_code_signing_floor rejects a sub-2048-bit 
     auto ec_csr = make_csr(*ec_key_pem, cp);
     REQUIRE(ec_csr);
     REQUIRE(subject_key_meets_code_signing_floor(*ec_csr));
+
+    // gov MED-2: Ed25519 — `openssl cms -sign` (the documented signing tool)
+    // fails on an Ed25519 codeSigning cert, so the floor must now REJECT it
+    // even though it is cryptographically strong. make_csr (x509_ca.cpp)
+    // always signs with a concrete digest, which Ed25519 rejects — build the
+    // CSR with the NULL-digest raw helper instead (the floor never verifies
+    // the CSR's own signature, only its subject public key).
+    auto ed25519_key_pem = generate_ed25519_key_pem();
+    auto ed25519_key = load_pkey(ed25519_key_pem);
+    REQUIRE(ed25519_key);
+    auto ed25519_csr = make_csr_null_digest(ed25519_key.get(), cp.subject.common_name);
+    REQUIRE_FALSE(subject_key_meets_code_signing_floor(ed25519_csr));
 
     // A garbage / unparseable CSR fails CLOSED — never a default-accept.
     REQUIRE_FALSE(subject_key_meets_code_signing_floor("not a csr"));

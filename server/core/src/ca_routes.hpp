@@ -49,11 +49,17 @@ namespace yuzu::server {
 
 /// Strict validator for the code-signing `label` (used verbatim as the issued
 /// leaf's subject CN). `^[A-Za-z0-9._-]{1,64}$` — no whitespace or DN
-/// metacharacters, so this CN can never collide with (or be mistaken for) an
-/// agent_id-shaped subject at the #1118 identity gate. Pure / no crypto dep so
-/// the REST route (ca_routes.cpp) and ServerImpl's defense-in-depth re-check
-/// (server.cpp, where the value is actually placed in the certificate) share
-/// exactly one definition rather than two hand-kept-in-sync regexes.
+/// metacharacters. This is defense-in-depth, NOT the primary control against
+/// #1118 agent impersonation: the actual control is that this leaf's usage is
+/// hard-pinned to `codeSigning`-only (rejected outright by the mTLS
+/// `SSL_CLIENT` purpose check, so it can never reach the agent-identity gate
+/// regardless of its CN) and its SAN is left empty — never an agent-style
+/// `yuzu://…/agent/…` URI SAN (see this header's file comment). The regex
+/// only keeps the CN itself well-formed and unambiguous. Pure / no crypto dep
+/// so the REST route (ca_routes.cpp) and ServerImpl's defense-in-depth
+/// re-check (server.cpp, where the value is actually placed in the
+/// certificate) share exactly one definition rather than two
+/// hand-kept-in-sync regexes.
 [[nodiscard]] constexpr bool is_valid_code_signing_label(std::string_view label) noexcept {
     if (label.empty() || label.size() > 64)
         return false;
@@ -65,6 +71,20 @@ namespace yuzu::server {
     }
     return true;
 }
+
+/// Derives the `ca.cert.*` audit `target_type` from a serial's OWN recorded
+/// `IssuedCertRecord::purpose` — "agent" -> "AgentCertificate", "code-signing"
+/// -> "CodeSigningCertificate", anything else (including a genuine store-read
+/// failure or an unknown serial — those are already carried by the caller's
+/// own outcome classification, e.g. `RevokeOutcome::StoreError`/`NotFound`)
+/// falls back to the neutral "Certificate". Pure / no crypto dep, so the REST
+/// revoke path (`ca_routes.cpp`'s `revoke_core`) and the MCP `revoke_certificate`
+/// handler (`mcp_server.cpp`) share exactly ONE definition rather than two
+/// hand-kept-in-sync copies — mirrors `is_valid_code_signing_label` above.
+/// Before this helper existed, the MCP path hardcoded "AgentCertificate" and
+/// durably mis-audited every code-signing revocation (gov HIGH-1).
+[[nodiscard]] std::string derive_cert_audit_target_type(CaStore& ca_store,
+                                                        const std::string& serial_hex);
 
 /// Prefix on `IssueCodeSigningFn`'s `unexpected()` when the failure is a
 /// caller-attributable business refusal — no CA root to issue from — rather

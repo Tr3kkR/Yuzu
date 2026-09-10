@@ -847,10 +847,15 @@ bool subject_key_meets_code_signing_floor(std::string_view csr_pem) {
         // first-class (matches this file's own P-256/P-384 leaf/CA choice).
         return name == "prime256v1" || name == "secp384r1" || name == "secp521r1";
     }
-    // Ed25519/Ed448: no factoring-style "bits" floor applies, and
-    // detached_signature.cpp's CMS_verify accepts them under OpenSSL 3 — safe
-    // to allow. Any other key type (RSA-PSS, DH, X25519, …) is rejected.
-    return base_id == EVP_PKEY_ED25519 || base_id == EVP_PKEY_ED448;
+    // gov MED-2: Ed25519/Ed448 are REJECTED, not accepted. detached_signature.cpp's
+    // own CMS_verify tolerates them, but `openssl cms -sign` — the documented
+    // code-signing tool (docs/user-manual/agent-plugins.md,
+    // docs/user-manual/server-admin.md) — fails on an Ed25519/Ed448 codeSigning
+    // cert ("no default digest"), so issuing one would hand the operator a leaf
+    // the shipped tooling cannot use. The accepted set is RSA 2048-16384 and EC
+    // P-256/P-384/P-521 ONLY; any other key type (RSA-PSS, DH, X25519, Ed25519,
+    // Ed448, …) is rejected.
+    return false;
 }
 
 namespace {

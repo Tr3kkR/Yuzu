@@ -215,6 +215,13 @@ impersonating case only, by construction rather than by policy:
   reading `ca.cert.issued`) can distinguish this leaf class from an agent
   enrollment leaf without inspecting the certificate.
 
+The CSR's subject key must meet a strength floor
+(`pki::subject_key_meets_code_signing_floor`): RSA 2048-16384 bits or EC
+P-256/P-384/P-521 ONLY — Ed25519 and Ed448 are rejected, because `openssl cms
+-sign` (the documented signing tool) cannot use them ("no default digest"),
+so issuing one would hand the operator a leaf the shipped tooling cannot sign
+with.
+
 Validity defaults to 365 days, operator-selectable up to a hard 730-day
 ceiling (`server.cpp::issue_code_signing_leaf`'s
 `kDefaultCodeSigningValidityDays`/`kMaxCodeSigningValidityDays`) — a request
@@ -239,11 +246,15 @@ Revoking a code-signing leaf through `POST /api/v1/ca/revoke` records the
 revocation in `ca_store` and republishes the CRL, same as revoking an agent
 cert — but the **agent-side plugin-load verifier does not consult the CRL**
 (`agents/core/src/detached_signature.cpp`; see `docs/user-manual/agent-plugins.md`
-"Not yet supported"). So revoking a signer here stops it being usable for
-*new* signatures and shows up in the issued-cert inventory as revoked, but does
-**not** yet cause an agent to reject plugins it already signed at the next
-restart — the same limitation a hand-rolled external signing CA has today.
-Closing this is a tracked follow-up (`#4234`). Separately, signer **expiry**
+"Not yet supported"). Revoking a signer here does **not** stop it being usable
+for *new* signatures: signing is an offline operation performed by the
+operator with their own private key, and the server is never in the signing
+path — a revoked signer can still be used to `openssl cms -sign` a new plugin
+tomorrow. Revocation is recorded in the issued-cert inventory and reaches the
+CRL, but the agent's plugin-load verifier does not consult it, so it does
+**not** yet cause an agent to reject plugins already signed with that leaf at
+the next restart — the same limitation a hand-rolled external signing CA has
+today. Closing this is a tracked follow-up (`#4234`). Separately, signer **expiry**
 already matters operationally: `CMS_verify` checks the signer leaf's validity
 window at verify time, so once a code-signing leaf's `not_after` passes, plugins
 it signed stop *loading* at the agent's next restart — track `not_after` from

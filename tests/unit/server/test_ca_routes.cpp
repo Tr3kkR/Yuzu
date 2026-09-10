@@ -964,6 +964,44 @@ TEST_CASE("ca_routes: POST /ca/issue-code-signing issues, returns the JSON shape
     REQUIRE_FALSE(h.last_issue_validity_days.has_value());
 }
 
+// gov HIGH-2 (ADR-1005 "mutations fail closed on audit failure"): a dropped
+// ca.cert.issued audit row must withhold the freshly issued certificate — the
+// leaf is already durably recorded via record_issued (mirrored here by
+// issue_calls==1, since this harness's fake IssueCodeSigningFn stands in for
+// that step), but the RESPONSE must never hand back certificate_pem/chain_pem
+// on an unaudited 200. Mirrors the #2466/#2406 engine-credential-mint REST
+// precedent (`rest_api_v1.cpp`) exactly.
+TEST_CASE("ca_routes: POST /ca/issue-code-signing fails closed and withholds the certificate "
+          "on a dropped audit row (gov HIGH-2)",
+          "[ca_routes][pki][code-signing][security][pg]") {
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root()));
+    h.audit_succeeds = false; // simulate the ca.cert.issued audit write failing
+    h.wire();
+
+    auto res = h.sink.Post("/api/v1/ca/issue-code-signing",
+                           R"({"csr_pem":"-----BEGIN CERTIFICATE REQUEST-----\nFAKE\n-----END )"
+                           R"(CERTIFICATE REQUEST-----\n","label":"failclose-signer"})");
+    REQUIRE(res);
+    REQUIRE(res->status == 503);
+    REQUIRE(res->get_header_value("Sec-Audit-Failed") == "true");
+    // The certificate is WITHHELD — neither PEM key ever appears in the body,
+    // even though issuance itself (the fake fn) was called and "succeeded".
+    REQUIRE(h.issue_calls == 1);
+    REQUIRE(res->body.find("certificate_pem") == std::string::npos);
+    REQUIRE(res->body.find("chain_pem") == std::string::npos);
+    REQUIRE(res->body.find("could not be persisted") != std::string::npos);
+
+    bool saw_issue = false;
+    for (const auto& a : h.audits) {
+        if (a.action == "ca.cert.issued" && a.result == "success") {
+            saw_issue = true;
+            REQUIRE(a.target_type == "CodeSigningCertificate");
+        }
+    }
+    REQUIRE(saw_issue); // the attempt WAS audited (as a row) — persisting it is what failed
+}
+
 TEST_CASE("ca_routes: POST /ca/issue-code-signing gates on Security:Write",
           "[ca_routes][pki][code-signing][security][pg]") {
     Harness h;

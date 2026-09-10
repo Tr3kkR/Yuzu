@@ -13075,6 +13075,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 for (auto& c : serial)
                     c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                // gov HIGH-1: derive the audit target_type from the cert's OWN
+                // recorded purpose BEFORE revoking — matches REST's revoke_core
+                // (ca_routes.cpp) via the shared ca_routes.hpp helper, so a
+                // code-signing revocation is never durably mis-audited as an
+                // AgentCertificate action on the MCP surface.
+                const std::string target_type = derive_cert_audit_target_type(*ca_store, serial);
                 auto revoked_or_err = ca_store->revoke(serial, reason);
                 if (!revoked_or_err) {
                     // ADR-0053: a genuine DB/lease failure — distinct from "not found or
@@ -13085,7 +13091,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // an agentic caller had no way to learn a dropped audit row accompanied this
                     // 503, the same evidence-chain gap the other two branches already surface.
                     const bool store_error_audit_ok =
-                        audit_fn(req, "ca.cert.revoked", "failure", "AgentCertificate", serial,
+                        audit_fn(req, "ca.cert.revoked", "failure", target_type, serial,
                                  revoked_or_err.error());
                     res.set_content(
                         error_response(id, kInternalError, "CA store unavailable",
@@ -13099,7 +13105,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // Idempotent reject-without-state-change → "denied" (matches REST).
                     // M1 (#1240): surface a dropped denied-row via the error data.
                     const bool denied_audit_ok = audit_fn(req, "ca.cert.revoked", "denied",
-                                                          "AgentCertificate", serial,
+                                                          target_type, serial,
                                                           "serial not found or already revoked");
                     res.set_content(
                         error_response(id, kInvalidParams, "serial not found or already revoked",
@@ -13113,7 +13119,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // caller via audit_persisted:false (the REST sibling uses the
                 // Sec-Audit-Failed header; JSON-RPC has no header channel).
                 bool audit_ok =
-                    audit_fn(req, "ca.cert.revoked", "success", "AgentCertificate", serial, reason);
+                    audit_fn(req, "ca.cert.revoked", "success", target_type, serial, reason);
                 bool crl_ok = false;
                 if (publish_crl_fn)
                     crl_ok = publish_crl_fn().has_value();
@@ -13232,13 +13238,34 @@ McpServer::HandlerFn McpServer::build_handler(
                 const bool audit_ok =
                     audit_fn(req, "ca.cert.issued", "success", "CodeSigningCertificate",
                              issued->serial_hex, "purpose=code-signing label=" + label);
+                if (!audit_ok) {
+                    // gov HIGH-2 (docs/mcp-server.md:166, ADR-1005): a privileged
+                    // credential MUTATION must never report success on an
+                    // unrecorded audit row. Mirrors mint_engine_credential
+                    // (#3937) exactly: the leaf IS already durably recorded in
+                    // ca_store via record_issued — only the audit row failed
+                    // to persist — so it is discoverable and reissuable rather
+                    // than lost; WITHHOLD certificate_pem/chain_pem instead of
+                    // returning them in an unaudited 200.
+                    mcp_audit("error", "audit_persist_failed");
+                    res.set_content(
+                        a4_error(503,
+                                 "code-signing certificate " + issued->serial_hex +
+                                     " was issued but its audit record could not be "
+                                     "persisted; the certificate was withheld. Check GET "
+                                     "/api/v1/ca/issued and reissue if the serial is not "
+                                     "recorded",
+                                 "check GET /api/v1/ca/issued for the serial and reissue; "
+                                 "do not retry blindly",
+                                 /*retry_after_ms=*/-1, /*cid_override=*/{}, /*audit_ok=*/false),
+                        "application/json");
+                    return;
+                }
                 nlohmann::json payload_j = {{"certificate_pem", issued->certificate_pem},
                                             {"chain_pem", issued->chain_pem},
                                             {"serial_hex", issued->serial_hex},
                                             {"not_after", issued->not_after},
                                             {"purpose", "code-signing"}};
-                if (!audit_ok)
-                    payload_j["audit_persisted"] = false;
                 const std::string payload = payload_j.dump();
                 // L2 (#1240): record the tool-layer invocation too (mcp.<tool>) so
                 // MCP usage correlates with the ca.* domain events in the audit store.

@@ -1976,9 +1976,10 @@ Response:
 above it — feed both `certificate_pem` and `chain_pem` to `openssl cms -sign
 -certfile` to build a signature an agent can chain to its trust anchor. Errors
 use the A4 envelope: `400` (missing/invalid `csr_pem`, invalid `label`,
-`validity_days` out of range, a signing key below the strength floor — RSA
-outside 2048-16384 bits or an EC curve other than P-256/P-384/P-521 (Ed25519 and
-Ed448 are accepted) — unknown field, bad JSON), `403` (missing
+`validity_days` out of range, a signing key below the strength floor — the
+accepted set is RSA 2048-16384 bits or EC P-256/P-384/P-521; Ed25519 and Ed448
+are rejected, since `openssl cms -sign` cannot use them — unknown field, bad
+JSON), `403` (missing
 `Security:Write`), `409` (no CA root — generate default certs first), `413`
 (body too large), `503` (CA unavailable). Audited as `ca.cert.issued`
 (`target_type=CodeSigningCertificate`, `target_id=<label or serial>`,

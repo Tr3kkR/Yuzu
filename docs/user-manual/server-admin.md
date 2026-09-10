@@ -2069,7 +2069,7 @@ CSR.
    issued-certificate inventory (`purpose: code-signing`).
 3. **Sign the plugin** with the returned leaf, including the issuer chain:
    ```bash
-   openssl cms -sign -binary -nodetach=false \
+   openssl cms -sign -binary \
      -signer signer.pem -inkey signer.key -certfile signer_chain.pem \
      -in chargen.so -outform pem -out chargen.so.sig
    ```

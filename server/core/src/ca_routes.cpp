@@ -15,6 +15,18 @@
 
 namespace yuzu::server {
 
+std::string derive_cert_audit_target_type(CaStore& ca_store, const std::string& serial_hex) {
+    std::string target_type = "Certificate";
+    if (auto rec_or_err = ca_store.get_issued(serial_hex); rec_or_err && rec_or_err->has_value()) {
+        const std::string& purpose = (*rec_or_err)->purpose;
+        if (purpose == "agent")
+            target_type = "AgentCertificate";
+        else if (purpose == "code-signing")
+            target_type = "CodeSigningCertificate";
+    }
+    return target_type;
+}
+
 namespace {
 
 using detail::error_json_a4;
@@ -275,22 +287,18 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
     auto revoke_core = [ca_store, audit_fn, publish_crl_fn](
                            const httplib::Request& req, const std::string& serial,
                            const std::string& reason) -> RevokeResult {
-        // gov B2 (F1: arch-1 + compliance HIGH): derive the audit target_type
-        // from the cert's OWN recorded purpose — now that code-signing certs
-        // (gap-matrix #10) are revocable through this same route, hardcoding
-        // "AgentCertificate" would durably mis-audit a code-signing revocation.
-        // A read failure (genuine store error, distinct from "not found" — see
-        // get_issued()'s contract) and a genuine "no such serial" both fall
-        // back to the neutral "Certificate": the StoreError/NotFound outcomes
-        // below already carry the more specific signal for that case.
-        std::string target_type = "Certificate";
-        if (auto rec_or_err = ca_store->get_issued(serial); rec_or_err && rec_or_err->has_value()) {
-            const std::string& purpose = (*rec_or_err)->purpose;
-            if (purpose == "agent")
-                target_type = "AgentCertificate";
-            else if (purpose == "code-signing")
-                target_type = "CodeSigningCertificate";
-        }
+        // gov B2 (F1: arch-1 + compliance HIGH; HIGH-1): derive the audit
+        // target_type from the cert's OWN recorded purpose — now that
+        // code-signing certs (gap-matrix #10) are revocable through this same
+        // route, hardcoding "AgentCertificate" would durably mis-audit a
+        // code-signing revocation. A read failure (genuine store error,
+        // distinct from "not found" — see get_issued()'s contract) and a
+        // genuine "no such serial" both fall back to the neutral
+        // "Certificate": the StoreError/NotFound outcomes below already carry
+        // the more specific signal for that case. Shared with MCP's
+        // revoke_certificate via derive_cert_audit_target_type (ca_routes.hpp)
+        // so both surfaces classify identically.
+        const std::string target_type = derive_cert_audit_target_type(*ca_store, serial);
         auto revoked_or_err = ca_store->revoke(serial, reason);
         if (!revoked_or_err) {
             // ADR-0053: a genuine DB/lease failure — distinct from "not found or already
@@ -718,8 +726,30 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
             const bool audit_ok =
                 audit_fn(req, "ca.cert.issued", "success", "CodeSigningCertificate",
                          issued->serial_hex, "purpose=code-signing label=" + label);
-            if (!audit_ok)
+            if (!audit_ok) {
+                // gov HIGH-2 (ADR-1005 "mutations fail closed on audit
+                // failure", mirrors #2466/#2406's engine-credential-mint
+                // precedent above): the leaf IS already durably recorded in
+                // ca_store via record_issued — only the audit row failed to
+                // persist — so it is discoverable and reissuable rather than
+                // lost. WITHHOLD certificate_pem/chain_pem instead of
+                // returning them in an unaudited 200; Sec-Audit-Failed alone
+                // (the REVOKE convention, unchanged elsewhere in this file) is
+                // not enough here because that header is easy for a caller to
+                // miss while still consuming the 200 body's secret material.
+                res.status = 503;
                 res.set_header("Sec-Audit-Failed", "true");
+                res.set_content(
+                    error_json_a4(503,
+                                 "code-signing certificate " + issued->serial_hex +
+                                     " was issued but its audit record could not be "
+                                     "persisted; the certificate was withheld. Check GET "
+                                     "/api/v1/ca/issued and reissue if the serial is not "
+                                     "recorded",
+                                 make_correlation_id()),
+                    kJson);
+                return;
+            }
             nlohmann::json out = {{"certificate_pem", issued->certificate_pem},
                                   {"chain_pem", issued->chain_pem},
                                   {"serial_hex", issued->serial_hex},
