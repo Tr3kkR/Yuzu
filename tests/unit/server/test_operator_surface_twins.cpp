@@ -467,6 +467,22 @@ constexpr TwinRow kExpectedTwins[] = {
     {"get_policy", "Policy", "Read", true},
     {"list_policy_fragments", "Policy", "Read", true},
     {"get_policy_agent_statuses", "Policy", "Read", true},
+    // #4035 (api-parity #2146 Batch A): MCP-only gaps closing the REST-only
+    // twins for /fragments/device/dex and /fragments/dex/device/app-perf —
+    // see docs/api-twin-recipe.md §6/§7/§8, which directs a twin PR to extend
+    // this array (not only the plugin-config/upload-grant families the
+    // header comment above was originally pinned against).
+    {"get_dex_device_score", "GuaranteedState", "Read", true},
+    {"get_dex_device_app_perf", "GuaranteedState", "Read", true},
+    // #4035: the 8 genuinely-new REST+MCP twins from the same issue.
+    {"get_dex_app", "GuaranteedState", "Read", true},
+    {"list_dex_apps", "GuaranteedState", "Read", true},
+    {"get_dex_catalogue_group", "GuaranteedState", "Read", true},
+    {"get_dex_device_history", "GuaranteedState", "Read", true},
+    {"get_dex_observation", "GuaranteedState", "Read", true},
+    {"get_dex_health", "GuaranteedState", "Read", true},
+    {"get_dex_trends", "GuaranteedState", "Read", true},
+    {"get_dex_overview", "GuaranteedState", "Read", true},
 };
 
 } // namespace
