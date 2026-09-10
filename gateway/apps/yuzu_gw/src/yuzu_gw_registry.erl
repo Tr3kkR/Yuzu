@@ -108,24 +108,32 @@ all_agents() ->
 all_agent_pids() ->
     pg:get_members(?PG_SCOPE, all_agents).
 
-%% @doc Return {AgentId, RegisterRequest} for every currently-registered
-%% agent. Used by yuzu_gw_upstream to re-proxy registrations when the
-%% upstream connection re-establishes. Because this reads straight from
-%% ETS at call time, an agent that deregistered during the outage is
-%% already absent — it will not be replayed.
+%% @doc Return {AgentId, SessionId, RegisterRequest} for every
+%% currently-registered agent. Used by yuzu_gw_upstream to re-proxy
+%% registrations when the upstream connection re-establishes. Because
+%% this reads straight from ETS at call time, an agent that
+%% deregistered during the outage is already absent — it will not be
+%% replayed.
+%%
+%% SessionId (HA WS-4 4.1) is the session the agent originally
+%% registered with; the replay carries it as `x-yuzu-session-id`
+%% metadata on the re-proxied ProxyRegister so the server can treat the
+%% replay as a re-announce of an existing session rather than minting a
+%% new one. `undefined` for an agent registered without a session (the
+%% register_agent/5 back-compat path, e.g. routing-focused tests).
 %%
 %% Returns [] if the table does not exist (registry not started, or
 %% torn down) — same defensive contract as agent_count/0, so a caller
 %% on the reconnect path never crashes just because the registry is
 %% momentarily absent.
--spec all_register_reqs() -> [{binary(), map()}].
+-spec all_register_reqs() -> [{binary(), binary() | undefined, map()}].
 all_register_reqs() ->
     case ets:info(?TABLE, size) of
         undefined ->
             [];
         _ ->
-            [{AgentId, RegisterReq}
-             || {AgentId, _, _, _, _, _, _, RegisterReq} <- ets:tab2list(?TABLE)]
+            [{AgentId, SessionId, RegisterReq}
+             || {AgentId, _, _, SessionId, _, _, _, RegisterReq} <- ets:tab2list(?TABLE)]
     end.
 
 %% @doc Return pids of agents that have a specific plugin loaded.
