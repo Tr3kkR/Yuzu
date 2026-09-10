@@ -109,6 +109,22 @@ manually: alert on `yuzu_server_command_outbox_pending` growing without
 bound, or on `yuzu_server_command_outbox_deliver_retry_total` climbing
 steadily.
 
+### Gateway routing directory metrics (HA WS-4 4.1)
+
+`GatewayRouteStore` (schema `gateway_route_store`) is the fenced agent→cluster
+routing directory written on the gateway-upstream connect/disconnect/heartbeat
+paths (`register_fresh`/`announce_connected`/`deregister`/`renew_leases`). See
+`docs/postgres-migration-ladder.md`'s `GatewayRouteStore` row for the full
+epoch-fence design.
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_server_gateway_route_write_failed_total` | counter | A `GatewayRouteStore` directory write that degraded instead of succeeding, labeled `op` (`register_fresh`\|`announce_connected`\|`deregister`\|`renew_leases`) and `reason` (`store_unavailable`\|`db_error`). **Fail-OPEN this slice** — the write is logged and the RPC proceeds regardless, since the directory is not yet dispatch-authoritative (4.1) — so this counter is the only signal a systemic Postgres write problem would otherwise leave invisible. |
+
+There is deliberately no success/rate counter and no alert rule for this
+family yet — both land with the WS-4 4.2 fail-closed flip, once a reader
+depends on the directory being fresh.
+
 ## SSO login metrics
 
 Every SAML and OIDC login attempt — success or failure — increments its provider's login counter. Both counters carry a uniform `{result, role}` label set on every series (including error paths), so a dashboard can group by either label without hitting an unlabelled/labelled split.

@@ -231,6 +231,7 @@
 #include "agent_registry.hpp"
 #include "agent_service_impl.hpp"
 #include "cidr_match.hpp"
+#include "gateway_route_store.hpp"
 #include "gateway_service_impl.hpp"
 
 #include <grpc/grpc_security_constants.h>
@@ -3656,7 +3657,12 @@ public:
         // construct a ServerImpl (auth_mgr_.metrics_ stays nullptr there).
         auth_mgr_.set_metrics_registry(&metrics_);
 
-        // Create gateway upstream service if configured
+        // Create gateway upstream service if configured. Its born-on-PG route
+        // store (HA WS-4 4.1, GatewayRouteStore) is constructed further below,
+        // AFTER the PostgreSQL substrate, and wired in via set_gateway_route_store
+        // — same optional-borrowed-pointer pattern as every other PG-backed store
+        // this service touches (mgmt_group_store_ etc.), so no construction-order
+        // dependency on pg_pool_ here.
         if (!cfg_.gateway_upstream_address.empty()) {
             gateway_service_ = std::make_unique<detail::GatewayUpstreamServiceImpl>(
                 registry_, event_bus_, auth_mgr, auto_approve_, &metrics_, &health_store_);
@@ -4159,6 +4165,27 @@ public:
                               "(database reachable but the deployment_run_store schema could not be "
                               "created/opened)");
                 startup_failed_ = true;
+            }
+        }
+
+        // GatewayRouteStore — born-on-PG agent->cluster routing directory (HA
+        // WS-4 slice 4.1; see gateway_route_store.hpp). INERT this slice: written
+        // by GatewayUpstreamServiceImpl's connect/heartbeat/disconnect paths (wired
+        // below via set_gateway_route_store, same optional-borrowed-pointer
+        // discipline as every other PG-backed store this service touches —
+        // mgmt_group_store_/inventory_store_/etc. below), read by nobody yet.
+        // Same fail-CLOSED construction posture as PreflightRunStore/
+        // DeploymentRunStore (ADR-0012 §1) — only built when a gateway upstream is
+        // actually configured.
+        if (!cfg_.gateway_upstream_address.empty() && pg_pool_ && !startup_failed_) {
+            gateway_route_store_ = std::make_unique<GatewayRouteStore>(*pg_pool_);
+            if (!gateway_route_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: gateway-route store migration/open failed "
+                              "(database reachable but the gateway_route_store schema could not "
+                              "be created/opened)");
+                startup_failed_ = true;
+            } else if (gateway_service_) {
+                gateway_service_->set_gateway_route_store(gateway_route_store_.get());
             }
         }
 
@@ -9253,6 +9280,15 @@ public:
         // thread this PR; keep the ADR-0012 teardown discipline so a future engine
         // can't UAF).
         vuln_finding_store_.reset();
+        // GatewayRouteStore (HA WS-4 4.1) borrows pg_pool_ — drop before the pool.
+        // Null the borrowed pointer in gateway_service_ FIRST, same discipline as
+        // every other PG-backed store it touches below (mgmt_group_store_ etc.) —
+        // agent_server_/mgmt_server_->Shutdown(deadline) already ran above, so no
+        // in-flight ProxyRegister/BatchHeartbeat/NotifyStreamStatus handler can
+        // still be touching it, but null it anyway (belt-and-braces).
+        if (gateway_service_)
+            gateway_service_->set_gateway_route_store(nullptr);
+        gateway_route_store_.reset();
         // AccessReviewStore borrows pg_pool_ — drop before the pool. No background
         // thread borrows it (only rest_api_v1_/mcp_server_ hold a raw pointer, and
         // every HTTP/MCP handler thread is already quiesced by the drain above);
@@ -18139,6 +18175,16 @@ private:
     /// declared after it so it destructs before the pool; reset in stop().
     std::unique_ptr<PreflightRunStore> preflight_run_store_;
     std::unique_ptr<DeploymentRunStore> deployment_run_store_;
+    /// HA WS-4 slice 4.1: born-on-PG agent->cluster routing directory (see
+    /// gateway_route_store.hpp). Borrows pg_pool_ → declared after it, so it
+    /// destructs before the pool. Borrowed by gateway_service_ via
+    /// set_gateway_route_store. NOTE the lifetime guarantee is stop(), NOT
+    /// declaration order: gateway_service_ is declared EARLIER, so it destructs
+    /// AFTER this store — on a raw member teardown the borrow would dangle. It
+    /// is safe because ~ServerImpl always runs stop(), which Shutdown(deadline)-
+    /// drains in-flight RPCs, THEN nulls the borrowed pointer, THEN resets this
+    /// store — same discipline as mgmt_group_store_/inventory_store_ etc. below.
+    std::unique_ptr<GatewayRouteStore> gateway_route_store_;
     /// Born-on-PG CAVM findings + per-agent coverage projection (ADR-0012).
     /// Borrows pg_pool_ → declared after it; reset in stop() before the pool.
     /// DORMANT this PR: constructed + wired into /readyz+/healthz, no engine yet.

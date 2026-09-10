@@ -420,6 +420,7 @@ yuzu_server_core_lib = static_library(
     'src/leader_elector.cpp',
     'src/command_outbox_store.cpp',
     'src/command_outbox_delivery.cpp',
+    'src/gateway_route_store.cpp', # HA WS-4 4.1: fenced agent->cluster routing directory
     'src/execution_event_bus.cpp',
     'src/fleet_topology_store.cpp',
     'src/heartbeat_ingestion.cpp',
