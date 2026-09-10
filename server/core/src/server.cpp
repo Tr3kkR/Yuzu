@@ -154,6 +154,7 @@
 #include "capability_decls/plugin_action_catalogue_disk_actions.hpp"
 #include "capability_decls/plugin_action_catalogue_filesystem_posture.hpp"
 #include "capability_decls/plugin_action_catalogue_power_health.hpp"
+#include "capability_decls/plugin_action_catalogue_autoruns.hpp"
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
@@ -164,6 +165,7 @@
 #include "guardian_ingest.hpp" // kGuardianEventStoreDurationMetric + warm_create_guardian_event_store_metric
 #include "dex_perf_rules.hpp"
 #include "dex_routes.hpp"
+#include "network_api.hpp" // ADR-0031 WS-A4: the public in-process /network API seam
 #include "network_perf_rules.hpp"
 #include "inventory_routes.hpp"
 #include "inventory_ci_join.hpp"
@@ -15531,130 +15533,16 @@ private:
         // NetworkRoutes — /network (page shell) + /fragments/network/* (the
         // network-quality lens + net/device/app co-occurrence evidence).
         //
-        // Provider: assemble a NetPerfSnapshot from the health store's network
-        // facts (net_snapshot — SAME 90s staleness as recompute_metrics, so the
-        // page and the yuzu_fleet_net_* gauges see the same population) joined
-        // with session OS + cohort tags. Mirrors dex_perf_uncached. app_unstable
-        // is wired with the per-connection collector slice (the co-occurrence
-        // "also app" band stays empty until net_degraded facts exist).
-        auto net_perf_uncached = [this](const std::string& cohort_key) -> NetPerfSnapshot {
-            NetPerfSnapshot snap;
-            snap.cohort_key = cohort_key;
-            std::unordered_map<std::string, std::string> cohort_values;
-            if (tag_store_ && !cohort_key.empty()) {
-                // Render/telemetry caller — same degrade posture as
-                // dex_perf_uncached above (ADR-0036/ADR-0050).
-                snap.available_keys =
-                    tag_store_->get_distinct_keys().value_or(std::vector<std::string>{});
-                cohort_values = tag_store_->get_values_for_key(cohort_key)
-                                    .value_or(std::unordered_map<std::string, std::string>{});
-            }
-            const auto health = health_store_.net_snapshot(std::chrono::seconds{90});
-            std::unordered_map<std::string, const detail::AgentHealthSnapshot*> by_id;
-            by_id.reserve(health.size());
-            for (const auto& h : health)
-                by_id[h.agent_id] = &h;
-
-            auto fill_facts = [](NetPerfDevice& d,
-                                 const std::unordered_map<std::string, std::string>& tags) {
-                auto get = [&](const char* k) -> std::string {
-                    auto t = tags.find(k);
-                    return t != tags.end() ? t->second : std::string{};
-                };
-                d.rtt_ms = detail::parse_net_rtt_ms(get(detail::kNetTagRttP50Ms));
-                d.retrans_pct = detail::parse_net_retrans_pct(get(detail::kNetTagRetransPct));
-                d.throughput_bps =
-                    detail::parse_net_throughput_bps(get(detail::kNetTagThroughputBps));
-                if (auto deg = detail::parse_net_degraded(get(detail::kNetTagDegraded)))
-                    d.net_degraded = *deg;
-                d.cpu_pct = detail::parse_perf_cpu_pct(get(detail::kPerfTagCpuPct));
-                d.commit_pct = detail::parse_perf_commit_pct(get(detail::kPerfTagCommitPct));
-                d.disk_lat_ms = detail::parse_perf_disk_lat_ms(get(detail::kPerfTagDiskLatMs));
-                d.app_unstable = false; // wired with the per-connection collector slice
-            };
-
-            std::unordered_set<std::string> seen;
-            for (const auto& id : registry_.all_ids()) {
-                auto s = registry_.get_session(id);
-                if (!s)
-                    continue;
-                NetPerfDevice d;
-                d.agent_id = id;
-                std::string os = s->os;
-                for (auto& c : os)
-                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                d.platform = os; // "windows" / "linux" / "darwin"
-                if (auto it = by_id.find(id); it != by_id.end())
-                    fill_facts(d, it->second->status_tags);
-                if (!cohort_key.empty()) {
-                    // STORE-FIRST precedence (operator-declared cohort wins over
-                    // a self-reported tag) — same posture as dex_perf_uncached.
-                    if (auto cv = cohort_values.find(id); cv != cohort_values.end())
-                        d.cohort = cv->second;
-                    else if (auto it = s->scopable_tags.find(cohort_key);
-                             it != s->scopable_tags.end() &&
-                             TagStore::validate_value(it->second))
-                        d.cohort = it->second;
-                }
-                snap.devices.push_back(std::move(d));
-                seen.insert(id);
-            }
-            // C-S1: health-only devices (session reaped, heartbeat still fresh)
-            // must also appear so the page and the gauges agree.
-            for (const auto& h : health) {
-                if (seen.contains(h.agent_id))
-                    continue;
-                NetPerfDevice d;
-                d.agent_id = h.agent_id;
-                fill_facts(d, h.status_tags);
-                if (!cohort_key.empty())
-                    if (auto cv = cohort_values.find(h.agent_id); cv != cohort_values.end())
-                        d.cohort = cv->second;
-                snap.devices.push_back(std::move(d));
-            }
-            return snap;
-        };
-        // 5s TTL memo keyed by cohort key (mirrors the dex_perf_fn memo) —
-        // heartbeat data changes on a ~30s cadence, so this bounds the per-request
-        // fleet walk (all_ids + per-id get_session + net_snapshot copy-under-mutex)
-        // under hard operator polling and the future REST surface.
-        struct NetPerfMemo {
-            std::mutex mu;
-            struct Entry {
-                std::chrono::steady_clock::time_point at;
-                NetPerfSnapshot snap;
-            };
-            std::unordered_map<std::string, Entry> by_key;
-        };
-        auto net_memo = std::make_shared<NetPerfMemo>();
-        auto net_perf_fn = [memo = net_memo,
-                            net_perf_uncached](const std::string& cohort_key) -> NetPerfSnapshot {
-            constexpr auto kTtl = std::chrono::seconds{5};
-            constexpr std::size_t kMaxMemoEntries = 8;
-            const auto now = std::chrono::steady_clock::now();
-            {
-                std::lock_guard lk(memo->mu);
-                if (auto it = memo->by_key.find(cohort_key);
-                    it != memo->by_key.end() && now - it->second.at < kTtl)
-                    return it->second.snap;
-            }
-            auto snap = net_perf_uncached(cohort_key);
-            {
-                std::lock_guard lk(memo->mu);
-                if (memo->by_key.size() >= kMaxMemoEntries && !memo->by_key.contains(cohort_key)) {
-                    auto oldest = memo->by_key.begin();
-                    for (auto it = memo->by_key.begin(); it != memo->by_key.end(); ++it)
-                        if (it->second.at < oldest->second.at)
-                            oldest = it;
-                    memo->by_key.erase(oldest);
-                }
-                memo->by_key[cohort_key] = {now, snap};
-            }
-            return snap;
-        };
+        // ADR-0031 WS-A4: the store-reaching assembly (net_snapshot — SAME 90s
+        // staleness as recompute_metrics; STORE-FIRST cohort precedence; C-S1
+        // health-only devices; the 5s TTL / 8-entry memo) moved verbatim behind
+        // the NetworkApi seam (network_api.{hpp,cpp}) — one instance, shared by
+        // this dashboard provider, the REST /api/v1/network/* siblings, and the
+        // MCP network tools, so all three can never disagree.
+        auto network_api = make_local_network_api(health_store_, registry_, tag_store_.get());
 
         network_routes_ = std::make_unique<NetworkRoutes>();
-        network_routes_->register_routes(*web_server_, auth_fn, perm_fn, audit_fn, net_perf_fn);
+        network_routes_->register_routes(*web_server_, auth_fn, perm_fn, audit_fn, network_api);
 
         // DeviceRoutes — /devices (fleet list) + /device?id= (the shared device
         // page; Device-info lens). Sourced from the live registry (the CONNECTED
@@ -17484,10 +17372,10 @@ private:
             // the /dex Performance fragments and the MCP perf tools use, so
             // REST, dashboard and MCP can never disagree.
             dex_perf_fn,
-            // N1: the shared network-quality snapshot provider — the same closure
-            // the /network fragments use, so the /api/v1/network/* siblings and
+            // N1/ADR-0031 WS-A4: the shared NetworkApi — the same instance the
+            // /network fragments use, so the /api/v1/network/* siblings and
             // MCP tools can never disagree with the dashboard.
-            net_perf_fn,
+            network_api,
             // lockout_clear_fn — admin unlock (POST /api/v1/users/<name>/unlock).
             // Wraps AuthDB::clear_failed_logins so RestApiV1 stays decoupled from
             // AuthDB (same injection pattern as session_revoke_fn). SOC 2 CC6.3.
@@ -17727,6 +17615,12 @@ private:
             // decision for the same caller (same conversion, same underlying
             // require_fleet_read call).
             mcp_server_->set_fleet_read_fn(fleet_read_fn);
+            // #4037 — the SAME list_read_fn lambda wired into the REST
+            // registration's trailing list_read_fn param below, so the REST
+            // GET /guaranteed-state/status and MCP get_guardian_status twins
+            // cannot observe a different admit decision for the same caller
+            // (same conversion, same underlying require_list_read call).
+            mcp_server_->set_list_read_fn(list_read_fn);
             // #4027 fix round (CDX-P1-01/K4): the RBAC/management-group AXIS
             // for these three tools is the fleet_read_fn_ already wired above
             // (the SAME instance query_installed_software uses).
@@ -17858,8 +17752,8 @@ private:
                 // F2a: the shared fleet perf snapshot provider (one closure,
                 // three surfaces — fragments, REST, MCP).
                 dex_perf_fn,
-                // N1: the shared network-quality provider (fragments + REST + MCP).
-                net_perf_fn,
+                // N1/ADR-0031 WS-A4: the shared NetworkApi (fragments + REST + MCP).
+                network_api,
                 // #1550 HIGH-1 / #1634: per-agent response-scope predicate for
                 // query_responses{execution_id} AND aggregate_responses. Routes through
                 // the single response_agent_in_scope helper — the SAME fail-closed
@@ -18255,6 +18149,7 @@ private:
         yuzu::server::capdecls::plugin_action_catalogue_disk_actions(),
         yuzu::server::capdecls::plugin_action_catalogue_filesystem_posture(),
         yuzu::server::capdecls::plugin_action_catalogue_power_health(),
+        yuzu::server::capdecls::plugin_action_catalogue_autoruns(),
     };
     /// Shared Postgres connection pool — the server storage substrate (ADR-0006/
     /// 0007). Constructed in the ctor BEFORE any Postgres-backed store (fail

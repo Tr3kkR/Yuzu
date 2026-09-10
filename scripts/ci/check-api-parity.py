@@ -114,7 +114,13 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # #4036 (preflight/deploy read-twin batch) flips 2 more rows to "twinned"
 # on top of origin/dev's 221 -- reconciled post-merge against the actual
 # measured count, not hand-added.
-BASELINE_UNTWINNED = 219
+#
+# #4037 (api-parity #2146 Batch A): six guardian.json rows flip to "twinned"
+# (get.fragments-device-guardian, get.fragments-guardian-events, get.fragments-
+# guardian-guard-form, get.fragments-guardian-guard-param-page, get.fragments-
+# guardian-guards, get.fragments-guardian-status) on top of origin/dev's 219 --
+# reconciled post-merge against the actual measured count, not hand-added.
+BASELINE_UNTWINNED = 213
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.

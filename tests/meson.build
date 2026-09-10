@@ -465,6 +465,13 @@ agent_test_exe = executable(
                                                 # LocalDispatcher. Deliberately NOT platform-guarded — it
                                                 # runs on every OS, and on a host with no battery it emits an
                                                 # explicit named SKIP rather than passing silently.
+    'unit/test_autoruns_parsers.cpp',   # Wave 7 PR7.1: pure parsers over REAL CAPTURE fixtures (dispatcher test lands with the OS legs)
+    'unit/test_autoruns_local_dispatcher.cpp',  # Wave 7 PR7.1: real plugin via LocalDispatcher, unguarded on every OS
+    'unit/test_autoruns_win_local.cpp',         # Wave 7 PR7.1: Windows leg (+ OS-independent WMI join tests)
+    'unit/test_autoruns_linux_local.cpp',       # Wave 7 PR7.1: Linux leg (+ read_file_bounded internals)
+    'unit/test_autoruns_macos_local.cpp',       # Wave 7 PR7.1: macOS leg (CFPropertyList over REAL plists)
+    'unit/test_posix_dir_walk.cpp',     # PR #4154 round-8 remediation: shared capped
+                                        # directory-walk primitive (agents/shared/posix_dir_walk.hpp)
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -474,6 +481,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/installed_apps/src'),  # installed_apps_registry_utf8.hpp (#1662 test)
     include_directories('../agents/plugins/disk_actions/src'), # disk_actions_legs.hpp (pure formatters)
     include_directories('../agents/plugins/power_health/src'),  # power_health_parsers.hpp (pure helpers)
+    include_directories('../agents/plugins/autoruns/src'),  # Wave 7 PR7.1
     include_directories('../agents/plugins/license_scan/src'),    # licensing_parsers.hpp / licensing_record.hpp (pure, SLE PR1)
     include_directories('../agents/plugins/wifi/src'),            # wifi_corewlan.hpp (pure connected-record formatter)
     include_directories('../agents/plugins/interaction/src'),     # interaction_parsers.hpp (pure helpers)
@@ -518,6 +526,11 @@ agent_test_exe = executable(
   cpp_args: test_partial_init_args + agent_platform_args + agent_test_native_args +
             ['-DYUZU_AGENT_SRC_DIR="' +
              (meson.project_source_root() / 'agents' / 'core' / 'src').replace('\\', '/') +
+             '"',
+             # Wave 7 PR7.1: committed fixture root; autoruns' REAL CAPTURE tests
+             # REQUIRE(exists), never skip.
+             '-DYUZU_TEST_FIXTURE_DIR="' +
+             (meson.project_source_root() / 'tests' / 'unit' / 'fixtures').replace('\\', '/') +
              '"'],
   # catch2_nomain_dep (#1648 diagnostic): yuzu_agent_tests supplies its own main()
   # via unit/test_runner_main.cpp, so it links Catch2 without Catch2Main.
@@ -528,7 +541,10 @@ agent_test_exe = executable(
   # only way to exercise KvStore's fallible-read branches end to end rather than through
   # an injected stand-in. Already a transitive dep of yuzu_agent_core; naming it here is
   # what puts sqlite3.h on the test TU's include path (same shape as tar_test_deps).
-  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_nomain_dep, agent_test_openssl_dep, spdlog_dep, sqlite3_dep] + agent_test_native_deps,
+  # libxml2_dep: test_autoruns_parsers.cpp #includes autoruns_parsers.hpp,
+  # which parses Task Scheduler XML via real libxml2 unconditionally on
+  # every platform -- this test TU needs it on its include/link path too.
+  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_nomain_dep, agent_test_openssl_dep, spdlog_dep, sqlite3_dep, libxml2_dep] + agent_test_native_deps,
   # Ensure the fixture plugins are built before the test runs so the lookups
   # inside test_plugin_loader.cpp / test_capability_descriptor.cpp find them
   # under MESON_BUILD_ROOT/tests/.
@@ -601,6 +617,7 @@ agent_test_exe = executable(
                 users_plugin_lib,
                 wifi_plugin_lib,
                 power_health_plugin_lib,
+                autoruns_plugin_lib,  # Wave 7 PR7.1
                 windows_updates_plugin_lib,
                 ],
 )
@@ -660,6 +677,12 @@ if host_machine.system() == 'linux' and get_option('b_sanitize') == 'none'
   test(
     'spark allocation budget',
     spark_alloc_budget_exe,
+    # BR4-005 sibling (this executable is Linux-only, so the macOS branch
+    # review never reached it): a plugin-scoped `--test-args '[tag]'` against
+    # the agent suite appends that filter here too, where it never matches —
+    # see the cert_store_fallback_test_exe comment above for the full
+    # rationale.
+    args: ['--allow-running-no-tests'],
     suite: 'agent',
     timeout: 60,
   )
@@ -755,7 +778,18 @@ if host_machine.system() == 'darwin'
     # actually calls into it.
     dependencies: [yuzu_sdk_dep, spdlog_dep, catch2_dep],
   )
-  test('cert_store macOS honest-unsupported', cert_store_fallback_test_exe, suite: 'agent', timeout: 30)
+  # BR4-005 (branch-review round 4): `meson test --suite agent --test-args
+  # '[some-tag]'` appends that tag filter to EVERY test in the agent suite,
+  # including this standalone executable — which has no tag matching a
+  # plugin-specific filter like `[autoruns]`/`[app_usage]`. Catch2 exits 2 on
+  # a zero-match tag filter by default, so a plugin-scoped `--test-args`
+  # invocation (documented practice for a fast, targeted local check)
+  # deterministically fails this ENTIRELY UNRELATED test. --allow-running-no-tests
+  # makes a zero-match filter here report success (0 run) instead, matching
+  # what the caller actually meant: "run autoruns's tests", not "fail
+  # anything that isn't autoruns's tests".
+  test('cert_store macOS honest-unsupported', cert_store_fallback_test_exe,
+       args: ['--allow-running-no-tests'], suite: 'agent', timeout: 30)
 endif
 
 # ── TAR plugin unit tests ────────────────────────────────────────────────────
@@ -1087,6 +1121,7 @@ if build_server
       'unit/server/test_app_perf_compare.cpp',
       'unit/server/test_dex_app_perf_ui.cpp',
       'unit/server/test_network_perf_model.cpp',
+      'unit/server/test_network_api.cpp', # ADR-0031 WS-A4: the first per-family in-process API seam pilot
       'unit/server/test_spark_fleet_tags.cpp',
       'unit/server/test_guardian_journal_fleet_tags.cpp',
       'unit/server/test_guardian_health_fleet_tags.cpp', # #2298 gate 3 item 6d — M1 health-stream fleet rollup pin

@@ -53,6 +53,7 @@
 #include "response_store.hpp"
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
+#include "test_network_api_double.hpp"
 #include "workflow_engine.hpp" // #4030 Gate 8 fix: mcp_workflow_tpl / get_workflow_execution tests
 // M5 remediation (ADR-0031 operator-surface functional coverage): mcp_server.hpp
 // only forward-declares PluginConfigStore (its .cpp includes the real header) —
@@ -1034,6 +1035,17 @@ struct McpTestServer {
         return {true, std::nullopt};
     };
 
+    /// #4037 — the fake twin of require_list_read (fixture-side, not
+    /// production's fail-closed-when-unwired default): admits unfiltered
+    /// unless a test overrides it, matching fleet_read_fn_for_test's
+    /// "legacy-open" default so existing/new tests keep reaching the
+    /// store/degrade paths below this gate without having to opt in.
+    yuzu::server::mcp::McpServer::ListReadFn list_read_fn_for_test =
+        [](const httplib::Request&, httplib::Response&, const std::string&,
+           const std::string&) -> yuzu::server::ListReadGate {
+        return {true, std::nullopt, std::nullopt};
+    };
+
     /// #4033 — the fake twin of the D3 Response:Read-visible-set resolver
     /// backing preview_management_group_agent_count. Default: TOP
     /// (nullopt, unfiltered) — a test that cares about scoping overrides
@@ -1296,6 +1308,13 @@ private:
         // shape for every pre-existing test that never touches it.
         mcp.set_fleet_read_fn(fleet_read_fn_for_test);
 
+        // #4037: list_read_fn ALSO rides a setter, same pattern as
+        // fleet_read_fn above — wire before the handlers are built.
+        // Unconditional: the fixture default above already mirrors the
+        // legacy-open posture, so this is a no-op change of shape for every
+        // pre-existing test that never touches it.
+        mcp.set_list_read_fn(list_read_fn_for_test);
+
         // #4033: response_visible_set_fn ALSO rides a setter, same pattern
         // as fleet_read_fn above — wire before the handlers are built.
         // Unconditional: the fixture default above is TOP/unfiltered, a
@@ -1355,6 +1374,14 @@ private:
             mcp.build_delete_handler(auth_fn, audit_fn, &mcp_disabled_, &streaming_disabled_,
                                      session_registry_for_test, allowed_origins_for_test);
 
+        // ADR-0031 WS-A4: wrap this file's plain NetPerfSnapshot(cohort_key)
+        // provider function in the NetworkApi seam — an unset
+        // net_perf_fn_for_test stays null (the "no provider wired" path).
+        std::shared_ptr<const yuzu::server::NetworkApi> network_api_for_test;
+        if (net_perf_fn_for_test)
+            network_api_for_test =
+                std::make_shared<yuzu::server::test::FnNetworkApi>(net_perf_fn_for_test);
+
         handler = mcp.build_handler(
             std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), std::move(agents_fn),
             /*rbac_store=*/rbac_store_for_test,
@@ -1378,7 +1405,7 @@ private:
             },
             /*guaranteed_state_store=*/guaranteed_state_store_for_test,
             /*dex_perf_fn=*/dex_perf_fn_for_test,
-            /*net_perf_fn=*/net_perf_fn_for_test,
+            /*network_api=*/network_api_for_test,
             /*response_scope_fn=*/response_scope_fn_for_test,
             /*software_inventory_store=*/software_inventory_store_for_test,
             /*metrics=*/metrics_for_test,
@@ -3544,6 +3571,350 @@ TEST_CASE("MCP Integration: get_guardian_schemas matches the REST catalog",
     REQUIRE(contents.size() >= 1);
     auto resource_catalog = nlohmann::json::parse(contents[0]["text"].get<std::string>());
     CHECK(resource_catalog == rest_catalog);
+}
+
+// ── Guardian read twins (#4037, api-parity #2146 Batch A) ───────────────────
+// Each mirrors its GET /api/v1/guaranteed-state/* REST sibling via the SAME
+// guardian_model.hpp builder functions (get_guardian_status /
+// guardian_status_rollup, get_guardian_rule_status / guardian_rule_agent_status_rows,
+// get_guardian_device_guards / guardian_device_all_guards) or the same store
+// call (list_guardian_rules / list_rules, list_guardian_events / query_events).
+
+static yuzu::test::PgTestTemplate mcp_guardian_read_twins_pg_tpl{
+    "guardianstate", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        GuaranteedStateStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("guardianstate template: store failed to migrate");
+    }};
+
+static void mcp_seed_rule(GuaranteedStateStore& store, const std::string& rule_id,
+                          const std::string& name) {
+    GuaranteedStateRuleRow r;
+    r.rule_id = rule_id;
+    r.name = name;
+    REQUIRE(store.create_rule(r).has_value());
+}
+
+static void mcp_seed_status(GuaranteedStateStore& store, const std::string& event_id,
+                            const std::string& agent, const std::string& rule_id,
+                            const std::string& event_type, const std::string& ts) {
+    GuaranteedStateEventRow e;
+    e.event_id = event_id;
+    e.rule_id = rule_id;
+    e.agent_id = agent;
+    e.event_type = event_type;
+    e.severity = "info";
+    e.timestamp = ts;
+    REQUIRE(store.insert_event(e).has_value());
+}
+
+TEST_CASE("MCP Guardian: get_guardian_status matches the REST fleet rollup shape",
+          "[pg][mcp][integration][guardian]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_rule(store, "r1", "rule-one");
+    mcp_seed_rule(store, "r2", "rule-two");
+    mcp_seed_status(store, "e1", "WS-1", "r1", "guard.unhealthy", "2026-06-20T10:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly"); // GuaranteedState:Read is allowed on every MCP tier
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":50,"params":{"name":"get_guardian_status"}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto data = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(data["total_rules"].get<int>() == 2);
+    CHECK(data["errored_rules"].get<int>() == 1);
+    CHECK(data["compliant_rules"].get<int>() == 0);
+    CHECK(data["drifted_rules"].get<int>() == 0);
+    CHECK(ts.audit_log.back() == "mcp.get_guardian_status|success");
+}
+
+TEST_CASE("MCP Guardian: get_guardian_status fails closed when list_read_fn is unwired",
+          "[pg][mcp][integration][guardian]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.list_read_fn_for_test = {}; // unwired
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":51,"params":{"name":"get_guardian_status"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+}
+
+TEST_CASE("MCP Guardian: list_guardian_rules mirrors GET /guaranteed-state/rules' fields",
+          "[pg][mcp][integration][guardian]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_rule(store, "r1", "rule-one");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":52,"params":{"name":"list_guardian_rules"}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto data = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(data["rules"].is_array());
+    CHECK(data["rules"].size() == 1);
+    CHECK(data["rules"][0]["rule_id"] == "r1");
+    CHECK(data["rules"][0]["name"] == "rule-one");
+    CHECK(data["total"].get<int>() == 1);
+    CHECK(ts.audit_log.back() == "mcp.list_guardian_rules|success");
+}
+
+TEST_CASE("MCP Guardian: list_guardian_events fleet-wide branch denies a service-scoped token",
+          "[pg][mcp][integration][guardian]") {
+    // #3238: the fleet-wide branch keeps REST's own bare-perm_fn posture — this
+    // proves the MCP twin does NOT invent a different (stronger OR weaker) gate.
+    // list_guardian_events is ServiceScopeClass::confined, so C8's own
+    // structural pre-handler refusal cannot fire here (that only triggers for
+    // `denied`-class tools) — this denial MUST come from the handler's own
+    // deny_fleet_wide_service_scoped call instead. The audit VERB is the
+    // discriminator, not audit presence: deny_fleet_wide_service_scoped emits
+    // dex.device.view|denied; had C8 fired instead (it can't, for a confined
+    // tool) it would have emitted a DIFFERENT row, mcp.list_guardian_events|denied
+    // via its own mcp_audit call (mcp_server.cpp's C8 block does audit a
+    // denied-class structural refusal — it just never runs for this tool).
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.mock_token_scope_service = "printers";
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":53,"params":{"name":"list_guardian_events"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(ts.audit_log.back() == "dex.device.view|denied");
+}
+
+TEST_CASE("MCP Guardian: list_guardian_events with agent_id scopes via scoped_perm_fn",
+          "[pg][mcp][integration][guardian]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_rule(store, "r1", "rule-one");
+    mcp_seed_status(store, "e1", "WS-1", "r1", "drift.detected", "2026-06-20T10:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    std::string last_scoped_agent;
+    ts.scoped_perm_fn_for_test = [&](const httplib::Request&, httplib::Response&,
+                                     const std::string&, const std::string&,
+                                     const std::string& agent_id) -> bool {
+        last_scoped_agent = agent_id;
+        return true;
+    };
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":54,"params":{"name":"list_guardian_events","arguments":{"agent_id":"WS-1"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(last_scoped_agent == "WS-1");
+    auto body = nlohmann::json::parse(res->body);
+    auto data = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(data["events"].is_array());
+    CHECK(data["events"].size() == 1);
+    CHECK(data["events"][0]["agent_id"] == "WS-1");
+    CHECK(ts.audit_log.back() == "dex.device.view|success");
+}
+
+TEST_CASE("MCP Guardian: list_guardian_events with agent_id admits a service-scoped token",
+          "[pg][mcp][integration][guardian]") {
+    // list_guardian_events is ServiceScopeClass::confined (not denied): C8 must
+    // let a service-scoped token THROUGH to the handler's own per-device
+    // scoped_perm_fn gate when agent_id is supplied, matching REST GET
+    // /guaranteed-state/events exactly. A `denied` classification would 403
+    // this call at C8 before the handler's real per-device mechanism ever ran
+    // — this is the regression this test guards against.
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_rule(store, "r1", "rule-one");
+    mcp_seed_status(store, "e1", "WS-1", "r1", "drift.detected", "2026-06-20T10:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.mock_token_scope_service = "printers";
+    std::string last_scoped_agent;
+    ts.scoped_perm_fn_for_test = [&](const httplib::Request&, httplib::Response&,
+                                     const std::string&, const std::string&,
+                                     const std::string& agent_id) -> bool {
+        last_scoped_agent = agent_id;
+        return true;
+    };
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":55,"params":{"name":"list_guardian_events","arguments":{"agent_id":"WS-1"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(last_scoped_agent == "WS-1");
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+}
+
+TEST_CASE("MCP Guardian: get_guardian_rule_status returns every reporting agent for one rule",
+          "[pg][mcp][integration][guardian]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_rule(store, "r1", "rule-one");
+    mcp_seed_status(store, "e1", "WS-1", "r1", "guard.unhealthy", "2026-06-20T10:00:00Z");
+    mcp_seed_status(store, "e2", "WS-2", "r1", "guard.compliant", "2026-06-20T10:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":55,"params":{"name":"get_guardian_rule_status","arguments":{"rule_id":"r1"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto data = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(data["rule_id"] == "r1");
+    REQUIRE(data["agents"].is_array());
+    CHECK(data["agents"].size() == 2);
+    CHECK(data["total"].get<int>() == 2);
+    CHECK(ts.audit_log.back() == "guaranteed_state.rule.view|success");
+}
+
+TEST_CASE("MCP Guardian: get_guardian_rule_status on an unknown rule_id errors, "
+          "audited not_found",
+          "[pg][mcp][integration][guardian]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":56,"params":{"name":"get_guardian_rule_status","arguments":{"rule_id":"no-such-rule"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(ts.audit_log.back() == "guaranteed_state.rule.view|not_found");
+}
+
+TEST_CASE("MCP Guardian: get_guardian_rule_status filters to gate.scope's visible agents "
+          "(ADR-0017) — this route's C++ post-filter (agent_rule_statuses(rule_id) has no "
+          "scope parameter of its own) is a distinct code path from get_guardian_status's "
+          "SQL-pushed errored_rule_count(agent_scope), so a confined witness on one does not "
+          "prove the other",
+          "[pg][mcp][integration][guardian][adr0017]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_rule(store, "r1", "rule-one");
+    mcp_seed_status(store, "e1", "WS-1", "r1", "guard.unhealthy", "2026-06-20T10:00:00Z");
+    mcp_seed_status(store, "e2", "WS-2", "r1", "guard.compliant", "2026-06-20T10:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    // AdmitScoped witness: only WS-1 is visible to this caller's management
+    // group — mirrors REST gs.rule-status's own [adr0017] AdmitScoped test.
+    ts.list_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                  const std::string&,
+                                  const std::string&) -> yuzu::server::ListReadGate {
+        return {true, std::vector<std::string>{"WS-1"}, std::nullopt};
+    };
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":58,"params":{"name":"get_guardian_rule_status","arguments":{"rule_id":"r1"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto data = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(data["agents"].is_array());
+    // WS-2's row is filtered out — it is outside the caller's visible set.
+    CHECK(data["agents"].size() == 1);
+    CHECK(data["agents"][0]["agent_id"] == "WS-1");
+    CHECK(data["total"].get<int>() == 1);
+}
+
+TEST_CASE("MCP Guardian: get_guardian_status scopes errored_rules to gate.scope's visible "
+          "agents (ADR-0017), same require_list_read composition as REST",
+          "[pg][mcp][integration][guardian][adr0017]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_rule(store, "r1", "rule-one");
+    mcp_seed_rule(store, "r2", "rule-two");
+    mcp_seed_status(store, "e1", "WS-1", "r1", "guard.unhealthy", "2026-06-20T10:00:00Z"); // visible
+    mcp_seed_status(store, "e2", "WS-2", "r2", "guard.unhealthy", "2026-06-20T10:00:00Z"); // NOT visible
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.list_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                  const std::string&,
+                                  const std::string&) -> yuzu::server::ListReadGate {
+        return {true, std::vector<std::string>{"WS-1"}, std::nullopt};
+    };
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":59,"params":{"name":"get_guardian_status"}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto data = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    // Only WS-1's errored rule (r1) counts — WS-2's r2 is out of scope.
+    CHECK(data["errored_rules"].get<int>() == 1);
+    // total_rules is never confined — it is the global rule-catalogue size.
+    CHECK(data["total_rules"].get<int>() == 2);
+}
+
+TEST_CASE("MCP Guardian: get_guardian_device_guards returns every guard's state for one "
+          "device, unscoped to any Baseline",
+          "[pg][mcp][integration][guardian]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_rule(store, "r1", "guard-one");
+    mcp_seed_rule(store, "r2", "guard-two");
+    mcp_seed_status(store, "e1", "WS-1", "r1", "guard.unhealthy", "2026-06-20T10:00:00Z");
+    mcp_seed_status(store, "e2", "WS-1", "r2", "guard.compliant", "2026-06-20T10:00:00Z");
+    mcp_seed_status(store, "e3", "WS-2", "r1", "guard.compliant", "2026-06-20T10:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    std::string last_scoped_agent;
+    ts.scoped_perm_fn_for_test = [&](const httplib::Request&, httplib::Response&,
+                                     const std::string&, const std::string&,
+                                     const std::string& agent_id) -> bool {
+        last_scoped_agent = agent_id;
+        return true;
+    };
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":57,"params":{"name":"get_guardian_device_guards","arguments":{"agent_id":"WS-1"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(last_scoped_agent == "WS-1");
+    auto body = nlohmann::json::parse(res->body);
+    auto data = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(data["agent_id"] == "WS-1");
+    REQUIRE(data["guards"].is_array());
+    CHECK(data["guards"].size() == 2);
+    CHECK(data["total_guards"].get<int>() == 2);
+    CHECK(ts.audit_log.back() == "guardian.device.view|success");
 }
 
 // ── Compliance/policy REST v1 read twins (api-parity #4034) ─────────────────
@@ -17783,7 +18154,7 @@ TEST_CASE("MCP approval recall executes through the real AuthRoutes::require_per
         /*inventory_store=*/nullptr, /*policy_store=*/nullptr, /*mgmt_store=*/nullptr, &appr,
         /*schedule_engine=*/nullptr, read_only, disabled,
         /*dispatch_fn=*/nullptr, /*ca_store=*/nullptr, /*publish_crl_fn=*/{},
-        /*guaranteed_state_store=*/nullptr, /*dex_perf_fn=*/{}, /*net_perf_fn=*/{},
+        /*guaranteed_state_store=*/nullptr, /*dex_perf_fn=*/{}, /*network_api=*/{},
         /*response_scope_fn=*/{}, /*software_inventory_store=*/nullptr,
         /*metrics=*/nullptr, /*app_perf_providers=*/{},
         /*quarantine_store=*/nullptr, /*tag_push_fn=*/{}, /*agent_registry=*/nullptr,

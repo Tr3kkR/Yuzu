@@ -351,7 +351,24 @@ rule it replaces.
 > INV-31-4's full "every registered route," and not a compensating control against a silent (3) escape.
 > **What remains for WS-A4** (split matrix): the *per-family* seam+contract enforcement that gates the
 > WS-B2 strangler cutover, the "handlers/renderers call the API, never a `Store*`" seam refactor, and the
-> behavioural-PII audit relocation — none of which #842 delivered.
+> cutover-time removal of the presentation handler's now-redundant behavioural-PII audit call (see the
+> 2026-09-10 update below — not one of these was #842's).
+>
+> **Update (2026-09-10): the FIRST per-family seam landed, on `network`.** `NetworkApi`
+> (`server/core/src/network_api.{hpp,cpp}`) is an abstract in-process API whose method set equals the
+> family's public REST resources (`fleet_now`/`device_list` == `GET /api/v1/network/fleet`/`GET
+> /api/v1/network/devices`); the store-backed impl (`LocalNetworkApi`) is private, the header is
+> store-dependency-free, and all three consumers — dashboard, REST, MCP — now call through it instead of
+> the prior ad-hoc `net_perf_fn` provider. `scripts/ci/check-seam-closure.py` pilots include-closure
+> enforcement for this family's dashboard/routes/model/API translation units (`rest_api_v1.cpp` and
+> `mcp_server.cpp` stay inspected-not-enforced — multi-family TUs). This is the template the other ~36
+> families copy; it is not yet a general refactor. **Correction to the "behavioural-PII audit relocation"
+> phrase above**, verified against the tree: the audit was never in `*_ui.cpp` (pure render functions, no
+> audit calls) — `emit_behavioral_audit` already lives centrally in `rest_audit.hpp`, called only from
+> `*_routes.cpp`/`rest_api_v1.cpp`. "PII-audit relocation" means removing the presentation-side handler's
+> audit call at the WS-B2 cutover once core's REST-side audit covers the same view (avoiding a duplicate
+> row per view), not moving anything out of `*_ui.cpp`. No family has cut over yet, so this step has not
+> been exercised.
 
 **INV-31-6 — Every store that a component depends on appears in that component's readiness probe.**
 Stated as an invariant rather than a habit, because the existing `stores_ok` conjunction in `/readyz`
@@ -411,8 +428,9 @@ none of them today:
    the INV-31-4 update note above; `scripts/ci/check-api-parity.py` + `test_openapi_spec_completeness.cpp`,
    #842/#3991/#3992. This gap is closed for `/api/vN/*` only by a LEXICAL gate (literal registrations fail
    the build; a non-literal *direct* verb call warns; a helper- or header-defined registration can escape
-   SILENTLY — see the INV-31-4 update note above; #2572); the per-family enforcement, the handler→API seam
-   refactor, and the PII-audit relocation halves of WS-A4 remain.)*
+   SILENTLY — see the INV-31-4 update note above; #2572); the per-family enforcement (one family,
+   `network`, done as the pilot as of 2026-09-10 — see the INV-31-4 update note above), the handler→API
+   seam refactor generally, and the cutover-time audit-removal halves of WS-A4 remain.)*
 2. **A REST route with no MCP twin.** Structurally invisible to the build.
 3. **A database grant handed to presentation or the engine.** Prevented by Postgres role
    configuration (2c D1), not by the compiler.
