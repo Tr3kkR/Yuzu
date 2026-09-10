@@ -442,6 +442,47 @@ constexpr TwinRow kExpectedTwins[] = {
     {"list_tar_process_tree_devices", "Infrastructure", "Read", true},
     {"list_tar_capture_sources_devices", "Infrastructure", "Read", true},
     {"list_tar_retention_paused", "Infrastructure", "Read", true},
+    // #4031: directory-sync (AD/Entra) read twin — parity with GET
+    // /api/v1/directory/users. The OIDC-config, auto-approve-rules, and
+    // pending-agents read twins are REST-only per #520 (see
+    // docs/mcp-server.md) and so carry no MCP tool, no row here.
+    //
+    // get_directory_status (the /directory/status twin) is deliberately NOT
+    // listed here even though it shares Directory:Read: it takes no input
+    // parameters, so its schema is the honest, bounded
+    // {"type":"object","properties":{}} shape — same precedent as
+    // get_guardian_schemas above, also absent from this array for the same
+    // reason (the A5 sweep below asserts every LISTED tool's schema differs
+    // from that literal, which is correct for this curated list but not a
+    // universal rule; validate_tool_security_registration's boot-time check
+    // is what proves get_directory_status's own table entries are
+    // consistent, and test_mcp_server.cpp exercises its dispatch directly).
+    {"list_directory_users", "Directory", "Read", true},
+    // #4033 (#2146 Batch A) — pinned against
+    // /fragments/create-group-form's own ManagementGroup:Write gate
+    // (dashboard_routes.cpp) and its REST twin GET /api/v1/management-groups/
+    // agent-count-preview (rest_api_v1.cpp).
+    {"preview_management_group_agent_count", "ManagementGroup", "Write", false},
+    // #4034 — compliance/policy REST v1 read twins.
+    {"get_policy", "Policy", "Read", true},
+    {"list_policy_fragments", "Policy", "Read", true},
+    {"get_policy_agent_statuses", "Policy", "Read", true},
+    // #4035 (api-parity #2146 Batch A): MCP-only gaps closing the REST-only
+    // twins for /fragments/device/dex and /fragments/dex/device/app-perf —
+    // see docs/api-twin-recipe.md §6/§7/§8, which directs a twin PR to extend
+    // this array (not only the plugin-config/upload-grant families the
+    // header comment above was originally pinned against).
+    {"get_dex_device_score", "GuaranteedState", "Read", true},
+    {"get_dex_device_app_perf", "GuaranteedState", "Read", true},
+    // #4035: the 8 genuinely-new REST+MCP twins from the same issue.
+    {"get_dex_app", "GuaranteedState", "Read", true},
+    {"list_dex_apps", "GuaranteedState", "Read", true},
+    {"get_dex_catalogue_group", "GuaranteedState", "Read", true},
+    {"get_dex_device_history", "GuaranteedState", "Read", true},
+    {"get_dex_observation", "GuaranteedState", "Read", true},
+    {"get_dex_health", "GuaranteedState", "Read", true},
+    {"get_dex_trends", "GuaranteedState", "Read", true},
+    {"get_dex_overview", "GuaranteedState", "Read", true},
 };
 
 } // namespace

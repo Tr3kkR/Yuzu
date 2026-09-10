@@ -431,6 +431,30 @@ std::string render_live_result(const std::string& kind, const LiveKind& /*lk*/,
 
 } // namespace
 
+// ── Shared REST+MCP JSON builders (#4033/#2146 Batch A) — see the doc
+// comments in device_routes.hpp. Pure: no httplib.h, no I/O.
+nlohmann::json device_agent_row_json(const nlohmann::json& agent) {
+    return {
+        {"agent_id", agent.value("agent_id", "")},
+        {"hostname", agent.value("hostname", "")},
+        {"os", agent.value("os", "")},
+        {"arch", agent.value("arch", "")},
+        {"agent_version", agent.value("agent_version", "")},
+    };
+}
+
+nlohmann::json device_agent_detail_json(const nlohmann::json& agent,
+                                        const std::vector<DeviceTag>* tags) {
+    auto obj = device_agent_row_json(agent);
+    if (tags) {
+        auto tag_arr = nlohmann::json::array();
+        for (const auto& t : *tags)
+            tag_arr.push_back({{"key", t.key}, {"value", t.value}, {"source", t.source}});
+        obj["tags"] = std::move(tag_arr);
+    }
+    return obj;
+}
+
 void DeviceRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
                                    ScopedPermFn scoped_perm_fn, DevicesFn devices_fn,
                                    LookupFn lookup_fn, const GuaranteedStateStore* store,

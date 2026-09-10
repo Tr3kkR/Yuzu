@@ -2554,19 +2554,40 @@ MCP twins).
 2. **The topology floor itself**: `{AccessReview:Read, UserManagement:Read,
    EnginePrincipal:Read}` — plus, as of #4028, `{TlsConfig:Read,
    PluginSigning:Read, ServerConfig:Read, AnalyticsConfig:Read}` (see
-   "Settings read-twins" below) — require the `admin` session role
-   regardless of the RBAC on/off toggle, via `authz_topology_floor.hpp`'s
-   `topology_floor_applies()`. The two groups are different categories that
-   happen to share this one mechanism: the original three are
+   "Settings read-twins" below), and as of #4031, `{Enrollment:Read,
+   OidcConfig:Read}` — require the `admin` session role regardless of the
+   RBAC on/off toggle, via `authz_topology_floor.hpp`'s
+   `topology_floor_applies()`. The three groups are different categories
+   that happen to share this one mechanism: the original three are
    authorization-topology reads (the RBAC role graph, the engine-principal
    grant graph, the access-review export) that intentionally stay reachable
    by an admin-owned session on ANY transport, MCP tokens included, per the
-   legacy-role-fallback note below; the #4028 four are
+   legacy-role-fallback note below; the #4028 four and #4031 two are
    server-administration reads that #520 additionally excludes from every
    MCP tier outright (`mcp_policy.hpp`'s `tier_allows()`), so an admin-owned
    MCP token cannot reach them even though it would otherwise satisfy this
-   same floor check. It is consulted **only** inside the legacy
-   (RBAC-off) fallback of `require_permission`/`require_scoped_permission`
+   same floor check. (`Directory` deliberately has no floor entry, since it
+   was never `admin_fn_`-gated to begin with — `list_directory_users` and
+   most of `get_directory_status`'s payload stay reachable at Viewer role
+   and readonly MCP tier. **One field is the exception:**
+   `groups[].mapped_role` on `get_directory_status` — the AD-group ->
+   Yuzu-role authorization map, the same data class as the floored
+   `OidcConfig` `admin_group` field (colleague review on #4176 caught this
+   inconsistency: `mapped_role` was newly MCP-reachable at readonly tier and
+   newly Viewer-reachable under RBAC-on with no floor treatment at all,
+   despite the sibling `OidcConfig` field being floored in this same PR).
+   Flooring all of `Directory:Read` was rejected — it would also demote
+   `list_directory_users` (lower-sensitivity PII, not authorization
+   topology) to admin-only under RBAC-off. Instead
+   `directory_status_json`'s `reveal_mapped_role` parameter redacts just
+   that field to the empty string for a non-admin caller, checked via the
+   same `auth::effective_role(session) == auth::Role::admin` test the
+   topology floor itself uses — REST v1, the legacy route, and the MCP tool
+   all compute it independently at their own call site, since the floor
+   mechanism only gates whole-route `(securable, operation)` pairs, not
+   individual response fields.) It is consulted **only**
+   inside the legacy (RBAC-off) fallback of
+   `require_permission`/`require_scoped_permission`
    — never ahead of, or instead of, the live-RBAC branch. That ordering is
    load-bearing, not incidental: #2324 cut the dedicated `AccessReview`
    securable specifically so a non-admin `Reviewer` role could be seeded
@@ -2846,6 +2867,10 @@ Deferred, not fixed here (flagged for a follow-up, not swept into #3789): MCP `l
 Still open after this migration (unrelated files, tracked separately, not swept into #1634): REST `GET /api/v1/execution-statistics/agents` + the workflow executions LIST fragment (#3526); three reliability gaps on the workflow detail route — legacy-fallback starvation, untested store-degrade banner, `get_execution` error-vs-absent ambiguity (#3527); `/fragments/results` has no audit trail at all (#3528); no `[pg]` end-to-end test proves the real `require_fleet_read`/`RbacStore`/`ManagementGroupStore` composition for the #1712 call sites (#3529). **Staleness of an already-open SSE stream (compliance/sre finding, this round):** `require_fleet_read`/`fleet_read_fn` is evaluated once, at subscribe time — neither `/sse/executions/{id}` nor `/api/v1/events` re-checks the caller's management-group scope for the life of the connection, so a scope narrowed (or a session revoked) mid-stream via `invalidate_session` does not disconnect an already-open subscriber; `invalidate_session` (`auth.cpp`) only erases the session record, it never reaches an open httplib connection, and no lever exists today to force-disconnect one live stream short of a full server restart. This is the same one-time-admission shape `require_fleet_read`'s non-streaming callers already have (a scope change doesn't retroactively alter an in-flight response either), but a held-open stream widens the exposure window from one request to as long as the tab/worker stays connected. Accepted for this migration (real-time revocation is a separate, larger change to the SSE subsystem, not a #1634 scope-pushdown fix); worth a security runbook line if this becomes an operational concern before it is addressed.
 
 `GET`/`PUT`/`DELETE /api/agents/:id/properties[/:key]` — found in this same governance re-review, bare `require_permission(Infrastructure,Read/Write)` with no per-agent scope filter at all (including a WRITE path) — is now **fixed** (#3700): all three routes migrated to `require_scoped_permission("Infrastructure", "Read"/"Write", agent_id)`, the same per-target gate the Tag routes (`/api/tags/set`, `/api/tags/delete`) use. RBAC-off behavior is unchanged, since `Infrastructure` is not in `kTopologyFloor`. Coverage: `tests/unit/server/test_agent_properties_scope_authz.cpp`.
+
+**Fifth migration (#4031 hardening round, adversarial review of the branch before push).** `GET /api/v1/enrollment/pending-agents` — a new REST v1 route, not a legacy one — was gated on bare `require_permission(Enrollment, Read)` (`perm_fn`) in an earlier revision of this branch, the exact anti-pattern this ADR's Consequences section names as forbidden for a new list/fan-out read of per-agent data: `pending_agent_row_json` rows carry a genuine `agent_id` plus hostname/os/arch/agent_version (`auth::PendingAgent`). Migrated onto `require_fleet_read("Enrollment", "Read")` as the route's sole gate, filtering with `authz::in_scope(gate.scope, agent.agent_id)` — the same idiom `GET /api/v1/inventory/software` uses. The defect this closed was **under-admission, not disclosure**: `require_permission`'s ordinary RBAC branch resolves authority via `RbacStore::collect_roles` (direct/group-role grants only) and never consults `ManagementGroupStore`, so a caller holding *only* a management-group-scoped `Enrollment:Read` grant — a combination the product's own docs (`docs/user-manual/rbac.md`) instruct operators to configure — was denied outright (403) rather than admitted with a real, correctly confined result. That result is typically empty under the intended enrollment workflow (a pending/not-yet-approved agent normally has no management-group membership yet — group assignment follows approval), but this is **not enforced by the data model**: `management_group_members.agent_id` carries no enrollment/agent-registry foreign key, and `POST /api/v1/management-groups/{id}/members` accepts any non-empty caller-supplied id with no existence check, so a pre-assigned membership row yields a non-empty, correctly-confined result via the same filter — never a widening. No live exploit path existed under the default seed (`Enrollment:Read` grants to Administrator only, resolved via `check_permission`'s global-grant branch regardless of which primitive gates the route), which is why this passed the branch's 7-pass, multi-agent governance run before an adversarial review of the branch caught it.
+
+This migration also closed a **second, load-bearing gap it exposed**: `Enrollment:Read` is the first `kTopologyFloor`-floored securable ever routed through `require_fleet_read`. Unlike `require_permission`'s legacy (RBAC-off) branch, `require_fleet_read`'s subordinate primitive, `RbacStore::authorize_list_read`, has no floor concept of its own by design (a data-layer primitive must not depend on `Session`) — its own legacy-open branch returns `AdmitAll` unconditionally once RBAC enforcement is off, with no way to distinguish an admin session from any other authenticated one. Every prior `require_fleet_read` caller (`Inventory`/`Execution`/`Response`/`Schedule:Read`) is unfloored, so this gap was latent, not exercised, until now — and `require_list_read`'s own doc comment (`auth_routes.hpp`) had already named the identical risk as something "a FUTURE floored securable... must re-apply explicitly." Fixed inside `require_fleet_read` itself (`authz_gates.cpp`), not as a route-level bolt-on: a pre-check mirroring `require_permission`'s own legacy-branch floor logic (same audit-reason prefix `"topology floor: "`, same `yuzu_auth_topology_floor_denied_total` counter) now runs before the management-group axis whenever RBAC enforcement is off, denying a non-admin session on any floored pair. Coverage: `tests/unit/server/test_authz_gates.cpp` (RBAC-off + floored securable, non-admin-denied and admin-admitted); `tests/unit/server/test_enrollment_directory_routes.cpp` (route-level scope-filtering, including the admitted-empty-not-403 case that is the whole point of the fix).
 
 **Consequences accepted for v1 (recorded, not oversights):** fleet-wide aggregates with no per-agent identity (e.g. `get_dex_perf_fleet`, `get_network_fleet`) stay `denied` at C8 — a `confined` label with no real downstream mechanism would be an unenforced claim; re-admission is a Phase 2 `kServiceScopeGlobalSafe` entry with security-guardian sign-off, not an inferred-safe classification during a routine change. Service-tag writes (whoever sets an agent's `service` tag moves scope) are hardened as of #3289 — a service-scoped session is denied, value-blind, before writing/deleting the `service` key at every REST/legacy-dashboard/MCP tag-mutation site, and the agent's own gRPC `Register` sync path no longer accepts an agent-claimed `service` value at all; plain `Tag:Write`/`Tag:Delete` remains sufficient for non-service-scoped (already fleet-scoped) holders. A related but distinct gap — a live agent's in-memory self-reported tags shadowing the store during scope-DSL evaluation — was tracked separately as #3295 and is now closed: `evaluate_scope`'s `tag:<key>` resolver is store-first (a TagStore row of any source wins over a connected agent's live claim; the session value answers only when the store has no row at all), and `register_agent` drops an agent-claimed `service` key from the session at ingest. No cached derived confinement sets. Dispatch's supersede→intersect migration (§3d, four `authorize_list_read` callers) is deferred, not part of this PR. **Bootstrap note:** an empty-cohort service token cannot bootstrap its own scope via any route — and since #3289, neither can an agent via its own Register sync; onboarding a brand-new service still needs an interactive/unscoped path; see `docs/user-manual/authentication.md`.
 

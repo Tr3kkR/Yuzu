@@ -306,8 +306,9 @@ std::optional<std::string> validate_definition_scope(const std::string& yaml_sou
 // #2542 PR-7: promoted verbatim from ServerImpl::validate_yaml_source
 // (server.cpp) — see instruction_store.hpp's doc comment for why this is a
 // promotion, not a duplication (a #2557 json_extract.hpp-style call site
-// straddling an extraction boundary: /fragments/instructions/yaml-preview
-// stays inline in server.cpp and shares this exact function).
+// straddling an extraction boundary: /fragments/instructions/yaml-preview,
+// now in instruction_fragment_routes.cpp (#2542 PR-12), shares this exact
+// function).
 std::vector<std::string> validate_yaml_source(const std::string& yaml_source) {
     // Shared with the POST /api/instructions/yaml save path so validate
     // and save can never diverge on what a complete definition is (#1993).

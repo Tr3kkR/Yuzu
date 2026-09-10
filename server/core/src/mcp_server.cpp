@@ -21,6 +21,7 @@
 #include "token_rotation_lookup.hpp" // shared REST/MCP human-token rotation successor lookup (P2 #11)
 
 #include "agent_registry.hpp"           // AgentRegistry (discover_plugins tool)
+#include "compliance_model.hpp"         // shared REST/MCP/fragment builders (#4034)
 #include "dashboard_routes.hpp"         // DashboardRoutes::gather_tar_retention_paused (#4027)
 #include "discover_routes.hpp"          // A2 discovery builders shared with REST /discover/*
 #include "instruction_definition_model.hpp" // #4029: shared row/detail/export builders
@@ -39,6 +40,8 @@
 #include "upload_grant_parsers.hpp"
 #include "engine_principal_store.hpp"     // PR 4.2: engine role-assignment MCP twins
 #include "dex_routes.hpp"               // dex_window_to_days / dex_iso_since (shared resolver)
+#include "dex_read_model.hpp"    // #4035: shared REST+MCP builders (device score, device app-perf, ...)
+#include "group_agent_count_preview.hpp" // #4033 — create-group agent-count preview shared model
 #include "auth_routes.hpp"      // detail::sanitize_detail_value — audit-string sanitiser
 #include "rest_a4_envelope.hpp"         // detail::make_correlation_id (A4 error.data, #1463)
 #include "rest_audit.hpp"               // detail::try_persist_audit (behavioural-audit kernel, #1647)
@@ -53,6 +56,7 @@
 #include "access_review_model.hpp"      // Periodic Access Reviews (SOC 2 CC6.2) — read-model
 #include "access_review_store.hpp"      // Periodic Access Reviews — campaign persistence
 #include "directory_sync.hpp"           // access-review read-model optional email enrichment
+#include "enrollment_directory_model.hpp" // #4031: shared row builders — REST/MCP parity (Rule 1)
 // ADR-0031 operator surface (PR1.5c/1.6c, p14) — MCP twins of p5's plugin
 // config/secret/kill-switch surface and p6's upload-grant mint/list/revoke.
 // The *_parsers.hpp headers are the SAME pure validation grammar the REST
@@ -557,13 +561,83 @@ static const ToolDef kTools[] = {
      R"({"type":"object","properties":{"policy_id":{"type":"string","description":"Policy ID"}},"required":["policy_id"]})",
      R"j({"type":"object","properties":{"policy_id":{"type":"string"},"compliant":{"type":"integer"},"non_compliant":{"type":"integer"},"unknown":{"type":"integer"},"fixing":{"type":"integer"},"error":{"type":"integer"},"total":{"type":"integer"}},"required":["policy_id","compliant","non_compliant","unknown","fixing","error","total"]})j"},
 
+    // #4034: output widened to carry `fixing`/`error` (previously silently
+    // dropped — a real shape mismatch against this tool's REST siblings,
+    // GET /api/compliance and the new GET /api/v1/compliance, found while
+    // verifying this ledger claim per the recipe's Rule 1). Purely additive
+    // (new required fields, no field removed/renamed) — a caller reading
+    // only the five pre-existing fields is unaffected.
     {"get_fleet_compliance", "Get fleet-wide compliance percentages across all policies.",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"total_checks":{"type":"integer"},"compliant":{"type":"integer"},"non_compliant":{"type":"integer"},"unknown":{"type":"integer"},"compliance_pct":{"type":"number"}},"required":["total_checks","compliant","non_compliant","unknown","compliance_pct"]})j"},
+     R"j({"type":"object","properties":{"total_checks":{"type":"integer"},"compliant":{"type":"integer"},"non_compliant":{"type":"integer"},"unknown":{"type":"integer"},"fixing":{"type":"integer"},"error":{"type":"integer"},"compliance_pct":{"type":"number"}},"required":["total_checks","compliant","non_compliant","unknown","fixing","error","compliance_pct"]})j"},
+
+    {"get_policy", "Get a single policy's full detail, including its compliance summary. "
+     "REST v1 twin: GET /api/v1/policies/{id}.",
+     R"({"type":"object","properties":{"policy_id":{"type":"string","minLength":1,"description":"Policy ID"}},"required":["policy_id"]})",
+     R"j({"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"description":{"type":"string"},"yaml_source":{"type":"string"},"fragment_id":{"type":"string"},"scope_expression":{"type":"string"},"enabled":{"type":"boolean"},"remediation_available":{"type":"boolean"},"inputs":{"type":"object"},"triggers":{"type":"array"},"management_groups":{"type":"array","items":{"type":"string"}},"created_at":{"type":"integer"},"updated_at":{"type":"integer"},"compliance":{"type":"object","properties":{"compliant":{"type":"integer"},"non_compliant":{"type":"integer"},"unknown":{"type":"integer"},"fixing":{"type":"integer"},"error":{"type":"integer"},"total":{"type":"integer"}}}},"required":["id","name","enabled","scope_expression"]})j"},
+
+    {"list_policy_fragments", "List reusable check/fix/postCheck policy fragments. "
+     "REST v1 twin: GET /api/v1/policy-fragments.",
+     R"({"type":"object","properties":{"name":{"type":"string","description":"Optional name filter, substring match"},"limit":{"type":"integer","minimum":1,"maximum":1000,"description":"Maximum results, default 100"}}})",
+     R"j({"type":"object","properties":{"fragments":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"description":{"type":"string"},"check_instruction":{"type":"string"},"check_compliance":{"type":"string"},"fix_instruction":{"type":"string"},"post_check_instruction":{"type":"string"},"created_at":{"type":"integer"},"updated_at":{"type":"integer"}},"required":["id","name","check_instruction"]}}},"required":["fragments"]})j"},
+
+    // #4034: the per-agent-status fan-out half of GET /api/v1/compliance/{id}
+    // — get_compliance_summary above covers the aggregate-only half.
+    // Confined via fleet_read_fn_ (ServiceScopeClass::confined below): a
+    // management-group/service-scoped caller sees only the agents it can
+    // itself list, and `summary` is tallied from exactly that filtered set,
+    // never the store's unfiltered aggregate (see compliance_model.hpp's
+    // confined_policy_compliance doc comment). Chosen as a DISTINCT tool
+    // rather than widening get_compliance_summary's own output: the
+    // per-agent list can grow with fleet size (unlike the fixed-shape
+    // aggregate) and is the one row the #4034 issue calls "worth a second
+    // look" for confinement, so it gets its own gate + tool rather than
+    // silently riding along on every aggregate-only call.
+    {"get_policy_agent_statuses",
+     "Get one policy's per-agent compliance statuses (fan-out list) plus a summary tallied "
+     "from exactly the agents returned. Confined by management group / service scope: a "
+     "confined caller's summary counts only its own visible agents, never the fleet-wide "
+     "total. REST v1 twin: GET /api/v1/compliance/{id} (same shape).",
+     R"({"type":"object","properties":{"policy_id":{"type":"string","minLength":1,"description":"Policy ID"}},"required":["policy_id"]})",
+     R"j({"type":"object","properties":{"policy_id":{"type":"string"},"summary":{"type":"object","properties":{"compliant":{"type":"integer"},"non_compliant":{"type":"integer"},"unknown":{"type":"integer"},"fixing":{"type":"integer"},"error":{"type":"integer"},"total":{"type":"integer"}}},"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"status":{"type":"string"},"last_check_at":{"type":"integer"},"last_fix_at":{"type":"integer"},"check_result":{"type":"string"}},"required":["agent_id","status"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["policy_id","summary","agents"]})j"},
 
     {"list_management_groups", "List management groups (hierarchical device grouping).",
      R"({"type":"object","properties":{}})",
      R"j({"type":"object","properties":{"groups":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"description":{"type":"string"},"parent_id":{"type":"string"},"membership_type":{"type":"string"},"scope_expression":{"type":"string"}},"required":["id","name","description","parent_id","membership_type","scope_expression"]}}},"required":["groups"]})j"},
+
+    // #4033 (#2146 Batch A) — MCP twin of /fragments/create-group-form's
+    // live scoped agent-count preview (GET /api/v1/management-groups/
+    // agent-count-preview is the REST twin; group_agent_count_preview.hpp
+    // is the shared builder this tool and that REST route both call — the
+    // dashboard fragment itself keeps its own separate, behaviourally-
+    // equivalent inline implementation, unchanged by this PR). Gated
+    // ManagementGroup:Write matching the fragment EXACTLY (only an operator
+    // who could create the group may preview it) — NOT ManagementGroup:Read,
+    // even though the tool performs no mutation. Consequence: approval-gated
+    // at supervised MCP tier like every other ManagementGroup:Write surface
+    // (mcp_policy.hpp's requires_approval() supervised-tier list already
+    // carries ManagementGroup:Write) — a deliberate side effect of REST
+    // parity with the fragment's own gate, not a new policy decision by this
+    // tool.
+    {"preview_management_group_agent_count",
+     "Preview the number of currently-visible agents that would match a would-be "
+     "management group's filter criteria, BEFORE creating it. Mirrors "
+     "/fragments/create-group-form's live count and GET /api/v1/management-groups/"
+     "agent-count-preview (this tool and that REST route share one builder, so those "
+     "two cannot drift from each other; the dashboard fragment keeps its own separate "
+     "inline implementation). filters is a "
+     "map of mangled column key -> exact-match value for `plugin`'s response columns "
+     "(lowercase, spaces/dashes -> underscore, e.g. \"Local Addr\" -> \"local_addr\"); "
+     "an empty filters map returns a genuine 0 (no scoped count to report), never a "
+     "store read. Requires ManagementGroup:Write — approval-gated (supervised MCP "
+     "tier maker-checker), matching every other ManagementGroup:Write surface, even "
+     "though this tool itself performs no mutation.",
+     R"j({"type":"object","properties":{)j"
+     R"j("command_id":{"type":"string","minLength":1,"description":"The response set's instruction/command id to count against"},)j"
+     R"j("plugin":{"type":"string","minLength":1,"description":"Plugin name whose response columns filters keys are matched against (result_parsing.hpp columns_for_plugin)"},)j"
+     R"j("filters":{"type":"object","additionalProperties":{"type":"string"},"description":"Mangled column key -> exact-match value; empty/omitted means no filter (count is 0)"})j"
+     R"j(},"required":["command_id","plugin"]})j",
+     R"j({"type":"object","properties":{"agent_count":{"type":"integer","description":"Number of currently-visible agents matching filters; 0 when filters is empty"}},"required":["agent_count"]})j"},
 
     {"get_execution_status",
      "Check status of a running or completed command execution. While status is "
@@ -645,6 +719,26 @@ static const ToolDef kTools[] = {
      R"({"type":"object","properties":{"status":{"type":"string","enum":["pending","approved","rejected"]},"submitted_by":{"type":"string"}}})",
      R"j({"type":"object","properties":{"approvals":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"status":{"type":"string"},"submitted_by":{"type":"string"},"submitted_at":{"type":"integer"},"scope_expression":{"type":"string"}},"required":["id","definition_id","status","submitted_by","submitted_at","scope_expression"]}}},"required":["approvals"]})j"},
 
+    // ── #4031: AD/Entra directory-sync read twins — parity with GET
+    // /api/v1/directory/users and /directory/status. NOT the OIDC SSO config
+    // route (that stays REST-only per #520, see docs/mcp-server.md) — the
+    // naming trap this comment exists to head off.
+    {"list_directory_users",
+     "List AD/Entra-synced directory users, optionally filtered by group. Requires "
+     "Directory:Read. Returns email/UPN/group-membership PII — every call is audited "
+     "(directory.users.view).",
+     R"({"type":"object","properties":{"group_id":{"type":"string","description":"Optional directory group id to filter by"}}})",
+     R"j({"type":"object","properties":{"users":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"display_name":{"type":"string"},"email":{"type":"string"},"upn":{"type":"string"},"enabled":{"type":"boolean"},"groups":{"type":"array","items":{"type":"string"}},"synced_at":{"type":"integer"}},"required":["id","display_name","email","upn","enabled","groups","synced_at"]}},"count":{"type":"integer"}},"required":["users","count"]})j"},
+
+    {"get_directory_status",
+     "Get AD/Entra directory-sync status: provider, last sync time/error, user/group counts, "
+     "and the synced group catalog. Requires Directory:Read. No PII (counts + group metadata "
+     "only). groups[].mapped_role (the AD-group -> Yuzu-role authorization map) is the empty "
+     "string for a non-admin caller, regardless of tier — admin-only, same posture as "
+     "OidcConfig's admin_group field.",
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{"provider":{"type":"string"},"status":{"type":"string"},"last_sync_at":{"type":"integer"},"user_count":{"type":"integer"},"group_count":{"type":"integer"},"last_error":{"type":"string"},"groups":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"display_name":{"type":"string"},"description":{"type":"string"},"mapped_role":{"type":"string"},"synced_at":{"type":"integer"}},"required":["id","display_name","description","mapped_role","synced_at"]}}},"required":["provider","status","last_sync_at","user_count","group_count","last_error","groups"]})j"},
+
     {"get_guardian_schemas",
      "Get the Guardian (Guaranteed State) Guard authoring schema catalog — the "
      "spark/assertion/remediation types and their JSON Schemas. Use this to discover how to "
@@ -687,6 +781,157 @@ static const ToolDef kTools[] = {
      R"j("devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"count":{"type":"integer"},"last_seen":{"type":"string"}},"required":["agent_id","count","last_seen"]}},)j"
      R"j("by_day":{"type":"array","items":{"type":"object","properties":{"day":{"type":"string"},"count":{"type":"integer"}},"required":["day","count"]}},)j"
      R"j("audit_persisted":{"type":"boolean"}},"required":["obs_type","os","subjects","by_os","devices","by_day"]})j"},
+
+    // ── #4035 (api-parity #2146 Batch A): MCP-only gap — REST twin GET
+    // /api/v1/dex/devices/{id} already exists, this tool closes the MCP side.
+    // Per-device behavioral data → the same ancestor-aware SCOPED
+    // GuaranteedState:Read gate as query_software_licenses/get_dex_device_app_perf
+    // below, not the global perm gate.
+    {"get_dex_device_score",
+     "Per-device DEX read model: the 0-100 experience score (-1 when unavailable — no "
+     "store, or the score cannot be computed) plus this device's OWN signal summary "
+     "(obs_type -> count/distinct_devices/last_seen). The per-device twin of "
+     "list_dex_signals's fleet rollup. Behavioral PII — every call is audit-logged "
+     "(dex.device.view), same verb as the REST twin and the dashboard's per-device DEX "
+     "lens. Mirrors GET /api/v1/dex/devices/{id}. Requires GuaranteedState:Read, "
+     "management-group-scoped to this device.",
+     R"j({"type":"object","properties":{)j"
+     R"j("agent_id":{"type":"string","minLength":1,"maxLength":256,"description":"Exact agent/device id"},)j"
+     R"j("window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"})j"
+     R"j(},"required":["agent_id"]})j",
+     R"j({"type":"object","properties":{"agent_id":{"type":"string"},"window":{"type":"string"},"score":{"type":"integer"},)j"
+     R"j("signals":{"type":"array","items":{"type":"object","properties":{"obs_type":{"type":"string"},"count":{"type":"integer"},"distinct_devices":{"type":"integer"},"last_seen":{"type":"string"}},"required":["obs_type","count","distinct_devices","last_seen"]}},)j"
+     R"j("audit_persisted":{"type":"boolean"}},"required":["agent_id","window","score","signals"]})j"},
+
+    // ── #4035 (api-parity #2146 Batch A): 8 genuinely-new DEX REST+MCP twins.
+    // Every handler calls the SAME shared pure builder (dex_read_model.hpp)
+    // the REST route calls (Rule 1). Audit posture mirrors rest_api_v1.cpp's
+    // route comment above the equivalent GET route -- see there for the
+    // per-capability rationale (aggregates: none; app/overview: fail-closed
+    // dex.app.view/dex.overview.view despite the fragment auditing only the
+    // denial, matching the two sibling fragments that DO audit success on an
+    // identical device-id-list shape; device history/observation: fail-closed
+    // dex.device.view/dex.observation.view, matching their fragments).
+    {"get_dex_app",
+     "App blast-radius drill: crash/hang summary + faulting modules + exception codes + the "
+     "affected-device list for one application. The devices list names affected agent IDs "
+     "(behavioral data), confined to the caller's management-group scope — every call is "
+     "audit-logged (dex.app.view). Mirrors GET /api/v1/dex/app. Requires GuaranteedState:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j("name":{"type":"string","minLength":1,"maxLength":512,"description":"Process image name, e.g. notepad.exe"},)j"
+     R"j("window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"})j"
+     R"j(},"required":["name"]})j",
+     R"j({"type":"object","properties":{)j"
+     R"j("process_name":{"type":"string"},"window":{"type":"string"},"crashes":{"type":"integer"},"hangs":{"type":"integer"},)j"
+     R"j("signals":{"type":"integer"},"distinct_devices":{"type":"integer"},"first_seen":{"type":"string"},"last_seen":{"type":"string"},)j"
+     R"j("modules":{"type":"array","items":{"type":"object","properties":{"component":{"type":"string"},"crashes":{"type":"integer"},"distinct_apps":{"type":"integer"}},"required":["component","crashes","distinct_apps"]}},)j"
+     R"j("exceptions":{"type":"array","items":{"type":"object","properties":{"reason":{"type":"string"},"symbolic":{"type":"string"},"crashes":{"type":"integer"}},"required":["reason","symbolic","crashes"]}},)j"
+     R"j("devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"crashes":{"type":"integer"},"last_seen":{"type":"string"}},"required":["agent_id","crashes","last_seen"]}},)j"
+     R"j("audit_persisted":{"type":"boolean"}},"required":["process_name","window","crashes","hangs","signals","distinct_devices","first_seen","last_seen","modules","exceptions","devices"]})j"},
+
+    {"list_dex_apps",
+     "App-centric stability list: every application with a crash/hang signal in the window, "
+     "ranked by activity. No per-agent identity (a distinct-device COUNT per app, never an "
+     "agent_id) — not audited. Mirrors GET /api/v1/dex/apps. Requires GuaranteedState:Read.",
+     R"j({"type":"object","properties":{"window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"}}})j",
+     R"j({"type":"object","properties":{"window":{"type":"string"},)j"
+     R"j("apps":{"type":"array","items":{"type":"object","properties":{"subject":{"type":"string"},"crashes":{"type":"integer"},"hangs":{"type":"integer"},"distinct_devices":{"type":"integer"},"last_seen":{"type":"string"}},"required":["subject","crashes","hangs","distinct_devices","last_seen"]}}},)j"
+     R"j("required":["window","apps"]})j"},
+
+    {"get_dex_catalogue_group",
+     "One signal family's member signals (Catalogue View 2): per-type monitored/not-collected "
+     "state, coverage platforms, event count + blast radius, plus the family's own health-score "
+     "slice. No per-agent identity — not audited. Mirrors GET /api/v1/dex/catalogue/group. "
+     "Requires GuaranteedState:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j("name":{"type":"string","minLength":1,"maxLength":128,"description":"Exact family name, e.g. 'App reliability' (see docs/dex-signal-catalog.md)"},)j"
+     R"j("os":{"type":"string","enum":["all","windows","linux","macos"],"default":"all"},)j"
+     R"j("window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"})j"
+     R"j(},"required":["name"]})j",
+     R"j({"type":"object","properties":{)j"
+     R"j("group_name":{"type":"string"},"os":{"type":"string"},"window":{"type":"string"},)j"
+     R"j("monitored_count":{"type":"integer"},"total_type_count":{"type":"integer"},)j"
+     R"j("health_score":{"type":["number","null"]},"active_events":{"type":"integer"},"max_signal_devices":{"type":"integer"},)j"
+     R"j("types":{"type":"array","items":{"type":"object","properties":{"obs_type":{"type":"string"},"monitored":{"type":"boolean"},"coverage_platforms":{"type":"string"},"count":{"type":"integer"},"distinct_devices":{"type":"integer"},"last_seen":{"type":"string"}},"required":["obs_type","monitored","coverage_platforms","count","distinct_devices","last_seen"]}})j"
+     R"j(},"required":["group_name","os","window","monitored_count","total_type_count","active_events","max_signal_devices","types"]})j"},
+
+    {"get_dex_device_history",
+     "Per-device raw signal history — the distinct SIGNAL-HISTORY capability from the per-device "
+     "SCORE-ONLY get_dex_device_score above (same device, different data). Behavioral PII — every "
+     "call is audit-logged (dex.device.view — the SAME verb get_dex_device_score uses; the "
+     "dashboard fragment audits this exact capability under this exact verb too). Mirrors GET "
+     "/api/v1/dex/devices/{id}/history. Requires GuaranteedState:Read, management-group-scoped.",
+     R"j({"type":"object","properties":{)j"
+     R"j("agent_id":{"type":"string","minLength":1,"maxLength":256},)j"
+     R"j("window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"})j"
+     R"j(},"required":["agent_id"]})j",
+     R"j({"type":"object","properties":{"agent_id":{"type":"string"},"window":{"type":"string"},)j"
+     R"j("crashes":{"type":"integer"},"hangs":{"type":"integer"},"signals":{"type":"integer"},"distinct_apps":{"type":"integer"},"last_seen":{"type":"string"},)j"
+     R"j("history":{"type":"array","items":{"type":"object","properties":{"event_id":{"type":"string"},"observed_at":{"type":"string"},"obs_type":{"type":"string"},"subject":{"type":"string"},"reason":{"type":"string"},"symbolic":{"type":"string"},"component":{"type":"string"},"metric":{"type":"number"}},"required":["event_id","observed_at","obs_type","subject","reason","symbolic","component","metric"]}},)j"
+     R"j("audit_persisted":{"type":"boolean"}},"required":["agent_id","window","crashes","hangs","signals","distinct_apps","last_seen","history"]})j"},
+
+    {"get_dex_observation",
+     "Single-observation detail — every captured projection field for one event (the device- "
+     "history row click target). Behavioral PII — every call is audit-logged "
+     "(dex.observation.view). A foreign or guessed event_id resolves identically to a genuinely-"
+     "absent one (no oracle). Mirrors GET /api/v1/dex/devices/{id}/observations/{event_id}. "
+     "Requires GuaranteedState:Read, management-group-scoped to agent_id.",
+     R"j({"type":"object","properties":{)j"
+     R"j("agent_id":{"type":"string","minLength":1,"maxLength":256},)j"
+     R"j("event_id":{"type":"string","minLength":1,"maxLength":256})j"
+     R"j(},"required":["agent_id","event_id"]})j",
+     R"j({"type":"object","properties":{)j"
+     R"j("event_id":{"type":"string"},"agent_id":{"type":"string"},"observed_at":{"type":"string"},"obs_type":{"type":"string"},)j"
+     R"j("subject":{"type":"string"},"reason":{"type":"string"},"symbolic":{"type":"string"},"component":{"type":"string"},)j"
+     R"j("version":{"type":"string"},"metric":{"type":"number"},"platform":{"type":"string"},"audit_persisted":{"type":"boolean"})j"
+     R"j(},"required":["event_id","agent_id","observed_at","obs_type","subject","reason","symbolic","component","version","metric","platform"]})j"},
+
+    {"get_dex_health",
+     "The derived composite health score (100 minus weighted per-family deductions; -1/null when "
+     "no reporting agents). No per-agent identity — not audited. Mirrors GET /api/v1/dex/health. "
+     "Requires GuaranteedState:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j("weighting":{"type":"string","enum":["default","stability","productivity","security"],"default":"default"},)j"
+     R"j("window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"})j"
+     R"j(}})j",
+     R"j({"type":"object","properties":{)j"
+     R"j("weighting":{"type":"string"},"window":{"type":"string"},"reporting":{"type":"integer"},"total_crashes":{"type":"integer"},)j"
+     R"j("crash_free_pct":{"type":["number","null"]},"score":{"type":["number","null"]},"band":{"type":["string","null"]},)j"
+     R"j("deductions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"severity":{"type":"string"},"deduction":{"type":"number"}},"required":["name","severity","deduction"]}})j"
+     R"j(},"required":["weighting","window","reporting","total_crashes","crash_free_pct","score","band","deductions"]})j"},
+
+    {"get_dex_trends",
+     "Cross-OS comparison + per-family day-by-day event counts (small-multiples/heatmap source "
+     "data). No per-agent identity — not audited. Mirrors GET /api/v1/dex/trends. Requires "
+     "GuaranteedState:Read.",
+     R"j({"type":"object","properties":{"window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"}}})j",
+     R"j({"type":"object","properties":{)j"
+     R"j("window":{"type":"string"},"total_catalogued_types":{"type":"integer"},"windows_reporting":{"type":"integer"},"crash_free_pct":{"type":["number","null"]},)j"
+     R"j("os_cards":{"type":"array","items":{"type":"object","properties":{"platform":{"type":"string"},"live":{"type":"boolean"},"distinct_types":{"type":"integer"},"total_events":{"type":"integer"}},"required":["platform","live","distinct_types","total_events"]}},)j"
+     R"j("days":{"type":"array","items":{"type":"string"}},)j"
+     R"j("families":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"total":{"type":"integer"},"counts":{"type":"array","items":{"type":"integer"}}},"required":["name","total","counts"]}})j"
+     R"j(},"required":["window","total_catalogued_types","windows_reporting","crash_free_pct","os_cards","days","families"]})j"},
+
+    {"get_dex_overview",
+     "The /dex landing page's fleet summary: per-device experience score distribution + "
+     "Device/App/Network composite, measured crash-free rate, top apps, and the most-affected- "
+     "devices list. The devices list names affected agent IDs (behavioral data), confined to "
+     "the caller's management-group scope — every call is audit-logged (dex.overview.view). "
+     "Mirrors GET /api/v1/dex/overview. Requires GuaranteedState:Read.",
+     R"j({"type":"object","properties":{"window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"}}})j",
+     R"j({"type":"object","properties":{)j"
+     R"j("window":{"type":"string"},"overall_experience":{"type":"integer"},"device_score":{"type":"integer"},"app_score":{"type":"integer"},"network_score":{"type":"integer"},)j"
+     R"j("great":{"type":"integer"},"fair":{"type":"integer"},"poor":{"type":"integer"},"coverage_monitored":{"type":"integer"},"coverage_total":{"type":"integer"},)j"
+     R"j("crash_free_pct":{"type":["number","null"]},"windows_reporting":{"type":"integer"},"crashes_per_1k_device_days":{"type":["number","null"]},)j"
+     R"j("total_crashes":{"type":"integer"},"devices_impacted":{"type":"integer"},"total_online":{"type":"integer"},)j"
+     R"j("active_signal_types":{"type":"integer"},"health_score":{"type":["number","null"]},"os_reporting_count":{"type":"integer"},)j"
+     R"j("segments":{"type":"array","items":{"type":"object","properties":{"os":{"type":"string"},"devices":{"type":"integer"},"avg_experience":{"type":"integer"}},"required":["os","devices","avg_experience"]}},)j"
+     R"j("crashes_by_day":{"type":"array","items":{"type":"object","properties":{"day":{"type":"string"},"crashes":{"type":"integer"}},"required":["day","crashes"]}},)j"
+     R"j("top_apps":{"type":"array","items":{"type":"object","properties":{"subject":{"type":"string"},"crashes":{"type":"integer"},"hangs":{"type":"integer"},"distinct_devices":{"type":"integer"},"last_seen":{"type":"string"}},"required":["subject","crashes","hangs","distinct_devices","last_seen"]}},)j"
+     R"j("top_devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"crashes":{"type":"integer"},"last_seen":{"type":"string"}},"required":["agent_id","crashes","last_seen"]}},)j"
+     R"j("os_table":{"type":"array","items":{"type":"object","properties":{"platform":{"type":"string"},"reporting":{"type":["integer","null"]},"crash_free_pct":{"type":["number","null"]},"distinct_types":{"type":"integer"},"total_events":{"type":"integer"}},"required":["platform","reporting","crash_free_pct","distinct_types","total_events"]}},)j"
+     R"j("audit_persisted":{"type":"boolean"})j"
+     R"j(},"required":["window","overall_experience","device_score","app_score","network_score","great","fair","poor","coverage_monitored","coverage_total","crash_free_pct","windows_reporting","crashes_per_1k_device_days","total_crashes","devices_impacted","total_online","active_signal_types","health_score","os_reporting_count","segments","crashes_by_day","top_apps","top_devices","os_table"]})j"},
 
     // ── F2a: DEX fleet performance read tools — parity with /api/v1/dex/perf/* ──
     {"get_dex_perf_fleet",
@@ -825,6 +1070,32 @@ static const ToolDef kTools[] = {
      R"j("hist_stale":{"type":"boolean"})j"
      R"j(},"required":["version","day","device_count","suppressed"]}})j"
      R"j(},"required":["group_id","app","version","floor","points"]})j"},
+
+    // ── #4035 (api-parity #2146 Batch A): MCP-only gap -- REST twin GET
+    // /api/v1/dex/devices/{id}/app-perf already exists (docs/api-twin-recipe.md
+    // §4's own worked "no MCP twin yet" example), this tool closes the MCP
+    // side. Per-device behavioral data -> the same ancestor-aware SCOPED
+    // GuaranteedState:Read gate as get_dex_device_score above.
+    {"get_dex_device_app_perf",
+     "One device's retained daily app-version performance series (B1) -- the 'on THIS "
+     "box, over time' companion to get_dex_app_perf's fleet trend. One row per "
+     "(app_name, version, day): samples, instances_max, cpu_avg/cpu_max (share of this "
+     "machine's own capacity), ws_avg_bytes/ws_max_bytes. No percentiles -- a single "
+     "device's daily averages ARE the series. Optional app narrows to one app name. "
+     "Behavioral PII -- every call is audit-logged (dex.device.app_perf.view), same "
+     "verb as the REST twin and the dashboard's per-device app-perf drill. Mirrors GET "
+     "/api/v1/dex/devices/{id}/app-perf. Requires GuaranteedState:Read, "
+     "management-group-scoped to this device.",
+     R"j({"type":"object","properties":{)j"
+     R"j("agent_id":{"type":"string","minLength":1,"maxLength":256,"description":"Exact agent/device id"},)j"
+     R"j("app":{"type":"string","maxLength":512,"description":"Narrow to one app name; omit for every app"})j"
+     R"j(},"required":["agent_id"]})j",
+     R"j({"type":"object","properties":{"agent_id":{"type":"string"},"app":{"type":"string"},)j"
+     R"j("rows":{"type":"array","items":{"type":"object","properties":{)j"
+     R"j("app_name":{"type":"string"},"version":{"type":"string"},"day":{"type":"integer"},"samples":{"type":"integer"},"instances_max":{"type":"integer"},)j"
+     R"j("cpu_avg":{"type":"number"},"cpu_max":{"type":"number"},"ws_avg_bytes":{"type":"integer"},"ws_max_bytes":{"type":"integer"}},)j"
+     R"j("required":["app_name","version","day","samples","instances_max","cpu_avg","cpu_max","ws_avg_bytes","ws_max_bytes"]}},)j"
+     R"j("audit_persisted":{"type":"boolean"}},"required":["agent_id","app","rows"]})j"},
 
     {"compare_app_perf_versions",
      "Before/after app performance for an upgrade (the /auto VERIFY evidence): did "
@@ -1894,6 +2165,10 @@ static const char* const kWriteToolsRaw[] = {
     // Human API-token rotation (P2 #11, SOC 2 CC6.3) — MCP twins of POST
     // /api/v1/tokens/{id}/rotate and /confirm.
     "rotate_api_token", "confirm_api_token_rotation",
+    // #4033 — ManagementGroup:Write (non-Read), matching the fragment's own
+    // gate; the tool performs no mutation, but the write set is keyed on the
+    // RBAC operation, not on whether a handler mutates state.
+    "preview_management_group_agent_count",
 };
 
 // Lookup set DERIVED from the raw sequence; collapse here is safe because the
@@ -2011,7 +2286,16 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"list_policies", {"Policy", "Read"}},
     {"get_compliance_summary", {"Policy", "Read"}},
     {"get_fleet_compliance", {"Policy", "Read"}},
+    {"get_policy", {"Policy", "Read"}},
+    {"list_policy_fragments", {"Policy", "Read"}},
+    // #4034 — fleet_read_fn_-gated (like query_installed_software/
+    // get_agent_details above): a REAL confinement mechanism, so `confined`
+    // rather than the default `denied`.
+    {"get_policy_agent_statuses", {"Policy", "Read", ServiceScopeClass::confined}},
     {"list_management_groups", {"ManagementGroup", "Read"}},
+    // #4033 — matches /fragments/create-group-form's own gate exactly
+    // (Write, not Read); see the kTools[] entry's comment for why.
+    {"preview_management_group_agent_count", {"ManagementGroup", "Write"}},
     // #1634 (adversarial-review K3/D3 follow-up) — both migrated onto
     // fleet_read_fn_ alongside the response tools above; same reclassification
     // rationale.
@@ -2032,10 +2316,35 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"validate_scope", {"Infrastructure", "Read"}},
     {"preview_scope_targets", {"Infrastructure", "Read"}},
     {"list_pending_approvals", {"Approval", "Read"}},
+    {"list_directory_users", {"Directory", "Read"}},
+    {"get_directory_status", {"Directory", "Read"}},
     {"get_guardian_schemas", {"GuaranteedState", "Read"}},
     {"list_dex_signals", {"GuaranteedState", "Read"}},
     {"get_dex_signal_scope", {"GuaranteedState", "Read"}},
     {"get_dex_signal_detail", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
+    // #4035: MCP-only gaps, per-device -> confined (same class as
+    // get_dex_signal_detail/get_dex_group_app_perf above).
+    {"get_dex_device_score", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
+    {"get_dex_device_app_perf", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
+    // #4035: 8 genuinely-new twins. app/overview each enumerate a device
+    // list and run their own deny_fleet_wide_service_scoped -> confined,
+    // matching get_dex_signal_detail/list_dex_perf_devices above.
+    // device_history/observation are per-device SCOPED -> confined, matching
+    // get_dex_device_score/get_dex_device_app_perf above. apps/catalogue_group/
+    // health/trends are pure aggregates -> default (denied), matching
+    // list_dex_signals/get_dex_perf_fleet/get_dex_perf_cohorts above (no
+    // `confined`/`global_safe` row in this table is currently marked
+    // global_safe -- this table's convention keeps even aggregate DEX reads
+    // structurally denied to a service-scoped token rather than reasoning
+    // per-tool about "is this data really safe", so these follow suit).
+    {"get_dex_app", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
+    {"list_dex_apps", {"GuaranteedState", "Read"}},
+    {"get_dex_catalogue_group", {"GuaranteedState", "Read"}},
+    {"get_dex_device_history", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
+    {"get_dex_observation", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
+    {"get_dex_health", {"GuaranteedState", "Read"}},
+    {"get_dex_trends", {"GuaranteedState", "Read"}},
+    {"get_dex_overview", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
     {"get_dex_perf_fleet", {"GuaranteedState", "Read"}},
     {"get_dex_perf_cohorts", {"GuaranteedState", "Read"}},
     {"list_dex_perf_apps", {"GuaranteedState", "Read"}},
@@ -2257,7 +2566,9 @@ constexpr std::string_view kRbacOps[] = {"Read",   "Write",  "Execute", "Delete"
 // Closed RBAC securable-type catalogue — mirrors rbac_store.cpp's seeded
 // `types[]` (MOVE TOGETHER; same binding test). A typo'd TYPE is the same
 // fail-open class as a typo'd op: supervised tier_allows() permits every
-// type and requires_approval() exact-matches type strings, so e.g.
+// type EXCEPT Enrollment/OidcConfig (#520/#4031's explicit server-
+// administration deny, applied before any tier branch) and
+// requires_approval() exact-matches type strings, so e.g.
 // {"quarantine_device", {"Securty", "Execute"}} would silently skip its
 // approval rule (governance UP-6).
 //
@@ -2287,7 +2598,13 @@ constexpr std::string_view kRbacSecurables[] = {
     // already-shipped /api/product-packs* routes but was never seeded on
     // either side, so no role could ever be granted ProductPack:*.
     "ProductPack",
-    "TlsConfig",      "PluginSigning",      "ServerConfig",          "AnalyticsConfig"};
+    "TlsConfig",      "PluginSigning",      "ServerConfig",          "AnalyticsConfig",
+    // #4031: mirrors rbac_store.cpp's types[] additions (MOVE TOGETHER; same
+    // binding test) — Directory (AD/Entra directory-sync, prerequisite 1 fix),
+    // Enrollment (auto-approve rules + pending-agent visibility), OidcConfig
+    // (OIDC SSO config read — deliberately NOT "Directory", see the naming
+    // trap called out in the issue and in discovery_routes.cpp).
+    "Directory", "Enrollment", "OidcConfig"};
 
 // Borrowed (name, input_schema_json) row for the registration validator's
 // 4th sequence (#2405). Views are valid only for the duration of the call.
@@ -2516,7 +2833,20 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"list_policies", {ToolEffect::ReadOnly, true, "List policies"}},
     {"get_compliance_summary", {ToolEffect::ReadOnly, true, "Get compliance summary"}},
     {"get_fleet_compliance", {ToolEffect::ReadOnly, true, "Get fleet compliance"}},
+    {"get_policy", {ToolEffect::ReadOnly, true, "Get policy"}},
+    {"list_policy_fragments", {ToolEffect::ReadOnly, true, "List policy fragments"}},
+    {"get_policy_agent_statuses", {ToolEffect::ReadOnly, true, "Get policy agent statuses"}},
     {"list_management_groups", {ToolEffect::ReadOnly, true, "List management groups"}},
+    // #4033 — NOT ToolEffect::ReadOnly: test_mcp_server.cpp's 2g PR2 cross-check
+    // mechanically requires readOnlyHint == (operation == "Read"), and this
+    // tool's operation is ManagementGroup:Write (matching the fragment's own
+    // gate). Additive is the honest remaining choice — the tool mutates
+    // nothing (readOnlyHint's mechanical rule is the ONLY reason it isn't
+    // ReadOnly) and is not destructive; idempotent:true because every call is
+    // a pure, deterministic read with no side effects (same shape as
+    // assign_engine_role's Additive/idempotent:true pairing above).
+    {"preview_management_group_agent_count",
+     {ToolEffect::Additive, true, "Preview management group agent count"}},
     {"get_execution_status", {ToolEffect::ReadOnly, true, "Get execution status"}},
     {"list_executions", {ToolEffect::ReadOnly, true, "List executions"}},
     {"list_schedules", {ToolEffect::ReadOnly, true, "List schedules"}},
@@ -2526,10 +2856,22 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"validate_scope", {ToolEffect::ReadOnly, true, "Validate scope"}},
     {"preview_scope_targets", {ToolEffect::ReadOnly, true, "Preview scope targets"}},
     {"list_pending_approvals", {ToolEffect::ReadOnly, true, "List pending approvals"}},
+    {"list_directory_users", {ToolEffect::ReadOnly, true, "List directory users"}},
+    {"get_directory_status", {ToolEffect::ReadOnly, true, "Get directory sync status"}},
     {"get_guardian_schemas", {ToolEffect::ReadOnly, true, "Get Guardian schemas"}},
     {"list_dex_signals", {ToolEffect::ReadOnly, true, "List DEX signals"}},
     {"get_dex_signal_scope", {ToolEffect::ReadOnly, true, "Get DEX signal scope"}},
     {"get_dex_signal_detail", {ToolEffect::ReadOnly, true, "Get DEX signal detail"}},
+    {"get_dex_device_score", {ToolEffect::ReadOnly, true, "Get per-device DEX score"}},
+    {"get_dex_device_app_perf", {ToolEffect::ReadOnly, true, "Get per-device DEX app performance"}},
+    {"get_dex_app", {ToolEffect::ReadOnly, true, "Get DEX app blast radius"}},
+    {"list_dex_apps", {ToolEffect::ReadOnly, true, "List DEX app stability"}},
+    {"get_dex_catalogue_group", {ToolEffect::ReadOnly, true, "Get DEX catalogue signal family"}},
+    {"get_dex_device_history", {ToolEffect::ReadOnly, true, "Get per-device DEX signal history"}},
+    {"get_dex_observation", {ToolEffect::ReadOnly, true, "Get DEX single-observation detail"}},
+    {"get_dex_health", {ToolEffect::ReadOnly, true, "Get DEX health score"}},
+    {"get_dex_trends", {ToolEffect::ReadOnly, true, "Get DEX cross-OS trends"}},
+    {"get_dex_overview", {ToolEffect::ReadOnly, true, "Get DEX fleet overview"}},
     {"get_dex_perf_fleet", {ToolEffect::ReadOnly, true, "Get DEX fleet performance"}},
     {"get_dex_perf_cohorts", {ToolEffect::ReadOnly, true, "Get DEX performance cohorts"}},
     {"get_dex_perf_cohort_diff", {ToolEffect::ReadOnly, true, "Get DEX cohort performance diff"}},
@@ -7089,17 +7431,13 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // #4034 Rule 1: same compliance_summary_json builder REST's
+                // GET /api/v1/compliance/{id} and GET /api/v1/policies/{id} call.
                 const auto& cs = *cs_res;
-                auto obj = JObj()
-                               .add("policy_id", cs.policy_id)
-                               .add("compliant", cs.compliant)
-                               .add("non_compliant", cs.non_compliant)
-                               .add("unknown", cs.unknown)
-                               .add("fixing", cs.fixing)
-                               .add("error", cs.error)
-                               .add("total", cs.total);
+                nlohmann::json obj = compliance_summary_json(cs);
+                obj["policy_id"] = cs.policy_id;
                 mcp_audit("success", policy_id);
-                res.set_content(success_response(id, tool_result(obj.str(), kObjectOutputSchema)),
+                res.set_content(success_response(id, tool_result(obj.dump(), kObjectOutputSchema)),
                                 "application/json");
                 return;
             }
@@ -7128,15 +7466,188 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // #4034 Rule 1: same fleet_compliance_json builder REST's
+                // GET /api/compliance and GET /api/v1/compliance call — this
+                // is also the fix for the shape mismatch this ledger claim
+                // surfaced (fixing/error were previously dropped here).
                 const auto& fc = *fc_res;
-                auto obj = JObj()
-                               .add("total_checks", fc.total_checks)
-                               .add("compliant", fc.compliant)
-                               .add("non_compliant", fc.non_compliant)
-                               .add("unknown", fc.unknown)
-                               .add("compliance_pct", fc.compliance_pct);
+                nlohmann::json obj = fleet_compliance_json(fc);
                 mcp_audit("success");
-                res.set_content(success_response(id, tool_result(obj.str(), kObjectOutputSchema)),
+                res.set_content(success_response(id, tool_result(obj.dump(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            // ── get_policy ─────────────────────────────────────────────────
+            // #4034 — MCP twin of GET /api/v1/policies/{id}. Plain perm_fn
+            // gate (not a fan-out list, so require_fleet_read does not apply).
+            if (tool_name == "get_policy") {
+                if (!tier_allows(tier, "Policy", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Policy", "Read"))
+                    return;
+                if (!policy_store) {
+                    res.set_content(error_response(id, kInternalError, "Policy store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto policy_id = param_str(args, "policy_id");
+                auto policy_res = policy_store->get_policy(policy_id);
+                if (!policy_res) {
+                    mcp_audit("failure", "store degraded; " + policy_id);
+                    res.set_content(
+                        a4_error(kInternalError, "Policy store degraded — query failed", {},
+                                 /*retry_after_ms=*/5000),
+                        "application/json");
+                    return;
+                }
+                if (!*policy_res) {
+                    mcp_audit("failure", "not found; " + policy_id);
+                    // Matches the wider codebase convention for a not-found
+                    // id ("bundle not found" / "tag not found" / "token not
+                    // found" above) — kInvalidParams via the plain
+                    // error_response, not the a4_error data envelope this
+                    // domain's degraded-store branches use.
+                    res.set_content(error_response(id, kInvalidParams, "policy not found"),
+                                    "application/json");
+                    return;
+                }
+                const Policy& policy = **policy_res;
+                auto cs_res = policy_store->get_compliance_summary(policy_id);
+                if (!cs_res) {
+                    mcp_audit("failure", "store degraded (compliance); " + policy_id);
+                    res.set_content(
+                        a4_error(kInternalError, "Policy store degraded — query failed", {},
+                                 /*retry_after_ms=*/5000),
+                        "application/json");
+                    return;
+                }
+                // Same fail-soft posture as the REST twin: a degraded
+                // fragment read means "not offered", not a distinct error —
+                // this only gates a UI/agentic affordance, not a grant.
+                bool remediation_available = false;
+                auto frag_res = policy_store->get_fragment(policy.fragment_id);
+                if (frag_res && *frag_res)
+                    remediation_available = !(*frag_res)->fix_instruction.empty();
+                nlohmann::json obj =
+                    single_policy_detail_json(policy, *cs_res, remediation_available);
+                mcp_audit("success", policy_id);
+                res.set_content(success_response(id, tool_result(obj.dump(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            // ── list_policy_fragments ──────────────────────────────────────
+            // #4034 — MCP twin of GET /api/v1/policy-fragments.
+            if (tool_name == "list_policy_fragments") {
+                if (!tier_allows(tier, "Policy", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Policy", "Read"))
+                    return;
+                if (!policy_store) {
+                    res.set_content(error_response(id, kInternalError, "Policy store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                FragmentQuery q;
+                auto name_filter = param_str(args, "name");
+                if (!name_filter.empty())
+                    q.name_filter = name_filter;
+                // Clamped like query_installed_software's own "limit" arg —
+                // bounds a caller-supplied 0/negative/huge value rather than
+                // passing it straight to the store (the legacy REST route
+                // has no such floor; this is deliberate MCP-side hardening).
+                q.limit = static_cast<int>(
+                    std::clamp<std::int64_t>(param_int(args, "limit", 100), 1, 1000));
+                auto frags_res = policy_store->query_fragments(q);
+                if (!frags_res) {
+                    mcp_audit("failure", "store degraded; list_policy_fragments");
+                    res.set_content(
+                        a4_error(kInternalError, "Policy store degraded — query failed", {},
+                                 /*retry_after_ms=*/5000),
+                        "application/json");
+                    return;
+                }
+                JArr arr;
+                for (const auto& f : *frags_res)
+                    arr.add_raw(policy_fragment_list_row_json(f).dump());
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id, tool_result(JObj().raw("fragments", arr.str()).str(),
+                                                     kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // ── get_policy_agent_statuses ───────────────────────────────────
+            // #4034 — the per-agent-status fan-out half of GET
+            // /api/v1/compliance/{id} (get_compliance_summary above covers
+            // the aggregate-only half). fleet_read_fn_ is the SOLE
+            // authorization gate — routed-concerns RBAC row: never stacked
+            // with perm_fn/tier_allows (same BLOCKING rule
+            // query_installed_software documents above).
+            if (tool_name == "get_policy_agent_statuses") {
+                if (!fleet_read_fn_) {
+                    spdlog::error("get_policy_agent_statuses: fleet_read_fn_ unwired — "
+                                  "misconfigured call site; failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto gate = fleet_read_fn_(req, res, "Policy", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the A4 error body + status.
+                if (!policy_store) {
+                    res.set_content(error_response(id, kInternalError, "Policy store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto policy_id = param_str(args, "policy_id");
+                auto statuses_res = policy_store->get_policy_agent_statuses(policy_id);
+                if (!statuses_res) {
+                    mcp_audit("failure", "store degraded; " + policy_id);
+                    res.set_content(
+                        a4_error(kInternalError, "Policy store degraded — query failed", {},
+                                 /*retry_after_ms=*/5000),
+                        "application/json");
+                    return;
+                }
+                // The confined tally (never the store's own unfiltered
+                // aggregate) — see compliance_model.hpp's
+                // confined_policy_compliance doc comment.
+                auto confined = confined_policy_compliance(*statuses_res, gate.scope, policy_id);
+                JArr arr;
+                for (const auto& s : confined.visible)
+                    arr.add_raw(policy_agent_status_json(s).dump());
+                // Set-and-proceed (audit_persisted:false on failure), never
+                // a 503 — this is the MCP-specific convention for surfacing
+                // an audit-persist gap (rest_audit.hpp: "MCP wraps the
+                // kernel itself and surfaces the gap through its own body
+                // field"), NOT the REST twin's posture: GET
+                // /api/v1/compliance/{id} was reclassified to fail-closed
+                // (503) because check_result can carry raw, unrestricted
+                // agent-instruction output — see that route's own comment
+                // (compliance_routes.cpp) for why "not behavioural PII"
+                // does NOT hold for this data. Reuses the REST route's own
+                // domain verb (recipe §4).
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "compliance.agent_statuses.view", "success", "Policy",
+                    policy_id, "agents=" + std::to_string(confined.visible.size()));
+                JObj payload;
+                payload.add("policy_id", policy_id);
+                payload.raw("summary", compliance_summary_json(confined.summary).dump());
+                payload.raw("agents", arr.str());
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");
                 return;
             }
@@ -7174,6 +7685,91 @@ McpServer::HandlerFn McpServer::build_handler(
                                       tool_result_split(arr.str(),
                                                          JObj().raw("groups", arr.str()).str(),
                                                          kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // ── preview_management_group_agent_count (#4033, #2146 Batch A) ─
+            // MCP twin of GET /api/v1/management-groups/agent-count-preview
+            // and /fragments/create-group-form's own live count — this tool
+            // and that REST route call the SAME shared builder
+            // (group_agent_count_preview.hpp), so those two cannot drift
+            // from each other; the fragment keeps its own separate,
+            // behaviourally-equivalent inline implementation, unchanged by
+            // this PR. Gated ManagementGroup:Write matching the fragment exactly (see
+            // kTools[]'s comment on this tool) — NOT migrated onto
+            // fleet_read_fn_ (that chokepoint is for per-agent LIST reads;
+            // this route's scope is the D3 Response:Read-visible set, a
+            // different resolver entirely).
+            if (tool_name == "preview_management_group_agent_count") {
+                if (!tier_allows(tier, "ManagementGroup", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "ManagementGroup", "Write"))
+                    return;
+                const auto command_id = param_str(args, "command_id");
+                const auto plugin = param_str(args, "plugin");
+                std::vector<std::pair<std::string, std::string>> raw_fields;
+                // Colleague review (#4188): the served inputSchema (kTools[]
+                // above) declares filters as an object of string values, but
+                // that schema is enforced ONLY on the C8 approval-gated path
+                // (#2405) — an admitted caller whose session carries no
+                // mcp_tier (so no approval ticket is ever minted) reaches
+                // this handler directly. Silently dropping a malformed
+                // filters shape (non-object, or a non-string value) here
+                // would leave raw_fields empty, which group_agent_count_preview
+                // treats as a GENUINE zero-filter result (its own documented
+                // contract, matching the dashboard fragment) — a caller who
+                // sent a malformed filter would see a fabricated successful
+                // agent_count:0 indistinguishable from "no filter". Reject
+                // explicitly instead, on every admitted path, not just the
+                // approval-gated one.
+                if (args.contains("filters")) {
+                    if (!args["filters"].is_object()) {
+                        res.set_content(
+                            error_response(id, kInvalidParams, "filters must be an object"),
+                            "application/json");
+                        return;
+                    }
+                    for (const auto& [key, value] : args["filters"].items()) {
+                        if (!value.is_string()) {
+                            res.set_content(
+                                error_response(id, kInvalidParams,
+                                               "filters values must be strings"),
+                                "application/json");
+                            return;
+                        }
+                        raw_fields.emplace_back(key, value.get<std::string>());
+                    }
+                }
+                auto filters = resolve_group_preview_filters(plugin, raw_fields);
+
+                // Elevated -> nullopt (JIT full-fleet view), else the D3
+                // resolver — mirrors DashboardRoutes::resolve_visible_scope
+                // (const auth::Session&) / the REST twin exactly.
+                std::optional<std::vector<std::string>> agent_scope;
+                if (!auth::is_elevated(*session) && response_visible_set_fn_) {
+                    if (auto scope = response_visible_set_fn_(session->username))
+                        agent_scope = std::vector<std::string>(scope->begin(), scope->end());
+                }
+
+                auto count =
+                    group_agent_count_preview(response_store, command_id, filters, agent_scope);
+                if (!count) {
+                    mcp_audit("failure", "store degraded; preview_management_group_agent_count");
+                    res.set_content(
+                        a4_error(kInternalError, "Response store degraded — preview unavailable",
+                                 {}, /*retry_after_ms=*/5000),
+                        "application/json");
+                    return;
+                }
+                mcp_audit("success");
+                res.set_content(
+                    success_response(
+                        id, tool_result(JObj().add("agent_count", *count).str(), kObjectOutputSchema)),
                     "application/json");
                 return;
             }
@@ -7902,6 +8498,83 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
+            // ── #4031: AD/Entra directory-sync read twins (REST/MCP parity
+            // for GET /api/v1/directory/users and /directory/status). Both
+            // call the SAME shared builders discovery_routes.cpp and
+            // enrollment_directory_routes.cpp use (docs/api-twin-recipe.md
+            // §1). The OIDC-config route stays REST-only per #520 — see
+            // docs/mcp-server.md.
+
+            if (tool_name == "list_directory_users") {
+                if (!tier_allows(tier, "Directory", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Directory", "Read"))
+                    return;
+                if (!directory_sync || !directory_sync->is_open()) {
+                    res.set_content(error_response(id, kInternalError, "directory sync unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto group_filter = param_str(args, "group_id");
+                auto users = directory_sync->get_synced_users(group_filter);
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& u : users)
+                    arr.push_back(directory_user_row_json(u));
+                nlohmann::json payload;
+                payload["users"] = arr;
+                payload["count"] = arr.size();
+                // Prefer the REST-established domain verb over the generic
+                // mcp.<tool_name> action (docs/api-twin-recipe.md §4) — set-
+                // and-proceed with audit_persisted:false on a persist
+                // failure, never a hard MCP error (this is a read, not a
+                // mutation, but MCP has no Sec-Audit-Failed header channel).
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "directory.users.view", "success", "Directory", group_filter,
+                    "MCP directory users read");
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                res.set_content(
+                    success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "get_directory_status") {
+                if (!tier_allows(tier, "Directory", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Directory", "Read"))
+                    return;
+                if (!directory_sync || !directory_sync->is_open()) {
+                    res.set_content(error_response(id, kInternalError, "directory sync unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto status = directory_sync->get_status();
+                auto groups = directory_sync->get_synced_groups();
+                // No audit call — no per-person PII (counts + group metadata
+                // only), matching the REST twin's same decision. mapped_role
+                // (the AD-group -> Yuzu-role authorization map) is redacted
+                // for non-admin callers, incl. every readonly-tier MCP
+                // token — see directory_status_json's own doc comment.
+                const bool reveal_mapped_role =
+                    session && auth::effective_role(*session) == auth::Role::admin;
+                res.set_content(
+                    success_response(
+                        id, tool_result(directory_status_json(status, groups, reveal_mapped_role)
+                                            .dump(),
+                                        kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
             // ── get_guardian_schemas ──────────────────────────────────────
             if (tool_name == "get_guardian_schemas") {
                 if (!tier_allows(tier, "GuaranteedState", "Read")) {
@@ -8119,6 +8792,513 @@ McpServer::HandlerFn McpServer::build_handler(
                         .str();
                 mcp_audit("success");
                 res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
+            // ── #4035 (api-parity #2146 Batch A): MCP-only gaps closing the
+            // per-device DEX read model + app-perf drill's REST-only twins.
+            // Both are per-device behavioral PII -> the SAME ancestor-aware
+            // SCOPED gate query_software_licenses/get_dex_group_app_perf use
+            // (never the global perm_fn), and both call the SHARED builder
+            // (dex_read_model.hpp) their REST twins also call, per Rule 1.
+            if (tool_name == "get_dex_device_score") {
+                if (!tier_allows(tier, "GuaranteedState", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                const auto agent_id = param_str(args, "agent_id");
+                if (agent_id.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "agent_id is required"),
+                                    "application/json");
+                    return;
+                }
+                // Per-device SCOPED gate (GuaranteedState:Read + management group) —
+                // mirrors REST's GET /api/v1/dex/devices/{id} (scoped_perm_fn
+                // mandatory there too), NOT the global perm_fn.
+                if (!scoped_perm_fn) {
+                    res.set_content(a4_error(kInternalError, "scope gate not configured"),
+                                    "application/json");
+                    return;
+                }
+                if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
+                    return; // the gate wrote its own 401/403
+                if (!guaranteed_state_store) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Guaranteed State store unavailable"),
+                        "application/json");
+                    return;
+                }
+                // Validate the window enum BEFORE auditing/reading — parity with REST's
+                // GET /api/v1/dex/devices/{id}, which rejects an off-enum value rather
+                // than silently resolving it to 7d (an echoed `window` that contradicts
+                // the data it labels is exactly what that validation exists to prevent).
+                const std::string window = param_str(args, "window", "7d");
+                if (window != "24h" && window != "7d" && window != "30d" && window != "all") {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "invalid window (expected 24h|7d|30d|all)"),
+                        "application/json");
+                    return;
+                }
+                const std::string since = dex_iso_since(dex_window_to_days(window));
+                const auto model =
+                    build_dex_device_score_model(guaranteed_state_store, agent_id, window, since);
+                // Behavioral-PII access audit — same verb/target as the REST twin and
+                // the dashboard's per-device DEX lens, so one SIEM filter catches all
+                // three. Set-and-proceed: MCP has no Sec-Audit-Failed header, so the
+                // persist bool is captured and surfaced as audit_persisted:false in the
+                // body instead (never a failed call — see docs/api-twin-recipe.md §4).
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "dex.device.view", "success", "Agent", agent_id,
+                    "DEX per-device score + signal summary via MCP get_dex_device_score");
+                mcp_audit("success", agent_id);
+                res.set_content(
+                    success_response(
+                        id, tool_result(dex_device_score_json(model, audit_ok), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "get_dex_device_app_perf") {
+                if (!tier_allows(tier, "GuaranteedState", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                const auto agent_id = param_str(args, "agent_id");
+                if (agent_id.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "agent_id is required"),
+                                    "application/json");
+                    return;
+                }
+                // Per-device SCOPED gate — mirrors REST's GET
+                // /api/v1/dex/devices/{id}/app-perf (scoped_perm_fn mandatory there too).
+                if (!scoped_perm_fn) {
+                    res.set_content(a4_error(kInternalError, "scope gate not configured"),
+                                    "application/json");
+                    return;
+                }
+                if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
+                    return; // the gate wrote its own 401/403
+                if (!app_perf_providers.device) {
+                    res.set_content(
+                        a4_error(kInternalError, "service unavailable", "retry the request",
+                                 /*retry_after_ms=*/mcp::kMcpProviderWarmupRetryMs),
+                        "application/json");
+                    return;
+                }
+                // Behavioral-PII access audit BEFORE the read (provider-null already
+                // checked, matching the REST twin's ordering) — same verb/target as
+                // the REST twin and the dashboard's app-perf-over-time drill.
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "dex.device.app_perf.view", "success", "Agent", agent_id,
+                    "device app-perf-over-time drill (B1 retained) via MCP "
+                    "get_dex_device_app_perf");
+                const auto app_filter = param_str(args, "app", "");
+                auto rows = app_perf_providers.device(agent_id);
+                if (!rows) {
+                    // Authoritative read degrade — an ERROR, never success+[] (matches
+                    // every other app-perf provider-degrade branch in this file).
+                    mcp_audit("failure", "app-perf store read degraded; agent=" + agent_id);
+                    res.set_content(
+                        a4_error(kInternalError, "app-perf store read degraded", "retry shortly",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                        "application/json");
+                    return;
+                }
+                mcp_audit("success", agent_id);
+                res.set_content(
+                    success_response(id, tool_result(dex_device_app_perf_json(agent_id, app_filter,
+                                                                               *rows, audit_ok),
+                                                      kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // ── #4035 (api-parity #2146 Batch A): 8 genuinely-new DEX twins.
+            // Every builder call is the SAME shared pure function
+            // (dex_read_model.hpp) the REST route calls (Rule 1). Audit
+            // posture: see rest_api_v1.cpp's route comment above the
+            // equivalent GET route for the per-capability rationale.
+
+            if (tool_name == "get_dex_app") {
+                if (!tier_allows(tier, "GuaranteedState", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                const auto name = param_str(args, "name");
+                if (name.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "name is required"),
+                                    "application/json");
+                    return;
+                }
+                // Fleet-wide identity-linked disclosure -- affected-devices
+                // list, same class as get_dex_signal_detail above.
+                if (deny_fleet_wide_service_scoped(
+                        "dex.app.view", "GuaranteedState",
+                        "fleet-wide DEX app affected-devices list denied to a service-scoped "
+                        "token (MCP get_dex_app)",
+                        "service-scoped tokens may not read the fleet-wide DEX app "
+                        "affected-devices list"))
+                    return;
+                if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                    return;
+                if (!guaranteed_state_store) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Guaranteed State store unavailable"),
+                        "application/json");
+                    return;
+                }
+                const std::string window = param_str(args, "window", "7d");
+                if (window != "24h" && window != "7d" && window != "30d" && window != "all") {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "invalid window (expected 24h|7d|30d|all)"),
+                        "application/json");
+                    return;
+                }
+                const std::string since = dex_iso_since(dex_window_to_days(window));
+                // #4035 hardening (governance): confine the affected-devices
+                // list to the caller's management-group scope (ADR-0017 World
+                // A) -- deny_fleet_wide_service_scoped above closes the
+                // service-scoped-token axis only; this is the independent
+                // confined-OPERATOR axis the REST twin now also applies (see
+                // rest_api_v1.cpp's GET /dex/app handler).
+                const std::optional<std::set<std::string>> vis =
+                    dex_visible_fn_ ? dex_visible_fn_(session->username) : std::nullopt;
+                const auto model = build_dex_app_model(guaranteed_state_store, name, window, since,
+                                                       vis ? &*vis : nullptr);
+                // Fail-closed success audit (matches REST twin's posture --
+                // see rest_api_v1.cpp's route comment above GET /dex/app).
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "dex.app.view", "success", "GuaranteedState", "",
+                    "DEX app affected-devices read via MCP get_dex_app");
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id, tool_result(dex_app_json(model, audit_ok),
+                                                      kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "list_dex_apps") {
+                if (!tier_allows(tier, "GuaranteedState", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                    return;
+                if (!guaranteed_state_store) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Guaranteed State store unavailable"),
+                        "application/json");
+                    return;
+                }
+                const std::string window = param_str(args, "window", "7d");
+                if (window != "24h" && window != "7d" && window != "30d" && window != "all") {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "invalid window (expected 24h|7d|30d|all)"),
+                        "application/json");
+                    return;
+                }
+                const std::string since = dex_iso_since(dex_window_to_days(window));
+                const auto model = build_dex_apps_model(guaranteed_state_store, window, since);
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id, tool_result(dex_apps_json(model), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "get_dex_catalogue_group") {
+                if (!tier_allows(tier, "GuaranteedState", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                const auto name = param_str(args, "name");
+                if (name.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "name is required"),
+                                    "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                    return;
+                if (!guaranteed_state_store) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Guaranteed State store unavailable"),
+                        "application/json");
+                    return;
+                }
+                const std::string window = param_str(args, "window", "7d");
+                if (window != "24h" && window != "7d" && window != "30d" && window != "all") {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "invalid window (expected 24h|7d|30d|all)"),
+                        "application/json");
+                    return;
+                }
+                const std::string since = dex_iso_since(dex_window_to_days(window));
+                const std::string os = param_str(args, "os", "all");
+                const DexFleet fleet = dex_fleet_fn_ ? dex_fleet_fn_() : DexFleet{};
+                auto model = build_dex_catalogue_group_model(guaranteed_state_store, name, os,
+                                                             fleet, window, since);
+                if (!model) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "no such signal family: " + name),
+                        "application/json");
+                    return;
+                }
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id, tool_result(dex_catalogue_group_json(*model),
+                                                      kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "get_dex_device_history") {
+                if (!tier_allows(tier, "GuaranteedState", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                const auto agent_id = param_str(args, "agent_id");
+                if (agent_id.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "agent_id is required"),
+                                    "application/json");
+                    return;
+                }
+                // Per-device SCOPED gate -- mirrors REST's GET
+                // /api/v1/dex/devices/{id}/history (scoped_perm_fn mandatory there too).
+                if (!scoped_perm_fn) {
+                    res.set_content(a4_error(kInternalError, "scope gate not configured"),
+                                    "application/json");
+                    return;
+                }
+                if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
+                    return; // the gate wrote its own 401/403
+                if (!guaranteed_state_store) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Guaranteed State store unavailable"),
+                        "application/json");
+                    return;
+                }
+                const std::string window = param_str(args, "window", "7d");
+                if (window != "24h" && window != "7d" && window != "30d" && window != "all") {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "invalid window (expected 24h|7d|30d|all)"),
+                        "application/json");
+                    return;
+                }
+                const std::string since = dex_iso_since(dex_window_to_days(window));
+                const auto model = build_dex_device_history_model(guaranteed_state_store, agent_id,
+                                                                   window, since);
+                // Behavioral-PII access audit -- SAME verb as get_dex_device_score
+                // above (dex.device.view; the dashboard fragment audits this exact
+                // signal-history capability under this exact verb too).
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "dex.device.view", "success", "Agent", agent_id,
+                    "DEX per-device signal history via MCP get_dex_device_history");
+                mcp_audit("success", agent_id);
+                res.set_content(
+                    success_response(
+                        id, tool_result(dex_device_history_json(model, audit_ok),
+                                        kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "get_dex_observation") {
+                if (!tier_allows(tier, "GuaranteedState", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                const auto agent_id = param_str(args, "agent_id");
+                const auto event_id = param_str(args, "event_id");
+                if (agent_id.empty() || event_id.empty()) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "agent_id and event_id are required"),
+                        "application/json");
+                    return;
+                }
+                if (!scoped_perm_fn) {
+                    res.set_content(a4_error(kInternalError, "scope gate not configured"),
+                                    "application/json");
+                    return;
+                }
+                if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
+                    return; // the gate wrote its own 401/403
+                // #4035 hardening (governance): every sibling DEX tool in this
+                // file explicit-errors on a null store BEFORE the read; this
+                // one didn't, so a genuinely-unavailable store returned the
+                // SAME "observation not found" as a real 404 -- storage-layer
+                // failure masked as not-found (build_dex_observation_model
+                // folds !store into nullopt, same as the not-found/foreign-
+                // device cases). Matches the REST twin's fix (rest_api_v1.cpp).
+                if (!guaranteed_state_store) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Guaranteed State store unavailable"),
+                        "application/json");
+                    return;
+                }
+                // Same oracle-closed contract as the fragment/REST twin: a
+                // guessed/foreign event_id and a genuinely-absent one both
+                // resolve to the SAME error, revealing nothing beyond what
+                // the scope gate already allowed.
+                auto obs = build_dex_observation_model(guaranteed_state_store, agent_id, event_id);
+                if (!obs) {
+                    res.set_content(error_response(id, kInvalidParams, "observation not found"),
+                                    "application/json");
+                    return;
+                }
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "dex.observation.view", "success", "Agent", agent_id,
+                    "DEX single-observation detail via MCP get_dex_observation: " +
+                        audit_token(obs->obs_type) + " (event " + audit_token(obs->event_id) + ")");
+                mcp_audit("success", agent_id);
+                res.set_content(
+                    success_response(
+                        id, tool_result(dex_observation_json(*obs, audit_ok), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "get_dex_health") {
+                if (!tier_allows(tier, "GuaranteedState", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                    return;
+                if (!guaranteed_state_store) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Guaranteed State store unavailable"),
+                        "application/json");
+                    return;
+                }
+                const std::string window = param_str(args, "window", "7d");
+                if (window != "24h" && window != "7d" && window != "30d" && window != "all") {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "invalid window (expected 24h|7d|30d|all)"),
+                        "application/json");
+                    return;
+                }
+                const std::string weighting = param_str(args, "weighting", "default");
+                const std::string since = dex_iso_since(dex_window_to_days(window));
+                const DexFleet fleet = dex_fleet_fn_ ? dex_fleet_fn_() : DexFleet{};
+                const auto model = build_dex_health_model(guaranteed_state_store, fleet, weighting,
+                                                          window, since);
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id, tool_result(dex_health_json(model), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "get_dex_trends") {
+                if (!tier_allows(tier, "GuaranteedState", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                    return;
+                if (!guaranteed_state_store) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Guaranteed State store unavailable"),
+                        "application/json");
+                    return;
+                }
+                const std::string window = param_str(args, "window", "7d");
+                if (window != "24h" && window != "7d" && window != "30d" && window != "all") {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "invalid window (expected 24h|7d|30d|all)"),
+                        "application/json");
+                    return;
+                }
+                const std::string since = dex_iso_since(dex_window_to_days(window));
+                const DexFleet fleet = dex_fleet_fn_ ? dex_fleet_fn_() : DexFleet{};
+                const auto model =
+                    build_dex_trends_model(guaranteed_state_store, fleet, window, since);
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id, tool_result(dex_trends_json(model), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "get_dex_overview") {
+                if (!tier_allows(tier, "GuaranteedState", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                // Fleet-wide identity-linked disclosure -- top-devices list,
+                // same class as get_dex_app above.
+                if (deny_fleet_wide_service_scoped(
+                        "dex.overview.view", "GuaranteedState",
+                        "fleet-wide DEX overview top-devices list denied to a service-scoped "
+                        "token (MCP get_dex_overview)",
+                        "service-scoped tokens may not read the fleet-wide DEX overview "
+                        "top-devices list"))
+                    return;
+                if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                    return;
+                if (!guaranteed_state_store) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Guaranteed State store unavailable"),
+                        "application/json");
+                    return;
+                }
+                const std::string window = param_str(args, "window", "7d");
+                if (window != "24h" && window != "7d" && window != "30d" && window != "all") {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "invalid window (expected 24h|7d|30d|all)"),
+                        "application/json");
+                    return;
+                }
+                const int window_days = dex_window_to_days(window);
+                const std::string since = dex_iso_since(window_days);
+                const DexFleet fleet = dex_fleet_fn_ ? dex_fleet_fn_() : DexFleet{};
+                // #4035 hardening (governance): confine the top-devices list
+                // to the caller's management-group scope (ADR-0017 World A) --
+                // same independent second belt as get_dex_app above.
+                const std::optional<std::set<std::string>> vis =
+                    dex_visible_fn_ ? dex_visible_fn_(session->username) : std::nullopt;
+                const auto model = build_dex_overview_model(guaranteed_state_store, fleet, window,
+                                                            window_days, since,
+                                                            vis ? &*vis : nullptr);
+                // Fail-closed success audit (matches REST twin's posture --
+                // see rest_api_v1.cpp's route comment above GET /dex/overview).
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "dex.overview.view", "success", "GuaranteedState", "",
+                    "DEX overview top-devices read via MCP get_dex_overview");
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id, tool_result(dex_overview_json(model, audit_ok),
+                                                      kObjectOutputSchema)),
+                    "application/json");
                 return;
             }
 
