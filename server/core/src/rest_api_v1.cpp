@@ -13035,8 +13035,13 @@ void RestApiV1::register_routes(
                                           .str())
                                  // ADR-0031 WS-A4 parity addition: the dashboard
                                  // fragment's cohort-key picker already had this;
-                                 // the REST twin didn't (mirrors DEX's fleet
-                                 // available_keys precedent).
+                                 // the REST twin didn't. NOTE: unlike DEX (which
+                                 // serves available_keys only from the dedicated
+                                 // GET /dex/perf/cohorts route, NOT its fleet
+                                 // endpoint), network has no /cohorts route, so
+                                 // the distinct tag KEYS are surfaced here on the
+                                 // pollable fleet resource — cheap because the 5s
+                                 // NetworkApi memo bounds get_distinct_keys().
                                  .raw("available_keys", keys.str())
                                  .str()),
                      "application/json");

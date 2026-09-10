@@ -67,7 +67,13 @@ The first draft asserted a falsified current state; a three-model adversarial pa
   **The pilot also closed an A1 dashboard-parity gap it surfaced**: `available_keys` (the cohort-picker
   tag-key list) was on the dashboard fragment but absent from the public REST/MCP fleet resource — now
   added to `NetPerfFleetNow` and serialized on `GET /api/v1/network/fleet` (JSON + OpenAPI) and MCP
-  `get_network_fleet` (payload + typed output schema), matching DEX's `available_keys` precedent.
+  `get_network_fleet` (payload + typed output schema). NB the seam design deliberately DIVERGES from DEX
+  here — DEX serves `available_keys` only from its dedicated `GET /api/v1/dex/perf/cohorts` route (never
+  its pollable fleet endpoint), whereas network has no cohorts route and so surfaces the distinct tag KEYS
+  on the fleet resource itself, resolved unconditionally in `fleet_now` (the distinct-key namespace does
+  not depend on a cohort key) and bounded by the 5s snapshot memo. A round-2 governance finding (4 agents)
+  caught that the first cut gated this on `!cohort_key.empty()`, leaving the field structurally always `[]`
+  on the key-less fleet surface; fixed + locked by a `fleet_now("")` test.
   Behaviour is otherwise byte-identical; the `network.device.view` audit and its deny stayed in the
   handlers, unchanged.
 - **The `*_ui.cpp` audit-relocation premise below (and previously in the WS-A4 row) was FALSE — corrected

@@ -16,12 +16,12 @@
 /// corresponding public REST/MCP resource would reintroduce a private core
 /// API and defeat the point of the seam.
 
-#include "network_perf_model.hpp"
-
 #include <memory>
 #include <optional>
 #include <string>
 #include <vector>
+
+#include "network_perf_model.hpp"
 
 namespace yuzu::server {
 
@@ -57,7 +57,12 @@ public:
     /// the shape GET /api/v1/network/fleet serves, plus `available_keys`
     /// (ADR-0031 WS-A4 parity addition, see network_perf_model.hpp) so a
     /// caller with no access to the raw snapshot can still populate a
-    /// cohort-key picker.
+    /// cohort-key picker. `available_keys` is the distinct-tag-KEY namespace
+    /// and is resolved UNCONDITIONALLY — even for cohort_key=="" (the key-less
+    /// fleet surface) — because it does not depend on the cohort key; the impl's
+    /// 5s memo bounds the extra tag read. (This deliberately differs from DEX,
+    /// which withholds available_keys from its pollable fleet endpoint; network
+    /// has no /cohorts route, so /api/v1/network/fleet carries it.)
     [[nodiscard]] virtual NetPerfFleetNow fleet_now(const std::string& cohort_key) const = 0;
 
     /// The ONE device list behind every /network drill — the shape
@@ -73,6 +78,14 @@ public:
 /// server.cpp assembly. The returned object is non-copyable (holds a mutex
 /// for its internal 5s TTL memo) — held by shared_ptr so it composes with
 /// the existing `std::function`-based route-provider wiring.
+///
+/// LIFETIME CONTRACT (load-bearing for the per-family seam pattern this pilots):
+/// `health`, `registry` and `*tags` are borrowed, NOT owned — they MUST outlive
+/// every call to the returned API. Today `ServerImpl` guarantees this by joining
+/// the web thread (`web_server_->stop()`) before it destroys these stores, so no
+/// handler can reach the API after they die. A future family copying this shape
+/// MUST preserve that ordering (or hold the API with a lifetime <= its stores) —
+/// this snapshot-at-construction idiom UAFs if the stores are torn down first.
 [[nodiscard]] std::shared_ptr<NetworkApi>
 make_local_network_api(detail::AgentHealthStore& health, detail::AgentRegistry& registry,
                        TagStore* tags);

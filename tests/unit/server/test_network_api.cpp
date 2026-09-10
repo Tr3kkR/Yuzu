@@ -31,7 +31,9 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <string>
+#include <thread>
 #include <vector>
 
 using yuzu::server::NetCoocFilter;
@@ -229,4 +231,84 @@ TEST_CASE("NetworkApi: fleet_now/device_list produce the expected derived shapes
     const auto cooc_rows = api->device_list(cooc_q);
     REQUIRE(cooc_rows.size() == 1);
     CHECK(cooc_rows[0].agent_id == "agent-hi");
+}
+
+// Governance BLOCKING (2026-09-10, 4 agents): available_keys must be populated
+// on the KEY-LESS fleet call, because both public fleet surfaces
+// (GET /api/v1/network/fleet, MCP get_network_fleet) call fleet_now("") and the
+// OpenAPI/MCP schema mark available_keys as carrying the fleet's tag keys. The
+// original cut gated it on !cohort_key.empty(), so it was structurally always []
+// on those surfaces. This case fails against that cut and locks the fix (the
+// distinct-KEY namespace does not depend on the cohort key).
+TEST_CASE("NetworkApi: fleet_now(\"\") populates available_keys (key-less fleet surface)",
+          "[pg][network_api]") {
+    yuzu::test::TagStorePg tag_bundle;
+    TagStore& tags = *tag_bundle;
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry{bus, metrics};
+    AgentHealthStore health;
+
+    REQUIRE(registry.register_agent(make_info("agent-ak", "linux")).has_value());
+    beat_net(health, "agent-ak", 12.0);
+    REQUIRE(tags.set_tag("agent-ak", "dept", "eng", "operator").has_value());
+    REQUIRE(tags.set_tag("agent-ak", "region", "emea", "operator").has_value());
+
+    auto api = make_local_network_api(health, registry, &tags);
+
+    // The fleet endpoints call fleet_now with an EMPTY cohort key.
+    const auto now = api->fleet_now("");
+    CHECK(std::find(now.available_keys.begin(), now.available_keys.end(), "dept") !=
+          now.available_keys.end());
+    CHECK(std::find(now.available_keys.begin(), now.available_keys.end(), "region") !=
+          now.available_keys.end());
+}
+
+// cpp-safety SHOULD (2026-09-10): the mutable 5s memo is the one genuinely
+// concurrent surface the seam adds (httplib is thread-per-connection, so the
+// three consumer surfaces call the shared shared_ptr<const NetworkApi> from many
+// threads at once). Hammer fleet_now/device_list across threads with distinct +
+// shared cohort keys (forcing memo eviction past the 8-entry cap) so nightly
+// TSan proves the lock discipline; also asserts results stay well-formed.
+TEST_CASE("NetworkApi: concurrent fleet_now/device_list are memo-race-free", "[network_api]") {
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry{bus, metrics};
+    AgentHealthStore health;
+
+    for (int i = 0; i < 6; ++i) {
+        REQUIRE(registry.register_agent(make_info("agent-" + std::to_string(i), "linux"))
+                    .has_value());
+        beat_net(health, "agent-" + std::to_string(i), 10.0 + i);
+    }
+
+    auto api = make_local_network_api(health, registry, nullptr);
+
+    constexpr int kThreads = 8;
+    constexpr int kIters = 200;
+    std::atomic<int> ok{0};
+    std::vector<std::thread> ts;
+    ts.reserve(kThreads);
+    for (int t = 0; t < kThreads; ++t) {
+        ts.emplace_back([&, t] {
+            for (int i = 0; i < kIters; ++i) {
+                // >8 distinct keys forces eviction under the 8-entry memo cap;
+                // key "" is the shared hot key both fleet surfaces use.
+                const std::string key = (i % 3 == 0) ? std::string{}
+                                                      : ("k" + std::to_string((t * kIters + i) % 16));
+                const auto now = api->fleet_now(key);
+                NetDeviceQuery q;
+                q.cohort_key = key;
+                const auto rows = api->device_list(q);
+                if (now.reporting == 6 && rows.size() == 6)
+                    ok.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    for (auto& th : ts)
+        th.join();
+    // Every iteration sees the full, consistent population (no torn/partial
+    // snapshot from a memo data race).
+    CHECK(ok.load() == kThreads * kIters);
 }

@@ -53,13 +53,23 @@ private:
         NetPerfSnapshot snap;
         snap.cohort_key = cohort_key;
         std::unordered_map<std::string, std::string> cohort_values;
-        if (tags_ && !cohort_key.empty()) {
-            // Render/telemetry caller — same degrade posture as
-            // dex_perf_uncached (ADR-0036/ADR-0050).
+        if (tags_) {
+            // `available_keys` is the distinct-tag-KEY namespace — it does NOT
+            // depend on the cohort key, so it is resolved UNCONDITIONALLY (even
+            // for the key-less fleet endpoint, which calls fleet_now("")). This
+            // deliberately DIFFERS from DEX, which withholds available_keys from
+            // its pollable fleet endpoint and serves it only from a dedicated
+            // /dex/perf/cohorts route: network has no /cohorts route, so the
+            // public /api/v1/network/fleet + get_network_fleet surface it here,
+            // and the 5s memo bounds get_distinct_keys() to <=1 read per window
+            // (governance BLOCKING #4-agent finding, 2026-09-10 — it was gated on
+            // !cohort_key.empty() and therefore always [] on the fleet surface).
             snap.available_keys = tags_->get_distinct_keys().value_or(std::vector<std::string>{});
-            cohort_values =
-                tags_->get_values_for_key(cohort_key)
-                    .value_or(std::unordered_map<std::string, std::string>{});
+            // cohort VALUES do depend on the chosen key — resolve only when given.
+            if (!cohort_key.empty())
+                cohort_values =
+                    tags_->get_values_for_key(cohort_key)
+                        .value_or(std::unordered_map<std::string, std::string>{});
         }
         const auto health = health_.net_snapshot(std::chrono::seconds{90});
         std::unordered_map<std::string, const detail::AgentHealthSnapshot*> by_id;
