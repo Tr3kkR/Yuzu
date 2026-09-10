@@ -144,6 +144,40 @@ TEST_CASE("TarDatabase: purge_source drops ALL tiers for one source, leaves othe
     CHECK(count("tcp_hourly") == 1); // ...across all of its tiers
 }
 
+TEST_CASE("TarDatabase: purge_source(usage) also erases usage_daily_user",
+          "[tar][store][purge][usage]") {
+    // usage_daily_user (Wave 7 PR7.2b) has no tier of its own in the schema
+    // registry -- the generic per-tier purge loop above never reaches it, so
+    // this is a REGRESSION test for the dedicated branch in purge_source, not
+    // a duplicate of the generic case just above.
+    auto t = make_test_db();
+    REQUIRE(t.db.execute_sql(
+        "INSERT INTO usage_daily (day_ts, exe_key, run_count, total_seconds, first_seen, "
+        "last_seen, distinct_users, superseded_runs, expired_runs) VALUES "
+        "(86400, 'a.exe', 1, 10, 1000, 1010, 1, 0, 0)"));
+    REQUIRE(t.db.execute_sql(
+        "INSERT INTO usage_daily_user (day_ts, exe_key, user) VALUES (86400, 'a.exe', 'alice')"));
+    REQUIRE(t.db.execute_sql(
+        "INSERT INTO usage_live (ts, snapshot_id, action, pid, exe_key, user, start_ts) VALUES "
+        "(1000, 0, 'open', 1, 'a.exe', 'alice', 1000)"));
+
+    auto count = [&](const std::string& table) {
+        auto r = t.db.execute_query("SELECT COUNT(*) FROM " + table);
+        REQUIRE(r.has_value());
+        return std::stoi(r->rows[0][0]);
+    };
+    REQUIRE(count("usage_daily") == 1);
+    REQUIRE(count("usage_daily_user") == 1);
+    REQUIRE(count("usage_live") == 1);
+
+    auto res = t.db.purge_source("usage");
+    REQUIRE(res.has_value());
+    CHECK(*res == 3); // usage_daily + usage_live (registered tiers) + usage_daily_user
+    CHECK(count("usage_daily") == 0);
+    CHECK(count("usage_daily_user") == 0); // the regression this test pins
+    CHECK(count("usage_live") == 0);
+}
+
 TEST_CASE("TarDatabase: purge_source rejects an unknown source", "[tar][store][purge]") {
     auto t = make_test_db();
     auto res = t.db.purge_source("not_a_source");
@@ -1271,7 +1305,7 @@ TEST_CASE("TarDatabase: a fresh open creates no tar_events table (#760 UP-8)",
     { TarDatabase discard = std::move(t.db); }
     auto reopened = TarDatabase::open(t.path);
     REQUIRE(reopened.has_value());
-    CHECK(reopened->schema_version() == 5);
+    CHECK(reopened->schema_version() == 6);
     auto q2 = reopened->execute_query(count_sql);
     REQUIRE(q2.has_value());
     CHECK(q2->rows[0][0] == "0");
@@ -1305,7 +1339,7 @@ TEST_CASE("TarDatabase: a pre-v3 database still has tar_events dropped on open",
     {
         auto db = TarDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 5); // the 2→3→4→5 walk ran
+        CHECK(db->schema_version() == 6); // the 2→3→4→5→6 walk ran
         auto q =
             db->execute_query("SELECT COUNT(*) FROM sqlite_master WHERE name = 'tar_events' OR "
                               "name LIKE 'idx_tar_events%'");
@@ -1345,7 +1379,7 @@ TEST_CASE("TarDatabase: schema v5 drops tar_events from an ALREADY-MIGRATED data
     {
         auto db = TarDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 5);
+        CHECK(db->schema_version() == 6);
         auto q = db->execute_query("SELECT COUNT(*) FROM sqlite_master WHERE name = 'tar_events' "
                                    "OR name LIKE 'idx_tar_events%'");
         REQUIRE(q.has_value());
@@ -1422,7 +1456,7 @@ TEST_CASE("TarDatabase: schema v4 ALTERs version onto a pre-existing procperf ti
     {
         auto db = TarDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 5); // the v3→v4→v5 walk ran
+        CHECK(db->schema_version() == 6); // the v3→v4→v5→v6 walk ran
 
         // Both tiers now carry `version` (added by the ALTER, not the DDL).
         for (const char* tbl : {"procperf_live", "procperf_hourly"}) {
