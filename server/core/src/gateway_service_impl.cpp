@@ -78,8 +78,8 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
             "yuzu_server_gateway_route_write_failed_total",
             "HA WS-4 4.1: GatewayRouteStore directory writes (register_fresh/"
             "announce_connected/deregister/renew_leases) that degraded instead of "
-            "succeeding, by op and reason. Fail-OPEN this slice — the RPC proceeds "
-            "regardless, since nothing reads this store for dispatch yet — so this "
+            "succeeding, by op and reason. Fail-OPEN this slice - the RPC proceeds "
+            "regardless, since nothing reads this store for dispatch yet - so this "
             "counter is the only signal a systemic write failure would otherwise "
             "leave invisible.",
             "counter");
