@@ -69,8 +69,13 @@ if host_machine.system() != 'windows'
   # libxml2_dep itself is declared once, unconditionally, at root scope
   # (see meson.build's own comment on that declaration) -- reuse it here
   # rather than re-declaring the same dependency under the same variable
-  # name, which would silently shadow/be-shadowed-by the root declaration
-  # depending on subdir() call order.
+  # name. Meson has no subdir()-local scoping (one flat variable
+  # namespace across every subdir() call), so a second declaration here
+  # would not "shadow" anything -- it would just deterministically
+  # overwrite the root value, order notwithstanding. Two declarations of
+  # the same dependency under the same name is simply redundant and a
+  # future-drift risk (e.g. if one copy's method/fallback ever changes
+  # without the other), not a shadowing hazard.
   xmlsec_dep = dependency('unofficial-xmlsec', method: 'cmake',
     modules: ['unofficial::xmlsec::xmlsec1-openssl'],
     required: false, include_type: 'system')
