@@ -39,13 +39,17 @@
 #include "event_bus.hpp"
 #include "gateway_route_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auto_approve.hpp>
 
 #include "../test_helpers.hpp"
 
+#include <libpq-fe.h>
+
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -84,6 +88,32 @@ apb::RegisterRequest make_gw_register(yuzu::server::auth::AuthManager& auth_mgr,
     req.mutable_info()->mutable_platform()->set_arch("x86_64");
     req.set_enrollment_token(auth_mgr.create_enrollment_token("test", 0, std::chrono::hours(1)));
     return req;
+}
+
+// Directly overwrite a row's (connection_epoch, session_id) on a second
+// connection — mirrors test_gateway_route_store.cpp's own `raw_bump_epoch`
+// helper (kept as a separate copy: that file's fixture is a class member
+// function, this file's tests construct the store inline per-case). Used to
+// deterministically force a SUBSEQUENT register_fresh call to LOSE its epoch
+// race (its freshly-minted epoch, drawn from the store's own sequence, ends
+// up lower than this artificially-bumped value) — the 4.2a #8
+// lost_race_sessions_ scenario, which single-threaded/in-order test calls
+// cannot otherwise reach (each real register_fresh call naturally mints a
+// strictly higher epoch than the last).
+void raw_bump_epoch(const std::string& dsn, const std::string& agent_id, std::int64_t epoch,
+                    const std::string& session_id) {
+    pg::PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    const std::string epoch_s = std::to_string(epoch);
+    const char* p1 = agent_id.c_str();
+    const char* p2 = epoch_s.c_str();
+    const char* p3 = session_id.c_str();
+    const char* params[3] = {p1, p2, p3};
+    pg::PgResult r{PQexecParams(conn.get(),
+                                "UPDATE gateway_route_store.agent_routes SET "
+                                "connection_epoch=$2::bigint, session_id=$3 WHERE agent_id=$1",
+                                3, nullptr, params, nullptr, nullptr, 0)};
+    REQUIRE(r.status() == PGRES_COMMAND_OK);
 }
 
 /// Real grpc::Server hosting a GatewayUpstreamServiceImpl wired to a
@@ -233,9 +263,18 @@ TEST_CASE("ProxyRegister: presenting a KNOWN x-yuzu-session-id re-announces (ren
     REQUIRE((*row2)->lease_until_ms.has_value());
 }
 
-TEST_CASE("ProxyRegister: an UNKNOWN presented x-yuzu-session-id falls through to fresh "
+TEST_CASE("ProxyRegister: an UNKNOWN presented x-yuzu-session-id renews the PRESENTED session "
+          "in the directory — NEVER register_fresh — so no row is minted for a first-ever "
           "registration",
           "[pg][gateway_route_wiring][grpc]") {
+    // 4.2a #2 (mechanism c): before this slice, an unknown-locally presented
+    // session fell through to the SAME "fresh" branch as no-metadata-at-all,
+    // which would mint a fresh epoch via register_fresh and unconditionally
+    // win — able to clobber a live newer connection's route on a stale
+    // replay. Now it renews the PRESENTED session only; since this agent has
+    // never registered before, that presented session matches no row, so the
+    // directory gets NO row at all (register_fresh never runs on this
+    // branch) and the shortfall is counted as a desync signal.
     YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayRouteStore store{pool};
@@ -248,13 +287,213 @@ TEST_CASE("ProxyRegister: an UNKNOWN presented x-yuzu-session-id falls through t
     // above.
     auto resp = h.register_agent("agent-unknown-session", "gw-session-forged-not-real");
     REQUIRE(resp.accepted());
-    CHECK(resp.session_id() != "gw-session-forged-not-real"); // fresh session minted
+    // Deferred S'-vs-S in-memory desync (#6/4.4, explicitly out of scope for
+    // this slice): the response still mints a fresh session_id, unchanged
+    // from the pre-4.2a behavior — only the DIRECTORY write changed.
+    CHECK(resp.session_id() != "gw-session-forged-not-real");
 
     auto row = store.lookup_route("agent-unknown-session");
     REQUIRE(row.has_value());
+    CHECK_FALSE(row->has_value()); // NO row minted — register_fresh never ran
+
+    CHECK(h.metrics
+              .counter("yuzu_server_gateway_route_desync_total",
+                       {{"op", "renew_leases"}, {"outcome", "shortfall"}})
+              .value() == 1);
+}
+
+TEST_CASE("ProxyRegister: a ZOMBIE unknown presented session (the agent's row belongs to a "
+          "DIFFERENT, current session) renews zero rows and leaves the live row untouched",
+          "[pg][gateway_route_wiring][grpc]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+    LiveGatewayWiringHarness h(store);
+
+    // Establish a real, current route via a genuine (no-metadata) fresh
+    // registration.
+    auto resp1 = h.register_agent("agent-zombie-1");
+    REQUIRE(resp1.accepted());
+    const std::string current_session = resp1.session_id();
+
+    auto row_before = store.lookup_route("agent-zombie-1");
+    REQUIRE(row_before.has_value());
+    REQUIRE(row_before->has_value());
+    CHECK((*row_before)->session_id == current_session);
+    const auto epoch_before = (*row_before)->connection_epoch;
+
+    // Present a DIFFERENT, forged session — never seen by this replica's
+    // gateway_sessions_ (case 3: unknown locally) AND not the row's current
+    // session either (the "zombie" shape) — renew_leases({forged}) must
+    // match zero rows and leave the live row alone.
+    auto resp2 = h.register_agent("agent-zombie-1", "gw-session-zombie-not-current");
+    REQUIRE(resp2.accepted());
+
+    auto row_after = store.lookup_route("agent-zombie-1");
+    REQUIRE(row_after.has_value());
+    REQUIRE(row_after->has_value());
+    CHECK((*row_after)->session_id == current_session); // untouched
+    CHECK((*row_after)->connection_epoch == epoch_before); // untouched
+
+    CHECK(h.metrics
+              .counter("yuzu_server_gateway_route_desync_total",
+                       {{"op", "renew_leases"}, {"outcome", "shortfall"}})
+              .value() == 1);
+}
+
+// ── #8 desync counters: announce_connected / deregister mismatch ───────────
+
+TEST_CASE("NotifyStreamStatus: a STALE CONNECTED for a session already superseded by a genuine "
+          "newer registration reports matched=false and bumps the desync counter",
+          "[pg][gateway_route_wiring]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    yuzu::server::auth::AuthManager auth_mgr;
+    yuzu::server::auth::AutoApproveEngine auto_approve;
+    GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
+    gateway_svc.set_gateway_route_store(&store);
+
+    // session1 legitimately WINS its own register_fresh epoch race (this is
+    // NOT the lost_race_sessions_ scenario) — it is only superseded LATER by
+    // session2's own genuine fresh registration.
+    auto req1 = make_gw_register(auth_mgr, "agent-mismatch-1");
+    apb::RegisterResponse resp1;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req1, &resp1).ok());
+    const std::string session1 = resp1.session_id();
+
+    auto req2 = make_gw_register(auth_mgr, "agent-mismatch-1");
+    apb::RegisterResponse resp2;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req2, &resp2).ok());
+    const std::string session2 = resp2.session_id();
+    REQUIRE(session2 != session1);
+
+    // A stale CONNECTED for the now-superseded session1.
+    gw::StreamStatusNotification notif;
+    notif.set_agent_id("agent-mismatch-1");
+    notif.set_session_id(session1);
+    notif.set_event(gw::StreamStatusNotification::CONNECTED);
+    notif.set_cluster_id("cluster-stale");
+    notif.set_gateway_node("node-stale");
+    gw::StreamStatusAck ack;
+    REQUIRE(gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &notif, &ack).ok());
+    CHECK(ack.acknowledged()); // the in-memory gateway_sessions_ guard still passes
+
+    // The store's session-guarded UPDATE did NOT match — session2 owns the row.
+    auto row = store.lookup_route("agent-mismatch-1");
+    REQUIRE(row.has_value());
     REQUIRE(row->has_value());
-    CHECK((*row)->session_id == resp.session_id());
-    CHECK((*row)->connection_epoch > 0);
+    CHECK((*row)->session_id == session2);
+    CHECK_FALSE((*row)->cluster_id.has_value()); // stale CONNECTED did not write through
+
+    CHECK(metrics
+              .counter("yuzu_server_gateway_route_desync_total",
+                       {{"op", "announce_connected"}, {"outcome", "session_mismatch"}})
+              .value() == 1);
+}
+
+TEST_CASE("ProxyRegister: a session that LOSES its register_fresh epoch race does NOT bump the "
+          "desync counter when its follow-up CONNECTED arrives (benign race loss, not a desync)",
+          "[pg][gateway_route_wiring]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    yuzu::server::auth::AuthManager auth_mgr;
+    yuzu::server::auth::AutoApproveEngine auto_approve;
+    GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
+    gateway_svc.set_gateway_route_store(&store);
+
+    auto req1 = make_gw_register(auth_mgr, "agent-race-1");
+    apb::RegisterResponse resp1;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req1, &resp1).ok());
+    auto row1 = store.lookup_route("agent-race-1");
+    REQUIRE(row1.has_value());
+    REQUIRE(row1->has_value());
+
+    // Artificially bump the row's epoch far above whatever the store's own
+    // sequence will mint next, simulating a newer connection that already
+    // won — deterministic single-threaded stand-in for the real concurrent
+    // race (see raw_bump_epoch's header comment).
+    raw_bump_epoch(db.dsn(), "agent-race-1", (*row1)->connection_epoch + 1000,
+                  "gw-session-already-won");
+
+    // A SECOND fresh registration (no metadata — same "fresh" branch) now
+    // mints a lower epoch than the artificially-bumped row and LOSES the
+    // race.
+    auto req2 = make_gw_register(auth_mgr, "agent-race-1");
+    apb::RegisterResponse resp2;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req2, &resp2).ok());
+    const std::string losing_session = resp2.session_id();
+
+    auto row2 = store.lookup_route("agent-race-1");
+    REQUIRE(row2.has_value());
+    REQUIRE(row2->has_value());
+    CHECK((*row2)->session_id == "gw-session-already-won"); // the losing register_fresh did NOT win
+
+    // The losing session's own follow-up CONNECTED must skip
+    // announce_connected entirely (lost_race_sessions_) rather than call it
+    // and observe matched=false.
+    gw::StreamStatusNotification notif;
+    notif.set_agent_id("agent-race-1");
+    notif.set_session_id(losing_session);
+    notif.set_event(gw::StreamStatusNotification::CONNECTED);
+    notif.set_cluster_id("cluster-loser");
+    notif.set_gateway_node("node-loser");
+    gw::StreamStatusAck ack;
+    REQUIRE(gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &notif, &ack).ok());
+    CHECK(ack.acknowledged());
+
+    // The winning row is completely untouched by the loser's CONNECTED.
+    auto row3 = store.lookup_route("agent-race-1");
+    REQUIRE(row3.has_value());
+    REQUIRE(row3->has_value());
+    CHECK((*row3)->session_id == "gw-session-already-won");
+    CHECK_FALSE((*row3)->cluster_id.has_value());
+
+    // The core assertion: no desync counter increment for this benign race loss.
+    CHECK(metrics
+              .counter("yuzu_server_gateway_route_desync_total",
+                       {{"op", "announce_connected"}, {"outcome", "session_mismatch"}})
+              .value() == 0);
+}
+
+// ── NotifyStreamStatus: unknown-session reject counter ──────────────────────
+
+TEST_CASE("NotifyStreamStatus: an unknown session (never registered on this replica) is "
+          "rejected and bumps the desync counter",
+          "[gateway_route_wiring]") {
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    yuzu::server::auth::AuthManager auth_mgr;
+    yuzu::server::auth::AutoApproveEngine auto_approve;
+    GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
+    // No gateway_route_store wired at all — this case exercises the
+    // in-memory gateway_sessions_ guard purely, unrelated to the store.
+
+    gw::StreamStatusNotification notif;
+    notif.set_agent_id("agent-never-registered");
+    notif.set_session_id("gw-session-never-seen");
+    notif.set_event(gw::StreamStatusNotification::CONNECTED);
+    gw::StreamStatusAck ack;
+    REQUIRE(gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &notif, &ack).ok());
+    CHECK_FALSE(ack.acknowledged());
+
+    CHECK(metrics
+              .counter("yuzu_server_gateway_route_desync_total",
+                       {{"op", "notify_stream_status"}, {"outcome", "unknown_session"}})
+              .value() == 1);
 }
 
 // ── NotifyStreamStatus: CONNECTED / DISCONNECTED ────────────────────────────
@@ -342,6 +581,14 @@ TEST_CASE("NotifyStreamStatus: DISCONNECTED tombstones the route only for the ma
     REQUIRE(row_after_stale->has_value());              // still present
     CHECK((*row_after_stale)->session_id == session2);  // untouched — still session2
 
+    // 4.2a #8: the store's session-guarded UPDATE matched zero rows
+    // (removed=false) — the stale session1 no-op is exactly the guard
+    // rejection this counter exists to make visible.
+    CHECK(metrics
+              .counter("yuzu_server_gateway_route_desync_total",
+                       {{"op", "deregister"}, {"outcome", "session_mismatch"}})
+              .value() == 1);
+
     // The matching DISCONNECTED for session2 DOES tombstone it (4.2a:
     // deregister is a session-guarded UPDATE-to-tombstone, not a DELETE — see
     // gateway_route_store.hpp "SLICE 4.2a" — so the row stays present with
@@ -358,6 +605,13 @@ TEST_CASE("NotifyStreamStatus: DISCONNECTED tombstones the route only for the ma
     REQUIRE(row_after_real->has_value()); // tombstoned, not removed
     CHECK_FALSE((*row_after_real)->session_id.has_value());
     CHECK_FALSE((*row_after_real)->lease_until_ms.has_value());
+
+    // The matching (removed=true) deregister must NOT bump the desync
+    // counter — still exactly the one count from the stale attempt above.
+    CHECK(metrics
+              .counter("yuzu_server_gateway_route_desync_total",
+                       {{"op", "deregister"}, {"outcome", "session_mismatch"}})
+              .value() == 1);
 }
 
 // ── BatchHeartbeat: renew_leases ────────────────────────────────────────────

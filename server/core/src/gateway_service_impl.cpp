@@ -62,6 +62,36 @@ void record_route_store_failure(yuzu::MetricsRegistry* metrics, std::string_view
     }
 }
 
+// WS-4 4.2a #8 — guard-no-op / directory-desync visibility. A guard (the
+// session-scoped WHERE clauses in announce_connected/deregister/renew_leases,
+// and NotifyStreamStatus's own gateway_sessions_ lookup) rejecting a write is
+// NOT a store failure — the call succeeded, the store correctly refused to
+// touch a row it doesn't own. That refusal is exactly the "systemic desync"
+// signal an operator needs visibility into (in-memory gateway_sessions_ vs.
+// the durable directory row disagreeing about which session currently owns
+// an agent's route), separate from record_route_store_failure's degraded-I/O
+// signal above. `count` lets a batched caller (renew_leases' shortfall)
+// report magnitude in one increment instead of one call per missing row.
+//
+// Deliberately EXCLUDED from this counter: a `register_fresh` epoch-race
+// loss (RegisterFreshResult::won == false). That is an expected, benign
+// outcome of concurrent connects for the SAME agent — see the ProxyRegister
+// `lost_race_sessions_` bookkeeping below, which skips the FOLLOW-UP
+// announce_connected call entirely for a losing session so it never reaches
+// this counter as a false "session_mismatch" desync.
+void record_directory_desync(yuzu::MetricsRegistry* metrics, std::string_view op,
+                             std::string_view outcome, double count = 1.0) {
+    spdlog::warn("[gateway] GatewayRouteStore {} guard rejected the write (outcome={}, count={}) "
+                 "— directory may be out of sync with the in-memory session map",
+                 op, outcome, count);
+    if (metrics) {
+        metrics
+            ->counter("yuzu_server_gateway_route_desync_total",
+                      {{"op", std::string(op)}, {"outcome", std::string(outcome)}})
+            .increment(count);
+    }
+}
+
 } // namespace
 
 // -- Constructor --------------------------------------------------------------
@@ -82,6 +112,18 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
             "regardless, since nothing reads this store for dispatch yet - so this "
             "counter is the only signal a systemic write failure would otherwise "
             "leave invisible.",
+            "counter");
+        metrics_->describe(
+            "yuzu_server_gateway_route_desync_total",
+            "HA WS-4 4.2a: GatewayRouteStore session-guard writes (announce_connected/"
+            "deregister/renew_leases) that succeeded but matched/renewed zero rows for the "
+            "presented session, plus NotifyStreamStatus's own unknown-session reject, by op "
+            "and outcome. A guard rejection is EXPECTED at a low background rate (stale/"
+            "superseded-session notifications the guards exist to no-op on) — a sustained rise "
+            "is the signal that the in-memory session map and the durable directory have gone "
+            "out of sync. A register_fresh epoch-race LOSS is deliberately excluded (see the "
+            "lost_race_sessions_ bookkeeping) so a benign concurrent-connect race never inflates "
+            "this counter.",
             "counter");
     }
 }
@@ -465,6 +507,7 @@ gw_enrolled:
     }
 
     std::string session_id;
+    bool lost_epoch_race = false;
     if (presented_session_known) {
         // -- Re-announce: reuse the caller's still-known session -------------
         //
@@ -483,10 +526,63 @@ gw_enrolled:
             if (auto res = gateway_route_store_->renew_leases(renew_ids, kGatewayRouteLeaseTtlSecs);
                 !res) {
                 record_route_store_failure(metrics_, "renew_leases", res.error());
+            } else if (*res < static_cast<int>(renew_ids.size())) {
+                record_directory_desync(metrics_, "renew_leases", "shortfall",
+                                        static_cast<double>(renew_ids.size() - *res));
             }
         }
         spdlog::debug("[gateway] ProxyRegister: re-announcing known session {} for agent {}",
                      session_id, info.agent_id());
+    } else if (!presented_session.empty()) {
+        // -- 4.2a #2 (mechanism c): presented but UNKNOWN locally -------------
+        //
+        // A non-empty x-yuzu-session-id this replica's `gateway_sessions_`
+        // doesn't recognize is either a replica restart (the durable
+        // directory row may still be current — this replica just lost its
+        // in-memory map), a cross-replica delivery, or a genuinely stale/
+        // zombie replay whose session has since been superseded. Either way
+        // `register_fresh` must NEVER run here: it would mint a fresh epoch
+        // and unconditionally win (register_fresh's guarded UPSERT only
+        // fences CONCURRENT registrations, not a stale replay processed
+        // later — see gateway_route_store.hpp's "4.2 OBLIGATIONS" note),
+        // silently clobbering a live newer connection's route.
+        //
+        // Instead, renew the PRESENTED session (not the freshly-minted
+        // session_id below): if the durable row still belongs to it, the
+        // renew matches and the lease is correctly extended with no epoch
+        // change. If it's a zombie (the row now belongs to a different,
+        // newer session), the renew matches zero rows — counted below as a
+        // desync signal — and nothing is clobbered.
+        //
+        // SCOPE LIMIT (deferred to #6/4.4): the in-memory gateway_sessions_
+        // entry and the session_id returned to the caller below are left
+        // UNCHANGED from the pre-4.2a "fresh" behavior — a new session_id is
+        // still minted and returned. That means the response's session_id
+        // (S') and the directory row this branch may have just renewed
+        // (still keyed on the presented S) can disagree; closing that
+        // S'-vs-S gap is out of scope for this slice (directory writes
+        // only).
+        if (gateway_route_store_) {
+            std::vector<std::string> renew_ids{presented_session};
+            if (auto res = gateway_route_store_->renew_leases(renew_ids, kGatewayRouteLeaseTtlSecs);
+                !res) {
+                record_route_store_failure(metrics_, "renew_leases", res.error());
+            } else if (*res < static_cast<int>(renew_ids.size())) {
+                record_directory_desync(metrics_, "renew_leases", "shortfall",
+                                        static_cast<double>(renew_ids.size() - *res));
+            }
+        }
+        spdlog::debug("[gateway] ProxyRegister: presented session {} for agent {} is unknown "
+                     "locally — renewed the presented session in the directory instead of "
+                     "minting a fresh epoch",
+                     presented_session, info.agent_id());
+        // Session-id minting and gateway_sessions_ population are UNCHANGED
+        // from the pre-4.2a behavior (deferred S'-vs-S fix, see above) —
+        // NO register_fresh call on this branch, per the mechanism-(c)
+        // contract: "never register_fresh" when a presented session is
+        // unknown locally.
+        session_id =
+            "gw-session-" + auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(16));
     } else {
         // -- Fresh registration (unchanged behavior) --------------------------
         session_id =
@@ -500,6 +596,12 @@ gw_enrolled:
                 // (out-of-order delivery, gateway_route_store.hpp). Inert this
                 // slice — nothing dispatches through this store yet — so just
                 // note it; this session still enrolls and connects normally.
+                // 4.2a #8: recorded in lost_race_sessions_ below so the
+                // FOLLOW-UP NotifyStreamStatus CONNECTED for this session
+                // skips announce_connected instead of reporting a false
+                // "session_mismatch" desync (see record_directory_desync's
+                // header comment).
+                lost_epoch_race = true;
                 spdlog::debug("[gateway] ProxyRegister: register_fresh for agent {} session {} "
                               "lost the epoch race to a newer connection",
                               info.agent_id(), session_id);
@@ -568,6 +670,17 @@ gw_enrolled:
     {
         std::lock_guard lock(sessions_mu_);
         gateway_sessions_[session_id] = info.agent_id();
+        // 4.2a #8: remember a register_fresh epoch-race loss against ITS
+        // session_id so the follow-up NotifyStreamStatus CONNECTED can skip
+        // announce_connected instead of reporting a benign race-loss as a
+        // desync (see record_directory_desync's header comment). A session
+        // that reaches this line via the re-announce or unknown-session
+        // branches never had lost_epoch_race set, so this is a plain insert,
+        // never a stale leftover from a prior session reusing this id (a
+        // freshly-minted random 128-bit session_id does not collide with an
+        // old entry still needing eviction).
+        if (lost_epoch_race)
+            lost_race_sessions_.insert(session_id);
     }
 
     spdlog::info("[gateway] ProxyRegister succeeded: agent={}, session={}", info.agent_id(),
@@ -657,6 +770,10 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
                     gateway_route_store_->renew_leases(session_ids, kGatewayRouteLeaseTtlSecs);
                 !res) {
                 record_route_store_failure(metrics_, "renew_leases", res.error());
+            } else if (*res < static_cast<int>(session_ids.size())) {
+                record_directory_desync(metrics_, "renew_leases", "shortfall",
+                                        static_cast<double>(session_ids.size() -
+                                                            static_cast<std::size_t>(*res)));
             }
         }
     }
@@ -804,6 +921,13 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
         if (it == gateway_sessions_.end() || it->second != agent_id) {
             spdlog::warn("[gateway] NotifyStreamStatus: unknown session {} for agent {}",
                          session_id, agent_id);
+            // 4.2a #8: this in-memory gateway_sessions_ guard, not the
+            // directory store, but the same "systemic desync visibility"
+            // signal the architect flagged as the dominant post-restart
+            // symptom (a replica that lost its gateway_sessions_ map, or a
+            // notification for a session that was never wired through
+            // ProxyRegister on this replica).
+            record_directory_desync(metrics_, "notify_stream_status", "unknown_session");
             response->set_acknowledged(false);
             return grpc::Status::OK;
         }
@@ -837,11 +961,30 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
         // degraded write here does NOT fail this notification or touch
         // registry_.set_gateway_route above.
         if (gateway_route_store_) {
-            if (auto res = gateway_route_store_->announce_connected(
-                    agent_id, session_id, request->cluster_id(), request->gateway_node(),
-                    kGatewayRouteLeaseTtlSecs);
-                !res) {
+            // 4.2a #8: a session recorded in lost_race_sessions_ lost its
+            // register_fresh epoch race — the durable row already belongs to
+            // a NEWER connection, so calling announce_connected here would
+            // only report matched=false and pollute the desync counter with
+            // an expected, benign race loss (see record_directory_desync's
+            // header comment). Skip the directory write entirely; registry_
+            // .set_gateway_route above is unaffected (legacy in-memory
+            // routing is not gated on the epoch race).
+            bool skip_announce = false;
+            {
+                std::lock_guard lock(sessions_mu_);
+                skip_announce = lost_race_sessions_.contains(session_id);
+            }
+            if (skip_announce) {
+                spdlog::debug("[gateway] NotifyStreamStatus CONNECTED: session {} lost its "
+                             "register_fresh epoch race — skipping directory announce_connected",
+                             session_id);
+            } else if (auto res = gateway_route_store_->announce_connected(
+                           agent_id, session_id, request->cluster_id(), request->gateway_node(),
+                           kGatewayRouteLeaseTtlSecs);
+                       !res) {
                 record_route_store_failure(metrics_, "announce_connected", res.error());
+            } else if (!res->matched) {
+                record_directory_desync(metrics_, "announce_connected", "session_mismatch");
             }
         }
         spdlog::info("[gateway] Agent {} stream CONNECTED at gateway node '{}' ({} wire "
@@ -866,11 +1009,14 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
         if (gateway_route_store_) {
             if (auto res = gateway_route_store_->deregister(agent_id, session_id); !res) {
                 record_route_store_failure(metrics_, "deregister", res.error());
+            } else if (!res->removed) {
+                record_directory_desync(metrics_, "deregister", "session_mismatch");
             }
         }
         {
             std::lock_guard lock(sessions_mu_);
             gateway_sessions_.erase(session_id);
+            lost_race_sessions_.erase(session_id);
         }
         spdlog::info("[gateway] Agent {} stream DISCONNECTED at gateway node '{}'", agent_id,
                      request->gateway_node());
