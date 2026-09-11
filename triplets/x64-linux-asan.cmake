@@ -20,9 +20,9 @@
 # ABSL_HAVE_ADDRESS_SANITIZER, never about needing dynamic linkage
 # specifically, and flag propagation is orthogonal to linkage mode - the
 # flags below apply to a static archive exactly as they did to a .so
-# (proven in this repo already: the libpq carve-out that used to live
-# here forced static linkage for libpq alone and its sanitizer coverage
-# was never in question).
+# (proven in this repo already: the libpq carve-out below, the only
+# static exception this triplet had before #4019, forced static linkage
+# for libpq alone and its sanitizer coverage was never in question).
 #
 # Root cause fixed by going static: under dynamic linkage, protobuf/
 # grpc/re2/etc. each become separate .so images, and each independently
@@ -37,11 +37,19 @@
 # queried by another's silently misses ~50% of the time. This is the same
 # shape as the pre-existing #501 cross-image hash-seed incident (see the
 # `guardian_dispatch_push_bytes_for_test` serialize-then-dispatch workaround
-# in tests/unit/test_guardian_engine.cpp), spilling wider because the
-# sanitizer triplets introduce MORE separate .so images than the stock
-# static triplet has. Static linkage collapses grpc/protobuf/re2/abseil
-# back into the same single image as the rest of the app, removing the
-# opportunity for a divergent copy.
+# in tests/unit/test_guardian_engine.cpp, still load-bearing -- see below),
+# spilling wider because the sanitizer triplets introduce MORE separate .so
+# images than the stock static triplet has. Static linkage collapses the
+# vcpkg dependency graph (grpc/protobuf/re2/abseil) into one archive per
+# consuming binary, closing the grpc-stack-boundary split this triplet was
+# hitting. It does NOT collapse everything Yuzu ships into one image: the
+# plugin-ABI shared library (`libyuzu_agent_core.so`) is architecturally
+# always a separate consumer, independent of this triplet's linkage, and
+# still independently embeds its own abseil copy with its own `kSeed` --
+# confirmed present post-fix via `nm -D`. That boundary is the reason the
+# #501 workaround above stays load-bearing rather than becoming dead code;
+# don't remove it on the assumption this fix eliminated every cross-image
+# split.
 
 set(VCPKG_TARGET_ARCHITECTURE x64)
 set(VCPKG_CRT_LINKAGE dynamic)
