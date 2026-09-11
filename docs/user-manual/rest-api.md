@@ -6617,7 +6617,8 @@ share).
 |---|---|
 | `limit` cannot be parsed as an integer (e.g. non-numeric) | `400` — a parseable but out-of-range value (0, negative, or > 100) is clamped, not rejected |
 | A service-scoped API token — this owner-scoped read cannot be confined to the token's service | `403`, audited under `preflight.run.view` (a distinct verb from `preflight.run`, the run-**creation** verb — see the audit note below) |
-| Pre-flight run store unavailable | `503` (A4 envelope, `retry_after_ms: 2000` — matches the MCP twin's own `kMcpStoreFaultShortRetryMs`) |
+| Pre-flight run store never configured on this server (permanent) | `503` (A4 envelope, no `retry_after_ms` — this is a deployment-config condition, not one a client can retry past) |
+| Pre-flight run store degraded (transient) | `503` (A4 envelope, `retry_after_ms: 2000` — matches the MCP twin's own `kMcpStoreFaultShortRetryMs`) |
 
 **Audit:** unaudited on a successful read (run scope/lifecycle metadata, not per-agent behavioural
 PII — matches the fragment's own posture); a service-scoped-token denial is audited under
@@ -6656,7 +6657,8 @@ ready to receive an installer, before you configure and start a deployment.
 | Missing `run` parameter | `400` |
 | A service-scoped API token — this owner-scoped read cannot be confined to the token's service | `403`, audited under `deployment.config.view` |
 | No such run, or it belongs to another operator | `404` — indistinguishable by design (closes the existence oracle) |
-| Pre-flight run store unavailable | `503` (A4 envelope, `retry_after_ms: 2000` — matches the MCP twin's own `kMcpStoreFaultShortRetryMs`) |
+| Pre-flight run store never configured on this server (permanent) | `503` (A4 envelope, no `retry_after_ms` — this is a deployment-config condition, not one a client can retry past) |
+| Pre-flight run store degraded (transient) | `503` (A4 envelope, `retry_after_ms: 2000` — matches the MCP twin's own `kMcpStoreFaultShortRetryMs`) |
 
 **Audit:** unaudited on a successful read (same rationale as the runs list above); a
 service-scoped-token denial is audited under `deployment.config.view` — already distinct from
