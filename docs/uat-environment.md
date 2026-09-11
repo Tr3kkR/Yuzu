@@ -25,55 +25,16 @@ bash scripts/start-UAT.sh status   # show running processes
 
 `scripts/start-demo.sh` stands up a three-tier **chiselled** Docker stack (server + gateway + N agent replicas) from release-pinned GHCR images. **Cannot run alongside `start-viz-uat.sh` or `start-UAT.sh`** — all three bind host ports 8080 and 50051 (the launcher pre-checks and refuses to start if they are busy). Clean-start by default (wipes `/tmp/yuzu-demo/` + compose volumes); `--keep` preserves state. Distinct from the viz-UAT rig. The **agent-bundle** delivery image (`docs/agent-bundle.md`, `scripts/build-agent-bundle.sh`) ships the agent for `linux-x64` / `windows-x64` / `macos-arm64` to design partners who can only `docker pull` — published + cosign-signed + SBOM'd by the `docker-publish-agent-bundle` release job. Full runbook: `docs/demo-environment.md`.
 
-## Observability overlay (alert rules wired into UAT, #2857)
+## Observability overlay (alert rules wired into UAT) — moved
 
-`deploy/docker/docker-compose.observability.yml` layers onto the UAT rig
-(`docker-compose.uat.yml`) only — `docker-compose.reference.yml` (the
-production single-server template) ships no Prometheus service at all, so
-there is nothing for this overlay to attach to there. It replaces the UAT
-Prometheus config-file mount with `prometheus-observability.yml` (the same
-scrape config as `prometheus-uat.yml`, plus `rule_files:`), mounts the
-`docs/prometheus/` directory read-only into the rules directory Prometheus
-already watches, and enables the lifecycle API (`--web.enable-lifecycle`)
-so a rules edit can be picked up with a reload rather than a container
-recreate — so the 115 shipped alert rules + 1 recording rule **can** be
-evaluated by a running Prometheus, not just parsed by `promtool` in CI.
-**Run it from `deploy/docker/`** (its own bind-mount paths are relative to
-that directory), **and the base file MUST come first** (governance R4-1,
-BLOCKING, reproduced by execution — reversing the order silently reverts
-to the base config with no `rule_files:`, leaving Prometheus healthy while
-it evaluates zero of the 115 rules):
-
-```bash
-cd deploy/docker
-docker compose -f docker-compose.uat.yml -f docker-compose.observability.yml up -d
-
-# Verify the rules actually loaded — `docker compose ... config` CANNOT do
-# this (rule_files: lives inside the mounted file, never in Compose's own
-# model, so a config-based check passes even in the broken reversed-order
-# case above). Ask Prometheus's own API instead:
-curl -s localhost:9090/api/v1/rules | python3 -c \
-  "import json,sys; d=json.load(sys.stdin); n=sum(len(g['rules']) for g in d['data']['groups']); print(n); assert n >= 115"
-
-# After editing docs/prometheus/yuzu-alerts.yml, reload without recreating:
-curl -X POST localhost:9090/-/reload
-```
-
-Both commands above were run live against a disposable project name/port
-(not the long-running UAT stack) and verified: correct `-f` order + a
-fresh boot loads 116 rules across 21 groups; the reversed order loads 0;
-`/-/reload` returns `200` post-fix (it returned a lifecycle-disabled error
-before `--web.enable-lifecycle` was added).
-
-Out of scope today, tracked as #2857 follow-ups: an Alertmanager (the
-`severity:` labels route nowhere without one — see `docs/ops-runbooks/slo.md`'s
-correction on this point) and a version marker/checksum on
-`yuzu-alerts.yml` so a deployed copy's drift from the shipped file is
-detectable. Also not shipped: a CI regression gate that boots this overlay
-and asserts on `/api/v1/rules` (tracked sre6-4) — until one exists, the
-verification above is a manual step, not an enforced one. Only
-`docker-compose.uat.yml` is overlaid; `docker-compose.full-uat.yml` would
-need its own equivalent overlay, not shipped yet.
+The overlay wiring `docs/prometheus/yuzu-alerts.yml` into a running UAT
+Prometheus is infrastructure with its own executable failure modes
+(stickiness against the native startup scripts, false-positive checks,
+reload-staleness, missing self-scrape, missing retention config) and is tracked
+separately from this branch. See issues #2857 (the original wiring gap)
+and #4140 (the startup-script
+stickiness gap that overlay cannot close from inside itself) for status.
+This branch carries none of that overlay's files.
 
 ## Port assignments
 

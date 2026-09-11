@@ -172,19 +172,34 @@ connected count over 5m, `severity: critical`), which is a different signal
 percentage (SLO = 100%).** Per ADR-0040, every behavioural-PII REST route
 using fail-closed audit-on-open (`guardian.device.view`, `dex.device.view`,
 `dex.signal.view`, `dex.perf.device.view`, `network.device.view`) returns
-`503` and withholds data the moment `yuzu_server_audit_emit_failed_total`
-rises — the system already treats any audit-write failure as an outage of
-those routes rather than a tolerable degradation, so the SLO mirrors that
-design rather than inventing a softer target.
+`503` and withholds data **on that one request** the moment its own audit
+emission fails — fail-closed here is a **per-request** decision
+(`server/core/src/rest_audit.hpp`'s `emit_behavioral_audit`), not a
+global switch that puts "those routes" into a standing outage state once
+tripped. A transient blip that fails one write does not withhold data on
+the next request whose own write succeeds; `yuzu_server_audit_emit_failed_total`
+is a count of individually-rejected requests, not a boolean "the routes are
+down" flag. The SLO target of zero is still the right target — it mirrors
+the per-request design's own bar (every eligible request either audits
+successfully or is refused) — but do not describe it, or read an alert
+against it, as if a single failure takes down the feature fleet-wide.
+
+**A deployment that never exercises the audited routes reads this section
+as 100% met with zero evidence of anything.** `yuzu_server_audit_emit_failed_total{}=0`
+over 30 days is also exactly what a deployment with **zero** guardian/DEX/network
+device-view traffic reports — there is no way to tell "verified across N
+audited requests, zero failed" from "zero audited requests occurred" by
+reading this counter alone. Cross-check `yuzu_server_audit_events_total{result="success"}`
+(or `="denied"`) is actually incrementing before treating a clean 30-day
+window as evidence the control is exercising, not merely idle.
 
 **Window:** 30-day rolling; the underlying alert **fires as a Prometheus
 alert within minutes of any single failure** (see below) — this is not a
 budget that "burns slowly." **Correction (governance sre3-1):** "fires"
 is not "pages." Routing/paging requires an operator-provided Alertmanager
-— none ships with this repo (`deploy/docker/docker-compose.observability.yml`'s
-own header lists Alertmanager as an open #2857 follow-up, and every
-`severity:` label in `docs/prometheus/yuzu-alerts.yml` "routes nowhere"
-until one is wired). See `docs/enterprise-readiness-soc2-first-customer.md`
+— none ships with this repo (issue #2857 lists Alertmanager as an open
+follow-up, and every `severity:` label in `docs/prometheus/yuzu-alerts.yml`
+"routes nowhere" until one is wired). See `docs/enterprise-readiness-soc2-first-customer.md`
 WS-D for the current status. A firing alert is visible in Prometheus's own
 UI/API (`/api/v1/alerts`) even with no Alertmanager — it does not reach an
 on-call human until one is configured.
@@ -289,18 +304,17 @@ docker run --rm --entrypoint /bin/promtool \
 Expected output: `SUCCESS: 116 rules found` (115 alert rules + 1 recording
 rule — see `docs/enterprise-readiness-soc2-first-customer.md` §3.4 for
 where that count is cross-checked against a raw `grep -c` of the file).
-See #2857 for why no shipped stack loads these rules at all today. **Do
-not read the observability overlay below as closing that gap yet**
-(governance sre6-5/R4-1/UP4-4/UP4-5): `deploy/docker/docker-compose.observability.yml`
-is a first attempt at wiring `docs/prometheus/yuzu-alerts.yml` into a
-running Prometheus, but its own documented verification step cannot
-detect the failure mode it exists to catch, there is no rule-reload path
-(a restart is required, undocumented), and the rules mount is a
-single-file bind that pins to a stale inode across a restart. Until those
-are fixed, the honest claim is **"these 115 rules exist and parse"**
-(`promtool check rules`, above — a real, CI-checkable fact) — **not**
-"these rules are evaluated by a live system," which this repo cannot
-currently substantiate.
+See #2857 for why no shipped stack on this branch loads these rules at
+all today. An attempt at wiring them into a running Prometheus — and the
+real infrastructure defects that attempt found (a merge order and a
+from-scratch startup path that both silently produce zero loaded rules;
+verification commands that pass in exactly that broken case; reload
+staleness; a missing self-scrape job; a missing retention flag) — is
+tracked separately from this branch (issues #2857, #4140). The honest
+claim on this branch is **"these 115 rules exist and parse"** (`promtool
+check rules`, above — a real, CI-checkable fact) — **not** "these rules
+are evaluated by a live system," which this branch cannot substantiate
+regardless of what that separately-tracked work eventually proves.
 
 ## Related
 
@@ -317,8 +331,7 @@ currently substantiate.
   address at all — see §1's ADR-2002 Phase B note).
 - Restore drill and the corrected DR procedure (measured RTO/RPO for the
   non-HA, single-replica deployment this document's §1 target describes):
-  see PR `po/dr-procedure` (`docs/ops-runbooks/restore-drill-2026-09.md`,
-  `dr-procedure-drill-2026-09.md`) — neither ships on this branch.
+  tracked in issue #4135 — not part of this branch's documentation set.
 - The server dead-man's-switch gap this document's §1 proposed alert would
   close is **untracked** — `docs/ops-runbooks/audit-store-clock-guard.md`
   cites #2956 for it, which is closed and does not (re-)name a live

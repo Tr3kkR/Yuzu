@@ -1,5 +1,17 @@
 # Yuzu Security Whitepaper
 
+> **This document describes unreleased `dev`-branch software, not something
+> you can install today.** Its anchor commit is a development checkout, not
+> a tagged release — you cannot pull, download, or deploy the version this
+> document is written against. **The latest release you actually can
+> install is `v0.13.0`** (2026-07-11), and it is **missing six of the
+> control families this document describes as shipped** — full list, with
+> each one verified against the codebase (not asserted from memory), in
+> "Version anchor" immediately below. **If you are evaluating `v0.13.0` for
+> installation, read that list before relying on anything else in this
+> document — do not assume dev-HEAD posture for a control this document
+> doesn't call out as `v0.13.0`-present.**
+
 **Audience:** a prospective customer's security reviewer performing technical
 due diligence (Workstream G, `docs/enterprise-readiness-soc2-first-customer.md`
 §3.7). **Every claim below cites the repo document it summarises** — this
@@ -11,38 +23,48 @@ disclosing one to this audience.
 **Last updated:** 2026-09-07. Re-review this document whenever any cited
 source doc materially changes (its own change-log/date is the trigger).
 
-**Version anchor.** This document describes Yuzu at `dev` @ `d295db964`
-(2026-09-07) unless a claim is explicitly marked otherwise. **The latest
-tagged release is v0.13.0** (2026-07-11), which **predates** several
-controls this document describes as shipped — every item below verified by
-`git log`/`git diff v0.13.0..d295db964 -- <file>`, not asserted from
-memory:
+**Version anchor — status, plainly.** This document is written against
+`dev` @ `d295db964` (2026-09-07), an unreleased development checkout — **not
+a version you can download or install.** It is not the same thing as "the
+current shipped product." **The latest tagged release — the version an
+installing customer actually receives — is `v0.13.0`** (2026-07-11).
+**Six control families below are `dev`-only: in `dev`, not yet released,**
+absent from `v0.13.0` and from every earlier tagged release. Each is
+verified against the codebase (`git log` / `git diff v0.13.0..d295db964 --
+<file>` / `git cat-file -e v0.13.0:<path>`), not asserted from memory:
 
-- The PostgreSQL-backed audit store (ADR-0040) — v0.13.0's audit trail is
-  still the legacy SQLite `audit.db` (§3.5/§4/§7).
-- The `CaStore` PostgreSQL migration (ADR-0053) — v0.13.0 still uses
-  `ca.db` (§2.1, matrix "CA / key custody").
-- The `RbacStore` PostgreSQL migration (ADR-0041) (§3.5, matrix "RBAC
-  configuration").
-- **The `ManagementGroupStore` PostgreSQL migration (ADR-0042)** — a
-  substantial rewrite between v0.13.0 and this anchor (826 insertions/533
-  deletions in `management_group_store.cpp` alone); v0.13.0's management
-  groups are SQLite-backed (§3.5's management-group scoping claims).
-- **`SessionStore` (durable, PostgreSQL-backed operator sessions, HA
-  WS-1/1a, ADR-2002 §4)** — `server/core/src/session_store.hpp` does not
-  exist at all in v0.13.0 (confirmed: `git cat-file -e
-  v0.13.0:server/core/src/session_store.hpp` fails). A v0.13.0 deployment's
-  sessions are in-memory only and do NOT survive a restart — the opposite
-  of what `docs/ops-runbooks/auth-db-recovery.md`'s corrected guidance
-  states for `dev`-HEAD (§3.1's "Durable operator sessions" claim is
-  dev-only).
-- **MCP Streamable HTTP transport** (`mcp_transport.hpp`, `mcp_session.hpp`,
-  ADR-1005 execution-plan Decision 15 / track 2f) — neither file exists in
-  v0.13.0 (same `git cat-file -e` check). §8's "is live" claim is dev-only;
-  a v0.13.0 deployment has the older, non-session MCP transport only.
+- **In `dev`, not yet released:** the PostgreSQL-backed audit store
+  (ADR-0040) — `v0.13.0`'s audit trail is still the legacy SQLite
+  `audit.db` (§3.5/§4/§7).
+- **In `dev`, not yet released:** the `CaStore` PostgreSQL migration
+  (ADR-0053) — `v0.13.0` still uses `ca.db` (§2.1, matrix "CA / key
+  custody").
+- **In `dev`, not yet released:** the `RbacStore` PostgreSQL migration
+  (ADR-0041) (§3.5, matrix "RBAC configuration").
+- **In `dev`, not yet released:** the `ManagementGroupStore` PostgreSQL
+  migration (ADR-0042) — a substantial rewrite between `v0.13.0` and this
+  anchor (826 insertions/533 deletions in `management_group_store.cpp`
+  alone); `v0.13.0`'s management groups are SQLite-backed (§3.5's
+  management-group scoping claims).
+- **In `dev`, not yet released:** `SessionStore` (durable, PostgreSQL-backed
+  operator sessions, HA WS-1/1a, ADR-2002 §4) —
+  `server/core/src/session_store.hpp` does not exist at all in `v0.13.0`
+  (confirmed: `git cat-file -e v0.13.0:server/core/src/session_store.hpp`
+  fails). A `v0.13.0` deployment's sessions are in-memory only and do NOT
+  survive a restart — the opposite of what
+  `docs/ops-runbooks/auth-db-recovery.md`'s corrected guidance states for
+  `dev`-HEAD (§3.1's "Durable operator sessions" claim is dev-only).
+- **In `dev`, not yet released:** MCP Streamable HTTP transport
+  (`mcp_transport.hpp`, `mcp_session.hpp`, ADR-1005 execution-plan Decision
+  15 / track 2f) — neither file exists in `v0.13.0` (same `git cat-file -e`
+  check). §8's "is live" claim is dev-only; a `v0.13.0` deployment has the
+  older, non-session MCP transport only.
 
-A reviewer evaluating a specific deployed version should confirm which of
-these have shipped in that build rather than assume dev-HEAD posture.
+**Every other claim in this document that is not listed above as
+`dev`-only should still be re-verified against your specific installed
+version before you rely on it** — this list is the six differences this
+review found, not a certified-complete diff; when in doubt, check the
+codebase at your installed tag rather than assume dev-HEAD posture.
 ADR-1005 (§9) is accepted as of 2026-09-07 (#4099) but is itself a
 `dev`-only fact at this writing — it has not yet reached a tagged release
 either.
@@ -302,11 +324,11 @@ pre-fix `origin/dev` version (reverted as part of a PO decision to split
 assurance-evidence work from DR-procedure work into independently-reviewable
 PRs) — treat every claim about what the DR procedure does, how long it
 takes, or what it was proven to do as **not applicable to this checkout**.
-For the actual drill transcripts (four attempts total, RTO/RPO figures,
-every defect found and how each was fixed and verified), the corrected
-procedure, and the corrected `scripts/yuzu-backup.sh`/`yuzu-restore.sh`:
-see PR `po/dr-procedure` (`docs/ops-runbooks/restore-drill-2026-09.md`,
-`docs/ops-runbooks/dr-procedure-drill-2026-09.md`). The optional
+The actual drill transcripts (four attempts total, RTO/RPO figures, every
+defect found and how each was fixed and verified), the corrected
+procedure, and the corrected `scripts/yuzu-backup.sh`/`yuzu-restore.sh`
+are tracked in **issue #4135** — not part of this document's or this
+branch's documentation set. The optional
 HA-Postgres profile's separately-measured failover figures (an unrelated,
 already-shipped mechanism, not affected by the DR-procedure split):
 `docs/user-manual/ha-postgres.md`.
@@ -320,8 +342,7 @@ server replica (ADR-2002 Phase B) to raise the single-replica 99.5%/30d
 availability target to 99.9%/30d; a scheduled (cron/systemd-timer) backup
 job (today's procedure is a documented manual/scriptable command, not an
 automatically-scheduled one, and this branch's copy carries none of the
-`po/dr-procedure` fixes — see that PR for the corrected version and its
-gap list).
+fixes tracked in issue #4135).
 
 ## 6. Supply chain integrity
 

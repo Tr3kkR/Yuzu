@@ -251,25 +251,85 @@ moment they try to log in".
 > in that release (confirmed: `git cat-file -e v0.13.0:server/core/src/session_store.hpp`
 > fails) — sessions are in-memory only, and **a server restart IS the
 > fastest fleet-wide revocation there is, requiring no database access.**
-> Check which build you are running before choosing an emergency action:
-> `SELECT store, version FROM session_store.schema_meta` (or equivalent)
-> succeeding means you are on the durable-session build and restart will
-> NOT help; the query failing with "relation does not exist" (or the
-> binary's own `--version` predating this fix) means you are on the
-> legacy build and restart DOES help. Governance UP4-9: an earlier
-> revision of this correction gave the `dev`-HEAD answer unconditionally,
-> which would have told a `v0.13.0` operator to give up their best,
-> fastest, no-DB-access emergency tool during an active compromise.
+>
+> **Do not use a PostgreSQL query to discriminate which build you are on
+> (governance UP4-9, corrected 2026-09-11).** An earlier revision of this
+> correction told you to run `SELECT ... FROM session_store.schema_meta` —
+> that table does not exist under that name on EITHER build (a real
+> mistake, not just a bad idea), and more fundamentally: this section is
+> read during a **Postgres-outage or emergency-revocation** scenario,
+> where a query failing to run is indistinguishable from a query
+> correctly reporting "relation does not exist" — the one signal this
+> discriminator needs is exactly the one an outage destroys. A
+> DB-reachability-dependent check is the wrong tool for a runbook whose
+> premise is that the DB may not be reachable.
+>
+> **Use build evidence instead, and default to the SAFE action when you
+> cannot tell:**
+> 1. **There is no concrete boundary release to name yet** — durable
+>    sessions exist only at `dev`-HEAD; no tagged release (`v0.13.0` or
+>    earlier) carries them. If you are running any OFFICIALLY RELEASED
+>    build, you are on the legacy (in-memory) behavior, full stop — no
+>    further check needed. The only way to be on the durable-session
+>    behavior today is to have built and deployed from `dev` branch source
+>    yourself, which you would know you did.
+> 2. If you built from source and are unsure which commit, check the
+>    startup log for a `session_store`/"durable operator session" line
+>    (`journalctl -u yuzu-server | grep -i session_store`, or your
+>    container log) — its presence means the durable build, its absence
+>    means legacy. This reads a log line already written at boot; it does
+>    not need Postgres to be reachable right now.
+> 3. **If you cannot determine which build you are on by either check,
+>    use `DELETE /api/v1/sessions` / `/api/v1/sessions/me` (below) as your
+>    ONLY action, not restart.** Both builds honor the REST revocation
+>    call's LOCAL in-memory wipe immediately regardless of Postgres
+>    reachability (durable builds attempt the PG-backed delete too, but
+>    the local wipe happens either way — see `docs/auth-architecture.md`'s
+>    "the local wipe still done so the operator's kill NOW intent is
+>    honored" language). Restart is the fastest tool ONLY on a confirmed
+>    legacy build; on an unconfirmed build it risks the dangerous
+>    direction — false confidence that a still-live durable session was
+>    revoked. When genuinely unsure, prefer REST revocation over restart:
+>    it cannot make things worse on either build, where guessing wrong on
+>    restart can.
 
 There **is** a sessions table (`session_store` schema, PostgreSQL) **on
 builds carrying HA WS-1/1a** — see the version check above before deciding
-whether restarting helps. On those builds, do not restart the server as an
-emergency-revocation step — it accomplishes nothing against sessions and
-only adds downtime; for targeted revocation while the server is running,
-use the REST surface:
+whether restarting helps.
+
+**During a genuine Postgres outage or `SessionStore` degrade on those
+builds, no documented revocation path is complete — say so plainly rather
+than pointing at the REST call below as if it fully works:**
+
+- **Restart revokes nothing durably.** It clears the in-memory cache only;
+  once Postgres recovers, an undeleted durable row is exactly as valid as
+  it was before the restart.
+- **The REST call below still does something, but not durable revocation.**
+  `AuthManager::invalidate_user_sessions` performs the process-local
+  in-memory wipe unconditionally (`docs/auth-architecture.md`'s "the local
+  wipe still done so the operator's kill NOW intent is honored" language)
+  — but during an actual outage, the durable delete that same call
+  attempts **fails** (`db_persisted=false`, audited as `result="partial"`,
+  `db_error=true`). That local wipe is a temporary illusion, not a fix: the
+  durable row is still sitting in Postgres, untouched. The moment Postgres
+  recovers, the next validation of that same bearer token re-reads the
+  still-present, never-deleted authoritative row and the session is live
+  again — indistinguishable from one that was never revoked.
+- **The honest containment step during the outage itself is network-layer,
+  not session-layer:** block the specific credential/source at a reverse
+  proxy or firewall (deny by token-hash prefix or source IP), or take the
+  listener offline — you cannot durably revoke a session against a store
+  you cannot write to, and no amount of retrying the REST call changes
+  that.
+- **Once Postgres has actually recovered**, issue the REST call below and
+  confirm the audit record reports `db_persisted=true` (not `"partial"`)
+  before treating the session as revoked. If it still reports partial,
+  Postgres is not fully back yet — retry rather than assume success from
+  the HTTP 200 alone.
 
 ```bash
-# Revoke every session for one operator (admin).
+# Revoke every session for one operator (admin). Only durable once
+# db_persisted=true shows in the audit record — see above.
 curl -fsS -X DELETE "https://yuzu.internal/api/v1/sessions?username=alice" \
      -H "Authorization: Bearer $TOKEN"
 
@@ -526,11 +586,12 @@ sudo systemctl restart yuzu-server
   procedure this doc's "Post-restore verification" section is cited from.
   **This file's own copy is the pre-fix version** (reverted to
   `origin/dev` as part of a PO decision splitting DR-procedure fixes into
-  a separate branch/PR, `po/dr-procedure`) — run the corrected procedure
-  from that branch, not this checkout, before relying on this page's
-  checks as the second half of a real recovery.
-- Restore drill and the corrected DR procedure: see PR `po/dr-procedure`
-  (`docs/ops-runbooks/restore-drill-2026-09.md`,
-  `dr-procedure-drill-2026-09.md`) — neither file ships on this branch;
-  do not expect either path to exist in this checkout or in a release cut
-  from it alone.
+  separately-tracked work, **issue #4135**) — do not rely on this page's
+  checks as the second half of a real recovery until the fix tracked
+  there has actually landed in the procedure you run; this checkout's own
+  copy has not.
+- Restore drill and the corrected DR procedure: tracked in **issue #4135**.
+  Neither the drill transcripts nor the corrected scripts/doc are part of
+  this branch's documentation set, and no branch name is cited here on
+  purpose — an unmerged branch reference goes stale the day it merges or
+  is renamed; the issue number is the durable pointer.

@@ -302,7 +302,15 @@ command dispatch latency, agent heartbeat freshness, audit write success,
 PostgreSQL substrate degrade events) — each backed by a metric verified
 present in the codebase and, where one ships, the exact Prometheus alert
 that **fires** on it (not "pages" — no Alertmanager ships, see below):
-`docs/ops-runbooks/slo.md`.
+`docs/ops-runbooks/slo.md`. **The audit-write-success signal (§4 there) is
+a per-request fail-closed control, not a global one** — a failed audit
+emission withholds only the one request whose own write failed, not a
+standing outage of the audited routes — **and its "0 emit failures / 30d"
+target reads as trivially met on a deployment with zero audited traffic**;
+`slo.md` §4 states both caveats and the companion counter to check
+(`yuzu_server_audit_events_total{result="success"}`) before treating a
+clean window as evidence the control is exercising rather than idle. Cite
+`slo.md` §4 itself for this control, not a paraphrase here.
 
 **Backup/restore drills were executed (four attempts total, real
 containers, measured timings) against both the containerized
@@ -311,10 +319,8 @@ containers, measured timings) against both the containerized
 corrected DR procedure they validate, and the corrected
 `scripts/yuzu-backup.sh`/`yuzu-restore.sh` do not ship on this branch/PR.**
 Per PO decision, DR-procedure work (drills, the runbook, the corrected
-scripts and doc) moved to a separate, independently-reviewable PR,
-`po/dr-procedure` — see `docs/ops-runbooks/restore-drill-2026-09.md` and
-`docs/ops-runbooks/dr-procedure-drill-2026-09.md` there for the full
-account: every defect found (backup manifest self-reference, `pg_restore`
+scripts and doc) is tracked separately from this branch in **issue #4135**,
+which is the full account of every defect found (backup manifest self-reference, `pg_restore`
 ownership pitfalls that can leave a database worse than before a restore,
 world-readable backup permissions exposing the CA root key, version-skew
 handling, and more), each one's fix, and the fix's own verification. This
@@ -325,31 +331,23 @@ fixed or verified in this checkout.
 
 **`docs/prometheus/yuzu-alerts.yml`'s 115 alert rules + 1 recording
 rule (116 total per `promtool check rules` — measured at the time of this
-writing, not CI-bound to this figure; governance UP4-12: re-derive with
-`promtool check rules` rather than trusting this number, the file is
-actively churning and nothing gates this citation, `slo.md`, or the matrix
-to it) were, until this change, evaluated by no shipped Prometheus stack at
-all** — the new `deploy/docker/docker-compose.observability.yml` overlay
-(issue #2857) is the first shipped stack that **can** evaluate them for the
-UAT rig (`docker-compose.reference.yml` ships no Prometheus at all).
-**"Can," not "is verified to on an ongoing basis" (governance sre6-5):**
-`docker compose ... config` does **not** confirm the rules load (R4-1,
-BLOCKING — `rule_files:` lives inside the mounted config file, never in
-Compose's own merged model, and the wrong `-f` order silently loads zero
-rules while `config` still shows the file mount); the real check is
-Prometheus's own API post-boot (`curl localhost:9090/api/v1/rules`, must
-return ≥115 rules — verified live this pass, both the correct order
-(116 rules, 21 groups) and the reversed order (0 rules) were actually
-booted and checked). The overlay also lacked a rules-reload path
-(`--web.enable-lifecycle`, now added) and used a single-file bind that
-pins to a stale inode across a restart (now a directory mount) — both
-fixed and verified this pass (UP4-4/UP4-5/UP4-14). No CI regression gate
-boots this overlay and asserts on `/api/v1/rules` yet (tracked sre6-4) —
-until one exists, this is a manually-verified capability, not a
-continuously-enforced one. The Alertmanager-routing and
-alerts-file-checksum halves of #2857 remain open follow-ups, not addressed
-by this change. **Also found while auditing
-#2857 (governance-reproduced, sre2-2/arch2-2):** the now-deleted
+writing, not CI-bound to this figure; re-derive with `promtool check
+rules` rather than trusting this number, the file is actively churning and
+nothing gates this citation, `slo.md`, or the matrix to it) are evaluated
+by no shipped Prometheus stack on this branch — #2857 remains open here.**
+An attempt at wiring one (mount the file into a running UAT Prometheus),
+the real infrastructure defects that attempt turned up (a wrong `-f` merge
+order and a from-scratch startup path both silently produce a healthy
+Prometheus evaluating zero rules; the two most obvious verification
+commands, `docker compose ... config` and `promtool check config`, both
+pass in exactly that broken case; a rejected rules reload leaves a stale
+rule count that still looks fine; no self-scrape job existed to observe
+the process's own health; no retention flag existed, so a 30-day SLO
+window silently read a 15-day TSDB), and the fixes for all of them, are
+tracked separately from this branch (issues #2857, #4140). This branch's
+own assurance claims do not depend on that work having merged.
+
+**Also found while auditing #2857:** the now-deleted
 `deploy/grafana/yuzu-alerts.yml` (10 alerts, zero references anywhere in
 the repo, deleted in an earlier round of this change) was not a strict
 subset of the canonical `docs/prometheus/yuzu-alerts.yml` — 7 of its 10
@@ -371,11 +369,18 @@ Three of the ten (`YuzuAgentDisconnected`, `YuzuHighCommandFailureRate`,
 None of the seven retired rules is restored here — `docs/prometheus/yuzu-alerts.yml`
 is not an owned file of this change — this table exists so "115 alert
 rules ship" is not read as "every alert this project has ever had still
-ships"; propose these seven as new issues against the canonical file if
+ships". Tracked: **issue #4231** (the coverage gap for these seven,
+confirmed by two independent measurements to affect no audit/auth/certificate-expiry
+signal and no shipped rig — the deleted file was never loaded by anything).
+**Residual, honestly stated rather than closed:** #4231 is a governance/GRC
+tracking issue, not something an operator upgrading this software would
+ever read — nothing in `docs/user-manual/` mentions this retirement, and
+no per-alert successor issue has been filed for any of the seven yet. If
 the coverage they represented (gateway health, stalled-pipeline detection,
-zero-agents) is still wanted. Incident response lifecycle and
-capacity plans for 1k/5k/10k+ agents remain undocumented — not addressed by
-this change, still open.
+zero-agents) is still wanted, filing those seven successor issues — and a
+user-manual mention, not only this table — is the remaining work. Incident
+response lifecycle and capacity plans for 1k/5k/10k+ agents remain
+undocumented — not addressed by this change, still open.
 
 ---
 
