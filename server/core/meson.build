@@ -704,9 +704,12 @@ endif
 # the top of this file on every platform). c-ares is best-effort via pkg-config
 # (`libcares`): needed at final link on static Linux/macOS; on Windows drogon/
 # trantor are dynamic DLLs that resolve their own deps at load, so a missing
-# libcares.pc there is harmless. Brotli/zlib/uuid are likewise LINK_ONLY-dropped
-# but are not referenced by the drogon::app() code path the canary exercises;
-# the presentation binary (WS-B2) will append whatever its used surface pulls.
+# libcares.pc there is harmless. Brotli/zlib/uuid are LINK_ONLY-dropped in the
+# same way, and — proven by `nm` on the minimal canary — ARE load-bearing even
+# for this link: the bare drogon::app() path drags in trantor's EventLoop/DNS/
+# TLS plus drogon's Utilities.cc (getUuid / gzip / brotli), so a static-link
+# platform genuinely needs the lot. The presentation binary (WS-B2) will append
+# whatever else its used surface pulls.
 # The dropped transitive set is trantor's (OpenSSL, c-ares) PLUS drogon's own
 # (`$<LINK_ONLY:ZLIB::ZLIB>`, `$<LINK_ONLY:Brotli_lib>`, `$<LINK_ONLY:UUID_lib>`
 # in DrogonTargets.cmake) — libdrogon.a's Utilities.cc (getUuid / gzip / brotli)
@@ -715,7 +718,18 @@ endif
 # Linux; each is best-effort (required:false) so the dynamic-DLL Windows leg and
 # macOS (where libuuid is a system framework, not a vcpkg port) don't fail
 # configure on a missing .pc.
-_drogon_transitive = [openssl_dep]
+#
+# openssl_dep guard (cross-platform FINDING 2): on Windows the required:false
+# cmake + find_library both-fail path (top of this file) leaves openssl_dep a
+# disabler(). A disabler propagated into a declare_dependency() dependency list
+# SILENTLY disables the executable() that consumes it — the canary would then
+# never build and CI would go green having proven nothing. Guard the append with
+# the same is_disabler()/found() check https_deps uses above; on Windows a
+# dynamic drogon DLL resolves its own OpenSSL at load, so omitting it is correct.
+_drogon_transitive = []
+if not is_disabler(openssl_dep) and openssl_dep.found()
+  _drogon_transitive += openssl_dep
+endif
 foreach _pc : ['libcares', 'zlib', 'uuid', 'libbrotlienc', 'libbrotlidec']
   _d = dependency(_pc, method: 'pkg-config', required: false, include_type: 'system')
   if _d.found()
@@ -724,9 +738,29 @@ foreach _pc : ['libcares', 'zlib', 'uuid', 'libbrotlienc', 'libbrotlidec']
 endforeach
 drogon_dep = declare_dependency(dependencies: [drogon_dep] + _drogon_transitive)
 
-executable(
+yuzu_drogon_canary_exe = executable(
   'yuzu_drogon_canary',
   files('src/drogon_canary_main.cpp'),
   dependencies: [drogon_dep],
   install: false,
+)
+
+# Actually RUN the canary in CI (cross-platform FINDING 1a / unhappy-path): a
+# link alone does not prove the process loads. The main() returns 0 after
+# forcing an out-of-line libdrogon symbol, so running it surfaces a load-time
+# failure (a missing/unresolvable Drogon or transitive DLL on the Windows
+# dynamic leg — precisely the #375-class regression this canary exists to
+# catch) that a pure link step would miss. Suite 'server-checks' because this is
+# a build/link/load structural assertion, not a functional server test — the
+# same suite as the sibling structural checks in tests/meson.build (the pg
+# shard-partition invariant, the mcp-bridge alloc-budget probe). CI executes it
+# on the Windows leg via `--suite server-checks` (ci.yml, where dynamic DLL
+# resolution actually matters) and on the unfiltered nightly ASan/TSan legs;
+# the self-hosted Linux PR/push leg selects server-checks members by name, so
+# there it still builds+links (its primary Linux value) but is not run.
+test(
+  'drogon build canary',
+  yuzu_drogon_canary_exe,
+  suite: ['server', 'server-checks'],
+  timeout: 30,
 )
