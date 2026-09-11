@@ -297,7 +297,7 @@ TEST_CASE("NotifyStreamStatus: CONNECTED fills cluster_id/gateway_node for the m
     CHECK((*row)->lease_until_ms.has_value()); // announce_connected sets the lease
 }
 
-TEST_CASE("NotifyStreamStatus: DISCONNECTED removes the route only for the matching "
+TEST_CASE("NotifyStreamStatus: DISCONNECTED tombstones the route only for the matching "
           "session — a stale/superseded session does not tear it down",
           "[pg][gateway_route_wiring]") {
     YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
@@ -342,7 +342,10 @@ TEST_CASE("NotifyStreamStatus: DISCONNECTED removes the route only for the match
     REQUIRE(row_after_stale->has_value());              // still present
     CHECK((*row_after_stale)->session_id == session2);  // untouched — still session2
 
-    // The matching DISCONNECTED for session2 DOES remove it.
+    // The matching DISCONNECTED for session2 DOES tombstone it (4.2a:
+    // deregister is a session-guarded UPDATE-to-tombstone, not a DELETE — see
+    // gateway_route_store.hpp "SLICE 4.2a" — so the row stays present with
+    // session_id/lease_until/cluster_id/gateway_node nulled, not gone).
     gw::StreamStatusNotification real;
     real.set_agent_id("agent-disconnect-1");
     real.set_session_id(session2);
@@ -352,7 +355,9 @@ TEST_CASE("NotifyStreamStatus: DISCONNECTED removes the route only for the match
 
     auto row_after_real = store.lookup_route("agent-disconnect-1");
     REQUIRE(row_after_real.has_value());
-    CHECK_FALSE(row_after_real->has_value()); // removed
+    REQUIRE(row_after_real->has_value()); // tombstoned, not removed
+    CHECK_FALSE((*row_after_real)->session_id.has_value());
+    CHECK_FALSE((*row_after_real)->lease_until_ms.has_value());
 }
 
 // ── BatchHeartbeat: renew_leases ────────────────────────────────────────────

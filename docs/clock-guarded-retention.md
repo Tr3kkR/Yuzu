@@ -156,6 +156,43 @@ These two carve-outs are recorded here per part (6)'s "record which way you went
 the full 7. SINGLE-WRITER today (the one server); becomes PG-shared-state under the ADR-0012
 advisory lock when a 2nd replica lands.
 
+### `GatewayRouteStore::reap_stale_routes` (HA WS-4 slice 4.2a)
+
+JOINS this guarded set on the `SessionStore::reap_expired` shape (advisory-lock own-statement
+`gateway_route_store:reap`, in-SQL DB `now()` read once for both cutoffs + anchor-compare +
+anchor-update, persisted+sanitised `route_meta` anchor, forward/backward-anomaly decline,
+unconditional per-predicate cap) and makes the SAME two carve-out choices `SessionStore` and
+`ExecutionTracker` made, for the SAME reason:
+
+1. **NO would-wipe probe** — the `agent_routes` table legitimately drains toward "every lease
+   expired" as ROUTINE behaviour (a fleet going offline overnight expires every lease), so a
+   would-wipe verdict cannot separate a true from a false positive here.
+4. **NO fact-set anomaly dedup** — a declined pass is `spdlog::warn`'d; the write-failure counter
+   Task C wires alongside this store's other degraded-write paths is the observable signal, not a
+   fourth latch.
+
+Part (6)'s missing-anchor decision is **PROCEED** (`ResultSetStore`'s answer): a route is
+regenerable by the agent's next heartbeat/`ProxyRegister`, so a from-boot skewed clock reaping a
+batch of already-stale routes on the first pass is an acceptable worst case, never non-reproducible
+evidence loss.
+
+Two predicates sweep in the same pass, both capped independently (`kReapCap = 5000`, matching
+`SessionStore`'s shape — never its number): (a) `lease_until` past a grace window of `2x` the 90s
+lease TTL (`kStaleLeaseGraceSecs = 180`) — TOMBSTONES the row (same shape as `deregister`, retaining
+`connection_epoch`) rather than deleting it, because the associated session may still be alive and
+merely stopped renewing; (b) a NULL-lease row (a real tombstone, or a row stuck since
+`register_fresh` that never got an `announce_connected`) whose `updated_at` is past a SHORT purge age
+(`kTombstonePurgeAgeSecs = 300`) — hard-DELETEs it, since by that age a late CONNECTED/DISCONNECTED
+resurrecting it is not a realistic risk and a genuine later `register_fresh` works identically
+whether the row exists or not. The implausible-forward-skew bound (part 1) is this store's own,
+NEVER copied from a sibling: `kMaxPlausibleSkewMs = 1 day`, sized against this store's own
+sub-ten-minute liveness horizon (grace + purge-age ≈ 480s), not `SessionStore`'s 366-day bound (sized
+to a human session's plausible lifetime).
+
+SINGLE-WRITER today (one dedicated advisory-lock key, `gateway_route_store:reap`); becomes
+PG-shared-state under the same ADR-0012 lock when a 2nd replica lands, matching every sibling in this
+register. See `gateway_route_store.hpp`'s `reap_stale_routes` doc comment for the full record.
+
 ### `ExecutionTracker::reap_command_execution_mappings` (HA WS-1(1b))
 
 JOINS this guarded set on the identical shape (advisory-lock own-statement, in-SQL DB `now()` read

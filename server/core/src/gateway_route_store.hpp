@@ -60,6 +60,31 @@
 /// a stale-lease reaper plus the fail-open->fail-closed flip must land before 4.2
 /// trusts this directory for routing.
 ///
+/// SLICE 4.2a — `deregister` TOMBSTONES instead of deleting (closes the
+/// "a late DISCONNECTED then deletes the re-homed route" obligation above,
+/// #4/#5 in the 4.2 design doc). A tombstone is `session_id IS NULL AND
+/// lease_until IS NULL`; `connection_epoch` is retained. Rationale: a bare
+/// DELETE lets `announce_connected`'s fallback `ON CONFLICT DO NOTHING`
+/// INSERT resurrect a dead route if a late/reordered CONNECTED notification
+/// for the just-torn-down session arrives after the DISCONNECTED that
+/// deleted it — the INSERT sees no row and recreates one carrying a session
+/// nobody holds. With a tombstone, that late CONNECTED's session-guarded
+/// UPDATE still misses (no row has that `session_id` — NULL never equals a
+/// bound parameter) and its fallback INSERT is now an `ON CONFLICT DO
+/// NOTHING` against an EXISTING row (the tombstone), so it no-ops instead of
+/// resurrecting. A genuine later `register_fresh` still reuses the row: its
+/// freshly-minted epoch is always higher than whatever the tombstoned row
+/// retained, so the guarded UPSERT wins unconditionally.
+///
+/// `reap_stale_routes()` is the durable-directory-hygiene reaper (#7 in the
+/// 4.2 design doc) for two row shapes this store accumulates over time: (a)
+/// a route whose lease has been expired for longer than a grace window (a
+/// gateway that stopped renewing — crashed, network-partitioned, or the
+/// agent disconnected without a clean DISCONNECTED notification), and (b) a
+/// tombstoned/never-announced row (`lease_until IS NULL`) old enough that it
+/// is definitely not mid-handshake. See the header comment on
+/// `reap_stale_routes` for the clock-guarded-retention adoption record.
+///
 /// Born-on-Postgres (ADR-0009 fresh-start): no legacy SQLite file, no
 /// backfill — this store never existed before WS-4.
 
@@ -98,7 +123,19 @@ struct AnnounceResult {
 
 /// Outcome of `deregister`.
 struct DeregisterResult {
-    bool removed{false}; ///< true iff a row owned by this session was deleted
+    bool removed{false}; ///< true iff a row owned by this session was tombstoned
+};
+
+/// Outcome of `reap_stale_routes`. `clock_anomaly` mirrors
+/// `SessionStore::ReapOutcome` (session_store.hpp): true iff the pass was
+/// DECLINED because a clock-guard-critical reading (DB `now()` or the
+/// persisted `route_meta` anchor) was unusable — implausibly ahead of, or
+/// behind, the anchor, or unparseable/negative. A declined pass reaps
+/// nothing and leaves the anchor unchanged.
+struct ReapRoutesResult {
+    int expired_leases_reaped{0}; ///< predicate (a): lease_until past the grace window
+    int tombstones_reaped{0};     ///< predicate (b): NULL-lease rows past the purge age
+    bool clock_anomaly{false};
 };
 
 /// A durable agent→cluster route, as read by `lookup_route`. Timestamps are
@@ -147,9 +184,11 @@ public:
                        std::string_view cluster_id, std::string_view gateway_node,
                        int lease_ttl_secs);
 
-    /// Remove the agent's route row, but ONLY if it still belongs to
-    /// `session_id` (a stale DISCONNECTED from a superseded session must not
-    /// tear down a newer re-home).
+    /// TOMBSTONE the agent's route row (session_id/lease_until/cluster_id/
+    /// gateway_node -> NULL; `connection_epoch` retained), but ONLY if the row
+    /// still belongs to `session_id` (a stale DISCONNECTED from a superseded
+    /// session must not tear down a newer re-home). See the file header
+    /// "SLICE 4.2a" note for why this is an UPDATE, not a DELETE.
     [[nodiscard]] std::expected<DeregisterResult, GatewayRouteStoreError>
     deregister(std::string_view agent_id, std::string_view session_id);
 
@@ -164,7 +203,38 @@ public:
     [[nodiscard]] std::expected<std::optional<RouteRow>, GatewayRouteStoreError>
     lookup_route(std::string_view agent_id);
 
-    /// The schema migrations for this store (version 1). Exposed for tests and
+    /// Directory-hygiene reaper (4.2a, #7 in the ADR-2002 §7 "4.2 design
+    /// obligations" list). CLOCK-GUARDED-RETENTION ADOPTION RECORD (routed
+    /// concern, CLAUDE.md; the full seven parts are in
+    /// docs/clock-guarded-retention.md) — mirrors `SessionStore::reap_expired`
+    /// (session_store.cpp):
+    ///  - Part 2/3 (persisted, sanitised clock reading): a `route_meta`
+    ///    anchor (migration v2) + Postgres `now()` read ONCE in-SQL under a
+    ///    dedicated advisory lock (`gateway_route_store:reap`) — the SAME
+    ///    clock domain that authors `lease_until`/`updated_at`.
+    ///  - Part 5 (unconditional cap): every accepted pass caps each of the
+    ///    two sweeps independently.
+    ///  - Part 6 (missing-anchor decision): **PROCEED** on the first pass —
+    ///    `ResultSetStore`'s answer. A route is regenerable by the agent's
+    ///    next heartbeat/`ProxyRegister`, so a from-boot skewed clock
+    ///    reaping a batch of already-stale rows on the very first pass is an
+    ///    acceptable worst case, never non-reproducible evidence loss.
+    ///  - Parts 1 (would-wipe probe) and 4 (fact-set anomaly dedup) are
+    ///    DELIBERATELY CARVED OUT, the `api_token_store`/`SessionStore`
+    ///    precedent: (1) this table drains toward "everything reapable" as
+    ///    ROUTINE behaviour (a fleet going offline overnight legitimately
+    ///    expires every lease), so a would-wipe verdict cannot separate a
+    ///    true positive from that routine case; (4) a declined pass is
+    ///    `spdlog::warn`'d — Task C's metrics wiring is the fact-set
+    ///    equivalent for this store, not a fourth latch.
+    /// SINGLE-WRITER today (advisory lock scoped to one dedicated key); becomes
+    /// PG-shared-state under the same ADR-0012 lock when a 2nd replica lands
+    /// (matches every other reaper in the register).
+    [[nodiscard]] std::expected<ReapRoutesResult, GatewayRouteStoreError>
+    reap_stale_routes();
+
+    /// The schema migrations for this store (version 2: v1 the `agent_routes`
+    /// table, v2 the `route_meta` reaper-anchor table). Exposed for tests and
     /// the migration ladder.
     static const std::vector<pg::PgMigration>& migrations();
 

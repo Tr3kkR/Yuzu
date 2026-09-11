@@ -7,9 +7,12 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm> // std::max (reap anchor) — not transitively guaranteed on libc++
+#include <cerrno> // errno — checked parse of the clock-guard-critical readings (session_store.cpp #3785 idiom)
 #include <charconv>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib> // std::strtoll — parse_reap_i64
 #include <string>
 #include <string_view>
 #include <vector>
@@ -27,8 +30,73 @@ constexpr const char* kStoreName = "gateway_route_store";
 // connect/disconnect notification path, not a synchronous operator request,
 // so modest deadlines are fine; the caller has its own retry on the next
 // notification.
-constexpr std::chrono::milliseconds kWriteTimeout{2000};
+//
+// #9 (4.2a): kWriteTimeout deliberately DIFFERS from the 2s codebase norm
+// (session_store.cpp:34, command_outbox_store.cpp:32) at 500ms. Every writer
+// here (register_fresh/announce_connected/deregister/renew_leases) runs
+// SYNCHRONOUSLY on a gRPC handler thread on the agent heartbeat/connect hot
+// path (agent_service_impl.cpp's BatchHeartbeat, gateway_service_impl.cpp's
+// ProxyRegister/ProxyStreamStatus) — a 2s stall under pool pressure pins that
+// thread for 2s per call, and these calls are already fail-open (a degraded
+// write here never fails the RPC — see record_route_store_failure in
+// gateway_service_impl.cpp). A short bound fails fast back to "log and
+// proceed" instead of holding the handler thread hostage; the expected
+// consequence is that yuzu_server_gateway_route_write_failed_total rises
+// under real pool pressure rather than every heartbeat blocking for 2s each.
+// reap_stale_routes() is a background pass, not a handler-thread call, so it
+// deliberately keeps the 2s norm (kReapWriteTimeout below) rather than this
+// shortened one.
+constexpr std::chrono::milliseconds kWriteTimeout{500};
 constexpr std::chrono::milliseconds kReadTimeout{2000};
+
+// reap_stale_routes() runs off a background timer (Task B's job wiring), not
+// a gRPC handler thread, so it keeps the 2s codebase norm rather than the
+// hot-path-motivated kWriteTimeout above.
+constexpr std::chrono::milliseconds kReapWriteTimeout{2000};
+
+// ---------------------------------------------------------------------------
+// reap_stale_routes() constants (clock-guarded-retention, see this store's
+// header + docs/clock-guarded-retention.md). Copy the SHAPE from
+// SessionStore::reap_expired, never the numbers — every constant here is
+// substrate/store-specific.
+//
+// The lease TTL agents/gateways renew against is
+// gateway_service_impl.cpp::kGatewayRouteLeaseTtlSecs = 90s. That file is out
+// of this task's scope (owned by Task C) and this store has no dependency on
+// the gateway wiring layer, so the value is DELIBERATELY DUPLICATED here as a
+// plain comment-documented constant rather than an include — a future TTL
+// bump there must be mirrored here (kStaleLeaseGraceSecs must stay >= 1x that
+// TTL) or a merely-late heartbeat mid-renew starts getting reaped.
+constexpr int kKnownLeaseTtlSecs = 90; // gateway_service_impl.cpp's kGatewayRouteLeaseTtlSecs
+
+// Grace >= 1 lease TTL (task spec): 2x tolerates a FULL missed renewal cycle
+// (not just the last heartbeat's worth of jitter) before treating a lease as
+// truly dead, mirroring the "tolerate a couple of missed heartbeats" margin
+// already chosen for the TTL itself.
+constexpr int kStaleLeaseGraceSecs = 2 * kKnownLeaseTtlSecs; // 180s
+
+// Tombstone/never-announced purge age: deliberately SHORT (task spec) — a
+// tombstone or a stuck mid-handshake row carries no state worth preserving
+// beyond letting a genuine register_fresh find and reuse the primary-keyed
+// row, which works whether the row exists or not (its higher minted epoch
+// always wins). ~3.3x the TTL is comfortably longer than the lease-grace
+// window (so this predicate never races predicate (a) over the same row)
+// and short enough that dead rows do not linger in the directory.
+constexpr int kTombstonePurgeAgeSecs = 300; // 5 minutes
+
+// Unconditional per-predicate cap (part 5) — follows session_store.cpp's
+// kReapCap shape (a hard ceiling that always applies, regardless of what the
+// clock/anomaly guards decide).
+constexpr int kReapCap = 5000;
+
+// Part 1's implausibility bound, PER THIS STORE (never copied from another
+// store's constant — docs/clock-guarded-retention.md part 1). This store's
+// entire liveness horizon is under ten minutes (grace 180s + purge-age 300s
+// == 480s); a `now()` reading more than a day ahead of the last accepted
+// pass is already ~180x that horizon and cannot be legitimate operation,
+// while staying far below SessionStore's 366-day bound (sized to a human
+// session's plausible lifetime, not this store's sub-10-minute signal).
+constexpr std::int64_t kMaxPlausibleSkewMs = 24LL * 3600 * 1000; // 1 day
 
 std::optional<std::int64_t> parse_ms(const char* v) {
     if (v == nullptr || *v == '\0')
@@ -45,6 +113,21 @@ std::optional<std::string> col_opt(PGresult* r, int row, int col) {
     if (PQgetisnull(r, row, col))
         return std::nullopt;
     return std::string(PQgetvalue(r, row, col));
+}
+
+// Checked parse for the two clock-guard-critical readings in
+// reap_stale_routes (the DB now() column and the persisted route_meta
+// anchor) — mirrors session_store.cpp's parse_reap_i64 (#3785): unparseable,
+// empty, or negative is an ANOMALY, never a quiet reset. A second hand-rolled
+// copy is the accepted drift for a three-line function (see that file's
+// comment) rather than a shared-utility header.
+std::optional<std::int64_t> parse_reap_i64(const std::string& val) {
+    errno = 0;
+    char* end = nullptr;
+    const long long v = std::strtoll(val.c_str(), &end, 10);
+    if (val.empty() || errno != 0 || end == val.c_str() || *end != '\0')
+        return std::nullopt;
+    return static_cast<std::int64_t>(v);
 }
 
 } // namespace
@@ -78,6 +161,14 @@ CREATE TABLE agent_routes (
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX agent_routes_session_id_idx ON agent_routes (session_id);
+)"},
+        // v2 (4.2a): reap_stale_routes()'s persisted, sanitised clock anchor
+        // (clock-guarded-retention parts 2/3), mirroring session_store's
+        // session_meta / execution_tracker's reap_meta anchor tables. Plain
+        // key/value, additive, no backfill (ADR-0009 — this store is
+        // born-on-Postgres and route_meta never existed before this slice).
+        {2, R"(
+CREATE TABLE IF NOT EXISTS route_meta(key TEXT PRIMARY KEY, value TEXT);
 )"},
     };
     return kMigrations;
@@ -246,10 +337,29 @@ GatewayRouteStore::deregister(std::string_view agent_id, std::string_view sessio
     }
     // Session-guarded: a stale DISCONNECTED from a superseded session must not
     // tear down a newer re-home's row.
+    //
+    // TOMBSTONE, not DELETE (file header "SLICE 4.2a", closes 4.2 design-doc
+    // obligations #4/#5). A DELETE lets a late/reordered CONNECTED for this
+    // same (now-gone) session resurrect the route via announce_connected's
+    // fallback `ON CONFLICT DO NOTHING` INSERT, because that fallback only
+    // refuses to clobber a row that EXISTS — against no row at all it just
+    // recreates one. Tombstoning leaves the row in place with
+    // `session_id IS NULL AND lease_until IS NULL` (the tombstone
+    // definition): the late CONNECTED's session-guarded UPDATE still misses
+    // (NULL never equals a bound `session_id` parameter) and its fallback
+    // INSERT now hits `ON CONFLICT (agent_id) DO NOTHING` against the
+    // EXISTING tombstoned row, so it no-ops instead of reviving a dead
+    // route. `connection_epoch` is retained (NOT reset) — it is the
+    // anti-replay fence's ratchet; a genuine later register_fresh mints a
+    // strictly higher epoch and always wins the guarded UPSERT regardless of
+    // what the tombstoned row's epoch is, so retaining it costs nothing and
+    // avoids re-litigating fence state on every deregister/reconnect cycle.
     pg::PgResult res = pg::exec_params(
         lease.get(),
-        "DELETE FROM gateway_route_store.agent_routes WHERE agent_id=$1 AND session_id=$2 "
-        "RETURNING agent_id",
+        "UPDATE gateway_route_store.agent_routes SET "
+        "  session_id=NULL, lease_until=NULL, cluster_id=NULL, gateway_node=NULL, "
+        "  updated_at=now() "
+        "WHERE agent_id=$1 AND session_id=$2 RETURNING agent_id",
         std::vector<std::optional<std::string>>{std::string(agent_id), std::string(session_id)});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("GatewayRouteStore::deregister: query failed: {}",
@@ -333,6 +443,197 @@ GatewayRouteStore::lookup_route(std::string_view agent_id) {
                               : parse_ms(PQgetvalue(res.get(), 0, 5));
     row.is_stale = std::string_view(PQgetvalue(res.get(), 0, 6)) == "t";
     return std::optional<RouteRow>(std::move(row));
+}
+
+std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_stale_routes() {
+    if (!open_)
+        return std::unexpected(GatewayRouteStoreError::store_unavailable);
+
+    // Clock-guarded, single-writer across replicas (SessionStore::reap_expired
+    // shape — see the header comment on this method and
+    // docs/clock-guarded-retention.md). The advisory lock is its OWN
+    // statement, first, inside the txn (a CTE-embedded lock has the same
+    // fixed-snapshot hazard session_store.cpp's comment describes). now_ms is
+    // the DB clock (Postgres now(), read once in-SQL under the lock — the
+    // SAME clock that authors lease_until/updated_at), sanitised against a
+    // persisted route_meta anchor so a forward- or backward-skewed reading is
+    // DECLINED, not acted on. Every accepted pass is unconditionally capped
+    // per predicate.
+    int expired_leases_reaped = 0;
+    int tombstones_reaped = 0;
+    bool clock_anomaly = false;
+    std::string err;
+    const bool ok = pool_.with_txn_for(kReapWriteTimeout, [&](PGconn* c) -> bool {
+        if (pg::exec_params(c, "SELECT pg_advisory_xact_lock(hashtext('gateway_route_store:reap'))",
+                            std::vector<std::string>{})
+                .status() != PGRES_TUPLES_OK) {
+            err = "reap advisory lock failed";
+            return false;
+        }
+        std::int64_t now_ms = 0;
+        {
+            pg::PgResult nr = pg::exec_params(
+                c, "SELECT (extract(epoch FROM now()) * 1000)::bigint", std::vector<std::string>{});
+            if (nr.status() != PGRES_TUPLES_OK || PQntuples(nr.get()) == 0) {
+                err = "reap now() read failed";
+                return false;
+            }
+            // SANITISE (clock-guarded-retention part 3): unparseable or
+            // negative is an ANOMALY, never a quiet fallback.
+            const std::string now_raw = PQgetvalue(nr.get(), 0, 0);
+            auto parsed_now = parse_reap_i64(now_raw);
+            if (!parsed_now || *parsed_now < 0) {
+                spdlog::warn("GatewayRouteStore::reap_stale_routes declined: unparseable or "
+                             "negative now() reading '{}'",
+                             now_raw);
+                clock_anomaly = true;
+                return true; // decline (commit the no-op lock release), anchor unchanged
+            }
+            now_ms = *parsed_now;
+        }
+        // Persisted anchor = the max now_ms any prior pass accepted. A
+        // reading implausibly far ahead of, or behind, it is an anomaly:
+        // decline this pass, do not advance the anchor.
+        pg::PgResult ar = pg::exec_params(
+            c, "SELECT value FROM gateway_route_store.route_meta WHERE key='reap_anchor_ms'",
+            std::vector<std::string>{});
+        if (ar.status() != PGRES_TUPLES_OK) {
+            err = "reap anchor read failed";
+            return false;
+        }
+        const bool has_anchor = PQntuples(ar.get()) > 0;
+        std::int64_t anchor = 0;
+        if (has_anchor) {
+            const std::string anchor_raw = PQgetvalue(ar.get(), 0, 0);
+            auto parsed_anchor = parse_reap_i64(anchor_raw);
+            if (!parsed_anchor || *parsed_anchor < 0) {
+                spdlog::warn("GatewayRouteStore::reap_stale_routes declined: unparseable or "
+                             "negative persisted anchor '{}'",
+                             anchor_raw);
+                clock_anomaly = true;
+                return true; // decline, anchor unchanged
+            }
+            anchor = *parsed_anchor;
+        }
+        // Overflow-safe forward-skew comparison (mirrors session_store.cpp's
+        // #3785 round-2 fix): subtracting (not adding) two already-sanitised
+        // non-negative int64_t values cannot overflow.
+        if (has_anchor && now_ms >= anchor && now_ms - anchor > kMaxPlausibleSkewMs) {
+            spdlog::warn("GatewayRouteStore::reap_stale_routes declined: now_ms {} implausibly "
+                         "ahead of anchor {}",
+                         now_ms, anchor);
+            clock_anomaly = true;
+            return true; // decline, anchor unchanged
+        }
+        // BACKWARD-anomaly guard: now_ms below the highest accepted reading
+        // means the wall clock moved backward, or an earlier forward-skewed
+        // pass poisoned the anchor. Decline (never reap under a rewound
+        // clock; never regress the anchor) — the safe direction, matching
+        // session_store.cpp: a poisoned anchor disables reap (rows accrue,
+        // alertable) rather than mass-reaping live routes when a later,
+        // smaller forward skew reads as "behind" it.
+        if (has_anchor && now_ms < anchor) {
+            spdlog::warn("GatewayRouteStore::reap_stale_routes declined: now_ms {} is behind "
+                         "anchor {} (backward clock movement or a poisoned anchor)",
+                         now_ms, anchor);
+            clock_anomaly = true;
+            return true;
+        }
+
+        // Accepted pass: TWO capped sweeps in the same transaction, both
+        // comparing epoch-ms cutoffs derived from the ONE sanitised now_ms
+        // read above (never a fresh in-SQL now() per statement — the cutoff,
+        // the anchor comparison, and the anchor update below all stay in the
+        // ONE clock domain read once under the lock).
+
+        // (a) Expired-lease routes: lease_until past the grace window. Grace
+        // (>= 1 lease TTL, task spec) means a merely-late heartbeat mid-renew
+        // is never reaped here. ACTION is the same TOMBSTONE `deregister`
+        // performs (retain connection_epoch, NULL the rest) rather than a
+        // hard delete: the associated session may still be alive and simply
+        // stopped renewing (network partition), and a late DISCONNECTED for
+        // it arriving after this pass must still land as a no-op against a
+        // tombstoned row rather than an error against a vanished one.
+        {
+            const std::int64_t cutoff_a_ms = now_ms - static_cast<std::int64_t>(kStaleLeaseGraceSecs) * 1000;
+            pg::PgResult dr = pg::exec_params(
+                c,
+                "UPDATE gateway_route_store.agent_routes SET "
+                "  session_id=NULL, lease_until=NULL, cluster_id=NULL, gateway_node=NULL, "
+                "  updated_at=now() "
+                "WHERE agent_id IN (SELECT agent_id FROM gateway_route_store.agent_routes "
+                "  WHERE lease_until IS NOT NULL "
+                "    AND (extract(epoch FROM lease_until) * 1000)::bigint < $1::bigint "
+                "  LIMIT $2::bigint) "
+                "RETURNING agent_id",
+                std::vector<std::string>{std::to_string(cutoff_a_ms), std::to_string(kReapCap)});
+            if (dr.status() != PGRES_TUPLES_OK) {
+                err = std::string("reap expired-lease sweep failed: ") + PQerrorMessage(c);
+                return false;
+            }
+            expired_leases_reaped = PQntuples(dr.get());
+        }
+
+        // (b) Tombstoned / never-announced rows (lease_until IS NULL) whose
+        // `updated_at` is older than the SHORT purge age (task spec) — this
+        // catches both a real tombstone (session_id also NULL, left by
+        // deregister or by sweep (a) above) and a row stuck since
+        // register_fresh that never got an announce_connected. ACTION is a
+        // hard DELETE, not a re-tombstone: by the purge age (well past any
+        // plausible network-reordering window for a CONNECTED/DISCONNECTED
+        // pair) a resurrection from a late notification is not a realistic
+        // risk, and a genuine later register_fresh works identically whether
+        // the row exists or not (INSERT with no conflict, always wins).
+        {
+            const std::int64_t cutoff_b_ms =
+                now_ms - static_cast<std::int64_t>(kTombstonePurgeAgeSecs) * 1000;
+            pg::PgResult dr = pg::exec_params(
+                c,
+                "DELETE FROM gateway_route_store.agent_routes WHERE agent_id IN "
+                "  (SELECT agent_id FROM gateway_route_store.agent_routes "
+                "     WHERE lease_until IS NULL "
+                "       AND (extract(epoch FROM updated_at) * 1000)::bigint < $1::bigint "
+                "     LIMIT $2::bigint) "
+                "RETURNING agent_id",
+                std::vector<std::string>{std::to_string(cutoff_b_ms), std::to_string(kReapCap)});
+            if (dr.status() != PGRES_TUPLES_OK) {
+                err = std::string("reap tombstone-purge sweep failed: ") + PQerrorMessage(c);
+                return false;
+            }
+            tombstones_reaped = PQntuples(dr.get());
+        }
+
+        // Advance the persisted anchor to the max now_ms any accepted pass
+        // has seen (std::max parenthesised to dodge the <windows.h> `max`
+        // function-like macro, MSVC — session_store.cpp idiom).
+        const std::int64_t new_anchor = has_anchor ? (std::max)(anchor, now_ms) : now_ms;
+        pg::PgResult ur = pg::exec_params(
+            c,
+            "INSERT INTO gateway_route_store.route_meta (key, value) VALUES "
+            "('reap_anchor_ms', $1) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
+            std::vector<std::string>{std::to_string(new_anchor)});
+        if (ur.status() != PGRES_COMMAND_OK) {
+            err = "reap anchor update failed";
+            return false;
+        }
+        return true;
+    });
+    if (!ok) {
+        // `err` stays empty when with_txn_for itself failed before the lambda
+        // ran a single statement (a try_acquire_for lease timeout, or BEGIN
+        // failing on a broken connection) — that is the same "degraded, not a
+        // query bug" case every other method here reports as
+        // store_unavailable. `err` non-empty means the lambda's own guard set
+        // it on a specific statement failure: a real db_error.
+        if (err.empty()) {
+            spdlog::warn("GatewayRouteStore::reap_stale_routes: lease timeout or txn-begin "
+                         "failure — degraded");
+            return std::unexpected(GatewayRouteStoreError::store_unavailable);
+        }
+        spdlog::error("GatewayRouteStore::reap_stale_routes: {}", err);
+        return std::unexpected(GatewayRouteStoreError::db_error);
+    }
+    return ReapRoutesResult{expired_leases_reaped, tombstones_reaped, clock_anomaly};
 }
 
 } // namespace yuzu::server
