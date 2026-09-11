@@ -3746,11 +3746,15 @@ namespace {
 struct ScratchDir {
     std::filesystem::path dir;
     std::filesystem::path file;
+    // yuzu_test_ prefix (not the original hand-rolled "spark_fileb2_...") so this
+    // lands inside the Wee Tam Defender path-exclusion wildcard 'yuzu_*'
+    // (scripts/windows-runner-defender-exclusions.ps1) - governance quality-engineer
+    // SHOULD-1 / consistency-auditor C-2, same flake class as #473/#482.
+    // yuzu::test::unique_temp_path also adds a monotonic per-process counter on top
+    // of process_random_salt() (which alone is constant within one process), so two
+    // ScratchDirs sharing a tag can no longer collide either.
     explicit ScratchDir(const char* tag) {
-        dir = std::filesystem::temp_directory_path() /
-             ("spark_fileb2_" + std::string(tag) + "_" +
-              std::to_string(::GetCurrentProcessId()) + "_" +
-              std::to_string(yuzu::test::process_random_salt() % 1000000000));
+        dir = yuzu::test::unique_temp_path("yuzu_test_spark_fileb2_" + std::string(tag) + "_");
         std::filesystem::create_directories(dir);
         file = dir / "watched.txt";
         { std::ofstream(file) << "seed"; }
