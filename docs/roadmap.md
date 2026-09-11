@@ -2149,8 +2149,8 @@ before acting on any "open" / "in progress" claim:
    step-up exists but isn't wired to approval), 13.3 (monitoring UI), 13.4 (branding). 13.2 and 13.5
    already shipped.
 8. **Phase 14** — Remaining scale items: 14.1 (P2P content), 14.2 (multi-gateway), 14.4–14.5
-   (additional connectors — nominally depend on the now-deferred Phase 9). 14.3 Partial (closed
-   not-planned; the sharding design was obsoleted by the Postgres substrate — see the Index row);
+   (additional connectors — nominally depend on the now-deferred Phase 9). 14.3 Partial (Closed —
+   not planned; the sharding design was obsoleted by the Postgres substrate — see the Index row);
    14.6 superseded by the ADR-2002 HA program above.
 9. **Phase 9 (demoted)** — Connector framework. **Deferred.** **Owner decision (2026-09-07):**
    declared next priority since 2026-03 with zero commits; whether connectors are core estate-fact
