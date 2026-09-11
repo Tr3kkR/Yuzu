@@ -161,13 +161,26 @@ FORBIDDEN_HEADER_PATTERNS = [
 ]
 
 # ── Family definitions ────────────────────────────────────────────────────
-# One family so far: `network` (WS-A4 item 1's pilot). The set covers the
+# Two families so far: `network` (WS-A4 item 1's pilot) and `verify` (WS-A4
+# #4250, the SECOND family through the seam). Each set covers the
 # presentation-side TUs plus BOTH halves of the seam header pair: the
-# abstract `network_api.hpp` and the core-only `network_api_local.hpp`
-# (#4249). Enforcing the local header pins its own purity (forward decls
-# only); it cannot self-match `*_api_local.hpp` because a TU is excluded
-# from its own closure. A declared-but-missing TU is a hard error - see
-# `check_family()`.
+# abstract `*_api.hpp` and the core-only `*_api_local.hpp` (#4249). Enforcing
+# the local header pins its own purity (forward decls only); it cannot
+# self-match `*_api_local.hpp` because a TU is excluded from its own closure.
+# A declared-but-missing TU is a hard error - see `check_family()`.
+#
+# `verify`'s closure was NOT clean before #4250's rewire: `verify_routes.hpp`
+# used to include `dex_app_perf_model.hpp` (for the retired `AppPerfCohortFn`)
+# AND `dex_routes.hpp` (for `DexRoutes::AuditFn`) - the latter transitively
+# reaches `dex_app_perf_ui.hpp` -> `dex_app_perf_model.hpp` regardless, which
+# itself `#include`s `app_perf_daily_store.hpp` + `app_perf_fleet_store.hpp`
+# (both `*_store.hpp`). The rewire (1) replaced the cohort provider with the
+# `VerifyApi` seam, (2) relocated the pure `app_perf_param_valid`/
+# `kAppPerfParamCap` validator out of `dex_app_perf_model.hpp` into the
+# already-pure `app_perf_compare.hpp`, and (3) defined `VerifyRoutes::AuditFn`
+# LOCALLY (same shape as `DexRoutes::AuditFn`/`NetworkRoutes::AuditFn`)
+# instead of borrowing `dex_routes.hpp` for one type alias - which is what
+# actually makes this family's closure clean, not merely dropping one include.
 FAMILIES = {
     "network": {
         "tus": [
@@ -176,6 +189,14 @@ FAMILIES = {
             "server/core/src/network_perf_model.cpp",
             "server/core/src/network_api.hpp",
             "server/core/src/network_api_local.hpp",
+        ],
+    },
+    "verify": {
+        "tus": [
+            "server/core/src/verify_routes.cpp",
+            "server/core/src/verify_ui.cpp",
+            "server/core/src/verify_api.hpp",
+            "server/core/src/verify_api_local.hpp",
         ],
     },
 }

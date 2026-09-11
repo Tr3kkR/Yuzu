@@ -1745,7 +1745,8 @@ void RestApiV1::register_routes(
     AuthDB* auth_db, DirectorySync* directory_sync, detail::StreamBudget* stream_budget,
     ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn, FleetReadFn fleet_read_fn,
     AgentsJsonFn agents_fn, ResponseVisibleSetFn response_visible_set_fn,
-    DexFleetFn dex_fleet_fn, DexVisibleFn dex_visible_fn) {
+    DexFleetFn dex_fleet_fn, DexVisibleFn dex_visible_fn,
+    std::shared_ptr<const VerifyApi> verify_api) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -1762,7 +1763,7 @@ void RestApiV1::register_routes(
                     auth_db, directory_sync, stream_budget, std::move(exec_visible_fn),
                     std::move(list_read_fn), std::move(fleet_read_fn), std::move(agents_fn),
                     std::move(response_visible_set_fn), std::move(dex_fleet_fn),
-                    std::move(dex_visible_fn));
+                    std::move(dex_visible_fn), std::move(verify_api));
 }
 
 void RestApiV1::register_routes(
@@ -1786,7 +1787,8 @@ void RestApiV1::register_routes(
     AuthDB* auth_db, DirectorySync* directory_sync, detail::StreamBudget* stream_budget,
     ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn, FleetReadFn fleet_read_fn,
     AgentsJsonFn agents_fn, ResponseVisibleSetFn response_visible_set_fn,
-    DexFleetFn dex_fleet_fn, DexVisibleFn dex_visible_fn) {
+    DexFleetFn dex_fleet_fn, DexVisibleFn dex_visible_fn,
+    std::shared_ptr<const VerifyApi> verify_api) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -12588,7 +12590,7 @@ void RestApiV1::register_routes(
     // route already audits its success path under that verb.
     sink.Get(
         "/api/v1/dex/perf/compare",
-        [perm_fn, audit_fn, app_perf_providers,
+        [perm_fn, audit_fn, verify_api,
          deny_fleet_wide_service_scoped](const httplib::Request& req, httplib::Response& res) {
             if (deny_fleet_wide_service_scoped(
                     req, res, "dex.app_perf.compare", "GuaranteedState",
@@ -12599,7 +12601,7 @@ void RestApiV1::register_routes(
                 return;
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
-            if (!app_perf_providers.cohort) {
+            if (!verify_api) {
                 res.status = 503;
                 res.set_content(detail::error_json_a4(
                                     503, "service unavailable", cid, /*retry_after_ms=*/5000,
@@ -12651,8 +12653,9 @@ void RestApiV1::register_routes(
             }
             window = std::clamp(window, 1, AppPerfDailyStore::kRetentionDays);
 
-            auto cohort = app_perf_providers.cohort(group_id, app, baseline, candidate, window);
-            if (!cohort) { // AUTHORITATIVE degrade (member resolution OR row read)
+            VerifyCompareQuery vq{group_id, app, baseline, candidate, window};
+            auto result = verify_api->compare(vq);
+            if (!result) { // AUTHORITATIVE degrade (member resolution OR row read)
                 res.status = 503;
                 res.set_content(
                     detail::error_json_a4(503, "app-perf cohort read degraded", cid,
@@ -12661,10 +12664,8 @@ void RestApiV1::register_routes(
                     "application/json");
                 return;
             }
-            const PairedComparison c =
-                build_comparison(cohort->rows, yuzu::util::canon_version(baseline),
-                                 yuzu::util::canon_version(candidate), window);
-            const std::int64_t no_data = cohort_no_data(c, cohort->member_count);
+            const PairedComparison& c = result->comparison;
+            const std::int64_t no_data = cohort_no_data(c, result->member_count);
 
             // OPERATIONAL audit, set-and-proceed (NOT fail-closed — this is an
             // aggregate, the per-machine drill is the fail-closed surface). Records
@@ -12675,7 +12676,7 @@ void RestApiV1::register_routes(
             detail::emit_behavioral_audit(
                 audit_fn, req, res, "dex.app_perf.compare", "success", "GuaranteedState", group_id,
                 "app=" + audit_token(app) + " base=" + audit_token(baseline) + " cand=" +
-                    audit_token(candidate) + " cohort=" + std::to_string(cohort->member_count) +
+                    audit_token(candidate) + " cohort=" + std::to_string(result->member_count) +
                     " paired=" + std::to_string(c.paired) + " view=aggregate cid=" + cid);
 
             const std::string cpu = JObj()
@@ -12703,7 +12704,7 @@ void RestApiV1::register_routes(
                                         .add("baseline_version", baseline)
                                         .add("candidate_version", candidate)
                                         .add("window_days", static_cast<int64_t>(window))
-                                        .add("cohort_size", cohort->member_count)
+                                        .add("cohort_size", result->member_count)
                                         .add("paired", c.paired)
                                         .add("baseline_only", c.baseline_only)
                                         .add("candidate_only", c.candidate_only)
@@ -12713,7 +12714,7 @@ void RestApiV1::register_routes(
                                         // truncated=true → the cohort exceeded the read
                                         // cap; the counts above are UNRELIABLE (a machine
                                         // that ran both may be mis-read as baseline_only).
-                                        .add("truncated", cohort->truncated)
+                                        .add("truncated", result->truncated)
                                         .raw("cpu", cpu)
                                         .raw("ws", ws)
                                         .raw("distribution", dist)

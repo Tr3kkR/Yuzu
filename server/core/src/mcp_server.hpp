@@ -27,6 +27,7 @@
 #include "dex_app_perf_model.hpp"
 #include "dex_perf_model.hpp"
 #include "network_api.hpp" // ADR-0031 WS-A4: the public in-process /network API seam
+#include "verify_api.hpp" // ADR-0031 WS-A4 #4250: the public in-process VERIFY API seam
 #include "dex_routes.hpp" // #4035: DexFleet -- the DexFleetFn provider seam below
 #include "network_perf_model.hpp"
 #include "execution_tracker.hpp"
@@ -726,7 +727,16 @@ public:
                             // optional dep; unset leaves the tool answering "CA not available"
                             // (kInternalError), the same degradation ca_store==nullptr produces
                             // for list_issued_certs/revoke_certificate above.
-                            IssueCodeSigningFn issue_code_signing_fn = {});
+                            IssueCodeSigningFn issue_code_signing_fn = {},
+                            // ADR-0031 WS-A4 #4250: the public in-process VERIFY API seam
+                            // (replaces the former AppPerfCohortFn-in-AppPerfProviders ad-hoc
+                            // cohort provider for compare_app_perf_versions) — the SAME
+                            // instance GET /api/v1/dex/perf/compare and the /auto VERIFY
+                            // dashboard fragments use, so all three surfaces can never
+                            // disagree. Trailing optional dep; nullptr leaves the tool
+                            // answering an internal-error JSON-RPC response, same degrade
+                            // as the retired cohort provider.
+                            std::shared_ptr<const VerifyApi> verify_api = nullptr);
 
     /// Build the GET/DELETE handlers for /mcp/v1/ (Streamable HTTP transport).
     /// Separate builders so tests can drive them without the httplib acceptor
@@ -824,7 +834,9 @@ public:
                          // forwarded to build_handler.
                          WorkflowEngine* workflow_engine = nullptr,
                          // gap-matrix #10 (ADR-1005 A5 parity) — forwarded to build_handler.
-                         IssueCodeSigningFn issue_code_signing_fn = {});
+                         IssueCodeSigningFn issue_code_signing_fn = {},
+                         // ADR-0031 WS-A4 #4250: see build_handler's doc comment above.
+                         std::shared_ptr<const VerifyApi> verify_api = nullptr);
 
     /// HttpRouteSink overload — testable in-process via TestRouteSink (no httplib
     /// acceptor; the #438 TSan trap). The httplib::Server& overload above wraps
@@ -871,7 +883,9 @@ public:
                          // #4030: backs list_workflows/get_workflow/get_workflow_execution.
                          WorkflowEngine* workflow_engine = nullptr,
                          // gap-matrix #10 (ADR-1005 A5 parity) — forwarded to build_handler.
-                         IssueCodeSigningFn issue_code_signing_fn = {});
+                         IssueCodeSigningFn issue_code_signing_fn = {},
+                         // ADR-0031 WS-A4 #4250: see build_handler's doc comment above.
+                         std::shared_ptr<const VerifyApi> verify_api = nullptr);
 
 private:
     // ── Engine-principal lifecycle wiring (ADR-1005 item 2b, plan PR 4.3) ──

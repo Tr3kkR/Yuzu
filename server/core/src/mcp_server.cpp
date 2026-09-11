@@ -3790,7 +3790,8 @@ McpServer::HandlerFn McpServer::build_handler(
     AuthDB* auth_db, DirectorySync* directory_sync, CallerFn caller_fn,
     yuzu::server::detail::StreamBudget* stream_budget, StreamRevalidateFn revalidate_fn,
     StreamPrincipalAuditFn principal_audit_fn, ProductPackStore* product_pack_store,
-    WorkflowEngine* workflow_engine, IssueCodeSigningFn issue_code_signing_fn) {
+    WorkflowEngine* workflow_engine, IssueCodeSigningFn issue_code_signing_fn,
+    std::shared_ptr<const VerifyApi> verify_api) {
 
     // Live reads via a pointer captured by value in the [=] handler below, so a
     // runtime settings-UI toggle of mcp_read_only / mcp_disable reaches this
@@ -10434,7 +10435,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
                     return;
-                if (!app_perf_providers.cohort) {
+                if (!verify_api) {
                     res.set_content(
                         error_response(id, kInternalError, "app-perf store provider unavailable",
                                        a4_data(mcp::kMcpProviderWarmupRetryMs, "retry after server warmup; the app-perf store "
@@ -10482,8 +10483,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 const int window = static_cast<int>(std::clamp<std::int64_t>(
                     param_int(args, "window", 7), 1, AppPerfDailyStore::kRetentionDays));
 
-                auto cohort = app_perf_providers.cohort(group, app, baseline, candidate, window);
-                if (!cohort) { // AUTHORITATIVE degrade
+                VerifyCompareQuery vq{group, app, baseline, candidate, window};
+                auto result = verify_api->compare(vq);
+                if (!result) { // AUTHORITATIVE degrade
                     res.set_content(
                         error_response(id, kInternalError, "app-perf cohort read degraded",
                                        a4_data(mcp::kMcpStoreFaultShortRetryMs, "the app-perf store could not be read; retry "
@@ -10491,10 +10493,8 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                const PairedComparison c =
-                    build_comparison(cohort->rows, yuzu::util::canon_version(baseline),
-                                     yuzu::util::canon_version(candidate), window);
-                const std::int64_t no_data = cohort_no_data(c, cohort->member_count);
+                const PairedComparison& c = result->comparison;
+                const std::int64_t no_data = cohort_no_data(c, result->member_count);
                 const std::string cpu = JObj()
                                             .add("before_mean", c.cpu_before_mean)
                                             .add("after_mean", c.cpu_after_mean)
@@ -10525,7 +10525,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     mcp_audit("success", "group=" + audit_token(group) + " app=" + audit_token(app) +
                                              " base=" + audit_token(baseline) + " cand=" +
                                              audit_token(candidate) + " cohort=" +
-                                             std::to_string(cohort->member_count) + " paired=" +
+                                             std::to_string(result->member_count) + " paired=" +
                                              std::to_string(c.paired));
                 JObj payload_obj;
                 payload_obj.add("app", app)
@@ -10533,7 +10533,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     .add("baseline_version", baseline)
                     .add("candidate_version", candidate)
                     .add("window_days", static_cast<int64_t>(window))
-                    .add("cohort_size", cohort->member_count)
+                    .add("cohort_size", result->member_count)
                     .add("paired", c.paired)
                     .add("baseline_only", c.baseline_only)
                     .add("candidate_only", c.candidate_only)
@@ -10541,7 +10541,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     .add("small_cohort", c.small_cohort)
                     .add("insufficient", c.insufficient)
                     // truncated=true → cohort exceeded the read cap; counts UNRELIABLE.
-                    .add("truncated", cohort->truncated)
+                    .add("truncated", result->truncated)
                     .raw("cpu", cpu)
                     .raw("ws", ws)
                     .raw("distribution", dist);
@@ -17108,7 +17108,8 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 StreamPrincipalAuditFn principal_audit_fn,
                                 CallerFn caller_fn, ProductPackStore* product_pack_store,
                                 WorkflowEngine* workflow_engine,
-                                IssueCodeSigningFn issue_code_signing_fn) {
+                                IssueCodeSigningFn issue_code_signing_fn,
+                                std::shared_ptr<const VerifyApi> verify_api) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
                     std::move(agents_fn), rbac_store, instruction_store, execution_tracker,
@@ -17124,7 +17125,7 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                     auth_db, directory_sync, stream_budget, std::move(revalidate_fn),
                     mcp_max_streams_per_principal, std::move(principal_audit_fn),
                     std::move(caller_fn), product_pack_store, workflow_engine,
-                    std::move(issue_code_signing_fn));
+                    std::move(issue_code_signing_fn), std::move(verify_api));
 }
 
 void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
@@ -17160,7 +17161,8 @@ void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                                 StreamPrincipalAuditFn principal_audit_fn,
                                 CallerFn caller_fn, ProductPackStore* product_pack_store,
                                 WorkflowEngine* workflow_engine,
-                                IssueCodeSigningFn issue_code_signing_fn) {
+                                IssueCodeSigningFn issue_code_signing_fn,
+                                std::shared_ptr<const VerifyApi> verify_api) {
     // GET + DELETE first: they COPY auth_fn / audit_fn / allowed_origins, which
     // build_handler std::move()s below. &mcp_disabled is a live pointer into the
     // cfg_ member (outlives the handlers).
@@ -17192,7 +17194,7 @@ void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                             // held-open worker, whichever verb pinned it.
                             stream_budget, std::move(revalidate_fn),
                             std::move(principal_audit_fn), product_pack_store, workflow_engine,
-                            std::move(issue_code_signing_fn)));
+                            std::move(issue_code_signing_fn), std::move(verify_api)));
 
     // Streaming is ON only when a registry is wired AND the kill switch is off —
     // report the true state, not just the kill-switch bit (governance arch/sre NICE).

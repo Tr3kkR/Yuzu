@@ -54,6 +54,7 @@
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
 #include "test_network_api_double.hpp"
+#include "test_verify_api_double.hpp"
 #include "workflow_engine.hpp" // #4030 Gate 8 fix: mcp_workflow_tpl / get_workflow_execution tests
 // M5 remediation (ADR-0031 operator-surface functional coverage): mcp_server.hpp
 // only forward-declares PluginConfigStore (its .cpp includes the real header) —
@@ -1080,6 +1081,11 @@ struct McpTestServer {
     /// DEX app-perf-over-time (slice 2): optionally wire the AppPerfProviders so the
     /// app-perf tools (list_dex_perf_apps / get_dex_app_perf / get_dex_group_app_perf)
     /// can be exercised. Default empty keeps existing tests on the unavailable path.
+    /// `.cohort` (ADR-0031 WS-A4 #4250) is no longer read by production
+    /// compare_app_perf_versions directly — the harness below wraps it in a
+    /// FnVerifyApi at build time so every EXISTING test setting `.cohort`
+    /// keeps its meaning unchanged; the field stays on `AppPerfProviders`
+    /// purely as this test-only adapter's input shape.
     yuzu::server::AppPerfProviders app_perf_providers_for_test{};
 
     /// #289 / Issue 13.5: optionally wire the write-tool stores so set_tag /
@@ -1382,6 +1388,15 @@ private:
             network_api_for_test =
                 std::make_shared<yuzu::server::test::FnNetworkApi>(net_perf_fn_for_test);
 
+        // ADR-0031 WS-A4 #4250: wrap this file's plain AppPerfCohortFn-shaped
+        // provider (app_perf_providers_for_test.cohort, unchanged shape) in the
+        // VerifyApi seam — an unset `.cohort` stays null (the "provider
+        // unavailable" path), matching the network_api pattern above.
+        std::shared_ptr<const yuzu::server::VerifyApi> verify_api_for_test;
+        if (app_perf_providers_for_test.cohort)
+            verify_api_for_test = std::make_shared<yuzu::server::test::FnVerifyApi>(
+                app_perf_providers_for_test.cohort);
+
         handler = mcp.build_handler(
             std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), std::move(agents_fn),
             /*rbac_store=*/rbac_store_for_test,
@@ -1437,7 +1452,8 @@ private:
             /*principal_audit_fn=*/principal_audit_fn_for_test,
             /*product_pack_store=*/product_pack_store_for_test,
             /*workflow_engine=*/workflow_engine_for_test,
-            /*issue_code_signing_fn=*/issue_code_signing_fn_for_test);
+            /*issue_code_signing_fn=*/issue_code_signing_fn_for_test,
+            /*verify_api=*/verify_api_for_test);
     }
 };
 
