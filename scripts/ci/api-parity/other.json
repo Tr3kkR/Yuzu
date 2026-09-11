@@ -189,7 +189,7 @@
     "capability_id": "get.api-executions-param-summary",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "composed-of:get.fragments-executions-param-detail"
   },
   {
     "method": "POST",
@@ -525,7 +525,7 @@
     "capability_id": "get.fragments-instructions",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "composed-of:get.api-instructions"
   },
   {
     "method": "GET",
@@ -533,7 +533,7 @@
     "capability_id": "get.fragments-instructions-editor",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "composed-of:get.api-instructions-param"
   },
   {
     "method": "POST",
