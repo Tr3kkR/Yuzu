@@ -2856,11 +2856,22 @@ public:
                           "gateway_route_store reap_stale_routes() pass outcomes, by outcome "
                           "(ok|declined|error). declined = the pass was skipped by the "
                           "clock-guarded-retention anomaly guard (implausible or unparseable "
-                          "now()/anchor reading) and reaped nothing; error = the store call "
+                          "now()/anchor reading, or an anomaly that has not yet persisted across "
+                          "a full decline-and-retry) and reaped nothing; error = the store call "
                           "failed outright (pool/query degradation). This is the observable "
-                          "signal for the clock-guarded-retention parts-1/4 carve-out documented "
-                          "in gateway_route_store.hpp's reap_stale_routes header.",
+                          "signal for the clock-guarded-retention part-1 carve-out and the "
+                          "decline-once/drain-on-repeat part-4 guard documented in "
+                          "gateway_route_store.hpp's reap_stale_routes header.",
                           "counter");
+        // PR #4299 review (SHOULD 1, observability-conventions.md:12): seed
+        // every outcome this counter can emit — following the
+        // kQuarantineGateOutcomes/kSystemReservedPushes idiom above — so
+        // `absent()` on any one of them means "never happened", not "nobody
+        // has looked yet". Without this, a healthy server that never once
+        // declines/errors reads identically to one whose reap job never runs
+        // at all.
+        for (const char* outcome : {"ok", "declined", "error"})
+            metrics_.counter("yuzu_server_gateway_route_reap_total", {{"outcome", outcome}});
         // Distinct from the reap-only counter above: this fires on the
         // WRITE path (AgentServiceImpl::record_execution_id, dispatch-time),
         // not the retention sweep. Governance Gate 4/6 finding: previously

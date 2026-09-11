@@ -25,6 +25,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <optional>
@@ -645,8 +646,9 @@ TEST_CASE("GatewayRouteStore[pg]: reap_stale_routes caps the expired-lease sweep
 // clock_anomaly, zero reaps, the anchor byte-for-byte unchanged, and both
 // rows untouched.
 
-TEST_CASE("GatewayRouteStore[pg]: reap declines when the anchor is implausibly BEHIND the "
-          "DB clock (forward skew)",
+TEST_CASE("GatewayRouteStore[pg]: reap declines a forward-skew anomaly ONCE, then RECOVERS "
+          "and drains on an identical repeat (decline-once/drain-on-repeat, PR #4299 review "
+          "BLOCKER 1)",
           "[gateway_route][pg][store][reap]") {
     GatewayRoutePg fx;
     auto baseline = fx.store().reap_stale_routes(); // establishes a real anchor
@@ -670,26 +672,169 @@ TEST_CASE("GatewayRouteStore[pg]: reap declines when the anchor is implausibly B
     const std::string poisoned = std::to_string(fx.raw_db_now_ms() - 2LL * 24 * 3600 * 1000);
     fx.raw_set_reap_anchor(poisoned);
 
+    // Pass 1: DECLINES — identical to the pre-fix behaviour. The anchor is
+    // frozen and nothing is reaped.
+    auto out1 = fx.store().reap_stale_routes();
+    REQUIRE(out1.has_value());
+    CHECK(out1->clock_anomaly);
+    CHECK(out1->expired_leases_reaped == 0);
+    CHECK(out1->tombstones_reaped == 0);
+
+    auto anchor_after1 = fx.raw_get_reap_anchor();
+    REQUIRE(anchor_after1.has_value());
+    CHECK(*anchor_after1 == poisoned); // a declined pass never advances the anchor
+
+    auto live1 = fx.store().lookup_route("agent-fwd-live");
+    REQUIRE(live1.has_value());
+    REQUIRE(live1->has_value());
+    REQUIRE((*live1)->session_id.has_value());
+    CHECK(*(*live1)->session_id == "s-live");
+    auto stale1 = fx.store().lookup_route("agent-fwd-stale");
+    REQUIRE(stale1.has_value());
+    REQUIRE(stale1->has_value());
+    REQUIRE((*stale1)->session_id.has_value());
+    CHECK(*(*stale1)->session_id == "s-stale"); // NOT tombstoned by the declined pass
+
+    // Pass 2: the anchor is STILL the same poisoned value (pass 1 never
+    // advanced it), so the identical anomaly persisting across a FULL
+    // decline pass is exactly what BLOCKER 1's fix treats as genuine
+    // elapsed downtime — this is the recovery this fix exists to provide;
+    // without it, this pass would decline forever (the pre-fix wedge).
+    auto out2 = fx.store().reap_stale_routes();
+    REQUIRE(out2.has_value());
+    CHECK_FALSE(out2->clock_anomaly); // recovered, not a further decline
+    CHECK(out2->expired_leases_reaped == 1); // agent-fwd-stale, past grace
+    CHECK(out2->tombstones_reaped == 0);
+
+    auto live2 = fx.store().lookup_route("agent-fwd-live");
+    REQUIRE(live2.has_value());
+    REQUIRE(live2->has_value());
+    REQUIRE((*live2)->session_id.has_value());
+    CHECK(*(*live2)->session_id == "s-live"); // untouched — its lease is not expired
+
+    auto stale2 = fx.store().lookup_route("agent-fwd-stale");
+    REQUIRE(stale2.has_value());
+    REQUIRE(stale2->has_value());
+    CHECK_FALSE((*stale2)->session_id.has_value()); // tombstoned by the recovered pass
+
+    // The anchor re-anchored to (approximately) the current DB clock —
+    // UNCONDITIONALLY, not max(anchor, now_ms), which would have left it
+    // stuck at the poisoned value forever.
+    auto anchor_after2 = fx.raw_get_reap_anchor();
+    REQUIRE(anchor_after2.has_value());
+    const std::int64_t anchor2 = std::strtoll(anchor_after2->c_str(), nullptr, 10);
+    const std::int64_t poisoned_val = std::strtoll(poisoned.c_str(), nullptr, 10);
+    CHECK(anchor2 > poisoned_val + 1LL * 24 * 3600 * 1000); // re-anchored, not stuck
+}
+
+TEST_CASE("GatewayRouteStore[pg]: a routine >24h gap between accepted passes (weekend "
+          "shutdown / DR failover / extended maintenance) declines once then recovers, "
+          "draining ONLY the genuinely-expired row (PR #4299 review BLOCKER 1)",
+          "[gateway_route][pg][store][reap]") {
+    GatewayRoutePg fx;
+    auto baseline = fx.store().reap_stale_routes(); // establishes a real anchor
+    REQUIRE(baseline.has_value());
+    CHECK_FALSE(baseline->clock_anomaly);
+
+    REQUIRE(fx.store().register_fresh("agent-gap-live", "s-live").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-gap-live", "s-live", "c1", "n1", 3600)
+                .value()
+                .matched);
+    REQUIRE(fx.store().register_fresh("agent-gap-expired", "s-expired").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-gap-expired", "s-expired", "c1", "n1", 30)
+                .value()
+                .matched);
+    fx.raw_set_lease_until_ago("agent-gap-expired", 200); // past the 180s grace
+
+    // Simulate a routine >24h gap between accepted passes — NOT clock
+    // corruption, just a server that was down/idle for a bit over a day, so
+    // the last accepted anchor is now stale relative to the real DB clock.
+    const std::int64_t now_before = fx.raw_db_now_ms();
+    const std::string stale_anchor = std::to_string(now_before - 25LL * 3600 * 1000);
+    fx.raw_set_reap_anchor(stale_anchor);
+
+    // Pass 1: declines — the forward-skew guard cannot yet distinguish a
+    // real gap from a clock glitch on the first observation.
+    auto out1 = fx.store().reap_stale_routes();
+    REQUIRE(out1.has_value());
+    CHECK(out1->clock_anomaly);
+    CHECK(out1->expired_leases_reaped == 0);
+    CHECK(out1->tombstones_reaped == 0);
+    auto anchor_after1 = fx.raw_get_reap_anchor();
+    REQUIRE(anchor_after1.has_value());
+    CHECK(*anchor_after1 == stale_anchor);
+
+    // Pass 2: the identical anomaly persisted across a full pass — RECOVERS,
+    // draining only the row that is genuinely past its grace window.
+    auto out2 = fx.store().reap_stale_routes();
+    REQUIRE(out2.has_value());
+    CHECK_FALSE(out2->clock_anomaly);
+    CHECK(out2->expired_leases_reaped == 1);
+    CHECK(out2->tombstones_reaped == 0);
+
+    auto live = fx.store().lookup_route("agent-gap-live");
+    REQUIRE(live.has_value());
+    REQUIRE(live->has_value());
+    REQUIRE((*live)->session_id.has_value());
+    CHECK(*(*live)->session_id == "s-live"); // untouched
+
+    auto expired = fx.store().lookup_route("agent-gap-expired");
+    REQUIRE(expired.has_value());
+    REQUIRE(expired->has_value());
+    CHECK_FALSE((*expired)->session_id.has_value()); // tombstoned
+
+    auto anchor_after2 = fx.raw_get_reap_anchor();
+    REQUIRE(anchor_after2.has_value());
+    const std::int64_t anchor2 = std::strtoll(anchor_after2->c_str(), nullptr, 10);
+    CHECK(anchor2 >= now_before); // re-anchored to ~now, not stuck at the stale value
+}
+
+TEST_CASE("GatewayRouteStore[pg]: a single glitched forward-skew pass reaps NOTHING at all, "
+          "even with many genuinely-expired rows present — the guard still prevents a "
+          "mass-reap on the one declined pass (PR #4299 review BLOCKER 1)",
+          "[gateway_route][pg][store][reap]") {
+    GatewayRoutePg fx;
+    auto baseline = fx.store().reap_stale_routes();
+    REQUIRE(baseline.has_value());
+    CHECK_FALSE(baseline->clock_anomaly);
+
+    // Bulk-seed a pile of genuinely sweep-(a)-eligible rows — if the
+    // decline-once/drain-on-repeat fix regressed into "decline only holds
+    // back the first row" or some other partial-suppression bug, this shape
+    // catches it: every one of these rows is a legitimate reap candidate.
+    fx.raw_bulk_insert_expired(50, "agent-glitch-bulk-");
+    REQUIRE(fx.store().register_fresh("agent-glitch-live", "s-live").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-glitch-live", "s-live", "c1", "n1", 3600)
+                .value()
+                .matched);
+
+    // A single forward-skew glitch (mirrors the existing forward-skew
+    // poisoning shape): this ONE pass must decline outright and touch
+    // nothing, regardless of how much genuinely-reapable data exists.
+    const std::string poisoned = std::to_string(fx.raw_db_now_ms() - 2LL * 24 * 3600 * 1000);
+    fx.raw_set_reap_anchor(poisoned);
+
     auto out = fx.store().reap_stale_routes();
     REQUIRE(out.has_value());
     CHECK(out->clock_anomaly);
     CHECK(out->expired_leases_reaped == 0);
     CHECK(out->tombstones_reaped == 0);
 
-    auto anchor_after = fx.raw_get_reap_anchor();
-    REQUIRE(anchor_after.has_value());
-    CHECK(*anchor_after == poisoned); // a declined pass never advances the anchor
-
-    auto live = fx.store().lookup_route("agent-fwd-live");
+    // Every one of the 50 genuinely-expired rows survives the single
+    // declined pass untouched — the guard does not "let a few through".
+    for (int i = 1; i <= 50; ++i) {
+        char buf[16];
+        std::snprintf(buf, sizeof buf, "%06d", i);
+        CHECK(fx.raw_row_exists(std::string("agent-glitch-bulk-") + buf));
+    }
+    auto live = fx.store().lookup_route("agent-glitch-live");
     REQUIRE(live.has_value());
     REQUIRE(live->has_value());
     REQUIRE((*live)->session_id.has_value());
     CHECK(*(*live)->session_id == "s-live");
-    auto stale = fx.store().lookup_route("agent-fwd-stale");
-    REQUIRE(stale.has_value());
-    REQUIRE(stale->has_value());
-    REQUIRE((*stale)->session_id.has_value());
-    CHECK(*(*stale)->session_id == "s-stale"); // NOT tombstoned by the declined pass
 }
 
 TEST_CASE("GatewayRouteStore[pg]: reap declines when the anchor is AHEAD of the DB clock "
@@ -906,6 +1051,97 @@ TEST_CASE("GatewayRouteStore[pg]: reap does not tombstone a row renewed to a fut
     REQUIRE((*row)->session_id.has_value());
     CHECK(*(*row)->session_id == "session-1");
     CHECK_FALSE((*row)->is_stale);
+}
+
+// ---------------------------------------------------------------------------
+// PR #4299 review, BLOCKER 2 (mechanical): sweep (b) (the NULL-lease/
+// tombstone-purge DELETE) was missing the outer-WHERE re-assert sweep (a)
+// got from governance fix #4 above — its outer DELETE checked only
+// `agent_id IN (...)`, so a route a concurrent register_fresh/
+// announce_connected just revived (setting a fresh session_id/updated_at
+// while the DELETE was blocked on the row lock) would still be deleted once
+// the lock released. Same #4213 UP-3 self-heal side-lock rendezvous pattern
+// as the sweep-(a) case above, driving the exact EvalPlanQual window: the
+// holder's UPDATE mirrors register_fresh's real re-registration UPSERT
+// shape (fresh session_id, lease_until reset to NULL, updated_at = now()) so
+// the inner subquery's stale-snapshot candidate becomes, by the time the
+// outer DELETE takes the row lock, a row that no longer matches either the
+// `lease_until IS NULL`-past-purge-age shape's cutoff (updated_at is now
+// fresh) — exactly the case the outer re-assert exists to catch.
+TEST_CASE("GatewayRouteStore[pg]: reap does not purge a tombstoned row concurrently revived "
+          "by a fresh register_fresh (outer-DELETE re-assert, PR #4299 review BLOCKER 2)",
+          "[gateway_route][pg][store][reap]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("agent-reap-epq-b", "session-b1").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-reap-epq-b", "session-b1", "c1", "n1", 30)
+                .value()
+                .matched);
+    REQUIRE(fx.store().deregister("agent-reap-epq-b", "session-b1").value().removed);
+    // Past the 300s tombstone purge age, committed — a genuine sweep-(b)
+    // candidate as far as any snapshot taken before the revive below is
+    // concerned.
+    fx.raw_set_updated_at_ago("agent-reap-epq-b", 400);
+
+    // Holder: BEGINs a revive UPDATE on the row and does NOT commit — this
+    // takes the row lock while leaving the OLD (tombstoned, committed)
+    // updated_at the only version any OTHER transaction can see under READ
+    // COMMITTED. The reaper's inner subquery therefore still legitimately
+    // selects this agent_id as a sweep-(b) candidate.
+    yuzu::server::pg::PgConn holder{PQconnectdb(fx.dsn().c_str())};
+    REQUIRE(PQstatus(holder.get()) == CONNECTION_OK);
+    {
+        yuzu::server::pg::PgResult begin{PQexec(holder.get(), "BEGIN")};
+        REQUIRE(begin.status() == PGRES_COMMAND_OK);
+        // Mirrors register_fresh's real re-registration UPSERT shape: a
+        // fresh session_id, lease_until reset to NULL (register_fresh always
+        // resets it — the winning connection's own announce_connected/renew
+        // sets it later), updated_at = now().
+        yuzu::server::pg::PgResult upd{PQexec(
+            holder.get(), "UPDATE gateway_route_store.agent_routes SET "
+                          "  connection_epoch = connection_epoch + 1, "
+                          "  session_id = 'session-b2', lease_until = NULL, updated_at = now() "
+                          "WHERE agent_id = 'agent-reap-epq-b'")};
+        REQUIRE(upd.status() == PGRES_COMMAND_OK);
+    }
+
+    // Run the reaper on its own thread, against the SAME store. Its
+    // sweep-(b) outer DELETE selects agent-reap-epq-b via the subquery, then
+    // blocks taking the row lock the holder connection is sitting on.
+    std::expected<ReapRoutesResult, GatewayRouteStoreError> out;
+    std::thread reaper([&] { out = fx.store().reap_stale_routes(); });
+
+    yuzu::server::pg::PgConn watcher{PQconnectdb(fx.dsn().c_str())};
+    REQUIRE(PQstatus(watcher.get()) == CONNECTION_OK);
+    const bool blocked = wait_for_lock_waiter(watcher.get());
+    REQUIRE(blocked); // if nothing ever blocks, the race this test exists to
+                       // force never happened.
+
+    // Only now does the revived version become visible to the blocked
+    // reaper — exactly the window BLOCKER 2's outer-WHERE re-assert defends
+    // via EvalPlanQual.
+    {
+        yuzu::server::pg::PgResult commit{PQexec(holder.get(), "COMMIT")};
+        REQUIRE(commit.status() == PGRES_COMMAND_OK);
+    }
+
+    reaper.join();
+
+    REQUIRE(out.has_value());
+    CHECK_FALSE(out->clock_anomaly);
+    // The concurrently-revived row must not be counted as purged. THIS IS
+    // THE DISCRIMINATING ASSERTION: revert the outer-WHERE re-assert (drop
+    // the trailing `AND lease_until IS NULL AND (...) < $1::bigint` from
+    // sweep (b)'s DELETE) and this goes to 1 with the row deleted — the test
+    // fails without the fix and passes with it.
+    CHECK(out->tombstones_reaped == 0);
+
+    REQUIRE(fx.raw_row_exists("agent-reap-epq-b")); // NOT deleted
+    auto row = fx.store().lookup_route("agent-reap-epq-b");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    REQUIRE((*row)->session_id.has_value());
+    CHECK(*(*row)->session_id == "session-b2"); // the revived session, untouched
 }
 
 TEST_CASE("GatewayRouteStore[pg]: migrates from an empty database",

@@ -657,6 +657,75 @@ TEST_CASE("BatchHeartbeat: renews the route lease for the carried session ids in
     CHECK((*row_after)->session_id == session_id);
 }
 
+TEST_CASE("BatchHeartbeat: a duplicate session id in one batch and a lost-epoch-race session "
+          "do NOT inflate the shortfall desync counter (PR #4299 review SHOULD 2)",
+          "[pg][gateway_route_wiring]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    yuzu::server::auth::AuthManager auth_mgr;
+    yuzu::server::auth::AutoApproveEngine auto_approve;
+    GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
+    gateway_svc.set_gateway_route_store(&store);
+
+    // A genuinely live session — its row is real, so renewing it matches
+    // exactly one row no matter how many times its id appears in the batch.
+    auto req_live = make_gw_register(auth_mgr, "agent-hb-dup-1");
+    apb::RegisterResponse resp_live;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req_live, &resp_live).ok());
+    const std::string live_session = resp_live.session_id();
+
+    // A session that LOSES its register_fresh epoch race — deterministic
+    // single-threaded stand-in via raw_bump_epoch, mirrors the existing
+    // "does NOT bump the desync counter" NotifyStreamStatus case above.
+    auto req_race1 = make_gw_register(auth_mgr, "agent-hb-race-1");
+    apb::RegisterResponse resp_race1;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req_race1, &resp_race1).ok());
+    auto row_race = store.lookup_route("agent-hb-race-1");
+    REQUIRE(row_race.has_value());
+    REQUIRE(row_race->has_value());
+    raw_bump_epoch(db.dsn(), "agent-hb-race-1", (*row_race)->connection_epoch + 1000,
+                  "gw-session-already-won");
+    auto req_race2 = make_gw_register(auth_mgr, "agent-hb-race-1");
+    apb::RegisterResponse resp_race2;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req_race2, &resp_race2).ok());
+    const std::string losing_session = resp_race2.session_id();
+    auto row_after_race = store.lookup_route("agent-hb-race-1");
+    REQUIRE(row_after_race.has_value());
+    REQUIRE(row_after_race->has_value());
+    CHECK((*row_after_race)->session_id == "gw-session-already-won"); // the loser did NOT win
+
+    // A batch carrying the live session TWICE (a retried-batch duplicate,
+    // per the Erlang heartbeat buffer's no-dedup prepend) plus the losing
+    // session once. renew_leases matches exactly ONE row (the live session
+    // — the losing session's row belongs to a DIFFERENT session and matches
+    // zero). Pre-fix, the raw comparison (3 requested vs 1 matched) would
+    // report a shortfall of 2; post-fix, deduping to {live, losing} and
+    // dropping the known race-loser leaves only {live}, matching 1-for-1.
+    gw::BatchHeartbeatRequest batch;
+    batch.set_gateway_node("node-hb-dup");
+    batch.add_heartbeats()->set_session_id(live_session);
+    batch.add_heartbeats()->set_session_id(live_session); // duplicate
+    batch.add_heartbeats()->set_session_id(losing_session);
+    gw::BatchHeartbeatResponse batch_resp;
+    REQUIRE(gateway_svc.BatchHeartbeat(/*context=*/nullptr, &batch, &batch_resp).ok());
+
+    auto row_live_after = store.lookup_route("agent-hb-dup-1");
+    REQUIRE(row_live_after.has_value());
+    REQUIRE(row_live_after->has_value());
+    CHECK((*row_live_after)->lease_until_ms.has_value()); // genuinely renewed
+
+    CHECK(metrics
+              .counter("yuzu_server_gateway_route_desync_total",
+                       {{"op", "renew_leases"}, {"outcome", "shortfall"}})
+              .value() == 0);
+}
+
 // ── Fail-open posture ────────────────────────────────────────────────────────
 
 TEST_CASE("ProxyRegister/NotifyStreamStatus: a degraded GatewayRouteStore write does NOT "

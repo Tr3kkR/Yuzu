@@ -432,7 +432,7 @@ intra-replica with a live session). Tracked as `#4246`; **slice 4.2a (below) clo
 `feat/ha-ws4-42a-directory-hardening`)** — `deregister` tombstone semantics, `reap_stale_routes`
 (scheduled `ReplicaSafe` in `background_jobs.hpp`, WS-10 classification), the mechanism-(c)
 unknown-presented-session fix, the `yuzu_server_gateway_route_desync_total` counter, and the
-hot-path/reaper write-timeout split (500ms/2000ms) all land in this slice. **The directory is STILL
+hot-path/reaper write-timeout split (500ms/2000ms) (#4246 #9 — **CLOSED, 4.2a**) all land in this slice. **The directory is STILL
 INERT** — nothing dispatches through it — and **4.2 (northbound dispatch rewire, making the directory
 dispatch-authoritative) is NOT done**; the fail-closed posture flip and its alert rule are explicitly
 deferred to 4.2b. Remaining WS-4 sub-work after 4.2a: 4.2b (fail-closed flip + alert rule), the durable

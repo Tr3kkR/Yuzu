@@ -1,5 +1,6 @@
 #include "gateway_service_impl.hpp"
 
+#include <algorithm>
 #include <chrono>
 
 #include <nlohmann/json.hpp>
@@ -41,6 +42,23 @@ namespace {
 // slice (nothing reads is_stale yet) but the margin is chosen now so a
 // future reader doesn't inherit an accidentally-tight TTL.
 constexpr int kGatewayRouteLeaseTtlSecs = 90;
+
+// PR #4299 review (MINOR): pin this against GatewayRouteStore's own
+// duplicate of the same value (gateway_route_store.hpp::kKnownLeaseTtlSecs;
+// see that header's doc comment and gateway_route_store.cpp's
+// reap_stale_routes() constants comment for why the value is duplicated
+// rather than shared via a cross-store include). The reap grace window
+// (kStaleLeaseGraceSecs = 2x kKnownLeaseTtlSecs) is only a safe margin over
+// THIS constant if the two never drift — following the kNetTag*
+// static_assert precedent (test_network_perf_model.cpp) of pinning two
+// deliberately-duplicated constants at the one point they are BOTH visible,
+// so a future bump to one alone is a build failure, not a silent margin
+// erosion.
+static_assert(kGatewayRouteLeaseTtlSecs == yuzu::server::kKnownLeaseTtlSecs,
+             "gateway_service_impl.cpp's kGatewayRouteLeaseTtlSecs and "
+             "gateway_route_store.hpp's kKnownLeaseTtlSecs are a deliberately "
+             "duplicated pair (see both files' comments) — they must be bumped "
+             "together or the reap grace window (>= 1x this TTL) silently erodes");
 
 // HA WS-4 slice 4.1: fail-OPEN observability for the (write-only, INERT)
 // gateway route directory (gateway_route_store.hpp). A degraded write here
@@ -127,6 +145,21 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
             "baseline rise (a replica that lost its in-memory session map until agents "
             "re-announce), and a redelivered/duplicate DISCONNECTED notification.",
             "counter");
+        // PR #4299 review (SHOULD 1, observability-conventions.md:12): seed
+        // only the (op,outcome) pairs this file ACTUALLY emits (see the
+        // record_directory_desync call sites below) — never the full
+        // op x outcome cross-product, most of which no code path can
+        // produce. Without this, a healthy server that never once hits a
+        // guard rejection reads identically to one where the desync signal
+        // itself is broken.
+        metrics_->counter("yuzu_server_gateway_route_desync_total",
+                          {{"op", "renew_leases"}, {"outcome", "shortfall"}});
+        metrics_->counter("yuzu_server_gateway_route_desync_total",
+                          {{"op", "announce_connected"}, {"outcome", "session_mismatch"}});
+        metrics_->counter("yuzu_server_gateway_route_desync_total",
+                          {{"op", "deregister"}, {"outcome", "session_mismatch"}});
+        metrics_->counter("yuzu_server_gateway_route_desync_total",
+                          {{"op", "notify_stream_status"}, {"outcome", "unknown_session"}});
     }
 }
 
@@ -772,10 +805,43 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
                     gateway_route_store_->renew_leases(session_ids, kGatewayRouteLeaseTtlSecs);
                 !res) {
                 record_route_store_failure(metrics_, "renew_leases", res.error());
-            } else if (*res < static_cast<int>(session_ids.size())) {
-                record_directory_desync(metrics_, "renew_leases", "shortfall",
-                                        static_cast<double>(session_ids.size() -
-                                                            static_cast<std::size_t>(*res)));
+            } else {
+                // PR #4299 review (SHOULD 2): renew_leases counts UPDATED
+                // ROWS, and comparing that against the RAW session_ids.size()
+                // over-counts the shortfall two ways (contradicting
+                // metrics.md:125's "benign race losses excluded"). (a) A
+                // RETRIED heartbeat batch can carry the SAME session id
+                // twice — the Erlang buffer retains a failed batch and
+                // PREPENDS the next one with no dedup
+                // (gateway/apps/yuzu_gw/src/yuzu_gw_heartbeat_buffer.erl) —
+                // so one row updated for a duplicate reads as one fewer
+                // "renewed" than requested even though nothing is actually
+                // missing. (b) A session that lost its register_fresh epoch
+                // race (lost_race_sessions_) is EXPECTED to never match a
+                // row again — it is excluded from desync on its own
+                // CONNECTED (see record_directory_desync's header comment)
+                // but was still counted here on every SUBSEQUENT heartbeat.
+                // Dedupe, then drop known race-losers, BEFORE comparing
+                // against rows_updated.
+                std::vector<std::string> distinct_ids(session_ids.begin(), session_ids.end());
+                std::sort(distinct_ids.begin(), distinct_ids.end());
+                distinct_ids.erase(std::unique(distinct_ids.begin(), distinct_ids.end()),
+                                   distinct_ids.end());
+                {
+                    std::lock_guard lock(sessions_mu_);
+                    distinct_ids.erase(
+                        std::remove_if(distinct_ids.begin(), distinct_ids.end(),
+                                       [this](const std::string& id) {
+                                           return lost_race_sessions_.contains(id);
+                                       }),
+                        distinct_ids.end());
+                }
+                const int eligible = static_cast<int>(distinct_ids.size());
+                const int shortfall = eligible - *res; // clamp >= 0 via the guard below
+                if (shortfall > 0) {
+                    record_directory_desync(metrics_, "renew_leases", "shortfall",
+                                            static_cast<double>(shortfall));
+                }
             }
         }
     }

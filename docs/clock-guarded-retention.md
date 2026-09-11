@@ -156,25 +156,42 @@ These two carve-outs are recorded here per part (6)'s "record which way you went
 the full 7. SINGLE-WRITER today (the one server); becomes PG-shared-state under the ADR-0012
 advisory lock when a 2nd replica lands.
 
-### `GatewayRouteStore::reap_stale_routes` (HA WS-4 slice 4.2a)
+### `GatewayRouteStore::reap_stale_routes` (HA WS-4 slice 4.2a, hardened PR #4299)
 
 JOINS this guarded set on the `SessionStore::reap_expired` shape (advisory-lock own-statement
 `gateway_route_store:reap`, in-SQL DB `now()` read once for both cutoffs + anchor-compare +
 anchor-update, persisted+sanitised `route_meta` anchor, forward/backward-anomaly decline,
-unconditional per-predicate cap) and makes the SAME two carve-out choices `SessionStore` and
-`ExecutionTracker` made, for the SAME reason:
+unconditional per-predicate cap):
 
-1. **NO would-wipe probe** — the `agent_routes` table legitimately drains toward "every lease
-   expired" as ROUTINE behaviour (a fleet going offline overnight expires every lease), so a
-   would-wipe verdict cannot separate a true from a false positive here.
-4. **NO fact-set anomaly dedup** — a declined pass is `spdlog::warn`'d AND counted:
+1. **NO would-wipe probe** (DELIBERATE carve-out, the `api_token_store`/`SessionStore` precedent) —
+   the `agent_routes` table legitimately drains toward "every lease expired" as ROUTINE behaviour (a
+   fleet going offline overnight expires every lease), so a would-wipe verdict cannot separate a true
+   from a false positive here.
+4. **Fact-set anomaly dedup is ADOPTED** (PR #4299 review; an earlier revision carved this out too,
+   the way `SessionStore` does — that was the defect this fix closes), in a form simplified for this
+   store's small state: **decline-once / drain-on-repeat, keyed on the declined `reap_anchor_ms`
+   value** rather than the full multi-field `Facts` struct `audit_store.cpp` uses. A forward- or
+   backward-skew anomaly persists `route_meta.reap_declined_anchor_ms = reap_anchor_ms` and declines;
+   an IDENTICAL repeat (the anchor still unmoved, because a decline never advances it) RECOVERS —
+   runs both sweeps under the cap, advances `reap_anchor_ms` to `now_ms` UNCONDITIONALLY (never
+   `max(anchor, now_ms)`, which would leave a forward-skew-poisoned anchor stuck forever), and clears
+   the declined-anchor marker. A normal (non-anomalous) accepted pass also clears the marker, so a
+   later transient glitch is judged fresh against the new anchor rather than free-riding on a stale
+   recovery. **Why this mattered**: the carved-out version wedged PERMANENTLY after any routine >24h
+   gap (weekend shutdown, DR failover, extended maintenance) — `now - anchor` only grows while
+   declined, so every subsequent pass declined forever with no recovery path; a persistent clock
+   problem (never resolving) correctly never recovers on its own by the same logic, and needs an
+   **operator re-anchor**: reset `route_meta.reap_anchor_ms` (and, for cleanliness,
+   `route_meta.reap_declined_anchor_ms`) to the corrected current epoch-ms once the underlying clock
+   is fixed — see the code comment at `gateway_route_store.cpp`'s anomaly-detection site. Every
+   decline is `spdlog::warn`'d AND counted:
    `yuzu_server_gateway_route_reap_total{outcome="declined"}` (incremented at the reap call site in
-   `server.cpp`) is the observable signal, not a fourth latch. This is a DEDICATED reap-outcome
-   counter, distinct from `yuzu_server_gateway_route_desync_total`/`_write_failed_total`, which cover
-   the WRITE path (`register_fresh`/`announce_connected`/`deregister`/`renew_leases`), not a reap
-   pass's own outcome. A reap pass that fails outright (pool/query degradation, distinct from a
-   clock-anomaly decline) is counted the same way under `outcome="error"`; a clean accepted pass is
-   `outcome="ok"`.
+   `server.cpp`, pre-seeded across `ok`/`declined`/`error` since PR #4299). This is a DEDICATED
+   reap-outcome counter, distinct from `yuzu_server_gateway_route_desync_total`/`_write_failed_total`,
+   which cover the WRITE path (`register_fresh`/`announce_connected`/`deregister`/`renew_leases`), not
+   a reap pass's own outcome. A reap pass that fails outright (pool/query degradation, distinct from a
+   clock-anomaly decline) is counted the same way under `outcome="error"`; a clean accepted OR
+   recovered pass is `outcome="ok"`.
 
 Part (6)'s missing-anchor decision is **PROCEED** (`ResultSetStore`'s answer): a route is
 regenerable by the agent's next heartbeat/`ProxyRegister`, so a from-boot skewed clock reaping a

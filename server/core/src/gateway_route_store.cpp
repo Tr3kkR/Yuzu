@@ -63,11 +63,16 @@ constexpr std::chrono::milliseconds kReapWriteTimeout{2000};
 // The lease TTL agents/gateways renew against is
 // gateway_service_impl.cpp::kGatewayRouteLeaseTtlSecs = 90s. That file is out
 // of this task's scope (owned by Task C) and this store has no dependency on
-// the gateway wiring layer, so the value is DELIBERATELY DUPLICATED here as a
-// plain comment-documented constant rather than an include — a future TTL
-// bump there must be mirrored here (kStaleLeaseGraceSecs must stay >= 1x that
-// TTL) or a merely-late heartbeat mid-renew starts getting reaped.
-constexpr int kKnownLeaseTtlSecs = 90; // gateway_service_impl.cpp's kGatewayRouteLeaseTtlSecs
+// the gateway wiring layer, so the value is DELIBERATELY DUPLICATED — but as
+// yuzu::server::kKnownLeaseTtlSecs, a plain namespace-scope constant declared
+// in this store's OWN header (gateway_route_store.hpp), not a local literal —
+// so gateway_service_impl.cpp (which already includes that header
+// transitively via gateway_service_impl.hpp) can `static_assert` the two
+// stay equal without either .cpp depending on the other (PR #4299 review;
+// see that static_assert for the enforcement). A future TTL bump there must
+// still be mirrored here (kStaleLeaseGraceSecs must stay >= 1x that TTL) or a
+// merely-late heartbeat mid-renew starts getting reaped — the static_assert
+// only catches the two constants disagreeing, not either one being wrong.
 
 // Grace >= 1 lease TTL (task spec): 2x tolerates a FULL missed renewal cycle
 // (not just the last heartbeat's worth of jitter) before treating a lease as
@@ -525,29 +530,94 @@ std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_
         // Overflow-safe forward-skew comparison (mirrors session_store.cpp's
         // #3785 round-2 fix): subtracting (not adding) two already-sanitised
         // non-negative int64_t values cannot overflow.
-        if (has_anchor && now_ms >= anchor && now_ms - anchor > kMaxPlausibleSkewMs) {
-            spdlog::warn("GatewayRouteStore::reap_stale_routes declined: now_ms {} implausibly "
-                         "ahead of anchor {}",
-                         now_ms, anchor);
-            clock_anomaly = true;
-            return true; // decline, anchor unchanged
-        }
+        const bool forward_skew =
+            has_anchor && now_ms >= anchor && now_ms - anchor > kMaxPlausibleSkewMs;
         // BACKWARD-anomaly guard: now_ms below the highest accepted reading
         // means the wall clock moved backward, or an earlier forward-skewed
-        // pass poisoned the anchor. Decline (never reap under a rewound
-        // clock; never regress the anchor) — the safe direction, matching
-        // session_store.cpp: a poisoned anchor disables reap (rows accrue,
-        // alertable) rather than mass-reaping live routes when a later,
-        // smaller forward skew reads as "behind" it.
-        if (has_anchor && now_ms < anchor) {
-            spdlog::warn("GatewayRouteStore::reap_stale_routes declined: now_ms {} is behind "
-                         "anchor {} (backward clock movement or a poisoned anchor)",
-                         now_ms, anchor);
-            clock_anomaly = true;
-            return true;
+        // pass poisoned the anchor.
+        const bool backward_skew = has_anchor && now_ms < anchor;
+
+        // DECLINE-ONCE / DRAIN-ON-REPEAT (PR #4299 review, BLOCKER 1).
+        // Mirrors audit_retention_rules.hpp::classify + AuditStore::
+        // cleanup_once's "decline ONCE on the fact set, then DRAIN an
+        // identical repeat, capped" shape (docs/clock-guarded-retention.md
+        // part 4) — a bare "always decline on skew" (the pre-fix behaviour)
+        // wedges PERMANENTLY after any routine >24h gap (weekend shutdown, DR
+        // failover, extended maintenance): now-anchor only grows while
+        // declined, so every later pass declines forever with no recovery.
+        //
+        // Keyed on the DECLINED anchor value, not on the anomaly's direction:
+        // `reap_anchor_ms` does not move while a decline is outstanding, so a
+        // genuine multi-day gap presents the IDENTICAL anchor to pass 2 — the
+        // signal that distinguishes "real elapsed downtime, decline once then
+        // recover" from a single glitched reading (whose corrected successor
+        // reads normally against the unmoved anchor and is an ordinary
+        // accepted pass, not a recovery).
+        //
+        // OPERATOR RE-ANCHOR PROCEDURE: a pass that is genuinely stuck (the
+        // clock itself is still wrong on pass 2, so the SAME anomaly keeps
+        // reporting against an ever-different anchor and never lines up with
+        // the declined marker) never recovers on its own — by design, since
+        // recovery must not fire on an ongoing skew. An operator can force
+        // recovery by resetting `route_meta.reap_anchor_ms` (and, for
+        // cleanliness, deleting `route_meta.reap_declined_anchor_ms`) to the
+        // corrected current epoch-ms once the underlying clock problem is
+        // fixed — the next pass then has a fresh, correct anchor and proceeds
+        // normally. See docs/clock-guarded-retention.md's GatewayRouteStore
+        // entry for the full record.
+        bool recovered_from_prior_decline = false;
+        if (forward_skew || backward_skew) {
+            pg::PgResult dr = pg::exec_params(
+                c,
+                "SELECT value FROM gateway_route_store.route_meta WHERE "
+                "key='reap_declined_anchor_ms'",
+                std::vector<std::string>{});
+            if (dr.status() != PGRES_TUPLES_OK) {
+                err = "reap declined-anchor read failed";
+                return false;
+            }
+            std::optional<std::int64_t> declined_anchor;
+            if (PQntuples(dr.get()) > 0) {
+                const std::string raw = PQgetvalue(dr.get(), 0, 0);
+                auto parsed = parse_reap_i64(raw);
+                // This method is the sole writer of this marker, so an
+                // unparseable value can only be external tampering. Treat it
+                // as absent rather than erroring the whole pass — the safe
+                // direction is to decline again below (re-arming the marker
+                // with a clean value), never to grant a recovery this pass
+                // never actually earned.
+                if (parsed && *parsed >= 0)
+                    declined_anchor = *parsed;
+            }
+            if (declined_anchor.has_value() && *declined_anchor == anchor) {
+                recovered_from_prior_decline = true;
+                spdlog::warn(
+                    "GatewayRouteStore::reap_stale_routes recovering: the clock anomaly at "
+                    "anchor {} persisted across a full decline pass (now_ms {}) — treating as "
+                    "genuine elapsed downtime and running the sweeps now",
+                    anchor, now_ms);
+            } else {
+                spdlog::warn(
+                    "GatewayRouteStore::reap_stale_routes declined: now_ms {} vs anchor {} "
+                    "({}) — declining this pass; an identical repeat (same anchor) recovers "
+                    "and drains, capped",
+                    now_ms, anchor, forward_skew ? "implausibly ahead" : "behind");
+                pg::PgResult set_declined = pg::exec_params(
+                    c,
+                    "INSERT INTO gateway_route_store.route_meta (key, value) VALUES "
+                    "('reap_declined_anchor_ms', $1) ON CONFLICT (key) DO UPDATE SET "
+                    "value=EXCLUDED.value",
+                    std::vector<std::string>{std::to_string(anchor)});
+                if (set_declined.status() != PGRES_COMMAND_OK) {
+                    err = "reap declined-anchor persist failed";
+                    return false;
+                }
+                clock_anomaly = true;
+                return true; // decline, anchor unchanged, declined-anchor marker set
+            }
         }
 
-        // Accepted pass: TWO capped sweeps in the same transaction, both
+        // Accepted (or recovered) pass: TWO capped sweeps in the same transaction, both
         // comparing epoch-ms cutoffs derived from the ONE sanitised now_ms
         // read above (never a fresh in-SQL now() per statement — the cutoff,
         // the anchor comparison, and the anchor update below all stay in the
@@ -606,6 +676,22 @@ std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_
         // pair) a resurrection from a late notification is not a realistic
         // risk, and a genuine later register_fresh works identically whether
         // the row exists or not (INSERT with no conflict, always wins).
+        //
+        // The outer DELETE's WHERE re-asserts the SAME predicate the subquery
+        // already applied (PR #4299 review, BLOCKER 2 — the same
+        // EvalPlanQual hazard sweep (a) closed above, missed here on the
+        // first pass): under READ COMMITTED the inner SELECT snapshots
+        // agent_id candidates, and by the time the outer DELETE takes each
+        // row's lock a concurrent `register_fresh`/`announce_connected` could
+        // have revived that exact row (a fresh session_id/lease_until) in the
+        // window between the snapshot and the lock. Without the re-check the
+        // outer DELETE only re-verifies `agent_id IN (...)` and deletes the
+        // just-revived row anyway — dropping a route a caller just believes
+        // it (re-)established. Re-checking `lease_until IS NULL` and the SAME
+        // `$1` cutoff the subquery used closes that window: a concurrently
+        // revived row now fails the outer predicate and drops out, at the
+        // cost of nothing — a row that is still genuinely a stale
+        // tombstone/never-announced row passes both checks identically.
         {
             const std::int64_t cutoff_b_ms =
                 now_ms - static_cast<std::int64_t>(kTombstonePurgeAgeSecs) * 1000;
@@ -616,6 +702,8 @@ std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_
                 "     WHERE lease_until IS NULL "
                 "       AND (extract(epoch FROM updated_at) * 1000)::bigint < $1::bigint "
                 "     LIMIT $2::bigint) "
+                "  AND lease_until IS NULL "
+                "  AND (extract(epoch FROM updated_at) * 1000)::bigint < $1::bigint "
                 "RETURNING agent_id",
                 std::vector<std::string>{std::to_string(cutoff_b_ms), std::to_string(kReapCap)});
             if (dr.status() != PGRES_TUPLES_OK) {
@@ -625,10 +713,18 @@ std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_
             tombstones_reaped = PQntuples(dr.get());
         }
 
-        // Advance the persisted anchor to the max now_ms any accepted pass
-        // has seen (std::max parenthesised to dodge the <windows.h> `max`
-        // function-like macro, MSVC — session_store.cpp idiom).
-        const std::int64_t new_anchor = has_anchor ? (std::max)(anchor, now_ms) : now_ms;
+        // Advance the persisted anchor. A RECOVERY pass sets it to now_ms
+        // UNCONDITIONALLY (never max(anchor, now_ms)) — the whole point of
+        // recovery is to move the anchor off the stale/poisoned value that
+        // wedged the guard; std::max would leave a forward-skew-poisoned
+        // anchor unchanged forever (it always picks the already-too-far-
+        // ahead anchor over a normal now_ms). A NORMAL accepted pass keeps
+        // the pre-existing max(anchor, now_ms) shape (session_store.cpp
+        // idiom, parenthesised to dodge the <windows.h> `max` function-like
+        // macro, MSVC).
+        const std::int64_t new_anchor =
+            recovered_from_prior_decline ? now_ms
+                                          : (has_anchor ? (std::max)(anchor, now_ms) : now_ms);
         pg::PgResult ur = pg::exec_params(
             c,
             "INSERT INTO gateway_route_store.route_meta (key, value) VALUES "
@@ -636,6 +732,18 @@ std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_
             std::vector<std::string>{std::to_string(new_anchor)});
         if (ur.status() != PGRES_COMMAND_OK) {
             err = "reap anchor update failed";
+            return false;
+        }
+        // Clear the declined-anchor marker on EVERY accepted/recovered pass
+        // (decline-once/drain-on-repeat, BLOCKER 1 above) — a later transient
+        // glitch must be judged fresh against the NEW anchor rather than
+        // silently recovering on its very first pass. A no-op DELETE when no
+        // marker is set (the common case) costs one statement per pass.
+        pg::PgResult clr_declined = pg::exec_params(
+            c, "DELETE FROM gateway_route_store.route_meta WHERE key='reap_declined_anchor_ms'",
+            std::vector<std::string>{});
+        if (clr_declined.status() != PGRES_COMMAND_OK) {
+            err = "reap declined-anchor clear failed";
             return false;
         }
         return true;

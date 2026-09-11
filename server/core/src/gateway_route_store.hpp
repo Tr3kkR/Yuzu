@@ -104,6 +104,16 @@ class PgPool;
 
 namespace yuzu::server {
 
+/// The lease TTL agents/gateways renew against — DUPLICATED from (never
+/// included from) `gateway_service_impl.cpp::kGatewayRouteLeaseTtlSecs`; see
+/// `gateway_route_store.cpp`'s `reap_stale_routes()` constants comment for
+/// why the duplication is deliberate. Declared here, rather than staying an
+/// anonymous-namespace literal in the .cpp, so `gateway_service_impl.cpp`
+/// (which already transitively includes this header) can `static_assert`
+/// the two constants stay equal — see that file's `static_assert` next to
+/// its own `kGatewayRouteLeaseTtlSecs` (PR #4299 review, MINOR).
+inline constexpr int kKnownLeaseTtlSecs = 90;
+
 /// Typed store failure.
 enum class GatewayRouteStoreError {
     store_unavailable, ///< not open / lease timeout — the store cannot answer
@@ -219,19 +229,32 @@ public:
     ///    next heartbeat/`ProxyRegister`, so a from-boot skewed clock
     ///    reaping a batch of already-stale rows on the very first pass is an
     ///    acceptable worst case, never non-reproducible evidence loss.
-    ///  - Parts 1 (would-wipe probe) and 4 (fact-set anomaly dedup) are
-    ///    DELIBERATELY CARVED OUT, the `api_token_store`/`SessionStore`
-    ///    precedent: (1) this table drains toward "everything reapable" as
-    ///    ROUTINE behaviour (a fleet going offline overnight legitimately
-    ///    expires every lease), so a would-wipe verdict cannot separate a
-    ///    true positive from that routine case; (4) a declined pass is
-    ///    `spdlog::warn`'d AND counted —
+    ///  - Part 1 (would-wipe probe) is DELIBERATELY CARVED OUT, the
+    ///    `api_token_store`/`SessionStore` precedent: this table drains
+    ///    toward "everything reapable" as ROUTINE behaviour (a fleet going
+    ///    offline overnight legitimately expires every lease), so a
+    ///    would-wipe verdict cannot separate a true positive from that
+    ///    routine case.
+    ///  - Part 4 (fact-set anomaly dedup) is ADOPTED, in a simplified form
+    ///    keyed on the declined `route_meta.reap_anchor_ms` value rather than
+    ///    the full multi-field `Facts` struct (PR #4299 review, BLOCKER 1) —
+    ///    a forward- or backward-skew anomaly declines ONCE (persisting
+    ///    `reap_declined_anchor_ms = reap_anchor_ms`) and an IDENTICAL
+    ///    repeat (the anchor still unmoved) RECOVERS and drains, capped,
+    ///    treating the persisted gap as genuine elapsed downtime rather than
+    ///    a transient glitch. Without this, a routine >24h gap (weekend
+    ///    shutdown, DR failover, extended maintenance) wedged the guard
+    ///    PERMANENTLY — `now - anchor` only grows while declined, so every
+    ///    later pass declined forever with no recovery path. An OPERATOR can
+    ///    force recovery early by resetting `route_meta.reap_anchor_ms` (see
+    ///    the operator re-anchor comment at the anomaly-detection site in
+    ///    `gateway_route_store.cpp`). Every decline (first or, before this
+    ///    fix, permanent) is `spdlog::warn`'d AND counted —
     ///    `yuzu_server_gateway_route_reap_total{outcome="declined"}`
-    ///    (incremented at the server.cpp reap call site) is the fact-set
-    ///    equivalent for this store, not a fourth latch. A failed pass
+    ///    (incremented at the server.cpp reap call site). A failed pass
     ///    (store/query error, distinct from a declined one) is counted the
-    ///    same way under `outcome="error"`; a clean accepted pass is
-    ///    `outcome="ok"`.
+    ///    same way under `outcome="error"`; a clean accepted OR recovered
+    ///    pass is `outcome="ok"`.
     /// SINGLE-WRITER today (advisory lock scoped to one dedicated key); becomes
     /// PG-shared-state under the same ADR-0012 lock when a 2nd replica lands
     /// (matches every other reaper in the register).
