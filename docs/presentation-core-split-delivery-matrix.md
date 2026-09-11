@@ -124,12 +124,14 @@ The first draft asserted a falsified current state; a three-model adversarial pa
   (the `#375` translator bug), so a `/MDd` debug exe loads Drogon's `/MD` release DLL — a mismatch that
   could bite at **runtime** when STL crosses the boundary — but this is a HAZARD TO VALIDATE, not a
   proven outcome: the repo's own debug-build DLL selection may already resolve it. Meson picks
-  `debug/lib/libdrogon.a` for the DIRECT dependency on a debug build, `ci.yml` prepends
+  the debug-config Drogon import lib (`debug/lib/drogon.lib`) for the DIRECT dependency on a debug build, `ci.yml` prepends
   `vcpkg_installed/x64-windows/debug/bin` to PATH before the Windows debug `server-checks` step, and
   `deploy_build_dlls.py` selects the matching-config DLL dir — so the loader may resolve the debug DLL
   by name regardless of what the import lib recorded. The open question is whether the debug/release
-  Drogon DLLs share a filename (no `DEBUG_POSTFIX`): if they differ, a wrong pick is a load FAILURE (the
-  canary catches it), not a silent CRT mismatch. A future STL-marshalling canary + a
+  Drogon DLLs share a filename (no `DEBUG_POSTFIX`). If they share a name, PATH order resolves the debug
+  one; if they differ, the outcome depends on what ends up beside the exe — `deploy_build_dlls.py`'s
+  secondary gap-fill can copy the other config's differently-named DLL, which could then LOAD (a silent
+  mismatch) rather than fail. Either way the categorical "loads the release DLL" claim is unproven. A future STL-marshalling canary + a
   `dumpbin`/import-provenance assertion resolve this at WS-B2 before prescribing the `#375` option-D
   (build-type-conditional import lib) fix — which would not touch the grpc branch. (2) **c-ares double-linkage (LNK2005) — the canary does
   NOT and CANNOT exercise this.** It links drogon/trantor only, never gRPC, so there is a single
@@ -138,10 +140,14 @@ The first draft asserted a falsified current state; a three-model adversarial pa
   two live in *separate binaries* so they may never co-link. Linux resolves the `$<LINK_ONLY:...>`-dropped
   transitive set explicitly (OpenSSL/c-ares/zlib/uuid/brotli via pkg-config); Windows dynamic DLLs resolve
   their own deps at load, so that append list is best-effort there. A Windows link/load red here is the
-  gate working — report it, do not paper over it. **WS-B2 follow-ups surfaced by this round:** feature-gate
-  Drogon to a server vcpkg feature (agent/ASan/cross legs currently build it unused; #TBD), a
+  gate working — report it, do not paper over it. **The Windows PR leg is the ONLY leg that exercises the
+  dynamic-DLL LOAD assertion** (Linux builds+links only); it is skipped when the Wee Tam pool is
+  unhealthy, so branch protection must treat a skipped Windows context as NOT-pass, and a CI presence
+  tripwire should guard the canary from silently ceasing to run (#4296). **WS-B2 follow-ups surfaced by this round:** feature-gate
+  Drogon to a server vcpkg feature (agent/ASan/cross legs currently build it unused; #4295), a
   STL-marshalling canary + a `dumpbin`/`ldd` import-provenance assertion, the Drogon+gRPC coexistence
-  link test. (Drogon's transitive tree already appears in the release SBOM today — `release.yml`'s Syft
+  link test, and adding Drogon/trantor/jsoncpp to `NOTICE`'s third-party attribution list once a shipped
+  binary links them. (Drogon's transitive tree already appears in the release SBOM today — `release.yml`'s Syft
   scan covers `path: .` incl. `vcpkg_installed`, per this PR's changelog fragment — so SBOM pickup is
   NOT a WS-B2 deferral.)
 

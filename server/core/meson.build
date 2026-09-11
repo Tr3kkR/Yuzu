@@ -677,7 +677,7 @@ executable(
 # triplets/x64-windows.cmake's static-linkage override list (scoped to
 # abseil/grpc/protobuf/upb/re2/c-ares/utf8-range only), so on Windows they
 # resolve as ordinary dynamic DLLs + import libs — the same shape as
-# sqlite3/openssl/libxml2 (which use method:'cmake' on Windows) and libpq
+# sqlite3/libxml2 (which use method:'cmake' on Windows) and libpq
 # (hand-wired find_library on Windows — same dynamic-DLL shape, see the libpq
 # block in the root meson.build), none of which hits LNK2038. So one uniform cmake dependency() call across every
 # platform, with a pkg-config fallback, is correct here. Do NOT hand-wire this
