@@ -665,3 +665,68 @@ executable(
   dependencies: [libpq_dep],
   install: false,
 )
+
+# Drogon build canary (WS-B1 / ADR-0031 Gate G10). Proves Drogon links into the
+# existing Meson/vcpkg matrix — Windows MSVC static leg included — WITHOUT
+# disturbing the #375 grpc/protobuf/abseil static-linkage config. Sibling of
+# yuzu_pg_canary above; server-only (this whole subdir is build_server-gated).
+#
+# Wiring rationale — mirror the sqlite3/libxml2 DYNAMIC-DLL pattern, NOT the
+# grpc/protobuf hand-wired static find_library() branch. Drogon and its
+# transitive deps (trantor, jsoncpp, brotli) are NOT in
+# triplets/x64-windows.cmake's static-linkage override list (scoped to
+# abseil/grpc/protobuf/upb/re2/c-ares/utf8-range only), so on Windows they
+# resolve as ordinary dynamic DLLs + import libs — the same shape as
+# sqlite3/libpq/openssl/libxml2, all of which already use method:'cmake' on
+# Windows without LNK2038. So one uniform cmake dependency() call across every
+# platform, with a pkg-config fallback, is correct here. Do NOT hand-wire this
+# into the Windows find_library() branch: that machinery exists solely for the
+# forced-static #375 stack.
+#
+# Trantor (Drogon's I/O layer) pulls c-ares and OpenSSL. c-ares IS in the #375
+# static-override list (already forced static for grpc), and OpenSSL is our own
+# — Drogon's TLS therefore rides our existing OpenSSL with no feature flag.
+# Default features only (no orm/postgres/sqlite3/...): ADR-0031 Decision 5.
+drogon_dep = dependency('Drogon', method: 'cmake', modules: ['Drogon::Drogon'],
+  required: false, include_type: 'system')
+if not drogon_dep.found()
+  drogon_dep = dependency('drogon', required: true, include_type: 'system')
+endif
+
+# meson's cmake dep translator does NOT evaluate CMake generator expressions,
+# so trantor's transitive link deps — declared as
+# `$<LINK_ONLY:OpenSSL::SSL>;$<LINK_ONLY:OpenSSL::Crypto>;$<LINK_ONLY:c-ares::cares>`
+# in TrantorTargets.cmake — are silently dropped from Drogon::Drogon's closure.
+# On static-link platforms (Linux .a / macOS .a) the final link then fails with
+# undefined OpenSSL EVP_* and c-ares ares_* symbols. Append them explicitly,
+# exactly as libpq_dep appends OpenSSL for the same reason (see the libpq
+# comment in the root meson.build). openssl_dep is already in scope (declared at
+# the top of this file on every platform). c-ares is best-effort via pkg-config
+# (`libcares`): needed at final link on static Linux/macOS; on Windows drogon/
+# trantor are dynamic DLLs that resolve their own deps at load, so a missing
+# libcares.pc there is harmless. Brotli/zlib/uuid are likewise LINK_ONLY-dropped
+# but are not referenced by the drogon::app() code path the canary exercises;
+# the presentation binary (WS-B2) will append whatever its used surface pulls.
+# The dropped transitive set is trantor's (OpenSSL, c-ares) PLUS drogon's own
+# (`$<LINK_ONLY:ZLIB::ZLIB>`, `$<LINK_ONLY:Brotli_lib>`, `$<LINK_ONLY:UUID_lib>`
+# in DrogonTargets.cmake) — libdrogon.a's Utilities.cc (getUuid / gzip / brotli)
+# references all of them, so even the minimal drogon::app() link needs the lot
+# on a static-link platform. All resolve via pkg-config in the vcpkg tree on
+# Linux; each is best-effort (required:false) so the dynamic-DLL Windows leg and
+# macOS (where libuuid is a system framework, not a vcpkg port) don't fail
+# configure on a missing .pc.
+_drogon_transitive = [openssl_dep]
+foreach _pc : ['libcares', 'zlib', 'uuid', 'libbrotlienc', 'libbrotlidec']
+  _d = dependency(_pc, method: 'pkg-config', required: false, include_type: 'system')
+  if _d.found()
+    _drogon_transitive += _d
+  endif
+endforeach
+drogon_dep = declare_dependency(dependencies: [drogon_dep] + _drogon_transitive)
+
+executable(
+  'yuzu_drogon_canary',
+  files('src/drogon_canary_main.cpp'),
+  dependencies: [drogon_dep],
+  install: false,
+)

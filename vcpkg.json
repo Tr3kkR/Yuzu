@@ -36,7 +36,8 @@
       "default-features": false
     },
     "xmlsec",
-    "zlib"
+    "zlib",
+    "drogon"
   ],
   "overrides": []
 }
