@@ -225,8 +225,13 @@ public:
     ///    ROUTINE behaviour (a fleet going offline overnight legitimately
     ///    expires every lease), so a would-wipe verdict cannot separate a
     ///    true positive from that routine case; (4) a declined pass is
-    ///    `spdlog::warn`'d — Task C's metrics wiring is the fact-set
-    ///    equivalent for this store, not a fourth latch.
+    ///    `spdlog::warn`'d AND counted —
+    ///    `yuzu_server_gateway_route_reap_total{outcome="declined"}`
+    ///    (incremented at the server.cpp reap call site) is the fact-set
+    ///    equivalent for this store, not a fourth latch. A failed pass
+    ///    (store/query error, distinct from a declined one) is counted the
+    ///    same way under `outcome="error"`; a clean accepted pass is
+    ///    `outcome="ok"`.
     /// SINGLE-WRITER today (advisory lock scoped to one dedicated key); becomes
     /// PG-shared-state under the same ADR-0012 lock when a 2nd replica lands
     /// (matches every other reaper in the register).

@@ -119,11 +119,13 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
             "deregister/renew_leases) that succeeded but matched/renewed zero rows for the "
             "presented session, plus NotifyStreamStatus's own unknown-session reject, by op "
             "and outcome. A guard rejection is EXPECTED at a low background rate (stale/"
-            "superseded-session notifications the guards exist to no-op on) — a sustained rise "
+            "superseded-session notifications the guards exist to no-op on) - a sustained rise "
             "is the signal that the in-memory session map and the durable directory have gone "
             "out of sync. A register_fresh epoch-race LOSS is deliberately excluded (see the "
             "lost_race_sessions_ bookkeeping) so a benign concurrent-connect race never inflates "
-            "this counter.",
+            "this counter. Two benign contributors not to page on: a post-restart/failover "
+            "baseline rise (a replica that lost its in-memory session map until agents "
+            "re-announce), and a redelivered/duplicate DISCONNECTED notification.",
             "counter");
     }
 }

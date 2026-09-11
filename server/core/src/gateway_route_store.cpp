@@ -464,6 +464,13 @@ std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_
     bool clock_anomaly = false;
     std::string err;
     const bool ok = pool_.with_txn_for(kReapWriteTimeout, [&](PGconn* c) -> bool {
+        // Fixed key, deliberately NOT salted per-instance/per-test: Postgres advisory
+        // locks are scoped per-DATABASE, and every [pg] test gets its own ephemeral
+        // database, so a fixed key here cannot collide across tests. Across real
+        // replicas sharing ONE production database, the fixed key IS the point — it is
+        // the single-writer rendezvous every replica's reap tick must serialize
+        // against (SINGLE-WRITER-today note above; becomes the PG-shared-state lock
+        // when a 2nd replica lands).
         if (pg::exec_params(c, "SELECT pg_advisory_xact_lock(hashtext('gateway_route_store:reap'))",
                             std::vector<std::string>{})
                 .status() != PGRES_TUPLES_OK) {
@@ -554,6 +561,19 @@ std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_
         // stopped renewing (network partition), and a late DISCONNECTED for
         // it arriving after this pass must still land as a no-op against a
         // tombstoned row rather than an error against a vanished one.
+        //
+        // The outer UPDATE's WHERE re-asserts the SAME expired predicate the
+        // subquery already applied (governance fix #4, cpp-safety/UP-4): under
+        // READ COMMITTED, the inner SELECT snapshots agent_id candidates, and
+        // by the time the outer UPDATE takes each row's lock a concurrent
+        // renew_leases()/announce_connected() could have pushed lease_until
+        // back into the future for one of those rows. Without the re-check the
+        // outer UPDATE only re-verifies `agent_id IN (...)` and would tombstone
+        // an agent that renewed in that window anyway. Re-checking against
+        // `$1` (the same cutoff the subquery used) closes that window: a
+        // concurrently-renewed row now fails the outer predicate and drops
+        // out, at the cost of nothing — a row that is still genuinely expired
+        // passes both checks identically.
         {
             const std::int64_t cutoff_a_ms = now_ms - static_cast<std::int64_t>(kStaleLeaseGraceSecs) * 1000;
             pg::PgResult dr = pg::exec_params(
@@ -565,6 +585,8 @@ std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_
                 "  WHERE lease_until IS NOT NULL "
                 "    AND (extract(epoch FROM lease_until) * 1000)::bigint < $1::bigint "
                 "  LIMIT $2::bigint) "
+                "  AND lease_until IS NOT NULL "
+                "  AND (extract(epoch FROM lease_until) * 1000)::bigint < $1::bigint "
                 "RETURNING agent_id",
                 std::vector<std::string>{std::to_string(cutoff_a_ms), std::to_string(kReapCap)});
             if (dr.status() != PGRES_TUPLES_OK) {
@@ -633,7 +655,9 @@ std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_
         spdlog::error("GatewayRouteStore::reap_stale_routes: {}", err);
         return std::unexpected(GatewayRouteStoreError::db_error);
     }
-    return ReapRoutesResult{expired_leases_reaped, tombstones_reaped, clock_anomaly};
+    return ReapRoutesResult{.expired_leases_reaped = expired_leases_reaped,
+                            .tombstones_reaped = tombstones_reaped,
+                            .clock_anomaly = clock_anomaly};
 }
 
 } // namespace yuzu::server

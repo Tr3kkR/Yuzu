@@ -24,6 +24,7 @@
 #include <libpq-fe.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -120,6 +121,48 @@ public:
             "WHERE agent_id=$1",
             2, nullptr, params, nullptr, nullptr, 0)};
         REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+
+    // The DB clock in wall-clock epoch-millis (the same expression
+    // reap_stale_routes reads) — mirrors test_session_store.cpp's db_now_ms.
+    std::int64_t raw_db_now_ms() {
+        yuzu::server::pg::PgConn conn{PQconnectdb(dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult r{
+            PQexec(conn.get(), "SELECT (extract(epoch FROM now()) * 1000)::bigint")};
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        return std::strtoll(PQgetvalue(r.get(), 0, 0), nullptr, 10);
+    }
+
+    // Write a RAW (un-sanitised) string into route_meta's reap_anchor_ms key —
+    // models a hand-edited row / storage corruption / a poisoned anchor from a
+    // prior forward-skewed pass. Mirrors test_session_store.cpp's
+    // set_meta_raw (#3785) — the typed reap path cannot express these values.
+    void raw_set_reap_anchor(const std::string& raw_value) {
+        yuzu::server::pg::PgConn conn{PQconnectdb(dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        const char* p1 = raw_value.c_str();
+        const char* params[1] = {p1};
+        yuzu::server::pg::PgResult r{PQexecParams(
+            conn.get(),
+            "INSERT INTO gateway_route_store.route_meta (key, value) VALUES "
+            "('reap_anchor_ms', $1) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
+            1, nullptr, params, nullptr, nullptr, 0)};
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+
+    // The persisted anchor's raw string value, or nullopt if never set — for
+    // asserting a DECLINED pass leaves it byte-for-byte unchanged.
+    std::optional<std::string> raw_get_reap_anchor() {
+        yuzu::server::pg::PgConn conn{PQconnectdb(dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult r{PQexec(
+            conn.get(),
+            "SELECT value FROM gateway_route_store.route_meta WHERE key='reap_anchor_ms'")};
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        if (PQntuples(r.get()) == 0)
+            return std::nullopt;
+        return std::string(PQgetvalue(r.get(), 0, 0));
     }
 
     // Row existence bypassing lookup_route (which reports a tombstone as a
@@ -567,6 +610,231 @@ TEST_CASE("GatewayRouteStore[pg]: reap_stale_routes caps the expired-lease sweep
     CHECK(second->expired_leases_reaped == 1); // second pass drains the remainder
 }
 
+// ---------------------------------------------------------------------------
+// Governance fix #2 (cpp-safety/quality-engineer/unhappy-path): drive
+// clock_anomaly == true via all four seeded-anchor scenarios the reviewers
+// named. Every case first runs ONE clean pass to establish a real persisted
+// anchor (part 6 PROCEEDs on the first/no-anchor pass, so the anomaly guards
+// below need a pre-existing anchor to compare against), seeds a LIVE row
+// (future lease) and a genuinely-STALE row (past grace) so a declined pass's
+// "touches nothing" guarantee is checked against both shapes, then asserts:
+// clock_anomaly, zero reaps, the anchor byte-for-byte unchanged, and both
+// rows untouched.
+
+TEST_CASE("GatewayRouteStore[pg]: reap declines when the anchor is implausibly BEHIND the "
+          "DB clock (forward skew)",
+          "[gateway_route][pg][store][reap]") {
+    GatewayRoutePg fx;
+    auto baseline = fx.store().reap_stale_routes(); // establishes a real anchor
+    REQUIRE(baseline.has_value());
+    CHECK_FALSE(baseline->clock_anomaly);
+
+    REQUIRE(fx.store().register_fresh("agent-fwd-live", "s-live").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-fwd-live", "s-live", "c1", "n1", 3600)
+                .value()
+                .matched);
+    REQUIRE(fx.store().register_fresh("agent-fwd-stale", "s-stale").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-fwd-stale", "s-stale", "c1", "n1", 30)
+                .value()
+                .matched);
+    fx.raw_set_lease_until_ago("agent-fwd-stale", 200); // past the 180s grace
+
+    // now_ms - anchor > kMaxPlausibleSkewMs (1 day): poison the anchor 2 days
+    // behind the current DB clock.
+    const std::string poisoned = std::to_string(fx.raw_db_now_ms() - 2LL * 24 * 3600 * 1000);
+    fx.raw_set_reap_anchor(poisoned);
+
+    auto out = fx.store().reap_stale_routes();
+    REQUIRE(out.has_value());
+    CHECK(out->clock_anomaly);
+    CHECK(out->expired_leases_reaped == 0);
+    CHECK(out->tombstones_reaped == 0);
+
+    auto anchor_after = fx.raw_get_reap_anchor();
+    REQUIRE(anchor_after.has_value());
+    CHECK(*anchor_after == poisoned); // a declined pass never advances the anchor
+
+    auto live = fx.store().lookup_route("agent-fwd-live");
+    REQUIRE(live.has_value());
+    REQUIRE(live->has_value());
+    REQUIRE((*live)->session_id.has_value());
+    CHECK(*(*live)->session_id == "s-live");
+    auto stale = fx.store().lookup_route("agent-fwd-stale");
+    REQUIRE(stale.has_value());
+    REQUIRE(stale->has_value());
+    REQUIRE((*stale)->session_id.has_value());
+    CHECK(*(*stale)->session_id == "s-stale"); // NOT tombstoned by the declined pass
+}
+
+TEST_CASE("GatewayRouteStore[pg]: reap declines when the anchor is AHEAD of the DB clock "
+          "(backward/poisoned)",
+          "[gateway_route][pg][store][reap]") {
+    GatewayRoutePg fx;
+    auto baseline = fx.store().reap_stale_routes();
+    REQUIRE(baseline.has_value());
+    CHECK_FALSE(baseline->clock_anomaly);
+
+    REQUIRE(fx.store().register_fresh("agent-bwd-live", "s-live").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-bwd-live", "s-live", "c1", "n1", 3600)
+                .value()
+                .matched);
+    REQUIRE(fx.store().register_fresh("agent-bwd-stale", "s-stale").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-bwd-stale", "s-stale", "c1", "n1", 30)
+                .value()
+                .matched);
+    fx.raw_set_lease_until_ago("agent-bwd-stale", 200);
+
+    // Anchor 1h AHEAD of the DB clock -> now_ms < anchor -> backward decline.
+    const std::string poisoned = std::to_string(fx.raw_db_now_ms() + 3600LL * 1000);
+    fx.raw_set_reap_anchor(poisoned);
+
+    auto out = fx.store().reap_stale_routes();
+    REQUIRE(out.has_value());
+    CHECK(out->clock_anomaly);
+    CHECK(out->expired_leases_reaped == 0);
+    CHECK(out->tombstones_reaped == 0);
+
+    auto anchor_after = fx.raw_get_reap_anchor();
+    REQUIRE(anchor_after.has_value());
+    CHECK(*anchor_after == poisoned);
+
+    auto live = fx.store().lookup_route("agent-bwd-live");
+    REQUIRE(live.has_value());
+    REQUIRE(live->has_value());
+    REQUIRE((*live)->session_id.has_value());
+    CHECK(*(*live)->session_id == "s-live");
+    auto stale = fx.store().lookup_route("agent-bwd-stale");
+    REQUIRE(stale.has_value());
+    REQUIRE(stale->has_value());
+    REQUIRE((*stale)->session_id.has_value());
+    CHECK(*(*stale)->session_id == "s-stale");
+}
+
+TEST_CASE("GatewayRouteStore[pg]: reap declines a non-numeric (junk) persisted anchor",
+          "[gateway_route][pg][store][reap]") {
+    GatewayRoutePg fx;
+    auto baseline = fx.store().reap_stale_routes();
+    REQUIRE(baseline.has_value());
+    CHECK_FALSE(baseline->clock_anomaly);
+
+    REQUIRE(fx.store().register_fresh("agent-junk-live", "s-live").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-junk-live", "s-live", "c1", "n1", 3600)
+                .value()
+                .matched);
+    REQUIRE(fx.store().register_fresh("agent-junk-stale", "s-stale").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-junk-stale", "s-stale", "c1", "n1", 30)
+                .value()
+                .matched);
+    fx.raw_set_lease_until_ago("agent-junk-stale", 200);
+
+    fx.raw_set_reap_anchor("not-a-number");
+
+    auto out = fx.store().reap_stale_routes();
+    REQUIRE(out.has_value());
+    CHECK(out->clock_anomaly);
+    CHECK(out->expired_leases_reaped == 0);
+    CHECK(out->tombstones_reaped == 0);
+
+    auto anchor_after = fx.raw_get_reap_anchor();
+    REQUIRE(anchor_after.has_value());
+    CHECK(*anchor_after == "not-a-number");
+
+    auto live = fx.store().lookup_route("agent-junk-live");
+    REQUIRE(live.has_value());
+    REQUIRE(live->has_value());
+    REQUIRE((*live)->session_id.has_value());
+    CHECK(*(*live)->session_id == "s-live");
+    auto stale = fx.store().lookup_route("agent-junk-stale");
+    REQUIRE(stale.has_value());
+    REQUIRE(stale->has_value());
+    REQUIRE((*stale)->session_id.has_value());
+    CHECK(*(*stale)->session_id == "s-stale");
+}
+
+TEST_CASE("GatewayRouteStore[pg]: reap declines a negative persisted anchor",
+          "[gateway_route][pg][store][reap]") {
+    GatewayRoutePg fx;
+    auto baseline = fx.store().reap_stale_routes();
+    REQUIRE(baseline.has_value());
+    CHECK_FALSE(baseline->clock_anomaly);
+
+    REQUIRE(fx.store().register_fresh("agent-neg-live", "s-live").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-neg-live", "s-live", "c1", "n1", 3600)
+                .value()
+                .matched);
+    REQUIRE(fx.store().register_fresh("agent-neg-stale", "s-stale").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-neg-stale", "s-stale", "c1", "n1", 30)
+                .value()
+                .matched);
+    fx.raw_set_lease_until_ago("agent-neg-stale", 200);
+
+    fx.raw_set_reap_anchor("-5");
+
+    auto out = fx.store().reap_stale_routes();
+    REQUIRE(out.has_value());
+    CHECK(out->clock_anomaly);
+    CHECK(out->expired_leases_reaped == 0);
+    CHECK(out->tombstones_reaped == 0);
+
+    auto anchor_after = fx.raw_get_reap_anchor();
+    REQUIRE(anchor_after.has_value());
+    CHECK(*anchor_after == "-5");
+
+    auto live = fx.store().lookup_route("agent-neg-live");
+    REQUIRE(live.has_value());
+    REQUIRE(live->has_value());
+    REQUIRE((*live)->session_id.has_value());
+    CHECK(*(*live)->session_id == "s-live");
+    auto stale = fx.store().lookup_route("agent-neg-stale");
+    REQUIRE(stale.has_value());
+    REQUIRE(stale->has_value());
+    REQUIRE((*stale)->session_id.has_value());
+    CHECK(*(*stale)->session_id == "s-stale");
+}
+
+// ---------------------------------------------------------------------------
+// Governance fix #4 (cpp-safety + unhappy-path UP-4): the outer UPDATE in
+// sweep (a) re-asserts the expired predicate, not just `agent_id IN (...)` —
+// a row renewed to a future lease must never be tombstoned. Not a true
+// LOCK-TABLE rendezvous race (task spec marks that nice-to-have, not
+// required): this drives the same end state a race would produce, a row
+// whose lease is healthy by the time the outer UPDATE would touch it.
+TEST_CASE("GatewayRouteStore[pg]: reap does not tombstone a row renewed to a future lease "
+          "(outer-UPDATE re-assert, governance fix #4)",
+          "[gateway_route][pg][store][reap]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("agent-reap-renew", "session-1").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-reap-renew", "session-1", "c1", "n1", 30)
+                .value()
+                .matched);
+    fx.raw_set_lease_until_ago("agent-reap-renew", 200); // past the 180s grace
+    auto renewed =
+        fx.store().renew_leases(std::vector<std::string>{"session-1"}, 3600); // future lease
+    REQUIRE(renewed.has_value());
+    CHECK(*renewed == 1);
+
+    auto out = fx.store().reap_stale_routes();
+    REQUIRE(out.has_value());
+    CHECK(out->expired_leases_reaped == 0);
+    CHECK_FALSE(out->clock_anomaly);
+
+    auto row = fx.store().lookup_route("agent-reap-renew");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    REQUIRE((*row)->session_id.has_value());
+    CHECK(*(*row)->session_id == "session-1");
+    CHECK_FALSE((*row)->is_stale);
+}
+
 TEST_CASE("GatewayRouteStore[pg]: migrates from an empty database",
           "[gateway_route][pg][store][migration]") {
     YUZU_REQUIRE_PG_MIGRATION_DB(db);
@@ -596,4 +864,20 @@ TEST_CASE("GatewayRouteStore: fail-closed construction against a closed pool",
         {.conninfo = "host=127.0.0.1 port=1 dbname=nonexistent connect_timeout=1", .size = 1}};
     GatewayRouteStore store{pool};
     CHECK_FALSE(store.is_open());
+}
+
+// Governance fix #5 (quality-engineer QE-5): reap_stale_routes() itself must
+// report the same fail-closed store_unavailable a closed/unreachable pool
+// gives every other method — mirrors the construction test directly above.
+TEST_CASE("GatewayRouteStore: reap_stale_routes fails closed against a closed pool",
+          "[gateway_route][pg]") {
+    if (yuzu::test::pg_admin_dsn_env() == nullptr)
+        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+    yuzu::server::pg::PgPool pool{
+        {.conninfo = "host=127.0.0.1 port=1 dbname=nonexistent connect_timeout=1", .size = 1}};
+    GatewayRouteStore store{pool};
+    REQUIRE_FALSE(store.is_open());
+    auto out = store.reap_stale_routes();
+    REQUIRE_FALSE(out.has_value());
+    CHECK(out.error() == GatewayRouteStoreError::store_unavailable);
 }

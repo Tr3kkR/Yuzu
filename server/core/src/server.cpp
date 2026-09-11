@@ -2842,6 +2842,25 @@ public:
                           "replica's in-memory SSE bus by the WS-2a-2 delivery poll",
                           "counter");
         metrics_.counter("yuzu_exec_outbox_poll_published_total");
+        // HA WS-4 4.2a governance fold: the reap-decline observability gap.
+        // gateway_route_store.hpp's clock-guarded-retention header previously
+        // claimed the parts-1/4 carve-out (no would-wipe probe, no fact-set
+        // anomaly dedup) was compensated by "Task C's metrics wiring" — but
+        // Task C's yuzu_server_gateway_route_desync_total/write_failed_total
+        // cover the WRITE path, not a reap pass's own outcome, so a declined
+        // or failed reap tick was spdlog::warn-only with no metric. THIS
+        // counter is the actual compensating signal: one increment per tick
+        // by outcome (ok = a clean accepted pass; declined = clock_anomaly;
+        // error = the store call itself failed).
+        metrics_.describe("yuzu_server_gateway_route_reap_total",
+                          "gateway_route_store reap_stale_routes() pass outcomes, by outcome "
+                          "(ok|declined|error). declined = the pass was skipped by the "
+                          "clock-guarded-retention anomaly guard (implausible or unparseable "
+                          "now()/anchor reading) and reaped nothing; error = the store call "
+                          "failed outright (pool/query degradation). This is the observable "
+                          "signal for the clock-guarded-retention parts-1/4 carve-out documented "
+                          "in gateway_route_store.hpp's reap_stale_routes header.",
+                          "counter");
         // Distinct from the reap-only counter above: this fires on the
         // WRITE path (AgentServiceImpl::record_execution_id, dispatch-time),
         // not the retention sweep. Governance Gate 4/6 finding: previously
@@ -15201,11 +15220,25 @@ private:
                                                  "{} tombstone(s) reaped",
                                                  reaped->expired_leases_reaped,
                                                  reaped->tombstones_reaped);
-                                if (reaped->clock_anomaly)
+                                if (reaped->clock_anomaly) {
                                     spdlog::warn("gateway_route_store reap declined: "
                                                  "clock anomaly detected");
+                                    metrics_
+                                        .counter("yuzu_server_gateway_route_reap_total",
+                                                 {{"outcome", "declined"}})
+                                        .increment();
+                                } else {
+                                    metrics_
+                                        .counter("yuzu_server_gateway_route_reap_total",
+                                                 {{"outcome", "ok"}})
+                                        .increment();
+                                }
                             } else {
                                 spdlog::warn("gateway_route_store reap failed (store error)");
+                                metrics_
+                                    .counter("yuzu_server_gateway_route_reap_total",
+                                             {{"outcome", "error"}})
+                                    .increment();
                             }
                         }
 

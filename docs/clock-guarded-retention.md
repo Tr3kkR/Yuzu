@@ -167,9 +167,14 @@ unconditional per-predicate cap) and makes the SAME two carve-out choices `Sessi
 1. **NO would-wipe probe** — the `agent_routes` table legitimately drains toward "every lease
    expired" as ROUTINE behaviour (a fleet going offline overnight expires every lease), so a
    would-wipe verdict cannot separate a true from a false positive here.
-4. **NO fact-set anomaly dedup** — a declined pass is `spdlog::warn`'d; the write-failure counter
-   Task C wires alongside this store's other degraded-write paths is the observable signal, not a
-   fourth latch.
+4. **NO fact-set anomaly dedup** — a declined pass is `spdlog::warn`'d AND counted:
+   `yuzu_server_gateway_route_reap_total{outcome="declined"}` (incremented at the reap call site in
+   `server.cpp`) is the observable signal, not a fourth latch. This is a DEDICATED reap-outcome
+   counter, distinct from `yuzu_server_gateway_route_desync_total`/`_write_failed_total`, which cover
+   the WRITE path (`register_fresh`/`announce_connected`/`deregister`/`renew_leases`), not a reap
+   pass's own outcome. A reap pass that fails outright (pool/query degradation, distinct from a
+   clock-anomaly decline) is counted the same way under `outcome="error"`; a clean accepted pass is
+   `outcome="ok"`.
 
 Part (6)'s missing-anchor decision is **PROCEED** (`ResultSetStore`'s answer): a route is
 regenerable by the agent's next heartbeat/`ProxyRegister`, so a from-boot skewed clock reaping a
