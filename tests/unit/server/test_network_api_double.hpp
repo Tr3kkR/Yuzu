@@ -11,7 +11,7 @@
 /// every network-route test.
 ///
 /// NOT for production use — the production factory is
-/// `make_local_network_api` (network_api.hpp).
+/// `make_local_network_api` (network_api_local.hpp).
 
 #include "network_api.hpp"
 #include "network_perf_model.hpp"

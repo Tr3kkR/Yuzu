@@ -19,6 +19,12 @@ the checker's own `check_family()` flags it (returns False) via the SAME
 FORBIDDEN_HEADER_PATTERNS the shipped gate uses - proving the gate actually
 fires on the policy it claims to enforce, not merely that it returns green on
 the current tree (which a checker that always returns True would also do).
+Each positive probe is paired with a negative control so a "fires" result is
+evidence the gate DISCRIMINATES, not that it fails everything: probes 4/5 for
+the store patterns, probe 6 for the angle-bracket internal-header escape, and
+probes 7/8 for #4249's abstract-vs-local seam boundary (a presentation TU
+reaching a core-only `*_api_local.hpp` must fire and name the chain; the
+abstract `*_api.hpp` half it is meant to include must pass).
 
 Not wired through subprocess against an alternate ledger file (unlike the
 interlock selftest) because check-seam-closure.py's policy is in-module
@@ -34,7 +40,9 @@ itself. Stdlib only.
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import os
 import sys
 import tempfile
@@ -46,6 +54,8 @@ CHECKER_PATH = REPO_ROOT / "scripts" / "ci" / "check-seam-closure.py"
 # --- FROZEN CONSTANTS (the lock). Editing check-seam-closure.py's FAMILIES or
 # --- FORBIDDEN_HEADER_PATTERNS to change any of these must also edit the
 # --- matching value here - a loud, reviewed change, never a silent narrowing.
+# --- The comparison is LIST EQUALITY, so it is ORDER-SENSITIVE by design: a
+# --- pure re-order also trips it (both lists are printed side by side).
 EXPECTED_FAMILIES = {
     "network": {
         "tus": [
@@ -53,6 +63,7 @@ EXPECTED_FAMILIES = {
             "server/core/src/network_ui.cpp",
             "server/core/src/network_perf_model.cpp",
             "server/core/src/network_api.hpp",
+            "server/core/src/network_api_local.hpp",
         ],
     },
 }
@@ -60,6 +71,13 @@ EXPECTED_FORBIDDEN_HEADER_PATTERNS = [
     "*_store.hpp",
     "agent_registry.hpp",
     "pg/*.hpp",
+    # #4249's abstract-vs-local seam boundary. Pinned here for the same
+    # reason as the three store patterns: the local header carries no store
+    # includes of its own, so dropping this pattern would leave a
+    # presentation TU free to reach the store-backed factory with a closure
+    # the other three patterns read as perfectly clean - a silent, invisible
+    # widening. Probe 7 below proves it actually fires.
+    "*_api_local.hpp",
 ]
 
 
@@ -91,9 +109,7 @@ def main() -> int:
               f"frozen {EXPECTED_FORBIDDEN_HEADER_PATTERNS!r}", failures)
 
     # 3. Missing-family-member HARD ERROR: a declared TU that does not exist
-    #    on disk must fail the family check, never be silently skipped (this
-    #    is the exact contract network_api.hpp exercises today, ahead of the
-    #    sibling INV-31-4 change that creates it).
+    #    on disk must fail the family check, never be silently skipped.
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         src = root / "server" / "core" / "src"
@@ -159,12 +175,68 @@ def main() -> int:
                   "the internal include root and catch its store header - "
                   "the angle-bracket escape is unguarded", failures)
 
+        # 7. ABSTRACT-VS-LOCAL SEAM POSITIVE PROBE (#4249): a synthetic
+        #    PRESENTATION TU that includes a core-only `*_api_local.hpp` must
+        #    be flagged. The fake local header holds only a forward
+        #    declaration and a factory signature - exactly the real
+        #    `network_api_local.hpp` shape - so NONE of the three store
+        #    patterns can see it; only `*_api_local.hpp` itself can. stderr is
+        #    captured so this asserts the checker NAMES THE CHAIN, not merely
+        #    that it returned False (`run_check()` maps any False family to
+        #    exit code 1).
+        (src / "fake_api_local.hpp").write_text(
+            "#pragma once\n"
+            "namespace detail { class FakeStore; }\n"
+            "int make_local_fake_api(detail::FakeStore&);\n",
+            encoding="utf-8")
+        (src / "seam_probe_routes.cpp").write_text(
+            '#include "fake_api_local.hpp"\nint main() {}\n', encoding="utf-8")
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            ok = mod.check_family("api-local-seam-probe",
+                                   ["server/core/src/seam_probe_routes.cpp"],
+                                   roots=roots,
+                                   patterns=mod.FORBIDDEN_HEADER_PATTERNS)
+        diag = captured.getvalue()
+        if ok:
+            _fail("check_family did not fire on a synthetic presentation TU "
+                  "including a *_api_local.hpp header - the abstract-vs-local "
+                  "seam boundary (#4249) is convention only, not enforced",
+                  failures)
+        elif "*_api_local.hpp" not in diag:
+            _fail("check_family fired on the *_api_local.hpp probe but did "
+                  f"not name the matched pattern; stderr was: {diag!r}", failures)
+        elif ("server/core/src/seam_probe_routes.cpp -> "
+              "server/core/src/fake_api_local.hpp") not in diag:
+            _fail("check_family fired on the *_api_local.hpp probe but did "
+                  f"not name the include chain; stderr was: {diag!r}", failures)
+
+        # 8. Negative control for probe 7: the ABSTRACT half of the same seam
+        #    (`fake_api.hpp`, no `_local`) is exactly what a presentation TU
+        #    IS meant to include, and must PASS - proving the new pattern
+        #    discriminates between the two halves rather than banning a
+        #    family's in-process API header outright.
+        (src / "fake_api.hpp").write_text(
+            "#pragma once\nclass FakeApi { public: virtual ~FakeApi() = default; };\n",
+            encoding="utf-8")
+        (src / "seam_control_routes.cpp").write_text(
+            '#include "fake_api.hpp"\nint main() {}\n', encoding="utf-8")
+        ok = mod.check_family("api-abstract-negative-control",
+                               ["server/core/src/seam_control_routes.cpp"],
+                               roots=roots,
+                               patterns=mod.FORBIDDEN_HEADER_PATTERNS)
+        if not ok:
+            _fail("check_family flagged a synthetic TU including only the "
+                  "ABSTRACT fake_api.hpp - the *_api_local.hpp pattern is "
+                  "over-firing onto the abstract half of the seam", failures)
+
     if failures:
         print(f"\n{len(failures)} seam-closure self-test failure(s).", file=sys.stderr)
         return 1
     print("seam closure self-test: OK - policy constants pinned; gate fires on "
           "its stated patterns (including the angle-bracket internal-header "
-          "shape) and does not over-fire.")
+          "shape and #4249's core-only *_api_local.hpp seam half) and does "
+          "not over-fire.")
     return 0
 
 

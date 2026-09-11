@@ -165,7 +165,7 @@
 #include "guardian_ingest.hpp" // kGuardianEventStoreDurationMetric + warm_create_guardian_event_store_metric
 #include "dex_perf_rules.hpp"
 #include "dex_routes.hpp"
-#include "network_api.hpp" // ADR-0031 WS-A4: the public in-process /network API seam
+#include "network_api_local.hpp" // ADR-0031 WS-A4: core-only /network seam factory
 #include "network_perf_rules.hpp"
 #include "inventory_routes.hpp"
 #include "inventory_ci_join.hpp"
@@ -15226,7 +15226,8 @@ private:
             // registration time, so the ordering is fine.
             [this](const std::string& scope, bool full_sync) -> int {
                 return guardian_push_fn_ ? guardian_push_fn_(scope, full_sync) : -2;
-            });
+            },
+            &metrics_); // #4252 — platform-support-matrix-stale counter
 
         // F2a: the fleet perf snapshot provider — joins AgentHealthStore heartbeat
         // perf tags (validated through the SAME dex_perf_rules the Prometheus
