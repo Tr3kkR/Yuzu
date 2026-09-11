@@ -7,7 +7,7 @@ tracks *what ships, in what order, who reviews it, and how we know it's done*. *
 with the ADRs, the ADR wins; on delivery status, this matrix is the source of truth.** The `/split`
 skill is a pointer to both and loses to both.
 
-**Verified against the tree 2026-09-11** (`origin/dev` @ `78bfb9513`; WS-0 merged #4161, INV-31-4 global test found already-shipped #842/#3991/#3992 — WS-A4 re-scoped; the three-way lexical caveat re-verified against `check-api-parity.py` and `HttplibRouteSink`/`test_openapi_spec_completeness.cpp` in review round 2; the `network` family landed as the FIRST per-family in-process API seam — `NetworkApi`/`network_api.{hpp,cpp}` + `scripts/ci/check-seam-closure.py` — see the WS-A4 row; #4249 then split that seam's factory header into `network_api.hpp` (abstract) + `network_api_local.hpp` (core-only), with the boundary between them CI-enforced, cutting the two-header shape the remaining families copy; **WS-B1 Drogon canary added on `feat/split-b1-drogon-canary` — Linux build+link+run proven, `#375` triplet/meson branch untouched, Windows MSVC static leg deferred to CI**). Re-stamp
+**Verified against the tree 2026-09-11** (`origin/dev` @ `a70b2942c`; WS-0 merged #4161, INV-31-4 global test found already-shipped #842/#3991/#3992 — WS-A4 re-scoped; the three-way lexical caveat re-verified against `check-api-parity.py` and `HttplibRouteSink`/`test_openapi_spec_completeness.cpp` in review round 2; the `network` family landed as the FIRST per-family in-process API seam — `NetworkApi`/`network_api.{hpp,cpp}` + `scripts/ci/check-seam-closure.py` — see the WS-A4 row; #4249 then split that seam's factory header into `network_api.hpp` (abstract) + `network_api_local.hpp` (core-only), with the boundary between them CI-enforced, cutting the two-header shape the remaining families copy; **WS-B1 Drogon canary added on `feat/split-b1-drogon-canary` — Linux build+link+run proven, `#375` triplet/meson branch untouched, Windows MSVC static leg deferred to CI**). Re-stamp
 this line whenever the table is revised — a matrix from a stale checkout is worse than none, and the
 current-state claims below were wrong in the first draft because they were copied from stale ADR status
 columns. Grep the tree, don't trust a doc.
@@ -110,8 +110,9 @@ The first draft asserted a falsified current state; a three-model adversarial pa
   `builtin-baseline`, added UNCONDITIONALLY (default features only). On Windows the base
   `triplets/x64-windows.cmake` linkage is `dynamic`, and drogon/trantor/jsoncpp/brotli are NOT in the
   `#375` static-override list (`abseil|grpc|protobuf|upb|re2|c-ares|utf8-range`), so they build as
-  ordinary DLLs + import libs — the SAME shape as sqlite3/libpq/libxml2, which already use
-  `method:'cmake'` on Windows without LNK2038. So the canary uses the uniform cmake-dep pattern, not the
+  ordinary DLLs + import libs — the SAME shape as sqlite3/libxml2 (which use `method:'cmake'` on
+  Windows) and libpq (hand-wired `find_library` on Windows — same dynamic-DLL shape), none hitting
+  LNK2038. So the canary uses the uniform cmake-dep pattern, not the
   hand-wired static branch. **What the canary proves, and its two Windows caveats (corrected per the WS-B1 governance round):**
   it proves Drogon **links and loads** into the matrix. It is registered as a meson test so CI *runs* it
   (not just builds it), surfacing a load-time failure. Its body forces `drogon::app()` and marshals **no
@@ -121,9 +122,16 @@ The first draft asserted a falsified current state; a three-model adversarial pa
   iterator-debug/`detect_mismatch` records (those live in the DLL's objects), so the debug leg **links
   green**. But meson's cmake translator reads `IMPORTED_LOCATION_RELEASE` even for `--buildtype=debug`
   (the `#375` translator bug), so a `/MDd` debug exe loads Drogon's `/MD` release DLL — a mismatch that
-  only bites at **runtime** when STL crosses the boundary. The link-only canary won't expose it; a
-  future STL-marshalling canary + the `#375` option-D (build-type-conditional import lib) fix are the
-  WS-B2 remedy, not touching the grpc branch. (2) **c-ares double-linkage (LNK2005) — the canary does
+  could bite at **runtime** when STL crosses the boundary — but this is a HAZARD TO VALIDATE, not a
+  proven outcome: the repo's own debug-build DLL selection may already resolve it. Meson picks
+  `debug/lib/libdrogon.a` for the DIRECT dependency on a debug build, `ci.yml` prepends
+  `vcpkg_installed/x64-windows/debug/bin` to PATH before the Windows debug `server-checks` step, and
+  `deploy_build_dlls.py` selects the matching-config DLL dir — so the loader may resolve the debug DLL
+  by name regardless of what the import lib recorded. The open question is whether the debug/release
+  Drogon DLLs share a filename (no `DEBUG_POSTFIX`): if they differ, a wrong pick is a load FAILURE (the
+  canary catches it), not a silent CRT mismatch. A future STL-marshalling canary + a
+  `dumpbin`/import-provenance assertion resolve this at WS-B2 before prescribing the `#375` option-D
+  (build-type-conditional import lib) fix — which would not touch the grpc branch. (2) **c-ares double-linkage (LNK2005) — the canary does
   NOT and CANNOT exercise this.** It links drogon/trantor only, never gRPC, so there is a single
   (static, trantor-internal) c-ares copy. The two-copy LNK2005 hazard needs gRPC + trantor in one link,
   i.e. the presentation binary linked beside the core gRPC stack — a WS-B2 concern, and per ADR-0031 the
@@ -133,7 +141,9 @@ The first draft asserted a falsified current state; a three-model adversarial pa
   gate working — report it, do not paper over it. **WS-B2 follow-ups surfaced by this round:** feature-gate
   Drogon to a server vcpkg feature (agent/ASan/cross legs currently build it unused; #TBD), a
   STL-marshalling canary + a `dumpbin`/`ldd` import-provenance assertion, the Drogon+gRPC coexistence
-  link test, and picking Drogon's transitive tree up in the customer SBOM once a shipped binary links it.
+  link test. (Drogon's transitive tree already appears in the release SBOM today — `release.yml`'s Syft
+  scan covers `path: .` incl. `vcpkg_installed`, per this PR's changelog fragment — so SBOM pickup is
+  NOT a WS-B2 deferral.)
 
 ---
 

@@ -27,10 +27,10 @@
 // Exit code 0 = the process linked and ran; there is no runtime contract
 // beyond "it started". The value of this target is at BUILD/LINK time.
 
-#include <drogon/drogon.h>
-
 #include <cstdio>
 #include <format>
+
+#include <drogon/drogon.h>
 
 int main() {
     // Out-of-line symbol from libdrogon (HttpAppFramework::instance() via the

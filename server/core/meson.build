@@ -677,8 +677,9 @@ executable(
 # triplets/x64-windows.cmake's static-linkage override list (scoped to
 # abseil/grpc/protobuf/upb/re2/c-ares/utf8-range only), so on Windows they
 # resolve as ordinary dynamic DLLs + import libs — the same shape as
-# sqlite3/libpq/openssl/libxml2, all of which already use method:'cmake' on
-# Windows without LNK2038. So one uniform cmake dependency() call across every
+# sqlite3/openssl/libxml2 (which use method:'cmake' on Windows) and libpq
+# (hand-wired find_library on Windows — same dynamic-DLL shape, see the libpq
+# block in the root meson.build), none of which hits LNK2038. So one uniform cmake dependency() call across every
 # platform, with a pkg-config fallback, is correct here. Do NOT hand-wire this
 # into the Windows find_library() branch: that machinery exists solely for the
 # forced-static #375 stack.
@@ -758,9 +759,16 @@ yuzu_drogon_canary_exe = executable(
 # resolution actually matters) and on the unfiltered nightly ASan/TSan legs;
 # the self-hosted Linux PR/push leg selects server-checks members by name, so
 # there it still builds+links (its primary Linux value) but is not run.
-test(
-  'drogon build canary',
-  yuzu_drogon_canary_exe,
-  suite: ['server', 'server-checks'],
-  timeout: 30,
-)
+# Gated on build_tests for consistency with every other registered test
+# (tests/meson.build is only walked under build_tests); the executable itself
+# still builds whenever build_server is set (its Linux link-check value, like
+# the sibling yuzu_pg_canary). CI legs that RUN this (Windows server-checks,
+# nightly ASan/TSan) enable build_tests to invoke `meson test`.
+if build_tests
+  test(
+    'drogon build canary',
+    yuzu_drogon_canary_exe,
+    suite: ['server', 'server-checks'],
+    timeout: 30,
+  )
+endif
