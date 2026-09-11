@@ -813,6 +813,24 @@ std::unique_ptr<ISparkMechanism> make_service_mechanism() {
     return std::make_unique<LinuxServiceMechanism>();
 }
 
+// #2012/#3840 PR-B3 restructured the WINDOWS SCM half only — Linux's
+// mechanism has no detached workers of its own (its ONE poll thread already
+// multiplexes every watch with no per-service blocking call to isolate), so
+// this overload just accepts and ignores `f3_counter`, mirroring how the
+// zero-argument form already behaves. Same object, same platform contract.
+std::unique_ptr<ISparkMechanism>
+make_service_mechanism(std::shared_ptr<std::atomic<std::size_t>> /*f3_counter*/) {
+    return std::make_unique<LinuxServiceMechanism>();
+}
+
+bool set_service_test_controls_for_test(ISparkMechanism&, ServiceMechanismTestControls) {
+    return false; // nothing to control on Linux — no probe lane exists here
+}
+
+std::optional<ServiceMechanismDebugCounters> service_debug_counters_for_test(const ISparkMechanism&) {
+    return std::nullopt;
+}
+
 } // namespace yuzu::agent
 
 #elif defined(_WIN32)
@@ -824,6 +842,28 @@ std::unique_ptr<ISparkMechanism> make_service_mechanism() {
 // thread — the same fire-and-forget command queue as Linux, and for the same
 // reason: the APC-processing thread IS the emit thread, so a synchronous
 // watch() that waited on itself would deadlock on every inline re-arm.
+//
+// #2012/#3840 PR-B3: watch()/unwatch() were ALREADY O(1) queue pushes (see
+// above) — the actual gap #3840 tracks is that OpenServiceW (the per-service
+// establishment call) ran synchronously, head-of-line, on this ONE mechanism
+// thread: a hung SCM call for one service delayed establishment, retries, AND
+// APC dispatch for every OTHER watched service sharing this thread. Establish-
+// ment is now isolated onto a bounded, F3-counted probe_lane_
+// (SparkDetachedLane, spark_detached_call.hpp) — mirroring spark_registry.cpp's
+// probe half, PROBE-ONLY, deliberately no drain-lane twin: Service's teardown
+// (CloseServiceHandle + a zero-timeout SleepEx(0,TRUE) APC pump) does not
+// block the way Registry's WaitForThreadpoolWaitCallbacks(...,TRUE) can, so
+// there is no genuinely-blocking close to isolate, and isolating one anyway
+// would trade a real hazard (Registry's #4181 same-type deadlock edge) for an
+// invented cross-thread close-vs-APC-reclamation ownership problem with no
+// measured benefit. NotifyServiceStatusChangeW and CloseServiceHandle
+// DELIBERATELY stay on this thread — the former by Win32's own thread-
+// affinity requirement (see notify_cb's own comment), the latter by design
+// decision (see begin_probe()'s doc comment). A hung NotifyServiceStatusChangeW
+// registration itself is NOT isolated by this restructure — only OpenServiceW
+// establishment is; its own measured cost is small (see
+// docs/spark-rebuild-baselines/stage2-watch-establish-latency.md) but that is
+// not a hard bound, and this residual must not be read as "closed" by #3840.
 // ═══════════════════════════════════════════════════════════════════════════
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -833,7 +873,8 @@ std::unique_ptr<ISparkMechanism> make_service_mechanism() {
 #define NOMINMAX
 #endif
 
-#include "guard_win_handle.hpp" // detail::EventHandle
+#include "guard_win_handle.hpp"    // detail::EventHandle
+#include "spark_detached_call.hpp" // SparkDetachedLane, DetachedCall (#2012/#3840 PR-B3)
 
 #include <windows.h>
 
@@ -897,6 +938,34 @@ static_assert((kNotifyMask & (SERVICE_NOTIFY_CREATED | SERVICE_NOTIFY_DELETED |
 
 constexpr std::uint64_t kAbsentRetryMs = 30000;
 
+// ── PR-B3 (#2012/#3840): probe-lane policy constants. Initial policy
+// references copied from spark_registry.cpp's probe half (its already-
+// reviewed values), NOT measured Service capacity — retune after a real
+// synthetic-storm measurement (tracked as a pre-flip follow-up, see the
+// kickoff doc). ──
+using Clock = std::chrono::steady_clock;
+constexpr std::size_t kServiceProbeLaneCap = 16; ///< concurrent detached probe workers
+/// How long an accepted establishment/re-establishment obligation may stay
+/// unresolved before the watch is reported faulted (mirrors
+/// spark_registry.cpp's kRegHealthGrace) — a grace window, not a timeout that
+/// abandons the probe; the probe itself keeps running past this point.
+constexpr std::chrono::milliseconds kServiceHealthGrace{50};
+/// First delay after a probe-lane admission refusal (cap full / launch
+/// failed): D, 2D, 4D, ... capped at kServiceAdmissionBackoffCap, never
+/// counted as a backend (OpenServiceW) attempt — mirrors
+/// spark_registry.cpp's kRegAdmissionBackoffSeed/-Cap.
+constexpr std::chrono::milliseconds kServiceAdmissionBackoffSeed{50};
+constexpr std::chrono::milliseconds kServiceAdmissionBackoffCap{30'000};
+/// Poll cadence while ANY watch has a probe outstanding — this mechanism
+/// never wait_take()s on its own probe lane (it must keep pumping APCs for
+/// every OTHER watch while one establishes), so the main loop's own wait
+/// timeout is capped at this cadence whenever a probe is Pending, or a
+/// completed-but-unpolled result could sit unnoticed until some UNRELATED
+/// event next woke the thread. Provisional value, same order of magnitude as
+/// spark_registry.cpp's kRegSweepCadence; a candidate for the same pre-flip
+/// tuning pass as the constants above.
+constexpr std::chrono::milliseconds kServicePollCadence{50};
+
 /// How many main-loop passes a retired SvcWatch survives in `retiring_`
 /// before being freed for real, once it stops observing any further APC
 /// delivery. Reset back to this value any time a stale APC DOES land during
@@ -931,6 +1000,87 @@ struct PendingFault {
     std::string reason;
 };
 
+/// Pending-operation state of one watch's establishment — INDEPENDENT of its
+/// health/armed status (mirrors spark_registry.cpp's ProbeState). Idle: no
+/// establishment outstanding (either healthy+registered, or a definite
+/// terminal Stopped needing only its next_retry poll). Pending: a probe is
+/// reserved or in flight on probe_lane_ (`call` engaged once launched).
+/// Deferred: a (re)probe will be launched at `next_retry` — covers admission
+/// backoff, a backend (OpenServiceW/Notify) failure's retry, and an absent-
+/// service re-poll (there is no notification for "a not-yet-existing service
+/// now exists").
+enum class ProbeState : std::uint8_t { Idle, Pending, Deferred };
+
+/// Shared, ref-counted ownership of the mechanism's OpenSCManagerW handle, so
+/// a detached probe holding a copy keeps the SCM connection alive even if
+/// stop() runs (and would otherwise close the mechanism's own handle) while
+/// that probe is still parked — mirrors spark_registry.cpp's PoolCore lease
+/// pattern (#2012/#3840 PR-B1). Concurrent OpenServiceW calls against the SAME
+/// hSCManager from different threads are a documented-safe SCM RPC pattern
+/// (every Windows service-control tool that enumerates+queries concurrently
+/// relies on it); this struct only owns the CLOSE, it never serialises
+/// callers against each other.
+struct ScmCore {
+    SC_HANDLE handle{nullptr};
+    ScmCore() = default;
+    ScmCore(const ScmCore&) = delete;
+    ScmCore& operator=(const ScmCore&) = delete;
+    ~ScmCore() {
+        if (handle)
+            ::CloseServiceHandle(handle);
+    }
+};
+
+/// What one detached establishment probe produced. Every OS resource it
+/// opened is owned here (RAII), so a discarded result closes itself on
+/// whichever thread drops it — never under any lock by construction of the
+/// call sites (this mechanism has no lock guarding svcs_/retiring_ at all;
+/// see the class comment). `scm` is declared FIRST so it outlives `svc` on
+/// destruction (a service handle opened against a connection is logically
+/// scoped by that connection, though CloseServiceHandle itself does not
+/// require ordering — this mirrors ProbeResult's own ordering discipline in
+/// spark_registry.cpp for the same defensive reason). nothrow-move by
+/// construction (SparkDetachedLane::launch() static_asserts it).
+struct ServiceProbeResult {
+    std::shared_ptr<ScmCore> scm;
+    yuzu::win::ScHandle svc; ///< opened SERVICE_QUERY_STATUS handle; empty on failure
+    bool ok{false};
+    DWORD err{0};
+};
+static_assert(std::is_nothrow_move_constructible_v<ServiceProbeResult>);
+
+using ServiceProbeHook = std::function<void(std::wstring_view name)>;
+
+/// The detached probe: OpenServiceW only. NotifyServiceStatusChangeW is
+/// DELIBERATELY not called here — Win32 requires the REGISTERING thread to
+/// pump the alertable wait that delivers its APC (this mechanism's own
+/// notify_cb/WaitForSingleObjectEx(...,TRUE) comment), so a detached worker
+/// that registered and then exited immediately could never receive one.
+/// Registration happens on the mechanism thread, in resolve_probe(), exactly
+/// as it did synchronously before PR-B3.
+struct ServiceProbeJob {
+    std::shared_ptr<ScmCore> scm;
+    std::wstring name; ///< original (unfolded) service name — OpenServiceW's own lookup key
+    std::shared_ptr<const ServiceProbeHook> hook; ///< test seam; may be null
+
+    ServiceProbeResult operator()() {
+        ServiceProbeResult r;
+        r.scm = scm;
+        if (hook && *hook)
+            (*hook)(name); // test seam: may park (a "hung SCM") or throw
+        SC_HANDLE h = ::OpenServiceW(scm->handle, name.c_str(), SERVICE_QUERY_STATUS);
+        if (!h) {
+            r.err = ::GetLastError();
+            r.ok = false;
+            return r;
+        }
+        r.svc.reset(h);
+        r.ok = true;
+        return r;
+    }
+};
+static_assert(std::is_nothrow_move_constructible_v<ServiceProbeJob>);
+
 /// One watched Windows service, mechanism-thread-confined. `notify` MUST
 /// outlive each one-shot registration (the SCM writes into it via APC);
 /// `pContext` points back at this struct so the APC callback can identify
@@ -963,6 +1113,31 @@ struct SvcWatch {
     /// >0 while parked in `retiring_` awaiting quiescence before real free;
     /// 0 for a live (non-retiring) watch. See `retiring_`'s doc comment.
     int retire_grace{0};
+
+    // ── PR-B3 (#2012/#3840): async establishment state ─────────────────────
+    ProbeState probe{ProbeState::Idle};
+    /// Mechanism-global, bumped at every probe reservation (defense-in-depth
+    /// only, mirrors spark_registry.cpp's probe_gen — Service has a single
+    /// thread ever launching or committing a probe for a given SvcWatch, so
+    /// unlike Registry there is no separate caller-thread racing the
+    /// commit; a generation mismatch at resolve time would indicate a
+    /// same-object double-launch bug, not an expected race, and is guarded
+    /// against defensively rather than relied upon).
+    std::uint64_t probe_gen{0};
+    /// Engaged from an admitted launch until resolve_probe() consumes it.
+    std::optional<DetachedCall<ServiceProbeResult>> call;
+    /// When the CURRENT establishment obligation was (re)accepted — reset on
+    /// every begin_probe() call, whether the initial arm, an admission
+    /// retry, or a backend-failure retry (mirrors spark_registry.cpp's
+    /// accepted_at: grace is measured from the most recent attempt, not the
+    /// original request, so a persistently-failing service stays faulted
+    /// for as long as establishment keeps failing).
+    Clock::time_point accepted_at{};
+    bool grace_counted{false};
+    /// Admission (lane-rejection) retry count, for the backoff doubling —
+    /// distinct from backend (OpenServiceW/Notify) failures, which retry on
+    /// the existing fixed kAbsentRetryMs cadence.
+    unsigned admission_attempts{0};
 };
 
 void CALLBACK notify_cb(PVOID param) {
@@ -980,6 +1155,13 @@ void CALLBACK notify_cb(PVOID param) {
 /// inline-re-arm-safety reason (see the file header comment).
 class WindowsServiceMechanism final : public ISparkMechanism {
 public:
+    /// `f3_counter` (may be null) is the agent-lifetime orphan-exit counter
+    /// every detached probe this mechanism launches is admitted against
+    /// (#2012/#3840 PR-B3, F3) — mirrors WindowsRegistryMechanism's
+    /// constructor. probe_lane_ is constructed here, once, and keeps its
+    /// identity across start()/stop() (SparkDetachedLane is non-movable).
+    explicit WindowsServiceMechanism(std::shared_ptr<std::atomic<std::size_t>> f3_counter)
+        : probe_lane_(std::move(f3_counter), kServiceProbeLaneCap) {}
     ~WindowsServiceMechanism() override { stop(); }
 
     void start(SparkEmitFn emit, SparkFaultFn fault) override {
@@ -988,8 +1170,14 @@ public:
             return; // idempotent
         emit_ = std::move(emit);
         fault_ = std::move(fault);
-        scm_.reset(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT));
-        if (!scm_) {
+        // Construct the lease EMPTY first, acquire the OS handle into it only
+        // after construction succeeds — mirrors spark_registry.cpp's PoolCore
+        // start() ordering. If make_shared's own allocation throws, nothing
+        // has been acquired yet, so nothing leaks; if OpenSCManagerW itself
+        // fails, `core` (still empty) destructs harmlessly below.
+        auto core = std::make_shared<ScmCore>();
+        core->handle = ::OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+        if (!core->handle) {
             spdlog::warn("spark_service: OpenSCManager failed (err={}) — service sparks inert on "
                          "this host",
                          GetLastError());
@@ -1000,12 +1188,13 @@ public:
         }
         wake_.reset(CreateEventW(nullptr, /*manualReset=*/FALSE, /*initial=*/FALSE, nullptr));
         if (!wake_) {
-            scm_.reset();
+            // `core` destructs here, closing the just-opened SCM handle via ~ScmCore.
             scm_ok_ = false;
             started_inert_.store(true, std::memory_order_release);
             started_ = true;
             return;
         }
+        scm_core_ = std::move(core);
         scm_ok_ = true;
         started_inert_.store(false, std::memory_order_release);
         stop_.store(false, std::memory_order_release);
@@ -1058,7 +1247,12 @@ public:
         svcs_.clear();
         retiring_.clear();
         key_svc_.clear();
-        scm_.reset();
+        // Drops the mechanism's own reference; a probe still parked on
+        // probe_lane_ (the F3-counted orphan case) holds its own ScmCore
+        // copy via ServiceProbeJob/ServiceProbeResult, so the SCM connection
+        // itself stays open until that probe's own result is disposed —
+        // never closed out from under it (#2012/#3840 PR-B3).
+        scm_core_.reset();
         wake_.reset();
         std::lock_guard lk(mu_);
         emit_ = nullptr;
@@ -1087,6 +1281,15 @@ private:
             SetEvent(wake_.get());
     }
 
+    // ── tunables (atomics so the test seam can override without a rebuild,
+    //    mirrors spark_registry.cpp's identical pattern) ─────────────────────
+    [[nodiscard]] std::chrono::milliseconds health_grace() const {
+        return std::chrono::milliseconds(health_grace_ms_.load(std::memory_order_relaxed));
+    }
+    [[nodiscard]] std::chrono::milliseconds admission_seed() const {
+        return std::chrono::milliseconds(admission_seed_ms_.load(std::memory_order_relaxed));
+    }
+
     // ── Mechanism-thread-confined helpers ───────────────────────────────────
 
     // Cancels the outstanding registration (closing the handle invalidates it),
@@ -1102,18 +1305,118 @@ private:
         }
     }
 
-    // (Re)open the service handle + (re)register the one-shot notify from
-    // scratch. Collects an initial/re-resolved emit for every current key on
-    // `w`. `ERROR_SERVICE_DOES_NOT_EXIST` is a genuine terminal Stopped, never
-    // a fault; every other open/register failure is a fault (never a false
-    // Stopped — the UP-4 class guard_systemd.cpp's ResolveResult split guards
-    // against on Linux).
-    void arm_watch(SvcWatch& w, std::vector<PendingEmit>& emits, std::vector<PendingFault>& faults) {
+    // Kicks off (re-)establishment for `w`: cancels any live registration/
+    // handle (cheap, synchronous — no OS call here can block for long), then
+    // launches OpenServiceW on probe_lane_ and returns IMMEDIATELY — never
+    // blocks on the OS call itself (#2012/#3840 PR-B3; before this, this
+    // function — then named arm_watch — made the OpenServiceW call inline,
+    // synchronously, head-of-line on this mechanism's one thread, per the
+    // file header comment). Every call site only reaches here from
+    // ProbeState::Idle or a due ProbeState::Deferred retry, so at most one
+    // probe is ever outstanding per watch; the guard below is defense-in-
+    // depth against that invariant being violated by a future change, not a
+    // path exercised today.
+    void begin_probe(SvcWatch& w) {
+        if (w.probe == ProbeState::Pending) {
+            spdlog::error("spark_service: begin_probe() called with a probe already outstanding "
+                         "for a watched service — ignoring (an admission invariant was violated)");
+            return;
+        }
         teardown_watch(w);
-        SC_HANDLE h = OpenServiceW(scm_.get(), w.name.c_str(), SERVICE_QUERY_STATUS);
-        if (!h) {
-            const DWORD err = GetLastError();
-            if (err == ERROR_SERVICE_DOES_NOT_EXIST) {
+        // Grace runs from the MOST RECENT attempt, not the original request —
+        // a persistently-failing service stays faulted for as long as
+        // establishment keeps failing, mirrors spark_registry.cpp.
+        w.accepted_at = Clock::now();
+        w.grace_counted = false;
+        w.probe = ProbeState::Pending;
+        w.probe_gen = ++gen_;
+        std::shared_ptr<const ServiceProbeHook> hook;
+        {
+            // See apply_test_controls()'s own comment — probe_hook_ needs
+            // mu_ specifically because, unlike spark_registry.cpp, nothing
+            // else on this thread's path already holds it.
+            std::lock_guard lk(mu_);
+            hook = probe_hook_;
+        }
+        auto lr = probe_lane_.launch(ServiceProbeJob{scm_core_, w.name, std::move(hook)});
+        if (lr.status == DetachedLaunch::Launched) {
+            w.call = std::move(lr.call);
+            probe_launched_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        // Admission refused (lane cap) or the OS refused the worker thread —
+        // never a backend (OpenServiceW) attempt, so this is NOT a fault
+        // edge: the obligation is retained and retried on a short doubling
+        // backoff, distinct from a genuine backend failure's fixed
+        // kAbsentRetryMs cadence below.
+        if (lr.status == DetachedLaunch::Rejected)
+            probe_admission_rejected_.fetch_add(1, std::memory_order_relaxed);
+        else
+            probe_launch_failed_.fetch_add(1, std::memory_order_relaxed);
+        w.probe = ProbeState::Deferred;
+        ++w.admission_attempts;
+        w.next_retry = Clock::now() + doubled(admission_seed(), w.admission_attempts,
+                                              kServiceAdmissionBackoffCap);
+    }
+
+    // base * 2^(attempts-1), saturating at cap (attempts >= 1) — copied
+    // verbatim from spark_registry.cpp's own already-reviewed helper rather
+    // than a bit-shift reimplementation, deliberately: this restructure
+    // cannot be compiled/verified on this box (Windows-only), so matching
+    // proven, already-compiled arithmetic exactly is lower-risk than a new
+    // expression whose duration/rep type inference has not been checked
+    // against a real MSVC build.
+    static std::chrono::milliseconds doubled(std::chrono::milliseconds base, unsigned attempts,
+                                             std::chrono::milliseconds cap) {
+        std::chrono::milliseconds d = base;
+        for (unsigned i = 1; i < attempts && d < cap; ++i)
+            d *= 2;
+        return std::min(d, cap);
+    }
+
+    // Consumes a completed establishment probe for `w` (called only from
+    // run()'s completion-poll scan, immediately after it try_take()s
+    // w.call). (Re)registers NotifyServiceStatusChangeW on THIS thread if
+    // OpenServiceW succeeded — exactly as arm_watch did synchronously before
+    // PR-B3 (Win32 requires the registering thread to pump the alertable
+    // wait that delivers the APC; see ServiceProbeJob's own doc comment) —
+    // or classifies the open failure (absent vs backend) and schedules the
+    // existing kAbsentRetryMs retry, byte-for-byte the same classification
+    // and cadence as before this restructure. `ERROR_SERVICE_DOES_NOT_EXIST`
+    // is a genuine terminal Stopped, never a fault; every other open/
+    // register failure is a fault (never a false Stopped — the UP-4 class
+    // guard_systemd.cpp's ResolveResult split guards against on Linux).
+    void resolve_probe(SvcWatch& w, DetachedResult<ServiceProbeResult> r,
+                       std::vector<PendingEmit>& emits, std::vector<PendingFault>& faults) {
+        w.probe = ProbeState::Idle;
+        if (!r.has_value()) {
+            // WorkerThrew or ResultAllocFailed — contained inside the lane;
+            // the OS call never reached a definite outcome. Treated as a
+            // backend failure (never a false Stopped), same retry cadence as
+            // a genuine OpenServiceW error below.
+            probe_backend_failed_.fetch_add(1, std::memory_order_relaxed);
+            spdlog::warn("spark_service: establishment probe for a watched service did not "
+                        "complete cleanly ({})",
+                        r.error() == DetachedCallError::WorkerThrew ? "threw"
+                                                                    : "result alloc failed");
+            if (!w.faulted) {
+                w.faulted = true;
+                for (const auto& k : w.keys)
+                    faults.push_back({k, true, "OpenService probe failed"});
+            }
+            // ProbeState::Deferred (not Idle) — a due next_retry with probe
+            // still Idle would never be picked up by run()'s retry scan,
+            // which gates specifically on Deferred (#2012/#3840 PR-B3, found
+            // in this session's own review before landing: the ONLY prior
+            // arm_watch()-based design had no ProbeState to get out of sync).
+            w.probe = ProbeState::Deferred;
+            w.next_retry = Clock::now() + std::chrono::milliseconds(kAbsentRetryMs);
+            return;
+        }
+        ServiceProbeResult& res = *r;
+        if (!res.ok) {
+            probe_backend_failed_.fetch_add(1, std::memory_order_relaxed);
+            if (res.err == ERROR_SERVICE_DOES_NOT_EXIST) {
                 set_terminal(w, ServiceRunState::Stopped, emits);
                 if (w.faulted) {
                     w.faulted = false;
@@ -1122,18 +1425,20 @@ private:
                 }
             } else {
                 spdlog::warn("spark_service: OpenService failed for a watched service (err={})",
-                             err);
+                             res.err);
                 if (!w.faulted) {
                     w.faulted = true;
                     for (const auto& k : w.keys)
                         faults.push_back({k, true, "OpenService failed"});
                 }
             }
-            w.next_retry = std::chrono::steady_clock::now() +
-                           std::chrono::milliseconds(kAbsentRetryMs);
+            // Deferred, not Idle — an absent service needs its periodic
+            // re-poll picked up by the retry scan too; see the comment above.
+            w.probe = ProbeState::Deferred;
+            w.next_retry = Clock::now() + std::chrono::milliseconds(kAbsentRetryMs);
             return;
         }
-        w.svc.reset(h);
+        w.svc = std::move(res.svc);
         w.notify = SERVICE_NOTIFYW{};
         w.notify.dwVersion = SERVICE_NOTIFY_STATUS_CHANGE;
         w.notify.pfnNotifyCallback = &notify_cb;
@@ -1149,18 +1454,42 @@ private:
                 for (const auto& k : w.keys)
                     faults.push_back({k, true, "NotifyServiceStatusChange failed"});
             }
-            w.next_retry = std::chrono::steady_clock::now() +
-                           std::chrono::milliseconds(kAbsentRetryMs);
+            // Deferred, not Idle — see the comment on the two branches above.
+            w.probe = ProbeState::Deferred;
+            w.next_retry = Clock::now() + std::chrono::milliseconds(kAbsentRetryMs);
             return;
         }
         // Registered — the immediate callback (and every later terminal
         // transition) delivers as an APC at the next alertable wait.
+        // Resets ONLY on this full-success path, mirroring
+        // spark_registry.cpp's commit_locked() — a successfully-LAUNCHED
+        // probe that then failed at the OS call itself does NOT reset the
+        // admission backoff schedule, only a genuine establishment does.
+        w.admission_attempts = 0;
         if (w.faulted) {
             w.faulted = false;
             for (const auto& k : w.keys)
                 faults.push_back({k, false, "recovered"});
         }
         w.next_retry = {}; // event-driven now; no polling backstop needed while armed
+    }
+
+    // Marks `w` faulted if its CURRENT establishment obligation has been
+    // outstanding past kServiceHealthGrace without resolving — the probe
+    // itself keeps running past this point; this only surfaces the delay to
+    // consumers instead of leaving them silently waiting (mirrors
+    // spark_registry.cpp's grace_check_locked). Called only while
+    // w.probe==Pending and no result is available yet.
+    void grace_check(SvcWatch& w, Clock::time_point now, std::vector<PendingFault>& faults) {
+        if (w.grace_counted || now - w.accepted_at <= health_grace())
+            return;
+        w.grace_counted = true;
+        if (!w.faulted) {
+            w.faulted = true;
+            health_edges_.fetch_add(1, std::memory_order_relaxed);
+            for (const auto& k : w.keys)
+                faults.push_back({k, true, "service watch establishment pending past grace"});
+        }
     }
 
     void set_terminal(SvcWatch& w, ServiceRunState mapped, std::vector<PendingEmit>& out) {
@@ -1187,15 +1516,31 @@ private:
         std::vector<PendingFault> faults;
 
         while (!stop_.load(std::memory_order_acquire)) {
-            // Compute the wait timeout: soonest per-service retry deadline.
+            // Compute the wait timeout: soonest per-service retry deadline,
+            // capped by kServicePollCadence whenever any probe is Pending —
+            // this mechanism never wait_take()s on probe_lane_ (it must keep
+            // pumping APCs for every OTHER watch while one establishes), so
+            // without this cap a completed-but-unpolled probe result could
+            // sit unnoticed until some UNRELATED command/APC next woke this
+            // thread (#2012/#3840 PR-B3).
             const auto now = std::chrono::steady_clock::now();
             bool have_deadline = false;
             auto next = now;
+            bool any_pending = false;
             for (auto& [name, wp] : svcs_) {
+                if (wp->probe == ProbeState::Pending)
+                    any_pending = true;
                 if (wp->next_retry == std::chrono::steady_clock::time_point{})
                     continue; // event-driven, no polling backstop
                 if (!have_deadline || wp->next_retry < next) {
                     next = wp->next_retry;
+                    have_deadline = true;
+                }
+            }
+            if (any_pending) {
+                const auto poll_deadline = now + kServicePollCadence;
+                if (!have_deadline || poll_deadline < next) {
+                    next = poll_deadline;
                     have_deadline = true;
                 }
             }
@@ -1242,20 +1587,44 @@ private:
                 break;
             }
 
-            if (r == WAIT_TIMEOUT) {
+            // Poll every outstanding establishment probe and launch any due
+            // Deferred (re-)probe — regardless of what `r` was (#2012/#3840
+            // PR-B3; the pre-PR-B3 code only ran the equivalent retry scan on
+            // WAIT_TIMEOUT, which was fine when arm_watch was the retry
+            // itself — now that begin_probe() is a cheap, non-blocking call,
+            // there is no reason to defer noticing a due retry just because a
+            // command or an APC also woke this same iteration). A probe can
+            // complete at any time with no OS notification for it (unlike an
+            // APC) — this is what actually notices completion; the
+            // wait-timeout computation above caps the wait specifically so
+            // this scan runs promptly instead of only on some unrelated wake.
+            {
                 const auto now2 = std::chrono::steady_clock::now();
                 for (auto& [name, wp] : svcs_) {
-                    if (wp->next_retry == std::chrono::steady_clock::time_point{} ||
-                        wp->next_retry > now2)
-                        continue;
-                    arm_watch(*wp, emits, faults); // may deliver APCs via its own SleepEx(0,TRUE)
+                    if (wp->probe == ProbeState::Pending) {
+                        if (!wp->call)
+                            continue; // defensive: begin_probe always pairs
+                                     // Pending with an engaged call on Launched
+                        if (auto res = wp->call->try_take()) {
+                            wp->call.reset();
+                            resolve_probe(*wp, std::move(*res), emits,
+                                         faults); // may deliver APCs via its own
+                                                   // NotifyServiceStatusChangeW registration
+                        } else {
+                            grace_check(*wp, now2, faults);
+                        }
+                    } else if (wp->probe == ProbeState::Deferred && wp->next_retry <= now2) {
+                        begin_probe(*wp); // may deliver APCs via its own SleepEx(0,TRUE)
+                                          // (teardown_watch)
+                    }
                 }
             }
 
-            // Drain pending watch()/unwatch() commands. Add's arm_watch (and
-            // Remove's teardown_watch) may ALSO deliver queued APCs via their
-            // internal SleepEx(0,TRUE) — the fired-flag scan below runs AFTER
-            // this drain so it catches those too.
+            // Drain pending watch()/unwatch() commands. Add's begin_probe
+            // (via its teardown_watch call) and Remove's teardown_watch may
+            // ALSO deliver queued APCs via their internal SleepEx(0,TRUE) —
+            // the fired-flag scan below runs AFTER this drain so it catches
+            // those too.
             std::deque<Cmd> cmds;
             {
                 std::lock_guard lk(mu_);
@@ -1280,7 +1649,7 @@ private:
                     w->keys.insert(cmd.key);
                     key_svc_.emplace(cmd.key, folded);
                     if (is_new) {
-                        arm_watch(*w, emits, faults);
+                        begin_probe(*w);
                     } else if (w->last) {
                         // Same UP-2 fix as the Linux mechanism: hand a
                         // newly-coalescing key the fault status too, not just
@@ -1352,7 +1721,7 @@ private:
                         // MARKED_FOR_DELETE / CLIENT_LAGGING or similar — the
                         // ServiceStatus is not trustworthy; re-resolve from
                         // scratch (-> absent path if truly gone).
-                        arm_watch(*wp, emits, faults);
+                        begin_probe(*wp);
                         continue;
                     }
                     if (is_pending(wp->current_state)) {
@@ -1360,7 +1729,7 @@ private:
                         // one-shot so the terminal state is still seen.
                         if (NotifyServiceStatusChangeW(wp->svc.get(), kNotifyMask, &wp->notify) !=
                             ERROR_SUCCESS)
-                            arm_watch(*wp, emits, faults);
+                            begin_probe(*wp);
                         continue;
                     }
                     // Terminal: re-arm the one-shot FIRST (it is consumed on
@@ -1370,7 +1739,7 @@ private:
                                                                     &wp->notify) == ERROR_SUCCESS;
                     set_terminal(*wp, map_terminal(wp->current_state), emits);
                     if (!rearmed)
-                        arm_watch(*wp, emits, faults);
+                        begin_probe(*wp);
                 }
                 if (!any) {
                     break; // converged — nothing fired this pass
@@ -1445,7 +1814,11 @@ private:
     std::atomic<bool> started_inert_{false};
     std::atomic<bool> stop_{false};
     std::thread thread_;
-    yuzu::win::ScHandle scm_;
+    /// Shared SCM connection lease — see ScmCore's own doc comment. Set once
+    /// per start()ed lifetime, cleared in stop(); a probe holding its own
+    /// copy keeps the connection open independent of this member's lifetime
+    /// (#2012/#3840 PR-B3).
+    std::shared_ptr<ScmCore> scm_core_;
     detail::EventHandle wake_;
 
     // Mechanism-thread-confined (no lock): touched only from run(), and from
@@ -1456,12 +1829,99 @@ private:
     /// Cmd::Remove handling and the reap loop in run() for why a watch isn't
     /// freed synchronously on removal.
     std::vector<std::unique_ptr<SvcWatch>> retiring_;
+
+    // ── PR-B3 (#2012/#3840): probe-only establishment lane ──────────────────
+    /// Mechanism-global, bumped at every probe reservation (begin_probe()) —
+    /// see SvcWatch::probe_gen's own doc comment for why this is
+    /// defense-in-depth here rather than load-bearing the way it is for
+    /// Registry.
+    std::uint64_t gen_{0};
+    std::shared_ptr<const ServiceProbeHook> probe_hook_; ///< test seam
+    SparkDetachedLane probe_lane_;
+
+    std::atomic<std::uint64_t> probe_launched_{0};
+    std::atomic<std::uint64_t> probe_admission_rejected_{0};
+    std::atomic<std::uint64_t> probe_launch_failed_{0};
+    std::atomic<std::uint64_t> probe_backend_failed_{0};
+    std::atomic<std::uint64_t> probe_discarded_{0}; ///< reserved for future use — see debug_counters()
+    std::atomic<std::uint64_t> health_edges_{0};
+
+public:
+    // ── test seams (spark_mechanism.hpp free functions forward here) ────────
+    void apply_test_controls(ServiceMechanismTestControls c) {
+        // probe_hook_ is read by begin_probe() on the mechanism's OWN thread
+        // (run()), outside any lock in the ordinary case — unlike
+        // spark_registry.cpp, where every reader of its equivalent
+        // probe_hook_ already runs under mu_. mu_ here otherwise guards only
+        // pending_/start-stop, so this write (and begin_probe's read, below)
+        // take it JUST for this one shared_ptr, rather than serialising the
+        // whole control path against it.
+        {
+            std::lock_guard lk(mu_);
+            if (c.probe_hook)
+                probe_hook_ = std::make_shared<const ServiceProbeHook>(std::move(c.probe_hook));
+            else
+                probe_hook_.reset();
+        }
+        if (c.probe_lane_cap)
+            probe_lane_.set_cap_for_test(c.probe_lane_cap);
+        if (c.health_grace.count() > 0)
+            health_grace_ms_.store(c.health_grace.count(), std::memory_order_relaxed);
+        if (c.admission_backoff_seed.count() > 0)
+            admission_seed_ms_.store(c.admission_backoff_seed.count(), std::memory_order_relaxed);
+        wake_signal(); // nudge run() in case a lowered cap/grace should apply promptly
+    }
+
+    [[nodiscard]] ServiceMechanismDebugCounters debug_counters() const {
+        ServiceMechanismDebugCounters d;
+        d.probe_launched = probe_launched_.load(std::memory_order_relaxed);
+        d.probe_admission_rejected = probe_admission_rejected_.load(std::memory_order_relaxed);
+        d.probe_launch_failed = probe_launch_failed_.load(std::memory_order_relaxed);
+        d.probe_backend_failed = probe_backend_failed_.load(std::memory_order_relaxed);
+        d.probe_discarded = probe_discarded_.load(std::memory_order_relaxed);
+        d.health_edges = health_edges_.load(std::memory_order_relaxed);
+        // probe_lane_'s own counters are lock-free/atomic by construction
+        // (SparkDetachedLane). svcs_/retiring_ are mechanism-thread-confined
+        // with NO lock (unlike Registry's watches_, which is mu_-guarded) —
+        // deliberately NOT exposed here: reading their .size() from this
+        // (arbitrary caller) thread while run() concurrently inserts/erases
+        // would be a real data race, not merely a point-in-time skew. A test
+        // that needs to observe watch-count-shaped behavior does so through
+        // Collector/emit counts, matching every existing Service test.
+        d.probe_workers_active = probe_lane_.active_workers();
+        return d;
+    }
+
+private:
+    std::atomic<std::int64_t> health_grace_ms_{kServiceHealthGrace.count()};
+    std::atomic<std::int64_t> admission_seed_ms_{kServiceAdmissionBackoffSeed.count()};
 };
 
 } // namespace
 
 std::unique_ptr<ISparkMechanism> make_service_mechanism() {
-    return std::make_unique<WindowsServiceMechanism>();
+    return std::make_unique<WindowsServiceMechanism>(nullptr); // no shared F3 counter (tests)
+}
+
+std::unique_ptr<ISparkMechanism>
+make_service_mechanism(std::shared_ptr<std::atomic<std::size_t>> f3_counter) {
+    return std::make_unique<WindowsServiceMechanism>(std::move(f3_counter));
+}
+
+bool set_service_test_controls_for_test(ISparkMechanism& mech, ServiceMechanismTestControls controls) {
+    auto* real = dynamic_cast<WindowsServiceMechanism*>(&mech);
+    if (!real)
+        return false;
+    real->apply_test_controls(std::move(controls));
+    return true;
+}
+
+std::optional<ServiceMechanismDebugCounters>
+service_debug_counters_for_test(const ISparkMechanism& mech) {
+    const auto* real = dynamic_cast<const WindowsServiceMechanism*>(&mech);
+    if (!real)
+        return std::nullopt;
+    return real->debug_counters();
 }
 
 } // namespace yuzu::agent
@@ -1472,6 +1932,19 @@ namespace yuzu::agent {
 
 std::unique_ptr<ISparkMechanism> make_service_mechanism() {
     return nullptr; // no mechanism → SparkEngine rejects arm(Service)
+}
+
+std::unique_ptr<ISparkMechanism>
+make_service_mechanism(std::shared_ptr<std::atomic<std::size_t>> /*f3_counter*/) {
+    return nullptr; // same platform contract as the zero-argument form
+}
+
+bool set_service_test_controls_for_test(ISparkMechanism&, ServiceMechanismTestControls) {
+    return false; // nothing to control off Windows and off Linux-with-libsystemd
+}
+
+std::optional<ServiceMechanismDebugCounters> service_debug_counters_for_test(const ISparkMechanism&) {
+    return std::nullopt;
 }
 
 } // namespace yuzu::agent
