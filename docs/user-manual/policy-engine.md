@@ -111,25 +111,37 @@ checks run.
 | `scope_expression` | Scope engine expression for device targeting |
 | `enabled` | Whether the policy is active (can be toggled) |
 | `inputs` | Key-value parameters passed to the fragment's instructions |
-| `triggers` | When to evaluate. **Only `interval` triggers are honoured as declared — every other type is silently ignored and the policy falls back to hourly evaluation of its full scope regardless** — see "Trigger Configuration" below (#4244). |
+| `triggers` | When to evaluate. **Only `interval` triggers are honoured as declared — every other type is silently ignored and the policy falls back to hourly evaluation of its full scope regardless.** You can always confirm what's actually stored: `GET /api/compliance` and the per-policy detail route both return each trigger's `type` and parsed `config` verbatim, so fetching the policy and comparing that against the cadence you intended is a working diagnostic — see "Trigger Configuration" below (#4244). |
 | `management_groups` | Group IDs this policy is scoped to |
 
 ### Trigger Configuration
 
-Triggers are stored per-policy with type-specific JSON configuration. **Corrected 2026-09-10 (Gate-of-record pass 4, item 3 — supersedes the pass 3 wording below, which was itself wrong): non-interval trigger types are accepted and stored, but IGNORED — they do NOT suppress evaluation.** `trigger_type` is a free-text column and every kind below is accepted and persisted without validation. The due-policy scheduling query is a **`LEFT JOIN`** from `policies` to `policy_triggers` filtered to `trigger_type='interval'` **in the join condition, not the `WHERE` clause** (`server/core/src/policy_store.cpp:1242-1252`) — so every enabled policy produces exactly one row whether or not it has an interval trigger. A policy with only a `file_change`/`service_status`/`event_log`/`registry`/`startup` trigger (or no trigger at all) still gets that row, with `config_json` = `NULL`, and `NULL` falls back to the **3600-second platform default** (`interval_from_config_json(..., default_interval_seconds)`). **The practical effect: a policy configured with a non-interval trigger still evaluates — every hour, against its full declared scope — as if it had an `interval` trigger set to the default, with no error, no warning at create time, no indication in REST reads that this is happening, and no dedicated cadence metric distinguishing "genuinely configured for hourly" from "fell back because the declared trigger type is a no-op" (tracked as issue #4244).** This is the opposite failure mode from "never evaluated": it's "evaluated on a schedule you didn't ask for, silently."
+Triggers are stored per-policy with type-specific JSON configuration. **Corrected 2026-09-11 (Gate-of-record pass 5, sec-P5-1/CHAOS-P5-1/CHAOS-P5-2 — the pass 4 wording below contained a false claim of its own, and undersold the parser's fragility):** non-interval trigger types are accepted and stored, but IGNORED — they do NOT suppress evaluation. `trigger_type` is a free-text column and every kind below is accepted and persisted without validation. The due-policy scheduling query is a **`LEFT JOIN`** from `policies` to `policy_triggers` filtered to `trigger_type='interval'` **in the join condition, not the `WHERE` clause** (`server/core/src/policy_store.cpp:1242-1252`) — so every enabled policy produces exactly one row whether or not it has an interval trigger. A policy with only a `file_change`/`service_status`/`event_log`/`registry`/`startup` trigger (or no trigger at all) still gets that row, with `config_json` = `NULL`, and `NULL` falls back to the **3600-second platform default** (`interval_from_config_json(..., default_interval_seconds)`). The practical effect: a policy configured with a non-interval trigger still evaluates — every hour, against its full declared scope — as if it had an `interval` trigger set to the default.
+
+**What you CAN see, and how to use it (corrects an earlier, false "nothing surfaces this" claim):** the policy-detail and policy-list REST reads genuinely return each trigger's `id`, `type`, and parsed `config` — `GET /api/compliance` (list) and the per-policy detail route both do this (`server/core/src/compliance_routes.cpp:596-598` and `:700-702`). Fetch the policy and look at its `triggers` array: if there's no entry with `"type": "interval"` and a numeric `config.interval_seconds`, the policy is on the 3600s fallback regardless of what other trigger types are listed. **What is NOT surfaced:** no validation or warning at policy-create time that a declared trigger type has no effect on cadence, and no dedicated metric reporting the *effective* evaluation interval after the parser's fallbacks — so you have to go looking, nothing tells you proactively. Tracked as issue #4244.
+
+**The `triggers:` parser is a hand-rolled line scan, not a real YAML parser, and it is fragile in ways that compound the above:**
+
+1. **Indentation:** `extract_yaml_section` keeps only lines *more indented* than the `triggers:` key itself — a `- type:` line indented at the *same* level as `triggers:` (a perfectly common, idiomatic YAML list style) yields **zero triggers parsed**, silently. See the indentation requirement spelled out under "Policy" below.
+2. **Duration parsing:** `interval_seconds` is read with `std::stoi`, which parses a numeric *prefix* and stops — `interval_seconds: 5m` (a human writing "5 minutes" the way they'd say it) parses as `5`, i.e. **5 seconds, not 300** — a 60× tighter cadence than intended, silently.
+3. **Range handling:** a value `std::stoi` can't parse as an `int` (e.g. a value larger than ~2.1 billion but still within `int64_t` range) is caught and stored as a **raw string** instead of a number; at dispatch time that string is re-parsed with `std::stoll`, which succeeds — so an accidental huge value doesn't error, it silently produces a multi-year effective interval. The policy dispatches roughly once and then not again for a very long time, while `enabled` keeps reporting `true` the whole time — there is no sign anything is wrong short of noticing the policy stopped producing results.
 
 | Trigger Type | Config Example | What actually happens |
 |---|---|---|
-| `interval` | `{"interval_seconds": 300}` | Evaluates on your declared cadence (floored at 60s). |
-| `file_change` | `{"path": "/etc/hosts"}` | **Ignored** — the file-change condition has no effect. The policy still evaluates every **3600s** (default) against its full scope. See #4244. |
-| `service_status` | `{"service": "sshd"}` | **Ignored** — same fallback to the 3600s default. See #4244. |
-| `event_log` | `{"log": "Security", "event_id": 4625}` | **Ignored** — same fallback to the 3600s default. See #4244. |
-| `registry` | `{"hive": "HKLM", "key": "SOFTWARE\\..."}` | **Ignored** — same fallback to the 3600s default. See #4244. |
-| `startup` | `{}` | **Ignored** — same fallback to the 3600s default. See #4244. |
+| `interval` | `{"interval_seconds": 300}` | Evaluates on your declared cadence (floored at 60s) — **if** the trigger actually parsed; see the fragility list above. |
+| `file_change` | `{"path": "/etc/hosts"}` | **Ignored for cadence purposes** — the file-change condition has no effect on *when* evaluation happens. The policy still evaluates every **3600s** (default) against its full scope. Visible via `GET /api/compliance` (the stored `config` has no `interval_seconds`). See #4244. |
+| `service_status` | `{"service": "sshd"}` | Same as `file_change` above. See #4244. |
+| `event_log` | `{"log": "Security", "event_id": 4625}` | Same as `file_change` above. See #4244. |
+| `registry` | `{"hive": "HKLM", "key": "SOFTWARE\\..."}` | Same as `file_change` above. See #4244. |
+| `startup` | `{}` | Same as `file_change` above. See #4244. |
 
-If you need a policy to re-evaluate on a specific cadence, declare an explicit `interval` trigger with the `interval_seconds` you want — do not assume a `file_change`/`service_status`/`event_log`/`registry`/`startup` trigger changes *when* evaluation happens; it doesn't, and the policy will silently run hourly against its full scope regardless. (Real-time, kernel-backed enforcement for a narrower set of settings exists on the agent-side Guardian path — see `docs/yuzu-guardian-design-v1.1.md` — which is a different mechanism from this server-side policy trigger configuration.)
+If you need a policy to re-evaluate on a specific cadence, declare an explicit `interval` trigger with the `interval_seconds` you want (as a plain integer, not a duration string) at the correct indentation (see "Policy" below) — do not assume a `file_change`/`service_status`/`event_log`/`registry`/`startup` trigger changes *when* evaluation happens; it doesn't, and the policy will silently run hourly against its full scope regardless. (Real-time, kernel-backed enforcement for a narrower set of settings exists on the agent-side Guardian path — see `docs/yuzu-guardian-design-v1.1.md` — which is a different mechanism from this server-side policy trigger configuration.)
 
-> **Common mistake:** pasting one of the non-`interval` examples above (or any policy with no `triggers:` block at all) does not mean "this policy never runs" — it means "this policy runs every hour against its full scope, invisibly." Nothing in policy creation, the REST read endpoints, or the dashboard currently surfaces that fallback as distinct from a deliberately-configured hourly interval (#4244). If a policy's checks are expensive or its scope is large, declare an explicit `interval` trigger with a cadence you've chosen on purpose, rather than relying on (or being unaware of) the default.
+> **Common mistake 1 — no interval trigger:** pasting one of the non-`interval` examples above (or any policy with no `triggers:` block at all) does not mean "this policy never runs" — it means "this policy runs every hour against its full scope." Nothing in policy creation or the dashboard proactively surfaces that fallback as distinct from a deliberately-configured hourly interval — but `GET /api/compliance` genuinely does show you the stored trigger `config`, so you can check (#4244). If a policy's checks are expensive or its scope is large, declare an explicit `interval` trigger with a cadence you've chosen on purpose, rather than relying on (or being unaware of) the default.
+>
+> **Common mistake 2 — wrong indentation silently drops all triggers:** writing `- type: interval` at the *same* indentation as the `triggers:` key above it (rather than indented one level deeper) parses as **zero triggers**, not an error — the policy falls back to the 3600s default exactly as if you'd written no triggers at all. A policy you believe is checking every 24 hours (`interval_seconds: 86400`) can end up running **24× more often** than intended this way, with every layer reporting healthy. See "Policy" below for the indentation the parser actually requires.
+>
+> **Common mistake 3 — duration strings and oversized values:** `interval_seconds: 5m` parses to `5` (seconds), not 300 — a **60× tighter cadence** than a human reading "5m" as "5 minutes" would expect. And an `interval_seconds` value large enough to overflow a 32-bit int (but still fitting in 64 bits) doesn't error either — it silently produces a multi-year effective interval, so the policy dispatches once and then appears to just stop, while still reporting `enabled: true`. Always write `interval_seconds` as a plain integer number of seconds, and sanity-check the value you get back from `GET /api/compliance` against what you intended.
 
 > **Trigger limit:** The agent's trigger engine enforces a configurable maximum trigger count (default: 2000). Triggers beyond this limit are rejected with a warning log message. This prevents runaway policy deployments from exhausting agent resources. The limit can be configured via the agent API. (Note: this is the *agent's own* `TriggerType` engine used elsewhere in the product, e.g. §17 of the capability map — distinct from the server-side `PolicyStore` trigger-type column described above, which does not dispatch through that engine at all.)
 
@@ -167,6 +179,23 @@ and silently falls back to the **3600-second** platform default
 (`policy_evaluator.hpp:107`), not the value you wrote. This corrects an
 earlier revision of this manual that itself used the wrong key. *(Corrected
 2026-09-10, Gate-of-record pass 4 item 1.)*
+
+**Indentation matters, and it is stricter than valid YAML in general
+(added 2026-09-11, Gate-of-record pass 5, CHAOS-P5-1).** The `- type:` line
+above **must** be indented *more* than the `triggers:` key it belongs to —
+in this example, `triggers:` is at 2 spaces and `- type: interval` is at 4.
+`extract_yaml_section` (`server/core/src/yaml_scan.cpp:279`) discards every
+line that is not strictly more indented than the section's own key, so the
+equally-valid, equally-common YAML style where a list's dashes align with
+their parent key —
+```yaml
+  triggers:
+  - type: interval
+    interval_seconds: 300
+```
+— parses as **zero triggers**, silently, with no error. Always indent
+`- type:` at least one level deeper than `triggers:`, exactly as shown in
+the example above.
 
 ---
 
@@ -438,6 +467,11 @@ exactly this reason; only `type: interval` currently has any effect on
 accepted, stored, and functionally ignored. *(Corrected 2026-09-10,
 Gate-of-record pass 4 item 2 — an earlier revision of this example put
 explanatory comments inside the sequence and broke on this exact bug.)*
+
+**Also indent `- type:` deeper than `triggers:`, never at the same level**
+(added 2026-09-11, Gate-of-record pass 5, CHAOS-P5-1) — see the worked
+example and explanation under "Example Policy YAML" above; the schema below
+uses the one indentation the parser accepts.
 
 ```yaml
 apiVersion: yuzu.io/v1alpha1

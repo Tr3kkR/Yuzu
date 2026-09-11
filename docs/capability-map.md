@@ -41,17 +41,19 @@ Each capability is rated on two axes:
 > this session — honest scoping over implied uniform depth. Domains 1-31's regraded rows each
 > carry their own inline evidence citation and verification date. **Rows regraded or added carry
 > the marker `*(verified <date>)*`; all other rows carry their v3.0 (2026-03-30) grade unchanged
-> and were NOT re-verified.** The marker carries **two possible dates**: `2026-09-07` (the v4.0
-> baseline pass + subsequent governance folds through Gate-of-record pass 2) and `2026-09-10`
-> (Gate-of-record pass 3's fixes + its targeted keyword sweep — a row keeps its original `07`
-> date if only prose was corrected without a grade change, and gets bumped to `10` if this pass
-> changed its icon or newly added the marker) — reproduce with
-> `grep -cE '\*\(verified 2026-09-(07|10)\)\*' docs/capability-map.md` → `82` (81 `###` rows —
+> and were NOT re-verified.** The marker carries **three possible dates**: `2026-09-07` (the v4.0
+> baseline pass + subsequent governance folds through Gate-of-record pass 2), `2026-09-10`
+> (Gate-of-record pass 3's fixes + its targeted keyword sweep, plus pass 4's fixes), and
+> `2026-09-11` (Gate-of-record pass 5's fixes) — a row keeps its most recent date; it only moves
+> forward when that pass changed its icon, newly added the marker, or materially rewrote its
+> claim (a pure prose polish with no substantive correction leaves the date alone) — reproduce
+> with
+> `grep -cE '\*\(verified 2026-09-(07|10|11)\)\*' docs/capability-map.md` → `83` (82 `###` rows —
 > 71 dated `07` across §5, §7, §10, §12-14, §17-18, §20-22, §24, §26-28, §30-31, all of §32-39,
-> plus 10 dated `10` across §2, §3, §4, §9, §14, §16, §20, §30-31 — plus one Appendix A caption
-> note dated `07`). Of the 265 total rows, 184 (265 - 81) are un-regraded v3.0 carry-overs —
-> this document does NOT represent whole-document verification against dev @ d295db964, only
-> the 81 marked rows do.
+> 9 dated `10` across §2, §3, §4, §9, §14, §20, §30-31, and 2 dated `11` (§16.2, §16.4) — plus
+> one Appendix A caption note dated `07`). Of the 265 total rows, 183 (265 - 82) are un-regraded
+> v3.0 carry-overs — this document does NOT represent whole-document verification against
+> dev @ d295db964, only the 82 marked rows do.
 > Four hand-maintained views
 > must be updated together whenever a row's icon or tier changes: the headline/tier bars below,
 > the per-domain summary table, Appendix A's plugin count, and Appendix B's Foundation tally —
@@ -784,17 +786,17 @@ Not implemented. Agent-side cache with delta sync.
 
 `PolicyStore` with `PolicyFragment` (check/fix/postCheck pattern) and `Policy` kinds. YAML-defined with CEL compliance expressions. CRUD via REST API.
 
-### 16.2 Policy Evaluation and Enforcement :large_orange_diamond: `T2` *(verified 2026-09-10)*
+### 16.2 Policy Evaluation and Enforcement :large_orange_diamond: `T2` *(verified 2026-09-11)*
 
-**Regraded 2026-09-10 (Gate-of-record pass 3, sec-2/UP-16): Done → Partial — interval-only in practice.** **Corrected 2026-09-10 (Gate-of-record pass 4, item 3 — the pass 3 wording above got the failure mode backwards):** `PolicyStore` tracks per-agent compliance status (compliant, non_compliant, unknown, fixing, error). `trigger_type` is a free-text column (`policy_store.hpp:68`: `"interval", "file_change", "event_log", etc.`) and a policy's YAML can name any of those trigger kinds — the store accepts and persists them all without validation (`policy_store.cpp:729-731`). The due-policy scheduling query is a **`LEFT JOIN`** — `"LEFT JOIN policy_store.policy_triggers t ON t.policy_id = p.id AND t.trigger_type = 'interval' WHERE p.enabled = TRUE"` (`server/core/src/policy_store.cpp:1242-1252`) — with the type filter **in the join condition, not the `WHERE` clause**, so a policy with no `interval` trigger is NOT dropped from the result set; it still produces a row, with `config_json = NULL`, and `interval_from_config_json(NULL, default_interval_seconds)` falls back to the **3600-second platform default**. **A policy configured with `file_change`/`event_log`/`service_status`/`registry`/`startup` is therefore NOT "never picked up" — it is accepted and stored but effectively ignored: the policy still evaluates on the interval cadence (the 3600s default, unless a separate `interval` trigger also exists) against its full declared scope, with no warning surfaced at create time, no `config_json` visible in REST reads distinguishing this from a deliberate interval configuration, and no cadence metric that would let an operator notice the fallback is happening (tracked as issue #4244).** This is the opposite risk from what the prior fold implied: not a silently-inert policy, but a silently-hourly, full-scope one. *(Evidence: `policy_store.hpp:68`; `policy_store.cpp:729-731,1242-1252`; verified 2026-09-10 — corrects the pass 3 fold's "never picked up by this join" claim, which misread a `LEFT JOIN`'s semantics.)*
+**Regraded 2026-09-10 (Gate-of-record pass 3, sec-2/UP-16): Done → Partial — interval-only in practice.** **Corrected 2026-09-10 (pass 4, item 3 — the pass 3 wording got the failure mode backwards) and 2026-09-11 (pass 5, sec-P5-1/CHAOS-P5-1/CHAOS-P5-2 — removes a false claim the PO's own pass-4 instruction introduced and adds three more measured parser bugs):** `PolicyStore` tracks per-agent compliance status (compliant, non_compliant, unknown, fixing, error). `trigger_type` is a free-text column (`policy_store.hpp:68`) and a policy's YAML can name any trigger kind — the store accepts and persists them all without validation (`policy_store.cpp:729-731`). The due-policy scheduling query is a **`LEFT JOIN`**, type filter in the join condition not the `WHERE` clause (`server/core/src/policy_store.cpp:1242-1252`), so a policy with no `interval` trigger still produces a row with `config_json = NULL`, and `interval_from_config_json(NULL, default_interval_seconds)` falls back to the **3600-second platform default** against the policy's **full declared scope** — silently-hourly, not silently-inert. **What IS surfaced:** the policy-detail and policy-list REST reads genuinely return each trigger's `id`, `type`, and parsed `config` (`compliance_routes.cpp:596-598,700-702`) — an operator can fetch a policy and see exactly what was stored. **What is NOT surfaced:** no validation or warning at create time that a declared trigger type has no effect on cadence, and no metric reporting the *effective* interval after the parser's fallbacks — so the diagnostic exists (compare the returned `config` against the cadence you intended) but nothing points you at it proactively. Three further parser fragility bugs (measured 2026-09-11): (1) `extract_yaml_section` keeps only lines *more indented* than `triggers:` (`yaml_scan.cpp:279`) — the equally-common same-indent list style (`- type:` aligned with `triggers:`) yields **zero triggers**, so a declared `interval_seconds: 86400` silently runs at the 3600s default (**24× over-dispatch**); (2) `std::stoi("5m")` returns `5` rather than erroring (`policy_store.cpp:658`) — a human-readable duration like "5m" becomes 5 *seconds*, not 300 (**60× amplification**); (3) a value outside `int` range is stored as a raw string and `std::stoll`-parsed back at dispatch time (`policy_store.cpp:658-661,218-223`) — a sufficiently large but `int64_t`-representable typo dispatches once and then not again for years, while the policy keeps reporting `enabled: true`. Full detail, worked examples, and the "Common mistake" callout: `docs/user-manual/policy-engine.md` § Trigger Configuration. Tracking issue: **#4244** (body corrected 2026-09-11 to remove the same false REST-reads claim this row is now correcting). *(Evidence: `policy_store.hpp:68`; `policy_store.cpp:218-223,658-661,729-731,1242-1252`; `compliance_routes.cpp:596-598,700-702`; `yaml_scan.cpp:279`; verified 2026-09-11.)*
 
 ### 16.3 Policy Assignment to Device Groups :white_check_mark: `T2`
 
 Policies support management group bindings via `PolicyGroupBinding`. Scope expressions for device targeting.
 
-### 16.4 Compliance Summary and Statistics :white_check_mark: `T2`
+### 16.4 Compliance Summary and Statistics :white_check_mark: `T2` *(verified 2026-09-11)*
 
-`FleetCompliance` aggregate with compliance percentage. Per-policy `ComplianceSummary`. Compliance dashboard with fleet-level and per-policy drill-down to agent-level detail.
+`FleetCompliance` aggregate with compliance percentage. Per-policy `ComplianceSummary`. Compliance dashboard with fleet-level and per-policy drill-down to agent-level detail. **Caveat added 2026-09-11 (Gate-of-record pass 5, comp-P5-1): the two summaries have different freshness guarantees — do not assume the per-policy summary is as fresh as the fleet-wide one.** `PolicyStore::compute_fleet_compliance()` demotes any status older than a 24-hour staleness window to `unknown` before aggregating (`kStalenessTtl = 24 * 3600`, `server/core/src/policy_store.cpp:34,1072-1076`: `CASE WHEN last_check_at >= cutoff THEN status ELSE 'unknown' END`). `PolicyStore::get_compliance_summary()` (the **per-policy** `ComplianceSummary`) has no equivalent filter at all — it is a raw `GROUP BY status` over `policy_status` with no `last_check_at` condition (`policy_store.cpp:1020-1060`), so a status computed once and never refreshed (e.g. because a policy's trigger is silently ignored per §16.2, or the agent went offline) counts as fully "compliant"/"non_compliant" indefinitely, with no staleness demotion and no indication of age in the summary itself. The per-agent detail list (`get_policy_agent_statuses`) does expose the raw `last_check_at` timestamp per row, so a consumer *can* compute staleness themselves from that — but the per-policy `ComplianceSummary` numbers do not do this for you. *(Evidence: `policy_store.cpp:34,1020-1060,1072-1076`; verified 2026-09-11.)*
 
 ### 16.5 Evaluation History and Audit Trail :white_check_mark: `T2`
 
